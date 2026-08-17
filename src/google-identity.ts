@@ -36,6 +36,7 @@ export type GoogleIdentityErrorCode =
   | "expired"
   | "wrong_audience"
   | "wrong_issuer"
+  | "wrong_nonce"
   | "unverified_email"
   | "keys_unavailable";
 
@@ -104,7 +105,7 @@ export function createGoogleIdentity(options: GoogleIdentityOptions): ExternalId
   };
 
   return {
-    async verify({ provider, assertion }) {
+    async verify({ provider, assertion, nonce }) {
       if (provider !== "google") throw new GoogleIdentityError("wrong_issuer");
       if (assertion.length > MAX_TOKEN_BYTES) throw new GoogleIdentityError("malformed");
 
@@ -162,6 +163,12 @@ export function createGoogleIdentity(options: GoogleIdentityOptions): ExternalId
       }
       if (typeof claims.sub !== "string" || claims.sub === "") {
         throw new GoogleIdentityError("malformed");
+      }
+      // The caller asked Google to stamp this value into the token. Checking it
+      // binds the token to that request: a token minted for some earlier or
+      // other attempt is a valid Google token and still not this one.
+      if (nonce !== undefined && claims.nonce !== nonce) {
+        throw new GoogleIdentityError("wrong_nonce");
       }
       // An unverified address is a string the account holder typed, and this
       // product keys nothing on it — but it is shown to other people, so a

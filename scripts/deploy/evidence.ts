@@ -21,6 +21,13 @@ export interface EvidenceRecord {
   readonly previousVersionId: string | null;
   readonly bundleDigest: string;
   readonly bundleBytes: number;
+  /**
+   * Digest of the realized configuration: the bindings, routes, and public
+   * variables the bundle runs under. Recorded because a deployment is the
+   * bytes *and* what they are wired to, and changing only the wiring is a real
+   * change that must publish.
+   */
+  readonly configDigest: string;
   readonly migrationDigest: string;
   readonly migrationFiles: readonly string[];
   readonly d1DatabaseId: string;
@@ -63,6 +70,7 @@ export function assertPublishedIdentity(
   ledger: readonly EvidenceRecord[],
   servedVersionId: string | null,
   bundleDigest: string,
+  configDigest: string,
 ): { readonly alreadyCurrent: boolean } {
   if (servedVersionId === null) return { alreadyCurrent: false };
 
@@ -74,5 +82,13 @@ export function assertPublishedIdentity(
       served.map((record) => `${record.publishedAt} ${record.bundleDigest}`).join("\n"),
     );
   }
-  return { alreadyCurrent: digests.has(bundleDigest) };
+  // Current means these bytes running under this wiring. Comparing only the
+  // bytes reports a configuration change as already deployed, which is how
+  // somebody turns a feature on, sees "nothing was published", and believes
+  // it is live. A record written before configuration was tracked has no
+  // digest to match, so the next publish goes out — which is the safe answer.
+  return {
+    alreadyCurrent:
+      digests.has(bundleDigest) && served.some((r) => r.configDigest === configDigest),
+  };
 }

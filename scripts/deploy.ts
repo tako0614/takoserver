@@ -159,6 +159,7 @@ async function run(mode: Mode): Promise<void> {
     previousVersionId,
     bundleDigest: report.bundleDigest,
     bundleBytes: report.bundleBytes,
+    configDigest: report.configDigest,
     migrationDigest: report.migrationDigest,
     migrationFiles: report.migrationFiles,
     d1DatabaseId: target.d1.databaseId,

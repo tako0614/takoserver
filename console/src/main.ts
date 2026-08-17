@@ -1,4 +1,5 @@
 import { type Child, h, live, text } from "./dom.ts";
+import { readGoogleReturn } from "./google.ts";
 import { wordmark } from "./mark.ts";
 import { billingPage } from "./pages/billing.ts";
 import { catalogPage } from "./pages/catalog.ts";
@@ -12,6 +13,7 @@ import { signInPage } from "./pages/signin.ts";
 import { effect, signal } from "./reactive.ts";
 import { linkProps, navigate, route } from "./router.ts";
 import {
+  adoptSession,
   api,
   applyTheme,
   currentOrganization,
@@ -59,6 +61,22 @@ function boot(): void {
   const root = document.getElementById("root");
   if (!root) throw new Error("console root is missing");
   root.append(mountToasts());
+
+  // Google may have just sent this browser back with a token in the fragment.
+  // It is read and cleared before anything renders, so a reload cannot replay
+  // a sign-in and the token never sits in the address bar.
+  const returned = readGoogleReturn();
+  if (returned.kind === "error") {
+    toast(returned.message, "bad");
+  } else if (returned.kind === "ok") {
+    api.signIn("google", returned.value.idToken, "oidc", returned.value.nonce).then(
+      ({ sessionToken }) => {
+        adoptSession(sessionToken);
+        navigate(returned.value.from, { replace: true });
+      },
+      (error: unknown) => toast(explain(error as Error), "bad"),
+    );
+  }
 
   const view = h("div");
   root.append(view);

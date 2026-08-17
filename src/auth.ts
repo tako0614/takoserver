@@ -78,6 +78,8 @@ export interface ExternalIdentityVerifier {
     readonly assertion: string;
     /** Which advertised method produced the assertion. */
     readonly method?: IdentityProviderDescriptor["method"] | undefined;
+    /** The value the caller asked the provider to embed in the token. */
+    readonly nonce?: string | undefined;
   }): Promise<{
     readonly providerSubject: string;
     readonly email: string;
@@ -100,6 +102,7 @@ export interface Accounts {
     readonly provider: IdentityProvider;
     readonly assertion: string;
     readonly method?: IdentityProviderDescriptor["method"] | undefined;
+    readonly nonce?: string | undefined;
     readonly sessionTtlSeconds?: number;
   }): Promise<{ readonly principal: Principal; readonly sessionToken: string }>;
   createOrganization(input: {
@@ -190,9 +193,9 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
   };
 
   const accounts: Accounts = {
-    async signIn({ provider, assertion, method, sessionTtlSeconds }) {
+    async signIn({ provider, assertion, method, nonce, sessionTtlSeconds }) {
       if (provider !== "google" && provider !== "github") throw new AuthError("invalid");
-      const verified = await identity.verify({ provider, assertion, method });
+      const verified = await identity.verify({ provider, assertion, method, nonce });
       const rows = await sql.query(
         "SELECT id, email, display_name FROM principals WHERE provider = ? AND provider_subject = ?",
         [provider, verified.providerSubject],

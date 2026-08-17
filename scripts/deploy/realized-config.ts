@@ -43,6 +43,20 @@ export function writeRealizedConfig(target: DeployTarget): string {
   return REALIZED_CONFIG_PATH;
 }
 
+/**
+ * Digest of what the bundle will run under.
+ *
+ * A deployment is the bytes and the wiring together. Naming the wiring lets the
+ * publish decision notice when only the wiring moved — turning a feature on
+ * through a variable is a change that has to reach production, not one that
+ * reports itself as already deployed.
+ */
+export async function realizedConfigDigest(configPath: string): Promise<string> {
+  const bytes = new TextEncoder().encode(readFileSync(configPath, "utf8"));
+  const hash = await crypto.subtle.digest("SHA-256", bytes as unknown as BufferSource);
+  return `sha256:${[...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
+}
+
 interface NeutralConfig extends Record<string, unknown> {
   readonly name: string;
 }

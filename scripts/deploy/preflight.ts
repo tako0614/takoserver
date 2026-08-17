@@ -3,7 +3,7 @@ import { preflightError } from "./errors.ts";
 import { assertPublishedIdentity, readLedger } from "./evidence.ts";
 import { runChecked, wranglerCommand } from "./process.ts";
 import { buildBundleDigest, migrationProvenance, resolvePushedCommit } from "./provenance.ts";
-import { writeRealizedConfig } from "./realized-config.ts";
+import { realizedConfigDigest, writeRealizedConfig } from "./realized-config.ts";
 import type { DeployTarget } from "./target.ts";
 import { servedVersionId } from "./worker-state.ts";
 
@@ -41,6 +41,7 @@ export interface PreflightReport {
   readonly migrationFiles: readonly string[];
   readonly live: LiveState;
   readonly alreadyCurrent: boolean;
+  readonly configDigest: string;
 }
 
 /** Read-only inspection of the realized target. Safe to run at any time. */
@@ -99,6 +100,7 @@ export async function preflight(
   }
 
   const bundle = await buildBundleDigest(configPath);
+  const configDigest = await realizedConfigDigest(configPath);
   const migrations = migrationProvenance();
   const live = await inspectLive(configPath, target);
 
@@ -109,6 +111,7 @@ export async function preflight(
     readLedger(),
     live.servedVersionId,
     bundle.digest,
+    configDigest,
   );
 
   return {
@@ -119,6 +122,7 @@ export async function preflight(
     remoteUrl,
     bundleDigest: bundle.digest,
     bundleBytes: bundle.bytes,
+    configDigest,
     migrationDigest: migrations.digest,
     migrationFiles: migrations.files,
     live,

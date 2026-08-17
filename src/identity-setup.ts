@@ -63,12 +63,21 @@ export function resolveIdentity(options: IdentitySetupOptions): IdentitySetup {
         ...(options.clock ? { clock: options.clock } : {}),
       }),
     );
-    // Described as what it is. It is the operator's signature, not sign-in.
-    providers.push({
-      id: "google",
-      displayName: "Operator assertion",
-      method: "operator-assertion",
-    });
+    // Advertised only when there is no real provider, because it is not
+    // sign-in — it is the operator vouching by signature, and it asks a person
+    // to paste a token they had to generate elsewhere. Once Google is
+    // configured, one button is the whole of the way in.
+    //
+    // It keeps working on the wire either way, named explicitly. That is
+    // deliberate: it is how the operator gets in when the identity provider is
+    // misconfigured, which is exactly when nobody can sign in the normal way.
+    if (!options.googleClientId) {
+      providers.push({
+        id: "google",
+        displayName: "Operator assertion",
+        method: "operator-assertion",
+      });
+    }
   }
 
   const fallback = providers[0]?.method;

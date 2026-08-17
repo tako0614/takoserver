@@ -176,14 +176,33 @@ describe("identity setup", () => {
     ]);
   });
 
-  test("offers Google first, and carries the client id a browser needs", async () => {
+  test("offers only Google once Google is configured", async () => {
     const { resolveIdentity } = await import("../src/identity-setup.ts");
     const setup = resolveIdentity({
       googleClientId: CLIENT_ID,
       operatorPublicKeyJwk: OPERATOR_JWK,
     });
-    expect(setup.providers.map((entry) => entry.method)).toEqual(["oidc", "operator-assertion"]);
+    // One button, not a button and a text field asking for a pasted token.
+    expect(setup.providers.map((entry) => entry.method)).toEqual(["oidc"]);
     expect(setup.providers[0]).toMatchObject({ clientId: CLIENT_ID });
+  });
+
+  test("keeps the operator path usable even when it is not advertised", async () => {
+    const { resolveIdentity } = await import("../src/identity-setup.ts");
+    const setup = resolveIdentity({
+      googleClientId: CLIENT_ID,
+      operatorPublicKeyJwk: OPERATOR_JWK,
+    });
+    // The escape hatch for a misconfigured provider — which is precisely when
+    // nobody can sign in the ordinary way — so it must not be removed with the
+    // button that stopped being shown.
+    await expect(
+      setup.verifier.verify({
+        provider: "google",
+        assertion: "not-an-assertion",
+        method: "operator-assertion",
+      }),
+    ).rejects.not.toBeInstanceOf(GoogleIdentityError);
   });
 
   test("routes by the method the caller names rather than guessing", async () => {
@@ -205,5 +224,34 @@ describe("identity setup", () => {
         method: "operator-assertion",
       }),
     ).rejects.not.toBeInstanceOf(GoogleIdentityError);
+  });
+});
+
+/**
+ * The nonce binds a token to the attempt that asked for it. Without it, a token
+ * captured from one sign-in is a valid token for the next one.
+ */
+describe("nonce", () => {
+  test("refuses a token minted for a different attempt", async () => {
+    const { sign, verifier } = await issuer();
+    const assertion = await sign(claims({ nonce: "the-one-google-stamped" }));
+    await expect(
+      verifier.verify({ provider: "google", assertion, nonce: "what-this-attempt-asked-for" }),
+    ).rejects.toMatchObject({ code: "wrong_nonce" });
+  });
+
+  test("accepts the token that carries the value this attempt asked for", async () => {
+    const { sign, verifier } = await issuer();
+    const assertion = await sign(claims({ nonce: "abc123" }));
+    const identity = await verifier.verify({ provider: "google", assertion, nonce: "abc123" });
+    expect(identity.providerSubject).toBe("108000000000000000001");
+  });
+
+  test("refuses a token with no nonce when one was asked for", async () => {
+    const { sign, verifier } = await issuer();
+    const assertion = await sign(claims());
+    await expect(
+      verifier.verify({ provider: "google", assertion, nonce: "abc123" }),
+    ).rejects.toMatchObject({ code: "wrong_nonce" });
   });
 });

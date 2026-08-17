@@ -143,7 +143,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       // `method` is optional: a caller that knows only one way in should not
       // have to name it, and a deployment that offers only one has nothing to
       // disambiguate.
-      exactKeys(body, ["provider", "assertion"], ["method"]);
+      exactKeys(body, ["provider", "assertion"], ["method", "nonce"]);
       const { principal, sessionToken } = await accounts.signIn({
         provider: enumValue(body.provider, ["google", "github"]) as "google" | "github",
         assertion: text(body.assertion),
@@ -154,6 +154,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
                 | "oidc"
                 | "operator-assertion",
             }),
+        ...(body.nonce === undefined ? {} : { nonce: text(body.nonce) }),
       });
       return Response.json({ principal, sessionToken });
     }

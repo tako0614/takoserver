@@ -192,11 +192,17 @@ export function createApi(options: ApiOptions) {
     identityProviders: () =>
       call<{ providers: readonly IdentityProvider[] }>("GET", "/v1/identity/providers"),
 
-    signIn: (provider: string, assertion: string, method?: IdentityProvider["method"]) =>
+    signIn: (
+      provider: string,
+      assertion: string,
+      method?: IdentityProvider["method"],
+      nonce?: string,
+    ) =>
       call<{ principal: Principal; sessionToken: string }>("POST", "/v1/sessions", {
         provider,
         assertion,
         ...(method === undefined ? {} : { method }),
+        ...(nonce === undefined ? {} : { nonce }),
       }),
 
     me: () =>
