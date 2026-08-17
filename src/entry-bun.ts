@@ -8,6 +8,7 @@ import { createMemoryObjectStore } from "./objects-mem.ts";
 import { createR2HttpObjectStore } from "./objects-r2-http.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
 import { CloudflareProvider } from "./providers/cloudflare.ts";
+import { createProvisionerEndpoint } from "./provisioner-endpoint.ts";
 import { createD1HttpSql } from "./sql-d1-http.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
@@ -141,6 +142,18 @@ const identity = resolveIdentity({
   operatorPublicKeyJwk: publicKeyJwk,
 });
 
+/**
+ * The half that can reach a cloud account also answers for it.
+ *
+ * Served in front of the product's router because it is not part of the
+ * product: no tenant, no billing, no lifecycle — a provider call in, a
+ * classified ticket out. It is served only when a credential is configured.
+ */
+const provision = createProvisionerEndpoint({
+  providers,
+  credential: process.env.TAKOSERVER_PROVISIONER_TOKEN,
+});
+
 const app = buildApp({
   sql,
   objects,
@@ -172,7 +185,15 @@ setInterval(() => {
     });
 }, 30_000);
 
-Bun.serve({ port, fetch: app.fetch });
+Bun.serve({
+  port,
+  // Longer than the default, because publishing a site means uploading its
+  // files and a request that is doing real work is not an idle one.
+  idleTimeout: 120,
+  async fetch(request) {
+    return (await provision(request)) ?? (await app.fetch(request));
+  },
+});
 console.log(
   `takoserver listening on :${port} as ${publicOrigin} ` +
     `(${providers.length === 0 ? "no provisioning backend" : "cloudflare provisioning"})`,

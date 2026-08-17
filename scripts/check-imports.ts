@@ -64,8 +64,8 @@ const LAYERS: readonly Layer[] = [
   {
     name: "routes",
     match:
-      /^src\/(?:router|control|data-storage|data-ai|openapi)\.ts$|^src\/takoform\/(?:routes|host)\.ts$/u,
-    may: ["core", "domain", "routes"],
+      /^src\/(?:router|control|data-storage|data-ai|openapi|provisioner-endpoint)\.ts$|^src\/takoform\/(?:routes|host)\.ts$/u,
+    may: ["core", "adapter", "domain", "routes"],
   },
   { name: "app", match: /^src\/app\.ts$/u, may: ["core", "adapter", "domain", "routes", "app"] },
   // An entry chooses concrete implementations — that is its whole job. What it

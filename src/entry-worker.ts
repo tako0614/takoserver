@@ -3,6 +3,7 @@ import { buildEdgeForms } from "./edge-forms.ts";
 import { resolveIdentity } from "./identity-setup.ts";
 import { createR2ObjectStore } from "./objects-r2.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
+import { createRemoteProvider } from "./providers/remote.ts";
 import { createD1Sql } from "./sql-d1.ts";
 
 /**
@@ -29,6 +30,10 @@ interface WorkerEnv {
   readonly OPERATOR_PUBLIC_JWK?: string;
   /** Public OAuth client id. Its presence turns Google sign-in on. */
   readonly GOOGLE_CLIENT_ID?: string;
+  /** Origin of the provisioner this deployment runs. */
+  readonly TAKOSERVER_PROVISIONER_ORIGIN?: string;
+  /** Credential this deployment issued to itself for that provisioner. */
+  readonly TAKOSERVER_PROVISIONER_TOKEN?: string;
 }
 
 /**
@@ -77,8 +82,21 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     publicOrigin: origin,
     ...(env.TAKOSERVER_CONSOLE_ORIGIN ? { consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN } : {}),
     forms: edge.forms,
-    // No providers: this entry cannot provision. See the note above.
-    providers: [],
+    // This entry cannot provision — it holds no cloud credential and the import
+    // gate proves it cannot acquire one. What it can do is ask the half that
+    // can. Without that, an apply against the public origin finds no provider
+    // and reports the backend unavailable, which is where the product stops
+    // being usable by anyone but its operator.
+    providers:
+      env.TAKOSERVER_PROVISIONER_ORIGIN && env.TAKOSERVER_PROVISIONER_TOKEN
+        ? [
+            createRemoteProvider({
+              origin: env.TAKOSERVER_PROVISIONER_ORIGIN,
+              offerings: edge.providerOfferings,
+              authorize: () => `Bearer ${env.TAKOSERVER_PROVISIONER_TOKEN}`,
+            }),
+          ]
+        : [],
     offerings: edge.offerings,
   });
   cached = { env, app };
