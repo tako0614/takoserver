@@ -21,13 +21,14 @@ export async function mutate(report: PreflightReport): Promise<MutationResult> {
   await runChecked(
     "mutation",
     "D1 forward migration",
+    // `d1 migrations apply` has no confirmation flag; it skips the prompt when
+    // stdin is not a terminal, which is how this writer always runs it.
     wranglerCommand([
       "d1",
       "migrations",
       "apply",
       "STATE_DB",
       "--remote",
-      "--yes",
       "--config",
       report.configPath,
     ]),
