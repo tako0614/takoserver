@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import type { ProviderOffering } from "../src/provider-port.ts";
-import { type ArtifactBytes, CloudflareProvider } from "../src/providers/cloudflare.ts";
+import {
+  type ArtifactBytes,
+  CloudflareProvider,
+  type CloudflareZone,
+} from "../src/providers/cloudflare.ts";
 
 const FORM_REF = {
   apiVersion: "edge.forms.takoform.com/v1beta1",
@@ -58,7 +62,10 @@ interface Call {
   readonly body: string;
 }
 
-function recorder(responses: readonly { status: number; body: unknown }[]) {
+function recorder(
+  responses: readonly { status: number; body: unknown }[],
+  extraZones: readonly CloudflareZone[] = [],
+) {
   const calls: Call[] = [];
   let index = 0;
   const provider = new CloudflareProvider({
@@ -66,6 +73,7 @@ function recorder(responses: readonly { status: number; body: unknown }[]) {
     offerings: [BUCKET, DATABASE, WORKER],
     artifacts,
     zones: [
+      ...extraZones,
       {
         suffix: "apps.takoserver.test",
         zoneId: "zone_platform",
@@ -280,6 +288,50 @@ describe("Cloudflare provider", () => {
       expect(ticket.phase).toBe("failed");
       expect(calls.filter((call) => call.url.includes("/workers/domains"))).toHaveLength(0);
     }
+  });
+
+  /**
+   * A domain someone brought with them is only useful at its apex. `example.com`
+   * with nothing in front of it is the address a customer actually wants, and a
+   * console or a marketing site that can only live at `www.` is a product
+   * limitation dressed up as a rule. A shared platform zone still refuses its
+   * own apex, because that name is the platform rather than anyone's to take.
+   */
+  test("serves the apex of a zone that offers it", async () => {
+    const { provider, calls } = recorder(
+      [
+        { status: 200, body: { success: true, errors: [], result: {} } },
+        { status: 200, body: { success: true, errors: [], result: {} } },
+      ],
+      [{ suffix: "brought.example", zoneId: "zone_brought", tenantRef: "org_acme", apex: true }],
+    );
+    const ticket = await provider.apply({
+      operationId: "op_apex",
+      offering: WORKER,
+      identity: IDENTITY,
+      spec: { bundle: `sha256:${"d".repeat(64)}`, hostnames: ["brought.example"] },
+    });
+    expect(ticket.phase).toBe("succeeded");
+    const attached = calls.find((call) => call.url.includes("/workers/domains"));
+    expect(JSON.parse(String(attached?.body))).toMatchObject({
+      zone_id: "zone_brought",
+      hostname: "brought.example",
+    });
+  });
+
+  test("refuses the apex of a zone that does not offer it", async () => {
+    const { provider, calls } = recorder(
+      [{ status: 200, body: { success: true, errors: [], result: {} } }],
+      [{ suffix: "shared.example", zoneId: "zone_shared", tenantRef: "org_acme" }],
+    );
+    const ticket = await provider.apply({
+      operationId: "op_apex_refused",
+      offering: WORKER,
+      identity: IDENTITY,
+      spec: { bundle: `sha256:${"d".repeat(64)}`, hostnames: ["shared.example"] },
+    });
+    expect(ticket.phase).toBe("failed");
+    expect(calls.filter((call) => call.url.includes("/workers/domains"))).toHaveLength(0);
   });
 
   test("refuses to publish a bundle the tenant does not hold", async () => {

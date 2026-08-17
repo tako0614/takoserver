@@ -74,6 +74,15 @@ export interface CloudflareZone {
    * fails to negotiate — an address that looks issued and does not work.
    */
   readonly singleLabel?: boolean;
+  /**
+   * Whether the zone's own name may be served.
+   *
+   * A customer who brought their own domain needs their apex — `example.com`
+   * with nothing in front of it is the address they actually want. A shared
+   * platform zone must never offer its apex, because that name *is* the
+   * platform, so this defaults to refusing it and is turned on per zone.
+   */
+  readonly apex?: boolean;
 }
 
 export interface CloudflareProviderOptions {
@@ -461,8 +470,9 @@ export class CloudflareProvider implements Provider {
     const eligible = this.#zones.filter(
       (zone) =>
         (zone.tenantRef === undefined || zone.tenantRef === tenantRef) &&
-        hostname.endsWith(`.${zone.suffix}`) &&
-        this.#labelAllowed(zone, hostname),
+        (hostname === zone.suffix
+          ? zone.apex === true
+          : hostname.endsWith(`.${zone.suffix}`) && this.#labelAllowed(zone, hostname)),
     );
     // The most specific zone wins, so a tenant zone nested inside a platform
     // zone is not shadowed by it.
