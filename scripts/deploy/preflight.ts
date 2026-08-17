@@ -7,10 +7,18 @@ import { writeRealizedConfig } from "./realized-config.ts";
 import type { DeployTarget } from "./target.ts";
 import { servedVersionId } from "./worker-state.ts";
 
+/**
+ * Tables whose absence means the deployment is not the product: identity,
+ * money, declared resources, and the key material tokens are checked against.
+ * A migration that failed halfway shows up here rather than as a 500 later.
+ */
 export const RUNTIME_TABLES = [
+  "auth_tokens",
+  "ledger",
+  "orgs",
+  "reservations",
   "runtime_grant_keys",
-  "runtime_grant_replays",
-  "runtime_resources",
+  "tf_resources",
 ] as const;
 
 /** Read-only description of the live target, taken before anything is mutated. */
