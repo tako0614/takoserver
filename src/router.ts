@@ -22,7 +22,56 @@ export type Router = (request: Request) => Promise<Response>;
 
 export function createRouter(options: CreateRouterOptions): Router {
   const origin = httpsOrigin(options.publicOrigin);
+  const route = dispatch(options, origin);
 
+  return async (request) => {
+    // A browser asking whether it may make the real call. Answering it is the
+    // whole of preflight; nothing is routed and nothing is authenticated.
+    if (request.method === "OPTIONS" && request.headers.get("origin")) {
+      return new Response(null, { status: 204, headers: crossOrigin(request) });
+    }
+    const response = await route(request);
+    if (!request.headers.get("origin")) return response;
+    const answered = new Response(response.body, response);
+    for (const [name, value] of Object.entries(crossOrigin(request))) {
+      answered.headers.set(name, value);
+    }
+    return answered;
+  };
+}
+
+/**
+ * Cross-origin access.
+ *
+ * The console runs on its own hostname, and so does anybody else's tool, so an
+ * API that refuses other origins is an API only servers can call. Any origin may
+ * ask here, because authority is a bearer token a browser never attaches by
+ * itself: a hostile page can issue the request and will not have the token to
+ * put in it.
+ *
+ * Credentials are never allowed, and that is what keeps the sentence above
+ * true. Permit them and a cookie would ride along unasked, which is exactly the
+ * request a hostile page can make.
+ */
+function crossOrigin(request: Request): Record<string, string> {
+  const asked = request.headers.get("access-control-request-headers");
+  return {
+    "access-control-allow-origin": "*",
+    "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+    // Reflected rather than listed: the Takoform lanes are a frozen contract
+    // carrying headers of their own, and a list here would quietly become the
+    // shorter of the two.
+    "access-control-allow-headers":
+      asked && asked.length <= 1_024 ? asked : "authorization, content-type",
+    // ETag is a fence a caller must present back, so it is useless unless a
+    // browser can read it.
+    "access-control-expose-headers": "etag, location, retry-after",
+    "access-control-max-age": "600",
+    vary: "origin, access-control-request-headers",
+  };
+}
+
+function dispatch(options: CreateRouterOptions, origin: string): Router {
   return async (request) => {
     const url = new URL(request.url);
 
