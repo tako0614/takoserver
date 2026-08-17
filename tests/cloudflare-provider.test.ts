@@ -162,6 +162,9 @@ describe("Cloudflare provider", () => {
     // cannot ask for reach its Form never offered.
     expect(upload?.body).toContain('"name":"DB"');
     expect(upload?.body).not.toContain("SNEAKY");
+    // An upload replaces the binding set, so secrets the operator set must be
+    // explicitly preserved or a deploy would quietly delete them.
+    expect(upload?.body).toContain('"keep_bindings":["secret_text"]');
   });
 
   test("creates Durable Object classes in the upload that binds them", async () => {
@@ -187,6 +190,9 @@ describe("Cloudflare provider", () => {
     // was never created is rejected outright.
     expect(metadata).toContain('"type":"durable_object_namespace"');
     expect(metadata).toContain('"class_name":"SessionDO"');
+    // One migration object, not a list: the list form belongs to the
+    // multi-script API and is rejected outright here.
+    expect(metadata).toMatch(/"migrations":\{/u);
     expect(metadata).toContain('"new_sqlite_classes":["SessionDO"]');
     expect(metadata).toContain('"new_classes":["RateLimiterDO"]');
   });

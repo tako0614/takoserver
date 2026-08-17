@@ -261,7 +261,15 @@ export class CloudflareProvider implements Provider {
                 class_name: entry.className,
               })),
             ],
-            ...(migration ? { migrations: [migration] } : {}),
+            // A single-script upload carries one migration object, not a list
+            // of them; the list form belongs to the multi-script API.
+            // A script upload replaces the whole binding set, which would
+            // silently delete every secret the operator had set. Secrets are
+            // deliberately not declarable in a Form — a declaration is stored,
+            // readable, and versioned, which is everything a secret must not
+            // be — so they are operator-managed and preserved across applies.
+            keep_bindings: ["secret_text"],
+            ...(migration ? { migrations: migration } : {}),
           }),
         ],
         { type: "application/json" },
@@ -394,13 +402,21 @@ export class CloudflareProvider implements Provider {
     if (response.ok && envelope?.success === true) {
       return { ok: true, status: response.status, result: envelope.result };
     }
-    return {
-      ok: false,
-      status: response.status,
-      // The provider's own error text is deliberately dropped: it is written
-      // for an operator of that cloud, not for our customer.
-      ticket: classify(response.status),
-    };
+    // The backend's own words are written for an operator of that cloud, not
+    // for our customer, so they never cross back in the ticket. They are
+    // exactly what an operator of *this* platform needs, though, so they are
+    // logged rather than discarded.
+    console.error(
+      JSON.stringify({
+        event: "takoserver.provider.refused",
+        provider: this.id,
+        method,
+        path,
+        status: response.status,
+        errors: Array.isArray(envelope?.errors) ? envelope.errors : undefined,
+      }).slice(0, 4_096),
+    );
+    return { ok: false, status: response.status, ticket: classify(response.status) };
   }
 }
 
@@ -420,7 +436,7 @@ function classify(status: number): ProviderTicket {
 
 async function readEnvelope(
   response: Response,
-): Promise<{ success?: unknown; result?: unknown } | null> {
+): Promise<{ success?: unknown; result?: unknown; errors?: unknown } | null> {
   let bytes: ArrayBuffer;
   try {
     bytes = await response.arrayBuffer();

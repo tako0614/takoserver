@@ -87,6 +87,9 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
       } catch (error) {
         if (error instanceof ArtifactInputError) return failure(error.code, error.status);
         if (error instanceof TakoformHostError) {
+          if (process.env.TAKOSERVER_TRACE_HOST_ERRORS) {
+            console.error("host error", error.code, error.status, error.stack);
+          }
           return failure(error.code, error.status, error.details);
         }
         // Anything else is a driver or runtime fault. The caller gets an
