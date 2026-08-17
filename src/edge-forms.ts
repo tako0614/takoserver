@@ -90,7 +90,19 @@ const WORKER_SCRIPT_SCHEMA: JsonObject = {
         additionalProperties: false,
       },
     },
-    workersDevSubdomain: { type: "string", maxLength: 63 },
+    // Where the Worker should answer. Either a subdomain of a suffix the
+    // platform offers, or a domain the operator has configured this tenant to
+    // use. A Worker with no hostname is published but not served, which is a
+    // legitimate thing to declare.
+    hostnames: {
+      type: "array",
+      maxItems: 8,
+      items: {
+        type: "string",
+        pattern: "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$",
+        maxLength: 253,
+      },
+    },
   },
   required: ["bundle"],
   additionalProperties: false,

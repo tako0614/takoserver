@@ -41,9 +41,39 @@ export interface TakoformBundleManifest {
   }[];
 }
 
+/**
+ * A DNS zone this deployment may attach customer Workers to.
+ *
+ * `suffix` is what a hostname must end with to belong to the zone. A platform
+ * zone (`apps.takoserver.com`) is how a tenant gets a free address; a customer
+ * zone is one the operator has added after the customer proved they control
+ * it. A hostname matching no configured zone is refused — that refusal is the
+ * ownership boundary, and it is why a tenant cannot claim somebody else's
+ * domain by declaring it.
+ */
+export interface CloudflareZone {
+  readonly suffix: string;
+  readonly zoneId: string;
+  /** Restricts the zone to one tenant. Absent means any tenant may use it. */
+  readonly tenantRef?: string;
+  /**
+   * Labels the platform keeps for itself. A shared zone hands out first-level
+   * names to whoever asks first, so the names the operator needs — and the ones
+   * a visitor would read as official — must not be claimable.
+   */
+  readonly reservedLabels?: readonly string[];
+  /**
+   * Requires the hostname to sit exactly one label below the suffix. Universal
+   * TLS certificates cover one level only, so a deeper name resolves and then
+   * fails to negotiate — an address that looks issued and does not work.
+   */
+  readonly singleLabel?: boolean;
+}
+
 export interface CloudflareProviderOptions {
   readonly id?: string;
   readonly accountId: string;
+  readonly zones?: readonly CloudflareZone[];
   readonly offerings: readonly ProviderOffering[];
   readonly artifacts: ArtifactBytes;
   /** Returns an `Authorization` header value. Credentials never live here. */
@@ -58,6 +88,7 @@ export class CloudflareProvider implements Provider {
   readonly #accountId: string;
   readonly #origin: string;
   readonly #artifacts: ArtifactBytes;
+  readonly #zones: readonly CloudflareZone[];
   readonly #authorize: CloudflareProviderOptions["authorize"];
   readonly #fetch: (request: Request) => Promise<Response>;
 
@@ -67,6 +98,7 @@ export class CloudflareProvider implements Provider {
     this.#origin = options.apiOrigin ?? API_ORIGIN;
     this.offerings = structuredClone(options.offerings);
     this.#artifacts = options.artifacts;
+    this.#zones = [...(options.zones ?? [])];
     this.#authorize = options.authorize;
     this.#fetch = options.fetch ?? ((request) => fetch(request));
   }
@@ -238,26 +270,58 @@ export class CloudflareProvider implements Provider {
     );
     if (!published.ok) return published.ticket;
 
-    const subdomain = optionalString(input.spec.workersDevSubdomain);
-    if (subdomain) {
-      // Uploading a script does not put it on the internet. Declaring a
-      // workers.dev subdomain is a request to serve it, so the route is enabled
-      // here rather than leaving an output URL that answers 404.
-      const exposed = await this.#call(
-        "POST",
-        `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(name)}/subdomain`,
-        { enabled: true, previews_enabled: false },
-      );
-      if (!exposed.ok) return exposed.ticket;
+    // Uploading a script does not put it on the internet. A declared hostname
+    // is a request to serve it there, so the route and its DNS record are
+    // attached here rather than leaving an output URL that answers nothing.
+    const hostnames = stringList(input.spec.hostnames);
+    for (const hostname of hostnames) {
+      const zone = this.#zoneFor(hostname, input.identity.tenantRef);
+      if (!zone) {
+        return failed(
+          "invalid_spec",
+          `no configured zone serves ${hostname}; a domain must be one this deployment offers ` +
+            "or one the operator has added for this tenant",
+        );
+      }
+      const attached = await this.#call("PUT", `/accounts/${this.#accountId}/workers/domains`, {
+        zone_id: zone.zoneId,
+        hostname,
+        service: name,
+        environment: "production",
+      });
+      if (!attached.ok) return attached.ticket;
     }
+
     return succeeded({
       nativeId: `worker:${name}`,
-      observed: { name, mainModule, moduleCount: modules.length },
+      observed: { name, mainModule, moduleCount: modules.length, hostnames },
       outputs: {
         scriptName: name,
-        ...(subdomain ? { url: `https://${name}.${subdomain}.workers.dev` } : {}),
+        hostnames,
+        ...(hostnames[0] ? { url: `https://${hostnames[0]}` } : {}),
       },
     });
+  }
+
+  /** The zone that may serve a hostname, if this deployment offers one. */
+  #zoneFor(hostname: string, tenantRef: string): CloudflareZone | undefined {
+    const eligible = this.#zones.filter(
+      (zone) =>
+        (zone.tenantRef === undefined || zone.tenantRef === tenantRef) &&
+        hostname.endsWith(`.${zone.suffix}`) &&
+        this.#labelAllowed(zone, hostname),
+    );
+    // The most specific zone wins, so a tenant zone nested inside a platform
+    // zone is not shadowed by it.
+    return eligible.sort((left, right) => right.suffix.length - left.suffix.length)[0];
+  }
+
+  #labelAllowed(zone: CloudflareZone, hostname: string): boolean {
+    const prefix = hostname.slice(0, -(zone.suffix.length + 1));
+    if (prefix.length === 0) return false;
+    if (zone.singleLabel && prefix.includes(".")) return false;
+    const label = prefix.split(".").at(-1) ?? "";
+    return !(zone.reservedLabels ?? []).includes(label);
   }
 
   // --- transport ------------------------------------------------------------

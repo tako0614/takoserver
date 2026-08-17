@@ -65,6 +65,15 @@ function recorder(responses: readonly { status: number; body: unknown }[]) {
     accountId: "acct_1",
     offerings: [BUCKET, DATABASE, WORKER],
     artifacts,
+    zones: [
+      {
+        suffix: "apps.takoserver.test",
+        zoneId: "zone_platform",
+        singleLabel: true,
+        reservedLabels: ["www", "api"],
+      },
+      { suffix: "acme.example", zoneId: "zone_acme", tenantRef: "org_acme" },
+    ],
     authorize: () => "Bearer secret-account-token",
     apiOrigin: "https://api.cloudflare.test/client/v4",
     async fetch(request) {
@@ -126,12 +135,22 @@ describe("Cloudflare provider", () => {
           { type: "r2_bucket", name: "OBJECTS", bucketName: "ts-abc" },
           { type: "secret_text", name: "SNEAKY", text: "nope" },
         ],
-        workersDevSubdomain: "acme",
+        hostnames: ["yurucommu.apps.takoserver.test"],
       },
     });
     expect(ticket.phase).toBe("succeeded");
     if (ticket.phase !== "succeeded") throw new Error("expected success");
-    expect(ticket.result.outputs).toMatchObject({ url: expect.stringContaining(".workers.dev") });
+    expect(ticket.result.outputs).toMatchObject({
+      url: "https://yurucommu.apps.takoserver.test",
+    });
+    // The route is attached, not merely promised in an output field.
+    const attach = calls[1];
+    expect(attach?.method).toBe("PUT");
+    expect(attach?.url).toContain("/workers/domains");
+    expect(JSON.parse(attach?.body ?? "{}")).toMatchObject({
+      zone_id: "zone_platform",
+      hostname: "yurucommu.apps.takoserver.test",
+    });
 
     const upload = calls[0];
     expect(upload?.method).toBe("PUT");
@@ -143,6 +162,66 @@ describe("Cloudflare provider", () => {
     // cannot ask for reach its Form never offered.
     expect(upload?.body).toContain('"name":"DB"');
     expect(upload?.body).not.toContain("SNEAKY");
+  });
+
+  test("refuses a hostname no configured zone serves", async () => {
+    const { provider, calls } = recorder([
+      { status: 200, body: { success: true, errors: [], result: {} } },
+    ]);
+    const ticket = await provider.apply({
+      operationId: "op_host",
+      offering: WORKER,
+      identity: { ...IDENTITY, name: "squatter" },
+      spec: {
+        bundle: `sha256:${"d".repeat(64)}`,
+        hostnames: ["www.somebody-elses-domain.test"],
+      },
+    });
+    expect(ticket.phase).toBe("failed");
+    if (ticket.phase !== "failed") throw new Error("expected failure");
+    expect(ticket.failure.code).toBe("invalid_spec");
+    // The script uploaded, but no route was attached to a domain the tenant
+    // never proved it controls.
+    expect(calls.filter((call) => call.url.includes("/workers/domains"))).toHaveLength(0);
+  });
+
+  test("keeps a tenant zone to the tenant it belongs to", async () => {
+    const { provider, calls } = recorder([
+      { status: 200, body: { success: true, errors: [], result: {} } },
+    ]);
+    const ticket = await provider.apply({
+      operationId: "op_zone",
+      offering: WORKER,
+      identity: { tenantRef: "org_other", space: "default", name: "app" },
+      spec: { bundle: `sha256:${"d".repeat(64)}`, hostnames: ["app.acme.example"] },
+    });
+    expect(ticket.phase).toBe("failed");
+    expect(calls.filter((call) => call.url.includes("/workers/domains"))).toHaveLength(0);
+  });
+
+  test("keeps reserved names and certificate-depth rules out of tenant hands", async () => {
+    for (const hostname of [
+      // A name a visitor would read as the platform's own.
+      "www.apps.takoserver.test",
+      "api.apps.takoserver.test",
+      // Two levels below the suffix: a universal certificate would not cover
+      // it, so the address would resolve and then fail to negotiate TLS.
+      "deep.nested.apps.takoserver.test",
+      // The zone apex itself is not a tenant's to take.
+      "apps.takoserver.test",
+    ]) {
+      const { provider, calls } = recorder([
+        { status: 200, body: { success: true, errors: [], result: {} } },
+      ]);
+      const ticket = await provider.apply({
+        operationId: "op_reserved",
+        offering: WORKER,
+        identity: IDENTITY,
+        spec: { bundle: `sha256:${"d".repeat(64)}`, hostnames: [hostname] },
+      });
+      expect(ticket.phase).toBe("failed");
+      expect(calls.filter((call) => call.url.includes("/workers/domains"))).toHaveLength(0);
+    }
   });
 
   test("refuses to publish a bundle the tenant does not hold", async () => {

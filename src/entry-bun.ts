@@ -89,6 +89,14 @@ const providers = process.env.CLOUDFLARE_ACCOUNT_ID
         accountId: required("CLOUDFLARE_ACCOUNT_ID"),
         offerings: edge.providerOfferings,
         authorize: () => `Bearer ${required("CLOUDFLARE_API_TOKEN")}`,
+        // Where tenants may be served. A platform suffix is the free address
+        // every tenant gets; a customer domain is added here only after the
+        // operator has confirmed the customer controls it.
+        zones: JSON.parse(process.env.TAKOSERVER_ZONES ?? "[]") as {
+          suffix: string;
+          zoneId: string;
+          tenantRef?: string;
+        }[],
         artifacts: {
           async manifest(tenantRef, digest) {
             return await artifactStore.resolveManifest(tenantRef, digest);
