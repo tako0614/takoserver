@@ -22,6 +22,8 @@ interface WorkerEnv {
   readonly STATE_DB: Parameters<typeof createD1Sql>[0];
   readonly OBJECTS: Parameters<typeof createR2ObjectStore>[0];
   readonly PUBLIC_ORIGIN?: string;
+  /** Where this deployment's console is served, if it has one. */
+  readonly TAKOSERVER_CONSOLE_ORIGIN?: string;
   /** Public half of the operator key, as an Ed25519 JWK. */
   readonly OPERATOR_PUBLIC_JWK?: string;
 }
@@ -61,6 +63,7 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     identity,
     settlement,
     publicOrigin: origin,
+    ...(env.TAKOSERVER_CONSOLE_ORIGIN ? { consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN } : {}),
     forms: edge.forms,
     // No providers: this entry cannot provision. See the note above.
     providers: [],

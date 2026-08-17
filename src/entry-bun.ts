@@ -141,6 +141,9 @@ const app = buildApp({
   identity: publicKeyJwk ? createOperatorIdentity({ publicKeyJwk }) : unconfigured,
   settlement: publicKeyJwk ? createOperatorSettlement({ publicKeyJwk }) : unconfigured,
   publicOrigin,
+  ...(process.env.TAKOSERVER_CONSOLE_ORIGIN
+    ? { consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN }
+    : {}),
   forms: edge.forms,
   providers,
   offerings: edge.offerings,

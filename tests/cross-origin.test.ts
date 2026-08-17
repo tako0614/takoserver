@@ -103,3 +103,34 @@ describe("Form registry on the control plane", () => {
     expect(body.profiles[0]).toHaveProperty("formRef");
   });
 });
+
+/**
+ * Discovery is what a client reads to find everything else, so a claim in it
+ * has to be true. Before this, it named the API's own root as the console —
+ * a page which is not one — and a client following that link found a
+ * placeholder where it expected an application.
+ */
+describe("product discovery", () => {
+  const read = async (options: { readonly consoleOrigin?: string }) => {
+    const served = createRouter({
+      control: async () => null,
+      publicOrigin: "https://api.example.test",
+      ...options,
+    });
+    const response = await served(new Request("https://api.example.test/.well-known/takoserver"));
+    return (await response.json()) as { endpoints: Record<string, string> };
+  };
+
+  test("names the console only when there is one", async () => {
+    expect((await read({})).endpoints).not.toHaveProperty("console");
+    expect((await read({ consoleOrigin: "https://console.example.test" })).endpoints.console).toBe(
+      "https://console.example.test",
+    );
+  });
+
+  test("always names the API and its description", async () => {
+    const { endpoints } = await read({});
+    expect(endpoints.api).toBe("https://api.example.test");
+    expect(endpoints.openapi).toBe("https://api.example.test/openapi.json");
+  });
+});

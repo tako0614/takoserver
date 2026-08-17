@@ -33,6 +33,8 @@ export interface AppPorts {
   readonly identity: ExternalIdentityVerifier;
   readonly settlement: FundingSettlementVerifier;
   readonly publicOrigin: string;
+  /** Where this deployment's console is served, if it has one. */
+  readonly consoleOrigin?: string;
   readonly forms: readonly InstalledTakoformForm[];
   /**
    * Backends this deployment can provision on. When present the Takoform lane
@@ -126,7 +128,12 @@ export function buildApp(ports: AppPorts): App {
   });
 
   return {
-    fetch: createRouter({ control, takoformHost, publicOrigin: ports.publicOrigin }),
+    fetch: createRouter({
+      control,
+      takoformHost,
+      publicOrigin: ports.publicOrigin,
+      ...(ports.consoleOrigin === undefined ? {} : { consoleOrigin: ports.consoleOrigin }),
+    }),
     async tick(): Promise<TickReport> {
       const expiredReservations = await reseller.expireDue(64);
       const store = inventory;

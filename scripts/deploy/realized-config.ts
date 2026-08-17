@@ -37,6 +37,9 @@ export function writeRealizedConfig(target: DeployTarget): string {
     ],
     r2_buckets: [{ binding: "OBJECTS", bucket_name: target.r2.bucketName }],
     ...serviceAddress(target.publicOrigin),
+    ...(target.consoleOrigin === undefined
+      ? {}
+      : { vars: { TAKOSERVER_CONSOLE_ORIGIN: target.consoleOrigin } }),
   };
   writeFileSync(REALIZED_CONFIG_PATH, `${JSON.stringify(realized, null, 2)}\n`, { mode: 0o600 });
   return REALIZED_CONFIG_PATH;

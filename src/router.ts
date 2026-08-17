@@ -16,6 +16,15 @@ export interface CreateRouterOptions {
   readonly control: ControlRoutes;
   readonly takoformHost?: TakoformHost;
   readonly publicOrigin: string;
+  /**
+   * Where this deployment's console is served, if it has one.
+   *
+   * Absent is a real answer. A deployment with no console is a complete
+   * product — the API, the CLI and the Takoform provider are the whole of it
+   * for anyone integrating — and pointing discovery at a page that is not a
+   * console is worse than admitting there is none.
+   */
+  readonly consoleOrigin?: string;
 }
 
 export type Router = (request: Request) => Promise<Response>;
@@ -72,6 +81,7 @@ function crossOrigin(request: Request): Record<string, string> {
 }
 
 function dispatch(options: CreateRouterOptions, origin: string): Router {
+  const console = options.consoleOrigin === undefined ? null : httpsOrigin(options.consoleOrigin);
   return async (request) => {
     const url = new URL(request.url);
 
@@ -81,7 +91,7 @@ function dispatch(options: CreateRouterOptions, origin: string): Router {
     }
 
     if (request.method === "GET" && url.pathname === "/") {
-      return new Response(CONSOLE_HTML, {
+      return new Response(landingPage(console), {
         headers: { "content-type": "text/html; charset=utf-8" },
       });
     }
@@ -94,7 +104,7 @@ function dispatch(options: CreateRouterOptions, origin: string): Router {
         apiVersion: "v1",
         endpoints: {
           api: origin,
-          console: `${origin}/`,
+          ...(console ? { console } : {}),
           openapi: `${origin}/openapi.json`,
           takoform: `${origin}/apis/forms.takoform.com/v1alpha3`,
         },
@@ -163,12 +173,21 @@ function httpsOrigin(value: string): string {
   return url.origin;
 }
 
-const CONSOLE_HTML = `<!doctype html>
+/**
+ * What the API serves at its own root.
+ *
+ * Not a console — the console is a separate deployment on its own hostname.
+ * This is the page a person lands on after typing the API's address, so it
+ * says where everything actually is.
+ */
+function landingPage(consoleOrigin: string | null): string {
+  const link = consoleOrigin ? `<li><a href="${consoleOrigin}">Console</a></li>\n` : "";
+  return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Takoserver</title>
+<title>Takoserver API</title>
 <style>
 :root { color-scheme: light dark; }
 body { margin: 0; padding: 3rem 1.5rem; font: 16px/1.6 system-ui, sans-serif; }
@@ -179,11 +198,11 @@ a { color: inherit; }
 </head>
 <body>
 <main>
-<h1>Takoserver</h1>
+<h1>Takoserver API</h1>
 <p>An independent prepaid resource platform. Declare resources with Takoform,
 fund a wallet, and reserve capacity.</p>
 <ul>
-<li><a href="/openapi.json">OpenAPI document</a></li>
+${link}<li><a href="/openapi.json">OpenAPI document</a></li>
 <li><a href="/.well-known/takoserver">Product discovery</a></li>
 <li><a href="/.well-known/takoform/v1alpha3">Takoform Host discovery</a></li>
 </ul>
@@ -191,3 +210,4 @@ fund a wallet, and reserve capacity.</p>
 </body>
 </html>
 `;
+}

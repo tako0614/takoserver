@@ -14,6 +14,12 @@ export interface DeployTarget {
   readonly d1: { readonly databaseName: string; readonly databaseId: string };
   readonly r2: { readonly bucketName: string };
   readonly publicOrigin: string;
+  /**
+   * Where this deployment's console is served, if it has one. Optional because
+   * a deployment is a complete product without a console — the API, the CLI and
+   * the Takoform provider are the whole of it for anyone integrating.
+   */
+  readonly consoleOrigin?: string;
   readonly grantKeyId: string;
 }
 
@@ -65,7 +71,11 @@ export function loadTarget(path: string): DeployTarget {
 
 function validateTarget(value: unknown, path: string): DeployTarget {
   if (!isRecord(value)) throw preflightError(`deploy target descriptor must be an object: ${path}`);
-  assertExactKeys(value, ["accountId", "workerName", "d1", "r2", "publicOrigin", "grantKeyId"]);
+  assertExactKeys(
+    value,
+    ["accountId", "workerName", "d1", "r2", "publicOrigin", "grantKeyId"],
+    ["consoleOrigin"],
+  );
 
   const d1 = value.d1;
   const r2 = value.r2;
@@ -83,16 +93,33 @@ function validateTarget(value: unknown, path: string): DeployTarget {
     },
     r2: { bucketName: pattern(r2.bucketName, BUCKET_NAME, "r2.bucketName") },
     publicOrigin: httpsOrigin(value.publicOrigin),
+    ...(value.consoleOrigin === undefined
+      ? {}
+      : { consoleOrigin: httpsOrigin(value.consoleOrigin) }),
     grantKeyId: pattern(value.grantKeyId, KEY_ID, "grantKeyId"),
   };
 }
 
-function assertExactKeys(value: Record<string, unknown>, expected: readonly string[]): void {
+/**
+ * Exactly the required keys, plus any of the optional ones.
+ *
+ * The strictness is the point: a descriptor with a misspelled key would
+ * otherwise deploy successfully against a target subtly other than the one the
+ * operator wrote down.
+ */
+function assertExactKeys(
+  value: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): void {
   const actual = Object.keys(value).sort();
-  if (JSON.stringify(actual) !== JSON.stringify([...expected].sort())) {
+  const missing = required.filter((key) => !actual.includes(key));
+  const unknown = actual.filter((key) => !required.includes(key) && !optional.includes(key));
+  if (missing.length > 0 || unknown.length > 0) {
     throw preflightError(
       `deploy target has unexpected keys: got ${JSON.stringify(actual)}, ` +
-        `expected exactly ${JSON.stringify([...expected].sort())}`,
+        `expected ${JSON.stringify([...required].sort())}` +
+        (optional.length > 0 ? ` and optionally ${JSON.stringify([...optional].sort())}` : ""),
     );
   }
 }
