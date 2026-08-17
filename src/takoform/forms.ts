@@ -93,6 +93,24 @@ export function sameFormRef(
 }
 
 /**
+ * Whether two references name the same Form, whatever definition of it.
+ *
+ * A Form's identity includes the digest of its schema, which is what stops a
+ * caller from being handed different semantics than the ones they reviewed. It
+ * is not meant to freeze a resource on the definition it was born under: a
+ * declaration that names a newer definition *and* its exact digest is being as
+ * explicit as the protocol allows. Same group and kind is the whole test —
+ * a different kind at the same address is a different resource, not a newer
+ * version of this one.
+ */
+export function sameFormLineage(
+  left: TakoformV1Alpha3FormRef,
+  right: TakoformV1Alpha3FormRef,
+): boolean {
+  return left.apiVersion === right.apiVersion && left.kind === right.kind;
+}
+
+/**
  * The retired `forms.takoform.com` alpha versions are blocklisted by name: they
  * were withdrawn, and accepting them would let a stale client believe it is
  * talking to a lane this Host still serves.
