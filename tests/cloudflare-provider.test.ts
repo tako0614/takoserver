@@ -34,21 +34,37 @@ const IDENTITY = { tenantRef: "org_acme", space: "default", name: "assets" };
 
 const MODULE_BYTES = new TextEncoder().encode("export default { fetch() {} }");
 
+const ASSET_BUNDLE = `sha256:${"c".repeat(64)}`;
+
 const artifacts: ArtifactBytes = {
   async manifest(_tenantRef, digest) {
-    return digest === `sha256:${"d".repeat(64)}`
-      ? {
-          kind: "WorkerBundle",
-          mainModule: "index.js",
-          modules: [
-            {
-              name: "index.js",
-              mediaType: "application/javascript+module",
-              digest: `sha256:${"e".repeat(64)}`,
-            },
-          ],
-        }
-      : null;
+    if (digest === `sha256:${"d".repeat(64)}`) {
+      return {
+        kind: "WorkerBundle",
+        mainModule: "index.js",
+        modules: [
+          {
+            name: "index.js",
+            mediaType: "application/javascript+module",
+            digest: `sha256:${"e".repeat(64)}`,
+          },
+        ],
+      };
+    }
+    if (digest === ASSET_BUNDLE) {
+      return {
+        kind: "StaticAssetBundle",
+        files: [
+          {
+            name: "index.html",
+            mediaType: "text/html",
+            size: MODULE_BYTES.byteLength,
+            digest: `sha256:${"e".repeat(64)}`,
+          },
+        ],
+      };
+    }
+    return null;
   },
   async blob(digest) {
     return digest === `sha256:${"e".repeat(64)}` ? MODULE_BYTES : null;
@@ -532,5 +548,52 @@ describe("hostname already in use", () => {
     // Ours, not Cloudflare's: no backend wording crosses back.
     expect(JSON.stringify(ticket)).toContain("remove them in the zone");
     expect(JSON.stringify(ticket)).not.toContain("externally managed");
+  });
+});
+
+/**
+ * Static assets are only half of serving a site. The asset layer answers
+ * requests that match a file; everything else reaches the Worker, so a Worker
+ * that cannot ask the asset layer anything is a Worker whose application 404s
+ * on every deep link. The binding is not optional and not declared — declaring
+ * assets is the declaration.
+ */
+describe("asset binding", () => {
+  test("hands a script that declares assets a way to reach them", async () => {
+    const { provider, calls } = recorder([
+      { status: 200, body: { success: true, errors: [], result: { jwt: "asset-token" } } },
+      { status: 200, body: { success: true, errors: [], result: {} } },
+      { status: 200, body: { success: true, errors: [], result: {} } },
+    ]);
+    const ticket = await provider.apply({
+      operationId: "op_assets",
+      offering: WORKER,
+      identity: IDENTITY,
+      spec: {
+        bundle: `sha256:${"d".repeat(64)}`,
+        assets: { bundle: ASSET_BUNDLE },
+      },
+    });
+
+    expect(ticket.phase).toBe("succeeded");
+    const upload = calls.find(
+      (call) => call.url.includes("/workers/scripts/") && !call.url.includes("assets-upload"),
+    );
+    expect(String(upload?.body)).toContain('"type":"assets","name":"ASSETS"');
+  });
+
+  test("refuses a declared binding that would collide with it", async () => {
+    const { provider } = recorder([]);
+    const ticket = await provider.apply({
+      operationId: "op_assets_collide",
+      offering: WORKER,
+      identity: IDENTITY,
+      spec: {
+        bundle: `sha256:${"d".repeat(64)}`,
+        assets: { bundle: ASSET_BUNDLE },
+        bindings: [{ type: "plain_text", name: "ASSETS", text: "mine" }],
+      },
+    });
+    expect(ticket).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
   });
 });

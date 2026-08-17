@@ -25,6 +25,9 @@ import {
 
 const API_ORIGIN = "https://api.cloudflare.com/client/v4";
 
+/** The name a script reaches its own static assets by. */
+const ASSETS_BINDING = "ASSETS";
+
 /** Cloudflare's code for "that hostname already resolves to something else". */
 const DNS_RECORDS_PRESENT = 100_117;
 
@@ -265,6 +268,21 @@ export class CloudflareProvider implements Provider {
     // Assets are uploaded before the script, because the script's metadata
     // must carry the completion token the asset upload returns.
     const assets = record(input.spec.assets);
+    // A script that declares assets is given a binding to them. Without one the
+    // asset layer only answers requests that match a file exactly: anything
+    // else reaches the Worker, and `notFoundHandling` — the whole reason an
+    // application with client-side routing survives a reload — never applies.
+    // The Worker has to be able to ask, so it is always handed the means.
+    if (
+      assets &&
+      bindingsOf(input.spec.bindings).some((binding) => binding.name === ASSETS_BINDING)
+    ) {
+      return failed(
+        "invalid_spec",
+        `a script that declares assets is given a binding named ${ASSETS_BINDING}; ` +
+          "declare your own binding under a different name",
+      );
+    }
     let assetToken: string | null = null;
     if (assets) {
       const uploaded = await this.#uploadAssets(name, input.identity.tenantRef, assets);
@@ -288,6 +306,7 @@ export class CloudflareProvider implements Provider {
                 name: entry.name,
                 class_name: entry.className,
               })),
+              ...(assetToken ? [{ type: "assets", name: ASSETS_BINDING }] : []),
             ],
             // A single-script upload carries one migration object, not a list
             // of them; the list form belongs to the multi-script API.

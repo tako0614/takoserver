@@ -1,20 +1,16 @@
 /**
  * The console's Worker.
  *
- * The console is a static bundle, and the asset layer answers everything that
- * matches a file — including unknown paths, which it resolves to the entry
- * document so a deep link survives a cold load. A Worker still has to exist for
- * a script to be published, and this is it.
+ * The console is a static bundle, so this hands every request straight to the
+ * asset layer. That is not a formality: the asset layer is what resolves an
+ * unknown path to the entry document, and a console whose deep links 404 on
+ * reload is a console people stop linking to.
  *
- * It answers only what the assets did not, which in practice is nothing. Saying
- * so plainly beats an empty handler that would make a real misconfiguration
- * look like a blank page.
+ * A script that declares assets is always given this binding, so nothing has
+ * to be declared for it to be here.
  */
 export default {
-  fetch(): Response {
-    return new Response("not found\n", {
-      status: 404,
-      headers: { "content-type": "text/plain; charset=utf-8" },
-    });
+  fetch(request: Request, env: { ASSETS: { fetch(request: Request): Promise<Response> } }) {
+    return env.ASSETS.fetch(request);
   },
 };
