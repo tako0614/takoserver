@@ -3,6 +3,8 @@ import { createCatalog, type Offering } from "./catalog.ts";
 import { createControlRoutes } from "./control.ts";
 import { createLedger, type FundingSettlementVerifier } from "./ledger.ts";
 import type { Clock, ObjectStore, Sql } from "./ports.ts";
+import { createProviderDriver } from "./provider-driver.ts";
+import type { Provider } from "./provider-port.ts";
 import { createReseller } from "./reseller.ts";
 import { createRouter, type Router } from "./router.ts";
 import { createTakoformHost } from "./takoform/host.ts";
@@ -30,7 +32,13 @@ export interface AppPorts {
   readonly settlement: FundingSettlementVerifier;
   readonly publicOrigin: string;
   readonly forms: readonly InstalledTakoformForm[];
-  readonly driver: TakoformResourceDriver;
+  /**
+   * Backends this deployment can provision on. When present the Takoform lane
+   * is driven by them and applies are billed; `driver` then only serves as an
+   * explicit override for tests about the Host itself.
+   */
+  readonly providers?: readonly Provider[];
+  readonly driver?: TakoformResourceDriver;
   readonly offerings: readonly Offering[];
   readonly signingKey?: SigningKey;
   /**
@@ -67,6 +75,9 @@ export function buildApp(ports: AppPorts): App {
     ...(ports.signingKey ? { signingKey: ports.signingKey } : {}),
   });
 
+  const driver =
+    ports.driver ?? createProviderDriver({ providers: ports.providers ?? [], catalog, ledger });
+
   const takoformHost =
     ports.takoformHost ??
     createTakoformHost({
@@ -82,7 +93,7 @@ export function buildApp(ports: AppPorts): App {
           : null;
       },
       forms: ports.forms,
-      driver: ports.driver,
+      driver,
       clock,
       randomId,
     });

@@ -320,6 +320,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       }
 
       const opId = operationId();
+      const existingNativeId = current ? await store.nativeIdOf(address) : null;
       const receipt = await driver.apply({
         operationId: opId,
         tenantId: context.tenantId,
@@ -328,9 +329,10 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         space: body.metadata.space,
         spec: structuredClone(body.spec),
         ...(current ? { previous: structuredClone(current) } : {}),
+        ...(existingNativeId ? { nativeId: existingNativeId } : {}),
       });
       const next = materializeResource(body, form, receipt, current, clock, randomId);
-      const nativeId = current ? await store.nativeIdOf(address) : null;
+      const nativeId = receipt.nativeId ?? existingNativeId;
       await commit(address, next, current ?? undefined, nativeId ?? undefined);
       const status = create ? 201 : 200;
       await recordOperationFor(context.tenantId)(opId, create ? "create" : "update", next);
@@ -368,12 +370,14 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       if (replay) return replayedObservation(replay, fingerprint, current.metadata.uid);
 
       const observeId = operationId();
+      const observedNativeId = await store.nativeIdOf(address);
       const receipt = await driver.observe({
         tenantId: context.tenantId,
         resource: structuredClone(current),
+        ...(observedNativeId ? { nativeId: observedNativeId } : {}),
       });
       const next = withObservation(current, form, receipt, clock);
-      await commit(address, next, current, (await store.nativeIdOf(address)) ?? undefined);
+      await commit(address, next, current, observedNativeId ?? undefined);
       await recordOperationFor(context.tenantId)(observeId, "observe", next);
       await store.putReplay(replayKey, {
         fingerprint,
@@ -497,10 +501,12 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       }
 
       const deleteId = operationId();
+      const deletedNativeId = await store.nativeIdOf(address);
       await driver.delete({
         operationId: deleteId,
         tenantId: context.tenantId,
         resource: structuredClone(current),
+        ...(deletedNativeId ? { nativeId: deletedNativeId } : {}),
       });
       const removed = await store.deleteResource(address, current.metadata.revision);
       if (!removed) throw new TakoformHostError("resource_busy", 409);

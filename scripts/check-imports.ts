@@ -44,7 +44,11 @@ interface Layer {
 }
 
 const LAYERS: readonly Layer[] = [
-  { name: "core", match: /^src\/(?:ports|json|strict-json|form-ref)\.ts$/u, may: ["core"] },
+  {
+    name: "core",
+    match: /^src\/(?:ports|json|strict-json|form-ref|provider-port)\.ts$/u,
+    may: ["core"],
+  },
   {
     name: "adapter",
     match: /^src\/(?:sql-d1|sql-sqlite|objects-r2|objects-mem)\.ts$|^src\/providers\//u,
@@ -53,7 +57,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "domain",
     match:
-      /^src\/(?:token|auth|ledger|catalog|reseller|metering)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$)/u,
+      /^src\/(?:token|auth|ledger|catalog|reseller|metering|provider-driver|reconcile)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$)/u,
     may: ["core", "domain"],
   },
   {

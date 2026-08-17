@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import type { ProviderOffering, ProviderTicket } from "../src/provider-port.ts";
 import { FakeProvider } from "../src/providers/fake.ts";
-import type { ProviderOffering, ProviderTicket } from "../src/providers/port.ts";
 
 const OFFERING: ProviderOffering = {
   id: "storage.object.standard",

@@ -1,5 +1,5 @@
-import type { TakoformV1Alpha3FormRef } from "../form-ref.ts";
-import type { DataProtocol, JsonObject } from "../ports.ts";
+import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
+import type { DataProtocol, JsonObject } from "./ports.ts";
 
 /**
  * The one seam between Takoserver and the clouds it provisions on.

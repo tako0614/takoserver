@@ -8,7 +8,7 @@ import {
   type ProviderTicket,
   running,
   succeeded,
-} from "./port.ts";
+} from "../provider-port.ts";
 
 /**
  * A provider that provisions nothing, in both completion styles.
