@@ -90,6 +90,9 @@ function publicSettings(target: DeployTarget): Record<string, unknown> {
   const vars: Record<string, string> = {};
   if (target.consoleOrigin !== undefined) vars.TAKOSERVER_CONSOLE_ORIGIN = target.consoleOrigin;
   if (target.googleClientId !== undefined) vars.GOOGLE_CLIENT_ID = target.googleClientId;
+  if (target.provisionerOrigin !== undefined) {
+    vars.TAKOSERVER_PROVISIONER_ORIGIN = target.provisionerOrigin;
+  }
   return Object.keys(vars).length === 0 ? {} : { vars };
 }
 

@@ -28,6 +28,14 @@ export interface DeployTarget {
    * rather than in the repository.
    */
   readonly googleClientId?: string;
+  /**
+   * Origin of the provisioner this deployment runs.
+   *
+   * Public, like the other two: it is an address. The credential that goes with
+   * it is a Worker secret and is deliberately not here, because a descriptor
+   * that carries a secret is a descriptor somebody will paste into a ticket.
+   */
+  readonly provisionerOrigin?: string;
   readonly grantKeyId: string;
 }
 
@@ -83,7 +91,7 @@ function validateTarget(value: unknown, path: string): DeployTarget {
   assertExactKeys(
     value,
     ["accountId", "workerName", "d1", "r2", "publicOrigin", "grantKeyId"],
-    ["consoleOrigin", "googleClientId"],
+    ["consoleOrigin", "googleClientId", "provisionerOrigin"],
   );
 
   const d1 = value.d1;
@@ -108,6 +116,9 @@ function validateTarget(value: unknown, path: string): DeployTarget {
     ...(value.googleClientId === undefined
       ? {}
       : { googleClientId: pattern(value.googleClientId, GOOGLE_CLIENT_ID, "googleClientId") }),
+    ...(value.provisionerOrigin === undefined
+      ? {}
+      : { provisionerOrigin: httpsOrigin(value.provisionerOrigin) }),
     grantKeyId: pattern(value.grantKeyId, KEY_ID, "grantKeyId"),
   };
 }
