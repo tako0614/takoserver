@@ -7,7 +7,9 @@
       "!!dist",
       "!!.git",
       "!!openapi/takoserver.openapi.json",
-      "!!worker-configuration.d.ts"
+      "!!worker-configuration.d.ts",
+      "!!.deploy",
+      "!!.wrangler-realized.jsonc"
     ]
   },
   "formatter": {
