@@ -101,6 +101,7 @@ export class FakeProvider implements Provider {
 
   async delete(input: {
     operationId: string;
+    offering: ProviderOffering;
     nativeId: string;
     identity: { tenantRef: string; space: string; name: string };
   }): Promise<ProviderTicket> {
@@ -112,6 +113,7 @@ export class FakeProvider implements Provider {
   }
 
   async adopt(input: {
+    offering: ProviderOffering;
     nativeId: string;
     identity: { tenantRef: string; space: string; name: string };
     spec: JsonObject;
