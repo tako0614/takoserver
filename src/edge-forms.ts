@@ -65,7 +65,7 @@ const SQL_DATABASE_SCHEMA: JsonObject = {
   additionalProperties: false,
 };
 
-const WORKER_SCRIPT_SCHEMA: JsonObject = {
+const WORKER_SCRIPT_SCHEMA_V1_1: JsonObject = {
   type: "object",
   properties: {
     // A committed WorkerBundle manifest the tenant holds. The bytes were
@@ -153,6 +153,36 @@ const WORKER_SCRIPT_SCHEMA_V1: JsonObject = {
   additionalProperties: false,
 };
 
+/**
+ * The current definition. Durable Objects are declared alongside bindings
+ * because a Worker that uses them cannot be published without also declaring
+ * the migration that creates their classes — the two are one operation to
+ * Cloudflare, and splitting them would let a caller publish a script whose
+ * bindings point at classes that do not exist.
+ */
+const WORKER_SCRIPT_SCHEMA: JsonObject = {
+  ...(WORKER_SCRIPT_SCHEMA_V1_1 as { readonly [key: string]: JsonObject }),
+  properties: {
+    ...(WORKER_SCRIPT_SCHEMA_V1_1 as { properties: { [key: string]: JsonObject } }).properties,
+    durableObjects: {
+      type: "array",
+      maxItems: 32,
+      items: {
+        type: "object",
+        properties: {
+          name: { type: "string", pattern: "^[A-Za-z_][A-Za-z0-9_]{0,63}$" },
+          className: { type: "string", pattern: "^[A-Za-z_][A-Za-z0-9_]{0,63}$" },
+          // SQLite-backed classes are created by a different migration verb
+          // than the original key-value ones, and the choice is permanent.
+          storage: { type: "string", enum: ["sqlite", "key-value"] },
+        },
+        required: ["name", "className"],
+        additionalProperties: false,
+      },
+    },
+  },
+};
+
 const OBSERVED_SCHEMA: JsonObject = { type: "object", additionalProperties: true };
 const OUTPUT_SCHEMA: JsonObject = { type: "object", additionalProperties: true };
 
@@ -191,7 +221,8 @@ export async function buildEdgeForms(prices: EdgeFormPrices = {}): Promise<EdgeF
       // Superseded, and deliberately still here. Resources created under it
       // stay readable, updatable, and deletable.
       { definitionVersion: "1.0.0", desiredSchema: WORKER_SCRIPT_SCHEMA_V1 },
-      { definitionVersion: "1.1.0", desiredSchema: WORKER_SCRIPT_SCHEMA },
+      { definitionVersion: "1.1.0", desiredSchema: WORKER_SCRIPT_SCHEMA_V1_1 },
+      { definitionVersion: "1.2.0", desiredSchema: WORKER_SCRIPT_SCHEMA },
     ],
   });
 

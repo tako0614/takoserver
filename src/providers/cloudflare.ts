@@ -237,6 +237,13 @@ export class CloudflareProvider implements Provider {
       : await derivedName("tsw", input.identity);
     if (!name) return failed("invalid_spec", "the previous native identity is unusable");
 
+    // Durable Object classes must be created by a migration in the same upload
+    // that binds them; Cloudflare treats the two as one operation, and a script
+    // whose bindings name classes that do not exist is rejected outright.
+    const durableObjects = durableObjectsOf(input.spec.durableObjects);
+    const previouslyDeclared = previousDurableClasses(input.previous?.spec);
+    const migration = migrationFor(durableObjects, previouslyDeclared);
+
     const form = new FormData();
     form.set(
       "metadata",
@@ -246,7 +253,15 @@ export class CloudflareProvider implements Provider {
             main_module: mainModule,
             compatibility_date: optionalString(input.spec.compatibilityDate) ?? "2026-01-01",
             compatibility_flags: stringList(input.spec.compatibilityFlags),
-            bindings: bindingsOf(input.spec.bindings),
+            bindings: [
+              ...bindingsOf(input.spec.bindings),
+              ...durableObjects.map((entry) => ({
+                type: "durable_object_namespace",
+                name: entry.name,
+                class_name: entry.className,
+              })),
+            ],
+            ...(migration ? { migrations: [migration] } : {}),
           }),
         ],
         { type: "application/json" },
@@ -491,6 +506,55 @@ function bindingsOf(value: JsonValue | undefined): readonly JsonObject[] {
     }
   }
   return bindings;
+}
+
+interface DurableObjectDeclaration {
+  readonly name: string;
+  readonly className: string;
+  readonly storage: "sqlite" | "key-value";
+}
+
+function durableObjectsOf(value: JsonValue | undefined): readonly DurableObjectDeclaration[] {
+  if (!Array.isArray(value)) return [];
+  const declared: DurableObjectDeclaration[] = [];
+  for (const entry of value) {
+    const record_ = record(entry);
+    const name = optionalString(record_?.name);
+    const className = optionalString(record_?.className);
+    if (!name || !className) continue;
+    declared.push({
+      name,
+      className,
+      storage: optionalString(record_?.storage) === "key-value" ? "key-value" : "sqlite",
+    });
+  }
+  return declared;
+}
+
+function previousDurableClasses(spec: JsonObject | undefined): ReadonlySet<string> {
+  return new Set(durableObjectsOf(spec?.durableObjects).map((entry) => entry.className));
+}
+
+/**
+ * The migration that introduces classes this upload declares for the first
+ * time. Classes already present are left alone: re-declaring one as new would
+ * ask Cloudflare to create something that exists, and dropping the ones no
+ * longer declared would destroy their stored state, which is never a safe
+ * inference from an absent line in a spec.
+ */
+function migrationFor(
+  declared: readonly DurableObjectDeclaration[],
+  existing: ReadonlySet<string>,
+): JsonObject | null {
+  const fresh = declared.filter((entry) => !existing.has(entry.className));
+  if (fresh.length === 0) return null;
+  const sqlite = fresh.filter((entry) => entry.storage === "sqlite").map((e) => e.className);
+  const keyValue = fresh.filter((entry) => entry.storage !== "sqlite").map((e) => e.className);
+  return {
+    tag: `v${existing.size + fresh.length}`,
+    ...(sqlite.length > 0 ? { new_sqlite_classes: sqlite } : {}),
+    ...(keyValue.length > 0 ? { new_classes: keyValue } : {}),
+  };
 }
 
 function stringList(value: JsonValue | undefined): readonly string[] {

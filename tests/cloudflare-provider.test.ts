@@ -164,6 +164,58 @@ describe("Cloudflare provider", () => {
     expect(upload?.body).not.toContain("SNEAKY");
   });
 
+  test("creates Durable Object classes in the upload that binds them", async () => {
+    const { provider, calls } = recorder([
+      { status: 200, body: { success: true, errors: [], result: {} } },
+    ]);
+    const ticket = await provider.apply({
+      operationId: "op_do",
+      offering: WORKER,
+      identity: { ...IDENTITY, name: "stateful" },
+      spec: {
+        bundle: `sha256:${"d".repeat(64)}`,
+        durableObjects: [
+          { name: "SESSIONS", className: "SessionDO" },
+          { name: "LIMITS", className: "RateLimiterDO", storage: "key-value" },
+        ],
+      },
+    });
+    expect(ticket.phase).toBe("succeeded");
+
+    const metadata = calls[0]?.body ?? "";
+    // Binding and migration travel together: a script bound to a class that
+    // was never created is rejected outright.
+    expect(metadata).toContain('"type":"durable_object_namespace"');
+    expect(metadata).toContain('"class_name":"SessionDO"');
+    expect(metadata).toContain('"new_sqlite_classes":["SessionDO"]');
+    expect(metadata).toContain('"new_classes":["RateLimiterDO"]');
+  });
+
+  test("does not re-create Durable Object classes an update already has", async () => {
+    const { provider, calls } = recorder([
+      { status: 200, body: { success: true, errors: [], result: {} } },
+    ]);
+    await provider.apply({
+      operationId: "op_do2",
+      offering: WORKER,
+      identity: { ...IDENTITY, name: "stateful" },
+      spec: {
+        bundle: `sha256:${"d".repeat(64)}`,
+        durableObjects: [{ name: "SESSIONS", className: "SessionDO" }],
+      },
+      previous: {
+        nativeId: "worker:tsw-existing",
+        spec: {
+          bundle: `sha256:${"d".repeat(64)}`,
+          durableObjects: [{ name: "SESSIONS", className: "SessionDO" }],
+        },
+      },
+    });
+    // Re-declaring an existing class would ask Cloudflare to create something
+    // that already holds state.
+    expect(calls[0]?.body ?? "").not.toContain("migrations");
+  });
+
   test("refuses a hostname no configured zone serves", async () => {
     const { provider, calls } = recorder([
       { status: 200, body: { success: true, errors: [], result: {} } },
