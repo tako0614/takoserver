@@ -44,11 +44,11 @@ interface Layer {
 }
 
 const LAYERS: readonly Layer[] = [
-  { name: "core", match: /^src\/(?:ports|json|strict-json)\.ts$/u, may: ["core"] },
+  { name: "core", match: /^src\/(?:ports|json|strict-json|form-ref)\.ts$/u, may: ["core"] },
   {
     name: "adapter",
     match: /^src\/(?:sql-d1|sql-sqlite|objects-r2|objects-mem)\.ts$|^src\/providers\//u,
-    may: ["core"],
+    may: ["core", "adapter"],
   },
   {
     name: "domain",

@@ -1,4 +1,7 @@
+import type { TakoformV1Alpha3FormRef } from "../form-ref.ts";
 import type { JsonObject } from "../ports.ts";
+
+export type { TakoformV1Alpha3FormRef };
 
 /**
  * The Takoform Host wire vocabulary.
@@ -7,13 +10,6 @@ import type { JsonObject } from "../ports.ts";
  * provider pins the exact `formRef` quad and the resource envelope below, so
  * fields may be added but never renamed, reordered in meaning, or removed.
  */
-
-export interface TakoformV1Alpha3FormRef {
-  readonly apiVersion: string;
-  readonly kind: string;
-  readonly definitionVersion: string;
-  readonly schemaDigest: `sha256:${string}`;
-}
 
 export interface TakoformInterfaceRef {
   readonly apiVersion: "interfaces.takoform.com/v1alpha1";

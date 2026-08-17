@@ -1,6 +1,6 @@
+import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import { canonicalDigest } from "./json.ts";
 import type { DataProtocol } from "./ports.ts";
-import type { TakoformV1Alpha3FormRef } from "./takoform/types.ts";
 
 export type { DataProtocol };
 
