@@ -154,13 +154,15 @@ const WORKER_SCRIPT_SCHEMA_V1: JsonObject = {
 };
 
 /**
- * The current definition. Durable Objects are declared alongside bindings
- * because a Worker that uses them cannot be published without also declaring
- * the migration that creates their classes — the two are one operation to
- * Cloudflare, and splitting them would let a caller publish a script whose
- * bindings point at classes that do not exist.
+ * Durable Objects are declared alongside bindings because a Worker that uses
+ * them cannot be published without also declaring the migration that creates
+ * their classes — the two are one operation to Cloudflare, and splitting them
+ * would let a caller publish a script whose bindings point at classes that do
+ * not exist.
+ *
+ * Superseded by 1.3.0, and kept because resources were created under it.
  */
-const WORKER_SCRIPT_SCHEMA: JsonObject = {
+const WORKER_SCRIPT_SCHEMA_V1_2: JsonObject = {
   ...(WORKER_SCRIPT_SCHEMA_V1_1 as { readonly [key: string]: JsonObject }),
   properties: {
     ...(WORKER_SCRIPT_SCHEMA_V1_1 as { properties: { [key: string]: JsonObject } }).properties,
@@ -179,6 +181,38 @@ const WORKER_SCRIPT_SCHEMA: JsonObject = {
         required: ["name", "className"],
         additionalProperties: false,
       },
+    },
+  },
+};
+
+/**
+ * The current definition, which adds static assets.
+ *
+ * A Worker that serves a site is one script plus a pile of files, and the files
+ * have to be uploaded and attached before the script is published — Cloudflare
+ * gives the upload a completion token that the script's metadata must carry.
+ * Declaring the asset bundle here is what lets a customer say "serve this site"
+ * in one resource rather than orchestrating that handshake themselves.
+ *
+ * `notFoundHandling` defaults to serving the app's entry document, because an
+ * application with client-side routing is the common case and a deep link that
+ * 404s on reload is the defect it produces.
+ */
+const WORKER_SCRIPT_SCHEMA: JsonObject = {
+  ...(WORKER_SCRIPT_SCHEMA_V1_2 as { readonly [key: string]: JsonObject }),
+  properties: {
+    ...(WORKER_SCRIPT_SCHEMA_V1_2 as { properties: { [key: string]: JsonObject } }).properties,
+    assets: {
+      type: "object",
+      properties: {
+        bundle: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
+        notFoundHandling: {
+          type: "string",
+          enum: ["single-page-application", "404-page", "none"],
+        },
+      },
+      required: ["bundle"],
+      additionalProperties: false,
     },
   },
 };
@@ -222,7 +256,8 @@ export async function buildEdgeForms(prices: EdgeFormPrices = {}): Promise<EdgeF
       // stay readable, updatable, and deletable.
       { definitionVersion: "1.0.0", desiredSchema: WORKER_SCRIPT_SCHEMA_V1 },
       { definitionVersion: "1.1.0", desiredSchema: WORKER_SCRIPT_SCHEMA_V1_1 },
-      { definitionVersion: "1.2.0", desiredSchema: WORKER_SCRIPT_SCHEMA },
+      { definitionVersion: "1.2.0", desiredSchema: WORKER_SCRIPT_SCHEMA_V1_2 },
+      { definitionVersion: "1.3.0", desiredSchema: WORKER_SCRIPT_SCHEMA },
     ],
   });
 

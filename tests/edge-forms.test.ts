@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { createCatalog } from "../src/catalog.ts";
 import { buildEdgeForms } from "../src/edge-forms.ts";
 import { canonicalDigest } from "../src/json.ts";
+import { validateDesired } from "../src/takoform/schema.ts";
 
 /**
  * A Form's identity includes the digest of its own schema, so improving a
@@ -78,5 +79,54 @@ describe("edge Forms", () => {
     for (const form of edge.workerScript.forms) {
       expect(form.artifactRequirement).toEqual({ specField: "bundle", kind: "WorkerBundle" });
     }
+  });
+});
+
+/**
+ * The digest of a shipped definition is its identity, and resources in
+ * production name it. Changing a schema in place — even to fix something —
+ * mints a different Form and strands every resource that named the old one:
+ * still running, still billing, no longer addressable. Pinning the digests
+ * turns that from a mistake somebody discovers in production into a failing
+ * test.
+ *
+ * Adding a line here is how a new definition ships. Changing one is not.
+ */
+describe("shipped Form digests", () => {
+  test("never move once published", async () => {
+    const edge = await buildEdgeForms();
+    const published = Object.fromEntries(
+      edge.workerScript.forms.map((form) => [
+        form.identity.formRef.definitionVersion,
+        form.identity.formRef.schemaDigest,
+      ]),
+    );
+    expect(published).toEqual({
+      "1.0.0": "sha256:2f53c9e9fba4ba4c96b4693fe1440e1e54fd2b3641f2fb5794b14068c0c46e32",
+      "1.1.0": "sha256:f5eaa41ee1dd1d701af921d6eb6f4ef8955dca7b3edcd9df58edcaeff0609f8f",
+      "1.2.0": "sha256:c76c3a5d0583ec749c119970090c3cf3fa9ec81ce039cbc09d8f312e12c7dcfa",
+      "1.3.0": "sha256:afff66bf3d4ba016a9fc3e99e50edee81f63a7c9caefd026e81a6b9960889fd9",
+    });
+  });
+
+  test("accepts a static asset declaration only in the definition that has it", async () => {
+    const edge = await buildEdgeForms();
+    const spec = {
+      bundle: `sha256:${"a".repeat(64)}`,
+      assets: { bundle: `sha256:${"b".repeat(64)}` },
+    };
+    const by = (version: string) =>
+      edge.workerScript.forms.find((form) => form.identity.formRef.definitionVersion === version);
+
+    const complaints = (version: string) => {
+      const form = by(version);
+      expect(form).toBeDefined();
+      return validateDesired(form as NonNullable<typeof form>, spec);
+    };
+
+    // 1.2.0 refuses it — which is the point of minting 1.3.0 rather than
+    // widening a definition that resources already name.
+    expect(complaints("1.2.0").length).toBeGreaterThan(0);
+    expect(complaints("1.3.0")).toEqual([]);
   });
 });
