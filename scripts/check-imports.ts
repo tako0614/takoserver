@@ -51,7 +51,8 @@ const LAYERS: readonly Layer[] = [
   },
   {
     name: "adapter",
-    match: /^src\/(?:sql-d1|sql-sqlite|objects-r2|objects-mem)\.ts$|^src\/providers\//u,
+    match:
+      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem)\.ts$|^src\/providers\//u,
     may: ["core", "adapter"],
   },
   {
@@ -114,6 +115,9 @@ const HOST_ONLY = [
   // that could reach either would hand that reach to every Worker sharing its
   // bundle, so provisioning runs on the self-hosted entry instead.
   "src/providers/cloudflare.ts",
+  // The HTTP transport needs an account credential for the same reason.
+  "src/sql-d1-http.ts",
+  "src/objects-r2-http.ts",
 ];
 
 if (existsSync(WORKER_ENTRY)) {

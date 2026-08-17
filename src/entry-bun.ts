@@ -3,8 +3,10 @@ import { buildApp } from "./app.ts";
 import { MIGRATIONS } from "./db-schema.ts";
 import { buildEdgeForms } from "./edge-forms.ts";
 import { createMemoryObjectStore } from "./objects-mem.ts";
+import { createR2HttpObjectStore } from "./objects-r2-http.ts";
 import { createOperatorIdentity, createOperatorSettlement } from "./operator-credentials.ts";
 import { CloudflareProvider } from "./providers/cloudflare.ts";
+import { createD1HttpSql } from "./sql-d1-http.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 
@@ -35,14 +37,39 @@ const publicOrigin = process.env.TAKOSERVER_PUBLIC_ORIGIN ?? "http://localhost:8
 const databasePath = process.env.TAKOSERVER_DB ?? ":memory:";
 const port = Number(process.env.PORT ?? 8787);
 
-const database = new Database(databasePath);
-// Applying every migration is safe to repeat only on a fresh file; a durable
-// deployment is migrated by its own operator step, exactly as D1 is.
-if (databasePath === ":memory:") {
-  for (const migration of MIGRATIONS) database.exec(migration.sql);
-}
-const sql = createSqliteSql(database);
-const objects = createMemoryObjectStore();
+/**
+ * State comes from the same D1 the Worker serves when one is configured. A
+ * provisioner with its own database would be a second product with a second
+ * truth: an organization created through the public API would be invisible to
+ * the process that provisions for it.
+ */
+const sharedDatabaseId = process.env.TAKOSERVER_D1_DATABASE_ID;
+const sql = sharedDatabaseId
+  ? createD1HttpSql({
+      accountId: required("CLOUDFLARE_ACCOUNT_ID"),
+      databaseId: sharedDatabaseId,
+      authorize: () => `Bearer ${required("CLOUDFLARE_API_TOKEN")}`,
+    })
+  : (() => {
+      const database = new Database(databasePath);
+      // Applying every migration is safe only on a fresh file; a durable
+      // deployment is migrated by its own operator step, exactly as D1 is.
+      if (databasePath === ":memory:") {
+        for (const migration of MIGRATIONS) database.exec(migration.sql);
+      }
+      return createSqliteSql(database);
+    })();
+// Bytes come from the same bucket the Worker writes to, for the same reason
+// the rows do: a bundle committed through the public API has to be there when
+// the provisioner goes to publish it.
+const sharedBucket = process.env.TAKOSERVER_R2_BUCKET;
+const objects = sharedBucket
+  ? createR2HttpObjectStore({
+      accountId: required("CLOUDFLARE_ACCOUNT_ID"),
+      bucketName: sharedBucket,
+      authorize: () => `Bearer ${required("CLOUDFLARE_API_TOKEN")}`,
+    })
+  : createMemoryObjectStore();
 const clock = () => new Date();
 const edge = await buildEdgeForms();
 
