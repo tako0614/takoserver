@@ -1,0 +1,35 @@
+{
+  "name": "@takoserver/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "fmt": "biome check --write .",
+    "fmt:check": "biome check .",
+    "lint": "biome lint .",
+    "typecheck": "tsc --noEmit",
+    "typecheck:worker": "tsc --noEmit -p tsconfig.worker.json",
+    "test": "bun test",
+    "build": "bun scripts/build.ts",
+    "build:worker": "bun scripts/build-worker.ts",
+    "check:imports": "bun scripts/check-imports.ts",
+    "check:migrations": "bun scripts/check-d1-migrations.ts",
+    "check:openapi": "bun scripts/check-openapi.ts",
+    "check:worker-startup": "bun scripts/check-worker-startup.ts",
+    "check:worker-types": "wrangler types worker-configuration.d.ts --check --include-runtime=false --config wrangler.jsonc",
+    "openapi:write": "bun scripts/write-openapi.ts",
+    "worker:types": "wrangler types worker-configuration.d.ts --include-runtime=false --config wrangler.jsonc",
+    "check": "bun run fmt:check && bun run lint && bun run check:imports && bun run check:worker-types && bun run typecheck && bun run typecheck:worker && bun run test && bun run check:migrations && bun run build && bun run build:worker && bun run check:worker-startup && bun run check:openapi",
+    "deploy": "bun scripts/deploy.ts"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.2.0",
+    "@cloudflare/workers-types": "5.20260817.1",
+    "@types/bun": "^1.2.20",
+    "typescript": "^5.9.2",
+    "wrangler": "^4.123.0"
+  }
+}
