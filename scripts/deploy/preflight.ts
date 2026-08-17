@@ -1,4 +1,4 @@
-import { RemoteD1, sqlLiteral } from "./d1.ts";
+import { RemoteD1 } from "./d1.ts";
 import { preflightError } from "./errors.ts";
 import { assertPublishedIdentity, readLedger } from "./evidence.ts";
 import { runChecked, wranglerCommand } from "./process.ts";
@@ -149,18 +149,36 @@ function assertMigrationLineage(applied: readonly string[], local: readonly stri
   }
 }
 
-/** Proves the credential in use can reach the exact database the target names. */
+/**
+ * Proves the credential in use resolves the target's database name to exactly
+ * the database id the target pins, so a same-named database in another account
+ * or a stale id cannot be published against.
+ */
 async function assertProbeDatabaseIdentity(
   configPath: string,
   target: DeployTarget,
 ): Promise<void> {
-  const rows = await new RemoteD1(configPath).query(
+  const raw = await runChecked(
     "preflight",
-    "D1 capability probe",
-    `SELECT ${sqlLiteral(target.d1.databaseId)} AS database_id`,
+    "D1 identity probe",
+    wranglerCommand(["d1", "info", target.d1.databaseName, "--json", "--config", configPath]),
   );
-  const first = rows[0];
-  if (!first || first.database_id !== target.d1.databaseId) {
-    throw preflightError("the D1 capability probe did not return the expected identity");
+  const start = raw.indexOf("{");
+  if (start < 0) throw preflightError("the D1 identity probe returned no JSON", raw);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.slice(start));
+  } catch {
+    throw preflightError("the D1 identity probe returned unparsable JSON", raw);
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    throw preflightError("the D1 identity probe returned an unexpected shape", raw);
+  }
+  const info = parsed as { readonly uuid?: unknown; readonly name?: unknown };
+  if (info.uuid !== target.d1.databaseId || info.name !== target.d1.databaseName) {
+    throw preflightError(
+      "the D1 identity probe resolved a different database than the deploy target pins",
+      `resolved uuid=${JSON.stringify(info.uuid)} name=${JSON.stringify(info.name)}`,
+    );
   }
 }
