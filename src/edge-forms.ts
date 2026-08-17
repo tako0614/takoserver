@@ -24,9 +24,14 @@ import type { InstalledTakoformForm } from "./takoform/types.ts";
 const GROUP = "edge.forms.takoform.com/v1beta1";
 
 export interface EdgeForm {
+  /** The definition new resources are created under. */
   readonly form: InstalledTakoformForm;
   readonly providerOffering: ProviderOffering;
   readonly offering: Offering;
+  /** Every definition, current and superseded, in order. */
+  readonly forms: readonly InstalledTakoformForm[];
+  readonly providerOfferings: readonly ProviderOffering[];
+  readonly offerings: readonly Offering[];
 }
 
 export interface EdgeFormBundle {
@@ -108,11 +113,51 @@ const WORKER_SCRIPT_SCHEMA: JsonObject = {
   additionalProperties: false,
 };
 
+/**
+ * The retired first definition of WorkerScript. It is kept verbatim, not
+ * tidied, because its digest *is* its identity: a resource created under it
+ * can only be read, updated, or deleted while this exact shape is installed.
+ * Deleting it would strand every resource that named it.
+ */
+const WORKER_SCRIPT_SCHEMA_V1: JsonObject = {
+  type: "object",
+  properties: {
+    bundle: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
+    compatibilityDate: { type: "string", pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+    compatibilityFlags: { type: "array", maxItems: 16, items: { type: "string", maxLength: 64 } },
+    bindings: {
+      type: "array",
+      maxItems: 64,
+      items: {
+        type: "object",
+        properties: {
+          type: {
+            type: "string",
+            enum: ["d1", "r2_bucket", "kv_namespace", "queue", "service", "plain_text"],
+          },
+          name: { type: "string", pattern: "^[A-Za-z_][A-Za-z0-9_]{0,63}$" },
+          databaseId: { type: "string", maxLength: 128 },
+          bucketName: { type: "string", maxLength: 128 },
+          namespaceId: { type: "string", maxLength: 128 },
+          queueName: { type: "string", maxLength: 128 },
+          service: { type: "string", maxLength: 128 },
+          text: { type: "string", maxLength: 4096 },
+        },
+        required: ["type", "name"],
+        additionalProperties: false,
+      },
+    },
+    workersDevSubdomain: { type: "string", maxLength: 63 },
+  },
+  required: ["bundle"],
+  additionalProperties: false,
+};
+
 const OBSERVED_SCHEMA: JsonObject = { type: "object", additionalProperties: true };
 const OUTPUT_SCHEMA: JsonObject = { type: "object", additionalProperties: true };
 
 export async function buildEdgeForms(prices: EdgeFormPrices = {}): Promise<EdgeFormBundle> {
-  const objectBucket = await define({
+  const objectBucket = await lineage({
     kind: "ObjectBucket",
     offeringId: "storage.object.standard",
     providerKind: "object_bucket",
@@ -120,9 +165,9 @@ export async function buildEdgeForms(prices: EdgeFormPrices = {}): Promise<EdgeF
     unit: "bucket-month",
     unitPriceMinor: prices.objectBucketMinor ?? 500,
     protocols: ["s3"],
-    desiredSchema: OBJECT_BUCKET_SCHEMA,
+    versions: [{ definitionVersion: "1.0.0", desiredSchema: OBJECT_BUCKET_SCHEMA }],
   });
-  const sqlDatabase = await define({
+  const sqlDatabase = await lineage({
     kind: "SqlDatabase",
     offeringId: "database.sql.standard",
     providerKind: "sql_database",
@@ -130,9 +175,9 @@ export async function buildEdgeForms(prices: EdgeFormPrices = {}): Promise<EdgeF
     unit: "database-month",
     unitPriceMinor: prices.sqlDatabaseMinor ?? 1_000,
     protocols: [],
-    desiredSchema: SQL_DATABASE_SCHEMA,
+    versions: [{ definitionVersion: "1.0.0", desiredSchema: SQL_DATABASE_SCHEMA }],
   });
-  const workerScript = await define({
+  const workerScript = await lineage({
     kind: "WorkerScript",
     offeringId: "compute.worker.standard",
     providerKind: "worker_script",
@@ -140,9 +185,14 @@ export async function buildEdgeForms(prices: EdgeFormPrices = {}): Promise<EdgeF
     unit: "worker-month",
     unitPriceMinor: prices.workerScriptMinor ?? 1_500,
     protocols: [],
-    desiredSchema: WORKER_SCRIPT_SCHEMA,
     // The bundle must be a committed artifact before the Form may name it.
     artifactRequirement: { specField: "bundle", kind: "WorkerBundle" },
+    versions: [
+      // Superseded, and deliberately still here. Resources created under it
+      // stay readable, updatable, and deletable.
+      { definitionVersion: "1.0.0", desiredSchema: WORKER_SCRIPT_SCHEMA_V1 },
+      { definitionVersion: "1.1.0", desiredSchema: WORKER_SCRIPT_SCHEMA },
+    ],
   });
 
   const all = [objectBucket, sqlDatabase, workerScript];
@@ -150,9 +200,60 @@ export async function buildEdgeForms(prices: EdgeFormPrices = {}): Promise<EdgeF
     objectBucket,
     sqlDatabase,
     workerScript,
-    forms: all.map((entry) => entry.form),
-    providerOfferings: all.map((entry) => entry.providerOffering),
-    offerings: all.map((entry) => entry.offering),
+    forms: all.flatMap((entry) => entry.forms),
+    providerOfferings: all.flatMap((entry) => entry.providerOfferings),
+    offerings: all.flatMap((entry) => entry.offerings),
+  };
+}
+
+interface FormVersion {
+  readonly definitionVersion: string;
+  readonly desiredSchema: JsonObject;
+}
+
+/**
+ * Builds every definition of one Form, current and superseded alike.
+ *
+ * A Form's identity includes the digest of its schema, so improving a schema
+ * mints a different Form. If only the newest were installed, every resource
+ * created under an earlier one would become unreachable — not deleted, just
+ * unaddressable, which is worse. Keeping the lineage installed is what lets a
+ * declaration made last month still be managed today.
+ */
+async function lineage(input: {
+  readonly kind: string;
+  readonly offeringId: string;
+  readonly providerKind: string;
+  readonly displayName: string;
+  readonly unit: string;
+  readonly unitPriceMinor: number;
+  readonly protocols: readonly ("s3" | "openai")[];
+  readonly versions: readonly FormVersion[];
+  readonly artifactRequirement?: InstalledTakoformForm["artifactRequirement"];
+}): Promise<EdgeForm> {
+  const built = await Promise.all(
+    input.versions.map(async (version, index) => {
+      const current = index === input.versions.length - 1;
+      return await define({
+        ...input,
+        definitionVersion: version.definitionVersion,
+        desiredSchema: version.desiredSchema,
+        // The public offering id belongs to the current definition; a
+        // superseded one keeps a version-qualified id so both can coexist.
+        offeringId: current ? input.offeringId : `${input.offeringId}@${version.definitionVersion}`,
+        retired: !current,
+      });
+    }),
+  );
+  const current = built.at(-1);
+  if (!current) throw new TypeError(`${input.kind} declares no definitions`);
+  return {
+    form: current.form,
+    providerOffering: current.providerOffering,
+    offering: current.offering,
+    forms: built.map((entry) => entry.form),
+    providerOfferings: built.map((entry) => entry.providerOffering),
+    offerings: built.map((entry) => entry.offering),
   };
 }
 
@@ -165,12 +266,14 @@ async function define(input: {
   readonly unitPriceMinor: number;
   readonly protocols: readonly ("s3" | "openai")[];
   readonly desiredSchema: JsonObject;
+  readonly definitionVersion: string;
+  readonly retired: boolean;
   readonly artifactRequirement?: InstalledTakoformForm["artifactRequirement"];
-}): Promise<EdgeForm> {
+}): Promise<Definition> {
   const formRef = {
     apiVersion: GROUP,
     kind: input.kind,
-    definitionVersion: "1.0.0",
+    definitionVersion: input.definitionVersion,
     schemaDigest: await canonicalDigest(input.desiredSchema),
   } as const;
 
@@ -205,6 +308,13 @@ async function define(input: {
       price: { currency: "USD", unit: input.unit, unitPriceMinor: input.unitPriceMinor },
       protocols: input.protocols,
       available: true,
+      ...(input.retired ? { retired: true } : {}),
     },
   };
+}
+
+interface Definition {
+  readonly form: InstalledTakoformForm;
+  readonly providerOffering: ProviderOffering;
+  readonly offering: Offering;
 }

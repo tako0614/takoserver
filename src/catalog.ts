@@ -32,6 +32,12 @@ export interface Offering {
   readonly protocols: readonly DataProtocol[];
   readonly regions?: readonly string[];
   readonly available: boolean;
+  /**
+   * A superseded definition. Still resolvable, so resources created under it
+   * remain manageable, but not offered for sale — nobody should newly choose a
+   * shape we have already moved on from.
+   */
+  readonly retired?: boolean;
 }
 
 export interface Catalog {
@@ -56,7 +62,7 @@ export function createCatalog(offerings: readonly Offering[]): Catalog {
 
   return {
     list(): readonly Offering[] {
-      return [...byId.values()].filter((offering) => offering.available);
+      return [...byId.values()].filter((offering) => offering.available && !offering.retired);
     },
 
     find(offeringId): Offering | undefined {

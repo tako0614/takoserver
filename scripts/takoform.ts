@@ -34,29 +34,55 @@ interface FormRef {
   readonly schemaDigest: string;
 }
 
-const formRef = await resolveForm(kind);
-const [group, version] = formRef.apiVersion.split("/");
-const query = new URLSearchParams({
-  space,
-  group: formRef.apiVersion,
-  kind: formRef.kind,
-  definitionVersion: formRef.definitionVersion,
-  schemaDigest: formRef.schemaDigest,
-});
-const resourcePath = `${LANE}/resources/${group}/${version}/${formRef.kind}/${name}?${query}`;
+// A kind usually has several installed definitions: the current one and the
+// superseded ones that keep older resources manageable. Newest first.
+const definitions = await resolveForms(kind);
+const formRef = definitions[0] as FormRef;
+
+function pathFor(ref: FormRef): string {
+  const [group, version] = ref.apiVersion.split("/");
+  const query = new URLSearchParams({
+    space,
+    group: ref.apiVersion,
+    kind: ref.kind,
+    definitionVersion: ref.definitionVersion,
+    schemaDigest: ref.schemaDigest,
+  });
+  return `${LANE}/resources/${group}/${version}/${ref.kind}/${name}?${query}`;
+}
+
+/** Finds which installed definition an existing resource was created under. */
+async function locate(): Promise<{ ref: FormRef; path: string; body: string } | null> {
+  for (const ref of definitions) {
+    const path = pathFor(ref);
+    const response = await call("GET", path);
+    if (response.ok) return { ref, path, body: await response.text() };
+  }
+  return null;
+}
+
+const resourcePath = pathFor(formRef);
 
 if (command === "get") {
-  const response = await call("GET", resourcePath);
-  process.stdout.write(`${await response.text()}\n`);
-  process.exit(response.ok ? 0 : 1);
+  const found = await locate();
+  if (!found) {
+    process.stderr.write(`no resource named ${name} under any installed ${kind} definition\n`);
+    process.exit(1);
+  }
+  process.stdout.write(`${found.body}\n`);
+  process.exit(0);
 }
 
 if (command === "delete") {
-  const current = await (await call("GET", resourcePath)).json();
+  const found = await locate();
+  if (!found) {
+    process.stderr.write(`no resource named ${name} under any installed ${kind} definition\n`);
+    process.exit(1);
+  }
   const generation = String(
-    (current as { metadata?: { generation?: string } }).metadata?.generation ?? "1",
+    (JSON.parse(found.body) as { metadata: { generation: string } }).metadata.generation,
   );
-  const response = await call("DELETE", resourcePath, undefined, {
+  const response = await call("DELETE", found.path, undefined, {
     "idempotency-key": `cli-delete-${name}-${Date.now()}`,
     "takoform-expected-generation": generation,
   });
@@ -83,6 +109,19 @@ const existing = await call("GET", resourcePath);
 const generation = existing.ok
   ? String(((await existing.json()) as { metadata: { generation: string } }).metadata.generation)
   : null;
+if (!existing.ok) {
+  // A resource of this name may exist under a superseded definition. Applying
+  // the current one would silently create a second resource beside it, so say
+  // so rather than doing that.
+  const elsewhere = await locate();
+  if (elsewhere) {
+    process.stderr.write(
+      `${name} already exists under ${kind} ${elsewhere.ref.definitionVersion}; ` +
+        "delete it first or apply against that definition\n",
+    );
+    process.exit(1);
+  }
+}
 
 const prepared = await call(
   "POST",
@@ -125,8 +164,8 @@ async function call(
   });
 }
 
-/** Finds the Form a kind names, from what the server actually offers. */
-async function resolveForm(wanted: string): Promise<FormRef> {
+/** Every installed definition of a kind, newest first. */
+async function resolveForms(wanted: string): Promise<readonly FormRef[]> {
   const response = await fetch(`${origin}${LANE}/support/forms`, {
     headers: { authorization: `Bearer ${apiKey}` },
   });
@@ -137,13 +176,26 @@ async function resolveForm(wanted: string): Promise<FormRef> {
   const { profiles } = (await response.json()) as {
     profiles: { formRef: FormRef }[];
   };
-  const match = profiles.filter((profile) => profile.formRef.kind === wanted);
-  if (match.length !== 1) {
+  const match = profiles
+    .filter((profile) => profile.formRef.kind === wanted)
+    .map((profile) => profile.formRef)
+    .sort((left, right) => compareVersions(right.definitionVersion, left.definitionVersion));
+  if (match.length === 0) {
     process.stderr.write(
-      `expected exactly one Form named ${wanted}, found ${match.length}: ` +
-        `${profiles.map((profile) => profile.formRef.kind).join(", ")}\n`,
+      `no Form named ${wanted}; the server offers ` +
+        `${[...new Set(profiles.map((profile) => profile.formRef.kind))].join(", ")}\n`,
     );
     process.exit(1);
   }
-  return (match[0] as { formRef: FormRef }).formRef;
+  return match;
+}
+
+function compareVersions(left: string, right: string): number {
+  const parse = (value: string) => value.split(".").map((part) => Number(part) || 0);
+  const [a, b] = [parse(left), parse(right)];
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    const difference = (a[index] ?? 0) - (b[index] ?? 0);
+    if (difference !== 0) return difference;
+  }
+  return 0;
 }
