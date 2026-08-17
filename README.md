@@ -129,17 +129,50 @@ bundle absence of Cloudflare REST/credential surfaces, and Worker startup
 profiling in a disposable output directory. It never selects a Cloudflare
 account or remote resource.
 
-Inspect the deploy contract without side effects:
+### Deploying
+
+`bun run deploy` is the single entrypoint and owns publication end to end:
 
 ```bash
-bun run deploy -- --contract
+bun run deploy -- --contract   # declare the contract; touches nothing
+bun run deploy -- --status     # read-only inspection of the realized target
+bun run deploy -- --plan       # every pre-mutation proof; publishes nothing
+bun run deploy -- --apply      # publish, then verify on the published origin
 ```
 
-There is intentionally no live deploy path. Every deploy invocation except the
-exact `--contract` probe refuses before Wrangler, credentials, or a target can
-be accessed. A reviewed owning command still needs target preflight, migration
-lineage/readback, immutable Worker provenance, key provisioning, reversal, and
-end-to-end post-conditions before it may mutate Cloudflare.
+Any other invocation refuses before Wrangler, credentials, or a target can be
+reached.
+
+The repository stays account-neutral. The realized account, D1 database, R2
+bucket, public origin, and verification-key identity live only in an
+operator-private target descriptor (`.deploy/target.json` by default, or
+`TAKOSERVER_DEPLOY_TARGET`). Realization joins that descriptor with
+`wrangler.jsonc` into a gitignored `.wrangler-realized.jsonc`, and refuses if
+the committed configuration ever grows an account id, route, or pinned
+database/bucket identity.
+
+`--apply` refuses a dirty worktree or a `HEAD` that is not already contained in
+its upstream branch. It then runs the portable gate and a strict dry-run of the
+realized configuration, inspects the live target read-only (migration lineage
+against the local files, the runtime tables, active keys, R2 reachability, the
+resolved database identity, and the served version), applies the forward-only
+migration, provisions the Ed25519 verification key when none is active,
+publishes a new immutable Worker version, and proves the result on the
+published origin: binding-closure readback, all three runtime tables, an active
+key, a signed object `PUT` and `GET` returning the exact bytes, rejection of the
+consumed grant as `grant_replayed`, and a control-plane route still answering
+503. The probe registration and object are removed afterwards. A published
+version already recorded for the same bundle digest publishes nothing.
+
+Evidence is appended to `.deploy/evidence/published.jsonl` and never contains a
+grant token, private key, or object byte. Failures are phase-classified: exit 2
+means nothing was touched, exit 3 means the target may have been mutated and
+the state is indeterminate, exit 4 means bytes are published but a
+post-condition failed. The writer never retries on its own.
+
+The private half of the verification key is written to `.deploy/private/` with
+owner-only permissions. That custody belongs to the durable control plane once
+it issues grants; until then the operator holds it.
 
 ## Current limits
 
@@ -147,9 +180,12 @@ The main product control plane (identity, Organizations, API keys, wallet,
 ledger, quotes, reservations, settlement, and grant issuance), Takoform resource
 state, and artifacts are still in-memory reference implementations. The Worker
 therefore returns 503 for those control-plane routes and advertises only the
-durable object-storage slice. D1 key/resource provisioning, full key rotation,
-a concrete payment-provider settlement adapter, OAuth network adapters, the
-complete official Takoform conformance runner, live-D1 verification, recovery
-drills, and production operations remain required before release. No
-production configuration, secret, provider ID, or deployment evidence belongs
-here.
+durable object-storage slice.
+
+A durable resource-registry writer, full key rotation, a concrete
+payment-provider settlement adapter, OAuth network adapters, the complete
+official Takoform conformance runner, recovery drills, and production
+operations remain required before release. Grant signing custody is still the
+operator's rather than a durable control plane's, and the deploy writer has not
+yet had the independent review its own contract requires. No production
+configuration, secret, provider ID, or deployment evidence belongs here.
