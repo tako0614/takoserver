@@ -1,5 +1,5 @@
 import type { ExactFormRef } from "./contracts.ts";
-import type { InstalledTakoformForm, TakoformInterfaceRef } from "./takoform-host.ts";
+import type { InstalledTakoformForm, TakoformInterfaceRef } from "./takoform/types.ts";
 
 /** Exact public identities carried by registry.terraform.io/tako0614/takoform v2.1.1. */
 export const TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM = Object.freeze({

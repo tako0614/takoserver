@@ -1,10 +1,10 @@
+import { createTakoformHost } from "./compat.ts";
 import type { TakoserverModule } from "./contracts.ts";
-import {
-  createTakoformHost,
-  type InstalledTakoformForm,
-  type TakoformHost,
-  type TakoformResourceDriver,
-} from "./takoform-host.ts";
+import type {
+  InstalledTakoformForm,
+  TakoformHost,
+  TakoformResourceDriver,
+} from "./takoform/types.ts";
 
 /**
  * Adapts an Organization-scoped Takoserver API key to the current Takoform

@@ -12,8 +12,7 @@ import { openApiDocument } from "./openapi.ts";
 import type { ResourceRuntime } from "./resource-runtime.ts";
 import { RuntimeExecutionError } from "./resource-runtime.ts";
 import { type ExecutionOperation, GrantVerificationError } from "./runtime-grants.ts";
-import type { TakoformHost } from "./takoform-host.ts";
-import { TakoformHostError } from "./takoform-host.ts";
+import { type TakoformHost, TakoformHostError } from "./takoform/types.ts";
 
 const TAKOFORM_PROVIDER_V21_VERSION = "v1beta1";
 const TAKOFORM_CURRENT_VERSION = "v1alpha3";

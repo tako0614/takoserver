@@ -4,7 +4,7 @@ import type {
   TakoformDriverReceipt,
   TakoformResourceDriver,
   TakoformStoredResource,
-} from "./takoform-host.ts";
+} from "./takoform/types.ts";
 
 interface BoundBackendResource {
   readonly backend: BackendAdapter;

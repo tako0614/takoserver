@@ -52,13 +52,13 @@ const LAYERS: readonly Layer[] = [
   },
   {
     name: "domain",
-    match: /^src\/(?:token|auth|ledger|catalog)\.ts$|^src\/takoform\/(?!routes\.ts$)/u,
+    match: /^src\/(?:token|auth|ledger|catalog)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$)/u,
     may: ["core", "domain"],
   },
   {
     name: "routes",
     match:
-      /^src\/(?:router|control|data-storage|data-ai|openapi)\.ts$|^src\/takoform\/routes\.ts$/u,
+      /^src\/(?:router|control|data-storage|data-ai|openapi)\.ts$|^src\/takoform\/(?:routes|host)\.ts$/u,
     may: ["core", "domain", "routes"],
   },
   { name: "app", match: /^src\/app\.ts$/u, may: ["core", "adapter", "domain", "routes", "app"] },

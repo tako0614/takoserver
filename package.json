@@ -22,8 +22,10 @@
     "check:worker-types": "wrangler types worker-configuration.d.ts --check --include-runtime=false --config wrangler.jsonc",
     "openapi:write": "bun scripts/write-openapi.ts",
     "worker:types": "wrangler types worker-configuration.d.ts --include-runtime=false --config wrangler.jsonc",
-    "check": "bun run fmt:check && bun run lint && bun run check:imports && bun run check:worker-types && bun run typecheck && bun run typecheck:worker && bun run test && bun run check:migrations && bun run build && bun run build:worker && bun run check:worker-startup && bun run check:openapi",
-    "deploy": "bun scripts/deploy.ts"
+    "check": "bun run fmt:check && bun run lint && bun run check:imports && bun run check:worker-types && bun run typecheck && bun run typecheck:worker && bun run test && bun run check:migrations && bun run build && bun run build:worker && bun run check:worker-startup && bun run check:openapi && bun run check:schema",
+    "deploy": "bun scripts/deploy.ts",
+    "schema:write": "bun scripts/write-schema.ts",
+    "check:schema": "bun scripts/check-schema.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.2.0",
