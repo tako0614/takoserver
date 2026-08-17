@@ -25,6 +25,9 @@ import {
 
 const API_ORIGIN = "https://api.cloudflare.com/client/v4";
 
+/** Cloudflare's code for "that hostname already resolves to something else". */
+const DNS_RECORDS_PRESENT = 100_117;
+
 export interface ArtifactBytes {
   /** The committed manifest a tenant holds, or null if it holds none. */
   manifest(tenantRef: string, digest: string): Promise<TakoformBundleManifest | null>;
@@ -349,7 +352,21 @@ export class CloudflareProvider implements Provider {
         service: name,
         environment: "production",
       });
-      if (!attached.ok) return attached.ticket;
+      if (!attached.ok) {
+        // Cloudflare refuses to attach a Worker to a hostname that already has
+        // DNS records, which is the ordinary state of a domain somebody brought
+        // with them. Reported as "the resource is busy" it reads as a transient
+        // fault worth retrying; it is neither, and only the customer can clear
+        // it.
+        if (attached.codes.includes(DNS_RECORDS_PRESENT)) {
+          return failed(
+            "invalid_spec",
+            `${hostname} already has DNS records of its own; remove them in the zone and apply ` +
+              "again, and this deployment will create the record it needs",
+          );
+        }
+        return attached.ticket;
+      }
     }
 
     return succeeded({
@@ -446,6 +463,7 @@ export class CloudflareProvider implements Provider {
         ok: false,
         status: 0,
         ticket: failed("unavailable", "asset upload unreachable", true),
+        codes: [],
       };
     }
     const envelope = await readEnvelope(response);
@@ -462,7 +480,12 @@ export class CloudflareProvider implements Provider {
         errors: Array.isArray(envelope?.errors) ? envelope.errors : undefined,
       }).slice(0, 4_096),
     );
-    return { ok: false, status: response.status, ticket: classify(response.status) };
+    return {
+      ok: false,
+      status: response.status,
+      ticket: classify(response.status),
+      codes: errorCodes(envelope?.errors),
+    };
   }
 
   /** The zone that may serve a hostname, if this deployment offers one. */
@@ -525,7 +548,7 @@ export class CloudflareProvider implements Provider {
     try {
       authorization = await this.#authorize();
     } catch {
-      return { ok: false, status: 0, ticket: failed("denied", "no usable credential") };
+      return { ok: false, status: 0, ticket: failed("denied", "no usable credential"), codes: [] };
     }
     let response: Response;
     try {
@@ -545,6 +568,7 @@ export class CloudflareProvider implements Provider {
         ok: false,
         status: 0,
         ticket: failed("unavailable", "the backend is unreachable", true),
+        codes: [],
       };
     }
     const envelope = await readEnvelope(response);
@@ -565,13 +589,37 @@ export class CloudflareProvider implements Provider {
         errors: Array.isArray(envelope?.errors) ? envelope.errors : undefined,
       }).slice(0, 4_096),
     );
-    return { ok: false, status: response.status, ticket: classify(response.status) };
+    return {
+      ok: false,
+      status: response.status,
+      ticket: classify(response.status),
+      codes: errorCodes(envelope?.errors),
+    };
   }
 }
 
 type CallResult =
   | { readonly ok: true; readonly status: number; readonly result?: unknown }
-  | { readonly ok: false; readonly status: number; readonly ticket: ProviderTicket };
+  | {
+      readonly ok: false;
+      readonly status: number;
+      readonly ticket: ProviderTicket;
+      /**
+       * The backend's own error codes. Its *words* are written for an operator
+       * of that cloud and never cross back, but a few of its codes describe
+       * something only our customer can fix, and those deserve a message in our
+       * vocabulary rather than a generic refusal.
+       */
+      readonly codes: readonly number[];
+    };
+
+/** The numeric codes in a Cloudflare error envelope, if it carried any. */
+function errorCodes(errors: unknown): readonly number[] {
+  if (!Array.isArray(errors)) return [];
+  return errors
+    .map((entry) => (entry as { code?: unknown } | null)?.code)
+    .filter((code): code is number => typeof code === "number");
+}
 
 function classify(status: number): ProviderTicket {
   if (status === 400 || status === 422)

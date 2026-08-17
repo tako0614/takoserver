@@ -492,3 +492,45 @@ describe("overlapping zones", () => {
     expect(calls.filter((call) => call.url.includes("/workers/domains"))).toHaveLength(0);
   });
 });
+
+/**
+ * A domain someone brought with them already points somewhere. Cloudflare
+ * refuses to attach a Worker to such a hostname until the existing records are
+ * gone — which is a thing only the customer can do, and which reads as a
+ * transient fault if it is reported as "the resource is busy".
+ */
+describe("hostname already in use", () => {
+  test("says what the customer must clear, not that the backend is busy", async () => {
+    const { provider } = recorder(
+      [
+        { status: 200, body: { success: true, errors: [], result: {} } },
+        {
+          status: 409,
+          body: {
+            success: false,
+            errors: [
+              {
+                code: 100117,
+                message:
+                  "Hostname 'brought.example' already has externally managed DNS records (A, CNAME, etc).",
+              },
+            ],
+          },
+        },
+      ],
+      [{ suffix: "brought.example", zoneId: "zone_brought", tenantRef: "org_acme", apex: true }],
+    );
+    const ticket = await provider.apply({
+      operationId: "op_taken",
+      offering: WORKER,
+      identity: IDENTITY,
+      spec: { bundle: `sha256:${"d".repeat(64)}`, hostnames: ["brought.example"] },
+    });
+
+    expect(ticket.phase).toBe("failed");
+    expect(ticket).toMatchObject({ failure: { code: "invalid_spec", retryable: false } });
+    // Ours, not Cloudflare's: no backend wording crosses back.
+    expect(JSON.stringify(ticket)).toContain("remove them in the zone");
+    expect(JSON.stringify(ticket)).not.toContain("externally managed");
+  });
+});
