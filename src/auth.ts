@@ -13,6 +13,22 @@ import type { Clock, Sql } from "./ports.ts";
 
 export type IdentityProvider = "google" | "github";
 
+/**
+ * How a caller may sign in here, as the console needs to hear it.
+ *
+ * `method` is the part that matters: the same provider is reached one way when
+ * a real OAuth client is configured and another way when the operator is still
+ * vouching by signature. Advertising the provider without the method leaves a
+ * console to guess, and it will guess the one that looks finished.
+ */
+export interface IdentityProviderDescriptor {
+  readonly id: IdentityProvider;
+  readonly displayName: string;
+  readonly method: "oidc" | "operator-assertion";
+  /** Public OAuth client id, present only for `oidc`. */
+  readonly clientId?: string;
+}
+
 export const API_KEY_SCOPES = [
   "catalog:read",
   "resources:read",
@@ -57,7 +73,12 @@ export interface Actor {
 }
 
 export interface ExternalIdentityVerifier {
-  verify(input: { readonly provider: IdentityProvider; readonly assertion: string }): Promise<{
+  verify(input: {
+    readonly provider: IdentityProvider;
+    readonly assertion: string;
+    /** Which advertised method produced the assertion. */
+    readonly method?: IdentityProviderDescriptor["method"] | undefined;
+  }): Promise<{
     readonly providerSubject: string;
     readonly email: string;
     readonly displayName: string;
@@ -78,6 +99,7 @@ export interface Accounts {
   signIn(input: {
     readonly provider: IdentityProvider;
     readonly assertion: string;
+    readonly method?: IdentityProviderDescriptor["method"] | undefined;
     readonly sessionTtlSeconds?: number;
   }): Promise<{ readonly principal: Principal; readonly sessionToken: string }>;
   createOrganization(input: {
@@ -168,9 +190,9 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
   };
 
   const accounts: Accounts = {
-    async signIn({ provider, assertion, sessionTtlSeconds }) {
+    async signIn({ provider, assertion, method, sessionTtlSeconds }) {
       if (provider !== "google" && provider !== "github") throw new AuthError("invalid");
-      const verified = await identity.verify({ provider, assertion });
+      const verified = await identity.verify({ provider, assertion, method });
       const rows = await sql.query(
         "SELECT id, email, display_name FROM principals WHERE provider = ? AND provider_subject = ?",
         [provider, verified.providerSubject],

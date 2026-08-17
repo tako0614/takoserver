@@ -1,4 +1,5 @@
 import { type Child, h, live, text } from "./dom.ts";
+import { wordmark } from "./mark.ts";
 import { billingPage } from "./pages/billing.ts";
 import { catalogPage } from "./pages/catalog.ts";
 import { formsPage } from "./pages/forms.ts";
@@ -95,23 +96,7 @@ function shell(): Child {
   return h(
     "div",
     { class: "shell" },
-    h(
-      "div",
-      { class: "brand" },
-      h(
-        "button",
-        {
-          class: "btn btn--ghost btn--sm",
-          type: "button",
-          "aria-label": "Toggle navigation",
-          style: { display: "none" },
-          onClick: () => railOpen.update((open) => !open),
-        },
-        icon(ICON.menu, 16),
-      ),
-      h("span", { class: "brand__mark" }, icon(ICON.layers, 15)),
-      h("a", { ...linkProps("/") }, "Takoserver"),
-    ),
+    h("div", { class: "brand" }, h("a", { ...linkProps("/") }, wordmark(22))),
     topbar(),
     live(() =>
       h(

@@ -8,6 +8,14 @@
  * call succeeded.
  */
 
+/** A way in, as the server advertises it. */
+export interface IdentityProvider {
+  readonly id: string;
+  readonly displayName: string;
+  readonly method: "oidc" | "operator-assertion";
+  readonly clientId?: string;
+}
+
 export interface Principal {
   readonly id: string;
   readonly provider: string;
@@ -182,12 +190,13 @@ export function createApi(options: ApiOptions) {
 
   return {
     identityProviders: () =>
-      call<{ providers: readonly string[] }>("GET", "/v1/identity/providers"),
+      call<{ providers: readonly IdentityProvider[] }>("GET", "/v1/identity/providers"),
 
-    signIn: (provider: string, assertion: string) =>
+    signIn: (provider: string, assertion: string, method?: IdentityProvider["method"]) =>
       call<{ principal: Principal; sessionToken: string }>("POST", "/v1/sessions", {
         provider,
         assertion,
+        ...(method === undefined ? {} : { method }),
       }),
 
     me: () =>

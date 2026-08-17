@@ -3,9 +3,10 @@ import { readFileSync } from "node:fs";
 import { buildApp } from "./app.ts";
 import { MIGRATIONS } from "./db-schema.ts";
 import { buildEdgeForms } from "./edge-forms.ts";
+import { resolveIdentity } from "./identity-setup.ts";
 import { createMemoryObjectStore } from "./objects-mem.ts";
 import { createR2HttpObjectStore } from "./objects-r2-http.ts";
-import { createOperatorIdentity, createOperatorSettlement } from "./operator-credentials.ts";
+import { createOperatorSettlement } from "./operator-credentials.ts";
 import { CloudflareProvider } from "./providers/cloudflare.ts";
 import { createD1HttpSql } from "./sql-d1-http.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
@@ -133,12 +134,18 @@ const unconfigured = {
 };
 const publicKeyJwk = operatorJwk
   ? (JSON.parse(operatorJwk) as { kty: string; crv: string; x: string })
-  : null;
+  : undefined;
+
+const identity = resolveIdentity({
+  googleClientId: process.env.GOOGLE_CLIENT_ID,
+  operatorPublicKeyJwk: publicKeyJwk,
+});
 
 const app = buildApp({
   sql,
   objects,
-  identity: publicKeyJwk ? createOperatorIdentity({ publicKeyJwk }) : unconfigured,
+  identity: identity.verifier,
+  identityProviders: identity.providers,
   settlement: publicKeyJwk ? createOperatorSettlement({ publicKeyJwk }) : unconfigured,
   publicOrigin,
   ...(process.env.TAKOSERVER_CONSOLE_ORIGIN

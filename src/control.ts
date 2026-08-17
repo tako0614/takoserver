@@ -1,4 +1,11 @@
-import { type Accounts, type Actor, API_KEY_SCOPES, type ApiKeyScope, AuthError } from "./auth.ts";
+import {
+  type Accounts,
+  type Actor,
+  API_KEY_SCOPES,
+  type ApiKeyScope,
+  AuthError,
+  type IdentityProviderDescriptor,
+} from "./auth.ts";
 import type { Catalog } from "./catalog.ts";
 import { type FundingSettlementVerifier, type Ledger, LedgerError } from "./ledger.ts";
 import type { Clock } from "./ports.ts";
@@ -47,6 +54,8 @@ export interface CreateControlRoutesOptions {
   readonly inventory: ResourceInventory;
   /** Every Form definition this Host will accept. */
   readonly forms: readonly InstalledTakoformForm[];
+  /** How a caller may sign in to this deployment. */
+  readonly identityProviders: readonly IdentityProviderDescriptor[];
   readonly ledger: Ledger;
   readonly catalog: Catalog;
   readonly reseller: Reseller;
@@ -58,7 +67,17 @@ export interface CreateControlRoutesOptions {
 export type ControlRoutes = (request: Request, url: URL) => Promise<Response | null>;
 
 export function createControlRoutes(options: CreateControlRoutesOptions): ControlRoutes {
-  const { accounts, inventory, forms, ledger, catalog, reseller, tokens, settlement } = options;
+  const {
+    accounts,
+    inventory,
+    forms,
+    identityProviders,
+    ledger,
+    catalog,
+    reseller,
+    tokens,
+    settlement,
+  } = options;
 
   const owner = async (request: Request, organizationId: string): Promise<Actor> => {
     const actor = await accounts.authenticate(authorization(request));
@@ -113,15 +132,28 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     }
 
     if (request.method === "GET" && url.pathname === "/v1/identity/providers") {
-      return Response.json({ providers: ["google", "github"] });
+      // What this deployment can actually do, not what the product could
+      // support. A console that offers a button for an unconfigured provider
+      // offers a button that fails.
+      return Response.json({ providers: identityProviders });
     }
 
     if (request.method === "POST" && url.pathname === "/v1/sessions") {
       const body = await jsonObject(request);
-      exactKeys(body, ["provider", "assertion"]);
+      // `method` is optional: a caller that knows only one way in should not
+      // have to name it, and a deployment that offers only one has nothing to
+      // disambiguate.
+      exactKeys(body, ["provider", "assertion"], ["method"]);
       const { principal, sessionToken } = await accounts.signIn({
         provider: enumValue(body.provider, ["google", "github"]) as "google" | "github",
         assertion: text(body.assertion),
+        ...(body.method === undefined
+          ? {}
+          : {
+              method: enumValue(body.method, ["oidc", "operator-assertion"]) as
+                | "oidc"
+                | "operator-assertion",
+            }),
       });
       return Response.json({ principal, sessionToken });
     }
@@ -467,10 +499,21 @@ async function jsonObject(request: Request): Promise<Record<string, unknown>> {
   }
 }
 
-function exactKeys(value: Record<string, unknown>, keys: readonly string[]): void {
-  if (JSON.stringify(Object.keys(value).sort()) !== JSON.stringify([...keys].sort())) {
-    controlError("invalid_argument", 400);
-  }
+/**
+ * Exactly the required keys, plus any of the optional ones.
+ *
+ * Refusing an unknown key is what keeps a typo from being silently ignored —
+ * a request that looks accepted and did something other than what it said.
+ */
+function exactKeys(
+  value: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): void {
+  const actual = Object.keys(value);
+  const missing = required.filter((key) => !actual.includes(key));
+  const unknown = actual.filter((key) => !required.includes(key) && !optional.includes(key));
+  if (missing.length > 0 || unknown.length > 0) controlError("invalid_argument", 400);
 }
 
 function record(value: unknown): Record<string, unknown> {

@@ -1,11 +1,49 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Takoserver">
-  <rect width="32" height="32" rx="8" fill="#5b4bdb" />
-  <path
-    d="M16 6.5 25 11l-9 4.5L7 11l9-4.5ZM7 16l9 4.5L25 16M7 20.5 16 25l9-4.5"
-    fill="none"
-    stroke="#fff"
-    stroke-width="2"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  />
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 34 34" shape-rendering="crispEdges" role="img" aria-label="Takoserver">
+  <title>Takoserver</title>
+  <rect x="9" y="0" width="17" height="8" fill="#b0301f"/>
+  <rect x="8" y="1" width="1" height="30" fill="#b0301f"/>
+  <rect x="26" y="1" width="1" height="33" fill="#b0301f"/>
+  <rect x="7" y="2" width="1" height="30" fill="#b0301f"/>
+  <rect x="27" y="2" width="1" height="30" fill="#b0301f"/>
+  <rect x="6" y="3" width="1" height="31" fill="#b0301f"/>
+  <rect x="28" y="3" width="1" height="22" fill="#b0301f"/>
+  <rect x="29" y="4" width="1" height="20" fill="#b0301f"/>
+  <rect x="5" y="5" width="1" height="29" fill="#b0301f"/>
+  <rect x="4" y="6" width="1" height="15" fill="#b0301f"/>
+  <rect x="30" y="6" width="1" height="17" fill="#b0301f"/>
+  <rect x="3" y="7" width="1" height="13" fill="#b0301f"/>
+  <rect x="31" y="7" width="1" height="15" fill="#b0301f"/>
+  <rect x="2" y="8" width="1" height="9" fill="#b0301f"/>
+  <rect x="9" y="8" width="4" height="23" fill="#b0301f"/>
+  <rect x="15" y="8" width="5" height="3" fill="#b0301f"/>
+  <rect x="22" y="8" width="4" height="23" fill="#b0301f"/>
+  <rect x="32" y="8" width="1" height="13" fill="#b0301f"/>
+  <rect x="1" y="10" width="1" height="4" fill="#b0301f"/>
+  <rect x="13" y="10" width="2" height="21" fill="#b0301f"/>
+  <rect x="20" y="10" width="2" height="24" fill="#b0301f"/>
+  <rect x="33" y="10" width="1" height="10" fill="#b0301f"/>
+  <rect x="17" y="11" width="3" height="20" fill="#b0301f"/>
+  <rect x="16" y="12" width="1" height="1" fill="#b0301f"/>
+  <rect x="15" y="14" width="1" height="20" fill="#b0301f"/>
+  <rect x="16" y="16" width="1" height="18" fill="#b0301f"/>
+  <rect x="0" y="20" width="3" height="2" fill="#b0301f"/>
+  <rect x="1" y="22" width="2" height="2" fill="#b0301f"/>
+  <rect x="3" y="23" width="2" height="8" fill="#b0301f"/>
+  <rect x="2" y="24" width="1" height="2" fill="#b0301f"/>
+  <rect x="28" y="27" width="1" height="4" fill="#b0301f"/>
+  <rect x="29" y="28" width="1" height="3" fill="#b0301f"/>
+  <rect x="2" y="29" width="1" height="2" fill="#b0301f"/>
+  <rect x="30" y="29" width="1" height="2" fill="#b0301f"/>
+  <rect x="1" y="30" width="1" height="1" fill="#b0301f"/>
+  <rect x="31" y="30" width="1" height="1" fill="#b0301f"/>
+  <rect x="10" y="31" width="3" height="1" fill="#b0301f"/>
+  <rect x="17" y="31" width="1" height="1" fill="#b0301f"/>
+  <rect x="22" y="31" width="1" height="1" fill="#b0301f"/>
+  <rect x="25" y="31" width="1" height="3" fill="#b0301f"/>
+  <rect x="10" y="32" width="2" height="2" fill="#b0301f"/>
+  <rect x="13" y="8" width="2" height="2" fill="#17100f"/>
+  <rect x="20" y="8" width="2" height="2" fill="#17100f"/>
+  <rect x="15" y="11" width="2" height="1" fill="#17100f"/>
+  <rect x="15" y="12" width="1" height="2" fill="#17100f"/>
+  <rect x="16" y="13" width="1" height="3" fill="#17100f"/>
 </svg>

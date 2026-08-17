@@ -1,4 +1,8 @@
-import { createAccounts, type ExternalIdentityVerifier } from "./auth.ts";
+import {
+  createAccounts,
+  type ExternalIdentityVerifier,
+  type IdentityProviderDescriptor,
+} from "./auth.ts";
 import { createCatalog, type Offering } from "./catalog.ts";
 import { createControlRoutes } from "./control.ts";
 import { createLedger, type FundingSettlementVerifier } from "./ledger.ts";
@@ -36,6 +40,8 @@ export interface AppPorts {
   /** Where this deployment's console is served, if it has one. */
   readonly consoleOrigin?: string;
   readonly forms: readonly InstalledTakoformForm[];
+  /** How a caller may sign in to this deployment. */
+  readonly identityProviders?: readonly IdentityProviderDescriptor[];
   /**
    * Backends this deployment can provision on. When present the Takoform lane
    * is driven by them and applies are billed; `driver` then only serves as an
@@ -119,6 +125,7 @@ export function buildApp(ports: AppPorts): App {
     accounts,
     inventory,
     forms: ports.forms,
+    identityProviders: ports.identityProviders ?? [],
     ledger,
     catalog,
     reseller,

@@ -1,7 +1,8 @@
 import { type App, buildApp } from "./app.ts";
 import { buildEdgeForms } from "./edge-forms.ts";
+import { resolveIdentity } from "./identity-setup.ts";
 import { createR2ObjectStore } from "./objects-r2.ts";
-import { createOperatorIdentity, createOperatorSettlement } from "./operator-credentials.ts";
+import { createOperatorSettlement } from "./operator-credentials.ts";
 import { createD1Sql } from "./sql-d1.ts";
 
 /**
@@ -26,28 +27,38 @@ interface WorkerEnv {
   readonly TAKOSERVER_CONSOLE_ORIGIN?: string;
   /** Public half of the operator key, as an Ed25519 JWK. */
   readonly OPERATOR_PUBLIC_JWK?: string;
+  /** Public OAuth client id. Its presence turns Google sign-in on. */
+  readonly GOOGLE_CLIENT_ID?: string;
 }
 
 /**
- * Sign-in and funding both need a fact the server cannot determine alone. When
- * an operator key is configured they are answered by the operator's signature;
- * when it is not, they refuse. Refusing is the point — a stub that said yes
- * would accept anyone and credit any amount while looking like a product.
+ * Sign-in and funding both need a fact the server cannot determine alone.
+ *
+ * Sign-in is answered by Google where an OAuth client is configured, and
+ * otherwise by the operator's signature. Funding has no such provider yet, so
+ * it is the operator's signature or nothing — and nothing means refusing. That
+ * refusal is the point: a stub that said yes would credit any amount while
+ * looking exactly like a finished product.
  */
-function operatorCredentials(env: WorkerEnv) {
+function credentials(env: WorkerEnv) {
   const raw = env.OPERATOR_PUBLIC_JWK;
-  if (!raw) {
-    const unconfigured = {
-      async verify(): Promise<never> {
-        throw new Error("operator credentials are not configured");
-      },
-    };
-    return { identity: unconfigured, settlement: unconfigured };
-  }
-  const publicKeyJwk = JSON.parse(raw) as { kty: string; crv: string; x: string };
+  const publicKeyJwk = raw
+    ? (JSON.parse(raw) as { kty: string; crv: string; x: string })
+    : undefined;
+  const identity = resolveIdentity({
+    googleClientId: env.GOOGLE_CLIENT_ID,
+    operatorPublicKeyJwk: publicKeyJwk,
+  });
   return {
-    identity: createOperatorIdentity({ publicKeyJwk }),
-    settlement: createOperatorSettlement({ publicKeyJwk }),
+    identity: identity.verifier,
+    identityProviders: identity.providers,
+    settlement: publicKeyJwk
+      ? createOperatorSettlement({ publicKeyJwk })
+      : {
+          async verify(): Promise<never> {
+            throw new Error("settlement credentials are not configured");
+          },
+        },
   };
 }
 
@@ -56,11 +67,12 @@ let cached: { readonly env: WorkerEnv; readonly app: App } | null = null;
 async function appFor(env: WorkerEnv, origin: string): Promise<App> {
   if (cached?.env === env) return cached.app;
   const edge = await buildEdgeForms();
-  const { identity, settlement } = operatorCredentials(env);
+  const { identity, identityProviders, settlement } = credentials(env);
   const app = buildApp({
     sql: createD1Sql(env.STATE_DB),
     objects: createR2ObjectStore(env.OBJECTS),
     identity,
+    identityProviders,
     settlement,
     publicOrigin: origin,
     ...(env.TAKOSERVER_CONSOLE_ORIGIN ? { consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN } : {}),
