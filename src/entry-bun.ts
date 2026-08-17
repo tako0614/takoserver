@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { readFileSync } from "node:fs";
 import { buildApp } from "./app.ts";
 import { MIGRATIONS } from "./db-schema.ts";
 import { buildEdgeForms } from "./edge-forms.ts";
@@ -33,6 +34,20 @@ function required(name: string): string {
   return value;
 }
 
+/**
+ * The account credential, read at the moment it is used.
+ *
+ * A token captured once at startup is a token that expires while the process
+ * keeps running — every call then fails with an authorization error that looks
+ * nothing like "your credential aged out". Reading a file per call lets an
+ * operator rotate or refresh without a restart.
+ */
+function cloudflareToken(): string {
+  const path = process.env.TAKOSERVER_CF_TOKEN_FILE;
+  if (!path) return required("CLOUDFLARE_API_TOKEN");
+  return readFileSync(path, "utf8").trim();
+}
+
 const publicOrigin = process.env.TAKOSERVER_PUBLIC_ORIGIN ?? "http://localhost:8787";
 const databasePath = process.env.TAKOSERVER_DB ?? ":memory:";
 const port = Number(process.env.PORT ?? 8787);
@@ -48,7 +63,7 @@ const sql = sharedDatabaseId
   ? createD1HttpSql({
       accountId: required("CLOUDFLARE_ACCOUNT_ID"),
       databaseId: sharedDatabaseId,
-      authorize: () => `Bearer ${required("CLOUDFLARE_API_TOKEN")}`,
+      authorize: () => `Bearer ${cloudflareToken()}`,
     })
   : (() => {
       const database = new Database(databasePath);
@@ -67,7 +82,7 @@ const objects = sharedBucket
   ? createR2HttpObjectStore({
       accountId: required("CLOUDFLARE_ACCOUNT_ID"),
       bucketName: sharedBucket,
-      authorize: () => `Bearer ${required("CLOUDFLARE_API_TOKEN")}`,
+      authorize: () => `Bearer ${cloudflareToken()}`,
     })
   : createMemoryObjectStore();
 const clock = () => new Date();
@@ -88,7 +103,7 @@ const providers = process.env.CLOUDFLARE_ACCOUNT_ID
       new CloudflareProvider({
         accountId: required("CLOUDFLARE_ACCOUNT_ID"),
         offerings: edge.providerOfferings,
-        authorize: () => `Bearer ${required("CLOUDFLARE_API_TOKEN")}`,
+        authorize: () => `Bearer ${cloudflareToken()}`,
         // Where tenants may be served. A platform suffix is the free address
         // every tenant gets; a customer domain is added here only after the
         // operator has confirmed the customer controls it.

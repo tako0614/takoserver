@@ -15,6 +15,7 @@ export type IdentityProvider = "google" | "github";
 
 export const API_KEY_SCOPES = [
   "catalog:read",
+  "resources:read",
   "resources:write",
   "wallet:read",
   "reseller:write",
@@ -84,6 +85,19 @@ export interface Accounts {
     readonly name: string;
   }): Promise<Organization>;
   organization(id: string): Promise<Organization | null>;
+  /** The person behind a session, for a console to greet and to audit against. */
+  principal(id: string): Promise<Principal | null>;
+  /** Every organization this principal owns, oldest first. */
+  organizations(principalId: string): Promise<readonly Organization[]>;
+  /**
+   * The organization's live keys. Secrets are never stored, so they cannot be
+   * listed — what a console shows is which keys exist, what they may do, and
+   * when they lapse.
+   */
+  apiKeys(input: {
+    readonly actor: Actor;
+    readonly organizationId: string;
+  }): Promise<readonly ApiKey[]>;
   /** Returns the secret exactly once; only its digest is retained. */
   createApiKey(input: {
     readonly actor: Actor;
@@ -214,6 +228,55 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
             createdAt: String(row.created_at),
           }
         : null;
+    },
+
+    async principal(id) {
+      const rows = await sql.query(
+        "SELECT id, provider, provider_subject, email, display_name FROM principals WHERE id = ?",
+        [id],
+      );
+      const row = rows[0];
+      return row
+        ? {
+            id: String(row.id),
+            provider: String(row.provider) as IdentityProvider,
+            providerSubject: String(row.provider_subject),
+            email: String(row.email),
+            displayName: String(row.display_name),
+          }
+        : null;
+    },
+
+    async organizations(principalId) {
+      const rows = await sql.query(
+        `SELECT id, name, owner_principal_id, created_at FROM orgs
+         WHERE owner_principal_id = ? ORDER BY created_at ASC, id ASC LIMIT 200`,
+        [principalId],
+      );
+      return rows.map((row) => ({
+        id: String(row.id),
+        name: String(row.name),
+        ownerPrincipalId: String(row.owner_principal_id),
+        createdAt: String(row.created_at),
+      }));
+    },
+
+    async apiKeys({ actor, organizationId }) {
+      await accounts.requireOwner(actor, organizationId);
+      const rows = await sql.query(
+        `SELECT id, org_id, name, scopes_json, created_at, expires_at FROM auth_tokens
+         WHERE org_id = ? AND kind = 'api_key' AND revoked_at IS NULL
+         ORDER BY created_at DESC, id DESC LIMIT 200`,
+        [organizationId],
+      );
+      return rows.map((row) => ({
+        id: String(row.id),
+        organizationId: String(row.org_id),
+        name: String(row.name),
+        scopes: JSON.parse(String(row.scopes_json)) as readonly ApiKeyScope[],
+        createdAt: String(row.created_at),
+        expiresAt: String(row.expires_at),
+      }));
     },
 
     async createApiKey({ actor, organizationId, name, scopes, expiresInSeconds }) {

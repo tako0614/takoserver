@@ -1,5 +1,5 @@
-import { readFileSync } from "node:fs";
-import { basename } from "node:path";
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { basename, join, relative } from "node:path";
 
 /**
  * Uploads a Worker bundle into Takoserver and prints its manifest digest.
@@ -18,9 +18,14 @@ import { basename } from "node:path";
 const [origin, apiKey, mainModule, ...files] = process.argv.slice(2);
 
 if (!origin || !apiKey || !mainModule || files.length === 0) {
-  process.stderr.write("usage: takoform-bundle.ts <origin> <apiKey> <mainModule> <file...>\n");
+  process.stderr.write(
+    "usage: takoform-bundle.ts <origin> <apiKey> <mainModule|--assets <root>> <file...>\n",
+  );
   process.exit(2);
 }
+
+/** `--assets <root>` bundles a directory of files a browser will be served. */
+const assetMode = mainModule === "--assets";
 
 const LANE = "/apis/forms.takoform.com/v1alpha3/artifacts";
 
@@ -31,32 +36,48 @@ interface Blob {
   readonly mediaType: string;
 }
 
+const root = assetMode ? (files[0] ?? ".") : "";
+const sources = assetMode ? walk(root) : files;
+
 const blobs: Blob[] = [];
-for (const file of files) {
+for (const file of sources) {
   const bytes = new Uint8Array(readFileSync(file));
   blobs.push({
-    name: basename(file),
+    // An asset keeps its path below the root, because that path is the URL a
+    // browser will ask for; a module keeps only its filename.
+    name: assetMode ? relative(root, file) : basename(file),
     bytes,
     digest: await digestOf(bytes),
     mediaType: mediaTypeOf(file),
   });
 }
-if (!blobs.some((blob) => blob.name === mainModule)) {
+if (!assetMode && !blobs.some((blob) => blob.name === mainModule)) {
   process.stderr.write(`the main module ${mainModule} is not among the uploaded files\n`);
   process.exit(2);
 }
 
-const manifest = {
-  apiVersion: "artifacts.takoform.com/v1alpha1",
-  kind: "WorkerBundle",
-  mainModule,
-  modules: blobs.map((blob) => ({
-    name: blob.name,
-    mediaType: blob.mediaType,
-    size: blob.bytes.byteLength,
-    digest: blob.digest,
-  })),
-};
+const manifest = assetMode
+  ? {
+      apiVersion: "artifacts.takoform.com/v1alpha1",
+      kind: "StaticAssetBundle",
+      files: blobs.map((blob) => ({
+        path: blob.name,
+        mediaType: blob.mediaType,
+        size: blob.bytes.byteLength,
+        digest: blob.digest,
+      })),
+    }
+  : {
+      apiVersion: "artifacts.takoform.com/v1alpha1",
+      kind: "WorkerBundle",
+      mainModule,
+      modules: blobs.map((blob) => ({
+        name: blob.name,
+        mediaType: blob.mediaType,
+        size: blob.bytes.byteLength,
+        digest: blob.digest,
+      })),
+    };
 
 const started = await call("POST", `${LANE}/uploads`, JSON.stringify({ manifest }), {
   "content-type": "application/json",
@@ -118,9 +139,26 @@ async function digestOf(bytes: Uint8Array): Promise<string> {
   return `sha256:${hex}`;
 }
 
+function walk(directory: string): string[] {
+  return readdirSync(directory).flatMap((entry) => {
+    const path = join(directory, entry);
+    return statSync(path).isDirectory() ? walk(path) : [path];
+  });
+}
+
 function mediaTypeOf(file: string): string {
   if (file.endsWith(".wasm")) return "application/wasm";
   if (file.endsWith(".map")) return "application/source-map+json";
-  if (file.endsWith(".js") || file.endsWith(".mjs")) return "application/javascript+module";
+  if (file.endsWith(".js") || file.endsWith(".mjs")) {
+    return assetMode ? "text/javascript" : "application/javascript+module";
+  }
+  if (file.endsWith(".html")) return "text/html";
+  if (file.endsWith(".css")) return "text/css";
+  if (file.endsWith(".json")) return "application/json";
+  if (file.endsWith(".svg")) return "image/svg+xml";
+  if (file.endsWith(".png")) return "image/png";
+  if (file.endsWith(".ico")) return "image/x-icon";
+  if (file.endsWith(".txt")) return "text/plain";
+  if (file.endsWith(".woff2")) return "font/woff2";
   return "application/octet-stream";
 }

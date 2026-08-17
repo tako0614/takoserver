@@ -40,6 +40,27 @@ export interface OperationRecord {
   readonly resource?: TakoformStoredResource;
 }
 
+/** A resource as an inventory shows it: address, lineage, and last movement. */
+export interface ResourceListing {
+  readonly space: string;
+  readonly apiVersion: string;
+  readonly kind: string;
+  readonly name: string;
+  readonly uid: string;
+  readonly generation: string;
+  readonly revision: string;
+  readonly nativeId: string | null;
+  readonly updatedAt: string;
+  readonly resource: TakoformStoredResource;
+}
+
+export interface OperationListing {
+  readonly id: string;
+  readonly operation: string;
+  readonly state: string;
+  readonly createdAt: string;
+}
+
 export interface StoredReplay {
   readonly fingerprint: string;
   readonly status: number;
@@ -94,6 +115,27 @@ export interface TakoformStore {
     installedDigests: readonly string[],
     limit: number,
   ): Promise<readonly { readonly space: string; readonly name: string; readonly kind: string }[]>;
+
+  /**
+   * One page of a tenant's resources, newest change first.
+   *
+   * The exact-pin lanes address a resource by its full quad, which is the right
+   * shape for a machine that already knows what it declared and the wrong shape
+   * for a person asking what they have. Paging is keyed on `(updated_at, uid)`
+   * rather than an offset so a concurrent write cannot make a row appear twice
+   * or vanish across pages.
+   */
+  listResources(
+    tenantId: string,
+    options: {
+      readonly space?: string | undefined;
+      readonly limit: number;
+      readonly cursor?: string | undefined;
+    },
+  ): Promise<{ readonly resources: readonly ResourceListing[]; readonly cursor: string | null }>;
+
+  /** The most recent settled operations for a tenant, newest first. */
+  listOperations(tenantId: string, limit: number): Promise<readonly OperationListing[]>;
 
   readReplay(key: string): Promise<StoredReplay | null>;
   putReplay(key: string, replay: StoredReplay): Promise<void>;
@@ -304,6 +346,64 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       }));
     },
 
+    async listResources(tenantId, { space, limit, cursor }) {
+      const page = Math.min(Math.max(limit, 1), 200);
+      const seek = decodeCursor(cursor);
+      const rows = await sql.query(
+        `SELECT space, api_version, kind, name, uid, generation, revision, native_id,
+                updated_at, resource_json
+         FROM tf_resources
+         WHERE tenant_id = ?
+           ${space === undefined ? "" : "AND space = ?"}
+           ${seek === null ? "" : "AND (updated_at < ? OR (updated_at = ? AND uid < ?))"}
+         ORDER BY updated_at DESC, uid DESC
+         LIMIT ?`,
+        [
+          tenantId,
+          ...(space === undefined ? [] : [space]),
+          ...(seek === null ? [] : [seek.updatedAt, seek.updatedAt, seek.uid]),
+          page + 1,
+        ],
+      );
+      // One row past the page is read only to learn whether another page
+      // exists. Handing back a cursor that leads nowhere is worse than none.
+      const visible = rows.slice(0, page);
+      const last = visible[visible.length - 1];
+      return {
+        resources: visible.map((row) => ({
+          space: text(row.space),
+          apiVersion: text(row.api_version),
+          kind: text(row.kind),
+          name: text(row.name),
+          uid: text(row.uid),
+          generation: text(row.generation),
+          revision: text(row.revision),
+          nativeId:
+            row.native_id === null || row.native_id === undefined ? null : text(row.native_id),
+          updatedAt: new Date(Number(row.updated_at)).toISOString(),
+          resource: JSON.parse(text(row.resource_json)) as TakoformStoredResource,
+        })),
+        cursor:
+          rows.length > page && last
+            ? encodeCursor({ updatedAt: Number(last.updated_at), uid: text(last.uid) })
+            : null,
+      };
+    },
+
+    async listOperations(tenantId, limit) {
+      const rows = await sql.query(
+        `SELECT id, operation, state, created_at FROM tf_operations
+         WHERE tenant_id = ? ORDER BY created_at DESC, id DESC LIMIT ?`,
+        [tenantId, Math.min(Math.max(limit, 1), 200)],
+      );
+      return rows.map((row) => ({
+        id: text(row.id),
+        operation: text(row.operation),
+        state: text(row.state),
+        createdAt: text(row.created_at),
+      }));
+    },
+
     async readReplay(key): Promise<StoredReplay | null> {
       const rows = await sql.query(
         "SELECT fingerprint, status, resource_json, bound_uid FROM tf_replays WHERE replay_key = ? AND expires_at > ?",
@@ -359,4 +459,35 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 function text(value: unknown): string {
   if (typeof value !== "string") throw new TypeError("expected a text column");
   return value;
+}
+
+/**
+ * Page cursors carry the sort key, not an offset.
+ *
+ * An opaque string keeps a caller from treating it as a position they may
+ * compute, and an unreadable one is ignored, which reads as "start from the
+ * beginning" rather than an error a person can do nothing about.
+ */
+function encodeCursor(seek: { readonly updatedAt: number; readonly uid: string }): string {
+  return btoa(`${seek.updatedAt}:${seek.uid}`)
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/u, "");
+}
+
+function decodeCursor(
+  cursor: string | undefined,
+): { readonly updatedAt: number; readonly uid: string } | null {
+  if (cursor === undefined || cursor === "") return null;
+  let decoded: string;
+  try {
+    decoded = atob(cursor.replaceAll("-", "+").replaceAll("_", "/"));
+  } catch {
+    return null;
+  }
+  const separator = decoded.indexOf(":");
+  const updatedAt = Number(decoded.slice(0, separator));
+  const uid = decoded.slice(separator + 1);
+  if (separator < 1 || !Number.isSafeInteger(updatedAt) || uid === "") return null;
+  return { updatedAt, uid };
 }

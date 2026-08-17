@@ -15,7 +15,10 @@ import { MAXIMUM_REQUEST_BODY_BYTES, TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES } from
  */
 
 const DIGEST = /^sha256:[0-9a-f]{64}$/u;
-const PATH = /^[A-Za-z0-9_][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_][A-Za-z0-9._-]*)*$/u;
+// A leading dot is allowed because `.well-known` is a standard web path and
+// refusing it would make a whole class of real sites undeployable. Traversal is
+// blocked separately: `.` and `..` segments are rejected by name.
+const PATH = /^[A-Za-z0-9_.][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_.][A-Za-z0-9._-]*)*$/u;
 const MEDIA_TYPE = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/u;
 const ARTIFACT_PREFIX = "/apis/forms.takoform.com/v1alpha3/artifacts";
 const REPLAY_TTL_MILLISECONDS = 24 * 60 * 60_000;
@@ -240,14 +243,43 @@ export function createTakoformArtifacts(
         if (replay) return replayArtifactResponse(replay);
         const upload = await ownedUpload(principal, requiredSegment(match[1]));
         if (!upload) return failure("artifact_missing", 404);
-        parseManifest(upload.manifest);
-        for (const declaration of declarations(upload.manifest)) {
+        // The manifest is not parsed again here. `parseManifest` reads the wire
+        // grammar, where a StaticAssetBundle file carries `path`; what a row
+        // holds is the parsed value, whose declarations carry `name`. Feeding
+        // one to the other rejected every asset bundle ever committed. The row
+        // exists only because a parse already succeeded.
+        //
+        // The checks run in waves rather than one at a time. A site bundle is
+        // hundreds of files, and against an object store reached over HTTP a
+        // serial pass spends the whole request in round trips — long enough
+        // that the server closed the connection before it could answer.
+        const verdicts = await inWaves(declarations(upload.manifest), 16, async (declaration) => {
           if (!(await holds(principal.tenantId, declaration.digest, "blob"))) {
-            return failure("artifact_missing", 404);
+            return { code: "artifact_missing", status: 404, detail: "no hold", declaration };
           }
           const stored = await objects.head(blobKey(declaration.digest));
-          if (!stored) return failure("artifact_missing", 404);
-          if (stored.size !== declaration.size) return failure("artifact_invalid", 400);
+          if (!stored) {
+            return { code: "artifact_missing", status: 404, detail: "absent blob", declaration };
+          }
+          if (stored.size !== declaration.size) {
+            return {
+              code: "artifact_invalid",
+              status: 400,
+              detail: `stored ${stored.size}`,
+              declaration,
+            };
+          }
+          return null;
+        });
+        const rejected = verdicts.find((verdict) => verdict !== null);
+        if (rejected) {
+          return refuse(
+            failure,
+            rejected.code,
+            rejected.status,
+            rejected.detail,
+            rejected.declaration,
+          );
         }
         const existed =
           (
@@ -260,9 +292,9 @@ export function createTakoformArtifacts(
           [upload.manifestDigest, JSON.stringify(upload.manifest), now()],
         );
         await grant(principal.tenantId, upload.manifestDigest, "manifest");
-        for (const declaration of declarations(upload.manifest)) {
-          await grant(principal.tenantId, declaration.digest, "blob");
-        }
+        await inWaves(declarations(upload.manifest), 16, (declaration) =>
+          grant(principal.tenantId, declaration.digest, "blob"),
+        );
         const result = {
           status: existed ? 200 : 201,
           body: { manifestDigest: upload.manifestDigest },
@@ -327,6 +359,47 @@ async function missingBlobs(
     if (!(await holds(tenantId, declaration.digest, "blob"))) missing.push(declaration.digest);
   }
   return missing;
+}
+
+/**
+ * Runs `work` over every item, at most `width` in flight.
+ *
+ * Unbounded `Promise.all` over a thousand-file manifest would open a thousand
+ * sockets at once and be refused by the other end; one at a time is too slow to
+ * finish inside a request. Waves keep both ends within what they can serve.
+ */
+async function inWaves<Item, Result>(
+  items: readonly Item[],
+  width: number,
+  work: (item: Item) => Promise<Result>,
+): Promise<readonly Result[]> {
+  const results: Result[] = [];
+  for (let start = 0; start < items.length; start += width) {
+    results.push(...(await Promise.all(items.slice(start, start + width).map(work))));
+  }
+  return results;
+}
+
+/**
+ * Refuse a commit, and say server-side which declaration was at fault.
+ *
+ * The wire answer stays the bare envelope a caller is promised; without the
+ * log, "artifact_invalid" on a commit of hundreds of files names no file, and
+ * the only way to find the bad one is to bisect the upload.
+ */
+function refuse(
+  failure: (code: string, status: number) => Response,
+  code: string,
+  status: number,
+  detail: string,
+  declaration: BlobDeclaration,
+): Response {
+  if (process.env?.["TAKOSERVER_TRACE_HOST_ERRORS"]) {
+    console.warn(
+      `takoserver.artifacts.refused ${code} ${detail} name=${declaration.name} size=${declaration.size} digest=${declaration.digest}`,
+    );
+  }
+  return failure(code, status);
 }
 
 function parseManifest(input: unknown): TakoformArtifactManifest {

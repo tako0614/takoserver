@@ -177,3 +177,108 @@ describe("ObjectStore port", () => {
     expect(await store.delete("art/one")).toBe(false);
   });
 });
+
+describe("artifact paths", () => {
+  test("accepts a standard hidden web directory but never traversal", async () => {
+    const { createTakoformArtifacts } = await import("../src/takoform/artifacts.ts");
+    const { createEphemeralSql } = await import("../src/compat.ts");
+    const { createMemoryObjectStore } = await import("../src/objects-mem.ts");
+    const artifacts = createTakoformArtifacts({
+      sql: createEphemeralSql(),
+      objects: createMemoryObjectStore(),
+      clock: () => new Date(),
+      randomId: () => "upload",
+    });
+
+    const start = async (path: string) =>
+      await artifacts.handle(
+        new Request("https://api.test/apis/forms.takoform.com/v1alpha3/artifacts/uploads", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "idempotency-key": `k-${path.length}-aaaa`,
+          },
+          body: JSON.stringify({
+            manifest: {
+              apiVersion: "artifacts.takoform.com/v1alpha1",
+              kind: "StaticAssetBundle",
+              files: [
+                { path, mediaType: "text/plain", size: 1, digest: `sha256:${"a".repeat(64)}` },
+              ],
+            },
+          }),
+        }),
+        { tenantId: "tenant_a", principalId: "principal_a" },
+        (code, status) => Response.json({ error: { code } }, { status }),
+      );
+
+    // `.well-known` is a standard path; refusing it would make a whole class of
+    // real sites undeployable.
+    expect((await start(".well-known/nodeinfo"))?.status).toBe(201);
+    // Traversal is refused at parse time, before anything is recorded. The
+    // transport raises rather than answering; the router is what turns that
+    // into a 400 for a caller.
+    for (const path of ["../escape", "a/../b", "./here"]) {
+      await expect(start(path)).rejects.toMatchObject({ code: "artifact_invalid" });
+    }
+  });
+});
+
+/**
+ * A StaticAssetBundle names its files `path` on the wire; every other manifest
+ * kind names them `name`. Only an end-to-end commit proves the two agree,
+ * because a mismatch surfaces nowhere until the last call of the upload.
+ */
+describe("static asset bundles", () => {
+  test("commits an upload whose files were declared by path", async () => {
+    const { createTakoformArtifacts } = await import("../src/takoform/artifacts.ts");
+    const { createEphemeralSql } = await import("../src/compat.ts");
+    const store = createMemoryObjectStore();
+    let issued = 0;
+    const artifacts = createTakoformArtifacts({
+      sql: createEphemeralSql(),
+      objects: store,
+      clock: () => new Date(),
+      randomId: () => `upload-${++issued}`,
+    });
+    const principal = { tenantId: "tenant_a", principalId: "principal_a" };
+    const fail = (code: string, status: number) => Response.json({ error: { code } }, { status });
+
+    const body = new TextEncoder().encode("<!doctype html>");
+    const hex = [...new Uint8Array(await crypto.subtle.digest("SHA-256", body))]
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+    const digest = `sha256:${hex}`;
+    const send = (path: string, init: RequestInit) =>
+      artifacts.handle(
+        new Request(`https://api.test/apis/forms.takoform.com/v1alpha3/artifacts/${path}`, init),
+        principal,
+        fail,
+      );
+
+    const started = await send("uploads", {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": "assets-start" },
+      body: JSON.stringify({
+        manifest: {
+          apiVersion: "artifacts.takoform.com/v1alpha1",
+          kind: "StaticAssetBundle",
+          files: [{ path: "index.html", mediaType: "text/html", size: body.byteLength, digest }],
+        },
+      }),
+    });
+    expect(started?.status).toBe(201);
+    const { uploadId } = (await (started as Response).json()) as { uploadId: string };
+
+    expect(
+      (await send(`uploads/${uploadId}/blobs/${digest}`, { method: "PUT", body }))?.status,
+    ).toBe(201);
+
+    const committed = await send(`uploads/${uploadId}/commit`, {
+      method: "POST",
+      headers: { "idempotency-key": "assets-commit" },
+    });
+    expect(committed?.status).toBe(201);
+    expect(await committed?.json()).toEqual({ manifestDigest: expect.any(String) });
+  });
+});

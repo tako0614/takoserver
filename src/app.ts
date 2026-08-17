@@ -109,8 +109,13 @@ export function buildApp(ports: AppPorts): App {
       randomId,
     });
 
+  // One store instance backs both the exact-pin lanes and the console's read
+  // side, so an inventory can never drift from what the lanes actually hold.
+  const inventory = createTakoformStore(ports.sql, clock);
+
   const control = createControlRoutes({
     accounts,
+    inventory,
     ledger,
     catalog,
     reseller,
@@ -123,7 +128,7 @@ export function buildApp(ports: AppPorts): App {
     fetch: createRouter({ control, takoformHost, publicOrigin: ports.publicOrigin }),
     async tick(): Promise<TickReport> {
       const expiredReservations = await reseller.expireDue(64);
-      const store = createTakoformStore(ports.sql, clock);
+      const store = inventory;
       const installed = ports.forms.map((form) => form.identity.formRef.schemaDigest);
       const orphans = await store.orphanedResources(installed, 32);
       const orphanedResources = orphans.map(

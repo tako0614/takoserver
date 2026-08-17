@@ -39,6 +39,12 @@ export interface TakoformBundleManifest {
     readonly mediaType: string;
     readonly digest: string;
   }[];
+  readonly files?: readonly {
+    readonly name: string;
+    readonly mediaType: string;
+    readonly size: number;
+    readonly digest: string;
+  }[];
 }
 
 /**
@@ -244,6 +250,16 @@ export class CloudflareProvider implements Provider {
     const previouslyDeclared = previousDurableClasses(input.previous?.spec);
     const migration = migrationFor(durableObjects, previouslyDeclared);
 
+    // Assets are uploaded before the script, because the script's metadata
+    // must carry the completion token the asset upload returns.
+    const assets = record(input.spec.assets);
+    let assetToken: string | null = null;
+    if (assets) {
+      const uploaded = await this.#uploadAssets(name, input.identity.tenantRef, assets);
+      if (typeof uploaded !== "string") return uploaded;
+      assetToken = uploaded;
+    }
+
     const form = new FormData();
     form.set(
       "metadata",
@@ -269,6 +285,18 @@ export class CloudflareProvider implements Provider {
             // readable, and versioned, which is everything a secret must not
             // be — so they are operator-managed and preserved across applies.
             keep_bindings: ["secret_text"],
+            ...(assetToken
+              ? {
+                  assets: {
+                    jwt: assetToken,
+                    config: {
+                      html_handling: "auto-trailing-slash",
+                      not_found_handling:
+                        optionalString(assets?.notFoundHandling) ?? "single-page-application",
+                    },
+                  },
+                }
+              : {}),
             ...(migration ? { migrations: migration } : {}),
           }),
         ],
@@ -324,6 +352,108 @@ export class CloudflareProvider implements Provider {
         ...(hostnames[0] ? { url: `https://${hostnames[0]}` } : {}),
       },
     });
+  }
+
+  /**
+   * Uploads a committed asset bundle and returns the completion token the
+   * script upload must carry.
+   *
+   * Cloudflare asks first which files it does not already hold, so an unchanged
+   * asset never travels twice — the same content-addressed idea the artifact
+   * store already uses, one layer down.
+   */
+  async #uploadAssets(
+    scriptName: string,
+    tenantRef: string,
+    assets: Record<string, unknown>,
+  ): Promise<string | ProviderTicket> {
+    const digest = optionalString(assets.bundle);
+    if (!digest) return failed("invalid_spec", "an asset bundle digest is required");
+    const manifest = await this.#artifacts.manifest(tenantRef, digest);
+    if (!manifest || manifest.kind !== "StaticAssetBundle") {
+      return failed("invalid_spec", "the declared assets are not a committed StaticAssetBundle");
+    }
+    const files = manifest.files ?? [];
+    if (files.length === 0) return failed("invalid_spec", "the asset bundle declares no files");
+
+    const declared: Record<string, { hash: string; size: number }> = {};
+    const byHash = new Map<string, { name: string; digest: string; mediaType: string }>();
+    for (const file of files) {
+      // Cloudflare identifies an asset by a 32-hex-character hash, not by the
+      // full digest, so the digest is truncated consistently on both sides.
+      const hash = file.digest.slice("sha256:".length, "sha256:".length + 32);
+      declared[`/${file.name}`] = { hash, size: file.size };
+      byHash.set(hash, { name: file.name, digest: file.digest, mediaType: file.mediaType });
+    }
+
+    const started = await this.#call(
+      "POST",
+      `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(scriptName)}/assets-upload-session`,
+      { manifest: declared },
+    );
+    if (!started.ok) return started.ticket;
+    const session = record(started.result);
+    const token = optionalString(session?.jwt);
+    const buckets = Array.isArray(session?.buckets) ? (session.buckets as string[][]) : [];
+    // No buckets means every file was already held; the token alone completes.
+    if (buckets.length === 0) return token ?? failed("provider_error", "no asset upload token");
+
+    let completion = token;
+    for (const bucket of buckets) {
+      const payload = new FormData();
+      for (const hash of bucket) {
+        const file = byHash.get(hash);
+        const bytes = file ? await this.#artifacts.blob(file.digest) : null;
+        if (!file || !bytes) return failed("invalid_spec", "a declared asset is missing");
+        payload.set(
+          hash,
+          new File([base64(bytes)], hash, { type: file.mediaType || "application/octet-stream" }),
+          hash,
+        );
+      }
+      const sent = await this.#sendAssets(completion ?? "", payload);
+      if (!sent.ok) return sent.ticket;
+      const result = record(sent.result);
+      completion = optionalString(result?.jwt) ?? completion;
+    }
+    return completion ?? failed("provider_error", "asset upload did not complete");
+  }
+
+  async #sendAssets(token: string, payload: FormData): Promise<CallResult> {
+    let response: Response;
+    try {
+      response = await this.#fetch(
+        new Request(
+          `${this.#origin}/accounts/${this.#accountId}/workers/assets/upload?base64=true`,
+          {
+            method: "POST",
+            headers: { accept: "application/json", authorization: `Bearer ${token}` },
+            body: payload,
+          },
+        ),
+      );
+    } catch {
+      return {
+        ok: false,
+        status: 0,
+        ticket: failed("unavailable", "asset upload unreachable", true),
+      };
+    }
+    const envelope = await readEnvelope(response);
+    if (response.ok && envelope?.success === true) {
+      return { ok: true, status: response.status, result: envelope.result };
+    }
+    console.error(
+      JSON.stringify({
+        event: "takoserver.provider.refused",
+        provider: this.id,
+        method: "POST",
+        path: "/workers/assets/upload",
+        status: response.status,
+        errors: Array.isArray(envelope?.errors) ? envelope.errors : undefined,
+      }).slice(0, 4_096),
+    );
+    return { ok: false, status: response.status, ticket: classify(response.status) };
   }
 
   /** The zone that may serve a hostname, if this deployment offers one. */
@@ -583,6 +713,12 @@ function record(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+}
+
+function base64(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
 }
 
 function optionalString(value: unknown): string | undefined {

@@ -4,6 +4,7 @@ import { type FundingSettlementVerifier, type Ledger, LedgerError } from "./ledg
 import type { Clock } from "./ports.ts";
 import { type Reseller, ResellerError } from "./reseller.ts";
 import { parseStrictJson, StrictJsonError } from "./strict-json.ts";
+import type { OperationListing, ResourceListing } from "./takoform/store.ts";
 import { TokenError, type TokenService } from "./token.ts";
 
 /**
@@ -19,8 +20,29 @@ import { TokenError, type TokenService } from "./token.ts";
 
 const MAX_BODY_BYTES = 64 * 1_024;
 
+/**
+ * The read side of what a tenant declared.
+ *
+ * The exact-pin lanes can only answer about a resource whose full quad the
+ * caller already knows. A person opening a console knows none of it — they know
+ * they have things and want to see them — so the control plane needs its own
+ * way in. This is deliberately narrow: listing, never mutation.
+ */
+export interface ResourceInventory {
+  listResources(
+    tenantId: string,
+    options: {
+      readonly space?: string | undefined;
+      readonly limit: number;
+      readonly cursor?: string | undefined;
+    },
+  ): Promise<{ readonly resources: readonly ResourceListing[]; readonly cursor: string | null }>;
+  listOperations(tenantId: string, limit: number): Promise<readonly OperationListing[]>;
+}
+
 export interface CreateControlRoutesOptions {
   readonly accounts: Accounts;
+  readonly inventory: ResourceInventory;
   readonly ledger: Ledger;
   readonly catalog: Catalog;
   readonly reseller: Reseller;
@@ -32,7 +54,7 @@ export interface CreateControlRoutesOptions {
 export type ControlRoutes = (request: Request, url: URL) => Promise<Response | null>;
 
 export function createControlRoutes(options: CreateControlRoutesOptions): ControlRoutes {
-  const { accounts, ledger, catalog, reseller, tokens, settlement } = options;
+  const { accounts, inventory, ledger, catalog, reseller, tokens, settlement } = options;
 
   const owner = async (request: Request, organizationId: string): Promise<Actor> => {
     const actor = await accounts.authenticate(authorization(request));
@@ -91,6 +113,17 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       return Response.json({ principal, sessionToken });
     }
 
+    if (request.method === "GET" && url.pathname === "/v1/me") {
+      const actor = await accounts.authenticate(authorization(request));
+      if (actor?.kind !== "session") throw new AuthError("unauthenticated");
+      const principal = await accounts.principal(actor.principalId);
+      if (!principal) throw new AuthError("unauthenticated");
+      return Response.json({
+        principal,
+        organizations: await accounts.organizations(actor.principalId),
+      });
+    }
+
     if (request.method === "POST" && url.pathname === "/v1/organizations") {
       const actor = await accounts.authenticate(authorization(request));
       if (actor?.kind !== "session") throw new AuthError("unauthenticated");
@@ -115,6 +148,12 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       });
       // The secret appears here and nowhere else, ever.
       return Response.json({ apiKey, secret }, { status: 201 });
+    }
+
+    if (request.method === "GET" && orgKeys) {
+      const organizationId = segment(orgKeys[1]);
+      const actor = await owner(request, organizationId);
+      return Response.json({ apiKeys: await accounts.apiKeys({ actor, organizationId }) });
     }
 
     const orgKey = /^\/v1\/organizations\/([^/]+)\/api-keys\/([^/]+)$/u.exec(url.pathname);
@@ -265,8 +304,72 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       });
     }
 
+    const resources = /^\/v1\/organizations\/([^/]+)\/resources$/u.exec(url.pathname);
+    if (request.method === "GET" && resources) {
+      const organizationId = segment(resources[1]);
+      await scoped(request, organizationId, "resources:read");
+      const space = url.searchParams.get("space");
+      const cursor = url.searchParams.get("cursor");
+      const page = await inventory.listResources(organizationId, {
+        limit: pageSize(url),
+        ...(space === null ? {} : { space: segment(space) }),
+        ...(cursor === null ? {} : { cursor }),
+      });
+      return Response.json({
+        resources: page.resources.map(presentResource),
+        ...(page.cursor === null ? {} : { cursor: page.cursor }),
+      });
+    }
+
+    const operations = /^\/v1\/organizations\/([^/]+)\/operations$/u.exec(url.pathname);
+    if (request.method === "GET" && operations) {
+      const organizationId = segment(operations[1]);
+      await scoped(request, organizationId, "resources:read");
+      return Response.json({
+        operations: await inventory.listOperations(organizationId, pageSize(url)),
+      });
+    }
+
     return controlError("not_found", 404);
   }
+}
+
+/**
+ * A resource as a console shows it.
+ *
+ * `status` is the resource's own account of itself and is passed through
+ * unedited; conditions and outputs are what a person actually reads. The
+ * provider's native id is not among them — it names the account we hold on
+ * their behalf, and nothing a customer can act on.
+ */
+function presentResource(listing: ResourceListing): Record<string, unknown> {
+  const resource = listing.resource as unknown as {
+    readonly spec?: unknown;
+    readonly status?: unknown;
+  };
+  return {
+    apiVersion: listing.apiVersion,
+    kind: listing.kind,
+    metadata: {
+      space: listing.space,
+      name: listing.name,
+      uid: listing.uid,
+      generation: listing.generation,
+      revision: listing.revision,
+      updatedAt: listing.updatedAt,
+    },
+    ...(resource.spec === undefined ? {} : { spec: resource.spec }),
+    ...(resource.status === undefined ? {} : { status: resource.status }),
+  };
+}
+
+/** A page size a caller may ask for, within what the server will serve. */
+function pageSize(url: URL): number {
+  const raw = url.searchParams.get("limit");
+  if (raw === null) return 50;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1) controlError("invalid_argument", 400);
+  return Math.min(value, 200);
 }
 
 export class ControlError extends Error {
