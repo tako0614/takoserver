@@ -36,6 +36,7 @@ export function writeRealizedConfig(target: DeployTarget): string {
       },
     ],
     r2_buckets: [{ binding: "OBJECTS", bucket_name: target.r2.bucketName }],
+    ...serviceAddress(target.publicOrigin),
   };
   writeFileSync(REALIZED_CONFIG_PATH, `${JSON.stringify(realized, null, 2)}\n`, { mode: 0o600 });
   return REALIZED_CONFIG_PATH;
@@ -62,6 +63,25 @@ function readNeutralConfig(): NeutralConfig {
 }
 
 /** Guards the claim that the committed configuration carries no realized identity. */
+/**
+ * Makes the target's `publicOrigin` true.
+ *
+ * The origin is not a label for a deployment, it is the address callers use, so
+ * publishing has to put the Worker there. A `workers.dev` origin is served by
+ * the subdomain that flag turns on; anything else is a domain in the account,
+ * attached as a custom domain — and the subdomain is then switched off, because
+ * leaving it on publishes the same API at a second address that spells out the
+ * operator's account name.
+ */
+function serviceAddress(publicOrigin: string): Record<string, unknown> {
+  const { hostname } = new URL(publicOrigin);
+  if (hostname.endsWith(".workers.dev")) return { workers_dev: true };
+  return {
+    workers_dev: false,
+    routes: [{ pattern: hostname, custom_domain: true }],
+  };
+}
+
 function assertNeutral(neutral: Record<string, unknown>): void {
   for (const forbidden of ["account_id", "routes", "route", "vars", "workers_dev_subdomain"]) {
     if (forbidden in neutral) {
