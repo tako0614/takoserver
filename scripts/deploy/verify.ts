@@ -33,16 +33,13 @@ export async function verify(
   proven.push(`binding closure of version ${versionId}`);
 
   const database = new RemoteD1(report.configPath);
-  const tables = (
-    await database.query(
-      "verification",
-      "runtime table readback",
-      "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN (" +
-        `${RUNTIME_TABLES.map(sqlLiteral).join(", ")}) ORDER BY name`,
-    )
-  )
-    .map((row) => row.name)
-    .filter((name): name is string => typeof name === "string");
+  const tables = await database.column(
+    "verification",
+    "runtime table readback",
+    "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN (" +
+      `${RUNTIME_TABLES.map((name) => sqlLiteral(name)).join(", ")}) ORDER BY name`,
+    "name",
+  );
   if (JSON.stringify(tables) !== JSON.stringify([...RUNTIME_TABLES].sort())) {
     throw verificationError(
       `the target is missing runtime tables: found ${JSON.stringify(tables)}`,
@@ -50,16 +47,13 @@ export async function verify(
   }
   proven.push("all three runtime tables present");
 
-  const activeKeys = (
-    await database.query(
-      "verification",
-      "active key readback",
-      "SELECT key_id FROM runtime_grant_keys WHERE revoked_at_epoch_seconds IS NULL " +
-        "ORDER BY key_id LIMIT 32",
-    )
-  )
-    .map((row) => row.key_id)
-    .filter((value): value is string => typeof value === "string");
+  const activeKeys = await database.column(
+    "verification",
+    "active key readback",
+    "SELECT key_id FROM runtime_grant_keys WHERE revoked_at_epoch_seconds IS NULL " +
+      "ORDER BY key_id LIMIT 32",
+    "key_id",
+  );
   if (!activeKeys.includes(report.target.grantKeyId)) {
     throw verificationError(
       `verification key ${report.target.grantKeyId} is not active on the target`,

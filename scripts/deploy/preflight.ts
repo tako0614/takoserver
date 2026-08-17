@@ -40,38 +40,30 @@ export async function inspectLive(configPath: string, target: DeployTarget): Pro
   const version = await servedVersionId(configPath);
   const database = new RemoteD1(configPath);
 
-  const tableRows = await database.query(
+  const tables = await database.column(
     "preflight",
     "D1 table inventory",
     "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name",
+    "name",
   );
-  const tables = tableRows
-    .map((row) => row.name)
-    .filter((name): name is string => typeof name === "string");
 
   const appliedMigrations = tables.includes("d1_migrations")
-    ? (
-        await database.query(
-          "preflight",
-          "D1 migration lineage",
-          "SELECT name FROM d1_migrations ORDER BY id",
-        )
+    ? await database.column(
+        "preflight",
+        "D1 migration lineage",
+        "SELECT name FROM d1_migrations ORDER BY id",
+        "name",
       )
-        .map((row) => row.name)
-        .filter((name): name is string => typeof name === "string")
     : [];
 
   const activeGrantKeyIds = tables.includes("runtime_grant_keys")
-    ? (
-        await database.query(
-          "preflight",
-          "active grant keys",
-          "SELECT key_id FROM runtime_grant_keys WHERE revoked_at_epoch_seconds IS NULL " +
-            "ORDER BY key_id LIMIT 32",
-        )
+    ? await database.column(
+        "preflight",
+        "active grant keys",
+        "SELECT key_id FROM runtime_grant_keys WHERE revoked_at_epoch_seconds IS NULL " +
+          "ORDER BY key_id LIMIT 32",
+        "key_id",
       )
-        .map((row) => row.key_id)
-        .filter((value): value is string => typeof value === "string")
     : [];
 
   await runChecked(
