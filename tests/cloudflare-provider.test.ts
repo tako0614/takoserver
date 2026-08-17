@@ -424,3 +424,71 @@ describe("Cloudflare provider", () => {
     expect(ticket.failure).toMatchObject({ code: "unavailable", retryable: true });
   });
 });
+
+/**
+ * An operator that holds names back from a zone it also offers to customers
+ * ends up with two zones for the same suffix: the open one with reserved
+ * labels, and its own grant. Which one applies must follow from the grant, not
+ * from where the entries sit in a list — a reordering that silently hands a
+ * reserved name to a tenant is exactly the kind of defect nobody looks for.
+ */
+describe("overlapping zones", () => {
+  for (const order of ["granted first", "granted last"] as const) {
+    test(`resolves by grant, not by configuration order (${order})`, async () => {
+      const granted: CloudflareZone = {
+        suffix: "shared.example",
+        zoneId: "zone_operator",
+        tenantRef: "org_acme",
+        apex: true,
+      };
+      const open: CloudflareZone = {
+        suffix: "shared.example",
+        zoneId: "zone_open",
+        singleLabel: true,
+        reservedLabels: ["api"],
+      };
+      const { provider, calls } = recorder(
+        [
+          { status: 200, body: { success: true, errors: [], result: {} } },
+          { status: 200, body: { success: true, errors: [], result: {} } },
+        ],
+        order === "granted first" ? [granted, open] : [open, granted],
+      );
+
+      // `api` is reserved on the open zone; the operator's own grant is what
+      // makes it serveable, and only for them.
+      const ticket = await provider.apply({
+        operationId: "op_overlap",
+        offering: WORKER,
+        identity: IDENTITY,
+        spec: { bundle: `sha256:${"d".repeat(64)}`, hostnames: ["api.shared.example"] },
+      });
+      expect(ticket.phase).toBe("succeeded");
+      const attached = calls.find((call) => call.url.includes("/workers/domains"));
+      expect(JSON.parse(String(attached?.body))).toMatchObject({ zone_id: "zone_operator" });
+    });
+  }
+
+  test("still refuses a reserved name to a tenant with no grant", async () => {
+    const { provider, calls } = recorder(
+      [{ status: 200, body: { success: true, errors: [], result: {} } }],
+      [
+        { suffix: "shared.example", zoneId: "zone_operator", tenantRef: "org_other", apex: true },
+        {
+          suffix: "shared.example",
+          zoneId: "zone_open",
+          singleLabel: true,
+          reservedLabels: ["api"],
+        },
+      ],
+    );
+    const ticket = await provider.apply({
+      operationId: "op_overlap_denied",
+      offering: WORKER,
+      identity: IDENTITY,
+      spec: { bundle: `sha256:${"d".repeat(64)}`, hostnames: ["api.shared.example"] },
+    });
+    expect(ticket.phase).toBe("failed");
+    expect(calls.filter((call) => call.url.includes("/workers/domains"))).toHaveLength(0);
+  });
+});

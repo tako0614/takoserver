@@ -475,8 +475,17 @@ export class CloudflareProvider implements Provider {
           : hostname.endsWith(`.${zone.suffix}`) && this.#labelAllowed(zone, hostname)),
     );
     // The most specific zone wins, so a tenant zone nested inside a platform
-    // zone is not shadowed by it.
-    return eligible.sort((left, right) => right.suffix.length - left.suffix.length)[0];
+    // zone is not shadowed by it. Where two zones cover the same suffix — the
+    // usual shape for an operator holding back names it needs from a zone it
+    // also offers to customers — the one granted to a named tenant is the more
+    // specific of the two. Deciding this by rule rather than by the order the
+    // zones happen to be configured in is what keeps the grant from depending
+    // on where somebody put a line in a list.
+    return eligible.sort(
+      (left, right) =>
+        right.suffix.length - left.suffix.length ||
+        Number(right.tenantRef !== undefined) - Number(left.tenantRef !== undefined),
+    )[0];
   }
 
   #labelAllowed(zone: CloudflareZone, hostname: string): boolean {
