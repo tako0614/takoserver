@@ -239,6 +239,17 @@ export class CloudflareProvider implements Provider {
     if (!published.ok) return published.ticket;
 
     const subdomain = optionalString(input.spec.workersDevSubdomain);
+    if (subdomain) {
+      // Uploading a script does not put it on the internet. Declaring a
+      // workers.dev subdomain is a request to serve it, so the route is enabled
+      // here rather than leaving an output URL that answers 404.
+      const exposed = await this.#call(
+        "POST",
+        `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(name)}/subdomain`,
+        { enabled: true, previews_enabled: false },
+      );
+      if (!exposed.ok) return exposed.ticket;
+    }
     return succeeded({
       nativeId: `worker:${name}`,
       observed: { name, mainModule, moduleCount: modules.length },
@@ -401,6 +412,15 @@ function bindingsOf(value: JsonValue | undefined): readonly JsonObject[] {
     } else if (type === "r2_bucket") {
       const bucket = optionalString(binding?.bucketName);
       if (bucket) bindings.push({ type: "r2_bucket", name, bucket_name: bucket });
+    } else if (type === "kv_namespace") {
+      const namespace = optionalString(binding?.namespaceId);
+      if (namespace) bindings.push({ type: "kv_namespace", name, namespace_id: namespace });
+    } else if (type === "queue") {
+      const queue = optionalString(binding?.queueName);
+      if (queue) bindings.push({ type: "queue", name, queue_name: queue });
+    } else if (type === "service") {
+      const service = optionalString(binding?.service);
+      if (service) bindings.push({ type: "service", name, service });
     } else if (type === "plain_text") {
       const text = optionalString(binding?.text);
       if (text !== undefined) bindings.push({ type: "plain_text", name, text });

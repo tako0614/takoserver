@@ -74,10 +74,16 @@ const WORKER_SCRIPT_SCHEMA: JsonObject = {
       items: {
         type: "object",
         properties: {
-          type: { type: "string", enum: ["d1", "r2_bucket", "plain_text"] },
+          type: {
+            type: "string",
+            enum: ["d1", "r2_bucket", "kv_namespace", "queue", "service", "plain_text"],
+          },
           name: { type: "string", pattern: "^[A-Za-z_][A-Za-z0-9_]{0,63}$" },
           databaseId: { type: "string", maxLength: 128 },
           bucketName: { type: "string", maxLength: 128 },
+          namespaceId: { type: "string", maxLength: 128 },
+          queueName: { type: "string", maxLength: 128 },
+          service: { type: "string", maxLength: 128 },
           text: { type: "string", maxLength: 4096 },
         },
         required: ["type", "name"],

@@ -96,17 +96,29 @@ export function createR2HttpObjectStore(options: R2HttpOptions): ObjectStore {
     },
 
     async head(key): Promise<StoredObject | null> {
-      const response = await call("HEAD", key);
-      if (response.status === 404) return null;
+      // The R2 HTTP API rejects HEAD on the objects endpoint (405), so a probe
+      // is a GET whose body is dropped without being read.
+      const response = await call("GET", key);
+      if (response.status === 404) {
+        await response.body?.cancel();
+        return null;
+      }
       if (!response.ok) {
+        await response.body?.cancel();
         throw new ObjectStoreError("unavailable", `R2 refused the probe (${response.status})`);
       }
-      const length = Number(response.headers.get("content-length") ?? 0);
+      const declared = Number(response.headers.get("content-length") ?? Number.NaN);
       const contentType = response.headers.get("content-type");
+      const etag = response.headers.get("etag") ?? "";
+      // Content length is not always present; falling back to reading the body
+      // keeps the size honest rather than reporting zero.
+      const size = Number.isSafeInteger(declared)
+        ? (await response.body?.cancel(), declared)
+        : (await response.arrayBuffer()).byteLength;
       return {
         key,
-        size: Number.isSafeInteger(length) ? length : 0,
-        etag: response.headers.get("etag") ?? "",
+        size,
+        etag,
         ...(contentType ? { contentType } : {}),
       };
     },

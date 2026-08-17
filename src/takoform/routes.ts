@@ -89,9 +89,18 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
         if (error instanceof TakoformHostError) {
           return failure(error.code, error.status, error.details);
         }
-        // Anything else is a driver or runtime fault. It is reported as an
+        // Anything else is a driver or runtime fault. The caller gets an
         // internal error with a fresh request id and no borrowed message, so a
-        // provider's own words never reach the caller.
+        // provider's own words never leak — but the operator needs to see what
+        // happened, so it is logged here rather than swallowed.
+        console.error(
+          JSON.stringify({
+            event: "takoform.host.unhandled_error",
+            method: request.method,
+            path: url.pathname,
+            error: error instanceof Error ? `${error.name}: ${error.message}` : "unknown",
+          }),
+        );
         return failure("internal_error", 500);
       }
     },
