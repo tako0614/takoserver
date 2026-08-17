@@ -20,6 +20,14 @@ export interface DeployTarget {
    * the Takoform provider are the whole of it for anyone integrating.
    */
   readonly consoleOrigin?: string;
+  /**
+   * Public OAuth client id. Its presence is what turns Google sign-in on.
+   *
+   * Not a secret — it ships in every page that offers the button — but it is
+   * per-deployment, which is why it lives beside the account and the origin
+   * rather than in the repository.
+   */
+  readonly googleClientId?: string;
   readonly grantKeyId: string;
 }
 
@@ -30,6 +38,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const WORKER_NAME = /^[a-z0-9][a-z0-9-]{1,62}$/u;
 const BUCKET_NAME = /^[a-z0-9][a-z0-9-]{2,62}$/u;
 const KEY_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/u;
+const GOOGLE_CLIENT_ID = /^[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com$/u;
 
 export function targetPath(explicit?: string): string {
   const candidate = explicit ?? process.env.TAKOSERVER_DEPLOY_TARGET ?? DEFAULT_TARGET_PATH;
@@ -74,7 +83,7 @@ function validateTarget(value: unknown, path: string): DeployTarget {
   assertExactKeys(
     value,
     ["accountId", "workerName", "d1", "r2", "publicOrigin", "grantKeyId"],
-    ["consoleOrigin"],
+    ["consoleOrigin", "googleClientId"],
   );
 
   const d1 = value.d1;
@@ -96,6 +105,9 @@ function validateTarget(value: unknown, path: string): DeployTarget {
     ...(value.consoleOrigin === undefined
       ? {}
       : { consoleOrigin: httpsOrigin(value.consoleOrigin) }),
+    ...(value.googleClientId === undefined
+      ? {}
+      : { googleClientId: pattern(value.googleClientId, GOOGLE_CLIENT_ID, "googleClientId") }),
     grantKeyId: pattern(value.grantKeyId, KEY_ID, "grantKeyId"),
   };
 }

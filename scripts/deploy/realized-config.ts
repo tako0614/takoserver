@@ -37,9 +37,7 @@ export function writeRealizedConfig(target: DeployTarget): string {
     ],
     r2_buckets: [{ binding: "OBJECTS", bucket_name: target.r2.bucketName }],
     ...serviceAddress(target.publicOrigin),
-    ...(target.consoleOrigin === undefined
-      ? {}
-      : { vars: { TAKOSERVER_CONSOLE_ORIGIN: target.consoleOrigin } }),
+    ...publicSettings(target),
   };
   writeFileSync(REALIZED_CONFIG_PATH, `${JSON.stringify(realized, null, 2)}\n`, { mode: 0o600 });
   return REALIZED_CONFIG_PATH;
@@ -66,6 +64,21 @@ function readNeutralConfig(): NeutralConfig {
 }
 
 /** Guards the claim that the committed configuration carries no realized identity. */
+/**
+ * Per-deployment values the Worker reads, and that are not secrets.
+ *
+ * Both are public by nature — one is an address, the other is an OAuth client
+ * id that ships in every page offering the button. They are here rather than in
+ * the repository because they differ per deployment, which is the same reason
+ * the account and the database are.
+ */
+function publicSettings(target: DeployTarget): Record<string, unknown> {
+  const vars: Record<string, string> = {};
+  if (target.consoleOrigin !== undefined) vars.TAKOSERVER_CONSOLE_ORIGIN = target.consoleOrigin;
+  if (target.googleClientId !== undefined) vars.GOOGLE_CLIENT_ID = target.googleClientId;
+  return Object.keys(vars).length === 0 ? {} : { vars };
+}
+
 /**
  * Makes the target's `publicOrigin` true.
  *
