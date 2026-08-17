@@ -14,5 +14,5 @@
     "types": ["bun"]
   },
   "include": ["src/**/*.ts", "scripts/**/*.ts", "tests/**/*.ts"],
-  "exclude": ["src/durable-worker-entry.ts", "worker-configuration.d.ts"]
+  "exclude": ["src/entry-worker.ts", "worker-configuration.d.ts"]
 }

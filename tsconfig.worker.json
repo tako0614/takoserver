@@ -4,13 +4,6 @@
     "lib": ["ES2022"],
     "types": ["@cloudflare/workers-types"]
   },
-  "include": [
-    "worker-configuration.d.ts",
-    "src/durable-worker-entry.ts",
-    "src/worker.ts",
-    "src/state-store.ts",
-    "src/object-storage.ts",
-    "src/runtime-grants.ts"
-  ],
+  "include": ["worker-configuration.d.ts", "src/entry-worker.ts"],
   "exclude": []
 }

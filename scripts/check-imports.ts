@@ -46,7 +46,7 @@ interface Layer {
 const LAYERS: readonly Layer[] = [
   {
     name: "core",
-    match: /^src\/(?:ports|json|strict-json|form-ref|provider-port)\.ts$/u,
+    match: /^src\/(?:ports|json|strict-json|form-ref|provider-port|db-schema)\.ts$/u,
     may: ["core"],
   },
   {
@@ -57,7 +57,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "domain",
     match:
-      /^src\/(?:token|auth|ledger|catalog|reseller|metering|provider-driver|reconcile)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$)/u,
+      /^src\/(?:token|auth|ledger|catalog|reseller|metering|provider-driver|reconcile|edge-forms)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$)/u,
     may: ["core", "domain"],
   },
   {
@@ -67,7 +67,14 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "domain", "routes"],
   },
   { name: "app", match: /^src\/app\.ts$/u, may: ["core", "adapter", "domain", "routes", "app"] },
-  { name: "entry", match: /^src\/entry-[^/]+\.ts$/u, may: ["core", "app"] },
+  // An entry chooses concrete implementations — that is its whole job. What it
+  // may not do is reach something its host cannot support, which the
+  // host-only ban below enforces per entry rather than by tier.
+  {
+    name: "entry",
+    match: /^src\/entry-[^/]+\.ts$/u,
+    may: ["core", "adapter", "domain", "routes", "app"],
+  },
 ];
 
 function layerOf(path: string): Layer | undefined {
@@ -100,7 +107,14 @@ for (const path of walk("src")) {
 // ---------------------------------------------------------------------------
 
 const WORKER_ENTRY = "src/entry-worker.ts";
-const HOST_ONLY = ["src/sql-sqlite.ts", "src/objects-mem.ts"];
+const HOST_ONLY = [
+  "src/sql-sqlite.ts",
+  "src/objects-mem.ts",
+  // Provisioning needs the Cloudflare REST API and an account token. A Worker
+  // that could reach either would hand that reach to every Worker sharing its
+  // bundle, so provisioning runs on the self-hosted entry instead.
+  "src/providers/cloudflare.ts",
+];
 
 if (existsSync(WORKER_ENTRY)) {
   const reachable = new Set<string>();

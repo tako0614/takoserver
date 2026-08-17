@@ -6,7 +6,7 @@ export function parseStrictJson(bytes: Uint8Array, maxBytes: number): unknown {
   if (bytes.byteLength === 0 || bytes.byteLength > maxBytes) throw new StrictJsonError();
   let text: string;
   try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes);
   } catch {
     throw new StrictJsonError();
   }

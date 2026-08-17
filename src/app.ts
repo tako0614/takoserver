@@ -7,6 +7,7 @@ import { createProviderDriver } from "./provider-driver.ts";
 import type { Provider } from "./provider-port.ts";
 import { createReseller } from "./reseller.ts";
 import { createRouter, type Router } from "./router.ts";
+import type { TakoformArtifactTransport } from "./takoform/artifacts.ts";
 import { createTakoformHost } from "./takoform/host.ts";
 import type {
   InstalledTakoformForm,
@@ -41,6 +42,8 @@ export interface AppPorts {
   readonly driver?: TakoformResourceDriver;
   readonly offerings: readonly Offering[];
   readonly signingKey?: SigningKey;
+  /** Shared with a provider that publishes committed bundles. */
+  readonly artifacts?: TakoformArtifactTransport;
   /**
    * Replaces the Takoform Host entirely. Used by conformance tests that need to
    * drive the lane with their own authentication; production never sets it.
@@ -94,6 +97,7 @@ export function buildApp(ports: AppPorts): App {
       },
       forms: ports.forms,
       driver,
+      ...(ports.artifacts ? { artifacts: ports.artifacts } : {}),
       clock,
       randomId,
     });
