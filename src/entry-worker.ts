@@ -1,6 +1,7 @@
 import { type App, buildApp } from "./app.ts";
 import { buildEdgeForms } from "./edge-forms.ts";
 import { createR2ObjectStore } from "./objects-r2.ts";
+import { createOperatorIdentity, createOperatorSettlement } from "./operator-credentials.ts";
 import { createD1Sql } from "./sql-d1.ts";
 
 /**
@@ -21,6 +22,31 @@ interface WorkerEnv {
   readonly STATE_DB: Parameters<typeof createD1Sql>[0];
   readonly OBJECTS: Parameters<typeof createR2ObjectStore>[0];
   readonly PUBLIC_ORIGIN?: string;
+  /** Public half of the operator key, as an Ed25519 JWK. */
+  readonly OPERATOR_PUBLIC_JWK?: string;
+}
+
+/**
+ * Sign-in and funding both need a fact the server cannot determine alone. When
+ * an operator key is configured they are answered by the operator's signature;
+ * when it is not, they refuse. Refusing is the point — a stub that said yes
+ * would accept anyone and credit any amount while looking like a product.
+ */
+function operatorCredentials(env: WorkerEnv) {
+  const raw = env.OPERATOR_PUBLIC_JWK;
+  if (!raw) {
+    const unconfigured = {
+      async verify(): Promise<never> {
+        throw new Error("operator credentials are not configured");
+      },
+    };
+    return { identity: unconfigured, settlement: unconfigured };
+  }
+  const publicKeyJwk = JSON.parse(raw) as { kty: string; crv: string; x: string };
+  return {
+    identity: createOperatorIdentity({ publicKeyJwk }),
+    settlement: createOperatorSettlement({ publicKeyJwk }),
+  };
 }
 
 let cached: { readonly env: WorkerEnv; readonly app: App } | null = null;
@@ -28,22 +54,12 @@ let cached: { readonly env: WorkerEnv; readonly app: App } | null = null;
 async function appFor(env: WorkerEnv, origin: string): Promise<App> {
   if (cached?.env === env) return cached.app;
   const edge = await buildEdgeForms();
+  const { identity, settlement } = operatorCredentials(env);
   const app = buildApp({
     sql: createD1Sql(env.STATE_DB),
     objects: createR2ObjectStore(env.OBJECTS),
-    identity: {
-      async verify() {
-        // Sign-in needs a network call to an identity provider, which this
-        // deployment does not yet configure. Failing here is better than
-        // minting a session for an assertion nobody checked.
-        throw new Error("identity verification is not configured");
-      },
-    },
-    settlement: {
-      async verify() {
-        throw new Error("settlement verification is not configured");
-      },
-    },
+    identity,
+    settlement,
     publicOrigin: origin,
     forms: edge.forms,
     // No providers: this entry cannot provision. See the note above.

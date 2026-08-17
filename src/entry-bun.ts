@@ -3,6 +3,7 @@ import { buildApp } from "./app.ts";
 import { MIGRATIONS } from "./db-schema.ts";
 import { buildEdgeForms } from "./edge-forms.ts";
 import { createMemoryObjectStore } from "./objects-mem.ts";
+import { createOperatorIdentity, createOperatorSettlement } from "./operator-credentials.ts";
 import { CloudflareProvider } from "./providers/cloudflare.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
@@ -74,19 +75,21 @@ const providers = process.env.CLOUDFLARE_ACCOUNT_ID
     ]
   : [];
 
+const operatorJwk = process.env.TAKOSERVER_OPERATOR_PUBLIC_JWK;
+const unconfigured = {
+  async verify(): Promise<never> {
+    throw new Error("operator credentials are not configured");
+  },
+};
+const publicKeyJwk = operatorJwk
+  ? (JSON.parse(operatorJwk) as { kty: string; crv: string; x: string })
+  : null;
+
 const app = buildApp({
   sql,
   objects,
-  identity: {
-    async verify() {
-      throw new Error("identity verification is not configured");
-    },
-  },
-  settlement: {
-    async verify() {
-      throw new Error("settlement verification is not configured");
-    },
-  },
+  identity: publicKeyJwk ? createOperatorIdentity({ publicKeyJwk }) : unconfigured,
+  settlement: publicKeyJwk ? createOperatorSettlement({ publicKeyJwk }) : unconfigured,
   publicOrigin,
   forms: edge.forms,
   providers,
