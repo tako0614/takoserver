@@ -5,6 +5,7 @@
       "**",
       "!!node_modules",
       "!!dist",
+      "!!console/dist",
       "!!.git",
       "!!openapi/takoserver.openapi.json",
       "!!worker-configuration.d.ts",
