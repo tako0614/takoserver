@@ -4,7 +4,7 @@ import {
   createRuntimeGrantVerifier,
   GrantVerificationError,
   InMemoryGrantReplayStore,
-} from "../src/index.ts";
+} from "../src/runtime-grants.ts";
 
 const issuedAt = Date.parse("2026-08-17T12:00:00.000Z");
 

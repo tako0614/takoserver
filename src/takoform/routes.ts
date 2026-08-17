@@ -89,7 +89,10 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
         if (error instanceof TakoformHostError) {
           return failure(error.code, error.status, error.details);
         }
-        throw error;
+        // Anything else is a driver or runtime fault. It is reported as an
+        // internal error with a fresh request id and no borrowed message, so a
+        // provider's own words never reach the caller.
+        return failure("internal_error", 500);
       }
     },
   };

@@ -1,5 +1,5 @@
 import { base64UrlDecode, base64UrlEncode, isSha256Digest } from "./json.ts";
-import type { Clock, Sql } from "./ports.ts";
+import type { Clock, DataProtocol, Sql } from "./ports.ts";
 
 /**
  * Every signed credential Takoserver issues, in one module.
@@ -29,10 +29,10 @@ const KEY_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/u;
 const ACTIVE_KEY_LIMIT = 32;
 const EXPIRED_REPLAY_DELETE_LIMIT = 64;
 
-export type DataProtocol = "s3" | "openai";
+export type { DataProtocol };
 
 export interface DataTokenClaims {
-  readonly orgId: string;
+  readonly organizationId: string;
   readonly tenantRef: string | null;
   readonly resourceUid: string;
   readonly protocols: readonly DataProtocol[];
@@ -42,7 +42,7 @@ export interface DataTokenClaims {
 }
 
 export interface ProvisionTokenClaims {
-  readonly orgId: string;
+  readonly organizationId: string;
   readonly tenantRef: string;
   readonly reservationId: string;
   readonly offeringId: string;
@@ -81,7 +81,7 @@ export interface SigningKey {
 
 export interface TokenService {
   issueDataToken(input: {
-    readonly orgId: string;
+    readonly organizationId: string;
     readonly tenantRef?: string | null;
     readonly resourceUid: string;
     readonly protocols: readonly DataProtocol[];
@@ -95,7 +95,7 @@ export interface TokenService {
   ): Promise<DataTokenClaims>;
 
   issueProvisionToken(input: {
-    readonly orgId: string;
+    readonly organizationId: string;
     readonly tenantRef: string;
     readonly reservationId: string;
     readonly offeringId: string;
@@ -213,7 +213,7 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
       return await sign(
         DATA_AUDIENCE,
         {
-          orgId: reference(input.orgId),
+          organizationId: reference(input.organizationId),
           protocols: protocols(input.protocols),
           resourceUid: reference(input.resourceUid),
           tenantRef: input.tenantRef == null ? null : reference(input.tenantRef),
@@ -238,7 +238,7 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
         {
           offeringDigest: input.offeringDigest,
           offeringId: reference(input.offeringId),
-          orgId: reference(input.orgId),
+          organizationId: reference(input.organizationId),
           reservationId: reference(input.reservationId),
           tenantRef: reference(input.tenantRef),
         },
@@ -384,14 +384,14 @@ function dataClaims(payload: Record<string, unknown>): DataTokenClaims {
     "iss",
     "jti",
     "nbf",
-    "orgId",
+    "organizationId",
     "protocols",
     "resourceUid",
     "tenantRef",
   ]);
   const tenantRef = payload.tenantRef;
   return {
-    orgId: claimReference(payload.orgId),
+    organizationId: claimReference(payload.organizationId),
     tenantRef: tenantRef === null ? null : claimReference(tenantRef),
     resourceUid: claimReference(payload.resourceUid),
     protocols: claimProtocols(payload.protocols),
@@ -411,13 +411,13 @@ function provisionClaims(payload: Record<string, unknown>): ProvisionTokenClaims
     "nbf",
     "offeringDigest",
     "offeringId",
-    "orgId",
+    "organizationId",
     "reservationId",
     "tenantRef",
   ]);
   if (!isSha256Digest(payload.offeringDigest)) fail("malformed_token");
   return {
-    orgId: claimReference(payload.orgId),
+    organizationId: claimReference(payload.organizationId),
     tenantRef: claimReference(payload.tenantRef),
     reservationId: claimReference(payload.reservationId),
     offeringId: claimReference(payload.offeringId),
@@ -506,8 +506,12 @@ function epochSeconds(value: unknown): number {
 
 function httpsOrigin(value: string): string {
   const url = new URL(value);
+  // Loopback over http is permitted so a self-hosted server can be developed
+  // against without a certificate. Everything else must be real HTTPS, because
+  // the issuer is baked into every token and checked on the way back in.
+  const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1";
   if (
-    url.protocol !== "https:" ||
+    (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) ||
     url.username ||
     url.password ||
     url.pathname !== "/" ||

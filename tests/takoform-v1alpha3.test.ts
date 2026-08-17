@@ -1,18 +1,50 @@
 import { describe, expect, test } from "bun:test";
 import {
-  createHttpHandler,
+  buildApp,
+  createEphemeralSql,
   createInMemoryTakoformHost,
+  createMemoryObjectStore,
   createTakoformHost,
-  createTakoserver,
-  createTakoserverTakoformHost,
   type ExternalIdentityVerifier,
+  type FundingSettlementVerifier,
   InMemoryTakoformResourceDriver,
-  PortableFakeBackend,
+  type InstalledTakoformForm,
   TAKOFORM_EDGE_OBJECTS_INTERFACE,
   TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM,
   TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_INSTALLED_FORM,
+  type TakoformHost,
   type TakoformResourceDriver,
 } from "../src/index.ts";
+
+const OWNER_IDENTITY: ExternalIdentityVerifier = {
+  async verify() {
+    return { providerSubject: "subject", email: "owner@example.com", displayName: "Owner" };
+  },
+};
+
+const SETTLEMENT: FundingSettlementVerifier = {
+  async verify() {
+    return { fundingRef: "settlement_1", amountMinor: 100_000, currency: "USD" };
+  },
+};
+
+/** Serves one Takoform Host through the real router and control plane. */
+function handlerFor(
+  takoformHost: TakoformHost,
+  identity: ExternalIdentityVerifier = OWNER_IDENTITY,
+) {
+  return buildApp({
+    sql: createEphemeralSql(),
+    objects: createMemoryObjectStore(),
+    identity,
+    settlement: SETTLEMENT,
+    publicOrigin: "https://api.takoserver.com",
+    forms: [],
+    driver: new InMemoryTakoformResourceDriver(),
+    offerings: [],
+    takoformHost,
+  }).fetch;
+}
 
 describe("Takoserver current Takoform Host", () => {
   test("serves the exact ObjectBucket Form used by released provider v2.1.1", async () => {
@@ -24,18 +56,7 @@ describe("Takoserver current Takoform Host", () => {
           : null,
       forms: [TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_INSTALLED_FORM],
     });
-    const handler = createHttpHandler({
-      server: createTakoserver({
-        identity: {
-          async verify() {
-            return { providerSubject: "subject", email: "owner@example.com", displayName: "Owner" };
-          },
-        },
-        backends: [new PortableFakeBackend("fake", [])],
-      }),
-      publicOrigin: "https://api.takoserver.com",
-      takoformHost: host,
-    });
+    const handler = handlerFor(host);
 
     const discovery = await handler(
       new Request("https://api.takoserver.com/.well-known/takoform/v1beta1"),
@@ -110,17 +131,12 @@ describe("Takoserver current Takoform Host", () => {
         return { providerSubject: "subject", email: "owner@example.com", displayName: "Owner" };
       },
     };
-    const handler = createHttpHandler({
-      server: createTakoserver({
-        identity,
-        backends: [new PortableFakeBackend("fake", [])],
-      }),
-      publicOrigin: "https://api.takoserver.com",
-      takoformHost: createInMemoryTakoformHost({
+    const handler = handlerFor(
+      createInMemoryTakoformHost({
         authenticate: async () => null,
         forms: [],
       }),
-    });
+    );
 
     const response = await handler(
       new Request("https://api.takoserver.com/.well-known/takoform/v1alpha3"),
@@ -176,18 +192,7 @@ describe("Takoserver current Takoform Host", () => {
       ],
       driver,
     });
-    const handler = createHttpHandler({
-      server: createTakoserver({
-        identity: {
-          async verify() {
-            return { providerSubject: "subject", email: "owner@example.com", displayName: "Owner" };
-          },
-        },
-        backends: [new PortableFakeBackend("fake", [])],
-      }),
-      publicOrigin: "https://api.takoserver.com",
-      takoformHost: host,
-    });
+    const handler = handlerFor(host);
     const resource = {
       apiVersion: formRef.apiVersion,
       kind: formRef.kind,
@@ -261,18 +266,7 @@ describe("Takoserver current Takoform Host", () => {
       ],
       clock: () => new Date("2026-08-17T12:00:00.000Z"),
     });
-    const handler = createHttpHandler({
-      server: createTakoserver({
-        identity: {
-          async verify() {
-            return { providerSubject: "subject", email: "owner@example.com", displayName: "Owner" };
-          },
-        },
-        backends: [new PortableFakeBackend("fake", [])],
-      }),
-      publicOrigin: "https://api.takoserver.com",
-      takoformHost: host,
-    });
+    const handler = handlerFor(host);
     const resource = {
       apiVersion: formRef.apiVersion,
       kind: formRef.kind,
@@ -523,18 +517,7 @@ describe("Takoserver current Takoform Host", () => {
         },
       ],
     });
-    const handler = createHttpHandler({
-      server: createTakoserver({
-        identity: {
-          async verify() {
-            return { providerSubject: "subject", email: "owner@example.com", displayName: "Owner" };
-          },
-        },
-        backends: [new PortableFakeBackend("fake", [])],
-      }),
-      publicOrigin: "https://api.takoserver.com",
-      takoformHost: host,
-    });
+    const handler = handlerFor(host);
     const owner = { authorization: "Bearer tenant-a-owner" };
     const support = await jsonRequest(
       handler,
@@ -731,60 +714,55 @@ describe("Takoserver current Takoform Host", () => {
   });
 
   test("uses an organization resources:write API key as the provider bearer, never a one-shot grant", async () => {
-    const server = createTakoserver({
-      identity: {
-        async verify() {
-          return { providerSubject: "subject", email: "owner@example.com", displayName: "Owner" };
-        },
-      },
-      backends: [new PortableFakeBackend("fake", [])],
-    });
-    const session = await server.execute({
-      kind: "identity.exchange",
-      provider: "github",
-      assertion: "verified-assertion",
-    });
-    if (session.kind !== "identity.exchanged") throw new Error("session exchange failed");
-    const organization = await server.execute({
-      kind: "organization.create",
-      authorization: `Bearer ${session.sessionToken}`,
-      name: "Host organization",
-    });
-    if (organization.kind !== "organization.created") throw new Error("organization failed");
-    const apiKey = await server.execute({
-      kind: "api-key.create",
-      authorization: `Bearer ${session.sessionToken}`,
-      organizationId: organization.organization.id,
-      name: "Takoform provider",
-      scopes: ["resources:write"],
-      expiresInSeconds: 3_600,
-    });
-    if (apiKey.kind !== "api-key.created") throw new Error("API key failed");
     const formRef = {
       apiVersion: "edge.forms.takoform.com/v1alpha1",
       kind: "EdgeObjectBucket",
       definitionVersion: "1.0.0",
       schemaDigest: `sha256:${"4".repeat(64)}`,
     } as const;
-    const host = createTakoserverTakoformHost({
-      server,
-      driver: new InMemoryTakoformResourceDriver(),
-      forms: [
-        {
-          identity: { formRef },
-          desiredSchema: { type: "object", properties: {}, additionalProperties: false },
-          operations: ["create", "read", "delete", "import", "observe"],
-        },
-      ],
-    });
-    const handler = createHttpHandler({
-      server,
+    const form: InstalledTakoformForm = {
+      identity: { formRef },
+      desiredSchema: { type: "object", properties: {}, additionalProperties: false },
+      operations: ["create", "read", "delete", "import", "observe"],
+    };
+    // No Host is injected here: the app wires the lane to its own control
+    // plane, which is exactly the policy under test.
+    const handler = buildApp({
+      sql: createEphemeralSql(),
+      objects: createMemoryObjectStore(),
+      identity: OWNER_IDENTITY,
+      settlement: SETTLEMENT,
       publicOrigin: "https://api.takoserver.com",
-      takoformHost: host,
+      forms: [form],
+      driver: new InMemoryTakoformResourceDriver(),
+      offerings: [],
+    }).fetch;
+
+    const session = await jsonRequest(handler, "POST", "/v1/sessions", {
+      provider: "github",
+      assertion: "verified-assertion",
     });
+    const sessionToken = String(session.body.sessionToken);
+    const organization = await jsonRequest(
+      handler,
+      "POST",
+      "/v1/organizations",
+      { name: "Host organization" },
+      { authorization: `Bearer ${sessionToken}` },
+    );
+    const organizationId = String((organization.body.organization as { id: string }).id);
+    const created = await jsonRequest(
+      handler,
+      "POST",
+      `/v1/organizations/${organizationId}/api-keys`,
+      { name: "Takoform provider", scopes: ["resources:write"], expiresInSeconds: 3_600 },
+      { authorization: `Bearer ${sessionToken}` },
+    );
+    const apiKey = { secret: String(created.body.secret) };
+
     const query = `/apis/forms.takoform.com/v1alpha3/forms?space=provider-space&group=${encodeURIComponent(formRef.apiVersion)}&kind=${formRef.kind}&definitionVersion=${formRef.definitionVersion}&schemaDigest=${encodeURIComponent(formRef.schemaDigest)}`;
     const sessionRejected = await jsonRequest(handler, "GET", query, undefined, {
-      authorization: `Bearer ${session.sessionToken}`,
+      authorization: `Bearer ${sessionToken}`,
     });
     expect(sessionRejected.status).toBe(401);
     const providerAuthorized = await jsonRequest(handler, "GET", query, undefined, {

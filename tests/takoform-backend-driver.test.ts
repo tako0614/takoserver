@@ -1,14 +1,40 @@
 import { describe, expect, test } from "bun:test";
 import type { BackendOffering } from "../src/backends.ts";
+import { PortableFakeBackend } from "../src/backends.ts";
 import {
-  BackendTakoformResourceDriver,
-  createHttpHandler,
+  buildApp,
+  createEphemeralSql,
+  createMemoryObjectStore,
   createTakoformHost,
-  createTakoserver,
-  PortableFakeBackend,
+  InMemoryTakoformResourceDriver,
   TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM,
   TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_INSTALLED_FORM,
+  type TakoformHost,
 } from "../src/index.ts";
+import { BackendTakoformResourceDriver } from "../src/takoform-backend-driver.ts";
+
+/** Serves one Takoform Host through the real router. */
+function handlerFor(takoformHost: TakoformHost) {
+  return buildApp({
+    sql: createEphemeralSql(),
+    objects: createMemoryObjectStore(),
+    identity: {
+      async verify() {
+        return { providerSubject: "subject", email: "owner@example.com", displayName: "Owner" };
+      },
+    },
+    settlement: {
+      async verify() {
+        return { fundingRef: "settlement_1", amountMinor: 1_000, currency: "USD" };
+      },
+    },
+    publicOrigin: "https://api.takoserver.com",
+    forms: [],
+    driver: new InMemoryTakoformResourceDriver(),
+    offerings: [],
+    takoformHost,
+  }).fetch;
+}
 
 const offering: BackendOffering = {
   id: "storage.object.standard",
@@ -33,18 +59,7 @@ describe("Takoform backend lifecycle", () => {
       clock: () => new Date("2026-08-17T12:00:00.000Z"),
       randomId: () => `backend-lifecycle-${++randomSequence}`,
     });
-    const handler = createHttpHandler({
-      server: createTakoserver({
-        identity: {
-          async verify() {
-            return { providerSubject: "subject", email: "owner@example.com", displayName: "Owner" };
-          },
-        },
-        backends: [backend],
-      }),
-      publicOrigin: "https://api.takoserver.com",
-      takoformHost: host,
-    });
+    const handler = handlerFor(host);
     const base = "/apis/forms.takoform.com/v1beta1";
     const formRef = TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_INSTALLED_FORM.identity.formRef;
     const resource = {

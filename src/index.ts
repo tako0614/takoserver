@@ -1,17 +1,86 @@
-export * from "./ai-gateway.ts";
-export * from "./backends.ts";
-export * from "./cloudflare-backend.ts";
-export * from "./compat.ts";
-export * from "./contracts.ts";
-export * from "./http.ts";
-export * from "./object-storage.ts";
-export * from "./openapi.ts";
-export * from "./resource-runtime.ts";
-export * from "./runtime-grants.ts";
-export * from "./takoform/artifacts.ts";
-export * from "./takoform/memory-driver.ts";
-export * from "./takoform/types.ts";
-export * from "./takoform-backend-driver.ts";
-export * from "./takoform-composition.ts";
-export * from "./takoform-released-provider.ts";
-export * from "./takoserver.ts";
+/**
+ * The public surface for embedders and tests.
+ *
+ * This is a curated list, not a barrel over every file: internal residue and
+ * duplicate vocabulary are deliberately not re-exported, so what a consumer can
+ * reach is a decision rather than an accident.
+ */
+
+export { type App, type AppPorts, buildApp, type TickReport } from "./app.ts";
+export {
+  type Accounts,
+  type Actor,
+  API_KEY_SCOPES,
+  type ApiKey,
+  type ApiKeyScope,
+  AuthError,
+  createAccounts,
+  type ExternalIdentityVerifier,
+  type IdentityProvider,
+  type Organization,
+  type Principal,
+} from "./auth.ts";
+export { type Catalog, createCatalog, type Offering, type OfferingPrice } from "./catalog.ts";
+export {
+  createEphemeralSql,
+  createInMemoryTakoformHost,
+  createTakoformHost,
+} from "./compat.ts";
+export { ControlError, createControlRoutes } from "./control.ts";
+export { bytesDigest, canonicalDigest, canonicalJson } from "./json.ts";
+export {
+  createLedger,
+  type FundingSettlementVerifier,
+  type Ledger,
+  type LedgerEntry,
+  LedgerError,
+  type Wallet,
+} from "./ledger.ts";
+export { createMemoryObjectStore } from "./objects-mem.ts";
+export { createR2ObjectStore } from "./objects-r2.ts";
+export { openApiDocument, openApiPaths } from "./openapi.ts";
+export type {
+  Clock,
+  DataProtocol,
+  JsonObject,
+  JsonValue,
+  ObjectStore,
+  Sql,
+  SqlWrite,
+} from "./ports.ts";
+export {
+  createReseller,
+  type Quote,
+  type Reseller,
+  ResellerError,
+  type Reservation,
+  type UsageStatement,
+} from "./reseller.ts";
+export { createRouter, type Router } from "./router.ts";
+export { createD1Sql } from "./sql-d1.ts";
+export { createMemorySql, createSqliteSql } from "./sql-sqlite.ts";
+export { parseStrictJson, StrictJsonError } from "./strict-json.ts";
+export { createTakoformArtifacts } from "./takoform/artifacts.ts";
+export { InMemoryTakoformResourceDriver } from "./takoform/memory-driver.ts";
+export type {
+  InstalledTakoformForm,
+  TakoformDiagnostic,
+  TakoformDriverReceipt,
+  TakoformHost,
+  TakoformHostPrincipal,
+  TakoformResourceDriver,
+  TakoformStoredResource,
+  TakoformV1Alpha3FormRef,
+} from "./takoform/types.ts";
+export { TakoformHostError } from "./takoform/types.ts";
+export {
+  TAKOFORM_EDGE_OBJECTS_INTERFACE,
+  TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM,
+  TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_INSTALLED_FORM,
+} from "./takoform-released-provider.ts";
+export {
+  createTokenService,
+  type SigningKey,
+  TokenError,
+  type TokenService,
+} from "./token.ts";

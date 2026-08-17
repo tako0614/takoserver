@@ -52,7 +52,8 @@ const LAYERS: readonly Layer[] = [
   },
   {
     name: "domain",
-    match: /^src\/(?:token|auth|ledger|catalog)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$)/u,
+    match:
+      /^src\/(?:token|auth|ledger|catalog|reseller|metering)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$)/u,
     may: ["core", "domain"],
   },
   {

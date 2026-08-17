@@ -1,0 +1,106 @@
+import { createAccounts, type ExternalIdentityVerifier } from "./auth.ts";
+import { createCatalog, type Offering } from "./catalog.ts";
+import { createControlRoutes } from "./control.ts";
+import { createLedger, type FundingSettlementVerifier } from "./ledger.ts";
+import type { Clock, ObjectStore, Sql } from "./ports.ts";
+import { createReseller } from "./reseller.ts";
+import { createRouter, type Router } from "./router.ts";
+import { createTakoformHost } from "./takoform/host.ts";
+import type {
+  InstalledTakoformForm,
+  TakoformHost,
+  TakoformResourceDriver,
+} from "./takoform/types.ts";
+import { createTokenService, type SigningKey } from "./token.ts";
+
+/**
+ * The composition root.
+ *
+ * This is the only module that knows which concrete pieces the product is made
+ * of. Everything below it receives ports; everything above it is an entry that
+ * supplies storage and calls `fetch`. Keeping assembly in one place is what
+ * lets the same code serve a Cloudflare Worker and a self-hosted server without
+ * either of them leaking into the other.
+ */
+
+export interface AppPorts {
+  readonly sql: Sql;
+  readonly objects: ObjectStore;
+  readonly identity: ExternalIdentityVerifier;
+  readonly settlement: FundingSettlementVerifier;
+  readonly publicOrigin: string;
+  readonly forms: readonly InstalledTakoformForm[];
+  readonly driver: TakoformResourceDriver;
+  readonly offerings: readonly Offering[];
+  readonly signingKey?: SigningKey;
+  /**
+   * Replaces the Takoform Host entirely. Used by conformance tests that need to
+   * drive the lane with their own authentication; production never sets it.
+   */
+  readonly takoformHost?: TakoformHost;
+  readonly clock?: Clock;
+  readonly randomId?: () => string;
+}
+
+export interface App {
+  readonly fetch: Router;
+  /** One pass of background settlement. Safe to call concurrently. */
+  tick(): Promise<TickReport>;
+}
+
+export interface TickReport {
+  readonly expiredReservations: number;
+}
+
+export function buildApp(ports: AppPorts): App {
+  const clock = ports.clock ?? (() => new Date());
+  const randomId = ports.randomId ?? (() => crypto.randomUUID().replaceAll("-", ""));
+
+  const accounts = createAccounts({ sql: ports.sql, identity: ports.identity, clock, randomId });
+  const ledger = createLedger(ports.sql, clock);
+  const catalog = createCatalog(ports.offerings);
+  const reseller = createReseller({ sql: ports.sql, ledger, catalog, clock, randomId });
+  const tokens = createTokenService({
+    sql: ports.sql,
+    issuer: ports.publicOrigin,
+    clock,
+    ...(ports.signingKey ? { signingKey: ports.signingKey } : {}),
+  });
+
+  const takoformHost =
+    ports.takoformHost ??
+    createTakoformHost({
+      sql: ports.sql,
+      objects: ports.objects,
+      // The Takoform lane is entered with an organization API key carrying
+      // `resources:write`. A single-use provisioning token is deliberately not
+      // accepted here: it authorizes one resource, not a whole lane.
+      authenticate: async (authorization) => {
+        const actor = await accounts.authorize(authorization, "resources:write");
+        return actor?.organizationId
+          ? { tenantId: actor.organizationId, principalId: actor.principalId }
+          : null;
+      },
+      forms: ports.forms,
+      driver: ports.driver,
+      clock,
+      randomId,
+    });
+
+  const control = createControlRoutes({
+    accounts,
+    ledger,
+    catalog,
+    reseller,
+    tokens,
+    settlement: ports.settlement,
+    clock,
+  });
+
+  return {
+    fetch: createRouter({ control, takoformHost, publicOrigin: ports.publicOrigin }),
+    async tick(): Promise<TickReport> {
+      return { expiredReservations: await reseller.expireDue(64) };
+    },
+  };
+}

@@ -43,6 +43,19 @@ export interface Wallet {
   readonly entries: readonly LedgerEntry[];
 }
 
+/**
+ * Turns an opaque payment proof into an amount. The caller never states how
+ * much it paid — only the verifier does, so a customer cannot credit itself by
+ * asking nicely.
+ */
+export interface FundingSettlementVerifier {
+  verify(input: { readonly organizationId: string; readonly settlementProof: string }): Promise<{
+    readonly fundingRef: string;
+    readonly amountMinor: number;
+    readonly currency: "USD";
+  }>;
+}
+
 export type LedgerErrorCode = "insufficient_funds" | "conservation_violated" | "invalid_amount";
 
 export class LedgerError extends Error {

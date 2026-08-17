@@ -1,163 +1,170 @@
 import { describe, expect, test } from "bun:test";
 import {
-  createHttpHandler,
-  createInMemoryTakoformHost,
-  createTakoserver,
+  buildApp,
+  createEphemeralSql,
+  createMemoryObjectStore,
   type ExternalIdentityVerifier,
+  type FundingSettlementVerifier,
+  InMemoryTakoformResourceDriver,
   openApiDocument,
-  PortableFakeBackend,
+  openApiPaths,
 } from "../src/index.ts";
 
-const currentTakoformPaths = [
-  "/apis/forms.takoform.com/v1alpha3/forms",
-  "/apis/forms.takoform.com/v1alpha3/form-definitions/{formGroup}/{formVersion}/{kind}",
-  "/apis/forms.takoform.com/v1alpha3/resources/validate",
-  "/apis/forms.takoform.com/v1alpha3/resources/prepare",
-  "/apis/forms.takoform.com/v1alpha3/resources/{formGroup}/{formVersion}/{kind}/{name}",
-  "/apis/forms.takoform.com/v1alpha3/resources/{formGroup}/{formVersion}/{kind}/{name}/import",
-  "/apis/forms.takoform.com/v1alpha3/resources/{formGroup}/{formVersion}/{kind}/{name}/observe",
-  "/apis/forms.takoform.com/v1alpha3/operations/{operationId}",
-  "/apis/forms.takoform.com/v1alpha3/operations/{operationId}/cancel",
-  "/apis/forms.takoform.com/v1alpha3/artifacts/uploads",
-  "/apis/forms.takoform.com/v1alpha3/artifacts/uploads/{uploadId}/blobs/{sha256}",
-  "/apis/forms.takoform.com/v1alpha3/artifacts/uploads/{uploadId}/commit",
-  "/apis/forms.takoform.com/v1alpha3/artifacts/uploads/{uploadId}",
-  "/apis/forms.takoform.com/v1alpha3/artifacts/{manifestDigest}",
-  "/apis/forms.takoform.com/v1alpha3/artifacts/blobs/{sha256}",
-  "/apis/forms.takoform.com/v1alpha3/support/forms",
-  "/apis/forms.takoform.com/v1alpha3/support/forms/{formGroup}/{formVersion}/{kind}/{definitionVersion}",
-  "/apis/forms.takoform.com/v1alpha3/support/interfaces/{name}/{version}",
-  "/apis/forms.takoform.com/v1alpha3/support/bindings/{name}/{version}",
-] as const;
+const identity: ExternalIdentityVerifier = {
+  async verify() {
+    return { providerSubject: "subject", email: "owner@example.com", displayName: "Owner" };
+  },
+};
 
-const expectedPaths = [
+const settlement: FundingSettlementVerifier = {
+  async verify() {
+    return { fundingRef: "settlement_1", amountMinor: 1_000, currency: "USD" };
+  },
+};
+
+function handler() {
+  return buildApp({
+    sql: createEphemeralSql(),
+    objects: createMemoryObjectStore(),
+    identity,
+    settlement,
+    publicOrigin: "https://api.takoserver.com",
+    forms: [],
+    driver: new InMemoryTakoformResourceDriver(),
+    offerings: [],
+  }).fetch;
+}
+
+/** Both Takoform lanes are mirrored, so the document must mirror them too. */
+const TAKOFORM_SUFFIXES = [
+  "/forms",
+  "/form-definitions/{group}/{version}/{kind}",
+  "/support/forms",
+  "/support/forms/{group}/{version}/{kind}/{definitionVersion}",
+  "/support/interfaces/{name}/{version}",
+  "/support/bindings/{name}/{version}",
+  "/resources/validate",
+  "/resources/prepare",
+  "/resources/{group}/{version}/{kind}/{name}",
+  "/resources/{group}/{version}/{kind}/{name}/observe",
+  "/resources/{group}/{version}/{kind}/{name}/import",
+  "/operations/{operationId}",
+  "/operations/{operationId}/cancel",
+  "/artifacts/uploads",
+  "/artifacts/uploads/{uploadId}",
+  "/artifacts/uploads/{uploadId}/commit",
+  "/artifacts/uploads/{uploadId}/blobs/{digest}",
+  "/artifacts/{digest}",
+  "/artifacts/blobs/{digest}",
+];
+
+const PUBLIC_PATHS = [
   "/",
-  "/.well-known/takoserver",
-  "/.well-known/takoform/v1beta1",
   "/.well-known/takoform/v1alpha3",
+  "/.well-known/takoform/v1beta1",
+  "/.well-known/takoserver",
   "/openapi.json",
+  "/v1/catalog",
   "/v1/identity/providers",
-  "/v1/sessions",
   "/v1/organizations",
   "/v1/organizations/{organizationId}/api-keys",
   "/v1/organizations/{organizationId}/api-keys/{apiKeyId}",
   "/v1/organizations/{organizationId}/wallet",
   "/v1/organizations/{organizationId}/wallet/funding",
-  "/v1/catalog",
-  "/v1/resources",
-  "/v1/storage/object",
-  "/v1/storage/objects",
-  "/v1/ai/models",
-  "/v1/ai/chat/completions",
   "/v1/reseller/quotes",
   "/v1/reseller/reservations",
-  "/v1/reseller/reservations/{reservationId}/grants",
   "/v1/reseller/reservations/{reservationId}/capture",
+  "/v1/reseller/reservations/{reservationId}/provision-tokens",
   "/v1/reseller/reservations/{reservationId}/release",
   "/v1/reseller/reservations/{reservationId}/usage-statement",
-  ...currentTakoformPaths,
-  ...currentTakoformPaths.map((path) => path.replaceAll("v1alpha3", "v1beta1")),
-] as const;
+  "/v1/sessions",
+];
 
-describe("Takoserver public HTTP contract", () => {
-  test("allows only HTTPS or a loopback HTTP origin", () => {
-    const server = createTakoserver({
-      identity: {
-        async verify() {
-          return { providerSubject: "subject", email: "owner@example.com", displayName: "Owner" };
-        },
-      },
-      backends: [new PortableFakeBackend("fake", [])],
-    });
-    expect(() =>
-      createHttpHandler({ server, publicOrigin: "http://127.0.0.1:18473" }),
-    ).not.toThrow();
-    expect(() =>
-      createHttpHandler({ server, publicOrigin: "http://localhost:18473" }),
-    ).not.toThrow();
-    expect(() => createHttpHandler({ server, publicOrigin: "http://api.takoserver.com" })).toThrow(
-      "publicOrigin must be HTTPS unless it is loopback",
+describe("published API description", () => {
+  test("declares exactly the surface that exists, with both lanes mirrored", () => {
+    const expected = [
+      ...PUBLIC_PATHS,
+      ...["v1beta1", "v1alpha3"].flatMap((lane) =>
+        TAKOFORM_SUFFIXES.map((suffix) => `/apis/forms.takoform.com/${lane}${suffix}`),
+      ),
+    ].sort();
+    expect(openApiPaths()).toEqual(expected);
+    // The mirror is generated, so the two lanes cannot drift apart.
+    expect(TAKOFORM_SUFFIXES.length * 2 + PUBLIC_PATHS.length).toBe(openApiPaths().length);
+  });
+
+  test("names one server and one bearer scheme", () => {
+    expect(openApiDocument.openapi).toBe("3.1.0");
+    expect(openApiDocument.servers).toEqual([{ url: "https://api.takoserver.com" }]);
+    expect(openApiDocument.components.securitySchemes.bearerAuth.scheme).toBe("bearer");
+  });
+
+  test("mentions no other product and leaks no upstream identity vocabulary", () => {
+    const serialized = JSON.stringify(openApiDocument);
+    expect(serialized).not.toMatch(/takosumi/i);
+    // The reseller lane speaks only in opaque tenant references.
+    expect(serialized).not.toMatch(/workspace|userId|principalId/);
+  });
+
+  test("serves the document it describes", async () => {
+    const fetch = handler();
+    const response = await fetch(new Request("https://api.takoserver.com/openapi.json"));
+    expect(response.status).toBe(200);
+    expect((await response.json()) as unknown).toEqual(
+      JSON.parse(JSON.stringify(openApiDocument)) as unknown,
     );
   });
 
-  test("publishes direct-product console, discovery, and a complete OpenAPI route inventory", async () => {
-    const identity: ExternalIdentityVerifier = {
-      async verify() {
-        return { providerSubject: "subject", email: "owner@example.com", displayName: "Owner" };
-      },
-    };
-    const handler = createHttpHandler({
-      server: createTakoserver({
+  test("answers discovery and the console without a credential", async () => {
+    const fetch = handler();
+    for (const path of [
+      "/",
+      "/openapi.json",
+      "/.well-known/takoserver",
+      "/v1/identity/providers",
+    ]) {
+      expect((await fetch(new Request(`https://api.takoserver.com${path}`))).status).toBe(200);
+    }
+  });
+
+  test("refuses an unknown path rather than guessing", async () => {
+    const fetch = handler();
+    const response = await fetch(new Request("https://api.takoserver.com/v1/nope"));
+    expect(response.status).toBe(404);
+    expect(await response.json()).toMatchObject({ error: { code: "not_found" } });
+  });
+
+  test("refuses a public origin that is not a bare HTTPS origin", () => {
+    for (const publicOrigin of [
+      "http://api.takoserver.com",
+      "https://api.takoserver.com/base",
+      "https://user:pw@api.takoserver.com",
+    ]) {
+      expect(() =>
+        buildApp({
+          sql: createEphemeralSql(),
+          objects: createMemoryObjectStore(),
+          identity,
+          settlement,
+          publicOrigin,
+          forms: [],
+          driver: new InMemoryTakoformResourceDriver(),
+          offerings: [],
+        }),
+      ).toThrow();
+    }
+    // Loopback stays usable so a self-hosted server needs no certificate.
+    expect(() =>
+      buildApp({
+        sql: createEphemeralSql(),
+        objects: createMemoryObjectStore(),
         identity,
-        backends: [new PortableFakeBackend("fake", [])],
-      }),
-      publicOrigin: "https://api.takoserver.com",
-      takoformHost: createInMemoryTakoformHost({
-        authenticate: async () => null,
+        settlement,
+        publicOrigin: "http://localhost:8787",
         forms: [],
+        driver: new InMemoryTakoformResourceDriver(),
+        offerings: [],
       }),
-    });
-
-    const consoleResponse = await handler(new Request("https://api.takoserver.com/"));
-    expect(consoleResponse.status).toBe(200);
-    expect(consoleResponse.headers.get("content-type")).toContain("text/html");
-    const consoleHtml = await consoleResponse.text();
-    expect(consoleHtml).toContain("Takoserver");
-    expect(consoleHtml).toContain("Google");
-    expect(consoleHtml).toContain("GitHub");
-
-    const takoform = await handler(
-      new Request("https://api.takoserver.com/.well-known/takoform/v1alpha3"),
-    );
-    expect(await takoform.json()).toEqual({
-      api_versions: ["forms.takoform.com/v1alpha3"],
-      features: {
-        service_forms: true,
-        exact_form_ref: true,
-        optimistic_concurrency: true,
-        idempotent_lifecycle: true,
-        operations: true,
-        artifact_upload: true,
-        support_profiles: true,
-      },
-      endpoints: {
-        api: "https://api.takoserver.com/apis/forms.takoform.com/v1alpha3",
-        artifacts: "https://api.takoserver.com/apis/forms.takoform.com/v1alpha3/artifacts",
-        operations: "https://api.takoserver.com/apis/forms.takoform.com/v1alpha3/operations",
-        support: "https://api.takoserver.com/apis/forms.takoform.com/v1alpha3/support",
-      },
-    });
-
-    const releasedProviderTakoform = await handler(
-      new Request("https://api.takoserver.com/.well-known/takoform/v1beta1"),
-    );
-    expect(await releasedProviderTakoform.json()).toEqual({
-      api_versions: ["forms.takoform.com/v1beta1"],
-      features: {
-        service_forms: true,
-        exact_form_ref: true,
-        optimistic_concurrency: true,
-        idempotent_lifecycle: true,
-        operations: true,
-        artifact_upload: true,
-        support_profiles: true,
-      },
-      endpoints: {
-        api: "https://api.takoserver.com/apis/forms.takoform.com/v1beta1",
-        artifacts: "https://api.takoserver.com/apis/forms.takoform.com/v1beta1/artifacts",
-        operations: "https://api.takoserver.com/apis/forms.takoform.com/v1beta1/operations",
-        support: "https://api.takoserver.com/apis/forms.takoform.com/v1beta1/support",
-      },
-    });
-
-    expect(Object.keys(openApiDocument.paths).sort()).toEqual([...expectedPaths].sort());
-    expect(openApiDocument.servers).toEqual([{ url: "https://api.takoserver.com" }]);
-    expect(JSON.stringify(openApiDocument)).not.toMatch(/takosumi/i);
-    const resellerSchemas = Object.fromEntries(
-      Object.entries(openApiDocument.components.schemas).filter(([name]) =>
-        name.startsWith("Reseller"),
-      ),
-    );
-    expect(JSON.stringify(resellerSchemas)).not.toMatch(/workspace|userId|principalId/i);
+    ).not.toThrow();
   });
 });

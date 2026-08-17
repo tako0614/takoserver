@@ -1,15 +1,13 @@
 import { describe, expect, test } from "bun:test";
+import { BackendError, PortableFakeBackend } from "../src/backends.ts";
+import { CloudflareBackendAdapter } from "../src/cloudflare-backend.ts";
+import { createResourceRuntime, RuntimeExecutionError } from "../src/resource-runtime.ts";
 import {
-  BackendError,
-  CloudflareBackendAdapter,
   createExecutionGrantSigner,
-  createResourceRuntime,
   createRuntimeGrantVerifier,
   executionIntentDigest,
   InMemoryGrantReplayStore,
-  PortableFakeBackend,
-  RuntimeExecutionError,
-} from "../src/index.ts";
+} from "../src/runtime-grants.ts";
 import { TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM } from "../src/takoform-released-provider.ts";
 
 const objectBucketOffering = {

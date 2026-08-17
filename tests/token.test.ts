@@ -59,7 +59,7 @@ describe("data tokens", () => {
   test("verify repeatedly within their window without touching durable state", async () => {
     const tokens = service(await provisionKey("sign-2026-08"));
     const { token, expiresAt } = await tokens.issueDataToken({
-      orgId: "org_alpha",
+      organizationId: "org_alpha",
       resourceUid: "res_alpha",
       protocols: ["s3"],
       ttlSeconds: 300,
@@ -72,7 +72,7 @@ describe("data tokens", () => {
         resourceUid: "res_alpha",
         protocol: "s3",
       });
-      expect(claims.orgId).toBe("org_alpha");
+      expect(claims.organizationId).toBe("org_alpha");
       expect(claims.tenantRef).toBeNull();
     }
     expect(await sql.query("SELECT COUNT(*) AS total FROM runtime_grant_replays")).toEqual([
@@ -88,7 +88,7 @@ describe("data tokens", () => {
   test("refuses a different resource, an unlisted protocol, or a tampered body", async () => {
     const tokens = service(await provisionKey("sign-2026-08"));
     const { token } = await tokens.issueDataToken({
-      orgId: "org_alpha",
+      organizationId: "org_alpha",
       tenantRef: "tenant_x",
       resourceUid: "res_alpha",
       protocols: ["s3"],
@@ -115,7 +115,7 @@ describe("data tokens", () => {
     const key = await provisionKey("sign-2026-08");
     const tokens = service(key);
     const { token } = await tokens.issueDataToken({
-      orgId: "org_alpha",
+      organizationId: "org_alpha",
       resourceUid: "res_alpha",
       protocols: ["s3", "openai"],
       ttlSeconds: 600,
@@ -139,7 +139,7 @@ describe("data tokens", () => {
   test("keeps a revoked key alive only for the declared cache window", async () => {
     const tokens = service(await provisionKey("sign-2026-08"), 10);
     const { token } = await tokens.issueDataToken({
-      orgId: "org_alpha",
+      organizationId: "org_alpha",
       resourceUid: "res_alpha",
       protocols: ["s3"],
       ttlSeconds: 600,
@@ -166,7 +166,7 @@ describe("provision tokens", () => {
   test("redeem exactly once", async () => {
     const tokens = service(await provisionKey("sign-2026-08"));
     const { token } = await tokens.issueProvisionToken({
-      orgId: "org_alpha",
+      organizationId: "org_alpha",
       tenantRef: "tenant_x",
       reservationId: "rsv_1",
       offeringId: "storage.object.standard",
@@ -186,7 +186,7 @@ describe("provision tokens", () => {
   test("cannot be presented as a data token, and vice versa", async () => {
     const tokens = service(await provisionKey("sign-2026-08"));
     const provision = await tokens.issueProvisionToken({
-      orgId: "org_alpha",
+      organizationId: "org_alpha",
       tenantRef: "tenant_x",
       reservationId: "rsv_1",
       offeringId: "storage.object.standard",
@@ -194,7 +194,7 @@ describe("provision tokens", () => {
       ttlSeconds: 120,
     });
     const data = await tokens.issueDataToken({
-      orgId: "org_alpha",
+      organizationId: "org_alpha",
       resourceUid: "res_alpha",
       protocols: ["s3"],
       ttlSeconds: 120,
@@ -214,7 +214,7 @@ describe("provision tokens", () => {
     const tokens = service(await provisionKey("sign-2026-08"));
     await expect(
       tokens.issueProvisionToken({
-        orgId: "org_alpha",
+        organizationId: "org_alpha",
         tenantRef: "tenant_x",
         reservationId: "rsv_1",
         offeringId: "storage.object.standard",
@@ -228,7 +228,7 @@ describe("provision tokens", () => {
     const tokens = service();
     await expect(
       tokens.issueDataToken({
-        orgId: "org_alpha",
+        organizationId: "org_alpha",
         resourceUid: "res_alpha",
         protocols: ["s3"],
         ttlSeconds: 60,

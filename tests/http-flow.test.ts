@@ -1,298 +1,339 @@
 import { describe, expect, test } from "bun:test";
 import {
-  createExecutionGrantSigner,
-  createHttpHandler,
-  createResourceRuntime,
-  createRuntimeGrantVerifier,
-  createTakoserver,
+  buildApp,
+  createEphemeralSql,
+  createMemoryObjectStore,
   type ExternalIdentityVerifier,
-  InMemoryGrantReplayStore,
-  PortableFakeBackend,
-  TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM,
+  type FundingSettlementVerifier,
+  InMemoryTakoformResourceDriver,
+  type Offering,
 } from "../src/index.ts";
 
-const offering = {
+/**
+ * The prepaid vertical, driven end to end over HTTP exactly as a customer
+ * would: sign in, create an organization, mint a key, fund the wallet, price an
+ * offering, reserve it, hand a runtime a single-use token, then capture.
+ */
+
+const OFFERING: Offering = {
   id: "storage.object.standard",
+  providerId: "cloudflare",
   kind: "object_bucket",
-  displayName: "Standard object storage",
-  form: TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM,
-  price: { currency: "USD" as const, unit: "resource_month", unitPriceMinor: 300 },
-  allowances: [
-    {
-      protocol: "s3" as const,
-      mode: "direct" as const,
-      authority: "resource_scoped_grant" as const,
-    },
-  ],
+  displayName: "Object bucket",
+  form: {
+    apiVersion: "edge.forms.takoform.com/v1beta1",
+    kind: "ObjectBucket",
+    definitionVersion: "0.1.0",
+    schemaDigest: `sha256:${"a".repeat(64)}`,
+  },
+  price: { currency: "USD", unit: "bucket-month", unitPriceMinor: 500 },
+  protocols: ["s3"],
+  available: true,
 };
 
-describe("Takoserver public vertical slice", () => {
-  test("runs direct identity through prepaid resource usage without another product identity", async () => {
-    const now = Date.parse("2026-08-17T12:00:00.000Z");
-    const keys = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
-    const backend = new PortableFakeBackend("portable", [offering]);
-    const identity: ExternalIdentityVerifier = {
-      async verify(input) {
-        if (input.provider !== "github" || input.assertion !== "verified-github-assertion") {
-          throw new Error("provider rejected assertion");
-        }
-        return { providerSubject: "github-42", email: "owner@example.com", displayName: "Owner" };
-      },
-    };
-    const server = createTakoserver({
-      identity,
-      backends: [backend],
-      grantSigner: createExecutionGrantSigner({
-        issuer: "https://api.takoserver.com",
-        keyId: "http-flow-key",
-        privateKey: keys.privateKey,
-      }),
-      fundingSettlement: {
-        async verify({ settlementProof }) {
-          if (settlementProof !== "proof_http_payment") throw new Error("invalid proof");
-          return {
-            fundingRef: "settled_http_payment",
-            amountMinor: 1_000,
-            currency: "USD" as const,
-          };
-        },
-      },
-      clock: () => new Date(now),
-    });
-    const runtime = createResourceRuntime({
-      backends: [backend],
-      committer: { commit: (input) => server.commitProvisioning(input) },
-      verifier: createRuntimeGrantVerifier({
-        issuer: "https://api.takoserver.com",
-        audience: "takoserver.runtime.v1",
-        publicKeys: new Map([["http-flow-key", keys.publicKey]]),
-        replayStore: new InMemoryGrantReplayStore(),
-        clock: () => new Date(now + 1_000),
-      }),
-      clock: () => new Date(now + 1_000),
-    });
-    const handler = createHttpHandler({
-      server,
-      runtime,
-      publicOrigin: "https://api.takoserver.com",
-    });
+const identity: ExternalIdentityVerifier = {
+  async verify() {
+    return { providerSubject: "subject", email: "owner@example.com", displayName: "Owner" };
+  },
+};
 
-    const session = await json(handler, "POST", "/v1/sessions", {
-      provider: "github",
-      assertion: "verified-github-assertion",
-    });
-    expect(session.status).toBe(200);
-    const sessionToken = requiredString(session.body, "sessionToken");
+const settlement: FundingSettlementVerifier = {
+  async verify({ settlementProof }) {
+    return { fundingRef: `settled_${settlementProof}`, amountMinor: 10_000, currency: "USD" };
+  },
+};
 
-    const organization = await json(
-      handler,
-      "POST",
-      "/v1/organizations",
-      { name: "Direct Reseller" },
-      {
-        authorization: `Bearer ${sessionToken}`,
-      },
-    );
-    expect(organization.status).toBe(201);
-    const organizationId = requiredString(requiredRecord(organization.body, "organization"), "id");
-
-    const key = await json(
-      handler,
-      "POST",
-      `/v1/organizations/${organizationId}/api-keys`,
-      {
-        name: "automation",
-        scopes: ["catalog:read", "wallet:read", "reseller:write", "usage:read"],
-        expiresInSeconds: 3_600,
-      },
-      { authorization: `Bearer ${sessionToken}` },
-    );
-    expect(key.status).toBe(201);
-    const apiKey = requiredString(key.body, "secret");
-    const apiHeaders = { authorization: `Bearer ${apiKey}` };
-
-    expect(
-      (
-        await json(
-          handler,
-          "POST",
-          `/v1/organizations/${organizationId}/wallet/funding`,
-          { settlementProof: "proof_http_payment" },
-          {
-            authorization: `Bearer ${sessionToken}`,
-            "idempotency-key": "http-funding-001",
-          },
-        )
-      ).status,
-    ).toBe(200);
-
-    const catalog = await json(
-      handler,
-      "GET",
-      `/v1/catalog?organizationId=${organizationId}`,
-      undefined,
-      apiHeaders,
-    );
-    expect(catalog.status).toBe(200);
-    expect(catalog.body).toMatchObject({ offerings: [{ id: offering.id, backendId: "portable" }] });
-
-    const quote = await json(
-      handler,
-      "POST",
-      "/v1/reseller/quotes",
-      { organizationId, tenantRef: "opaque_customer_77", offeringId: offering.id, quantity: 1 },
-      { ...apiHeaders, "idempotency-key": "http-quote-00001" },
-    );
-    const quoteId = requiredString(requiredRecord(quote.body, "quote"), "id");
-    const reservation = await json(
-      handler,
-      "POST",
-      "/v1/reseller/reservations",
-      { organizationId, tenantRef: "opaque_customer_77", quoteId },
-      { ...apiHeaders, "idempotency-key": "http-reserve-001" },
-    );
-    const reservationId = requiredString(requiredRecord(reservation.body, "reservation"), "id");
-    const grant = await json(
-      handler,
-      "POST",
-      `/v1/reseller/reservations/${reservationId}/grants`,
-      {
-        organizationId,
-        tenantRef: "opaque_customer_77",
-        operation: "resource.provision",
-        intent: {
-          name: "customer-media",
-          space: "customer-space",
-          spec: { location: "auto" },
-        },
-        expiresInSeconds: 120,
-      },
-      { ...apiHeaders, "idempotency-key": "http-grant-00001" },
-    );
-    const grantToken = requiredString(requiredRecord(grant.body, "grant"), "token");
-
-    const substitutedResource = await json(
-      handler,
-      "POST",
-      "/v1/resources",
-      { name: "other-media", space: "customer-space", spec: { location: "auto" } },
-      { authorization: `Bearer ${grantToken}`, "idempotency-key": "http-runtime-substitution" },
-    );
-    expect(substitutedResource.status).toBe(401);
-    expect(substitutedResource.body).toEqual({
-      error: { code: "wrong_intent", message: "execution grant rejected" },
-    });
-
-    const resource = await json(
-      handler,
-      "POST",
-      "/v1/resources",
-      { name: "customer-media", space: "customer-space", spec: { location: "auto" } },
-      { authorization: `Bearer ${grantToken}`, "idempotency-key": "http-runtime-001" },
-    );
-    expect(resource.status).toBe(201);
-    expect(resource.body).toMatchObject({
-      resource: { tenantRef: "opaque_customer_77", backendId: "portable", state: "ready" },
-    });
-    const resourceRef = requiredString(requiredRecord(resource.body, "resource"), "id");
-    const replayedResource = await json(
-      handler,
-      "POST",
-      "/v1/resources",
-      { name: "customer-media", space: "customer-space", spec: { location: "auto" } },
-      { authorization: `Bearer ${grantToken}`, "idempotency-key": "http-runtime-001" },
-    );
-    expect(replayedResource.status).toBe(201);
-    expect(requiredRecord(replayedResource.body, "resource").id).toBe(resourceRef);
-
-    const dataGrant = await json(
-      handler,
-      "POST",
-      `/v1/reseller/reservations/${reservationId}/grants`,
-      {
-        organizationId,
-        tenantRef: "opaque_customer_77",
-        operation: "s3.access",
-        intent: {
-          operation: "get",
-          tenantRef: "opaque_customer_77",
-          resourceRef,
-          key: "welcome.txt",
-        },
-        expiresInSeconds: 120,
-      },
-      { ...apiHeaders, "idempotency-key": "http-data-grant-0001" },
-    );
-    expect(dataGrant.status).toBe(201);
-    expect(dataGrant.body).toMatchObject({ grant: { operation: "s3.access" } });
-    const disallowedDataGrant = await json(
-      handler,
-      "POST",
-      `/v1/reseller/reservations/${reservationId}/grants`,
-      {
-        organizationId,
-        tenantRef: "opaque_customer_77",
-        operation: "ai.invoke",
-        intent: {
-          operation: "models.list",
-          tenantRef: "opaque_customer_77",
-          resourceRef,
-        },
-        expiresInSeconds: 120,
-      },
-      { ...apiHeaders, "idempotency-key": "http-disallowed-data-grant" },
-    );
-    expect(disallowedDataGrant.status).toBe(400);
-    expect(disallowedDataGrant.body).toEqual({
-      error: {
-        code: "invalid_argument",
-        message: "operation is not allowed by the provisioned resource",
-      },
-    });
-
-    const statement = await json(
-      handler,
-      "GET",
-      `/v1/reseller/reservations/${reservationId}/usage-statement?organizationId=${organizationId}&tenantRef=opaque_customer_77`,
-      undefined,
-      apiHeaders,
-    );
-    expect(statement.status).toBe(200);
-    expect(statement.body).toMatchObject({
-      statement: { tenantRef: "opaque_customer_77", amountMinor: 300 },
-    });
+function newApp() {
+  return buildApp({
+    sql: createEphemeralSql(),
+    objects: createMemoryObjectStore(),
+    identity,
+    settlement,
+    publicOrigin: "https://api.takoserver.com",
+    forms: [],
+    driver: new InMemoryTakoformResourceDriver(),
+    offerings: [OFFERING],
   });
-});
+}
 
-async function json(
-  handler: (request: Request) => Promise<Response>,
+async function call(
+  fetch: (request: Request) => Promise<Response>,
   method: string,
   path: string,
   body?: unknown,
-  headers: Readonly<Record<string, string>> = {},
-): Promise<{ readonly status: number; readonly body: Record<string, unknown> }> {
-  const response = await handler(
+  headers: Record<string, string> = {},
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const response = await fetch(
     new Request(`https://api.takoserver.com${path}`, {
       method,
-      headers: {
-        ...headers,
-        ...(body === undefined ? {} : { "content-type": "application/json" }),
-      },
+      headers: body === undefined ? headers : { ...headers, "content-type": "application/json" },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     }),
   );
-  return { status: response.status, body: (await response.json()) as Record<string, unknown> };
+  const text = await response.text();
+  return {
+    status: response.status,
+    body: text ? (JSON.parse(text) as Record<string, unknown>) : {},
+  };
 }
 
-function requiredRecord(value: Record<string, unknown>, key: string): Record<string, unknown> {
-  const found = value[key];
-  if (typeof found !== "object" || found === null || Array.isArray(found))
-    throw new Error(`missing ${key}`);
-  return found as Record<string, unknown>;
+async function fundedOrganization(fetch: (request: Request) => Promise<Response>) {
+  const session = await call(fetch, "POST", "/v1/sessions", {
+    provider: "google",
+    assertion: "verified",
+  });
+  const sessionToken = String(session.body.sessionToken);
+  const owner = { authorization: `Bearer ${sessionToken}` };
+
+  const organization = await call(fetch, "POST", "/v1/organizations", { name: "Acme" }, owner);
+  const organizationId = String((organization.body.organization as { id: string }).id);
+
+  const key = await call(
+    fetch,
+    "POST",
+    `/v1/organizations/${organizationId}/api-keys`,
+    {
+      name: "reseller",
+      scopes: ["reseller:write", "catalog:read", "wallet:read"],
+      expiresInSeconds: 3_600,
+    },
+    owner,
+  );
+  const secret = String(key.body.secret);
+
+  await call(
+    fetch,
+    "POST",
+    `/v1/organizations/${organizationId}/wallet/funding`,
+    { settlementProof: "proof-1" },
+    owner,
+  );
+  return { organizationId, owner, keyHeaders: { authorization: `Bearer ${secret}` } };
 }
 
-function requiredString(value: Record<string, unknown>, key: string): string {
-  const found = value[key];
-  if (typeof found !== "string") throw new Error(`missing ${key}`);
-  return found;
-}
+describe("prepaid vertical over HTTP", () => {
+  test("carries one reservation from quote to captured statement", async () => {
+    const { fetch } = newApp();
+    const { organizationId, owner, keyHeaders } = await fundedOrganization(fetch);
+
+    const wallet = await call(
+      fetch,
+      "GET",
+      `/v1/organizations/${organizationId}/wallet`,
+      undefined,
+      owner,
+    );
+    expect(wallet.body.wallet).toMatchObject({ settledMinor: 10_000, availableMinor: 10_000 });
+
+    const catalog = await call(
+      fetch,
+      "GET",
+      `/v1/catalog?organizationId=${organizationId}`,
+      undefined,
+      keyHeaders,
+    );
+    expect(catalog.status).toBe(200);
+    expect((catalog.body.offerings as unknown[]).length).toBe(1);
+
+    const quote = await call(
+      fetch,
+      "POST",
+      "/v1/reseller/quotes",
+      { tenantRef: "tenant_x", offeringId: OFFERING.id, quantity: 2 },
+      keyHeaders,
+    );
+    expect(quote.status).toBe(201);
+    expect(quote.body.quote).toMatchObject({ amountMinor: 1_000 });
+
+    const reservation = await call(
+      fetch,
+      "POST",
+      "/v1/reseller/reservations",
+      { tenantRef: "tenant_x", quoteId: String((quote.body.quote as { id: string }).id) },
+      keyHeaders,
+    );
+    expect(reservation.status).toBe(201);
+    const reservationId = String((reservation.body.reservation as { id: string }).id);
+
+    const held = await call(
+      fetch,
+      "GET",
+      `/v1/organizations/${organizationId}/wallet`,
+      undefined,
+      owner,
+    );
+    expect(held.body.wallet).toMatchObject({ heldMinor: 1_000, availableMinor: 9_000 });
+
+    const token = await call(
+      fetch,
+      "POST",
+      `/v1/reseller/reservations/${reservationId}/provision-tokens`,
+      { tenantRef: "tenant_x", expiresInSeconds: 120 },
+      keyHeaders,
+    );
+    // No signing key is configured for this app, so minting must fail closed
+    // rather than hand out an unverifiable credential.
+    expect(token.status).toBe(400);
+
+    const captured = await call(
+      fetch,
+      "POST",
+      `/v1/reseller/reservations/${reservationId}/capture`,
+      { tenantRef: "tenant_x", usage: { meter: "bucket-month", quantity: 2 } },
+      keyHeaders,
+    );
+    expect(captured.status).toBe(200);
+    expect(captured.body.statement).toMatchObject({ amountMinor: 1_000 });
+
+    const settled = await call(
+      fetch,
+      "GET",
+      `/v1/organizations/${organizationId}/wallet`,
+      undefined,
+      owner,
+    );
+    expect(settled.body.wallet).toMatchObject({ settledMinor: 9_000, heldMinor: 0 });
+
+    const statement = await call(
+      fetch,
+      "GET",
+      `/v1/reseller/reservations/${reservationId}/usage-statement?tenantRef=tenant_x`,
+      undefined,
+      keyHeaders,
+    );
+    expect(statement.status).toBe(200);
+  });
+
+  test("keeps sessions and API keys in their own lanes", async () => {
+    const { fetch } = newApp();
+    const { organizationId, owner, keyHeaders } = await fundedOrganization(fetch);
+
+    // An API key may not administer the organization that issued it.
+    const keyAdmin = await call(
+      fetch,
+      "POST",
+      `/v1/organizations/${organizationId}/api-keys`,
+      { name: "escalated", scopes: ["reseller:write"], expiresInSeconds: 60 },
+      keyHeaders,
+    );
+    expect(keyAdmin.status).toBe(401);
+
+    // A session is not an organization actor on the reseller lane.
+    const sessionReseller = await call(
+      fetch,
+      "POST",
+      "/v1/reseller/quotes",
+      { tenantRef: "tenant_x", offeringId: OFFERING.id, quantity: 1 },
+      owner,
+    );
+    expect(sessionReseller.status).toBe(403);
+  });
+
+  test("hides another organization's wallet", async () => {
+    const { fetch } = newApp();
+    const first = await fundedOrganization(fetch);
+    const second = await fundedOrganization(fetch);
+
+    const crossed = await call(
+      fetch,
+      "GET",
+      `/v1/organizations/${first.organizationId}/wallet`,
+      undefined,
+      second.keyHeaders,
+    );
+    expect(crossed.status).toBe(403);
+  });
+
+  test("refuses a reservation the wallet cannot cover, leaving the balance intact", async () => {
+    const { fetch } = newApp();
+    const { organizationId, owner, keyHeaders } = await fundedOrganization(fetch);
+
+    const quote = await call(
+      fetch,
+      "POST",
+      "/v1/reseller/quotes",
+      { tenantRef: "tenant_x", offeringId: OFFERING.id, quantity: 100 },
+      keyHeaders,
+    );
+    const reservation = await call(
+      fetch,
+      "POST",
+      "/v1/reseller/reservations",
+      { tenantRef: "tenant_x", quoteId: String((quote.body.quote as { id: string }).id) },
+      keyHeaders,
+    );
+    expect(reservation.status).toBe(402);
+
+    const wallet = await call(
+      fetch,
+      "GET",
+      `/v1/organizations/${organizationId}/wallet`,
+      undefined,
+      owner,
+    );
+    expect(wallet.body.wallet).toMatchObject({ heldMinor: 0, availableMinor: 10_000 });
+  });
+
+  test("credits a repeated settlement proof exactly once", async () => {
+    const { fetch } = newApp();
+    const { organizationId, owner } = await fundedOrganization(fetch);
+    await call(
+      fetch,
+      "POST",
+      `/v1/organizations/${organizationId}/wallet/funding`,
+      { settlementProof: "proof-1" },
+      owner,
+    );
+    const wallet = await call(
+      fetch,
+      "GET",
+      `/v1/organizations/${organizationId}/wallet`,
+      undefined,
+      owner,
+    );
+    expect(wallet.body.wallet).toMatchObject({ settledMinor: 10_000 });
+  });
+
+  test("returns expired holds when the background pass runs", async () => {
+    let now = Date.UTC(2026, 7, 17, 12, 0, 0);
+    const app = buildApp({
+      sql: createEphemeralSql(),
+      objects: createMemoryObjectStore(),
+      identity,
+      settlement,
+      publicOrigin: "https://api.takoserver.com",
+      forms: [],
+      driver: new InMemoryTakoformResourceDriver(),
+      offerings: [OFFERING],
+      clock: () => new Date(now),
+    });
+    const { organizationId, owner, keyHeaders } = await fundedOrganization(app.fetch);
+    const quote = await call(
+      app.fetch,
+      "POST",
+      "/v1/reseller/quotes",
+      { tenantRef: "tenant_x", offeringId: OFFERING.id, quantity: 1 },
+      keyHeaders,
+    );
+    await call(
+      app.fetch,
+      "POST",
+      "/v1/reseller/reservations",
+      { tenantRef: "tenant_x", quoteId: String((quote.body.quote as { id: string }).id) },
+      keyHeaders,
+    );
+
+    expect((await app.tick()).expiredReservations).toBe(0);
+    now += 61 * 60_000;
+    expect((await app.tick()).expiredReservations).toBe(1);
+
+    const wallet = await call(
+      app.fetch,
+      "GET",
+      `/v1/organizations/${organizationId}/wallet`,
+      undefined,
+      owner,
+    );
+    expect(wallet.body.wallet).toMatchObject({ heldMinor: 0, availableMinor: 10_000 });
+  });
+});
