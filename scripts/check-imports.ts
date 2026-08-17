@@ -1,17 +1,20 @@
-import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { dirname, join, normalize, relative, resolve } from "node:path";
+
+const violations: string[] = [];
+
+// ---------------------------------------------------------------------------
+// Cross-product firewall: no Takosumi source, package, or path may be reached.
+// ---------------------------------------------------------------------------
 
 const forbidden = /(?:^|[/@])takosumi(?:-cloud)?(?:$|[/])/iu;
 const roots = ["src", "scripts", "tests"];
-const violations: string[] = [];
 
 for (const root of roots) {
   for (const path of walk(root)) {
     if (!path.endsWith(".ts")) continue;
-    const source = readFileSync(path, "utf8");
-    for (const match of source.matchAll(/(?:from\s+|import\s*\()(["'])([^"']+)\1/gu)) {
-      const specifier = match[2];
-      if (specifier && forbidden.test(specifier)) violations.push(`${path}: ${specifier}`);
+    for (const specifier of importsOf(path)) {
+      if (forbidden.test(specifier)) violations.push(`${path}: ${specifier}`);
     }
   }
 }
@@ -24,9 +27,114 @@ for (const name of Object.keys({ ...manifest.dependencies, ...manifest.devDepend
   if (forbidden.test(name)) violations.push(`package.json: ${name}`);
 }
 
+// ---------------------------------------------------------------------------
+// Layering: the architecture is only real if the import graph enforces it.
+//
+// Each layer names the layers it may import from. Domain code never reaches for
+// an adapter — it receives ports instead — and only the composition root is
+// allowed to know which implementations exist. Files that match no layer are
+// pre-redesign modules; they are exempt until the milestone that deletes them,
+// so the rule tightens on its own as the rewrite lands.
+// ---------------------------------------------------------------------------
+
+interface Layer {
+  readonly name: string;
+  readonly match: RegExp;
+  readonly may: readonly string[];
+}
+
+const LAYERS: readonly Layer[] = [
+  { name: "core", match: /^src\/(?:ports|json|strict-json)\.ts$/u, may: ["core"] },
+  {
+    name: "adapter",
+    match: /^src\/(?:sql-d1|sql-sqlite|objects-r2|objects-mem)\.ts$|^src\/providers\//u,
+    may: ["core"],
+  },
+  {
+    name: "domain",
+    match: /^src\/(?:token|auth|ledger|catalog)\.ts$|^src\/takoform\/(?!routes\.ts$)/u,
+    may: ["core", "domain"],
+  },
+  {
+    name: "routes",
+    match:
+      /^src\/(?:router|control|data-storage|data-ai|openapi)\.ts$|^src\/takoform\/routes\.ts$/u,
+    may: ["core", "domain", "routes"],
+  },
+  { name: "app", match: /^src\/app\.ts$/u, may: ["core", "adapter", "domain", "routes", "app"] },
+  { name: "entry", match: /^src\/entry-[^/]+\.ts$/u, may: ["core", "app"] },
+];
+
+function layerOf(path: string): Layer | undefined {
+  return LAYERS.find((layer) => layer.match.test(path));
+}
+
+for (const path of walk("src")) {
+  if (!path.endsWith(".ts")) continue;
+  const layer = layerOf(path);
+  if (!layer) continue;
+  for (const target of localImportsOf(path)) {
+    const targetLayer = layerOf(target);
+    if (!targetLayer) {
+      violations.push(`${path} (${layer.name}) imports pre-redesign module ${target}`);
+      continue;
+    }
+    if (!layer.may.includes(targetLayer.name)) {
+      violations.push(
+        `${path} (${layer.name}) imports ${target} (${targetLayer.name}); ` +
+          `${layer.name} may import only ${layer.may.join(", ")}`,
+      );
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Bundle hygiene: the Workers entry must not be able to reach a host-only
+// implementation, even indirectly. `scripts/build-worker.ts` checks the emitted
+// bytes; this checks the graph, so the mistake is caught before a build.
+// ---------------------------------------------------------------------------
+
+const WORKER_ENTRY = "src/entry-worker.ts";
+const HOST_ONLY = ["src/sql-sqlite.ts", "src/objects-mem.ts"];
+
+if (existsSync(WORKER_ENTRY)) {
+  const reachable = new Set<string>();
+  const pending = [WORKER_ENTRY];
+  while (pending.length > 0) {
+    const path = pending.pop();
+    if (path === undefined || reachable.has(path)) continue;
+    reachable.add(path);
+    pending.push(...localImportsOf(path));
+  }
+  for (const banned of HOST_ONLY) {
+    if (reachable.has(banned)) {
+      violations.push(`${WORKER_ENTRY} transitively imports host-only module ${banned}`);
+    }
+  }
+}
+
 if (violations.length > 0) {
-  console.error(`forbidden cross-product imports found:\n${violations.join("\n")}`);
+  console.error(`forbidden imports found:\n${violations.join("\n")}`);
   process.exit(1);
+}
+
+/**
+ * Every module specifier a file names. The bare side-effect form (`import
+ * "./x.ts"`) is matched too: it carries a real edge in the graph, and a rule
+ * that misses it can be stepped around without noticing.
+ */
+function importsOf(path: string): readonly string[] {
+  const source = readFileSync(path, "utf8");
+  return [...source.matchAll(/(?:from\s+|import\s*\(|import\s+)(["'])([^"']+)\1/gu)]
+    .map((match) => match[2])
+    .filter((specifier): specifier is string => specifier !== undefined);
+}
+
+/** Repository-relative paths of the in-repo modules a file imports. */
+function localImportsOf(path: string): readonly string[] {
+  return importsOf(path)
+    .filter((specifier) => specifier.startsWith("."))
+    .map((specifier) => normalize(relative(resolve("."), resolve(dirname(path), specifier))));
 }
 
 function walk(directory: string): string[] {
