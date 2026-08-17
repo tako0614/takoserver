@@ -16,14 +16,22 @@
 
 export {};
 
-const [command, origin, apiKey, kind, space, name, specJson] = process.argv.slice(2);
+const [command, rawOrigin, rawApiKey, rawKind, rawSpace, rawName, specJson] = process.argv.slice(2);
 
-if (!command || !origin || !apiKey || !kind || !space || !name) {
+if (!command || !rawOrigin || !rawApiKey || !rawKind || !rawSpace || !rawName) {
   process.stderr.write(
     "usage: takoform.ts apply|get|delete <origin> <apiKey> <kind> <space> <name> [specJson]\n",
   );
   process.exit(2);
 }
+
+// Bound once, so the helpers below see values rather than possibly-absent
+// arguments.
+const origin: string = rawOrigin;
+const apiKey: string = rawApiKey;
+const kind: string = rawKind;
+const space: string = rawSpace;
+const name: string = rawName;
 
 const LANE = "/apis/forms.takoform.com/v1alpha3";
 
