@@ -260,3 +260,40 @@ describe("Takoform apply on a real backend", () => {
     expect(provider.listResources()).toEqual([]);
   });
 });
+
+describe("orphaned declarations", () => {
+  test("names resources whose Form is no longer installed", async () => {
+    const sql = createEphemeralSql();
+    const provider = new FakeProvider({ offerings: [PROVIDER_OFFERING] });
+    const ports = {
+      sql,
+      objects: createMemoryObjectStore(),
+      identity,
+      settlement,
+      publicOrigin: "https://api.takoserver.com",
+      providers: [provider],
+      offerings: [SOLD],
+    };
+
+    const app = buildApp({ ...ports, forms: [FORM] });
+    const { provider: auth } = await tenant(app.fetch);
+    await applyBucket(app.fetch, auth, "assets", { location: "apac" }, "orphan-001");
+    expect((await app.tick()).orphanedResources).toEqual([]);
+
+    // The same deployment, restarted with a Form whose schema moved on without
+    // a new definition version. The declaration is now unresolvable, and the
+    // backend resource it describes is still running.
+    const moved = buildApp({
+      ...ports,
+      forms: [
+        {
+          ...FORM,
+          identity: {
+            formRef: { ...FORM_REF, schemaDigest: `sha256:${"9".repeat(64)}` },
+          },
+        },
+      ],
+    });
+    expect((await moved.tick()).orphanedResources).toEqual(["default/ObjectBucket/assets"]);
+  });
+});

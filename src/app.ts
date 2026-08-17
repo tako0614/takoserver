@@ -9,6 +9,7 @@ import { createReseller } from "./reseller.ts";
 import { createRouter, type Router } from "./router.ts";
 import type { TakoformArtifactTransport } from "./takoform/artifacts.ts";
 import { createTakoformHost } from "./takoform/host.ts";
+import { createTakoformStore } from "./takoform/store.ts";
 import type {
   InstalledTakoformForm,
   TakoformHost,
@@ -61,6 +62,12 @@ export interface App {
 
 export interface TickReport {
   readonly expiredReservations: number;
+  /**
+   * Declarations pointing at a Form this deployment no longer installs. Any
+   * number above zero means somebody's resource is unmanageable, so it is
+   * surfaced rather than left to be met one 404 at a time.
+   */
+  readonly orphanedResources: readonly string[];
 }
 
 export function buildApp(ports: AppPorts): App {
@@ -115,7 +122,24 @@ export function buildApp(ports: AppPorts): App {
   return {
     fetch: createRouter({ control, takoformHost, publicOrigin: ports.publicOrigin }),
     async tick(): Promise<TickReport> {
-      return { expiredReservations: await reseller.expireDue(64) };
+      const expiredReservations = await reseller.expireDue(64);
+      const store = createTakoformStore(ports.sql, clock);
+      const installed = ports.forms.map((form) => form.identity.formRef.schemaDigest);
+      const orphans = await store.orphanedResources(installed, 32);
+      const orphanedResources = orphans.map(
+        (orphan) => `${orphan.space}/${orphan.kind}/${orphan.name}`,
+      );
+      if (orphanedResources.length > 0) {
+        console.warn(
+          JSON.stringify({
+            event: "takoserver.resources.orphaned",
+            count: orphanedResources.length,
+            resources: orphanedResources,
+            hint: "a Form schema changed without a new definitionVersion",
+          }),
+        );
+      }
+      return { expiredReservations, orphanedResources };
     },
   };
 }

@@ -81,6 +81,20 @@ export interface TakoformStore {
   putOperation(tenantId: string, record: OperationRecord): Promise<void>;
   readOperation(tenantId: string, id: string): Promise<OperationRecord | null>;
 
+  /**
+   * Resources whose Form is no longer installed.
+   *
+   * These are not broken rows — they are declarations the Host can no longer
+   * resolve, so the customer cannot read, update, or delete them while the
+   * backend resource keeps running and keeps billing. It happens when a Form's
+   * schema is changed without minting a new definition version, and it is
+   * silent unless something looks for it.
+   */
+  orphanedResources(
+    installedDigests: readonly string[],
+    limit: number,
+  ): Promise<readonly { readonly space: string; readonly name: string; readonly kind: string }[]>;
+
   readReplay(key: string): Promise<StoredReplay | null>;
   putReplay(key: string, replay: StoredReplay): Promise<void>;
   deleteReplay(key: string): Promise<void>;
@@ -272,6 +286,22 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           ? { resource: JSON.parse(resourceJson) as TakoformStoredResource }
           : {}),
       };
+    },
+
+    async orphanedResources(installedDigests, limit) {
+      if (installedDigests.length === 0) return [];
+      const placeholders = installedDigests.map(() => "?").join(", ");
+      const rows = await sql.query(
+        `SELECT space, name, kind FROM tf_resources
+         WHERE json_extract(resource_json, '$.form.formRef.schemaDigest') NOT IN (${placeholders})
+         ORDER BY updated_at DESC LIMIT ?`,
+        [...installedDigests, limit],
+      );
+      return rows.map((row) => ({
+        space: text(row.space),
+        name: text(row.name),
+        kind: text(row.kind),
+      }));
     },
 
     async readReplay(key): Promise<StoredReplay | null> {
