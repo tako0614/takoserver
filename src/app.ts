@@ -116,6 +116,7 @@ export function buildApp(ports: AppPorts): App {
   const control = createControlRoutes({
     accounts,
     inventory,
+    forms: ports.forms,
     ledger,
     catalog,
     reseller,

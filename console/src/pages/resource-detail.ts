@@ -268,6 +268,39 @@ function identity(found: ResourceSummary): Child {
   const rows: readonly (readonly [string, Child])[] = [
     ["Kind", h("span", { class: "mono" }, found.kind)],
     ["API version", copyable(found.apiVersion)],
+    ...(found.form
+      ? ([
+          [
+            "Definition version",
+            h(
+              "span",
+              null,
+              h("span", { class: "mono" }, found.form.formRef.definitionVersion),
+              h(
+                "span",
+                { class: "dim", style: { marginLeft: "8px" } },
+                "the definition this resource was made under",
+              ),
+            ),
+          ],
+          [
+            "Schema digest",
+            h(
+              "span",
+              null,
+              copyable(
+                found.form.formRef.schemaDigest,
+                shortDigest(found.form.formRef.schemaDigest),
+              ),
+              h(
+                "div",
+                { class: "dim", style: { marginTop: "2px" } },
+                "part of the Form's identity: a different schema is a different Form",
+              ),
+            ),
+          ],
+        ] as const)
+      : []),
     ["Space", h("span", { class: "mono" }, found.metadata.space)],
     ["Name", copyable(found.metadata.name)],
     ["UID", copyable(found.metadata.uid, shortDigest(found.metadata.uid))],

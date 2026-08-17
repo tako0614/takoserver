@@ -187,7 +187,9 @@ function row(entry: ResourceSummary): Child {
     h(
       "td",
       { class: "dim mono", style: { fontSize: "12px" } },
-      `${entry.apiVersion.split("/")[0] ?? entry.apiVersion} · ${shortDigest(entry.metadata.uid)}`,
+      entry.form
+        ? `${entry.form.formRef.definitionVersion} · ${shortDigest(entry.form.formRef.schemaDigest)}`
+        : "—",
     ),
     h("td", { class: "dim", title: entry.metadata.updatedAt }, ago(entry.metadata.updatedAt)),
   );

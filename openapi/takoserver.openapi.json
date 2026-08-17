@@ -102,6 +102,27 @@
         "security": []
       }
     },
+    "/v1/me": {
+      "get": {
+        "summary": "Read the signed-in principal and the organizations it owns",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/forms": {
+      "get": {
+        "summary": "List every Form definition this Host will accept",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        },
+        "security": []
+      }
+    },
     "/v1/organizations": {
       "post": {
         "summary": "Create an Organization",
@@ -115,6 +136,34 @@
     "/v1/organizations/{organizationId}/api-keys": {
       "post": {
         "summary": "Create a scoped API key",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      },
+      "get": {
+        "summary": "List the organization's live API keys",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationId}/resources": {
+      "get": {
+        "summary": "List the organization's Takoform resources",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationId}/operations": {
+      "get": {
+        "summary": "List the organization's recent Takoform operations",
         "responses": {
           "200": {
             "description": "Success"

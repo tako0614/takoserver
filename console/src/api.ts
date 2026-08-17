@@ -100,6 +100,7 @@ export interface ResourceSummary {
   };
   readonly spec?: Record<string, unknown>;
   readonly status?: ResourceStatus;
+  readonly form?: { readonly formRef: FormRef };
 }
 
 export interface Operation {
@@ -121,14 +122,22 @@ export class ApiError extends Error {
   constructor(
     readonly code: string,
     readonly status: number,
+    readonly path: string,
   ) {
     super(code);
     this.name = "ApiError";
   }
 
-  /** True when the only useful next step is to sign in again. */
+  /**
+   * True when the only useful next step is to sign in again.
+   *
+   * Scoped to the control plane on purpose. Takoserver serves other lanes with
+   * their own credentials, and a 401 from one of those means the console asked
+   * the wrong door — not that the person's session died. Treating every 401 as
+   * a dead session logs somebody out for a mistake this code made.
+   */
   get isExpiredSession(): boolean {
-    return this.status === 401 || this.code === "unauthenticated";
+    return this.path.startsWith("/v1/") && (this.status === 401 || this.code === "unauthenticated");
   }
 }
 
@@ -154,7 +163,7 @@ export function createApi(options: ApiOptions) {
     } catch {
       // A refused connection and a rejected request are different problems and
       // a person can act on the difference, so they never share a message.
-      throw new ApiError("unreachable", 0);
+      throw new ApiError("unreachable", 0, path);
     }
 
     const payload = await response
@@ -164,7 +173,7 @@ export function createApi(options: ApiOptions) {
     if (!response.ok) {
       const envelope = (payload as { error?: { code?: unknown } } | null)?.error;
       const code = typeof envelope?.code === "string" ? envelope.code : `http_${response.status}`;
-      const failure = new ApiError(code, response.status);
+      const failure = new ApiError(code, response.status, path);
       if (failure.isExpiredSession) options.onSessionLost();
       throw failure;
     }
@@ -245,13 +254,11 @@ export function createApi(options: ApiOptions) {
         `/v1/organizations/${encodeURIComponent(organizationId)}/operations`,
       ),
 
-    // The Host's own account of what it will accept. It needs no organization:
-    // which Forms exist is a property of the platform, not of a tenant.
-    forms: () =>
-      call<{ profiles: readonly FormSupport[] }>(
-        "GET",
-        "/apis/forms.takoform.com/v1alpha3/support/forms",
-      ),
+    // The Host's own account of what it will accept. Read from the control
+    // plane rather than the exact-pin lane, which only admits an organization
+    // key: a person holding a session would be told they are not authenticated
+    // for asking a question that has nothing to do with their organization.
+    forms: () => call<{ profiles: readonly FormSupport[] }>("GET", "/v1/forms"),
   };
 }
 

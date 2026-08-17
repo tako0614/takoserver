@@ -4,7 +4,9 @@ import { type FundingSettlementVerifier, type Ledger, LedgerError } from "./ledg
 import type { Clock } from "./ports.ts";
 import { type Reseller, ResellerError } from "./reseller.ts";
 import { parseStrictJson, StrictJsonError } from "./strict-json.ts";
+import { formSupportProfile } from "./takoform/forms.ts";
 import type { OperationListing, ResourceListing } from "./takoform/store.ts";
+import type { InstalledTakoformForm } from "./takoform/types.ts";
 import { TokenError, type TokenService } from "./token.ts";
 
 /**
@@ -43,6 +45,8 @@ export interface ResourceInventory {
 export interface CreateControlRoutesOptions {
   readonly accounts: Accounts;
   readonly inventory: ResourceInventory;
+  /** Every Form definition this Host will accept. */
+  readonly forms: readonly InstalledTakoformForm[];
   readonly ledger: Ledger;
   readonly catalog: Catalog;
   readonly reseller: Reseller;
@@ -54,7 +58,7 @@ export interface CreateControlRoutesOptions {
 export type ControlRoutes = (request: Request, url: URL) => Promise<Response | null>;
 
 export function createControlRoutes(options: CreateControlRoutesOptions): ControlRoutes {
-  const { accounts, inventory, ledger, catalog, reseller, tokens, settlement } = options;
+  const { accounts, inventory, forms, ledger, catalog, reseller, tokens, settlement } = options;
 
   const owner = async (request: Request, organizationId: string): Promise<Actor> => {
     const actor = await accounts.authenticate(authorization(request));
@@ -99,6 +103,15 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
   };
 
   async function route(request: Request, url: URL): Promise<Response> {
+    // Which Forms exist is a property of the platform, not of a tenant, and it
+    // is the first thing anyone integrating needs. The exact-pin lanes can
+    // answer this too, but only to an organization key — a person reading the
+    // catalogue in a console holds a session, and would otherwise be told they
+    // are not authenticated for asking a public question.
+    if (request.method === "GET" && url.pathname === "/v1/forms") {
+      return Response.json({ profiles: forms.map(formSupportProfile) });
+    }
+
     if (request.method === "GET" && url.pathname === "/v1/identity/providers") {
       return Response.json({ providers: ["google", "github"] });
     }
@@ -346,10 +359,15 @@ function presentResource(listing: ResourceListing): Record<string, unknown> {
   const resource = listing.resource as unknown as {
     readonly spec?: unknown;
     readonly status?: unknown;
+    readonly form?: unknown;
   };
   return {
     apiVersion: listing.apiVersion,
     kind: listing.kind,
+    // Two resources of the same kind are not necessarily the same thing: the
+    // Form's identity includes the digest of its own schema. Omitting it would
+    // leave a reader unable to tell which definition they are looking at.
+    ...(resource.form === undefined ? {} : { form: resource.form }),
     metadata: {
       space: listing.space,
       name: listing.name,

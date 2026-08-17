@@ -62,3 +62,44 @@ describe("cross-origin access", () => {
     expect(response.headers.get("access-control-allow-origin")).toBeNull();
   });
 });
+
+/**
+ * A person holding a session asking which Forms exist is asking a question
+ * about the platform, not about their organization. Answering "you are not
+ * authenticated" — which is what the exact-pin lanes must say, since they only
+ * admit an organization key — logs them out for asking.
+ */
+describe("Form registry on the control plane", () => {
+  test("is reachable without an organization credential", async () => {
+    const { buildApp } = await import("../src/app.ts");
+    const { buildEdgeForms } = await import("../src/edge-forms.ts");
+    const { createEphemeralSql } = await import("../src/compat.ts");
+    const { createMemoryObjectStore } = await import("../src/objects-mem.ts");
+    const edge = await buildEdgeForms();
+
+    const app = buildApp({
+      sql: createEphemeralSql(),
+      objects: createMemoryObjectStore(),
+      forms: edge.forms,
+      providers: [],
+      offerings: [],
+      publicOrigin: "https://api.example.test",
+      identity: {
+        verify: () => {
+          throw new Error("not configured");
+        },
+      },
+      settlement: {
+        verify: () => {
+          throw new Error("not configured");
+        },
+      },
+    });
+
+    const response = await app.fetch(new Request("https://api.example.test/v1/forms"));
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { profiles: readonly { formRef: unknown }[] };
+    expect(body.profiles.length).toBe(edge.forms.length);
+    expect(body.profiles[0]).toHaveProperty("formRef");
+  });
+});

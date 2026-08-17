@@ -111,8 +111,23 @@ const PUBLIC_PATHS: Record<string, Record<string, unknown>> = {
   "/v1/sessions": operation("post", "Exchange an external assertion for a session", {
     security: [],
   }),
+  "/v1/me": operation("get", "Read the signed-in principal and the organizations it owns"),
+  "/v1/forms": operation("get", "List every Form definition this Host will accept", {
+    security: [],
+  }),
   "/v1/organizations": operation("post", "Create an Organization"),
-  "/v1/organizations/{organizationId}/api-keys": operation("post", "Create a scoped API key"),
+  "/v1/organizations/{organizationId}/api-keys": operations({
+    post: "Create a scoped API key",
+    get: "List the organization's live API keys",
+  }),
+  "/v1/organizations/{organizationId}/resources": operation(
+    "get",
+    "List the organization's Takoform resources",
+  ),
+  "/v1/organizations/{organizationId}/operations": operation(
+    "get",
+    "List the organization's recent Takoform operations",
+  ),
   "/v1/organizations/{organizationId}/api-keys/{apiKeyId}": operation(
     "delete",
     "Revoke an API key",
@@ -142,6 +157,14 @@ const PUBLIC_PATHS: Record<string, Record<string, unknown>> = {
     "Read the usage statement of a captured reservation",
   ),
 };
+
+/** One path that answers to more than one method. */
+function operations(summaries: Readonly<Record<string, string>>): Record<string, unknown> {
+  return Object.assign(
+    {},
+    ...Object.entries(summaries).map(([method, summary]) => operation(method, summary)),
+  ) as Record<string, unknown>;
+}
 
 function operation(
   method: string,
