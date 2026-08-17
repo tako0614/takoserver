@@ -1,0 +1,330 @@
+import { bytesDigest } from "./json.ts";
+import type { Clock, Sql } from "./ports.ts";
+
+/**
+ * Who is calling, and what they are allowed to ask for.
+ *
+ * Sessions and API keys are the same mechanism wearing two hats: a bearer
+ * secret that resolves to a principal, optionally scoped to one organization
+ * and a set of scopes. Only the SHA-256 digest of a secret is ever stored, so
+ * the database cannot leak a usable credential, and a secret is returned to its
+ * creator exactly once.
+ */
+
+export type IdentityProvider = "google" | "github";
+
+export const API_KEY_SCOPES = [
+  "catalog:read",
+  "resources:write",
+  "wallet:read",
+  "reseller:write",
+  "usage:read",
+] as const;
+
+export type ApiKeyScope = (typeof API_KEY_SCOPES)[number];
+
+export interface Principal {
+  readonly id: string;
+  readonly provider: IdentityProvider;
+  readonly providerSubject: string;
+  readonly email: string;
+  readonly displayName: string;
+}
+
+export interface Organization {
+  readonly id: string;
+  readonly name: string;
+  readonly ownerPrincipalId: string;
+  readonly createdAt: string;
+}
+
+export interface ApiKey {
+  readonly id: string;
+  readonly organizationId: string;
+  readonly name: string;
+  readonly scopes: readonly ApiKeyScope[];
+  readonly createdAt: string;
+  readonly expiresAt: string;
+}
+
+/** The resolved caller. `organizationId` is absent for a bare user session. */
+export interface Actor {
+  readonly principalId: string;
+  readonly organizationId?: string;
+  readonly scopes: readonly ApiKeyScope[];
+  readonly kind: "session" | "api_key";
+}
+
+export interface ExternalIdentityVerifier {
+  verify(input: { readonly provider: IdentityProvider; readonly assertion: string }): Promise<{
+    readonly providerSubject: string;
+    readonly email: string;
+    readonly displayName: string;
+  }>;
+}
+
+export type AuthErrorCode = "unauthenticated" | "permission_denied" | "not_found" | "invalid";
+
+export class AuthError extends Error {
+  constructor(readonly code: AuthErrorCode) {
+    super(code);
+    this.name = "AuthError";
+  }
+}
+
+export interface Accounts {
+  /** Exchanges a verified external assertion for a principal and a session. */
+  signIn(input: {
+    readonly provider: IdentityProvider;
+    readonly assertion: string;
+    readonly sessionTtlSeconds?: number;
+  }): Promise<{ readonly principal: Principal; readonly sessionToken: string }>;
+  createOrganization(input: {
+    readonly actor: Actor;
+    readonly name: string;
+  }): Promise<Organization>;
+  organization(id: string): Promise<Organization | null>;
+  /** Returns the secret exactly once; only its digest is retained. */
+  createApiKey(input: {
+    readonly actor: Actor;
+    readonly organizationId: string;
+    readonly name: string;
+    readonly scopes: readonly ApiKeyScope[];
+    readonly expiresInSeconds: number;
+  }): Promise<{ readonly apiKey: ApiKey; readonly secret: string }>;
+  revokeApiKey(input: {
+    readonly actor: Actor;
+    readonly organizationId: string;
+    readonly apiKeyId: string;
+  }): Promise<ApiKey>;
+  /** Resolves a bearer credential. Returns null for anything unusable. */
+  authenticate(authorization: string | null): Promise<Actor | null>;
+  /** Resolves and requires a scope on one organization. */
+  authorize(authorization: string | null, scope: ApiKeyScope): Promise<Actor | null>;
+  /** Refuses unless the actor owns the organization outright. */
+  requireOwner(actor: Actor, organizationId: string): Promise<Organization>;
+}
+
+export interface CreateAccountsOptions {
+  readonly sql: Sql;
+  readonly identity: ExternalIdentityVerifier;
+  readonly clock?: Clock;
+  readonly randomSecret?: () => string;
+  readonly randomId?: () => string;
+}
+
+export function createAccounts(options: CreateAccountsOptions): Accounts {
+  const { sql, identity } = options;
+  const clock = options.clock ?? (() => new Date());
+  const randomSecret = options.randomSecret ?? defaultSecret;
+  const randomId = options.randomId ?? (() => crypto.randomUUID().replaceAll("-", ""));
+  const stamp = (): string => clock().toISOString();
+  const after = (seconds: number): string =>
+    new Date(clock().getTime() + seconds * 1_000).toISOString();
+
+  const issueToken = async (input: {
+    kind: "session" | "api_key";
+    principalId: string;
+    organizationId?: string;
+    name: string;
+    scopes: readonly ApiKeyScope[];
+    expiresInSeconds: number;
+  }): Promise<{ id: string; secret: string; createdAt: string; expiresAt: string }> => {
+    const secret = randomSecret();
+    const id = `${input.kind === "session" ? "ses" : "key"}_${randomId()}`;
+    const createdAt = stamp();
+    const expiresAt = after(input.expiresInSeconds);
+    await sql.run(
+      `INSERT INTO auth_tokens
+         (secret_digest, id, kind, principal_id, org_id, name, scopes_json, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        await bytesDigest(new TextEncoder().encode(secret)),
+        id,
+        input.kind,
+        input.principalId,
+        input.organizationId ?? null,
+        input.name,
+        JSON.stringify([...input.scopes]),
+        createdAt,
+        expiresAt,
+      ],
+    );
+    return { id, secret, createdAt, expiresAt };
+  };
+
+  const accounts: Accounts = {
+    async signIn({ provider, assertion, sessionTtlSeconds }) {
+      if (provider !== "google" && provider !== "github") throw new AuthError("invalid");
+      const verified = await identity.verify({ provider, assertion });
+      const rows = await sql.query(
+        "SELECT id, email, display_name FROM principals WHERE provider = ? AND provider_subject = ?",
+        [provider, verified.providerSubject],
+      );
+      const existing = rows[0];
+      const id = existing ? String(existing.id) : `prn_${randomId()}`;
+      if (!existing) {
+        await sql.run(
+          `INSERT INTO principals (id, provider, provider_subject, email, display_name, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [id, provider, verified.providerSubject, verified.email, verified.displayName, stamp()],
+        );
+      }
+      const { secret } = await issueToken({
+        kind: "session",
+        principalId: id,
+        name: "session",
+        scopes: [],
+        expiresInSeconds: sessionTtlSeconds ?? 12 * 60 * 60,
+      });
+      return {
+        principal: {
+          id,
+          provider,
+          providerSubject: verified.providerSubject,
+          email: verified.email,
+          displayName: verified.displayName,
+        },
+        sessionToken: secret,
+      };
+    },
+
+    async createOrganization({ actor, name }) {
+      if (name.length === 0 || name.length > 128) throw new AuthError("invalid");
+      const id = `org_${randomId()}`;
+      const createdAt = stamp();
+      await sql.run(
+        "INSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES (?, ?, ?, ?)",
+        [id, name, actor.principalId, createdAt],
+      );
+      return { id, name, ownerPrincipalId: actor.principalId, createdAt };
+    },
+
+    async organization(id) {
+      const rows = await sql.query(
+        "SELECT id, name, owner_principal_id, created_at FROM orgs WHERE id = ?",
+        [id],
+      );
+      const row = rows[0];
+      return row
+        ? {
+            id: String(row.id),
+            name: String(row.name),
+            ownerPrincipalId: String(row.owner_principal_id),
+            createdAt: String(row.created_at),
+          }
+        : null;
+    },
+
+    async createApiKey({ actor, organizationId, name, scopes, expiresInSeconds }) {
+      await accounts.requireOwner(actor, organizationId);
+      const validated = validScopes(scopes);
+      if (name.length === 0 || name.length > 128) throw new AuthError("invalid");
+      if (!Number.isSafeInteger(expiresInSeconds) || expiresInSeconds <= 0) {
+        throw new AuthError("invalid");
+      }
+      const issued = await issueToken({
+        kind: "api_key",
+        principalId: actor.principalId,
+        organizationId,
+        name,
+        scopes: validated,
+        expiresInSeconds,
+      });
+      return {
+        apiKey: {
+          id: issued.id,
+          organizationId,
+          name,
+          scopes: validated,
+          createdAt: issued.createdAt,
+          expiresAt: issued.expiresAt,
+        },
+        secret: issued.secret,
+      };
+    },
+
+    async revokeApiKey({ actor, organizationId, apiKeyId }) {
+      await accounts.requireOwner(actor, organizationId);
+      const rows = await sql.query(
+        `SELECT id, org_id, name, scopes_json, created_at, expires_at
+         FROM auth_tokens WHERE id = ? AND org_id = ? AND kind = 'api_key'`,
+        [apiKeyId, organizationId],
+      );
+      const row = rows[0];
+      if (!row) throw new AuthError("not_found");
+      await sql.run("UPDATE auth_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", [
+        stamp(),
+        apiKeyId,
+      ]);
+      return {
+        id: String(row.id),
+        organizationId,
+        name: String(row.name),
+        scopes: JSON.parse(String(row.scopes_json)) as ApiKeyScope[],
+        createdAt: String(row.created_at),
+        expiresAt: String(row.expires_at),
+      };
+    },
+
+    async authenticate(authorization) {
+      const secret = bearer(authorization);
+      if (!secret) return null;
+      const rows = await sql.query(
+        `SELECT kind, principal_id, org_id, scopes_json FROM auth_tokens
+         WHERE secret_digest = ? AND revoked_at IS NULL AND expires_at > ?`,
+        [await bytesDigest(new TextEncoder().encode(secret)), stamp()],
+      );
+      const row = rows[0];
+      if (!row) return null;
+      const organizationId = row.org_id;
+      return {
+        principalId: String(row.principal_id),
+        ...(typeof organizationId === "string" ? { organizationId } : {}),
+        scopes: JSON.parse(String(row.scopes_json)) as ApiKeyScope[],
+        kind: String(row.kind) === "session" ? "session" : "api_key",
+      };
+    },
+
+    async authorize(authorization, scope) {
+      const actor = await accounts.authenticate(authorization);
+      if (!actor?.organizationId || !actor.scopes.includes(scope)) return null;
+      return actor;
+    },
+
+    async requireOwner(actor, organizationId) {
+      const organization = await accounts.organization(organizationId);
+      // An unknown organization and one owned by somebody else are reported the
+      // same way, so ownership cannot be probed by watching status codes.
+      if (!organization || organization.ownerPrincipalId !== actor.principalId) {
+        throw new AuthError("not_found");
+      }
+      return organization;
+    },
+  };
+
+  return accounts;
+}
+
+function validScopes(scopes: readonly ApiKeyScope[]): readonly ApiKeyScope[] {
+  if (
+    !Array.isArray(scopes) ||
+    scopes.length === 0 ||
+    new Set(scopes).size !== scopes.length ||
+    scopes.some((scope) => !API_KEY_SCOPES.includes(scope))
+  ) {
+    throw new AuthError("invalid");
+  }
+  return [...scopes];
+}
+
+function bearer(authorization: string | null): string | null {
+  if (!authorization?.startsWith("Bearer ")) return null;
+  const secret = authorization.slice("Bearer ".length);
+  return secret.length >= 16 && secret.length <= 512 ? secret : null;
+}
+
+function defaultSecret(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
