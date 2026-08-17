@@ -7,7 +7,9 @@ import {
   type IdentityProviderDescriptor,
 } from "./auth.ts";
 import type { Catalog } from "./catalog.ts";
+import { GoogleIdentityError } from "./google-identity.ts";
 import { type FundingSettlementVerifier, type Ledger, LedgerError } from "./ledger.ts";
+import { OperatorAssertionError } from "./operator-credentials.ts";
 import type { Clock } from "./ports.ts";
 import { type Reseller, ResellerError } from "./reseller.ts";
 import { parseStrictJson, StrictJsonError } from "./strict-json.ts";
@@ -146,7 +148,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       exactKeys(body, ["provider", "assertion"], ["method", "nonce"]);
       const { principal, sessionToken } = await accounts.signIn({
         provider: enumValue(body.provider, ["google", "github"]) as "google" | "github",
-        assertion: text(body.assertion),
+        assertion: bounded(body.assertion, 8 * 1_024),
         ...(body.method === undefined
           ? {}
           : {
@@ -468,6 +470,17 @@ function classify(error: unknown): { code: string; status: number } {
     };
   }
   if (error instanceof TokenError) return { code: error.code, status: 400 };
+  // A credential the verifier refused is the caller's problem to fix, and it
+  // reads as an outage if it arrives as a 500. Which check failed is logged
+  // rather than returned: the codes describe somebody's identity, and the
+  // difference between "expired" and "wrong audience" is not the caller's to
+  // learn from a stranger's token.
+  if (error instanceof GoogleIdentityError || error instanceof OperatorAssertionError) {
+    if (process.env?.["TAKOSERVER_TRACE_HOST_ERRORS"]) {
+      console.warn(`takoserver.signin.refused ${error.name} ${error.code}`);
+    }
+    return { code: "unauthenticated", status: 401 };
+  }
   return { code: "internal_error", status: 500 };
 }
 
@@ -525,7 +538,19 @@ function record(value: unknown): Record<string, unknown> {
 }
 
 function text(value: unknown): string {
-  if (typeof value !== "string" || value.length === 0 || value.length > 1_024) {
+  return bounded(value, 1_024);
+}
+
+/**
+ * A string field with its own length.
+ *
+ * The general bound is sized for a name, and a signed assertion is not a name:
+ * a Google ID token routinely runs past a kilobyte, so the ordinary limit
+ * rejected every real sign-in as a malformed request. Bounds belong to fields,
+ * not to types.
+ */
+function bounded(value: unknown, limit: number): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > limit) {
     controlError("invalid_argument", 400);
   }
   return value as string;

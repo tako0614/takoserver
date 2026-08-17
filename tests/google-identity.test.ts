@@ -255,3 +255,65 @@ describe("nonce", () => {
     ).rejects.toMatchObject({ code: "wrong_nonce" });
   });
 });
+
+/**
+ * A signed assertion is not a name, and the field that carries it must be sized
+ * for what it actually holds. The general string bound is a kilobyte, which a
+ * real Google ID token routinely passes — under it, every genuine sign-in was
+ * rejected as a malformed request, and the message said nothing about length.
+ */
+describe("sign-in request", () => {
+  const build = async (assertion: string) => {
+    const { buildApp } = await import("../src/app.ts");
+    const { buildEdgeForms } = await import("../src/edge-forms.ts");
+    const { createEphemeralSql } = await import("../src/compat.ts");
+    const { createMemoryObjectStore } = await import("../src/objects-mem.ts");
+    const edge = await buildEdgeForms();
+    const seen: string[] = [];
+    const app = buildApp({
+      sql: createEphemeralSql(),
+      objects: createMemoryObjectStore(),
+      forms: edge.forms,
+      providers: [],
+      offerings: [],
+      publicOrigin: "https://api.example.test",
+      identity: {
+        async verify(input) {
+          seen.push(input.assertion);
+          return {
+            providerSubject: "subject",
+            email: "person@example.com",
+            displayName: "A Person",
+          };
+        },
+      },
+      settlement: {
+        verify: () => {
+          throw new Error("not configured");
+        },
+      },
+    });
+    const response = await app.fetch(
+      new Request("https://api.example.test/v1/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ provider: "google", assertion, method: "oidc" }),
+      }),
+    );
+    return { response, seen };
+  };
+
+  test("accepts an assertion longer than a name", async () => {
+    // Comfortably past the kilobyte that used to be the ceiling.
+    const token = `head.${"a".repeat(1_400)}.signature`;
+    const { response, seen } = await build(token);
+    expect(response.status).toBe(200);
+    expect(seen[0]).toBe(token);
+  });
+
+  test("still refuses one past what any token could be", async () => {
+    const { response } = await build("a".repeat(9_000));
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: { code: "invalid_argument" } });
+  });
+});
