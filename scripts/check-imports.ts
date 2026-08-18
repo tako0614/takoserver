@@ -46,13 +46,13 @@ interface Layer {
 const LAYERS: readonly Layer[] = [
   {
     name: "core",
-    match: /^src\/(?:ports|json|strict-json|form-ref|provider-port|db-schema)\.ts$/u,
+    match: /^src\/(?:ports|json|strict-json|form-ref|provider-port|db-schema|migrate-sqlite)\.ts$/u,
     may: ["core"],
   },
   {
     name: "adapter",
     match:
-      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem)\.ts$|^src\/providers\//u,
+      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem|objects-fs)\.ts$|^src\/providers\//u,
     may: ["core", "adapter"],
   },
   {
@@ -117,6 +117,9 @@ const WORKER_ENTRY = "src/entry-worker.ts";
 const HOST_ONLY = [
   "src/sql-sqlite.ts",
   "src/objects-mem.ts",
+  // A Worker has no filesystem. Reaching this would fail at runtime rather
+  // than at the gate, and only for the requests that touched it.
+  "src/objects-fs.ts",
   // The Worker has D1 and R2 bindings. A credential-bearing HTTP transport is
   // not a capability it needs, and a capability nothing needs is one worth
   // refusing — see docs/adr/0001-provision-from-the-worker.md, which permits

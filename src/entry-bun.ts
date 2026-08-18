@@ -1,16 +1,20 @@
 import { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { buildApp } from "./app.ts";
-import { MIGRATIONS } from "./db-schema.ts";
 import { buildEdgeForms } from "./edge-forms.ts";
 import { resolveIdentity } from "./identity-setup.ts";
+import { migrateSqlite } from "./migrate-sqlite.ts";
+import { createFileObjectStore } from "./objects-fs.ts";
 import { createMemoryObjectStore } from "./objects-mem.ts";
 import { createR2HttpObjectStore } from "./objects-r2-http.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
 import { resolvePayment } from "./payment-setup.ts";
 import { CloudflareProvider } from "./providers/cloudflare.ts";
+import { createLocalProvider, LOCAL_KINDS, localOfferings } from "./providers/local.ts";
 import { createProvisionerEndpoint } from "./provisioner-endpoint.ts";
-import { loadSigningKey } from "./signing-key.ts";
+import { ensureSigningKey, loadSigningKey } from "./signing-key.ts";
 import { createD1HttpSql } from "./sql-d1-http.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
@@ -71,10 +75,15 @@ const sql = sharedDatabaseId
     })
   : (() => {
       const database = new Database(databasePath);
-      // Applying every migration is safe only on a fresh file; a durable
-      // deployment is migrated by its own operator step, exactly as D1 is.
-      if (databasePath === ":memory:") {
-        for (const migration of MIGRATIONS) database.exec(migration.sql);
+      // A self-hosted deployment starts with an empty file, so it is brought up
+      // to this build's schema here. Forward only and recorded, so running it
+      // again applies nothing and a database from a newer build is refused
+      // rather than repaired.
+      const migrated = migrateSqlite(database);
+      if (migrated.applied.length > 0) {
+        process.stdout.write(
+          `applied ${migrated.applied.length} migration(s): ${migrated.applied.join(", ")}\n`,
+        );
       }
       return createSqliteSql(database);
     })();
@@ -88,7 +97,12 @@ const objects = sharedBucket
       bucketName: sharedBucket,
       authorize: () => `Bearer ${cloudflareToken()}`,
     })
-  : createMemoryObjectStore();
+  : // No shared bucket means this is a machine standing on its own, and a
+    // self-hosted deployment that forgets every customer's files on restart is
+    // not storage. Memory is kept for tests, which say so by asking for it.
+    process.env.TAKOSERVER_OBJECTS_IN_MEMORY === "1"
+    ? createMemoryObjectStore()
+    : createFileObjectStore({ root: process.env.TAKOSERVER_DATA_ROOT ?? ".takoserver" });
 const clock = () => new Date();
 const edge = await buildEdgeForms();
 
@@ -102,6 +116,18 @@ const artifactStore = createTakoformArtifacts({
   randomId: () => crypto.randomUUID(),
 });
 
+/**
+ * What this machine can provision on.
+ *
+ * A Cloudflare account if one is configured; otherwise the machine itself. The
+ * second is what makes self-hosting real rather than architectural: without a
+ * provider, every apply answers that the backend is unavailable, which is true
+ * and leaves nothing to run.
+ *
+ * The catalogue is narrowed to what the chosen provider will actually execute.
+ * Listing a Worker for sale on a deployment that cannot run one sells a
+ * resource that fails at apply.
+ */
 const providers = process.env.CLOUDFLARE_ACCOUNT_ID
   ? [
       new CloudflareProvider({
@@ -127,7 +153,12 @@ const providers = process.env.CLOUDFLARE_ACCOUNT_ID
         },
       }),
     ]
-  : [];
+  : [
+      createLocalProvider({
+        offerings: localOfferings(edge.providerOfferings),
+        dataRoot: process.env.TAKOSERVER_DATA_ROOT ?? ".takoserver",
+      }),
+    ];
 
 const operatorJwk = process.env.TAKOSERVER_OPERATOR_PUBLIC_JWK;
 const unconfigured = {
@@ -161,10 +192,26 @@ const provision = createProvisionerEndpoint({
   credential: process.env.TAKOSERVER_PROVISIONER_TOKEN,
 });
 
-const signingKey = await loadSigningKey(
-  process.env.TAKOSERVER_SIGNING_KEY_ID,
-  process.env.TAKOSERVER_SIGNING_KEY,
-);
+// A shared deployment is given its key; a machine standing on its own makes
+// one, keeps it under the data root, and registers the half that verifies it.
+const signingKey = sharedDatabaseId
+  ? await loadSigningKey(process.env.TAKOSERVER_SIGNING_KEY_ID, process.env.TAKOSERVER_SIGNING_KEY)
+  : await ensureSigningKey({
+      keyId: process.env.TAKOSERVER_SIGNING_KEY_ID ?? "takoserver-local",
+      privateJwk: process.env.TAKOSERVER_SIGNING_KEY,
+      path: join(process.env.TAKOSERVER_DATA_ROOT ?? ".takoserver", "signing-key.jwk"),
+      sql,
+      readFile: (path) =>
+        readFile(path, "utf8").then(
+          (text) => text,
+          () => null,
+        ),
+      async writeFile(path, contents) {
+        await mkdir(dirname(path), { recursive: true });
+        await writeFile(path, contents, { mode: 0o600 });
+        process.stdout.write(`generated a signing key at ${path}\n`);
+      },
+    });
 
 const app = buildApp({
   sql,
@@ -182,7 +229,15 @@ const app = buildApp({
     : {}),
   forms: edge.forms,
   providers,
-  offerings: edge.offerings,
+  // The catalogue names which provider executes each offering, and the driver
+  // looks that provider up by name. Left saying `cloudflare` on a machine with
+  // no Cloudflare, every apply answers that the backend is unavailable — true,
+  // and impossible for anyone to act on.
+  offerings: process.env.CLOUDFLARE_ACCOUNT_ID
+    ? edge.offerings
+    : edge.offerings
+        .filter((offering) => LOCAL_KINDS.includes(offering.kind))
+        .map((offering) => ({ ...offering, providerId: "local" })),
   artifacts: artifactStore,
   clock,
 });
@@ -212,5 +267,8 @@ Bun.serve({
 });
 console.log(
   `takoserver listening on :${port} as ${publicOrigin} ` +
-    `(${providers.length === 0 ? "no provisioning backend" : "cloudflare provisioning"})`,
+    // Named from what is actually configured. A banner that says Cloudflare on
+    // a machine with no account is the first thing an operator reads and the
+    // first thing that misleads them.
+    `(provisioning: ${providers.map((provider) => provider.id).join(", ") || "none"})`,
 );
