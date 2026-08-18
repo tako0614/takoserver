@@ -52,7 +52,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "adapter",
     match:
-      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem|objects-fs)\.ts$|^src\/providers\//u,
+      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem|objects-fs)\.ts$|^src\/workerd-runtime\.ts$|^src\/providers\//u,
     may: ["core", "adapter"],
   },
   {
@@ -120,6 +120,8 @@ const HOST_ONLY = [
   // A Worker has no filesystem. Reaching this would fail at runtime rather
   // than at the gate, and only for the requests that touched it.
   "src/objects-fs.ts",
+  // Writing files and starting processes: a Worker can do neither.
+  "src/workerd-runtime.ts",
   // The Worker has D1 and R2 bindings. A credential-bearing HTTP transport is
   // not a capability it needs, and a capability nothing needs is one worth
   // refusing — see docs/adr/0001-provision-from-the-worker.md, which permits

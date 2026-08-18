@@ -4,17 +4,17 @@
 
 ## Repository
 
-- Scope: Standalone Takoserver provider service with direct Console/API keys/prepaid and public provider contracts.
+- Scope: Standalone prepaid resource platform selling exact Takoform Forms, with console, organizations, API keys, wallet, and a reseller lane.
 - Repository kind: `product`
 - Direct sibling dependencies: なし
 - Repository gate: `bun run check`
-- Canonical docs: [README.md](README.md)
+- Canonical docs: [README.md](README.md), [docs/provisioner.md](docs/provisioner.md), [docs/adr/0001-provision-from-the-worker.md](docs/adr/0001-provision-from-the-worker.md)
 
 ## Ownership
 
-- Owns: Takoserver direct Console and API-key account plane / Prepaid wallet, append-only funding/usage ledger, catalog, and resource lifecycle / Takoform Host plus AI, S3, and Cloudflare-backed provider adapters / Short-lived scoped reseller execution grants and public API/OpenAPI/SDK/CLI artifacts
-- Does not own: Takosumi OSS Run, state, output, audit, or ProviderConnection authority / Takosumi Hosted customer accounts, Marketplace, Stripe, or support / Takosumi Accounts or the transition-to-archive takosumi-cloud repository
-- Hazards: Source visibility is closed even when API/OpenAPI/SDK/CLI artifacts are public. / Reseller requests carry only an opaque tenantRef and a short-lived audience-bound grant. / Do not import Takosumi or Hosted source, account IDs, sessions, or private operator state.
+- Owns: Takoform Host lanes, catalog offerings, and in-Worker Cloudflare provisioning / Organizations, API keys, prepaid wallet, Stripe settlement, and the console / Reseller lane quotes, reservations, capture, release, and provision tokens
+- Does not own: Takosumi OSS Run, state, output, audit, or ProviderConnection authority / Takosumi Hosted customer accounts, Marketplace, retail Stripe, or support / Takosumi Accounts or the retiring takosumi-cloud repository
+- Hazards: Do not import Takosumi or Hosted source, account IDs, sessions, or private operator state. / Shipped Form definitions are frozen by schemaDigest pins; add a definitionVersion instead of editing one. / Reseller customers cross the wire only as opaque tenantRef values and single-use provision tokens.
 
 ## Required workflow
 
