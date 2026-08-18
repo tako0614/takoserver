@@ -1,6 +1,6 @@
 # Takoserver
 
-A self-hostable platform for [Takoform](https://takoform.com). Customers
+An Open Source, Self-Hostable PaaS for [Takoform](https://takoform.com). Customers
 declare infrastructure — object buckets, SQL databases, Workers — and Takoserver
 provisions it, serves it, and bills for it.
 
