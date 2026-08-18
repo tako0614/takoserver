@@ -8,6 +8,7 @@ import { createCatalog, type Offering } from "./catalog.ts";
 import { type Checkout, createControlRoutes } from "./control.ts";
 import { createDataObjectRoutes } from "./data-objects.ts";
 import { createLedger, type FundingSettlementVerifier } from "./ledger.ts";
+import { createMetering, type MeteringRates } from "./metering.ts";
 import type { Clock, ObjectStore, Sql } from "./ports.ts";
 import { createProviderDriver } from "./provider-driver.ts";
 import type { Provider } from "./provider-port.ts";
@@ -40,6 +41,8 @@ export interface AppPorts {
   readonly settlement: FundingSettlementVerifier;
   /** Starts a payment, where this deployment can take one. */
   readonly checkout?: Checkout | undefined;
+  /** What data costs here. Absent means measured and not charged. */
+  readonly meteringRates?: MeteringRates | undefined;
   readonly publicOrigin: string;
   /** Where this deployment's console is served, if it has one. */
   readonly consoleOrigin?: string;
@@ -80,6 +83,8 @@ export interface TickReport {
    * surfaced rather than left to be met one 404 at a time.
    */
   readonly orphanedResources: readonly string[];
+  /** Usage rows folded into ledger entries this tick. */
+  readonly meteredRows: number;
 }
 
 export function buildApp(ports: AppPorts): App {
@@ -157,7 +162,18 @@ export function buildApp(ports: AppPorts): App {
     clock,
   });
 
-  const dataObjects = createDataObjectRoutes({ objects: ports.objects, tokens });
+  const metering = createMetering({
+    sql: ports.sql,
+    ledger,
+    clock,
+    randomId,
+    ...(ports.meteringRates ? { rates: ports.meteringRates } : {}),
+  });
+  const dataObjects = createDataObjectRoutes({
+    objects: ports.objects,
+    tokens,
+    record: (usage) => metering.record({ ...usage, requestId: randomId() }),
+  });
 
   return {
     fetch: createRouter({
@@ -172,6 +188,7 @@ export function buildApp(ports: AppPorts): App {
       const store = inventory;
       const installed = ports.forms.map((form) => form.identity.formRef.schemaDigest);
       const orphans = await store.orphanedResources(installed, 32);
+      const meteredRows = await metering.rollUp(500);
       const orphanedResources = orphans.map(
         (orphan) => `${orphan.space}/${orphan.kind}/${orphan.name}`,
       );
@@ -185,7 +202,7 @@ export function buildApp(ports: AppPorts): App {
           }),
         );
       }
-      return { expiredReservations, orphanedResources };
+      return { expiredReservations, orphanedResources, meteredRows };
     },
   };
 }
