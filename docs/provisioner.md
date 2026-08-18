@@ -1,17 +1,19 @@
-# Running the provisioner
+# Running a provisioner
 
-Takoserver is two halves.
+Cloudflare is provisioned from the Worker itself — see
+[ADR 0001](adr/0001-provision-from-the-worker.md). Nothing in this document is
+needed for that; set `zones` on the deploy target and put a scoped API token in
+`CLOUDFLARE_API_TOKEN` as a Worker secret.
 
-The half on Workers answers the public API. It holds no cloud account
-credential, and `scripts/check-imports.ts` proves it cannot acquire one: the
-Cloudflare provider and both HTTP transports are unreachable from its import
-graph. That is the whole reason the other half exists.
+This is for the residue: a provider that cannot live at the edge because it
+carries a large SDK, holds a connection open, touches a filesystem, or runs
+longer than an edge request should. Such a provider runs in a process you host,
+which answers exactly one path — a provider call in, a classified ticket out —
+and the Worker reaches it as an ordinary `Provider`.
 
-The other half provisions. It runs wherever you choose, holds the account
-credential, and answers exactly one path — a provider call in, a classified
-ticket out. Until it is running and reachable, an apply against the public API
-answers `backend_unavailable`, which is honest: there is nothing to provision
-with.
+Most providers will not need this. One that reaches its backend by calling an
+HTTP API with a credential fits a Worker exactly, and adding it means adding a
+module rather than a machine.
 
 ## What it needs
 

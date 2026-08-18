@@ -340,7 +340,9 @@ export class CloudflareProvider implements Provider {
       if (!bytes) return failed("invalid_spec", `a declared module is missing: ${module.name}`);
       form.set(
         module.name,
-        new Blob([bytes as unknown as BlobPart], { type: module.mediaType }),
+        // The Workers and Bun lib types disagree about what a Blob part is.
+        // Both accept the bytes; only the declarations differ.
+        new Blob([bytes.buffer as ArrayBuffer], { type: module.mediaType }),
         module.name,
       );
     }

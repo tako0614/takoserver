@@ -36,6 +36,14 @@ export interface DeployTarget {
    * that carries a secret is a descriptor somebody will paste into a ticket.
    */
   readonly provisionerOrigin?: string;
+  /**
+   * DNS zones this deployment may attach customer Workers to.
+   *
+   * Declared here because which domains a deployment serves is a property of
+   * the deployment, and because leaving it to an environment variable somebody
+   * edits by hand is how a zone quietly stops being offered.
+   */
+  readonly zones?: readonly Record<string, unknown>[];
   readonly grantKeyId: string;
 }
 
@@ -91,7 +99,7 @@ function validateTarget(value: unknown, path: string): DeployTarget {
   assertExactKeys(
     value,
     ["accountId", "workerName", "d1", "r2", "publicOrigin", "grantKeyId"],
-    ["consoleOrigin", "googleClientId", "provisionerOrigin"],
+    ["consoleOrigin", "googleClientId", "provisionerOrigin", "zones"],
   );
 
   const d1 = value.d1;
@@ -119,6 +127,7 @@ function validateTarget(value: unknown, path: string): DeployTarget {
     ...(value.provisionerOrigin === undefined
       ? {}
       : { provisionerOrigin: httpsOrigin(value.provisionerOrigin) }),
+    ...(value.zones === undefined ? {} : { zones: zoneList(value.zones) }),
     grantKeyId: pattern(value.grantKeyId, KEY_ID, "grantKeyId"),
   };
 }
@@ -130,6 +139,17 @@ function validateTarget(value: unknown, path: string): DeployTarget {
  * otherwise deploy successfully against a target subtly other than the one the
  * operator wrote down.
  */
+/** Zones, checked only for the shape the provider will read. */
+function zoneList(value: unknown): readonly Record<string, unknown>[] {
+  if (!Array.isArray(value)) throw preflightError("deploy target `zones` must be an array");
+  for (const entry of value) {
+    if (!isRecord(entry) || typeof entry.suffix !== "string" || typeof entry.zoneId !== "string") {
+      throw preflightError("each zone needs a `suffix` and a `zoneId`");
+    }
+  }
+  return value as readonly Record<string, unknown>[];
+}
+
 function assertExactKeys(
   value: Record<string, unknown>,
   required: readonly string[],

@@ -3,8 +3,11 @@ import { buildEdgeForms } from "./edge-forms.ts";
 import { resolveIdentity } from "./identity-setup.ts";
 import { createR2ObjectStore } from "./objects-r2.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
+import type { Provider } from "./provider-port.ts";
+import { CloudflareProvider, type CloudflareZone } from "./providers/cloudflare.ts";
 import { createRemoteProvider } from "./providers/remote.ts";
 import { createD1Sql } from "./sql-d1.ts";
+import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 
 /**
  * The Cloudflare Workers entry.
@@ -30,10 +33,16 @@ interface WorkerEnv {
   readonly OPERATOR_PUBLIC_JWK?: string;
   /** Public OAuth client id. Its presence turns Google sign-in on. */
   readonly GOOGLE_CLIENT_ID?: string;
-  /** Origin of the provisioner this deployment runs. */
+  /** Origin of the provisioner this deployment runs, for providers that need one. */
   readonly TAKOSERVER_PROVISIONER_ORIGIN?: string;
   /** Credential this deployment issued to itself for that provisioner. */
   readonly TAKOSERVER_PROVISIONER_TOKEN?: string;
+  /** The Cloudflare account this deployment provisions in. */
+  readonly CLOUDFLARE_ACCOUNT_ID?: string;
+  /** Scoped Cloudflare API token. A secret, never a var. */
+  readonly CLOUDFLARE_API_TOKEN?: string;
+  /** DNS zones this deployment may attach Workers to, as JSON. */
+  readonly TAKOSERVER_ZONES?: string;
 }
 
 /**
@@ -67,36 +76,83 @@ function credentials(env: WorkerEnv) {
   };
 }
 
+/**
+ * What this deployment can provision on.
+ *
+ * Cloudflare is provisioned from here, with a scoped token held as a secret —
+ * see docs/adr/0001-provision-from-the-worker.md, which retired the rule that
+ * kept it out. A remote provisioner remains available for a provider that
+ * cannot live at the edge; both may be present, and neither is required.
+ */
+function provisioning(
+  env: WorkerEnv,
+  edge: Awaited<ReturnType<typeof buildEdgeForms>>,
+  objects: ReturnType<typeof createR2ObjectStore>,
+  artifacts: ReturnType<typeof createTakoformArtifacts>,
+): readonly Provider[] {
+  const providers: Provider[] = [];
+
+  if (env.CLOUDFLARE_ACCOUNT_ID && env.CLOUDFLARE_API_TOKEN) {
+    const token = env.CLOUDFLARE_API_TOKEN;
+    providers.push(
+      new CloudflareProvider({
+        accountId: env.CLOUDFLARE_ACCOUNT_ID,
+        offerings: edge.providerOfferings,
+        authorize: () => `Bearer ${token}`,
+        // Where tenants may be served. A platform suffix is the free address
+        // every tenant gets; a customer domain appears here only after the
+        // operator has confirmed the customer controls it.
+        zones: JSON.parse(env.TAKOSERVER_ZONES ?? "[]") as CloudflareZone[],
+        artifacts: {
+          manifest: (tenantRef, digest) => artifacts.resolveManifest(tenantRef, digest),
+          async blob(digest) {
+            const stored = await objects.get(`art/${digest.slice("sha256:".length)}`);
+            return stored ? new Uint8Array(await new Response(stored.body).arrayBuffer()) : null;
+          },
+        },
+      }),
+    );
+  }
+
+  if (env.TAKOSERVER_PROVISIONER_ORIGIN && env.TAKOSERVER_PROVISIONER_TOKEN) {
+    const token = env.TAKOSERVER_PROVISIONER_TOKEN;
+    providers.push(
+      createRemoteProvider({
+        origin: env.TAKOSERVER_PROVISIONER_ORIGIN,
+        offerings: edge.providerOfferings,
+        authorize: () => `Bearer ${token}`,
+      }),
+    );
+  }
+
+  return providers;
+}
+
 let cached: { readonly env: WorkerEnv; readonly app: App } | null = null;
 
 async function appFor(env: WorkerEnv, origin: string): Promise<App> {
   if (cached?.env === env) return cached.app;
   const edge = await buildEdgeForms();
   const { identity, identityProviders, settlement } = credentials(env);
+  const sql = createD1Sql(env.STATE_DB);
+  const objects = createR2ObjectStore(env.OBJECTS);
+  const artifacts = createTakoformArtifacts({
+    sql,
+    objects,
+    clock: () => new Date(),
+    randomId: () => crypto.randomUUID(),
+  });
   const app = buildApp({
-    sql: createD1Sql(env.STATE_DB),
-    objects: createR2ObjectStore(env.OBJECTS),
+    sql,
+    objects,
+    artifacts,
     identity,
     identityProviders,
     settlement,
     publicOrigin: origin,
     ...(env.TAKOSERVER_CONSOLE_ORIGIN ? { consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN } : {}),
     forms: edge.forms,
-    // This entry cannot provision — it holds no cloud credential and the import
-    // gate proves it cannot acquire one. What it can do is ask the half that
-    // can. Without that, an apply against the public origin finds no provider
-    // and reports the backend unavailable, which is where the product stops
-    // being usable by anyone but its operator.
-    providers:
-      env.TAKOSERVER_PROVISIONER_ORIGIN && env.TAKOSERVER_PROVISIONER_TOKEN
-        ? [
-            createRemoteProvider({
-              origin: env.TAKOSERVER_PROVISIONER_ORIGIN,
-              offerings: edge.providerOfferings,
-              authorize: () => `Bearer ${env.TAKOSERVER_PROVISIONER_TOKEN}`,
-            }),
-          ]
-        : [],
+    providers: provisioning(env, edge, objects, artifacts),
     offerings: edge.offerings,
   });
   cached = { env, app };

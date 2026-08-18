@@ -111,11 +111,10 @@ const WORKER_ENTRY = "src/entry-worker.ts";
 const HOST_ONLY = [
   "src/sql-sqlite.ts",
   "src/objects-mem.ts",
-  // Provisioning needs the Cloudflare REST API and an account token. A Worker
-  // that could reach either would hand that reach to every Worker sharing its
-  // bundle, so provisioning runs on the self-hosted entry instead.
-  "src/providers/cloudflare.ts",
-  // The HTTP transport needs an account credential for the same reason.
+  // The Worker has D1 and R2 bindings. A credential-bearing HTTP transport is
+  // not a capability it needs, and a capability nothing needs is one worth
+  // refusing — see docs/adr/0001-provision-from-the-worker.md, which permits
+  // the Cloudflare provider here and keeps these two out.
   "src/sql-d1-http.ts",
   "src/objects-r2-http.ts",
 ];

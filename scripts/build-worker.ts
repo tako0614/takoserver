@@ -32,12 +32,13 @@ try {
     const bundles = files(output).filter((path) => path.endsWith(".js"));
     if (bundles.length === 0) throw new Error("Wrangler dry-run produced no JavaScript bundle");
     const source = bundles.map((path) => readFileSync(path, "utf8")).join("\n");
-    for (const forbidden of [
-      "api.cloudflare.com/client/v4",
-      "CLOUDFLARE_API_TOKEN",
-      "R2_ACCESS_KEY_ID",
-      "R2_SECRET_ACCESS_KEY",
-    ]) {
+    // Long-lived S3 keys have no business in an edge bundle: nothing here
+    // needs them, and unlike a Worker secret they cannot be rotated by the
+    // platform that issued them. The Cloudflare REST origin and the name of a
+    // secret are no longer refused — naming a secret is how a Worker reads
+    // one, and a gate that forbids the name only teaches people to spell it
+    // differently. See docs/adr/0001-provision-from-the-worker.md.
+    for (const forbidden of ["R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]) {
       if (source.includes(forbidden)) {
         throw new Error(
           `Worker bundle contains forbidden REST or credential surface: ${forbidden}`,

@@ -93,6 +93,12 @@ function publicSettings(target: DeployTarget): Record<string, unknown> {
   if (target.provisionerOrigin !== undefined) {
     vars.TAKOSERVER_PROVISIONER_ORIGIN = target.provisionerOrigin;
   }
+  if (target.zones !== undefined) {
+    // The account the Worker provisions in is the account it is deployed to;
+    // saying so once here keeps the provider from having to be told twice.
+    vars.CLOUDFLARE_ACCOUNT_ID = target.accountId;
+    vars.TAKOSERVER_ZONES = JSON.stringify(target.zones);
+  }
   return Object.keys(vars).length === 0 ? {} : { vars };
 }
 
