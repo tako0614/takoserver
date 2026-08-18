@@ -238,11 +238,13 @@ describe("prepaid vertical over HTTP", () => {
       definitionVersion: OFFERING.form.definitionVersion,
       schemaDigest: OFFERING.form.schemaDigest,
     });
-    const path = `/apis/forms.takoform.com/v1beta1/resources/edge.forms.takoform.com/v1beta1/ObjectBucket/media?${query}`;
+    const mutationPath =
+      "/apis/forms.takoform.com/v1beta1/resources/edge.forms.takoform.com/v1beta1/ObjectBucket/media";
+    const resourcePath = `${mutationPath}?${query}`;
     const applied = await call(
       fetch,
       "PUT",
-      path,
+      mutationPath,
       { ...resource, review: { prepareDigest } },
       { ...bearer, "idempotency-key": "run-http-apply", "if-none-match": "*" },
     );
@@ -258,7 +260,7 @@ describe("prepaid vertical over HTTP", () => {
       keyHeaders,
     );
     expect(cannotRelease.status).toBe(409);
-    const prematureDelete = await call(fetch, "DELETE", path, undefined, {
+    const prematureDelete = await call(fetch, "DELETE", resourcePath, undefined, {
       ...bearer,
       "idempotency-key": "run-http-delete-too-early",
       "takoform-expected-generation": generation,
@@ -281,7 +283,7 @@ describe("prepaid vertical over HTTP", () => {
     );
     expect(paidOnce.body.wallet).toMatchObject({ settledMinor: 9_500, heldMinor: 0 });
 
-    const staleProvisionBearer = await call(fetch, "GET", path, undefined, bearer);
+    const staleProvisionBearer = await call(fetch, "GET", resourcePath, undefined, bearer);
     expect(staleProvisionBearer.status).toBe(401);
 
     // A second paid create authority for the same address must not turn into
@@ -337,7 +339,7 @@ describe("prepaid vertical over HTTP", () => {
     const refusedReplacement = await call(
       fetch,
       "PUT",
-      path,
+      mutationPath,
       {
         ...resource,
         expectedUid: resourceUid,
@@ -380,7 +382,7 @@ describe("prepaid vertical over HTTP", () => {
       )}`,
     };
 
-    const deleted = await call(fetch, "DELETE", path, undefined, {
+    const deleted = await call(fetch, "DELETE", resourcePath, undefined, {
       ...manageBearer,
       "idempotency-key": "run-http-delete",
       "takoform-expected-generation": generation,
