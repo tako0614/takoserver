@@ -233,6 +233,26 @@ describe("provision-token redemption lane", () => {
     );
     expect(replayed.status).toBe(409);
     expect(replayed.body).toMatchObject({ error: { code: "token_replayed" } });
+
+    // Once the provision token has been spent, the reservation's hold is the
+    // payment authority for the resource that now exists. Releasing that hold
+    // would leave a live provider resource unpaid.
+    await expect(
+      lane.reseller.release({
+        organizationId: ORG,
+        tenantRef: TENANT,
+        reservationId: lane.reservation.id,
+      }),
+    ).rejects.toMatchObject({ code: "conflict", status: 409 });
+
+    await expect(
+      lane.reseller.capture({
+        organizationId: ORG,
+        tenantRef: TENANT,
+        reservationId: lane.reservation.id,
+        usage: { meter: lane.quoteMeter, quantity: 1 },
+      }),
+    ).resolves.toMatchObject({ reservationId: lane.reservation.id, amountMinor: 500 });
   });
 
   test("the body must be the purchased form in the token's space", async () => {
