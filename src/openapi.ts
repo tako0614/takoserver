@@ -140,6 +140,10 @@ const PUBLIC_PATHS: Record<string, Record<string, unknown>> = {
     "get",
     "List the organization's Takoform resources",
   ),
+  "/v1/organizations/{organizationId}/resources/{resourceUid}": operation(
+    "get",
+    "Read one exact organization Takoform resource",
+  ),
   "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations": operations({
     get: "List explicit provider migrations for one logical Resource",
     post: "Plan a migration against an exact commercial reservation",

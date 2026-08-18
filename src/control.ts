@@ -449,6 +449,18 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       });
     }
 
+    const organizationResource = /^\/v1\/organizations\/([^/]+)\/resources\/([^/]+)$/u.exec(
+      url.pathname,
+    );
+    if (request.method === "GET" && organizationResource) {
+      const organizationId = segment(organizationResource[1]);
+      const resourceUid = segment(organizationResource[2]);
+      await scoped(request, organizationId, "resources:read");
+      const resource = await inventory.resourceByUid(organizationId, resourceUid);
+      if (!resource) controlError("not_found", 404);
+      return Response.json({ resource: presentResource(resource) });
+    }
+
     const organizationAttachments = /^\/v1\/organizations\/([^/]+)\/attachments$/u.exec(
       url.pathname,
     );

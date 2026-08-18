@@ -172,6 +172,30 @@ async function fixture() {
 }
 
 describe("standard S3 connection credentials", () => {
+  test("reads one exact organization resource so a reseller can enforce its tenant space", async () => {
+    const { call, organizationId, apiKey, install } = await fixture();
+    await install({ uid: "uid_bucket" });
+    const reader = await apiKey(["resources:read"]);
+
+    const response = await call(
+      "GET",
+      `/v1/organizations/${organizationId}/resources/uid_bucket`,
+      undefined,
+      reader,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      resource: {
+        metadata: { uid: "uid_bucket", space: "default" },
+      },
+    });
+    expect(
+      (await call("GET", `/v1/organizations/org_not_owner/resources/uid_bucket`, undefined, reader))
+        .status,
+    ).toBe(403);
+  });
+
   test("issues short-lived standard credentials for one exact ObjectBucket", async () => {
     const { call, organizationId, apiKey, install, issues } = await fixture();
     await install({ uid: "uid_bucket" });

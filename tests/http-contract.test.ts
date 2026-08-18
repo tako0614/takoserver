@@ -77,6 +77,7 @@ const PUBLIC_PATHS = [
   "/v1/organizations/{organizationId}/api-keys/{apiKeyId}",
   "/v1/organizations/{organizationId}/operations",
   "/v1/organizations/{organizationId}/resources",
+  "/v1/organizations/{organizationId}/resources/{resourceUid}",
   "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations",
   "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}",
   "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/cancel",
