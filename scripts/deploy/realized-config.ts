@@ -37,7 +37,7 @@ export function writeRealizedConfig(target: DeployTarget): string {
     ],
     r2_buckets: [{ binding: "OBJECTS", bucket_name: target.r2.bucketName }],
     ...serviceAddress(target.publicOrigin, target.aliases ?? []),
-    ...publicSettings(target),
+    ...deploymentVariables(target),
   };
   writeFileSync(REALIZED_CONFIG_PATH, `${JSON.stringify(realized, null, 2)}\n`, { mode: 0o600 });
   return REALIZED_CONFIG_PATH;
@@ -86,7 +86,7 @@ function readNeutralConfig(): NeutralConfig {
  * the repository because they differ per deployment, which is the same reason
  * the account and the database are.
  */
-function publicSettings(target: DeployTarget): Record<string, unknown> {
+export function deploymentVariables(target: DeployTarget): Record<string, unknown> {
   const vars: Record<string, string> = {};
   if (target.consoleOrigin !== undefined) vars.TAKOSERVER_CONSOLE_ORIGIN = target.consoleOrigin;
   if (target.googleClientId !== undefined) vars.GOOGLE_CLIENT_ID = target.googleClientId;
@@ -96,11 +96,19 @@ function publicSettings(target: DeployTarget): Record<string, unknown> {
   // The key id is public — its public half is in the database for anyone to
   // verify against. The private half is a secret and is set separately.
   vars.TAKOSERVER_SIGNING_KEY_ID = target.grantKeyId;
-  if (target.zones !== undefined) {
+  if (
+    target.zones !== undefined ||
+    target.aiModels !== undefined ||
+    target.r2ParentAccessKeyId !== undefined
+  ) {
     // The account the Worker provisions in is the account it is deployed to;
     // saying so once here keeps the provider from having to be told twice.
     vars.CLOUDFLARE_ACCOUNT_ID = target.accountId;
     vars.TAKOSERVER_ZONES = JSON.stringify(target.zones);
+  }
+  if (target.aiModels !== undefined) vars.TAKOSERVER_AI_MODELS = JSON.stringify(target.aiModels);
+  if (target.r2ParentAccessKeyId !== undefined) {
+    vars.TAKOSERVER_R2_PARENT_ACCESS_KEY_ID = target.r2ParentAccessKeyId;
   }
   return Object.keys(vars).length === 0 ? {} : { vars };
 }

@@ -10,6 +10,7 @@ import { createRemoteProvider } from "./providers/remote.ts";
 import { loadSigningKey } from "./signing-key.ts";
 import { createD1Sql } from "./sql-d1.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
+import { createWorkerDataServices } from "./worker-data-services.ts";
 
 /**
  * The Cloudflare Workers entry.
@@ -51,6 +52,12 @@ interface WorkerEnv {
   readonly TAKOSERVER_SIGNING_KEY_ID?: string;
   /** Private half, as an Ed25519 JWK. A secret. */
   readonly TAKOSERVER_SIGNING_KEY?: string;
+  /** Private model mapping and retail price configuration. */
+  readonly TAKOSERVER_AI_MODELS?: string;
+  /** Metadata identifying the R2 parent token used for temporary credentials. */
+  readonly TAKOSERVER_R2_PARENT_ACCESS_KEY_ID?: string;
+  /** R2 parent token. A secret distinct from the general Cloudflare API token. */
+  readonly TAKOSERVER_R2_PARENT_TOKEN?: string;
 }
 
 /**
@@ -165,6 +172,7 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     env.TAKOSERVER_SIGNING_KEY_ID,
     env.TAKOSERVER_SIGNING_KEY,
   );
+  const dataServices = createWorkerDataServices(env);
   const app = buildApp({
     sql,
     objects,
@@ -174,6 +182,7 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     identityProviders,
     settlement,
     ...(checkout ? { checkout } : {}),
+    ...dataServices,
     publicOrigin: origin,
     ...(env.TAKOSERVER_CONSOLE_ORIGIN ? { consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN } : {}),
     forms: edge.forms,

@@ -106,7 +106,7 @@ export async function preflight(
 
   assertMigrationLineage(live.appliedMigrations, migrations.files);
   await assertAliasesAttachable(target);
-  await assertSigningKeyPresent(configPath);
+  await assertRequiredSecretsPresent(configPath, target);
   await assertProbeDatabaseIdentity(configPath, target);
 
   const { alreadyCurrent } = assertPublishedIdentity(
@@ -243,16 +243,42 @@ async function resolves(hostname: string): Promise<boolean> {
  * unhelpful unless you already know what it means. Asking here turns it into a
  * sentence naming the secret to set.
  */
-async function assertSigningKeyPresent(configPath: string): Promise<void> {
+async function assertRequiredSecretsPresent(
+  configPath: string,
+  target: DeployTarget,
+): Promise<void> {
   const listed = await runCommand(wranglerCommand(["secret", "list", "--config", configPath]));
   // A listing we could not obtain is not evidence of absence, and refusing to
   // deploy over a transient wrangler failure would be its own defect.
   if (listed.exitCode !== 0) return;
-  if (listed.stdout.includes("TAKOSERVER_SIGNING_KEY")) return;
-  throw preflightError(
-    "the signing key secret is not set",
-    "Data tokens are signed with it, and without it every request for one fails with " +
-      "`no_active_keys`. Set it from the operator's private key:\n" +
-      "  wrangler secret put TAKOSERVER_SIGNING_KEY --config .wrangler-realized.jsonc",
-  );
+  const required = [
+    {
+      name: "TAKOSERVER_SIGNING_KEY",
+      why: "data tokens cannot be issued without the private signing key",
+    },
+    ...(target.zones !== undefined || target.aiModels !== undefined
+      ? [
+          {
+            name: "CLOUDFLARE_API_TOKEN",
+            why: "Cloudflare provisioning or AI is enabled by this target",
+          },
+        ]
+      : []),
+    ...(target.r2ParentAccessKeyId !== undefined
+      ? [
+          {
+            name: "TAKOSERVER_R2_PARENT_TOKEN",
+            why: "standard S3 temporary credentials are enabled by this target",
+          },
+        ]
+      : []),
+  ];
+  for (const secret of required) {
+    if (listed.stdout.includes(secret.name)) continue;
+    throw preflightError(
+      `required Worker secret ${secret.name} is not set`,
+      `${secret.why}. Set it through the owner configuration before publishing:\n` +
+        `  wrangler secret put ${secret.name} --config .wrangler-realized.jsonc`,
+    );
+  }
 }
