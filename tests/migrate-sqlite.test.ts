@@ -20,6 +20,7 @@ describe("bringing a local database up to date", () => {
       "orgs",
       "ledger",
       "tf_resources",
+      "tf_resource_attachments",
       "tf_resource_deployments",
       "reservations",
     ]) {

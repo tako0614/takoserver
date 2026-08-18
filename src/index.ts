@@ -14,6 +14,17 @@ export {
 } from "./ai-port.ts";
 export { type App, type AppPorts, buildApp, type TickReport } from "./app.ts";
 export {
+  AttachmentError,
+  type AttachmentFactory,
+  type AttachmentResolution,
+  type AttachmentResourceView,
+  type AttachmentStore,
+  createAttachmentService,
+  createAttachmentStore,
+  type NewResourceAttachment,
+  type ResourceAttachment,
+} from "./attachments.ts";
+export {
   type Accounts,
   type Actor,
   API_KEY_SCOPES,
