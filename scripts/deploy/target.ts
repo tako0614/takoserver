@@ -15,6 +15,15 @@ export interface DeployTarget {
   readonly r2: { readonly bucketName: string };
   readonly publicOrigin: string;
   /**
+   * Other hostnames this deployment also answers on.
+   *
+   * `publicOrigin` is the canonical address — the one discovery advertises and
+   * the one a client should use. An alias is a second door to the same rooms,
+   * which an apex usually is: people type the bare domain, and a bare domain
+   * that answers nothing looks like a product that is not there.
+   */
+  readonly aliases?: readonly string[];
+  /**
    * Where this deployment's console is served, if it has one. Optional because
    * a deployment is a complete product without a console — the API, the CLI and
    * the Takoform provider are the whole of it for anyone integrating.
@@ -55,6 +64,8 @@ const WORKER_NAME = /^[a-z0-9][a-z0-9-]{1,62}$/u;
 const BUCKET_NAME = /^[a-z0-9][a-z0-9-]{2,62}$/u;
 const KEY_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/u;
 const GOOGLE_CLIENT_ID = /^[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com$/u;
+const HOSTNAME =
+  /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/u;
 
 export function targetPath(explicit?: string): string {
   const candidate = explicit ?? process.env.TAKOSERVER_DEPLOY_TARGET ?? DEFAULT_TARGET_PATH;
@@ -99,7 +110,7 @@ function validateTarget(value: unknown, path: string): DeployTarget {
   assertExactKeys(
     value,
     ["accountId", "workerName", "d1", "r2", "publicOrigin", "grantKeyId"],
-    ["consoleOrigin", "googleClientId", "provisionerOrigin", "zones"],
+    ["aliases", "consoleOrigin", "googleClientId", "provisionerOrigin", "zones"],
   );
 
   const d1 = value.d1;
@@ -118,6 +129,7 @@ function validateTarget(value: unknown, path: string): DeployTarget {
     },
     r2: { bucketName: pattern(r2.bucketName, BUCKET_NAME, "r2.bucketName") },
     publicOrigin: httpsOrigin(value.publicOrigin),
+    ...(value.aliases === undefined ? {} : { aliases: hostnames(value.aliases) }),
     ...(value.consoleOrigin === undefined
       ? {}
       : { consoleOrigin: httpsOrigin(value.consoleOrigin) }),
@@ -139,6 +151,17 @@ function validateTarget(value: unknown, path: string): DeployTarget {
  * otherwise deploy successfully against a target subtly other than the one the
  * operator wrote down.
  */
+/** Hostnames, as hostnames — not origins, because a route is not a URL. */
+function hostnames(value: unknown): readonly string[] {
+  if (!Array.isArray(value)) throw preflightError("deploy target `aliases` must be an array");
+  return value.map((entry) => {
+    if (typeof entry !== "string" || !HOSTNAME.test(entry)) {
+      throw preflightError(`alias is not a hostname: ${JSON.stringify(entry)}`);
+    }
+    return entry;
+  });
+}
+
 /** Zones, checked only for the shape the provider will read. */
 function zoneList(value: unknown): readonly Record<string, unknown>[] {
   if (!Array.isArray(value)) throw preflightError("deploy target `zones` must be an array");

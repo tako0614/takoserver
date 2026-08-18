@@ -36,7 +36,7 @@ export function writeRealizedConfig(target: DeployTarget): string {
       },
     ],
     r2_buckets: [{ binding: "OBJECTS", bucket_name: target.r2.bucketName }],
-    ...serviceAddress(target.publicOrigin),
+    ...serviceAddress(target.publicOrigin, target.aliases ?? []),
     ...publicSettings(target),
   };
   writeFileSync(REALIZED_CONFIG_PATH, `${JSON.stringify(realized, null, 2)}\n`, { mode: 0o600 });
@@ -112,12 +112,20 @@ function publicSettings(target: DeployTarget): Record<string, unknown> {
  * leaving it on publishes the same API at a second address that spells out the
  * operator's account name.
  */
-function serviceAddress(publicOrigin: string): Record<string, unknown> {
+function serviceAddress(
+  publicOrigin: string,
+  aliases: readonly string[] = [],
+): Record<string, unknown> {
   const { hostname } = new URL(publicOrigin);
-  if (hostname.endsWith(".workers.dev")) return { workers_dev: true };
+  if (hostname.endsWith(".workers.dev")) {
+    if (aliases.length > 0) {
+      throw preflightError("a workers.dev origin cannot carry aliases; name a real origin first");
+    }
+    return { workers_dev: true };
+  }
   return {
     workers_dev: false,
-    routes: [{ pattern: hostname, custom_domain: true }],
+    routes: [hostname, ...aliases].map((pattern) => ({ pattern, custom_domain: true })),
   };
 }
 
