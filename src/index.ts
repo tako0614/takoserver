@@ -54,7 +54,6 @@ export {
   compileCatalog,
   type DeliveryMode,
   type ProviderInstallation,
-  type ProviderPackDescriptor,
   type SupplyContract,
 } from "./catalog-compiler.ts";
 export {
@@ -84,6 +83,17 @@ export type {
   Sql,
   SqlWrite,
 } from "./ports.ts";
+export {
+  type CostEstimator,
+  type CredentialIssuer,
+  createProviderPack,
+  type MeterSource,
+  type ProviderPack,
+  type ProviderPackDefinition,
+  type ProviderPackDescriptor,
+  type ResourceProvisioner,
+  type TransferEndpoint,
+} from "./provider-pack.ts";
 export {
   createOpenAiGateway,
   type OpenAiGatewayOptions,

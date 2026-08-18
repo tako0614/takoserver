@@ -4,9 +4,9 @@ import {
   compileCatalog,
   type PricePlan,
   type ProviderInstallation,
-  type ProviderPackDescriptor,
   type SupplyContract,
 } from "../src/catalog-compiler.ts";
+import type { ProviderPackDescriptor } from "../src/provider-pack.ts";
 
 const FORM = {
   apiVersion: "edge.forms.takoform.com/v1beta1",

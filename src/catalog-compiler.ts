@@ -1,19 +1,11 @@
 import { type Catalog, createCatalog, type Offering, type PricePlan } from "./catalog.ts";
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import type { TakoformBindingRef, TakoformInterfaceRef } from "./interface-ref.ts";
+import type { ProviderPackDescriptor } from "./provider-pack.ts";
 
 export type { PricePlan } from "./catalog.ts";
 
 export type DeliveryMode = Offering["deliveryMode"];
-
-export interface ProviderPackDescriptor {
-  readonly id: string;
-  readonly providerType: string;
-  readonly forms: readonly TakoformV1Alpha3FormRef[];
-  readonly providedInterfaces: readonly TakoformInterfaceRef[];
-  readonly bindingRefs: readonly TakoformBindingRef[];
-  readonly meterSources: readonly string[];
-}
 
 export interface SupplyContract {
   readonly id: string;
