@@ -6,6 +6,12 @@
  * reach is a decision rather than an accident.
  */
 
+export {
+  type AiGateway,
+  AiGatewayError,
+  type AiModel,
+  type AiUsage,
+} from "./ai-port.ts";
 export { type App, type AppPorts, buildApp, type TickReport } from "./app.ts";
 export {
   type Accounts,
@@ -27,6 +33,7 @@ export {
   createTakoformHost,
 } from "./compat.ts";
 export { ControlError, createControlRoutes } from "./control.ts";
+export { createDataAiRoutes, type DataAiRoutes } from "./data-ai.ts";
 export { bytesDigest, canonicalDigest, canonicalJson } from "./json.ts";
 export {
   createLedger,
@@ -48,6 +55,12 @@ export type {
   Sql,
   SqlWrite,
 } from "./ports.ts";
+export {
+  createOpenAiGateway,
+  type OpenAiGatewayOptions,
+  type OpenAiModelConfig,
+  parseOpenAiModelConfig,
+} from "./providers/openai.ts";
 export {
   createReseller,
   type Quote,

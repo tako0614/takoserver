@@ -28,8 +28,8 @@ const SHAPES: readonly unknown[] = [
   {
     apiVersion: "edge.forms.takoform.com/v1beta1",
     kind: "ObjectBucket",
-    definitionVersion: "1.0.0",
-    schemaDigest: `sha256:${"a".repeat(64)}`,
+    definitionVersion: "0.1.0",
+    schemaDigest: "sha256:3383a60c12bdc5a853868bd7ccab3670e1aff7b3eca889583b86d11ac0f90494",
   },
   { quoted: 'he said "hi"', escaped: "back\\slash", newline: "a\nb", tab: "a\tb" },
   { surrogate: "\u{1f419}" },

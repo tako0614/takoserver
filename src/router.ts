@@ -1,4 +1,5 @@
 import type { ControlRoutes } from "./control.ts";
+import type { DataAiRoutes } from "./data-ai.ts";
 import type { DataObjectRoutes } from "./data-objects.ts";
 import { landingHtml } from "./landing.ts";
 import { openApiDocument } from "./openapi.ts";
@@ -18,6 +19,8 @@ export interface CreateRouterOptions {
   readonly control: ControlRoutes;
   /** The data plane: reaching what a resource actually holds. */
   readonly dataObjects?: DataObjectRoutes;
+  readonly dataAi?: DataAiRoutes;
+  readonly aiAvailable?: boolean;
   readonly takoformHost?: TakoformHost;
   readonly publicOrigin: string;
   /**
@@ -96,6 +99,11 @@ function dispatch(options: CreateRouterOptions, origin: string): Router {
       if (served) return served;
     }
 
+    if (options.dataAi) {
+      const served = await options.dataAi(request, url);
+      if (served) return served;
+    }
+
     if (options.takoformHost) {
       const handled = await options.takoformHost.handle(request);
       if (handled) return handled;
@@ -118,6 +126,7 @@ function dispatch(options: CreateRouterOptions, origin: string): Router {
           ...(console ? { console } : {}),
           openapi: `${origin}/openapi.json`,
           takoform: `${origin}/apis/forms.takoform.com/v1alpha3`,
+          ...(options.aiAvailable ? { ai: `${origin}/v1/ai` } : {}),
         },
       });
     }

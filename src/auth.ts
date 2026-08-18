@@ -30,6 +30,7 @@ export interface IdentityProviderDescriptor {
 }
 
 export const API_KEY_SCOPES = [
+  "ai:invoke",
   "catalog:read",
   "resources:read",
   "resources:write",

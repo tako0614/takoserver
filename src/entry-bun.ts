@@ -14,6 +14,7 @@ import { ensureOperatorKey, signOperatorAssertion } from "./operator-key.ts";
 import { resolvePayment } from "./payment-setup.ts";
 import { CloudflareProvider } from "./providers/cloudflare.ts";
 import { createLocalProvider, LOCAL_KINDS, localOfferings } from "./providers/local.ts";
+import { createOpenAiGateway, parseOpenAiModelConfig } from "./providers/openai.ts";
 import { createWorkerdProvider } from "./providers/workerd.ts";
 import { createProvisionerEndpoint } from "./provisioner-endpoint.ts";
 import { ensureSigningKey, loadSigningKey } from "./signing-key.ts";
@@ -58,6 +59,28 @@ function cloudflareToken(): string {
   const path = process.env.TAKOSERVER_CF_TOKEN_FILE;
   if (!path) return required("CLOUDFLARE_API_TOKEN");
   return readFileSync(path, "utf8").trim();
+}
+
+function aiGateway() {
+  const baseUrl = process.env.TAKOSERVER_AI_BASE_URL;
+  const models = process.env.TAKOSERVER_AI_MODELS;
+  const tokenFile = process.env.TAKOSERVER_AI_TOKEN_FILE;
+  const token = process.env.TAKOSERVER_AI_TOKEN;
+  if (!baseUrl && !models && !tokenFile && !token) return undefined;
+  if (!baseUrl || !models || (!tokenFile && !token)) {
+    throw new Error(
+      "TAKOSERVER_AI_BASE_URL, TAKOSERVER_AI_MODELS, and one AI token source are required together",
+    );
+  }
+  return createOpenAiGateway({
+    baseUrl,
+    models: parseOpenAiModelConfig(models),
+    authorize: () => {
+      const secret = tokenFile ? readFileSync(tokenFile, "utf8").trim() : token;
+      if (!secret) throw new Error("AI upstream token is empty");
+      return `Bearer ${secret}`;
+    },
+  });
 }
 
 const publicOrigin = process.env.TAKOSERVER_PUBLIC_ORIGIN ?? "http://localhost:8787";
@@ -276,12 +299,14 @@ const signingKey = sharedDatabaseId
       },
     });
 
+const configuredAi = aiGateway();
 const app = buildApp({
   sql,
   objects,
   ...(signingKey ? { signingKey } : {}),
   identity: identity.verifier,
   identityProviders: identity.providers,
+  ...(configuredAi ? { ai: configuredAi } : {}),
   settlement:
     payment.settlement ??
     (publicKeyJwk ? createOperatorSettlement({ publicKeyJwk }) : unconfigured),

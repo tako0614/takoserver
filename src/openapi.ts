@@ -112,6 +112,22 @@ const PUBLIC_PATHS: Record<string, Record<string, unknown>> = {
     security: [],
   }),
   "/v1/me": operation("get", "Read the signed-in principal and the organizations it owns"),
+  "/v1/ai/models": operation("get", "List configured OpenAI-compatible models"),
+  "/v1/ai/chat/completions": operation(
+    "post",
+    "Create a prepaid OpenAI-compatible chat completion",
+    {
+      parameters: [
+        {
+          name: "Idempotency-Key",
+          in: "header",
+          required: true,
+          schema: { type: "string", minLength: 1, maxLength: 128 },
+          description: "Stable per paid inference; replays return the same settled result.",
+        },
+      ],
+    },
+  ),
   "/v1/forms": operation("get", "List every Form definition this Host will accept", {
     security: [],
   }),
@@ -186,13 +202,17 @@ function operations(summaries: Readonly<Record<string, string>>): Record<string,
 function operation(
   method: string,
   summary: string,
-  extra: { readonly security?: readonly unknown[] } = {},
+  extra: {
+    readonly security?: readonly unknown[];
+    readonly parameters?: readonly unknown[];
+  } = {},
 ): Record<string, unknown> {
   return {
     [method]: {
       summary,
       responses: { "200": { description: "Success" } },
       ...(extra.security ? { security: extra.security } : {}),
+      ...(extra.parameters ? { parameters: extra.parameters } : {}),
     },
   };
 }

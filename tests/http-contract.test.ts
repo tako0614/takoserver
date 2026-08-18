@@ -70,6 +70,8 @@ const PUBLIC_PATHS = [
   "/v1/forms",
   "/v1/identity/providers",
   "/v1/me",
+  "/v1/ai/models",
+  "/v1/ai/chat/completions",
   "/v1/organizations",
   "/v1/organizations/{organizationId}/api-keys",
   "/v1/organizations/{organizationId}/api-keys/{apiKeyId}",

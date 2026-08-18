@@ -112,6 +112,39 @@
         }
       }
     },
+    "/v1/ai/models": {
+      "get": {
+        "summary": "List configured OpenAI-compatible models",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/ai/chat/completions": {
+      "post": {
+        "summary": "Create a prepaid OpenAI-compatible chat completion",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        },
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "description": "Stable per paid inference; replays return the same settled result."
+          }
+        ]
+      }
+    },
     "/v1/forms": {
       "get": {
         "summary": "List every Form definition this Host will accept",

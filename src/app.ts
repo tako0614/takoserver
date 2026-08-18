@@ -1,3 +1,4 @@
+import type { AiGateway } from "./ai-port.ts";
 import {
   createAccounts,
   type ExternalIdentityVerifier,
@@ -6,6 +7,7 @@ import {
 } from "./auth.ts";
 import { createCatalog, type Offering } from "./catalog.ts";
 import { type Checkout, createControlRoutes } from "./control.ts";
+import { createDataAiRoutes } from "./data-ai.ts";
 import { createDataObjectRoutes } from "./data-objects.ts";
 import { createLedger, type FundingSettlementVerifier } from "./ledger.ts";
 import { createMetering, type MeteringRates } from "./metering.ts";
@@ -43,6 +45,8 @@ export interface AppPorts {
   readonly checkout?: Checkout | undefined;
   /** What data costs here. Absent means measured and not charged. */
   readonly meteringRates?: MeteringRates | undefined;
+  /** OpenAI-compatible inference backend. Absent keeps the AI route unavailable. */
+  readonly ai?: AiGateway;
   readonly publicOrigin: string;
   /** Where this deployment's console is served, if it has one. */
   readonly consoleOrigin?: string;
@@ -177,10 +181,21 @@ export function buildApp(ports: AppPorts): App {
     tokens,
     record: (usage) => metering.record({ ...usage, requestId: randomId() }),
   });
+  const dataAi = createDataAiRoutes({
+    accounts,
+    ...(ports.ai ? { gateway: ports.ai } : {}),
+    ledger,
+    sql: ports.sql,
+    record: (usage) => metering.recordAi(usage),
+    clock,
+    randomId,
+  });
 
   return {
     fetch: createRouter({
       control,
+      dataAi,
+      aiAvailable: ports.ai !== undefined,
       dataObjects,
       takoformHost,
       publicOrigin: ports.publicOrigin,

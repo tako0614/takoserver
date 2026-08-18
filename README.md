@@ -1,8 +1,15 @@
 # Takoserver
 
-An Open Source, Self-Hostable PaaS for [Takoform](https://takoform.com). Customers
-declare infrastructure — object buckets, SQL databases, Workers — and Takoserver
-provisions it, serves it, and bills for it.
+An Open Source, Self-Hostable PaaS with a [Takoform](https://takoform.com) Host
+for declarative infrastructure and ordinary data APIs for already-standardized
+services. Today its shipped infrastructure catalog is the exact ObjectBucket
+Form carried by the released Takoform provider. Object access and
+OpenAI-compatible AI inference are data services, not locally invented Forms.
+
+The current `/data/v1/objects` surface is a small Takoserver data API, **not an
+S3-compatible endpoint**. ObjectBucket lifecycle stays in Takoform, while the
+GA object data plane will speak the standard S3 wire directly. That work does
+not create another Form.
 
 Run it on your own machine and it uses your disk and [workerd](https://github.com/cloudflare/workerd),
 the runtime Cloudflare runs at the edge. Point it at a Cloudflare account and it
@@ -32,6 +39,11 @@ the part that owns accounts, money, and the machines.
   settled minus held, computed from entries that are only ever appended.
 - **Reach** what you provisioned. A bucket is not a name in a list: a
   short-lived token scoped to one resource opens its data plane.
+- **Infer** through `/v1/ai`. An organization API key with `ai:invoke` sees only
+  operator-configured public model IDs. Takoserver holds the maximum prepaid
+  charge before inference, captures reported token use, and releases the rest.
+  Paid inference requires `Idempotency-Key`; a settled result is replayed from
+  durable state without calling the upstream or charging again.
 
 ## Self-hosting
 
@@ -47,6 +59,10 @@ Everything lives under one directory, `.takoserver` by default.
 | `TAKOSERVER_OPERATOR_PUBLIC_JWK` | Public half of the operator key. Generated under the data root if unset. |
 | `GOOGLE_CLIENT_ID` | Turns on Google sign-in. Its absence leaves the operator path. |
 | `STRIPE_SECRET_KEY` | Turns on card payment. Its absence leaves operator-signed funding. |
+| `TAKOSERVER_AI_BASE_URL` | HTTPS base path of an OpenAI-compatible upstream. |
+| `TAKOSERVER_AI_MODELS` | JSON allowlist mapping public model IDs to upstream IDs, limits, and retail token prices. |
+| `TAKOSERVER_AI_TOKEN_FILE` | Preferred rotatable upstream bearer secret file. |
+| `TAKOSERVER_AI_TOKEN` | Direct upstream bearer secret when a file is not used. |
 
 Nothing in that table is required to start. What is absent is absent rather than
 faked: a deployment with no Stripe key does not serve the route that would begin
@@ -102,7 +118,7 @@ for why the deployed Worker holds the account credential, and what that costs.
 
 ## How it is built
 
-Five ports, and everything above them is provider-neutral.
+Six ports, and everything above them is provider-neutral.
 
 | Port | Implementations |
 |---|---|
@@ -111,6 +127,7 @@ Five ports, and everything above them is provider-neutral.
 | `Provider` | local, workerd, Cloudflare, a remote provisioner |
 | `ExternalIdentityVerifier` | Google ID tokens, operator signature |
 | `FundingSettlementVerifier` | Stripe, operator signature |
+| `AiGateway` | any OpenAI-compatible upstream; private deployments may compose a native binding |
 
 `scripts/check-imports.ts` enforces the layering as a gate rather than a
 convention: core, adapters, domain, routes, composition, entries — and a
@@ -118,11 +135,12 @@ per-entry ban, so the Workers entry cannot reach a filesystem it does not have.
 
 Three properties are worth knowing before reading the code:
 
-**Shipped Form definitions are frozen.** A Form's identity includes the digest
-of its schema, so changing one mints a different Form and strands every resource
-that named the old one — still running, still billing, no longer addressable.
-The digests are pinned by a test. Adding a line to it is how a definition ships;
-changing one is not.
+**Shipped Form definitions come from a release.** Takoserver cannot author a
+name in the Takoform namespace. `bun run check:official-forms` pins the exact
+Takoform provider tag, commit, identity ledger, definition, and package index,
+then proves the shipped catalog is an exact subset. A new Form needs a released
+provider definition and an implemented backend; AI and S3 protocol operations
+do not become Forms just because Takoserver offers them.
 
 **Guarded writes, not transactions.** The control database may be D1, which has
 no interactive transaction, so invariants live in `WHERE` clauses and are

@@ -21,9 +21,9 @@ const WORKER: ProviderOffering = {
   displayName: "Worker",
   form: {
     apiVersion: "edge.forms.takoform.com/v1beta1",
-    kind: "WorkerScript",
-    definitionVersion: "1.0.0",
-    schemaDigest: `sha256:${"a".repeat(64)}`,
+    kind: "WorkerVersion",
+    definitionVersion: "0.1.0",
+    schemaDigest: "sha256:22fde31c0b695ca59f5c46230c1ed03d6a6f53c01015d4a5acf6bdb0ed70b50c",
   },
   unit: "worker-month",
   unitPriceMinor: 1_500,

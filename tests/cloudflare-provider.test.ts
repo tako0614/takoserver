@@ -9,8 +9,8 @@ import {
 const FORM_REF = {
   apiVersion: "edge.forms.takoform.com/v1beta1",
   kind: "ObjectBucket",
-  definitionVersion: "1.0.0",
-  schemaDigest: `sha256:${"c".repeat(64)}`,
+  definitionVersion: "0.1.0",
+  schemaDigest: "sha256:3383a60c12bdc5a853868bd7ccab3670e1aff7b3eca889583b86d11ac0f90494",
 } as const;
 
 function offering(id: string, kind: string): ProviderOffering {
@@ -18,7 +18,15 @@ function offering(id: string, kind: string): ProviderOffering {
     id,
     kind,
     displayName: id,
-    form: { ...FORM_REF, kind: kind === "worker_script" ? "WorkerScript" : FORM_REF.kind },
+    form:
+      kind === "worker_script"
+        ? {
+            apiVersion: "edge.forms.takoform.com/v1beta1",
+            kind: "WorkerVersion",
+            definitionVersion: "0.1.0",
+            schemaDigest: "sha256:22fde31c0b695ca59f5c46230c1ed03d6a6f53c01015d4a5acf6bdb0ed70b50c",
+          }
+        : FORM_REF,
     unit: "unit",
     unitPriceMinor: 100,
     protocols: [],
