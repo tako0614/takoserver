@@ -5,6 +5,7 @@ import { health } from "../resource-state.ts";
 import { linkProps, navigate, resourcePath } from "../router.ts";
 import { api } from "../state.ts";
 import { ago, badge, card, empty, ICON, icon, shortDigest, whenReady } from "../ui.ts";
+import { createResource } from "./create-resource.ts";
 
 /**
  * Everything the organization has declared.
@@ -18,6 +19,9 @@ export function resourcesPage(organizationId: string): Child {
   const filter = signal("");
   const spaceFilter = signal("");
   const page = resource(() => api.resources(organizationId));
+  // Loaded alongside, because the button that creates a resource must offer
+  // exactly what this organization may provision — not a list written here.
+  const catalog = resource(() => api.catalog(organizationId));
 
   return h(
     "div",
@@ -36,10 +40,32 @@ export function resourcesPage(organizationId: string): Child {
         ),
       ),
       h(
-        "button",
-        { class: "btn", type: "button", onClick: page.reload },
-        icon(ICON.refresh, 14),
-        text("Reload"),
+        "div",
+        { class: "toolbar" },
+        h(
+          "button",
+          { class: "btn", type: "button", onClick: page.reload },
+          icon(ICON.refresh, 14),
+          text("Reload"),
+        ),
+        live(() => {
+          const state = catalog.get();
+          return h(
+            "button",
+            {
+              class: "btn btn--primary",
+              type: "button",
+              ...(state.state === "ready" ? {} : { disabled: true }),
+              onClick: () => {
+                if (state.state === "ready") {
+                  createResource(organizationId, state.value.offerings);
+                }
+              },
+            },
+            icon(ICON.plus, 14),
+            text("New resource"),
+          );
+        }),
       ),
     ),
     live(() =>
@@ -51,7 +77,7 @@ export function resourcesPage(organizationId: string): Child {
               null,
               empty(
                 "Nothing declared yet",
-                "Apply a resource with the Takoform provider or the CLI, and it will appear here the moment the Host accepts it.",
+                "Declare one here, or apply it with the Takoform provider or the CLI — either way it appears the moment the Host accepts it.",
               ),
             );
           }

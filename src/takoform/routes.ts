@@ -54,7 +54,7 @@ const RESOURCE = new RegExp(
 const OPERATION = new RegExp(`^${escaped(CURRENT_LANE)}/operations/([^/]+)(/cancel)?$`, "u");
 
 export interface CreateTakoformRoutesOptions {
-  readonly authenticate: (authorization: string | null) => Promise<TakoformHostPrincipal | null>;
+  readonly authenticate: (request: Request) => Promise<TakoformHostPrincipal | null>;
   readonly engine: TakoformEngine;
   readonly store: TakoformStore;
   readonly forms: FormRegistry;
@@ -71,7 +71,7 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
       if (!url.pathname.startsWith(CURRENT_LANE)) return null;
       if (url.pathname.includes("%")) return failure("invalid_argument", 400);
 
-      const principal = await authenticate(request.headers.get("authorization"));
+      const principal = await authenticate(request);
       if (!principal) return failure("unauthenticated", 401);
       const context: EngineContext = {
         request,

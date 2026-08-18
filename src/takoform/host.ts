@@ -21,7 +21,7 @@ import type {
 export interface CreateTakoformHostOptions {
   readonly sql: Sql;
   readonly objects: ObjectStore;
-  readonly authenticate: (authorization: string | null) => Promise<TakoformHostPrincipal | null>;
+  readonly authenticate: (request: Request) => Promise<TakoformHostPrincipal | null>;
   readonly forms: readonly InstalledTakoformForm[];
   readonly driver: TakoformResourceDriver;
   readonly artifacts?: TakoformArtifactTransport;

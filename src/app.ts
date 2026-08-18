@@ -1,6 +1,7 @@
 import {
   createAccounts,
   type ExternalIdentityVerifier,
+  grants,
   type IdentityProviderDescriptor,
 } from "./auth.ts";
 import { createCatalog, type Offering } from "./catalog.ts";
@@ -104,11 +105,29 @@ export function buildApp(ports: AppPorts): App {
       // The Takoform lane is entered with an organization API key carrying
       // `resources:write`. A single-use provisioning token is deliberately not
       // accepted here: it authorizes one resource, not a whole lane.
-      authenticate: async (authorization) => {
-        const actor = await accounts.authorize(authorization, "resources:write");
-        return actor?.organizationId
-          ? { tenantId: actor.organizationId, principalId: actor.principalId }
-          : null;
+      //
+      // A signed-in person may enter it too, and must say which organization
+      // they are acting for. A key names one organization by existing; a
+      // session names a person, who may own several, and guessing which of
+      // somebody's organizations to bill is not a guess worth making. The
+      // header is ignored for a key, whose organization is not up for
+      // discussion.
+      authenticate: async (request) => {
+        const authorization = request.headers.get("authorization");
+        const actor = await accounts.authenticate(authorization);
+        if (!actor) return null;
+        if (actor.kind === "api_key") {
+          return actor.organizationId && grants(actor.scopes, "resources:write")
+            ? { tenantId: actor.organizationId, principalId: actor.principalId }
+            : null;
+        }
+        const organizationId = request.headers.get("takoform-organization");
+        if (!organizationId) return null;
+        const owned = await accounts
+          .requireOwner(actor, organizationId)
+          .then(() => true)
+          .catch(() => false);
+        return owned ? { tenantId: organizationId, principalId: actor.principalId } : null;
       },
       forms: ports.forms,
       driver,

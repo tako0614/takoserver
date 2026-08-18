@@ -160,3 +160,114 @@ describe("scope implication", () => {
     expect(grants(["catalog:read"], "reseller:write")).toBe(false);
   });
 });
+
+/**
+ * A signed-in person may enter the exact-pin lane, and must say which
+ * organization they are acting for.
+ *
+ * A key names one organization by existing. A session names a person, who may
+ * own several — and guessing which of somebody's organizations to bill is not
+ * a guess worth making, so an unnamed session is refused rather than resolved.
+ */
+describe("entering the lane with a session", () => {
+  const build = async () => {
+    const { buildApp } = await import("../src/app.ts");
+    const { buildEdgeForms } = await import("../src/edge-forms.ts");
+    const { createEphemeralSql } = await import("../src/compat.ts");
+    const { createMemoryObjectStore } = await import("../src/objects-mem.ts");
+    const edge = await buildEdgeForms();
+    const app = buildApp({
+      sql: createEphemeralSql(),
+      objects: createMemoryObjectStore(),
+      forms: edge.forms,
+      providers: [],
+      offerings: edge.offerings,
+      publicOrigin: "https://api.example.test",
+      identity: {
+        async verify() {
+          return {
+            providerSubject: "108000000000000000001",
+            email: "person@example.com",
+            displayName: "A Person",
+          };
+        },
+      },
+      settlement: {
+        verify: () => {
+          throw new Error("not configured");
+        },
+      },
+    });
+
+    const session = (await (
+      await app.fetch(
+        new Request("https://api.example.test/v1/sessions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ provider: "google", assertion: "anything" }),
+        }),
+      )
+    ).json()) as { sessionToken: string };
+
+    const organization = (await (
+      await app.fetch(
+        new Request("https://api.example.test/v1/organizations", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${session.sessionToken}`,
+          },
+          body: JSON.stringify({ name: "Acme" }),
+        }),
+      )
+    ).json()) as { organization: { id: string } };
+
+    return { app, token: session.sessionToken, organizationId: organization.organization.id };
+  };
+
+  const prepare = async (
+    app: Awaited<ReturnType<typeof build>>["app"],
+    token: string,
+    headers: Record<string, string>,
+  ) => {
+    const { buildEdgeForms } = await import("../src/edge-forms.ts");
+    const edge = await buildEdgeForms();
+    const form = edge.objectBucket.form.identity.formRef;
+    return await app.fetch(
+      new Request("https://api.example.test/apis/forms.takoform.com/v1alpha3/resources/prepare", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${token}`,
+          ...headers,
+        },
+        body: JSON.stringify({
+          apiVersion: form.apiVersion,
+          kind: form.kind,
+          form: { formRef: form },
+          metadata: { name: "media", space: "default" },
+          spec: {},
+        }),
+      }),
+    );
+  };
+
+  test("accepts a session that names an organization it owns", async () => {
+    const { app, token, organizationId } = await build();
+    const response = await prepare(app, token, { "takoform-organization": organizationId });
+    expect(response.status).toBe(200);
+  });
+
+  test("refuses a session that names nothing", async () => {
+    const { app, token } = await build();
+    expect((await prepare(app, token, {})).status).toBe(401);
+  });
+
+  test("refuses a session that names somebody else's organization", async () => {
+    const { app, token } = await build();
+    const response = await prepare(app, token, {
+      "takoform-organization": "org_00000000000000000000000000000000",
+    });
+    expect(response.status).toBe(401);
+  });
+});

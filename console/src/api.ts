@@ -126,6 +126,9 @@ export interface FormSupport {
   readonly limits?: { readonly maximumBundleBytes?: number };
 }
 
+/** The exact-pin lane this console speaks. */
+const LANE = "/apis/forms.takoform.com/v1alpha3";
+
 export class ApiError extends Error {
   constructor(
     readonly code: string,
@@ -149,6 +152,14 @@ export class ApiError extends Error {
   }
 }
 
+/** A resource as a person declares it in the console. */
+export interface ResourceDeclaration {
+  readonly form: FormRef;
+  readonly space: string;
+  readonly name: string;
+  readonly spec: Record<string, unknown>;
+}
+
 export interface ApiOptions {
   readonly origin: string;
   readonly token: () => string | null;
@@ -156,7 +167,12 @@ export interface ApiOptions {
 }
 
 export function createApi(options: ApiOptions) {
-  const call = async <Result>(method: string, path: string, body?: unknown): Promise<Result> => {
+  const call = async <Result>(
+    method: string,
+    path: string,
+    body?: unknown,
+    extra: Record<string, string> = {},
+  ): Promise<Result> => {
     const token = options.token();
     let response: Response;
     try {
@@ -165,6 +181,7 @@ export function createApi(options: ApiOptions) {
         headers: {
           ...(token ? { authorization: `Bearer ${token}` } : {}),
           ...(body === undefined ? {} : { "content-type": "application/json" }),
+          ...extra,
         },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
@@ -260,6 +277,68 @@ export function createApi(options: ApiOptions) {
       return call<{ resources: readonly ResourceSummary[]; cursor?: string }>(
         "GET",
         `/v1/organizations/${encodeURIComponent(organizationId)}/resources${suffix}`,
+      );
+    },
+
+    /**
+     * Creates a resource through the exact-pin lane.
+     *
+     * Two calls, because the protocol is reviewed: the Host says exactly what
+     * it read, and the apply must present that digest back. A console that
+     * skipped the review would be one that could apply something other than
+     * what it showed.
+     */
+    async createResource(organizationId: string, declaration: ResourceDeclaration) {
+      const body = {
+        apiVersion: declaration.form.apiVersion,
+        kind: declaration.form.kind,
+        form: { formRef: declaration.form },
+        metadata: { name: declaration.name, space: declaration.space },
+        spec: declaration.spec,
+      };
+      const naming = { "takoform-organization": organizationId };
+      const prepared = await call<{ review: { prepareDigest: string } }>(
+        "POST",
+        `${LANE}/resources/prepare`,
+        body,
+        naming,
+      );
+      const [group, version] = declaration.form.apiVersion.split("/");
+      return await call<ResourceSummary>(
+        "PUT",
+        `${LANE}/resources/${group}/${version}/${declaration.form.kind}/${encodeURIComponent(declaration.name)}`,
+        { ...body, review: { prepareDigest: prepared.review.prepareDigest } },
+        {
+          ...naming,
+          "idempotency-key": `console-${declaration.space}-${declaration.name}-${Date.now()}`,
+          "if-none-match": "*",
+        },
+      );
+    },
+
+    /** Deletes a resource, fenced on the generation the console last read. */
+    deleteResource(
+      organizationId: string,
+      declaration: Omit<ResourceDeclaration, "spec">,
+      generation: string,
+    ) {
+      const [group, version] = declaration.form.apiVersion.split("/");
+      const query = new URLSearchParams({
+        space: declaration.space,
+        group: declaration.form.apiVersion,
+        kind: declaration.form.kind,
+        definitionVersion: declaration.form.definitionVersion,
+        schemaDigest: declaration.form.schemaDigest,
+      });
+      return call<void>(
+        "DELETE",
+        `${LANE}/resources/${group}/${version}/${declaration.form.kind}/${encodeURIComponent(declaration.name)}?${query}`,
+        undefined,
+        {
+          "takoform-organization": organizationId,
+          "idempotency-key": `console-delete-${declaration.name}-${Date.now()}`,
+          "takoform-expected-generation": generation,
+        },
       );
     },
 

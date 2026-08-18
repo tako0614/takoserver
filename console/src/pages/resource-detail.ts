@@ -1,8 +1,8 @@
-import type { ResourceSummary } from "../api.ts";
+import type { FormRef, ResourceSummary } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
 import { resource, signal } from "../reactive.ts";
 import { health } from "../resource-state.ts";
-import { linkProps } from "../router.ts";
+import { linkProps, navigate } from "../router.ts";
 import { api } from "../state.ts";
 import {
   badge,
@@ -16,6 +16,7 @@ import {
   when,
   whenReady,
 } from "../ui.ts";
+import { deleteResource } from "./create-resource.ts";
 
 /**
  * One resource, in full.
@@ -56,7 +57,7 @@ export function resourceDetailPage(
                   h("a", { class: "btn", ...linkProps("/resources") }, "Back to resources"),
                 ),
               )
-            : body(found, tab, page.reload),
+            : body(found, tab, page.reload, organizationId),
         { retry: page.reload },
       ),
     ),
@@ -67,12 +68,13 @@ function body(
   found: ResourceSummary,
   tab: ReturnType<typeof signal<"overview" | "spec" | "observed" | "identity">>,
   reload: () => void,
+  organizationId: string,
 ): Child {
   const state = health(found);
   return h(
     "div",
     { style: { display: "grid", gap: "18px" } },
-    header(found, reload),
+    header(found, reload, organizationId),
     h(
       "div",
       { class: "tabs" },
@@ -112,7 +114,7 @@ function body(
   );
 }
 
-function header(found: ResourceSummary, reload: () => void): Child {
+function header(found: ResourceSummary, reload: () => void, organizationId: string): Child {
   const state = health(found);
   return h(
     "div",
@@ -137,10 +139,35 @@ function header(found: ResourceSummary, reload: () => void): Child {
       h("p", null, `${found.kind} · ${found.apiVersion}`),
     ),
     h(
-      "button",
-      { class: "btn", type: "button", onClick: reload },
-      icon(ICON.refresh, 14),
-      text("Reload"),
+      "div",
+      { class: "toolbar" },
+      h(
+        "button",
+        { class: "btn", type: "button", onClick: reload },
+        icon(ICON.refresh, 14),
+        text("Reload"),
+      ),
+      found.form
+        ? h(
+            "button",
+            {
+              class: "btn btn--danger",
+              type: "button",
+              onClick: () =>
+                deleteResource(
+                  organizationId,
+                  {
+                    form: (found.form as { formRef: FormRef }).formRef,
+                    space: found.metadata.space,
+                    name: found.metadata.name,
+                    generation: found.metadata.generation,
+                  },
+                  () => navigate("/resources"),
+                ),
+            },
+            "Delete",
+          )
+        : null,
     ),
   );
 }

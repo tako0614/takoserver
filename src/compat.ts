@@ -45,7 +45,11 @@ export function createTakoformHost(options: EphemeralTakoformHostOptions): Takof
   return assembleTakoformHost({
     sql: options.sql ?? createEphemeralSql(),
     objects: options.objects ?? createMemoryObjectStore(),
-    authenticate: options.authenticate,
+    // Tests and the conformance suite authenticate on the header alone; the
+    // lane now hands over the whole request so a session can name the
+    // organization it is acting for. Adapting here keeps every existing caller
+    // spelled the way it was written.
+    authenticate: (request: Request) => options.authenticate(request.headers.get("authorization")),
     forms: options.forms,
     driver: options.driver,
     ...(options.artifacts ? { artifacts: options.artifacts } : {}),
