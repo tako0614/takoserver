@@ -326,7 +326,12 @@ export function resourceResponse(resource: TakoformStoredResource, status = 200)
 }
 
 export function etag(resource: TakoformStoredResource): HeadersInit {
-  return { etag: `"${resource.metadata.revision}"` };
+  // The ETag is the strong revision fence defined by Takoform. Cloudflare may
+  // otherwise compress the JSON representation and rewrite it to W/"...",
+  // which correctly makes the released provider reject the response as a
+  // different representation. Prevent transformations instead of weakening
+  // the protocol fence.
+  return { etag: `"${resource.metadata.revision}"`, "cache-control": "no-transform" };
 }
 
 /**
