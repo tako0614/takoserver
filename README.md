@@ -1,8 +1,16 @@
 # Takoserver
 
-An Open Source, Self-Hostable PaaS for [Takoform](https://takoform.com). Customers
-declare infrastructure — object buckets, SQL databases, Workers — and Takoserver
-provisions it, serves it, and bills for it.
+An Open Source, Self-Hostable PaaS with a [Takoform](https://takoform.com) Host
+for declarative infrastructure and ordinary data APIs for already-standardized
+services. Today its shipped infrastructure catalog is the exact ObjectBucket
+Form carried by the released Takoform provider. Object access and
+OpenAI-compatible AI inference are data services, not locally invented Forms.
+
+ObjectBucket lifecycle stays in Takoform, while the standard data path is `POST
+/v1/organizations/{organizationId}/resources/{resourceUid}/s3-credentials`.
+It returns a short-lived bucket-scoped access key, secret, and session token
+that an ordinary AWS SDK, CLI, or other SigV4 S3 client uses against the
+returned endpoint. That does not create another Form.
 
 Run it on your own machine and it uses your disk and [workerd](https://github.com/cloudflare/workerd),
 the runtime Cloudflare runs at the edge. Point it at a Cloudflare account and it
@@ -32,6 +40,18 @@ the part that owns accounts, money, and the machines.
   settled minus held, computed from entries that are only ever appended.
 - **Reach** what you provisioned. A bucket is not a name in a list: a
   short-lived token scoped to one resource opens its data plane.
+- **Attach** independent resources by exact Interface reference. An Attachment
+  stores only resource/deployment identity and an opaque grant, endpoint,
+  secret, or native-binding reference; it never embeds a provider credential.
+- **Migrate** by selecting another Offering for the same exact Form. Takoserver
+  provisions a candidate Deployment, transfers and verifies the data, then
+  atomically switches the active Deployment and Attachment resolutions. The
+  source stays retained for the bounded rollback window.
+- **Infer** through `/v1/ai`. An organization API key with `ai:invoke` sees only
+  operator-configured public model IDs. Takoserver holds the maximum prepaid
+  charge before inference, captures reported token use, and releases the rest.
+  Paid inference requires `Idempotency-Key`; a settled result is replayed from
+  durable state without calling the upstream or charging again.
 
 ## Self-hosting
 
@@ -47,6 +67,10 @@ Everything lives under one directory, `.takoserver` by default.
 | `TAKOSERVER_OPERATOR_PUBLIC_JWK` | Public half of the operator key. Generated under the data root if unset. |
 | `GOOGLE_CLIENT_ID` | Turns on Google sign-in. Its absence leaves the operator path. |
 | `STRIPE_SECRET_KEY` | Turns on card payment. Its absence leaves operator-signed funding. |
+| `TAKOSERVER_AI_BASE_URL` | HTTPS base path of an OpenAI-compatible upstream. |
+| `TAKOSERVER_AI_MODELS` | JSON allowlist mapping public model IDs to upstream IDs, limits, and retail token prices. |
+| `TAKOSERVER_AI_TOKEN_FILE` | Preferred rotatable upstream bearer secret file. |
+| `TAKOSERVER_AI_TOKEN` | Direct upstream bearer secret when a file is not used. |
 
 Nothing in that table is required to start. What is absent is absent rather than
 faked: a deployment with no Stripe key does not serve the route that would begin
@@ -100,17 +124,38 @@ describes what publishing that involves and what it refuses to do.
 See [docs/adr/0001-provision-from-the-worker.md](docs/adr/0001-provision-from-the-worker.md)
 for why the deployed Worker holds the account credential, and what that costs.
 
+## Resource and supply model
+
+Takoform owns the portable words: Form, Interface, Binding, Attachment, and
+Migration semantics. Takoserver owns the supply decisions: Offerings, provider
+installations, Deployments, commercial authority, placement, credentials,
+metering, and cost.
+
+One exact Form may have many Offerings. A logical Resource keeps one stable UID
+while one or more provider-backed Deployments coexist during migration. Provider
+IDs exist only on Deployments; provider names and prices never enter a Form.
+Deleting either side of a live Attachment fails with `dependency_in_use` until
+the Attachment is removed.
+
+Migration planning accepts no caller-invented payment claim. The target
+Offering must be backed by one active, exact-digest reservation of quantity one;
+the reservation is unique to the Migration and is captured only after cutover.
+Cancelling before cutover first deletes any authoritative candidate Deployment
+and only then releases the hold. An acknowledgement gap is left open for
+operator reconciliation rather than being reported as a successful cancellation.
+
 ## How it is built
 
-Five ports, and everything above them is provider-neutral.
+Six ports, and everything above them is provider-neutral.
 
 | Port | Implementations |
 |---|---|
 | `Sql` | SQLite, D1 binding, D1 over HTTP |
 | `ObjectStore` | filesystem, R2 binding, R2 over HTTP, memory |
-| `Provider` | local, workerd, Cloudflare, a remote provisioner |
+| `Provider Pack` | provisioning, Attachment, transfer, credential, meter, and cost capabilities |
 | `ExternalIdentityVerifier` | Google ID tokens, operator signature |
 | `FundingSettlementVerifier` | Stripe, operator signature |
+| `AiGateway` | any OpenAI-compatible upstream; private deployments may compose a native binding |
 
 `scripts/check-imports.ts` enforces the layering as a gate rather than a
 convention: core, adapters, domain, routes, composition, entries — and a
@@ -118,11 +163,12 @@ per-entry ban, so the Workers entry cannot reach a filesystem it does not have.
 
 Three properties are worth knowing before reading the code:
 
-**Shipped Form definitions are frozen.** A Form's identity includes the digest
-of its schema, so changing one mints a different Form and strands every resource
-that named the old one — still running, still billing, no longer addressable.
-The digests are pinned by a test. Adding a line to it is how a definition ships;
-changing one is not.
+**Shipped Form definitions come from a release.** Takoserver cannot author a
+name in the Takoform namespace. `bun run check:official-forms` pins the exact
+Takoform provider tag, commit, identity ledger, definition, and package index,
+then proves the shipped catalog is an exact subset. A new Form needs a released
+provider definition and an implemented backend; AI and S3 protocol operations
+do not become Forms just because Takoserver offers them.
 
 **Guarded writes, not transactions.** The control database may be D1, which has
 no interactive transaction, so invariants live in `WHERE` clauses and are

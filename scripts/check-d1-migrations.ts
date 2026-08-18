@@ -51,7 +51,7 @@ try {
     config,
     "--json",
     "--command",
-    "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('runtime_grant_keys', 'runtime_grant_replays', 'runtime_resources') ORDER BY name",
+    "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('runtime_grant_keys', 'runtime_grant_replays', 'runtime_resources', 'tf_resource_attachments', 'tf_resource_deployments') ORDER BY name",
   ]);
   const value: unknown = JSON.parse(raw);
   if (!Array.isArray(value) || !isRecord(value[0]) || !Array.isArray(value[0].results)) {
@@ -63,7 +63,13 @@ try {
     .filter((name): name is string => typeof name === "string");
   if (
     JSON.stringify(names) !==
-    JSON.stringify(["runtime_grant_keys", "runtime_grant_replays", "runtime_resources"])
+    JSON.stringify([
+      "runtime_grant_keys",
+      "runtime_grant_replays",
+      "runtime_resources",
+      "tf_resource_attachments",
+      "tf_resource_deployments",
+    ])
   ) {
     throw new Error(`D1 schema probe returned unexpected tables: ${JSON.stringify(names)}`);
   }

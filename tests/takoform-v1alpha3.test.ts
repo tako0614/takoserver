@@ -47,6 +47,73 @@ function handlerFor(
 }
 
 describe("Takoserver current Takoform Host", () => {
+  test("refuses provider deletion while a logical Attachment still references the Resource", async () => {
+    const formRef = {
+      apiVersion: "data.resources.takoform.com/v1alpha1",
+      kind: "SqliteDatabase",
+      definitionVersion: "1.0.0",
+      schemaDigest: `sha256:${"b".repeat(64)}` as const,
+    };
+    const host = createInMemoryTakoformHost({
+      authenticate: async () => ({ tenantId: "organization-a", principalId: "provider-key" }),
+      forms: [
+        {
+          identity: { formRef },
+          desiredSchema: { type: "object", properties: {}, additionalProperties: false },
+          operations: ["create", "read", "delete"],
+        },
+      ],
+      blockingRelations: async (_tenantId, resourceUid) =>
+        resourceUid.length > 0 ? ["att_api_main_db"] : [],
+    });
+    const handler = handlerFor(host);
+    const auth = { authorization: "Bearer provider-key" };
+    const resource = {
+      apiVersion: formRef.apiVersion,
+      kind: formRef.kind,
+      form: { formRef },
+      metadata: { name: "main", space: "production" },
+      spec: {},
+    };
+    const prepared = await jsonRequest(
+      handler,
+      "POST",
+      "/apis/forms.takoform.com/v1alpha3/resources/prepare",
+      resource,
+      auth,
+    );
+    const prepareDigest = requiredString(requiredRecord(prepared.body, "review"), "prepareDigest");
+    const created = await jsonRequest(
+      handler,
+      "PUT",
+      "/apis/forms.takoform.com/v1alpha3/resources/data.resources.takoform.com/v1alpha1/SqliteDatabase/main",
+      { ...resource, review: { prepareDigest } },
+      { ...auth, "idempotency-key": "create-sqlite-main-001", "if-none-match": "*" },
+    );
+    expect(created.status).toBe(201);
+
+    const query = new URLSearchParams({
+      space: "production",
+      group: formRef.apiVersion,
+      kind: formRef.kind,
+      definitionVersion: formRef.definitionVersion,
+      schemaDigest: formRef.schemaDigest,
+    });
+    const deleted = await jsonRequest(
+      handler,
+      "DELETE",
+      `/apis/forms.takoform.com/v1alpha3/resources/data.resources.takoform.com/v1alpha1/SqliteDatabase/main?${query}`,
+      undefined,
+      {
+        ...auth,
+        "idempotency-key": "delete-sqlite-main-001",
+        "takoform-expected-generation": "1",
+      },
+    );
+    expect(deleted.status).toBe(409);
+    expect(deleted.body).toMatchObject({ error: { code: "dependency_in_use" } });
+  });
+
   test("serves the exact ObjectBucket Form used by released provider v2.1.1", async () => {
     const { packageDigest: _packageDigest, ...formRef } = TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM;
     const host = createInMemoryTakoformHost({

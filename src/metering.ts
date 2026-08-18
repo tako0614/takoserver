@@ -1,3 +1,4 @@
+import type { AiUsage } from "./ai-port.ts";
 import type { Ledger } from "./ledger.ts";
 import type { Clock, Sql } from "./ports.ts";
 
@@ -40,6 +41,8 @@ export interface UsageRecord {
 
 export interface Metering {
   record(usage: UsageRecord): Promise<void>;
+  /** Records already-settled AI token usage without charging it twice. */
+  recordAi(usage: AiUsage): Promise<void>;
   /** Folds unbilled usage into ledger entries. Returns how many rows moved. */
   rollUp(limit: number): Promise<number>;
 }
@@ -74,6 +77,22 @@ export function createMetering(options: {
           `object.${usage.operation}`,
           usage.bytes,
           Math.round(amount * 1_000_000),
+          clock().toISOString(),
+        ],
+      );
+    },
+
+    async recordAi(usage) {
+      await sql.run(
+        `INSERT OR IGNORE INTO usage_events
+           (request_id, org_id, resource_uid, meter, quantity, amount_minor, created_at)
+         VALUES (?, ?, ?, ?, ?, 0, ?)`,
+        [
+          usage.requestId,
+          usage.organizationId,
+          `ai/${usage.model}`,
+          `ai.tokens.${usage.model}`,
+          usage.inputTokens + usage.outputTokens,
           clock().toISOString(),
         ],
       );

@@ -1,3 +1,4 @@
+import { AttachmentError, type AttachmentService } from "./attachments.ts";
 import {
   type Accounts,
   type Actor,
@@ -13,8 +14,17 @@ import { type FundingSettlementVerifier, type Ledger, LedgerError } from "./ledg
 import { OperatorAssertionError } from "./operator-credentials.ts";
 import type { Clock } from "./ports.ts";
 import { type Reseller, ResellerError } from "./reseller.ts";
+import type { ResourceDeploymentStore } from "./resource-deployments.ts";
+import { ResourceMigrationError, type ResourceMigrationService } from "./resource-migrations.ts";
+import {
+  type S3Access,
+  S3CredentialError,
+  type S3CredentialIssuer,
+  validateS3CredentialSet,
+} from "./s3-port.ts";
 import { parseStrictJson, StrictJsonError } from "./strict-json.ts";
-import { formSupportProfile } from "./takoform/forms.ts";
+import { formSupportProfile, sameFormRef } from "./takoform/forms.ts";
+import { TAKOFORM_EDGE_OBJECTS_INTERFACE } from "./takoform/official-forms.ts";
 import type { OperationListing, ResourceListing } from "./takoform/store.ts";
 import type { InstalledTakoformForm } from "./takoform/types.ts";
 import { TokenError, type TokenService } from "./token.ts";
@@ -49,6 +59,7 @@ export interface ResourceInventory {
       readonly cursor?: string | undefined;
     },
   ): Promise<{ readonly resources: readonly ResourceListing[]; readonly cursor: string | null }>;
+  resourceByUid(tenantId: string, uid: string): Promise<ResourceListing | null>;
   listOperations(tenantId: string, limit: number): Promise<readonly OperationListing[]>;
 }
 
@@ -65,6 +76,9 @@ export interface Checkout {
 export interface CreateControlRoutesOptions {
   readonly accounts: Accounts;
   readonly inventory: ResourceInventory;
+  readonly deployments: Pick<ResourceDeploymentStore, "active">;
+  readonly attachments: AttachmentService;
+  readonly migrations: ResourceMigrationService;
   /** Every Form definition this Host will accept. */
   readonly forms: readonly InstalledTakoformForm[];
   /** How a caller may sign in to this deployment. */
@@ -80,6 +94,8 @@ export interface CreateControlRoutesOptions {
    * would begin a checkout is simply not served.
    */
   readonly checkout?: Checkout | undefined;
+  /** Standard S3 credentials for already-provisioned ObjectBuckets. */
+  readonly s3?: S3CredentialIssuer | undefined;
   readonly clock: Clock;
 }
 
@@ -89,6 +105,9 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
   const {
     accounts,
     inventory,
+    deployments,
+    attachments,
+    migrations,
     forms,
     identityProviders,
     ledger,
@@ -96,6 +115,8 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     reseller,
     tokens,
     settlement,
+    s3,
+    clock,
   } = options;
 
   const owner = async (request: Request, organizationId: string): Promise<Actor> => {
@@ -126,6 +147,14 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
   const resellerActor = async (request: Request): Promise<Actor> => {
     const actor = await accounts.authenticate(authorization(request));
     if (!actor?.organizationId || !grants(actor.scopes, "reseller:write")) {
+      throw new AuthError("permission_denied");
+    }
+    return actor;
+  };
+
+  const migrationActor = async (request: Request, organizationId: string): Promise<Actor> => {
+    const actor = await scoped(request, organizationId, "resources:write");
+    if (actor.kind === "api_key" && !grants(actor.scopes, "reseller:write")) {
       throw new AuthError("permission_denied");
     }
     return actor;
@@ -292,9 +321,14 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
             kind: offering.kind,
             displayName: offering.displayName,
             form: offering.form,
-            price: offering.price,
-            protocols: offering.protocols,
-            ...(offering.regions ? { regions: offering.regions } : {}),
+            pricePlan: offering.pricePlan,
+            resourceClass: offering.resourceClass,
+            deliveryMode: offering.deliveryMode,
+            providedInterfaces: offering.providedInterfaces,
+            bindingRefs: offering.bindingRefs,
+            regions: offering.regions,
+            portability: offering.portability,
+            isolation: offering.isolation,
             digest: await catalog.digest(offering),
           })),
         ),
@@ -415,30 +449,270 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       });
     }
 
-    const dataToken = /^\/v1\/organizations\/([^/]+)\/resources\/([^/]+)\/data-tokens$/u.exec(
+    const organizationResource = /^\/v1\/organizations\/([^/]+)\/resources\/([^/]+)$/u.exec(
       url.pathname,
     );
-    if (request.method === "POST" && dataToken) {
-      const organizationId = segment(dataToken[1]);
-      const resourceUid = segment(dataToken[2]);
+    if (request.method === "GET" && organizationResource) {
+      const organizationId = segment(organizationResource[1]);
+      const resourceUid = segment(organizationResource[2]);
       await scoped(request, organizationId, "resources:read");
+      const resource = await inventory.resourceByUid(organizationId, resourceUid);
+      if (!resource) controlError("not_found", 404);
+      return Response.json({ resource: presentResource(resource) });
+    }
+
+    const organizationAttachments = /^\/v1\/organizations\/([^/]+)\/attachments$/u.exec(
+      url.pathname,
+    );
+    if (organizationAttachments) {
+      const organizationId = segment(organizationAttachments[1]);
+      if (request.method === "GET") {
+        await scoped(request, organizationId, "resources:read");
+        const resourceUid = url.searchParams.get("resourceUid");
+        return Response.json({
+          attachments: await attachments.list(organizationId, {
+            limit: pageSize(url),
+            ...(resourceUid === null ? {} : { resourceUid: segment(resourceUid) }),
+          }),
+        });
+      }
+      if (request.method === "POST") {
+        await scoped(request, organizationId, "resources:write");
+        const body = await jsonObject(request);
+        exactKeys(body, [
+          "id",
+          "consumerResourceUid",
+          "providerResourceUid",
+          "interfaceRef",
+          "target",
+          "permissions",
+        ]);
+        const interfaceRef = record(body.interfaceRef);
+        exactKeys(interfaceRef, ["apiVersion", "name", "version", "schemaDigest"]);
+        const attachment = await attachments.createAndResolve({
+          tenantId: organizationId,
+          id: text(body.id),
+          consumerResourceUid: text(body.consumerResourceUid),
+          providerResourceUid: text(body.providerResourceUid),
+          interfaceRef: {
+            apiVersion: enumValue(interfaceRef.apiVersion, [
+              "interfaces.takoform.com/v1alpha1",
+            ]) as "interfaces.takoform.com/v1alpha1",
+            name: text(interfaceRef.name),
+            version: text(interfaceRef.version),
+            schemaDigest: text(interfaceRef.schemaDigest) as `sha256:${string}`,
+          },
+          target: text(body.target),
+          permissions: stringList(body.permissions),
+        });
+        return Response.json({ attachment }, { status: 201 });
+      }
+    }
+
+    const organizationAttachment = /^\/v1\/organizations\/([^/]+)\/attachments\/([^/]+)$/u.exec(
+      url.pathname,
+    );
+    if (organizationAttachment) {
+      const organizationId = segment(organizationAttachment[1]);
+      const attachmentId = segment(organizationAttachment[2]);
+      if (request.method === "GET") {
+        await scoped(request, organizationId, "resources:read");
+        const attachment = await attachments.read(organizationId, attachmentId);
+        if (!attachment) controlError("not_found", 404);
+        return Response.json({ attachment });
+      }
+      if (request.method === "DELETE") {
+        await scoped(request, organizationId, "resources:write");
+        await attachments.remove(organizationId, attachmentId);
+        return new Response(null, { status: 204 });
+      }
+    }
+
+    const resourceMigrations =
+      /^\/v1\/organizations\/([^/]+)\/resources\/([^/]+)\/migrations$/u.exec(url.pathname);
+    if (resourceMigrations) {
+      const organizationId = segment(resourceMigrations[1]);
+      const resourceUid = segment(resourceMigrations[2]);
+      if (request.method === "GET") {
+        await scoped(request, organizationId, "resources:read");
+        return Response.json({
+          migrations: await migrations.list(organizationId, resourceUid, pageSize(url)),
+        });
+      }
+      if (request.method === "POST") {
+        await migrationActor(request, organizationId);
+        const body = await jsonObject(request);
+        exactKeys(body, [
+          "id",
+          "targetOfferingId",
+          "commercialTenantRef",
+          "reservationId",
+          "mode",
+          "transferFormat",
+        ]);
+        const targetOfferingId = text(body.targetOfferingId);
+        const commercialTenantRef = tenantRef(body.commercialTenantRef);
+        const reservationId = text(body.reservationId);
+        await requireMigrationReservation({
+          organizationId,
+          commercialTenantRef,
+          reservationId,
+          targetOfferingId,
+          allowCaptured: false,
+        });
+        const migration = await migrations.plan({
+          tenantId: organizationId,
+          id: text(body.id),
+          resourceUid,
+          targetOfferingId,
+          commercialTenantRef,
+          commercialAuthorizationRef: reservationId,
+          mode: enumValue(body.mode, ["offline", "online"]) as "offline" | "online",
+          transferFormat: text(body.transferFormat),
+        });
+        return Response.json({ migration }, { status: 201 });
+      }
+    }
+
+    const resourceMigration =
+      /^\/v1\/organizations\/([^/]+)\/resources\/([^/]+)\/migrations\/([^/]+)(?:\/(execute|cutover|rollback|cancel))?$/u.exec(
+        url.pathname,
+      );
+    if (resourceMigration) {
+      const organizationId = segment(resourceMigration[1]);
+      const resourceUid = segment(resourceMigration[2]);
+      const migrationId = segment(resourceMigration[3]);
+      const action = resourceMigration[4];
+      if (request.method === "GET" && action === undefined) {
+        await scoped(request, organizationId, "resources:read");
+        const migration = await migrations.read(organizationId, migrationId);
+        if (!migration || migration.resourceUid !== resourceUid) controlError("not_found", 404);
+        return Response.json({ migration });
+      }
+      if (request.method === "POST" && action !== undefined) {
+        await migrationActor(request, organizationId);
+        const held = await migrations.read(organizationId, migrationId);
+        if (!held || held.resourceUid !== resourceUid) controlError("not_found", 404);
+        if (action === "execute") {
+          return Response.json({
+            migration: await migrations.execute(organizationId, migrationId),
+          });
+        }
+        if (action === "cutover") {
+          if (!held.commercialTenantRef) controlError("migration_conflict", 409);
+          const reservation = await requireMigrationReservation({
+            organizationId,
+            commercialTenantRef: held.commercialTenantRef,
+            reservationId: held.commercialAuthorizationRef,
+            targetOfferingId: held.targetOfferingId,
+            allowCaptured: true,
+          });
+          const migration = await migrations.cutover(organizationId, migrationId);
+          const statement = await reseller.capture({
+            organizationId,
+            tenantRef: held.commercialTenantRef,
+            reservationId: held.commercialAuthorizationRef,
+            usage: { quantity: reservation.quantity },
+          });
+          return Response.json({ migration, statement });
+        }
+        if (action === "cancel") {
+          if (!held.commercialTenantRef) controlError("migration_conflict", 409);
+          const heldReservation = await reseller.reservation({
+            organizationId,
+            tenantRef: held.commercialTenantRef,
+            reservationId: held.commercialAuthorizationRef,
+          });
+          if (
+            heldReservation.offeringId !== held.targetOfferingId ||
+            heldReservation.quantity !== 1 ||
+            heldReservation.status === "captured"
+          ) {
+            controlError("migration_commercial_authority_invalid", 409);
+          }
+          const migration = await migrations.cancel(organizationId, migrationId);
+          const reservation =
+            heldReservation.status === "active"
+              ? await reseller.release({
+                  organizationId,
+                  tenantRef: held.commercialTenantRef,
+                  reservationId: held.commercialAuthorizationRef,
+                })
+              : heldReservation;
+          return Response.json({ migration, reservation });
+        }
+        return Response.json({ migration: await migrations.rollback(organizationId, migrationId) });
+      }
+    }
+
+    const s3Credentials =
+      /^\/v1\/organizations\/([^/]+)\/resources\/([^/]+)\/s3-credentials$/u.exec(url.pathname);
+    if (request.method === "POST" && s3Credentials) {
+      const organizationId = segment(s3Credentials[1]);
+      const resourceUid = segment(s3Credentials[2]);
       const body = await jsonObject(request);
-      exactKeys(body, [], ["ttlSeconds"]);
+      exactKeys(body, ["access"], ["expiresInSeconds"]);
+      const access = enumValue(body.access, ["read-only", "read-write"]) as S3Access;
+      await scoped(
+        request,
+        organizationId,
+        access === "read-write" ? "resources:write" : "resources:read",
+      );
+      if (!s3) controlError("backend_unavailable", 503);
 
-      // The uid has to belong to this organization. Without the check, a token
-      // would be minted for any resource whose uid somebody could name — and a
-      // uid is not a secret, it is printed in every listing.
-      const held = await inventory.listResources(organizationId, { limit: 200 });
-      const owned = held.resources.find((entry) => entry.uid === resourceUid);
-      if (!owned) throw new AuthError("not_found");
+      const resource = await inventory.resourceByUid(organizationId, resourceUid);
+      if (!resource) controlError("not_found", 404);
+      const installed = forms.find((form) =>
+        sameFormRef(form.identity.formRef, resource.resource.form.formRef),
+      );
+      const exposesObjects = installed?.providedInterfaces?.some(
+        (candidate) =>
+          candidate.apiVersion === TAKOFORM_EDGE_OBJECTS_INTERFACE.apiVersion &&
+          candidate.name === TAKOFORM_EDGE_OBJECTS_INTERFACE.name &&
+          candidate.version === TAKOFORM_EDGE_OBJECTS_INTERFACE.version &&
+          candidate.schemaDigest === TAKOFORM_EDGE_OBJECTS_INTERFACE.schemaDigest,
+      );
+      const deployment = await deployments.active(organizationId, resourceUid);
+      if (!installed || !exposesObjects || !deployment) {
+        controlError("unsupported_capability", 409);
+      }
+      const ready = resource.resource.status.conditions.some(
+        (condition) => condition.type === "Ready" && condition.status === "True",
+      );
+      if (!ready) controlError("resource_not_ready", 409);
 
-      const issued = await tokens.issueDataToken({
+      const ttlSeconds = body.expiresInSeconds === undefined ? 900 : integer(body.expiresInSeconds);
+      if (ttlSeconds < 60 || ttlSeconds > 3_600) controlError("invalid_argument", 400);
+      const issue = {
         organizationId,
         resourceUid,
-        protocols: ["s3"],
-        ttlSeconds: body.ttlSeconds === undefined ? 3_600 : integer(body.ttlSeconds),
-      });
-      return Response.json({ dataToken: issued }, { status: 201 });
+        deploymentId: deployment.id,
+        offeringId: deployment.offeringId,
+        providerPackRef: deployment.providerPackRef,
+        providerInstallationRef: deployment.providerInstallationRef,
+        nativeId: deployment.nativeId,
+        access,
+        ttlSeconds,
+      };
+      const connection = validateS3CredentialSet(await s3.issue(issue), issue, options.clock());
+      return Response.json(
+        {
+          kind: "takoserver.s3-connection@v1",
+          endpoint: connection.endpoint,
+          region: connection.region,
+          bucket: connection.bucket,
+          credentials: {
+            accessKeyId: connection.accessKeyId,
+            secretAccessKey: connection.secretAccessKey,
+            sessionToken: connection.sessionToken,
+            expiresAt: connection.expiresAt,
+          },
+        },
+        {
+          status: 201,
+          headers: { "cache-control": "private, no-store", pragma: "no-cache" },
+        },
+      );
     }
 
     const operations = /^\/v1\/organizations\/([^/]+)\/operations$/u.exec(url.pathname);
@@ -451,6 +725,34 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     }
 
     return controlError("not_found", 404);
+  }
+
+  async function requireMigrationReservation(input: {
+    readonly organizationId: string;
+    readonly commercialTenantRef: string;
+    readonly reservationId: string;
+    readonly targetOfferingId: string;
+    readonly allowCaptured: boolean;
+  }) {
+    const reservation = await reseller.reservation({
+      organizationId: input.organizationId,
+      tenantRef: input.commercialTenantRef,
+      reservationId: input.reservationId,
+    });
+    if (
+      reservation.offeringId !== input.targetOfferingId ||
+      reservation.quantity !== 1 ||
+      (reservation.status !== "active" &&
+        !(input.allowCaptured && reservation.status === "captured")) ||
+      (reservation.status === "active" && Date.parse(reservation.expiresAt) <= clock().getTime())
+    ) {
+      controlError("migration_commercial_authority_invalid", 409);
+    }
+    const offering = catalog.findOffering(input.targetOfferingId);
+    if (!offering || (await catalog.digest(offering)) !== reservation.offeringDigest) {
+      controlError("migration_commercial_authority_invalid", 409);
+    }
+    return reservation;
   }
 }
 
@@ -542,6 +844,29 @@ function classify(error: unknown): { code: string; status: number } {
     };
   }
   if (error instanceof TokenError) return { code: error.code, status: 400 };
+  if (error instanceof S3CredentialError) {
+    return { code: error.code, status: error.code === "backend_unavailable" ? 503 : 502 };
+  }
+  if (error instanceof AttachmentError) {
+    const status =
+      error.code === "resource_not_found"
+        ? 404
+        : error.code === "attachment_unsupported"
+          ? 422
+          : 409;
+    return { code: error.code, status };
+  }
+  if (error instanceof ResourceMigrationError) {
+    const status =
+      error.code === "resource_not_found"
+        ? 404
+        : error.code === "backend_unavailable"
+          ? 503
+          : error.code === "transfer_unsupported"
+            ? 422
+            : 409;
+    return { code: error.code, status };
+  }
   // A credential the verifier refused is the caller's problem to fix, and it
   // reads as an outage if it arrives as a 500. Which check failed is logged
   // rather than returned: the codes describe somebody's identity, and the
@@ -659,6 +984,17 @@ function scopeList(value: unknown): readonly ApiKeyScope[] {
     controlError("invalid_argument", 400);
   }
   return scopes as readonly ApiKeyScope[];
+}
+
+function stringList(value: unknown): readonly string[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 32) {
+    controlError("invalid_argument", 400);
+  }
+  const values = value as unknown[];
+  if (values.some((item) => typeof item !== "string")) {
+    controlError("invalid_argument", 400);
+  }
+  return values as readonly string[];
 }
 
 function segment(value: string | undefined): string {

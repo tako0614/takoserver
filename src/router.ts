@@ -1,5 +1,5 @@
 import type { ControlRoutes } from "./control.ts";
-import type { DataObjectRoutes } from "./data-objects.ts";
+import type { DataAiRoutes } from "./data-ai.ts";
 import { landingHtml } from "./landing.ts";
 import { openApiDocument } from "./openapi.ts";
 import type { TakoformHost } from "./takoform/types.ts";
@@ -16,8 +16,8 @@ import type { TakoformHost } from "./takoform/types.ts";
 
 export interface CreateRouterOptions {
   readonly control: ControlRoutes;
-  /** The data plane: reaching what a resource actually holds. */
-  readonly dataObjects?: DataObjectRoutes;
+  readonly dataAi?: DataAiRoutes;
+  readonly aiAvailable?: boolean;
   readonly takoformHost?: TakoformHost;
   readonly publicOrigin: string;
   /**
@@ -89,10 +89,8 @@ function dispatch(options: CreateRouterOptions, origin: string): Router {
   return async (request) => {
     const url = new URL(request.url);
 
-    // Offered first and cheaply: a data request carries its own short-lived
-    // token and has nothing to do with the control plane's credentials.
-    if (options.dataObjects) {
-      const served = await options.dataObjects(request, url);
+    if (options.dataAi) {
+      const served = await options.dataAi(request, url);
       if (served) return served;
     }
 
@@ -118,6 +116,7 @@ function dispatch(options: CreateRouterOptions, origin: string): Router {
           ...(console ? { console } : {}),
           openapi: `${origin}/openapi.json`,
           takoform: `${origin}/apis/forms.takoform.com/v1alpha3`,
+          ...(options.aiAvailable ? { ai: `${origin}/v1/ai` } : {}),
         },
       });
     }

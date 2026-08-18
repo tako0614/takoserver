@@ -94,7 +94,7 @@ export interface ProvisionLanePorts {
     consumeProvisionToken(token: string): Promise<ProvisionTokenClaimsView>;
   };
   readonly catalog: {
-    find(offeringId: string): ProvisionOfferingView | undefined;
+    findOffering(offeringId: string): ProvisionOfferingView | undefined;
     digest(offering: ProvisionOfferingView): Promise<string>;
   };
 }
@@ -353,7 +353,7 @@ async function provisionRoute(
 
   // The digest pins the commercial terms the reservation paid for. An
   // offering that changed or left the catalog is refused, never substituted.
-  const offering = ports.catalog.find(claims.offeringId);
+  const offering = ports.catalog.findOffering(claims.offeringId);
   if (!offering) return failure("offering_unavailable", 409);
   if ((await ports.catalog.digest(offering)) !== claims.offeringDigest) {
     return failure("offering_changed", 409);

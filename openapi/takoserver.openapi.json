@@ -112,6 +112,49 @@
         }
       }
     },
+    "/v1/ai/models": {
+      "get": {
+        "summary": "List configured OpenAI-compatible models",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/ai/chat/completions": {
+      "post": {
+        "summary": "Create a prepaid OpenAI-compatible chat completion",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        },
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "description": "Stable per paid inference; replays return the same settled result."
+          },
+          {
+            "name": "X-Takoserver-AI-Pricing-Revision",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^sha256:[a-f0-9]{64}$"
+            },
+            "description": "Optional exact model pricing revision from /v1/ai/models; drift is rejected before inference."
+          }
+        ]
+      }
+    },
     "/v1/forms": {
       "get": {
         "summary": "List every Form definition this Host will accept",
@@ -161,9 +204,27 @@
         }
       }
     },
-    "/v1/organizations/{organizationId}/resources/{resourceUid}/data-tokens": {
+    "/v1/organizations/{organizationId}/resources/{resourceUid}": {
+      "get": {
+        "summary": "Read one exact organization Takoform resource",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations": {
+      "get": {
+        "summary": "List explicit provider migrations for one logical Resource",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      },
       "post": {
-        "summary": "Mint a short-lived token for one resource's data plane",
+        "summary": "Plan a migration against an exact commercial reservation",
         "responses": {
           "200": {
             "description": "Success"
@@ -171,40 +232,77 @@
         }
       }
     },
-    "/data/v1/objects/{resourceUid}": {
+    "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}": {
       "get": {
-        "summary": "List what a bucket holds",
+        "summary": "Read one Resource Migration",
         "responses": {
           "200": {
             "description": "Success"
           }
-        },
-        "security": [
-          {
-            "dataToken": []
-          }
-        ]
+        }
       }
     },
-    "/data/v1/objects/{resourceUid}/{key}": {
-      "put": {
-        "summary": "Write an object",
+    "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/execute": {
+      "post": {
+        "summary": "Provision, transfer, and verify a candidate Deployment",
         "responses": {
           "200": {
             "description": "Success"
           }
         }
-      },
+      }
+    },
+    "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/cutover": {
+      "post": {
+        "summary": "Atomically activate the candidate and re-resolve Attachments",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/rollback": {
+      "post": {
+        "summary": "Restore the retained Deployment and Attachment resolutions",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/cancel": {
+      "post": {
+        "summary": "Delete an uncut candidate and release its commercial reservation",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationId}/attachments": {
       "get": {
-        "summary": "Read an object",
+        "summary": "List the organization's Resource Attachments",
         "responses": {
           "200": {
             "description": "Success"
           }
         }
       },
-      "head": {
-        "summary": "Read an object's metadata",
+      "post": {
+        "summary": "Resolve and create a Resource Attachment",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationId}/attachments/{attachmentId}": {
+      "get": {
+        "summary": "Read one Resource Attachment",
         "responses": {
           "200": {
             "description": "Success"
@@ -212,7 +310,17 @@
         }
       },
       "delete": {
-        "summary": "Remove an object",
+        "summary": "Delete one Resource Attachment",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationId}/resources/{resourceUid}/s3-credentials": {
+      "post": {
+        "summary": "Issue short-lived standard S3 credentials for an ObjectBucket",
         "responses": {
           "200": {
             "description": "Success"

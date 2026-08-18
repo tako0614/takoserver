@@ -60,8 +60,6 @@ const TAKOFORM_SUFFIXES = [
 
 const PUBLIC_PATHS = [
   "/",
-  "/data/v1/objects/{resourceUid}",
-  "/data/v1/objects/{resourceUid}/{key}",
   "/.well-known/takoform/v1alpha3",
   "/.well-known/takoform/v1beta1",
   "/.well-known/takoserver",
@@ -70,12 +68,23 @@ const PUBLIC_PATHS = [
   "/v1/forms",
   "/v1/identity/providers",
   "/v1/me",
+  "/v1/ai/models",
+  "/v1/ai/chat/completions",
   "/v1/organizations",
+  "/v1/organizations/{organizationId}/attachments",
+  "/v1/organizations/{organizationId}/attachments/{attachmentId}",
   "/v1/organizations/{organizationId}/api-keys",
   "/v1/organizations/{organizationId}/api-keys/{apiKeyId}",
   "/v1/organizations/{organizationId}/operations",
   "/v1/organizations/{organizationId}/resources",
-  "/v1/organizations/{organizationId}/resources/{resourceUid}/data-tokens",
+  "/v1/organizations/{organizationId}/resources/{resourceUid}",
+  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations",
+  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}",
+  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/cancel",
+  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/cutover",
+  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/execute",
+  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/rollback",
+  "/v1/organizations/{organizationId}/resources/{resourceUid}/s3-credentials",
   "/v1/organizations/{organizationId}/wallet",
   "/v1/organizations/{organizationId}/wallet/checkout",
   "/v1/organizations/{organizationId}/wallet/funding",
@@ -140,6 +149,16 @@ describe("published API description", () => {
     const response = await fetch(new Request("https://api.takoserver.com/v1/nope"));
     expect(response.status).toBe(404);
     expect(await response.json()).toMatchObject({ error: { code: "not_found" } });
+  });
+
+  test("does not publish a Takoserver-specific object protocol beside standard S3", async () => {
+    const fetch = handler();
+    for (const path of [
+      "/data/v1/objects/uid_bucket/file.txt",
+      "/v1/organizations/org_1/resources/uid_bucket/data-tokens",
+    ]) {
+      expect((await fetch(new Request(`https://api.takoserver.com${path}`))).status).toBe(404);
+    }
   });
 
   test("refuses a public origin that is not a bare HTTPS origin", () => {

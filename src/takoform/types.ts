@@ -1,7 +1,8 @@
 import type { TakoformV1Alpha3FormRef } from "../form-ref.ts";
+import type { TakoformBindingRef, TakoformInterfaceRef } from "../interface-ref.ts";
 import type { JsonObject } from "../ports.ts";
 
-export type { TakoformV1Alpha3FormRef };
+export type { TakoformBindingRef, TakoformInterfaceRef, TakoformV1Alpha3FormRef };
 
 /**
  * The Takoform Host wire vocabulary.
@@ -10,20 +11,6 @@ export type { TakoformV1Alpha3FormRef };
  * provider pins the exact `formRef` quad and the resource envelope below, so
  * fields may be added but never renamed, reordered in meaning, or removed.
  */
-
-export interface TakoformInterfaceRef {
-  readonly apiVersion: "interfaces.takoform.com/v1alpha1";
-  readonly name: string;
-  readonly version: string;
-  readonly schemaDigest: `sha256:${string}`;
-}
-
-export interface TakoformBindingRef {
-  readonly apiVersion: "bindings.takoform.com/v1alpha1";
-  readonly name: string;
-  readonly version: string;
-  readonly schemaDigest: `sha256:${string}`;
-}
 
 export type TakoformOperation = "create" | "read" | "update" | "delete" | "import" | "observe";
 
@@ -63,40 +50,34 @@ export interface TakoformHostPrincipal {
 export interface TakoformDriverReceipt {
   readonly observed?: JsonObject;
   readonly outputs?: JsonObject;
-  /**
-   * What the backend calls the thing it just made. The Host records it so
-   * later observes, updates, and deletes can name the same resource, and so
-   * one native resource can back at most one address.
-   */
-  readonly nativeId?: string;
 }
 
 export interface TakoformResourceDriver {
   apply(input: {
     readonly operationId: string;
     readonly tenantId: string;
+    readonly resourceUid: string;
     readonly form: InstalledTakoformForm;
     readonly name: string;
     readonly space: string;
     readonly spec: JsonObject;
     readonly previous?: TakoformStoredResource;
-    /** The native identity already recorded, when this is an update. */
-    readonly nativeId?: string;
   }): Promise<TakoformDriverReceipt>;
   observe(input: {
     readonly tenantId: string;
+    readonly resourceUid: string;
     readonly resource: TakoformStoredResource;
-    readonly nativeId?: string;
   }): Promise<TakoformDriverReceipt>;
   delete(input: {
     readonly operationId: string;
     readonly tenantId: string;
+    readonly resourceUid: string;
     readonly resource: TakoformStoredResource;
-    readonly nativeId?: string;
   }): Promise<void>;
   import?(input: {
     readonly operationId: string;
     readonly tenantId: string;
+    readonly resourceUid: string;
     readonly form: InstalledTakoformForm;
     readonly name: string;
     readonly space: string;

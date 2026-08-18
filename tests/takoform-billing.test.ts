@@ -20,8 +20,8 @@ import { FakeProvider } from "../src/providers/fake.ts";
 const FORM_REF = {
   apiVersion: "edge.forms.takoform.com/v1beta1",
   kind: "ObjectBucket",
-  definitionVersion: "1.0.0",
-  schemaDigest: `sha256:${"b".repeat(64)}`,
+  definitionVersion: "0.1.0",
+  schemaDigest: "sha256:3383a60c12bdc5a853868bd7ccab3670e1aff7b3eca889583b86d11ac0f90494",
 } as const;
 
 const FORM: InstalledTakoformForm = {
@@ -40,20 +40,40 @@ const PROVIDER_OFFERING: ProviderOffering = {
   kind: "object_bucket",
   displayName: "Object bucket",
   form: FORM_REF,
-  unit: "bucket-month",
-  unitPriceMinor: 500,
-  protocols: ["s3"],
+  providedInterfaces: [],
+  bindingRefs: [],
   capabilities: ["create", "update", "delete", "observe"],
 };
 
 const SOLD: Offering = {
   id: PROVIDER_OFFERING.id,
-  providerId: "fake",
+  providerPackRef: "fake",
+  providerInstallationRef: "fake.primary",
+  supplyContractRef: "fake.test-contract",
+  pricePlanRef: "storage.object.standard.price-v1",
+  resourceClass: "storage.object",
+  deliveryMode: "managed-endpoint",
+  supportPolicyRef: "support:test",
+  abusePolicyRef: "abuse:test",
   kind: PROVIDER_OFFERING.kind,
   displayName: PROVIDER_OFFERING.displayName,
   form: FORM_REF,
-  price: { currency: "USD", unit: "bucket-month", unitPriceMinor: 500 },
-  protocols: ["s3"],
+  pricePlan: {
+    id: "storage.object.standard.price-v1",
+    currency: "USD",
+    recurring: { meter: "bucket-month", amountMinor: 500 },
+    meters: [],
+  },
+  providedInterfaces: [],
+  bindingRefs: [],
+  regions: ["test"],
+  portability: {
+    api: "portable",
+    exportFormats: [],
+    importFormats: [],
+    migrationModes: ["offline"],
+  },
+  isolation: "dedicated-resource",
   available: true,
 };
 
@@ -85,7 +105,7 @@ function newApp(options: { failOn?: readonly string[] } = {}) {
     providers: [provider],
     offerings: [SOLD],
   });
-  return { app, provider, ledger: createLedger(sql, () => new Date()) };
+  return { app, provider, ledger: createLedger(sql, () => new Date()), sql };
 }
 
 async function call(
@@ -227,9 +247,33 @@ describe("Takoform apply on a real backend", () => {
   });
 
   test("records the backend's own identity so a later read finds the same thing", async () => {
-    const { app, ledger } = newApp();
+    const { app, ledger, sql } = newApp();
     const { organizationId, provider: auth } = await tenant(app.fetch);
-    await applyBucket(app.fetch, auth, "assets", { location: "apac" }, "apply-003");
+    const created = await applyBucket(app.fetch, auth, "assets", { location: "apac" }, "apply-003");
+    const resource = created.body as unknown as { metadata: { uid: string } };
+
+    // The wire Resource is logical. Provider identity belongs only to its
+    // active Deployment, where a later migration may add a candidate beside it.
+    expect(
+      (await sql.query("PRAGMA table_info(tf_resources)")).map((column) => column.name),
+    ).not.toContain("native_id");
+    expect(
+      await sql.query(
+        `SELECT resource_uid, offering_id, provider_pack_ref, provider_installation_ref,
+                native_id, state
+         FROM tf_resource_deployments WHERE tenant_id = ? AND resource_uid = ?`,
+        [organizationId, resource.metadata.uid],
+      ),
+    ).toEqual([
+      {
+        resource_uid: resource.metadata.uid,
+        offering_id: SOLD.id,
+        provider_pack_ref: "fake",
+        provider_installation_ref: "fake.primary",
+        native_id: `fake:${organizationId}/default/assets`,
+        state: "active",
+      },
+    ]);
 
     const observed = await call(
       app.fetch,
@@ -244,9 +288,10 @@ describe("Takoform apply on a real backend", () => {
   });
 
   test("deletes on the backend when the resource is deleted", async () => {
-    const { app, provider } = newApp();
+    const { app, provider, sql } = newApp();
     const { provider: auth } = await tenant(app.fetch);
-    await applyBucket(app.fetch, auth, "assets", {}, "apply-004");
+    const created = await applyBucket(app.fetch, auth, "assets", {}, "apply-004");
+    const resource = created.body as unknown as { metadata: { uid: string } };
     expect(provider.listResources()).toHaveLength(1);
 
     const deleted = await call(
@@ -258,6 +303,11 @@ describe("Takoform apply on a real backend", () => {
     );
     expect(deleted.status).toBe(204);
     expect(provider.listResources()).toEqual([]);
+    expect(
+      await sql.query("SELECT state FROM tf_resource_deployments WHERE resource_uid = ?", [
+        resource.metadata.uid,
+      ]),
+    ).toEqual([{ state: "deleted" }]);
   });
 });
 

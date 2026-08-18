@@ -15,9 +15,23 @@ describe("bringing a local database up to date", () => {
     expect(report.applied).toEqual(MIGRATIONS.map((migration) => migration.name));
 
     // The tables the product actually needs on its first request.
-    for (const table of ["principals", "orgs", "ledger", "tf_resources", "reservations"]) {
+    for (const table of [
+      "principals",
+      "orgs",
+      "ledger",
+      "tf_resources",
+      "tf_resource_attachments",
+      "tf_resource_deployments",
+      "reservations",
+    ]) {
       expect(() => database.query(`SELECT 1 FROM ${table} LIMIT 1`).all()).not.toThrow();
     }
+    expect(
+      database
+        .query("PRAGMA table_info(tf_resources)")
+        .all()
+        .map((column) => String((column as { name: unknown }).name)),
+    ).not.toContain("native_id");
   });
 
   test("running it again applies nothing", () => {
@@ -48,6 +62,53 @@ describe("bringing a local database up to date", () => {
     expect(() => migrateSqlite(database)).toThrow(/migration .* failed/u);
     expect(database.query("SELECT COUNT(*) AS n FROM applied_migrations").all()).toEqual([
       { n: 0 },
+    ]);
+  });
+
+  test("refuses to discard a legacy native identity that has not been adopted", () => {
+    const database = new Database(":memory:");
+    database.exec(`
+      CREATE TABLE applied_migrations (
+        name TEXT PRIMARY KEY NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+    const dropNativeIdentity = MIGRATIONS.findIndex((migration) =>
+      migration.name.startsWith("0007_"),
+    );
+    expect(dropNativeIdentity).toBeGreaterThan(0);
+    for (const migration of MIGRATIONS.slice(0, dropNativeIdentity)) {
+      database.exec(migration.sql);
+      database
+        .query("INSERT INTO applied_migrations (name, applied_at) VALUES (?, 'now')")
+        .run(migration.name);
+    }
+    database
+      .query(
+        `INSERT INTO tf_resources
+           (tenant_id, space, api_version, kind, name, uid, generation, revision,
+            resource_json, native_id, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "org_1",
+        "default",
+        "forms/v1",
+        "Bucket",
+        "assets",
+        "uid_1",
+        "1",
+        "1",
+        "{}",
+        "bucket:assets",
+        1,
+      );
+
+    expect(() => migrateSqlite(database)).toThrow(
+      /0007_logical_resources_drop_native_identity\.sql failed/u,
+    );
+    expect(database.query("SELECT native_id FROM tf_resources").all()).toEqual([
+      { native_id: "bucket:assets" },
     ]);
   });
 });

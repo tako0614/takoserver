@@ -112,8 +112,5 @@ export class ObjectStoreError extends Error {
   }
 }
 
-/** Direct data-plane protocols a resource can expose. */
-export type DataProtocol = "s3" | "openai";
-
 /** Wall clock, injected so tests and replay logic never read the ambient one. */
 export type Clock = () => Date;

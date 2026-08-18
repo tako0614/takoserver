@@ -13,7 +13,8 @@ import {
  * The same runtime Cloudflare runs at the edge, started as a local process
  * against a configuration this generates. That is what makes a self-hosted
  * deployment a PaaS rather than a place to keep files: the whole point of
- * declaring a WorkerScript is that something serves it afterwards.
+ * implementing the official Worker Forms is that something serves the active
+ * Worker Version afterwards.
  *
  * The design is deliberately dull. Every published script is a directory of
  * modules under the data root and an entry in one generated config; workerd

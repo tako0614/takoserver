@@ -12,7 +12,8 @@ import { basename, join, relative } from "node:path";
  *
  *   bun scripts/takoform-bundle.ts <origin> <apiKey> <mainModule> <file...>
  *
- * The digest it prints is what a WorkerScript's `bundle` field takes.
+ * The digest it prints identifies the WorkerBundle artifact referenced by an
+ * official WorkerVersion Form.
  */
 
 const [origin, apiKey, mainModule, ...files] = process.argv.slice(2);

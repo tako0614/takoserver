@@ -57,7 +57,7 @@ export function migrateSqlite(database: MigratableDatabase): MigrationReport {
     // two of them.
     database.exec("BEGIN IMMEDIATE");
     try {
-      database.exec(migration.sql);
+      executeStatements(database, migration.sql);
       database.exec(
         `INSERT INTO applied_migrations (name, applied_at) VALUES ('${migration.name}', datetime('now'))`,
       );
@@ -70,4 +70,19 @@ export function migrateSqlite(database: MigratableDatabase): MigrationReport {
   }
 
   return { applied, alreadyApplied: already.size };
+}
+
+/**
+ * Bun's `Database.exec()` may stop at a failed statement in a multi-statement
+ * string without surfacing that intermediate error. Migrations need the
+ * opposite contract, so execute the repository's deliberately simple SQL
+ * files statement-by-statement after removing line comments.
+ */
+function executeStatements(database: MigratableDatabase, sql: string): void {
+  const statements = sql
+    .replace(/^\s*--.*$/gmu, "")
+    .split(";")
+    .map((statement) => statement.trim())
+    .filter((statement) => statement.length > 0);
+  for (const statement of statements) database.exec(statement);
 }

@@ -3,6 +3,7 @@ import type {
   TakoformResourceDriver,
   TakoformStoredResource,
 } from "./types.ts";
+import { TakoformHostError } from "./types.ts";
 
 /**
  * A driver that provisions nothing and reports the desired state back as
@@ -14,6 +15,9 @@ import type {
  * protocol rather than about any backend.
  */
 export class InMemoryTakoformResourceDriver implements TakoformResourceDriver {
+  readonly #nativeByResource = new Map<string, string>();
+  readonly #resourceByNative = new Map<string, string>();
+
   async apply(
     input: Parameters<TakoformResourceDriver["apply"]>[0],
   ): Promise<TakoformDriverReceipt> {
@@ -35,8 +39,25 @@ export class InMemoryTakoformResourceDriver implements TakoformResourceDriver {
   async import(
     input: Parameters<NonNullable<TakoformResourceDriver["import"]>>[0],
   ): Promise<TakoformDriverReceipt> {
+    const resourceKey = `${input.tenantId}\0${input.resourceUid}`;
+    const nativeKey = `${input.tenantId}\0${input.nativeId}`;
+    const claimedResource = this.#resourceByNative.get(nativeKey);
+    const currentNative = this.#nativeByResource.get(resourceKey);
+    if (
+      (claimedResource !== undefined && claimedResource !== resourceKey) ||
+      (currentNative !== undefined && currentNative !== nativeKey)
+    ) {
+      throw new TakoformHostError("import_conflict", 409);
+    }
+    this.#resourceByNative.set(nativeKey, resourceKey);
+    this.#nativeByResource.set(resourceKey, nativeKey);
     return { observed: structuredClone(input.spec) };
   }
 
-  async delete(): Promise<void> {}
+  async delete(input: Parameters<TakoformResourceDriver["delete"]>[0]): Promise<void> {
+    const resourceKey = `${input.tenantId}\0${input.resourceUid}`;
+    const nativeKey = this.#nativeByResource.get(resourceKey);
+    if (nativeKey !== undefined) this.#resourceByNative.delete(nativeKey);
+    this.#nativeByResource.delete(resourceKey);
+  }
 }

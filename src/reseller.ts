@@ -1,4 +1,4 @@
-import type { Catalog } from "./catalog.ts";
+import { type Catalog, priceRecurring } from "./catalog.ts";
 import type { Ledger } from "./ledger.ts";
 import type { Clock, Sql } from "./ports.ts";
 
@@ -42,6 +42,7 @@ export interface Reservation {
   readonly quoteId: string;
   readonly offeringId: string;
   readonly offeringDigest: `sha256:${string}`;
+  readonly quantity: number;
   readonly amountMinor: number;
   readonly currency: "USD";
   /** The usage meter carried over from the quote. */
@@ -167,10 +168,14 @@ export function createReseller(options: CreateResellerOptions): Reseller {
       if (!Number.isSafeInteger(quantity) || quantity <= 0 || quantity > 1_000_000) {
         throw new ResellerError("invalid_argument", 400);
       }
-      const offering = catalog.find(offeringId);
+      const offering = catalog.findOffering(offeringId);
       if (!offering) throw new ResellerError("offering_unavailable", 503);
-      const amountMinor = offering.price.unitPriceMinor * quantity;
-      if (!Number.isSafeInteger(amountMinor)) throw new ResellerError("invalid_argument", 400);
+      let amountMinor: number;
+      try {
+        amountMinor = priceRecurring(offering.pricePlan, quantity);
+      } catch {
+        throw new ResellerError("invalid_argument", 400);
+      }
 
       const id = `qte_${randomId()}`;
       const expiresAt = after(QUOTE_TTL_SECONDS);
@@ -186,7 +191,7 @@ export function createReseller(options: CreateResellerOptions): Reseller {
           await catalog.digest(offering),
           quantity,
           amountMinor,
-          offering.price.unit,
+          offering.pricePlan.recurring.meter,
           expiresAt,
           stamp(),
         ],
@@ -198,7 +203,7 @@ export function createReseller(options: CreateResellerOptions): Reseller {
         quantity,
         currency: "USD",
         amountMinor,
-        meter: offering.price.unit,
+        meter: offering.pricePlan.recurring.meter,
         expiresAt,
       };
     },
@@ -261,6 +266,7 @@ export function createReseller(options: CreateResellerOptions): Reseller {
         quoteId,
         offeringId: String(quote.offering_id),
         offeringDigest: String(quote.offering_digest) as `sha256:${string}`,
+        quantity: Number(quote.quantity),
         amountMinor,
         currency: "USD",
         meter: String(quote.meter),
@@ -313,11 +319,7 @@ export function createReseller(options: CreateResellerOptions): Reseller {
     },
 
     async release({ organizationId, tenantRef, reservationId }) {
-      const { quantity: _quantity, ...reservation } = await readReservation(
-        organizationId,
-        tenantRef,
-        reservationId,
-      );
+      const reservation = await readReservation(organizationId, tenantRef, reservationId);
       if (reservation.status === "released") return reservation;
       if (reservation.status !== "active") throw new ResellerError("conflict", 409);
 
@@ -354,12 +356,7 @@ export function createReseller(options: CreateResellerOptions): Reseller {
     },
 
     async reservation({ organizationId, tenantRef, reservationId }) {
-      const { quantity: _quantity, ...reservation } = await readReservation(
-        organizationId,
-        tenantRef,
-        reservationId,
-      );
-      return reservation;
+      return await readReservation(organizationId, tenantRef, reservationId);
     },
 
     async expireDue(limit) {

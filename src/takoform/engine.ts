@@ -88,6 +88,11 @@ export interface CreateTakoformEngineOptions {
   readonly artifacts: ArtifactResolver;
   readonly clock: Clock;
   readonly randomId: () => string;
+  /** Every live relation that must be removed before the Resource can be deleted. */
+  readonly blockingRelations?: (
+    tenantId: string,
+    resourceUid: string,
+  ) => Promise<readonly string[]>;
 }
 
 export function createTakoformEngine(options: CreateTakoformEngineOptions): TakoformEngine {
@@ -171,13 +176,11 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
     address: ResourceAddress,
     resource: TakoformStoredResource,
     previous: TakoformStoredResource | undefined,
-    nativeId?: string,
   ): Promise<void> => {
     const written = await store.writeResource({
       address,
       resource,
       expectedRevision: previous?.metadata.revision ?? null,
-      ...(nativeId === undefined ? {} : { nativeId }),
     });
     if (!written) throw new TakoformHostError("resource_busy", 409);
   };
@@ -320,20 +323,19 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       }
 
       const opId = operationId();
-      const existingNativeId = current ? await store.nativeIdOf(address) : null;
+      const uid = current?.metadata.uid ?? nextResourceUid(randomId);
       const receipt = await driver.apply({
         operationId: opId,
         tenantId: context.tenantId,
+        resourceUid: uid,
         form,
         name: body.metadata.name,
         space: body.metadata.space,
         spec: structuredClone(body.spec),
         ...(current ? { previous: structuredClone(current) } : {}),
-        ...(existingNativeId ? { nativeId: existingNativeId } : {}),
       });
-      const next = materializeResource(body, form, receipt, current, clock, randomId);
-      const nativeId = receipt.nativeId ?? existingNativeId;
-      await commit(address, next, current ?? undefined, nativeId ?? undefined);
+      const next = materializeResource(body, form, receipt, current, clock, uid);
+      await commit(address, next, current ?? undefined);
       const status = create ? 201 : 200;
       await recordOperationFor(context.tenantId)(opId, create ? "create" : "update", next);
       await store.putReplay(replayKey, {
@@ -370,14 +372,13 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       if (replay) return replayedObservation(replay, fingerprint, current.metadata.uid);
 
       const observeId = operationId();
-      const observedNativeId = await store.nativeIdOf(address);
       const receipt = await driver.observe({
         tenantId: context.tenantId,
+        resourceUid: current.metadata.uid,
         resource: structuredClone(current),
-        ...(observedNativeId ? { nativeId: observedNativeId } : {}),
       });
       const next = withObservation(current, form, receipt, clock);
-      await commit(address, next, current, observedNativeId ?? undefined);
+      await commit(address, next, current);
       await recordOperationFor(context.tenantId)(observeId, "observe", next);
       await store.putReplay(replayKey, {
         fingerprint,
@@ -433,19 +434,12 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         }
       }
 
-      // A native resource belongs to exactly one address, and an existing
-      // address keeps the native id it was adopted with.
-      const claim = await store.nativeClaim(context.tenantId, body.nativeId);
-      const claimedElsewhere = claim !== null && !sameAddress(claim, address);
-      const rebinding = current !== null && (await store.nativeIdOf(address)) !== body.nativeId;
-      if (claimedElsewhere || rebinding) {
-        throw new TakoformHostError("import_conflict", 409);
-      }
-
       const importId = operationId();
+      const uid = current?.metadata.uid ?? nextResourceUid(randomId);
       const receipt = await driver.import({
         operationId: importId,
         tenantId: context.tenantId,
+        resourceUid: uid,
         form,
         name: body.metadata.name,
         space: body.metadata.space,
@@ -453,8 +447,8 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         nativeId: body.nativeId,
         ...(current ? { previous: structuredClone(current) } : {}),
       });
-      const next = materializeResource(body, form, receipt, current, clock, randomId);
-      await commit(address, next, current ?? undefined, body.nativeId);
+      const next = materializeResource(body, form, receipt, current, clock, uid);
+      await commit(address, next, current ?? undefined);
       const status = create ? 201 : 200;
       await recordOperationFor(context.tenantId)(importId, "import", next);
       await store.putReplay(replayKey, {
@@ -499,14 +493,19 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       if (ifMatch && ifMatch !== `"${current.metadata.revision}"`) {
         throw new TakoformHostError("revision_conflict", 412);
       }
+      if (
+        options.blockingRelations &&
+        (await options.blockingRelations(context.tenantId, current.metadata.uid)).length > 0
+      ) {
+        throw new TakoformHostError("dependency_in_use", 409);
+      }
 
       const deleteId = operationId();
-      const deletedNativeId = await store.nativeIdOf(address);
       await driver.delete({
         operationId: deleteId,
         tenantId: context.tenantId,
+        resourceUid: current.metadata.uid,
         resource: structuredClone(current),
-        ...(deletedNativeId ? { nativeId: deletedNativeId } : {}),
       });
       const removed = await store.deleteResource(address, current.metadata.revision);
       if (!removed) throw new TakoformHostError("resource_busy", 409);
@@ -515,16 +514,6 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       return { kind: "deleted" };
     },
   };
-}
-
-function sameAddress(left: ResourceAddress, right: ResourceAddress): boolean {
-  return (
-    left.tenantId === right.tenantId &&
-    left.space === right.space &&
-    left.apiVersion === right.apiVersion &&
-    left.kind === right.kind &&
-    left.name === right.name
-  );
 }
 
 /**
@@ -563,7 +552,7 @@ function materializeResource(
   receipt: TakoformDriverReceipt,
   current: TakoformStoredResource | null,
   clock: Clock,
-  randomId: () => string,
+  resourceUid: string,
 ): TakoformStoredResource {
   // Generation tracks desired state, so it only moves when the spec does.
   const generation = current
@@ -579,7 +568,7 @@ function materializeResource(
     metadata: {
       name: input.metadata.name,
       space: input.metadata.space,
-      uid: current?.metadata.uid ?? `uid_${randomId().replace(/[^A-Za-z0-9._-]/gu, "")}`,
+      uid: resourceUid,
       generation,
       revision,
     },
@@ -597,6 +586,10 @@ function materializeResource(
       ...projectReceipt(form, receipt),
     },
   };
+}
+
+function nextResourceUid(randomId: () => string): string {
+  return `uid_${randomId().replace(/[^A-Za-z0-9._-]/gu, "")}`;
 }
 
 /** An observation that changed nothing must not mint a new revision. */

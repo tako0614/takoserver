@@ -41,6 +41,10 @@ export interface EphemeralTakoformHostOptions {
   readonly clock?: Clock;
   readonly randomId?: () => string;
   readonly provision?: ProvisionLanePorts;
+  readonly blockingRelations?: (
+    tenantId: string,
+    resourceUid: string,
+  ) => Promise<readonly string[]>;
 }
 
 export function createTakoformHost(options: EphemeralTakoformHostOptions): TakoformHost {
@@ -58,6 +62,7 @@ export function createTakoformHost(options: EphemeralTakoformHostOptions): Takof
     ...(options.clock ? { clock: options.clock } : {}),
     ...(options.randomId ? { randomId: options.randomId } : {}),
     ...(options.provision ? { provision: options.provision } : {}),
+    ...(options.blockingRelations ? { blockingRelations: options.blockingRelations } : {}),
   });
 }
 

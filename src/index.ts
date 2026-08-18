@@ -6,7 +6,26 @@
  * reach is a decision rather than an accident.
  */
 
+export {
+  type AiGateway,
+  AiGatewayError,
+  type AiModel,
+  type AiUsage,
+} from "./ai-port.ts";
 export { type App, type AppPorts, buildApp, type TickReport } from "./app.ts";
+export {
+  AttachmentError,
+  type AttachmentFactory,
+  type AttachmentRebinding,
+  type AttachmentResolution,
+  type AttachmentResourceView,
+  type AttachmentService,
+  type AttachmentStore,
+  createAttachmentService,
+  createAttachmentStore,
+  type NewResourceAttachment,
+  type ResourceAttachment,
+} from "./attachments.ts";
 export {
   type Accounts,
   type Actor,
@@ -20,13 +39,32 @@ export {
   type Organization,
   type Principal,
 } from "./auth.ts";
-export { type Catalog, createCatalog, type Offering, type OfferingPrice } from "./catalog.ts";
+export {
+  type Catalog,
+  createCatalog,
+  type Offering,
+  type PricedUsage,
+  type PricePlan,
+  type PricePlanCharge,
+  priceMeteredUsage,
+  priceRecurring,
+} from "./catalog.ts";
+export {
+  type CatalogCandidate,
+  type CatalogCompilation,
+  type CatalogDiagnosticCode,
+  compileCatalog,
+  type DeliveryMode,
+  type ProviderInstallation,
+  type SupplyContract,
+} from "./catalog-compiler.ts";
 export {
   createEphemeralSql,
   createInMemoryTakoformHost,
   createTakoformHost,
 } from "./compat.ts";
 export { ControlError, createControlRoutes } from "./control.ts";
+export { createDataAiRoutes, type DataAiRoutes } from "./data-ai.ts";
 export { bytesDigest, canonicalDigest, canonicalJson } from "./json.ts";
 export {
   createLedger,
@@ -41,13 +79,29 @@ export { createR2ObjectStore } from "./objects-r2.ts";
 export { openApiDocument, openApiPaths } from "./openapi.ts";
 export type {
   Clock,
-  DataProtocol,
   JsonObject,
   JsonValue,
   ObjectStore,
   Sql,
   SqlWrite,
 } from "./ports.ts";
+export {
+  type CostEstimator,
+  type CredentialIssuer,
+  createProviderPack,
+  type MeterSource,
+  type ProviderPack,
+  type ProviderPackDefinition,
+  type ProviderPackDescriptor,
+  type ResourceProvisioner,
+  type TransferEndpoint,
+} from "./provider-pack.ts";
+export {
+  createOpenAiGateway,
+  type OpenAiGatewayOptions,
+  type OpenAiModelConfig,
+  parseOpenAiModelConfig,
+} from "./providers/openai.ts";
 export {
   createReseller,
   type Quote,
@@ -56,7 +110,34 @@ export {
   type Reservation,
   type UsageStatement,
 } from "./reseller.ts";
+export {
+  createResourceDeploymentStore,
+  type NewResourceDeployment,
+  type ResourceDeployment,
+  type ResourceDeploymentState,
+  type ResourceDeploymentStore,
+} from "./resource-deployments.ts";
+export {
+  createResourceMigrationService,
+  createResourceMigrationStore,
+  type MigrationResourceView,
+  type MigrationVerification,
+  type PlanResourceMigration,
+  type ResourceMigration,
+  ResourceMigrationError,
+  type ResourceMigrationService,
+  type ResourceMigrationState,
+  type ResourceMigrationStore,
+} from "./resource-migrations.ts";
 export { createRouter, type Router } from "./router.ts";
+export {
+  type S3Access,
+  S3CredentialError,
+  type S3CredentialIssue,
+  type S3CredentialIssuer,
+  type S3CredentialSet,
+  validateS3CredentialSet,
+} from "./s3-port.ts";
 export { createD1Sql } from "./sql-d1.ts";
 export { createMemorySql, createSqliteSql } from "./sql-sqlite.ts";
 export { parseStrictJson, StrictJsonError } from "./strict-json.ts";
@@ -64,10 +145,12 @@ export { createTakoformArtifacts } from "./takoform/artifacts.ts";
 export { InMemoryTakoformResourceDriver } from "./takoform/memory-driver.ts";
 export type {
   InstalledTakoformForm,
+  TakoformBindingRef,
   TakoformDiagnostic,
   TakoformDriverReceipt,
   TakoformHost,
   TakoformHostPrincipal,
+  TakoformInterfaceRef,
   TakoformResourceDriver,
   TakoformStoredResource,
   TakoformV1Alpha3FormRef,

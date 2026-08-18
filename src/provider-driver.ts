@@ -1,12 +1,17 @@
 import type { Catalog } from "./catalog.ts";
+import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import type { Ledger } from "./ledger.ts";
-import type { JsonObject } from "./ports.ts";
-import type { Provider, ProviderOffering, ProviderTicket } from "./provider-port.ts";
+import type {
+  Provider,
+  ProviderOffering,
+  ProviderResult,
+  ProviderTicket,
+} from "./provider-port.ts";
+import type { ResourceDeployment, ResourceDeploymentStore } from "./resource-deployments.ts";
 import type {
   InstalledTakoformForm,
   TakoformDriverReceipt,
   TakoformResourceDriver,
-  TakoformStoredResource,
 } from "./takoform/types.ts";
 import { TakoformHostError } from "./takoform/types.ts";
 
@@ -20,15 +25,16 @@ import { TakoformHostError } from "./takoform/types.ts";
  * captured on success or released on failure, keyed by the operation id so a
  * retry settles once.
  *
- * Provider selection is by exact Form. A Form maps to at most one offering; two
- * would be a configuration error rather than a choice the Host may make on a
- * customer's behalf.
+ * Until the durable Deployment controller calls this port directly, the bare
+ * Takoform lane is usable only when one exact sellable Offering exists. More
+ * than one fails closed: a Form is never authority to choose supply.
  */
 
 export interface CreateProviderDriverOptions {
   readonly providers: readonly Provider[];
   readonly catalog: Catalog;
   readonly ledger: Ledger;
+  readonly deployments: ResourceDeploymentStore;
   /**
    * How long an apply may wait for a backend that answers `running`. Cloudflare
    * settles within one call; anything slower currently surfaces as retryable
@@ -40,7 +46,7 @@ export interface CreateProviderDriverOptions {
 }
 
 export function createProviderDriver(options: CreateProviderDriverOptions): TakoformResourceDriver {
-  const { providers, catalog, ledger } = options;
+  const { providers, catalog, ledger, deployments } = options;
   const pollBudget = options.inlinePollBudget ?? 5;
   const sleep =
     options.sleep ??
@@ -50,13 +56,19 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
 
   const select = (
     form: InstalledTakoformForm,
-  ): { provider: Provider; offering: ProviderOffering; priceMinor: number } => {
-    const sold = catalog.forForm(form.identity.formRef);
+  ): {
+    provider: Provider;
+    offering: ProviderOffering;
+    sold: ReturnType<Catalog["offeringsFor"]>[number];
+    priceMinor: number;
+  } => {
+    const matches = catalog.offeringsFor(form.identity.formRef);
+    const sold = matches.length === 1 ? matches[0] : undefined;
     if (!sold) throw new TakoformHostError("unsupported_capability", 422);
-    const provider = byId.get(sold.providerId);
+    const provider = byId.get(sold.providerPackRef);
     const offering = provider?.offerings.find((candidate) => candidate.id === sold.id);
     if (!provider || !offering) throw new TakoformHostError("backend_unavailable", 503);
-    return { provider, offering, priceMinor: sold.price.unitPriceMinor };
+    return { provider, offering, sold, priceMinor: sold.pricePlan.recurring.amountMinor };
   };
 
   /** Drives a ticket to a terminal state within the inline budget. */
@@ -74,13 +86,9 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     return ticket;
   };
 
-  const receiptOf = (ticket: ProviderTicket): TakoformDriverReceipt => {
+  const resultOf = (ticket: ProviderTicket): ProviderResult => {
     if (ticket.phase === "succeeded") {
-      return {
-        observed: ticket.result.observed,
-        outputs: ticket.result.outputs,
-        nativeId: ticket.result.nativeId,
-      };
+      return ticket.result;
     }
     if (ticket.phase === "running") {
       // Still working when the budget ran out. Saying so is honest; claiming
@@ -99,7 +107,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     operationId: string,
     priceMinor: number,
     work: () => Promise<ProviderTicket>,
-  ): Promise<TakoformDriverReceipt> => {
+  ): Promise<ProviderResult> => {
     const held = await ledger.hold({
       organizationId,
       reference: operationId,
@@ -118,14 +126,76 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     } else {
       await ledger.release({ organizationId, reference: operationId, amountMinor: priceMinor });
     }
-    return receiptOf(ticket);
+    return resultOf(ticket);
+  };
+
+  const receiptOf = (result: ProviderResult): TakoformDriverReceipt => ({
+    observed: result.observed,
+    outputs: result.outputs,
+  });
+
+  const installed = (
+    deployment: ResourceDeployment,
+    form: TakoformV1Alpha3FormRef,
+  ): { provider: Provider; offering: ProviderOffering } => {
+    const sold = catalog.findOffering(deployment.offeringId);
+    if (
+      !sold ||
+      sold.providerPackRef !== deployment.providerPackRef ||
+      sold.providerInstallationRef !== deployment.providerInstallationRef ||
+      sold.form.apiVersion !== form.apiVersion ||
+      sold.form.kind !== form.kind ||
+      sold.form.definitionVersion !== form.definitionVersion ||
+      sold.form.schemaDigest !== form.schemaDigest
+    ) {
+      throw new TakoformHostError("backend_unavailable", 503);
+    }
+    const provider = byId.get(deployment.providerPackRef);
+    const offering = provider?.offerings.find(
+      (candidate) => candidate.id === deployment.offeringId,
+    );
+    if (!provider || !offering) throw new TakoformHostError("backend_unavailable", 503);
+    return { provider, offering };
+  };
+
+  const active = async (tenantId: string, resourceUid: string): Promise<ResourceDeployment> => {
+    const deployment = await deployments.active(tenantId, resourceUid);
+    if (!deployment) throw new TakoformHostError("resource_not_found", 404);
+    return deployment;
+  };
+
+  const refresh = async (deployment: ResourceDeployment, result: ProviderResult): Promise<void> => {
+    if (
+      result.nativeId !== deployment.nativeId ||
+      !(await deployments.refresh(
+        deployment.tenantId,
+        deployment.id,
+        deployment.nativeId,
+        result.observed,
+        result.outputs,
+      ))
+    ) {
+      throw new TakoformHostError("resource_busy", 409);
+    }
   };
 
   return {
     async apply(input): Promise<TakoformDriverReceipt> {
-      const { provider, offering, priceMinor } = select(input.form);
-      const previous = previousOf(input.previous, input.nativeId);
-      return await charged(input.tenantId, input.operationId, priceMinor, async () =>
+      const { provider, offering, sold, priceMinor } = select(input.form);
+      const current = await deployments.active(input.tenantId, input.resourceUid);
+      if (
+        current &&
+        (current.offeringId !== sold.id ||
+          current.providerPackRef !== sold.providerPackRef ||
+          current.providerInstallationRef !== sold.providerInstallationRef)
+      ) {
+        // Moving supply is a Migration, never an ordinary Resource update.
+        throw new TakoformHostError("unsupported_capability", 422);
+      }
+      const previous = current
+        ? { nativeId: current.nativeId, spec: input.previous?.spec ?? input.spec }
+        : undefined;
+      const result = await charged(input.tenantId, input.operationId, priceMinor, async () =>
         settle(
           provider,
           input.operationId,
@@ -138,19 +208,37 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
           }),
         ),
       );
+      if (current) {
+        await refresh(current, result);
+      } else {
+        try {
+          await deployments.create({
+            tenantId: input.tenantId,
+            id: `dep_${input.operationId}`,
+            resourceUid: input.resourceUid,
+            offeringId: sold.id,
+            providerPackRef: sold.providerPackRef,
+            providerInstallationRef: sold.providerInstallationRef,
+            nativeId: result.nativeId,
+            state: "active",
+            observed: result.observed,
+            outputs: result.outputs,
+          });
+        } catch {
+          throw new TakoformHostError("resource_busy", 409);
+        }
+      }
+      return receiptOf(result);
     },
 
     async observe(input): Promise<TakoformDriverReceipt> {
       // Reading state is not a billable act.
-      const form = formOf(input.resource);
-      const sold = catalog.forForm(form);
-      const provider = sold ? byId.get(sold.providerId) : undefined;
-      const offering = provider?.offerings.find((candidate) => candidate.id === sold?.id);
-      if (!provider || !offering) throw new TakoformHostError("backend_unavailable", 503);
-      return receiptOf(
+      const deployment = await active(input.tenantId, input.resourceUid);
+      const { provider, offering } = installed(deployment, input.resource.form.formRef);
+      const result = resultOf(
         await provider.observe({
           offering,
-          nativeId: requiredNativeId(input.nativeId),
+          nativeId: deployment.nativeId,
           identity: {
             tenantRef: input.tenantId,
             space: input.resource.metadata.space,
@@ -159,20 +247,20 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
           spec: input.resource.spec,
         }),
       );
+      await refresh(deployment, result);
+      return receiptOf(result);
     },
 
     async delete(input): Promise<void> {
-      const sold = catalog.forForm(formOf(input.resource));
-      const provider = sold ? byId.get(sold.providerId) : undefined;
-      const offering = provider?.offerings.find((candidate) => candidate.id === sold?.id);
-      if (!provider || !offering) throw new TakoformHostError("backend_unavailable", 503);
+      const deployment = await active(input.tenantId, input.resourceUid);
+      const { provider, offering } = installed(deployment, input.resource.form.formRef);
       const ticket = await settle(
         provider,
         input.operationId,
         await provider.delete({
           operationId: input.operationId,
           offering,
-          nativeId: requiredNativeId(input.nativeId),
+          nativeId: deployment.nativeId,
           identity: {
             tenantRef: input.tenantId,
             space: input.resource.metadata.space,
@@ -180,15 +268,36 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
           },
         }),
       );
-      if (ticket.phase !== "succeeded") receiptOf(ticket);
+      const result = resultOf(ticket);
+      if (
+        result.nativeId !== deployment.nativeId ||
+        !(await deployments.markDeleted(input.tenantId, deployment.id, deployment.nativeId))
+      ) {
+        throw new TakoformHostError("resource_busy", 409);
+      }
     },
 
     async import(input): Promise<TakoformDriverReceipt> {
-      const { provider, offering } = select(input.form);
+      const { provider, offering, sold } = select(input.form);
       if (!provider.adopt) throw new TakoformHostError("unsupported_capability", 422);
+      const claim = await deployments.findByNative(
+        input.tenantId,
+        sold.providerInstallationRef,
+        input.nativeId,
+      );
+      const current = await deployments.active(input.tenantId, input.resourceUid);
+      if (
+        (claim && claim.resourceUid !== input.resourceUid) ||
+        (current &&
+          (current.nativeId !== input.nativeId ||
+            current.offeringId !== sold.id ||
+            current.providerInstallationRef !== sold.providerInstallationRef))
+      ) {
+        throw new TakoformHostError("import_conflict", 409);
+      }
       // Adoption bills nothing: the resource already exists and was paid for
       // wherever it came from.
-      return receiptOf(
+      const result = resultOf(
         await provider.adopt({
           offering,
           nativeId: input.nativeId,
@@ -196,25 +305,32 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
           spec: input.spec,
         }),
       );
+      if (result.nativeId !== input.nativeId) {
+        throw new TakoformHostError("import_conflict", 409);
+      }
+      if (current) {
+        await refresh(current, result);
+      } else {
+        try {
+          await deployments.create({
+            tenantId: input.tenantId,
+            id: `dep_${input.operationId}`,
+            resourceUid: input.resourceUid,
+            offeringId: sold.id,
+            providerPackRef: sold.providerPackRef,
+            providerInstallationRef: sold.providerInstallationRef,
+            nativeId: result.nativeId,
+            state: "active",
+            observed: result.observed,
+            outputs: result.outputs,
+          });
+        } catch {
+          throw new TakoformHostError("resource_busy", 409);
+        }
+      }
+      return receiptOf(result);
     },
   };
-}
-
-function previousOf(
-  resource: TakoformStoredResource | undefined,
-  nativeId: string | undefined,
-): { readonly nativeId: string; readonly spec: JsonObject } | undefined {
-  return resource && nativeId ? { nativeId, spec: resource.spec } : undefined;
-}
-
-function formOf(resource: TakoformStoredResource) {
-  return resource.form.formRef;
-}
-
-/** A resource the Host holds no native identity for was never provisioned. */
-function requiredNativeId(nativeId: string | undefined): string {
-  if (!nativeId) throw new TakoformHostError("resource_not_found", 404);
-  return nativeId;
 }
 
 export function failureToWire(code: string): [string, number] {

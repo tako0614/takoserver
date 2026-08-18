@@ -1,3 +1,5 @@
+import type { AiGateway } from "./ai-port.ts";
+import { createAttachmentService, createAttachmentStore } from "./attachments.ts";
 import {
   createAccounts,
   type ExternalIdentityVerifier,
@@ -6,15 +8,23 @@ import {
 } from "./auth.ts";
 import { createCatalog, type Offering } from "./catalog.ts";
 import { type Checkout, createControlRoutes } from "./control.ts";
-import { createDataObjectRoutes } from "./data-objects.ts";
+import { createDataAiRoutes } from "./data-ai.ts";
 import { createLedger, type FundingSettlementVerifier } from "./ledger.ts";
 import { createMetering, type MeteringRates } from "./metering.ts";
 import type { Clock, ObjectStore, Sql } from "./ports.ts";
 import { createProviderDriver } from "./provider-driver.ts";
+import type { ProviderPack } from "./provider-pack.ts";
 import type { Provider } from "./provider-port.ts";
 import { createReseller } from "./reseller.ts";
+import { createResourceDeploymentStore } from "./resource-deployments.ts";
+import {
+  createResourceMigrationService,
+  createResourceMigrationStore,
+} from "./resource-migrations.ts";
 import { createRouter, type Router } from "./router.ts";
+import type { S3CredentialIssuer } from "./s3-port.ts";
 import type { TakoformArtifactTransport } from "./takoform/artifacts.ts";
+import { sameFormRef } from "./takoform/forms.ts";
 import { createTakoformHost } from "./takoform/host.ts";
 import { createTakoformStore } from "./takoform/store.ts";
 import type {
@@ -43,6 +53,10 @@ export interface AppPorts {
   readonly checkout?: Checkout | undefined;
   /** What data costs here. Absent means measured and not charged. */
   readonly meteringRates?: MeteringRates | undefined;
+  /** OpenAI-compatible inference backend. Absent keeps the AI route unavailable. */
+  readonly ai?: AiGateway;
+  /** Short-lived standard S3 credentials for a provisioned ObjectBucket. */
+  readonly s3?: S3CredentialIssuer;
   readonly publicOrigin: string;
   /** Where this deployment's console is served, if it has one. */
   readonly consoleOrigin?: string;
@@ -55,6 +69,8 @@ export interface AppPorts {
    * explicit override for tests about the Host itself.
    */
   readonly providers?: readonly Provider[];
+  /** Capability bundles used for attachments and explicit cross-provider migration. */
+  readonly providerPacks?: readonly ProviderPack[];
   readonly driver?: TakoformResourceDriver;
   readonly offerings: readonly Offering[];
   readonly signingKey?: SigningKey;
@@ -94,6 +110,42 @@ export function buildApp(ports: AppPorts): App {
   const accounts = createAccounts({ sql: ports.sql, identity: ports.identity, clock, randomId });
   const ledger = createLedger(ports.sql, clock);
   const catalog = createCatalog(ports.offerings);
+  const deployments = createResourceDeploymentStore(ports.sql, clock);
+  const inventory = createTakoformStore(ports.sql, clock);
+  const attachments = createAttachmentService({
+    store: createAttachmentStore(ports.sql, clock),
+    deployments,
+    factories: (ports.providerPacks ?? []).flatMap((pack) => pack.attachmentFactories),
+    clock,
+    resource: async (tenantId, uid) => {
+      const listing = await inventory.resourceByUid(tenantId, uid);
+      if (!listing) return null;
+      const installed = ports.forms.find((form) =>
+        sameFormRef(form.identity.formRef, listing.resource.form.formRef),
+      );
+      return installed ? { uid, providedInterfaces: installed.providedInterfaces ?? [] } : null;
+    },
+  });
+  const migrations = createResourceMigrationService({
+    store: createResourceMigrationStore(ports.sql, clock),
+    deployments,
+    catalog,
+    packs: ports.providerPacks ?? [],
+    resource: async (tenantId, uid) => {
+      const listing = await inventory.resourceByUid(tenantId, uid);
+      return listing
+        ? {
+            uid,
+            form: listing.resource.form.formRef,
+            space: listing.space,
+            name: listing.name,
+            spec: listing.resource.spec,
+          }
+        : null;
+    },
+    attachments,
+    clock,
+  });
   const reseller = createReseller({ sql: ports.sql, ledger, catalog, clock, randomId });
   const tokens = createTokenService({
     sql: ports.sql,
@@ -103,7 +155,13 @@ export function buildApp(ports: AppPorts): App {
   });
 
   const driver =
-    ports.driver ?? createProviderDriver({ providers: ports.providers ?? [], catalog, ledger });
+    ports.driver ??
+    createProviderDriver({
+      providers: ports.providers ?? [],
+      catalog,
+      ledger,
+      deployments,
+    });
 
   const takoformHost =
     ports.takoformHost ??
@@ -145,15 +203,15 @@ export function buildApp(ports: AppPorts): App {
       // The redemption lane: a reseller's single-use provision token buys
       // exactly one apply of the offering it names, in the tenant's space.
       provision: { tokens, catalog },
+      blockingRelations: attachments.blocksDeletion,
     });
-
-  // One store instance backs both the exact-pin lanes and the console's read
-  // side, so an inventory can never drift from what the lanes actually hold.
-  const inventory = createTakoformStore(ports.sql, clock);
 
   const control = createControlRoutes({
     accounts,
     inventory,
+    deployments,
+    attachments,
+    migrations,
     forms: ports.forms,
     identityProviders: ports.identityProviders ?? [],
     ...(ports.checkout ? { checkout: ports.checkout } : {}),
@@ -161,6 +219,7 @@ export function buildApp(ports: AppPorts): App {
     catalog,
     reseller,
     tokens,
+    ...(ports.s3 ? { s3: ports.s3 } : {}),
     settlement: ports.settlement,
     clock,
   });
@@ -172,16 +231,21 @@ export function buildApp(ports: AppPorts): App {
     randomId,
     ...(ports.meteringRates ? { rates: ports.meteringRates } : {}),
   });
-  const dataObjects = createDataObjectRoutes({
-    objects: ports.objects,
-    tokens,
-    record: (usage) => metering.record({ ...usage, requestId: randomId() }),
+  const dataAi = createDataAiRoutes({
+    accounts,
+    ...(ports.ai ? { gateway: ports.ai } : {}),
+    ledger,
+    sql: ports.sql,
+    record: (usage) => metering.recordAi(usage),
+    clock,
+    randomId,
   });
 
   return {
     fetch: createRouter({
       control,
-      dataObjects,
+      dataAi,
+      aiAvailable: ports.ai !== undefined,
       takoformHost,
       publicOrigin: ports.publicOrigin,
       ...(ports.consoleOrigin === undefined ? {} : { consoleOrigin: ports.consoleOrigin }),

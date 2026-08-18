@@ -12,7 +12,8 @@
       "!!worker-configuration.d.ts",
       "!!.deploy",
       "!!.wrangler-realized.jsonc",
-      "!!src/db-schema.ts"
+      "!!src/db-schema.ts",
+      "!!vendor/takoform"
     ]
   },
   "formatter": {

@@ -112,6 +112,30 @@ const PUBLIC_PATHS: Record<string, Record<string, unknown>> = {
     security: [],
   }),
   "/v1/me": operation("get", "Read the signed-in principal and the organizations it owns"),
+  "/v1/ai/models": operation("get", "List configured OpenAI-compatible models"),
+  "/v1/ai/chat/completions": operation(
+    "post",
+    "Create a prepaid OpenAI-compatible chat completion",
+    {
+      parameters: [
+        {
+          name: "Idempotency-Key",
+          in: "header",
+          required: true,
+          schema: { type: "string", minLength: 1, maxLength: 128 },
+          description: "Stable per paid inference; replays return the same settled result.",
+        },
+        {
+          name: "X-Takoserver-AI-Pricing-Revision",
+          in: "header",
+          required: false,
+          schema: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" },
+          description:
+            "Optional exact model pricing revision from /v1/ai/models; drift is rejected before inference.",
+        },
+      ],
+    },
+  ),
   "/v1/forms": operation("get", "List every Form definition this Host will accept", {
     security: [],
   }),
@@ -124,19 +148,38 @@ const PUBLIC_PATHS: Record<string, Record<string, unknown>> = {
     "get",
     "List the organization's Takoform resources",
   ),
-  "/v1/organizations/{organizationId}/resources/{resourceUid}/data-tokens": operation(
-    "post",
-    "Mint a short-lived token for one resource's data plane",
+  "/v1/organizations/{organizationId}/resources/{resourceUid}": operation(
+    "get",
+    "Read one exact organization Takoform resource",
   ),
-  "/data/v1/objects/{resourceUid}": operation("get", "List what a bucket holds", {
-    security: [{ dataToken: [] }],
+  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations": operations({
+    get: "List explicit provider migrations for one logical Resource",
+    post: "Plan a migration against an exact commercial reservation",
   }),
-  "/data/v1/objects/{resourceUid}/{key}": operations({
-    put: "Write an object",
-    get: "Read an object",
-    head: "Read an object's metadata",
-    delete: "Remove an object",
+  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}": operation(
+    "get",
+    "Read one Resource Migration",
+  ),
+  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/execute":
+    operation("post", "Provision, transfer, and verify a candidate Deployment"),
+  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/cutover":
+    operation("post", "Atomically activate the candidate and re-resolve Attachments"),
+  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/rollback":
+    operation("post", "Restore the retained Deployment and Attachment resolutions"),
+  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/cancel":
+    operation("post", "Delete an uncut candidate and release its commercial reservation"),
+  "/v1/organizations/{organizationId}/attachments": operations({
+    get: "List the organization's Resource Attachments",
+    post: "Resolve and create a Resource Attachment",
   }),
+  "/v1/organizations/{organizationId}/attachments/{attachmentId}": operations({
+    get: "Read one Resource Attachment",
+    delete: "Delete one Resource Attachment",
+  }),
+  "/v1/organizations/{organizationId}/resources/{resourceUid}/s3-credentials": operation(
+    "post",
+    "Issue short-lived standard S3 credentials for an ObjectBucket",
+  ),
   "/v1/organizations/{organizationId}/operations": operation(
     "get",
     "List the organization's recent Takoform operations",
@@ -186,13 +229,17 @@ function operations(summaries: Readonly<Record<string, string>>): Record<string,
 function operation(
   method: string,
   summary: string,
-  extra: { readonly security?: readonly unknown[] } = {},
+  extra: {
+    readonly security?: readonly unknown[];
+    readonly parameters?: readonly unknown[];
+  } = {},
 ): Record<string, unknown> {
   return {
     [method]: {
       summary,
       responses: { "200": { description: "Success" } },
       ...(extra.security ? { security: extra.security } : {}),
+      ...(extra.parameters ? { parameters: extra.parameters } : {}),
     },
   };
 }
