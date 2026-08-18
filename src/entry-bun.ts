@@ -13,11 +13,13 @@ import { createOperatorSettlement } from "./operator-credentials.ts";
 import { resolvePayment } from "./payment-setup.ts";
 import { CloudflareProvider } from "./providers/cloudflare.ts";
 import { createLocalProvider, LOCAL_KINDS, localOfferings } from "./providers/local.ts";
+import { createWorkerdProvider } from "./providers/workerd.ts";
 import { createProvisionerEndpoint } from "./provisioner-endpoint.ts";
 import { ensureSigningKey, loadSigningKey } from "./signing-key.ts";
 import { createD1HttpSql } from "./sql-d1-http.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
+import { createWorkerdRuntime } from "./workerd-runtime.ts";
 
 /**
  * The self-hosted entry, and the only one that can provision.
@@ -90,6 +92,8 @@ const sql = sharedDatabaseId
 // Bytes come from the same bucket the Worker writes to, for the same reason
 // the rows do: a bundle committed through the public API has to be there when
 // the provisioner goes to publish it.
+/** Everything this machine keeps lives under one directory. */
+const dataRoot = process.env.TAKOSERVER_DATA_ROOT ?? ".takoserver";
 const sharedBucket = process.env.TAKOSERVER_R2_BUCKET;
 const objects = sharedBucket
   ? createR2HttpObjectStore({
@@ -102,7 +106,7 @@ const objects = sharedBucket
     // not storage. Memory is kept for tests, which say so by asking for it.
     process.env.TAKOSERVER_OBJECTS_IN_MEMORY === "1"
     ? createMemoryObjectStore()
-    : createFileObjectStore({ root: process.env.TAKOSERVER_DATA_ROOT ?? ".takoserver" });
+    : createFileObjectStore({ root: dataRoot });
 const clock = () => new Date();
 const edge = await buildEdgeForms();
 
@@ -156,7 +160,32 @@ const providers = process.env.CLOUDFLARE_ACCOUNT_ID
   : [
       createLocalProvider({
         offerings: localOfferings(edge.providerOfferings),
-        dataRoot: process.env.TAKOSERVER_DATA_ROOT ?? ".takoserver",
+        dataRoot,
+      }),
+      createWorkerdProvider({
+        offerings: edge.providerOfferings.filter((offering) => offering.kind === "worker_script"),
+        runtime: createWorkerdRuntime({
+          root: dataRoot,
+          ...(process.env.TAKOSERVER_WORKERD_PORT
+            ? { port: Number(process.env.TAKOSERVER_WORKERD_PORT) }
+            : {}),
+          async onReload(configPath) {
+            // Told, not restarted: workerd watches the file, and bouncing the
+            // process would drop every in-flight request of every other tenant
+            // for one tenant's deploy.
+            process.stdout.write(`workerd configuration written to ${configPath}\n`);
+          },
+        }),
+        artifacts: {
+          manifest: (tenantRef, digest) => artifactStore.resolveManifest(tenantRef, digest),
+          async blob(digest) {
+            const stored = await objects.get(`art/${digest.slice("sha256:".length)}`);
+            return stored ? new Uint8Array(await new Response(stored.body).arrayBuffer()) : null;
+          },
+        },
+        ...(process.env.TAKOSERVER_SUFFIXES
+          ? { suffixes: process.env.TAKOSERVER_SUFFIXES.split(",").map((entry) => entry.trim()) }
+          : {}),
       }),
     ];
 
@@ -199,7 +228,7 @@ const signingKey = sharedDatabaseId
   : await ensureSigningKey({
       keyId: process.env.TAKOSERVER_SIGNING_KEY_ID ?? "takoserver-local",
       privateJwk: process.env.TAKOSERVER_SIGNING_KEY,
-      path: join(process.env.TAKOSERVER_DATA_ROOT ?? ".takoserver", "signing-key.jwk"),
+      path: join(dataRoot, "signing-key.jwk"),
       sql,
       readFile: (path) =>
         readFile(path, "utf8").then(
@@ -236,8 +265,13 @@ const app = buildApp({
   offerings: process.env.CLOUDFLARE_ACCOUNT_ID
     ? edge.offerings
     : edge.offerings
-        .filter((offering) => LOCAL_KINDS.includes(offering.kind))
-        .map((offering) => ({ ...offering, providerId: "local" })),
+        .filter(
+          (offering) => LOCAL_KINDS.includes(offering.kind) || offering.kind === "worker_script",
+        )
+        .map((offering) => ({
+          ...offering,
+          providerId: offering.kind === "worker_script" ? "workerd" : "local",
+        })),
   artifacts: artifactStore,
   clock,
 });
