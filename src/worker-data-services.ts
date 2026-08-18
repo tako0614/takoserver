@@ -56,7 +56,7 @@ export function createWorkerDataServices(env: WorkerDataServiceEnv): WorkerDataS
           accountId: env.CLOUDFLARE_ACCOUNT_ID,
           providerInstallationRef: "cloudflare.primary",
           parentAccessKeyId: env.TAKOSERVER_R2_PARENT_ACCESS_KEY_ID,
-          authorize: () => `Bearer ${env.TAKOSERVER_R2_PARENT_TOKEN}`,
+          parentSecretAccessKey: env.TAKOSERVER_R2_PARENT_TOKEN,
         });
       })()
     : undefined;

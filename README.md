@@ -127,10 +127,12 @@ mapping, limits, and retail token prices; the latter is only the public id of an
 R2 parent token. Realization places those non-secret values in Worker vars. AI
 uses the native Workers AI binding, so it does not copy an account API token
 into inference requests. `CLOUDFLARE_API_TOKEN` remains the provisioning
-secret, while `TAKOSERVER_R2_PARENT_TOKEN` is the separate S3 credential-issuer
-secret. Deploy preflight refuses an enabled capability whose required secret is
-absent. With no such target fields, `/v1/ai` and S3 credential issuance stay
-absent rather than using a demo backend.
+secret, while `TAKOSERVER_R2_PARENT_TOKEN` is the parent R2 secret access key.
+The Worker uses that key only to sign short-lived bucket-scoped session
+credentials locally; it never returns or forwards the parent key. Deploy
+preflight refuses an enabled capability whose required secret is absent. With
+no such target fields, `/v1/ai` and S3 credential issuance stay absent rather
+than using a demo backend.
 
 See [docs/adr/0001-provision-from-the-worker.md](docs/adr/0001-provision-from-the-worker.md)
 for why the deployed Worker holds the account credential, and what that costs.
