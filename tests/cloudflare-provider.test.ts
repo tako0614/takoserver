@@ -27,8 +27,6 @@ function offering(id: string, kind: string): ProviderOffering {
             schemaDigest: "sha256:22fde31c0b695ca59f5c46230c1ed03d6a6f53c01015d4a5acf6bdb0ed70b50c",
           }
         : FORM_REF,
-    unit: "unit",
-    unitPriceMinor: 100,
     providedInterfaces: [],
     bindingRefs: [],
     capabilities: ["create", "update", "delete", "observe", "import"],

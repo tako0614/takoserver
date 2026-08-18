@@ -23,8 +23,6 @@ const OFFERING: ProviderOffering = {
     definitionVersion: "0.1.0",
     schemaDigest: "sha256:22fde31c0b695ca59f5c46230c1ed03d6a6f53c01015d4a5acf6bdb0ed70b50c",
   },
-  unit: "worker-month",
-  unitPriceMinor: 500,
   providedInterfaces: [],
   bindingRefs: [],
   capabilities: ["create", "delete", "observe"],

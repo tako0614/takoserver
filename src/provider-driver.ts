@@ -57,7 +57,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     const provider = byId.get(sold.providerPackRef);
     const offering = provider?.offerings.find((candidate) => candidate.id === sold.id);
     if (!provider || !offering) throw new TakoformHostError("backend_unavailable", 503);
-    return { provider, offering, priceMinor: sold.price.unitPriceMinor };
+    return { provider, offering, priceMinor: sold.pricePlan.recurring.amountMinor };
   };
 
   /** Drives a ticket to a terminal state within the inline budget. */

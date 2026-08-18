@@ -12,8 +12,6 @@ const OFFERING: ProviderOffering = {
     definitionVersion: "0.1.0",
     schemaDigest: `sha256:${"a".repeat(64)}`,
   },
-  unit: "bucket-month",
-  unitPriceMinor: 500,
   providedInterfaces: [],
   bindingRefs: [],
   capabilities: ["create", "update", "delete", "observe", "import"],

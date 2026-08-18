@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { createCatalog, type Offering } from "../src/catalog.ts";
+import { createCatalog, type Offering, priceMeteredUsage, priceRecurring } from "../src/catalog.ts";
 import type { TakoformInterfaceRef } from "../src/takoform/types.ts";
 
 const FORM = {
@@ -23,12 +23,24 @@ function offering(id: string, providerPackRef: string): Offering {
     providerInstallationRef: `${providerPackRef}.primary`,
     supplyContractRef: `${providerPackRef}.resale-2026`,
     pricePlanRef: `${id}.price-v1`,
+    resourceClass: "storage.s3",
+    deliveryMode: "provider-subaccount",
+    supportPolicyRef: "support:storage:oncall",
+    abusePolicyRef: "abuse:storage:standard",
     kind: "object_bucket",
     displayName: id,
     form: FORM,
     providedInterfaces: [OBJECTS],
     bindingRefs: [],
-    price: { currency: "USD", unit: "bucket-month", unitPriceMinor: 500 },
+    pricePlan: {
+      id: `${id}.price-v1`,
+      currency: "USD",
+      recurring: { meter: "bucket-month", amountMinor: 500 },
+      meters: [
+        { meter: "storage.gib-hour", amountMinor: 1, quantity: 1 },
+        { meter: "requests.million", amountMinor: 30, quantity: 1_000_000 },
+      ],
+    },
     regions: ["global"],
     portability: {
       api: "portable",
@@ -58,5 +70,27 @@ describe("Offering catalog", () => {
     ]);
 
     expect("forForm" in catalog).toBe(false);
+  });
+
+  test("prices recurring and aggregated multi-meter usage from one Price Plan", () => {
+    const plan = offering("storage.s3.wasabi.ap-northeast", "wasabi").pricePlan;
+
+    expect(priceRecurring(plan, 2)).toBe(1_000);
+    expect(
+      priceMeteredUsage(plan, [
+        { meter: "storage.gib-hour", quantity: 2 },
+        { meter: "storage.gib-hour", quantity: 3 },
+        { meter: "requests.million", quantity: 1_500_000 },
+      ]),
+    ).toEqual({
+      amountMinor: 50,
+      lines: [
+        { meter: "requests.million", quantity: 1_500_000, amountMinor: 45 },
+        { meter: "storage.gib-hour", quantity: 5, amountMinor: 5 },
+      ],
+    });
+    expect(() => priceMeteredUsage(plan, [{ meter: "provider.invoice", quantity: 1 }])).toThrow(
+      "unknown meter",
+    );
   });
 });

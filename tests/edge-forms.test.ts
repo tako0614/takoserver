@@ -48,6 +48,6 @@ describe("official Takoform catalog", () => {
     expect(defaultCatalog.objectBucket.form.identity).toEqual(
       repricedCatalog.objectBucket.form.identity,
     );
-    expect(repricedCatalog.objectBucket.offering.price.unitPriceMinor).toBe(750);
+    expect(repricedCatalog.objectBucket.offering.pricePlan.recurring.amountMinor).toBe(750);
   });
 });

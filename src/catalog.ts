@@ -13,10 +13,60 @@ import { canonicalDigest } from "./json.ts";
  * changes at deploy time.
  */
 
-export interface OfferingPrice {
+export interface PricePlanCharge {
+  readonly meter: string;
+  readonly amountMinor: number;
+  /** Number of meter units bought by one charge. */
+  readonly quantity?: number;
+}
+
+export interface PricePlan {
+  readonly id: string;
   readonly currency: "USD";
-  readonly unit: string;
-  readonly unitPriceMinor: number;
+  readonly recurring: PricePlanCharge;
+  readonly meters: readonly PricePlanCharge[];
+}
+
+export interface PricedUsage {
+  readonly amountMinor: number;
+  readonly lines: readonly {
+    readonly meter: string;
+    readonly quantity: number;
+    readonly amountMinor: number;
+  }[];
+}
+
+export function priceRecurring(plan: PricePlan, quantity: number): number {
+  if (!Number.isSafeInteger(quantity) || quantity <= 0) throw new TypeError("invalid quantity");
+  const amount = plan.recurring.amountMinor * quantity;
+  if (!Number.isSafeInteger(amount)) throw new TypeError("price overflow");
+  return amount;
+}
+
+/** Prices already-aggregated usage; callers must not round each raw event separately. */
+export function priceMeteredUsage(
+  plan: PricePlan,
+  usage: readonly { readonly meter: string; readonly quantity: number }[],
+): PricedUsage {
+  const quantities = new Map<string, number>();
+  for (const item of usage) {
+    if (!Number.isFinite(item.quantity) || item.quantity < 0)
+      throw new TypeError("invalid quantity");
+    quantities.set(item.meter, (quantities.get(item.meter) ?? 0) + item.quantity);
+  }
+  const rates = new Map(plan.meters.map((charge) => [charge.meter, charge]));
+  const lines = [...quantities]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([meter, quantity]) => {
+      const rate = rates.get(meter);
+      if (!rate) throw new TypeError(`unknown meter: ${meter}`);
+      const amountMinor = Math.ceil((quantity * rate.amountMinor) / (rate.quantity ?? 1));
+      if (!Number.isSafeInteger(amountMinor)) throw new TypeError("price overflow");
+      return { meter, quantity, amountMinor };
+    });
+  const amountMinor = lines.reduce((sum, line) => sum + line.amountMinor, 0);
+  if (!Number.isSafeInteger(amountMinor)) throw new TypeError("price overflow");
+  return { amountMinor, lines };
 }
 
 export interface Offering {
@@ -25,10 +75,20 @@ export interface Offering {
   readonly providerInstallationRef: string;
   readonly supplyContractRef: string;
   readonly pricePlanRef: string;
+  readonly resourceClass: string;
+  readonly deliveryMode:
+    | "embedded-binding"
+    | "managed-endpoint"
+    | "native-credentials"
+    | "provider-subaccount"
+    | "white-label"
+    | "byoc-management";
+  readonly supportPolicyRef: string;
+  readonly abusePolicyRef: string;
   readonly kind: string;
   readonly displayName: string;
   readonly form: TakoformV1Alpha3FormRef;
-  readonly price: OfferingPrice;
+  readonly pricePlan: PricePlan;
   readonly providedInterfaces: readonly TakoformInterfaceRef[];
   readonly bindingRefs: readonly TakoformBindingRef[];
   readonly regions: readonly string[];
@@ -101,9 +161,13 @@ export function createCatalog(offerings: readonly Offering[]): Catalog {
         providerInstallationRef: offering.providerInstallationRef,
         supplyContractRef: offering.supplyContractRef,
         pricePlanRef: offering.pricePlanRef,
+        resourceClass: offering.resourceClass,
+        deliveryMode: offering.deliveryMode,
+        supportPolicyRef: offering.supportPolicyRef,
+        abusePolicyRef: offering.abusePolicyRef,
         kind: offering.kind,
         form: offering.form,
-        price: offering.price,
+        pricePlan: offering.pricePlan,
         providedInterfaces: offering.providedInterfaces,
         bindingRefs: offering.bindingRefs,
         regions: [...offering.regions].sort(),

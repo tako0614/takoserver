@@ -37,7 +37,26 @@ export {
   type Organization,
   type Principal,
 } from "./auth.ts";
-export { type Catalog, createCatalog, type Offering, type OfferingPrice } from "./catalog.ts";
+export {
+  type Catalog,
+  createCatalog,
+  type Offering,
+  type PricedUsage,
+  type PricePlan,
+  type PricePlanCharge,
+  priceMeteredUsage,
+  priceRecurring,
+} from "./catalog.ts";
+export {
+  type CatalogCandidate,
+  type CatalogCompilation,
+  type CatalogDiagnosticCode,
+  compileCatalog,
+  type DeliveryMode,
+  type ProviderInstallation,
+  type ProviderPackDescriptor,
+  type SupplyContract,
+} from "./catalog-compiler.ts";
 export {
   createEphemeralSql,
   createInMemoryTakoformHost,

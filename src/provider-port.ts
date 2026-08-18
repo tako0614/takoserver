@@ -58,8 +58,6 @@ export interface ProviderOffering {
   readonly kind: string;
   readonly displayName: string;
   readonly form: TakoformV1Alpha3FormRef;
-  readonly unit: string;
-  readonly unitPriceMinor: number;
   readonly providedInterfaces: readonly TakoformInterfaceRef[];
   readonly bindingRefs: readonly TakoformBindingRef[];
   readonly regions?: readonly string[];

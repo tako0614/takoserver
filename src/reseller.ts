@@ -1,4 +1,4 @@
-import type { Catalog } from "./catalog.ts";
+import { type Catalog, priceRecurring } from "./catalog.ts";
 import type { Ledger } from "./ledger.ts";
 import type { Clock, Sql } from "./ports.ts";
 
@@ -169,8 +169,12 @@ export function createReseller(options: CreateResellerOptions): Reseller {
       }
       const offering = catalog.findOffering(offeringId);
       if (!offering) throw new ResellerError("offering_unavailable", 503);
-      const amountMinor = offering.price.unitPriceMinor * quantity;
-      if (!Number.isSafeInteger(amountMinor)) throw new ResellerError("invalid_argument", 400);
+      let amountMinor: number;
+      try {
+        amountMinor = priceRecurring(offering.pricePlan, quantity);
+      } catch {
+        throw new ResellerError("invalid_argument", 400);
+      }
 
       const id = `qte_${randomId()}`;
       const expiresAt = after(QUOTE_TTL_SECONDS);
@@ -186,7 +190,7 @@ export function createReseller(options: CreateResellerOptions): Reseller {
           await catalog.digest(offering),
           quantity,
           amountMinor,
-          offering.price.unit,
+          offering.pricePlan.recurring.meter,
           expiresAt,
           stamp(),
         ],
@@ -198,7 +202,7 @@ export function createReseller(options: CreateResellerOptions): Reseller {
         quantity,
         currency: "USD",
         amountMinor,
-        meter: offering.price.unit,
+        meter: offering.pricePlan.recurring.meter,
         expiresAt,
       };
     },
