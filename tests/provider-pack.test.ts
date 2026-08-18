@@ -48,8 +48,14 @@ function pack(overrides: Partial<ProviderPackDefinition> = {}) {
         exportFormats: ["s3.object-set.takoform.com/v1"],
         importFormats: ["s3.object-set.takoform.com/v1"],
         migrationModes: ["offline", "online"],
-        startExport: async () => ({ operationRef: "transfer:export:test" }),
-        startImport: async () => ({ operationRef: "transfer:import:test" }),
+        export: async () => ({ transferRef: "transfer:export:test" }),
+        import: async () => undefined,
+        verify: async () => ({
+          schema: true,
+          rowCounts: true,
+          checksums: true,
+          evidenceDigest: `sha256:${"d".repeat(64)}`,
+        }),
       },
     ],
     credentialIssuers: [

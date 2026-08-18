@@ -73,7 +73,11 @@ describe("bringing a local database up to date", () => {
         applied_at TEXT NOT NULL
       );
     `);
-    for (const migration of MIGRATIONS.slice(0, -2)) {
+    const dropNativeIdentity = MIGRATIONS.findIndex((migration) =>
+      migration.name.startsWith("0007_"),
+    );
+    expect(dropNativeIdentity).toBeGreaterThan(0);
+    for (const migration of MIGRATIONS.slice(0, dropNativeIdentity)) {
       database.exec(migration.sql);
       database
         .query("INSERT INTO applied_migrations (name, applied_at) VALUES (?, 'now')")

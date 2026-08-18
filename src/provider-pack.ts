@@ -20,17 +20,38 @@ export interface TransferEndpoint {
   readonly exportFormats: readonly string[];
   readonly importFormats: readonly string[];
   readonly migrationModes: readonly ("offline" | "online")[];
-  startExport(input: {
+  export(input: {
+    /** Stable across retries of one Migration phase. */
+    readonly operationId: string;
     readonly tenantId: string;
     readonly source: ResourceDeployment;
     readonly format: string;
-  }): Promise<{ readonly operationRef: string }>;
-  startImport(input: {
+  }): Promise<{ readonly transferRef: string }>;
+  import(input: {
+    /** Stable across retries of one Migration phase. */
+    readonly operationId: string;
     readonly tenantId: string;
     readonly target: ResourceDeployment;
     readonly transferRef: string;
     readonly format: string;
-  }): Promise<{ readonly operationRef: string }>;
+  }): Promise<void>;
+  verify(input: {
+    /** Stable across retries of one Migration phase. */
+    readonly operationId: string;
+    readonly tenantId: string;
+    readonly source: ResourceDeployment;
+    readonly target: ResourceDeployment;
+    readonly requirements: {
+      readonly schema: boolean;
+      readonly rowCounts: boolean;
+      readonly checksums: boolean;
+    };
+  }): Promise<{
+    readonly schema: boolean;
+    readonly rowCounts: boolean;
+    readonly checksums: boolean;
+    readonly evidenceDigest: `sha256:${string}`;
+  }>;
 }
 
 export interface CredentialIssuer {

@@ -115,6 +115,17 @@ export {
   type ResourceDeploymentState,
   type ResourceDeploymentStore,
 } from "./resource-deployments.ts";
+export {
+  createResourceMigrationService,
+  createResourceMigrationStore,
+  type MigrationResourceView,
+  type MigrationVerification,
+  type PlanResourceMigration,
+  type ResourceMigration,
+  ResourceMigrationError,
+  type ResourceMigrationState,
+  type ResourceMigrationStore,
+} from "./resource-migrations.ts";
 export { createRouter, type Router } from "./router.ts";
 export {
   type S3Access,
