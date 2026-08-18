@@ -58,7 +58,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "domain",
     match:
-      /^src\/(?:token|auth|ledger|catalog|reseller|metering|provider-driver|reconcile|edge-forms|operator-credentials|google-identity|identity-setup|stripe-settlement)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$)/u,
+      /^src\/(?:token|auth|ledger|catalog|reseller|metering|provider-driver|reconcile|edge-forms|operator-credentials|google-identity|identity-setup|stripe-settlement|signing-key)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$)/u,
     may: ["core", "domain"],
   },
   {

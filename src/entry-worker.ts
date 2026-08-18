@@ -7,6 +7,7 @@ import { resolvePayment } from "./payment-setup.ts";
 import type { Provider } from "./provider-port.ts";
 import { CloudflareProvider, type CloudflareZone } from "./providers/cloudflare.ts";
 import { createRemoteProvider } from "./providers/remote.ts";
+import { loadSigningKey } from "./signing-key.ts";
 import { createD1Sql } from "./sql-d1.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 
@@ -46,6 +47,10 @@ interface WorkerEnv {
   readonly TAKOSERVER_ZONES?: string;
   /** Stripe secret key. Its presence is what lets a customer pay. */
   readonly STRIPE_SECRET_KEY?: string;
+  /** Key id whose public half is registered for verification. */
+  readonly TAKOSERVER_SIGNING_KEY_ID?: string;
+  /** Private half, as an Ed25519 JWK. A secret. */
+  readonly TAKOSERVER_SIGNING_KEY?: string;
 }
 
 /**
@@ -156,10 +161,15 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     clock: () => new Date(),
     randomId: () => crypto.randomUUID(),
   });
+  const signingKey = await loadSigningKey(
+    env.TAKOSERVER_SIGNING_KEY_ID,
+    env.TAKOSERVER_SIGNING_KEY,
+  );
   const app = buildApp({
     sql,
     objects,
     artifacts,
+    ...(signingKey ? { signingKey } : {}),
     identity,
     identityProviders,
     settlement,

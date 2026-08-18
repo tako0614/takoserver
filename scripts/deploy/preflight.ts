@@ -1,7 +1,7 @@
 import { RemoteD1 } from "./d1.ts";
 import { preflightError } from "./errors.ts";
 import { assertPublishedIdentity, readLedger } from "./evidence.ts";
-import { runChecked, wranglerCommand } from "./process.ts";
+import { runChecked, runCommand, wranglerCommand } from "./process.ts";
 import { buildBundleDigest, migrationProvenance, resolvePushedCommit } from "./provenance.ts";
 import { realizedConfigDigest, writeRealizedConfig } from "./realized-config.ts";
 import type { DeployTarget } from "./target.ts";
@@ -106,6 +106,7 @@ export async function preflight(
 
   assertMigrationLineage(live.appliedMigrations, migrations.files);
   await assertAliasesAttachable(target);
+  await assertSigningKeyPresent(configPath);
   await assertProbeDatabaseIdentity(configPath, target);
 
   const { alreadyCurrent } = assertPublishedIdentity(
@@ -231,4 +232,27 @@ async function resolves(hostname: string): Promise<boolean> {
     if (Array.isArray(body?.Answer) && body.Answer.length > 0) return true;
   }
   return false;
+}
+
+/**
+ * A deployment that verifies tokens it can never issue.
+ *
+ * The public half of the signing key lives in the database, so verification
+ * works from the first deploy and issuing does not. The failure surfaces later,
+ * to a customer, as `no_active_keys` on the one call that mattered — true, and
+ * unhelpful unless you already know what it means. Asking here turns it into a
+ * sentence naming the secret to set.
+ */
+async function assertSigningKeyPresent(configPath: string): Promise<void> {
+  const listed = await runCommand(wranglerCommand(["secret", "list", "--config", configPath]));
+  // A listing we could not obtain is not evidence of absence, and refusing to
+  // deploy over a transient wrangler failure would be its own defect.
+  if (listed.exitCode !== 0) return;
+  if (listed.stdout.includes("TAKOSERVER_SIGNING_KEY")) return;
+  throw preflightError(
+    "the signing key secret is not set",
+    "Data tokens are signed with it, and without it every request for one fails with " +
+      "`no_active_keys`. Set it from the operator's private key:\n" +
+      "  wrangler secret put TAKOSERVER_SIGNING_KEY --config .wrangler-realized.jsonc",
+  );
 }

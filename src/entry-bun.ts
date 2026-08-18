@@ -10,6 +10,7 @@ import { createOperatorSettlement } from "./operator-credentials.ts";
 import { resolvePayment } from "./payment-setup.ts";
 import { CloudflareProvider } from "./providers/cloudflare.ts";
 import { createProvisionerEndpoint } from "./provisioner-endpoint.ts";
+import { loadSigningKey } from "./signing-key.ts";
 import { createD1HttpSql } from "./sql-d1-http.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
@@ -160,9 +161,15 @@ const provision = createProvisionerEndpoint({
   credential: process.env.TAKOSERVER_PROVISIONER_TOKEN,
 });
 
+const signingKey = await loadSigningKey(
+  process.env.TAKOSERVER_SIGNING_KEY_ID,
+  process.env.TAKOSERVER_SIGNING_KEY,
+);
+
 const app = buildApp({
   sql,
   objects,
+  ...(signingKey ? { signingKey } : {}),
   identity: identity.verifier,
   identityProviders: identity.providers,
   settlement:

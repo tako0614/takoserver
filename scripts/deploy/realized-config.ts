@@ -93,6 +93,9 @@ function publicSettings(target: DeployTarget): Record<string, unknown> {
   if (target.provisionerOrigin !== undefined) {
     vars.TAKOSERVER_PROVISIONER_ORIGIN = target.provisionerOrigin;
   }
+  // The key id is public — its public half is in the database for anyone to
+  // verify against. The private half is a secret and is set separately.
+  vars.TAKOSERVER_SIGNING_KEY_ID = target.grantKeyId;
   if (target.zones !== undefined) {
     // The account the Worker provisions in is the account it is deployed to;
     // saying so once here keeps the provider from having to be told twice.
