@@ -121,6 +121,15 @@ provisions R2 buckets, D1 databases, and Workers in that account instead. The
 control plane itself can also run as a Worker; `bun run deploy -- --contract`
 describes what publishing that involves and what it refuses to do.
 
+The operator-private deploy target may also declare `aiModels` and
+`r2ParentAccessKeyId`. The former is the exact public-model to upstream-model
+mapping, limits, and retail token prices; the latter is only the public id of an
+R2 parent token. Realization places those non-secret values in Worker vars.
+`CLOUDFLARE_API_TOKEN` and `TAKOSERVER_R2_PARENT_TOKEN` remain Worker secrets,
+and deploy preflight refuses an enabled data service whose required secret is
+absent. With no such target fields, `/v1/ai` and S3 credential issuance stay
+absent rather than using a demo backend.
+
 See [docs/adr/0001-provision-from-the-worker.md](docs/adr/0001-provision-from-the-worker.md)
 for why the deployed Worker holds the account credential, and what that costs.
 

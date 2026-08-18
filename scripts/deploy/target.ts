@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
+import { parseOpenAiModelConfig } from "../../src/providers/openai.ts";
 import { preflightError } from "./errors.ts";
 import { REPOSITORY } from "./process.ts";
 
@@ -53,6 +54,10 @@ export interface DeployTarget {
    * edits by hand is how a zone quietly stops being offered.
    */
   readonly zones?: readonly Record<string, unknown>[];
+  /** Private model mapping and retail prices for the ordinary AI API. */
+  readonly aiModels?: readonly Record<string, unknown>[];
+  /** Public id of the R2 parent token used to mint temporary S3 credentials. */
+  readonly r2ParentAccessKeyId?: string;
   readonly grantKeyId: string;
 }
 
@@ -110,7 +115,15 @@ function validateTarget(value: unknown, path: string): DeployTarget {
   assertExactKeys(
     value,
     ["accountId", "workerName", "d1", "r2", "publicOrigin", "grantKeyId"],
-    ["aliases", "consoleOrigin", "googleClientId", "provisionerOrigin", "zones"],
+    [
+      "aliases",
+      "consoleOrigin",
+      "googleClientId",
+      "provisionerOrigin",
+      "zones",
+      "aiModels",
+      "r2ParentAccessKeyId",
+    ],
   );
 
   const d1 = value.d1;
@@ -140,6 +153,12 @@ function validateTarget(value: unknown, path: string): DeployTarget {
       ? {}
       : { provisionerOrigin: httpsOrigin(value.provisionerOrigin) }),
     ...(value.zones === undefined ? {} : { zones: zoneList(value.zones) }),
+    ...(value.aiModels === undefined ? {} : { aiModels: modelList(value.aiModels) }),
+    ...(value.r2ParentAccessKeyId === undefined
+      ? {}
+      : {
+          r2ParentAccessKeyId: pattern(value.r2ParentAccessKeyId, KEY_ID, "r2ParentAccessKeyId"),
+        }),
     grantKeyId: pattern(value.grantKeyId, KEY_ID, "grantKeyId"),
   };
 }
@@ -171,6 +190,15 @@ function zoneList(value: unknown): readonly Record<string, unknown>[] {
     }
   }
   return value as readonly Record<string, unknown>[];
+}
+
+function modelList(value: unknown): readonly Record<string, unknown>[] {
+  try {
+    parseOpenAiModelConfig(JSON.stringify(value));
+  } catch {
+    throw preflightError("deploy target `aiModels` is invalid");
+  }
+  return structuredClone(value) as readonly Record<string, unknown>[];
 }
 
 function assertExactKeys(
