@@ -391,6 +391,7 @@ describe("Takoserver current Takoform Host", () => {
     );
     expect(created.status).toBe(201);
     expect(created.headers.get("etag")).toBe('"1"');
+    expect(created.headers.get("cache-control")).toBe("no-transform");
     expect(created.body).toMatchObject({
       metadata: { name: "media", space: "space-a", generation: "1", revision: "1" },
       status: { observedGeneration: "1", conditions: [{ type: "Ready", status: "True" }] },
