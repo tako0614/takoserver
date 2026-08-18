@@ -74,6 +74,7 @@ const PUBLIC_PATHS = [
   "/v1/organizations/{organizationId}/operations",
   "/v1/organizations/{organizationId}/resources",
   "/v1/organizations/{organizationId}/wallet",
+  "/v1/organizations/{organizationId}/wallet/checkout",
   "/v1/organizations/{organizationId}/wallet/funding",
   "/v1/reseller/quotes",
   "/v1/reseller/reservations",

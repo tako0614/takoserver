@@ -52,6 +52,16 @@ export interface ResourceInventory {
   listOperations(tenantId: string, limit: number): Promise<readonly OperationListing[]>;
 }
 
+/** Starting a payment. Everything about the payment processor stays behind it. */
+export interface Checkout {
+  begin(input: {
+    readonly organizationId: string;
+    readonly amountMinor: number;
+  }): Promise<{ readonly url: string }>;
+  /** Smallest and largest a single payment may be, in minor units. */
+  readonly bounds: { readonly minimumMinor: number; readonly maximumMinor: number };
+}
+
 export interface CreateControlRoutesOptions {
   readonly accounts: Accounts;
   readonly inventory: ResourceInventory;
@@ -64,6 +74,12 @@ export interface CreateControlRoutesOptions {
   readonly reseller: Reseller;
   readonly tokens: TokenService;
   readonly settlement: FundingSettlementVerifier;
+  /**
+   * Starts a payment, when this deployment can take one. Absent means funding
+   * happens some other way — the operator's signature — and the route that
+   * would begin a checkout is simply not served.
+   */
+  readonly checkout?: Checkout | undefined;
   readonly clock: Clock;
 }
 
@@ -241,6 +257,29 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
         amountMinor: settled.amountMinor,
       });
       return Response.json({ wallet: credited });
+    }
+
+    const checkout = /^\/v1\/organizations\/([^/]+)\/wallet\/checkout$/u.exec(url.pathname);
+    if (request.method === "POST" && checkout) {
+      const organizationId = segment(checkout[1]);
+      await owner(request, organizationId);
+      if (!options.checkout) {
+        // Not configured is not "you may not". Saying `not_found` keeps a
+        // console from offering a payment this deployment cannot take.
+        controlError("not_found", 404);
+      }
+      const body = await jsonObject(request);
+      exactKeys(body, ["amountMinor"]);
+      const amountMinor = integer(body.amountMinor);
+      const { minimumMinor, maximumMinor } = options.checkout.bounds;
+      if (amountMinor < minimumMinor || amountMinor > maximumMinor) {
+        controlError("invalid_argument", 400);
+      }
+      // Where the payment returns to is configured, not requested. An address
+      // taken from the caller is an open redirect wearing a payment's clothes,
+      // and there is nothing a caller could usefully say here anyway.
+      const started = await options.checkout.begin({ organizationId, amountMinor });
+      return Response.json({ checkout: started }, { status: 201 });
     }
 
     if (request.method === "GET" && url.pathname === "/v1/catalog") {

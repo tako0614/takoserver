@@ -191,6 +191,16 @@
         }
       }
     },
+    "/v1/organizations/{organizationId}/wallet/checkout": {
+      "post": {
+        "summary": "Begin a card payment for this organization",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
     "/v1/organizations/{organizationId}/wallet/funding": {
       "post": {
         "summary": "Credit the wallet from a verified settlement proof",

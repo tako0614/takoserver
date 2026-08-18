@@ -58,7 +58,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "domain",
     match:
-      /^src\/(?:token|auth|ledger|catalog|reseller|metering|provider-driver|reconcile|edge-forms|operator-credentials|google-identity|identity-setup)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$)/u,
+      /^src\/(?:token|auth|ledger|catalog|reseller|metering|provider-driver|reconcile|edge-forms|operator-credentials|google-identity|identity-setup|stripe-settlement)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$)/u,
     may: ["core", "domain"],
   },
   {
@@ -67,7 +67,13 @@ const LAYERS: readonly Layer[] = [
       /^src\/(?:router|control|data-storage|data-ai|openapi|provisioner-endpoint)\.ts$|^src\/takoform\/(?:routes|host)\.ts$/u,
     may: ["core", "adapter", "domain", "routes"],
   },
-  { name: "app", match: /^src\/app\.ts$/u, may: ["core", "adapter", "domain", "routes", "app"] },
+  {
+    name: "app",
+    // `payment-setup` builds the shape the routes layer asks for, which makes
+    // it composition rather than domain: it is allowed to know both halves.
+    match: /^src\/(?:app|payment-setup)\.ts$/u,
+    may: ["core", "adapter", "domain", "routes", "app"],
+  },
   // An entry chooses concrete implementations — that is its whole job. What it
   // may not do is reach something its host cannot support, which the
   // host-only ban below enforces per entry rather than by tier.

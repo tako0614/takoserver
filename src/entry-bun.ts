@@ -7,6 +7,7 @@ import { resolveIdentity } from "./identity-setup.ts";
 import { createMemoryObjectStore } from "./objects-mem.ts";
 import { createR2HttpObjectStore } from "./objects-r2-http.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
+import { resolvePayment } from "./payment-setup.ts";
 import { CloudflareProvider } from "./providers/cloudflare.ts";
 import { createProvisionerEndpoint } from "./provisioner-endpoint.ts";
 import { createD1HttpSql } from "./sql-d1-http.ts";
@@ -137,6 +138,11 @@ const publicKeyJwk = operatorJwk
   ? (JSON.parse(operatorJwk) as { kty: string; crv: string; x: string })
   : undefined;
 
+const payment = resolvePayment({
+  stripeSecretKey: process.env.STRIPE_SECRET_KEY,
+  consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN,
+});
+
 const identity = resolveIdentity({
   googleClientId: process.env.GOOGLE_CLIENT_ID,
   operatorPublicKeyJwk: publicKeyJwk,
@@ -159,7 +165,10 @@ const app = buildApp({
   objects,
   identity: identity.verifier,
   identityProviders: identity.providers,
-  settlement: publicKeyJwk ? createOperatorSettlement({ publicKeyJwk }) : unconfigured,
+  settlement:
+    payment.settlement ??
+    (publicKeyJwk ? createOperatorSettlement({ publicKeyJwk }) : unconfigured),
+  ...(payment.checkout ? { checkout: payment.checkout } : {}),
   publicOrigin,
   ...(process.env.TAKOSERVER_CONSOLE_ORIGIN
     ? { consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN }

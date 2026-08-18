@@ -133,6 +133,10 @@ const PUBLIC_PATHS: Record<string, Record<string, unknown>> = {
     "Revoke an API key",
   ),
   "/v1/organizations/{organizationId}/wallet": operation("get", "Read the prepaid wallet"),
+  "/v1/organizations/{organizationId}/wallet/checkout": operation(
+    "post",
+    "Begin a card payment for this organization",
+  ),
   "/v1/organizations/{organizationId}/wallet/funding": operation(
     "post",
     "Credit the wallet from a verified settlement proof",

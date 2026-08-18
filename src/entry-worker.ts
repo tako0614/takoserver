@@ -3,6 +3,7 @@ import { buildEdgeForms } from "./edge-forms.ts";
 import { resolveIdentity } from "./identity-setup.ts";
 import { createR2ObjectStore } from "./objects-r2.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
+import { resolvePayment } from "./payment-setup.ts";
 import type { Provider } from "./provider-port.ts";
 import { CloudflareProvider, type CloudflareZone } from "./providers/cloudflare.ts";
 import { createRemoteProvider } from "./providers/remote.ts";
@@ -43,6 +44,8 @@ interface WorkerEnv {
   readonly CLOUDFLARE_API_TOKEN?: string;
   /** DNS zones this deployment may attach Workers to, as JSON. */
   readonly TAKOSERVER_ZONES?: string;
+  /** Stripe secret key. Its presence is what lets a customer pay. */
+  readonly STRIPE_SECRET_KEY?: string;
 }
 
 /**
@@ -63,16 +66,27 @@ function credentials(env: WorkerEnv) {
     googleClientId: env.GOOGLE_CLIENT_ID,
     operatorPublicKeyJwk: publicKeyJwk,
   });
+  const payment = resolvePayment({
+    stripeSecretKey: env.STRIPE_SECRET_KEY,
+    consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN,
+  });
+
   return {
     identity: identity.verifier,
     identityProviders: identity.providers,
-    settlement: publicKeyJwk
-      ? createOperatorSettlement({ publicKeyJwk })
-      : {
-          async verify(): Promise<never> {
-            throw new Error("settlement credentials are not configured");
-          },
-        },
+    ...(payment.checkout ? { checkout: payment.checkout } : {}),
+    // Stripe where a customer can pay; the operator's signature where they
+    // cannot; and a refusal where neither exists, because a stub that said yes
+    // would credit any amount while looking exactly like a finished product.
+    settlement:
+      payment.settlement ??
+      (publicKeyJwk
+        ? createOperatorSettlement({ publicKeyJwk })
+        : {
+            async verify(): Promise<never> {
+              throw new Error("settlement credentials are not configured");
+            },
+          }),
   };
 }
 
@@ -133,7 +147,7 @@ let cached: { readonly env: WorkerEnv; readonly app: App } | null = null;
 async function appFor(env: WorkerEnv, origin: string): Promise<App> {
   if (cached?.env === env) return cached.app;
   const edge = await buildEdgeForms();
-  const { identity, identityProviders, settlement } = credentials(env);
+  const { identity, identityProviders, settlement, checkout } = credentials(env);
   const sql = createD1Sql(env.STATE_DB);
   const objects = createR2ObjectStore(env.OBJECTS);
   const artifacts = createTakoformArtifacts({
@@ -149,6 +163,7 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     identity,
     identityProviders,
     settlement,
+    ...(checkout ? { checkout } : {}),
     publicOrigin: origin,
     ...(env.TAKOSERVER_CONSOLE_ORIGIN ? { consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN } : {}),
     forms: edge.forms,

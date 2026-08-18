@@ -256,6 +256,17 @@ export function createApi(options: ApiOptions) {
         `/v1/organizations/${encodeURIComponent(organizationId)}/wallet`,
       ),
 
+    /**
+     * Starts a payment. Answers 404 where this deployment cannot take one,
+     * which is how the console knows not to offer it.
+     */
+    beginCheckout: (organizationId: string, amountMinor: number) =>
+      call<{ checkout: { url: string } }>(
+        "POST",
+        `/v1/organizations/${encodeURIComponent(organizationId)}/wallet/checkout`,
+        { amountMinor },
+      ),
+
     fund: (organizationId: string, settlementProof: string) =>
       call<{ wallet: Wallet }>(
         "POST",

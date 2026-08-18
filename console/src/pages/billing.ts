@@ -1,6 +1,6 @@
 import type { LedgerEntry } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
-import { resource } from "../reactive.ts";
+import { resource, signal } from "../reactive.ts";
 import { api } from "../state.ts";
 import {
   badge,
@@ -28,6 +28,11 @@ import {
  */
 export function billingPage(organizationId: string): Child {
   const wallet = resource(() => api.wallet(organizationId));
+  // A payment that just completed comes back through the URL. It is settled
+  // before anything renders, so the balance a person sees already includes
+  // what they just paid — otherwise the first thing the console does after
+  // taking money is show the old number.
+  settleReturn(organizationId, wallet.reload);
 
   return h(
     "div",
@@ -136,13 +141,69 @@ function delta(minor: number, currency: string): string {
 }
 
 /**
- * Funding takes a settlement proof, not an amount.
+ * Adding money.
  *
- * The customer never states how much arrived — only the settlement verifier
- * does — so this dialog asks for the proof and nothing else. A field for the
- * amount would imply an authority the caller does not have.
+ * A card where this deployment can take one, and the operator's signed proof
+ * where it cannot — decided by asking, because a console that offers a payment
+ * the server will refuse is worse than one that offers nothing.
+ *
+ * Either way the customer never states an amount that reaches the ledger. With
+ * a card they choose what to pay and Stripe is asked what was collected; with a
+ * proof the amount is inside the proof. The number typed here is a request, not
+ * a credit.
  */
 function addFunds(organizationId: string, reload: () => void): void {
+  const amount = h("input", { class: "input", type: "number", value: "50", min: "5", step: "5" });
+  const busy = signal(false);
+
+  const close = openModal({
+    title: "Add funds",
+    confirmLabel: "Continue to payment",
+    body: h(
+      "div",
+      { style: { display: "grid", gap: "14px" } },
+      h(
+        "div",
+        { class: "field" },
+        h("label", null, "Amount (USD)"),
+        amount,
+        h("small", null, "Charged once. The balance is credited when the payment settles."),
+      ),
+      live(() => (busy() ? h("div", { class: "dim" }, "Opening Stripe…") : h("div"))),
+    ),
+    onConfirm: async () => {
+      const dollars = Number(amount.value);
+      if (!Number.isFinite(dollars) || dollars < 5) {
+        toast("Enter an amount of at least $5", "bad");
+        return;
+      }
+      busy.set(true);
+      try {
+        const started = await api.beginCheckout(organizationId, Math.round(dollars * 100));
+        window.location.assign(started.checkout.url);
+      } catch (error) {
+        busy.set(false);
+        const failure = error as { code?: string };
+        if (failure.code === "not_found") {
+          // This deployment takes no card. Offer the way it does take money.
+          close();
+          operatorFunding(organizationId, reload);
+          return;
+        }
+        toast(explain(error as Error), "bad");
+      }
+    },
+  });
+}
+
+/**
+ * The operator's signed proof.
+ *
+ * The customer never states how much arrived — only the verifier does — so this
+ * asks for the proof and nothing else. A field for the amount would imply an
+ * authority the caller does not have.
+ */
+function operatorFunding(organizationId: string, reload: () => void): void {
   const input = h("textarea", {
     class: "textarea",
     placeholder: "Paste the settlement proof issued for this organization",
@@ -161,7 +222,7 @@ function addFunds(organizationId: string, reload: () => void): void {
         h(
           "div",
           null,
-          "The amount comes from the proof, not from you. Presenting the same proof twice credits once.",
+          "This deployment does not take card payments. The amount comes from the proof, not from you, and presenting the same proof twice credits once.",
         ),
       ),
       h(
@@ -188,4 +249,31 @@ function addFunds(organizationId: string, reload: () => void): void {
       }
     },
   });
+}
+
+/**
+ * Finishing a payment the person has just come back from.
+ *
+ * The session id arrives in the URL and is exchanged once, then removed from
+ * the address bar so a reload does not try again — the ledger would refuse the
+ * second attempt anyway, but a person should not be shown an error for
+ * pressing refresh.
+ */
+function settleReturn(organizationId: string, reload: () => void): void {
+  const parameters = new URLSearchParams(window.location.search);
+  const checkout = parameters.get("checkout");
+  if (!checkout) return;
+  window.history.replaceState({}, "", window.location.pathname);
+
+  if (checkout === "cancelled") {
+    toast("Payment cancelled. Nothing was charged.", "plain");
+    return;
+  }
+  api.fund(organizationId, checkout).then(
+    () => {
+      toast("Payment received", "ok");
+      reload();
+    },
+    (error: unknown) => toast(explain(error as Error), "bad"),
+  );
 }

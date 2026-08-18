@@ -5,7 +5,7 @@ import {
   type IdentityProviderDescriptor,
 } from "./auth.ts";
 import { createCatalog, type Offering } from "./catalog.ts";
-import { createControlRoutes } from "./control.ts";
+import { type Checkout, createControlRoutes } from "./control.ts";
 import { createLedger, type FundingSettlementVerifier } from "./ledger.ts";
 import type { Clock, ObjectStore, Sql } from "./ports.ts";
 import { createProviderDriver } from "./provider-driver.ts";
@@ -37,6 +37,8 @@ export interface AppPorts {
   readonly objects: ObjectStore;
   readonly identity: ExternalIdentityVerifier;
   readonly settlement: FundingSettlementVerifier;
+  /** Starts a payment, where this deployment can take one. */
+  readonly checkout?: Checkout | undefined;
   readonly publicOrigin: string;
   /** Where this deployment's console is served, if it has one. */
   readonly consoleOrigin?: string;
@@ -145,6 +147,7 @@ export function buildApp(ports: AppPorts): App {
     inventory,
     forms: ports.forms,
     identityProviders: ports.identityProviders ?? [],
+    ...(ports.checkout ? { checkout: ports.checkout } : {}),
     ledger,
     catalog,
     reseller,
