@@ -40,6 +40,14 @@ the part that owns accounts, money, and the machines.
   settled minus held, computed from entries that are only ever appended.
 - **Reach** what you provisioned. A bucket is not a name in a list: a
   short-lived token scoped to one resource opens its data plane.
+- **Run** the ordinary Takoform provider without handing a hosted runner the
+  reseller's organization API key. A reseller reservation can mint a
+  short-lived bearer pinned to one opaque tenant, exact Form, and exact
+  Resource name. Before capture it can only validate, prepare, and create that
+  paid address. After capture, a new bearer additionally pins the immutable
+  Resource UID before it may read, observe, update, or delete that incarnation.
+  The first create atomically marks the reservation consumed before provider
+  side effects, so a release can never leave an unpaid Resource.
 - **Attach** independent resources by exact Interface reference. An Attachment
   stores only resource/deployment identity and an opaque grant, endpoint,
   secret, or native-binding reference; it never embeds a provider credential.

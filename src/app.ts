@@ -32,7 +32,8 @@ import type {
   TakoformHost,
   TakoformResourceDriver,
 } from "./takoform/types.ts";
-import { createTokenService, type SigningKey } from "./token.ts";
+import { TakoformHostError } from "./takoform/types.ts";
+import { createTokenService, type SigningKey, TokenError } from "./token.ts";
 
 /**
  * The composition root.
@@ -168,9 +169,11 @@ export function buildApp(ports: AppPorts): App {
     createTakoformHost({
       sql: ports.sql,
       objects: ports.objects,
-      // The Takoform lane is entered with an organization API key carrying
-      // `resources:write`. A single-use provisioning token is deliberately not
-      // accepted here: it authorizes one resource, not a whole lane.
+      // The ordinary organization lane accepts a resources:write API key. A
+      // reseller may instead issue a short-lived run token pinned to one paid
+      // reservation and one exact Resource address. The latter is useful to a
+      // hosted runner because it never receives the reseller's organization
+      // key and cannot cross into another opaque tenant space.
       //
       // A signed-in person may enter it too, and must say which organization
       // they are acting for. A key names one organization by existing; a
@@ -181,19 +184,79 @@ export function buildApp(ports: AppPorts): App {
       authenticate: async (request) => {
         const authorization = request.headers.get("authorization");
         const actor = await accounts.authenticate(authorization);
-        if (!actor) return null;
-        if (actor.kind === "api_key") {
+        if (actor?.kind === "api_key") {
           return actor.organizationId && grants(actor.scopes, "resources:write")
             ? { tenantId: actor.organizationId, principalId: actor.principalId }
             : null;
         }
-        const organizationId = request.headers.get("takoform-organization");
-        if (!organizationId) return null;
-        const owned = await accounts
-          .requireOwner(actor, organizationId)
-          .then(() => true)
-          .catch(() => false);
-        return owned ? { tenantId: organizationId, principalId: actor.principalId } : null;
+        if (actor?.kind === "session") {
+          const organizationId = request.headers.get("takoform-organization");
+          if (!organizationId) return null;
+          const owned = await accounts
+            .requireOwner(actor, organizationId)
+            .then(() => true)
+            .catch(() => false);
+          return owned ? { tenantId: organizationId, principalId: actor.principalId } : null;
+        }
+
+        const bearer = authorization?.startsWith("Bearer ")
+          ? authorization.slice("Bearer ".length)
+          : null;
+        if (!bearer) return null;
+        try {
+          const claims = await tokens.verifyTakoformRunToken(bearer);
+          const reservation = await reseller.reservation({
+            organizationId: claims.organizationId,
+            tenantRef: claims.tenantRef,
+            reservationId: claims.reservationId,
+          });
+          if (
+            reservation.offeringId !== claims.offeringId ||
+            reservation.offeringDigest !== claims.offeringDigest ||
+            (claims.mode === "provision"
+              ? reservation.status !== "active"
+              : reservation.status !== "captured")
+          ) {
+            return null;
+          }
+          return {
+            tenantId: claims.organizationId,
+            principalId: `run:${claims.tokenId}`,
+            scope: {
+              space: claims.tenantRef,
+              formRef: claims.formRef,
+              resourceName: claims.resourceName,
+              mode: claims.mode,
+              ...(claims.resourceUid === undefined
+                ? {}
+                : { expectedResourceUid: claims.resourceUid }),
+              commercialAuthority: {
+                reservationId: claims.reservationId,
+                offeringId: claims.offeringId,
+                offeringDigest: claims.offeringDigest,
+              },
+              ...(claims.mode === "provision"
+                ? {
+                    claimCreate: async () => {
+                      try {
+                        await tokens.claimTakoformRunTokenForCreate(bearer);
+                      } catch (error) {
+                        if (error instanceof TokenError && error.code === "token_replayed") {
+                          throw new TakoformHostError("resource_busy", 409);
+                        }
+                        if (error instanceof TokenError && error.code === "state_unavailable") {
+                          throw new TakoformHostError("unavailable", 503);
+                        }
+                        throw new TakoformHostError("unauthenticated", 401);
+                      }
+                    },
+                  }
+                : {}),
+            },
+          };
+        } catch {
+          return null;
+        }
       },
       forms: ports.forms,
       driver,

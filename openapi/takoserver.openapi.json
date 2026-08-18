@@ -438,6 +438,16 @@
         }
       }
     },
+    "/v1/reseller/reservations/{reservationId}/takoform-run-tokens": {
+      "post": {
+        "summary": "Mint a short-lived exact-Resource bearer for an ordinary Takoform provider run",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
     "/v1/reseller/reservations/{reservationId}/usage-statement": {
       "get": {
         "summary": "Read the usage statement of a captured reservation",

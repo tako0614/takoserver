@@ -1,14 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import {
   buildApp,
+  createCatalog,
   createEphemeralSql,
   createLedger,
   createMemoryObjectStore,
+  createResourceDeploymentStore,
   type ExternalIdentityVerifier,
   type FundingSettlementVerifier,
   type InstalledTakoformForm,
   type Offering,
 } from "../src/index.ts";
+import { createProviderDriver } from "../src/provider-driver.ts";
 import type { ProviderOffering } from "../src/provider-port.ts";
 import { FakeProvider } from "../src/providers/fake.ts";
 
@@ -192,6 +195,42 @@ async function applyBucket(
 }
 
 describe("Takoform apply on a real backend", () => {
+  test("does not charge a reseller reservation a second time inside the provider driver", async () => {
+    const sql = createEphemeralSql();
+    const clock = () => new Date("2026-08-18T18:00:00.000Z");
+    const ledger = createLedger(sql, clock);
+    const catalog = createCatalog([SOLD]);
+    const provider = new FakeProvider({ offerings: [PROVIDER_OFFERING] });
+    const driver = createProviderDriver({
+      providers: [provider],
+      catalog,
+      ledger,
+      deployments: createResourceDeploymentStore(sql, clock),
+    });
+    await ledger.fund({ organizationId: "org_reseller", fundingRef: "paid", amountMinor: 2_000 });
+
+    await driver.apply({
+      operationId: "op_reseller_create",
+      tenantId: "org_reseller",
+      resourceUid: "uid_reseller_bucket",
+      form: FORM,
+      name: "media",
+      space: "opaque-tenant",
+      spec: { location: "apac" },
+      commercialAuthority: {
+        reservationId: "rsv_paid",
+        offeringId: SOLD.id,
+        offeringDigest: await catalog.digest(SOLD),
+      },
+    });
+
+    expect(await ledger.wallet("org_reseller")).toMatchObject({
+      settledMinor: 2_000,
+      heldMinor: 0,
+    });
+    expect(provider.listResources()).toEqual(["org_reseller/opaque-tenant/media"]);
+  });
+
   test("provisions and charges the wallet exactly once", async () => {
     const { app, provider, ledger } = newApp();
     const { organizationId, provider: auth } = await tenant(app.fetch);

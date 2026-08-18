@@ -134,9 +134,19 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
         url,
         tenantId: boundedTenantReference(principal.tenantId),
         principalId: boundedTenantReference(principal.principalId),
+        ...(principal.scope?.mode === "provision" && principal.scope.claimCreate
+          ? { beforeCreate: principal.scope.claimCreate, provisionOnly: true }
+          : {}),
+        ...(principal.scope?.expectedResourceUid
+          ? { expectedResourceUid: principal.scope.expectedResourceUid }
+          : {}),
+        ...(principal.scope?.commercialAuthority
+          ? { commercialAuthority: principal.scope.commercialAuthority }
+          : {}),
       };
 
       try {
+        if (principal.scope) await assertPrincipalScope(principal.scope, request, url);
         const artifactResponse = await artifacts.handle(request, context, failure);
         if (artifactResponse) return artifactResponse;
         return await route(context, url, request);
@@ -309,6 +319,124 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
 
     return failure("invalid_argument", 404);
   }
+}
+
+async function assertPrincipalScope(
+  scope: NonNullable<TakoformHostPrincipal["scope"]>,
+  request: Request,
+  url: URL,
+): Promise<void> {
+  const formPath = `${scope.formRef.apiVersion}/${scope.formRef.kind}`;
+  if (request.method === "GET" && url.pathname === `${CURRENT_LANE}/forms`) {
+    if (!scopeQueryMatches(scope, url)) throw new TakoformHostError("resource_not_found", 404);
+    return;
+  }
+
+  const definition = FORM_DEFINITION.exec(url.pathname);
+  if (request.method === "GET" && definition) {
+    const candidate = `${safeSegment(definition[1])}/${safeSegment(definition[2])}/${safeSegment(definition[3])}`;
+    if (
+      candidate !== formPath ||
+      url.searchParams.get("definitionVersion") !== scope.formRef.definitionVersion ||
+      url.searchParams.get("schemaDigest") !== scope.formRef.schemaDigest
+    ) {
+      throw new TakoformHostError("resource_not_found", 404);
+    }
+    return;
+  }
+
+  if (
+    request.method === "POST" &&
+    (url.pathname === `${CURRENT_LANE}/resources/validate` ||
+      url.pathname === `${CURRENT_LANE}/resources/prepare`)
+  ) {
+    if (!(await scopeBodyMatches(scope, request))) {
+      throw new TakoformHostError("resource_not_found", 404);
+    }
+    return;
+  }
+
+  const resource = RESOURCE.exec(url.pathname);
+  if (resource) {
+    const path = parsedResourcePath(resource);
+    if (
+      path.apiVersion !== scope.formRef.apiVersion ||
+      path.kind !== scope.formRef.kind ||
+      path.name !== scope.resourceName ||
+      !scopeQueryMatches(scope, url)
+    ) {
+      throw new TakoformHostError("resource_not_found", 404);
+    }
+    if (
+      (request.method === "PUT" || path.action === "import") &&
+      !(await scopeBodyMatches(scope, request))
+    ) {
+      throw new TakoformHostError("resource_not_found", 404);
+    }
+    const create = request.method === "PUT" && request.headers.get("if-none-match") === "*";
+    if (create) {
+      if (scope.mode !== "provision" || !scope.claimCreate) {
+        throw new TakoformHostError("resource_not_found", 404);
+      }
+    } else if (scope.mode !== "manage") {
+      throw new TakoformHostError("resource_not_found", 404);
+    }
+    return;
+  }
+
+  // Support profiles are public protocol metadata and carry no tenant state.
+  if (request.method === "GET" && url.pathname.startsWith(`${CURRENT_LANE}/support/`)) return;
+
+  throw new TakoformHostError("resource_not_found", 404);
+}
+
+function scopeQueryMatches(scope: NonNullable<TakoformHostPrincipal["scope"]>, url: URL): boolean {
+  return (
+    url.searchParams.get("space") === scope.space &&
+    url.searchParams.get("group") === scope.formRef.apiVersion &&
+    url.searchParams.get("kind") === scope.formRef.kind &&
+    url.searchParams.get("definitionVersion") === scope.formRef.definitionVersion &&
+    url.searchParams.get("schemaDigest") === scope.formRef.schemaDigest
+  );
+}
+
+async function scopeBodyMatches(
+  scope: NonNullable<TakoformHostPrincipal["scope"]>,
+  request: Request,
+): Promise<boolean> {
+  let value: unknown;
+  try {
+    value = await request.clone().json();
+  } catch {
+    return false;
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const body = value as Record<string, unknown>;
+  const metadata = body.metadata;
+  const form = body.form;
+  if (
+    typeof metadata !== "object" ||
+    metadata === null ||
+    Array.isArray(metadata) ||
+    typeof form !== "object" ||
+    form === null ||
+    Array.isArray(form)
+  ) {
+    return false;
+  }
+  const formRef = (form as Record<string, unknown>).formRef;
+  if (typeof formRef !== "object" || formRef === null || Array.isArray(formRef)) return false;
+  const ref = formRef as Record<string, unknown>;
+  return (
+    body.apiVersion === scope.formRef.apiVersion &&
+    body.kind === scope.formRef.kind &&
+    (metadata as Record<string, unknown>).space === scope.space &&
+    (metadata as Record<string, unknown>).name === scope.resourceName &&
+    ref.apiVersion === scope.formRef.apiVersion &&
+    ref.kind === scope.formRef.kind &&
+    ref.definitionVersion === scope.formRef.definitionVersion &&
+    ref.schemaDigest === scope.formRef.schemaDigest
+  );
 }
 
 function hostErrorResponse(error: unknown, request: Request, url: URL): Response {
