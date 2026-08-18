@@ -409,6 +409,32 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       });
     }
 
+    const dataToken = /^\/v1\/organizations\/([^/]+)\/resources\/([^/]+)\/data-tokens$/u.exec(
+      url.pathname,
+    );
+    if (request.method === "POST" && dataToken) {
+      const organizationId = segment(dataToken[1]);
+      const resourceUid = segment(dataToken[2]);
+      await scoped(request, organizationId, "resources:read");
+      const body = await jsonObject(request);
+      exactKeys(body, [], ["ttlSeconds"]);
+
+      // The uid has to belong to this organization. Without the check, a token
+      // would be minted for any resource whose uid somebody could name — and a
+      // uid is not a secret, it is printed in every listing.
+      const held = await inventory.listResources(organizationId, { limit: 200 });
+      const owned = held.resources.find((entry) => entry.uid === resourceUid);
+      if (!owned) throw new AuthError("not_found");
+
+      const issued = await tokens.issueDataToken({
+        organizationId,
+        resourceUid,
+        protocols: ["s3"],
+        ttlSeconds: body.ttlSeconds === undefined ? 3_600 : integer(body.ttlSeconds),
+      });
+      return Response.json({ dataToken: issued }, { status: 201 });
+    }
+
     const operations = /^\/v1\/organizations\/([^/]+)\/operations$/u.exec(url.pathname);
     if (request.method === "GET" && operations) {
       const organizationId = segment(operations[1]);

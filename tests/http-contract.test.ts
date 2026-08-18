@@ -60,6 +60,8 @@ const TAKOFORM_SUFFIXES = [
 
 const PUBLIC_PATHS = [
   "/",
+  "/data/v1/objects/{resourceUid}",
+  "/data/v1/objects/{resourceUid}/{key}",
   "/.well-known/takoform/v1alpha3",
   "/.well-known/takoform/v1beta1",
   "/.well-known/takoserver",
@@ -73,6 +75,7 @@ const PUBLIC_PATHS = [
   "/v1/organizations/{organizationId}/api-keys/{apiKeyId}",
   "/v1/organizations/{organizationId}/operations",
   "/v1/organizations/{organizationId}/resources",
+  "/v1/organizations/{organizationId}/resources/{resourceUid}/data-tokens",
   "/v1/organizations/{organizationId}/wallet",
   "/v1/organizations/{organizationId}/wallet/checkout",
   "/v1/organizations/{organizationId}/wallet/funding",

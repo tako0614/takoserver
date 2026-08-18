@@ -1,4 +1,5 @@
 import type { ControlRoutes } from "./control.ts";
+import type { DataObjectRoutes } from "./data-objects.ts";
 import { landingHtml } from "./landing.ts";
 import { openApiDocument } from "./openapi.ts";
 import type { TakoformHost } from "./takoform/types.ts";
@@ -15,6 +16,8 @@ import type { TakoformHost } from "./takoform/types.ts";
 
 export interface CreateRouterOptions {
   readonly control: ControlRoutes;
+  /** The data plane: reaching what a resource actually holds. */
+  readonly dataObjects?: DataObjectRoutes;
   readonly takoformHost?: TakoformHost;
   readonly publicOrigin: string;
   /**
@@ -85,6 +88,13 @@ function dispatch(options: CreateRouterOptions, origin: string): Router {
   const console = options.consoleOrigin === undefined ? null : httpsOrigin(options.consoleOrigin);
   return async (request) => {
     const url = new URL(request.url);
+
+    // Offered first and cheaply: a data request carries its own short-lived
+    // token and has nothing to do with the control plane's credentials.
+    if (options.dataObjects) {
+      const served = await options.dataObjects(request, url);
+      if (served) return served;
+    }
 
     if (options.takoformHost) {
       const handled = await options.takoformHost.handle(request);

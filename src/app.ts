@@ -6,6 +6,7 @@ import {
 } from "./auth.ts";
 import { createCatalog, type Offering } from "./catalog.ts";
 import { type Checkout, createControlRoutes } from "./control.ts";
+import { createDataObjectRoutes } from "./data-objects.ts";
 import { createLedger, type FundingSettlementVerifier } from "./ledger.ts";
 import type { Clock, ObjectStore, Sql } from "./ports.ts";
 import { createProviderDriver } from "./provider-driver.ts";
@@ -156,9 +157,12 @@ export function buildApp(ports: AppPorts): App {
     clock,
   });
 
+  const dataObjects = createDataObjectRoutes({ objects: ports.objects, tokens });
+
   return {
     fetch: createRouter({
       control,
+      dataObjects,
       takoformHost,
       publicOrigin: ports.publicOrigin,
       ...(ports.consoleOrigin === undefined ? {} : { consoleOrigin: ports.consoleOrigin }),
