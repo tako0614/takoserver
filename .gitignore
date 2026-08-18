@@ -10,3 +10,4 @@ coverage/
 .deploy/
 .wrangler-realized.jsonc
 console/dist/
+site/dist/

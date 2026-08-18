@@ -64,7 +64,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "routes",
     match:
-      /^src\/(?:router|control|data-storage|data-ai|openapi|provisioner-endpoint)\.ts$|^src\/takoform\/(?:routes|host)\.ts$/u,
+      /^src\/(?:router|control|data-storage|data-ai|openapi|landing|provisioner-endpoint)\.ts$|^src\/takoform\/(?:routes|host)\.ts$/u,
     may: ["core", "adapter", "domain", "routes"],
   },
   {
