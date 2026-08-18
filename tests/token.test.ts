@@ -52,6 +52,30 @@ beforeEach(() => {
       expires_at_epoch_seconds INTEGER NOT NULL,
       consumed_at_epoch_seconds INTEGER NOT NULL
     );
+    CREATE TABLE reservations (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+      tenant_ref TEXT NOT NULL,
+      offering_id TEXT NOT NULL,
+      offering_digest TEXT NOT NULL,
+      status TEXT NOT NULL
+    );
+    CREATE TABLE provision_token_consumptions (
+      token_id TEXT PRIMARY KEY NOT NULL,
+      organization_id TEXT NOT NULL,
+      tenant_ref TEXT NOT NULL,
+      reservation_id TEXT NOT NULL UNIQUE,
+      offering_id TEXT NOT NULL,
+      offering_digest TEXT NOT NULL,
+      expires_at_epoch_seconds INTEGER NOT NULL,
+      consumed_at_epoch_seconds INTEGER NOT NULL
+    );
+    INSERT INTO reservations
+      (id, org_id, tenant_ref, offering_id, offering_digest, status)
+    VALUES
+      ('rsv_1', 'org_alpha', 'tenant_x', 'storage.object.standard',
+       'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+       'active');
   `);
 });
 
@@ -88,13 +112,31 @@ describe("provision tokens", () => {
     expect(expiresAt).toBe(new Date(NOW + 120_000).toISOString());
     expect((await tokens.verifyProvisionToken(token)).offeringId).toBe("storage.object.standard");
     expect((await tokens.verifyProvisionToken(token)).offeringId).toBe("storage.object.standard");
-    expect(await sql.query("SELECT COUNT(*) AS total FROM runtime_grant_replays")).toEqual([
+    expect(await sql.query("SELECT COUNT(*) AS total FROM provision_token_consumptions")).toEqual([
       { total: 0 },
     ]);
     await tokens.consumeProvisionToken(token);
-    expect(await sql.query("SELECT COUNT(*) AS total FROM runtime_grant_replays")).toEqual([
+    expect(await sql.query("SELECT COUNT(*) AS total FROM provision_token_consumptions")).toEqual([
       { total: 1 },
     ]);
+  });
+
+  test("allows only one redeemed token for a reservation", async () => {
+    const tokens = service(await provisionKey("sign-2026-08"));
+    const input = {
+      organizationId: "org_alpha",
+      tenantRef: "tenant_x",
+      reservationId: "rsv_1",
+      offeringId: "storage.object.standard",
+      offeringDigest: `sha256:${"c".repeat(64)}` as const,
+      ttlSeconds: 120,
+    };
+    const first = await tokens.issueProvisionToken(input);
+    const second = await tokens.issueProvisionToken(input);
+    await tokens.consumeProvisionToken(first.token);
+    await expect(tokens.consumeProvisionToken(second.token)).rejects.toMatchObject({
+      code: "token_replayed",
+    });
   });
 
   test("refuses expiry, oversized lifetime, revoked keys, and missing signer", async () => {

@@ -203,7 +203,7 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
     async consumeProvisionToken(token) {
       const payload = await open(token, PROVISION_AUDIENCE, maxProvisionLifetime);
       const claims = provisionClaims(payload);
-      await consume(options.sql, clock, claims.tokenId, claims.expiresAtEpochSeconds);
+      await consume(options.sql, clock, claims);
       return claims;
     },
   };
@@ -215,31 +215,50 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
  * zero changes and loses. Expired identifiers are swept in bounded batches so
  * the table cannot grow without limit.
  */
-async function consume(
-  sql: Sql,
-  clock: Clock,
-  tokenId: string,
-  expiresAtEpochSeconds: number,
-): Promise<void> {
+async function consume(sql: Sql, clock: Clock, claims: ProvisionTokenClaims): Promise<void> {
   const now = Math.floor(clock().getTime() / 1_000);
-  if (expiresAtEpochSeconds <= now) fail("token_expired");
+  if (claims.expiresAtEpochSeconds <= now) fail("token_expired");
   let claimed: { changes: number };
   try {
     await sql.run(
-      `DELETE FROM runtime_grant_replays
-       WHERE grant_id IN (
-         SELECT grant_id FROM runtime_grant_replays
-         WHERE expires_at_epoch_seconds <= ?
-         ORDER BY expires_at_epoch_seconds, grant_id
+      `DELETE FROM provision_token_consumptions
+       WHERE token_id IN (
+         SELECT consumed.token_id
+         FROM provision_token_consumptions AS consumed
+         LEFT JOIN reservations AS reservation
+           ON reservation.id = consumed.reservation_id
+          AND reservation.org_id = consumed.organization_id
+          AND reservation.tenant_ref = consumed.tenant_ref
+         WHERE consumed.expires_at_epoch_seconds <= ?
+           AND (reservation.id IS NULL OR reservation.status <> 'active')
+         ORDER BY consumed.expires_at_epoch_seconds, consumed.token_id
          LIMIT ?
        )`,
       [now, EXPIRED_REPLAY_DELETE_LIMIT],
     );
     claimed = await sql.run(
-      `INSERT OR IGNORE INTO runtime_grant_replays
-         (grant_id, expires_at_epoch_seconds, consumed_at_epoch_seconds)
-       VALUES (?, ?, ?)`,
-      [tokenId, expiresAtEpochSeconds, now],
+      `INSERT OR IGNORE INTO provision_token_consumptions
+         (token_id, organization_id, tenant_ref, reservation_id, offering_id,
+          offering_digest, expires_at_epoch_seconds, consumed_at_epoch_seconds)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?
+       FROM reservations
+       WHERE id = ? AND org_id = ? AND tenant_ref = ?
+         AND offering_id = ? AND offering_digest = ? AND status = 'active'`,
+      [
+        claims.tokenId,
+        claims.organizationId,
+        claims.tenantRef,
+        claims.reservationId,
+        claims.offeringId,
+        claims.offeringDigest,
+        claims.expiresAtEpochSeconds,
+        now,
+        claims.reservationId,
+        claims.organizationId,
+        claims.tenantRef,
+        claims.offeringId,
+        claims.offeringDigest,
+      ],
     );
   } catch {
     throw new TokenError("state_unavailable");

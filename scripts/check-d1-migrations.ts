@@ -51,7 +51,7 @@ try {
     config,
     "--json",
     "--command",
-    "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('runtime_grant_keys', 'runtime_grant_replays', 'runtime_resources', 'tf_resource_attachments', 'tf_resource_deployments') ORDER BY name",
+    "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('provision_token_consumptions', 'runtime_grant_keys', 'runtime_grant_replays', 'runtime_resources', 'tf_resource_attachments', 'tf_resource_deployments') ORDER BY name",
   ]);
   const value: unknown = JSON.parse(raw);
   if (!Array.isArray(value) || !isRecord(value[0]) || !Array.isArray(value[0].results)) {
@@ -64,6 +64,7 @@ try {
   if (
     JSON.stringify(names) !==
     JSON.stringify([
+      "provision_token_consumptions",
       "runtime_grant_keys",
       "runtime_grant_replays",
       "runtime_resources",

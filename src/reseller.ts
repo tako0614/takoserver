@@ -284,7 +284,17 @@ export function createReseller(options: CreateResellerOptions): Reseller {
         return await reseller.statement({ organizationId, tenantRef, reservationId });
       }
       if (reservation.status !== "active") throw new ResellerError("conflict", 409);
-      if (reservation.expiresAt <= stamp()) throw new ResellerError("expired", 409);
+      if (reservation.expiresAt <= stamp()) {
+        const consumed = await sql.query(
+          `SELECT 1 FROM provision_token_consumptions
+           WHERE reservation_id = ? AND organization_id = ? AND tenant_ref = ? LIMIT 1`,
+          [reservationId, organizationId, tenantRef],
+        );
+        // An ordinary expired reservation releases its hold. A redeemed
+        // provision token may already have created the paid resource, so its
+        // hold remains capturable until an operator reconciles the outcome.
+        if (!consumed[0]) throw new ResellerError("expired", 409);
+      }
       const meter = usage.meter ?? reservation.meter;
       if (meter !== reservation.meter) throw new ResellerError("invalid_argument", 400);
 
@@ -324,8 +334,13 @@ export function createReseller(options: CreateResellerOptions): Reseller {
       if (reservation.status !== "active") throw new ResellerError("conflict", 409);
 
       const claimed = await sql.run(
-        "UPDATE reservations SET status = 'released' WHERE id = ? AND status = 'active'",
-        [reservationId],
+        `UPDATE reservations SET status = 'released'
+         WHERE id = ? AND org_id = ? AND tenant_ref = ? AND status = 'active'
+           AND NOT EXISTS (
+             SELECT 1 FROM provision_token_consumptions
+             WHERE reservation_id = ? AND organization_id = ? AND tenant_ref = ?
+           )`,
+        [reservationId, organizationId, tenantRef, reservationId, organizationId, tenantRef],
       );
       if (claimed.changes !== 1) throw new ResellerError("conflict", 409);
       await ledger.release({
@@ -369,8 +384,14 @@ export function createReseller(options: CreateResellerOptions): Reseller {
       for (const row of due) {
         const id = String(row.id);
         const claimed = await sql.run(
-          "UPDATE reservations SET status = 'expired' WHERE id = ? AND status = 'active'",
-          [id],
+          `UPDATE reservations SET status = 'expired'
+           WHERE id = ? AND status = 'active'
+             AND NOT EXISTS (
+               SELECT 1 FROM provision_token_consumptions
+               WHERE reservation_id = ? AND organization_id = reservations.org_id
+                 AND tenant_ref = reservations.tenant_ref
+             )`,
+          [id, id],
         );
         if (claimed.changes !== 1) continue;
         await ledger.release({

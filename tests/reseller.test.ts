@@ -128,6 +128,55 @@ describe("reseller lane", () => {
     expect(await ledger.wallet("org_a")).toMatchObject({ settledMinor: 10_000, heldMinor: 0 });
   });
 
+  test("keeps a redeemed provision reservation held until capture", async () => {
+    await funded(10_000);
+    const { reservation } = await activeReservation();
+    await sql.run(
+      `INSERT INTO provision_token_consumptions
+         (token_id, organization_id, tenant_ref, reservation_id, offering_id,
+          offering_digest, expires_at_epoch_seconds, consumed_at_epoch_seconds)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        "tok_redeemed",
+        "org_a",
+        "tenant_x",
+        reservation.id,
+        reservation.offeringId,
+        reservation.offeringDigest,
+        Math.floor(now / 1_000) + 120,
+        Math.floor(now / 1_000),
+      ],
+    );
+
+    await expect(
+      reseller.release({
+        organizationId: "org_a",
+        tenantRef: "tenant_x",
+        reservationId: reservation.id,
+      }),
+    ).rejects.toMatchObject({ code: "conflict", status: 409 });
+
+    now += 61 * 60_000;
+    expect(await reseller.expireDue(16)).toBe(0);
+    expect(
+      await reseller.reservation({
+        organizationId: "org_a",
+        tenantRef: "tenant_x",
+        reservationId: reservation.id,
+      }),
+    ).toMatchObject({ status: "active" });
+    expect(await ledger.wallet("org_a")).toMatchObject({ heldMinor: 1_000, availableMinor: 9_000 });
+
+    await expect(
+      reseller.capture({
+        organizationId: "org_a",
+        tenantRef: "tenant_x",
+        reservationId: reservation.id,
+        usage: { meter: "bucket-month", quantity: 2 },
+      }),
+    ).resolves.toMatchObject({ reservationId: reservation.id, amountMinor: 1_000 });
+  });
+
   test("refuses to capture a reservation that was already released", async () => {
     await funded(10_000);
     const { reservation } = await activeReservation();
