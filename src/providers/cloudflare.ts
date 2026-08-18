@@ -367,12 +367,20 @@ export class CloudflareProvider implements Provider {
             "or one the operator has added for this tenant",
         );
       }
-      const attached = await this.#call("PUT", `/accounts/${this.#accountId}/workers/domains`, {
-        zone_id: zone.zoneId,
-        hostname,
-        service: name,
-        environment: "production",
-      });
+      const replaceable = new Set(stringList(input.spec.replaceExistingRecords));
+      let attached = await this.#attach(zone, hostname, name);
+      if (
+        !attached.ok &&
+        attached.codes.includes(DNS_RECORDS_PRESENT) &&
+        replaceable.has(hostname)
+      ) {
+        // The declaration asked for this hostname by name, knowing it points
+        // somewhere. Clearing the records is destructive and one-way, which is
+        // exactly why it happens only when it was asked for.
+        const cleared = await this.#clearRecords(zone, hostname);
+        if (!cleared.ok) return cleared.ticket;
+        attached = await this.#attach(zone, hostname, name);
+      }
       if (!attached.ok) {
         // Cloudflare refuses to attach a Worker to a hostname that already has
         // DNS records, which is the ordinary state of a domain somebody brought
@@ -507,6 +515,45 @@ export class CloudflareProvider implements Provider {
       ticket: classify(response.status),
       codes: errorCodes(envelope?.errors),
     };
+  }
+
+  /** Points a hostname at a script. */
+  async #attach(zone: CloudflareZone, hostname: string, script: string): Promise<CallResult> {
+    return await this.#call("PUT", `/accounts/${this.#accountId}/workers/domains`, {
+      zone_id: zone.zoneId,
+      hostname,
+      service: script,
+      environment: "production",
+    });
+  }
+
+  /**
+   * Removes the records standing where a hostname is about to be served.
+   *
+   * Only the records for that exact name: a zone holds other people's names
+   * too, and a delete that reached one of those would take a service down that
+   * nobody was talking about.
+   */
+  async #clearRecords(zone: CloudflareZone, hostname: string): Promise<CallResult> {
+    const listed = await this.#call(
+      "GET",
+      `/zones/${zone.zoneId}/dns_records?name=${encodeURIComponent(hostname)}&per_page=100`,
+    );
+    if (!listed.ok) return listed;
+    const records = Array.isArray(listed.result) ? listed.result : [];
+    for (const record of records) {
+      const id = (record as { id?: unknown })?.id;
+      const type = (record as { type?: unknown })?.type;
+      // Only the kinds that stand in the way. A TXT record proving domain
+      // ownership somewhere else is not in the way, and deleting it would
+      // break something invisible from here.
+      if (typeof id !== "string" || (type !== "A" && type !== "AAAA" && type !== "CNAME")) {
+        continue;
+      }
+      const removed = await this.#call("DELETE", `/zones/${zone.zoneId}/dns_records/${id}`);
+      if (!removed.ok && removed.status !== 404) return removed;
+    }
+    return { ok: true, status: 200 };
   }
 
   /** The zone that may serve a hostname, if this deployment offers one. */

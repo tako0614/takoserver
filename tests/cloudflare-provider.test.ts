@@ -597,3 +597,98 @@ describe("asset binding", () => {
     expect(ticket).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
   });
 });
+
+/**
+ * A domain somebody brings almost always resolves already — to their old host,
+ * to a parking page, to a record nobody remembers adding. Without a way
+ * through, the answer to "point my domain here" is "first go and delete some
+ * DNS records", which is a worse product and a step people get wrong.
+ *
+ * Replacing a record is destructive and one-way, so it happens only for a
+ * hostname the declaration named.
+ */
+describe("taking a hostname that already points somewhere", () => {
+  const zone: CloudflareZone = {
+    suffix: "brought.example",
+    zoneId: "zone_brought",
+    tenantRef: "org_acme",
+    apex: true,
+  };
+  const taken = {
+    status: 409,
+    body: {
+      success: false,
+      errors: [{ code: 100117, message: "Hostname already has externally managed DNS records" }],
+    },
+  };
+  const ok = { status: 200, body: { success: true, errors: [], result: {} } };
+
+  test("clears the records it was told to replace, then attaches", async () => {
+    const { provider, calls } = recorder(
+      [
+        ok, // script upload
+        taken, // first attach
+        {
+          status: 200,
+          body: {
+            success: true,
+            errors: [],
+            result: [
+              { id: "rec_a", type: "A" },
+              { id: "rec_txt", type: "TXT" },
+            ],
+          },
+        },
+        ok, // delete rec_a
+        ok, // attach again
+      ],
+      [zone],
+    );
+    const ticket = await provider.apply({
+      operationId: "op_takeover",
+      offering: WORKER,
+      identity: IDENTITY,
+      spec: {
+        bundle: `sha256:${"d".repeat(64)}`,
+        hostnames: ["brought.example"],
+        replaceExistingRecords: ["brought.example"],
+      },
+    });
+
+    expect(ticket.phase).toBe("succeeded");
+    const deletes = calls.filter((call) => call.url.includes("/dns_records/"));
+    // The A record stood in the way. The TXT record proves something
+    // elsewhere and was left exactly where it was.
+    expect(deletes).toHaveLength(1);
+    expect(deletes[0]?.url).toContain("rec_a");
+  });
+
+  test("does not touch records for a hostname it was not told to replace", async () => {
+    const { provider, calls } = recorder([ok, taken], [zone]);
+    const ticket = await provider.apply({
+      operationId: "op_no_takeover",
+      offering: WORKER,
+      identity: IDENTITY,
+      spec: { bundle: `sha256:${"d".repeat(64)}`, hostnames: ["brought.example"] },
+    });
+
+    expect(ticket.phase).toBe("failed");
+    expect(calls.filter((call) => call.url.includes("/dns_records"))).toHaveLength(0);
+  });
+
+  test("will not replace records for a hostname it is not serving", async () => {
+    const { provider, calls } = recorder([ok, taken], [zone]);
+    await provider.apply({
+      operationId: "op_wrong_name",
+      offering: WORKER,
+      identity: IDENTITY,
+      spec: {
+        bundle: `sha256:${"d".repeat(64)}`,
+        hostnames: ["brought.example"],
+        // Naming a different hostname must not authorise anything here.
+        replaceExistingRecords: ["someone-else.example"],
+      },
+    });
+    expect(calls.filter((call) => call.url.includes("/dns_records"))).toHaveLength(0);
+  });
+});

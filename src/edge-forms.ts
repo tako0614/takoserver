@@ -186,6 +186,8 @@ const WORKER_SCRIPT_SCHEMA_V1_2: JsonObject = {
 };
 
 /**
+ * Superseded by 1.4.0, and kept because resources were created under it.
+ *
  * The current definition, which adds static assets.
  *
  * A Worker that serves a site is one script plus a pile of files, and the files
@@ -198,7 +200,7 @@ const WORKER_SCRIPT_SCHEMA_V1_2: JsonObject = {
  * application with client-side routing is the common case and a deep link that
  * 404s on reload is the defect it produces.
  */
-const WORKER_SCRIPT_SCHEMA: JsonObject = {
+const WORKER_SCRIPT_SCHEMA_V1_3: JsonObject = {
   ...(WORKER_SCRIPT_SCHEMA_V1_2 as { readonly [key: string]: JsonObject }),
   properties: {
     ...(WORKER_SCRIPT_SCHEMA_V1_2 as { properties: { [key: string]: JsonObject } }).properties,
@@ -213,6 +215,38 @@ const WORKER_SCRIPT_SCHEMA: JsonObject = {
       },
       required: ["bundle"],
       additionalProperties: false,
+    },
+  },
+};
+
+/**
+ * The current definition, which can take a hostname that already points
+ * somewhere.
+ *
+ * A domain somebody brings with them almost always resolves already — to their
+ * old host, to a parking page, to a record nobody remembers adding. Cloudflare
+ * refuses to attach a Worker to such a hostname, so without this the answer to
+ * "point my domain here" is "first go and delete some DNS records", which is
+ * both a worse product and a step people get wrong.
+ *
+ * It is opt-in per hostname and it says what it does. Replacing a record is
+ * destructive and one-way: the previous value is gone, and whatever it pointed
+ * at stops receiving traffic the moment it takes effect. A declaration is the
+ * only reasonable place to ask for that, and asking by name — rather than a
+ * blanket flag — means a spec cannot take over a hostname it merely mentions.
+ */
+const WORKER_SCRIPT_SCHEMA: JsonObject = {
+  ...(WORKER_SCRIPT_SCHEMA_V1_3 as { readonly [key: string]: JsonObject }),
+  properties: {
+    ...(WORKER_SCRIPT_SCHEMA_V1_3 as { properties: { [key: string]: JsonObject } }).properties,
+    replaceExistingRecords: {
+      type: "array",
+      maxItems: 8,
+      items: {
+        type: "string",
+        pattern: "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$",
+        maxLength: 253,
+      },
     },
   },
 };
@@ -257,7 +291,8 @@ export async function buildEdgeForms(prices: EdgeFormPrices = {}): Promise<EdgeF
       { definitionVersion: "1.0.0", desiredSchema: WORKER_SCRIPT_SCHEMA_V1 },
       { definitionVersion: "1.1.0", desiredSchema: WORKER_SCRIPT_SCHEMA_V1_1 },
       { definitionVersion: "1.2.0", desiredSchema: WORKER_SCRIPT_SCHEMA_V1_2 },
-      { definitionVersion: "1.3.0", desiredSchema: WORKER_SCRIPT_SCHEMA },
+      { definitionVersion: "1.3.0", desiredSchema: WORKER_SCRIPT_SCHEMA_V1_3 },
+      { definitionVersion: "1.4.0", desiredSchema: WORKER_SCRIPT_SCHEMA },
     ],
   });
 

@@ -106,6 +106,7 @@ describe("shipped Form digests", () => {
       "1.1.0": "sha256:f5eaa41ee1dd1d701af921d6eb6f4ef8955dca7b3edcd9df58edcaeff0609f8f",
       "1.2.0": "sha256:c76c3a5d0583ec749c119970090c3cf3fa9ec81ce039cbc09d8f312e12c7dcfa",
       "1.3.0": "sha256:afff66bf3d4ba016a9fc3e99e50edee81f63a7c9caefd026e81a6b9960889fd9",
+      "1.4.0": "sha256:964efe3ae08c74096a04665bc034a99cb9058a311e568b73fac844be6f02039e",
     });
   });
 
@@ -128,5 +129,6 @@ describe("shipped Form digests", () => {
     // widening a definition that resources already name.
     expect(complaints("1.2.0").length).toBeGreaterThan(0);
     expect(complaints("1.3.0")).toEqual([]);
+    expect(complaints("1.4.0")).toEqual([]);
   });
 });
