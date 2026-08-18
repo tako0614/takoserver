@@ -6,6 +6,7 @@ import { createSqliteSql } from "./sql-sqlite.ts";
 import type { TakoformArtifactTransport } from "./takoform/artifacts.ts";
 import { createTakoformHost as assembleTakoformHost } from "./takoform/host.ts";
 import { InMemoryTakoformResourceDriver } from "./takoform/memory-driver.ts";
+import type { ProvisionLanePorts } from "./takoform/routes.ts";
 import type {
   InstalledTakoformForm,
   TakoformHost,
@@ -39,6 +40,7 @@ export interface EphemeralTakoformHostOptions {
   readonly artifacts?: TakoformArtifactTransport;
   readonly clock?: Clock;
   readonly randomId?: () => string;
+  readonly provision?: ProvisionLanePorts;
 }
 
 export function createTakoformHost(options: EphemeralTakoformHostOptions): TakoformHost {
@@ -55,6 +57,7 @@ export function createTakoformHost(options: EphemeralTakoformHostOptions): Takof
     ...(options.artifacts ? { artifacts: options.artifacts } : {}),
     ...(options.clock ? { clock: options.clock } : {}),
     ...(options.randomId ? { randomId: options.randomId } : {}),
+    ...(options.provision ? { provision: options.provision } : {}),
   });
 }
 

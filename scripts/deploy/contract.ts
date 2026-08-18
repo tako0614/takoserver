@@ -12,9 +12,8 @@ export const DEPLOY_CONTRACT = {
       covers: [
         "wrangler.jsonc",
         "migrations",
-        "src/worker.ts",
-        "src/durable-worker-entry.ts",
-        "src/state-store.ts",
+        "src/entry-worker.ts",
+        "src",
         "scripts/build-worker.ts",
         "scripts/check-d1-migrations.ts",
         "scripts/check-worker-startup.ts",

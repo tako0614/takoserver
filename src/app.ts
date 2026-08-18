@@ -142,6 +142,9 @@ export function buildApp(ports: AppPorts): App {
       ...(ports.artifacts ? { artifacts: ports.artifacts } : {}),
       clock,
       randomId,
+      // The redemption lane: a reseller's single-use provision token buys
+      // exactly one apply of the offering it names, in the tenant's space.
+      provision: { tokens, catalog },
     });
 
   // One store instance backs both the exact-pin lanes and the console's read

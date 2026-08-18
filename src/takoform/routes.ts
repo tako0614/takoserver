@@ -311,6 +311,136 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
   }
 }
 
+function hostErrorResponse(error: unknown, request: Request, url: URL): Response {
+  if (error instanceof ArtifactInputError) return failure(error.code, error.status);
+  if (error instanceof TakoformHostError) {
+    if (process.env.TAKOSERVER_TRACE_HOST_ERRORS) {
+      console.error("host error", error.code, error.status, error.stack);
+    }
+    return failure(error.code, error.status, error.details);
+  }
+  // Anything else is a driver or runtime fault. The caller gets an
+  // internal error with a fresh request id and no borrowed message, so a
+  // provider's own words never leak — but the operator needs to see what
+  // happened, so it is logged here rather than swallowed.
+  console.error(
+    JSON.stringify({
+      event: "takoform.host.unhandled_error",
+      method: request.method,
+      path: url.pathname,
+      error: error instanceof Error ? `${error.name}: ${error.message}` : "unknown",
+    }),
+  );
+  return failure("internal_error", 500);
+}
+
+async function provisionRoute(
+  ports: ProvisionLanePorts,
+  engine: TakoformEngine,
+  request: Request,
+  url: URL,
+): Promise<Response> {
+  const authorization = request.headers.get("authorization");
+  if (!authorization?.startsWith("Bearer ")) return failure("unauthenticated", 401);
+  const token = authorization.slice("Bearer ".length);
+
+  let claims: ProvisionTokenClaimsView;
+  try {
+    claims = await ports.tokens.verifyProvisionToken(token);
+  } catch (error) {
+    return provisionTokenFailure(error);
+  }
+
+  // The digest pins the commercial terms the reservation paid for. An
+  // offering that changed or left the catalog is refused, never substituted.
+  const offering = ports.catalog.find(claims.offeringId);
+  if (!offering) return failure("offering_unavailable", 409);
+  if ((await ports.catalog.digest(offering)) !== claims.offeringDigest) {
+    return failure("offering_changed", 409);
+  }
+
+  const context: EngineContext = {
+    request,
+    url,
+    tenantId: boundedTenantReference(claims.organizationId),
+    principalId: boundedTenantReference(`provision:${claims.tokenId}`),
+  };
+
+  if (
+    request.method === "POST" &&
+    (url.pathname === `${PROVISION_LANE}/resources/validate` ||
+      url.pathname === `${PROVISION_LANE}/resources/prepare`)
+  ) {
+    await assertProvisionBody(request, offering, claims);
+    const result = await engine.validateOrPrepare(
+      context,
+      url.pathname.endsWith("/validate") ? "validate" : "prepare",
+    );
+    if (result.kind === "validated") {
+      return Response.json({ valid: result.valid, diagnostics: result.diagnostics });
+    }
+    if (result.kind !== "prepared") throw new TakoformHostError();
+    return Response.json({ resource: result.resource, review: result.review });
+  }
+
+  const resource = PROVISION_RESOURCE.exec(url.pathname);
+  if (resource && request.method === "PUT") {
+    // The token provisions exactly one new resource. Updates and deletes need
+    // the organization's own credentials, so the create precondition is
+    // demanded before the token is spent.
+    if (request.headers.get("if-none-match") !== "*") {
+      return failure("invalid_argument", 400);
+    }
+    const path = parsedResourcePath(resource);
+    await assertProvisionBody(request, offering, claims);
+    try {
+      await ports.tokens.consumeProvisionToken(token);
+    } catch (error) {
+      return provisionTokenFailure(error);
+    }
+    return shaped(await engine.apply(context, path));
+  }
+
+  return failure("not_found", 404);
+}
+
+/** The body must be the resource the token paid for, in the token's space. */
+async function assertProvisionBody(
+  request: Request,
+  offering: ProvisionOfferingView,
+  claims: ProvisionTokenClaimsView,
+): Promise<void> {
+  let probe: unknown;
+  try {
+    probe = await request.clone().json();
+  } catch {
+    throw new TakoformHostError();
+  }
+  const body = probe as {
+    readonly form?: { readonly formRef?: Record<string, unknown> };
+    readonly metadata?: { readonly space?: unknown };
+  };
+  const ref = body?.form?.formRef;
+  const pinned =
+    ref !== undefined &&
+    ref !== null &&
+    ref.apiVersion === offering.form.apiVersion &&
+    ref.kind === offering.form.kind &&
+    ref.definitionVersion === offering.form.definitionVersion &&
+    ref.schemaDigest === offering.form.schemaDigest;
+  if (!pinned) throw new TakoformHostError("offering_mismatch", 409);
+  if (body?.metadata?.space !== claims.tenantRef) {
+    throw new TakoformHostError("space_mismatch", 409);
+  }
+}
+
+function provisionTokenFailure(error: unknown): Response {
+  const code = (error as { readonly code?: unknown }).code;
+  if (code === "token_replayed") return failure("token_replayed", 409);
+  if (code === "state_unavailable") return failure("unavailable", 503);
+  return failure("unauthenticated", 401);
+}
+
 function shaped(result: Awaited<ReturnType<TakoformEngine["read"]>>): Response {
   if (result.kind === "resource") return resourceResponse(result.resource, result.status);
   if (result.kind === "deleted") return new Response(null, { status: 204 });

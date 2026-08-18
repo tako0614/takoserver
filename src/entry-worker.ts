@@ -14,15 +14,15 @@ import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 /**
  * The Cloudflare Workers entry.
  *
- * This serves the whole product except provisioning. Creating a bucket, a
- * database, or a Worker needs `api.cloudflare.com` and an account token, and
- * the bundle gate forbids both here — a Worker that could reach them would
- * hand that reach to everything sharing its bundle. Provisioning therefore
- * runs on the self-hosted entry, and an apply that arrives here is refused
- * rather than half-performed.
+ * This serves the whole product, provisioning included. ADR 0001 decided that
+ * the Worker provisions Cloudflare resources itself with a scoped API token
+ * held as a secret: customer Workers are separate scripts with separate
+ * bundles, so there is nobody to leak that reach to. What stays forbidden in
+ * this bundle are the D1/R2 HTTP transports — the Worker has bindings for
+ * both, and long-lived storage keys have no business in an edge isolate.
  *
- * Accounts, the wallet, the reseller lane, artifact upload, and every Takoform
- * read are served normally.
+ * A remote provisioner can still be attached for providers that need an SDK,
+ * a persistent connection, or more time than an edge request allows.
  */
 
 interface WorkerEnv {

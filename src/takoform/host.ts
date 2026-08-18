@@ -2,7 +2,7 @@ import type { Clock, ObjectStore, Sql } from "../ports.ts";
 import { createTakoformArtifacts, type TakoformArtifactTransport } from "./artifacts.ts";
 import { createTakoformEngine } from "./engine.ts";
 import { installedForms } from "./forms.ts";
-import { createTakoformRoutes } from "./routes.ts";
+import { createTakoformRoutes, type ProvisionLanePorts } from "./routes.ts";
 import { createTakoformStore } from "./store.ts";
 import type {
   InstalledTakoformForm,
@@ -27,6 +27,8 @@ export interface CreateTakoformHostOptions {
   readonly artifacts?: TakoformArtifactTransport;
   readonly clock?: Clock;
   readonly randomId?: () => string;
+  /** When present, the single-use provision-token redemption lane is served. */
+  readonly provision?: ProvisionLanePorts;
 }
 
 export function createTakoformHost(options: CreateTakoformHostOptions): TakoformHost {
@@ -51,5 +53,6 @@ export function createTakoformHost(options: CreateTakoformHostOptions): Takoform
     store,
     forms,
     artifacts,
+    ...(options.provision ? { provision: options.provision } : {}),
   });
 }

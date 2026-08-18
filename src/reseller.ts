@@ -26,6 +26,11 @@ export interface Quote {
   readonly quantity: number;
   readonly currency: "USD";
   readonly amountMinor: number;
+  /**
+   * The usage meter the offering is billed by, baked in at quote time so a
+   * reseller can settle a capture even after the offering leaves the catalog.
+   */
+  readonly meter: string;
   readonly expiresAt: string;
 }
 
@@ -39,6 +44,8 @@ export interface Reservation {
   readonly offeringDigest: `sha256:${string}`;
   readonly amountMinor: number;
   readonly currency: "USD";
+  /** The usage meter carried over from the quote. */
+  readonly meter: string;
   readonly status: ReservationStatus;
   readonly expiresAt: string;
 }
@@ -90,7 +97,8 @@ export interface Reseller {
     readonly organizationId: string;
     readonly tenantRef: string;
     readonly reservationId: string;
-    readonly usage: { readonly meter: string; readonly quantity: number };
+    /** `meter` may be omitted; the reservation already knows its meter. */
+    readonly usage: { readonly meter?: string; readonly quantity: number };
   }): Promise<UsageStatement>;
   release(input: {
     readonly organizationId: string;
@@ -130,7 +138,7 @@ export function createReseller(options: CreateResellerOptions): Reseller {
     organizationId: string,
     tenantRef: string,
     reservationId: string,
-  ): Promise<Reservation & { readonly meter: string; readonly quantity: number }> => {
+  ): Promise<Reservation & { readonly quantity: number }> => {
     const rows = await sql.query(
       `SELECT id, tenant_ref, quote_id, offering_id, offering_digest, quantity, amount_minor,
               meter, status, expires_at
@@ -190,6 +198,7 @@ export function createReseller(options: CreateResellerOptions): Reseller {
         quantity,
         currency: "USD",
         amountMinor,
+        meter: offering.price.unit,
         expiresAt,
       };
     },
@@ -254,6 +263,7 @@ export function createReseller(options: CreateResellerOptions): Reseller {
         offeringDigest: String(quote.offering_digest) as `sha256:${string}`,
         amountMinor,
         currency: "USD",
+        meter: String(quote.meter),
         status: "active",
         expiresAt,
       };
@@ -269,7 +279,8 @@ export function createReseller(options: CreateResellerOptions): Reseller {
       }
       if (reservation.status !== "active") throw new ResellerError("conflict", 409);
       if (reservation.expiresAt <= stamp()) throw new ResellerError("expired", 409);
-      if (usage.meter !== reservation.meter) throw new ResellerError("invalid_argument", 400);
+      const meter = usage.meter ?? reservation.meter;
+      if (meter !== reservation.meter) throw new ResellerError("invalid_argument", 400);
 
       const claimed = await sql.run(
         "UPDATE reservations SET status = 'captured' WHERE id = ? AND status = 'active'",
@@ -292,7 +303,7 @@ export function createReseller(options: CreateResellerOptions): Reseller {
           organizationId,
           tenantRef,
           reservation.offeringId,
-          usage.meter,
+          meter,
           usage.quantity,
           reservation.amountMinor,
           capturedAt,
@@ -302,7 +313,11 @@ export function createReseller(options: CreateResellerOptions): Reseller {
     },
 
     async release({ organizationId, tenantRef, reservationId }) {
-      const reservation = await readReservation(organizationId, tenantRef, reservationId);
+      const { quantity: _quantity, ...reservation } = await readReservation(
+        organizationId,
+        tenantRef,
+        reservationId,
+      );
       if (reservation.status === "released") return reservation;
       if (reservation.status !== "active") throw new ResellerError("conflict", 409);
 
@@ -339,11 +354,11 @@ export function createReseller(options: CreateResellerOptions): Reseller {
     },
 
     async reservation({ organizationId, tenantRef, reservationId }) {
-      const {
-        meter: _meter,
-        quantity: _quantity,
-        ...reservation
-      } = await readReservation(organizationId, tenantRef, reservationId);
+      const { quantity: _quantity, ...reservation } = await readReservation(
+        organizationId,
+        tenantRef,
+        reservationId,
+      );
       return reservation;
     },
 

@@ -11,13 +11,11 @@ import {
 /**
  * Provisioning on Cloudflare through its REST API.
  *
- * **This module must never reach a Workers bundle.** Publishing a Worker,
- * creating a D1 database, and creating an R2 bucket all require
- * `api.cloudflare.com` and an account token, and the bundle gate forbids both
- * inside a deployed Worker — for good reason, since every Worker sharing a
- * bundle would share that reach. Provisioning therefore runs on the
- * self-hosted entry, and `check-imports` proves the Worker's import graph
- * cannot reach this file.
+ * This module runs inside the API Worker itself (ADR 0001): customer Workers
+ * are separate scripts with separate bundles, so holding a scoped account
+ * token here hands reach to nobody else. The token must stay scoped — Workers
+ * Scripts, R2, D1, and the configured zones only — because the blast radius
+ * of this isolate is exactly what that token can do.
  *
  * Everything Cloudflare-shaped stops here: URLs, envelopes, and error bodies.
  * What crosses back is a classified ticket.

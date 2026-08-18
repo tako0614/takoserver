@@ -339,12 +339,18 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       if (reservationAction[2] === "capture") {
         exactKeys(body, ["tenantRef", "usage"]);
         const usage = record(body.usage);
-        exactKeys(usage, ["meter", "quantity"]);
+        // `meter` is optional: the reservation already knows its meter, and
+        // requiring the caller to restate it made capture depend on a catalog
+        // read that fails once the offering retires.
+        exactKeys(usage, ["quantity"], ["meter"]);
         const statement = await reseller.capture({
           organizationId,
           tenantRef: tenantRef(body.tenantRef),
           reservationId,
-          usage: { meter: text(usage.meter), quantity: number(usage.quantity) },
+          usage: {
+            quantity: number(usage.quantity),
+            ...(usage.meter === undefined ? {} : { meter: text(usage.meter) }),
+          },
         });
         return Response.json({ statement });
       }

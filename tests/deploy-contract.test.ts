@@ -31,7 +31,7 @@ describe("Takoserver deploy entrypoint", () => {
         {
           surface: "takoserver-api",
           target: "cloudflare-worker:takoserver-api",
-          covers: expect.arrayContaining(["wrangler.jsonc", "migrations", "src/worker.ts"]),
+          covers: expect.arrayContaining(["wrangler.jsonc", "migrations", "src/entry-worker.ts"]),
           requiresScripts: ["check", "deploy"],
           requiresTools: ["bun", "wrangler"],
           requiresEnv: [],
