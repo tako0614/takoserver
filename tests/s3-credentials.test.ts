@@ -133,8 +133,8 @@ async function fixture() {
     await sql.run(
       `INSERT INTO tf_resources
        (tenant_id, space, api_version, kind, name, uid, generation, revision,
-        resource_json, native_id, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        resource_json, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         organizationId,
         "default",
@@ -145,7 +145,6 @@ async function fixture() {
         "1",
         "1",
         JSON.stringify(resource),
-        input.nativeId ?? "r2:ts-private-bucket",
         Date.parse("2026-08-18T12:00:00.000Z"),
       ],
     );

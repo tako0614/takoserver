@@ -49,7 +49,6 @@ export interface ResourceListing {
   readonly uid: string;
   readonly generation: string;
   readonly revision: string;
-  readonly nativeId: string | null;
   readonly updatedAt: string;
   readonly resource: TakoformStoredResource;
 }
@@ -79,12 +78,8 @@ export interface TakoformStore {
     readonly address: ResourceAddress;
     readonly resource: TakoformStoredResource;
     readonly expectedRevision: string | null;
-    readonly nativeId?: string | undefined;
   }): Promise<boolean>;
   deleteResource(address: ResourceAddress, expectedRevision: string): Promise<boolean>;
-  /** The address currently claiming a native id within a tenant, if any. */
-  nativeClaim(tenantId: string, nativeId: string): Promise<ResourceAddress | null>;
-  nativeIdOf(address: ResourceAddress): Promise<string | null>;
 
   putPrepare(
     tenantId: string,
@@ -159,21 +154,20 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       return row ? (JSON.parse(text(row.resource_json)) as TakoformStoredResource) : null;
     },
 
-    async writeResource({ address, resource, expectedRevision, nativeId }): Promise<boolean> {
+    async writeResource({ address, resource, expectedRevision }): Promise<boolean> {
       const key = [address.tenantId, address.space, address.apiVersion, address.kind, address.name];
       if (expectedRevision === null) {
         const written = await sql.run(
           `INSERT OR IGNORE INTO tf_resources
              (tenant_id, space, api_version, kind, name, uid, generation, revision,
-              resource_json, native_id, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              resource_json, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             ...key,
             resource.metadata.uid,
             resource.metadata.generation,
             resource.metadata.revision,
             JSON.stringify(resource),
-            nativeId ?? null,
             now(),
           ],
         );
@@ -181,7 +175,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       }
       const written = await sql.run(
         `UPDATE tf_resources
-         SET uid = ?, generation = ?, revision = ?, resource_json = ?, native_id = ?, updated_at = ?
+         SET uid = ?, generation = ?, revision = ?, resource_json = ?, updated_at = ?
          WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
            AND revision = ?`,
         [
@@ -189,7 +183,6 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           resource.metadata.generation,
           resource.metadata.revision,
           JSON.stringify(resource),
-          nativeId ?? null,
           now(),
           ...key,
           expectedRevision,
@@ -213,34 +206,6 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         ],
       );
       return written.changes === 1;
-    },
-
-    async nativeClaim(tenantId, nativeId): Promise<ResourceAddress | null> {
-      const rows = await sql.query(
-        `SELECT space, api_version, kind, name FROM tf_resources
-         WHERE tenant_id = ? AND native_id = ?`,
-        [tenantId, nativeId],
-      );
-      const row = rows[0];
-      return row
-        ? {
-            tenantId,
-            space: text(row.space),
-            apiVersion: text(row.api_version),
-            kind: text(row.kind),
-            name: text(row.name),
-          }
-        : null;
-    },
-
-    async nativeIdOf(address): Promise<string | null> {
-      const rows = await sql.query(
-        `SELECT native_id FROM tf_resources
-         WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?`,
-        [address.tenantId, address.space, address.apiVersion, address.kind, address.name],
-      );
-      const value = rows[0]?.native_id;
-      return typeof value === "string" ? value : null;
     },
 
     async putPrepare(tenantId, prepareDigest, prepare, expiresAt): Promise<void> {
@@ -353,7 +318,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       const page = Math.min(Math.max(limit, 1), 200);
       const seek = decodeCursor(cursor);
       const rows = await sql.query(
-        `SELECT space, api_version, kind, name, uid, generation, revision, native_id,
+        `SELECT space, api_version, kind, name, uid, generation, revision,
                 updated_at, resource_json
          FROM tf_resources
          WHERE tenant_id = ?
@@ -386,7 +351,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       // but old schemas did not enforce it. Ambiguity must never mint reach to
       // one arbitrary backend resource.
       const rows = await sql.query(
-        `SELECT space, api_version, kind, name, uid, generation, revision, native_id,
+        `SELECT space, api_version, kind, name, uid, generation, revision,
                 updated_at, resource_json
          FROM tf_resources
          WHERE tenant_id = ? AND uid = ?
@@ -473,7 +438,6 @@ function resourceListing(row: Row): ResourceListing {
     uid: text(row.uid),
     generation: text(row.generation),
     revision: text(row.revision),
-    nativeId: row.native_id === null || row.native_id === undefined ? null : text(row.native_id),
     updatedAt: new Date(Number(row.updated_at)).toISOString(),
     resource: JSON.parse(text(row.resource_json)) as TakoformStoredResource,
   };

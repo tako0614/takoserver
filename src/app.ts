@@ -101,6 +101,7 @@ export function buildApp(ports: AppPorts): App {
   const accounts = createAccounts({ sql: ports.sql, identity: ports.identity, clock, randomId });
   const ledger = createLedger(ports.sql, clock);
   const catalog = createCatalog(ports.offerings);
+  const deployments = createResourceDeploymentStore(ports.sql, clock);
   const reseller = createReseller({ sql: ports.sql, ledger, catalog, clock, randomId });
   const tokens = createTokenService({
     sql: ports.sql,
@@ -110,7 +111,13 @@ export function buildApp(ports: AppPorts): App {
   });
 
   const driver =
-    ports.driver ?? createProviderDriver({ providers: ports.providers ?? [], catalog, ledger });
+    ports.driver ??
+    createProviderDriver({
+      providers: ports.providers ?? [],
+      catalog,
+      ledger,
+      deployments,
+    });
 
   const takoformHost =
     ports.takoformHost ??
@@ -157,7 +164,6 @@ export function buildApp(ports: AppPorts): App {
   // One store instance backs both the exact-pin lanes and the console's read
   // side, so an inventory can never drift from what the lanes actually hold.
   const inventory = createTakoformStore(ports.sql, clock);
-  const deployments = createResourceDeploymentStore(ports.sql, clock);
 
   const control = createControlRoutes({
     accounts,

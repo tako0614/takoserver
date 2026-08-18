@@ -50,40 +50,34 @@ export interface TakoformHostPrincipal {
 export interface TakoformDriverReceipt {
   readonly observed?: JsonObject;
   readonly outputs?: JsonObject;
-  /**
-   * What the backend calls the thing it just made. The Host records it so
-   * later observes, updates, and deletes can name the same resource, and so
-   * one native resource can back at most one address.
-   */
-  readonly nativeId?: string;
 }
 
 export interface TakoformResourceDriver {
   apply(input: {
     readonly operationId: string;
     readonly tenantId: string;
+    readonly resourceUid: string;
     readonly form: InstalledTakoformForm;
     readonly name: string;
     readonly space: string;
     readonly spec: JsonObject;
     readonly previous?: TakoformStoredResource;
-    /** The native identity already recorded, when this is an update. */
-    readonly nativeId?: string;
   }): Promise<TakoformDriverReceipt>;
   observe(input: {
     readonly tenantId: string;
+    readonly resourceUid: string;
     readonly resource: TakoformStoredResource;
-    readonly nativeId?: string;
   }): Promise<TakoformDriverReceipt>;
   delete(input: {
     readonly operationId: string;
     readonly tenantId: string;
+    readonly resourceUid: string;
     readonly resource: TakoformStoredResource;
-    readonly nativeId?: string;
   }): Promise<void>;
   import?(input: {
     readonly operationId: string;
     readonly tenantId: string;
+    readonly resourceUid: string;
     readonly form: InstalledTakoformForm;
     readonly name: string;
     readonly space: string;

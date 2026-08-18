@@ -29,8 +29,21 @@ export type NewResourceDeployment = Omit<ResourceDeployment, "createdAt" | "upda
 export interface ResourceDeploymentStore {
   create(input: NewResourceDeployment): Promise<void>;
   find(tenantId: string, deploymentId: string): Promise<ResourceDeployment | null>;
+  findByNative(
+    tenantId: string,
+    providerInstallationRef: string,
+    nativeId: string,
+  ): Promise<ResourceDeployment | null>;
   active(tenantId: string, resourceUid: string): Promise<ResourceDeployment | null>;
   forResource(tenantId: string, resourceUid: string): Promise<readonly ResourceDeployment[]>;
+  refresh(
+    tenantId: string,
+    deploymentId: string,
+    expectedNativeId: string,
+    observed: JsonObject,
+    outputs: JsonObject,
+  ): Promise<boolean>;
+  markDeleted(tenantId: string, deploymentId: string, expectedNativeId: string): Promise<boolean>;
   cutover(
     tenantId: string,
     resourceUid: string,
@@ -78,6 +91,15 @@ export function createResourceDeploymentStore(sql: Sql, clock: Clock): ResourceD
       return one(rows);
     },
 
+    async findByNative(tenantId, providerInstallationRef, nativeId) {
+      const rows = await sql.query(
+        `SELECT * FROM tf_resource_deployments
+         WHERE tenant_id = ? AND provider_installation_ref = ? AND native_id = ? LIMIT 2`,
+        [tenantId, providerInstallationRef, nativeId],
+      );
+      return one(rows);
+    },
+
     async active(tenantId, resourceUid): Promise<ResourceDeployment | null> {
       const rows = await sql.query(
         `SELECT * FROM tf_resource_deployments
@@ -98,6 +120,32 @@ export function createResourceDeploymentStore(sql: Sql, clock: Clock): ResourceD
         [tenantId, resourceUid],
       );
       return rows.map(deployment);
+    },
+
+    async refresh(tenantId, deploymentId, expectedNativeId, observed, outputs) {
+      const changed = await sql.run(
+        `UPDATE tf_resource_deployments
+         SET observed_json = ?, outputs_json = ?, updated_at = ?
+         WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`,
+        [
+          JSON.stringify(observed),
+          JSON.stringify(outputs),
+          now(),
+          tenantId,
+          deploymentId,
+          expectedNativeId,
+        ],
+      );
+      return changed.changes === 1;
+    },
+
+    async markDeleted(tenantId, deploymentId, expectedNativeId) {
+      const changed = await sql.run(
+        `UPDATE tf_resource_deployments SET state = 'deleted', updated_at = ?
+         WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`,
+        [now(), tenantId, deploymentId, expectedNativeId],
+      );
+      return changed.changes === 1;
     },
 
     async cutover(tenantId, resourceUid, expectedActiveDeploymentId, candidateDeploymentId) {
