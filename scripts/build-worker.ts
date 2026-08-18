@@ -45,7 +45,7 @@ try {
         );
       }
     }
-    for (const binding of ["STATE_DB", "OBJECTS"]) {
+    for (const binding of ["STATE_DB", "OBJECTS", "AI"]) {
       if (!source.includes(binding)) throw new Error(`Worker bundle does not use ${binding}`);
     }
   }

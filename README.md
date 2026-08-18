@@ -124,9 +124,11 @@ describes what publishing that involves and what it refuses to do.
 The operator-private deploy target may also declare `aiModels` and
 `r2ParentAccessKeyId`. The former is the exact public-model to upstream-model
 mapping, limits, and retail token prices; the latter is only the public id of an
-R2 parent token. Realization places those non-secret values in Worker vars.
-`CLOUDFLARE_API_TOKEN` and `TAKOSERVER_R2_PARENT_TOKEN` remain Worker secrets,
-and deploy preflight refuses an enabled data service whose required secret is
+R2 parent token. Realization places those non-secret values in Worker vars. AI
+uses the native Workers AI binding, so it does not copy an account API token
+into inference requests. `CLOUDFLARE_API_TOKEN` remains the provisioning
+secret, while `TAKOSERVER_R2_PARENT_TOKEN` is the separate S3 credential-issuer
+secret. Deploy preflight refuses an enabled capability whose required secret is
 absent. With no such target fields, `/v1/ai` and S3 credential issuance stay
 absent rather than using a demo backend.
 
@@ -164,7 +166,7 @@ Six ports, and everything above them is provider-neutral.
 | `Provider Pack` | provisioning, Attachment, transfer, credential, meter, and cost capabilities |
 | `ExternalIdentityVerifier` | Google ID tokens, operator signature |
 | `FundingSettlementVerifier` | Stripe, operator signature |
-| `AiGateway` | any OpenAI-compatible upstream; private deployments may compose a native binding |
+| `AiGateway` | any OpenAI-compatible upstream; the Worker entry uses its native Workers AI binding |
 
 `scripts/check-imports.ts` enforces the layering as a gate rather than a
 convention: core, adapters, domain, routes, composition, entries — and a

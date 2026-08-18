@@ -6,6 +6,7 @@ import { createOperatorSettlement } from "./operator-credentials.ts";
 import { resolvePayment } from "./payment-setup.ts";
 import type { Provider } from "./provider-port.ts";
 import { CloudflareProvider, type CloudflareZone } from "./providers/cloudflare.ts";
+import type { CloudflareWorkersAiBinding } from "./providers/cloudflare-workers-ai.ts";
 import { createRemoteProvider } from "./providers/remote.ts";
 import { loadSigningKey } from "./signing-key.ts";
 import { createD1Sql } from "./sql-d1.ts";
@@ -27,6 +28,7 @@ import { createWorkerDataServices } from "./worker-data-services.ts";
  */
 
 interface WorkerEnv {
+  readonly AI?: CloudflareWorkersAiBinding;
   readonly STATE_DB: Parameters<typeof createD1Sql>[0];
   readonly OBJECTS: Parameters<typeof createR2ObjectStore>[0];
   readonly PUBLIC_ORIGIN?: string;

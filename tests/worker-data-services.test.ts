@@ -20,9 +20,10 @@ describe("Worker data service composition", () => {
   });
 
   test("composes exact public AI models and standard S3 credentials", () => {
+    const AI = { async run() {} };
     const services = createWorkerDataServices({
+      AI,
       CLOUDFLARE_ACCOUNT_ID: "account_01",
-      CLOUDFLARE_API_TOKEN: "ai-secret",
       TAKOSERVER_AI_MODELS: MODELS,
       TAKOSERVER_R2_PARENT_ACCESS_KEY_ID: "parent-key",
       TAKOSERVER_R2_PARENT_TOKEN: "s3-secret",
@@ -37,20 +38,19 @@ describe("Worker data service composition", () => {
       },
     ]);
     expect(services.s3).toBeDefined();
-    expect(JSON.stringify(services)).not.toContain("ai-secret");
     expect(JSON.stringify(services)).not.toContain("s3-secret");
   });
 
   test("refuses partial or malformed operator configuration", () => {
     expect(() => createWorkerDataServices({ TAKOSERVER_AI_MODELS: MODELS })).toThrow(
-      "Cloudflare account is not configured",
+      "AI binding is not configured",
     );
     expect(() =>
       createWorkerDataServices({
         CLOUDFLARE_ACCOUNT_ID: "account_01",
         TAKOSERVER_AI_MODELS: MODELS,
       }),
-    ).toThrow("AI credential is not configured");
+    ).toThrow("AI binding is not configured");
     expect(() =>
       createWorkerDataServices({
         CLOUDFLARE_ACCOUNT_ID: "account_01",
