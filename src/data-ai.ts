@@ -35,6 +35,9 @@ export type DataAiRoutes = (request: Request, url: URL) => Promise<Response | nu
 /** OpenAI-compatible models and non-streaming Chat Completions. */
 export function createDataAiRoutes(options: DataAiOptions): DataAiRoutes {
   const models = validateModels(options.gateway?.models ?? []);
+  const commercialModels = new Map(
+    models.map((model) => [model.id, modelCommercialTerms(model)] as const),
+  );
   const requests = createAiRequestStore(options.sql, options.clock);
 
   return async (request, url) => {
@@ -50,12 +53,15 @@ export function createDataAiRoutes(options: DataAiOptions): DataAiRoutes {
     if (request.method === "GET" && url.pathname === `${PREFIX}models`) {
       return Response.json({
         object: "list",
-        data: models.map((model) => ({
-          id: model.id,
-          object: "model",
-          created: model.created,
-          owned_by: model.ownedBy,
-        })),
+        data: await Promise.all(
+          models.map(async (model) => ({
+            id: model.id,
+            object: "model",
+            created: model.created,
+            owned_by: model.ownedBy,
+            takoserver: await commercialModels.get(model.id),
+          })),
+        ),
       });
     }
 
@@ -72,6 +78,13 @@ export function createDataAiRoutes(options: DataAiOptions): DataAiRoutes {
 
       const model = requestedModel(body, models);
       if (!model) return openAiFailure("model_not_found", 404, "model");
+      const expectedPricingRevision = request.headers.get("x-takoserver-ai-pricing-revision");
+      if (
+        expectedPricingRevision !== null &&
+        expectedPricingRevision !== (await commercialModels.get(model.id))?.pricing_revision
+      ) {
+        return openAiFailure("pricing_revision_conflict", 409, "model");
+      }
       if (!validMessages(body.messages)) {
         return openAiFailure("invalid_messages", 400, "messages");
       }
@@ -417,6 +430,24 @@ function tokenCharge(inputTokens: number, outputTokens: number, model: AiModel):
     inputTokens * model.price.inputMinorPerMillionTokens +
     outputTokens * model.price.outputMinorPerMillionTokens;
   return Math.ceil(micros / 1_000_000);
+}
+
+async function modelCommercialTerms(model: AiModel): Promise<{
+  readonly pricing_revision: `sha256:${string}`;
+  readonly maximum_charge_minor: number;
+}> {
+  return {
+    pricing_revision: await canonicalDigest({
+      id: model.id,
+      limits: model.limits,
+      price: model.price,
+    }),
+    maximum_charge_minor: tokenCharge(
+      model.limits.maxInputTokens,
+      model.limits.maxOutputTokens,
+      model,
+    ),
+  };
 }
 
 function durableJsonBytes(value: JsonObject): number {

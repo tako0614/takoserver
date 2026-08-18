@@ -121,9 +121,40 @@ describe("OpenAI-compatible AI data plane", () => {
     expect(await response?.json()).toEqual({
       object: "list",
       data: [
-        { id: "takoserver-text", object: "model", created: 1_787_054_400, owned_by: "takoserver" },
+        {
+          id: "takoserver-text",
+          object: "model",
+          created: 1_787_054_400,
+          owned_by: "takoserver",
+          takoserver: {
+            pricing_revision: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+            maximum_charge_minor: 110,
+          },
+        },
       ],
     });
+  });
+
+  test("rejects a drifted pricing revision before holding funds or invoking upstream", async () => {
+    const { call, calls, scoped, ledger, organization } = await fixture();
+    const response = await call("/v1/ai/chat/completions", scoped.secret, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "idempotency-key": "chat-priced",
+        "x-takoserver-ai-pricing-revision": `sha256:${"0".repeat(64)}`,
+      },
+      body: JSON.stringify({
+        model: "takoserver-text",
+        messages: [{ role: "user", content: "hello" }],
+        max_tokens: 10,
+      }),
+    });
+
+    expect(response?.status).toBe(409);
+    expect(await response?.json()).toMatchObject({ error: { code: "pricing_revision_conflict" } });
+    expect(calls).toEqual([]);
+    expect((await ledger.wallet(organization.id)).availableMinor).toBe(1_000);
   });
 
   test("holds the maximum, captures actual tokens, and records usage", async () => {

@@ -125,6 +125,14 @@ const PUBLIC_PATHS: Record<string, Record<string, unknown>> = {
           schema: { type: "string", minLength: 1, maxLength: 128 },
           description: "Stable per paid inference; replays return the same settled result.",
         },
+        {
+          name: "X-Takoserver-AI-Pricing-Revision",
+          in: "header",
+          required: false,
+          schema: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" },
+          description:
+            "Optional exact model pricing revision from /v1/ai/models; drift is rejected before inference.",
+        },
       ],
     },
   ),
