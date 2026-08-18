@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { buildApp } from "./app.ts";
@@ -10,6 +10,7 @@ import { createFileObjectStore } from "./objects-fs.ts";
 import { createMemoryObjectStore } from "./objects-mem.ts";
 import { createR2HttpObjectStore } from "./objects-r2-http.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
+import { ensureOperatorKey, signOperatorAssertion } from "./operator-key.ts";
 import { resolvePayment } from "./payment-setup.ts";
 import { CloudflareProvider } from "./providers/cloudflare.ts";
 import { createLocalProvider, LOCAL_KINDS, localOfferings } from "./providers/local.ts";
@@ -60,8 +61,19 @@ function cloudflareToken(): string {
 }
 
 const publicOrigin = process.env.TAKOSERVER_PUBLIC_ORIGIN ?? "http://localhost:8787";
-const databasePath = process.env.TAKOSERVER_DB ?? ":memory:";
 const port = Number(process.env.PORT ?? 8787);
+
+/** Everything this machine keeps lives under one directory. */
+const dataRoot = process.env.TAKOSERVER_DATA_ROOT ?? ".takoserver";
+
+// Organizations, keys, and the ledger are as durable as the files are: a
+// machine that forgets who its customers are, and what they are owed, on
+// restart is not a platform. Memory is kept for tests, which say so by
+// asking for it.
+const databasePath =
+  process.env.TAKOSERVER_DB ??
+  (dataRoot === ":memory:" ? ":memory:" : `${dataRoot}/control.sqlite`);
+if (databasePath !== ":memory:") mkdirSync(dirname(databasePath), { recursive: true });
 
 /**
  * State comes from the same D1 the Worker serves when one is configured. A
@@ -99,8 +111,6 @@ const workerd = createWorkerdSupervisor({
   log: (message) => process.stdout.write(`${message}\n`),
 });
 
-/** Everything this machine keeps lives under one directory. */
-const dataRoot = process.env.TAKOSERVER_DATA_ROOT ?? ".takoserver";
 const sharedBucket = process.env.TAKOSERVER_R2_BUCKET;
 const objects = sharedBucket
   ? createR2HttpObjectStore({
@@ -197,15 +207,31 @@ const providers = process.env.CLOUDFLARE_ACCOUNT_ID
       }),
     ];
 
-const operatorJwk = process.env.TAKOSERVER_OPERATOR_PUBLIC_JWK;
 const unconfigured = {
   async verify(): Promise<never> {
     throw new Error("operator credentials are not configured");
   },
 };
-const publicKeyJwk = operatorJwk
-  ? (JSON.parse(operatorJwk) as { kty: string; crv: string; x: string })
-  : undefined;
+
+// A machine with no identity provider would advertise no way in and refuse
+// every sign-in, so it mints an operator key and offers that instead. A shared
+// deployment is given its public half and generates nothing.
+const operatorKeyPath = join(dataRoot, "operator-key.jwk");
+const publicKeyJwk = await ensureOperatorKey({
+  configured: process.env.TAKOSERVER_OPERATOR_PUBLIC_JWK,
+  hasIdentityProvider: Boolean(process.env.GOOGLE_CLIENT_ID) || Boolean(sharedDatabaseId),
+  path: operatorKeyPath,
+  readFile: (path) =>
+    readFile(path, "utf8").then(
+      (text) => text,
+      () => null,
+    ),
+  async writeFile(path, contents) {
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, contents, { mode: 0o600 });
+    process.stdout.write(`generated an operator key at ${path}\n`);
+  },
+});
 
 const payment = resolvePayment({
   stripeSecretKey: process.env.STRIPE_SECRET_KEY,
@@ -314,3 +340,29 @@ console.log(
     // first thing that misleads them.
     `(provisioning: ${providers.map((provider) => provider.id).join(", ") || "none"})`,
 );
+
+// Having minted the way in, say what it is. A machine that generates a key and
+// leaves the operator to discover how to present it has automated the easy half.
+if (identity.providers.some((provider) => provider.method === "operator-assertion")) {
+  const stored = await readFile(operatorKeyPath, "utf8").catch(() => null);
+  if (stored) {
+    const assertion = await signOperatorAssertion({
+      privateJwk: stored,
+      claims: {
+        purpose: "sign-in",
+        provider: "google",
+        subject: "operator",
+        email: "operator@localhost",
+        displayName: "Operator",
+      },
+      nowSeconds: Math.floor(Date.now() / 1_000),
+      lifetimeSeconds: 600,
+    });
+    console.log(
+      `\nno identity provider is configured, so this deployment signs you in as its operator.\n` +
+        `open ${publicOrigin}/console and paste this (valid 10 minutes):\n\n${assertion}\n\n` +
+        `later ones: bun scripts/operator-key.ts sign-in google operator operator@localhost Operator\n` +
+        `  (with TAKOSERVER_OPERATOR_KEY=${operatorKeyPath})`,
+    );
+  }
+}

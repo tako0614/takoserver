@@ -1,5 +1,5 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 
 /**
  * The operator's own key, and the assertions it signs.
@@ -16,8 +16,15 @@ import { resolve } from "node:path";
  * prints the public JWK to configure as `OPERATOR_PUBLIC_JWK`.
  */
 
-const PRIVATE_DIRECTORY = resolve(import.meta.dir, "../.deploy/private");
-const PRIVATE_PATH = resolve(PRIVATE_DIRECTORY, "operator.jwk");
+// A self-hosted deployment generates its own key under its data root, so the
+// tool has to be able to sign with that one. Without this it would only ever
+// reach the repository's key, and signing with a key the server never heard of
+// fails as an invalid signature — which reads like the key is wrong rather than
+// like it is the wrong key.
+const PRIVATE_PATH = process.env.TAKOSERVER_OPERATOR_KEY
+  ? resolve(process.env.TAKOSERVER_OPERATOR_KEY)
+  : resolve(import.meta.dir, "../.deploy/private/operator.jwk");
+const PRIVATE_DIRECTORY = dirname(PRIVATE_PATH);
 const LIFETIME_SECONDS = 600;
 
 const [command, ...args] = process.argv.slice(2);

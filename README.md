@@ -1,191 +1,143 @@
 # Takoserver
 
-Takoserver is an independent prepaid resource platform. A customer signs in
-directly with Google or GitHub, creates a Takoserver Organization and scoped API
-keys, funds a USD wallet, reserves a catalog offering, and receives a
-short-lived execution grant. It does not import or delegate identity, billing,
-or runtime authority to another product.
+A self-hostable platform for [Takoform](https://takoform.com). Customers
+declare infrastructure — object buckets, SQL databases, Workers — and Takoserver
+provisions it, serves it, and bills for it.
 
-Funding never accepts a caller-authored amount or settlement reference. Only
-the Organization owner may submit an opaque proof, and an injected settlement
-verifier supplies the immutable USD amount and provider reference.
+Run it on your own machine and it uses your disk and [workerd](https://github.com/cloudflare/workerd),
+the runtime Cloudflare runs at the edge. Point it at a Cloudflare account and it
+uses R2, D1, and Workers instead. Nothing above the provider knows which.
 
-The product concentrates behavior behind a small set of deep interfaces:
-
-- `TakoserverModule.execute` owns accounts, authorization, catalog, the
-  append-only wallet ledger, quotes, reservations, settlement, and usage.
-- `ResourceRuntime.execute` consumes a single-use signed grant and dispatches
-  the offering selected by that grant.
-- `BackendAdapter` hides provider lifecycle details. Portable fake and
-  Cloudflare R2 implementations prove that product authority is not tied to one
-  cloud provider.
-- `ObjectStorageModule` and `AiGatewayModule` expose resource-scoped data
-  planes. Each request consumes a signed intent-bound grant before provider I/O;
-  provider credentials and raw errors remain inside adapters.
-- `TakoformHost` exposes the current versioned portable resource lifecycle as
-  one integration surface. `BackendTakoformResourceDriver` resolves exactly one
-  available offering for the exact FormRef and carries create, observe, import,
-  and delete into the same provider-neutral backend lifecycle. It is not
-  Takoserver's product boundary.
-- `createHttpHandler` exposes the direct Console and the versioned HTTP
-  contract.
-
-No balance counter is authoritative. Wallet projections are recomputed from
-ledger entries: funding changes settled value, reservation changes held value,
-and capture atomically removes and debits the full reviewed quote. Grant
-issuance never charges. The trusted provisioning committer records the exact
-resource registration and captures only after provider success; its replay is
-idempotent. Expired and explicitly released reservations return the hold once.
-
-## Public surfaces
-
-- Direct product discovery: `GET /.well-known/takoserver`
-- Identity providers: `GET /v1/identity/providers`; session exchange:
-  `POST /v1/sessions`
-- Organizations, API keys, wallet, catalog, resource, reseller, and usage routes
-  under `/v1`
-- OpenAPI 3.1: [`openapi/takoserver.openapi.json`](openapi/takoserver.openapi.json)
-- Resource-scoped object storage: `/v1/storage/object` and
-  `/v1/storage/objects`
-- OpenAI-shaped AI gateway: `/v1/ai/models` and
-  `/v1/ai/chat/completions`
-- Released provider discovery: `GET /.well-known/takoform/v1beta1`
-- Released provider Host API: `/apis/forms.takoform.com/v1beta1`
-- Current Takoform discovery: `GET /.well-known/takoform/v1alpha3`
-- Current Takoform Host API: `/apis/forms.takoform.com/v1alpha3`
-
-The two versioned mounts share one Host engine. HTTP lane versions are adapted;
-exact FormRef values are not rewritten. This keeps provider `2.1.1` usable while
-the independently versioned current Host contract remains available.
-
-The Takoform Host owns exact Form availability/definitions, validate and
-reviewed prepare, fenced create/update/read/import/observe/delete, synchronous
-operation endpoints, tenant-held content-addressed artifacts, and support
-profiles. The unversioned legacy discovery/API is deliberately absent.
-
-Reseller requests identify the reseller's customer only by opaque `tenantRef`.
-They never accept an upstream product's user or workspace identity. The signed
-grant contains only the internal security domain, tenant reference,
-reservation, exact offering snapshot digest, operation, issuer, audience,
-lifetime, and replay identifier. The runtime checks that snapshot before any
-provider I/O.
-
-Catalog `s3` and `openai` allowances describe which direct data protocol an
-offering may expose. They are not credentials or grants. Object bodies and AI
-requests are bound into signed execution intents, isolated by opaque tenant and
-resource references, bounded before provider access, and covered by portable
-in-memory plus Cloudflare R2 or injected AI adapter tests.
-
-Backend logical addresses include the opaque tenant reference before space and
-name. The Cloudflare adapter derives its R2 bucket identity from that complete
-address, so equal user-facing names in separate Organizations do not alias.
-Provider credentials, native error bodies, and account identifiers never cross
-the adapter receipt.
-
-## Development
-
-Requires Bun.
-
-```bash
+```
 bun install
-bun run check
+bun src/entry-bun.ts
 ```
 
-Focused commands are `bun test`, `bun run typecheck`, `bun run fmt:check`, and
-`bun run build`. `bun run openapi:write` is the explicit writer for the checked
-OpenAPI artifact.
+That is the whole first run. It creates its schema, generates the keys it signs
+with, prints a sign-in you can paste into its console, and starts serving.
 
-### Cloudflare Worker durability slice
+## What it is
 
-[`wrangler.jsonc`](wrangler.jsonc) is a target-neutral Workers configuration
-with generated `Env` bindings for D1 `STATE_DB` and R2 `OBJECTS`. It omits
-account-specific resource IDs, production routes, secrets, and realized
-configuration. Regenerate the checked type artifact after changing bindings:
+Takoform is an infrastructure protocol: a customer declares what they want, and
+a Host accepts, prices, provisions, and reports on it. Takoserver is a Host —
+the part that owns accounts, money, and the machines.
 
-```bash
-bun run worker:types
+- **Declare** through the Takoform lanes. Every declaration names a Form by an
+  exact reference: group, kind, definition version, and the digest of the
+  schema itself. Two resources of the same kind are not necessarily the same
+  thing, and the digest is what says so.
+- **Pay** from a prepaid wallet. Work places a hold against the available
+  balance and captures it when it succeeds; if it fails, the hold is released
+  and nothing is charged. There is no balance column anywhere — available is
+  settled minus held, computed from entries that are only ever appended.
+- **Reach** what you provisioned. A bucket is not a name in a list: a
+  short-lived token scoped to one resource opens its data plane.
+
+## Self-hosting
+
+Everything lives under one directory, `.takoserver` by default.
+
+| Variable | What it does |
+|---|---|
+| `TAKOSERVER_DATA_ROOT` | Objects, databases, published Workers, and the signing key. |
+| `TAKOSERVER_DB` | Control database. A file under the data root by default. |
+| `PORT` | Where the API and console API listen. |
+| `TAKOSERVER_WORKERD_PORT` | Where published Workers are served. |
+| `TAKOSERVER_SUFFIXES` | Hostname suffixes this deployment will serve. Empty means any. |
+| `TAKOSERVER_OPERATOR_PUBLIC_JWK` | Public half of the operator key. Generated under the data root if unset. |
+| `GOOGLE_CLIENT_ID` | Turns on Google sign-in. Its absence leaves the operator path. |
+| `STRIPE_SECRET_KEY` | Turns on card payment. Its absence leaves operator-signed funding. |
+
+Nothing in that table is required to start. What is absent is absent rather than
+faked: a deployment with no Stripe key does not serve the route that would begin
+a payment, and its console offers the way it does take money instead.
+
+Sign-in and money are the two facts a server cannot determine for itself. With
+no identity provider configured, the operator answers the first by signature —
+so a fresh machine mints an operator key, keeps it beside its database, and
+prints an assertion good for ten minutes. Later ones:
+
+```
+TAKOSERVER_OPERATOR_KEY=.takoserver/operator-key.jwk \
+  bun scripts/operator-key.ts sign-in google operator operator@localhost Operator
 ```
 
-The complete durable path in this slice is object storage. Each request loads
-active Ed25519 public verification keys, verifies and consumes the grant replay
-identifier in D1, then resolves the exact resource registration with the signed
-security-domain ID plus the requested tenant/resource references. It checks the
-registration's reservation, offering, `cloudflare-r2-binding` backend, and `s3`
-allowance before using the R2 Worker binding directly. There is no Cloudflare
-REST object path and object responses stay streamed. D1 statements bind at
-most three parameters; expired replay cleanup is bounded to 64 rows.
+The same key credits the wallet (`operator-key.ts funding <org> <ref> <minor>`)
+until Stripe is configured. It is the operator vouching in a form the server can
+check and nobody else can forge — not an identity provider, and it stops being
+the way in the moment a real one is configured.
 
-[`migrations/0001_runtime_storage.sql`](migrations/0001_runtime_storage.sql)
-creates only the runtime verification-key, replay, and resource-registry
-tables. The registry row shape is `(organizationId, securityDomainId, tenantRef,
-resourceRef, reservationId, offeringId, offeringDigest, backendId, nativeId,
-allowances)`. This repository
-does not yet expose a registry writer: the future durable resource-provisioning
-owner must populate it through a separately reviewed authority-bearing path.
+Everything durable is under that one directory, so backing up a deployment is
+copying it and moving one is moving it:
 
-`bun run check` verifies generated bindings, both Bun and Workers type worlds,
-the migration on a disposable local D1 database, a strict Wrangler dry-run,
-bundle absence of Cloudflare REST/credential surfaces, and Worker startup
-profiling in a disposable output directory. It never selects a Cloudflare
-account or remote resource.
-
-### Deploying
-
-`bun run deploy` is the single entrypoint and owns publication end to end:
-
-```bash
-bun run deploy -- --contract   # declare the contract; touches nothing
-bun run deploy -- --status     # read-only inspection of the realized target
-bun run deploy -- --plan       # every pre-mutation proof; publishes nothing
-bun run deploy -- --apply      # publish, then verify on the published origin
+```
+.takoserver/
+  control.sqlite      organizations, keys, the ledger, resources
+  signing-key.jwk     signs data-plane tokens
+  operator-key.jwk    signs operator assertions
+  objects/            customer objects, and uploaded bundles under art/
+  databases/          customer SQL databases
+  workers/            published Workers and the workerd config
 ```
 
-Any other invocation refuses before Wrangler, credentials, or a target can be
-reached.
+Published Workers are served by a workerd process Takoserver starts on the first
+publish and leaves watching its configuration — a deploy rewrites the config,
+and no other tenant's in-flight requests are dropped for it. A machine with no
+workerd binary says so once and keeps serving storage and databases.
 
-The repository stays account-neutral. The realized account, D1 database, R2
-bucket, public origin, and verification-key identity live only in an
-operator-private target descriptor (`.deploy/target.json` by default, or
-`TAKOSERVER_DEPLOY_TARGET`). Realization joins that descriptor with
-`wrangler.jsonc` into a gitignored `.wrangler-realized.jsonc`, and refuses if
-the committed configuration ever grows an account id, route, or pinned
-database/bucket identity.
+## Running it on Cloudflare
 
-`--apply` refuses a dirty worktree or a `HEAD` that is not already contained in
-its upstream branch. It then runs the portable gate and a strict dry-run of the
-realized configuration, inspects the live target read-only (migration lineage
-against the local files, the runtime tables, active keys, R2 reachability, the
-resolved database identity, and the served version), applies the forward-only
-migration, provisions the Ed25519 verification key when none is active,
-publishes a new immutable Worker version, and proves the result on the
-published origin: binding-closure readback, all three runtime tables, an active
-key, a signed object `PUT` and `GET` returning the exact bytes, rejection of the
-consumed grant as `grant_replayed`, and a control-plane route still answering
-503. The probe registration and object are removed afterwards. A published
-version already recorded for the same bundle digest publishes nothing.
+Set `CLOUDFLARE_ACCOUNT_ID` and a scoped API token, and the same server
+provisions R2 buckets, D1 databases, and Workers in that account instead. The
+control plane itself can also run as a Worker; `bun run deploy -- --contract`
+describes what publishing that involves and what it refuses to do.
 
-Evidence is appended to `.deploy/evidence/published.jsonl` and never contains a
-grant token, private key, or object byte. Failures are phase-classified: exit 2
-means nothing was touched, exit 3 means the target may have been mutated and
-the state is indeterminate, exit 4 means bytes are published but a
-post-condition failed. The writer never retries on its own.
+See [docs/adr/0001-provision-from-the-worker.md](docs/adr/0001-provision-from-the-worker.md)
+for why the deployed Worker holds the account credential, and what that costs.
 
-The private half of the verification key is written to `.deploy/private/` with
-owner-only permissions. That custody belongs to the durable control plane once
-it issues grants; until then the operator holds it.
+## How it is built
 
-## Current limits
+Five ports, and everything above them is provider-neutral.
 
-The main product control plane (identity, Organizations, API keys, wallet,
-ledger, quotes, reservations, settlement, and grant issuance), Takoform resource
-state, and artifacts are still in-memory reference implementations. The Worker
-therefore returns 503 for those control-plane routes and advertises only the
-durable object-storage slice.
+| Port | Implementations |
+|---|---|
+| `Sql` | SQLite, D1 binding, D1 over HTTP |
+| `ObjectStore` | filesystem, R2 binding, R2 over HTTP, memory |
+| `Provider` | local, workerd, Cloudflare, a remote provisioner |
+| `ExternalIdentityVerifier` | Google ID tokens, operator signature |
+| `FundingSettlementVerifier` | Stripe, operator signature |
 
-A durable resource-registry writer, full key rotation, a concrete
-payment-provider settlement adapter, OAuth network adapters, the complete
-official Takoform conformance runner, recovery drills, and production
-operations remain required before release. Grant signing custody is still the
-operator's rather than a durable control plane's, and the deploy writer has not
-yet had the independent review its own contract requires. No production
-configuration, secret, provider ID, or deployment evidence belongs here.
+`scripts/check-imports.ts` enforces the layering as a gate rather than a
+convention: core, adapters, domain, routes, composition, entries — and a
+per-entry ban, so the Workers entry cannot reach a filesystem it does not have.
+
+Three properties are worth knowing before reading the code:
+
+**Shipped Form definitions are frozen.** A Form's identity includes the digest
+of its schema, so changing one mints a different Form and strands every resource
+that named the old one — still running, still billing, no longer addressable.
+The digests are pinned by a test. Adding a line to it is how a definition ships;
+changing one is not.
+
+**Guarded writes, not transactions.** The control database may be D1, which has
+no interactive transaction, so invariants live in `WHERE` clauses and are
+verified by counting the rows a write actually changed. A hold that cannot be
+covered is not written at all.
+
+**Failure is a value.** A provider returns a classified ticket rather than
+throwing, so the engine, the ledger, and the operation record all see the same
+outcome. A credential *we* misconfigured is never reported to a customer as
+their permission problem.
+
+## Working on it
+
+```
+bun run check     # format, lint, layering, types, tests, builds
+bun run fmt       # the only thing that rewrites source
+```
+
+`bun run check` is the gate. It is read-only and it does not skip.
+
+## Licence
+
+Not yet chosen. Until one is added, no licence is granted.
