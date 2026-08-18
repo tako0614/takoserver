@@ -4,6 +4,7 @@ import {
   API_KEY_SCOPES,
   type ApiKeyScope,
   AuthError,
+  grants,
   type IdentityProviderDescriptor,
 } from "./auth.ts";
 import type { Catalog } from "./catalog.ts";
@@ -100,7 +101,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       await accounts.requireOwner(actor, organizationId);
       return actor;
     }
-    if (actor.organizationId !== organizationId || !actor.scopes.includes(scope)) {
+    if (actor.organizationId !== organizationId || !grants(actor.scopes, scope)) {
       throw new AuthError("permission_denied");
     }
     return actor;
@@ -108,7 +109,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
 
   const resellerActor = async (request: Request): Promise<Actor> => {
     const actor = await accounts.authenticate(authorization(request));
-    if (!actor?.organizationId || !actor.scopes.includes("reseller:write")) {
+    if (!actor?.organizationId || !grants(actor.scopes, "reseller:write")) {
       throw new AuthError("permission_denied");
     }
     return actor;

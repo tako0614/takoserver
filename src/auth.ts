@@ -40,6 +40,24 @@ export const API_KEY_SCOPES = [
 
 export type ApiKeyScope = (typeof API_KEY_SCOPES)[number];
 
+/**
+ * Scopes that carry others with them.
+ *
+ * A key that may create a resource may see the resource it created. Requiring
+ * both separately does not make anything safer — a writer can learn the state
+ * by writing — and it does make every key issued before a read scope existed
+ * unable to list its own work, which is how a new scope quietly breaks
+ * everything already deployed.
+ */
+const IMPLIED: Partial<Record<ApiKeyScope, readonly ApiKeyScope[]>> = {
+  "resources:write": ["resources:read"],
+};
+
+/** Whether these granted scopes cover the one being asked for. */
+export function grants(scopes: readonly ApiKeyScope[], wanted: ApiKeyScope): boolean {
+  return scopes.some((held) => held === wanted || (IMPLIED[held] ?? []).includes(wanted));
+}
+
 export interface Principal {
   readonly id: string;
   readonly provider: IdentityProvider;
@@ -376,7 +394,7 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
 
     async authorize(authorization, scope) {
       const actor = await accounts.authenticate(authorization);
-      if (!actor?.organizationId || !actor.scopes.includes(scope)) return null;
+      if (!actor?.organizationId || !grants(actor.scopes, scope)) return null;
       return actor;
     },
 

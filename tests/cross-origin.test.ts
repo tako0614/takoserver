@@ -134,3 +134,29 @@ describe("product discovery", () => {
     expect(endpoints.openapi).toBe("https://api.example.test/openapi.json");
   });
 });
+
+/**
+ * A key issued before a scope existed must not lose access to its own work.
+ * `resources:read` was added after keys were already in the field; without an
+ * implication, every one of them stopped being able to list what it had
+ * created — and requiring both separately buys nothing, because a writer can
+ * always learn the state by writing.
+ */
+describe("scope implication", () => {
+  test("a writer may read", async () => {
+    const { grants } = await import("../src/auth.ts");
+    expect(grants(["resources:write"], "resources:read")).toBe(true);
+  });
+
+  test("a reader may not write", async () => {
+    const { grants } = await import("../src/auth.ts");
+    expect(grants(["resources:read"], "resources:write")).toBe(false);
+  });
+
+  test("nothing else is implied", async () => {
+    const { grants } = await import("../src/auth.ts");
+    expect(grants(["resources:write"], "wallet:read")).toBe(false);
+    expect(grants(["wallet:read"], "resources:read")).toBe(false);
+    expect(grants(["catalog:read"], "reseller:write")).toBe(false);
+  });
+});
