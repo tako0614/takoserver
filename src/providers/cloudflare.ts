@@ -726,7 +726,9 @@ async function derivedName(
   prefix: string,
   identity: { tenantRef: string; space: string; name: string },
 ): Promise<string> {
-  const bytes = new TextEncoder().encode(`${identity.tenantRef} ${identity.space} ${identity.name}`);
+  const bytes = new TextEncoder().encode(
+    `${identity.tenantRef}\0${identity.space}\0${identity.name}`,
+  );
   const digest = new Uint8Array(
     await crypto.subtle.digest("SHA-256", bytes as unknown as BufferSource),
   );
