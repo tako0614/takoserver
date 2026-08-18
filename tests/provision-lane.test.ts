@@ -413,11 +413,13 @@ describe("Takoform run-token lane", () => {
       definitionVersion: FORM_REF.definitionVersion,
       schemaDigest: FORM_REF.schemaDigest,
     });
-    const resourcePath = `/apis/forms.takoform.com/v1beta1/resources/edge.forms.takoform.com/v1alpha1/EdgeObjectBucket/media?${query}`;
+    const mutationPath =
+      "/apis/forms.takoform.com/v1beta1/resources/edge.forms.takoform.com/v1alpha1/EdgeObjectBucket/media";
+    const resourcePath = `${mutationPath}?${query}`;
     const unreviewed = await laneRequest(
       host,
       "PUT",
-      resourcePath,
+      mutationPath,
       issued.token,
       { ...resourceBody(), review: { prepareDigest: `sha256:${"f".repeat(64)}` } },
       { "idempotency-key": "run-unreviewed", "if-none-match": "*" },
@@ -439,7 +441,7 @@ describe("Takoform run-token lane", () => {
     const applied = await laneRequest(
       host,
       "PUT",
-      resourcePath,
+      mutationPath,
       issued.token,
       { ...resourceBody(), review: { prepareDigest } },
       { "idempotency-key": "run-apply-1", "if-none-match": "*" },

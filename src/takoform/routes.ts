@@ -359,18 +359,16 @@ async function assertPrincipalScope(
   const resource = RESOURCE.exec(url.pathname);
   if (resource) {
     const path = parsedResourcePath(resource);
+    const bodyMutation = request.method === "PUT" || path.action === "import";
     if (
       path.apiVersion !== scope.formRef.apiVersion ||
       path.kind !== scope.formRef.kind ||
       path.name !== scope.resourceName ||
-      !scopeQueryMatches(scope, url)
+      (bodyMutation ? url.search !== "" : !scopeQueryMatches(scope, url))
     ) {
       throw new TakoformHostError("resource_not_found", 404);
     }
-    if (
-      (request.method === "PUT" || path.action === "import") &&
-      !(await scopeBodyMatches(scope, request))
-    ) {
+    if (bodyMutation && !(await scopeBodyMatches(scope, request))) {
       throw new TakoformHostError("resource_not_found", 404);
     }
     const create = request.method === "PUT" && request.headers.get("if-none-match") === "*";
