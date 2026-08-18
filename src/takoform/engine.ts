@@ -6,6 +6,7 @@ import { materializeDefaults, validateDesired, validateSchemaValue } from "./sch
 import type { ResourceAddress, StoredReplay, TakoformStore } from "./store.ts";
 import {
   type InstalledTakoformForm,
+  type TakoformCommercialAuthority,
   type TakoformDiagnostic,
   type TakoformDriverReceipt,
   TakoformHostError,
@@ -52,6 +53,12 @@ export interface EngineContext {
   readonly url: URL;
   readonly tenantId: string;
   readonly principalId: string;
+  /** Runs after every portable fence/review check and immediately before create side effects. */
+  readonly beforeCreate?: () => Promise<void>;
+  /** A paid create credential must never inherit authority over an existing incarnation. */
+  readonly provisionOnly?: boolean;
+  readonly expectedResourceUid?: string;
+  readonly commercialAuthority?: TakoformCommercialAuthority;
 }
 
 export type EngineResult =
@@ -256,6 +263,12 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       if (!resource || !sameFormRef(resource.form.formRef, form.identity.formRef)) {
         throw new TakoformHostError("resource_not_found", 404);
       }
+      if (
+        context.expectedResourceUid !== undefined &&
+        resource.metadata.uid !== context.expectedResourceUid
+      ) {
+        throw new TakoformHostError("resource_not_found", 404);
+      }
       if (!form.operations.includes("read")) {
         throw new TakoformHostError("unsupported_capability", 422);
       }
@@ -275,6 +288,15 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       };
       const address = addressOf(context.tenantId, body);
       const current = await store.readResource(address);
+      if (context.provisionOnly && current !== null) {
+        throw new TakoformHostError("resource_not_found", 404);
+      }
+      if (
+        context.expectedResourceUid !== undefined &&
+        current?.metadata.uid !== context.expectedResourceUid
+      ) {
+        throw new TakoformHostError("resource_not_found", 404);
+      }
       if (current && !sameFormRef(current.form.formRef, form.identity.formRef)) {
         throw new TakoformHostError("resource_not_found", 404);
       }
@@ -322,6 +344,8 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         throw new TakoformHostError();
       }
 
+      if (create) await context.beforeCreate?.();
+
       const opId = operationId();
       const uid = current?.metadata.uid ?? nextResourceUid(randomId);
       const receipt = await driver.apply({
@@ -332,6 +356,9 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         name: body.metadata.name,
         space: body.metadata.space,
         spec: structuredClone(body.spec),
+        ...(context.commercialAuthority
+          ? { commercialAuthority: context.commercialAuthority }
+          : {}),
         ...(current ? { previous: structuredClone(current) } : {}),
       });
       const next = materializeResource(body, form, receipt, current, clock, uid);
@@ -354,6 +381,12 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       const address = addressFromParts(context.tenantId, requiredQuery(context.url, "space"), path);
       const current = await store.readResource(address);
       if (!current || !sameFormRef(current.form.formRef, form.identity.formRef)) {
+        throw new TakoformHostError("resource_not_found", 404);
+      }
+      if (
+        context.expectedResourceUid !== undefined &&
+        current.metadata.uid !== context.expectedResourceUid
+      ) {
         throw new TakoformHostError("resource_not_found", 404);
       }
       if (!form.operations.includes("observe")) {
@@ -409,6 +442,12 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       }
       const address = addressOf(context.tenantId, body);
       const current = await store.readResource(address);
+      if (
+        context.expectedResourceUid !== undefined &&
+        current?.metadata.uid !== context.expectedResourceUid
+      ) {
+        throw new TakoformHostError("resource_not_found", 404);
+      }
       if (current && !sameFormRef(current.form.formRef, form.identity.formRef)) {
         throw new TakoformHostError("resource_not_found", 404);
       }
@@ -481,6 +520,12 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         return { kind: "deleted" };
       }
       if (!current || !sameFormRef(current.form.formRef, form.identity.formRef)) {
+        throw new TakoformHostError("resource_not_found", 404);
+      }
+      if (
+        context.expectedResourceUid !== undefined &&
+        current.metadata.uid !== context.expectedResourceUid
+      ) {
         throw new TakoformHostError("resource_not_found", 404);
       }
       if (!form.operations.includes("delete")) {

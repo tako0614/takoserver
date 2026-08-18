@@ -184,6 +184,13 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
       const { provider, offering, sold, priceMinor } = select(input.form);
       const current = await deployments.active(input.tenantId, input.resourceUid);
       if (
+        input.commercialAuthority &&
+        (input.commercialAuthority.offeringId !== sold.id ||
+          (!current && input.commercialAuthority.offeringDigest !== (await catalog.digest(sold))))
+      ) {
+        throw new TakoformHostError("unsupported_capability", 422);
+      }
+      if (
         current &&
         (current.offeringId !== sold.id ||
           current.providerPackRef !== sold.providerPackRef ||
@@ -195,8 +202,8 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
       const previous = current
         ? { nativeId: current.nativeId, spec: input.previous?.spec ?? input.spec }
         : undefined;
-      const result = await charged(input.tenantId, input.operationId, priceMinor, async () =>
-        settle(
+      const work = async () =>
+        await settle(
           provider,
           input.operationId,
           await provider.apply({
@@ -206,8 +213,14 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
             spec: input.spec,
             ...(previous ? { previous } : {}),
           }),
-        ),
-      );
+        );
+      // A reseller reservation already holds this exact Offering's price.
+      // Charging the organization wallet again here would double-settle the
+      // same Resource. Direct organization credentials have no such authority
+      // and retain the ordinary hold/capture path.
+      const result = input.commercialAuthority
+        ? resultOf(await work())
+        : await charged(input.tenantId, input.operationId, priceMinor, work);
       if (current) {
         await refresh(current, result);
       } else {

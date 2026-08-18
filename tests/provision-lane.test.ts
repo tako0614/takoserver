@@ -331,3 +331,130 @@ describe("provision-token redemption lane", () => {
     expect(statement.usage).toEqual({ meter: "bucket-month", quantity: 1 });
   });
 });
+
+describe("Takoform run-token lane", () => {
+  test("reuses a short-lived bearer only for its exact Form, space, and resource address", async () => {
+    const sql = createEphemeralSql();
+    const clock = () => new Date(NOW);
+    const catalog = createCatalog([OFFERING]);
+    const ledger = createLedger(sql, clock);
+    const reseller = createReseller({ sql, ledger, catalog, clock });
+    await ledger.fund({ organizationId: ORG, fundingRef: "pay_run", amountMinor: 10_000 });
+    const quote = await reseller.quote({
+      organizationId: ORG,
+      tenantRef: TENANT,
+      offeringId: OFFERING.id,
+      quantity: 1,
+    });
+    const reservation = await reseller.reserve({
+      organizationId: ORG,
+      tenantRef: TENANT,
+      quoteId: quote.id,
+    });
+    const tokens = createTokenService({
+      sql,
+      issuer: ISSUER,
+      clock,
+      keyCacheSeconds: 0,
+      signingKey: await provisionKey(sql),
+    });
+    const issued = await tokens.issueTakoformRunToken({
+      organizationId: ORG,
+      tenantRef: TENANT,
+      reservationId: reservation.id,
+      offeringId: OFFERING.id,
+      offeringDigest: await catalog.digest(OFFERING),
+      formRef: FORM_REF,
+      resourceName: "media",
+      mode: "provision",
+      ttlSeconds: 600,
+    });
+    let mode: "provision" | "manage" = "provision";
+    const host = createTakoformHost({
+      sql,
+      objects: createMemoryObjectStore(),
+      authenticate: async (authorization) => {
+        const token = authorization?.replace(/^Bearer /u, "");
+        if (!token) return null;
+        const claims = await tokens.verifyTakoformRunToken(token);
+        return {
+          tenantId: claims.organizationId,
+          principalId: `run:${claims.tokenId}`,
+          scope: {
+            space: claims.tenantRef,
+            formRef: claims.formRef,
+            resourceName: claims.resourceName,
+            mode,
+            claimCreate: async () => {
+              await tokens.claimTakoformRunTokenForCreate(token);
+            },
+          },
+        };
+      },
+      forms: [INSTALLED_FORM],
+      driver: new InMemoryTakoformResourceDriver(),
+      clock,
+    });
+
+    const foreign = await laneRequest(
+      host,
+      "POST",
+      "/apis/forms.takoform.com/v1beta1/resources/prepare",
+      issued.token,
+      { ...resourceBody(), metadata: { space: TENANT, name: "other" } },
+    );
+    expect(foreign.status).toBe(404);
+    expect(foreign.body).toMatchObject({ error: { code: "resource_not_found" } });
+
+    const query = new URLSearchParams({
+      space: TENANT,
+      group: FORM_REF.apiVersion,
+      kind: FORM_REF.kind,
+      definitionVersion: FORM_REF.definitionVersion,
+      schemaDigest: FORM_REF.schemaDigest,
+    });
+    const resourcePath = `/apis/forms.takoform.com/v1beta1/resources/edge.forms.takoform.com/v1alpha1/EdgeObjectBucket/media?${query}`;
+    const unreviewed = await laneRequest(
+      host,
+      "PUT",
+      resourcePath,
+      issued.token,
+      { ...resourceBody(), review: { prepareDigest: `sha256:${"f".repeat(64)}` } },
+      { "idempotency-key": "run-unreviewed", "if-none-match": "*" },
+    );
+    expect(unreviewed.status).toBe(400);
+    expect(await sql.query("SELECT COUNT(*) AS total FROM provision_token_consumptions")).toEqual([
+      { total: 0 },
+    ]);
+
+    const prepared = await laneRequest(
+      host,
+      "POST",
+      "/apis/forms.takoform.com/v1beta1/resources/prepare",
+      issued.token,
+      resourceBody(),
+    );
+    expect(prepared.status).toBe(200);
+    const prepareDigest = String((prepared.body.review as { prepareDigest: string }).prepareDigest);
+    const applied = await laneRequest(
+      host,
+      "PUT",
+      resourcePath,
+      issued.token,
+      { ...resourceBody(), review: { prepareDigest } },
+      { "idempotency-key": "run-apply-1", "if-none-match": "*" },
+    );
+    expect(applied.status).toBe(201);
+
+    mode = "manage";
+    const observed = await laneRequest(
+      host,
+      "POST",
+      `${resourcePath.replace(`?${query}`, "/observe")}?${query}`,
+      issued.token,
+      {},
+      { "idempotency-key": "run-observe-1", "takoform-expected-generation": "1" },
+    );
+    expect(observed.status).toBe(200);
+  });
+});

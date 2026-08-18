@@ -1,3 +1,4 @@
+import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import { base64UrlDecode, base64UrlEncode, isSha256Digest } from "./json.ts";
 import type { Clock, Sql } from "./ports.ts";
 
@@ -17,7 +18,9 @@ import type { Clock, Sql } from "./ports.ts";
 
 const TOKEN_TYPE = "takoserver-token+jwt";
 const PROVISION_AUDIENCE = "tako.provision";
+const TAKOFORM_RUN_AUDIENCE = "takoform.run";
 const REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{2,255}$/u;
+const RESOURCE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const KEY_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/u;
 const ACTIVE_KEY_LIMIT = 32;
 const EXPIRED_REPLAY_DELETE_LIMIT = 64;
@@ -31,6 +34,13 @@ export interface ProvisionTokenClaims {
   readonly issuedAtEpochSeconds: number;
   readonly expiresAtEpochSeconds: number;
   readonly tokenId: string;
+}
+
+export interface TakoformRunTokenClaims extends ProvisionTokenClaims {
+  readonly formRef: TakoformV1Alpha3FormRef;
+  readonly resourceName: string;
+  readonly mode: "provision" | "manage";
+  readonly resourceUid?: string;
 }
 
 export type TokenErrorCode =
@@ -77,6 +87,33 @@ export interface TokenService {
 
   /** Single-use: the identifier is consumed atomically, so a replay loses. */
   consumeProvisionToken(token: string): Promise<ProvisionTokenClaims>;
+
+  issueTakoformRunToken(
+    input: {
+      readonly organizationId: string;
+      readonly tenantRef: string;
+      readonly reservationId: string;
+      readonly offeringId: string;
+      readonly offeringDigest: `sha256:${string}`;
+      readonly formRef: TakoformV1Alpha3FormRef;
+      readonly resourceName: string;
+      readonly ttlSeconds: number;
+    } & (
+      | { readonly mode: "provision"; readonly resourceUid?: never }
+      | { readonly mode: "manage"; readonly resourceUid: string }
+    ),
+  ): Promise<{ readonly token: string; readonly expiresAt: string }>;
+
+  /** Reusable only within its short lifetime and exact Resource address. */
+  verifyTakoformRunToken(token: string): Promise<TakoformRunTokenClaims>;
+
+  /**
+   * Claims the paid reservation before the first provider create. Repeating
+   * the same token is accepted so the Host's own idempotency receipt can
+   * recover a lost acknowledgement; a different token for the reservation is
+   * rejected.
+   */
+  claimTakoformRunTokenForCreate(token: string): Promise<TakoformRunTokenClaims>;
 }
 
 export interface CreateTokenServiceOptions {
@@ -85,6 +122,7 @@ export interface CreateTokenServiceOptions {
   readonly signingKey?: SigningKey;
   readonly clock?: Clock;
   readonly maxProvisionTokenLifetimeSeconds?: number;
+  readonly maxTakoformRunTokenLifetimeSeconds?: number;
   readonly keyCacheSeconds?: number;
 }
 
@@ -92,6 +130,9 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
   const issuer = httpsOrigin(options.issuer);
   const clock = options.clock ?? (() => new Date());
   const maxProvisionLifetime = positiveInteger(options.maxProvisionTokenLifetimeSeconds ?? 300);
+  const maxTakoformRunLifetime = positiveInteger(
+    options.maxTakoformRunTokenLifetimeSeconds ?? 3_600,
+  );
   const keyCacheSeconds = options.keyCacheSeconds ?? 10;
   const keys = createKeyCache(options.sql, clock, keyCacheSeconds);
 
@@ -206,6 +247,46 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
       await consume(options.sql, clock, claims);
       return claims;
     },
+
+    async issueTakoformRunToken(input) {
+      if (!isSha256Digest(input.offeringDigest)) throw new TypeError("offering digest is invalid");
+      const formRef = validatedFormRef(input.formRef);
+      if (!RESOURCE_NAME.test(input.resourceName)) {
+        throw new TypeError("resource name is invalid");
+      }
+      if (input.mode === "manage" && !REFERENCE.test(input.resourceUid)) {
+        throw new TypeError("resource uid is invalid");
+      }
+      return await sign(
+        TAKOFORM_RUN_AUDIENCE,
+        {
+          formRef,
+          offeringDigest: input.offeringDigest,
+          offeringId: reference(input.offeringId),
+          organizationId: reference(input.organizationId),
+          reservationId: reference(input.reservationId),
+          resourceUid: input.mode === "manage" ? input.resourceUid : null,
+          resourceName: input.resourceName,
+          mode: input.mode,
+          tenantRef: reference(input.tenantRef),
+        },
+        input.ttlSeconds,
+        maxTakoformRunLifetime,
+      );
+    },
+
+    async verifyTakoformRunToken(token) {
+      return takoformRunClaims(await open(token, TAKOFORM_RUN_AUDIENCE, maxTakoformRunLifetime));
+    },
+
+    async claimTakoformRunTokenForCreate(token) {
+      const claims = takoformRunClaims(
+        await open(token, TAKOFORM_RUN_AUDIENCE, maxTakoformRunLifetime),
+      );
+      if (claims.mode !== "provision") fail("malformed_token");
+      await claimReusableCreate(options.sql, clock, claims);
+      return claims;
+    },
   };
 }
 
@@ -264,6 +345,63 @@ async function consume(sql: Sql, clock: Clock, claims: ProvisionTokenClaims): Pr
     throw new TokenError("state_unavailable");
   }
   if (claimed.changes !== 1) fail("token_replayed");
+}
+
+async function claimReusableCreate(
+  sql: Sql,
+  clock: Clock,
+  claims: TakoformRunTokenClaims,
+): Promise<void> {
+  const now = Math.floor(clock().getTime() / 1_000);
+  if (claims.expiresAtEpochSeconds <= now) fail("token_expired");
+  try {
+    const claimed = await sql.run(
+      `INSERT OR IGNORE INTO provision_token_consumptions
+         (token_id, organization_id, tenant_ref, reservation_id, offering_id,
+          offering_digest, expires_at_epoch_seconds, consumed_at_epoch_seconds)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?
+       FROM reservations
+       WHERE id = ? AND org_id = ? AND tenant_ref = ?
+         AND offering_id = ? AND offering_digest = ? AND status = 'active'`,
+      [
+        claims.tokenId,
+        claims.organizationId,
+        claims.tenantRef,
+        claims.reservationId,
+        claims.offeringId,
+        claims.offeringDigest,
+        claims.expiresAtEpochSeconds,
+        now,
+        claims.reservationId,
+        claims.organizationId,
+        claims.tenantRef,
+        claims.offeringId,
+        claims.offeringDigest,
+      ],
+    );
+    if (claimed.changes === 1) return;
+
+    const rows = await sql.query(
+      `SELECT token_id, organization_id, tenant_ref, reservation_id, offering_id, offering_digest
+       FROM provision_token_consumptions
+       WHERE reservation_id = ? AND organization_id = ? AND tenant_ref = ? LIMIT 1`,
+      [claims.reservationId, claims.organizationId, claims.tenantRef],
+    );
+    const row = rows[0];
+    if (
+      row?.token_id === claims.tokenId &&
+      row.organization_id === claims.organizationId &&
+      row.tenant_ref === claims.tenantRef &&
+      row.reservation_id === claims.reservationId &&
+      row.offering_id === claims.offeringId &&
+      row.offering_digest === claims.offeringDigest
+    ) {
+      return;
+    }
+  } catch {
+    throw new TokenError("state_unavailable");
+  }
+  fail("token_replayed");
 }
 
 interface KeyCache {
@@ -372,6 +510,86 @@ function provisionClaims(payload: Record<string, unknown>): ProvisionTokenClaims
     issuedAtEpochSeconds: epochSeconds(payload.iat),
     expiresAtEpochSeconds: epochSeconds(payload.exp),
     tokenId: claimReference(payload.jti),
+  };
+}
+
+function takoformRunClaims(payload: Record<string, unknown>): TakoformRunTokenClaims {
+  exactKeys(payload, [
+    "aud",
+    "exp",
+    "formRef",
+    "iat",
+    "iss",
+    "jti",
+    "mode",
+    "nbf",
+    "offeringDigest",
+    "offeringId",
+    "organizationId",
+    "reservationId",
+    "resourceName",
+    "resourceUid",
+    "tenantRef",
+  ]);
+  if (!isSha256Digest(payload.offeringDigest)) fail("malformed_token");
+  if (payload.mode !== "provision" && payload.mode !== "manage") fail("malformed_token");
+  if (typeof payload.resourceName !== "string" || !RESOURCE_NAME.test(payload.resourceName)) {
+    fail("malformed_token");
+  }
+  const resourceUid =
+    payload.resourceUid === null
+      ? undefined
+      : typeof payload.resourceUid === "string" && REFERENCE.test(payload.resourceUid)
+        ? payload.resourceUid
+        : fail("malformed_token");
+  if (
+    (payload.mode === "provision" && resourceUid !== undefined) ||
+    (payload.mode === "manage" && resourceUid === undefined)
+  ) {
+    fail("malformed_token");
+  }
+  return {
+    organizationId: claimReference(payload.organizationId),
+    tenantRef: claimReference(payload.tenantRef),
+    reservationId: claimReference(payload.reservationId),
+    offeringId: claimReference(payload.offeringId),
+    offeringDigest: payload.offeringDigest,
+    formRef: claimedFormRef(payload.formRef),
+    resourceName: payload.resourceName,
+    mode: payload.mode,
+    ...(resourceUid === undefined ? {} : { resourceUid }),
+    issuedAtEpochSeconds: epochSeconds(payload.iat),
+    expiresAtEpochSeconds: epochSeconds(payload.exp),
+    tokenId: claimReference(payload.jti),
+  };
+}
+
+function validatedFormRef(value: TakoformV1Alpha3FormRef): TakoformV1Alpha3FormRef {
+  return claimedFormRef(value);
+}
+
+function claimedFormRef(value: unknown): TakoformV1Alpha3FormRef {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    fail("malformed_token");
+  }
+  const formRef = value as Record<string, unknown>;
+  exactKeys(formRef, ["apiVersion", "kind", "definitionVersion", "schemaDigest"]);
+  if (
+    typeof formRef.apiVersion !== "string" ||
+    !REFERENCE.test(formRef.apiVersion) ||
+    typeof formRef.kind !== "string" ||
+    !RESOURCE_NAME.test(formRef.kind) ||
+    typeof formRef.definitionVersion !== "string" ||
+    !REFERENCE.test(formRef.definitionVersion) ||
+    !isSha256Digest(formRef.schemaDigest)
+  ) {
+    fail("malformed_token");
+  }
+  return {
+    apiVersion: formRef.apiVersion,
+    kind: formRef.kind,
+    definitionVersion: formRef.definitionVersion,
+    schemaDigest: formRef.schemaDigest,
   };
 }
 

@@ -45,6 +45,27 @@ export interface TakoformDiagnostic {
 export interface TakoformHostPrincipal {
   readonly tenantId: string;
   readonly principalId: string;
+  /**
+   * A reseller-issued run credential may operate only one exact Resource
+   * address. Organization sessions/API keys omit this and retain their normal
+   * organization-wide authority.
+   */
+  readonly scope?: {
+    readonly space: string;
+    readonly formRef: TakoformV1Alpha3FormRef;
+    readonly resourceName: string;
+    readonly mode: "provision" | "manage";
+    readonly expectedResourceUid?: string;
+    readonly commercialAuthority?: TakoformCommercialAuthority;
+    /** Atomically binds the paid reservation before the first create. */
+    readonly claimCreate?: () => Promise<void>;
+  };
+}
+
+export interface TakoformCommercialAuthority {
+  readonly reservationId: string;
+  readonly offeringId: string;
+  readonly offeringDigest: `sha256:${string}`;
 }
 
 export interface TakoformDriverReceipt {
@@ -61,6 +82,7 @@ export interface TakoformResourceDriver {
     readonly name: string;
     readonly space: string;
     readonly spec: JsonObject;
+    readonly commercialAuthority?: TakoformCommercialAuthority;
     readonly previous?: TakoformStoredResource;
   }): Promise<TakoformDriverReceipt>;
   observe(input: {

@@ -361,7 +361,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     }
 
     const reservationAction =
-      /^\/v1\/reseller\/reservations\/([^/]+)\/(capture|release|provision-tokens)$/u.exec(
+      /^\/v1\/reseller\/reservations\/([^/]+)\/(capture|release|provision-tokens|takoform-run-tokens)$/u.exec(
         url.pathname,
       );
     if (request.method === "POST" && reservationAction) {
@@ -396,6 +396,59 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
           reservationId,
         });
         return Response.json({ reservation });
+      }
+
+      if (reservationAction[2] === "takoform-run-tokens") {
+        exactKeys(body, ["tenantRef", "resourceName", "expiresInSeconds"], ["resourceUid"]);
+        const requestedTenant = tenantRef(body.tenantRef);
+        const requestedName = resourceName(body.resourceName);
+        const reservation = await reseller.reservation({
+          organizationId,
+          tenantRef: requestedTenant,
+          reservationId,
+        });
+        if (reservation.status !== "active" && reservation.status !== "captured") {
+          throw new ResellerError("conflict", 409);
+        }
+        let resourceUid: string | undefined;
+        let formRef: InstalledTakoformForm["identity"]["formRef"];
+        if (reservation.status === "captured") {
+          resourceUid = segment(text(body.resourceUid));
+          const existing = await inventory.resourceByUid(organizationId, resourceUid);
+          const deployment = await deployments.active(organizationId, resourceUid);
+          if (
+            !existing ||
+            !deployment ||
+            deployment.offeringId !== reservation.offeringId ||
+            existing.space !== reservation.tenantRef ||
+            existing.name !== requestedName
+          ) {
+            controlError("not_found", 404);
+          }
+          formRef = existing.resource.form.formRef;
+        } else if (body.resourceUid !== undefined) {
+          controlError("invalid_argument", 400);
+        } else {
+          const offering = catalog.findOffering(reservation.offeringId);
+          if (!offering || (await catalog.digest(offering)) !== reservation.offeringDigest) {
+            throw new ResellerError("offering_unavailable", 503);
+          }
+          formRef = offering.form;
+        }
+        const issued = await tokens.issueTakoformRunToken({
+          organizationId,
+          tenantRef: reservation.tenantRef,
+          reservationId: reservation.id,
+          offeringId: reservation.offeringId,
+          offeringDigest: reservation.offeringDigest,
+          formRef,
+          resourceName: requestedName,
+          ...(resourceUid === undefined
+            ? { mode: "provision" as const }
+            : { mode: "manage" as const, resourceUid }),
+          ttlSeconds: integer(body.expiresInSeconds),
+        });
+        return Response.json({ takoformRunToken: issued }, { status: 201 });
       }
 
       exactKeys(body, ["tenantRef", "expiresInSeconds"]);
@@ -956,6 +1009,14 @@ function bounded(value: unknown, limit: number): string {
 function tenantRef(value: unknown): string {
   const parsed = text(value);
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$/u.test(parsed)) controlError("invalid_argument", 400);
+  return parsed;
+}
+
+function resourceName(value: unknown): string {
+  const parsed = text(value);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(parsed)) {
+    controlError("invalid_argument", 400);
+  }
   return parsed;
 }
 

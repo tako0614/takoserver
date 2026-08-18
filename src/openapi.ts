@@ -212,6 +212,10 @@ const PUBLIC_PATHS: Record<string, Record<string, unknown>> = {
     "post",
     "Mint a single-use provisioning token for a reservation",
   ),
+  "/v1/reseller/reservations/{reservationId}/takoform-run-tokens": operation(
+    "post",
+    "Mint a short-lived exact-Resource bearer for an ordinary Takoform provider run",
+  ),
   "/v1/reseller/reservations/{reservationId}/usage-statement": operation(
     "get",
     "Read the usage statement of a captured reservation",

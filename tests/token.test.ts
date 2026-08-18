@@ -183,3 +183,62 @@ describe("provision tokens", () => {
     ).rejects.toMatchObject({ code: "no_active_keys" });
   });
 });
+
+describe("Takoform run tokens", () => {
+  test("bind one reusable credential to an exact reservation, Form, space, and address", async () => {
+    const tokens = service(await provisionKey("sign-2026-08"));
+    const formRef = {
+      apiVersion: "edge.forms.takoform.com/v1beta1",
+      kind: "ObjectBucket",
+      definitionVersion: "0.1.0",
+      schemaDigest: `sha256:${"a".repeat(64)}` as const,
+    };
+    const issued = await tokens.issueTakoformRunToken({
+      organizationId: "org_alpha",
+      tenantRef: "tenant_x",
+      reservationId: "rsv_1",
+      offeringId: "storage.object.standard",
+      offeringDigest: `sha256:${"c".repeat(64)}`,
+      formRef,
+      resourceName: "media",
+      mode: "provision",
+      ttlSeconds: 600,
+    });
+
+    expect(issued.expiresAt).toBe(new Date(NOW + 600_000).toISOString());
+    expect(await tokens.verifyTakoformRunToken(issued.token)).toMatchObject({
+      organizationId: "org_alpha",
+      tenantRef: "tenant_x",
+      reservationId: "rsv_1",
+      offeringId: "storage.object.standard",
+      offeringDigest: `sha256:${"c".repeat(64)}`,
+      formRef,
+      resourceName: "media",
+    });
+    expect((await tokens.verifyTakoformRunToken(issued.token)).tokenId).toStartWith("tok_");
+    await expect(tokens.claimTakoformRunTokenForCreate(issued.token)).resolves.toMatchObject({
+      resourceName: "media",
+    });
+    await expect(tokens.claimTakoformRunTokenForCreate(issued.token)).resolves.toMatchObject({
+      resourceName: "media",
+    });
+    expect(await sql.query("SELECT COUNT(*) AS total FROM provision_token_consumptions")).toEqual([
+      { total: 1 },
+    ]);
+
+    const competing = await tokens.issueTakoformRunToken({
+      organizationId: "org_alpha",
+      tenantRef: "tenant_x",
+      reservationId: "rsv_1",
+      offeringId: "storage.object.standard",
+      offeringDigest: `sha256:${"c".repeat(64)}`,
+      formRef,
+      resourceName: "media",
+      mode: "provision",
+      ttlSeconds: 600,
+    });
+    await expect(tokens.claimTakoformRunTokenForCreate(competing.token)).rejects.toMatchObject({
+      code: "token_replayed",
+    });
+  });
+});

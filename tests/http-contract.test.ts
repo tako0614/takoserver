@@ -93,6 +93,7 @@ const PUBLIC_PATHS = [
   "/v1/reseller/reservations/{reservationId}/capture",
   "/v1/reseller/reservations/{reservationId}/provision-tokens",
   "/v1/reseller/reservations/{reservationId}/release",
+  "/v1/reseller/reservations/{reservationId}/takoform-run-tokens",
   "/v1/reseller/reservations/{reservationId}/usage-statement",
   "/v1/sessions",
 ];
