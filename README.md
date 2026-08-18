@@ -140,4 +140,9 @@ bun run fmt       # the only thing that rewrites source
 
 ## Licence
 
-Not yet chosen. Until one is added, no licence is granted.
+[GNU Affero General Public License v3.0](LICENSE).
+
+Run it, host it, change it, sell it. The one obligation is the one that matters
+for something people reach over a network: if you offer a modified takoserver as
+a service, its users are entitled to your modifications. Self-hosting for
+yourself carries no such duty.
