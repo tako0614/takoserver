@@ -111,4 +111,75 @@ describe("bringing a local database up to date", () => {
       { native_id: "bucket:assets" },
     ]);
   });
+
+  test("adopts exact released legacy resources into provider Deployments before dropping native identity", () => {
+    const database = new Database(":memory:");
+    database.exec(`
+      CREATE TABLE applied_migrations (
+        name TEXT PRIMARY KEY NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+    const dropNativeIdentity = MIGRATIONS.findIndex((migration) =>
+      migration.name.startsWith("0007_"),
+    );
+    for (const migration of MIGRATIONS.slice(0, dropNativeIdentity)) {
+      database.exec(migration.sql);
+      database
+        .query("INSERT INTO applied_migrations (name, applied_at) VALUES (?, 'now')")
+        .run(migration.name);
+    }
+    database
+      .query(
+        `INSERT INTO tf_resources
+           (tenant_id, space, api_version, kind, name, uid, generation, revision,
+            resource_json, native_id, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "org_1",
+        "default",
+        "edge.forms.takoform.com/v1beta1",
+        "ObjectBucket",
+        "assets",
+        "uid_legacy_bucket",
+        "1",
+        "2",
+        JSON.stringify({
+          status: { observed: { region: "global" }, outputs: { bucket: "opaque" } },
+        }),
+        "r2:opaque-native-id",
+        42,
+      );
+
+    migrateSqlite(database);
+    expect(
+      database
+        .query(
+          `SELECT id, resource_uid, offering_id, provider_pack_ref,
+                  provider_installation_ref, native_id, state, observed_json,
+                  outputs_json
+           FROM tf_resource_deployments`,
+        )
+        .all(),
+    ).toEqual([
+      {
+        id: "dep_legacy_uid_legacy_bucket",
+        resource_uid: "uid_legacy_bucket",
+        offering_id: "storage.object.standard",
+        provider_pack_ref: "cloudflare",
+        provider_installation_ref: "cloudflare.primary",
+        native_id: "r2:opaque-native-id",
+        state: "active",
+        observed_json: '{"region":"global"}',
+        outputs_json: '{"bucket":"opaque"}',
+      },
+    ]);
+    expect(
+      database
+        .query("PRAGMA table_info(tf_resources)")
+        .all()
+        .map((column) => String((column as { name: unknown }).name)),
+    ).not.toContain("native_id");
+  });
 });
