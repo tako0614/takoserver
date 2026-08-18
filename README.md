@@ -40,6 +40,13 @@ the part that owns accounts, money, and the machines.
   settled minus held, computed from entries that are only ever appended.
 - **Reach** what you provisioned. A bucket is not a name in a list: a
   short-lived token scoped to one resource opens its data plane.
+- **Attach** independent resources by exact Interface reference. An Attachment
+  stores only resource/deployment identity and an opaque grant, endpoint,
+  secret, or native-binding reference; it never embeds a provider credential.
+- **Migrate** by selecting another Offering for the same exact Form. Takoserver
+  provisions a candidate Deployment, transfers and verifies the data, then
+  atomically switches the active Deployment and Attachment resolutions. The
+  source stays retained for the bounded rollback window.
 - **Infer** through `/v1/ai`. An organization API key with `ai:invoke` sees only
   operator-configured public model IDs. Takoserver holds the maximum prepaid
   charge before inference, captures reported token use, and releases the rest.
@@ -117,6 +124,26 @@ describes what publishing that involves and what it refuses to do.
 See [docs/adr/0001-provision-from-the-worker.md](docs/adr/0001-provision-from-the-worker.md)
 for why the deployed Worker holds the account credential, and what that costs.
 
+## Resource and supply model
+
+Takoform owns the portable words: Form, Interface, Binding, Attachment, and
+Migration semantics. Takoserver owns the supply decisions: Offerings, provider
+installations, Deployments, commercial authority, placement, credentials,
+metering, and cost.
+
+One exact Form may have many Offerings. A logical Resource keeps one stable UID
+while one or more provider-backed Deployments coexist during migration. Provider
+IDs exist only on Deployments; provider names and prices never enter a Form.
+Deleting either side of a live Attachment fails with `dependency_in_use` until
+the Attachment is removed.
+
+Migration planning accepts no caller-invented payment claim. The target
+Offering must be backed by one active, exact-digest reservation of quantity one;
+the reservation is unique to the Migration and is captured only after cutover.
+Cancelling before cutover first deletes any authoritative candidate Deployment
+and only then releases the hold. An acknowledgement gap is left open for
+operator reconciliation rather than being reported as a successful cancellation.
+
 ## How it is built
 
 Six ports, and everything above them is provider-neutral.
@@ -125,7 +152,7 @@ Six ports, and everything above them is provider-neutral.
 |---|---|
 | `Sql` | SQLite, D1 binding, D1 over HTTP |
 | `ObjectStore` | filesystem, R2 binding, R2 over HTTP, memory |
-| `Provider` | local, workerd, Cloudflare, a remote provisioner |
+| `Provider Pack` | provisioning, Attachment, transfer, credential, meter, and cost capabilities |
 | `ExternalIdentityVerifier` | Google ID tokens, operator signature |
 | `FundingSettlementVerifier` | Stripe, operator signature |
 | `AiGateway` | any OpenAI-compatible upstream; private deployments may compose a native binding |

@@ -140,6 +140,22 @@ const PUBLIC_PATHS: Record<string, Record<string, unknown>> = {
     "get",
     "List the organization's Takoform resources",
   ),
+  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations": operations({
+    get: "List explicit provider migrations for one logical Resource",
+    post: "Plan a migration against an exact commercial reservation",
+  }),
+  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}": operation(
+    "get",
+    "Read one Resource Migration",
+  ),
+  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/execute":
+    operation("post", "Provision, transfer, and verify a candidate Deployment"),
+  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/cutover":
+    operation("post", "Atomically activate the candidate and re-resolve Attachments"),
+  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/rollback":
+    operation("post", "Restore the retained Deployment and Attachment resolutions"),
+  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/cancel":
+    operation("post", "Delete an uncut candidate and release its commercial reservation"),
   "/v1/organizations/{organizationId}/attachments": operations({
     get: "List the organization's Resource Attachments",
     post: "Resolve and create a Resource Attachment",

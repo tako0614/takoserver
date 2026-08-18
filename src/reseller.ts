@@ -42,6 +42,7 @@ export interface Reservation {
   readonly quoteId: string;
   readonly offeringId: string;
   readonly offeringDigest: `sha256:${string}`;
+  readonly quantity: number;
   readonly amountMinor: number;
   readonly currency: "USD";
   /** The usage meter carried over from the quote. */
@@ -265,6 +266,7 @@ export function createReseller(options: CreateResellerOptions): Reseller {
         quoteId,
         offeringId: String(quote.offering_id),
         offeringDigest: String(quote.offering_digest) as `sha256:${string}`,
+        quantity: Number(quote.quantity),
         amountMinor,
         currency: "USD",
         meter: String(quote.meter),
@@ -317,11 +319,7 @@ export function createReseller(options: CreateResellerOptions): Reseller {
     },
 
     async release({ organizationId, tenantRef, reservationId }) {
-      const { quantity: _quantity, ...reservation } = await readReservation(
-        organizationId,
-        tenantRef,
-        reservationId,
-      );
+      const reservation = await readReservation(organizationId, tenantRef, reservationId);
       if (reservation.status === "released") return reservation;
       if (reservation.status !== "active") throw new ResellerError("conflict", 409);
 
@@ -358,12 +356,7 @@ export function createReseller(options: CreateResellerOptions): Reseller {
     },
 
     async reservation({ organizationId, tenantRef, reservationId }) {
-      const { quantity: _quantity, ...reservation } = await readReservation(
-        organizationId,
-        tenantRef,
-        reservationId,
-      );
-      return reservation;
+      return await readReservation(organizationId, tenantRef, reservationId);
     },
 
     async expireDue(limit) {

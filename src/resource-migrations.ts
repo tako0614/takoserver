@@ -1,9 +1,10 @@
+import type { AttachmentRebinding, AttachmentService } from "./attachments.ts";
 import type { Catalog, Offering } from "./catalog.ts";
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import type { Clock, JsonObject, Row, Sql } from "./ports.ts";
 import type { ProviderPack, TransferEndpoint } from "./provider-pack.ts";
 import type { ProviderResult, ProviderTicket } from "./provider-port.ts";
-import type { ResourceDeploymentStore } from "./resource-deployments.ts";
+import type { ResourceDeployment, ResourceDeploymentStore } from "./resource-deployments.ts";
 
 export type ResourceMigrationState =
   | "planned"
@@ -31,10 +32,12 @@ export interface ResourceMigration {
   readonly targetProviderPackRef: string;
   readonly targetProviderInstallationRef: string;
   readonly commercialAuthorizationRef: string;
+  readonly commercialTenantRef?: string;
   readonly mode: "offline" | "online";
   readonly transferFormat: string;
   readonly state: ResourceMigrationState;
   readonly verification?: MigrationVerification;
+  readonly attachmentRebindings: readonly AttachmentRebinding[];
   readonly rollbackUntil?: string;
   readonly createdAt: string;
   readonly updatedAt: string;
@@ -54,6 +57,7 @@ export interface PlanResourceMigration {
   readonly resourceUid: string;
   readonly targetOfferingId: string;
   readonly commercialAuthorizationRef: string;
+  readonly commercialTenantRef: string;
   readonly mode: "offline" | "online";
   readonly transferFormat: string;
 }
@@ -61,6 +65,7 @@ export interface PlanResourceMigration {
 export interface ResourceMigrationStore {
   create(input: ResourceMigration): Promise<void>;
   read(tenantId: string, id: string): Promise<ResourceMigration | null>;
+  list(tenantId: string, resourceUid: string, limit: number): Promise<readonly ResourceMigration[]>;
   claim(tenantId: string, id: string): Promise<ResourceMigration | null>;
   transferring(tenantId: string, id: string): Promise<boolean>;
   verified(
@@ -69,8 +74,12 @@ export interface ResourceMigrationStore {
     verification: MigrationVerification,
     rollbackUntil: number,
   ): Promise<boolean>;
-  cutover(migration: ResourceMigration): Promise<boolean>;
+  cutover(
+    migration: ResourceMigration,
+    rebindings: readonly AttachmentRebinding[],
+  ): Promise<boolean>;
   rollback(migration: ResourceMigration): Promise<boolean>;
+  abandon(migration: ResourceMigration, target: ResourceDeployment | null): Promise<boolean>;
 }
 
 export class ResourceMigrationError extends Error {
@@ -90,18 +99,28 @@ export class ResourceMigrationError extends Error {
   }
 }
 
+export interface ResourceMigrationService {
+  plan(input: PlanResourceMigration): Promise<ResourceMigration>;
+  read(tenantId: string, id: string): Promise<ResourceMigration | null>;
+  list(tenantId: string, resourceUid: string, limit: number): Promise<readonly ResourceMigration[]>;
+  execute(tenantId: string, id: string): Promise<ResourceMigration>;
+  cutover(tenantId: string, id: string): Promise<ResourceMigration>;
+  rollback(tenantId: string, id: string): Promise<ResourceMigration>;
+  cancel(tenantId: string, id: string): Promise<ResourceMigration>;
+}
+
 export function createResourceMigrationService(options: {
   readonly store: ResourceMigrationStore;
   readonly deployments: ResourceDeploymentStore;
   readonly catalog: Catalog;
   readonly packs: readonly ProviderPack[];
   readonly resource: (tenantId: string, uid: string) => Promise<MigrationResourceView | null>;
-  readonly blockingAttachments: (tenantId: string, uid: string) => Promise<readonly string[]>;
+  readonly attachments: Pick<AttachmentService, "blocksDeletion" | "prepareMigrationRebindings">;
   readonly clock: Clock;
   readonly rollbackWindowMilliseconds?: number;
   readonly pollBudget?: number;
   readonly sleep?: (milliseconds: number) => Promise<void>;
-}) {
+}): ResourceMigrationService {
   const packs = new Map(options.packs.map((pack) => [pack.id, pack]));
   const rollbackWindow = options.rollbackWindowMilliseconds ?? 24 * 60 * 60 * 1_000;
   const pollBudget = options.pollBudget ?? 10;
@@ -149,10 +168,26 @@ export function createResourceMigrationService(options: {
     return ticket.result;
   };
 
+  const settleDeletion = async (
+    provisioner: ReturnType<ProviderPack["provisionerForOffering"]>,
+    operationId: string,
+    first: ProviderTicket,
+  ): Promise<void> => {
+    let ticket = first;
+    for (let attempt = 0; ticket.phase === "running" && attempt < pollBudget; attempt += 1) {
+      if (!provisioner.poll) break;
+      await sleep(ticket.pollAfterMs);
+      ticket = await provisioner.poll({ operationId, handle: ticket.handle });
+    }
+    if (ticket.phase === "failed" && ticket.failure.code === "not_found") return;
+    if (ticket.phase !== "succeeded") throw new ResourceMigrationError("backend_unavailable");
+  };
+
   return {
     async plan(input: PlanResourceMigration): Promise<ResourceMigration> {
       validIdentifier(input.id);
       validIdentifier(input.commercialAuthorizationRef);
+      validIdentifier(input.commercialTenantRef);
       const [resource, source, target] = await Promise.all([
         options.resource(input.tenantId, input.resourceUid),
         options.deployments.active(input.tenantId, input.resourceUid),
@@ -175,6 +210,7 @@ export function createResourceMigrationService(options: {
         targetProviderPackRef: target.providerPackRef,
         targetProviderInstallationRef: target.providerInstallationRef,
         state: "planned",
+        attachmentRebindings: [],
         createdAt: now,
         updatedAt: now,
       };
@@ -186,8 +222,26 @@ export function createResourceMigrationService(options: {
       return structuredClone(migration);
     },
 
+    async read(tenantId, id): Promise<ResourceMigration | null> {
+      return await options.store.read(tenantId, id);
+    },
+
+    async list(tenantId, resourceUid, limit): Promise<readonly ResourceMigration[]> {
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+        throw new ResourceMigrationError("migration_conflict");
+      }
+      return await options.store.list(tenantId, resourceUid, limit);
+    },
+
     async execute(tenantId: string, id: string): Promise<ResourceMigration> {
       const migration = await options.store.claim(tenantId, id);
+      if (
+        migration?.state === "verified" ||
+        migration?.state === "completed" ||
+        migration?.state === "rolled_back"
+      ) {
+        return migration;
+      }
       if (
         !migration ||
         (migration.state !== "provisioning" && migration.state !== "transferring")
@@ -286,13 +340,39 @@ export function createResourceMigrationService(options: {
 
     async cutover(tenantId: string, id: string): Promise<ResourceMigration> {
       const migration = await options.store.read(tenantId, id);
+      if (migration?.state === "completed") return migration;
       if (!migration || migration.state !== "verified") {
         throw new ResourceMigrationError("migration_conflict");
       }
-      if ((await options.blockingAttachments(tenantId, migration.resourceUid)).length > 0) {
+      const [source, target] = await Promise.all([
+        options.deployments.find(tenantId, migration.sourceDeploymentId),
+        options.deployments.find(tenantId, migration.targetDeploymentId),
+      ]);
+      if (source?.state !== "active" || target?.state !== "candidate") {
+        throw new ResourceMigrationError("migration_conflict");
+      }
+      let rebindings: readonly AttachmentRebinding[];
+      try {
+        rebindings = await options.attachments.prepareMigrationRebindings({
+          tenantId,
+          resourceUid: migration.resourceUid,
+          sourceDeployment: source,
+          targetDeployment: target,
+          operationId: `migration:${migration.id}:cutover`,
+        });
+      } catch {
         throw new ResourceMigrationError("attachment_rebind_required");
       }
-      if (!(await options.store.cutover(migration))) {
+      const blocking = await options.attachments.blocksDeletion(tenantId, migration.resourceUid);
+      if (
+        !sameIds(
+          blocking,
+          rebindings.map((item) => item.id),
+        )
+      ) {
+        throw new ResourceMigrationError("attachment_rebind_required");
+      }
+      if (!(await options.store.cutover(migration, rebindings))) {
         throw new ResourceMigrationError("migration_conflict");
       }
       const completed = await options.store.read(tenantId, id);
@@ -302,6 +382,7 @@ export function createResourceMigrationService(options: {
 
     async rollback(tenantId: string, id: string): Promise<ResourceMigration> {
       const migration = await options.store.read(tenantId, id);
+      if (migration?.state === "rolled_back") return migration;
       if (!migration || migration.state !== "completed") {
         throw new ResourceMigrationError("migration_conflict");
       }
@@ -311,7 +392,13 @@ export function createResourceMigrationService(options: {
       ) {
         throw new ResourceMigrationError("rollback_expired");
       }
-      if ((await options.blockingAttachments(tenantId, migration.resourceUid)).length > 0) {
+      const blocking = await options.attachments.blocksDeletion(tenantId, migration.resourceUid);
+      if (
+        !sameIds(
+          blocking,
+          migration.attachmentRebindings.map((item) => item.id),
+        )
+      ) {
         throw new ResourceMigrationError("attachment_rebind_required");
       }
       if (!(await options.store.rollback(migration))) {
@@ -320,6 +407,53 @@ export function createResourceMigrationService(options: {
       const rolledBack = await options.store.read(tenantId, id);
       if (!rolledBack) throw new ResourceMigrationError("migration_conflict");
       return rolledBack;
+    },
+
+    async cancel(tenantId: string, id: string): Promise<ResourceMigration> {
+      const migration = await options.store.read(tenantId, id);
+      if (migration?.state === "failed") return migration;
+      if (!migration || migration.state === "completed" || migration.state === "rolled_back") {
+        throw new ResourceMigrationError("migration_conflict");
+      }
+      const target = await options.deployments.find(tenantId, migration.targetDeploymentId);
+      if (!target) {
+        // Once provider execution has begun, an absent Deployment row is an
+        // acknowledgement gap. Never release its commercial hold or claim the
+        // candidate was removed without an authoritative provider receipt.
+        if (migration.state !== "planned") {
+          throw new ResourceMigrationError("backend_unavailable");
+        }
+      } else if (target.state === "candidate") {
+        const resource = await options.resource(tenantId, migration.resourceUid);
+        if (!resource) throw new ResourceMigrationError("resource_not_found");
+        const targetOffering = exactOffering(options.catalog, migration);
+        const provisioner = pack(migration.targetProviderPackRef).provisionerForOffering(
+          targetOffering.id,
+        );
+        const providerOffering = provisioner.offerings.find(
+          (offering) => offering.id === targetOffering.id,
+        );
+        if (!providerOffering) throw new ResourceMigrationError("offering_invalid");
+        const operationId = `${migration.id}:cancel-target`;
+        await settleDeletion(
+          provisioner,
+          operationId,
+          await provisioner.delete({
+            operationId,
+            offering: providerOffering,
+            nativeId: target.nativeId,
+            identity: { tenantRef: tenantId, space: resource.space, name: resource.name },
+          }),
+        );
+      } else if (target.state !== "deleted") {
+        throw new ResourceMigrationError("migration_conflict");
+      }
+      if (!(await options.store.abandon(migration, target))) {
+        throw new ResourceMigrationError("migration_conflict");
+      }
+      const cancelled = await options.store.read(tenantId, id);
+      if (!cancelled) throw new ResourceMigrationError("migration_conflict");
+      return cancelled;
     },
   };
 }
@@ -333,9 +467,9 @@ export function createResourceMigrationStore(sql: Sql, clock: Clock): ResourceMi
         `INSERT INTO tf_resource_migrations
            (tenant_id, id, resource_uid, source_deployment_id, target_deployment_id,
             target_offering_id, target_provider_pack_ref, target_provider_installation_ref,
-            commercial_authorization_ref, mode, transfer_format, state,
+            commercial_authorization_ref, commercial_tenant_ref, mode, transfer_format, state,
             verification_json, rollback_until, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
         [
           input.tenantId,
           input.id,
@@ -346,6 +480,7 @@ export function createResourceMigrationStore(sql: Sql, clock: Clock): ResourceMi
           input.targetProviderPackRef,
           input.targetProviderInstallationRef,
           input.commercialAuthorizationRef,
+          input.commercialTenantRef ?? null,
           input.mode,
           input.transferFormat,
           input.state,
@@ -363,6 +498,16 @@ export function createResourceMigrationStore(sql: Sql, clock: Clock): ResourceMi
       );
       if (rows.length > 1) throw new Error("resource_migration_ambiguous");
       return rows[0] ? migration(rows[0]) : null;
+    },
+
+    async list(tenantId, resourceUid, limit) {
+      const rows = await sql.query(
+        `SELECT * FROM tf_resource_migrations
+         WHERE tenant_id = ? AND resource_uid = ?
+         ORDER BY created_at DESC, id DESC LIMIT ?`,
+        [tenantId, resourceUid, limit],
+      );
+      return rows.map(migration);
     },
 
     async claim(tenantId, id) {
@@ -393,8 +538,25 @@ export function createResourceMigrationStore(sql: Sql, clock: Clock): ResourceMi
       return result.changes === 1;
     },
 
-    async cutover(input) {
+    async cutover(input, rebindings) {
       const timestamp = now();
+      const oldAttachmentGuards = rebindings.flatMap((item) => [
+        {
+          sql: ` AND EXISTS (
+                   SELECT 1 FROM tf_resource_attachments
+                   WHERE tenant_id = ? AND id = ? AND state = 'active'
+                     AND provider_deployment_id = ? AND consumer_deployment_id = ?
+                     AND resolution_json = ?
+                 )`,
+          params: [
+            input.tenantId,
+            item.id,
+            item.oldProviderDeploymentId,
+            item.oldConsumerDeploymentId,
+            JSON.stringify(item.oldResolution),
+          ],
+        },
+      ]);
       const results = await sql.batch([
         {
           sql: `UPDATE tf_resource_deployments
@@ -407,7 +569,7 @@ export function createResourceMigrationStore(sql: Sql, clock: Clock): ResourceMi
                   AND EXISTS (
                     SELECT 1 FROM tf_resource_deployments
                     WHERE tenant_id = ? AND resource_uid = ? AND id = ? AND state = 'candidate'
-                  )`,
+                  )${oldAttachmentGuards.map((guard) => guard.sql).join("")}`,
           params: [
             timestamp,
             input.tenantId,
@@ -418,6 +580,7 @@ export function createResourceMigrationStore(sql: Sql, clock: Clock): ResourceMi
             input.tenantId,
             input.resourceUid,
             input.targetDeploymentId,
+            ...oldAttachmentGuards.flatMap((guard) => guard.params),
           ],
         },
         {
@@ -444,8 +607,28 @@ export function createResourceMigrationStore(sql: Sql, clock: Clock): ResourceMi
             input.sourceDeploymentId,
           ],
         },
+        ...rebindings.map((item) => ({
+          sql: `UPDATE tf_resource_attachments
+                SET provider_deployment_id = ?, consumer_deployment_id = ?,
+                    resolution_json = ?, updated_at = ?
+                WHERE tenant_id = ? AND id = ? AND state = 'active'
+                  AND provider_deployment_id = ? AND consumer_deployment_id = ?
+                  AND resolution_json = ?`,
+          params: [
+            item.newProviderDeploymentId,
+            item.newConsumerDeploymentId,
+            JSON.stringify(item.newResolution),
+            timestamp,
+            input.tenantId,
+            item.id,
+            item.oldProviderDeploymentId,
+            item.oldConsumerDeploymentId,
+            JSON.stringify(item.oldResolution),
+          ],
+        })),
         {
-          sql: `UPDATE tf_resource_migrations SET state = 'completed', updated_at = ?
+          sql: `UPDATE tf_resource_migrations
+                SET state = 'completed', attachment_rebindings_json = ?, updated_at = ?
                 WHERE tenant_id = ? AND id = ? AND state = 'verified'
                   AND EXISTS (
                     SELECT 1 FROM tf_resource_deployments
@@ -456,6 +639,7 @@ export function createResourceMigrationStore(sql: Sql, clock: Clock): ResourceMi
                     WHERE tenant_id = ? AND id = ? AND state = 'active'
                   )`,
           params: [
+            JSON.stringify(rebindings),
             timestamp,
             input.tenantId,
             input.id,
@@ -466,11 +650,26 @@ export function createResourceMigrationStore(sql: Sql, clock: Clock): ResourceMi
           ],
         },
       ]);
-      return results[0]?.changes === 1 && results[1]?.changes === 1 && results[2]?.changes === 1;
+      return results.every((result) => result.changes === 1);
     },
 
     async rollback(input) {
       const timestamp = now();
+      const newAttachmentGuards = input.attachmentRebindings.map((item) => ({
+        sql: ` AND EXISTS (
+                 SELECT 1 FROM tf_resource_attachments
+                 WHERE tenant_id = ? AND id = ? AND state = 'active'
+                   AND provider_deployment_id = ? AND consumer_deployment_id = ?
+                   AND resolution_json = ?
+               )`,
+        params: [
+          input.tenantId,
+          item.id,
+          item.newProviderDeploymentId,
+          item.newConsumerDeploymentId,
+          JSON.stringify(item.newResolution),
+        ],
+      }));
       const results = await sql.batch([
         {
           sql: `UPDATE tf_resource_deployments
@@ -484,7 +683,7 @@ export function createResourceMigrationStore(sql: Sql, clock: Clock): ResourceMi
                   AND EXISTS (
                     SELECT 1 FROM tf_resource_deployments
                     WHERE tenant_id = ? AND resource_uid = ? AND id = ? AND state = 'retained'
-                  )`,
+                  )${newAttachmentGuards.map((guard) => guard.sql).join("")}`,
           params: [
             timestamp,
             input.tenantId,
@@ -496,6 +695,7 @@ export function createResourceMigrationStore(sql: Sql, clock: Clock): ResourceMi
             input.tenantId,
             input.resourceUid,
             input.sourceDeploymentId,
+            ...newAttachmentGuards.flatMap((guard) => guard.params),
           ],
         },
         {
@@ -524,6 +724,25 @@ export function createResourceMigrationStore(sql: Sql, clock: Clock): ResourceMi
             input.targetDeploymentId,
           ],
         },
+        ...input.attachmentRebindings.map((item) => ({
+          sql: `UPDATE tf_resource_attachments
+                SET provider_deployment_id = ?, consumer_deployment_id = ?,
+                    resolution_json = ?, updated_at = ?
+                WHERE tenant_id = ? AND id = ? AND state = 'active'
+                  AND provider_deployment_id = ? AND consumer_deployment_id = ?
+                  AND resolution_json = ?`,
+          params: [
+            item.oldProviderDeploymentId,
+            item.oldConsumerDeploymentId,
+            JSON.stringify(item.oldResolution),
+            timestamp,
+            input.tenantId,
+            item.id,
+            item.newProviderDeploymentId,
+            item.newConsumerDeploymentId,
+            JSON.stringify(item.newResolution),
+          ],
+        })),
         {
           sql: `UPDATE tf_resource_migrations SET state = 'rolled_back', updated_at = ?
                 WHERE tenant_id = ? AND id = ? AND state = 'completed'
@@ -546,7 +765,79 @@ export function createResourceMigrationStore(sql: Sql, clock: Clock): ResourceMi
           ],
         },
       ]);
-      return results[0]?.changes === 1 && results[1]?.changes === 1 && results[2]?.changes === 1;
+      return results.every((result) => result.changes === 1);
+    },
+
+    async abandon(input, target) {
+      const timestamp = now();
+      const openStates = "'planned', 'provisioning', 'transferring', 'verified'";
+      if (!target) {
+        const result = await sql.run(
+          `UPDATE tf_resource_migrations SET state = 'failed', updated_at = ?
+           WHERE tenant_id = ? AND id = ? AND state = 'planned'
+             AND NOT EXISTS (
+               SELECT 1 FROM tf_resource_deployments
+               WHERE tenant_id = ? AND id = ?
+             )`,
+          [timestamp, input.tenantId, input.id, input.tenantId, input.targetDeploymentId],
+        );
+        return result.changes === 1;
+      }
+      if (target.state === "deleted") {
+        const result = await sql.run(
+          `UPDATE tf_resource_migrations SET state = 'failed', updated_at = ?
+           WHERE tenant_id = ? AND id = ? AND state IN (${openStates})
+             AND EXISTS (
+               SELECT 1 FROM tf_resource_deployments
+               WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'deleted'
+             )`,
+          [
+            timestamp,
+            input.tenantId,
+            input.id,
+            input.tenantId,
+            input.targetDeploymentId,
+            target.nativeId,
+          ],
+        );
+        return result.changes === 1;
+      }
+      if (target.state !== "candidate") return false;
+      const results = await sql.batch([
+        {
+          sql: `UPDATE tf_resource_deployments SET state = 'deleted', updated_at = ?
+                WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'candidate'
+                  AND EXISTS (
+                    SELECT 1 FROM tf_resource_migrations
+                    WHERE tenant_id = ? AND id = ? AND state IN (${openStates})
+                  )`,
+          params: [
+            timestamp,
+            input.tenantId,
+            input.targetDeploymentId,
+            target.nativeId,
+            input.tenantId,
+            input.id,
+          ],
+        },
+        {
+          sql: `UPDATE tf_resource_migrations SET state = 'failed', updated_at = ?
+                WHERE tenant_id = ? AND id = ? AND state IN (${openStates})
+                  AND EXISTS (
+                    SELECT 1 FROM tf_resource_deployments
+                    WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'deleted'
+                  )`,
+          params: [
+            timestamp,
+            input.tenantId,
+            input.id,
+            input.tenantId,
+            input.targetDeploymentId,
+            target.nativeId,
+          ],
+        },
+      ]);
+      return results.length === 2 && results.every((result) => result.changes === 1);
     },
   };
 }
@@ -578,6 +869,13 @@ function validIdentifier(value: string): void {
   }
 }
 
+function sameIds(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false;
+  const sortedLeft = [...left].sort();
+  const sortedRight = [...right].sort();
+  return sortedLeft.every((value, index) => value === sortedRight[index]);
+}
+
 function hasControlCharacter(value: string): boolean {
   return [...value].some((character) => {
     const code = character.codePointAt(0);
@@ -588,6 +886,8 @@ function hasControlCharacter(value: string): boolean {
 function migration(row: Row): ResourceMigration {
   const verification = row.verification_json;
   const rollbackUntil = row.rollback_until;
+  const attachmentRebindings = row.attachment_rebindings_json;
+  const commercialTenantRef = row.commercial_tenant_ref;
   return {
     tenantId: text(row.tenant_id),
     id: text(row.id),
@@ -598,11 +898,16 @@ function migration(row: Row): ResourceMigration {
     targetProviderPackRef: text(row.target_provider_pack_ref),
     targetProviderInstallationRef: text(row.target_provider_installation_ref),
     commercialAuthorizationRef: text(row.commercial_authorization_ref),
+    ...(typeof commercialTenantRef === "string" ? { commercialTenantRef } : {}),
     mode: mode(row.mode),
     transferFormat: text(row.transfer_format),
     state: state(row.state),
+    attachmentRebindings:
+      typeof attachmentRebindings === "string"
+        ? persistedAttachmentRebindings(attachmentRebindings)
+        : [],
     ...(typeof verification === "string"
-      ? { verification: JSON.parse(verification) as MigrationVerification }
+      ? { verification: persistedVerification(verification) }
       : {}),
     ...(typeof rollbackUntil === "number"
       ? { rollbackUntil: new Date(rollbackUntil).toISOString() }
@@ -610,6 +915,118 @@ function migration(row: Row): ResourceMigration {
     createdAt: new Date(integer(row.created_at)).toISOString(),
     updatedAt: new Date(integer(row.updated_at)).toISOString(),
   };
+}
+
+function persistedVerification(value: string): MigrationVerification {
+  const parsed = parsedObject(value);
+  exactPersistedKeys(parsed, ["schema", "rowCounts", "checksums", "evidenceDigest"]);
+  if (
+    typeof parsed.schema !== "boolean" ||
+    typeof parsed.rowCounts !== "boolean" ||
+    typeof parsed.checksums !== "boolean" ||
+    typeof parsed.evidenceDigest !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/u.test(parsed.evidenceDigest)
+  ) {
+    invalidPersistedMigration();
+  }
+  return {
+    schema: parsed.schema as boolean,
+    rowCounts: parsed.rowCounts as boolean,
+    checksums: parsed.checksums as boolean,
+    evidenceDigest: parsed.evidenceDigest as `sha256:${string}`,
+  };
+}
+
+function persistedAttachmentRebindings(value: string): readonly AttachmentRebinding[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    invalidPersistedMigration();
+  }
+  if (!Array.isArray(parsed) || parsed.length > 100) invalidPersistedMigration();
+  const seen = new Set<string>();
+  return parsed.map((candidate) => {
+    const item = persistedObject(candidate);
+    exactPersistedKeys(item, [
+      "id",
+      "oldProviderDeploymentId",
+      "oldConsumerDeploymentId",
+      "oldResolution",
+      "newProviderDeploymentId",
+      "newConsumerDeploymentId",
+      "newResolution",
+    ]);
+    const id = persistedReference(item.id, 3, 128);
+    if (seen.has(id)) invalidPersistedMigration();
+    seen.add(id);
+    return {
+      id,
+      oldProviderDeploymentId: persistedReference(item.oldProviderDeploymentId, 3, 128),
+      oldConsumerDeploymentId: persistedReference(item.oldConsumerDeploymentId, 3, 128),
+      oldResolution: persistedResolution(item.oldResolution),
+      newProviderDeploymentId: persistedReference(item.newProviderDeploymentId, 3, 128),
+      newConsumerDeploymentId: persistedReference(item.newConsumerDeploymentId, 3, 128),
+      newResolution: persistedResolution(item.newResolution),
+    };
+  });
+}
+
+function persistedResolution(value: unknown): AttachmentRebinding["oldResolution"] {
+  const parsed = persistedObject(value);
+  exactPersistedKeys(parsed, ["kind", "ref"]);
+  if (
+    parsed.kind !== "credential-grant-ref" &&
+    parsed.kind !== "secret-ref" &&
+    parsed.kind !== "endpoint-ref" &&
+    parsed.kind !== "native-binding-ref"
+  ) {
+    invalidPersistedMigration();
+  }
+  return {
+    kind: parsed.kind as AttachmentRebinding["oldResolution"]["kind"],
+    ref: persistedReference(parsed.ref, 1, 512),
+  };
+}
+
+function parsedObject(value: string): Record<string, unknown> {
+  try {
+    return persistedObject(JSON.parse(value));
+  } catch (error) {
+    if (error instanceof Error && error.message === "resource_migration_row_invalid") throw error;
+    return invalidPersistedMigration();
+  }
+}
+
+function persistedObject(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return invalidPersistedMigration();
+  }
+  return value as Record<string, unknown>;
+}
+
+function exactPersistedKeys(value: Record<string, unknown>, expected: readonly string[]): void {
+  const actual = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  if (actual.length !== wanted.length || actual.some((key, index) => key !== wanted[index])) {
+    invalidPersistedMigration();
+  }
+}
+
+function persistedReference(value: unknown, minimum: number, maximum: number): string {
+  if (
+    typeof value !== "string" ||
+    value.length < minimum ||
+    value.length > maximum ||
+    hasControlCharacter(value)
+  ) {
+    return invalidPersistedMigration();
+  }
+  return value;
+}
+
+function invalidPersistedMigration(): never {
+  throw new Error("resource_migration_row_invalid");
 }
 
 function text(value: unknown): string {

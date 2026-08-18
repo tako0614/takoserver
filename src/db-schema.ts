@@ -46,5 +46,13 @@ export const MIGRATIONS: readonly Migration[] = [
   {
     "name": "0010_attachment_target_uniqueness.sql",
     "sql": "-- One consumer target resolves to one live provider Resource. Callers must\n-- remove the old Attachment before pointing the target somewhere else.\nCREATE UNIQUE INDEX tf_resource_attachments_live_consumer_target\n  ON tf_resource_attachments (tenant_id, consumer_resource_uid, target)\n  WHERE state <> 'deleted';\n"
+  },
+  {
+    "name": "0011_resource_migration_attachment_rebindings.sql",
+    "sql": "-- A completed Migration keeps the exact Attachment CAS projection needed to\n-- roll back within its reviewed window. It contains only opaque references.\nALTER TABLE tf_resource_migrations\n  ADD COLUMN attachment_rebindings_json TEXT\n  CHECK (\n    attachment_rebindings_json IS NULL OR\n    length(attachment_rebindings_json) BETWEEN 2 AND 262144\n  );\n"
+  },
+  {
+    "name": "0012_resource_migration_commercial_authority.sql",
+    "sql": "-- A migration's target Deployment consumes one exact commercial reservation.\n-- The downstream tenant reference is needed to re-read that authority without\n-- weakening the reseller tenant boundary.\nALTER TABLE tf_resource_migrations\n  ADD COLUMN commercial_tenant_ref TEXT\n  CHECK (\n    commercial_tenant_ref IS NULL OR\n    length(commercial_tenant_ref) BETWEEN 3 AND 128\n  );\n\nCREATE UNIQUE INDEX tf_resource_migrations_commercial_authority\n  ON tf_resource_migrations (tenant_id, commercial_authorization_ref);\n"
   }
 ];

@@ -15,6 +15,7 @@ import { OperatorAssertionError } from "./operator-credentials.ts";
 import type { Clock } from "./ports.ts";
 import { type Reseller, ResellerError } from "./reseller.ts";
 import type { ResourceDeploymentStore } from "./resource-deployments.ts";
+import { ResourceMigrationError, type ResourceMigrationService } from "./resource-migrations.ts";
 import {
   type S3Access,
   S3CredentialError,
@@ -77,6 +78,7 @@ export interface CreateControlRoutesOptions {
   readonly inventory: ResourceInventory;
   readonly deployments: Pick<ResourceDeploymentStore, "active">;
   readonly attachments: AttachmentService;
+  readonly migrations: ResourceMigrationService;
   /** Every Form definition this Host will accept. */
   readonly forms: readonly InstalledTakoformForm[];
   /** How a caller may sign in to this deployment. */
@@ -105,6 +107,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     inventory,
     deployments,
     attachments,
+    migrations,
     forms,
     identityProviders,
     ledger,
@@ -113,6 +116,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     tokens,
     settlement,
     s3,
+    clock,
   } = options;
 
   const owner = async (request: Request, organizationId: string): Promise<Actor> => {
@@ -143,6 +147,14 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
   const resellerActor = async (request: Request): Promise<Actor> => {
     const actor = await accounts.authenticate(authorization(request));
     if (!actor?.organizationId || !grants(actor.scopes, "reseller:write")) {
+      throw new AuthError("permission_denied");
+    }
+    return actor;
+  };
+
+  const migrationActor = async (request: Request, organizationId: string): Promise<Actor> => {
+    const actor = await scoped(request, organizationId, "resources:write");
+    if (actor.kind === "api_key" && !grants(actor.scopes, "reseller:write")) {
       throw new AuthError("permission_denied");
     }
     return actor;
@@ -504,6 +516,123 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       }
     }
 
+    const resourceMigrations =
+      /^\/v1\/organizations\/([^/]+)\/resources\/([^/]+)\/migrations$/u.exec(url.pathname);
+    if (resourceMigrations) {
+      const organizationId = segment(resourceMigrations[1]);
+      const resourceUid = segment(resourceMigrations[2]);
+      if (request.method === "GET") {
+        await scoped(request, organizationId, "resources:read");
+        return Response.json({
+          migrations: await migrations.list(organizationId, resourceUid, pageSize(url)),
+        });
+      }
+      if (request.method === "POST") {
+        await migrationActor(request, organizationId);
+        const body = await jsonObject(request);
+        exactKeys(body, [
+          "id",
+          "targetOfferingId",
+          "commercialTenantRef",
+          "reservationId",
+          "mode",
+          "transferFormat",
+        ]);
+        const targetOfferingId = text(body.targetOfferingId);
+        const commercialTenantRef = tenantRef(body.commercialTenantRef);
+        const reservationId = text(body.reservationId);
+        await requireMigrationReservation({
+          organizationId,
+          commercialTenantRef,
+          reservationId,
+          targetOfferingId,
+          allowCaptured: false,
+        });
+        const migration = await migrations.plan({
+          tenantId: organizationId,
+          id: text(body.id),
+          resourceUid,
+          targetOfferingId,
+          commercialTenantRef,
+          commercialAuthorizationRef: reservationId,
+          mode: enumValue(body.mode, ["offline", "online"]) as "offline" | "online",
+          transferFormat: text(body.transferFormat),
+        });
+        return Response.json({ migration }, { status: 201 });
+      }
+    }
+
+    const resourceMigration =
+      /^\/v1\/organizations\/([^/]+)\/resources\/([^/]+)\/migrations\/([^/]+)(?:\/(execute|cutover|rollback|cancel))?$/u.exec(
+        url.pathname,
+      );
+    if (resourceMigration) {
+      const organizationId = segment(resourceMigration[1]);
+      const resourceUid = segment(resourceMigration[2]);
+      const migrationId = segment(resourceMigration[3]);
+      const action = resourceMigration[4];
+      if (request.method === "GET" && action === undefined) {
+        await scoped(request, organizationId, "resources:read");
+        const migration = await migrations.read(organizationId, migrationId);
+        if (!migration || migration.resourceUid !== resourceUid) controlError("not_found", 404);
+        return Response.json({ migration });
+      }
+      if (request.method === "POST" && action !== undefined) {
+        await migrationActor(request, organizationId);
+        const held = await migrations.read(organizationId, migrationId);
+        if (!held || held.resourceUid !== resourceUid) controlError("not_found", 404);
+        if (action === "execute") {
+          return Response.json({
+            migration: await migrations.execute(organizationId, migrationId),
+          });
+        }
+        if (action === "cutover") {
+          if (!held.commercialTenantRef) controlError("migration_conflict", 409);
+          const reservation = await requireMigrationReservation({
+            organizationId,
+            commercialTenantRef: held.commercialTenantRef,
+            reservationId: held.commercialAuthorizationRef,
+            targetOfferingId: held.targetOfferingId,
+            allowCaptured: true,
+          });
+          const migration = await migrations.cutover(organizationId, migrationId);
+          const statement = await reseller.capture({
+            organizationId,
+            tenantRef: held.commercialTenantRef,
+            reservationId: held.commercialAuthorizationRef,
+            usage: { quantity: reservation.quantity },
+          });
+          return Response.json({ migration, statement });
+        }
+        if (action === "cancel") {
+          if (!held.commercialTenantRef) controlError("migration_conflict", 409);
+          const heldReservation = await reseller.reservation({
+            organizationId,
+            tenantRef: held.commercialTenantRef,
+            reservationId: held.commercialAuthorizationRef,
+          });
+          if (
+            heldReservation.offeringId !== held.targetOfferingId ||
+            heldReservation.quantity !== 1 ||
+            heldReservation.status === "captured"
+          ) {
+            controlError("migration_commercial_authority_invalid", 409);
+          }
+          const migration = await migrations.cancel(organizationId, migrationId);
+          const reservation =
+            heldReservation.status === "active"
+              ? await reseller.release({
+                  organizationId,
+                  tenantRef: held.commercialTenantRef,
+                  reservationId: held.commercialAuthorizationRef,
+                })
+              : heldReservation;
+          return Response.json({ migration, reservation });
+        }
+        return Response.json({ migration: await migrations.rollback(organizationId, migrationId) });
+      }
+    }
+
     const s3Credentials =
       /^\/v1\/organizations\/([^/]+)\/resources\/([^/]+)\/s3-credentials$/u.exec(url.pathname);
     if (request.method === "POST" && s3Credentials) {
@@ -584,6 +713,34 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     }
 
     return controlError("not_found", 404);
+  }
+
+  async function requireMigrationReservation(input: {
+    readonly organizationId: string;
+    readonly commercialTenantRef: string;
+    readonly reservationId: string;
+    readonly targetOfferingId: string;
+    readonly allowCaptured: boolean;
+  }) {
+    const reservation = await reseller.reservation({
+      organizationId: input.organizationId,
+      tenantRef: input.commercialTenantRef,
+      reservationId: input.reservationId,
+    });
+    if (
+      reservation.offeringId !== input.targetOfferingId ||
+      reservation.quantity !== 1 ||
+      (reservation.status !== "active" &&
+        !(input.allowCaptured && reservation.status === "captured")) ||
+      (reservation.status === "active" && Date.parse(reservation.expiresAt) <= clock().getTime())
+    ) {
+      controlError("migration_commercial_authority_invalid", 409);
+    }
+    const offering = catalog.findOffering(input.targetOfferingId);
+    if (!offering || (await catalog.digest(offering)) !== reservation.offeringDigest) {
+      controlError("migration_commercial_authority_invalid", 409);
+    }
+    return reservation;
   }
 }
 
@@ -685,6 +842,17 @@ function classify(error: unknown): { code: string; status: number } {
         : error.code === "attachment_unsupported"
           ? 422
           : 409;
+    return { code: error.code, status };
+  }
+  if (error instanceof ResourceMigrationError) {
+    const status =
+      error.code === "resource_not_found"
+        ? 404
+        : error.code === "backend_unavailable"
+          ? 503
+          : error.code === "transfer_unsupported"
+            ? 422
+            : 409;
     return { code: error.code, status };
   }
   // A credential the verifier refused is the caller's problem to fix, and it

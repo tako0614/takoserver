@@ -194,6 +194,74 @@
         }
       }
     },
+    "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations": {
+      "get": {
+        "summary": "List explicit provider migrations for one logical Resource",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      },
+      "post": {
+        "summary": "Plan a migration against an exact commercial reservation",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}": {
+      "get": {
+        "summary": "Read one Resource Migration",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/execute": {
+      "post": {
+        "summary": "Provision, transfer, and verify a candidate Deployment",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/cutover": {
+      "post": {
+        "summary": "Atomically activate the candidate and re-resolve Attachments",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/rollback": {
+      "post": {
+        "summary": "Restore the retained Deployment and Attachment resolutions",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/cancel": {
+      "post": {
+        "summary": "Delete an uncut candidate and release its commercial reservation",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
     "/v1/organizations/{organizationId}/attachments": {
       "get": {
         "summary": "List the organization's Resource Attachments",

@@ -16,6 +16,7 @@ export { type App, type AppPorts, buildApp, type TickReport } from "./app.ts";
 export {
   AttachmentError,
   type AttachmentFactory,
+  type AttachmentRebinding,
   type AttachmentResolution,
   type AttachmentResourceView,
   type AttachmentService,
@@ -124,6 +125,7 @@ export {
   type PlanResourceMigration,
   type ResourceMigration,
   ResourceMigrationError,
+  type ResourceMigrationService,
   type ResourceMigrationState,
   type ResourceMigrationStore,
 } from "./resource-migrations.ts";

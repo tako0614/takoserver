@@ -44,10 +44,22 @@ export interface AttachmentFactory {
     readonly consumerDeployment: ResourceDeployment;
   }): boolean;
   resolve(input: {
+    /** Stable across retries of one create, cutover, or rollback. */
+    readonly operationId: string;
     readonly attachment: NewResourceAttachment;
     readonly providerDeployment: ResourceDeployment;
     readonly consumerDeployment: ResourceDeployment;
   }): Promise<AttachmentResolution>;
+}
+
+export interface AttachmentRebinding {
+  readonly id: string;
+  readonly oldProviderDeploymentId: string;
+  readonly oldConsumerDeploymentId: string;
+  readonly oldResolution: AttachmentResolution;
+  readonly newProviderDeploymentId: string;
+  readonly newConsumerDeploymentId: string;
+  readonly newResolution: AttachmentResolution;
 }
 
 export interface AttachmentStore {
@@ -89,6 +101,13 @@ export interface AttachmentService {
     options: { readonly resourceUid?: string; readonly limit: number },
   ): Promise<readonly ResourceAttachment[]>;
   remove(tenantId: string, id: string): Promise<void>;
+  prepareMigrationRebindings(input: {
+    readonly tenantId: string;
+    readonly resourceUid: string;
+    readonly sourceDeployment: ResourceDeployment;
+    readonly targetDeployment: ResourceDeployment;
+    readonly operationId: string;
+  }): Promise<readonly AttachmentRebinding[]>;
 }
 
 export function createAttachmentService(options: {
@@ -98,6 +117,36 @@ export function createAttachmentService(options: {
   readonly clock: Clock;
   readonly resource: (tenantId: string, uid: string) => Promise<AttachmentResourceView | null>;
 }): AttachmentService {
+  const resolve = async (
+    attachment: NewResourceAttachment,
+    providerDeployment: ResourceDeployment,
+    consumerDeployment: ResourceDeployment,
+    operationId: string,
+  ): Promise<AttachmentResolution> => {
+    const matchingFactories = options.factories.filter(
+      (factory) =>
+        factory.providerPackRef === providerDeployment.providerPackRef &&
+        factory.supports({
+          interfaceRef: attachment.interfaceRef,
+          providerDeployment,
+          consumerDeployment,
+        }),
+    );
+    if (matchingFactories.length !== 1) {
+      throw new AttachmentError("attachment_unsupported");
+    }
+    const [factory] = matchingFactories;
+    if (!factory) throw new AttachmentError("attachment_unsupported");
+    return safeResolution(
+      await factory.resolve({
+        operationId,
+        attachment,
+        providerDeployment,
+        consumerDeployment,
+      }),
+    );
+  };
+
   return {
     async createAndResolve(input: NewResourceAttachment): Promise<ResourceAttachment> {
       validateAttachmentInput(input);
@@ -121,32 +170,19 @@ export function createAttachmentService(options: {
       if (!consumerDeployment || !providerDeployment) {
         throw new AttachmentError("deployment_not_ready");
       }
-      const matchingFactories = options.factories.filter(
-        (factory) =>
-          factory.providerPackRef === providerDeployment.providerPackRef &&
-          factory.supports({
-            interfaceRef: input.interfaceRef,
-            providerDeployment,
-            consumerDeployment,
-          }),
-      );
-      if (matchingFactories.length !== 1) {
-        throw new AttachmentError("attachment_unsupported");
-      }
-      const [factory] = matchingFactories;
-      if (!factory) throw new AttachmentError("attachment_unsupported");
-      const resolution = await factory.resolve({
-        attachment: input,
+      const resolution = await resolve(
+        input,
         providerDeployment,
         consumerDeployment,
-      });
+        `attachment:create:${input.id}`,
+      );
       const now = options.clock().toISOString();
       const attachment: ResourceAttachment = {
         ...structuredClone(input),
         state: "active",
         providerDeploymentId: providerDeployment.id,
         consumerDeploymentId: consumerDeployment.id,
-        resolution: safeResolution(resolution),
+        resolution,
         createdAt: now,
         updatedAt: now,
       };
@@ -180,6 +216,64 @@ export function createAttachmentService(options: {
       if (!(await options.store.remove(tenantId, id))) {
         throw new AttachmentError("resource_not_found");
       }
+    },
+
+    async prepareMigrationRebindings(input): Promise<readonly AttachmentRebinding[]> {
+      if (
+        input.sourceDeployment.resourceUid !== input.resourceUid ||
+        input.targetDeployment.resourceUid !== input.resourceUid
+      ) {
+        throw new AttachmentError("deployment_not_ready");
+      }
+      const held = await options.store.list(input.tenantId, {
+        resourceUid: input.resourceUid,
+        limit: 101,
+      });
+      if (held.length > 100) throw new AttachmentError("attachment_unsupported");
+      return await Promise.all(
+        held.map(async (attachment): Promise<AttachmentRebinding> => {
+          if (attachment.state !== "active") {
+            throw new AttachmentError("deployment_not_ready");
+          }
+          const providerMoves = attachment.providerResourceUid === input.resourceUid;
+          const consumerMoves = attachment.consumerResourceUid === input.resourceUid;
+          if (providerMoves === consumerMoves) {
+            throw new AttachmentError("attachment_unsupported");
+          }
+          const otherResourceUid = providerMoves
+            ? attachment.consumerResourceUid
+            : attachment.providerResourceUid;
+          const other = await options.deployments.active(input.tenantId, otherResourceUid);
+          if (!other) throw new AttachmentError("deployment_not_ready");
+          if (
+            (providerMoves &&
+              (attachment.providerDeploymentId !== input.sourceDeployment.id ||
+                attachment.consumerDeploymentId !== other.id)) ||
+            (consumerMoves &&
+              (attachment.consumerDeploymentId !== input.sourceDeployment.id ||
+                attachment.providerDeploymentId !== other.id))
+          ) {
+            throw new AttachmentError("deployment_not_ready");
+          }
+          const providerDeployment = providerMoves ? input.targetDeployment : other;
+          const consumerDeployment = consumerMoves ? input.targetDeployment : other;
+          const next = await resolve(
+            attachment,
+            providerDeployment,
+            consumerDeployment,
+            `${input.operationId}:${attachment.id}`,
+          );
+          return {
+            id: attachment.id,
+            oldProviderDeploymentId: attachment.providerDeploymentId,
+            oldConsumerDeploymentId: attachment.consumerDeploymentId,
+            oldResolution: attachment.resolution,
+            newProviderDeploymentId: providerDeployment.id,
+            newConsumerDeploymentId: consumerDeployment.id,
+            newResolution: next,
+          };
+        }),
+      );
     },
   };
 }

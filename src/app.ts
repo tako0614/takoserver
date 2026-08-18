@@ -17,6 +17,10 @@ import type { ProviderPack } from "./provider-pack.ts";
 import type { Provider } from "./provider-port.ts";
 import { createReseller } from "./reseller.ts";
 import { createResourceDeploymentStore } from "./resource-deployments.ts";
+import {
+  createResourceMigrationService,
+  createResourceMigrationStore,
+} from "./resource-migrations.ts";
 import { createRouter, type Router } from "./router.ts";
 import type { S3CredentialIssuer } from "./s3-port.ts";
 import type { TakoformArtifactTransport } from "./takoform/artifacts.ts";
@@ -122,6 +126,26 @@ export function buildApp(ports: AppPorts): App {
       return installed ? { uid, providedInterfaces: installed.providedInterfaces ?? [] } : null;
     },
   });
+  const migrations = createResourceMigrationService({
+    store: createResourceMigrationStore(ports.sql, clock),
+    deployments,
+    catalog,
+    packs: ports.providerPacks ?? [],
+    resource: async (tenantId, uid) => {
+      const listing = await inventory.resourceByUid(tenantId, uid);
+      return listing
+        ? {
+            uid,
+            form: listing.resource.form.formRef,
+            space: listing.space,
+            name: listing.name,
+            spec: listing.resource.spec,
+          }
+        : null;
+    },
+    attachments,
+    clock,
+  });
   const reseller = createReseller({ sql: ports.sql, ledger, catalog, clock, randomId });
   const tokens = createTokenService({
     sql: ports.sql,
@@ -187,6 +211,7 @@ export function buildApp(ports: AppPorts): App {
     inventory,
     deployments,
     attachments,
+    migrations,
     forms: ports.forms,
     identityProviders: ports.identityProviders ?? [],
     ...(ports.checkout ? { checkout: ports.checkout } : {}),

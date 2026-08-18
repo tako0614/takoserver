@@ -229,4 +229,56 @@ describe("Resource Attachments", () => {
       }),
     ).rejects.toMatchObject({ code: "attachment_unsupported" });
   });
+
+  test("prepares an exact Attachment rebind from the active to candidate Deployment", async () => {
+    const { service, deployments } = fixture();
+    await activeDeployments(deployments);
+    await service.createAndResolve({
+      tenantId: "org_1",
+      id: "att_api_main_db",
+      consumerResourceUid: "uid_api",
+      providerResourceUid: "uid_db",
+      interfaceRef: POSTGRES,
+      target: "DATABASE_URL",
+      permissions: ["query"],
+    });
+    await deployments.create({
+      tenantId: "org_1",
+      id: "dep_db_candidate",
+      resourceUid: "uid_db",
+      offeringId: "database.postgresql.other.standard",
+      providerPackRef: "aiven",
+      providerInstallationRef: "aiven.secondary",
+      nativeId: "service:pg-candidate",
+      state: "candidate",
+      observed: {},
+      outputs: {},
+    });
+    const source = await deployments.find("org_1", "dep_db");
+    const target = await deployments.find("org_1", "dep_db_candidate");
+    if (!source || !target) throw new Error("deployment fixture missing");
+
+    expect(
+      await service.prepareMigrationRebindings({
+        tenantId: "org_1",
+        resourceUid: "uid_db",
+        sourceDeployment: source,
+        targetDeployment: target,
+        operationId: "migration:mig_main:cutover",
+      }),
+    ).toEqual([
+      {
+        id: "att_api_main_db",
+        oldProviderDeploymentId: "dep_db",
+        oldConsumerDeploymentId: "dep_api",
+        oldResolution: { kind: "credential-grant-ref", ref: "grant:att_api_main_db:dep_db" },
+        newProviderDeploymentId: "dep_db_candidate",
+        newConsumerDeploymentId: "dep_api",
+        newResolution: {
+          kind: "credential-grant-ref",
+          ref: "grant:att_api_main_db:dep_db_candidate",
+        },
+      },
+    ]);
+  });
 });
