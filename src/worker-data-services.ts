@@ -1,12 +1,15 @@
 import type { AiGateway } from "./ai-port.ts";
-import { createCloudflareAiGateway } from "./providers/cloudflare-ai.ts";
 import { createCloudflareS3CredentialIssuer } from "./providers/cloudflare-s3.ts";
+import {
+  type CloudflareWorkersAiBinding,
+  createCloudflareWorkersAiGateway,
+} from "./providers/cloudflare-workers-ai.ts";
 import { parseOpenAiModelConfig } from "./providers/openai.ts";
 import type { S3CredentialIssuer } from "./s3-port.ts";
 
 export interface WorkerDataServiceEnv {
+  readonly AI?: CloudflareWorkersAiBinding;
   readonly CLOUDFLARE_ACCOUNT_ID?: string;
-  readonly CLOUDFLARE_API_TOKEN?: string;
   readonly TAKOSERVER_AI_MODELS?: string;
   readonly TAKOSERVER_R2_PARENT_ACCESS_KEY_ID?: string;
   readonly TAKOSERVER_R2_PARENT_TOKEN?: string;
@@ -30,21 +33,22 @@ export function createWorkerDataServices(env: WorkerDataServiceEnv): WorkerDataS
     env.TAKOSERVER_R2_PARENT_TOKEN !== undefined;
 
   if (!aiConfigured && !s3Configured) return {};
-  if (!env.CLOUDFLARE_ACCOUNT_ID) throw new TypeError("Cloudflare account is not configured");
 
   const ai = aiConfigured
     ? (() => {
-        if (!env.CLOUDFLARE_API_TOKEN) throw new TypeError("AI credential is not configured");
-        return createCloudflareAiGateway({
-          accountId: env.CLOUDFLARE_ACCOUNT_ID,
+        if (!env.AI) throw new TypeError("AI binding is not configured");
+        return createCloudflareWorkersAiGateway({
+          binding: env.AI,
           models: parseOpenAiModelConfig(env.TAKOSERVER_AI_MODELS as string),
-          authorize: () => `Bearer ${env.CLOUDFLARE_API_TOKEN}`,
         });
       })()
     : undefined;
 
   const s3 = s3Configured
     ? (() => {
+        if (!env.CLOUDFLARE_ACCOUNT_ID) {
+          throw new TypeError("Cloudflare account is not configured");
+        }
         if (!env.TAKOSERVER_R2_PARENT_ACCESS_KEY_ID || !env.TAKOSERVER_R2_PARENT_TOKEN) {
           throw new TypeError("S3 credential issuer is not fully configured");
         }

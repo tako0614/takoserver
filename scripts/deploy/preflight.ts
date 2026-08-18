@@ -256,11 +256,11 @@ async function assertRequiredSecretsPresent(
       name: "TAKOSERVER_SIGNING_KEY",
       why: "data tokens cannot be issued without the private signing key",
     },
-    ...(target.zones !== undefined || target.aiModels !== undefined
+    ...(target.zones !== undefined
       ? [
           {
             name: "CLOUDFLARE_API_TOKEN",
-            why: "Cloudflare provisioning or AI is enabled by this target",
+            why: "Cloudflare provisioning is enabled by this target",
           },
         ]
       : []),
