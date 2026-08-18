@@ -193,26 +193,42 @@ async function assertProbeDatabaseIdentity(
  *
  * Cloudflare refuses a custom domain on a hostname that already has DNS
  * records of its own, and it refuses it *after* the script has uploaded — so
- * the deploy ends with the code published, the routes half-applied, and
- * nothing rolled back. Asking first turns that into a refusal that touched
- * nothing.
+ * the deploy ends with the code published, the routes half applied, and
+ * wrangler saying in as many words that nothing was rolled back.
+ *
+ * What Cloudflare objects to is the record, not the answer: a hostname can
+ * resolve and serve nothing at all, and still be refused. So the question is
+ * whether anything resolves, and whether what resolves is already us — the
+ * second half matters because attaching succeeds and then this deployment's
+ * own record would look exactly like somebody else's.
  */
 async function assertAliasesAttachable(target: DeployTarget): Promise<void> {
   for (const alias of target.aliases ?? []) {
+    if (!(await resolves(alias))) continue;
     const answer = await fetch(`https://${alias}/.well-known/takoserver`, {
       redirect: "manual",
       signal: AbortSignal.timeout(10_000),
     }).catch(() => null);
-    // Already ours: attaching again is a no-op. Otherwise something answers
-    // there, and Cloudflare will refuse rather than take it from underneath.
     if (answer?.ok) continue;
-    if (answer !== null) {
-      throw preflightError(
-        `${alias} is already answering something else`,
-        "Cloudflare will not attach a Worker to a hostname that has its own DNS records, " +
-          "and it refuses after the script is uploaded — leaving the deploy half applied. " +
-          `Delete the DNS records for ${alias}, or drop it from \`aliases\`, then deploy again.`,
-      );
-    }
+    throw preflightError(
+      `${alias} already has DNS records of its own`,
+      "Cloudflare will not attach a Worker to such a hostname, and it refuses only after the " +
+        "script is uploaded — leaving the deploy half applied. Delete the records for " +
+        `${alias}, or drop it from \`aliases\`, then deploy again.`,
+    );
   }
+}
+
+/** Whether a hostname resolves at all, asked of a resolver rather than of us. */
+async function resolves(hostname: string): Promise<boolean> {
+  for (const type of ["A", "AAAA", "CNAME"]) {
+    const answer = await fetch(
+      `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(hostname)}&type=${type}`,
+      { headers: { accept: "application/dns-json" }, signal: AbortSignal.timeout(10_000) },
+    ).catch(() => null);
+    if (!answer?.ok) continue;
+    const body = (await answer.json().catch(() => null)) as { Answer?: unknown[] } | null;
+    if (Array.isArray(body?.Answer) && body.Answer.length > 0) return true;
+  }
+  return false;
 }
