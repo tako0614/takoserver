@@ -20,6 +20,7 @@ import { createD1HttpSql } from "./sql-d1-http.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import { createWorkerdRuntime } from "./workerd-runtime.ts";
+import { createWorkerdSupervisor, findWorkerd } from "./workerd-supervisor.ts";
 
 /**
  * The self-hosted entry, and the only one that can provision.
@@ -92,6 +93,12 @@ const sql = sharedDatabaseId
 // Bytes come from the same bucket the Worker writes to, for the same reason
 // the rows do: a bundle committed through the public API has to be there when
 // the provisioner goes to publish it.
+const workerd = createWorkerdSupervisor({
+  binary: process.env.TAKOSERVER_WORKERD_BINARY ?? findWorkerd(process.cwd()),
+  spawn: (command) => Bun.spawn(command as string[], { stdout: "inherit", stderr: "inherit" }),
+  log: (message) => process.stdout.write(`${message}\n`),
+});
+
 /** Everything this machine keeps lives under one directory. */
 const dataRoot = process.env.TAKOSERVER_DATA_ROOT ?? ".takoserver";
 const sharedBucket = process.env.TAKOSERVER_R2_BUCKET;
@@ -170,10 +177,11 @@ const providers = process.env.CLOUDFLARE_ACCOUNT_ID
             ? { port: Number(process.env.TAKOSERVER_WORKERD_PORT) }
             : {}),
           async onReload(configPath) {
-            // Told, not restarted: workerd watches the file, and bouncing the
-            // process would drop every in-flight request of every other tenant
-            // for one tenant's deploy.
-            process.stdout.write(`workerd configuration written to ${configPath}\n`);
+            // Started on the first publish rather than at boot, so a machine
+            // that never runs a Worker never runs a runtime for one. After
+            // that it watches the file itself: one tenant's deploy must not
+            // bounce every other tenant's in-flight requests.
+            await workerd.ensure(configPath);
           },
         }),
         artifacts: {
