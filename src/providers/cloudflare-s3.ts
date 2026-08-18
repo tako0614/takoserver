@@ -1,16 +1,11 @@
 import { S3CredentialError, type S3CredentialIssuer, type S3CredentialSet } from "../s3-port.ts";
 
-const CLOUDFLARE_API = "https://api.cloudflare.com/client/v4";
-const MAX_RESPONSE_BYTES = 64 * 1_024;
-
 export interface CloudflareS3CredentialOptions {
   readonly accountId: string;
   readonly providerInstallationRef: string;
   readonly parentAccessKeyId: string;
-  readonly authorize: () => string | Promise<string>;
+  readonly parentSecretAccessKey: string;
   readonly clock?: () => Date;
-  readonly apiOrigin?: string;
-  readonly fetch?: (request: Request) => Promise<Response>;
 }
 
 /** Cloudflare R2 Temporary Credentials behind Takoserver's standard S3 port. */
@@ -20,9 +15,10 @@ export function createCloudflareS3CredentialIssuer(
   const accountId = identifier(options.accountId, 128);
   const providerInstallationRef = identifier(options.providerInstallationRef, 255);
   const parentAccessKeyId = identifier(options.parentAccessKeyId, 512);
-  const origin = options.apiOrigin ?? CLOUDFLARE_API;
-  const fetchRequest = options.fetch ?? ((request: Request) => fetch(request));
+  const parentSecretAccessKey = parentSecret(options.parentSecretAccessKey);
   const clock = options.clock ?? (() => new Date());
+  const endpoint = `https://${accountId}.r2.cloudflarestorage.com`;
+  const audience = new URL(endpoint).host;
 
   return {
     async issue(input): Promise<S3CredentialSet> {
@@ -40,69 +36,80 @@ export function createCloudflareS3CredentialIssuer(
       ) {
         throw new S3CredentialError("upstream_invalid");
       }
-      const authorization = await options.authorize();
-      if (!authorization) throw new S3CredentialError("backend_unavailable");
-
-      let response: Response;
-      try {
-        response = await fetchRequest(
-          new Request(`${origin}/accounts/${accountId}/r2/temp-access-credentials`, {
-            method: "POST",
-            headers: { authorization, "content-type": "application/json" },
-            body: JSON.stringify({
-              bucket,
-              parentAccessKeyId,
-              permission: input.access === "read-write" ? "object-read-write" : "object-read-only",
-              ttlSeconds: input.ttlSeconds,
-            }),
-          }),
-        );
-      } catch {
-        throw new S3CredentialError("backend_unavailable");
-      }
-      if (!response.ok) {
-        await response.body?.cancel();
-        throw new S3CredentialError("backend_unavailable");
-      }
-      const bytes = new Uint8Array(await response.arrayBuffer());
-      if (bytes.byteLength === 0 || bytes.byteLength > MAX_RESPONSE_BYTES) {
-        throw new S3CredentialError("upstream_invalid");
-      }
-      const envelope = parseEnvelope(bytes);
       const now = clock();
-      const expiresAt = new Date(now.getTime() + (input.ttlSeconds - 5) * 1_000).toISOString();
+      const issuedAt = Math.floor(now.getTime() / 1_000);
+      if (!Number.isSafeInteger(issuedAt) || issuedAt < 0) {
+        throw new S3CredentialError("backend_unavailable");
+      }
+      const expiresAtEpochSeconds = issuedAt + input.ttlSeconds;
+      const scope = input.access === "read-write" ? "object-read-write" : "object-read-only";
+      const jwt = await signedJwt(
+        {
+          aud: audience,
+          bucket,
+          exp: expiresAtEpochSeconds,
+          iat: issuedAt,
+          iss: parentAccessKeyId,
+          scope,
+          sub: accountId,
+        },
+        parentSecretAccessKey,
+      );
+      const secretAccessKey = await sha256Hex(jwt);
       return {
-        endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
+        endpoint,
         region: "auto",
         bucket,
-        accessKeyId: envelope.accessKeyId,
-        secretAccessKey: envelope.secretAccessKey,
-        sessionToken: envelope.sessionToken,
-        expiresAt,
+        accessKeyId: parentAccessKeyId,
+        secretAccessKey,
+        sessionToken: btoa(`jwt/${jwt}`),
+        // Stop advertising the credential five seconds before R2 does. A
+        // caller that begins a request at our deadline must not lose the race
+        // to the signed token's exact expiration.
+        expiresAt: new Date((expiresAtEpochSeconds - 5) * 1_000).toISOString(),
       };
     },
   };
 }
 
-function parseEnvelope(bytes: Uint8Array): {
-  readonly accessKeyId: string;
-  readonly secretAccessKey: string;
-  readonly sessionToken: string;
-} {
-  let value: unknown;
+async function signedJwt(
+  claims: Readonly<Record<string, string | number>>,
+  secretAccessKey: string,
+): Promise<string> {
+  const encoder = new TextEncoder();
+  const header = base64Url(encoder.encode(JSON.stringify({ alg: "HS256", typ: "JWT" })));
+  const payload = base64Url(encoder.encode(JSON.stringify(claims)));
+  const input = `${header}.${payload}`;
   try {
-    value = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
+    const key = await crypto.subtle.importKey(
+      "raw",
+      encoder.encode(secretAccessKey),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+    const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(input));
+    return `${input}.${base64Url(new Uint8Array(signature))}`;
   } catch {
-    throw new S3CredentialError("upstream_invalid");
+    throw new S3CredentialError("backend_unavailable");
   }
-  if (!record(value) || value.success !== true || !record(value.result)) {
-    throw new S3CredentialError("upstream_invalid");
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  try {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+    return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join(
+      "",
+    );
+  } catch {
+    throw new S3CredentialError("backend_unavailable");
   }
-  return {
-    accessKeyId: secret(value.result.accessKeyId, 512),
-    secretAccessKey: secret(value.result.secretAccessKey, 4_096),
-    sessionToken: secret(value.result.sessionToken, 16_384),
-  };
+}
+
+function base64Url(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
 }
 
 function r2Bucket(nativeId: string): string {
@@ -122,13 +129,9 @@ function identifier(value: string, maximum: number): string {
   return value;
 }
 
-function secret(value: unknown, maximum: number): string {
-  if (typeof value !== "string" || value.length === 0 || value.length > maximum) {
+function parentSecret(value: unknown): string {
+  if (typeof value !== "string" || !/^[0-9a-f]{64}$/u.test(value)) {
     throw new S3CredentialError("upstream_invalid");
   }
   return value;
-}
-
-function record(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
