@@ -181,3 +181,22 @@ describe("provisioning across the road", () => {
     expect(ticket).toMatchObject({ phase: "failed", failure: { retryable: true } });
   });
 });
+
+/**
+ * A provider refuses a credential — ours. What the customer must not be told is
+ * that *they* lack permission: they would check their key, their scopes, and
+ * their account, and find nothing wrong, because nothing is.
+ */
+describe("failures as the caller sees them", () => {
+  test("never blames the caller for a credential of ours", async () => {
+    const { failureToWire } = await import("../src/provider-driver.ts");
+    expect(failureToWire("denied")).toEqual(["backend_unavailable", 503]);
+  });
+
+  test("still blames the caller for what the caller wrote", async () => {
+    const { failureToWire } = await import("../src/provider-driver.ts");
+    expect(failureToWire("invalid_spec")).toEqual(["invalid_argument", 400]);
+    expect(failureToWire("conflict")).toEqual(["resource_busy", 409]);
+    expect(failureToWire("not_found")).toEqual(["resource_not_found", 404]);
+  });
+});

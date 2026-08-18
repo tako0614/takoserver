@@ -217,7 +217,7 @@ function requiredNativeId(nativeId: string | undefined): string {
   return nativeId;
 }
 
-function failureToWire(code: string): [string, number] {
+export function failureToWire(code: string): [string, number] {
   switch (code) {
     case "invalid_spec":
       return ["invalid_argument", 400];
@@ -226,7 +226,12 @@ function failureToWire(code: string): [string, number] {
     case "not_found":
       return ["resource_not_found", 404];
     case "denied":
-      return ["permission_denied", 403];
+      // The credential a provider refused is *ours*, not the caller's. Told
+      // "permission denied", a customer checks their own key, their own
+      // scopes, and their own account, and finds nothing wrong — because
+      // nothing is. This is our misconfiguration or our outage, and it is
+      // retryable in the only sense that matters: it will work once we fix it.
+      return ["backend_unavailable", 503];
     case "quota":
       return ["quota_exceeded", 409];
     case "timeout":
