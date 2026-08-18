@@ -105,6 +105,7 @@ export async function preflight(
   const live = await inspectLive(configPath, target);
 
   assertMigrationLineage(live.appliedMigrations, migrations.files);
+  await assertAliasesAttachable(target);
   await assertProbeDatabaseIdentity(configPath, target);
 
   const { alreadyCurrent } = assertPublishedIdentity(
@@ -184,5 +185,34 @@ async function assertProbeDatabaseIdentity(
       "the D1 identity probe resolved a different database than the deploy target pins",
       `resolved uuid=${JSON.stringify(info.uuid)} name=${JSON.stringify(info.name)}`,
     );
+  }
+}
+
+/**
+ * An alias must be attachable before the publish begins.
+ *
+ * Cloudflare refuses a custom domain on a hostname that already has DNS
+ * records of its own, and it refuses it *after* the script has uploaded — so
+ * the deploy ends with the code published, the routes half-applied, and
+ * nothing rolled back. Asking first turns that into a refusal that touched
+ * nothing.
+ */
+async function assertAliasesAttachable(target: DeployTarget): Promise<void> {
+  for (const alias of target.aliases ?? []) {
+    const answer = await fetch(`https://${alias}/.well-known/takoserver`, {
+      redirect: "manual",
+      signal: AbortSignal.timeout(10_000),
+    }).catch(() => null);
+    // Already ours: attaching again is a no-op. Otherwise something answers
+    // there, and Cloudflare will refuse rather than take it from underneath.
+    if (answer?.ok) continue;
+    if (answer !== null) {
+      throw preflightError(
+        `${alias} is already answering something else`,
+        "Cloudflare will not attach a Worker to a hostname that has its own DNS records, " +
+          "and it refuses after the script is uploaded — leaving the deploy half applied. " +
+          `Delete the DNS records for ${alias}, or drop it from \`aliases\`, then deploy again.`,
+      );
+    }
   }
 }
