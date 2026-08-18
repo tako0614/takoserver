@@ -204,6 +204,16 @@
         }
       }
     },
+    "/v1/organizations/{organizationId}/resources/{resourceUid}/s3-credentials": {
+      "post": {
+        "summary": "Issue short-lived standard S3 credentials for an ObjectBucket",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
     "/data/v1/objects/{resourceUid}": {
       "get": {
         "summary": "List what a bucket holds",

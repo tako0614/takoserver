@@ -70,6 +70,14 @@ export {
   type UsageStatement,
 } from "./reseller.ts";
 export { createRouter, type Router } from "./router.ts";
+export {
+  type S3Access,
+  S3CredentialError,
+  type S3CredentialIssue,
+  type S3CredentialIssuer,
+  type S3CredentialSet,
+  validateS3CredentialSet,
+} from "./s3-port.ts";
 export { createD1Sql } from "./sql-d1.ts";
 export { createMemorySql, createSqliteSql } from "./sql-sqlite.ts";
 export { parseStrictJson, StrictJsonError } from "./strict-json.ts";

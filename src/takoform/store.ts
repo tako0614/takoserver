@@ -1,4 +1,4 @@
-import type { Clock, Sql } from "../ports.ts";
+import type { Clock, Row, Sql } from "../ports.ts";
 import { OPERATION_TTL_MILLISECONDS, REPLAY_TTL_MILLISECONDS, SWEEP_ROW_LIMIT } from "./limits.ts";
 import type { TakoformStoredResource } from "./types.ts";
 
@@ -133,6 +133,9 @@ export interface TakoformStore {
       readonly cursor?: string | undefined;
     },
   ): Promise<{ readonly resources: readonly ResourceListing[]; readonly cursor: string | null }>;
+
+  /** Exact resource lookup for a credential broker; a uid is not a list cursor. */
+  resourceByUid(tenantId: string, uid: string): Promise<ResourceListing | null>;
 
   /** The most recent settled operations for a tenant, newest first. */
   listOperations(tenantId: string, limit: number): Promise<readonly OperationListing[]>;
@@ -370,24 +373,29 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       const visible = rows.slice(0, page);
       const last = visible[visible.length - 1];
       return {
-        resources: visible.map((row) => ({
-          space: text(row.space),
-          apiVersion: text(row.api_version),
-          kind: text(row.kind),
-          name: text(row.name),
-          uid: text(row.uid),
-          generation: text(row.generation),
-          revision: text(row.revision),
-          nativeId:
-            row.native_id === null || row.native_id === undefined ? null : text(row.native_id),
-          updatedAt: new Date(Number(row.updated_at)).toISOString(),
-          resource: JSON.parse(text(row.resource_json)) as TakoformStoredResource,
-        })),
+        resources: visible.map(resourceListing),
         cursor:
           rows.length > page && last
             ? encodeCursor({ updatedAt: Number(last.updated_at), uid: text(last.uid) })
             : null,
       };
+    },
+
+    async resourceByUid(tenantId, uid) {
+      // LIMIT 2 is an integrity check: uid generation is expected to be unique,
+      // but old schemas did not enforce it. Ambiguity must never mint reach to
+      // one arbitrary backend resource.
+      const rows = await sql.query(
+        `SELECT space, api_version, kind, name, uid, generation, revision, native_id,
+                updated_at, resource_json
+         FROM tf_resources
+         WHERE tenant_id = ? AND uid = ?
+         LIMIT 2`,
+        [tenantId, uid],
+      );
+      if (rows.length === 0) return null;
+      if (rows.length !== 1) throw new Error("duplicate_resource_uid");
+      return resourceListing(rows[0] as Row);
     },
 
     async listOperations(tenantId, limit) {
@@ -453,6 +461,21 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
     async deleteReplay(key): Promise<void> {
       await sql.run("DELETE FROM tf_replays WHERE replay_key = ?", [key]);
     },
+  };
+}
+
+function resourceListing(row: Row): ResourceListing {
+  return {
+    space: text(row.space),
+    apiVersion: text(row.api_version),
+    kind: text(row.kind),
+    name: text(row.name),
+    uid: text(row.uid),
+    generation: text(row.generation),
+    revision: text(row.revision),
+    nativeId: row.native_id === null || row.native_id === undefined ? null : text(row.native_id),
+    updatedAt: new Date(Number(row.updated_at)).toISOString(),
+    resource: JSON.parse(text(row.resource_json)) as TakoformStoredResource,
   };
 }
 

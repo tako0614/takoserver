@@ -78,6 +78,7 @@ const PUBLIC_PATHS = [
   "/v1/organizations/{organizationId}/operations",
   "/v1/organizations/{organizationId}/resources",
   "/v1/organizations/{organizationId}/resources/{resourceUid}/data-tokens",
+  "/v1/organizations/{organizationId}/resources/{resourceUid}/s3-credentials",
   "/v1/organizations/{organizationId}/wallet",
   "/v1/organizations/{organizationId}/wallet/checkout",
   "/v1/organizations/{organizationId}/wallet/funding",

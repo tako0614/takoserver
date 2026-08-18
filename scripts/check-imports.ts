@@ -52,7 +52,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "core",
     match:
-      /^src\/(?:ports|json|strict-json|form-ref|provider-port|ai-port|db-schema|migrate-sqlite)\.ts$/u,
+      /^src\/(?:ports|json|strict-json|form-ref|provider-port|ai-port|s3-port|db-schema|migrate-sqlite)\.ts$/u,
     may: ["core"],
   },
   {

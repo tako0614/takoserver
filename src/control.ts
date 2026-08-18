@@ -13,8 +13,15 @@ import { type FundingSettlementVerifier, type Ledger, LedgerError } from "./ledg
 import { OperatorAssertionError } from "./operator-credentials.ts";
 import type { Clock } from "./ports.ts";
 import { type Reseller, ResellerError } from "./reseller.ts";
+import {
+  type S3Access,
+  S3CredentialError,
+  type S3CredentialIssuer,
+  validateS3CredentialSet,
+} from "./s3-port.ts";
 import { parseStrictJson, StrictJsonError } from "./strict-json.ts";
-import { formSupportProfile } from "./takoform/forms.ts";
+import { formSupportProfile, sameFormRef } from "./takoform/forms.ts";
+import { TAKOFORM_EDGE_OBJECTS_INTERFACE } from "./takoform/official-forms.ts";
 import type { OperationListing, ResourceListing } from "./takoform/store.ts";
 import type { InstalledTakoformForm } from "./takoform/types.ts";
 import { TokenError, type TokenService } from "./token.ts";
@@ -49,6 +56,7 @@ export interface ResourceInventory {
       readonly cursor?: string | undefined;
     },
   ): Promise<{ readonly resources: readonly ResourceListing[]; readonly cursor: string | null }>;
+  resourceByUid(tenantId: string, uid: string): Promise<ResourceListing | null>;
   listOperations(tenantId: string, limit: number): Promise<readonly OperationListing[]>;
 }
 
@@ -80,6 +88,8 @@ export interface CreateControlRoutesOptions {
    * would begin a checkout is simply not served.
    */
   readonly checkout?: Checkout | undefined;
+  /** Standard S3 credentials for already-provisioned ObjectBuckets. */
+  readonly s3?: S3CredentialIssuer | undefined;
   readonly clock: Clock;
 }
 
@@ -96,6 +106,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     reseller,
     tokens,
     settlement,
+    s3,
   } = options;
 
   const owner = async (request: Request, organizationId: string): Promise<Actor> => {
@@ -441,6 +452,71 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       return Response.json({ dataToken: issued }, { status: 201 });
     }
 
+    const s3Credentials =
+      /^\/v1\/organizations\/([^/]+)\/resources\/([^/]+)\/s3-credentials$/u.exec(url.pathname);
+    if (request.method === "POST" && s3Credentials) {
+      const organizationId = segment(s3Credentials[1]);
+      const resourceUid = segment(s3Credentials[2]);
+      const body = await jsonObject(request);
+      exactKeys(body, ["access"], ["expiresInSeconds"]);
+      const access = enumValue(body.access, ["read-only", "read-write"]) as S3Access;
+      await scoped(
+        request,
+        organizationId,
+        access === "read-write" ? "resources:write" : "resources:read",
+      );
+      if (!s3) controlError("backend_unavailable", 503);
+
+      const resource = await inventory.resourceByUid(organizationId, resourceUid);
+      if (!resource) controlError("not_found", 404);
+      const installed = forms.find((form) =>
+        sameFormRef(form.identity.formRef, resource.resource.form.formRef),
+      );
+      const exposesObjects = installed?.providedInterfaces?.some(
+        (candidate) =>
+          candidate.apiVersion === TAKOFORM_EDGE_OBJECTS_INTERFACE.apiVersion &&
+          candidate.name === TAKOFORM_EDGE_OBJECTS_INTERFACE.name &&
+          candidate.version === TAKOFORM_EDGE_OBJECTS_INTERFACE.version &&
+          candidate.schemaDigest === TAKOFORM_EDGE_OBJECTS_INTERFACE.schemaDigest,
+      );
+      if (!installed || !exposesObjects || !resource.nativeId) {
+        controlError("unsupported_capability", 409);
+      }
+      const ready = resource.resource.status.conditions.some(
+        (condition) => condition.type === "Ready" && condition.status === "True",
+      );
+      if (!ready) controlError("resource_not_ready", 409);
+
+      const ttlSeconds = body.expiresInSeconds === undefined ? 900 : integer(body.expiresInSeconds);
+      if (ttlSeconds < 60 || ttlSeconds > 3_600) controlError("invalid_argument", 400);
+      const issue = {
+        organizationId,
+        resourceUid,
+        nativeId: resource.nativeId,
+        access,
+        ttlSeconds,
+      };
+      const connection = validateS3CredentialSet(await s3.issue(issue), issue, options.clock());
+      return Response.json(
+        {
+          kind: "takoserver.s3-connection@v1",
+          endpoint: connection.endpoint,
+          region: connection.region,
+          bucket: connection.bucket,
+          credentials: {
+            accessKeyId: connection.accessKeyId,
+            secretAccessKey: connection.secretAccessKey,
+            sessionToken: connection.sessionToken,
+            expiresAt: connection.expiresAt,
+          },
+        },
+        {
+          status: 201,
+          headers: { "cache-control": "private, no-store", pragma: "no-cache" },
+        },
+      );
+    }
+
     const operations = /^\/v1\/organizations\/([^/]+)\/operations$/u.exec(url.pathname);
     if (request.method === "GET" && operations) {
       const organizationId = segment(operations[1]);
@@ -542,6 +618,9 @@ function classify(error: unknown): { code: string; status: number } {
     };
   }
   if (error instanceof TokenError) return { code: error.code, status: 400 };
+  if (error instanceof S3CredentialError) {
+    return { code: error.code, status: error.code === "backend_unavailable" ? 503 : 502 };
+  }
   // A credential the verifier refused is the caller's problem to fix, and it
   // reads as an outage if it arrives as a 500. Which check failed is logged
   // rather than returned: the codes describe somebody's identity, and the

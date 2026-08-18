@@ -16,6 +16,7 @@ import { createProviderDriver } from "./provider-driver.ts";
 import type { Provider } from "./provider-port.ts";
 import { createReseller } from "./reseller.ts";
 import { createRouter, type Router } from "./router.ts";
+import type { S3CredentialIssuer } from "./s3-port.ts";
 import type { TakoformArtifactTransport } from "./takoform/artifacts.ts";
 import { createTakoformHost } from "./takoform/host.ts";
 import { createTakoformStore } from "./takoform/store.ts";
@@ -47,6 +48,8 @@ export interface AppPorts {
   readonly meteringRates?: MeteringRates | undefined;
   /** OpenAI-compatible inference backend. Absent keeps the AI route unavailable. */
   readonly ai?: AiGateway;
+  /** Short-lived standard S3 credentials for a provisioned ObjectBucket. */
+  readonly s3?: S3CredentialIssuer;
   readonly publicOrigin: string;
   /** Where this deployment's console is served, if it has one. */
   readonly consoleOrigin?: string;
@@ -165,6 +168,7 @@ export function buildApp(ports: AppPorts): App {
     catalog,
     reseller,
     tokens,
+    ...(ports.s3 ? { s3: ports.s3 } : {}),
     settlement: ports.settlement,
     clock,
   });

@@ -8,8 +8,11 @@ OpenAI-compatible AI inference are data services, not locally invented Forms.
 
 The current `/data/v1/objects` surface is a small Takoserver data API, **not an
 S3-compatible endpoint**. ObjectBucket lifecycle stays in Takoform, while the
-GA object data plane will speak the standard S3 wire directly. That work does
-not create another Form.
+standard data path is `POST
+/v1/organizations/{organizationId}/resources/{resourceUid}/s3-credentials`.
+It returns a short-lived bucket-scoped access key, secret, and session token
+that an ordinary AWS SDK, CLI, or other SigV4 S3 client uses against the
+returned endpoint. That does not create another Form.
 
 Run it on your own machine and it uses your disk and [workerd](https://github.com/cloudflare/workerd),
 the runtime Cloudflare runs at the edge. Point it at a Cloudflare account and it
