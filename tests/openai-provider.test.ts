@@ -4,7 +4,7 @@ import { createOpenAiGateway } from "../src/providers/openai.ts";
 
 const model = {
   id: "takoserver-text",
-  upstreamId: "provider/model-v1",
+  upstreamId: "@cf/provider/model-v1",
   created: 1_787_054_400,
   ownedBy: "takoserver",
   limits: { maxInputTokens: 24_000, maxOutputTokens: 4_096 },
@@ -24,7 +24,7 @@ describe("OpenAI-compatible upstream adapter", () => {
           id: "chatcmpl_upstream",
           object: "chat.completion",
           created: 1_787_054_400,
-          model: "provider/model-v1",
+          model: "@cf/provider/model-v1",
           choices: [
             {
               index: 0,
@@ -50,7 +50,7 @@ describe("OpenAI-compatible upstream adapter", () => {
     expect(requests[0]?.headers.get("authorization")).toBe("Bearer upstream-secret");
     expect(requests[0]?.headers.get("idempotency-key")).toBe("chat-one");
     expect(requests[0]?.headers.get("x-request-id")).toBe("ai_one");
-    expect(await requests[0]?.json()).toMatchObject({ model: "provider/model-v1" });
+    expect(await requests[0]?.json()).toMatchObject({ model: "@cf/provider/model-v1" });
   });
 
   test("classifies an upstream refusal without exposing its response", async () => {

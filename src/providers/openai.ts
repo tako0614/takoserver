@@ -3,7 +3,7 @@ import { isJsonObject, type JsonObject } from "../json.ts";
 import { parseStrictJson } from "../strict-json.ts";
 
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
-const REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/u;
+const UPSTREAM_REFERENCE = /^@?[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}$/u;
 
 export interface OpenAiModelConfig extends AiModel {
   readonly upstreamId: string;
@@ -81,7 +81,7 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): AiGateway {
   const baseUrl = apiBase(options.baseUrl);
   const configured = new Map<string, OpenAiModelConfig>();
   for (const model of options.models) {
-    if (!REFERENCE.test(model.upstreamId) || configured.has(model.id)) {
+    if (!UPSTREAM_REFERENCE.test(model.upstreamId) || configured.has(model.id)) {
       throw new TypeError("invalid OpenAI model mapping");
     }
     configured.set(model.id, structuredClone(model));
