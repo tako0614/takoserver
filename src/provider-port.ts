@@ -1,5 +1,6 @@
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
-import type { DataProtocol, JsonObject } from "./ports.ts";
+import type { TakoformBindingRef, TakoformInterfaceRef } from "./interface-ref.ts";
+import type { JsonObject } from "./ports.ts";
 
 /**
  * The one seam between Takoserver and the clouds it provisions on.
@@ -59,7 +60,8 @@ export interface ProviderOffering {
   readonly form: TakoformV1Alpha3FormRef;
   readonly unit: string;
   readonly unitPriceMinor: number;
-  readonly protocols: readonly DataProtocol[];
+  readonly providedInterfaces: readonly TakoformInterfaceRef[];
+  readonly bindingRefs: readonly TakoformBindingRef[];
   readonly regions?: readonly string[];
   readonly capabilities: readonly ProviderCapability[];
 }

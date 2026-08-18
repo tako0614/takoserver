@@ -47,7 +47,7 @@ if (
   edge.forms.length !== 1 ||
   edge.forms[0]?.identity.formRef.kind !== "ObjectBucket" ||
   edge.offerings.length !== 1 ||
-  edge.offerings[0]?.protocols.join(",") !== "s3"
+  edge.offerings[0]?.providedInterfaces.map((entry) => entry.name).join(",") !== "edge.objects"
 ) {
   throw new Error("released_takoform_product_catalog_mismatch");
 }

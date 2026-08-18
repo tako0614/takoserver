@@ -54,12 +54,16 @@ export async function buildEdgeForms(prices: EdgeFormPrices = {}): Promise<EdgeF
     form: formRef,
     unit: "bucket-month",
     unitPriceMinor: prices.objectBucketMinor ?? 500,
-    protocols: ["s3"],
+    providedInterfaces: form.providedInterfaces ?? [],
+    bindingRefs: form.acceptedBindings ?? [],
     capabilities: ["create", "delete", "import", "observe"],
   };
   const offering: Offering = {
     id: providerOffering.id,
-    providerId: "cloudflare",
+    providerPackRef: "cloudflare",
+    providerInstallationRef: "cloudflare.primary",
+    supplyContractRef: "cloudflare.operator-contract",
+    pricePlanRef: "storage.object.standard.price-v1",
     kind: providerOffering.kind,
     displayName: providerOffering.displayName,
     form: formRef,
@@ -68,7 +72,16 @@ export async function buildEdgeForms(prices: EdgeFormPrices = {}): Promise<EdgeF
       unit: providerOffering.unit,
       unitPriceMinor: providerOffering.unitPriceMinor,
     },
-    protocols: providerOffering.protocols,
+    providedInterfaces: providerOffering.providedInterfaces,
+    bindingRefs: providerOffering.bindingRefs,
+    regions: ["global"],
+    portability: {
+      api: "portable",
+      exportFormats: ["s3.object-set.takoform.com/v1"],
+      importFormats: ["s3.object-set.takoform.com/v1"],
+      migrationModes: ["offline", "online"],
+    },
+    isolation: "dedicated-resource",
     available: true,
   };
   const objectBucket: EdgeForm = {

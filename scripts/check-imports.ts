@@ -52,7 +52,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "core",
     match:
-      /^src\/(?:ports|json|strict-json|form-ref|provider-port|ai-port|s3-port|db-schema|migrate-sqlite)\.ts$/u,
+      /^src\/(?:ports|json|strict-json|form-ref|interface-ref|provider-port|ai-port|s3-port|db-schema|migrate-sqlite)\.ts$/u,
     may: ["core"],
   },
   {
@@ -64,13 +64,13 @@ const LAYERS: readonly Layer[] = [
   {
     name: "domain",
     match:
-      /^src\/(?:token|auth|ledger|catalog|reseller|metering|provider-driver|reconcile|metering|edge-forms|ai-requests|operator-credentials|google-identity|identity-setup|stripe-settlement|signing-key|operator-key)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$)/u,
+      /^src\/(?:token|auth|ledger|catalog|reseller|metering|provider-driver|resource-deployments|reconcile|metering|edge-forms|ai-requests|operator-credentials|google-identity|identity-setup|stripe-settlement|signing-key|operator-key)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$)/u,
     may: ["core", "domain", "release-data"],
   },
   {
     name: "routes",
     match:
-      /^src\/(?:router|control|data-storage|data-ai|openapi|landing|data-objects|provisioner-endpoint)\.ts$|^src\/takoform\/(?:routes|host)\.ts$/u,
+      /^src\/(?:router|control|data-storage|data-ai|openapi|landing|provisioner-endpoint)\.ts$|^src\/takoform\/(?:routes|host)\.ts$/u,
     may: ["core", "adapter", "domain", "routes"],
   },
   {

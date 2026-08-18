@@ -149,6 +149,24 @@ async function fixture() {
         Date.parse("2026-08-18T12:00:00.000Z"),
       ],
     );
+    await sql.run(
+      `INSERT INTO tf_resource_deployments
+       (tenant_id, id, resource_uid, offering_id, provider_pack_ref,
+        provider_installation_ref, native_id, state, observed_json, outputs_json,
+        created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'active', '{}', '{}', ?, ?)`,
+      [
+        organizationId,
+        `dep_${input.uid}`,
+        input.uid,
+        "storage.object.standard",
+        "cloudflare",
+        "cloudflare.primary",
+        input.nativeId ?? "r2:ts-private-bucket",
+        Date.parse("2026-08-18T12:00:00.000Z"),
+        Date.parse("2026-08-18T12:00:00.000Z"),
+      ],
+    );
   };
 
   return { call, organizationId, apiKey, install, issues };
@@ -185,6 +203,10 @@ describe("standard S3 connection credentials", () => {
       {
         organizationId,
         resourceUid: "uid_bucket",
+        deploymentId: "dep_uid_bucket",
+        offeringId: "storage.object.standard",
+        providerPackRef: "cloudflare",
+        providerInstallationRef: "cloudflare.primary",
         nativeId: "r2:ts-private-bucket",
         access: "read-only",
         ttlSeconds: 900,

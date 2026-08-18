@@ -24,7 +24,8 @@ const OFFERING: ProviderOffering = {
   },
   unit: "bucket-month",
   unitPriceMinor: 500,
-  protocols: ["s3"],
+  providedInterfaces: [],
+  bindingRefs: [],
   capabilities: ["create", "update", "delete", "import", "observe"],
 };
 

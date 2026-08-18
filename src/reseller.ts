@@ -167,7 +167,7 @@ export function createReseller(options: CreateResellerOptions): Reseller {
       if (!Number.isSafeInteger(quantity) || quantity <= 0 || quantity > 1_000_000) {
         throw new ResellerError("invalid_argument", 400);
       }
-      const offering = catalog.find(offeringId);
+      const offering = catalog.findOffering(offeringId);
       if (!offering) throw new ResellerError("offering_unavailable", 503);
       const amountMinor = offering.price.unitPriceMinor * quantity;
       if (!Number.isSafeInteger(amountMinor)) throw new ResellerError("invalid_argument", 400);

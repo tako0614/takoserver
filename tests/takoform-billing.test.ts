@@ -42,18 +42,31 @@ const PROVIDER_OFFERING: ProviderOffering = {
   form: FORM_REF,
   unit: "bucket-month",
   unitPriceMinor: 500,
-  protocols: ["s3"],
+  providedInterfaces: [],
+  bindingRefs: [],
   capabilities: ["create", "update", "delete", "observe"],
 };
 
 const SOLD: Offering = {
   id: PROVIDER_OFFERING.id,
-  providerId: "fake",
+  providerPackRef: "fake",
+  providerInstallationRef: "fake.primary",
+  supplyContractRef: "fake.test-contract",
+  pricePlanRef: "storage.object.standard.price-v1",
   kind: PROVIDER_OFFERING.kind,
   displayName: PROVIDER_OFFERING.displayName,
   form: FORM_REF,
   price: { currency: "USD", unit: "bucket-month", unitPriceMinor: 500 },
-  protocols: ["s3"],
+  providedInterfaces: [],
+  bindingRefs: [],
+  regions: ["test"],
+  portability: {
+    api: "portable",
+    exportFormats: [],
+    importFormats: [],
+    migrationModes: ["offline"],
+  },
+  isolation: "dedicated-resource",
   available: true,
 };
 

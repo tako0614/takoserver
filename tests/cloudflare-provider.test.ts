@@ -29,7 +29,8 @@ function offering(id: string, kind: string): ProviderOffering {
         : FORM_REF,
     unit: "unit",
     unitPriceMinor: 100,
-    protocols: [],
+    providedInterfaces: [],
+    bindingRefs: [],
     capabilities: ["create", "update", "delete", "observe", "import"],
   };
 }

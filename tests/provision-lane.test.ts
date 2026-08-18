@@ -37,12 +37,24 @@ const INSTALLED_FORM: InstalledTakoformForm = {
 
 const OFFERING: Offering = {
   id: "storage.object.standard",
-  providerId: "fake",
+  providerPackRef: "fake",
+  providerInstallationRef: "fake.primary",
+  supplyContractRef: "fake.test-contract",
+  pricePlanRef: "storage.object.standard.price-v1",
   kind: "object_bucket",
   displayName: "Object bucket",
   form: FORM_REF,
   price: { currency: "USD", unit: "bucket-month", unitPriceMinor: 500 },
-  protocols: [],
+  providedInterfaces: [],
+  bindingRefs: [],
+  regions: ["test"],
+  portability: {
+    api: "portable",
+    exportFormats: [],
+    importFormats: [],
+    migrationModes: ["offline"],
+  },
+  isolation: "dedicated-resource",
   available: true,
 };
 

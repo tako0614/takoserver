@@ -140,23 +140,10 @@ const PUBLIC_PATHS: Record<string, Record<string, unknown>> = {
     "get",
     "List the organization's Takoform resources",
   ),
-  "/v1/organizations/{organizationId}/resources/{resourceUid}/data-tokens": operation(
-    "post",
-    "Mint a short-lived token for one resource's data plane",
-  ),
   "/v1/organizations/{organizationId}/resources/{resourceUid}/s3-credentials": operation(
     "post",
     "Issue short-lived standard S3 credentials for an ObjectBucket",
   ),
-  "/data/v1/objects/{resourceUid}": operation("get", "List what a bucket holds", {
-    security: [{ dataToken: [] }],
-  }),
-  "/data/v1/objects/{resourceUid}/{key}": operations({
-    put: "Write an object",
-    get: "Read an object",
-    head: "Read an object's metadata",
-    delete: "Remove an object",
-  }),
   "/v1/organizations/{organizationId}/operations": operation(
     "get",
     "List the organization's recent Takoform operations",

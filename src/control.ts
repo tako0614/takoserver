@@ -13,6 +13,7 @@ import { type FundingSettlementVerifier, type Ledger, LedgerError } from "./ledg
 import { OperatorAssertionError } from "./operator-credentials.ts";
 import type { Clock } from "./ports.ts";
 import { type Reseller, ResellerError } from "./reseller.ts";
+import type { ResourceDeploymentStore } from "./resource-deployments.ts";
 import {
   type S3Access,
   S3CredentialError,
@@ -73,6 +74,7 @@ export interface Checkout {
 export interface CreateControlRoutesOptions {
   readonly accounts: Accounts;
   readonly inventory: ResourceInventory;
+  readonly deployments: Pick<ResourceDeploymentStore, "active">;
   /** Every Form definition this Host will accept. */
   readonly forms: readonly InstalledTakoformForm[];
   /** How a caller may sign in to this deployment. */
@@ -99,6 +101,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
   const {
     accounts,
     inventory,
+    deployments,
     forms,
     identityProviders,
     ledger,
@@ -304,8 +307,11 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
             displayName: offering.displayName,
             form: offering.form,
             price: offering.price,
-            protocols: offering.protocols,
-            ...(offering.regions ? { regions: offering.regions } : {}),
+            providedInterfaces: offering.providedInterfaces,
+            bindingRefs: offering.bindingRefs,
+            regions: offering.regions,
+            portability: offering.portability,
+            isolation: offering.isolation,
             digest: await catalog.digest(offering),
           })),
         ),
@@ -426,32 +432,6 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       });
     }
 
-    const dataToken = /^\/v1\/organizations\/([^/]+)\/resources\/([^/]+)\/data-tokens$/u.exec(
-      url.pathname,
-    );
-    if (request.method === "POST" && dataToken) {
-      const organizationId = segment(dataToken[1]);
-      const resourceUid = segment(dataToken[2]);
-      await scoped(request, organizationId, "resources:read");
-      const body = await jsonObject(request);
-      exactKeys(body, [], ["ttlSeconds"]);
-
-      // The uid has to belong to this organization. Without the check, a token
-      // would be minted for any resource whose uid somebody could name — and a
-      // uid is not a secret, it is printed in every listing.
-      const held = await inventory.listResources(organizationId, { limit: 200 });
-      const owned = held.resources.find((entry) => entry.uid === resourceUid);
-      if (!owned) throw new AuthError("not_found");
-
-      const issued = await tokens.issueDataToken({
-        organizationId,
-        resourceUid,
-        protocols: ["s3"],
-        ttlSeconds: body.ttlSeconds === undefined ? 3_600 : integer(body.ttlSeconds),
-      });
-      return Response.json({ dataToken: issued }, { status: 201 });
-    }
-
     const s3Credentials =
       /^\/v1\/organizations\/([^/]+)\/resources\/([^/]+)\/s3-credentials$/u.exec(url.pathname);
     if (request.method === "POST" && s3Credentials) {
@@ -479,7 +459,8 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
           candidate.version === TAKOFORM_EDGE_OBJECTS_INTERFACE.version &&
           candidate.schemaDigest === TAKOFORM_EDGE_OBJECTS_INTERFACE.schemaDigest,
       );
-      if (!installed || !exposesObjects || !resource.nativeId) {
+      const deployment = await deployments.active(organizationId, resourceUid);
+      if (!installed || !exposesObjects || !deployment) {
         controlError("unsupported_capability", 409);
       }
       const ready = resource.resource.status.conditions.some(
@@ -492,7 +473,11 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       const issue = {
         organizationId,
         resourceUid,
-        nativeId: resource.nativeId,
+        deploymentId: deployment.id,
+        offeringId: deployment.offeringId,
+        providerPackRef: deployment.providerPackRef,
+        providerInstallationRef: deployment.providerInstallationRef,
+        nativeId: deployment.nativeId,
         access,
         ttlSeconds,
       };

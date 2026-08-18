@@ -20,9 +20,9 @@ import { TakoformHostError } from "./takoform/types.ts";
  * captured on success or released on failure, keyed by the operation id so a
  * retry settles once.
  *
- * Provider selection is by exact Form. A Form maps to at most one offering; two
- * would be a configuration error rather than a choice the Host may make on a
- * customer's behalf.
+ * Until the durable Deployment controller calls this port directly, the bare
+ * Takoform lane is usable only when one exact sellable Offering exists. More
+ * than one fails closed: a Form is never authority to choose supply.
  */
 
 export interface CreateProviderDriverOptions {
@@ -51,9 +51,10 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
   const select = (
     form: InstalledTakoformForm,
   ): { provider: Provider; offering: ProviderOffering; priceMinor: number } => {
-    const sold = catalog.forForm(form.identity.formRef);
+    const matches = catalog.offeringsFor(form.identity.formRef);
+    const sold = matches.length === 1 ? matches[0] : undefined;
     if (!sold) throw new TakoformHostError("unsupported_capability", 422);
-    const provider = byId.get(sold.providerId);
+    const provider = byId.get(sold.providerPackRef);
     const offering = provider?.offerings.find((candidate) => candidate.id === sold.id);
     if (!provider || !offering) throw new TakoformHostError("backend_unavailable", 503);
     return { provider, offering, priceMinor: sold.price.unitPriceMinor };
@@ -143,8 +144,9 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     async observe(input): Promise<TakoformDriverReceipt> {
       // Reading state is not a billable act.
       const form = formOf(input.resource);
-      const sold = catalog.forForm(form);
-      const provider = sold ? byId.get(sold.providerId) : undefined;
+      const matches = catalog.offeringsFor(form);
+      const sold = matches.length === 1 ? matches[0] : undefined;
+      const provider = sold ? byId.get(sold.providerPackRef) : undefined;
       const offering = provider?.offerings.find((candidate) => candidate.id === sold?.id);
       if (!provider || !offering) throw new TakoformHostError("backend_unavailable", 503);
       return receiptOf(
@@ -162,8 +164,9 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     },
 
     async delete(input): Promise<void> {
-      const sold = catalog.forForm(formOf(input.resource));
-      const provider = sold ? byId.get(sold.providerId) : undefined;
+      const matches = catalog.offeringsFor(formOf(input.resource));
+      const sold = matches.length === 1 ? matches[0] : undefined;
+      const provider = sold ? byId.get(sold.providerPackRef) : undefined;
       const offering = provider?.offerings.find((candidate) => candidate.id === sold?.id);
       if (!provider || !offering) throw new TakoformHostError("backend_unavailable", 503);
       const ticket = await settle(

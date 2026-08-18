@@ -15,7 +15,14 @@ describe("bringing a local database up to date", () => {
     expect(report.applied).toEqual(MIGRATIONS.map((migration) => migration.name));
 
     // The tables the product actually needs on its first request.
-    for (const table of ["principals", "orgs", "ledger", "tf_resources", "reservations"]) {
+    for (const table of [
+      "principals",
+      "orgs",
+      "ledger",
+      "tf_resources",
+      "tf_resource_deployments",
+      "reservations",
+    ]) {
       expect(() => database.query(`SELECT 1 FROM ${table} LIMIT 1`).all()).not.toThrow();
     }
   });

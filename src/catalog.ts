@@ -1,8 +1,6 @@
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
+import type { TakoformBindingRef, TakoformInterfaceRef } from "./interface-ref.ts";
 import { canonicalDigest } from "./json.ts";
-import type { DataProtocol } from "./ports.ts";
-
-export type { DataProtocol };
 
 /**
  * What Takoserver sells.
@@ -23,14 +21,29 @@ export interface OfferingPrice {
 
 export interface Offering {
   readonly id: string;
-  readonly providerId: string;
+  readonly providerPackRef: string;
+  readonly providerInstallationRef: string;
+  readonly supplyContractRef: string;
+  readonly pricePlanRef: string;
   readonly kind: string;
   readonly displayName: string;
   readonly form: TakoformV1Alpha3FormRef;
   readonly price: OfferingPrice;
-  /** Direct data-plane protocols this offering exposes, if any. */
-  readonly protocols: readonly DataProtocol[];
-  readonly regions?: readonly string[];
+  readonly providedInterfaces: readonly TakoformInterfaceRef[];
+  readonly bindingRefs: readonly TakoformBindingRef[];
+  readonly regions: readonly string[];
+  readonly portability: {
+    readonly api: "native" | "portable";
+    readonly exportFormats: readonly string[];
+    readonly importFormats: readonly string[];
+    readonly migrationModes: readonly ("offline" | "online")[];
+  };
+  readonly isolation:
+    | "shared-resource"
+    | "dedicated-resource"
+    | "provider-subaccount"
+    | "dedicated-project"
+    | "customer-byoc";
   readonly available: boolean;
   /**
    * A superseded definition. Still resolvable, so resources created under it
@@ -42,9 +55,8 @@ export interface Offering {
 
 export interface Catalog {
   list(): readonly Offering[];
-  find(offeringId: string): Offering | undefined;
-  /** The offering that serves an exact Form, when exactly one does. */
-  forForm(form: TakoformV1Alpha3FormRef): Offering | undefined;
+  findOffering(offeringId: string): Offering | undefined;
+  offeringsFor(form: TakoformV1Alpha3FormRef): readonly Offering[];
   /**
    * Pins the commercial terms a caller was quoted. A grant carries this digest
    * so a price or capability change between reservation and execution is
@@ -65,33 +77,38 @@ export function createCatalog(offerings: readonly Offering[]): Catalog {
       return [...byId.values()].filter((offering) => offering.available && !offering.retired);
     },
 
-    find(offeringId): Offering | undefined {
+    findOffering(offeringId): Offering | undefined {
       const offering = byId.get(offeringId);
       return offering?.available ? offering : undefined;
     },
 
-    forForm(form): Offering | undefined {
-      const matches = [...byId.values()].filter(
+    offeringsFor(form): readonly Offering[] {
+      return [...byId.values()].filter(
         (offering) =>
           offering.available &&
+          !offering.retired &&
           offering.form.apiVersion === form.apiVersion &&
           offering.form.kind === form.kind &&
           offering.form.definitionVersion === form.definitionVersion &&
           offering.form.schemaDigest === form.schemaDigest,
       );
-      // Two offerings for one Form is a configuration error, not a choice the
-      // Host is entitled to make on the customer's behalf.
-      return matches.length === 1 ? matches[0] : undefined;
     },
 
     async digest(offering): Promise<`sha256:${string}`> {
       return await canonicalDigest({
         id: offering.id,
-        providerId: offering.providerId,
+        providerPackRef: offering.providerPackRef,
+        providerInstallationRef: offering.providerInstallationRef,
+        supplyContractRef: offering.supplyContractRef,
+        pricePlanRef: offering.pricePlanRef,
         kind: offering.kind,
         form: offering.form,
         price: offering.price,
-        protocols: [...offering.protocols].sort(),
+        providedInterfaces: offering.providedInterfaces,
+        bindingRefs: offering.bindingRefs,
+        regions: [...offering.regions].sort(),
+        portability: offering.portability,
+        isolation: offering.isolation,
       });
     },
   };

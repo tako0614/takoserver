@@ -48,7 +48,6 @@ export { createR2ObjectStore } from "./objects-r2.ts";
 export { openApiDocument, openApiPaths } from "./openapi.ts";
 export type {
   Clock,
-  DataProtocol,
   JsonObject,
   JsonValue,
   ObjectStore,
@@ -69,6 +68,13 @@ export {
   type Reservation,
   type UsageStatement,
 } from "./reseller.ts";
+export {
+  createResourceDeploymentStore,
+  type NewResourceDeployment,
+  type ResourceDeployment,
+  type ResourceDeploymentState,
+  type ResourceDeploymentStore,
+} from "./resource-deployments.ts";
 export { createRouter, type Router } from "./router.ts";
 export {
   type S3Access,

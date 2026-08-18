@@ -25,7 +25,8 @@ const OFFERING: ProviderOffering = {
   },
   unit: "worker-month",
   unitPriceMinor: 500,
-  protocols: [],
+  providedInterfaces: [],
+  bindingRefs: [],
   capabilities: ["create", "delete", "observe"],
 };
 

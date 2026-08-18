@@ -8,13 +8,13 @@ import {
 import { createCatalog, type Offering } from "./catalog.ts";
 import { type Checkout, createControlRoutes } from "./control.ts";
 import { createDataAiRoutes } from "./data-ai.ts";
-import { createDataObjectRoutes } from "./data-objects.ts";
 import { createLedger, type FundingSettlementVerifier } from "./ledger.ts";
 import { createMetering, type MeteringRates } from "./metering.ts";
 import type { Clock, ObjectStore, Sql } from "./ports.ts";
 import { createProviderDriver } from "./provider-driver.ts";
 import type { Provider } from "./provider-port.ts";
 import { createReseller } from "./reseller.ts";
+import { createResourceDeploymentStore } from "./resource-deployments.ts";
 import { createRouter, type Router } from "./router.ts";
 import type { S3CredentialIssuer } from "./s3-port.ts";
 import type { TakoformArtifactTransport } from "./takoform/artifacts.ts";
@@ -157,10 +157,12 @@ export function buildApp(ports: AppPorts): App {
   // One store instance backs both the exact-pin lanes and the console's read
   // side, so an inventory can never drift from what the lanes actually hold.
   const inventory = createTakoformStore(ports.sql, clock);
+  const deployments = createResourceDeploymentStore(ports.sql, clock);
 
   const control = createControlRoutes({
     accounts,
     inventory,
+    deployments,
     forms: ports.forms,
     identityProviders: ports.identityProviders ?? [],
     ...(ports.checkout ? { checkout: ports.checkout } : {}),
@@ -180,11 +182,6 @@ export function buildApp(ports: AppPorts): App {
     randomId,
     ...(ports.meteringRates ? { rates: ports.meteringRates } : {}),
   });
-  const dataObjects = createDataObjectRoutes({
-    objects: ports.objects,
-    tokens,
-    record: (usage) => metering.record({ ...usage, requestId: randomId() }),
-  });
   const dataAi = createDataAiRoutes({
     accounts,
     ...(ports.ai ? { gateway: ports.ai } : {}),
@@ -200,7 +197,6 @@ export function buildApp(ports: AppPorts): App {
       control,
       dataAi,
       aiAvailable: ports.ai !== undefined,
-      dataObjects,
       takoformHost,
       publicOrigin: ports.publicOrigin,
       ...(ports.consoleOrigin === undefined ? {} : { consoleOrigin: ports.consoleOrigin }),

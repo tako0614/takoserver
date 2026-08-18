@@ -6,9 +6,7 @@ services. Today its shipped infrastructure catalog is the exact ObjectBucket
 Form carried by the released Takoform provider. Object access and
 OpenAI-compatible AI inference are data services, not locally invented Forms.
 
-The current `/data/v1/objects` surface is a small Takoserver data API, **not an
-S3-compatible endpoint**. ObjectBucket lifecycle stays in Takoform, while the
-standard data path is `POST
+ObjectBucket lifecycle stays in Takoform, while the standard data path is `POST
 /v1/organizations/{organizationId}/resources/{resourceUid}/s3-credentials`.
 It returns a short-lived bucket-scoped access key, secret, and session token
 that an ordinary AWS SDK, CLI, or other SigV4 S3 client uses against the

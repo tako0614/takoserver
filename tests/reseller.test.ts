@@ -7,7 +7,10 @@ import { createReseller, type Reseller } from "../src/reseller.ts";
 
 const OFFERING: Offering = {
   id: "storage.object.standard",
-  providerId: "cloudflare",
+  providerPackRef: "cloudflare",
+  providerInstallationRef: "cloudflare.primary",
+  supplyContractRef: "cloudflare.test-contract",
+  pricePlanRef: "storage.object.standard.price-v1",
   kind: "object_bucket",
   displayName: "Object bucket",
   form: {
@@ -17,7 +20,16 @@ const OFFERING: Offering = {
     schemaDigest: `sha256:${"a".repeat(64)}`,
   },
   price: { currency: "USD", unit: "bucket-month", unitPriceMinor: 500 },
-  protocols: ["s3"],
+  providedInterfaces: [],
+  bindingRefs: [],
+  regions: ["test"],
+  portability: {
+    api: "portable",
+    exportFormats: [],
+    importFormats: [],
+    migrationModes: ["offline"],
+  },
+  isolation: "dedicated-resource",
   available: true,
 };
 

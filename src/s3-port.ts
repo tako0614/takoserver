@@ -11,7 +11,11 @@ export type S3Access = "read-only" | "read-write";
 export interface S3CredentialIssue {
   readonly organizationId: string;
   readonly resourceUid: string;
-  /** Provider-private identity recorded by the Takoform Host. */
+  readonly deploymentId: string;
+  readonly offeringId: string;
+  readonly providerPackRef: string;
+  readonly providerInstallationRef: string;
+  /** Provider-private identity recorded on the active Deployment. */
   readonly nativeId: string;
   readonly access: S3Access;
   readonly ttlSeconds: number;

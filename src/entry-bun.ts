@@ -329,7 +329,9 @@ const app = buildApp({
         )
         .map((offering) => ({
           ...offering,
-          providerId: offering.kind === "worker_script" ? "workerd" : "local",
+          providerPackRef: offering.kind === "worker_script" ? "workerd" : "local",
+          providerInstallationRef:
+            offering.kind === "worker_script" ? "workerd.local" : "local.primary",
         })),
   artifacts: artifactStore,
   clock,

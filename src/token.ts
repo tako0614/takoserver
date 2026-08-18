@@ -1,20 +1,14 @@
 import { base64UrlDecode, base64UrlEncode, isSha256Digest } from "./json.ts";
-import type { Clock, DataProtocol, Sql } from "./ports.ts";
+import type { Clock, Sql } from "./ports.ts";
 
 /**
  * Every signed credential Takoserver issues, in one module.
  *
- * Two audiences share one Ed25519 format and one key table:
- *
- * - **data tokens** are resource-scoped and time-bounded. They are reusable
- *   until they expire and verify statelessly, so a data-plane request costs no
- *   control-plane round trip. That is the whole point: one signature check per
- *   `GET`, not one token mint per `GET`.
- * - **provision tokens** are single-use. They hand a reseller's untrusted
+ * Provision tokens are single-use. They hand a reseller's untrusted
  *   runtime the authority to create exactly one resource against exactly one
  *   reservation, and the identifier is consumed atomically on redemption.
  *
- * Revocation has two tiers. Revoking a signing key in `runtime_grant_keys`
+ * Revoking a signing key in `runtime_grant_keys`
  * kills every token it signed; per-resource kill is a caller concern layered on
  * top (the resource row carries an epoch the data plane checks). Key state is
  * cached for {@link CreateTokenServiceOptions.keyCacheSeconds}, which is the
@@ -22,24 +16,11 @@ import type { Clock, DataProtocol, Sql } from "./ports.ts";
  */
 
 const TOKEN_TYPE = "takoserver-token+jwt";
-const DATA_AUDIENCE = "tako.data";
 const PROVISION_AUDIENCE = "tako.provision";
 const REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{2,255}$/u;
 const KEY_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/u;
 const ACTIVE_KEY_LIMIT = 32;
 const EXPIRED_REPLAY_DELETE_LIMIT = 64;
-
-export type { DataProtocol };
-
-export interface DataTokenClaims {
-  readonly organizationId: string;
-  readonly tenantRef: string | null;
-  readonly resourceUid: string;
-  readonly protocols: readonly DataProtocol[];
-  readonly issuedAtEpochSeconds: number;
-  readonly expiresAtEpochSeconds: number;
-  readonly tokenId: string;
-}
 
 export interface ProvisionTokenClaims {
   readonly organizationId: string;
@@ -58,8 +39,6 @@ export type TokenErrorCode =
   | "invalid_signature"
   | "wrong_issuer"
   | "wrong_audience"
-  | "wrong_resource"
-  | "wrong_protocol"
   | "token_not_yet_valid"
   | "token_expired"
   | "token_lifetime_exceeded"
@@ -80,20 +59,6 @@ export interface SigningKey {
 }
 
 export interface TokenService {
-  issueDataToken(input: {
-    readonly organizationId: string;
-    readonly tenantRef?: string | null;
-    readonly resourceUid: string;
-    readonly protocols: readonly DataProtocol[];
-    readonly ttlSeconds: number;
-  }): Promise<{ readonly token: string; readonly expiresAt: string }>;
-
-  /** Stateless: signature, issuer, audience, window, resource, and protocol. */
-  verifyDataToken(
-    token: string,
-    expected: { readonly resourceUid: string; readonly protocol: DataProtocol },
-  ): Promise<DataTokenClaims>;
-
   issueProvisionToken(input: {
     readonly organizationId: string;
     readonly tenantRef: string;
@@ -119,7 +84,6 @@ export interface CreateTokenServiceOptions {
   readonly issuer: string;
   readonly signingKey?: SigningKey;
   readonly clock?: Clock;
-  readonly maxDataTokenLifetimeSeconds?: number;
   readonly maxProvisionTokenLifetimeSeconds?: number;
   readonly keyCacheSeconds?: number;
 }
@@ -127,7 +91,6 @@ export interface CreateTokenServiceOptions {
 export function createTokenService(options: CreateTokenServiceOptions): TokenService {
   const issuer = httpsOrigin(options.issuer);
   const clock = options.clock ?? (() => new Date());
-  const maxDataLifetime = positiveInteger(options.maxDataTokenLifetimeSeconds ?? 3_600);
   const maxProvisionLifetime = positiveInteger(options.maxProvisionTokenLifetimeSeconds ?? 300);
   const keyCacheSeconds = options.keyCacheSeconds ?? 10;
   const keys = createKeyCache(options.sql, clock, keyCacheSeconds);
@@ -216,28 +179,6 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
   };
 
   return {
-    async issueDataToken(input) {
-      return await sign(
-        DATA_AUDIENCE,
-        {
-          organizationId: reference(input.organizationId),
-          protocols: protocols(input.protocols),
-          resourceUid: reference(input.resourceUid),
-          tenantRef: input.tenantRef == null ? null : reference(input.tenantRef),
-        },
-        input.ttlSeconds,
-        maxDataLifetime,
-      );
-    },
-
-    async verifyDataToken(token, expected) {
-      const payload = await open(token, DATA_AUDIENCE, maxDataLifetime);
-      const claims = dataClaims(payload);
-      if (claims.resourceUid !== expected.resourceUid) fail("wrong_resource");
-      if (!claims.protocols.includes(expected.protocol)) fail("wrong_protocol");
-      return claims;
-    },
-
     async issueProvisionToken(input) {
       if (!isSha256Digest(input.offeringDigest)) throw new TypeError("offering digest is invalid");
       return await sign(
@@ -388,31 +329,6 @@ async function importPublicKey(value: unknown): Promise<CryptoKey> {
   }
 }
 
-function dataClaims(payload: Record<string, unknown>): DataTokenClaims {
-  exactKeys(payload, [
-    "aud",
-    "exp",
-    "iat",
-    "iss",
-    "jti",
-    "nbf",
-    "organizationId",
-    "protocols",
-    "resourceUid",
-    "tenantRef",
-  ]);
-  const tenantRef = payload.tenantRef;
-  return {
-    organizationId: claimReference(payload.organizationId),
-    tenantRef: tenantRef === null ? null : claimReference(tenantRef),
-    resourceUid: claimReference(payload.resourceUid),
-    protocols: claimProtocols(payload.protocols),
-    issuedAtEpochSeconds: epochSeconds(payload.iat),
-    expiresAtEpochSeconds: epochSeconds(payload.exp),
-    tokenId: claimReference(payload.jti),
-  };
-}
-
 function provisionClaims(payload: Record<string, unknown>): ProvisionTokenClaims {
   exactKeys(payload, [
     "aud",
@@ -471,32 +387,6 @@ function exactKeys(value: Record<string, unknown>, expected: readonly string[]):
   if (JSON.stringify(Object.keys(value).sort()) !== JSON.stringify([...expected].sort())) {
     fail("malformed_token");
   }
-}
-
-function protocols(value: readonly DataProtocol[]): readonly DataProtocol[] {
-  if (
-    !Array.isArray(value) ||
-    value.length === 0 ||
-    value.length > 2 ||
-    new Set(value).size !== value.length ||
-    value.some((entry) => entry !== "s3" && entry !== "openai")
-  ) {
-    throw new TypeError("data token protocols are invalid");
-  }
-  return [...value].sort();
-}
-
-function claimProtocols(value: unknown): readonly DataProtocol[] {
-  if (
-    !Array.isArray(value) ||
-    value.length === 0 ||
-    value.length > 2 ||
-    new Set(value).size !== value.length ||
-    value.some((entry) => entry !== "s3" && entry !== "openai")
-  ) {
-    fail("malformed_token");
-  }
-  return value as readonly DataProtocol[];
 }
 
 function reference(value: string): string {
