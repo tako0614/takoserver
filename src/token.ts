@@ -103,6 +103,13 @@ export interface TokenService {
     readonly ttlSeconds: number;
   }): Promise<{ readonly token: string; readonly expiresAt: string }>;
 
+  /**
+   * Stateless check that leaves the token spendable. The provision lane reads
+   * a token several times — validate, prepare — before the one apply that
+   * spends it, and only `consumeProvisionToken` burns the identifier.
+   */
+  verifyProvisionToken(token: string): Promise<ProvisionTokenClaims>;
+
   /** Single-use: the identifier is consumed atomically, so a replay loses. */
   consumeProvisionToken(token: string): Promise<ProvisionTokenClaims>;
 }
@@ -245,6 +252,11 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
         input.ttlSeconds,
         maxProvisionLifetime,
       );
+    },
+
+    async verifyProvisionToken(token) {
+      const payload = await open(token, PROVISION_AUDIENCE, maxProvisionLifetime);
+      return provisionClaims(payload);
     },
 
     async consumeProvisionToken(token) {

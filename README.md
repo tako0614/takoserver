@@ -85,6 +85,11 @@ publish and leaves watching its configuration — a deploy rewrites the config,
 and no other tenant's in-flight requests are dropped for it. A machine with no
 workerd binary says so once and keeps serving storage and databases.
 
+A Worker that declares static assets gets them: the files are served ahead of
+the script through an `ASSETS` binding, and `notFoundHandling` decides what an
+unmatched path means, so a single-page application survives a reload here the
+same way it does on Cloudflare.
+
 ## Running it on Cloudflare
 
 Set `CLOUDFLARE_ACCOUNT_ID` and a scoped API token, and the same server

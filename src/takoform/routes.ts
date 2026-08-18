@@ -53,21 +53,77 @@ const RESOURCE = new RegExp(
 );
 const OPERATION = new RegExp(`^${escaped(CURRENT_LANE)}/operations/([^/]+)(/cancel)?$`, "u");
 
+/**
+ * The provision-token redemption lane.
+ *
+ * A reseller's runtime enters here with a single-use provision token instead
+ * of an organization credential. The token pins one offering — and through it
+ * one exact Form — and one opaque tenant, so the lane accepts exactly the
+ * resource the reservation paid for: validate and prepare read the token,
+ * the one apply spends it. Resources land in the reseller organization's
+ * tenancy under a space named by the opaque tenantRef, which is what keeps
+ * one reseller customer from seeing another's resources.
+ */
+const PROVISION_LANE = "/provision/v1";
+const PROVISION_RESOURCE = new RegExp(
+  `^${escaped(PROVISION_LANE)}/resources/([^/]+)/([^/]+)/([^/]+)/([^/]+)$`,
+  "u",
+);
+
+export interface ProvisionTokenClaimsView {
+  readonly organizationId: string;
+  readonly tenantRef: string;
+  readonly reservationId: string;
+  readonly offeringId: string;
+  readonly offeringDigest: string;
+  readonly tokenId: string;
+}
+
+export interface ProvisionOfferingView {
+  readonly form: {
+    readonly apiVersion: string;
+    readonly kind: string;
+    readonly definitionVersion: string;
+    readonly schemaDigest: string;
+  };
+}
+
+export interface ProvisionLanePorts {
+  readonly tokens: {
+    verifyProvisionToken(token: string): Promise<ProvisionTokenClaimsView>;
+    consumeProvisionToken(token: string): Promise<ProvisionTokenClaimsView>;
+  };
+  readonly catalog: {
+    find(offeringId: string): ProvisionOfferingView | undefined;
+    digest(offering: ProvisionOfferingView): Promise<string>;
+  };
+}
+
 export interface CreateTakoformRoutesOptions {
   readonly authenticate: (request: Request) => Promise<TakoformHostPrincipal | null>;
   readonly engine: TakoformEngine;
   readonly store: TakoformStore;
   readonly forms: FormRegistry;
   readonly artifacts: TakoformArtifactTransport;
+  readonly provision?: ProvisionLanePorts;
 }
 
 export function createTakoformRoutes(options: CreateTakoformRoutesOptions): TakoformHost {
-  const { authenticate, engine, store, forms, artifacts } = options;
+  const { authenticate, engine, store, forms, artifacts, provision } = options;
 
   return {
     async handle(incoming): Promise<Response | null> {
       const request = currentLaneRequest(incoming);
       const url = new URL(request.url);
+      if (url.pathname.startsWith(`${PROVISION_LANE}/`)) {
+        if (url.pathname.includes("%")) return failure("invalid_argument", 400);
+        if (!provision) return failure("not_found", 404);
+        try {
+          return await provisionRoute(provision, engine, request, url);
+        } catch (error) {
+          return hostErrorResponse(error, request, url);
+        }
+      }
       if (!url.pathname.startsWith(CURRENT_LANE)) return null;
       if (url.pathname.includes("%")) return failure("invalid_argument", 400);
 
@@ -85,26 +141,7 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
         if (artifactResponse) return artifactResponse;
         return await route(context, url, request);
       } catch (error) {
-        if (error instanceof ArtifactInputError) return failure(error.code, error.status);
-        if (error instanceof TakoformHostError) {
-          if (process.env.TAKOSERVER_TRACE_HOST_ERRORS) {
-            console.error("host error", error.code, error.status, error.stack);
-          }
-          return failure(error.code, error.status, error.details);
-        }
-        // Anything else is a driver or runtime fault. The caller gets an
-        // internal error with a fresh request id and no borrowed message, so a
-        // provider's own words never leak — but the operator needs to see what
-        // happened, so it is logged here rather than swallowed.
-        console.error(
-          JSON.stringify({
-            event: "takoform.host.unhandled_error",
-            method: request.method,
-            path: url.pathname,
-            error: error instanceof Error ? `${error.name}: ${error.message}` : "unknown",
-          }),
-        );
-        return failure("internal_error", 500);
+        return hostErrorResponse(error, request, url);
       }
     },
   };

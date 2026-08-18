@@ -38,13 +38,21 @@ export interface WorkerdSite {
   readonly directory: string;
   readonly mainModule: string;
   readonly hostnames: readonly string[];
-  /** Directory of static files served before the script, if any. */
-  readonly assets?: string;
+  /**
+   * How the asset layer answers a path that matches no file, when the script
+   * declared assets. Absent means it declared none.
+   */
+  readonly assets?: { readonly notFoundHandling: string };
 }
 
 export interface WorkerdRuntime {
   /** Makes a published script's files present, replacing whatever was there. */
-  write(name: string, site: WorkerdSite, modules: ReadonlyMap<string, Uint8Array>): Promise<void>;
+  write(
+    name: string,
+    site: WorkerdSite,
+    modules: ReadonlyMap<string, Uint8Array>,
+    assets?: ReadonlyMap<string, Uint8Array>,
+  ): Promise<void>;
   /** Forgets a script and its files. */
   remove(name: string): Promise<void>;
   /** Rewrites the configuration from every script currently published. */
@@ -66,7 +74,11 @@ export interface WorkerdProviderOptions {
       readonly kind: string;
       readonly mainModule?: string;
       readonly modules?: readonly { readonly name: string; readonly digest: string }[];
-      readonly files?: readonly { readonly name: string; readonly digest: string }[];
+      readonly files?: readonly {
+        readonly name: string;
+        readonly digest: string;
+        readonly mediaType?: string;
+      }[];
     } | null>;
     blob(digest: string): Promise<Uint8Array | null>;
   };
@@ -130,13 +142,61 @@ export function createWorkerdProvider(options: WorkerdProviderOptions): Provider
         modules.set(module.name, bytes);
       }
 
+      // A site is the ordinary case, not an extra: a Worker that declares
+      // assets and is served without them answers every path with its script,
+      // which for anything with client-side routing means a blank page.
+      const declaredAssets =
+        typeof input.spec.assets === "object" && input.spec.assets !== null
+          ? (input.spec.assets as { bundle?: unknown; notFoundHandling?: unknown })
+          : null;
+      let assets: Map<string, Uint8Array> | undefined;
+      let notFoundHandling = "single-page-application";
+      if (declaredAssets) {
+        const digest = typeof declaredAssets.bundle === "string" ? declaredAssets.bundle : null;
+        if (!digest) return failed("invalid_spec", "an asset bundle digest is required");
+        const bundle = await artifacts.manifest(input.identity.tenantRef, digest);
+        if (!bundle || bundle.kind !== "StaticAssetBundle") {
+          return failed(
+            "invalid_spec",
+            "the declared assets are not a committed StaticAssetBundle",
+          );
+        }
+        const files = bundle.files ?? [];
+        if (files.length === 0) return failed("invalid_spec", "the asset bundle declares no files");
+        assets = new Map<string, Uint8Array>();
+        for (const file of files) {
+          const bytes = await artifacts.blob(file.digest);
+          if (!bytes) return failed("invalid_spec", `a declared asset is missing: ${file.name}`);
+          assets.set(file.name, bytes);
+        }
+        if (typeof declaredAssets.notFoundHandling === "string") {
+          notFoundHandling = declaredAssets.notFoundHandling;
+        }
+      }
+
       const name = scriptName(input.identity);
-      await runtime.write(name, { directory: name, mainModule, hostnames }, modules);
+      await runtime.write(
+        name,
+        {
+          directory: name,
+          mainModule,
+          hostnames,
+          ...(assets ? { assets: { notFoundHandling } } : {}),
+        },
+        modules,
+        assets,
+      );
       await runtime.reload();
 
       return succeeded({
         nativeId: `workerd:${name}`,
-        observed: { name, mainModule, moduleCount: modules.size, hostnames },
+        observed: {
+          name,
+          mainModule,
+          moduleCount: modules.size,
+          hostnames,
+          ...(assets ? { assetCount: assets.size } : {}),
+        },
         outputs: {
           scriptName: name,
           hostnames,
