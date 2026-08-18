@@ -1,4 +1,5 @@
 import type { AiGateway } from "./ai-port.ts";
+import { createAttachmentService, createAttachmentStore } from "./attachments.ts";
 import {
   createAccounts,
   type ExternalIdentityVerifier,
@@ -12,12 +13,14 @@ import { createLedger, type FundingSettlementVerifier } from "./ledger.ts";
 import { createMetering, type MeteringRates } from "./metering.ts";
 import type { Clock, ObjectStore, Sql } from "./ports.ts";
 import { createProviderDriver } from "./provider-driver.ts";
+import type { ProviderPack } from "./provider-pack.ts";
 import type { Provider } from "./provider-port.ts";
 import { createReseller } from "./reseller.ts";
 import { createResourceDeploymentStore } from "./resource-deployments.ts";
 import { createRouter, type Router } from "./router.ts";
 import type { S3CredentialIssuer } from "./s3-port.ts";
 import type { TakoformArtifactTransport } from "./takoform/artifacts.ts";
+import { sameFormRef } from "./takoform/forms.ts";
 import { createTakoformHost } from "./takoform/host.ts";
 import { createTakoformStore } from "./takoform/store.ts";
 import type {
@@ -62,6 +65,8 @@ export interface AppPorts {
    * explicit override for tests about the Host itself.
    */
   readonly providers?: readonly Provider[];
+  /** Capability bundles used for attachments and explicit cross-provider migration. */
+  readonly providerPacks?: readonly ProviderPack[];
   readonly driver?: TakoformResourceDriver;
   readonly offerings: readonly Offering[];
   readonly signingKey?: SigningKey;
@@ -102,6 +107,21 @@ export function buildApp(ports: AppPorts): App {
   const ledger = createLedger(ports.sql, clock);
   const catalog = createCatalog(ports.offerings);
   const deployments = createResourceDeploymentStore(ports.sql, clock);
+  const inventory = createTakoformStore(ports.sql, clock);
+  const attachments = createAttachmentService({
+    store: createAttachmentStore(ports.sql, clock),
+    deployments,
+    factories: (ports.providerPacks ?? []).flatMap((pack) => pack.attachmentFactories),
+    clock,
+    resource: async (tenantId, uid) => {
+      const listing = await inventory.resourceByUid(tenantId, uid);
+      if (!listing) return null;
+      const installed = ports.forms.find((form) =>
+        sameFormRef(form.identity.formRef, listing.resource.form.formRef),
+      );
+      return installed ? { uid, providedInterfaces: installed.providedInterfaces ?? [] } : null;
+    },
+  });
   const reseller = createReseller({ sql: ports.sql, ledger, catalog, clock, randomId });
   const tokens = createTokenService({
     sql: ports.sql,
@@ -159,16 +179,14 @@ export function buildApp(ports: AppPorts): App {
       // The redemption lane: a reseller's single-use provision token buys
       // exactly one apply of the offering it names, in the tenant's space.
       provision: { tokens, catalog },
+      blockingRelations: attachments.blocksDeletion,
     });
-
-  // One store instance backs both the exact-pin lanes and the console's read
-  // side, so an inventory can never drift from what the lanes actually hold.
-  const inventory = createTakoformStore(ports.sql, clock);
 
   const control = createControlRoutes({
     accounts,
     inventory,
     deployments,
+    attachments,
     forms: ports.forms,
     identityProviders: ports.identityProviders ?? [],
     ...(ports.checkout ? { checkout: ports.checkout } : {}),

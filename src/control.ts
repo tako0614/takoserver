@@ -1,3 +1,4 @@
+import { AttachmentError, type AttachmentService } from "./attachments.ts";
 import {
   type Accounts,
   type Actor,
@@ -75,6 +76,7 @@ export interface CreateControlRoutesOptions {
   readonly accounts: Accounts;
   readonly inventory: ResourceInventory;
   readonly deployments: Pick<ResourceDeploymentStore, "active">;
+  readonly attachments: AttachmentService;
   /** Every Form definition this Host will accept. */
   readonly forms: readonly InstalledTakoformForm[];
   /** How a caller may sign in to this deployment. */
@@ -102,6 +104,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     accounts,
     inventory,
     deployments,
+    attachments,
     forms,
     identityProviders,
     ledger,
@@ -434,6 +437,73 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       });
     }
 
+    const organizationAttachments = /^\/v1\/organizations\/([^/]+)\/attachments$/u.exec(
+      url.pathname,
+    );
+    if (organizationAttachments) {
+      const organizationId = segment(organizationAttachments[1]);
+      if (request.method === "GET") {
+        await scoped(request, organizationId, "resources:read");
+        const resourceUid = url.searchParams.get("resourceUid");
+        return Response.json({
+          attachments: await attachments.list(organizationId, {
+            limit: pageSize(url),
+            ...(resourceUid === null ? {} : { resourceUid: segment(resourceUid) }),
+          }),
+        });
+      }
+      if (request.method === "POST") {
+        await scoped(request, organizationId, "resources:write");
+        const body = await jsonObject(request);
+        exactKeys(body, [
+          "id",
+          "consumerResourceUid",
+          "providerResourceUid",
+          "interfaceRef",
+          "target",
+          "permissions",
+        ]);
+        const interfaceRef = record(body.interfaceRef);
+        exactKeys(interfaceRef, ["apiVersion", "name", "version", "schemaDigest"]);
+        const attachment = await attachments.createAndResolve({
+          tenantId: organizationId,
+          id: text(body.id),
+          consumerResourceUid: text(body.consumerResourceUid),
+          providerResourceUid: text(body.providerResourceUid),
+          interfaceRef: {
+            apiVersion: enumValue(interfaceRef.apiVersion, [
+              "interfaces.takoform.com/v1alpha1",
+            ]) as "interfaces.takoform.com/v1alpha1",
+            name: text(interfaceRef.name),
+            version: text(interfaceRef.version),
+            schemaDigest: text(interfaceRef.schemaDigest) as `sha256:${string}`,
+          },
+          target: text(body.target),
+          permissions: stringList(body.permissions),
+        });
+        return Response.json({ attachment }, { status: 201 });
+      }
+    }
+
+    const organizationAttachment = /^\/v1\/organizations\/([^/]+)\/attachments\/([^/]+)$/u.exec(
+      url.pathname,
+    );
+    if (organizationAttachment) {
+      const organizationId = segment(organizationAttachment[1]);
+      const attachmentId = segment(organizationAttachment[2]);
+      if (request.method === "GET") {
+        await scoped(request, organizationId, "resources:read");
+        const attachment = await attachments.read(organizationId, attachmentId);
+        if (!attachment) controlError("not_found", 404);
+        return Response.json({ attachment });
+      }
+      if (request.method === "DELETE") {
+        await scoped(request, organizationId, "resources:write");
+        await attachments.remove(organizationId, attachmentId);
+        return new Response(null, { status: 204 });
+      }
+    }
+
     const s3Credentials =
       /^\/v1\/organizations\/([^/]+)\/resources\/([^/]+)\/s3-credentials$/u.exec(url.pathname);
     if (request.method === "POST" && s3Credentials) {
@@ -608,6 +678,15 @@ function classify(error: unknown): { code: string; status: number } {
   if (error instanceof S3CredentialError) {
     return { code: error.code, status: error.code === "backend_unavailable" ? 503 : 502 };
   }
+  if (error instanceof AttachmentError) {
+    const status =
+      error.code === "resource_not_found"
+        ? 404
+        : error.code === "attachment_unsupported"
+          ? 422
+          : 409;
+    return { code: error.code, status };
+  }
   // A credential the verifier refused is the caller's problem to fix, and it
   // reads as an outage if it arrives as a 500. Which check failed is logged
   // rather than returned: the codes describe somebody's identity, and the
@@ -725,6 +804,17 @@ function scopeList(value: unknown): readonly ApiKeyScope[] {
     controlError("invalid_argument", 400);
   }
   return scopes as readonly ApiKeyScope[];
+}
+
+function stringList(value: unknown): readonly string[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 32) {
+    controlError("invalid_argument", 400);
+  }
+  const values = value as unknown[];
+  if (values.some((item) => typeof item !== "string")) {
+    controlError("invalid_argument", 400);
+  }
+  return values as readonly string[];
 }
 
 function segment(value: string | undefined): string {

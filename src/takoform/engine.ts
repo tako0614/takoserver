@@ -88,6 +88,11 @@ export interface CreateTakoformEngineOptions {
   readonly artifacts: ArtifactResolver;
   readonly clock: Clock;
   readonly randomId: () => string;
+  /** Every live relation that must be removed before the Resource can be deleted. */
+  readonly blockingRelations?: (
+    tenantId: string,
+    resourceUid: string,
+  ) => Promise<readonly string[]>;
 }
 
 export function createTakoformEngine(options: CreateTakoformEngineOptions): TakoformEngine {
@@ -487,6 +492,12 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       const ifMatch = context.request.headers.get("if-match");
       if (ifMatch && ifMatch !== `"${current.metadata.revision}"`) {
         throw new TakoformHostError("revision_conflict", 412);
+      }
+      if (
+        options.blockingRelations &&
+        (await options.blockingRelations(context.tenantId, current.metadata.uid)).length > 0
+      ) {
+        throw new TakoformHostError("dependency_in_use", 409);
       }
 
       const deleteId = operationId();

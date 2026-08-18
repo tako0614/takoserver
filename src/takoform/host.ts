@@ -29,6 +29,10 @@ export interface CreateTakoformHostOptions {
   readonly randomId?: () => string;
   /** When present, the single-use provision-token redemption lane is served. */
   readonly provision?: ProvisionLanePorts;
+  readonly blockingRelations?: (
+    tenantId: string,
+    resourceUid: string,
+  ) => Promise<readonly string[]>;
 }
 
 export function createTakoformHost(options: CreateTakoformHostOptions): TakoformHost {
@@ -46,6 +50,7 @@ export function createTakoformHost(options: CreateTakoformHostOptions): Takoform
     artifacts,
     clock,
     randomId,
+    ...(options.blockingRelations ? { blockingRelations: options.blockingRelations } : {}),
   });
   return createTakoformRoutes({
     authenticate: options.authenticate,

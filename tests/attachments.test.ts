@@ -152,6 +152,43 @@ describe("Resource Attachments", () => {
 
     expect(await service.blocksDeletion("org_1", "uid_db")).toEqual(["att_api_main_db"]);
     expect(await service.blocksDeletion("org_1", "uid_api")).toEqual(["att_api_main_db"]);
+
+    expect(await service.list("org_1", { resourceUid: "uid_db", limit: 50 })).toEqual([
+      expect.objectContaining({ id: "att_api_main_db", state: "active" }),
+    ]);
+    expect(await service.read("org_1", "att_api_main_db")).toMatchObject({
+      providerDeploymentId: "dep_db",
+      consumerDeploymentId: "dep_api",
+    });
+    await expect(
+      service.createAndResolve({
+        tenantId: "org_1",
+        id: "att_api_main_db",
+        consumerResourceUid: "uid_api",
+        providerResourceUid: "uid_db",
+        interfaceRef: POSTGRES,
+        target: "DATABASE_URL",
+        permissions: ["query"],
+      }),
+    ).rejects.toMatchObject({ code: "attachment_conflict" });
+    await expect(
+      service.createAndResolve({
+        tenantId: "org_1",
+        id: "att_api_duplicate_target",
+        consumerResourceUid: "uid_api",
+        providerResourceUid: "uid_db",
+        interfaceRef: POSTGRES,
+        target: "DATABASE_URL",
+        permissions: ["query"],
+      }),
+    ).rejects.toMatchObject({ code: "attachment_conflict" });
+
+    await service.remove("org_1", "att_api_main_db");
+    expect(await service.blocksDeletion("org_1", "uid_db")).toEqual([]);
+    expect(await service.read("org_1", "att_api_main_db")).toBeNull();
+    await expect(service.remove("org_1", "att_api_main_db")).rejects.toMatchObject({
+      code: "resource_not_found",
+    });
   });
 
   test("selects one Interface-specific factory and rejects ambiguous resolution", async () => {
@@ -164,7 +201,13 @@ describe("Resource Attachments", () => {
       resolve: async () => ({ kind: "endpoint-ref", ref: `endpoint:${id}` }),
     });
     const service = createAttachmentService({
-      store: { create: async () => undefined, blocking: async () => [] },
+      store: {
+        create: async () => undefined,
+        read: async () => null,
+        list: async () => [],
+        remove: async () => false,
+        blocking: async () => [],
+      },
       deployments,
       factories: [matchingFactory("dsn"), matchingFactory("proxy")],
       clock: () => new Date(1_700_000_000_000),

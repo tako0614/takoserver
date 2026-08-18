@@ -140,6 +140,14 @@ const PUBLIC_PATHS: Record<string, Record<string, unknown>> = {
     "get",
     "List the organization's Takoform resources",
   ),
+  "/v1/organizations/{organizationId}/attachments": operations({
+    get: "List the organization's Resource Attachments",
+    post: "Resolve and create a Resource Attachment",
+  }),
+  "/v1/organizations/{organizationId}/attachments/{attachmentId}": operations({
+    get: "Read one Resource Attachment",
+    delete: "Delete one Resource Attachment",
+  }),
   "/v1/organizations/{organizationId}/resources/{resourceUid}/s3-credentials": operation(
     "post",
     "Issue short-lived standard S3 credentials for an ObjectBucket",

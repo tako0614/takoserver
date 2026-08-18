@@ -52,6 +52,12 @@ export interface AttachmentFactory {
 
 export interface AttachmentStore {
   create(input: ResourceAttachment): Promise<void>;
+  read(tenantId: string, id: string): Promise<ResourceAttachment | null>;
+  list(
+    tenantId: string,
+    options: { readonly resourceUid?: string; readonly limit: number },
+  ): Promise<readonly ResourceAttachment[]>;
+  remove(tenantId: string, id: string): Promise<boolean>;
   blocking(tenantId: string, resourceUid: string): Promise<readonly string[]>;
 }
 
@@ -66,11 +72,23 @@ export class AttachmentError extends Error {
       | "resource_not_found"
       | "interface_not_provided"
       | "deployment_not_ready"
-      | "attachment_unsupported",
+      | "attachment_unsupported"
+      | "attachment_conflict",
   ) {
     super(code);
     this.name = "AttachmentError";
   }
+}
+
+export interface AttachmentService {
+  createAndResolve(input: NewResourceAttachment): Promise<ResourceAttachment>;
+  blocksDeletion(tenantId: string, resourceUid: string): Promise<readonly string[]>;
+  read(tenantId: string, id: string): Promise<ResourceAttachment | null>;
+  list(
+    tenantId: string,
+    options: { readonly resourceUid?: string; readonly limit: number },
+  ): Promise<readonly ResourceAttachment[]>;
+  remove(tenantId: string, id: string): Promise<void>;
 }
 
 export function createAttachmentService(options: {
@@ -79,7 +97,7 @@ export function createAttachmentService(options: {
   readonly factories: readonly AttachmentFactory[];
   readonly clock: Clock;
   readonly resource: (tenantId: string, uid: string) => Promise<AttachmentResourceView | null>;
-}) {
+}): AttachmentService {
   return {
     async createAndResolve(input: NewResourceAttachment): Promise<ResourceAttachment> {
       validateAttachmentInput(input);
@@ -139,6 +157,30 @@ export function createAttachmentService(options: {
     async blocksDeletion(tenantId: string, resourceUid: string): Promise<readonly string[]> {
       return await options.store.blocking(tenantId, resourceUid);
     },
+
+    async read(tenantId: string, id: string): Promise<ResourceAttachment | null> {
+      return await options.store.read(tenantId, id);
+    },
+
+    async list(
+      tenantId: string,
+      listOptions: { readonly resourceUid?: string; readonly limit: number },
+    ): Promise<readonly ResourceAttachment[]> {
+      if (
+        !Number.isSafeInteger(listOptions.limit) ||
+        listOptions.limit < 1 ||
+        listOptions.limit > 200
+      ) {
+        throw new AttachmentError("attachment_unsupported");
+      }
+      return await options.store.list(tenantId, listOptions);
+    },
+
+    async remove(tenantId: string, id: string): Promise<void> {
+      if (!(await options.store.remove(tenantId, id))) {
+        throw new AttachmentError("resource_not_found");
+      }
+    },
   };
 }
 
@@ -151,7 +193,11 @@ function validateAttachmentInput(input: NewResourceAttachment): void {
     input.permissions.length < 1 ||
     input.permissions.length > 32 ||
     new Set(input.permissions).size !== input.permissions.length ||
-    input.permissions.some((permission) => !safeIdentifier(permission, 1, 128))
+    input.permissions.some((permission) => !safeIdentifier(permission, 1, 128)) ||
+    input.interfaceRef.apiVersion !== "interfaces.takoform.com/v1alpha1" ||
+    !safeIdentifier(input.interfaceRef.name, 1, 255) ||
+    !safeIdentifier(input.interfaceRef.version, 1, 64) ||
+    !/^sha256:[0-9a-f]{64}$/u.test(input.interfaceRef.schemaDigest)
   ) {
     throw new AttachmentError("attachment_unsupported");
   }
@@ -171,7 +217,7 @@ export function createAttachmentStore(sql: Sql, clock: Clock): AttachmentStore {
     async create(input): Promise<void> {
       const now = clock().getTime();
       const written = await sql.run(
-        `INSERT INTO tf_resource_attachments
+        `INSERT OR IGNORE INTO tf_resource_attachments
            (tenant_id, id, consumer_resource_uid, provider_resource_uid,
             interface_ref_json, target, permissions_json, state,
             provider_deployment_id, consumer_deployment_id, resolution_json,
@@ -193,7 +239,44 @@ export function createAttachmentStore(sql: Sql, clock: Clock): AttachmentStore {
           now,
         ],
       );
-      if (written.changes !== 1) throw new Error("resource_attachment_create_failed");
+      if (written.changes !== 1) throw new AttachmentError("attachment_conflict");
+    },
+
+    async read(tenantId, id): Promise<ResourceAttachment | null> {
+      const rows = await sql.query(
+        `SELECT * FROM tf_resource_attachments
+         WHERE tenant_id = ? AND id = ? AND state <> 'deleted' LIMIT 2`,
+        [tenantId, id],
+      );
+      if (rows.length > 1) throw new Error("resource_attachment_ambiguous");
+      return rows[0] ? attachment(rows[0]) : null;
+    },
+
+    async list(tenantId, options): Promise<readonly ResourceAttachment[]> {
+      const rows = options.resourceUid
+        ? await sql.query(
+            `SELECT * FROM tf_resource_attachments
+             WHERE tenant_id = ? AND state <> 'deleted'
+               AND (consumer_resource_uid = ? OR provider_resource_uid = ?)
+             ORDER BY created_at, id LIMIT ?`,
+            [tenantId, options.resourceUid, options.resourceUid, options.limit],
+          )
+        : await sql.query(
+            `SELECT * FROM tf_resource_attachments
+             WHERE tenant_id = ? AND state <> 'deleted'
+             ORDER BY created_at, id LIMIT ?`,
+            [tenantId, options.limit],
+          );
+      return rows.map(attachment);
+    },
+
+    async remove(tenantId, id): Promise<boolean> {
+      const changed = await sql.run(
+        `UPDATE tf_resource_attachments SET state = 'deleted', updated_at = ?
+         WHERE tenant_id = ? AND id = ? AND state <> 'deleted'`,
+        [clock().getTime(), tenantId, id],
+      );
+      return changed.changes === 1;
     },
 
     async blocking(tenantId, resourceUid): Promise<readonly string[]> {
@@ -208,6 +291,78 @@ export function createAttachmentStore(sql: Sql, clock: Clock): AttachmentStore {
       return rows.map((row) => text(row, "id"));
     },
   };
+}
+
+function attachment(row: Row): ResourceAttachment {
+  return {
+    tenantId: text(row, "tenant_id"),
+    id: text(row, "id"),
+    consumerResourceUid: text(row, "consumer_resource_uid"),
+    providerResourceUid: text(row, "provider_resource_uid"),
+    interfaceRef: interfaceRef(row.interface_ref_json),
+    target: text(row, "target"),
+    permissions: stringList(row.permissions_json),
+    state: attachmentState(row.state),
+    providerDeploymentId: text(row, "provider_deployment_id"),
+    consumerDeploymentId: text(row, "consumer_deployment_id"),
+    resolution: resolution(row.resolution_json),
+    createdAt: timestamp(row.created_at),
+    updatedAt: timestamp(row.updated_at),
+  };
+}
+
+function interfaceRef(value: unknown): TakoformInterfaceRef {
+  const parsed = jsonRecord(value);
+  if (
+    parsed.apiVersion !== "interfaces.takoform.com/v1alpha1" ||
+    typeof parsed.name !== "string" ||
+    typeof parsed.version !== "string" ||
+    typeof parsed.schemaDigest !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/u.test(parsed.schemaDigest)
+  ) {
+    throw new Error("resource_attachment_row_invalid");
+  }
+  return parsed as unknown as TakoformInterfaceRef;
+}
+
+function stringList(value: unknown): readonly string[] {
+  const parsed: unknown = JSON.parse(serialized(value));
+  if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== "string")) {
+    throw new Error("resource_attachment_row_invalid");
+  }
+  return parsed;
+}
+
+function resolution(value: unknown): AttachmentResolution {
+  const parsed = jsonRecord(value);
+  return safeResolution(parsed as unknown as AttachmentResolution);
+}
+
+function jsonRecord(value: unknown): Record<string, unknown> {
+  const parsed: unknown = JSON.parse(serialized(value));
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("resource_attachment_row_invalid");
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function serialized(value: unknown): string {
+  if (typeof value !== "string") throw new Error("resource_attachment_row_invalid");
+  return value;
+}
+
+function attachmentState(value: unknown): ResourceAttachment["state"] {
+  if (value !== "active" && value !== "stale" && value !== "deleted") {
+    throw new Error("resource_attachment_row_invalid");
+  }
+  return value;
+}
+
+function timestamp(value: unknown): string {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error("resource_attachment_row_invalid");
+  }
+  return new Date(value).toISOString();
 }
 
 function sameInterface(left: TakoformInterfaceRef, right: TakoformInterfaceRef): boolean {

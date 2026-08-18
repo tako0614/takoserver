@@ -71,6 +71,8 @@ const PUBLIC_PATHS = [
   "/v1/ai/models",
   "/v1/ai/chat/completions",
   "/v1/organizations",
+  "/v1/organizations/{organizationId}/attachments",
+  "/v1/organizations/{organizationId}/attachments/{attachmentId}",
   "/v1/organizations/{organizationId}/api-keys",
   "/v1/organizations/{organizationId}/api-keys/{apiKeyId}",
   "/v1/organizations/{organizationId}/operations",

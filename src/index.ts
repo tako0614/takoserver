@@ -18,6 +18,7 @@ export {
   type AttachmentFactory,
   type AttachmentResolution,
   type AttachmentResourceView,
+  type AttachmentService,
   type AttachmentStore,
   createAttachmentService,
   createAttachmentStore,
@@ -142,10 +143,12 @@ export { createTakoformArtifacts } from "./takoform/artifacts.ts";
 export { InMemoryTakoformResourceDriver } from "./takoform/memory-driver.ts";
 export type {
   InstalledTakoformForm,
+  TakoformBindingRef,
   TakoformDiagnostic,
   TakoformDriverReceipt,
   TakoformHost,
   TakoformHostPrincipal,
+  TakoformInterfaceRef,
   TakoformResourceDriver,
   TakoformStoredResource,
   TakoformV1Alpha3FormRef,
