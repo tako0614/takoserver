@@ -1,0 +1,45 @@
+{
+  "apiVersion": "edge.forms.takoform.com/v1beta1",
+  "kind": "ObjectBucket",
+  "definitionVersion": "0.1.0",
+  "title": "Object Bucket",
+  "description": "Flat-namespace object store with strong read-after-write consistency, streaming bodies, ranged and conditional reads, and multipart upload, exactly as fixed by the edge.objects Interface. An object body is a byte stream, never a JSON string: the contract's 5 GiB ceiling is only meaningful because bodies never travel inside an operation document (decision 0020). Operating rules such as CORS, lifecycle, and lock are separate policy resources, never desired fields of the bucket identity.",
+  "role": "identity",
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Flat-namespace object store with strong read-after-write consistency, streaming bodies, ranged and conditional reads, and multipart upload, exactly as fixed by the edge.objects Interface. An object body is a byte stream, never a JSON string: the contract's 5 GiB ceiling is only meaningful because bodies never travel inside an operation document (decision 0020). Operating rules such as CORS, lifecycle, and lock are separate policy resources, never desired fields of the bucket identity.",
+    "properties": {},
+    "title": "Object Bucket desired state",
+    "type": "object"
+  },
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "providedInterfaces": [
+    {
+      "apiVersion": "interfaces.takoform.com/v1alpha1",
+      "name": "edge.objects",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:fad47fa63409a05fb0b5886d23300e7ecd32fd64b11aaef5a200247872d19e00"
+    }
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

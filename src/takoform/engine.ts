@@ -7,6 +7,7 @@ import { exactInstalledForm, type FormRegistry, sameFormRef } from "./forms.ts";
 import { PREPARE_TTL_MILLISECONDS } from "./limits.ts";
 import { relationDrift, resolveRelations, type TakoformStoredRelation } from "./relations.ts";
 import { materializeDefaults, validateDesired, validateSchemaValue } from "./schema.ts";
+import { applySqliteMigrationApplication, sqliteMigrationCondition } from "./sqlite-migrations.ts";
 import type { ResourceAddress, StoredReplay, TakoformStore } from "./store.ts";
 import {
   type InstalledTakoformForm,
@@ -306,10 +307,26 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         relations,
         store,
       });
-      const workerCondition = drift
+      const migrationCondition = drift
         ? null
-        : await workerServiceCondition({ tenantId: context.tenantId, resource, store });
-      const rendered = withDerivedRendering(resource, drift ?? workerCondition, clock);
+        : await sqliteMigrationCondition({
+            tenantId: context.tenantId,
+            space: resource.metadata.space,
+            form,
+            relations,
+            store,
+            artifacts,
+            driver,
+          });
+      const workerCondition =
+        drift || migrationCondition
+          ? null
+          : await workerServiceCondition({ tenantId: context.tenantId, resource, store });
+      const rendered = withDerivedRendering(
+        resource,
+        drift ?? migrationCondition ?? workerCondition,
+        clock,
+      );
       if (rendered.metadata.revision !== resource.metadata.revision) {
         await commit(address, rendered, resource, relations);
         resource = rendered;
@@ -416,10 +433,24 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         : null;
       const currentWorkerCondition =
         current && !currentDrift
+          ? await sqliteMigrationCondition({
+              tenantId: context.tenantId,
+              space: current.metadata.space,
+              form,
+              relations: currentRelations,
+              store,
+              artifacts,
+              driver,
+            })
+          : null;
+      const currentMigrationCondition = currentWorkerCondition;
+      const currentActualWorkerCondition =
+        current && !currentDrift && !currentMigrationCondition
           ? await workerServiceCondition({ tenantId: context.tenantId, resource: current, store })
           : null;
       const currentDerivedReady =
-        currentWorkerCondition === null || currentWorkerCondition.status === "True";
+        (currentMigrationCondition === null || currentMigrationCondition.status === "True") &&
+        (currentActualWorkerCondition === null || currentActualWorkerCondition.status === "True");
       if (
         current &&
         form.role !== "revision" &&
@@ -478,6 +509,15 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         artifacts,
         ...(options.workerModuleInspector ? { inspector: options.workerModuleInspector } : {}),
       });
+      await applySqliteMigrationApplication({
+        tenantId: context.tenantId,
+        space: body.metadata.space,
+        form,
+        relations,
+        store,
+        artifacts,
+        driver,
+      });
 
       if (create) await context.beforeCreate?.();
 
@@ -497,12 +537,28 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         ...(current ? { previous: structuredClone(current) } : {}),
       });
       const materialized = materializeResource(body, form, receipt, current, clock, uid);
-      const initialWorkerCondition = await workerServiceCondition({
+      const initialMigrationCondition = await sqliteMigrationCondition({
         tenantId: context.tenantId,
-        resource: materialized,
+        space: body.metadata.space,
+        form,
+        relations,
         store,
+        artifacts,
+        driver,
       });
-      const next = withDerivedRendering(materialized, initialWorkerCondition, clock, !create);
+      const initialWorkerCondition = initialMigrationCondition
+        ? null
+        : await workerServiceCondition({
+            tenantId: context.tenantId,
+            resource: materialized,
+            store,
+          });
+      const next = withDerivedRendering(
+        materialized,
+        initialMigrationCondition ?? initialWorkerCondition,
+        clock,
+        !create,
+      );
       await commit(address, next, current ?? undefined, relations);
       const status = create ? 201 : 200;
       await recordOperationFor(context.tenantId)(opId, create ? "create" : "update", next);
@@ -551,8 +607,35 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         resourceUid: current.metadata.uid,
         resource: structuredClone(current),
       });
-      const next = withObservation(current, form, receipt);
-      await commit(address, next, current, await store.readRelations(address));
+      const relations = await store.readRelations(address);
+      const observed = withObservation(current, form, receipt);
+      const drift = await relationDrift({
+        tenantId: context.tenantId,
+        space: current.metadata.space,
+        relations,
+        store,
+      });
+      const migrationCondition = drift
+        ? null
+        : await sqliteMigrationCondition({
+            tenantId: context.tenantId,
+            space: current.metadata.space,
+            form,
+            relations,
+            store,
+            artifacts,
+            driver,
+          });
+      const workerCondition =
+        drift || migrationCondition
+          ? null
+          : await workerServiceCondition({ tenantId: context.tenantId, resource: observed, store });
+      const next = withDerivedRendering(
+        observed,
+        drift ?? migrationCondition ?? workerCondition,
+        clock,
+      );
+      await commit(address, next, current, relations);
       await recordOperationFor(context.tenantId)(observeId, "observe", next);
       await store.putReplay(replayKey, {
         fingerprint,
@@ -652,6 +735,15 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         artifacts,
         ...(options.workerModuleInspector ? { inspector: options.workerModuleInspector } : {}),
       });
+      await applySqliteMigrationApplication({
+        tenantId: context.tenantId,
+        space: body.metadata.space,
+        form,
+        relations,
+        store,
+        artifacts,
+        driver,
+      });
 
       const importId = operationId();
       const uid = current?.metadata.uid ?? nextResourceUid(randomId);
@@ -667,12 +759,28 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         ...(current ? { previous: structuredClone(current) } : {}),
       });
       const materialized = materializeResource(body, form, receipt, current, clock, uid);
-      const initialWorkerCondition = await workerServiceCondition({
+      const initialMigrationCondition = await sqliteMigrationCondition({
         tenantId: context.tenantId,
-        resource: materialized,
+        space: body.metadata.space,
+        form,
+        relations,
         store,
+        artifacts,
+        driver,
       });
-      const next = withDerivedRendering(materialized, initialWorkerCondition, clock, !create);
+      const initialWorkerCondition = initialMigrationCondition
+        ? null
+        : await workerServiceCondition({
+            tenantId: context.tenantId,
+            resource: materialized,
+            store,
+          });
+      const next = withDerivedRendering(
+        materialized,
+        initialMigrationCondition ?? initialWorkerCondition,
+        clock,
+        !create,
+      );
       await commit(address, next, current ?? undefined, relations);
       const status = create ? 201 : 200;
       await recordOperationFor(context.tenantId)(importId, "import", next);

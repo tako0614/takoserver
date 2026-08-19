@@ -130,6 +130,32 @@ export interface TakoformResourceDriver {
     readonly nativeId: string;
     readonly previous?: TakoformStoredResource;
   }): Promise<TakoformDriverReceipt>;
+  /**
+   * Portable SQLite migration execution against the target database itself.
+   * Each suffix item and its ledger row must commit atomically in that
+   * database; the Host control database is deliberately not used as a second
+   * source of truth for applied schema history.
+   */
+  sqliteMigrations?: {
+    readLedger(input: {
+      readonly tenantId: string;
+      readonly database: TakoformStoredResource;
+    }): Promise<readonly TakoformSqliteMigrationIdentity[]>;
+    applySuffix(input: {
+      readonly tenantId: string;
+      readonly database: TakoformStoredResource;
+      readonly migrations: readonly TakoformSqliteMigration[];
+    }): Promise<void>;
+  };
+}
+
+export interface TakoformSqliteMigrationIdentity {
+  readonly path: string;
+  readonly digest: `sha256:${string}`;
+}
+
+export interface TakoformSqliteMigration extends TakoformSqliteMigrationIdentity {
+  readonly sql: Uint8Array;
 }
 
 /**

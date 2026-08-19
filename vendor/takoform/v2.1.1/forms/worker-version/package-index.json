@@ -1,0 +1,115 @@
+{
+  "apiVersion": "packages.forms.takoform.com/v1alpha4",
+  "kind": "FormPackage",
+  "formRef": {
+    "apiVersion": "edge.forms.takoform.com/v1beta1",
+    "kind": "WorkerVersion",
+    "definitionVersion": "0.1.0",
+    "schemaDigest": "sha256:22fde31c0b695ca59f5c46230c1ed03d6a6f53c01015d4a5acf6bdb0ed70b50c"
+  },
+  "definitionPath": "definition.json",
+  "files": [
+    {
+      "path": "definition.json",
+      "mediaType": "application/vnd.takoform.form-definition.v1+json",
+      "size": 25639,
+      "digest": "sha256:71d1902da2cc9ad44f7daf8f6fab80e0551b1cef1013db7cc9e72da9f2ca5b26"
+    },
+    {
+      "path": "fixtures/desired.json",
+      "mediaType": "application/json",
+      "size": 1717,
+      "digest": "sha256:5c900730aebba3635389161a5de82f91796f5be07ceee9695f445e8c5a082db3"
+    },
+    {
+      "path": "fixtures/negative-assets.json",
+      "mediaType": "application/json",
+      "size": 1709,
+      "digest": "sha256:cd4bf8f6e02a44d8e130e0eec6fdbb53ddbed83d4f5f0ede43d294dca34a275a"
+    },
+    {
+      "path": "fixtures/negative-bucket-bindings-binding-name.json",
+      "mediaType": "application/json",
+      "size": 1721,
+      "digest": "sha256:106469577d13702c5337f9337713bdf4c4d180e0ff4547ce828c410142dca3e2"
+    },
+    {
+      "path": "fixtures/negative-bundle.json",
+      "mediaType": "application/json",
+      "size": 1723,
+      "digest": "sha256:52ae3c78bd51acf6ab968f3d9234704e618590a0aca6d6b710452a2ab42a09a7"
+    },
+    {
+      "path": "fixtures/negative-handlers.json",
+      "mediaType": "application/json",
+      "size": 1733,
+      "digest": "sha256:ecfedff4c618e8843caae660c4dd8109c9c7b91b38618534142c7fecf487e19d"
+    },
+    {
+      "path": "fixtures/negative-kv-bindings-binding-name.json",
+      "mediaType": "application/json",
+      "size": 1717,
+      "digest": "sha256:b851abc9d81bb1fe9cf9f1106b00ca522442c6b18f5f9b097ca948d6c0654fc2"
+    },
+    {
+      "path": "fixtures/negative-missing-bundle.json",
+      "mediaType": "application/json",
+      "size": 1589,
+      "digest": "sha256:fdd3decd19573604df29db6f38fd7fabca42eaec1182207890dc71049d4df670"
+    },
+    {
+      "path": "fixtures/negative-missing-handlers.json",
+      "mediaType": "application/json",
+      "size": 1684,
+      "digest": "sha256:77bd93f45eda94ef66d680eab93b0761befe2fef693019c3d82244ae0940651a"
+    },
+    {
+      "path": "fixtures/negative-missing-worker.json",
+      "mediaType": "application/json",
+      "size": 1589,
+      "digest": "sha256:bdb15626ce4df3e772dd1c9d5a334aaadedbd1c2e026b773562dd0b53c4a9e7b"
+    },
+    {
+      "path": "fixtures/negative-queue-producer-bindings-binding-name.json",
+      "mediaType": "application/json",
+      "size": 1714,
+      "digest": "sha256:2bdb7dd4e46f88ca3ba216ae5bcc74d541fe63d3e80ed0f45e462a761027aac6"
+    },
+    {
+      "path": "fixtures/negative-required-sensitive-vars.json",
+      "mediaType": "application/json",
+      "size": 1709,
+      "digest": "sha256:2a557c7ffe7e409ccaee45524681bfcc2d26286ba17a730cb25194a1f3dd11ea"
+    },
+    {
+      "path": "fixtures/negative-service-bindings-binding-name.json",
+      "mediaType": "application/json",
+      "size": 1724,
+      "digest": "sha256:6eece3d940bb163a3a8d0ce09b85de9686a96b8495f08ca650ab402b9fedfb36"
+    },
+    {
+      "path": "fixtures/negative-sqlite-bindings-binding-name.json",
+      "mediaType": "application/json",
+      "size": 1722,
+      "digest": "sha256:87a7fda07f6bada2b2f3f33dd6db2f8264222c89b4094b08b97f8d6cf1e3d7bf"
+    },
+    {
+      "path": "fixtures/negative-unexpected-property.json",
+      "mediaType": "application/json",
+      "size": 1747,
+      "digest": "sha256:f606d304be1b74f4998e38862114a65777ead79f422414ed6fddd99f8b486de0"
+    },
+    {
+      "path": "fixtures/negative-vars.json",
+      "mediaType": "application/json",
+      "size": 1722,
+      "digest": "sha256:f4ffa2e0c924376d0220cb0a0ef5770ba22799ef4ac5ba4d26aacb9789863e21"
+    },
+    {
+      "path": "fixtures/negative-worker.json",
+      "mediaType": "application/json",
+      "size": 1723,
+      "digest": "sha256:12269a20ebfe3c62037725c4f7ead44514ee38a410b174ede11b70ed89a3eed5"
+    }
+  ]
+}

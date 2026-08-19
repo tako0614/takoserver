@@ -76,7 +76,7 @@ export interface WorkerdProviderOptions {
       readonly mainModule?: string;
       readonly modules?: readonly { readonly name: string; readonly digest: string }[];
       readonly files?: readonly {
-        readonly name: string;
+        readonly path: string;
         readonly digest: string;
         readonly mediaType?: string;
       }[];
@@ -167,8 +167,8 @@ export function createWorkerdProvider(options: WorkerdProviderOptions): Provider
         assets = new Map<string, Uint8Array>();
         for (const file of files) {
           const bytes = await artifacts.blob(file.digest);
-          if (!bytes) return failed("invalid_spec", `a declared asset is missing: ${file.name}`);
-          assets.set(file.name, bytes);
+          if (!bytes) return failed("invalid_spec", `a declared asset is missing: ${file.path}`);
+          assets.set(file.path, bytes);
         }
         if (typeof declaredAssets.notFoundHandling === "string") {
           notFoundHandling = declaredAssets.notFoundHandling;

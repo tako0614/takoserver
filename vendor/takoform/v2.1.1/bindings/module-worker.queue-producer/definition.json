@@ -1,0 +1,31 @@
+{
+  "apiVersion": "bindings.takoform.com/v1alpha1",
+  "kind": "BindingDefinition",
+  "name": "module-worker.queue-producer",
+  "version": "1.0.0",
+  "title": "Module Worker queue producer binding",
+  "description": "Projects only the submission half of edge.queue (send, sendBatch) into a Worker Version. Consumption is never a binding: it is the QueueConsumer attachment resource. Runtime surface: env.NAME is an object with exactly the methods send(body, options?) and sendBatch(messages), each returning a promise that resolves to the message identity or identities the host assigned. A body is BYTES: an ArrayBuffer, a typed array, or a string encoded UTF-8. There is no receive, no peek, and none of the settlement methods — acknowledge, retry, acknowledgeAll, and retryAll exist on the BATCH the module's queue handler receives, never here, because settling a message you were not delivered is not an operation. A resolved send means ACCEPTED and durable, not delivered — delivery is at-least-once and unordered, so the consumer may see duplicates and must be idempotent. Errors reject with an Error named for the edge.queue code.",
+  "sourceRole": "revision",
+  "targetInterface": {
+    "apiVersion": "interfaces.takoform.com/v1alpha1",
+    "name": "edge.queue",
+    "version": "1.0.0",
+    "schemaDigest": "sha256:d8ed5c673cb544f5b2bd61aa66ac1c1a716276cf072232b3a0d06471403c2ff7"
+  },
+  "allowedTargetForms": [
+    {
+      "apiVersion": "edge.forms.takoform.com/v1beta1",
+      "kind": "AtLeastOnceQueue"
+    }
+  ],
+  "bindingNameGrammar": "^[A-Za-z_$][A-Za-z0-9_$]*$",
+  "runtimeProjection": {
+    "operations": [
+      "send",
+      "sendBatch"
+    ]
+  },
+  "lifecycle": {
+    "targetDeletion": "refuse_while_bound"
+  }
+}

@@ -388,6 +388,7 @@ const app = buildApp({
     ? { consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN }
     : {}),
   forms: edge.forms,
+  bindings: edge.bindings,
   providers,
   providerPacks: deployment.providerPacks,
   offerings: deployment.offerings,

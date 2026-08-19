@@ -1,10 +1,9 @@
 import type { TakoformArtifactManifest } from "./artifacts.ts";
+import { isEdgeFormsApiVersion } from "./edge-family.ts";
 import type { ArtifactResolver, WorkerModuleInspector } from "./engine.ts";
 import type { TakoformStoredRelation } from "./relations.ts";
 import type { TakoformStore } from "./store.ts";
 import { type InstalledTakoformForm, TakoformHostError } from "./types.ts";
-
-const EDGE_FORMS = "edge.forms.takoform.com/v1alpha1";
 
 export async function validateWorkerBundleRuntime(input: {
   readonly tenantId: string;
@@ -14,7 +13,7 @@ export async function validateWorkerBundleRuntime(input: {
   readonly inspector?: WorkerModuleInspector;
 }): Promise<void> {
   if (
-    input.form.identity.formRef.apiVersion !== EDGE_FORMS ||
+    !isEdgeFormsApiVersion(input.form.identity.formRef.apiVersion) ||
     input.form.identity.formRef.kind !== "WorkerBundle" ||
     input.form.role !== "identity"
   ) {
@@ -42,7 +41,7 @@ export async function validateWorkerVersionRuntime(input: {
   readonly inspector?: WorkerModuleInspector;
 }): Promise<void> {
   if (
-    input.form.identity.formRef.apiVersion !== EDGE_FORMS ||
+    !isEdgeFormsApiVersion(input.form.identity.formRef.apiVersion) ||
     input.form.identity.formRef.kind !== "WorkerVersion" ||
     input.form.role !== "revision" ||
     !declaresWorkerRuntime(input.form)

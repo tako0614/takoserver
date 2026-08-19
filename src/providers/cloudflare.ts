@@ -44,7 +44,7 @@ export interface TakoformBundleManifest {
     readonly digest: string;
   }[];
   readonly files?: readonly {
-    readonly name: string;
+    readonly path: string;
     readonly mediaType: string;
     readonly size: number;
     readonly digest: string;
@@ -435,8 +435,8 @@ export class CloudflareProvider implements Provider {
       // Cloudflare identifies an asset by a 32-hex-character hash, not by the
       // full digest, so the digest is truncated consistently on both sides.
       const hash = file.digest.slice("sha256:".length, "sha256:".length + 32);
-      declared[`/${file.name}`] = { hash, size: file.size };
-      byHash.set(hash, { name: file.name, digest: file.digest, mediaType: file.mediaType });
+      declared[`/${file.path}`] = { hash, size: file.size };
+      byHash.set(hash, { name: file.path, digest: file.digest, mediaType: file.mediaType });
     }
 
     const started = await this.#call(

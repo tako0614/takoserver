@@ -1,0 +1,113 @@
+{
+  "apiVersion": "edge.forms.takoform.com/v1beta1",
+  "kind": "WorkerEndpoint",
+  "definitionVersion": "0.1.0",
+  "title": "Worker Endpoint",
+  "description": "Makes one Module Worker reachable over HTTPS at an address the HOST assigns, with no customer-owned domain and no DNS of the author's. The desired state is the worker and nothing else: the author asks for reachability, and where that reachability lives is the host's decision, exactly as an account, a region, and a vendor subdomain are. Requests arriving at the address invoke the fetch handler of the worker's ACTIVE DEPLOYMENT, so promotion and rollback move what answers without the endpoint being re-applied and without its address changing. The scheme is https and the path root is `/`; TLS is not an option a host may decline, because an address that is only reachable in plaintext is a different promise from the one this Form makes. A worker has AT MOST ONE endpoint: two would be two addresses for one service with nothing saying which is canonical, and the second is refused. The assigned address is published as outputs — a portable author may rely on a value being returned, on its scheme being https, and on it routing to the active deployment, and on nothing about its SHAPE: which subdomain, which apex, and how long the label is are host detail no portable configuration may parse or reconstruct. The address is IMMUTABLE for the lifetime of the endpoint's attachment UID. It MUST NOT change on deployment promotion, on status refresh, on a host's internal placement change, or on a backend migration; a host that needs to change the address deletes the endpoint and the author creates a new one, which is a new attachment with a new UID.",
+  "role": "attachment",
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Makes one Module Worker reachable over HTTPS at an address the HOST assigns, with no customer-owned domain and no DNS of the author's. The desired state is the worker and nothing else: the author asks for reachability, and where that reachability lives is the host's decision, exactly as an account, a region, and a vendor subdomain are. Requests arriving at the address invoke the fetch handler of the worker's ACTIVE DEPLOYMENT, so promotion and rollback move what answers without the endpoint being re-applied and without its address changing. The scheme is https and the path root is `/`; TLS is not an option a host may decline, because an address that is only reachable in plaintext is a different promise from the one this Form makes. A worker has AT MOST ONE endpoint: two would be two addresses for one service with nothing saying which is canonical, and the second is refused. The assigned address is published as outputs — a portable author may rely on a value being returned, on its scheme being https, and on it routing to the active deployment, and on nothing about its SHAPE: which subdomain, which apex, and how long the label is are host detail no portable configuration may parse or reconstruct. The address is IMMUTABLE for the lifetime of the endpoint's attachment UID. It MUST NOT change on deployment promotion, on status refresh, on a host's internal placement change, or on a backend migration; a host that needs to change the address deletes the endpoint and the author creates a new one, which is a new attachment with a new UID.",
+    "properties": {
+      "worker": {
+        "additionalProperties": false,
+        "description": "Module Worker whose active deployment answers requests at the assigned address. Changing it replaces the endpoint.",
+        "properties": {
+          "apiVersion": {
+            "const": "edge.forms.takoform.com/v1beta1",
+            "type": "string"
+          },
+          "kind": {
+            "const": "ModuleWorker",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9-]{0,62}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "apiVersion",
+          "kind",
+          "name"
+        ],
+        "type": "object",
+        "x-takoform-required-interface": {
+          "apiVersion": "interfaces.takoform.com/v1alpha1",
+          "name": "worker.runtime",
+          "schemaDigest": "sha256:c5d71337fb615f403f00c21a92dc6bcc9fc3cbcffad600e537a55f124441e820",
+          "version": "1.0.0"
+        }
+      }
+    },
+    "required": [
+      "worker"
+    ],
+    "title": "Worker Endpoint desired state",
+    "type": "object"
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Host-computed values this Form publishes in status.outputs. Every member is returned by a conforming host; the object is closed.",
+    "properties": {
+      "hostname": {
+        "description": "Dotted DNS hostname the host assigned to this endpoint, in canonical form: lowercase where DNS is case-insensitive and no trailing root dot. The GRAMMAR admits exactly that form, so the rule and the pattern say one thing. An author's hostname admits both variant spellings because a host canonicalizes what it is given; an assigned name has no earlier spelling to preserve. The value is IMMUTABLE for the lifetime of this endpoint's attachment UID: it does not change on deployment promotion, on status refresh, on a host's internal placement change, or on a backend migration, so a consumer may store it; a host that must change the address deletes the endpoint and the author creates a new one. Its VALUE is portable to read and pass on; its SHAPE is host detail, so a portable configuration never parses it, never asserts a suffix, and never reconstructs it from the resource name.",
+        "maxLength": 253,
+        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$",
+        "type": "string"
+      },
+      "url": {
+        "description": "Absolute HTTPS URL of the endpoint's path root: exactly `https://` + the assigned hostname + `/`. The scheme is fixed by the Form and the path root is `/`; there is no plaintext address and no port, so a consumer composes deeper paths onto this value rather than deriving an origin. It admits exactly the hostnames the hostname member admits, and it is immutable for exactly as long, because it IS that hostname.",
+        "maxLength": 264,
+        "pattern": "^https://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+/$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "hostname",
+      "url"
+    ],
+    "title": "Worker Endpoint outputs",
+    "type": "object"
+  },
+  "immutableFields": [
+    "/worker"
+  ],
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-worker",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-worker.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-worker",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-worker.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

@@ -6,17 +6,17 @@ describe("official Takoform catalog", () => {
   test("exposes only exact Forms carried by the released Takoform provider", async () => {
     const edge = await buildEdgeForms();
 
-    expect(edge.forms.map((form) => form.identity)).toEqual([
-      {
-        formRef: {
-          apiVersion: TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM.apiVersion,
-          kind: TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM.kind,
-          definitionVersion: TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM.definitionVersion,
-          schemaDigest: TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM.schemaDigest,
-        },
-        packageDigest: TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM.packageDigest,
+    expect(edge.forms).toHaveLength(15);
+    expect(edge.bindings).toHaveLength(5);
+    expect(edge.objectBucket.form.identity).toEqual({
+      formRef: {
+        apiVersion: TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM.apiVersion,
+        kind: TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM.kind,
+        definitionVersion: TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM.definitionVersion,
+        schemaDigest: TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM.schemaDigest,
       },
-    ]);
+      packageDigest: TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM.packageDigest,
+    });
     expect(edge.objectBucket.form.desiredSchema).toEqual({
       $schema: "https://json-schema.org/draft/2020-12/schema",
       additionalProperties: false,
@@ -46,8 +46,10 @@ describe("official Takoform catalog", () => {
       regions: ["global"],
     });
 
-    expect(JSON.stringify({ edge, technical })).not.toContain("pricePlan");
-    expect(JSON.stringify({ edge, technical })).not.toContain("supplyContract");
-    expect(JSON.stringify({ edge, technical })).not.toContain("available");
+    for (const value of [...edge.forms, ...edge.bindings, technical]) {
+      expect(value).not.toHaveProperty("pricePlan");
+      expect(value).not.toHaveProperty("supplyContract");
+      expect(value).not.toHaveProperty("available");
+    }
   });
 });

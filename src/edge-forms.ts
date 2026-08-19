@@ -1,9 +1,11 @@
 import type { ProviderOffering } from "./provider-port.ts";
 import {
+  assertReleasedTakoformProviderBindings,
   assertReleasedTakoformProviderForms,
+  releasedTakoformProviderBindings,
   releasedTakoformProviderForms,
 } from "./takoform/released-provider-catalog.ts";
-import type { InstalledTakoformForm } from "./takoform/types.ts";
+import type { InstalledTakoformBinding, InstalledTakoformForm } from "./takoform/types.ts";
 
 /**
  * The official Takoform Forms this Host can execute today.
@@ -21,6 +23,7 @@ export interface EdgeForm {
 export interface EdgeFormBundle {
   readonly objectBucket: EdgeForm;
   readonly forms: readonly InstalledTakoformForm[];
+  readonly bindings: readonly InstalledTakoformBinding[];
 }
 
 export interface ObjectBucketProviderOfferingOptions {
@@ -41,11 +44,14 @@ export async function buildEdgeForms(): Promise<EdgeFormBundle> {
   }
   const form: InstalledTakoformForm = objectBuckets[0];
   const objectBucket: EdgeForm = { form };
+  const bindings = releasedTakoformProviderBindings();
   const bundle = {
     objectBucket,
-    forms: [form],
+    forms: releasedForms,
+    bindings,
   };
   assertReleasedTakoformProviderForms(bundle.forms);
+  assertReleasedTakoformProviderBindings(bundle.bindings);
   return bundle;
 }
 

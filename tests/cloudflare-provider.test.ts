@@ -63,7 +63,7 @@ const artifacts: ArtifactBytes = {
         kind: "StaticAssetBundle",
         files: [
           {
-            name: "index.html",
+            path: "index.html",
             mediaType: "text/html",
             size: MODULE_BYTES.byteLength,
             digest: `sha256:${"e".repeat(64)}`,

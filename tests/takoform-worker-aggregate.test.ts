@@ -7,7 +7,7 @@ import {
 } from "../src/takoform/worker-aggregate.ts";
 
 const formRef = {
-  apiVersion: "edge.forms.takoform.com/v1alpha1",
+  apiVersion: "edge.forms.takoform.com/v1beta1",
   kind: "ModuleWorker",
   definitionVersion: "0.1.0",
   schemaDigest: `sha256:${"1".repeat(64)}` as const,

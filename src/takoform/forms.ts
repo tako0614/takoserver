@@ -1,5 +1,10 @@
 import type { JsonObject } from "../ports.ts";
-import { TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES } from "./limits.ts";
+import { isEdgeFormsApiVersion } from "./edge-family.ts";
+import {
+  TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES,
+  TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
+  TAKOFORM_MAXIMUM_WORKER_BUNDLE_MODULES,
+} from "./limits.ts";
 import { validateRelationSchema } from "./relations.ts";
 import {
   type InstalledTakoformForm,
@@ -150,9 +155,23 @@ export function isKind(value: string): boolean {
 /** What a caller may rely on before attempting an operation on this Form. */
 export function formSupportProfile(form: InstalledTakoformForm): JsonObject {
   const supportedEnums = topLevelSupportedEnums(form.desiredSchema);
-  const workerVersion =
-    form.identity.formRef.apiVersion === "edge.forms.takoform.com/v1alpha1" &&
-    form.identity.formRef.kind === "WorkerVersion";
+  const edgeForm = isEdgeFormsApiVersion(form.identity.formRef.apiVersion);
+  const workerVersion = edgeForm && form.identity.formRef.kind === "WorkerVersion";
+  const artifactFileLimit = edgeForm
+    ? form.identity.formRef.kind === "WorkerBundle"
+      ? TAKOFORM_MAXIMUM_WORKER_BUNDLE_MODULES
+      : form.identity.formRef.kind === "StaticAssetBundle" ||
+          form.identity.formRef.kind === "SQLiteMigrationSet"
+        ? TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES
+        : undefined
+    : undefined;
+  const configuredArtifactFileLimit =
+    artifactFileLimit ??
+    (form.artifactRequirement?.kind === "WorkerBundle"
+      ? TAKOFORM_MAXIMUM_WORKER_BUNDLE_MODULES
+      : form.artifactRequirement !== undefined
+        ? TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES
+        : undefined);
   return {
     apiVersion: "support.takoform.com/v1alpha1",
     kind: "FormSupport",
@@ -166,9 +185,16 @@ export function formSupportProfile(form: InstalledTakoformForm): JsonObject {
           ),
         }
       : {}),
-    ...(form.artifactRequirement?.kind === "WorkerBundle" || workerVersion
-      ? { limits: { maximumBundleBytes: TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES } }
-      : {}),
+    ...(configuredArtifactFileLimit !== undefined
+      ? {
+          limits: {
+            maximumBundleBytes: TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
+            maximumBundleFiles: configuredArtifactFileLimit,
+          },
+        }
+      : workerVersion
+        ? { limits: { maximumBundleBytes: TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES } }
+        : {}),
   };
 }
 

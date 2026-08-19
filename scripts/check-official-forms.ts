@@ -1,41 +1,56 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { buildEdgeForms, objectBucketProviderOffering } from "../src/edge-forms.ts";
-import { assertReleasedTakoformProviderForms } from "../src/takoform/released-provider-catalog.ts";
+import {
+  assertReleasedTakoformProviderBindings,
+  assertReleasedTakoformProviderForms,
+} from "../src/takoform/released-provider-catalog.ts";
 
-const SOURCE_RELEASE = Object.freeze({
-  repository: "https://github.com/tako0614/takoform.git",
-  tag: "v2.1.1",
-  commit: "9810570d542434efcf177543de9d463bbfda0d09",
-  files: [
-    {
-      local: "vendor/takoform/v2.1.1/provider-form-identities.json",
-      source: "release/provider-form-identities.json",
-      size: 7_177,
-      sha256: "494919695007578684f7bf4dfbbd96811f2b9577c17bf7b4a2410312b218d81a",
-    },
-    {
-      local: "vendor/takoform/v2.1.1/object-bucket.definition.json",
-      source: "forms/candidates/edge/v1beta1/object-bucket/definition.json",
-      size: 2_103,
-      sha256: "61f29bd91e211bbf1880e58e13565873c5ebe47417de307d94f5fb0b31df2994",
-    },
-    {
-      local: "vendor/takoform/v2.1.1/object-bucket.package-index.json",
-      source: "forms/candidates/edge/v1beta1/object-bucket/package-index.json",
-      size: 1_014,
-      sha256: "7017c95a1359f9435d3b30d68ebdecc57d3f60295d283d6944f8ac781db18587",
-    },
-  ],
-});
+const VENDOR_ROOT = "vendor/takoform/v2.1.1";
+const MANIFEST_PATH = `${VENDOR_ROOT}/source-manifest.json`;
+const MANIFEST_SIZE = 9_595;
+const MANIFEST_SHA256 = "229cd5c5209fae5c1088418216f75ce1ea7d049af027c527117aff0f1137f2ad";
 
-for (const file of SOURCE_RELEASE.files) {
-  const vendored = readFileSync(file.local);
+interface SourceManifest {
+  readonly format: "takoserver.vendored-takoform-source@v1";
+  readonly repository: string;
+  readonly tag: string;
+  readonly commit: string;
+  readonly files: readonly {
+    readonly local: string;
+    readonly source: string;
+    readonly size: number;
+    readonly sha256: string;
+  }[];
+}
+
+const manifestBytes = readFileSync(MANIFEST_PATH);
+if (
+  manifestBytes.byteLength !== MANIFEST_SIZE ||
+  createHash("sha256").update(manifestBytes).digest("hex") !== MANIFEST_SHA256
+) {
+  throw new Error("released_takoform_source_manifest_mismatch");
+}
+const source = JSON.parse(manifestBytes.toString("utf8")) as SourceManifest;
+if (
+  source.format !== "takoserver.vendored-takoform-source@v1" ||
+  source.repository !== "https://github.com/tako0614/takoform.git" ||
+  source.tag !== "v2.1.1" ||
+  source.commit !== "9810570d542434efcf177543de9d463bbfda0d09" ||
+  source.files.length !== 36
+) {
+  throw new Error("released_takoform_source_authority_mismatch");
+}
+
+for (const file of source.files) {
+  if (!/^[A-Za-z0-9._/-]+$/u.test(file.local) || file.local.includes("..")) {
+    throw new Error("released_takoform_source_path_invalid");
+  }
+  const vendored = readFileSync(`${VENDOR_ROOT}/${file.local}`);
   if (vendored.byteLength !== file.size) {
     throw new Error(`released_takoform_source_size_mismatch:${file.local}`);
   }
-  const digest = createHash("sha256").update(vendored).digest("hex");
-  if (digest !== file.sha256) {
+  if (createHash("sha256").update(vendored).digest("hex") !== file.sha256) {
     throw new Error(`released_takoform_source_digest_mismatch:${file.local}`);
   }
   JSON.parse(vendored.toString("utf8"));
@@ -43,19 +58,23 @@ for (const file of SOURCE_RELEASE.files) {
 
 const edge = await buildEdgeForms();
 assertReleasedTakoformProviderForms(edge.forms);
+assertReleasedTakoformProviderBindings(edge.bindings);
 const objectBucket = objectBucketProviderOffering(edge.objectBucket.form, {
   id: "storage.object.standard",
   displayName: "Object bucket",
 });
 if (
-  edge.forms.length !== 1 ||
-  edge.forms[0]?.identity.formRef.kind !== "ObjectBucket" ||
+  edge.forms.length !== 15 ||
+  edge.bindings.length !== 5 ||
+  edge.forms.some(
+    (form) => form.identity.formRef.apiVersion !== "edge.forms.takoform.com/v1beta1",
+  ) ||
   objectBucket.providedInterfaces.map((entry) => entry.name).join(",") !== "edge.objects"
 ) {
   throw new Error("released_takoform_product_catalog_mismatch");
 }
 
 console.log(
-  `official Forms ok: ${SOURCE_RELEASE.repository} ${SOURCE_RELEASE.tag} ` +
-    `${SOURCE_RELEASE.commit}; ${edge.forms.length} shipped Form`,
+  `official Forms ok: ${source.repository} ${source.tag} ${source.commit}; ` +
+    `${edge.forms.length} Forms and ${edge.bindings.length} Bindings`,
 );

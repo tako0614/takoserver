@@ -242,7 +242,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
                 updated_at, resource_json
          FROM tf_resources
          WHERE tenant_id = ?
-           AND api_version = 'edge.forms.takoform.com/v1alpha1'
+           AND api_version LIKE 'edge.forms.takoform.com/%'
            AND kind = 'WorkerCustomDomain'
            AND json_extract(resource_json, '$.spec.hostname') = ?
          ORDER BY space, name
@@ -262,7 +262,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
            JOIN tf_resources AS consumer
              ON consumer.tenant_id = ?
             AND consumer.space = ?
-            AND consumer.api_version = 'edge.forms.takoform.com/v1alpha1'
+            AND consumer.api_version LIKE 'edge.forms.takoform.com/%'
             AND consumer.kind = 'QueueConsumer'
            JOIN json_each(consumer.relations_json) AS drained
              ON json_extract(drained.value, '$.relation') = '/queue'

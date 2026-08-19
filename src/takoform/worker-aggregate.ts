@@ -1,10 +1,10 @@
 import type { JsonObject } from "../ports.ts";
+import { isEdgeFormsApiVersion } from "./edge-family.ts";
 import type { TakoformStoredRelation } from "./relations.ts";
 import type { TakoformStore } from "./store.ts";
 import type { TakoformCondition, TakoformStoredResource } from "./types.ts";
 import { type InstalledTakoformForm, TakoformHostError } from "./types.ts";
 
-const EDGE_FORMS = "edge.forms.takoform.com/v1alpha1";
 const MODULE_WORKER = "ModuleWorker";
 const WORKER_DEPLOYMENT = "WorkerDeployment";
 const WORKER_RELATION = "/worker";
@@ -31,7 +31,8 @@ export async function validateWorkerAggregate(input: {
     "hostnameClaims" | "queuePathReaches" | "resourcesByRelation" | "readResource" | "readRelations"
   >;
 }): Promise<void> {
-  if (input.form.identity.formRef.apiVersion !== EDGE_FORMS) return;
+  const edgeApiVersion = input.form.identity.formRef.apiVersion;
+  if (!isEdgeFormsApiVersion(edgeApiVersion)) return;
   if (input.form.identity.formRef.kind === WORKER_DEPLOYMENT && input.form.role === "deployment") {
     const versions = input.spec.versions;
     if (
@@ -53,7 +54,7 @@ export async function validateWorkerAggregate(input: {
     const active = await input.store.resourcesByRelation({
       tenantId: input.tenantId,
       space: input.space,
-      sourceApiVersion: EDGE_FORMS,
+      sourceApiVersion: edgeApiVersion,
       sourceKind: WORKER_DEPLOYMENT,
       relation: WORKER_RELATION,
       targetUid: worker.targetUid,
@@ -85,7 +86,7 @@ export async function validateWorkerAggregate(input: {
         throw new TakoformHostError("invalid_argument", 400);
       }
     }
-    const requiredHandlers = await dependentHandlers(input, worker.targetUid);
+    const requiredHandlers = await dependentHandlers(input, worker.targetUid, edgeApiVersion);
     for (const handler of requiredHandlers) {
       if (!(await selectedVersionsServe(input, weighted, handler))) {
         throw new TakoformHostError("unsupported_capability", 422);
@@ -97,7 +98,7 @@ export async function validateWorkerAggregate(input: {
     validateEnvironmentNamespace(input.spec);
     for (const relation of input.relations) {
       if (relation.relation !== SERVICE_BINDING_RELATION) continue;
-      if (!(await workerServes(input, relation.targetUid, "fetch"))) {
+      if (!(await workerServes(input, relation.targetUid, "fetch", edgeApiVersion))) {
         throw new TakoformHostError("unsupported_capability", 422);
       }
     }
@@ -118,14 +119,14 @@ export async function validateWorkerAggregate(input: {
   }
   const worker = input.relations.find((relation) => relation.relation === WORKER_RELATION);
   if (!worker) throw new TakoformHostError("invalid_argument", 400);
-  if (!(await workerServes(input, worker.targetUid, handler))) {
+  if (!(await workerServes(input, worker.targetUid, handler, edgeApiVersion))) {
     throw new TakoformHostError("unsupported_capability", 422);
   }
   if (input.form.identity.formRef.kind === "WorkerEndpoint") {
     const endpoints = await input.store.resourcesByRelation({
       tenantId: input.tenantId,
       space: input.space,
-      sourceApiVersion: EDGE_FORMS,
+      sourceApiVersion: edgeApiVersion,
       sourceKind: "WorkerEndpoint",
       relation: WORKER_RELATION,
       targetUid: worker.targetUid,
@@ -153,7 +154,7 @@ export async function validateWorkerAggregate(input: {
     const consumers = await input.store.resourcesByRelation({
       tenantId: input.tenantId,
       space: input.space,
-      sourceApiVersion: EDGE_FORMS,
+      sourceApiVersion: edgeApiVersion,
       sourceKind: "QueueConsumer",
       relation: QUEUE_RELATION,
       targetUid: queue.targetUid,
@@ -174,7 +175,7 @@ export async function validateWorkerDeploymentRemoval(input: {
   readonly store: Pick<TakoformStore, "resourcesByRelation">;
 }): Promise<void> {
   if (
-    input.form.identity.formRef.apiVersion !== EDGE_FORMS ||
+    !isEdgeFormsApiVersion(input.form.identity.formRef.apiVersion) ||
     input.form.identity.formRef.kind !== WORKER_DEPLOYMENT ||
     input.form.role !== "deployment"
   ) {
@@ -182,7 +183,10 @@ export async function validateWorkerDeploymentRemoval(input: {
   }
   const worker = input.relations.find((relation) => relation.relation === WORKER_RELATION);
   if (!worker) throw new TakoformHostError("invalid_argument", 400);
-  if ((await dependentHandlers(input, worker.targetUid)).size > 0) {
+  if (
+    (await dependentHandlers(input, worker.targetUid, input.form.identity.formRef.apiVersion))
+      .size > 0
+  ) {
     throw new TakoformHostError("dependency_in_use", 409);
   }
 }
@@ -194,6 +198,7 @@ async function dependentHandlers(
     readonly store: Pick<TakoformStore, "resourcesByRelation">;
   },
   workerUid: string,
+  edgeApiVersion: string,
 ): Promise<ReadonlySet<string>> {
   const required = new Set<string>();
   for (const [sourceKind, relation, handler] of [
@@ -206,7 +211,7 @@ async function dependentHandlers(
     const dependents = await input.store.resourcesByRelation({
       tenantId: input.tenantId,
       space: input.space,
-      sourceApiVersion: EDGE_FORMS,
+      sourceApiVersion: edgeApiVersion,
       sourceKind,
       relation,
       targetUid: workerUid,
@@ -292,12 +297,12 @@ export async function workerServiceCondition(input: {
   readonly resource: TakoformStoredResource;
   readonly store: Pick<TakoformStore, "resourcesByRelation" | "readResource">;
 }): Promise<TakoformCondition | null> {
-  if (input.resource.apiVersion !== EDGE_FORMS || input.resource.kind !== MODULE_WORKER)
+  if (!isEdgeFormsApiVersion(input.resource.apiVersion) || input.resource.kind !== MODULE_WORKER)
     return null;
   const deployments = await input.store.resourcesByRelation({
     tenantId: input.tenantId,
     space: input.resource.metadata.space,
-    sourceApiVersion: EDGE_FORMS,
+    sourceApiVersion: input.resource.apiVersion,
     sourceKind: WORKER_DEPLOYMENT,
     relation: WORKER_RELATION,
     targetUid: input.resource.metadata.uid,
@@ -362,11 +367,12 @@ async function workerServes(
   },
   workerUid: string,
   handler: string,
+  edgeApiVersion: string,
 ): Promise<boolean> {
   const deployments = await input.store.resourcesByRelation({
     tenantId: input.tenantId,
     space: input.space,
-    sourceApiVersion: EDGE_FORMS,
+    sourceApiVersion: edgeApiVersion,
     sourceKind: WORKER_DEPLOYMENT,
     relation: WORKER_RELATION,
     targetUid: workerUid,

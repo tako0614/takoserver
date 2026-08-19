@@ -1,7 +1,6 @@
 import type { JsonObject } from "../ports.ts";
+import { isEdgeFormsApiVersion } from "./edge-family.ts";
 import type { InstalledTakoformForm, TakoformDiagnostic } from "./types.ts";
-
-const EDGE_FORMS = "edge.forms.takoform.com/v1alpha1";
 
 /** Semantic rules that a JSON Schema cannot express for the official Edge Forms. */
 export function validateEdgeSemantics(
@@ -9,7 +8,7 @@ export function validateEdgeSemantics(
   spec: JsonObject,
 ): readonly TakoformDiagnostic[] {
   if (
-    form.identity.formRef.apiVersion !== EDGE_FORMS ||
+    !isEdgeFormsApiVersion(form.identity.formRef.apiVersion) ||
     form.identity.formRef.kind !== "WorkerCronTrigger"
   ) {
     return [];
@@ -23,7 +22,7 @@ export function validateEdgeSemantics(
 /** Canonicalize Edge values before validation, prepare hashing, and provider dispatch. */
 export function canonicalizeEdgeSpec(form: InstalledTakoformForm, spec: JsonObject): JsonObject {
   if (
-    form.identity.formRef.apiVersion !== EDGE_FORMS ||
+    !isEdgeFormsApiVersion(form.identity.formRef.apiVersion) ||
     form.identity.formRef.kind !== "WorkerCustomDomain" ||
     typeof spec.hostname !== "string"
   ) {

@@ -84,8 +84,8 @@ describe("a Worker that declares a site", () => {
         "sha256:site": {
           kind: "StaticAssetBundle",
           files: [
-            { name: "index.html", digest: "sha256:html" },
-            { name: "app.css", digest: "sha256:css" },
+            { path: "index.html", digest: "sha256:html" },
+            { path: "app.css", digest: "sha256:css" },
           ],
         },
       },
@@ -104,7 +104,7 @@ describe("a Worker that declares a site", () => {
         "sha256:worker": WORKER_BUNDLE,
         "sha256:site": {
           kind: "StaticAssetBundle",
-          files: [{ name: "index.html", digest: "sha256:html" }],
+          files: [{ path: "index.html", digest: "sha256:html" }],
         },
       },
       { "sha256:mod": "export default {}", "sha256:html": "<html>" },
@@ -147,8 +147,8 @@ describe("a Worker that declares a site", () => {
         "sha256:site": {
           kind: "StaticAssetBundle",
           files: [
-            { name: "index.html", digest: "sha256:html" },
-            { name: "gone.css", digest: "sha256:gone" },
+            { path: "index.html", digest: "sha256:html" },
+            { path: "gone.css", digest: "sha256:gone" },
           ],
         },
       },

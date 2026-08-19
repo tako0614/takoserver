@@ -9,6 +9,12 @@
 /** Largest Worker bundle a tenant may commit. Advertised in support profiles. */
 export const TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES = 10_485_760;
 
+/** Maximum module entries in one WorkerBundle manifest. */
+export const TAKOFORM_MAXIMUM_WORKER_BUNDLE_MODULES = 4_096;
+
+/** Maximum file entries in one StaticAssetBundle or MigrationBundle. */
+export const TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES = 16_384;
+
 /** Largest request body the Host will read, before parsing it. */
 export const MAXIMUM_REQUEST_BODY_BYTES = 1_048_576;
 

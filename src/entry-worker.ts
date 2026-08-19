@@ -149,6 +149,7 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     publicOrigin: origin,
     ...(env.TAKOSERVER_CONSOLE_ORIGIN ? { consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN } : {}),
     forms: edge.forms,
+    bindings: edge.bindings,
     providers: deployment.providers,
     providerPacks: deployment.providerPacks,
     offerings: deployment.offerings,

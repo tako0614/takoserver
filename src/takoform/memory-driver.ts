@@ -17,6 +17,35 @@ import { TakoformHostError } from "./types.ts";
 export class InMemoryTakoformResourceDriver implements TakoformResourceDriver {
   readonly #nativeByResource = new Map<string, string>();
   readonly #resourceByNative = new Map<string, string>();
+  readonly #migrationLedgers = new Map<
+    string,
+    readonly { path: string; digest: `sha256:${string}` }[]
+  >();
+
+  readonly sqliteMigrations = {
+    readLedger: async (input: {
+      readonly tenantId: string;
+      readonly database: TakoformStoredResource;
+    }) =>
+      structuredClone(
+        this.#migrationLedgers.get(`${input.tenantId}\0${input.database.metadata.uid}`) ?? [],
+      ),
+    applySuffix: async (input: {
+      readonly tenantId: string;
+      readonly database: TakoformStoredResource;
+      readonly migrations: readonly {
+        readonly path: string;
+        readonly digest: `sha256:${string}`;
+      }[];
+    }) => {
+      const key = `${input.tenantId}\0${input.database.metadata.uid}`;
+      const current = this.#migrationLedgers.get(key) ?? [];
+      this.#migrationLedgers.set(key, [
+        ...current,
+        ...input.migrations.map(({ path, digest }) => ({ path, digest })),
+      ]);
+    },
+  };
 
   async apply(
     input: Parameters<TakoformResourceDriver["apply"]>[0],

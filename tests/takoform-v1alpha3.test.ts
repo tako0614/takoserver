@@ -1252,7 +1252,7 @@ describe("Takoserver current Takoform Host", () => {
           kind: "FormSupport",
           formRef,
           operations: ["create", "read", "delete", "import", "observe"],
-          limits: { maximumBundleBytes: 10_485_760 },
+          limits: { maximumBundleBytes: 10_485_760, maximumBundleFiles: 4_096 },
         },
       ],
     });
