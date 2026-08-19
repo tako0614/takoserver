@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import type { ProviderOffering } from "../src/provider-port.ts";
+import { buildEdgeForms, edgeProviderOffering } from "../src/edge-forms.ts";
+import type { JsonObject } from "../src/ports.ts";
+import type { ProviderOffering, ProviderRelation } from "../src/provider-port.ts";
 import {
   type ArtifactBytes,
   CloudflareProvider,
@@ -77,6 +79,8 @@ const artifacts: ArtifactBytes = {
     return digest === `sha256:${"e".repeat(64)}` ? MODULE_BYTES : null;
   },
 };
+
+const RELEASED_EDGE = await buildEdgeForms();
 
 interface Call {
   readonly method: string;
@@ -446,6 +450,315 @@ describe("Cloudflare provider", () => {
     if (ticket.phase !== "failed") throw new Error("expected failure");
     expect(ticket.failure).toMatchObject({ code: "unavailable", retryable: true });
   });
+});
+
+describe("released edge Form placement", () => {
+  const edge = RELEASED_EDGE;
+  const form = (kind: string) => {
+    const found = edge.forms.find((candidate) => candidate.identity.formRef.kind === kind);
+    if (!found) throw new Error(`missing released Form: ${kind}`);
+    return found;
+  };
+  const technical = (kind: string) =>
+    edgeProviderOffering(form(kind), { id: `cloudflare.edge.${kind}`, regions: ["global"] });
+
+  test("creates the provider-backed identity Forms without inventing their schema", async () => {
+    const offerings = [
+      technical("ModuleWorker"),
+      technical("EdgeKVNamespace"),
+      technical("SQLiteDatabase"),
+      technical("AtLeastOnceQueue"),
+    ];
+    const calls: Call[] = [];
+    const responses = [
+      { id: "kv-id" },
+      { uuid: "database-id", name: "database-name" },
+      { queue_id: "queue-id", queue_name: "queue-name" },
+    ];
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings,
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        calls.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body: await request.clone().text(),
+        });
+        return Response.json({ success: true, errors: [], result: responses[calls.length - 1] });
+      },
+    });
+    const worker = await provider.apply({
+      operationId: "op-worker",
+      offering: offerings[0] as ProviderOffering,
+      identity: { ...IDENTITY, name: "api" },
+      spec: {},
+    });
+    expect(worker.phase).toBe("succeeded");
+    expect(calls).toHaveLength(0);
+    const kv = await provider.apply({
+      operationId: "op-kv",
+      offering: offerings[1] as ProviderOffering,
+      identity: { ...IDENTITY, name: "cache" },
+      spec: {},
+    });
+    const database = await provider.apply({
+      operationId: "op-db",
+      offering: offerings[2] as ProviderOffering,
+      identity: { ...IDENTITY, name: "main" },
+      spec: {},
+    });
+    const queue = await provider.apply({
+      operationId: "op-queue",
+      offering: offerings[3] as ProviderOffering,
+      identity: { ...IDENTITY, name: "jobs" },
+      spec: { messageRetentionSeconds: 86_400, deliveryDelaySeconds: 3 },
+    });
+    expect(kv).toMatchObject({ phase: "succeeded", result: { nativeId: "kv:kv-id" } });
+    expect(database).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: "d1:database-id", outputs: { databaseId: "database-id" } },
+    });
+    expect(queue).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: "queue:queue-id" },
+    });
+    expect(calls.map((call) => new URL(call.url).pathname)).toEqual([
+      "/client/v4/accounts/acct_1/storage/kv/namespaces",
+      "/client/v4/accounts/acct_1/d1/database",
+      "/client/v4/accounts/acct_1/queues",
+    ]);
+  });
+
+  test("uploads a Worker Version then deploys that exact provider Version", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const versionOffering = technical("WorkerVersion");
+    const deploymentOffering = technical("WorkerDeployment");
+    const calls: Call[] = [];
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering, versionOffering, deploymentOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        calls.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body: await request.clone().text(),
+        });
+        return Response.json({
+          success: true,
+          errors: [],
+          result: calls.length === 1 ? { id: "version-id" } : { id: "deployment-id" },
+        });
+      },
+    });
+    const worker = related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+      nativeId: "worker:script-name",
+      offeringId: workerOffering.id,
+      providerPackRef: "cloudflare",
+      outputs: { scriptName: "script-name" },
+    });
+    const bundle = related(
+      "/bundle",
+      stored("WorkerBundle", "bundle-uid", { manifestDigest: `sha256:${"d".repeat(64)}` }),
+    );
+    const version = await provider.apply({
+      operationId: "op-version",
+      offering: versionOffering,
+      identity: { ...IDENTITY, name: "v1" },
+      spec: {
+        worker: {
+          apiVersion: "edge.forms.takoform.com/v1beta1",
+          kind: "ModuleWorker",
+          name: "api",
+        },
+        bundle: {
+          apiVersion: "edge.forms.takoform.com/v1beta1",
+          kind: "WorkerBundle",
+          name: "bundle",
+        },
+        handlers: ["fetch"],
+      },
+      relations: [worker, bundle],
+    });
+    expect(version).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: "version:script-name:version-id" },
+    });
+    const versionRelation = related(
+      "/versions/0/workerVersion",
+      stored("WorkerVersion", "version-uid", {}),
+      {
+        nativeId: "version:script-name:version-id",
+        offeringId: versionOffering.id,
+        providerPackRef: "cloudflare",
+        outputs: { versionId: "version-id", scriptName: "script-name" },
+      },
+    );
+    const deployed = await provider.apply({
+      operationId: "op-deploy",
+      offering: deploymentOffering,
+      identity: { ...IDENTITY, name: "live" },
+      spec: { versions: [{ weight: 10_000 }], worker: {} },
+      relations: [worker, versionRelation],
+    });
+    expect(deployed).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: "deployment:script-name:deployment-id" },
+    });
+    expect(calls[0]?.url).toContain("/workers/scripts/script-name/versions");
+    expect(calls[1]?.url).toContain("/workers/scripts/script-name/deployments");
+    expect(calls[1]?.body).toContain('"percentage":100');
+    expect(calls[1]?.body).toContain('"version_id":"version-id"');
+  });
+
+  test("observes and removes every composed provider object without guessing identity", async () => {
+    const offerings = [
+      technical("WorkerVersion"),
+      technical("WorkerDeployment"),
+      technical("WorkerEndpoint"),
+      technical("WorkerCustomDomain"),
+      technical("WorkerCronTrigger"),
+      technical("QueueConsumer"),
+    ];
+    const calls: Call[] = [];
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings,
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      workerEndpointSuffix: "tenant.workers.dev",
+      async fetch(request) {
+        const path = new URL(request.url).pathname;
+        calls.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body: await request.clone().text(),
+        });
+        const result = path.endsWith("/subdomain")
+          ? { enabled: true }
+          : path.endsWith("/workers/domains/domain-id")
+            ? { id: "domain-id", hostname: "api.example.com", service: "script-name" }
+            : path.endsWith("/schedules") && request.method === "GET"
+              ? [{ cron: "*/5 * * * *" }, { cron: "0 0 * * *" }]
+              : path.includes("/consumers/")
+                ? { consumer_id: "consumer-id", script_name: "script-name" }
+                : path.includes("/deployments/")
+                  ? { id: "deployment-id", versions: [] }
+                  : { id: "version-id" };
+        return Response.json({ success: true, errors: [], result });
+      },
+    });
+    const cases = [
+      ["version:script-name:version-id", offerings[0], {}],
+      ["deployment:script-name:deployment-id", offerings[1], {}],
+      ["endpoint:script-name", offerings[2], {}],
+      ["domain:domain-id", offerings[3], { hostname: "api.example.com" }],
+      ["cron:script-name:cron-digest", offerings[4], { cron: "*/5 * * * *" }],
+      ["consumer:queue-id:consumer-id", offerings[5], {}],
+    ] as const;
+    for (const [nativeId, offering, spec] of cases) {
+      expect(
+        await provider.observe({
+          offering: offering as ProviderOffering,
+          nativeId,
+          spec,
+        }),
+      ).toMatchObject({ phase: "succeeded", result: { nativeId } });
+    }
+
+    const retained = await provider.delete({
+      operationId: "delete-version",
+      offering: offerings[0] as ProviderOffering,
+      nativeId: "version:script-name:version-id",
+      identity: IDENTITY,
+      spec: {},
+    });
+    expect(retained).toMatchObject({
+      phase: "succeeded",
+      result: { disposition: "retained", observed: { retained: true } },
+    });
+    for (const [nativeId, offering, spec] of cases.slice(1)) {
+      expect(
+        await provider.delete({
+          operationId: `delete-${nativeId}`,
+          offering: offering as ProviderOffering,
+          nativeId,
+          identity: IDENTITY,
+          spec,
+        }),
+      ).toMatchObject({ phase: "succeeded", result: { nativeId } });
+    }
+    expect(calls.map((call) => `${call.method} ${new URL(call.url).pathname}`)).toContain(
+      "DELETE /client/v4/accounts/acct_1/workers/scripts/script-name/deployments/deployment-id",
+    );
+    expect(calls.map((call) => `${call.method} ${new URL(call.url).pathname}`)).toContain(
+      "DELETE /client/v4/accounts/acct_1/workers/domains/domain-id",
+    );
+    expect(calls.map((call) => `${call.method} ${new URL(call.url).pathname}`)).toContain(
+      "DELETE /client/v4/accounts/acct_1/queues/queue-id/consumers/consumer-id",
+    );
+    const scheduleUpdate = calls.find(
+      (call) => call.method === "PUT" && call.url.endsWith("/schedules"),
+    );
+    expect(scheduleUpdate?.body).toBe('[{"cron":"0 0 * * *"}]');
+  });
+
+  function stored(kind: string, uid: string, spec: JsonObject) {
+    const installed = form(kind);
+    return {
+      apiVersion: installed.identity.formRef.apiVersion,
+      kind,
+      form: installed.identity,
+      metadata: { name: kind.toLowerCase(), space: "default", uid, generation: "1", revision: "1" },
+      spec,
+      status: { observedGeneration: "1", conditions: [] },
+    };
+  }
+
+  function related(
+    pointer: string,
+    resource: ReturnType<typeof stored>,
+    deployment?: {
+      nativeId: string;
+      offeringId: string;
+      providerPackRef: string;
+      outputs: JsonObject;
+    },
+  ): ProviderRelation {
+    return {
+      pointer,
+      relation: pointer.replace(/\/\d+/gu, "/*"),
+      targetUid: resource.metadata.uid,
+      resource,
+      ...(deployment
+        ? {
+            deployment: {
+              tenantId: "org_acme",
+              id: `dep_${resource.metadata.uid}`,
+              resourceUid: resource.metadata.uid,
+              offeringId: deployment.offeringId,
+              providerPackRef: deployment.providerPackRef,
+              providerInstallationRef: "cloudflare.primary",
+              nativeId: deployment.nativeId,
+              state: "active",
+              observed: {},
+              outputs: deployment.outputs,
+              createdAt: "2026-08-19T00:00:00.000Z",
+              updatedAt: "2026-08-19T00:00:00.000Z",
+            },
+          }
+        : {}),
+    };
+  }
 });
 
 /**

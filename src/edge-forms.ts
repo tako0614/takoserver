@@ -32,6 +32,12 @@ export interface ObjectBucketProviderOfferingOptions {
   readonly regions?: readonly string[];
 }
 
+export interface EdgeProviderOfferingOptions {
+  readonly id: string;
+  readonly displayName?: string;
+  readonly regions?: readonly string[];
+}
+
 export async function buildEdgeForms(): Promise<EdgeFormBundle> {
   const releasedForms = releasedTakoformProviderForms();
   const objectBuckets = releasedForms.filter(
@@ -79,5 +85,38 @@ export function objectBucketProviderOffering(
     bindingRefs: form.acceptedBindings ?? [],
     ...(options.regions ? { regions: [...options.regions] } : {}),
     capabilities: ["create", "delete", "import", "observe"],
+  };
+}
+
+/**
+ * Projects one released edge Form into a provider's technical capability.
+ *
+ * This is not a commercial Offering. Identity Forms may later be joined to a
+ * price and supply contract; revision/deployment/attachment Forms inherit the
+ * provider installation of their pinned identity relation.
+ */
+export function edgeProviderOffering(
+  form: InstalledTakoformForm,
+  options: EdgeProviderOfferingOptions,
+): ProviderOffering {
+  if (form.identity.formRef.apiVersion !== "edge.forms.takoform.com/v1beta1") {
+    throw new TypeError("released_takoform_edge_form_required");
+  }
+  return {
+    id: options.id,
+    kind: `takoform.${form.identity.formRef.kind}`,
+    displayName: options.displayName ?? form.displayName ?? form.identity.formRef.kind,
+    form: structuredClone(form.identity.formRef),
+    providedInterfaces: structuredClone(form.providedInterfaces ?? []),
+    bindingRefs: structuredClone(form.acceptedBindings ?? []),
+    ...(options.regions ? { regions: [...options.regions] } : {}),
+    capabilities: form.operations.filter(
+      (operation): operation is ProviderOffering["capabilities"][number] =>
+        operation === "create" ||
+        operation === "update" ||
+        operation === "delete" ||
+        operation === "import" ||
+        operation === "observe",
+    ),
   };
 }

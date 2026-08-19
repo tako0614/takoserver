@@ -96,6 +96,22 @@ export interface TakoformDriverReceipt {
   readonly conditions?: readonly TakoformCondition[];
 }
 
+/**
+ * One relation after the Host has resolved and re-read its exact UID target.
+ *
+ * Provider adapters receive this projection instead of resolving names on
+ * their own. The relation pin remains the authority; `resource` is the exact
+ * same-tenant, same-space representation observed immediately before the
+ * provider mutation.
+ */
+export interface TakoformDriverRelation {
+  readonly pointer: string;
+  readonly relation: string;
+  readonly targetUid: string;
+  readonly resource: TakoformStoredResource;
+  readonly bindingRef?: TakoformBindingRef;
+}
+
 export interface TakoformResourceDriver {
   apply(input: {
     readonly operationId: string;
@@ -105,6 +121,7 @@ export interface TakoformResourceDriver {
     readonly name: string;
     readonly space: string;
     readonly spec: JsonObject;
+    readonly relations: readonly TakoformDriverRelation[];
     readonly commercialAuthority?: TakoformCommercialAuthority;
     readonly previous?: TakoformStoredResource;
   }): Promise<TakoformDriverReceipt>;
@@ -112,12 +129,14 @@ export interface TakoformResourceDriver {
     readonly tenantId: string;
     readonly resourceUid: string;
     readonly resource: TakoformStoredResource;
+    readonly relations: readonly TakoformDriverRelation[];
   }): Promise<TakoformDriverReceipt>;
   delete(input: {
     readonly operationId: string;
     readonly tenantId: string;
     readonly resourceUid: string;
     readonly resource: TakoformStoredResource;
+    readonly relations: readonly TakoformDriverRelation[];
   }): Promise<void>;
   import?(input: {
     readonly operationId: string;
@@ -128,6 +147,7 @@ export interface TakoformResourceDriver {
     readonly space: string;
     readonly spec: JsonObject;
     readonly nativeId: string;
+    readonly relations: readonly TakoformDriverRelation[];
     readonly previous?: TakoformStoredResource;
   }): Promise<TakoformDriverReceipt>;
   /**

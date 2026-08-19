@@ -39,6 +39,12 @@ export interface ProviderResult {
   readonly nativeId: string;
   readonly observed: JsonObject;
   readonly outputs: JsonObject;
+  /**
+   * Physical disposition after a logical delete. Providers that cannot remove
+   * an immutable revision must say so; the Deployment is then retained rather
+   * than falsely recorded as deleted.
+   */
+  readonly disposition?: "deleted" | "retained";
 }
 
 export type ProviderTicket =
@@ -80,6 +86,50 @@ export interface ApplyInput {
   readonly region?: string;
   /** Present for an update; absent for a create. */
   readonly previous?: { readonly nativeId: string; readonly spec: JsonObject };
+  /** Exact Host-pinned dependencies with any active provider realization. */
+  readonly relations?: readonly ProviderRelation[];
+}
+
+/** Exact logical target projected to a Provider Pack at the mutation barrier. */
+export interface ProviderRelation {
+  readonly pointer: string;
+  readonly relation: string;
+  readonly targetUid: string;
+  readonly resource: {
+    readonly apiVersion: string;
+    readonly kind: string;
+    readonly form: { readonly formRef: TakoformV1Alpha3FormRef };
+    readonly metadata: {
+      readonly name: string;
+      readonly space: string;
+      readonly uid: string;
+      readonly generation: string;
+      readonly revision: string;
+    };
+    readonly spec: JsonObject;
+  };
+  readonly bindingRef?: TakoformBindingRef;
+  readonly deployment?: {
+    readonly tenantId: string;
+    readonly id: string;
+    readonly resourceUid: string;
+    readonly offeringId: string;
+    readonly providerPackRef: string;
+    readonly providerInstallationRef: string;
+    readonly nativeId: string;
+    readonly state:
+      | "provisioning"
+      | "candidate"
+      | "active"
+      | "draining"
+      | "retained"
+      | "failed"
+      | "deleted";
+    readonly observed: JsonObject;
+    readonly outputs: JsonObject;
+    readonly createdAt: string;
+    readonly updatedAt: string;
+  };
 }
 
 export interface Provider {
@@ -93,12 +143,15 @@ export interface Provider {
     readonly nativeId: string;
     readonly identity: ResourceIdentity;
     readonly spec: JsonObject;
+    readonly relations?: readonly ProviderRelation[];
   }): Promise<ProviderTicket>;
   delete(input: {
     readonly operationId: string;
     readonly offering: ProviderOffering;
     readonly nativeId: string;
     readonly identity: ResourceIdentity;
+    readonly spec?: JsonObject;
+    readonly relations?: readonly ProviderRelation[];
   }): Promise<ProviderTicket>;
   /** Adopts an existing native resource. Absent when adoption is impossible. */
   adopt?(input: {
@@ -106,6 +159,7 @@ export interface Provider {
     readonly nativeId: string;
     readonly identity: ResourceIdentity;
     readonly spec: JsonObject;
+    readonly relations?: readonly ProviderRelation[];
   }): Promise<ProviderTicket>;
 }
 

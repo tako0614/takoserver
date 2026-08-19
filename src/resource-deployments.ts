@@ -45,6 +45,13 @@ export interface ResourceDeploymentStore {
     outputs: JsonObject,
   ): Promise<boolean>;
   markDeleted(tenantId: string, deploymentId: string, expectedNativeId: string): Promise<boolean>;
+  markRetained(
+    tenantId: string,
+    deploymentId: string,
+    expectedNativeId: string,
+    observed: JsonObject,
+    outputs: JsonObject,
+  ): Promise<boolean>;
   cutover(
     tenantId: string,
     resourceUid: string,
@@ -166,6 +173,23 @@ export function createResourceDeploymentStore(sql: Sql, clock: Clock): ResourceD
         `UPDATE tf_resource_deployments SET state = 'deleted', updated_at = ?
          WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`,
         [now(), tenantId, deploymentId, expectedNativeId],
+      );
+      return changed.changes === 1;
+    },
+
+    async markRetained(tenantId, deploymentId, expectedNativeId, observed, outputs) {
+      const changed = await sql.run(
+        `UPDATE tf_resource_deployments
+         SET state = 'retained', observed_json = ?, outputs_json = ?, updated_at = ?
+         WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`,
+        [
+          JSON.stringify(observed),
+          JSON.stringify(outputs),
+          now(),
+          tenantId,
+          deploymentId,
+          expectedNativeId,
+        ],
       );
       return changed.changes === 1;
     },

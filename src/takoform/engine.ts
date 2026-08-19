@@ -14,6 +14,7 @@ import {
   type TakoformCommercialAuthority,
   type TakoformDiagnostic,
   type TakoformDriverReceipt,
+  type TakoformDriverRelation,
   TakoformHostError,
   type TakoformResourceDriver,
   type TakoformStoredResource,
@@ -218,6 +219,41 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       expectedRevision: previous?.metadata.revision ?? null,
     });
     if (!written) throw new TakoformHostError("resource_busy", 409);
+  };
+
+  /** Re-reads every pinned target immediately before provider execution. */
+  const driverRelations = async (
+    tenantId: string,
+    space: string,
+    relations: readonly TakoformStoredRelation[],
+  ): Promise<readonly TakoformDriverRelation[]> => {
+    const resolved: TakoformDriverRelation[] = [];
+    for (const relation of relations) {
+      const resource = await store.readResource({
+        tenantId,
+        space,
+        apiVersion: relation.targetApiVersion,
+        kind: relation.targetKind,
+        name: relation.targetName,
+      });
+      if (
+        !resource ||
+        resource.metadata.uid !== relation.targetUid ||
+        !sameFormRef(resource.form.formRef, relation.targetFormRef)
+      ) {
+        throw new TakoformHostError("resource_not_found", 404, {
+          pointer: relation.pointer,
+        });
+      }
+      resolved.push({
+        pointer: relation.pointer,
+        relation: relation.relation,
+        targetUid: relation.targetUid,
+        resource: structuredClone(resource),
+        ...(relation.bindingRef ? { bindingRef: structuredClone(relation.bindingRef) } : {}),
+      });
+    }
+    return resolved;
   };
 
   return {
@@ -531,6 +567,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         name: body.metadata.name,
         space: body.metadata.space,
         spec: structuredClone(body.spec),
+        relations: await driverRelations(context.tenantId, body.metadata.space, relations),
         ...(context.commercialAuthority
           ? { commercialAuthority: context.commercialAuthority }
           : {}),
@@ -601,13 +638,14 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       const replay = await store.readReplay(replayKey);
       if (replay) return replayedObservation(replay, fingerprint, current.metadata.uid);
 
+      const relations = await store.readRelations(address);
       const observeId = operationId();
       const receipt = await driver.observe({
         tenantId: context.tenantId,
         resourceUid: current.metadata.uid,
         resource: structuredClone(current),
+        relations: await driverRelations(context.tenantId, current.metadata.space, relations),
       });
-      const relations = await store.readRelations(address);
       const observed = withObservation(current, form, receipt);
       const drift = await relationDrift({
         tenantId: context.tenantId,
@@ -756,6 +794,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         space: body.metadata.space,
         spec: structuredClone(body.spec),
         nativeId: body.nativeId,
+        relations: await driverRelations(context.tenantId, body.metadata.space, relations),
         ...(current ? { previous: structuredClone(current) } : {}),
       });
       const materialized = materializeResource(body, form, receipt, current, clock, uid);
@@ -868,6 +907,11 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         tenantId: context.tenantId,
         resourceUid: current.metadata.uid,
         resource: structuredClone(current),
+        relations: await driverRelations(
+          context.tenantId,
+          current.metadata.space,
+          currentRelations,
+        ),
       });
       const removed = await store.deleteResource(address, current.metadata.revision);
       if (!removed) throw new TakoformHostError("resource_busy", 409);

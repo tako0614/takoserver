@@ -419,9 +419,15 @@ describe("Takoserver current Takoform Host", () => {
     const memory = new InMemoryTakoformResourceDriver();
     const sql = createEphemeralSql();
     let sourceMutations = 0;
+    let resolvedTargetUid: string | undefined;
     const driver: TakoformResourceDriver = {
       async apply(input) {
-        if (input.form.identity.formRef.kind === sourceFormRef.kind) sourceMutations += 1;
+        if (input.form.identity.formRef.kind === sourceFormRef.kind) {
+          sourceMutations += 1;
+          expect(input.relations).toHaveLength(1);
+          expect(input.relations[0]?.resource.metadata.uid).toBe(input.relations[0]?.targetUid);
+          resolvedTargetUid = input.relations[0]?.targetUid;
+        }
         return memory.apply(input);
       },
       observe: (input) => memory.observe(input),
@@ -541,6 +547,7 @@ describe("Takoserver current Takoform Host", () => {
       ).status,
     ).toBe(201);
     expect(sourceMutations).toBe(1);
+    expect(resolvedTargetUid).toBe(oldTargetUid);
 
     const targetQuery = new URLSearchParams({
       space: "conformance",

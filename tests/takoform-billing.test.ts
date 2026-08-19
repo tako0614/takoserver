@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { buildEdgeForms, edgeProviderOffering } from "../src/edge-forms.ts";
 import {
   buildApp,
   createCatalog,
@@ -195,6 +196,82 @@ async function applyBucket(
 }
 
 describe("Takoform apply on a real backend", () => {
+  test("inherits one exact provider installation for a revision Form", async () => {
+    const sql = createEphemeralSql();
+    const clock = () => new Date("2026-08-19T00:00:00.000Z");
+    const deployments = createResourceDeploymentStore(sql, clock);
+    const bundle = await buildEdgeForms();
+    const worker = bundle.forms.find(
+      (candidate) => candidate.identity.formRef.kind === "ModuleWorker",
+    );
+    const version = bundle.forms.find(
+      (candidate) => candidate.identity.formRef.kind === "WorkerVersion",
+    );
+    if (!worker || !version) throw new Error("released edge Forms missing");
+    const versionOffering = edgeProviderOffering(version, {
+      id: "cloudflare.worker-version",
+    });
+    const provider = new FakeProvider({ offerings: [versionOffering] });
+    const driver = createProviderDriver({
+      providers: [provider],
+      catalog: createCatalog([]),
+      ledger: createLedger(sql, clock),
+      deployments,
+    });
+    await deployments.create({
+      tenantId: "org_inherited",
+      id: "dep_worker",
+      resourceUid: "uid_worker",
+      offeringId: "cloudflare.module-worker",
+      providerPackRef: "fake",
+      providerInstallationRef: "cloudflare.primary",
+      nativeId: "worker:script-name",
+      state: "active",
+      observed: { allocated: true },
+      outputs: { scriptName: "script-name" },
+    });
+    const result = await driver.apply({
+      operationId: "op_version",
+      tenantId: "org_inherited",
+      resourceUid: "uid_version",
+      form: version,
+      name: "v1",
+      space: "default",
+      spec: {},
+      relations: [
+        {
+          pointer: "/worker",
+          relation: "/worker",
+          targetUid: "uid_worker",
+          resource: {
+            apiVersion: worker.identity.formRef.apiVersion,
+            kind: worker.identity.formRef.kind,
+            form: worker.identity,
+            metadata: {
+              name: "api",
+              space: "default",
+              uid: "uid_worker",
+              generation: "1",
+              revision: "1",
+            },
+            spec: {},
+            status: { observedGeneration: "1", conditions: [] },
+          },
+        },
+      ],
+    });
+    expect(result.observed).toEqual({});
+    expect(await deployments.active("org_inherited", "uid_version")).toMatchObject({
+      offeringId: "cloudflare.worker-version",
+      providerPackRef: "fake",
+      providerInstallationRef: "cloudflare.primary",
+    });
+    expect(await createLedger(sql, clock).wallet("org_inherited")).toMatchObject({
+      settledMinor: 0,
+      heldMinor: 0,
+    });
+  });
+
   test("does not charge a reseller reservation a second time inside the provider driver", async () => {
     const sql = createEphemeralSql();
     const clock = () => new Date("2026-08-18T18:00:00.000Z");
@@ -217,6 +294,7 @@ describe("Takoform apply on a real backend", () => {
       name: "media",
       space: "opaque-tenant",
       spec: { location: "apac" },
+      relations: [],
       commercialAuthority: {
         reservationId: "rsv_paid",
         offeringId: SOLD.id,
