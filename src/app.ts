@@ -13,6 +13,7 @@ import { createLedger, type FundingSettlementVerifier } from "./ledger.ts";
 import { createMetering, type MeteringRates } from "./metering.ts";
 import type { Clock, ObjectStore, Sql } from "./ports.ts";
 import { createProviderDriver } from "./provider-driver.ts";
+import { createProviderMetering } from "./provider-metering.ts";
 import type { ProviderPack } from "./provider-pack.ts";
 import type { Provider } from "./provider-port.ts";
 import { createReseller } from "./reseller.ts";
@@ -102,6 +103,10 @@ export interface TickReport {
   readonly orphanedResources: readonly string[];
   /** Usage rows folded into ledger entries this tick. */
   readonly meteredRows: number;
+  /** Provider observation windows made durable before this tick's rollup. */
+  readonly providerMeterWindows: number;
+  /** Deployment ids whose upstream usage could not be settled this pass. */
+  readonly providerMeterFailures: readonly string[];
 }
 
 export function buildApp(ports: AppPorts): App {
@@ -294,6 +299,15 @@ export function buildApp(ports: AppPorts): App {
     randomId,
     ...(ports.meteringRates ? { rates: ports.meteringRates } : {}),
   });
+  const providerMetering = createProviderMetering({
+    sql: ports.sql,
+    deployments,
+    catalog,
+    packs: ports.providerPacks ?? [],
+    metering,
+    clock,
+    randomId,
+  });
   const dataAi = createDataAiRoutes({
     accounts,
     ...(ports.ai ? { gateway: ports.ai } : {}),
@@ -318,6 +332,7 @@ export function buildApp(ports: AppPorts): App {
       const store = inventory;
       const installed = ports.forms.map((form) => form.identity.formRef.schemaDigest);
       const orphans = await store.orphanedResources(installed, 32);
+      const providerUsage = await providerMetering.reconcile(32);
       const meteredRows = await metering.rollUp(500);
       const orphanedResources = orphans.map(
         (orphan) => `${orphan.space}/${orphan.kind}/${orphan.name}`,
@@ -332,7 +347,13 @@ export function buildApp(ports: AppPorts): App {
           }),
         );
       }
-      return { expiredReservations, orphanedResources, meteredRows };
+      return {
+        expiredReservations,
+        orphanedResources,
+        meteredRows,
+        providerMeterWindows: providerUsage.windows,
+        providerMeterFailures: providerUsage.failures,
+      };
     },
   };
 }

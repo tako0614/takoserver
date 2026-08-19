@@ -3,6 +3,13 @@ import { buildEdgeForms } from "../src/edge-forms.ts";
 import { HOSTED_OBJECT_BUCKET_SUPPLIES_KIND } from "../src/hosted-object-bucket-supplies.ts";
 import { createWorkerObjectBucketComposition } from "../src/worker-object-bucket-composition.ts";
 
+const s3CredentialIssuer = {
+  limits: () => ({ minimumSeconds: 60, maximumSeconds: 3_600, defaultSeconds: 900 }),
+  async issue(): Promise<never> {
+    throw new Error("not used by composition");
+  },
+};
+
 const supply = (provider: "cloudflare" | "wasabi") => ({
   offeringId: `storage.object.${provider}`,
   displayName: `${provider} object storage`,
@@ -37,7 +44,17 @@ const supply = (provider: "cloudflare" | "wasabi") => ({
     id: `storage.object.${provider}.price-v1`,
     currency: "USD",
     recurring: { meter: "bucket-month", amountMinor: 500 },
-    meters: [],
+    meters:
+      provider === "cloudflare"
+        ? [
+            { meter: "storage.gib-hour", amountMinor: 2, quantity: 720 },
+            { meter: "requests.million", amountMinor: 50 },
+          ]
+        : [
+            { meter: "storage.gib-hour", amountMinor: 3, quantity: 720 },
+            { meter: "requests.million", amountMinor: 60 },
+            { meter: "egress.gib", amountMinor: 1 },
+          ],
   },
   placement: {
     deliveryMode: "native-credentials",
@@ -69,6 +86,7 @@ describe("Worker ObjectBucket composition", () => {
       },
       form: edge.objectBucket.form,
       artifacts: { manifest: async () => null, blob: async () => null },
+      s3CredentialIssuer,
       now: new Date("2026-08-19T00:00:00.000Z"),
     });
     expect(composed.offerings.map((offering) => offering.id).sort()).toEqual([
@@ -79,6 +97,13 @@ describe("Worker ObjectBucket composition", () => {
       "cloudflare",
       "wasabi",
     ]);
+    expect(composed.providerPacks.map((pack) => pack.descriptor.meterSources)).toEqual([
+      ["requests.million", "storage.gib-hour"],
+      ["egress.gib", "requests.million", "storage.gib-hour"],
+    ]);
+    expect(composed.providerPacks.every((pack) => pack.attachmentFactories.length === 1)).toBe(
+      true,
+    );
   });
 
   test("never infers a sellable Offering from an ambient credential", async () => {
@@ -91,5 +116,24 @@ describe("Worker ObjectBucket composition", () => {
         now: new Date("2026-08-19T00:00:00.000Z"),
       }),
     ).toThrow("provider credentials require hosted ObjectBucket supplies");
+  });
+
+  test("does not publish native-credential storage without the credential broker", async () => {
+    const edge = await buildEdgeForms();
+    expect(() =>
+      createWorkerObjectBucketComposition({
+        env: {
+          TAKOSERVER_OBJECT_BUCKET_SUPPLIES: JSON.stringify({
+            kind: HOSTED_OBJECT_BUCKET_SUPPLIES_KIND,
+            supplies: [supply("cloudflare")],
+          }),
+          CLOUDFLARE_ACCOUNT_ID: "account-id",
+          CLOUDFLARE_API_TOKEN: "cloudflare-token",
+        },
+        form: edge.objectBucket.form,
+        artifacts: { manifest: async () => null, blob: async () => null },
+        now: new Date("2026-08-19T00:00:00.000Z"),
+      }),
+    ).toThrow("hosted ObjectBucket supplies require an S3 credential issuer");
   });
 });

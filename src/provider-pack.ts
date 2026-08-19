@@ -1,8 +1,11 @@
 import type { AttachmentFactory } from "./attachments.ts";
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import type { TakoformBindingRef, TakoformInterfaceRef } from "./interface-ref.ts";
+import type { MeterSource } from "./provider-meter-port.ts";
 import type { Provider } from "./provider-port.ts";
 import type { ResourceDeployment } from "./resource-deployments.ts";
+
+export type { MeterSource } from "./provider-meter-port.ts";
 
 export type ResourceProvisioner = Provider;
 
@@ -66,17 +69,6 @@ export interface CredentialIssuer {
   }): Promise<{ readonly grantRef: string; readonly expiresAt: string }>;
 }
 
-export interface MeterSource {
-  readonly id: string;
-  readonly meters: readonly string[];
-  read(input: {
-    readonly tenantId: string;
-    readonly deployment: ResourceDeployment;
-    readonly from: string;
-    readonly until: string;
-  }): Promise<readonly { readonly meter: string; readonly quantity: number }[]>;
-}
-
 export interface CostEstimator {
   readonly id: string;
   readonly meters: readonly string[];
@@ -114,6 +106,17 @@ export function createProviderPack(definition: ProviderPackDefinition): Provider
   uniqueIds(definition.costEstimators, "CostEstimator");
   if (definition.attachmentFactories.some((factory) => factory.providerPackRef !== definition.id)) {
     throw new TypeError("AttachmentFactory belongs to another Provider Pack");
+  }
+  const ownedMeters = new Set<string>();
+  for (const source of definition.meterSources) {
+    positiveSeconds(source.settlementDelaySeconds, true);
+    positiveSeconds(source.maximumWindowSeconds, false);
+    if (source.retentionSeconds !== undefined) positiveSeconds(source.retentionSeconds, false);
+    for (const meter of source.meters) {
+      validateId(meter);
+      if (ownedMeters.has(meter)) throw new TypeError(`ambiguous MeterSource meter: ${meter}`);
+      ownedMeters.add(meter);
+    }
   }
 
   const provisioners = new Map<string, ResourceProvisioner>();
@@ -159,6 +162,12 @@ function uniqueIds(values: readonly { readonly id: string }[], kind: string): vo
 function validateId(value: string): void {
   if (value.length < 1 || value.length > 255 || !/^[a-z0-9][a-z0-9._:-]*$/u.test(value)) {
     throw new TypeError("invalid Provider Pack identifier");
+  }
+}
+
+function positiveSeconds(value: number, zeroAllowed: boolean): void {
+  if (!Number.isSafeInteger(value) || value < (zeroAllowed ? 0 : 1) || value > 3_155_760_000) {
+    throw new TypeError("invalid MeterSource window");
   }
 }
 

@@ -7,6 +7,7 @@ import {
   type DeploymentComposition,
 } from "./deployment-composition.ts";
 import { objectBucketProviderOffering } from "./edge-forms.ts";
+import type { ProviderPackDefinition } from "./provider-pack.ts";
 import type { Provider } from "./provider-port.ts";
 import type { InstalledTakoformForm } from "./takoform/types.ts";
 
@@ -38,6 +39,16 @@ export function compileObjectBucketDeployment(input: {
   readonly supplyContract: SupplyContract;
   readonly pricePlan: PricePlan;
   readonly placement: ObjectBucketPlacement;
+  readonly capabilities?: Partial<
+    Pick<
+      ProviderPackDefinition,
+      | "attachmentFactories"
+      | "transferEndpoints"
+      | "credentialIssuers"
+      | "meterSources"
+      | "costEstimators"
+    >
+  >;
   readonly now: Date;
 }): DeploymentComposition {
   return compileObjectBucketDeployments({ deployments: [input], now: input.now });
@@ -67,6 +78,7 @@ export function compileObjectBucketDeployments(input: {
     const pack = createProvisioningProviderPack({
       provider: deployment.provider,
       providerType: deployment.providerType,
+      ...(deployment.capabilities ? { capabilities: deployment.capabilities } : {}),
     });
     candidates.push(
       createCatalogCandidate(technical, {

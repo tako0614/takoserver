@@ -95,6 +95,9 @@ describe("Worker data service composition", () => {
       "AI binding is not configured",
     );
     expect(() =>
+      createWorkerDataServices({ TAKOSERVER_OBJECT_BUCKET_SUPPLIES: cloudflareSupply }),
+    ).toThrow("S3 credential issuer is not fully configured");
+    expect(() =>
       createWorkerDataServices({
         CLOUDFLARE_ACCOUNT_ID: "account_01",
         TAKOSERVER_AI_MODELS: MODELS,

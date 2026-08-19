@@ -86,6 +86,10 @@ export type {
   SqlWrite,
 } from "./ports.ts";
 export {
+  createProviderMetering,
+  type ProviderMeteringReport,
+} from "./provider-metering.ts";
+export {
   type CostEstimator,
   type CredentialIssuer,
   createProviderPack,
@@ -96,12 +100,18 @@ export {
   type ResourceProvisioner,
   type TransferEndpoint,
 } from "./provider-pack.ts";
+export { createCloudflareR2MeterSource } from "./providers/cloudflare-r2-meter.ts";
 export {
   createOpenAiGateway,
   type OpenAiGatewayOptions,
   type OpenAiModelConfig,
   parseOpenAiModelConfig,
 } from "./providers/openai.ts";
+export {
+  OBJECT_STORAGE_METERS,
+  ProviderMeterError,
+} from "./providers/provider-meter.ts";
+export { createWasabiBucketMeterSource } from "./providers/wasabi-meter.ts";
 export {
   createReseller,
   type Quote,
@@ -130,6 +140,7 @@ export {
   type ResourceMigrationStore,
 } from "./resource-migrations.ts";
 export { createRouter, type Router } from "./router.ts";
+export { createS3AttachmentFactory } from "./s3-attachment-factory.ts";
 export {
   createS3CredentialIssuerRouter,
   type S3CredentialIssuerRoute,

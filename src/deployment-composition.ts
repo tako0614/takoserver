@@ -6,7 +6,11 @@ import {
   type ProviderInstallation,
   type SupplyContract,
 } from "./catalog-compiler.ts";
-import { createProviderPack, type ProviderPack } from "./provider-pack.ts";
+import {
+  createProviderPack,
+  type ProviderPack,
+  type ProviderPackDefinition,
+} from "./provider-pack.ts";
 import type { Provider } from "./provider-port.ts";
 
 export interface DeploymentComposition {
@@ -55,16 +59,26 @@ export function createCatalogCandidate(
 export function createProvisioningProviderPack(input: {
   readonly provider: Provider;
   readonly providerType: string;
+  readonly capabilities?: Partial<
+    Pick<
+      ProviderPackDefinition,
+      | "attachmentFactories"
+      | "transferEndpoints"
+      | "credentialIssuers"
+      | "meterSources"
+      | "costEstimators"
+    >
+  >;
 }): ProviderPack {
   return createProviderPack({
     id: input.provider.id,
     providerType: input.providerType,
     provisioners: [input.provider],
-    attachmentFactories: [],
-    transferEndpoints: [],
-    credentialIssuers: [],
-    meterSources: [],
-    costEstimators: [],
+    attachmentFactories: input.capabilities?.attachmentFactories ?? [],
+    transferEndpoints: input.capabilities?.transferEndpoints ?? [],
+    credentialIssuers: input.capabilities?.credentialIssuers ?? [],
+    meterSources: input.capabilities?.meterSources ?? [],
+    costEstimators: input.capabilities?.costEstimators ?? [],
   });
 }
 

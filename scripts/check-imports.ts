@@ -52,7 +52,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "core",
     match:
-      /^src\/(?:ports|json|strict-json|form-ref|interface-ref|provider-port|ai-port|s3-port|s3-issuer-router|db-schema|migrate-sqlite)\.ts$/u,
+      /^src\/(?:ports|json|strict-json|form-ref|interface-ref|provider-port|provider-meter-port|ai-port|s3-port|s3-issuer-router|db-schema|migrate-sqlite)\.ts$/u,
     may: ["core"],
   },
   {
@@ -64,7 +64,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "domain",
     match:
-      /^src\/(?:token|auth|ledger|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|resource-deployments|resource-migrations|attachments|reconcile|metering|edge-forms|ai-requests|operator-credentials|google-identity|identity-setup|stripe-settlement|signing-key|operator-key)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$)/u,
+      /^src\/(?:token|auth|ledger|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|provider-metering|resource-deployments|resource-migrations|attachments|s3-attachment-factory|reconcile|metering|edge-forms|ai-requests|operator-credentials|google-identity|identity-setup|stripe-settlement|signing-key|operator-key)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$)/u,
     may: ["core", "domain", "release-data"],
   },
   {

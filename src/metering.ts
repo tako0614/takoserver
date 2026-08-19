@@ -1,4 +1,6 @@
 import type { AiUsage } from "./ai-port.ts";
+import type { PricedUsage } from "./catalog.ts";
+import { canonicalDigest } from "./json.ts";
 import type { Ledger } from "./ledger.ts";
 import type { Clock, Sql } from "./ports.ts";
 
@@ -43,6 +45,15 @@ export interface Metering {
   record(usage: UsageRecord): Promise<void>;
   /** Records already-settled AI token usage without charging it twice. */
   recordAi(usage: AiUsage): Promise<void>;
+  recordProviderWindow(usage: {
+    readonly organizationId: string;
+    readonly resourceUid: string;
+    readonly deploymentId: string;
+    readonly meterSourceId: string;
+    readonly from: string;
+    readonly until: string;
+    readonly priced: PricedUsage;
+  }): Promise<void>;
   /** Folds unbilled usage into ledger entries. Returns how many rows moved. */
   rollUp(limit: number): Promise<number>;
 }
@@ -96,6 +107,38 @@ export function createMetering(options: {
           clock().toISOString(),
         ],
       );
+    },
+
+    async recordProviderWindow(usage) {
+      const windowDigest = await canonicalDigest({
+        organizationId: usage.organizationId,
+        resourceUid: usage.resourceUid,
+        deploymentId: usage.deploymentId,
+        meterSourceId: usage.meterSourceId,
+        from: usage.from,
+        until: usage.until,
+      });
+      for (const line of usage.priced.lines) {
+        if (!Number.isSafeInteger(line.amountMinor) || line.amountMinor < 0) {
+          throw new TypeError("provider usage price invalid");
+        }
+        const micros = line.amountMinor * 1_000_000;
+        if (!Number.isSafeInteger(micros)) throw new TypeError("provider usage price overflow");
+        await sql.run(
+          `INSERT OR IGNORE INTO usage_events
+             (request_id, org_id, resource_uid, meter, quantity, amount_minor, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [
+            `provider:${windowDigest.slice(7)}:${line.meter}`,
+            usage.organizationId,
+            usage.resourceUid,
+            line.meter,
+            line.quantity,
+            micros,
+            clock().toISOString(),
+          ],
+        );
+      }
     },
 
     async rollUp(limit) {

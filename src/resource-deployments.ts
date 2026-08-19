@@ -36,6 +36,7 @@ export interface ResourceDeploymentStore {
   ): Promise<ResourceDeployment | null>;
   active(tenantId: string, resourceUid: string): Promise<ResourceDeployment | null>;
   forResource(tenantId: string, resourceUid: string): Promise<readonly ResourceDeployment[]>;
+  meteringCandidates(limit: number): Promise<readonly ResourceDeployment[]>;
   refresh(
     tenantId: string,
     deploymentId: string,
@@ -118,6 +119,27 @@ export function createResourceDeploymentStore(sql: Sql, clock: Clock): ResourceD
            WHEN 'draining' THEN 3 WHEN 'retained' THEN 4 WHEN 'failed' THEN 5 ELSE 6
          END, created_at, id`,
         [tenantId, resourceUid],
+      );
+      return rows.map(deployment);
+    },
+
+    async meteringCandidates(limit): Promise<readonly ResourceDeployment[]> {
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+        throw new Error("resource_deployment_metering_limit_invalid");
+      }
+      const timestamp = now();
+      const rows = await sql.query(
+        `SELECT deployment.* FROM tf_resource_deployments AS deployment
+         LEFT JOIN provider_meter_schedule AS schedule
+           ON schedule.tenant_id = deployment.tenant_id
+          AND schedule.deployment_id = deployment.id
+         WHERE deployment.state = 'active'
+           AND COALESCE(schedule.lease_until, 0) <= ?
+           AND COALESCE(schedule.next_at, deployment.created_at) <= ?
+         ORDER BY COALESCE(schedule.next_at, deployment.created_at),
+                  deployment.tenant_id, deployment.id
+         LIMIT ?`,
+        [timestamp, timestamp, limit],
       );
       return rows.map(deployment);
     },

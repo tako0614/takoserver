@@ -4,10 +4,15 @@ import {
   parseHostedObjectBucketSupplies,
 } from "./hosted-object-bucket-supplies.ts";
 import { compileObjectBucketDeployments } from "./object-bucket-deployment.ts";
+import type { MeterSource } from "./provider-pack.ts";
 import type { Provider } from "./provider-port.ts";
 import type { ArtifactBytes, CloudflareZone } from "./providers/cloudflare.ts";
 import { CloudflareProvider } from "./providers/cloudflare.ts";
+import { createCloudflareR2MeterSource } from "./providers/cloudflare-r2-meter.ts";
 import { createWasabiProvider } from "./providers/wasabi.ts";
+import { createWasabiBucketMeterSource } from "./providers/wasabi-meter.ts";
+import { createS3AttachmentFactory } from "./s3-attachment-factory.ts";
+import type { S3CredentialIssuer } from "./s3-port.ts";
 import type { InstalledTakoformForm } from "./takoform/types.ts";
 
 export interface WorkerObjectBucketCompositionEnv {
@@ -31,6 +36,7 @@ export function createWorkerObjectBucketComposition(input: {
   readonly env: WorkerObjectBucketCompositionEnv;
   readonly form: InstalledTakoformForm;
   readonly artifacts: ArtifactBytes;
+  readonly s3CredentialIssuer?: S3CredentialIssuer;
   readonly now: Date;
 }): WorkerObjectBucketComposition {
   const { env } = input;
@@ -47,6 +53,10 @@ export function createWorkerObjectBucketComposition(input: {
     }
     return { supplies: null, providers: [], providerPacks: [], offerings: [] };
   }
+  if (!input.s3CredentialIssuer) {
+    throw new TypeError("hosted ObjectBucket supplies require an S3 credential issuer");
+  }
+  const s3CredentialIssuer = input.s3CredentialIssuer;
 
   const deployments = supplies.supplies.map((supply) => {
     const technical = objectBucketProviderOffering(input.form, {
@@ -54,7 +64,10 @@ export function createWorkerObjectBucketComposition(input: {
       displayName: supply.displayName,
       regions: supply.providerInstallation.regions.map((region) => region.id),
     });
+    const interfaceRef = technical.providedInterfaces[0];
+    if (!interfaceRef) throw new TypeError("ObjectBucket S3 interface is not installed");
     let provider: Provider;
+    let meterSources: readonly MeterSource[];
     if (supply.provider.kind === "cloudflare") {
       const accountId = paired(
         env.CLOUDFLARE_ACCOUNT_ID,
@@ -68,6 +81,9 @@ export function createWorkerObjectBucketComposition(input: {
         zones: parseZones(env.TAKOSERVER_ZONES),
         artifacts: input.artifacts,
       });
+      meterSources = [
+        createCloudflareR2MeterSource({ accountId: accountId.left, apiToken: accountId.right }),
+      ];
     } else {
       const credentials = paired(
         env.TAKOSERVER_WASABI_ACCESS_KEY_ID,
@@ -80,6 +96,13 @@ export function createWorkerObjectBucketComposition(input: {
         secretAccessKey: credentials.right,
         offerings: [technical],
       });
+      meterSources = [
+        createWasabiBucketMeterSource({
+          region: supply.provider.region,
+          accessKeyId: credentials.left,
+          secretAccessKey: credentials.right,
+        }),
+      ];
     }
     return {
       form: input.form,
@@ -92,6 +115,16 @@ export function createWorkerObjectBucketComposition(input: {
       supplyContract: supply.supplyContract,
       pricePlan: supply.pricePlan,
       placement: supply.placement,
+      capabilities: {
+        meterSources,
+        attachmentFactories: [
+          createS3AttachmentFactory({
+            providerPackRef: supply.provider.kind,
+            interfaceRef,
+            issuer: s3CredentialIssuer,
+          }),
+        ],
+      },
     };
   });
 

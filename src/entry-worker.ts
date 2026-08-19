@@ -133,6 +133,7 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
         return stored ? new Uint8Array(await new Response(stored.body).arrayBuffer()) : null;
       },
     },
+    ...(dataServices.s3 ? { s3CredentialIssuer: dataServices.s3 } : {}),
     now: new Date(),
   });
   const app = buildApp({

@@ -38,6 +38,7 @@ export interface WorkerDataServices {
 export function createWorkerDataServices(env: WorkerDataServiceEnv): WorkerDataServices {
   const aiConfigured = env.TAKOSERVER_AI_MODELS !== undefined;
   const s3Configured =
+    env.TAKOSERVER_OBJECT_BUCKET_SUPPLIES !== undefined ||
     env.TAKOSERVER_R2_PARENT_ACCESS_KEY_ID !== undefined ||
     env.TAKOSERVER_R2_PARENT_TOKEN !== undefined ||
     env.TAKOSERVER_WASABI_ACCESS_KEY_ID !== undefined ||
