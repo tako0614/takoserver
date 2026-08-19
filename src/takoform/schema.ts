@@ -1,5 +1,6 @@
 import { canonicalJson } from "../json.ts";
 import type { JsonObject, JsonValue } from "../ports.ts";
+import { validateEdgeSemantics } from "./edge-semantics.ts";
 import type { InstalledTakoformForm, TakoformDiagnostic } from "./types.ts";
 
 /**
@@ -16,8 +17,11 @@ export function validateDesired(
   form: InstalledTakoformForm,
   spec: JsonObject,
 ): readonly TakoformDiagnostic[] {
-  if (form.validateDesired) return clone(form.validateDesired(clone(spec)));
-  return validateSchemaValue(form.desiredSchema, spec, "");
+  return [
+    ...validateSchemaValue(form.desiredSchema, spec, ""),
+    ...validateEdgeSemantics(form, spec),
+    ...(form.validateDesired ? clone(form.validateDesired(clone(spec))) : []),
+  ];
 }
 
 export function validateSchemaValue(

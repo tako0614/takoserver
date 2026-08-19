@@ -29,6 +29,7 @@ import { sameFormRef } from "./takoform/forms.ts";
 import { createTakoformHost } from "./takoform/host.ts";
 import { createTakoformStore } from "./takoform/store.ts";
 import type {
+  InstalledTakoformBinding,
   InstalledTakoformForm,
   TakoformHost,
   TakoformResourceDriver,
@@ -63,6 +64,8 @@ export interface AppPorts {
   /** Where this deployment's console is served, if it has one. */
   readonly consoleOrigin?: string;
   readonly forms: readonly InstalledTakoformForm[];
+  /** Exact portable BindingDefinitions installed by this Host composition. */
+  readonly bindings?: readonly InstalledTakoformBinding[];
   /** How a caller may sign in to this deployment. */
   readonly identityProviders?: readonly IdentityProviderDescriptor[];
   /**
@@ -264,6 +267,7 @@ export function buildApp(ports: AppPorts): App {
         }
       },
       forms: ports.forms,
+      ...(ports.bindings ? { bindings: ports.bindings } : {}),
       driver,
       ...(ports.artifacts ? { artifacts: ports.artifacts } : {}),
       clock,

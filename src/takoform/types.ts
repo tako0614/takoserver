@@ -36,6 +36,23 @@ export interface InstalledTakoformForm {
   readonly validateDesired?: (spec: JsonObject) => readonly TakoformDiagnostic[];
 }
 
+/**
+ * One installed portable BindingDefinition.
+ *
+ * Forms only name accepted binding identities. The definition is separate
+ * host configuration because it owns the source role, target Interface, and
+ * allowed target Form kinds that make a relation safe to project at runtime.
+ */
+export interface InstalledTakoformBinding {
+  readonly bindingRef: TakoformBindingRef;
+  readonly sourceRole: NonNullable<InstalledTakoformForm["role"]>;
+  readonly targetInterface: TakoformInterfaceRef;
+  readonly allowedTargetForms: readonly {
+    readonly apiVersion: string;
+    readonly kind: string;
+  }[];
+}
+
 export interface TakoformDiagnostic {
   readonly severity: "error" | "warning";
   readonly field?: string;
@@ -71,6 +88,12 @@ export interface TakoformCommercialAuthority {
 export interface TakoformDriverReceipt {
   readonly observed?: JsonObject;
   readonly outputs?: JsonObject;
+  /**
+   * The provider's current portable readiness condition. Omitting it means
+   * the representation did not move; returning it lets an observe record a
+   * host-side status transition without pretending desired state changed.
+   */
+  readonly conditions?: readonly TakoformCondition[];
 }
 
 export interface TakoformResourceDriver {
@@ -119,19 +142,27 @@ export interface TakoformResourceDriver {
  * can be described truthfully instead of being unrepresentable.
  */
 export interface TakoformCondition {
-  readonly type: "Ready";
+  readonly type: "Ready" | "Reconciling" | "Degraded" | "Drifted" | "Blocked" | "Deleting";
   readonly status: "True" | "False" | "Unknown";
   readonly reason: TakoformConditionReason;
   readonly lastTransitionTime: string;
+  readonly hostReason?: string;
   readonly message?: string;
 }
 
 export type TakoformConditionReason =
   | "Available"
   | "Provisioning"
-  | "CreateFailed"
-  | "UpdateFailed"
-  | "DeleteFailed";
+  | "Reconciling"
+  | "Failed"
+  | "BackendUnavailable"
+  | "SpecDrift"
+  | "ExternalChange"
+  | "DependencyMissing"
+  | "DependencyInUse"
+  | "PolicyDenied"
+  | "UnsupportedCapability"
+  | "Deleting";
 
 export interface TakoformStoredResource {
   readonly apiVersion: string;

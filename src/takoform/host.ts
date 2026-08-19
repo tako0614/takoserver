@@ -1,10 +1,13 @@
 import type { Clock, ObjectStore, Sql } from "../ports.ts";
 import { createTakoformArtifacts, type TakoformArtifactTransport } from "./artifacts.ts";
+import { installedBindings } from "./bindings.ts";
+import type { WorkerModuleInspector } from "./engine.ts";
 import { createTakoformEngine } from "./engine.ts";
 import { installedForms } from "./forms.ts";
 import { createTakoformRoutes, type ProvisionLanePorts } from "./routes.ts";
 import { createTakoformStore } from "./store.ts";
 import type {
+  InstalledTakoformBinding,
   InstalledTakoformForm,
   TakoformHost,
   TakoformHostPrincipal,
@@ -23,10 +26,12 @@ export interface CreateTakoformHostOptions {
   readonly objects: ObjectStore;
   readonly authenticate: (request: Request) => Promise<TakoformHostPrincipal | null>;
   readonly forms: readonly InstalledTakoformForm[];
+  readonly bindings?: readonly InstalledTakoformBinding[];
   readonly driver: TakoformResourceDriver;
   readonly artifacts?: TakoformArtifactTransport;
   readonly clock?: Clock;
   readonly randomId?: () => string;
+  readonly workerModuleInspector?: WorkerModuleInspector;
   /** When present, the single-use provision-token redemption lane is served. */
   readonly provision?: ProvisionLanePorts;
   readonly blockingRelations?: (
@@ -39,6 +44,7 @@ export function createTakoformHost(options: CreateTakoformHostOptions): Takoform
   const clock = options.clock ?? (() => new Date());
   const randomId = options.randomId ?? (() => crypto.randomUUID());
   const forms = installedForms(options.forms);
+  const bindings = installedBindings(options.bindings ?? []);
   const store = createTakoformStore(options.sql, clock);
   const artifacts =
     options.artifacts ??
@@ -46,10 +52,14 @@ export function createTakoformHost(options: CreateTakoformHostOptions): Takoform
   const engine = createTakoformEngine({
     store,
     forms,
+    bindings,
     driver: options.driver,
     artifacts,
     clock,
     randomId,
+    ...(options.workerModuleInspector
+      ? { workerModuleInspector: options.workerModuleInspector }
+      : {}),
     ...(options.blockingRelations ? { blockingRelations: options.blockingRelations } : {}),
   });
   return createTakoformRoutes({
@@ -57,6 +67,7 @@ export function createTakoformHost(options: CreateTakoformHostOptions): Takoform
     engine,
     store,
     forms,
+    bindings,
     artifacts,
     ...(options.provision ? { provision: options.provision } : {}),
   });

@@ -1,5 +1,6 @@
 import type { JsonObject } from "../ports.ts";
 import { TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES } from "./limits.ts";
+import { validateRelationSchema } from "./relations.ts";
 import {
   type InstalledTakoformForm,
   TakoformHostError,
@@ -56,6 +57,7 @@ export function installedForms(input: readonly InstalledTakoformForm[]): FormReg
     if (form.role === "revision" && form.operations.includes("update")) {
       throw new TypeError("revision Form cannot declare update");
     }
+    validateRelationSchema(form);
     const definitionKey = `${form.identity.formRef.apiVersion}\0${form.identity.formRef.kind}\0${form.identity.formRef.definitionVersion}`;
     const installedDigest = definitionDigests.get(definitionKey);
     if (installedDigest !== undefined && installedDigest !== form.identity.formRef.schemaDigest) {
@@ -147,11 +149,16 @@ export function isKind(value: string): boolean {
 
 /** What a caller may rely on before attempting an operation on this Form. */
 export function formSupportProfile(form: InstalledTakoformForm): JsonObject {
+  const supportedEnums = topLevelSupportedEnums(form.desiredSchema);
+  const workerVersion =
+    form.identity.formRef.apiVersion === "edge.forms.takoform.com/v1alpha1" &&
+    form.identity.formRef.kind === "WorkerVersion";
   return {
     apiVersion: "support.takoform.com/v1alpha1",
     kind: "FormSupport",
     formRef: structuredClone(form.identity.formRef) as unknown as JsonObject,
     operations: [...form.operations],
+    ...(Object.keys(supportedEnums).length > 0 ? { supportedEnums } : {}),
     ...(form.acceptedBindings && form.acceptedBindings.length > 0
       ? {
           supportedBindings: form.acceptedBindings.map(
@@ -159,10 +166,34 @@ export function formSupportProfile(form: InstalledTakoformForm): JsonObject {
           ),
         }
       : {}),
-    ...(form.artifactRequirement?.kind === "WorkerBundle"
+    ...(form.artifactRequirement?.kind === "WorkerBundle" || workerVersion
       ? { limits: { maximumBundleBytes: TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES } }
       : {}),
   };
+}
+
+function topLevelSupportedEnums(schema: JsonObject): JsonObject {
+  const result: Record<string, string[]> = {};
+  const properties = schema.properties;
+  if (typeof properties !== "object" || properties === null || Array.isArray(properties)) {
+    return result;
+  }
+  for (const [name, raw] of Object.entries(properties)) {
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) continue;
+    const property = raw as JsonObject;
+    const direct = Array.isArray(property.enum) ? property.enum : undefined;
+    const items =
+      typeof property.items === "object" &&
+      property.items !== null &&
+      !Array.isArray(property.items)
+        ? (property.items as JsonObject)
+        : undefined;
+    const values = direct ?? (Array.isArray(items?.enum) ? items.enum : undefined);
+    if (values?.length && values.every((value) => typeof value === "string")) {
+      result[name] = values as string[];
+    }
+  }
+  return result;
 }
 
 export function requireInstalledOperation(

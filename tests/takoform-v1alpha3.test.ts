@@ -8,6 +8,7 @@ import {
   type ExternalIdentityVerifier,
   type FundingSettlementVerifier,
   InMemoryTakoformResourceDriver,
+  type InstalledTakoformBinding,
   type InstalledTakoformForm,
   TAKOFORM_EDGE_OBJECTS_INTERFACE,
   TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM,
@@ -150,6 +151,21 @@ describe("Takoserver current Takoform Host", () => {
     expect(await forms.json()).toMatchObject({
       forms: [{ identity: { formRef }, installed: true, executable: true }],
     });
+    const definition = await handler(
+      new Request(
+        `https://api.takoserver.com/apis/forms.takoform.com/v1beta1/form-definitions/${formRef.apiVersion}/${formRef.kind}?space=provider-space&group=${encodeURIComponent(formRef.apiVersion)}&kind=${formRef.kind}&definitionVersion=${formRef.definitionVersion}&schemaDigest=${encodeURIComponent(formRef.schemaDigest)}`,
+        { headers: { authorization: "Bearer provider-v2.1.1" } },
+      ),
+    );
+    expect(definition.status).toBe(200);
+    const definitionBody = (await definition.json()) as Record<string, unknown>;
+    expect(definitionBody).toMatchObject({ identity: { formRef } });
+    expect(Object.keys(definitionBody).sort()).toEqual([
+      "description",
+      "desiredSchema",
+      "displayName",
+      "identity",
+    ]);
     const interfaceSupport = await handler(
       new Request(
         "https://api.takoserver.com/apis/forms.takoform.com/v1beta1/support/interfaces/edge.objects/1.0.0",
@@ -161,6 +177,54 @@ describe("Takoserver current Takoform Host", () => {
       apiVersion: "support.takoform.com/v1alpha1",
       kind: "InterfaceSupport",
       interfaceRef: TAKOFORM_EDGE_OBJECTS_INTERFACE,
+    });
+  });
+
+  test("serves installed Binding and target Interface support without inventing a provider Form", async () => {
+    const targetInterface = TAKOFORM_EDGE_OBJECTS_INTERFACE;
+    const binding: InstalledTakoformBinding = {
+      bindingRef: {
+        apiVersion: "bindings.takoform.com/v1alpha1",
+        name: "module-worker.object-bucket",
+        version: "1.0.0",
+        schemaDigest: `sha256:${"9".repeat(64)}`,
+      },
+      sourceRole: "revision",
+      targetInterface,
+      allowedTargetForms: [
+        { apiVersion: "edge.forms.takoform.com/v1alpha1", kind: "ObjectBucket" },
+      ],
+    };
+    const host = createInMemoryTakoformHost({
+      authenticate: async () => ({ tenantId: "tenant-a", principalId: "principal-a" }),
+      forms: [],
+      bindings: [binding],
+    });
+    const handler = handlerFor(host);
+    const auth = { headers: { authorization: "Bearer primary" } };
+    const bindingSupport = await handler(
+      new Request(
+        "https://api.takoserver.com/apis/forms.takoform.com/v1alpha3/support/bindings/module-worker.object-bucket/1.0.0",
+        auth,
+      ),
+    );
+    expect(bindingSupport.status).toBe(200);
+    expect(await bindingSupport.json()).toEqual({
+      apiVersion: "support.takoform.com/v1alpha1",
+      kind: "BindingSupport",
+      bindingRef: binding.bindingRef,
+    });
+    const interfaceSupport = await handler(
+      new Request(
+        "https://api.takoserver.com/apis/forms.takoform.com/v1alpha3/support/interfaces/edge.objects/1.0.0",
+        auth,
+      ),
+    );
+    expect(interfaceSupport.status).toBe(200);
+    expect(await interfaceSupport.json()).toEqual({
+      apiVersion: "support.takoform.com/v1alpha1",
+      kind: "InterfaceSupport",
+      interfaceRef: targetInterface,
     });
   });
 
@@ -190,6 +254,555 @@ describe("Takoserver current Takoform Host", () => {
         ],
       }),
     ).toThrow("ambiguous installed Form definition");
+  });
+
+  test("checks an existing-resource create fence before update capability", async () => {
+    const formRef = {
+      apiVersion: "edge.forms.takoform.com/v1alpha1",
+      kind: "ModuleWorker",
+      definitionVersion: "0.1.0",
+      schemaDigest: `sha256:${"7".repeat(64)}` as const,
+    };
+    const host = createInMemoryTakoformHost({
+      authenticate: async (authorization) =>
+        authorization === "Bearer primary" || authorization === "Bearer alternate"
+          ? {
+              tenantId: "tenant-a",
+              principalId: authorization === "Bearer primary" ? "primary" : "alternate",
+            }
+          : null,
+      forms: [
+        {
+          identity: { formRef },
+          desiredSchema: { type: "object", properties: {}, additionalProperties: false },
+          operations: ["create", "read", "delete", "import", "observe"],
+        },
+      ],
+    });
+    const handler = handlerFor(host);
+    const resource = {
+      apiVersion: formRef.apiVersion,
+      kind: formRef.kind,
+      form: { formRef },
+      metadata: { name: "worker", space: "conformance" },
+      spec: {},
+    };
+    const prepared = await jsonRequest(
+      handler,
+      "POST",
+      "/apis/forms.takoform.com/v1alpha3/resources/prepare",
+      resource,
+      { authorization: "Bearer primary" },
+    );
+    const prepareDigest = requiredString(requiredRecord(prepared.body, "review"), "prepareDigest");
+    const target =
+      "/apis/forms.takoform.com/v1alpha3/resources/edge.forms.takoform.com/v1alpha1/ModuleWorker/worker";
+    const created = await jsonRequest(
+      handler,
+      "PUT",
+      target,
+      { ...resource, review: { prepareDigest } },
+      {
+        authorization: "Bearer primary",
+        "idempotency-key": "create-worker",
+        "if-none-match": "*",
+      },
+    );
+    expect(created.status).toBe(201);
+    const collision = await jsonRequest(
+      handler,
+      "PUT",
+      target,
+      { ...resource, review: { prepareDigest } },
+      {
+        authorization: "Bearer alternate",
+        "idempotency-key": "create-worker",
+        "if-none-match": "*",
+      },
+    );
+    expect(collision.status).toBe(412);
+    expect(collision.body).toMatchObject({ error: { code: "generation_conflict" } });
+  });
+
+  test("rejects an in-place revision-role update as invalid desired state", async () => {
+    const formRef = {
+      apiVersion: "edge.forms.takoform.com/v1alpha1",
+      kind: "WorkerVersion",
+      definitionVersion: "0.1.0",
+      schemaDigest: `sha256:${"c".repeat(64)}` as const,
+    };
+    const host = createInMemoryTakoformHost({
+      authenticate: async () => ({ tenantId: "tenant-a", principalId: "primary" }),
+      forms: [
+        {
+          identity: { formRef },
+          role: "revision",
+          desiredSchema: {
+            type: "object",
+            properties: { label: { type: "string" } },
+            required: ["label"],
+            additionalProperties: false,
+          },
+          operations: ["create", "read", "delete", "observe"],
+        },
+      ],
+    });
+    const handler = handlerFor(host);
+    const auth = { authorization: "Bearer primary" };
+    const path =
+      "/apis/forms.takoform.com/v1alpha3/resources/edge.forms.takoform.com/v1alpha1/WorkerVersion/revision";
+    const initial = {
+      apiVersion: formRef.apiVersion,
+      kind: formRef.kind,
+      form: { formRef },
+      metadata: { name: "revision", space: "conformance" },
+      spec: { label: "one" },
+    };
+    const firstPrepare = await jsonRequest(
+      handler,
+      "POST",
+      "/apis/forms.takoform.com/v1alpha3/resources/prepare",
+      initial,
+      auth,
+    );
+    const firstDigest = requiredString(
+      requiredRecord(firstPrepare.body, "review"),
+      "prepareDigest",
+    );
+    expect(
+      (
+        await jsonRequest(
+          handler,
+          "PUT",
+          path,
+          { ...initial, review: { prepareDigest: firstDigest } },
+          { ...auth, "idempotency-key": "create-revision", "if-none-match": "*" },
+        )
+      ).status,
+    ).toBe(201);
+    const changed = { ...initial, spec: { label: "two" } };
+    const updatePrepare = await jsonRequest(
+      handler,
+      "POST",
+      "/apis/forms.takoform.com/v1alpha3/resources/prepare",
+      changed,
+      { ...auth, "takoform-expected-generation": "1" },
+    );
+    const updateDigest = requiredString(
+      requiredRecord(updatePrepare.body, "review"),
+      "prepareDigest",
+    );
+    const rejected = await jsonRequest(
+      handler,
+      "PUT",
+      path,
+      { ...changed, expectedGeneration: "1", review: { prepareDigest: updateDigest } },
+      { ...auth, "idempotency-key": "update-revision", "takoform-expected-generation": "1" },
+    );
+    expect(rejected.status).toBe(400);
+    expect(rejected.body).toMatchObject({ error: { code: "invalid_argument" } });
+  });
+
+  test("pins same-space relation targets before mutation and blocks target deletion", async () => {
+    const targetFormRef = {
+      apiVersion: "edge.forms.takoform.com/v1alpha1",
+      kind: "ModuleWorker",
+      definitionVersion: "0.1.0",
+      schemaDigest: `sha256:${"a".repeat(64)}` as const,
+    };
+    const sourceFormRef = {
+      apiVersion: "edge.forms.takoform.com/v1alpha1",
+      kind: "WorkerDeployment",
+      definitionVersion: "0.1.0",
+      schemaDigest: `sha256:${"b".repeat(64)}` as const,
+    };
+    const memory = new InMemoryTakoformResourceDriver();
+    const sql = createEphemeralSql();
+    let sourceMutations = 0;
+    const driver: TakoformResourceDriver = {
+      async apply(input) {
+        if (input.form.identity.formRef.kind === sourceFormRef.kind) sourceMutations += 1;
+        return memory.apply(input);
+      },
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+      import: (input) => memory.import(input),
+    };
+    const referenceSchema = {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        apiVersion: { const: targetFormRef.apiVersion },
+        kind: { const: targetFormRef.kind },
+        name: { type: "string" },
+      },
+      required: ["apiVersion", "kind", "name"],
+      "x-takoform-target-formrefs": [targetFormRef],
+    } as const;
+    const host = createTakoformHost({
+      sql,
+      authenticate: async () => ({ tenantId: "tenant-a", principalId: "primary" }),
+      forms: [
+        {
+          identity: { formRef: targetFormRef },
+          desiredSchema: { type: "object", properties: {}, additionalProperties: false },
+          operations: ["create", "read", "update", "delete", "observe"],
+        },
+        {
+          identity: { formRef: sourceFormRef },
+          desiredSchema: {
+            type: "object",
+            properties: { worker: referenceSchema },
+            required: ["worker"],
+            additionalProperties: false,
+          },
+          operations: ["create", "read", "update", "delete", "observe"],
+        },
+      ],
+      driver,
+    });
+    const handler = handlerFor(host);
+    const auth = { authorization: "Bearer primary" };
+    const source = {
+      apiVersion: sourceFormRef.apiVersion,
+      kind: sourceFormRef.kind,
+      form: { formRef: sourceFormRef },
+      metadata: { name: "deployment", space: "conformance" },
+      spec: {
+        worker: {
+          apiVersion: targetFormRef.apiVersion,
+          kind: targetFormRef.kind,
+          name: "absent-worker",
+        },
+      },
+    };
+    const sourcePrepared = await jsonRequest(
+      handler,
+      "POST",
+      "/apis/forms.takoform.com/v1alpha3/resources/prepare",
+      source,
+      auth,
+    );
+    const sourcePrepareDigest = requiredString(
+      requiredRecord(sourcePrepared.body, "review"),
+      "prepareDigest",
+    );
+    const sourcePath =
+      "/apis/forms.takoform.com/v1alpha3/resources/edge.forms.takoform.com/v1alpha1/WorkerDeployment/deployment";
+    const missing = await jsonRequest(
+      handler,
+      "PUT",
+      sourcePath,
+      { ...source, review: { prepareDigest: sourcePrepareDigest } },
+      { ...auth, "idempotency-key": "create-deployment", "if-none-match": "*" },
+    );
+    expect(missing.status).toBe(404);
+    expect(missing.body).toMatchObject({ error: { code: "resource_not_found" } });
+    expect(sourceMutations).toBe(0);
+
+    const target = {
+      apiVersion: targetFormRef.apiVersion,
+      kind: targetFormRef.kind,
+      form: { formRef: targetFormRef },
+      metadata: { name: "absent-worker", space: "conformance" },
+      spec: {},
+    };
+    const targetPrepared = await jsonRequest(
+      handler,
+      "POST",
+      "/apis/forms.takoform.com/v1alpha3/resources/prepare",
+      target,
+      auth,
+    );
+    const targetPrepareDigest = requiredString(
+      requiredRecord(targetPrepared.body, "review"),
+      "prepareDigest",
+    );
+    const targetPath =
+      "/apis/forms.takoform.com/v1alpha3/resources/edge.forms.takoform.com/v1alpha1/ModuleWorker/absent-worker";
+    const createdTarget = await jsonRequest(
+      handler,
+      "PUT",
+      targetPath,
+      { ...target, review: { prepareDigest: targetPrepareDigest } },
+      { ...auth, "idempotency-key": "create-worker", "if-none-match": "*" },
+    );
+    expect(createdTarget.status).toBe(201);
+    const oldTargetUid = requiredString(requiredRecord(createdTarget.body, "metadata"), "uid");
+    expect(
+      (
+        await jsonRequest(
+          handler,
+          "PUT",
+          sourcePath,
+          { ...source, review: { prepareDigest: sourcePrepareDigest } },
+          { ...auth, "idempotency-key": "create-deployment", "if-none-match": "*" },
+        )
+      ).status,
+    ).toBe(201);
+    expect(sourceMutations).toBe(1);
+
+    const targetQuery = new URLSearchParams({
+      space: "conformance",
+      group: targetFormRef.apiVersion,
+      kind: targetFormRef.kind,
+      definitionVersion: targetFormRef.definitionVersion,
+      schemaDigest: targetFormRef.schemaDigest,
+    });
+    const blocked = await jsonRequest(
+      handler,
+      "DELETE",
+      `${targetPath}?${targetQuery}`,
+      undefined,
+      {
+        ...auth,
+        "idempotency-key": "delete-worker",
+        "takoform-expected-generation": "1",
+      },
+    );
+    expect(blocked.status).toBe(409);
+    expect(blocked.body).toMatchObject({ error: { code: "dependency_in_use" } });
+
+    expect(
+      (
+        await sql.run(
+          `DELETE FROM tf_resources
+           WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?`,
+          [
+            "tenant-a",
+            "conformance",
+            targetFormRef.apiVersion,
+            targetFormRef.kind,
+            "absent-worker",
+          ],
+        )
+      ).changes,
+    ).toBe(1);
+    const sourceQuery = new URLSearchParams({
+      space: "conformance",
+      group: sourceFormRef.apiVersion,
+      kind: sourceFormRef.kind,
+      definitionVersion: sourceFormRef.definitionVersion,
+      schemaDigest: sourceFormRef.schemaDigest,
+    });
+    const missingRead = await jsonRequest(
+      handler,
+      "GET",
+      `${sourcePath}?${sourceQuery}`,
+      undefined,
+      auth,
+    );
+    expect(missingRead.body).toMatchObject({
+      metadata: { generation: "1", revision: "2" },
+      status: {
+        conditions: [{ status: "False", reason: "DependencyMissing" }],
+      },
+    });
+
+    const recreatedPrepare = await jsonRequest(
+      handler,
+      "POST",
+      "/apis/forms.takoform.com/v1alpha3/resources/prepare",
+      target,
+      auth,
+    );
+    const recreatedDigest = requiredString(
+      requiredRecord(recreatedPrepare.body, "review"),
+      "prepareDigest",
+    );
+    const recreatedTarget = await jsonRequest(
+      handler,
+      "PUT",
+      targetPath,
+      { ...target, review: { prepareDigest: recreatedDigest } },
+      { ...auth, "idempotency-key": "recreate-worker", "if-none-match": "*" },
+    );
+    expect(recreatedTarget.status).toBe(201);
+    const newTargetUid = requiredString(requiredRecord(recreatedTarget.body, "metadata"), "uid");
+    expect(newTargetUid).not.toBe(oldTargetUid);
+    const changedRead = await jsonRequest(
+      handler,
+      "GET",
+      `${sourcePath}?${sourceQuery}`,
+      undefined,
+      auth,
+    );
+    expect(changedRead.body).toMatchObject({
+      metadata: { generation: "1", revision: "3" },
+      status: {
+        conditions: [
+          {
+            status: "False",
+            reason: "ExternalChange",
+          },
+        ],
+      },
+    });
+    const changedConditions = requiredRecord(changedRead.body, "status").conditions;
+    expect(Array.isArray(changedConditions)).toBeTrue();
+    const changedCondition = (changedConditions as Record<string, unknown>[])[0] ?? {};
+    const hostReason = requiredString(changedCondition, "hostReason");
+    expect(hostReason).toContain(oldTargetUid);
+    expect(hostReason).toContain(newTargetUid);
+  });
+
+  test("records a provider status transition without moving desired generation", async () => {
+    const formRef = {
+      apiVersion: "edge.forms.takoform.com/v1alpha1",
+      kind: "EdgeKVNamespace",
+      definitionVersion: "0.1.0",
+      schemaDigest: `sha256:${"6".repeat(64)}` as const,
+    };
+    const memory = new InMemoryTakoformResourceDriver();
+    const driver: TakoformResourceDriver = {
+      apply: (input) => memory.apply(input),
+      import: (input) => memory.import(input),
+      delete: (input) => memory.delete(input),
+      async observe(input) {
+        return {
+          ...(await memory.observe(input)),
+          conditions: [
+            {
+              type: "Ready",
+              status: "True",
+              reason: "Available",
+              lastTransitionTime: "2026-08-19T00:00:01.000Z",
+              message: "provider status refreshed",
+            },
+          ],
+        };
+      },
+    };
+    const host = createTakoformHost({
+      authenticate: async () => ({ tenantId: "tenant-a", principalId: "primary" }),
+      forms: [
+        {
+          identity: { formRef },
+          desiredSchema: { type: "object", properties: {}, additionalProperties: false },
+          operations: ["create", "read", "delete", "import", "observe"],
+        },
+      ],
+      driver,
+      clock: () => new Date("2026-08-19T00:00:00.000Z"),
+    });
+    const handler = handlerFor(host);
+    const resource = {
+      apiVersion: formRef.apiVersion,
+      kind: formRef.kind,
+      form: { formRef },
+      metadata: { name: "queue", space: "conformance" },
+      spec: {},
+    };
+    const prepared = await jsonRequest(
+      handler,
+      "POST",
+      "/apis/forms.takoform.com/v1alpha3/resources/prepare",
+      resource,
+      { authorization: "Bearer primary" },
+    );
+    const prepareDigest = requiredString(requiredRecord(prepared.body, "review"), "prepareDigest");
+    const target =
+      "/apis/forms.takoform.com/v1alpha3/resources/edge.forms.takoform.com/v1alpha1/EdgeKVNamespace/queue";
+    const created = await jsonRequest(
+      handler,
+      "PUT",
+      target,
+      { ...resource, review: { prepareDigest } },
+      {
+        authorization: "Bearer primary",
+        "idempotency-key": "create-queue",
+        "if-none-match": "*",
+      },
+    );
+    expect(created.body).toMatchObject({ metadata: { generation: "1", revision: "1" } });
+    const observed = await jsonRequest(
+      handler,
+      "POST",
+      `${target}/observe?space=conformance&group=${encodeURIComponent(formRef.apiVersion)}&kind=${formRef.kind}&definitionVersion=${formRef.definitionVersion}&schemaDigest=${encodeURIComponent(formRef.schemaDigest)}`,
+      undefined,
+      {
+        authorization: "Bearer primary",
+        "idempotency-key": "observe-queue",
+        "takoform-expected-generation": "1",
+      },
+    );
+    expect(observed.status).toBe(200);
+    expect(requiredRecord(observed.body, "resource")).toMatchObject({
+      metadata: { generation: "1", revision: "2" },
+      status: { conditions: [{ message: "provider status refreshed" }] },
+    });
+  });
+
+  test("distinguishes a held manifest of the wrong artifact kind from a missing artifact", async () => {
+    const formRef = {
+      apiVersion: "edge.forms.takoform.com/v1alpha1",
+      kind: "WorkerBundle",
+      definitionVersion: "0.1.0",
+      schemaDigest: `sha256:${"5".repeat(64)}` as const,
+    };
+    const manifestDigest = `sha256:${"4".repeat(64)}` as const;
+    const host = createTakoformHost({
+      authenticate: async () => ({ tenantId: "tenant-a", principalId: "primary" }),
+      forms: [
+        {
+          identity: { formRef },
+          desiredSchema: {
+            type: "object",
+            properties: { manifestDigest: { type: "string" } },
+            required: ["manifestDigest"],
+            additionalProperties: false,
+          },
+          artifactRequirement: { specField: "manifestDigest", kind: "WorkerBundle" },
+          operations: ["create", "read", "delete", "import", "observe"],
+        },
+      ],
+      driver: new InMemoryTakoformResourceDriver(),
+      artifacts: {
+        async handle() {
+          return null;
+        },
+        async resolveManifest() {
+          return {
+            apiVersion: "artifacts.takoform.com/v1alpha1",
+            kind: "StaticAssetBundle",
+            files: [],
+          };
+        },
+        async resolveBlob() {
+          return null;
+        },
+      },
+    });
+    const handler = handlerFor(host);
+    const resource = {
+      apiVersion: formRef.apiVersion,
+      kind: formRef.kind,
+      form: { formRef },
+      metadata: { name: "bundle", space: "conformance" },
+      spec: { manifestDigest },
+    };
+    const prepared = await jsonRequest(
+      handler,
+      "POST",
+      "/apis/forms.takoform.com/v1alpha3/resources/prepare",
+      resource,
+      { authorization: "Bearer primary" },
+    );
+    expect(prepared.status).toBe(200);
+    const prepareDigest = requiredString(requiredRecord(prepared.body, "review"), "prepareDigest");
+    const applied = await jsonRequest(
+      handler,
+      "PUT",
+      "/apis/forms.takoform.com/v1alpha3/resources/edge.forms.takoform.com/v1alpha1/WorkerBundle/bundle",
+      { ...resource, review: { prepareDigest } },
+      {
+        authorization: "Bearer primary",
+        "idempotency-key": "apply-wrong-kind",
+        "if-none-match": "*",
+      },
+    );
+    expect(applied.status).toBe(400);
+    expect(applied.body).toMatchObject({ error: { code: "artifact_invalid" } });
   });
 
   test("keeps the current versioned v1alpha3 discovery contract beside the released lane", async () => {
@@ -439,6 +1052,15 @@ describe("Takoserver current Takoform Host", () => {
     expect(changedForm.body).toMatchObject({ error: { code: "resource_not_found" } });
 
     const updatedResource = { ...resource, spec: { location: "weur" } };
+    const unfencedPrepare = await jsonRequest(
+      handler,
+      "POST",
+      "/apis/forms.takoform.com/v1alpha3/resources/prepare",
+      updatedResource,
+      auth,
+    );
+    expect(unfencedPrepare.status).toBe(400);
+    expect(unfencedPrepare.body).toMatchObject({ error: { code: "invalid_argument" } });
     const preparedUpdate = await jsonRequest(
       handler,
       "POST",
@@ -587,6 +1209,34 @@ describe("Takoserver current Takoform Host", () => {
     });
     const handler = handlerFor(host);
     const owner = { authorization: "Bearer tenant-a-owner" };
+    const uncommittedResource = {
+      apiVersion: formRef.apiVersion,
+      kind: formRef.kind,
+      form: { formRef },
+      metadata: { name: "uncommitted", space: "shared" },
+      spec: { bundleManifestDigest: `sha256:${"9".repeat(64)}` },
+    };
+    const uncommittedPrepare = await jsonRequest(
+      handler,
+      "POST",
+      "/apis/forms.takoform.com/v1alpha3/resources/prepare",
+      uncommittedResource,
+      owner,
+    );
+    expect(uncommittedPrepare.status).toBe(200);
+    const uncommittedDigest = requiredString(
+      requiredRecord(uncommittedPrepare.body, "review"),
+      "prepareDigest",
+    );
+    const uncommittedApply = await jsonRequest(
+      handler,
+      "PUT",
+      "/apis/forms.takoform.com/v1alpha3/resources/edge.forms.takoform.com/v1alpha1/EdgeObjectBucket/uncommitted",
+      { ...uncommittedResource, review: { prepareDigest: uncommittedDigest } },
+      { ...owner, "idempotency-key": "uncommitted-apply", "if-none-match": "*" },
+    );
+    expect(uncommittedApply.status).toBe(404);
+    expect(uncommittedApply.body).toMatchObject({ error: { code: "artifact_missing" } });
     const support = await jsonRequest(
       handler,
       "GET",

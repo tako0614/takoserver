@@ -161,6 +161,7 @@ export { parseStrictJson, StrictJsonError } from "./strict-json.ts";
 export { createTakoformArtifacts } from "./takoform/artifacts.ts";
 export { InMemoryTakoformResourceDriver } from "./takoform/memory-driver.ts";
 export type {
+  InstalledTakoformBinding,
   InstalledTakoformForm,
   TakoformBindingRef,
   TakoformDiagnostic,

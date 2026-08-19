@@ -44,7 +44,7 @@ export interface TakoformArtifactPrincipal {
 
 export type TakoformArtifactFailure = (code: string, status: number, details?: unknown) => Response;
 
-interface BlobDeclaration {
+export interface BlobDeclaration {
   readonly name: string;
   readonly mediaType: string;
   readonly size: number;
@@ -66,6 +66,7 @@ export interface TakoformArtifactTransport {
     failure: TakoformArtifactFailure,
   ): Promise<Response | null>;
   resolveManifest(tenantId: string, digest: string): Promise<TakoformArtifactManifest | null>;
+  resolveBlob(tenantId: string, digest: string): Promise<Uint8Array | null>;
 }
 
 export class ArtifactInputError extends Error {
@@ -167,6 +168,12 @@ export function createTakoformArtifacts(
       );
       const row = rows[0];
       return row ? (JSON.parse(String(row.manifest_json)) as TakoformArtifactManifest) : null;
+    },
+
+    async resolveBlob(tenantId, digest) {
+      if (!DIGEST.test(digest) || !(await holds(tenantId, digest, "blob"))) return null;
+      const stored = await objects.get(blobKey(digest));
+      return stored ? new Uint8Array(await new Response(stored.body).arrayBuffer()) : null;
     },
 
     async handle(request, principal, failure) {
