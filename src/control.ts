@@ -734,9 +734,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       );
       if (!ready) controlError("resource_not_ready", 409);
 
-      const ttlSeconds = body.expiresInSeconds === undefined ? 900 : integer(body.expiresInSeconds);
-      if (ttlSeconds < 60 || ttlSeconds > 3_600) controlError("invalid_argument", 400);
-      const issue = {
+      const authority = {
         organizationId,
         resourceUid,
         deploymentId: deployment.id,
@@ -745,8 +743,17 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
         providerInstallationRef: deployment.providerInstallationRef,
         nativeId: deployment.nativeId,
         access,
-        ttlSeconds,
       };
+      const limits = s3.limits(authority);
+      if (!limits) controlError("unsupported_capability", 409);
+      const ttlSeconds =
+        body.expiresInSeconds === undefined
+          ? limits.defaultSeconds
+          : integer(body.expiresInSeconds);
+      if (ttlSeconds < limits.minimumSeconds || ttlSeconds > limits.maximumSeconds) {
+        controlError("invalid_argument", 400);
+      }
+      const issue = { ...authority, ttlSeconds };
       const connection = validateS3CredentialSet(await s3.issue(issue), issue, options.clock());
       return Response.json(
         {

@@ -181,7 +181,7 @@ describe("entering the lane with a session", () => {
       objects: createMemoryObjectStore(),
       forms: edge.forms,
       providers: [],
-      offerings: edge.offerings,
+      offerings: [],
       publicOrigin: "https://api.example.test",
       identity: {
         async verify() {

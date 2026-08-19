@@ -28,6 +28,54 @@ const MODEL = {
   outputMinorPerMillionTokens: 300,
 };
 
+const SUPPLIES = {
+  kind: "takoserver.hosted-object-bucket-supplies@v1",
+  supplies: [
+    {
+      offeringId: "storage.object.cloudflare",
+      displayName: "Object storage",
+      provider: { kind: "cloudflare" },
+      providerInstallation: {
+        id: "cloudflare.primary",
+        providerPackRef: "cloudflare",
+        supplyContractRef: "cloudflare.contract",
+        state: "active",
+        regions: [{ id: "global", capacity: "available" }],
+      },
+      supplyContract: {
+        id: "cloudflare.contract",
+        providerType: "cloudflare",
+        permittedResourceClasses: ["storage.object"],
+        deliveryModes: ["native-credentials"],
+        customerAccess: "scoped-native-access",
+        whiteLabelAllowed: true,
+        endUserTermsRequired: false,
+        regions: ["global"],
+        validFrom: "2026-01-01T00:00:00.000Z",
+        evidenceRef: "private:cloudflare",
+      },
+      pricePlan: {
+        id: "storage.object.cloudflare.price-v1",
+        currency: "USD",
+        recurring: { meter: "bucket-month", amountMinor: 500 },
+        meters: [],
+      },
+      placement: {
+        deliveryMode: "native-credentials",
+        supportPolicyRef: "support:hosted:standard",
+        abusePolicyRef: "abuse:hosted:standard",
+        portability: {
+          api: "portable",
+          exportFormats: ["s3.object-set.takoform.com/v1"],
+          importFormats: ["s3.object-set.takoform.com/v1"],
+          migrationModes: ["offline"],
+        },
+        isolation: "dedicated-resource",
+      },
+    },
+  ],
+};
+
 describe("private data service deploy configuration", () => {
   test("validates private prices and realizes no secret value", () => {
     const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
@@ -35,13 +83,21 @@ describe("private data service deploy configuration", () => {
       const path = join(directory, "target.json");
       writeFileSync(
         path,
-        JSON.stringify({ ...BASE, aiModels: [MODEL], r2ParentAccessKeyId: "parent-key" }),
+        JSON.stringify({
+          ...BASE,
+          aiModels: [MODEL],
+          r2ParentAccessKeyId: "parent-key",
+          objectBucketSupplies: SUPPLIES,
+        }),
       );
       const target = loadTarget(path);
       const realized = deploymentVariables(target) as { vars: Record<string, string> };
       expect(JSON.parse(realized.vars.TAKOSERVER_AI_MODELS ?? "null")).toEqual([MODEL]);
       expect(realized.vars.CLOUDFLARE_ACCOUNT_ID).toBe(BASE.accountId);
       expect(realized.vars.TAKOSERVER_R2_PARENT_ACCESS_KEY_ID).toBe("parent-key");
+      expect(JSON.parse(realized.vars.TAKOSERVER_OBJECT_BUCKET_SUPPLIES ?? "null")).toEqual(
+        SUPPLIES,
+      );
       expect(JSON.stringify(realized)).not.toContain("TOKEN");
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -54,6 +110,17 @@ describe("private data service deploy configuration", () => {
       const path = join(directory, "target.json");
       writeFileSync(path, JSON.stringify({ ...BASE, aiModels: [{ ...MODEL, surprise: true }] }));
       expect(() => loadTarget(path)).toThrow("deploy target `aiModels` is invalid");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("will not sell a Cloudflare bucket without its ordinary S3 data plane", () => {
+    const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
+    try {
+      const path = join(directory, "target.json");
+      writeFileSync(path, JSON.stringify({ ...BASE, objectBucketSupplies: SUPPLIES }));
+      expect(() => loadTarget(path)).toThrow("must be configured together");
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

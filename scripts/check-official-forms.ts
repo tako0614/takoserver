@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { buildEdgeForms } from "../src/edge-forms.ts";
+import { buildEdgeForms, objectBucketProviderOffering } from "../src/edge-forms.ts";
 import { assertReleasedTakoformProviderForms } from "../src/takoform/released-provider-catalog.ts";
 
 const SOURCE_RELEASE = Object.freeze({
@@ -43,11 +43,14 @@ for (const file of SOURCE_RELEASE.files) {
 
 const edge = await buildEdgeForms();
 assertReleasedTakoformProviderForms(edge.forms);
+const objectBucket = objectBucketProviderOffering(edge.objectBucket.form, {
+  id: "storage.object.standard",
+  displayName: "Object bucket",
+});
 if (
   edge.forms.length !== 1 ||
   edge.forms[0]?.identity.formRef.kind !== "ObjectBucket" ||
-  edge.offerings.length !== 1 ||
-  edge.offerings[0]?.providedInterfaces.map((entry) => entry.name).join(",") !== "edge.objects"
+  objectBucket.providedInterfaces.map((entry) => entry.name).join(",") !== "edge.objects"
 ) {
   throw new Error("released_takoform_product_catalog_mismatch");
 }

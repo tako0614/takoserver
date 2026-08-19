@@ -131,11 +131,17 @@ export {
 } from "./resource-migrations.ts";
 export { createRouter, type Router } from "./router.ts";
 export {
+  createS3CredentialIssuerRouter,
+  type S3CredentialIssuerRoute,
+} from "./s3-issuer-router.ts";
+export {
   type S3Access,
+  type S3CredentialAuthority,
   S3CredentialError,
   type S3CredentialIssue,
   type S3CredentialIssuer,
   type S3CredentialSet,
+  type S3CredentialTtlLimits,
   validateS3CredentialSet,
 } from "./s3-port.ts";
 export { createD1Sql } from "./sql-d1.ts";
