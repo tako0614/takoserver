@@ -27,6 +27,16 @@ const API_ORIGIN = "https://api.cloudflare.com/client/v4";
 /** The name a script reaches its own static assets by. */
 const ASSETS_BINDING = "ASSETS";
 
+/**
+ * Cloudflare's Versions API accepts a new version only after the script
+ * container exists. A ModuleWorker therefore owns one inert bootstrap module;
+ * customer bytes arrive later through WorkerVersion and traffic moves only
+ * through WorkerDeployment/WorkerEndpoint.
+ */
+const BOOTSTRAP_MODULE = "takoserver-bootstrap.mjs";
+const BOOTSTRAP_SOURCE =
+  'export default { async fetch() { return new Response("Not deployed", { status: 503 }); } };\n';
+
 /** Cloudflare's code for "that hostname already resolves to something else". */
 const DNS_RECORDS_PRESENT = 100_117;
 
@@ -382,8 +392,32 @@ export class CloudflareProvider implements Provider {
       ? (parseNativeId(input.previous.nativeId)?.name ?? "")
       : await derivedName("tsw", input.identity);
     if (!name) return failed("invalid_spec", "the previous native identity is unusable");
-    // The script container is materialized by WorkerVersion. Allocating its
-    // collision-free provider name is the complete ModuleWorker identity act.
+    if (!input.previous) {
+      const form = new FormData();
+      form.set(
+        "metadata",
+        new Blob(
+          [
+            JSON.stringify({
+              main_module: BOOTSTRAP_MODULE,
+              compatibility_date: this.#workerCompatibilityDate,
+            }),
+          ],
+          { type: "application/json" },
+        ),
+      );
+      form.set(
+        BOOTSTRAP_MODULE,
+        new Blob([BOOTSTRAP_SOURCE], { type: "application/javascript+module" }),
+        BOOTSTRAP_MODULE,
+      );
+      const created = await this.#callForm(
+        "PUT",
+        `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(name)}`,
+        form,
+      );
+      if (!created.ok) return created.ticket;
+    }
     return succeeded({
       nativeId: `worker:${name}`,
       observed: { scriptName: name, allocated: true },

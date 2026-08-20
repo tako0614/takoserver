@@ -471,6 +471,7 @@ describe("released edge Form placement", () => {
     ];
     const calls: Call[] = [];
     const responses = [
+      {},
       { id: "kv-id" },
       { uuid: "database-id", name: "database-name" },
       { queue_id: "queue-id", queue_name: "queue-name" },
@@ -498,7 +499,15 @@ describe("released edge Form placement", () => {
       spec: {},
     });
     expect(worker.phase).toBe("succeeded");
-    expect(calls).toHaveLength(0);
+    expect(worker).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: expect.stringMatching(/^worker:tsw-/) },
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.method).toBe("PUT");
+    expect(calls[0]?.url).toContain("/workers/scripts/tsw-");
+    expect(calls[0]?.body).toContain("takoserver-bootstrap.mjs");
+    expect(calls[0]?.body).toContain("Not deployed");
     const kv = await provider.apply({
       operationId: "op-kv",
       offering: offerings[1] as ProviderOffering,
@@ -527,6 +536,7 @@ describe("released edge Form placement", () => {
       result: { nativeId: "queue:queue-id" },
     });
     expect(calls.map((call) => new URL(call.url).pathname)).toEqual([
+      expect.stringMatching(/\/workers\/scripts\/tsw-/),
       "/client/v4/accounts/acct_1/storage/kv/namespaces",
       "/client/v4/accounts/acct_1/d1/database",
       "/client/v4/accounts/acct_1/queues",
