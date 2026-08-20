@@ -197,7 +197,7 @@ export function buildApp(ports: AppPorts): App {
         const actor = await accounts.authenticate(authorization);
         if (actor?.kind === "api_key") {
           return actor.organizationId && grants(actor.scopes, "resources:write")
-            ? { tenantId: actor.organizationId, principalId: actor.principalId }
+            ? { tenantId: actor.organizationId, principalId: actor.hostPrincipalId }
             : null;
         }
         if (actor?.kind === "session") {
@@ -207,7 +207,7 @@ export function buildApp(ports: AppPorts): App {
             .requireOwner(actor, organizationId)
             .then(() => true)
             .catch(() => false);
-          return owned ? { tenantId: organizationId, principalId: actor.principalId } : null;
+          return owned ? { tenantId: organizationId, principalId: actor.hostPrincipalId } : null;
         }
 
         const bearer = authorization?.startsWith("Bearer ")
