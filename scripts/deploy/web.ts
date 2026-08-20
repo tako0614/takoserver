@@ -71,10 +71,7 @@ export async function runWebRelease(
   await runChecked("preflight", "portable gate `bun run check`", ["bun", "run", "check"]);
   const built = await buildWebSurface(surface, target, source.commit);
   try {
-    const previousService = await currentDomainService(
-      target.accountId,
-      new URL(built.origin).hostname,
-    );
+    const previousService = await currentWebOwner(surface, target.accountId, built.origin);
     process.stdout.write(
       `${JSON.stringify(
         {
@@ -111,10 +108,7 @@ export async function runWebRelease(
       ]),
     );
 
-    const currentService = await currentDomainService(
-      target.accountId,
-      new URL(built.origin).hostname,
-    );
+    const currentService = await currentWebOwner(surface, target.accountId, built.origin);
     if (currentService !== built.workerName) {
       throw new DeployError(
         "verification",
@@ -202,7 +196,15 @@ async function buildWebSurface(
             directory,
             not_found_handling: surface === "console" ? "single-page-application" : "404-page",
           },
-          routes: [{ pattern: new URL(spec.origin).hostname, custom_domain: true }],
+          routes:
+            surface === "console"
+              ? [{ pattern: new URL(spec.origin).hostname, custom_domain: true }]
+              : [
+                  {
+                    pattern: `${new URL(spec.origin).hostname}/*`,
+                    zone_name: new URL(spec.origin).hostname,
+                  },
+                ],
           observability: { enabled: true },
           annotations: { "workers/message": `${spec.workerName} ${commit}` },
         },
@@ -273,6 +275,50 @@ async function currentDomainService(accountId: string, hostname: string): Promis
   );
   if (matches.length > 1) throw preflightError(`${hostname} has more than one Worker domain owner`);
   return matches[0]?.service ?? null;
+}
+
+async function currentWebOwner(
+  surface: WebSurface,
+  accountId: string,
+  origin: string,
+): Promise<string | null> {
+  const hostname = new URL(origin).hostname;
+  return surface === "console"
+    ? currentDomainService(accountId, hostname)
+    : currentRouteService(hostname);
+}
+
+async function currentRouteService(hostname: string): Promise<string | null> {
+  const token = process.env.CLOUDFLARE_API_TOKEN?.trim();
+  if (!token) throw preflightError("CLOUDFLARE_API_TOKEN is required for web route authority");
+  const headers = { authorization: `Bearer ${token}` };
+  const zonesResponse = await fetch(
+    `https://api.cloudflare.com/client/v4/zones?name=${encodeURIComponent(hostname)}`,
+    { headers, signal: AbortSignal.timeout(15_000) },
+  );
+  if (!zonesResponse.ok) throw preflightError("Cloudflare zone inventory failed");
+  const zonesBody = (await zonesResponse.json()) as { readonly result?: readonly unknown[] };
+  const zoneIds = (zonesBody.result ?? []).flatMap((entry) => {
+    if (typeof entry !== "object" || entry === null) return [];
+    const id = (entry as { id?: unknown }).id;
+    const name = (entry as { name?: unknown }).name;
+    return typeof id === "string" && name === hostname ? [id] : [];
+  });
+  if (zoneIds.length !== 1) throw preflightError(`${hostname} does not resolve to one exact zone`);
+  const routesResponse = await fetch(
+    `https://api.cloudflare.com/client/v4/zones/${zoneIds[0]}/workers/routes`,
+    { headers, signal: AbortSignal.timeout(15_000) },
+  );
+  if (!routesResponse.ok) throw preflightError("Cloudflare Worker route inventory failed");
+  const routesBody = (await routesResponse.json()) as { readonly result?: readonly unknown[] };
+  const services = (routesBody.result ?? []).flatMap((entry) => {
+    if (typeof entry !== "object" || entry === null) return [];
+    const pattern = (entry as { pattern?: unknown }).pattern;
+    const script = (entry as { script?: unknown }).script;
+    return pattern === `${hostname}/*` && typeof script === "string" ? [script] : [];
+  });
+  if (services.length > 1) throw preflightError(`${hostname} has more than one exact Worker route`);
+  return services[0] ?? null;
 }
 
 async function readLive(
