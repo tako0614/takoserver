@@ -38,6 +38,8 @@ export interface DeployTarget {
    * the Takoform provider are the whole of it for anyone integrating.
    */
   readonly consoleOrigin?: string;
+  /** Public product site origin, released independently from the API and console. */
+  readonly siteOrigin?: string;
   /**
    * Public OAuth client id. Its presence is what turns Google sign-in on.
    *
@@ -128,6 +130,7 @@ function validateTarget(value: unknown, path: string): DeployTarget {
     [
       "aliases",
       "consoleOrigin",
+      "siteOrigin",
       "googleClientId",
       "takosId",
       "hostedSponsorship",
@@ -160,6 +163,7 @@ function validateTarget(value: unknown, path: string): DeployTarget {
     ...(value.consoleOrigin === undefined
       ? {}
       : { consoleOrigin: httpsOrigin(value.consoleOrigin) }),
+    ...(value.siteOrigin === undefined ? {} : { siteOrigin: httpsOrigin(value.siteOrigin) }),
     ...(value.googleClientId === undefined
       ? {}
       : { googleClientId: pattern(value.googleClientId, GOOGLE_CLIENT_ID, "googleClientId") }),

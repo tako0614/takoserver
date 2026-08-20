@@ -25,33 +25,45 @@ describe("Takoserver deploy entrypoint", () => {
   test("reports an authority-triggered contract without touching a target", async () => {
     const probe = await deploy(["--contract"]);
     expect(probe.exitCode).toBe(0);
-    expect(JSON.parse(probe.stdout)).toMatchObject({
-      kind: "takos.deploy-contract@v2",
-      surfaces: [
-        {
-          surface: "takoserver-api",
-          target: "cloudflare-worker:takoserver-api",
-          covers: expect.arrayContaining(["wrangler.jsonc", "migrations", "src/entry-worker.ts"]),
-          requiresScripts: ["check", "deploy"],
-          requiresTools: ["bun", "wrangler"],
-          requiresEnv: [],
-          triggers: ["published-identity", "authority", "irreversible"],
-          obligations: {
-            provenance: expect.any(String),
-            "post-conditions": expect.any(String),
-            reversal: expect.any(String),
-            "failure-handling": expect.any(String),
-            "no-overwrite": expect.any(String),
-            "pre-mutation-proof": expect.any(String),
-            "independent-review": expect.any(String),
-          },
-        },
-      ],
+    const contract = JSON.parse(probe.stdout) as {
+      kind: string;
+      surfaces: { surface: string; [key: string]: unknown }[];
+    };
+    expect(contract.kind).toBe("takos.deploy-contract@v2");
+    expect(contract.surfaces[0]).toMatchObject({
+      surface: "takoserver-api",
+      target: "cloudflare-worker:takoserver-api",
+      covers: expect.arrayContaining(["wrangler.jsonc", "migrations", "src/entry-worker.ts"]),
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [],
+      triggers: ["published-identity", "authority", "irreversible"],
+      obligations: {
+        provenance: expect.any(String),
+        "post-conditions": expect.any(String),
+        reversal: expect.any(String),
+        "failure-handling": expect.any(String),
+        "no-overwrite": expect.any(String),
+        "pre-mutation-proof": expect.any(String),
+        "independent-review": expect.any(String),
+      },
     });
+    expect(contract.surfaces.map((surface) => surface.surface)).toEqual([
+      "takoserver-api",
+      "takoserver-console",
+      "takoserver-site",
+    ]);
   });
 
   test("refuses every invocation that does not name an explicit action", async () => {
-    for (const args of [[], ["--contract", "takoserver-api"], ["--apply", "--plan"], ["--nope"]]) {
+    for (const args of [
+      [],
+      ["--contract", "takoserver-api"],
+      ["--apply", "--plan"],
+      ["--nope"],
+      ["console"],
+      ["console", "site", "--plan"],
+    ]) {
       const refused = await deploy(args);
       expect(refused.exitCode).toBe(2);
       expect(refused.stdout).toBe("");

@@ -26,7 +26,7 @@ export interface LandingOptions {
 export function landingHtml(options: LandingOptions): string {
   const consoleOrigin = options.consoleOrigin;
   const console_ = consoleOrigin
-    ? `<a class="cta" href="${consoleOrigin}">Open the console</a>`
+    ? `<a class="cta" href="${consoleOrigin}" data-i18n="console">Open the console</a>`
     : "";
   const base = options.apiOrigin ?? "";
   return `<!doctype html>
@@ -58,6 +58,16 @@ body {
   letter-spacing: -0.006em; -webkit-font-smoothing: antialiased;
 }
 main { max-width: 46rem; margin: 0 auto; padding: 88px 24px 96px; }
+.top { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.wordmark { font-weight: 650; letter-spacing: -0.025em; }
+.locale { display: inline-flex; padding: 3px; border: 1px solid var(--line); border-radius: 7px; }
+.locale button {
+  appearance: none; border: 0; border-radius: 4px; padding: 5px 9px; cursor: pointer;
+  background: transparent; color: var(--ink-2); font: inherit; font-size: 12px;
+}
+.locale button[aria-pressed="true"] { background: var(--bg-2); color: var(--ink); }
+.hero { margin-top: 76px; }
+.eyebrow { color: var(--accent); font: 600 12px/1.3 ui-monospace, monospace; letter-spacing: .06em; text-transform: uppercase; }
 h1 { margin: 22px 0 0; font-size: 34px; font-weight: 600; letter-spacing: -0.035em; }
 p.lede { margin: 12px 0 0; color: var(--ink-2); font-size: 16px; max-width: 34rem; }
 .cta {
@@ -66,6 +76,13 @@ p.lede { margin: 12px 0 0; color: var(--ink-2); font-size: 16px; max-width: 34re
   font-size: 14px; font-weight: 500; text-decoration: none;
 }
 .cta:hover { filter: brightness(1.08); }
+.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; margin-top: 56px; background: var(--line); border: 1px solid var(--line); }
+.grid article { min-height: 132px; padding: 20px; background: var(--bg); }
+.grid h2 { margin: 0; font-size: 14px; font-weight: 600; }
+.grid p { margin: 8px 0 0; color: var(--ink-2); font-size: 13px; }
+.billing { margin-top: 56px; padding: 22px; border-left: 3px solid var(--accent); background: var(--bg-2); }
+.billing h2 { margin: 0; font-size: 18px; }
+.billing p { margin: 6px 0 0; color: var(--ink-2); }
 ul { margin: 44px 0 0; padding: 0; list-style: none; border-top: 1px solid var(--line); }
 li { border-bottom: 1px solid var(--line); }
 li a {
@@ -76,22 +93,45 @@ li a:hover { background: var(--bg-2); }
 li span { color: var(--ink-2); font-size: 13px; }
 code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13px; }
 footer { margin-top: 56px; color: var(--ink-2); font-size: 13px; }
+@media (max-width: 520px) {
+  main { padding-top: 28px; }
+  .hero { margin-top: 54px; }
+  .grid { grid-template-columns: 1fr; }
+}
 </style>
 </head>
 <body>
 <main>
+<div class="top"><span class="wordmark">takoserver</span><div class="locale" role="group" aria-label="Language"><button type="button" data-locale="ja">日本語</button><button type="button" data-locale="en">English</button></div></div>
+<section class="hero">
 <svg viewBox="0 0 34 34" width="44" height="44" shape-rendering="crispEdges" aria-hidden="true"><rect x="9" y="0" width="17" height="8" fill="var(--accent)"/><rect x="8" y="1" width="1" height="30" fill="var(--accent)"/><rect x="26" y="1" width="1" height="33" fill="var(--accent)"/><rect x="7" y="2" width="1" height="30" fill="var(--accent)"/><rect x="27" y="2" width="1" height="30" fill="var(--accent)"/><rect x="6" y="3" width="1" height="31" fill="var(--accent)"/><rect x="28" y="3" width="1" height="22" fill="var(--accent)"/><rect x="29" y="4" width="1" height="20" fill="var(--accent)"/><rect x="5" y="5" width="1" height="29" fill="var(--accent)"/><rect x="4" y="6" width="1" height="15" fill="var(--accent)"/><rect x="30" y="6" width="1" height="17" fill="var(--accent)"/><rect x="3" y="7" width="1" height="13" fill="var(--accent)"/><rect x="31" y="7" width="1" height="15" fill="var(--accent)"/><rect x="2" y="8" width="1" height="9" fill="var(--accent)"/><rect x="9" y="8" width="4" height="23" fill="var(--accent)"/><rect x="15" y="8" width="5" height="3" fill="var(--accent)"/><rect x="22" y="8" width="4" height="23" fill="var(--accent)"/><rect x="32" y="8" width="1" height="13" fill="var(--accent)"/><rect x="1" y="10" width="1" height="4" fill="var(--accent)"/><rect x="13" y="10" width="2" height="21" fill="var(--accent)"/><rect x="20" y="10" width="2" height="24" fill="var(--accent)"/><rect x="33" y="10" width="1" height="10" fill="var(--accent)"/><rect x="17" y="11" width="3" height="20" fill="var(--accent)"/><rect x="16" y="12" width="1" height="1" fill="var(--accent)"/><rect x="15" y="14" width="1" height="20" fill="var(--accent)"/><rect x="16" y="16" width="1" height="18" fill="var(--accent)"/><rect x="0" y="20" width="3" height="2" fill="var(--accent)"/><rect x="1" y="22" width="2" height="2" fill="var(--accent)"/><rect x="3" y="23" width="2" height="8" fill="var(--accent)"/><rect x="2" y="24" width="1" height="2" fill="var(--accent)"/><rect x="28" y="27" width="1" height="4" fill="var(--accent)"/><rect x="29" y="28" width="1" height="3" fill="var(--accent)"/><rect x="2" y="29" width="1" height="2" fill="var(--accent)"/><rect x="30" y="29" width="1" height="2" fill="var(--accent)"/><rect x="1" y="30" width="1" height="1" fill="var(--accent)"/><rect x="31" y="30" width="1" height="1" fill="var(--accent)"/><rect x="10" y="31" width="3" height="1" fill="var(--accent)"/><rect x="17" y="31" width="1" height="1" fill="var(--accent)"/><rect x="22" y="31" width="1" height="1" fill="var(--accent)"/><rect x="25" y="31" width="1" height="3" fill="var(--accent)"/><rect x="10" y="32" width="2" height="2" fill="var(--accent)"/><rect x="13" y="8" width="2" height="2" fill="var(--face)"/><rect x="20" y="8" width="2" height="2" fill="var(--face)"/><rect x="15" y="11" width="2" height="1" fill="var(--face)"/><rect x="15" y="12" width="1" height="2" fill="var(--face)"/><rect x="16" y="13" width="1" height="3" fill="var(--face)"/></svg>
-<h1>Takoserver</h1>
-<p class="lede">A prepaid resource platform. Declare what you need with Takoform,
-fund a wallet, and pay only for what is actually provisioned.</p>
+<p class="eyebrow" data-i18n="eyebrow">Developer cloud</p>
+<h1 data-i18n="headline">Cloud resources, without the cloud maze.</h1>
+<p class="lede" data-i18n="lede">Create compute, data, storage, and AI resources through one control plane. Fund a wallet and pay for provisioned capacity and metered usage.</p>
 ${console_}
+</section>
+<section class="grid" aria-label="Products">
+<article><h2 data-i18n="computeTitle">Compute</h2><p data-i18n="computeBody">Deploy edge services and attach the resources they use.</p></article>
+<article><h2 data-i18n="dataTitle">Data</h2><p data-i18n="dataBody">Databases, key-value storage, queues, and migration-ready state.</p></article>
+<article><h2 data-i18n="storageTitle">Object storage</h2><p data-i18n="storageBody">Standard S3 access with scoped credentials and independent lifecycle.</p></article>
+<article><h2 data-i18n="aiTitle">AI</h2><p data-i18n="aiBody">OpenAI-compatible inference with explicit model prices and usage records.</p></article>
+</section>
+<section class="billing"><h2 data-i18n="billingTitle">Usage-based, prepaid billing</h2><p data-i18n="billingBody">Recurring capacity and measured usage are recorded separately. You can see what was reserved, used, and charged.</p></section>
 <ul>
-<li><a href="${base}/openapi.json"><code>${base}/openapi.json</code><span>API description</span></a></li>
-<li><a href="${base}/.well-known/takoserver"><code>${base}/.well-known/takoserver</code><span>Product discovery</span></a></li>
-<li><a href="${base}/.well-known/takoform/v1alpha3"><code>${base}/.well-known/takoform/v1alpha3</code><span>Takoform Host discovery</span></a></li>
+<li><a href="${base}/openapi.json"><code>${base}/openapi.json</code><span data-i18n="api">API description</span></a></li>
+<li><a href="${base}/.well-known/takoserver"><code>${base}/.well-known/takoserver</code><span data-i18n="product">Product discovery</span></a></li>
+<li><a href="${base}/.well-known/takoform/v1alpha3"><code>${base}/.well-known/takoform/v1alpha3</code><span data-i18n="host">Takoform Host discovery</span></a></li>
 </ul>
 <footer>takoserver.com</footer>
 </main>
+<script>
+const messages={
+en:{description:"A developer cloud for compute, data, storage, and AI.",console:"Open the console",eyebrow:"Developer cloud",headline:"Cloud resources, without the cloud maze.",lede:"Create compute, data, storage, and AI resources through one control plane. Fund a wallet and pay for provisioned capacity and metered usage.",computeTitle:"Compute",computeBody:"Deploy edge services and attach the resources they use.",dataTitle:"Data",dataBody:"Databases, key-value storage, queues, and migration-ready state.",storageTitle:"Object storage",storageBody:"Standard S3 access with scoped credentials and independent lifecycle.",aiTitle:"AI",aiBody:"OpenAI-compatible inference with explicit model prices and usage records.",billingTitle:"Usage-based, prepaid billing",billingBody:"Recurring capacity and measured usage are recorded separately. You can see what was reserved, used, and charged.",api:"API description",product:"Product discovery",host:"Takoform Host discovery"},
+ja:{description:"コンピュート、データ、ストレージ、AIのための開発者向けクラウド。",console:"コンソールを開く",eyebrow:"開発者向けクラウド",headline:"クラウドを、迷わず使える形に。",lede:"コンピュート、データ、ストレージ、AIを一つのコントロールプレーンから作成できます。ウォレットへ入金し、確保した容量と実際の使用量に応じて支払います。",computeTitle:"コンピュート",computeBody:"エッジサービスをデプロイし、利用するリソースを接続します。",dataTitle:"データ",dataBody:"データベース、KVS、キューと、移行可能な状態管理を提供します。",storageTitle:"オブジェクトストレージ",storageBody:"スコープされた認証情報と独立したライフサイクルを持つ標準S3アクセスです。",aiTitle:"AI",aiBody:"明示されたモデル価格と使用記録を持つOpenAI互換推論です。",billingTitle:"前払い・使用量ベースの課金",billingBody:"確保した容量と計測した使用量を分けて記録します。予約、利用、請求の内訳を確認できます。",api:"API仕様",product:"製品ディスカバリー",host:"Takoform Hostディスカバリー"}
+};
+const setLocale=(locale)=>{const lang=locale==="ja"?"ja":"en";document.documentElement.lang=lang;document.querySelector('meta[name="description"]').content=messages[lang].description;for(const node of document.querySelectorAll("[data-i18n]")){const value=messages[lang][node.dataset.i18n];if(value)node.textContent=value}for(const button of document.querySelectorAll("[data-locale]"))button.setAttribute("aria-pressed",String(button.dataset.locale===lang));try{localStorage.setItem("takoserver.locale",lang)}catch{}};
+let stored=null;try{stored=localStorage.getItem("takoserver.locale")}catch{}setLocale(stored??(navigator.language.toLowerCase().startsWith("ja")?"ja":"en"));for(const button of document.querySelectorAll("[data-locale]"))button.addEventListener("click",()=>setLocale(button.dataset.locale));
+</script>
 </body>
 </html>
 `;

@@ -6,6 +6,7 @@ import { inspectLive, preflight } from "./deploy/preflight.ts";
 import { writeRealizedConfig } from "./deploy/realized-config.ts";
 import { loadTarget, targetPath } from "./deploy/target.ts";
 import { verify } from "./deploy/verify.ts";
+import { runWebRelease, type WebSurface } from "./deploy/web.ts";
 
 const USAGE = `takoserver deploy
 
@@ -13,6 +14,12 @@ const USAGE = `takoserver deploy
   bun run deploy -- --status            read-only inspection of the realized target
   bun run deploy -- --plan              run every pre-mutation proof, publish nothing
   bun run deploy -- --apply             publish, then verify on the published origin
+  bun run deploy -- console --status    inspect the public console bytes
+  bun run deploy -- console --plan      build and prove the console release, publish nothing
+  bun run deploy -- console --apply     publish and byte-verify the public console
+  bun run deploy -- site --status       inspect the public product site bytes
+  bun run deploy -- site --plan         build and prove the site release, publish nothing
+  bun run deploy -- site --apply        publish and byte-verify the public product site
 
   --target <path>                       deploy target descriptor
                                         (default .deploy/target.json, or
@@ -36,14 +43,20 @@ const AFTERMATH: Readonly<Record<DeployPhase, string>> = {
 interface Mode {
   readonly action: "status" | "plan" | "apply";
   readonly targetPath: string;
+  readonly surface: "api" | WebSurface;
 }
 
 function parseMode(args: readonly string[]): Mode | null {
   let action: Mode["action"] | null = null;
   let explicitTarget: string | undefined;
+  let surface: Mode["surface"] = "api";
 
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
+    if ((argument === "console" || argument === "site") && index === 0) {
+      surface = argument;
+      continue;
+    }
     if (argument === "--status" || argument === "--plan" || argument === "--apply") {
       if (action !== null) return null;
       action = argument.slice(2) as Mode["action"];
@@ -59,7 +72,7 @@ function parseMode(args: readonly string[]): Mode | null {
     return null;
   }
   if (action === null) return null;
-  return { action, targetPath: targetPath(explicitTarget) };
+  return { action, targetPath: targetPath(explicitTarget), surface };
 }
 
 function reversalNotice(previousVersionId: string | null, workerName: string): string {
@@ -79,6 +92,11 @@ function reversalNotice(previousVersionId: string | null, workerName: string): s
 
 async function run(mode: Mode): Promise<void> {
   const target = loadTarget(mode.targetPath);
+
+  if (mode.surface !== "api") {
+    await runWebRelease(mode.surface, mode.action, target);
+    return;
+  }
 
   if (mode.action === "status") {
     const configPath = writeRealizedConfig(target);
