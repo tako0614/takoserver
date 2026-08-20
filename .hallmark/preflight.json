@@ -1,0 +1,13 @@
+{
+  "framework": "vanilla HTML generated from TypeScript",
+  "existingFonts": "system sans and monospace",
+  "existingPalette": "neutral white and red",
+  "existingMotion": "hover brightness only",
+  "existingSpacing": "ad hoc pixel values",
+  "preserved": [
+    "one shared landing document for the API root and apex",
+    "separate Console hostname",
+    "self-contained functional HTML",
+    "Takoform and Takoserver discovery links"
+  ]
+}
