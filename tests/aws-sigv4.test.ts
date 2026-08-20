@@ -3,6 +3,7 @@ import { signAwsV4Request } from "../src/providers/aws-sigv4.ts";
 
 describe("AWS Signature Version 4", () => {
   test("matches the official S3 header-signing example", async () => {
+    // takos-secret-scan: synthetic — AWS's published SigV4 example pair.
     const request = await signAwsV4Request({
       method: "GET",
       url: "https://examplebucket.s3.amazonaws.com/test.txt",
