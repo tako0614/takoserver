@@ -71,5 +71,57 @@ export const DEPLOY_CONTRACT = {
           "identity, reversal, and readback evidence before it is used again.",
       },
     },
+    {
+      surface: "takoserver-console",
+      target: "cloudflare-worker:takoserver-console",
+      covers: ["console", "scripts/build-console.ts", "scripts/deploy.ts", "scripts/deploy/web.ts"],
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: ["CLOUDFLARE_API_TOKEN"],
+      triggers: ["published-identity"],
+      obligations: {
+        provenance:
+          "The owner builds console assets from a clean pushed commit into a fresh private temporary directory and records the commit, exact asset digest, byte count, Worker name and public origin.",
+        "post-conditions":
+          "The writer proves the custom domain is owned by takoserver-console and that the live console.js body is byte-exact with the just-built artifact.",
+        reversal:
+          "The previous custom-domain service is captured before publication and no previous Worker is deleted, so the hostname can be reattached without reconstructing old bytes.",
+        "failure-handling":
+          "Build and authority failures occur before publication; a failed mutation or byte readback is classified and never retried automatically.",
+        "no-overwrite":
+          "Wrangler publishes immutable Worker versions and the append-only web ledger never overwrites an earlier publication receipt.",
+        "pre-mutation-proof":
+          "The full portable gate, pushed-source proof, fresh console build, content digest and current custom-domain owner are read before publication.",
+      },
+    },
+    {
+      surface: "takoserver-site",
+      target: "cloudflare-worker:takoserver-site",
+      covers: [
+        "site",
+        "src/landing.ts",
+        "scripts/build-site.ts",
+        "scripts/deploy.ts",
+        "scripts/deploy/web.ts",
+      ],
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: ["CLOUDFLARE_API_TOKEN"],
+      triggers: ["published-identity"],
+      obligations: {
+        provenance:
+          "The owner builds the site from a clean pushed commit into a fresh private temporary directory and records its exact digest, size, origin and Worker identity.",
+        "post-conditions":
+          "The writer proves the custom domain is owned by takoserver-site and that the served index document is byte-exact with the built page.",
+        reversal:
+          "The previous custom-domain service is captured and retained for reattachment; no customer or API state is changed.",
+        "failure-handling":
+          "Build and authority failures occur before publication; mutation and verification failures are terminal and require status readback.",
+        "no-overwrite":
+          "Each publication is an immutable Worker Version with an append-only evidence receipt.",
+        "pre-mutation-proof":
+          "The full portable gate, pushed-source proof, fresh site build, digest and current domain owner are read before mutation.",
+      },
+    },
   ],
 } as const;
