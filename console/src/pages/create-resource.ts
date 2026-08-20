@@ -1,9 +1,10 @@
 import type { FormRef, Offering } from "../api.ts";
-import { type Child, h } from "../dom.ts";
+import { h } from "../dom.ts";
+import { recurringPriceSentence } from "../offering-view.ts";
 import { signal } from "../reactive.ts";
 import { navigate, resourcePath } from "../router.ts";
 import { api } from "../state.ts";
-import { explain, money, openModal, toast } from "../ui.ts";
+import { explain, openModal, toast } from "../ui.ts";
 
 /**
  * Declaring a resource from the console.
@@ -32,11 +33,7 @@ export function createResource(organizationId: string, offerings: readonly Offer
 
   const price = h("div", { class: "dim", style: { fontSize: "12.5px" } });
   const showPrice = (offering: Offering): void => {
-    price.replaceChildren(
-      document.createTextNode(
-        `${money(offering.price.unitPriceMinor, offering.price.currency)} per ${offering.price.unit} — held when you apply, charged when it succeeds.`,
-      ),
-    );
+    price.replaceChildren(document.createTextNode(recurringPriceSentence(offering)));
   };
   showPrice(chosen());
 

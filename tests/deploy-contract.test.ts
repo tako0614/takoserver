@@ -46,16 +46,52 @@ describe("Takoserver deploy entrypoint", () => {
             "independent-review": expect.any(String),
           },
         },
+        {
+          surface: "takoserver-console",
+          target: "cloudflare-worker:takoserver-console",
+          covers: expect.arrayContaining(["wrangler.console.jsonc", "console"]),
+          triggers: ["authority"],
+          obligations: {
+            provenance: expect.any(String),
+            "post-conditions": expect.any(String),
+            reversal: expect.any(String),
+            "failure-handling": expect.any(String),
+            "independent-review": expect.any(String),
+          },
+        },
+        {
+          surface: "takoserver-site",
+          target: "cloudflare-worker:takoserver-site",
+          covers: expect.arrayContaining(["wrangler.site.jsonc", "site", "src/landing.ts"]),
+          triggers: ["authority"],
+          obligations: {
+            provenance: expect.any(String),
+            "post-conditions": expect.any(String),
+            reversal: expect.any(String),
+            "failure-handling": expect.any(String),
+            "independent-review": expect.any(String),
+          },
+        },
       ],
     });
   });
 
   test("refuses every invocation that does not name an explicit action", async () => {
-    for (const args of [[], ["--contract", "takoserver-api"], ["--apply", "--plan"], ["--nope"]]) {
+    for (const args of [
+      [],
+      ["--contract", "takoserver-api"],
+      ["--apply", "--plan"],
+      ["--nope"],
+      ["takoserver-console"],
+      ["takoserver-console", "--apply"],
+      ["takoserver-site", "--plan", "--review", "nobody"],
+    ]) {
       const refused = await deploy(args);
       expect(refused.exitCode).toBe(2);
       expect(refused.stdout).toBe("");
-      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).toMatch(
+        /no target was touched|requires exactly one|requires --review/u,
+      );
     }
   });
 

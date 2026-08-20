@@ -1,7 +1,8 @@
 import { type Child, h, live } from "../dom.ts";
+import { offeringInterfaceLabels, offeringPriceLines } from "../offering-view.ts";
 import { resource } from "../reactive.ts";
 import { api } from "../state.ts";
-import { badge, card, copyable, empty, money, shortDigest, whenReady } from "../ui.ts";
+import { badge, card, copyable, empty, shortDigest, whenReady } from "../ui.ts";
 
 /**
  * What Takoserver sells, and the exact Form each offering executes.
@@ -40,8 +41,10 @@ export function catalogPage(organizationId: string): Child {
             : h(
                 "div",
                 { class: "grid" },
-                ...offerings.map((offering) =>
-                  card(
+                ...offerings.map((offering) => {
+                  const [recurringPrice, ...meterPrices] = offeringPriceLines(offering);
+                  const interfaces = offeringInterfaceLabels(offering);
+                  return card(
                     h(
                       "span",
                       { style: { display: "flex", alignItems: "center", gap: "8px" } },
@@ -54,12 +57,10 @@ export function catalogPage(organizationId: string): Child {
                       h(
                         "div",
                         { class: "stat__value", style: { fontSize: "20px" } },
-                        `${money(offering.price.unitPriceMinor, offering.price.currency)}`,
-                        h(
-                          "span",
-                          { class: "dim", style: { fontSize: "13px", fontWeight: "400" } },
-                          ` / ${offering.price.unit}`,
-                        ),
+                        recurringPrice,
+                      ),
+                      ...meterPrices.map((line) =>
+                        h("div", { class: "dim", style: { fontSize: "13px" } }, line),
                       ),
                       h(
                         "div",
@@ -80,13 +81,13 @@ export function catalogPage(organizationId: string): Child {
                             shortDigest(offering.form.schemaDigest),
                           ),
                         ),
-                        offering.protocols.length > 0
+                        interfaces.length > 0
                           ? detail(
-                              "Data protocols",
+                              "Interfaces",
                               h(
                                 "span",
                                 { style: { display: "flex", gap: "4px", flexWrap: "wrap" } },
-                                ...offering.protocols.map((protocol) => badge(protocol)),
+                                ...interfaces.map((label) => badge(label)),
                               ),
                             )
                           : null,
@@ -95,8 +96,8 @@ export function catalogPage(organizationId: string): Child {
                           : null,
                       ),
                     ),
-                  ),
-                ),
+                  );
+                }),
               ),
         { retry: catalog.reload },
       ),

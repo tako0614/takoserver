@@ -8,6 +8,8 @@
  * call succeeded.
  */
 
+import type { CatalogOfferingWire } from "../../src/catalog.ts";
+
 /** A way in, as the server advertises it. */
 export interface IdentityProvider {
   readonly id: string;
@@ -58,20 +60,7 @@ export interface Wallet {
   readonly entries: readonly LedgerEntry[];
 }
 
-export interface Offering {
-  readonly id: string;
-  readonly kind: string;
-  readonly displayName: string;
-  readonly form: FormRef;
-  readonly price: {
-    readonly currency: string;
-    readonly unit: string;
-    readonly unitPriceMinor: number;
-  };
-  readonly protocols: readonly string[];
-  readonly regions?: readonly string[];
-  readonly digest: string;
-}
+export type Offering = CatalogOfferingWire;
 
 export interface FormRef {
   readonly apiVersion: string;

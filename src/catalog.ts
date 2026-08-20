@@ -113,6 +113,29 @@ export interface Offering {
   readonly retired?: boolean;
 }
 
+/** The public Offering projection returned by the control-plane catalog. */
+export type CatalogOfferingWire = Pick<
+  Offering,
+  | "id"
+  | "kind"
+  | "displayName"
+  | "form"
+  | "pricePlan"
+  | "resourceClass"
+  | "deliveryMode"
+  | "providedInterfaces"
+  | "bindingRefs"
+  | "regions"
+  | "portability"
+  | "isolation"
+> & {
+  readonly digest: `sha256:${string}`;
+};
+
+export interface CatalogResponse {
+  readonly offerings: readonly CatalogOfferingWire[];
+}
+
 export interface Catalog {
   list(): readonly Offering[];
   findOffering(offeringId: string): Offering | undefined;

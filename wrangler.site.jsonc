@@ -1,0 +1,16 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "takoserver-site",
+  "compatibility_date": "2026-08-20",
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [
+    {
+      "pattern": "takoserver.com/*",
+      "zone_name": "takoserver.com"
+    }
+  ],
+  "assets": {
+    "directory": "./site/dist"
+  }
+}

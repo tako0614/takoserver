@@ -8,7 +8,7 @@ import {
   grants,
   type IdentityProviderDescriptor,
 } from "./auth.ts";
-import type { Catalog } from "./catalog.ts";
+import type { Catalog, CatalogResponse } from "./catalog.ts";
 import { GoogleIdentityError } from "./google-identity.ts";
 import { type FundingSettlementVerifier, type Ledger, LedgerError } from "./ledger.ts";
 import { OperatorAssertionError } from "./operator-credentials.ts";
@@ -332,7 +332,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
             digest: await catalog.digest(offering),
           })),
         ),
-      });
+      } satisfies CatalogResponse);
     }
 
     if (request.method === "POST" && url.pathname === "/v1/reseller/quotes") {

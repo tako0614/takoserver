@@ -71,5 +71,62 @@ export const DEPLOY_CONTRACT = {
           "identity, reversal, and readback evidence before it is used again.",
       },
     },
+    {
+      surface: "takoserver-console",
+      target: "cloudflare-worker:takoserver-console",
+      covers: [
+        "wrangler.console.jsonc",
+        "console",
+        "scripts/build-console.ts",
+        "scripts/deploy.ts",
+        "scripts/deploy/static.ts",
+        "package.json",
+      ],
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [],
+      triggers: ["authority"],
+      obligations: {
+        provenance:
+          "Publication refuses a dirty, detached, or unpushed worktree; runs the complete owner gate; rebuilds the Console with the exact production API origin; scans the public artifact for credential-shaped bytes; performs a strict Wrangler dry-run; and records the commit, artifact digest, Worker version, route target, and reviewer in an operator-private 0600 ledger.",
+        "post-conditions":
+          "After publication the owner reads the new 100% Worker deployment, byte-compares production index.html and console.js to the reviewed build, verifies a SPA deep link, and rejects any served bundle that still contains the retired unitPriceMinor or protocols projection.",
+        reversal:
+          "The prior Worker version is captured before mutation and printed as an exact Wrangler rollback command. On the first owned publication, deleting the new Worker removes its route and restores the pre-existing DNS origin without changing that DNS record.",
+        "failure-handling":
+          "Preflight failure exits before Cloudflare mutation; publication or readback failure is terminal and classified as indeterminate, preserves the previous version, and requires the read-only --status path before any retry.",
+        "independent-review":
+          "--apply requires a named reviewer after the plan has exposed the exact commit, artifact digest, prior version, route, and current HTTP state.",
+      },
+    },
+    {
+      surface: "takoserver-site",
+      target: "cloudflare-worker:takoserver-site",
+      covers: [
+        "wrangler.site.jsonc",
+        "site",
+        "src/landing.ts",
+        "scripts/build-site.ts",
+        "scripts/deploy.ts",
+        "scripts/deploy/static.ts",
+        "package.json",
+      ],
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [],
+      triggers: ["authority"],
+      obligations: {
+        provenance:
+          "Publication refuses a dirty, detached, or unpushed worktree; runs the complete owner gate; rebuilds the apex from the shared Takoserver landing source with exact Console and API origins; scans public bytes; performs a strict Wrangler dry-run; and records commit, artifact digest, Worker version, route target, and reviewer in an operator-private 0600 ledger.",
+        "post-conditions":
+          "After publication the owner reads the new 100% Worker deployment, byte-compares https://takoserver.com/ with the reviewed index.html, and requires the served page to link the exact production Console and API origins.",
+        reversal:
+          "The prior Worker version is captured before mutation and printed as an exact Wrangler rollback command. On the first owned publication, deleting the new Worker removes its route and restores the exact pre-publication origin behavior.",
+        "failure-handling":
+          "Preflight failure exits before Cloudflare mutation; publication or readback failure is terminal and classified as indeterminate, preserves the previous version, and requires the read-only --status path before any retry.",
+        "independent-review":
+          "--apply requires a named reviewer after the plan has exposed the exact commit, artifact digest, prior version, route, and current HTTP state.",
+      },
+    },
   ],
 } as const;

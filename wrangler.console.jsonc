@@ -1,0 +1,19 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "takoserver-console",
+  "main": "./console/worker.ts",
+  "compatibility_date": "2026-08-20",
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [
+    {
+      "pattern": "console.takoserver.com/*",
+      "zone_name": "takoserver.com"
+    }
+  ],
+  "assets": {
+    "directory": "./console/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  }
+}

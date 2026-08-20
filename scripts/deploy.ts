@@ -4,6 +4,7 @@ import { appendLedger, EVIDENCE_LEDGER } from "./deploy/evidence.ts";
 import { mutate } from "./deploy/mutate.ts";
 import { inspectLive, preflight } from "./deploy/preflight.ts";
 import { writeRealizedConfig } from "./deploy/realized-config.ts";
+import { runStaticSurface, type StaticSurfaceName } from "./deploy/static.ts";
 import { loadTarget, targetPath } from "./deploy/target.ts";
 import { verify } from "./deploy/verify.ts";
 
@@ -13,6 +14,11 @@ const USAGE = `takoserver deploy
   bun run deploy -- --status            read-only inspection of the realized target
   bun run deploy -- --plan              run every pre-mutation proof, publish nothing
   bun run deploy -- --apply             publish, then verify on the published origin
+
+  bun run deploy -- takoserver-console --status|--plan
+  bun run deploy -- takoserver-console --apply --review <reviewer>
+  bun run deploy -- takoserver-site --status|--plan
+  bun run deploy -- takoserver-site --apply --review <reviewer>
 
   --target <path>                       deploy target descriptor
                                         (default .deploy/target.json, or
@@ -175,6 +181,22 @@ const argv = process.argv.slice(2);
 
 if (argv.length === 1 && argv[0] === "--contract") {
   process.stdout.write(`${JSON.stringify(DEPLOY_CONTRACT, null, 2)}\n`);
+  process.exit(0);
+}
+
+const selectedSurface = argv[0];
+if (selectedSurface === "takoserver-console" || selectedSurface === "takoserver-site") {
+  try {
+    await runStaticSurface(selectedSurface as StaticSurfaceName, argv.slice(1));
+  } catch (error) {
+    if (error instanceof DeployError) {
+      process.stderr.write(`deploy failed during ${error.phase}: ${error.message}\n`);
+      if (error.detail) process.stderr.write(`\n${error.detail}\n`);
+      process.stderr.write(`\n${AFTERMATH[error.phase]}\n`);
+      process.exit(PHASE_EXIT_CODE[error.phase]);
+    }
+    throw error;
+  }
   process.exit(0);
 }
 
