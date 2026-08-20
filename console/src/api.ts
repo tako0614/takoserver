@@ -14,6 +14,7 @@ export interface IdentityProvider {
   readonly displayName: string;
   readonly method: "oidc" | "operator-assertion";
   readonly clientId?: string;
+  readonly issuer?: string;
 }
 
 export interface Principal {
@@ -178,6 +179,7 @@ export function createApi(options: ApiOptions) {
     try {
       response = await fetch(`${options.origin}${path}`, {
         method,
+        credentials: "include",
         headers: {
           ...(token ? { authorization: `Bearer ${token}` } : {}),
           ...(body === undefined ? {} : { "content-type": "application/json" }),
@@ -215,12 +217,14 @@ export function createApi(options: ApiOptions) {
       method?: IdentityProvider["method"],
       nonce?: string,
     ) =>
-      call<{ principal: Principal; sessionToken: string }>("POST", "/v1/sessions", {
+      call<{ principal: Principal; sessionToken?: string }>("POST", "/v1/sessions", {
         provider,
         assertion,
         ...(method === undefined ? {} : { method }),
         ...(nonce === undefined ? {} : { nonce }),
       }),
+
+    signOut: () => call<void>("DELETE", "/v1/session"),
 
     me: () =>
       call<{ principal: Principal; organizations: readonly Organization[] }>("GET", "/v1/me"),

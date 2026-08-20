@@ -38,6 +38,11 @@ interface WorkerEnv {
   readonly OPERATOR_PUBLIC_JWK?: string;
   /** Public OAuth client id. Its presence turns Google sign-in on. */
   readonly GOOGLE_CLIENT_ID?: string;
+  /** Shared company identity issuer and this product's public OIDC client. */
+  readonly TAKOS_ID_ISSUER?: string;
+  readonly TAKOS_ID_CLIENT_ID?: string;
+  /** Private Takosumi Hosted sponsorship service bearer. */
+  readonly TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN?: string;
   /** The Cloudflare account this deployment provisions in. */
   readonly CLOUDFLARE_ACCOUNT_ID?: string;
   /** Scoped Cloudflare API token. A secret, never a var. */
@@ -82,6 +87,14 @@ function credentials(env: WorkerEnv) {
     ? (JSON.parse(raw) as { kty: string; crv: string; x: string })
     : undefined;
   const identity = resolveIdentity({
+    ...(env.TAKOS_ID_ISSUER && env.TAKOS_ID_CLIENT_ID
+      ? {
+          takosId: {
+            issuer: env.TAKOS_ID_ISSUER,
+            clientId: env.TAKOS_ID_CLIENT_ID,
+          },
+        }
+      : {}),
     googleClientId: env.GOOGLE_CLIENT_ID,
     operatorPublicKeyJwk: publicKeyJwk,
   });
@@ -154,6 +167,9 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     ...dataServices,
     publicOrigin: origin,
     ...(env.TAKOSERVER_CONSOLE_ORIGIN ? { consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN } : {}),
+    ...(env.TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN
+      ? { sponsorshipServiceToken: env.TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN }
+      : {}),
     forms: edge.forms,
     bindings: edge.bindings,
     providers: deployment.providers,

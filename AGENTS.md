@@ -13,8 +13,8 @@
 ## Ownership
 
 - Owns: Takoserver direct Console and API-key account plane / Prepaid wallet, append-only funding/usage ledger, multi-Offering catalog, and logical Resource lifecycle / Takoform Host, ResourceDeployment, Attachment, Migration, Provider Pack, meter, and self-host models / Public AI and S3 data planes plus publishable provider adapters / Short-lived scoped reseller execution grants and public API/OpenAPI/SDK/CLI artifacts
-- Does not own: Takosumi OSS Run, state, output, audit, or ProviderConnection authority / Takosumi Hosted customer accounts, Marketplace, Stripe, or support / Signed Supply Contracts, negotiated prices, production provider accounts, credentials, and operator-only capacity policy / Takosumi Accounts or the archived takosumi-cloud repository
-- Hazards: Portable Form identity must come from released Takoform packages; never mint a provider-shaped Form locally. / Provider capability does not imply resale authority; production Offerings require private Supply Contract composition. / Reseller requests carry only an opaque tenantRef and a short-lived audience-bound grant. / Do not import Takosumi or Hosted source, account IDs, sessions, or private operator state.
+- Does not own: Takosumi OSS Run, state, output, audit, or ProviderConnection authority / Takosumi Hosted plan entitlements or sponsored-credit purchase policy / Person identity, legal Organizations, reusable payment profiles, or product-external sessions / Signed Supply Contracts, negotiated prices, production provider accounts, credentials, and operator-only capacity policy
+- Hazards: Consume Takos ID only through OIDC/HTTP; do not import Takosumi, Hosted, or Takos ID source or accept their cookies. / Portable Form identity must come from released Takoform packages; never mint a provider-shaped Form locally. / Provider capability does not imply resale authority; production Offerings require private Supply Contract composition. / Reseller requests carry only an opaque tenantRef and a short-lived audience-bound grant.
 
 ## Required workflow
 

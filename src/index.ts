@@ -155,6 +155,7 @@ export {
   type S3CredentialTtlLimits,
   validateS3CredentialSet,
 } from "./s3-port.ts";
+export { createSponsorshipRoutes, type SponsorshipRoutes } from "./sponsorship-api.ts";
 export { createD1Sql } from "./sql-d1.ts";
 export { createMemorySql, createSqliteSql } from "./sql-sqlite.ts";
 export { parseStrictJson, StrictJsonError } from "./strict-json.ts";

@@ -4,11 +4,9 @@ import { signal } from "./reactive.ts";
 /**
  * What the console remembers between page loads.
  *
- * A session token is the whole of a person's authority here, so where it lives
- * is a decision and not a detail. It is held in `sessionStorage`: it survives a
- * reload, which is what a working console needs, and it does not survive the
- * tab closing, which is what a shared machine needs. It is never put in the
- * URL, where it would end up in history and in every referrer.
+ * Session authority is an HttpOnly cookie owned by the API origin. JavaScript
+ * stores only a non-authoritative UI marker so a reload can choose the signed-
+ * in shell; `/v1/me` clears a stale marker when the cookie has expired.
  */
 
 const SESSION_KEY = "takoserver.session";
@@ -18,7 +16,7 @@ const ORIGIN_KEY = "takoserver.origin";
 
 export type Theme = "system" | "light" | "dark";
 
-export const session = signal<string | null>(sessionStorage.getItem(SESSION_KEY));
+export const session = signal<string | null>(localStorage.getItem(SESSION_KEY));
 export const principal = signal<Principal | null>(null);
 export const organizations = signal<readonly Organization[]>([]);
 export const currentOrganizationId = signal<string | null>(localStorage.getItem(ORG_KEY));
@@ -51,16 +49,20 @@ export function setApiOrigin(origin: string): void {
   apiOrigin.set(trimmed);
 }
 
-export function signOut(): void {
-  sessionStorage.removeItem(SESSION_KEY);
+function clearSession(): void {
+  localStorage.removeItem(SESSION_KEY);
   session.set(null);
   principal.set(null);
   organizations.set([]);
 }
 
-export function adoptSession(token: string): void {
-  sessionStorage.setItem(SESSION_KEY, token);
-  session.set(token);
+export function signOut(): void {
+  void api.signOut().finally(clearSession);
+}
+
+export function adoptSession(): void {
+  localStorage.setItem(SESSION_KEY, "cookie");
+  session.set("cookie");
 }
 
 export function selectOrganization(id: string): void {
@@ -72,8 +74,8 @@ export const api: Api = createApi({
   get origin() {
     return apiOrigin();
   },
-  token: () => session(),
-  onSessionLost: signOut,
+  token: () => null,
+  onSessionLost: clearSession,
 });
 
 /** The organization every screen acts on, or null before one is chosen. */

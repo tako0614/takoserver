@@ -24,6 +24,7 @@ import {
 } from "./resource-migrations.ts";
 import { createRouter, type Router } from "./router.ts";
 import type { S3CredentialIssuer } from "./s3-port.ts";
+import { createSponsorshipRoutes } from "./sponsorship-api.ts";
 import type { TakoformArtifactTransport } from "./takoform/artifacts.ts";
 import type { WorkerModuleInspector } from "./takoform/engine.ts";
 import { sameFormRef } from "./takoform/forms.ts";
@@ -64,6 +65,8 @@ export interface AppPorts {
   readonly publicOrigin: string;
   /** Where this deployment's console is served, if it has one. */
   readonly consoleOrigin?: string;
+  /** Private Hosted-to-Takoserver sponsorship bearer; absent disables the seam. */
+  readonly sponsorshipServiceToken?: string;
   readonly forms: readonly InstalledTakoformForm[];
   /** Exact portable BindingDefinitions installed by this Host composition. */
   readonly bindings?: readonly InstalledTakoformBinding[];
@@ -284,6 +287,44 @@ export function buildApp(ports: AppPorts): App {
       blockingRelations: attachments.blocksDeletion,
     });
 
+  const sponsorshipLifecycle = ports.sponsorshipServiceToken
+    ? createTakoformHost({
+        sql: ports.sql,
+        objects: ports.objects,
+        authenticate: async (request) => {
+          if (request.headers.get("authorization") !== "Bearer internal-sponsorship-lifecycle") {
+            return null;
+          }
+          const tenantId = request.headers.get("x-takoserver-sponsorship-organization");
+          const expectedResourceUid = request.headers.get("x-takoserver-sponsorship-resource");
+          if (!tenantId || !expectedResourceUid) return null;
+          const listing = await inventory.resourceByUid(tenantId, expectedResourceUid);
+          if (!listing) return null;
+          return {
+            tenantId,
+            principalId: "service:takosumi-hosted-sponsorship",
+            scope: {
+              space: listing.space,
+              formRef: listing.resource.form.formRef,
+              resourceName: listing.name,
+              mode: "manage",
+              expectedResourceUid,
+            },
+          };
+        },
+        forms: ports.forms,
+        ...(ports.bindings ? { bindings: ports.bindings } : {}),
+        driver,
+        ...(ports.artifacts ? { artifacts: ports.artifacts } : {}),
+        ...(ports.workerModuleInspector
+          ? { workerModuleInspector: ports.workerModuleInspector }
+          : {}),
+        clock,
+        randomId,
+        blockingRelations: attachments.blocksDeletion,
+      })
+    : null;
+
   const control = createControlRoutes({
     accounts,
     inventory,
@@ -300,6 +341,7 @@ export function buildApp(ports: AppPorts): App {
     ...(ports.s3 ? { s3: ports.s3 } : {}),
     settlement: ports.settlement,
     clock,
+    ...(ports.consoleOrigin === undefined ? {} : { consoleOrigin: ports.consoleOrigin }),
   });
 
   const metering = createMetering({
@@ -327,10 +369,23 @@ export function buildApp(ports: AppPorts): App {
     clock,
     randomId,
   });
+  const sponsorship =
+    ports.sponsorshipServiceToken && sponsorshipLifecycle
+      ? createSponsorshipRoutes({
+          sql: ports.sql,
+          ledger,
+          inventory,
+          lifecycle: sponsorshipLifecycle,
+          serviceToken: ports.sponsorshipServiceToken,
+          publicOrigin: ports.publicOrigin,
+          clock,
+        })
+      : undefined;
 
   return {
     fetch: createRouter({
       control,
+      ...(sponsorship ? { sponsorship } : {}),
       dataAi,
       aiAvailable: ports.ai !== undefined,
       takoformHost,

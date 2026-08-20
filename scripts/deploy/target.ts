@@ -46,6 +46,10 @@ export interface DeployTarget {
    * rather than in the repository.
    */
   readonly googleClientId?: string;
+  /** Exact Takos ID issuer and this deployment's public OIDC client id. */
+  readonly takosId?: { readonly issuer: string; readonly clientId: string };
+  /** Enables the private Takosumi Hosted sponsorship funding seam. */
+  readonly hostedSponsorship?: boolean;
   /**
    * DNS zones this deployment may attach customer Workers to.
    *
@@ -125,6 +129,8 @@ function validateTarget(value: unknown, path: string): DeployTarget {
       "aliases",
       "consoleOrigin",
       "googleClientId",
+      "takosId",
+      "hostedSponsorship",
       "zones",
       "aiModels",
       "r2ParentAccessKeyId",
@@ -157,6 +163,10 @@ function validateTarget(value: unknown, path: string): DeployTarget {
     ...(value.googleClientId === undefined
       ? {}
       : { googleClientId: pattern(value.googleClientId, GOOGLE_CLIENT_ID, "googleClientId") }),
+    ...(value.takosId === undefined ? {} : { takosId: takosId(value.takosId) }),
+    ...(value.hostedSponsorship === undefined
+      ? {}
+      : { hostedSponsorship: boolean(value.hostedSponsorship, "hostedSponsorship") }),
     ...(value.zones === undefined ? {} : { zones: zoneList(value.zones) }),
     ...(value.aiModels === undefined ? {} : { aiModels: modelList(value.aiModels) }),
     ...(value.r2ParentAccessKeyId === undefined
@@ -194,7 +204,19 @@ function validateTarget(value: unknown, path: string): DeployTarget {
       "deploy target edge supplies and `workerEndpointSuffix` must be configured together",
     );
   }
+  if (target.takosId && target.googleClientId) {
+    throw preflightError("deploy target cannot configure both `takosId` and `googleClientId`");
+  }
   return target;
+}
+
+function takosId(value: unknown): { issuer: string; clientId: string } {
+  if (!isRecord(value)) throw preflightError("deploy target `takosId` must be an object");
+  assertExactKeys(value, ["issuer", "clientId"]);
+  return {
+    issuer: httpsOrigin(value.issuer),
+    clientId: pattern(value.clientId, KEY_ID, "takosId.clientId"),
+  };
 }
 
 /**
@@ -270,6 +292,13 @@ function assertExactKeys(
 
 function pattern(value: unknown, expression: RegExp, field: string): string {
   if (typeof value !== "string" || !expression.test(value)) {
+    throw preflightError(`deploy target \`${field}\` is invalid`);
+  }
+  return value;
+}
+
+function boolean(value: unknown, field: string): boolean {
+  if (typeof value !== "boolean") {
     throw preflightError(`deploy target \`${field}\` is invalid`);
   }
   return value;

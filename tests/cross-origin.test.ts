@@ -63,6 +63,76 @@ describe("cross-origin access", () => {
   });
 });
 
+describe("browser console session", () => {
+  test("keeps the session in an HttpOnly cookie scoped to the exact console origin", async () => {
+    const { buildApp } = await import("../src/app.ts");
+    const { buildEdgeForms } = await import("../src/edge-forms.ts");
+    const { createEphemeralSql } = await import("../src/compat.ts");
+    const { createMemoryObjectStore } = await import("../src/objects-mem.ts");
+    const edge = await buildEdgeForms();
+    const app = buildApp({
+      sql: createEphemeralSql(),
+      objects: createMemoryObjectStore(),
+      forms: edge.forms,
+      providers: [],
+      offerings: [],
+      publicOrigin: "https://api.example.test",
+      consoleOrigin: "https://console.example.test",
+      identity: {
+        async verify() {
+          return {
+            providerSubject: "pairwise-subject",
+            email: "person@example.test",
+            displayName: "A Person",
+          };
+        },
+      },
+      settlement: {
+        verify: () => {
+          throw new Error("not configured");
+        },
+      },
+    });
+
+    const signedIn = await app.fetch(
+      new Request("https://api.example.test/v1/sessions", {
+        method: "POST",
+        headers: {
+          origin: "https://console.example.test",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ provider: "google", assertion: "anything" }),
+      }),
+    );
+    expect(signedIn.status).toBe(200);
+    expect(signedIn.headers.get("access-control-allow-origin")).toBe(
+      "https://console.example.test",
+    );
+    expect(signedIn.headers.get("access-control-allow-credentials")).toBe("true");
+    const cookie = signedIn.headers.get("set-cookie") ?? "";
+    expect(cookie).toContain("takoserver_session=");
+    expect(cookie).toContain("HttpOnly");
+    expect(cookie).toContain("Secure");
+    expect(await signedIn.json()).not.toHaveProperty("sessionToken");
+
+    const me = await app.fetch(
+      new Request("https://api.example.test/v1/me", {
+        headers: { origin: "https://console.example.test", cookie },
+      }),
+    );
+    expect(me.status).toBe(200);
+
+    const csrf = await app.fetch(
+      new Request("https://api.example.test/v1/me", {
+        headers: { origin: "https://evil.example.test", cookie },
+      }),
+    );
+    expect(csrf.status).toBe(401);
+    expect(csrf.headers.get("access-control-allow-origin")).toBe("*");
+    expect(csrf.headers.get("access-control-allow-credentials")).toBeNull();
+  });
+});
+
 /**
  * A person holding a session asking which Forms exist is asking a question
  * about the platform, not about their organization. Answering "you are not

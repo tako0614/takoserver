@@ -27,6 +27,7 @@ import { formSupportProfile, sameFormRef } from "./takoform/forms.ts";
 import { TAKOFORM_EDGE_OBJECTS_INTERFACE } from "./takoform/official-forms.ts";
 import type { OperationListing, ResourceListing } from "./takoform/store.ts";
 import type { InstalledTakoformForm } from "./takoform/types.ts";
+import { TakosIdIdentityError } from "./takos-id-identity.ts";
 import { TokenError, type TokenService } from "./token.ts";
 
 /**
@@ -97,6 +98,8 @@ export interface CreateControlRoutesOptions {
   /** Standard S3 credentials for already-provisioned ObjectBuckets. */
   readonly s3?: S3CredentialIssuer | undefined;
   readonly clock: Clock;
+  /** Exact browser console origin allowed to carry the HttpOnly session cookie. */
+  readonly consoleOrigin?: string;
 }
 
 export type ControlRoutes = (request: Request, url: URL) => Promise<Response | null>;
@@ -117,7 +120,16 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     settlement,
     s3,
     clock,
+    consoleOrigin,
   } = options;
+
+  const authorization = (request: Request): string | null => {
+    const header = request.headers.get("authorization");
+    if (header) return header;
+    if (!consoleOrigin || request.headers.get("origin") !== consoleOrigin) return null;
+    const token = cookie(request, "takoserver_session");
+    return token ? `Bearer ${token}` : null;
+  };
 
   const owner = async (request: Request, organizationId: string): Promise<Actor> => {
     const actor = await accounts.authenticate(authorization(request));
@@ -193,7 +205,10 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       // disambiguate.
       exactKeys(body, ["provider", "assertion"], ["method", "nonce"]);
       const { principal, sessionToken } = await accounts.signIn({
-        provider: enumValue(body.provider, ["google", "github"]) as "google" | "github",
+        provider: enumValue(body.provider, ["takos-id", "google", "github"]) as
+          | "takos-id"
+          | "google"
+          | "github",
         assertion: bounded(body.assertion, 8 * 1_024),
         ...(body.method === undefined
           ? {}
@@ -204,7 +219,28 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
             }),
         ...(body.nonce === undefined ? {} : { nonce: text(body.nonce) }),
       });
+      if (consoleOrigin && request.headers.get("origin") === consoleOrigin) {
+        return Response.json(
+          { principal },
+          {
+            headers: {
+              "set-cookie": sessionCookie(sessionToken, new URL(request.url).protocol === "https:"),
+            },
+          },
+        );
+      }
       return Response.json({ principal, sessionToken });
+    }
+
+    if (request.method === "DELETE" && url.pathname === "/v1/session") {
+      const actor = await accounts.authenticate(authorization(request));
+      if (actor?.kind !== "session") throw new AuthError("unauthenticated");
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "set-cookie": clearSessionCookie(new URL(request.url).protocol === "https:"),
+        },
+      });
     }
 
     if (request.method === "GET" && url.pathname === "/v1/me") {
@@ -932,8 +968,12 @@ function classify(error: unknown): { code: string; status: number } {
   // rather than returned: the codes describe somebody's identity, and the
   // difference between "expired" and "wrong audience" is not the caller's to
   // learn from a stranger's token.
-  if (error instanceof GoogleIdentityError || error instanceof OperatorAssertionError) {
-    if (process.env?.["TAKOSERVER_TRACE_HOST_ERRORS"]) {
+  if (
+    error instanceof GoogleIdentityError ||
+    error instanceof OperatorAssertionError ||
+    error instanceof TakosIdIdentityError
+  ) {
+    if (process.env?.TAKOSERVER_TRACE_HOST_ERRORS) {
       console.warn(`takoserver.signin.refused ${error.name} ${error.code}`);
     }
     return { code: "unauthenticated", status: 401 };
@@ -941,8 +981,38 @@ function classify(error: unknown): { code: string; status: number } {
   return { code: "internal_error", status: 500 };
 }
 
-function authorization(request: Request): string | null {
-  return request.headers.get("authorization");
+function cookie(request: Request, name: string): string | null {
+  for (const part of (request.headers.get("cookie") ?? "").split(";")) {
+    const [key, ...value] = part.trim().split("=");
+    if (key === name) return value.join("=") || null;
+  }
+  return null;
+}
+
+function sessionCookie(token: string, secure: boolean): string {
+  return [
+    `takoserver_session=${token}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+    "Max-Age=43200",
+    secure ? "Secure" : "",
+  ]
+    .filter(Boolean)
+    .join("; ");
+}
+
+function clearSessionCookie(secure: boolean): string {
+  return [
+    "takoserver_session=",
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+    "Max-Age=0",
+    secure ? "Secure" : "",
+  ]
+    .filter(Boolean)
+    .join("; ");
 }
 
 function organizationOf(actor: Actor): string {
