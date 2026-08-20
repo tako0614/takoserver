@@ -366,15 +366,27 @@ async function verifyConsole(surface: StaticSurface): Promise<void> {
 }
 
 async function verifySite(surface: StaticSurface): Promise<void> {
-  const expected = readFileSync(resolve(REPOSITORY, surface.outputDirectory, "index.html"));
-  const served = await get(`${surface.publicOrigin}/`);
-  exactBytes(served, expected, "site index");
-  const html = served.toString("utf8");
+  const localRoot = resolve(REPOSITORY, surface.outputDirectory);
+  const [root, english, japanese] = await Promise.all([
+    get(`${surface.publicOrigin}/`),
+    get(`${surface.publicOrigin}/en/`),
+    get(`${surface.publicOrigin}/ja/`),
+  ]);
+  exactBytes(root, readFileSync(join(localRoot, "index.html")), "site default English index");
+  exactBytes(english, readFileSync(join(localRoot, "en", "index.html")), "site English index");
+  exactBytes(japanese, readFileSync(join(localRoot, "ja", "index.html")), "site Japanese index");
+  const html = root.toString("utf8");
   if (
     !html.includes("https://console.takoserver.com") ||
     !html.includes("https://api.takoserver.com")
   ) {
     throw new Error("served site does not link the Console and API");
+  }
+  if (
+    !english.toString("utf8").includes('<html lang="en">') ||
+    !japanese.toString("utf8").includes('<html lang="ja">')
+  ) {
+    throw new Error("served site locale documents do not declare exact language identity");
   }
 }
 

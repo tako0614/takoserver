@@ -11,7 +11,263 @@ export interface LandingOptions {
   readonly consoleOrigin: string | null;
   /** Prefix for the API links. Empty when the page is served by the API. */
   readonly apiOrigin: string | null;
+  /** Canonical public site origin. Absent on API-only/self-hosted deployments. */
+  readonly siteOrigin?: string | null;
 }
+
+export type LandingLocale = "en" | "ja";
+
+interface LandingCopy {
+  readonly meta: { readonly title: string; readonly description: string };
+  readonly navigation: {
+    readonly ariaLabel: string;
+    readonly brandLabel: string;
+    readonly languageLabel: string;
+    readonly openConsole: string;
+    readonly readApi: string;
+  };
+  readonly hero: {
+    readonly title: string;
+    readonly lede: string;
+    readonly signalsLabel: string;
+    readonly signals: readonly [string, string, string];
+  };
+  readonly map: {
+    readonly legend: string;
+    readonly status: string;
+    readonly resourceDescription: string;
+    readonly controlPlane: string;
+    readonly controlAction: string;
+    readonly controlItems: readonly [string, string, string];
+    readonly services: string;
+    readonly serviceAction: string;
+    readonly serviceItems: readonly [string, string, string];
+  };
+  readonly lanes: {
+    readonly title: string;
+    readonly intro: string;
+    readonly infrastructureTitle: string;
+    readonly infrastructureBody: string;
+    readonly standardsTitle: string;
+    readonly standardsBody: string;
+  };
+  readonly billing: {
+    readonly title: string;
+    readonly intro: string;
+    readonly rows: readonly (readonly [string, string])[];
+  };
+  readonly model: {
+    readonly title: string;
+    readonly intro: string;
+    readonly rows: readonly (readonly [string, string])[];
+  };
+  readonly migration: {
+    readonly title: string;
+    readonly intro: string;
+    readonly ariaLabel: string;
+    readonly steps: readonly (readonly [string, string])[];
+  };
+  readonly developer: {
+    readonly title: string;
+    readonly intro: string;
+    readonly rows: readonly (readonly [string, string])[];
+  };
+  readonly closing: { readonly ariaLabel: string; readonly statement: string };
+  readonly footer: { readonly statement: string; readonly discovery: string };
+}
+
+const COPY: Readonly<Record<LandingLocale, LandingCopy>> = {
+  en: {
+    meta: {
+      title: "Takoserver — portable cloud resources",
+      description:
+        "Portable compute, databases, storage, queues, and AI with usage-based pricing and developer-first APIs.",
+    },
+    navigation: {
+      ariaLabel: "Primary navigation",
+      brandLabel: "Takoserver home",
+      languageLabel: "Language",
+      openConsole: "Open Console",
+      readApi: "Read API",
+    },
+    hero: {
+      title: "Build on a cloud that stays portable.",
+      lede: "Create compute, databases, storage, queues, and AI services through one developer-first control plane. Connect resources explicitly and pay for measured usage.",
+      signalsLabel: "Product characteristics",
+      signals: ["Usage based", "Portable resources", "Developer API"],
+    },
+    map: {
+      legend: "resource routing",
+      status: "explicit placement",
+      resourceDescription: "A durable resource contract with an independent identity.",
+      controlPlane: "Takoserver control plane",
+      controlAction: "Place · attach · meter",
+      controlItems: ["Offering catalog", "Deployment state", "Scoped grants"],
+      services: "Cloud services",
+      serviceAction: "Compute · data · AI",
+      serviceItems: ["Databases", "Object storage", "Queues and workers"],
+    },
+    lanes: {
+      title: "One control plane. Two clean lanes.",
+      intro:
+        "Infrastructure meaning belongs in Takoform. Protocols that are already standard stay ordinary data services.",
+      infrastructureTitle: "Infrastructure through Takoform",
+      infrastructureBody:
+        "Exact Form references describe the resource. Service tiers choose region and capacity. Deployments record the running realization.",
+      standardsTitle: "Standard APIs stay standard",
+      standardsBody:
+        "S3-compatible object access and OpenAI-compatible inference remain direct APIs with short-lived, resource-scoped authority.",
+    },
+    billing: {
+      title: "Pay for what you use.",
+      intro:
+        "Takoserver pricing is expressed in stable service units. Usage is aggregated before settlement, so tiny operations stay precise instead of being rounded into oversized charges.",
+      rows: [
+        ["Compute", "Requests · CPU milliseconds"],
+        ["Databases", "Rows read · rows written · storage capacity-time"],
+        ["Object storage", "Storage capacity-time · Class A operations · Class B operations"],
+        ["Queues", "64 KiB operations"],
+        ["AI", "Input tokens · output tokens"],
+      ],
+    },
+    model: {
+      title: "Infrastructure that stays portable.",
+      intro:
+        "Takoserver keeps meaning, service tier, realization, connection, and movement separate so one concern can change without rewriting the rest.",
+      rows: [
+        ["Form", "What the resource means."],
+        [
+          "Offering",
+          "A selectable service tier with a region, price plan, isolation, and portability contract.",
+        ],
+        ["Deployment", "One running realization of the logical resource."],
+        [
+          "Attachment",
+          "A scoped connection between independent resources without embedding credentials in outputs.",
+        ],
+        [
+          "Migration",
+          "An explicit cutover between source and candidate Deployments, with a retained rollback window.",
+        ],
+      ],
+    },
+    migration: {
+      title: "Change placement, not identity.",
+      intro:
+        "Moving between service tiers is a lifecycle, not an opaque update. Attachments follow the active Deployment after verification.",
+      ariaLabel: "Deployment migration states",
+      steps: [
+        ["Active", "The current realization keeps serving."],
+        ["Candidate", "Provision, transfer, and verify independently."],
+        ["Retained", "Cut over, re-resolve Attachments, preserve rollback."],
+      ],
+    },
+    developer: {
+      title: "Start from the contract.",
+      intro:
+        "The product describes itself over stable discovery and OpenAPI surfaces. No dashboard archaeology required.",
+      rows: [
+        ["HTTP API description", "Open schema"],
+        ["Takoserver discovery", "Read discovery"],
+        ["Takoform Host discovery", "Read host contract"],
+      ],
+    },
+    closing: {
+      ariaLabel: "Closing statement",
+      statement: "Keep the resource. Change where it runs.",
+    },
+    footer: { statement: "Takoserver · developer cloud", discovery: "Discovery" },
+  },
+  ja: {
+    meta: {
+      title: "Takoserver — 移行できるクラウドリソース",
+      description:
+        "従量課金と開発者向けAPIで、コンピュート、データベース、ストレージ、キュー、AIを提供します。",
+    },
+    navigation: {
+      ariaLabel: "メインナビゲーション",
+      brandLabel: "Takoserver ホーム",
+      languageLabel: "言語",
+      openConsole: "コンソール",
+      readApi: "APIを見る",
+    },
+    hero: {
+      title: "移行できるクラウドで、つくろう。",
+      lede: "コンピュート、データベース、ストレージ、キュー、AIを、ひとつの開発者向けコントロールプレーンから。リソースを明示的につなぎ、使った分だけ支払えます。",
+      signalsLabel: "製品の特長",
+      signals: ["従量課金", "ポータブルなリソース", "開発者向けAPI"],
+    },
+    map: {
+      legend: "リソースの配置",
+      status: "配置を明示",
+      resourceDescription: "実行環境から独立した、永続的なリソース契約。",
+      controlPlane: "Takoserver コントロールプレーン",
+      controlAction: "配置 · 接続 · 計測",
+      controlItems: ["サービスカタログ", "デプロイ状態", "スコープ付き権限"],
+      services: "クラウドサービス",
+      serviceAction: "コンピュート · データ · AI",
+      serviceItems: ["データベース", "オブジェクトストレージ", "キューとWorker"],
+    },
+    lanes: {
+      title: "ひとつのコントロールプレーン。ふたつの明確な入口。",
+      intro:
+        "インフラの意味はTakoformで。すでに標準化されたプロトコルは、通常のデータサービスとして提供します。",
+      infrastructureTitle: "Takoformで扱うインフラ",
+      infrastructureBody:
+        "正確なForm参照がリソースを表し、サービスプランがリージョンと容量を選び、Deploymentが稼働中の実体を記録します。",
+      standardsTitle: "標準APIは、そのまま標準で。",
+      standardsBody:
+        "S3互換のオブジェクトアクセスとOpenAI互換の推論APIは、短期かつリソース単位の権限で直接利用できます。",
+    },
+    billing: {
+      title: "使った分だけ支払う。",
+      intro:
+        "Takoserverの料金は、変わりにくいサービス単位で表します。細かな利用は集約してから精算するため、小さな操作を大きな料金単位へ切り上げません。",
+      rows: [
+        ["コンピュート", "リクエスト数 · CPUミリ秒"],
+        ["データベース", "読み取り行数 · 書き込み行数 · ストレージ容量時間"],
+        ["オブジェクトストレージ", "ストレージ容量時間 · Class A操作 · Class B操作"],
+        ["キュー", "64 KiB単位の操作"],
+        ["AI", "入力トークン · 出力トークン"],
+      ],
+    },
+    model: {
+      title: "移行できるインフラ。",
+      intro:
+        "Takoserverは、意味、サービスプラン、実体、接続、移行を分離します。ひとつを変えても、残りを書き直す必要はありません。",
+      rows: [
+        ["Form", "リソースが何を意味するかを表します。"],
+        ["Offering", "リージョン、料金、分離方式、移行性を持つ選択可能なサービスプラン。"],
+        ["Deployment", "論理リソースを実際に稼働させているひとつの実体。"],
+        ["Attachment", "認証情報を出力へ埋め込まず、独立したリソース同士を限定権限で接続します。"],
+        ["Migration", "移行元と候補Deploymentを明示的に切り替え、ロールバック期間を残します。"],
+      ],
+    },
+    migration: {
+      title: "変えるのは配置。リソースのIDではない。",
+      intro:
+        "サービスプラン間の移動は、不透明な更新ではなく独立したライフサイクルです。検証後、Attachmentが稼働中のDeploymentへ追従します。",
+      ariaLabel: "Deploymentの移行状態",
+      steps: [
+        ["Active", "現在の実体がサービスを継続します。"],
+        ["Candidate", "移行先を作成し、転送して、独立に検証します。"],
+        ["Retained", "切り替え後も移行元を保持し、ロールバックに備えます。"],
+      ],
+    },
+    developer: {
+      title: "契約から始める。",
+      intro:
+        "Takoserverは、安定したDiscoveryとOpenAPIで自身を説明します。画面の奥から仕様を探し出す必要はありません。",
+      rows: [
+        ["HTTP API仕様", "スキーマを開く"],
+        ["Takoserver Discovery", "Discoveryを読む"],
+        ["Takoform Host Discovery", "Host契約を読む"],
+      ],
+    },
+    closing: { ariaLabel: "まとめ", statement: "リソースはそのまま。動かす場所を変えられる。" },
+    footer: { statement: "Takoserver · 開発者向けクラウド", discovery: "Discovery" },
+  },
+};
 
 /**
  * What the API serves at its own root.
@@ -23,21 +279,63 @@ export interface LandingOptions {
  * The document is functional without a second request. Web fonts are an
  * optional visual enhancement and have local fallbacks.
  */
-export function landingHtml(options: LandingOptions): string {
+export function landingHtml(options: LandingOptions, locale: LandingLocale = "en"): string {
   const base = options.apiOrigin ?? "";
   const primaryHref = options.consoleOrigin ?? `${base}/openapi.json`;
-  const primaryLabel = options.consoleOrigin ? "Open Console" : "Read API";
+  const copy = COPY[locale];
+  const primaryLabel = options.consoleOrigin
+    ? copy.navigation.openConsole
+    : copy.navigation.readApi;
+  const siteOrigin = options.siteOrigin?.replace(/\/$/u, "") ?? null;
+  const localeMetadata = siteOrigin
+    ? `<link rel="canonical" href="${siteOrigin}/${locale}/">
+<link rel="alternate" href="${siteOrigin}/en/" hreflang="en">
+<link rel="alternate" href="${siteOrigin}/ja/" hreflang="ja">
+<link rel="alternate" href="${siteOrigin}/" hreflang="x-default">`
+    : "";
+  const localeNavigation = siteOrigin
+    ? `<div class="locale-switcher" aria-label="${copy.navigation.languageLabel}">
+        <a href="/en/" lang="en" hreflang="en"${locale === "en" ? ' aria-current="page"' : ""}>EN</a>
+        <span aria-hidden="true">/</span>
+        <a href="/ja/" lang="ja" hreflang="ja"${locale === "ja" ? ' aria-current="page"' : ""}>日本語</a>
+      </div>`
+    : "";
+  const modelRows = (rows: readonly (readonly [string, string])[]): string =>
+    rows
+      .map(
+        ([term, description]) =>
+          `<div class="model-row"><dt>${term}</dt><dd>${description}</dd></div>`,
+      )
+      .join("\n        ");
+  const migrationSteps = copy.migration.steps
+    .map(
+      ([state, description], index) =>
+        `<div class="migration-step${index === 0 ? " migration-step--active" : ""}"><strong>${state}</strong><span>${description}</span></div>`,
+    )
+    .join("\n        ");
+  const developerPaths = [
+    `${base}/openapi.json`,
+    `${base}/.well-known/takoserver`,
+    `${base}/.well-known/takoform/v1alpha3`,
+  ] as const;
+  const developerRows = copy.developer.rows
+    .map(
+      ([description, action], index) =>
+        `<div class="developer-row"><code>${developerPaths[index]}</code><span>${description}</span><a class="developer-action" href="${developerPaths[index]}">${action}</a></div>`,
+    )
+    .join("\n        ");
 
   return `<!doctype html>
-<html lang="en">
+<html lang="${locale}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Takoserver — portable cloud resources</title>
-<meta name="description" content="Portable compute, databases, storage, queues, and AI with usage-based pricing and developer-first APIs.">
+<title>${copy.meta.title}</title>
+<meta name="description" content="${copy.meta.description}">
+${localeMetadata}
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@500&amp;display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@500&amp;family=Noto+Sans+JP:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
 <style>
 /* Hallmark · genre: modern-minimal · macrostructure: Map / Diagram · theme: Coral · enrichment: Tier-A CSS system map · nav: N9 · footer: Ft5 · audience: developers · use: open Console · tone: technical
  * pre-emit critique: P5 H4 E4 S5 R5 V4
@@ -60,6 +358,8 @@ export function landingHtml(options: LandingOptions): string {
   --color-transparent: transparent;
   --font-display: "Geist", "Avenir Next", "Helvetica Neue", sans-serif;
   --font-body: "Geist", "Avenir Next", "Helvetica Neue", sans-serif;
+  --font-display-ja: "Noto Sans JP", "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif;
+  --font-body-ja: "Noto Sans JP", "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif;
   --font-mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
   --space-3xs: 0.25rem;
   --space-2xs: 0.5rem;
@@ -102,6 +402,17 @@ body {
   letter-spacing: -0.012em;
   -webkit-font-smoothing: antialiased;
 }
+html[lang="ja"] body {
+  font-family: var(--font-body-ja);
+  letter-spacing: 0;
+}
+html[lang="ja"] :is(.brand, .hero h1, .section h2, .closing p) {
+  font-family: var(--font-display-ja);
+}
+html[lang="ja"] :is(.hero h1, .section h2, .closing p) {
+  line-height: 1.12;
+  letter-spacing: -0.045em;
+}
 a { color: inherit; }
 a:focus-visible {
   outline: var(--rule-bold) solid var(--color-focus);
@@ -118,6 +429,32 @@ a:focus-visible {
   justify-content: space-between;
   gap: var(--space-md);
   min-height: 5.25rem;
+}
+.nav-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+}
+.locale-switcher {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  color: var(--color-ink-soft);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+.locale-switcher a {
+  display: inline-flex;
+  min-height: 2.75rem;
+  align-items: center;
+  border-block-end: var(--rule-bold) solid var(--color-transparent);
+  text-decoration: none;
+}
+.locale-switcher a[aria-current="page"] {
+  border-block-end-color: var(--color-accent);
+  color: var(--color-ink);
 }
 .brand {
   display: inline-flex;
@@ -466,13 +803,17 @@ a:focus-visible {
 .footer a { min-height: 2.75rem; display: inline-flex; align-items: center; line-height: 1; white-space: nowrap; }
 a:active { color: var(--color-accent-strong); }
 @media (hover: hover) and (pointer: fine) {
-  .brand:hover, .footer a:hover { color: var(--color-accent-strong); }
+  .brand:hover, .locale-switcher a:hover, .footer a:hover { color: var(--color-accent-strong); }
   .button:hover { background: var(--color-accent-strong); border-color: var(--color-accent-strong); }
   .button--quiet:hover { background: var(--color-accent-soft); color: var(--color-accent-strong); }
   .developer-action:hover { color: var(--color-ink); }
 }
 @media (pointer: coarse) {
-  .button, .developer-action, .footer a { min-height: 3rem; }
+  .button, .locale-switcher a, .developer-action, .footer a { min-height: 3rem; }
+}
+@media (max-width: 30rem) {
+  .nav { flex-wrap: wrap; padding-block: var(--space-sm); }
+  .nav-actions { width: 100%; justify-content: space-between; }
 }
 @media (min-width: 40rem) {
   .lane { grid-template-columns: minmax(0, 0.75fr) minmax(0, 1.45fr); align-items: start; }
@@ -500,62 +841,65 @@ a:active { color: var(--color-accent-strong); }
 </head>
 <body>
 <div class="shell">
-  <nav class="nav" aria-label="Primary navigation">
-    <a class="brand" href="/" aria-label="Takoserver home">
+  <nav class="nav" aria-label="${copy.navigation.ariaLabel}">
+    <a class="brand" href="${locale === "ja" ? "/ja/" : "/en/"}" aria-label="${copy.navigation.brandLabel}">
       <svg class="brand-mark" viewBox="0 0 28 28" aria-hidden="true">
         <rect class="brand-mark__head" x="7" y="3" width="14" height="10" rx="2"/>
         <path class="brand-mark__line" d="M8 12v8c0 3-4 2-4 5M12 12v10c0 3-2 3-2 3M16 12v10c0 3 2 3 2 3M20 12v8c0 3 4 2 4 5"/>
       </svg>
       <span>Takoserver</span>
     </a>
-    <a class="button" href="${primaryHref}">${primaryLabel}</a>
+    <div class="nav-actions">
+      ${localeNavigation}
+      <a class="button" href="${primaryHref}">${primaryLabel}</a>
+    </div>
   </nav>
 
   <main>
     <section class="hero">
       <div class="hero-copy">
-        <h1>Build on a cloud that stays portable.</h1>
-        <p class="hero-lede">Create compute, databases, storage, queues, and AI services through one developer-first control plane. Connect resources explicitly and pay for measured usage.</p>
+        <h1>${copy.hero.title}</h1>
+        <p class="hero-lede">${copy.hero.lede}</p>
         <div class="hero-actions">
           <a class="button" href="${primaryHref}">${primaryLabel}</a>
-          <a class="button button--quiet" href="${base}/openapi.json">Read API</a>
+          <a class="button button--quiet" href="${base}/openapi.json">${copy.navigation.readApi}</a>
         </div>
-        <div class="signals" aria-label="Product characteristics">
-          <span class="signal">Usage based</span>
-          <span class="signal">Portable resources</span>
-          <span class="signal">Developer API</span>
+        <div class="signals" aria-label="${copy.hero.signalsLabel}">
+          <span class="signal">${copy.hero.signals[0]}</span>
+          <span class="signal">${copy.hero.signals[1]}</span>
+          <span class="signal">${copy.hero.signals[2]}</span>
         </div>
       </div>
 
       <figure class="system-map">
         <figcaption class="system-map__legend">
-          <span>resource routing</span>
-          <span class="system-map__status">explicit placement</span>
+          <span>${copy.map.legend}</span>
+          <span class="system-map__status">${copy.map.status}</span>
         </figcaption>
         <div class="map-grid">
           <article class="map-node">
             <span class="map-node__type">Takoform Form</span>
             <h2>ObjectBucket</h2>
-            <p>A durable resource contract with an independent identity.</p>
+            <p>${copy.map.resourceDescription}</p>
           </article>
           <div class="map-flow" aria-hidden="true"></div>
           <article class="map-node map-node--core">
-            <span class="map-node__type">Takoserver control plane</span>
-            <h2>Place · attach · meter</h2>
+            <span class="map-node__type">${copy.map.controlPlane}</span>
+            <h2>${copy.map.controlAction}</h2>
             <ul class="map-node__list">
-              <li>Offering catalog</li>
-              <li>Deployment state</li>
-              <li>Scoped grants</li>
+              <li>${copy.map.controlItems[0]}</li>
+              <li>${copy.map.controlItems[1]}</li>
+              <li>${copy.map.controlItems[2]}</li>
             </ul>
           </article>
           <div class="map-flow" aria-hidden="true"></div>
           <article class="map-node">
-            <span class="map-node__type">Cloud services</span>
-            <h2>Compute · data · AI</h2>
+            <span class="map-node__type">${copy.map.services}</span>
+            <h2>${copy.map.serviceAction}</h2>
             <ul class="map-node__list">
-              <li>Databases</li>
-              <li>Object storage</li>
-              <li>Queues and workers</li>
+              <li>${copy.map.serviceItems[0]}</li>
+              <li>${copy.map.serviceItems[1]}</li>
+              <li>${copy.map.serviceItems[2]}</li>
             </ul>
           </article>
         </div>
@@ -563,76 +907,64 @@ a:active { color: var(--color-accent-strong); }
     </section>
 
     <section class="section" aria-labelledby="lanes-title">
-      <h2 id="lanes-title">One control plane. Two clean lanes.</h2>
-      <p class="section-intro">Infrastructure meaning belongs in Takoform. Protocols that are already standard stay ordinary data services.</p>
+      <h2 id="lanes-title">${copy.lanes.title}</h2>
+      <p class="section-intro">${copy.lanes.intro}</p>
       <div class="lanes">
         <article class="lane">
-          <h3>Infrastructure through Takoform</h3>
-          <p>Exact Form references describe the resource. Service tiers choose region and capacity. Deployments record the running realization.</p>
+          <h3>${copy.lanes.infrastructureTitle}</h3>
+          <p>${copy.lanes.infrastructureBody}</p>
           <code>Form → Offering → Deployment</code>
         </article>
         <article class="lane">
-          <h3>Standard APIs stay standard</h3>
-          <p>S3-compatible object access and OpenAI-compatible inference remain direct APIs with short-lived, resource-scoped authority.</p>
+          <h3>${copy.lanes.standardsTitle}</h3>
+          <p>${copy.lanes.standardsBody}</p>
           <code>S3 · OpenAI</code>
         </article>
       </div>
     </section>
 
     <section class="section" aria-labelledby="billing-title">
-      <h2 id="billing-title">Pay for what you use.</h2>
-      <p class="section-intro">Takoserver pricing is expressed in stable service units. Usage is aggregated before settlement, so tiny operations stay precise instead of being rounded into oversized charges.</p>
+      <h2 id="billing-title">${copy.billing.title}</h2>
+      <p class="section-intro">${copy.billing.intro}</p>
       <dl class="model">
-        <div class="model-row"><dt>Compute</dt><dd>Requests · CPU milliseconds</dd></div>
-        <div class="model-row"><dt>Databases</dt><dd>Rows read · rows written · storage capacity-time</dd></div>
-        <div class="model-row"><dt>Object storage</dt><dd>Storage capacity-time · Class A operations · Class B operations</dd></div>
-        <div class="model-row"><dt>Queues</dt><dd>64 KiB operations</dd></div>
-        <div class="model-row"><dt>AI</dt><dd>Input tokens · output tokens</dd></div>
+        ${modelRows(copy.billing.rows)}
       </dl>
     </section>
 
     <section class="section" aria-labelledby="model-title">
-      <h2 id="model-title">Infrastructure that stays portable.</h2>
-      <p class="section-intro">Takoserver keeps meaning, service tier, realization, connection, and movement separate so one concern can change without rewriting the rest.</p>
+      <h2 id="model-title">${copy.model.title}</h2>
+      <p class="section-intro">${copy.model.intro}</p>
       <dl class="model">
-        <div class="model-row"><dt>Form</dt><dd>What the resource means.</dd></div>
-        <div class="model-row"><dt>Offering</dt><dd>A selectable service tier with a region, price plan, isolation, and portability contract.</dd></div>
-        <div class="model-row"><dt>Deployment</dt><dd>One running realization of the logical resource.</dd></div>
-        <div class="model-row"><dt>Attachment</dt><dd>A scoped connection between independent resources without embedding credentials in outputs.</dd></div>
-        <div class="model-row"><dt>Migration</dt><dd>An explicit cutover between source and candidate Deployments, with a retained rollback window.</dd></div>
+        ${modelRows(copy.model.rows)}
       </dl>
     </section>
 
     <section class="section section--compact" aria-labelledby="migration-title">
-      <h2 id="migration-title">Change placement, not identity.</h2>
-      <p class="section-intro">Moving between service tiers is a lifecycle, not an opaque update. Attachments follow the active Deployment after verification.</p>
-      <div class="migration" aria-label="Deployment migration states">
-        <div class="migration-step migration-step--active"><strong>Active</strong><span>The current realization keeps serving.</span></div>
-        <div class="migration-step"><strong>Candidate</strong><span>Provision, transfer, and verify independently.</span></div>
-        <div class="migration-step"><strong>Retained</strong><span>Cut over, re-resolve Attachments, preserve rollback.</span></div>
+      <h2 id="migration-title">${copy.migration.title}</h2>
+      <p class="section-intro">${copy.migration.intro}</p>
+      <div class="migration" aria-label="${copy.migration.ariaLabel}">
+        ${migrationSteps}
       </div>
     </section>
 
     <section class="section" aria-labelledby="developer-title">
-      <h2 id="developer-title">Start from the contract.</h2>
-      <p class="section-intro">The product describes itself over stable discovery and OpenAPI surfaces. No dashboard archaeology required.</p>
+      <h2 id="developer-title">${copy.developer.title}</h2>
+      <p class="section-intro">${copy.developer.intro}</p>
       <div class="developer-links">
-        <div class="developer-row"><code>${base}/openapi.json</code><span>HTTP API description</span><a class="developer-action" href="${base}/openapi.json">Open schema</a></div>
-        <div class="developer-row"><code>${base}/.well-known/takoserver</code><span>Takoserver discovery</span><a class="developer-action" href="${base}/.well-known/takoserver">Read discovery</a></div>
-        <div class="developer-row"><code>${base}/.well-known/takoform/v1alpha3</code><span>Takoform Host discovery</span><a class="developer-action" href="${base}/.well-known/takoform/v1alpha3">Read host contract</a></div>
+        ${developerRows}
       </div>
     </section>
 
-    <section class="closing" aria-label="Closing statement">
-      <p>Keep the resource. Change where it runs.</p>
+    <section class="closing" aria-label="${copy.closing.ariaLabel}">
+      <p>${copy.closing.statement}</p>
     </section>
   </main>
 
   <footer class="footer">
-    <span>Takoserver · developer cloud</span>
+    <span>${copy.footer.statement}</span>
     <span class="footer-links">
       <a href="${base}/openapi.json">OpenAPI</a>
-      <a href="${base}/.well-known/takoserver">Discovery</a>
+      <a href="${base}/.well-known/takoserver">${copy.footer.discovery}</a>
     </span>
   </footer>
 </div>

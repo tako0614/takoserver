@@ -25,7 +25,8 @@ describe("Takoserver deploy entrypoint", () => {
   test("reports an authority-triggered contract without touching a target", async () => {
     const probe = await deploy(["--contract"]);
     expect(probe.exitCode).toBe(0);
-    expect(JSON.parse(probe.stdout)).toMatchObject({
+    const contract = JSON.parse(probe.stdout) as unknown;
+    expect(contract).toMatchObject({
       kind: "takos.deploy-contract@v2",
       surfaces: [
         {
@@ -74,6 +75,8 @@ describe("Takoserver deploy entrypoint", () => {
         },
       ],
     });
+    expect(probe.stdout).toContain("https://takoserver.com/en/");
+    expect(probe.stdout).toContain("https://takoserver.com/ja/");
   });
 
   test("refuses every invocation that does not name an explicit action", async () => {

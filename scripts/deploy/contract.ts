@@ -119,7 +119,7 @@ export const DEPLOY_CONTRACT = {
         provenance:
           "Publication refuses a dirty, detached, or unpushed worktree; runs the complete owner gate; rebuilds the apex from the shared Takoserver landing source with exact Console and API origins; scans public bytes; performs a strict Wrangler dry-run; and records commit, artifact digest, Worker version, route target, and reviewer in an operator-private 0600 ledger.",
         "post-conditions":
-          "After publication the owner reads the new 100% Worker deployment, byte-compares https://takoserver.com/ with the reviewed index.html, and requires the served page to link the exact production Console and API origins.",
+          "After publication the owner reads the new 100% Worker deployment; byte-compares https://takoserver.com/, https://takoserver.com/en/, and https://takoserver.com/ja/ with the reviewed locale artifacts; verifies exact HTML language identities; and requires the served page to link the exact production Console and API origins.",
         reversal:
           "The prior Worker version is captured before mutation and printed as an exact Wrangler rollback command. On the first owned publication, deleting the new Worker removes its route and restores the exact pre-publication origin behavior.",
         "failure-handling":

@@ -10,7 +10,7 @@ import { landingHtml } from "../src/landing.ts";
  * from the one the API serves is a landing page that describes a different
  * product.
  *
- *   bun scripts/build-site.ts [--out <dir>] [--console <origin>] [--api <origin>]
+ *   bun scripts/build-site.ts [--out <dir>] [--console <origin>] [--api <origin>] [--site <origin>]
  */
 
 const args = process.argv.slice(2);
@@ -28,14 +28,22 @@ const value = (flag: string): string | undefined => {
 const outDir = value("--out") ?? "site/dist";
 rmSync(outDir, { recursive: true, force: true });
 mkdirSync(outDir, { recursive: true });
+mkdirSync(join(outDir, "en"), { recursive: true });
+mkdirSync(join(outDir, "ja"), { recursive: true });
 
-await Bun.write(
-  join(outDir, "index.html"),
-  landingHtml({
-    consoleOrigin: value("--console") ?? null,
-    apiOrigin: value("--api") ?? null,
-  }),
-);
+const landingOptions = {
+  consoleOrigin: value("--console") ?? null,
+  apiOrigin: value("--api") ?? null,
+  siteOrigin: value("--site") ?? "https://takoserver.com",
+} as const;
+const english = landingHtml(landingOptions, "en");
+const japanese = landingHtml(landingOptions, "ja");
+
+await Promise.all([
+  Bun.write(join(outDir, "index.html"), english),
+  Bun.write(join(outDir, "en", "index.html"), english),
+  Bun.write(join(outDir, "ja", "index.html"), japanese),
+]);
 await Bun.write(
   join(outDir, "_headers"),
   "/*\n  Cache-Control: public, max-age=0, must-revalidate, no-transform\n",
