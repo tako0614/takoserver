@@ -266,7 +266,7 @@ export const openApiDocument = {
   openapi: "3.1.0",
   info: {
     title: "Takoserver API",
-    version: "0.2.0",
+    version: "1.0.0",
     summary: "An independent prepaid platform for Takoform-declared resources.",
   },
   servers: [{ url: "https://api.takoserver.com" }],
