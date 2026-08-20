@@ -207,7 +207,7 @@ export class CloudflareProvider implements Provider {
       if (expected.length > 64 * 1_024) {
         return providerValueFailure("invalid_spec", "the migration prefix is too large");
       }
-      const batch: { sql: string; params?: readonly string[] }[] = [
+      const batch: { sql: string; params?: readonly (string | number)[] }[] = [
         { sql: SQLITE_MIGRATION_LEDGER_DDL },
         {
           sql: `INSERT INTO ${SQLITE_MIGRATION_LEDGER} (sequence, path, digest)
@@ -221,7 +221,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
         OR actual.path != json_extract(expected.value, '$.path')
         OR actual.digest != json_extract(expected.value, '$.digest')
    )`,
-          params: [String(input.expectedPrefix.length), expected],
+          params: [input.expectedPrefix.length, expected],
         },
       ];
       for (const [offset, migration] of input.migrations.entries()) {
@@ -241,11 +241,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
           { sql },
           {
             sql: `INSERT INTO ${SQLITE_MIGRATION_LEDGER} (sequence, path, digest) VALUES (?, ?, ?)`,
-            params: [
-              String(input.expectedPrefix.length + offset + 1),
-              migration.path,
-              migration.digest,
-            ],
+            params: [input.expectedPrefix.length + offset + 1, migration.path, migration.digest],
           },
         );
       }
@@ -1232,9 +1228,12 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
   async #d1Query(
     databaseId: string,
     body:
-      | { readonly sql: string; readonly params?: readonly string[] }
+      | { readonly sql: string; readonly params?: readonly (string | number)[] }
       | {
-          readonly batch: readonly { readonly sql: string; readonly params?: readonly string[] }[];
+          readonly batch: readonly {
+            readonly sql: string;
+            readonly params?: readonly (string | number)[];
+          }[];
         },
   ): Promise<CallResult> {
     return await this.#call(

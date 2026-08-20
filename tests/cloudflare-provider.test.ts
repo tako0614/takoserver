@@ -679,11 +679,18 @@ describe("released edge Form placement", () => {
     expect(applied).toEqual({ ok: true, value: undefined });
     expect(calls).toHaveLength(3);
     expect(calls.every((call) => call.url.endsWith("/d1/database/database-id/query"))).toBe(true);
-    const batch = JSON.parse(calls[2]?.body ?? "{}") as { batch?: { sql?: string }[] };
+    const batch = JSON.parse(calls[2]?.body ?? "{}") as {
+      batch?: { sql?: string; params?: unknown[] }[];
+    };
     expect(batch.batch).toHaveLength(4);
     expect(batch.batch?.[1]?.sql).toContain("json_each(?)");
+    expect(batch.batch?.[1]?.params).toEqual([
+      1,
+      JSON.stringify([{ path: "0001.sql", digest: `sha256:${"a".repeat(64)}` }]),
+    ]);
     expect(batch.batch?.[2]?.sql).toBe("CREATE TABLE example (id INTEGER PRIMARY KEY);");
     expect(batch.batch?.[3]?.sql).toContain("INSERT INTO _takoform_sqlite_migrations");
+    expect(batch.batch?.[3]?.params?.[0]).toBe(2);
   });
 
   test("observes and removes every composed provider object without guessing identity", async () => {
