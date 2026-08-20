@@ -7,6 +7,7 @@ import type {
   ProviderRelation,
   ProviderResult,
   ProviderTicket,
+  ProviderValue,
 } from "./provider-port.ts";
 import type { ResourceDeployment, ResourceDeploymentStore } from "./resource-deployments.ts";
 import type {
@@ -14,6 +15,7 @@ import type {
   TakoformDriverReceipt,
   TakoformDriverRelation,
   TakoformResourceDriver,
+  TakoformStoredResource,
 } from "./takoform/types.ts";
 import { TakoformHostError } from "./takoform/types.ts";
 
@@ -243,7 +245,44 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     }
   };
 
+  const sqliteProvider = async (
+    tenantId: string,
+    database: TakoformStoredResource,
+  ): Promise<{
+    provider: Provider;
+    deployment: ResourceDeployment;
+    port: NonNullable<Provider["sqliteMigrations"]>;
+  }> => {
+    const deployment = await active(tenantId, database.metadata.uid);
+    const { provider } = installed(deployment, database.form.formRef);
+    if (!provider.sqliteMigrations) {
+      throw new TakoformHostError("unsupported_capability", 422);
+    }
+    return { provider, deployment, port: provider.sqliteMigrations };
+  };
+
+  const providerValue = <T>(result: ProviderValue<T>): T => {
+    if (result.ok) return result.value as T;
+    throw new TakoformHostError(...failureToWire(result.failure.code));
+  };
+
   return {
+    sqliteMigrations: {
+      async readLedger(input) {
+        const { deployment, port } = await sqliteProvider(input.tenantId, input.database);
+        return providerValue(await port.readLedger({ nativeId: deployment.nativeId }));
+      },
+      async applySuffix(input) {
+        const { deployment, port } = await sqliteProvider(input.tenantId, input.database);
+        providerValue(
+          await port.applySuffix({
+            nativeId: deployment.nativeId,
+            expectedPrefix: input.expectedPrefix,
+            migrations: input.migrations,
+          }),
+        );
+      },
+    },
     async apply(input): Promise<TakoformDriverReceipt> {
       const current = await deployments.active(input.tenantId, input.resourceUid);
       if (intrinsicForm(input.form)) {

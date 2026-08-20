@@ -628,6 +628,64 @@ describe("released edge Form placement", () => {
     expect(calls[1]?.body).toContain('"version_id":"version-id"');
   });
 
+  test("reads and atomically appends the exact SQLite migration prefix", async () => {
+    const calls: Call[] = [];
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [technical("SQLiteDatabase")],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        calls.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body: await request.clone().text(),
+        });
+        const index = calls.length;
+        const result =
+          index === 1
+            ? [{ success: true, results: [{ name: "_takoform_sqlite_migrations" }] }]
+            : index === 2
+              ? [
+                  {
+                    success: true,
+                    results: [
+                      { sequence: 1, path: "0001.sql", digest: `sha256:${"a".repeat(64)}` },
+                    ],
+                  },
+                ]
+              : Array.from({ length: 4 }, () => ({ success: true, results: [] }));
+        return Response.json({ success: true, errors: [], result });
+      },
+    });
+    const ledger = await provider.sqliteMigrations.readLedger({ nativeId: "d1:database-id" });
+    expect(ledger).toEqual({
+      ok: true,
+      value: [{ path: "0001.sql", digest: `sha256:${"a".repeat(64)}` }],
+    });
+    const applied = await provider.sqliteMigrations.applySuffix({
+      nativeId: "d1:database-id",
+      expectedPrefix: [{ path: "0001.sql", digest: `sha256:${"a".repeat(64)}` }],
+      migrations: [
+        {
+          path: "0002.sql",
+          digest: `sha256:${"b".repeat(64)}`,
+          sql: new TextEncoder().encode("CREATE TABLE example (id INTEGER PRIMARY KEY);"),
+        },
+      ],
+    });
+    expect(applied).toEqual({ ok: true, value: undefined });
+    expect(calls).toHaveLength(3);
+    expect(calls.every((call) => call.url.endsWith("/d1/database/database-id/query"))).toBe(true);
+    const batch = JSON.parse(calls[2]?.body ?? "{}") as { batch?: { sql?: string }[] };
+    expect(batch.batch).toHaveLength(4);
+    expect(batch.batch?.[1]?.sql).toContain("json_each(?)");
+    expect(batch.batch?.[2]?.sql).toBe("CREATE TABLE example (id INTEGER PRIMARY KEY);");
+    expect(batch.batch?.[3]?.sql).toContain("INSERT INTO _takoform_sqlite_migrations");
+  });
+
   test("observes and removes every composed provider object without guessing identity", async () => {
     const offerings = [
       technical("WorkerVersion"),

@@ -164,6 +164,7 @@ export interface TakoformResourceDriver {
     applySuffix(input: {
       readonly tenantId: string;
       readonly database: TakoformStoredResource;
+      readonly expectedPrefix: readonly TakoformSqliteMigrationIdentity[];
       readonly migrations: readonly TakoformSqliteMigration[];
     }): Promise<void>;
   };

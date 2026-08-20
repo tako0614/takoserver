@@ -132,6 +132,19 @@ export interface ProviderRelation {
   };
 }
 
+export interface ProviderSqliteMigrationIdentity {
+  readonly path: string;
+  readonly digest: `sha256:${string}`;
+}
+
+export interface ProviderSqliteMigration extends ProviderSqliteMigrationIdentity {
+  readonly sql: Uint8Array;
+}
+
+export type ProviderValue<T> =
+  | { readonly ok: true; readonly value: T }
+  | { readonly ok: false; readonly failure: ProviderFailure };
+
 export interface Provider {
   readonly id: string;
   /** Static configuration, not a per-request discovery call. */
@@ -161,6 +174,17 @@ export interface Provider {
     readonly spec: JsonObject;
     readonly relations?: readonly ProviderRelation[];
   }): Promise<ProviderTicket>;
+  /** Administrative SQLite history, separate from the runtime SQL Interface. */
+  readonly sqliteMigrations?: {
+    readLedger(input: {
+      readonly nativeId: string;
+    }): Promise<ProviderValue<readonly ProviderSqliteMigrationIdentity[]>>;
+    applySuffix(input: {
+      readonly nativeId: string;
+      readonly expectedPrefix: readonly ProviderSqliteMigrationIdentity[];
+      readonly migrations: readonly ProviderSqliteMigration[];
+    }): Promise<ProviderValue<undefined>>;
+  };
 }
 
 export function succeeded(result: ProviderResult): ProviderTicket {

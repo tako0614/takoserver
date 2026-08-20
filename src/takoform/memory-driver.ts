@@ -33,6 +33,7 @@ export class InMemoryTakoformResourceDriver implements TakoformResourceDriver {
     applySuffix: async (input: {
       readonly tenantId: string;
       readonly database: TakoformStoredResource;
+      readonly expectedPrefix: readonly { path: string; digest: `sha256:${string}` }[];
       readonly migrations: readonly {
         readonly path: string;
         readonly digest: `sha256:${string}`;
@@ -40,6 +41,16 @@ export class InMemoryTakoformResourceDriver implements TakoformResourceDriver {
     }) => {
       const key = `${input.tenantId}\0${input.database.metadata.uid}`;
       const current = this.#migrationLedgers.get(key) ?? [];
+      if (
+        current.length !== input.expectedPrefix.length ||
+        current.some(
+          (migration, index) =>
+            migration.path !== input.expectedPrefix[index]?.path ||
+            migration.digest !== input.expectedPrefix[index]?.digest,
+        )
+      ) {
+        throw new TakoformHostError("migration_required", 409);
+      }
       this.#migrationLedgers.set(key, [
         ...current,
         ...input.migrations.map(({ path, digest }) => ({ path, digest })),

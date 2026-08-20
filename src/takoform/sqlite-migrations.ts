@@ -54,7 +54,12 @@ export async function applySqliteMigrationApplication(input: MigrationContext): 
     migrations.push({ ...migration, sql });
   }
   if (migrations.length > 0) {
-    await executor.applySuffix({ tenantId: input.tenantId, database: plan.database, migrations });
+    await executor.applySuffix({
+      tenantId: input.tenantId,
+      database: plan.database,
+      expectedPrefix: applied,
+      migrations,
+    });
   }
   const settled = await executor.readLedger({ tenantId: input.tenantId, database: plan.database });
   if (!sameLedger(settled, plan.desired)) throw new TakoformHostError("backend_unavailable", 503);

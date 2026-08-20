@@ -5,7 +5,10 @@ import {
   failed,
   type Provider,
   type ProviderOffering,
+  type ProviderSqliteMigration,
+  type ProviderSqliteMigrationIdentity,
   type ProviderTicket,
+  type ProviderValue,
   succeeded,
 } from "../provider-port.ts";
 
@@ -36,6 +39,16 @@ const ASSETS_BINDING = "ASSETS";
 const BOOTSTRAP_MODULE = "takoserver-bootstrap.mjs";
 const BOOTSTRAP_SOURCE =
   'export default { async fetch() { return new Response("Not deployed", { status: 503 }); } };\n';
+
+const SQLITE_MIGRATION_LEDGER = "_takoform_sqlite_migrations";
+const SQLITE_MIGRATION_LEDGER_DDL = `CREATE TABLE IF NOT EXISTS ${SQLITE_MIGRATION_LEDGER} (
+  sequence INTEGER PRIMARY KEY NOT NULL CHECK (sequence > 0),
+  path TEXT NOT NULL UNIQUE CHECK (length(path) BETWEEN 1 AND 255),
+  digest TEXT NOT NULL CHECK (
+    substr(digest, 1, 7) = 'sha256:' AND length(digest) = 71 AND
+    substr(digest, 8) NOT GLOB '*[^0-9a-f]*'
+  )
+)`;
 
 /** Cloudflare's code for "that hostname already resolves to something else". */
 const DNS_RECORDS_PRESENT = 100_117;
@@ -139,6 +152,116 @@ export class CloudflareProvider implements Provider {
     this.#workerEndpointSuffix = options.workerEndpointSuffix;
     this.#workerCompatibilityDate = options.workerCompatibilityDate ?? "2026-08-19";
   }
+
+  readonly sqliteMigrations = {
+    readLedger: async (input: {
+      readonly nativeId: string;
+    }): Promise<ProviderValue<readonly ProviderSqliteMigrationIdentity[]>> => {
+      const databaseId = d1DatabaseId(input.nativeId);
+      if (!databaseId)
+        return providerValueFailure("invalid_spec", "the database identity is invalid");
+      const exists = await this.#d1Query(databaseId, {
+        sql: "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 2",
+        params: [SQLITE_MIGRATION_LEDGER],
+      });
+      if (!exists.ok) return callFailure(exists);
+      const existsRows = d1Rows(exists.result);
+      if (!existsRows || existsRows.length > 1) {
+        return providerValueFailure("provider_error", "the migration ledger response is invalid");
+      }
+      if (existsRows.length === 0) return { ok: true, value: [] };
+
+      const read = await this.#d1Query(databaseId, {
+        sql: `SELECT sequence, path, digest FROM ${SQLITE_MIGRATION_LEDGER} ORDER BY sequence`,
+      });
+      if (!read.ok) return callFailure(read);
+      const rows = d1Rows(read.result);
+      if (!rows) {
+        return providerValueFailure("provider_error", "the migration ledger response is invalid");
+      }
+      const ledger: ProviderSqliteMigrationIdentity[] = [];
+      for (const [index, rowValue] of rows.entries()) {
+        const row = record(rowValue);
+        const sequence = integer(row?.sequence);
+        const path = optionalString(row?.path);
+        const digest = optionalString(row?.digest);
+        if (sequence !== index + 1 || !migrationPath(path) || !sha256Digest(digest)) {
+          return providerValueFailure("provider_error", "the migration ledger is malformed");
+        }
+        ledger.push({ path, digest });
+      }
+      return { ok: true, value: ledger };
+    },
+    applySuffix: async (input: {
+      readonly nativeId: string;
+      readonly expectedPrefix: readonly ProviderSqliteMigrationIdentity[];
+      readonly migrations: readonly ProviderSqliteMigration[];
+    }): Promise<ProviderValue<undefined>> => {
+      const databaseId = d1DatabaseId(input.nativeId);
+      if (!databaseId)
+        return providerValueFailure("invalid_spec", "the database identity is invalid");
+      if (input.migrations.length < 1 || input.migrations.length > 100) {
+        return providerValueFailure("invalid_spec", "the migration suffix is invalid");
+      }
+      const expected = JSON.stringify(input.expectedPrefix);
+      if (expected.length > 64 * 1_024) {
+        return providerValueFailure("invalid_spec", "the migration prefix is too large");
+      }
+      const batch: { sql: string; params?: readonly string[] }[] = [
+        { sql: SQLITE_MIGRATION_LEDGER_DDL },
+        {
+          sql: `INSERT INTO ${SQLITE_MIGRATION_LEDGER} (sequence, path, digest)
+SELECT 0, '__takoform_guard__', 'sha256:${"0".repeat(64)}'
+WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
+   OR EXISTS (
+     SELECT 1 FROM json_each(?) AS expected
+     LEFT JOIN ${SQLITE_MIGRATION_LEDGER} AS actual
+       ON actual.sequence = CAST(expected.key AS INTEGER) + 1
+     WHERE actual.path IS NULL
+        OR actual.path != json_extract(expected.value, '$.path')
+        OR actual.digest != json_extract(expected.value, '$.digest')
+   )`,
+          params: [String(input.expectedPrefix.length), expected],
+        },
+      ];
+      for (const [offset, migration] of input.migrations.entries()) {
+        if (!migrationPath(migration.path) || !sha256Digest(migration.digest)) {
+          return providerValueFailure("invalid_spec", "a migration identity is invalid");
+        }
+        let sql: string;
+        try {
+          sql = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(migration.sql);
+        } catch {
+          return providerValueFailure("invalid_spec", "a migration is not UTF-8 SQL");
+        }
+        if (sql.length === 0 || sql.length > 100_000) {
+          return providerValueFailure("invalid_spec", "a migration SQL statement is invalid");
+        }
+        batch.push(
+          { sql },
+          {
+            sql: `INSERT INTO ${SQLITE_MIGRATION_LEDGER} (sequence, path, digest) VALUES (?, ?, ?)`,
+            params: [
+              String(input.expectedPrefix.length + offset + 1),
+              migration.path,
+              migration.digest,
+            ],
+          },
+        );
+      }
+      const applied = await this.#d1Query(databaseId, { batch });
+      if (!applied.ok) return callFailure(applied);
+      const results = d1Results(applied.result);
+      if (
+        !results ||
+        results.length !== batch.length ||
+        results.some((result) => result.success !== true)
+      ) {
+        return providerValueFailure("provider_error", "the migration batch result is invalid");
+      }
+      return { ok: true, value: undefined };
+    },
+  };
 
   async apply(input: ApplyInput): Promise<ProviderTicket> {
     if (
@@ -1106,6 +1229,21 @@ export class CloudflareProvider implements Provider {
     return await this.#send(method, path, { body: form });
   }
 
+  async #d1Query(
+    databaseId: string,
+    body:
+      | { readonly sql: string; readonly params?: readonly string[] }
+      | {
+          readonly batch: readonly { readonly sql: string; readonly params?: readonly string[] }[];
+        },
+  ): Promise<CallResult> {
+    return await this.#call(
+      "POST",
+      `/accounts/${this.#accountId}/d1/database/${encodeURIComponent(databaseId)}/query`,
+      body,
+    );
+  }
+
   async #send(
     method: string,
     path: string,
@@ -1214,6 +1352,54 @@ async function readEnvelope(
   } catch {
     return null;
   }
+}
+
+function providerValueFailure<T>(
+  code: Parameters<typeof failed>[0],
+  message: string,
+  retryable = false,
+): ProviderValue<T> {
+  return { ok: false, failure: { code, message, retryable } };
+}
+
+function callFailure<T>(call: Extract<CallResult, { readonly ok: false }>): ProviderValue<T> {
+  return call.ticket.phase === "failed"
+    ? { ok: false, failure: call.ticket.failure }
+    : providerValueFailure("unavailable", "the backend did not settle", true);
+}
+
+function d1Results(value: unknown): readonly Record<string, unknown>[] | null {
+  if (!Array.isArray(value)) return null;
+  const results = value.map(record);
+  return results.every((result): result is Record<string, unknown> => result !== undefined)
+    ? results
+    : null;
+}
+
+function d1Rows(value: unknown): readonly unknown[] | null {
+  const results = d1Results(value);
+  if (!results || results.length !== 1 || results[0]?.success !== true) return null;
+  return Array.isArray(results[0].results) ? results[0].results : null;
+}
+
+function d1DatabaseId(nativeId: string): string | null {
+  const native = parseNativeId(nativeId);
+  return native?.kind === "d1" ? native.name : null;
+}
+
+function migrationPath(value: string | undefined): value is string {
+  return (
+    typeof value === "string" &&
+    value.length >= 1 &&
+    value.length <= 255 &&
+    !value.startsWith("/") &&
+    !value.includes("\\") &&
+    !value.split("/").includes("..")
+  );
+}
+
+function sha256Digest(value: string | undefined): value is `sha256:${string}` {
+  return typeof value === "string" && /^sha256:[0-9a-f]{64}$/u.test(value);
 }
 
 /**
