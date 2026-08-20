@@ -1,7 +1,12 @@
 import { bytesDigest, canonicalDigest } from "../json.ts";
 import type { Clock, ObjectStore, Sql } from "../ports.ts";
 import { parseStrictJson, StrictJsonError } from "../strict-json.ts";
-import { MAXIMUM_REQUEST_BODY_BYTES, TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES } from "./limits.ts";
+import {
+  MAXIMUM_REQUEST_BODY_BYTES,
+  TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES,
+  TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
+  TAKOFORM_MAXIMUM_WORKER_BUNDLE_MODULES,
+} from "./limits.ts";
 
 /**
  * Tenant-held, content-addressed artifacts.
@@ -44,8 +49,15 @@ export interface TakoformArtifactPrincipal {
 
 export type TakoformArtifactFailure = (code: string, status: number, details?: unknown) => Response;
 
-interface BlobDeclaration {
+export interface BlobDeclaration {
   readonly name: string;
+  readonly mediaType: string;
+  readonly size: number;
+  readonly digest: `sha256:${string}`;
+}
+
+export interface FileDeclaration {
+  readonly path: string;
   readonly mediaType: string;
   readonly size: number;
   readonly digest: `sha256:${string}`;
@@ -56,7 +68,7 @@ export interface TakoformArtifactManifest {
   readonly kind: "WorkerBundle" | "StaticAssetBundle" | "MigrationBundle";
   readonly mainModule?: string;
   readonly modules?: readonly BlobDeclaration[];
-  readonly files?: readonly BlobDeclaration[];
+  readonly files?: readonly FileDeclaration[];
 }
 
 export interface TakoformArtifactTransport {
@@ -66,6 +78,7 @@ export interface TakoformArtifactTransport {
     failure: TakoformArtifactFailure,
   ): Promise<Response | null>;
   resolveManifest(tenantId: string, digest: string): Promise<TakoformArtifactManifest | null>;
+  resolveBlob(tenantId: string, digest: string): Promise<Uint8Array | null>;
 }
 
 export class ArtifactInputError extends Error {
@@ -169,6 +182,12 @@ export function createTakoformArtifacts(
       return row ? (JSON.parse(String(row.manifest_json)) as TakoformArtifactManifest) : null;
     },
 
+    async resolveBlob(tenantId, digest) {
+      if (!DIGEST.test(digest) || !(await holds(tenantId, digest, "blob"))) return null;
+      const stored = await objects.get(blobKey(digest));
+      return stored ? new Uint8Array(await new Response(stored.body).arrayBuffer()) : null;
+    },
+
     async handle(request, principal, failure) {
       const url = new URL(request.url);
       if (!url.pathname.startsWith(ARTIFACT_PREFIX)) return null;
@@ -243,11 +262,10 @@ export function createTakoformArtifacts(
         if (replay) return replayArtifactResponse(replay);
         const upload = await ownedUpload(principal, requiredSegment(match[1]));
         if (!upload) return failure("artifact_missing", 404);
-        // The manifest is not parsed again here. `parseManifest` reads the wire
-        // grammar, where a StaticAssetBundle file carries `path`; what a row
-        // holds is the parsed value, whose declarations carry `name`. Feeding
-        // one to the other rejected every asset bundle ever committed. The row
-        // exists only because a parse already succeeded.
+        // The manifest is not parsed again here. The row exists only because a
+        // strict parse already succeeded, and preserving its portable `path`
+        // field is what keeps the content address equal to the caller's
+        // canonical manifest.
         //
         // The checks run in waves rather than one at a time. A site bundle is
         // hundreds of files, and against an object store reached over HTTP a
@@ -414,7 +432,7 @@ function parseManifest(input: unknown): TakoformArtifactManifest {
   if (kind === "WorkerBundle") {
     exactKeys(input, ["apiVersion", "kind", "mainModule", "modules"]);
     const mainModule = artifactPath(input.mainModule);
-    const modules = blobDeclarations(input.modules, true, 4_096);
+    const modules = blobDeclarations(input.modules, true, TAKOFORM_MAXIMUM_WORKER_BUNDLE_MODULES);
     const main = modules.find((entry) => entry.name === mainModule);
     if (!main || !LOADABLE_MEDIA.has(main.mediaType)) throw new ArtifactInputError();
     const names = new Set(modules.map((entry) => entry.name));
@@ -434,11 +452,30 @@ function parseManifest(input: unknown): TakoformArtifactManifest {
     return { apiVersion: input.apiVersion, kind, mainModule, modules };
   }
   exactKeys(input, ["apiVersion", "kind", "files"]);
+  const files = fileDeclarations(input.files, TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES);
+  requireMaximumBundleBytes(files);
   return {
     apiVersion: input.apiVersion,
     kind,
-    files: blobDeclarations(input.files, false, 16_384),
+    files,
   };
+}
+
+function requireMaximumBundleBytes(declarations: readonly { readonly size: number }[]): void {
+  let total = 0;
+  for (const declaration of declarations) {
+    total += declaration.size;
+    if (!Number.isSafeInteger(total) || total > TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES) {
+      throw new ArtifactInputError();
+    }
+  }
+}
+
+function fileDeclarations(input: unknown, limit: number): readonly FileDeclaration[] {
+  return blobDeclarations(input, false, limit).map(({ name, ...declaration }) => ({
+    path: name,
+    ...declaration,
+  }));
 }
 
 function blobDeclarations(
@@ -477,7 +514,11 @@ function blobDeclarations(
 }
 
 function declarations(manifest: TakoformArtifactManifest): readonly BlobDeclaration[] {
-  return manifest.modules ?? manifest.files ?? [];
+  if (manifest.modules) return manifest.modules;
+  return (manifest.files ?? []).map(({ path, ...declaration }) => ({
+    name: path,
+    ...declaration,
+  }));
 }
 
 async function strictJsonObject(request: Request): Promise<Record<string, unknown>> {

@@ -1,6 +1,7 @@
 import type { JsonObject } from "../ports.ts";
 import type { TakoformArtifactTransport } from "./artifacts.ts";
 import { ArtifactInputError } from "./artifacts.ts";
+import type { BindingRegistry } from "./bindings.ts";
 import type { EngineContext, TakoformEngine } from "./engine.ts";
 import { exactInstalledForm, type FormRegistry, formSupportProfile } from "./forms.ts";
 import type { OperationRecord, TakoformStore } from "./store.ts";
@@ -75,7 +76,7 @@ export interface ProvisionTokenClaimsView {
   readonly tenantRef: string;
   readonly reservationId: string;
   readonly offeringId: string;
-  readonly offeringDigest: string;
+  readonly offeringDigest: `sha256:${string}`;
   readonly tokenId: string;
 }
 
@@ -104,12 +105,13 @@ export interface CreateTakoformRoutesOptions {
   readonly engine: TakoformEngine;
   readonly store: TakoformStore;
   readonly forms: FormRegistry;
+  readonly bindings: BindingRegistry;
   readonly artifacts: TakoformArtifactTransport;
   readonly provision?: ProvisionLanePorts;
 }
 
 export function createTakoformRoutes(options: CreateTakoformRoutesOptions): TakoformHost {
-  const { authenticate, engine, store, forms, artifacts, provision } = options;
+  const { authenticate, engine, store, forms, bindings, artifacts, provision } = options;
 
   return {
     async handle(incoming): Promise<Response | null> {
@@ -182,11 +184,13 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
       const route = supportContract[1];
       const name = safeSegment(supportContract[2]);
       const version = safeSegment(supportContract[3]);
-      const references: readonly (TakoformInterfaceRef | TakoformBindingRef)[] = [
-        ...forms.values(),
-      ].flatMap((form): readonly (TakoformInterfaceRef | TakoformBindingRef)[] =>
-        route === "interfaces" ? (form.providedInterfaces ?? []) : (form.acceptedBindings ?? []),
-      );
+      const references: readonly (TakoformInterfaceRef | TakoformBindingRef)[] =
+        route === "interfaces"
+          ? [
+              ...[...forms.values()].flatMap((form) => form.providedInterfaces ?? []),
+              ...[...bindings.values()].map((binding) => binding.targetInterface),
+            ]
+          : [...bindings.values()].map((binding) => binding.bindingRef);
       const matches = references.filter(
         (reference) => reference.name === name && reference.version === version,
       );
@@ -244,11 +248,17 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
 
     const definition = FORM_DEFINITION.exec(url.pathname);
     if (request.method === "GET" && definition) {
-      exactQuery(url, ["definitionVersion", "schemaDigest"]);
+      exactQuery(url, ["space", "group", "kind", "definitionVersion", "schemaDigest"]);
+      requiredQuery(url, "space");
+      const apiVersion = `${safeSegment(definition[1])}/${safeSegment(definition[2])}`;
+      const kind = safeSegment(definition[3]);
+      if (requiredQuery(url, "group") !== apiVersion || requiredQuery(url, "kind") !== kind) {
+        throw new TakoformHostError();
+      }
       const form = exactInstalledForm(
         {
-          apiVersion: `${safeSegment(definition[1])}/${safeSegment(definition[2])}`,
-          kind: safeSegment(definition[3]),
+          apiVersion,
+          kind,
           definitionVersion: requiredQuery(url, "definitionVersion"),
           schemaDigest: requiredQuery(url, "schemaDigest"),
         },
@@ -490,6 +500,14 @@ async function provisionRoute(
     url,
     tenantId: boundedTenantReference(claims.organizationId),
     principalId: boundedTenantReference(`provision:${claims.tokenId}`),
+    // The reservation already holds this exact Offering's price. Without this
+    // authority the provider driver treats redemption as an ordinary direct
+    // organization apply and charges the wallet a second time.
+    commercialAuthority: {
+      reservationId: claims.reservationId,
+      offeringId: claims.offeringId,
+      offeringDigest: claims.offeringDigest,
+    },
   };
 
   if (
@@ -588,16 +606,7 @@ function formDefinition(form: InstalledTakoformForm): JsonObject {
     identity: structuredClone(form.identity) as unknown as JsonObject,
     ...(form.displayName ? { displayName: form.displayName } : {}),
     ...(form.description ? { description: form.description } : {}),
-    ...(form.role ? { role: form.role } : {}),
     desiredSchema: structuredClone(form.desiredSchema),
-    ...(form.observedSchema ? { observedSchema: structuredClone(form.observedSchema) } : {}),
-    ...(form.outputSchema ? { outputSchema: structuredClone(form.outputSchema) } : {}),
-    ...(form.providedInterfaces
-      ? { providedInterfaces: structuredClone(form.providedInterfaces) as unknown as JsonObject[] }
-      : {}),
-    ...(form.acceptedBindings
-      ? { acceptedBindings: structuredClone(form.acceptedBindings) as unknown as JsonObject[] }
-      : {}),
   };
 }
 

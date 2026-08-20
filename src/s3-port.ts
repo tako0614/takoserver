@@ -31,7 +31,17 @@ export interface S3CredentialSet {
   readonly expiresAt: string;
 }
 
+export type S3CredentialAuthority = Omit<S3CredentialIssue, "ttlSeconds">;
+
+export interface S3CredentialTtlLimits {
+  readonly minimumSeconds: number;
+  readonly maximumSeconds: number;
+  readonly defaultSeconds: number;
+}
+
 export interface S3CredentialIssuer {
+  /** Returns null when this issuer does not own the exact active Deployment. */
+  limits(input: S3CredentialAuthority): S3CredentialTtlLimits | null;
   issue(input: S3CredentialIssue): Promise<S3CredentialSet>;
 }
 

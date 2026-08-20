@@ -36,6 +36,7 @@ export interface ResourceDeploymentStore {
   ): Promise<ResourceDeployment | null>;
   active(tenantId: string, resourceUid: string): Promise<ResourceDeployment | null>;
   forResource(tenantId: string, resourceUid: string): Promise<readonly ResourceDeployment[]>;
+  meteringCandidates(limit: number): Promise<readonly ResourceDeployment[]>;
   refresh(
     tenantId: string,
     deploymentId: string,
@@ -44,6 +45,13 @@ export interface ResourceDeploymentStore {
     outputs: JsonObject,
   ): Promise<boolean>;
   markDeleted(tenantId: string, deploymentId: string, expectedNativeId: string): Promise<boolean>;
+  markRetained(
+    tenantId: string,
+    deploymentId: string,
+    expectedNativeId: string,
+    observed: JsonObject,
+    outputs: JsonObject,
+  ): Promise<boolean>;
   cutover(
     tenantId: string,
     resourceUid: string,
@@ -122,6 +130,27 @@ export function createResourceDeploymentStore(sql: Sql, clock: Clock): ResourceD
       return rows.map(deployment);
     },
 
+    async meteringCandidates(limit): Promise<readonly ResourceDeployment[]> {
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+        throw new Error("resource_deployment_metering_limit_invalid");
+      }
+      const timestamp = now();
+      const rows = await sql.query(
+        `SELECT deployment.* FROM tf_resource_deployments AS deployment
+         LEFT JOIN provider_meter_schedule AS schedule
+           ON schedule.tenant_id = deployment.tenant_id
+          AND schedule.deployment_id = deployment.id
+         WHERE deployment.state = 'active'
+           AND COALESCE(schedule.lease_until, 0) <= ?
+           AND COALESCE(schedule.next_at, deployment.created_at) <= ?
+         ORDER BY COALESCE(schedule.next_at, deployment.created_at),
+                  deployment.tenant_id, deployment.id
+         LIMIT ?`,
+        [timestamp, timestamp, limit],
+      );
+      return rows.map(deployment);
+    },
+
     async refresh(tenantId, deploymentId, expectedNativeId, observed, outputs) {
       const changed = await sql.run(
         `UPDATE tf_resource_deployments
@@ -144,6 +173,23 @@ export function createResourceDeploymentStore(sql: Sql, clock: Clock): ResourceD
         `UPDATE tf_resource_deployments SET state = 'deleted', updated_at = ?
          WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`,
         [now(), tenantId, deploymentId, expectedNativeId],
+      );
+      return changed.changes === 1;
+    },
+
+    async markRetained(tenantId, deploymentId, expectedNativeId, observed, outputs) {
+      const changed = await sql.run(
+        `UPDATE tf_resource_deployments
+         SET state = 'retained', observed_json = ?, outputs_json = ?, updated_at = ?
+         WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`,
+        [
+          JSON.stringify(observed),
+          JSON.stringify(outputs),
+          now(),
+          tenantId,
+          deploymentId,
+          expectedNativeId,
+        ],
       );
       return changed.changes === 1;
     },

@@ -1,5 +1,6 @@
 import type { Clock, Row, Sql } from "../ports.ts";
 import { OPERATION_TTL_MILLISECONDS, REPLAY_TTL_MILLISECONDS, SWEEP_ROW_LIMIT } from "./limits.ts";
+import type { TakoformStoredRelation } from "./relations.ts";
 import type { TakoformStoredResource } from "./types.ts";
 
 /**
@@ -60,6 +61,11 @@ export interface OperationListing {
   readonly createdAt: string;
 }
 
+export interface RelatedResource {
+  readonly resource: TakoformStoredResource;
+  readonly relations: readonly TakoformStoredRelation[];
+}
+
 export interface StoredReplay {
   readonly fingerprint: string;
   readonly status: number;
@@ -69,6 +75,30 @@ export interface StoredReplay {
 
 export interface TakoformStore {
   readResource(address: ResourceAddress): Promise<TakoformStoredResource | null>;
+  readRelations(address: ResourceAddress): Promise<readonly TakoformStoredRelation[]>;
+  relationHolders(tenantId: string, targetUid: string): Promise<readonly string[]>;
+  resourcesByRelation(input: {
+    readonly tenantId: string;
+    readonly space: string;
+    readonly sourceApiVersion: string;
+    readonly sourceKind: string;
+    readonly relation: string;
+    readonly targetUid: string;
+    readonly limit: number;
+  }): Promise<readonly RelatedResource[]>;
+  /** Live custom-domain claims for one canonical DNS name, across every tenant space. */
+  hostnameClaims(
+    tenantId: string,
+    hostname: string,
+    limit: number,
+  ): Promise<readonly ResourceListing[]>;
+  /** Whether following QueueConsumer dead-letter edges reaches another queue. */
+  queuePathReaches(input: {
+    readonly tenantId: string;
+    readonly space: string;
+    readonly fromQueueUid: string;
+    readonly toQueueUid: string;
+  }): Promise<boolean>;
   /**
    * Writes a resource under an optimistic fence. `expectedRevision` is null for
    * a create, which then requires the row to be absent. Returns false when the
@@ -77,6 +107,7 @@ export interface TakoformStore {
   writeResource(input: {
     readonly address: ResourceAddress;
     readonly resource: TakoformStoredResource;
+    readonly relations: readonly TakoformStoredRelation[];
     readonly expectedRevision: string | null;
   }): Promise<boolean>;
   deleteResource(address: ResourceAddress, expectedRevision: string): Promise<boolean>;
@@ -154,20 +185,112 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       return row ? (JSON.parse(text(row.resource_json)) as TakoformStoredResource) : null;
     },
 
-    async writeResource({ address, resource, expectedRevision }): Promise<boolean> {
+    async readRelations(address): Promise<readonly TakoformStoredRelation[]> {
+      const rows = await sql.query(
+        `SELECT relations_json FROM tf_resources
+         WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?`,
+        [address.tenantId, address.space, address.apiVersion, address.kind, address.name],
+      );
+      const row = rows[0];
+      return row ? storedRelations(text(row.relations_json)) : [];
+    },
+
+    async relationHolders(tenantId, targetUid): Promise<readonly string[]> {
+      const rows = await sql.query(
+        `SELECT DISTINCT resource.api_version, resource.kind, resource.name
+         FROM tf_resources AS resource, json_each(resource.relations_json) AS relation
+         WHERE resource.tenant_id = ?
+           AND json_extract(relation.value, '$.targetUid') = ?
+         ORDER BY resource.api_version, resource.kind, resource.name
+         LIMIT 2`,
+        [tenantId, targetUid],
+      );
+      return rows.map((row) => `${text(row.api_version)}/${text(row.kind)}/${text(row.name)}`);
+    },
+
+    async resourcesByRelation(input): Promise<readonly RelatedResource[]> {
+      const rows = await sql.query(
+        `SELECT DISTINCT resource.resource_json, resource.relations_json
+         FROM tf_resources AS resource, json_each(resource.relations_json) AS relation
+         WHERE resource.tenant_id = ?
+           AND resource.space = ?
+           AND resource.api_version = ?
+           AND resource.kind = ?
+           AND json_extract(relation.value, '$.relation') = ?
+           AND json_extract(relation.value, '$.targetUid') = ?
+         ORDER BY resource.name
+         LIMIT ?`,
+        [
+          input.tenantId,
+          input.space,
+          input.sourceApiVersion,
+          input.sourceKind,
+          input.relation,
+          input.targetUid,
+          input.limit,
+        ],
+      );
+      return rows.map((row) => ({
+        resource: JSON.parse(text(row.resource_json)) as TakoformStoredResource,
+        relations: storedRelations(text(row.relations_json)),
+      }));
+    },
+
+    async hostnameClaims(tenantId, hostname, limit): Promise<readonly ResourceListing[]> {
+      const rows = await sql.query(
+        `SELECT space, api_version, kind, name, uid, generation, revision,
+                updated_at, resource_json
+         FROM tf_resources
+         WHERE tenant_id = ?
+           AND api_version LIKE 'edge.forms.takoform.com/%'
+           AND kind = 'WorkerCustomDomain'
+           AND json_extract(resource_json, '$.spec.hostname') = ?
+         ORDER BY space, name
+         LIMIT ?`,
+        [tenantId, hostname, Math.min(Math.max(limit, 1), 2)],
+      );
+      return rows.map(resourceListing);
+    },
+
+    async queuePathReaches(input): Promise<boolean> {
+      const rows = await sql.query(
+        `WITH RECURSIVE dead_letter_path(queue_uid) AS (
+           VALUES (?)
+           UNION
+           SELECT json_extract(dead_letter.value, '$.targetUid')
+           FROM dead_letter_path AS path
+           JOIN tf_resources AS consumer
+             ON consumer.tenant_id = ?
+            AND consumer.space = ?
+            AND consumer.api_version LIKE 'edge.forms.takoform.com/%'
+            AND consumer.kind = 'QueueConsumer'
+           JOIN json_each(consumer.relations_json) AS drained
+             ON json_extract(drained.value, '$.relation') = '/queue'
+            AND json_extract(drained.value, '$.targetUid') = path.queue_uid
+           JOIN json_each(consumer.relations_json) AS dead_letter
+             ON json_extract(dead_letter.value, '$.relation') = '/deadLetterQueue'
+         )
+         SELECT 1 AS found FROM dead_letter_path WHERE queue_uid = ? LIMIT 1`,
+        [input.fromQueueUid, input.tenantId, input.space, input.toQueueUid],
+      );
+      return rows.length === 1;
+    },
+
+    async writeResource({ address, resource, relations, expectedRevision }): Promise<boolean> {
       const key = [address.tenantId, address.space, address.apiVersion, address.kind, address.name];
       if (expectedRevision === null) {
         const written = await sql.run(
           `INSERT OR IGNORE INTO tf_resources
              (tenant_id, space, api_version, kind, name, uid, generation, revision,
-              resource_json, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              resource_json, relations_json, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             ...key,
             resource.metadata.uid,
             resource.metadata.generation,
             resource.metadata.revision,
             JSON.stringify(resource),
+            JSON.stringify(relations),
             now(),
           ],
         );
@@ -175,7 +298,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       }
       const written = await sql.run(
         `UPDATE tf_resources
-         SET uid = ?, generation = ?, revision = ?, resource_json = ?, updated_at = ?
+         SET uid = ?, generation = ?, revision = ?, resource_json = ?, relations_json = ?, updated_at = ?
          WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
            AND revision = ?`,
         [
@@ -183,6 +306,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           resource.metadata.generation,
           resource.metadata.revision,
           JSON.stringify(resource),
+          JSON.stringify(relations),
           now(),
           ...key,
           expectedRevision,
@@ -427,6 +551,12 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       await sql.run("DELETE FROM tf_replays WHERE replay_key = ?", [key]);
     },
   };
+}
+
+function storedRelations(value: string): readonly TakoformStoredRelation[] {
+  const parsed: unknown = JSON.parse(value);
+  if (!Array.isArray(parsed)) throw new TypeError("invalid stored Takoform relations");
+  return parsed as readonly TakoformStoredRelation[];
 }
 
 function resourceListing(row: Row): ResourceListing {

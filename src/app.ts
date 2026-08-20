@@ -13,6 +13,7 @@ import { createLedger, type FundingSettlementVerifier } from "./ledger.ts";
 import { createMetering, type MeteringRates } from "./metering.ts";
 import type { Clock, ObjectStore, Sql } from "./ports.ts";
 import { createProviderDriver } from "./provider-driver.ts";
+import { createProviderMetering } from "./provider-metering.ts";
 import type { ProviderPack } from "./provider-pack.ts";
 import type { Provider } from "./provider-port.ts";
 import { createReseller } from "./reseller.ts";
@@ -24,10 +25,12 @@ import {
 import { createRouter, type Router } from "./router.ts";
 import type { S3CredentialIssuer } from "./s3-port.ts";
 import type { TakoformArtifactTransport } from "./takoform/artifacts.ts";
+import type { WorkerModuleInspector } from "./takoform/engine.ts";
 import { sameFormRef } from "./takoform/forms.ts";
 import { createTakoformHost } from "./takoform/host.ts";
 import { createTakoformStore } from "./takoform/store.ts";
 import type {
+  InstalledTakoformBinding,
   InstalledTakoformForm,
   TakoformHost,
   TakoformResourceDriver,
@@ -62,6 +65,8 @@ export interface AppPorts {
   /** Where this deployment's console is served, if it has one. */
   readonly consoleOrigin?: string;
   readonly forms: readonly InstalledTakoformForm[];
+  /** Exact portable BindingDefinitions installed by this Host composition. */
+  readonly bindings?: readonly InstalledTakoformBinding[];
   /** How a caller may sign in to this deployment. */
   readonly identityProviders?: readonly IdentityProviderDescriptor[];
   /**
@@ -77,6 +82,8 @@ export interface AppPorts {
   readonly signingKey?: SigningKey;
   /** Shared with a provider that publishes committed bundles. */
   readonly artifacts?: TakoformArtifactTransport;
+  /** Parses committed worker bytes without executing tenant code. */
+  readonly workerModuleInspector?: WorkerModuleInspector;
   /**
    * Replaces the Takoform Host entirely. Used by conformance tests that need to
    * drive the lane with their own authentication; production never sets it.
@@ -102,6 +109,10 @@ export interface TickReport {
   readonly orphanedResources: readonly string[];
   /** Usage rows folded into ledger entries this tick. */
   readonly meteredRows: number;
+  /** Provider observation windows made durable before this tick's rollup. */
+  readonly providerMeterWindows: number;
+  /** Deployment ids whose upstream usage could not be settled this pass. */
+  readonly providerMeterFailures: readonly string[];
 }
 
 export function buildApp(ports: AppPorts): App {
@@ -186,7 +197,7 @@ export function buildApp(ports: AppPorts): App {
         const actor = await accounts.authenticate(authorization);
         if (actor?.kind === "api_key") {
           return actor.organizationId && grants(actor.scopes, "resources:write")
-            ? { tenantId: actor.organizationId, principalId: actor.principalId }
+            ? { tenantId: actor.organizationId, principalId: actor.hostPrincipalId }
             : null;
         }
         if (actor?.kind === "session") {
@@ -196,7 +207,7 @@ export function buildApp(ports: AppPorts): App {
             .requireOwner(actor, organizationId)
             .then(() => true)
             .catch(() => false);
-          return owned ? { tenantId: organizationId, principalId: actor.principalId } : null;
+          return owned ? { tenantId: organizationId, principalId: actor.hostPrincipalId } : null;
         }
 
         const bearer = authorization?.startsWith("Bearer ")
@@ -259,8 +270,12 @@ export function buildApp(ports: AppPorts): App {
         }
       },
       forms: ports.forms,
+      ...(ports.bindings ? { bindings: ports.bindings } : {}),
       driver,
       ...(ports.artifacts ? { artifacts: ports.artifacts } : {}),
+      ...(ports.workerModuleInspector
+        ? { workerModuleInspector: ports.workerModuleInspector }
+        : {}),
       clock,
       randomId,
       // The redemption lane: a reseller's single-use provision token buys
@@ -294,6 +309,15 @@ export function buildApp(ports: AppPorts): App {
     randomId,
     ...(ports.meteringRates ? { rates: ports.meteringRates } : {}),
   });
+  const providerMetering = createProviderMetering({
+    sql: ports.sql,
+    deployments,
+    catalog,
+    packs: ports.providerPacks ?? [],
+    metering,
+    clock,
+    randomId,
+  });
   const dataAi = createDataAiRoutes({
     accounts,
     ...(ports.ai ? { gateway: ports.ai } : {}),
@@ -318,6 +342,7 @@ export function buildApp(ports: AppPorts): App {
       const store = inventory;
       const installed = ports.forms.map((form) => form.identity.formRef.schemaDigest);
       const orphans = await store.orphanedResources(installed, 32);
+      const providerUsage = await providerMetering.reconcile(32);
       const meteredRows = await metering.rollUp(500);
       const orphanedResources = orphans.map(
         (orphan) => `${orphan.space}/${orphan.kind}/${orphan.name}`,
@@ -332,7 +357,13 @@ export function buildApp(ports: AppPorts): App {
           }),
         );
       }
-      return { expiredReservations, orphanedResources, meteredRows };
+      return {
+        expiredReservations,
+        orphanedResources,
+        meteredRows,
+        providerMeterWindows: providerUsage.windows,
+        providerMeterFailures: providerUsage.failures,
+      };
     },
   };
 }

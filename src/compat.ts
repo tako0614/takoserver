@@ -4,10 +4,12 @@ import { createMemoryObjectStore } from "./objects-mem.ts";
 import type { Clock, ObjectStore, Sql } from "./ports.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import type { TakoformArtifactTransport } from "./takoform/artifacts.ts";
+import type { WorkerModuleInspector } from "./takoform/engine.ts";
 import { createTakoformHost as assembleTakoformHost } from "./takoform/host.ts";
 import { InMemoryTakoformResourceDriver } from "./takoform/memory-driver.ts";
 import type { ProvisionLanePorts } from "./takoform/routes.ts";
 import type {
+  InstalledTakoformBinding,
   InstalledTakoformForm,
   TakoformHost,
   TakoformHostPrincipal,
@@ -34,12 +36,14 @@ export function createEphemeralSql(): Sql {
 export interface EphemeralTakoformHostOptions {
   readonly authenticate: (authorization: string | null) => Promise<TakoformHostPrincipal | null>;
   readonly forms: readonly InstalledTakoformForm[];
+  readonly bindings?: readonly InstalledTakoformBinding[];
   readonly driver: TakoformResourceDriver;
   readonly sql?: Sql;
   readonly objects?: ObjectStore;
   readonly artifacts?: TakoformArtifactTransport;
   readonly clock?: Clock;
   readonly randomId?: () => string;
+  readonly workerModuleInspector?: WorkerModuleInspector;
   readonly provision?: ProvisionLanePorts;
   readonly blockingRelations?: (
     tenantId: string,
@@ -57,10 +61,14 @@ export function createTakoformHost(options: EphemeralTakoformHostOptions): Takof
     // spelled the way it was written.
     authenticate: (request: Request) => options.authenticate(request.headers.get("authorization")),
     forms: options.forms,
+    ...(options.bindings ? { bindings: options.bindings } : {}),
     driver: options.driver,
     ...(options.artifacts ? { artifacts: options.artifacts } : {}),
     ...(options.clock ? { clock: options.clock } : {}),
     ...(options.randomId ? { randomId: options.randomId } : {}),
+    ...(options.workerModuleInspector
+      ? { workerModuleInspector: options.workerModuleInspector }
+      : {}),
     ...(options.provision ? { provision: options.provision } : {}),
     ...(options.blockingRelations ? { blockingRelations: options.blockingRelations } : {}),
   });

@@ -90,25 +90,33 @@ export function deploymentVariables(target: DeployTarget): Record<string, unknow
   const vars: Record<string, string> = {};
   if (target.consoleOrigin !== undefined) vars.TAKOSERVER_CONSOLE_ORIGIN = target.consoleOrigin;
   if (target.googleClientId !== undefined) vars.GOOGLE_CLIENT_ID = target.googleClientId;
-  if (target.provisionerOrigin !== undefined) {
-    vars.TAKOSERVER_PROVISIONER_ORIGIN = target.provisionerOrigin;
-  }
   // The key id is public — its public half is in the database for anyone to
   // verify against. The private half is a secret and is set separately.
   vars.TAKOSERVER_SIGNING_KEY_ID = target.grantKeyId;
   if (
     target.zones !== undefined ||
     target.aiModels !== undefined ||
-    target.r2ParentAccessKeyId !== undefined
+    target.r2ParentAccessKeyId !== undefined ||
+    target.objectBucketSupplies !== undefined ||
+    target.edgeSupplies !== undefined
   ) {
     // The account the Worker provisions in is the account it is deployed to;
     // saying so once here keeps the provider from having to be told twice.
     vars.CLOUDFLARE_ACCOUNT_ID = target.accountId;
-    vars.TAKOSERVER_ZONES = JSON.stringify(target.zones);
   }
+  if (target.zones !== undefined) vars.TAKOSERVER_ZONES = JSON.stringify(target.zones);
   if (target.aiModels !== undefined) vars.TAKOSERVER_AI_MODELS = JSON.stringify(target.aiModels);
   if (target.r2ParentAccessKeyId !== undefined) {
     vars.TAKOSERVER_R2_PARENT_ACCESS_KEY_ID = target.r2ParentAccessKeyId;
+  }
+  if (target.objectBucketSupplies !== undefined) {
+    vars.TAKOSERVER_OBJECT_BUCKET_SUPPLIES = JSON.stringify(target.objectBucketSupplies);
+  }
+  if (target.edgeSupplies !== undefined) {
+    vars.TAKOSERVER_EDGE_SUPPLIES = JSON.stringify(target.edgeSupplies);
+  }
+  if (target.workerEndpointSuffix !== undefined) {
+    vars.TAKOSERVER_WORKER_ENDPOINT_SUFFIX = target.workerEndpointSuffix;
   }
   return Object.keys(vars).length === 0 ? {} : { vars };
 }

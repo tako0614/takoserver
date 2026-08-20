@@ -1,0 +1,161 @@
+{
+  "apiVersion": "edge.forms.takoform.com/v1beta1",
+  "kind": "WorkerDeployment",
+  "definitionVersion": "0.1.0",
+  "title": "Worker Deployment",
+  "description": "Selects which Worker Versions of one Module Worker serve traffic and in what proportion. Weights are basis points and must sum to exactly 10000 across entries; the sum is host-validated semantics because a schema cannot add weights. Rollback is re-weighting, never mutating a revision.",
+  "role": "deployment",
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Selects which Worker Versions of one Module Worker serve traffic and in what proportion. Weights are basis points and must sum to exactly 10000 across entries; the sum is host-validated semantics because a schema cannot add weights. Rollback is re-weighting, never mutating a revision.",
+    "properties": {
+      "versions": {
+        "description": "Active Worker Versions and their traffic weights in basis points. Weights must sum to exactly 10000.",
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "weight": {
+              "description": "Traffic share in basis points (1..10000).",
+              "maximum": 10000,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "workerVersion": {
+              "additionalProperties": false,
+              "description": "Worker Version receiving this weight.",
+              "properties": {
+                "apiVersion": {
+                  "const": "edge.forms.takoform.com/v1beta1",
+                  "type": "string"
+                },
+                "kind": {
+                  "const": "WorkerVersion",
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-z][a-z0-9-]{0,62}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "apiVersion",
+                "kind",
+                "name"
+              ],
+              "type": "object",
+              "x-takoform-target-formrefs": [
+                {
+                  "apiVersion": "edge.forms.takoform.com/v1beta1",
+                  "definitionVersion": "0.1.0",
+                  "kind": "WorkerVersion",
+                  "schemaDigest": "sha256:22fde31c0b695ca59f5c46230c1ed03d6a6f53c01015d4a5acf6bdb0ed70b50c"
+                }
+              ]
+            }
+          },
+          "required": [
+            "weight",
+            "workerVersion"
+          ],
+          "type": "object"
+        },
+        "maxItems": 8,
+        "minItems": 1,
+        "type": "array",
+        "uniqueItems": true
+      },
+      "worker": {
+        "additionalProperties": false,
+        "description": "Module Worker identity whose traffic this deployment governs.",
+        "properties": {
+          "apiVersion": {
+            "const": "edge.forms.takoform.com/v1beta1",
+            "type": "string"
+          },
+          "kind": {
+            "const": "ModuleWorker",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9-]{0,62}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "apiVersion",
+          "kind",
+          "name"
+        ],
+        "type": "object",
+        "x-takoform-target-formrefs": [
+          {
+            "apiVersion": "edge.forms.takoform.com/v1beta1",
+            "definitionVersion": "0.1.0",
+            "kind": "ModuleWorker",
+            "schemaDigest": "sha256:6de1d1ff575caf7e6ca10ee6d905df1174bc26943ca95de6ada5f9229507d192"
+          }
+        ]
+      }
+    },
+    "required": [
+      "versions",
+      "worker"
+    ],
+    "title": "Worker Deployment desired state",
+    "type": "object"
+  },
+  "immutableFields": [
+    "/worker"
+  ],
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "update",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-worker",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-worker.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-versions",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-versions.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-worker",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-worker.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-versions",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-versions.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

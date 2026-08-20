@@ -69,6 +69,8 @@ function pack(overrides: Partial<ProviderPackDefinition> = {}) {
       {
         id: "wasabi-storage",
         meters: ["storage.gib-hour", "egress.gib", "requests.million"],
+        settlementDelaySeconds: 0,
+        maximumWindowSeconds: 86_400,
         read: async () => [],
       },
     ],

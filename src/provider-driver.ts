@@ -4,14 +4,18 @@ import type { Ledger } from "./ledger.ts";
 import type {
   Provider,
   ProviderOffering,
+  ProviderRelation,
   ProviderResult,
   ProviderTicket,
+  ProviderValue,
 } from "./provider-port.ts";
 import type { ResourceDeployment, ResourceDeploymentStore } from "./resource-deployments.ts";
 import type {
   InstalledTakoformForm,
   TakoformDriverReceipt,
+  TakoformDriverRelation,
   TakoformResourceDriver,
+  TakoformStoredResource,
 } from "./takoform/types.ts";
 import { TakoformHostError } from "./takoform/types.ts";
 
@@ -54,8 +58,9 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
 
   const byId = new Map(providers.map((provider) => [provider.id, provider]));
 
-  const select = (
+  const selectSold = (
     form: InstalledTakoformForm,
+    offeringId?: string,
   ): {
     provider: Provider;
     offering: ProviderOffering;
@@ -63,12 +68,74 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     priceMinor: number;
   } => {
     const matches = catalog.offeringsFor(form.identity.formRef);
-    const sold = matches.length === 1 ? matches[0] : undefined;
+    const sold = offeringId
+      ? matches.find((candidate) => candidate.id === offeringId)
+      : matches.length === 1
+        ? matches[0]
+        : undefined;
     if (!sold) throw new TakoformHostError("unsupported_capability", 422);
     const provider = byId.get(sold.providerPackRef);
     const offering = provider?.offerings.find((candidate) => candidate.id === sold.id);
     if (!provider || !offering) throw new TakoformHostError("backend_unavailable", 503);
     return { provider, offering, sold, priceMinor: sold.pricePlan.recurring.amountMinor };
+  };
+
+  const providerRelations = async (
+    tenantId: string,
+    relations: readonly TakoformDriverRelation[],
+  ): Promise<readonly ProviderRelation[]> =>
+    await Promise.all(
+      relations.map(async (relation) => {
+        const deployment = await deployments.active(tenantId, relation.targetUid);
+        return {
+          ...structuredClone(relation),
+          ...(deployment ? { deployment } : {}),
+        };
+      }),
+    );
+
+  const inherited = async (
+    tenantId: string,
+    form: InstalledTakoformForm,
+    relations: readonly TakoformDriverRelation[],
+  ): Promise<{
+    provider: Provider;
+    offering: ProviderOffering;
+    providerInstallationRef: string;
+    relations: readonly ProviderRelation[];
+  }> => {
+    const resolved = await providerRelations(tenantId, relations);
+    const parents = resolved.flatMap((relation) =>
+      relation.deployment ? [relation.deployment] : [],
+    );
+    if (parents.length === 0) throw new TakoformHostError("unsupported_capability", 422);
+    const providerPackRef = parents[0]?.providerPackRef;
+    const providerInstallationRef = parents[0]?.providerInstallationRef;
+    if (
+      !providerPackRef ||
+      !providerInstallationRef ||
+      parents.some(
+        (deployment) =>
+          deployment.providerPackRef !== providerPackRef ||
+          deployment.providerInstallationRef !== providerInstallationRef,
+      )
+    ) {
+      // A native attachment cannot silently bridge two provider accounts.
+      throw new TakoformHostError("unsupported_capability", 422);
+    }
+    const provider = byId.get(providerPackRef);
+    const offerings = provider?.offerings.filter((candidate) =>
+      sameForm(candidate.form, form.identity.formRef),
+    );
+    if (!provider || offerings?.length !== 1 || offerings[0] === undefined) {
+      throw new TakoformHostError("unsupported_capability", 422);
+    }
+    return {
+      provider,
+      offering: offerings[0],
+      providerInstallationRef,
+      relations: resolved,
+    };
   };
 
   /** Drives a ticket to a terminal state within the inline budget. */
@@ -138,23 +205,22 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     deployment: ResourceDeployment,
     form: TakoformV1Alpha3FormRef,
   ): { provider: Provider; offering: ProviderOffering } => {
-    const sold = catalog.findOffering(deployment.offeringId);
-    if (
-      !sold ||
-      sold.providerPackRef !== deployment.providerPackRef ||
-      sold.providerInstallationRef !== deployment.providerInstallationRef ||
-      sold.form.apiVersion !== form.apiVersion ||
-      sold.form.kind !== form.kind ||
-      sold.form.definitionVersion !== form.definitionVersion ||
-      sold.form.schemaDigest !== form.schemaDigest
-    ) {
-      throw new TakoformHostError("backend_unavailable", 503);
-    }
     const provider = byId.get(deployment.providerPackRef);
     const offering = provider?.offerings.find(
       (candidate) => candidate.id === deployment.offeringId,
     );
-    if (!provider || !offering) throw new TakoformHostError("backend_unavailable", 503);
+    const sold = catalog.findOffering(deployment.offeringId);
+    if (
+      !provider ||
+      !offering ||
+      !sameForm(offering.form, form) ||
+      (sold !== undefined &&
+        (sold.providerPackRef !== deployment.providerPackRef ||
+          sold.providerInstallationRef !== deployment.providerInstallationRef ||
+          !sameForm(sold.form, form)))
+    ) {
+      throw new TakoformHostError("backend_unavailable", 503);
+    }
     return { provider, offering };
   };
 
@@ -179,11 +245,67 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     }
   };
 
+  const sqliteProvider = async (
+    tenantId: string,
+    database: TakoformStoredResource,
+  ): Promise<{
+    provider: Provider;
+    deployment: ResourceDeployment;
+    port: NonNullable<Provider["sqliteMigrations"]>;
+  }> => {
+    const deployment = await active(tenantId, database.metadata.uid);
+    const { provider } = installed(deployment, database.form.formRef);
+    if (!provider.sqliteMigrations) {
+      throw new TakoformHostError("unsupported_capability", 422);
+    }
+    return { provider, deployment, port: provider.sqliteMigrations };
+  };
+
+  const providerValue = <T>(result: ProviderValue<T>): T => {
+    if (result.ok) return result.value as T;
+    throw new TakoformHostError(...failureToWire(result.failure.code));
+  };
+
   return {
+    sqliteMigrations: {
+      async readLedger(input) {
+        const { deployment, port } = await sqliteProvider(input.tenantId, input.database);
+        return providerValue(await port.readLedger({ nativeId: deployment.nativeId }));
+      },
+      async applySuffix(input) {
+        const { deployment, port } = await sqliteProvider(input.tenantId, input.database);
+        providerValue(
+          await port.applySuffix({
+            nativeId: deployment.nativeId,
+            expectedPrefix: input.expectedPrefix,
+            migrations: input.migrations,
+          }),
+        );
+      },
+    },
     async apply(input): Promise<TakoformDriverReceipt> {
-      const { provider, offering, sold, priceMinor } = select(input.form);
       const current = await deployments.active(input.tenantId, input.resourceUid);
+      if (intrinsicForm(input.form)) {
+        if (current) throw new TakoformHostError("backend_unavailable", 503);
+        return { observed: structuredClone(input.spec) };
+      }
+      const soldSelection =
+        input.form.role === "identity" ||
+        catalog.offeringsFor(input.form.identity.formRef).length > 0
+          ? selectSold(input.form, input.commercialAuthority?.offeringId)
+          : undefined;
+      const inheritedSelection = soldSelection
+        ? undefined
+        : await inherited(input.tenantId, input.form, input.relations);
+      const provider = soldSelection?.provider ?? inheritedSelection?.provider;
+      const offering = soldSelection?.offering ?? inheritedSelection?.offering;
+      if (!provider || !offering) throw new TakoformHostError("unsupported_capability", 422);
+      const sold = soldSelection?.sold;
+      const priceMinor = soldSelection?.priceMinor ?? 0;
+      const relationTargets =
+        inheritedSelection?.relations ?? (await providerRelations(input.tenantId, input.relations));
       if (
+        sold &&
         input.commercialAuthority &&
         (input.commercialAuthority.offeringId !== sold.id ||
           (!current && input.commercialAuthority.offeringDigest !== (await catalog.digest(sold))))
@@ -192,9 +314,10 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
       }
       if (
         current &&
-        (current.offeringId !== sold.id ||
-          current.providerPackRef !== sold.providerPackRef ||
-          current.providerInstallationRef !== sold.providerInstallationRef)
+        (current.offeringId !== offering.id ||
+          current.providerPackRef !== provider.id ||
+          current.providerInstallationRef !==
+            (sold?.providerInstallationRef ?? inheritedSelection?.providerInstallationRef))
       ) {
         // Moving supply is a Migration, never an ordinary Resource update.
         throw new TakoformHostError("unsupported_capability", 422);
@@ -211,6 +334,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
             offering,
             identity: { tenantRef: input.tenantId, space: input.space, name: input.name },
             spec: input.spec,
+            relations: relationTargets,
             ...(previous ? { previous } : {}),
           }),
         );
@@ -218,9 +342,10 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
       // Charging the organization wallet again here would double-settle the
       // same Resource. Direct organization credentials have no such authority
       // and retain the ordinary hold/capture path.
-      const result = input.commercialAuthority
-        ? resultOf(await work())
-        : await charged(input.tenantId, input.operationId, priceMinor, work);
+      const result =
+        input.commercialAuthority || priceMinor === 0
+          ? resultOf(await work())
+          : await charged(input.tenantId, input.operationId, priceMinor, work);
       if (current) {
         await refresh(current, result);
       } else {
@@ -229,9 +354,14 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
             tenantId: input.tenantId,
             id: `dep_${input.operationId}`,
             resourceUid: input.resourceUid,
-            offeringId: sold.id,
-            providerPackRef: sold.providerPackRef,
-            providerInstallationRef: sold.providerInstallationRef,
+            offeringId: offering.id,
+            providerPackRef: provider.id,
+            providerInstallationRef:
+              sold?.providerInstallationRef ??
+              inheritedSelection?.providerInstallationRef ??
+              (() => {
+                throw new TakoformHostError("backend_unavailable", 503);
+              })(),
             nativeId: result.nativeId,
             state: "active",
             observed: result.observed,
@@ -245,6 +375,14 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     },
 
     async observe(input): Promise<TakoformDriverReceipt> {
+      if (intrinsicFormRef(input.resource.form.formRef)) {
+        return {
+          observed: structuredClone(input.resource.status.observed ?? input.resource.spec),
+          ...(input.resource.status.outputs
+            ? { outputs: structuredClone(input.resource.status.outputs) }
+            : {}),
+        };
+      }
       // Reading state is not a billable act.
       const deployment = await active(input.tenantId, input.resourceUid);
       const { provider, offering } = installed(deployment, input.resource.form.formRef);
@@ -258,6 +396,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
             name: input.resource.metadata.name,
           },
           spec: input.resource.spec,
+          relations: await providerRelations(input.tenantId, input.relations),
         }),
       );
       await refresh(deployment, result);
@@ -265,6 +404,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     },
 
     async delete(input): Promise<void> {
+      if (intrinsicFormRef(input.resource.form.formRef)) return;
       const deployment = await active(input.tenantId, input.resourceUid);
       const { provider, offering } = installed(deployment, input.resource.form.formRef);
       const ticket = await settle(
@@ -279,23 +419,48 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
             space: input.resource.metadata.space,
             name: input.resource.metadata.name,
           },
+          spec: input.resource.spec,
+          relations: await providerRelations(input.tenantId, input.relations),
         }),
       );
       const result = resultOf(ticket);
-      if (
-        result.nativeId !== deployment.nativeId ||
-        !(await deployments.markDeleted(input.tenantId, deployment.id, deployment.nativeId))
-      ) {
+      const recorded =
+        result.disposition === "retained"
+          ? await deployments.markRetained(
+              input.tenantId,
+              deployment.id,
+              deployment.nativeId,
+              result.observed,
+              result.outputs,
+            )
+          : await deployments.markDeleted(input.tenantId, deployment.id, deployment.nativeId);
+      if (result.nativeId !== deployment.nativeId || !recorded) {
         throw new TakoformHostError("resource_busy", 409);
       }
     },
 
     async import(input): Promise<TakoformDriverReceipt> {
-      const { provider, offering, sold } = select(input.form);
+      if (intrinsicForm(input.form)) return { observed: structuredClone(input.spec) };
+      const soldSelection =
+        input.form.role === "identity" ||
+        catalog.offeringsFor(input.form.identity.formRef).length > 0
+          ? selectSold(input.form)
+          : undefined;
+      const inheritedSelection = soldSelection
+        ? undefined
+        : await inherited(input.tenantId, input.form, input.relations);
+      const provider = soldSelection?.provider ?? inheritedSelection?.provider;
+      const offering = soldSelection?.offering ?? inheritedSelection?.offering;
+      const sold = soldSelection?.sold;
+      const providerInstallationRef =
+        sold?.providerInstallationRef ?? inheritedSelection?.providerInstallationRef;
+      if (!provider || !offering || !providerInstallationRef) {
+        throw new TakoformHostError("unsupported_capability", 422);
+      }
       if (!provider.adopt) throw new TakoformHostError("unsupported_capability", 422);
       const claim = await deployments.findByNative(
         input.tenantId,
-        sold.providerInstallationRef,
+        providerInstallationRef,
         input.nativeId,
       );
       const current = await deployments.active(input.tenantId, input.resourceUid);
@@ -303,8 +468,8 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
         (claim && claim.resourceUid !== input.resourceUid) ||
         (current &&
           (current.nativeId !== input.nativeId ||
-            current.offeringId !== sold.id ||
-            current.providerInstallationRef !== sold.providerInstallationRef))
+            current.offeringId !== offering.id ||
+            current.providerInstallationRef !== providerInstallationRef))
       ) {
         throw new TakoformHostError("import_conflict", 409);
       }
@@ -316,6 +481,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
           nativeId: input.nativeId,
           identity: { tenantRef: input.tenantId, space: input.space, name: input.name },
           spec: input.spec,
+          relations: await providerRelations(input.tenantId, input.relations),
         }),
       );
       if (result.nativeId !== input.nativeId) {
@@ -329,9 +495,9 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
             tenantId: input.tenantId,
             id: `dep_${input.operationId}`,
             resourceUid: input.resourceUid,
-            offeringId: sold.id,
-            providerPackRef: sold.providerPackRef,
-            providerInstallationRef: sold.providerInstallationRef,
+            offeringId: offering.id,
+            providerPackRef: provider.id,
+            providerInstallationRef,
             nativeId: result.nativeId,
             state: "active",
             observed: result.observed,
@@ -344,6 +510,30 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
       return receiptOf(result);
     },
   };
+}
+
+const INTRINSIC_FORMS = new Set([
+  "WorkerBundle",
+  "StaticAssetBundle",
+  "SQLiteMigrationSet",
+  "SQLiteMigrationApplication",
+]);
+
+function intrinsicForm(form: InstalledTakoformForm): boolean {
+  return intrinsicFormRef(form.identity.formRef);
+}
+
+function intrinsicFormRef(form: TakoformV1Alpha3FormRef): boolean {
+  return form.apiVersion.startsWith("edge.forms.takoform.com/") && INTRINSIC_FORMS.has(form.kind);
+}
+
+function sameForm(left: TakoformV1Alpha3FormRef, right: TakoformV1Alpha3FormRef): boolean {
+  return (
+    left.apiVersion === right.apiVersion &&
+    left.kind === right.kind &&
+    left.definitionVersion === right.definitionVersion &&
+    left.schemaDigest === right.schemaDigest
+  );
 }
 
 export function failureToWire(code: string): [string, number] {

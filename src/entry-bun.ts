@@ -3,17 +3,19 @@ import { mkdirSync, readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { buildApp } from "./app.ts";
-import { buildEdgeForms } from "./edge-forms.ts";
+import { buildEdgeForms, objectBucketProviderOffering } from "./edge-forms.ts";
 import { resolveIdentity } from "./identity-setup.ts";
 import { migrateSqlite } from "./migrate-sqlite.ts";
+import { compileObjectBucketDeployment } from "./object-bucket-deployment.ts";
 import { createFileObjectStore } from "./objects-fs.ts";
 import { createMemoryObjectStore } from "./objects-mem.ts";
 import { createR2HttpObjectStore } from "./objects-r2-http.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
 import { ensureOperatorKey, signOperatorAssertion } from "./operator-key.ts";
 import { resolvePayment } from "./payment-setup.ts";
+import type { Provider } from "./provider-port.ts";
 import { CloudflareProvider } from "./providers/cloudflare.ts";
-import { createLocalProvider, LOCAL_KINDS, localOfferings } from "./providers/local.ts";
+import { createLocalProvider } from "./providers/local.ts";
 import { createOpenAiGateway, parseOpenAiModelConfig } from "./providers/openai.ts";
 import { createWorkerdProvider } from "./providers/workerd.ts";
 import { createProvisionerEndpoint } from "./provisioner-endpoint.ts";
@@ -21,17 +23,17 @@ import { ensureSigningKey, loadSigningKey } from "./signing-key.ts";
 import { createD1HttpSql } from "./sql-d1-http.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
+import { createJavaScriptWorkerModuleInspector } from "./takoform/worker-module-inspector.ts";
 import { createWorkerdRuntime } from "./workerd-runtime.ts";
 import { createWorkerdSupervisor, findWorkerd } from "./workerd-supervisor.ts";
 
 /**
- * The self-hosted entry, and the only one that can provision.
+ * The self-hosted entry and its local or account-backed provisioners.
  *
- * Publishing a Worker or creating a database means calling a cloud's API with
- * an account credential. That is deliberately impossible inside the deployed
- * Worker, so this process is where provisioning lives — and it is the same
- * shape a future AWS or bare-metal backend will plug into, because it talks to
- * the provider port rather than to any one cloud.
+ * This process can own local state and long-running provider SDKs. The deployed
+ * Worker may provision through edge-safe adapters too; both entries assemble
+ * the same Provider Pack and Catalog Compiler boundary rather than carrying
+ * separate product semantics.
  *
  * Run it with:
  *
@@ -149,6 +151,11 @@ const objects = sharedBucket
     : createFileObjectStore({ root: dataRoot });
 const clock = () => new Date();
 const edge = await buildEdgeForms();
+const objectBucketOffering = objectBucketProviderOffering(edge.objectBucket.form, {
+  id: "storage.object.standard",
+  displayName: "Object bucket",
+  regions: ["global"],
+});
 
 // The provider reads committed bundles through the same artifact store the
 // Host writes them to, so a Worker can only be published from bytes a tenant
@@ -172,63 +179,129 @@ const artifactStore = createTakoformArtifacts({
  * Listing a Worker for sale on a deployment that cannot run one sells a
  * resource that fails at apply.
  */
-const providers = process.env.CLOUDFLARE_ACCOUNT_ID
-  ? [
-      new CloudflareProvider({
-        accountId: required("CLOUDFLARE_ACCOUNT_ID"),
-        offerings: edge.providerOfferings,
-        authorize: () => `Bearer ${cloudflareToken()}`,
-        // Where tenants may be served. A platform suffix is the free address
-        // every tenant gets; a customer domain is added here only after the
-        // operator has confirmed the customer controls it.
-        zones: JSON.parse(process.env.TAKOSERVER_ZONES ?? "[]") as {
-          suffix: string;
-          zoneId: string;
-          tenantRef?: string;
-        }[],
-        artifacts: {
-          async manifest(tenantRef, digest) {
-            return await artifactStore.resolveManifest(tenantRef, digest);
-          },
-          async blob(digest) {
-            const stored = await objects.get(`art/${digest.slice("sha256:".length)}`);
-            return stored ? new Uint8Array(await new Response(stored.body).arrayBuffer()) : null;
-          },
-        },
-      }),
-    ]
-  : [
-      createLocalProvider({
-        offerings: localOfferings(edge.providerOfferings),
-        dataRoot,
-      }),
-      createWorkerdProvider({
-        offerings: edge.providerOfferings.filter((offering) => offering.kind === "worker_script"),
-        runtime: createWorkerdRuntime({
-          root: dataRoot,
-          ...(process.env.TAKOSERVER_WORKERD_PORT
-            ? { port: Number(process.env.TAKOSERVER_WORKERD_PORT) }
-            : {}),
-          async onReload(configPath) {
-            // Started on the first publish rather than at boot, so a machine
-            // that never runs a Worker never runs a runtime for one. After
-            // that it watches the file itself: one tenant's deploy must not
-            // bounce every other tenant's in-flight requests.
-            await workerd.ensure(configPath);
-          },
-        }),
-        artifacts: {
-          manifest: (tenantRef, digest) => artifactStore.resolveManifest(tenantRef, digest),
-          async blob(digest) {
-            const stored = await objects.get(`art/${digest.slice("sha256:".length)}`);
-            return stored ? new Uint8Array(await new Response(stored.body).arrayBuffer()) : null;
-          },
-        },
-        ...(process.env.TAKOSERVER_SUFFIXES
-          ? { suffixes: process.env.TAKOSERVER_SUFFIXES.split(",").map((entry) => entry.trim()) }
+let objectBucketProvider: Provider;
+let providerType: string;
+let providerInstallationRef: string;
+let supplyContractRef: string;
+let deliveryMode: "embedded-binding" | "managed-endpoint";
+let providers: readonly Provider[];
+if (process.env.CLOUDFLARE_ACCOUNT_ID) {
+  objectBucketProvider = new CloudflareProvider({
+    accountId: required("CLOUDFLARE_ACCOUNT_ID"),
+    offerings: [objectBucketOffering],
+    authorize: () => `Bearer ${cloudflareToken()}`,
+    // Where tenants may be served. A platform suffix is the free address
+    // every tenant gets; a customer domain is added here only after the
+    // operator has confirmed the customer controls it.
+    zones: JSON.parse(process.env.TAKOSERVER_ZONES ?? "[]") as {
+      suffix: string;
+      zoneId: string;
+      tenantRef?: string;
+    }[],
+    artifacts: {
+      async manifest(tenantRef, digest) {
+        return await artifactStore.resolveManifest(tenantRef, digest);
+      },
+      async blob(digest) {
+        const stored = await objects.get(`art/${digest.slice("sha256:".length)}`);
+        return stored ? new Uint8Array(await new Response(stored.body).arrayBuffer()) : null;
+      },
+    },
+  });
+  providerType = "cloudflare";
+  providerInstallationRef = "cloudflare.primary";
+  supplyContractRef = "cloudflare.operator-contract";
+  deliveryMode = "embedded-binding";
+  providers = [objectBucketProvider];
+} else {
+  objectBucketProvider = createLocalProvider({
+    offerings: [objectBucketOffering],
+    dataRoot,
+  });
+  providerType = "selfhost";
+  providerInstallationRef = "local.primary";
+  supplyContractRef = "local.ownership-contract";
+  deliveryMode = "managed-endpoint";
+  providers = [
+    objectBucketProvider,
+    createWorkerdProvider({
+      // No Worker Form is released by Takoform today. Keep the runtime
+      // available for future exact Forms without advertising a made-up one.
+      offerings: [],
+      runtime: createWorkerdRuntime({
+        root: dataRoot,
+        ...(process.env.TAKOSERVER_WORKERD_PORT
+          ? { port: Number(process.env.TAKOSERVER_WORKERD_PORT) }
           : {}),
+        async onReload(configPath) {
+          // Started on the first publish rather than at boot, so a machine
+          // that never runs a Worker never runs a runtime for one. After
+          // that it watches the file itself: one tenant's deploy must not
+          // bounce every other tenant's in-flight requests.
+          await workerd.ensure(configPath);
+        },
       }),
-    ];
+      artifacts: {
+        manifest: (tenantRef, digest) => artifactStore.resolveManifest(tenantRef, digest),
+        async blob(digest) {
+          const stored = await objects.get(`art/${digest.slice("sha256:".length)}`);
+          return stored ? new Uint8Array(await new Response(stored.body).arrayBuffer()) : null;
+        },
+      },
+      ...(process.env.TAKOSERVER_SUFFIXES
+        ? { suffixes: process.env.TAKOSERVER_SUFFIXES.split(",").map((entry) => entry.trim()) }
+        : {}),
+    }),
+  ];
+}
+
+const deployment = compileObjectBucketDeployment({
+  form: edge.objectBucket.form,
+  provider: objectBucketProvider,
+  providerType,
+  offeringId: objectBucketOffering.id,
+  displayName: objectBucketOffering.displayName,
+  regions: ["global"],
+  providerInstallation: {
+    id: providerInstallationRef,
+    providerPackRef: objectBucketProvider.id,
+    supplyContractRef,
+    state: "active",
+    regions: [{ id: "global", capacity: "available" }],
+  },
+  supplyContract: {
+    id: supplyContractRef,
+    providerType,
+    permittedResourceClasses: ["storage.object"],
+    deliveryModes: [deliveryMode],
+    customerAccess: "operator-only",
+    whiteLabelAllowed: false,
+    endUserTermsRequired: false,
+    regions: ["global"],
+    validFrom: "2026-01-01T00:00:00.000Z",
+    evidenceRef:
+      providerType === "selfhost" ? "selfhost-ownership:local" : "operator-contract:cloudflare",
+  },
+  pricePlan: {
+    id: "storage.object.standard.price-v1",
+    currency: "USD",
+    recurring: { meter: "bucket-month", amountMinor: 500 },
+    meters: [],
+  },
+  placement: {
+    deliveryMode,
+    supportPolicyRef: "support:operator:standard",
+    abusePolicyRef: "abuse:operator:standard",
+    portability: {
+      api: "portable",
+      exportFormats: ["s3.object-set.takoform.com/v1"],
+      importFormats: ["s3.object-set.takoform.com/v1"],
+      migrationModes: ["offline", "online"],
+    },
+    isolation: "dedicated-resource",
+  },
+  now: clock(),
+});
 
 const unconfigured = {
   async verify(): Promise<never> {
@@ -316,24 +389,12 @@ const app = buildApp({
     ? { consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN }
     : {}),
   forms: edge.forms,
+  bindings: edge.bindings,
   providers,
-  // The catalogue names which provider executes each offering, and the driver
-  // looks that provider up by name. Left saying `cloudflare` on a machine with
-  // no Cloudflare, every apply answers that the backend is unavailable — true,
-  // and impossible for anyone to act on.
-  offerings: process.env.CLOUDFLARE_ACCOUNT_ID
-    ? edge.offerings
-    : edge.offerings
-        .filter(
-          (offering) => LOCAL_KINDS.includes(offering.kind) || offering.kind === "worker_script",
-        )
-        .map((offering) => ({
-          ...offering,
-          providerPackRef: offering.kind === "worker_script" ? "workerd" : "local",
-          providerInstallationRef:
-            offering.kind === "worker_script" ? "workerd.local" : "local.primary",
-        })),
+  providerPacks: deployment.providerPacks,
+  offerings: deployment.offerings,
   artifacts: artifactStore,
+  workerModuleInspector: createJavaScriptWorkerModuleInspector(),
   clock,
 });
 

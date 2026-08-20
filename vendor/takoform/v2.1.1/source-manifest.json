@@ -1,0 +1,224 @@
+{
+  "format": "takoserver.vendored-takoform-source@v1",
+  "repository": "https://github.com/tako0614/takoform.git",
+  "tag": "v2.1.1",
+  "commit": "9810570d542434efcf177543de9d463bbfda0d09",
+  "files": [
+    {
+      "local": "provider-form-identities.json",
+      "source": "release/provider-form-identities.json",
+      "size": 7177,
+      "sha256": "494919695007578684f7bf4dfbbd96811f2b9577c17bf7b4a2410312b218d81a"
+    },
+    {
+      "local": "forms/at-least-once-queue/definition.json",
+      "source": "forms/candidates/edge/v1beta1/at-least-once-queue/definition.json",
+      "size": 3259,
+      "sha256": "d1b6c752b5b0b29f8f55016472b33bd980cd1227af560aa3dc808783f80bdd99"
+    },
+    {
+      "local": "forms/at-least-once-queue/package-index.json",
+      "source": "forms/candidates/edge/v1beta1/at-least-once-queue/package-index.json",
+      "size": 1702,
+      "sha256": "9f565158dcac38b9101f6a963f79bf1febd12af610a4346f09f9d5e541a794a0"
+    },
+    {
+      "local": "forms/edge-kv-namespace/definition.json",
+      "source": "forms/candidates/edge/v1beta1/edge-kv-namespace/definition.json",
+      "size": 2125,
+      "sha256": "e227bdf4d8c1b9ecbfde6a4992720f80f8742801fd28a61d6b38d68590fa51e9"
+    },
+    {
+      "local": "forms/edge-kv-namespace/package-index.json",
+      "source": "forms/candidates/edge/v1beta1/edge-kv-namespace/package-index.json",
+      "size": 1017,
+      "sha256": "9d468f3f73178ae4d5bd3b6b1e88d51fc6ed6fad2aeaf765b59ffab59d4e1b4f"
+    },
+    {
+      "local": "forms/module-worker/definition.json",
+      "source": "forms/candidates/edge/v1beta1/module-worker/definition.json",
+      "size": 2814,
+      "sha256": "603543b0ee2c1773022a0deb89f94c76d96f19bb5e35ea812b6edae4f228ed4f"
+    },
+    {
+      "local": "forms/module-worker/package-index.json",
+      "source": "forms/candidates/edge/v1beta1/module-worker/package-index.json",
+      "size": 1014,
+      "sha256": "d835bfef7c5b16e0801b0781950262ed4c0c8789c8919e714bb7b5e7f9d57686"
+    },
+    {
+      "local": "forms/object-bucket/definition.json",
+      "source": "forms/candidates/edge/v1beta1/object-bucket/definition.json",
+      "size": 2103,
+      "sha256": "61f29bd91e211bbf1880e58e13565873c5ebe47417de307d94f5fb0b31df2994"
+    },
+    {
+      "local": "forms/object-bucket/package-index.json",
+      "source": "forms/candidates/edge/v1beta1/object-bucket/package-index.json",
+      "size": 1014,
+      "sha256": "7017c95a1359f9435d3b30d68ebdecc57d3f60295d283d6944f8ac781db18587"
+    },
+    {
+      "local": "forms/queue-consumer/definition.json",
+      "source": "forms/candidates/edge/v1beta1/queue-consumer/definition.json",
+      "size": 10768,
+      "sha256": "4a97275e40dfb6b5bbbc6feda62cb9d37a462d55c1f2fe0cb20620c2a8246aec"
+    },
+    {
+      "local": "forms/queue-consumer/package-index.json",
+      "source": "forms/candidates/edge/v1beta1/queue-consumer/package-index.json",
+      "size": 4312,
+      "sha256": "28ccf79ad9a82e3103b0f083246204c275368ea3e22d352db792de8ca92a71af"
+    },
+    {
+      "local": "forms/sqlite-database/definition.json",
+      "source": "forms/candidates/edge/v1beta1/sqlite-database/definition.json",
+      "size": 2325,
+      "sha256": "98660065170785cf826e1cc44b559eaef293164db825c10281a551c30e810428"
+    },
+    {
+      "local": "forms/sqlite-database/package-index.json",
+      "source": "forms/candidates/edge/v1beta1/sqlite-database/package-index.json",
+      "size": 1016,
+      "sha256": "047572dac384178117c3beadc5f84c48bce98c4b965334a4c8ba6316c10d0527"
+    },
+    {
+      "local": "forms/sqlite-migration-application/definition.json",
+      "source": "forms/candidates/edge/v1beta1/sqlite-migration-application/definition.json",
+      "size": 5419,
+      "sha256": "24bce91260dc5a84985c8cd0f66d4e56122ea9c63f9ec5af39cb0799e04f5535"
+    },
+    {
+      "local": "forms/sqlite-migration-application/package-index.json",
+      "source": "forms/candidates/edge/v1beta1/sqlite-migration-application/package-index.json",
+      "size": 1897,
+      "sha256": "a8beb1230de6d12ef817daf998bf1d3a8c18be0a3eb67c766bc15f28badaf127"
+    },
+    {
+      "local": "forms/sqlite-migration-set/definition.json",
+      "source": "forms/candidates/edge/v1beta1/sqlite-migration-set/definition.json",
+      "size": 2852,
+      "sha256": "67f54014804afec334f5cd686467c9f35e645cfa7ac250c2114655b13df2852b"
+    },
+    {
+      "local": "forms/sqlite-migration-set/package-index.json",
+      "source": "forms/candidates/edge/v1beta1/sqlite-migration-set/package-index.json",
+      "size": 1461,
+      "sha256": "68e4cc870222f9145c0a215f93fe15b0a25b235d28c48cb65b1addaf25f5301d"
+    },
+    {
+      "local": "forms/static-asset-bundle/definition.json",
+      "source": "forms/candidates/edge/v1beta1/static-asset-bundle/definition.json",
+      "size": 2987,
+      "sha256": "c1a4dda5939581f310d9b1145a569008adc1ea93c45a84aea9fb87ad6c3cd94d"
+    },
+    {
+      "local": "forms/static-asset-bundle/package-index.json",
+      "source": "forms/candidates/edge/v1beta1/static-asset-bundle/package-index.json",
+      "size": 1460,
+      "sha256": "daabd329eb268e714eed05c2d14a8164d7634becb216b4b315b6b9278e8d3d28"
+    },
+    {
+      "local": "forms/worker-bundle/definition.json",
+      "source": "forms/candidates/edge/v1beta1/worker-bundle/definition.json",
+      "size": 2723,
+      "sha256": "7be805062b059af995744f1e09ddaa36d63fc51f0b48f45e75bbc4ae08fd8064"
+    },
+    {
+      "local": "forms/worker-bundle/package-index.json",
+      "source": "forms/candidates/edge/v1beta1/worker-bundle/package-index.json",
+      "size": 1455,
+      "sha256": "f35dffdd8cba275af61485b71bb5e67f96cdcedbfcf56d4e3e926be3d0617f56"
+    },
+    {
+      "local": "forms/worker-cron-trigger/definition.json",
+      "source": "forms/candidates/edge/v1beta1/worker-cron-trigger/definition.json",
+      "size": 6159,
+      "sha256": "3513ac73664a639a3cca442919045f2b7134f692bc124f2c67c0a3d81ec5b156"
+    },
+    {
+      "local": "forms/worker-cron-trigger/package-index.json",
+      "source": "forms/candidates/edge/v1beta1/worker-cron-trigger/package-index.json",
+      "size": 1865,
+      "sha256": "234cd26c5f5c4d0bc6a9aaf762f4222d3e647942202fac60a5599cb0e2985167"
+    },
+    {
+      "local": "forms/worker-custom-domain/definition.json",
+      "source": "forms/candidates/edge/v1beta1/worker-custom-domain/definition.json",
+      "size": 4653,
+      "sha256": "7a3ef9c575b72f02dd72e0a5daab4a1cb9ace7f2420f464689ce2681c9ed23b8"
+    },
+    {
+      "local": "forms/worker-custom-domain/package-index.json",
+      "source": "forms/candidates/edge/v1beta1/worker-custom-domain/package-index.json",
+      "size": 1874,
+      "sha256": "41becbde96d963d5abf5c914853750b266f8b219be4e152a838dd8968bce6ff3"
+    },
+    {
+      "local": "forms/worker-deployment/definition.json",
+      "source": "forms/candidates/edge/v1beta1/worker-deployment/definition.json",
+      "size": 5208,
+      "sha256": "0008a1eb50198af1163728ddede05e0ca0d3d9b9d6bfe3bd609965917981e628"
+    },
+    {
+      "local": "forms/worker-deployment/package-index.json",
+      "source": "forms/candidates/edge/v1beta1/worker-deployment/package-index.json",
+      "size": 1873,
+      "sha256": "1c4fe076da463f7f03604c14a048e0862fffc3a6c5dae3a66be60390379e9ddd"
+    },
+    {
+      "local": "forms/worker-endpoint/definition.json",
+      "source": "forms/candidates/edge/v1beta1/worker-endpoint/definition.json",
+      "size": 7615,
+      "sha256": "4caedc872674485274e9ede2472ed35732b101622db6d87122115659ac5fad82"
+    },
+    {
+      "local": "forms/worker-endpoint/package-index.json",
+      "source": "forms/candidates/edge/v1beta1/worker-endpoint/package-index.json",
+      "size": 1441,
+      "sha256": "8123977a94ff191a127a680200fc6ca73c3293f81f88a43e9b2194029585692b"
+    },
+    {
+      "local": "forms/worker-version/definition.json",
+      "source": "forms/candidates/edge/v1beta1/worker-version/definition.json",
+      "size": 25639,
+      "sha256": "71d1902da2cc9ad44f7daf8f6fab80e0551b1cef1013db7cc9e72da9f2ca5b26"
+    },
+    {
+      "local": "forms/worker-version/package-index.json",
+      "source": "forms/candidates/edge/v1beta1/worker-version/package-index.json",
+      "size": 4105,
+      "sha256": "02daddbd55adeea937d16dc1ea9d0be64009ea5c0dc76f86c7f22ce4c265ddde"
+    },
+    {
+      "local": "bindings/module-worker.edge-kv/definition.json",
+      "source": "bindings/candidates/v1alpha1/module-worker.edge-kv/definition.json",
+      "size": 1878,
+      "sha256": "ed94626d480682bccb107eec62d6aec63cd410939f1006fb3b25ac6bb6667742"
+    },
+    {
+      "local": "bindings/module-worker.object-bucket/definition.json",
+      "source": "bindings/candidates/v1alpha1/module-worker.object-bucket/definition.json",
+      "size": 2263,
+      "sha256": "ba4c070c0d116fe899b58b0ea13a8eef12087f70397755b293f97822373b1fad"
+    },
+    {
+      "local": "bindings/module-worker.queue-producer/definition.json",
+      "source": "bindings/candidates/v1alpha1/module-worker.queue-producer/definition.json",
+      "size": 1736,
+      "sha256": "5fd6bdbe118da932481fa62cab60e84f5505d0acbbe5f7bbc912eed1b1710fe6"
+    },
+    {
+      "local": "bindings/module-worker.service/definition.json",
+      "source": "bindings/candidates/v1alpha1/module-worker.service/definition.json",
+      "size": 1835,
+      "sha256": "7a07250df6d0d58a165a76c0abce07a8e745a50061d9dfcdf62bd0462c989dd5"
+    },
+    {
+      "local": "bindings/module-worker.sqlite/definition.json",
+      "source": "bindings/candidates/v1alpha1/module-worker.sqlite/definition.json",
+      "size": 2253,
+      "sha256": "4a92732263fe1c5dd468ef2069a84e08e1afa4d8f615a1c5afce9c801f3a5c90"
+    }
+  ]
+}

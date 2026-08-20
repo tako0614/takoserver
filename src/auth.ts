@@ -85,6 +85,9 @@ export interface ApiKey {
 
 /** The resolved caller. `organizationId` is absent for a bare user session. */
 export interface Actor {
+  /** Principal used by the data/Host plane. Each API key is its own service principal. */
+  readonly hostPrincipalId: string;
+  /** Human identity used only for account ownership and key administration. */
   readonly principalId: string;
   readonly organizationId?: string;
   readonly scopes: readonly ApiKeyScope[];
@@ -378,18 +381,21 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
       const secret = bearer(authorization);
       if (!secret) return null;
       const rows = await sql.query(
-        `SELECT kind, principal_id, org_id, scopes_json FROM auth_tokens
+        `SELECT id, kind, principal_id, org_id, scopes_json FROM auth_tokens
          WHERE secret_digest = ? AND revoked_at IS NULL AND expires_at > ?`,
         [await bytesDigest(new TextEncoder().encode(secret)), stamp()],
       );
       const row = rows[0];
       if (!row) return null;
       const organizationId = row.org_id;
+      const kind = String(row.kind) === "session" ? "session" : "api_key";
       return {
+        hostPrincipalId:
+          kind === "session" ? String(row.principal_id) : `api-key:${String(row.id)}`,
         principalId: String(row.principal_id),
         ...(typeof organizationId === "string" ? { organizationId } : {}),
         scopes: JSON.parse(String(row.scopes_json)) as ApiKeyScope[],
-        kind: String(row.kind) === "session" ? "session" : "api_key",
+        kind,
       };
     },
 

@@ -1,10 +1,14 @@
 import type { JsonObject, JsonValue } from "../ports.ts";
+import type { ProviderRelation } from "../provider-port.ts";
 import {
   type ApplyInput,
   failed,
   type Provider,
   type ProviderOffering,
+  type ProviderSqliteMigration,
+  type ProviderSqliteMigrationIdentity,
   type ProviderTicket,
+  type ProviderValue,
   succeeded,
 } from "../provider-port.ts";
 
@@ -26,6 +30,26 @@ const API_ORIGIN = "https://api.cloudflare.com/client/v4";
 /** The name a script reaches its own static assets by. */
 const ASSETS_BINDING = "ASSETS";
 
+/**
+ * Cloudflare's Versions API accepts a new version only after the script
+ * container exists. A ModuleWorker therefore owns one inert bootstrap module;
+ * customer bytes arrive later through WorkerVersion and traffic moves only
+ * through WorkerDeployment/WorkerEndpoint.
+ */
+const BOOTSTRAP_MODULE = "takoserver-bootstrap.mjs";
+const BOOTSTRAP_SOURCE =
+  'export default { async fetch() { return new Response("Not deployed", { status: 503 }); } };\n';
+
+const SQLITE_MIGRATION_LEDGER = "_takoform_sqlite_migrations";
+const SQLITE_MIGRATION_LEDGER_DDL = `CREATE TABLE IF NOT EXISTS ${SQLITE_MIGRATION_LEDGER} (
+  sequence INTEGER PRIMARY KEY NOT NULL CHECK (sequence > 0),
+  path TEXT NOT NULL UNIQUE CHECK (length(path) BETWEEN 1 AND 255),
+  digest TEXT NOT NULL CHECK (
+    substr(digest, 1, 7) = 'sha256:' AND length(digest) = 71 AND
+    substr(digest, 8) NOT GLOB '*[^0-9a-f]*'
+  )
+)`;
+
 /** Cloudflare's code for "that hostname already resolves to something else". */
 const DNS_RECORDS_PRESENT = 100_117;
 
@@ -44,7 +68,7 @@ export interface TakoformBundleManifest {
     readonly digest: string;
   }[];
   readonly files?: readonly {
-    readonly name: string;
+    readonly path: string;
     readonly mediaType: string;
     readonly size: number;
     readonly digest: string;
@@ -98,6 +122,9 @@ export interface CloudflareProviderOptions {
   /** Returns an `Authorization` header value. Credentials never live here. */
   readonly authorize: () => Promise<string> | string;
   readonly apiOrigin?: string;
+  /** Exact suffix assigned to this account, for example `team.workers.dev`. */
+  readonly workerEndpointSuffix?: string;
+  readonly workerCompatibilityDate?: string;
   readonly fetch?: (request: Request) => Promise<Response>;
 }
 
@@ -110,6 +137,8 @@ export class CloudflareProvider implements Provider {
   readonly #zones: readonly CloudflareZone[];
   readonly #authorize: CloudflareProviderOptions["authorize"];
   readonly #fetch: (request: Request) => Promise<Response>;
+  readonly #workerEndpointSuffix: string | undefined;
+  readonly #workerCompatibilityDate: string;
 
   constructor(options: CloudflareProviderOptions) {
     this.id = options.id ?? "cloudflare";
@@ -120,9 +149,146 @@ export class CloudflareProvider implements Provider {
     this.#zones = [...(options.zones ?? [])];
     this.#authorize = options.authorize;
     this.#fetch = options.fetch ?? ((request) => fetch(request));
+    this.#workerEndpointSuffix = options.workerEndpointSuffix;
+    this.#workerCompatibilityDate = options.workerCompatibilityDate ?? "2026-08-19";
   }
 
+  readonly sqliteMigrations = {
+    readLedger: async (input: {
+      readonly nativeId: string;
+    }): Promise<ProviderValue<readonly ProviderSqliteMigrationIdentity[]>> => {
+      const databaseId = d1DatabaseId(input.nativeId);
+      if (!databaseId)
+        return providerValueFailure("invalid_spec", "the database identity is invalid");
+      const exists = await this.#d1Query(databaseId, {
+        sql: "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 2",
+        params: [SQLITE_MIGRATION_LEDGER],
+      });
+      if (!exists.ok) return callFailure(exists);
+      const existsRows = d1Rows(exists.result);
+      if (!existsRows || existsRows.length > 1) {
+        return providerValueFailure("provider_error", "the migration ledger response is invalid");
+      }
+      if (existsRows.length === 0) return { ok: true, value: [] };
+
+      const read = await this.#d1Query(databaseId, {
+        sql: `SELECT sequence, path, digest FROM ${SQLITE_MIGRATION_LEDGER} ORDER BY sequence`,
+      });
+      if (!read.ok) return callFailure(read);
+      const rows = d1Rows(read.result);
+      if (!rows) {
+        return providerValueFailure("provider_error", "the migration ledger response is invalid");
+      }
+      const ledger: ProviderSqliteMigrationIdentity[] = [];
+      for (const [index, rowValue] of rows.entries()) {
+        const row = record(rowValue);
+        const sequence = integer(row?.sequence);
+        const path = optionalString(row?.path);
+        const digest = optionalString(row?.digest);
+        if (sequence !== index + 1 || !migrationPath(path) || !sha256Digest(digest)) {
+          return providerValueFailure("provider_error", "the migration ledger is malformed");
+        }
+        ledger.push({ path, digest });
+      }
+      return { ok: true, value: ledger };
+    },
+    applySuffix: async (input: {
+      readonly nativeId: string;
+      readonly expectedPrefix: readonly ProviderSqliteMigrationIdentity[];
+      readonly migrations: readonly ProviderSqliteMigration[];
+    }): Promise<ProviderValue<undefined>> => {
+      const databaseId = d1DatabaseId(input.nativeId);
+      if (!databaseId)
+        return providerValueFailure("invalid_spec", "the database identity is invalid");
+      if (input.migrations.length < 1 || input.migrations.length > 100) {
+        return providerValueFailure("invalid_spec", "the migration suffix is invalid");
+      }
+      const expected = JSON.stringify(input.expectedPrefix);
+      if (expected.length > 64 * 1_024) {
+        return providerValueFailure("invalid_spec", "the migration prefix is too large");
+      }
+      const batch: { sql: string; params?: readonly (string | number)[] }[] = [
+        { sql: SQLITE_MIGRATION_LEDGER_DDL },
+        {
+          sql: `INSERT INTO ${SQLITE_MIGRATION_LEDGER} (sequence, path, digest)
+SELECT 0, '__takoform_guard__', 'sha256:${"0".repeat(64)}'
+WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
+   OR EXISTS (
+     SELECT 1 FROM json_each(?) AS expected
+     LEFT JOIN ${SQLITE_MIGRATION_LEDGER} AS actual
+       ON actual.sequence = CAST(expected.key AS INTEGER) + 1
+     WHERE actual.path IS NULL
+        OR actual.path != json_extract(expected.value, '$.path')
+        OR actual.digest != json_extract(expected.value, '$.digest')
+   )`,
+          params: [input.expectedPrefix.length, expected],
+        },
+      ];
+      for (const [offset, migration] of input.migrations.entries()) {
+        if (!migrationPath(migration.path) || !sha256Digest(migration.digest)) {
+          return providerValueFailure("invalid_spec", "a migration identity is invalid");
+        }
+        let sql: string;
+        try {
+          sql = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(migration.sql);
+        } catch {
+          return providerValueFailure("invalid_spec", "a migration is not UTF-8 SQL");
+        }
+        if (sql.length === 0 || sql.length > 100_000) {
+          return providerValueFailure("invalid_spec", "a migration SQL statement is invalid");
+        }
+        batch.push(
+          { sql },
+          {
+            sql: `INSERT INTO ${SQLITE_MIGRATION_LEDGER} (sequence, path, digest) VALUES (?, ?, ?)`,
+            params: [input.expectedPrefix.length + offset + 1, migration.path, migration.digest],
+          },
+        );
+      }
+      const applied = await this.#d1Query(databaseId, { batch });
+      if (!applied.ok) return callFailure(applied);
+      const results = d1Results(applied.result);
+      if (
+        !results ||
+        results.length !== batch.length ||
+        results.some((result) => result.success !== true)
+      ) {
+        return providerValueFailure("provider_error", "the migration batch result is invalid");
+      }
+      return { ok: true, value: undefined };
+    },
+  };
+
   async apply(input: ApplyInput): Promise<ProviderTicket> {
+    if (
+      input.offering.kind.startsWith("takoform.") &&
+      input.offering.form.apiVersion === "edge.forms.takoform.com/v1beta1"
+    ) {
+      switch (input.offering.form.kind) {
+        case "ModuleWorker":
+          return await this.#applyModuleWorker(input);
+        case "EdgeKVNamespace":
+          return await this.#applyKvNamespace(input);
+        case "SQLiteDatabase":
+          return await this.#applyDatabase(input);
+        case "AtLeastOnceQueue":
+          return await this.#applyQueue(input);
+        case "ObjectBucket":
+          return await this.#applyBucket(input);
+        case "WorkerVersion":
+          return await this.#applyWorkerVersion(input);
+        case "WorkerDeployment":
+          return await this.#applyWorkerDeployment(input);
+        case "WorkerEndpoint":
+          return await this.#applyWorkerEndpoint(input);
+        case "WorkerCustomDomain":
+          return await this.#applyWorkerCustomDomain(input);
+        case "WorkerCronTrigger":
+          return await this.#applyWorkerCronTrigger(input);
+        case "QueueConsumer":
+          return await this.#applyQueueConsumer(input);
+      }
+    }
     switch (input.offering.kind) {
       case "object_bucket":
         return await this.#applyBucket(input);
@@ -142,18 +308,129 @@ export class CloudflareProvider implements Provider {
   }): Promise<ProviderTicket> {
     const native = parseNativeId(input.nativeId);
     if (!native) return failed("not_found", "unrecognised native identity");
+    if (native.kind === "worker" && input.offering.form.kind === "ModuleWorker") {
+      return succeeded({
+        nativeId: input.nativeId,
+        observed: { scriptName: native.name, allocated: true },
+        outputs: { scriptName: native.name },
+      });
+    }
+    if (native.kind === "version") {
+      const read = await this.#call(
+        "GET",
+        `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(native.parent)}/versions/${encodeURIComponent(native.name)}`,
+      );
+      if (!read.ok) return read.ticket;
+      return succeeded({
+        nativeId: input.nativeId,
+        observed: {
+          scriptName: native.parent,
+          versionId: native.name,
+          ...(record(read.result) ?? {}),
+        },
+        outputs: { scriptName: native.parent, versionId: native.name },
+      });
+    }
+    if (native.kind === "deployment") {
+      const read = await this.#call(
+        "GET",
+        `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(native.parent)}/deployments/${encodeURIComponent(native.name)}`,
+      );
+      if (!read.ok) return read.ticket;
+      return succeeded({
+        nativeId: input.nativeId,
+        observed: {
+          scriptName: native.parent,
+          deploymentId: native.name,
+          ...(record(read.result) ?? {}),
+        },
+        outputs: {},
+      });
+    }
+    if (native.kind === "endpoint") {
+      const read = await this.#call(
+        "GET",
+        `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(native.name)}/subdomain`,
+      );
+      if (!read.ok) return read.ticket;
+      if (record(read.result)?.enabled !== true || !this.#workerEndpointSuffix) {
+        return failed("not_found", "the Worker endpoint is not active");
+      }
+      const hostname = `${native.name}.${this.#workerEndpointSuffix}`.toLowerCase();
+      return succeeded({
+        nativeId: input.nativeId,
+        observed: { enabled: true, scriptName: native.name },
+        outputs: { hostname, url: `https://${hostname}/` },
+      });
+    }
+    if (native.kind === "domain") {
+      const read = await this.#call(
+        "GET",
+        `/accounts/${this.#accountId}/workers/domains/${encodeURIComponent(native.name)}`,
+      );
+      if (!read.ok) return read.ticket;
+      const domain = record(read.result);
+      return succeeded({
+        nativeId: input.nativeId,
+        observed: {
+          domainId: native.name,
+          ...(optionalString(domain?.hostname) ? { hostname: domain?.hostname as string } : {}),
+          ...(optionalString(domain?.service) ? { scriptName: domain?.service as string } : {}),
+        },
+        outputs: {},
+      });
+    }
+    if (native.kind === "cron") {
+      const read = await this.#call(
+        "GET",
+        `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(native.parent)}/schedules`,
+      );
+      if (!read.ok) return read.ticket;
+      const cron = optionalString(input.spec?.cron);
+      if (!cron || !scheduleValues(read.result).includes(cron)) {
+        return failed("not_found", "the Worker schedule does not exist");
+      }
+      return succeeded({
+        nativeId: input.nativeId,
+        observed: { cron, scriptName: native.parent },
+        outputs: {},
+      });
+    }
+    if (native.kind === "consumer") {
+      const read = await this.#call(
+        "GET",
+        `/accounts/${this.#accountId}/queues/${encodeURIComponent(native.parent)}/consumers/${encodeURIComponent(native.name)}`,
+      );
+      if (!read.ok) return read.ticket;
+      const consumer = record(read.result);
+      return succeeded({
+        nativeId: input.nativeId,
+        observed: {
+          queueId: native.parent,
+          consumerId: native.name,
+          ...(optionalString(consumer?.script_name)
+            ? { scriptName: consumer?.script_name as string }
+            : {}),
+        },
+        outputs: {},
+      });
+    }
     const path =
       native.kind === "r2"
         ? `/accounts/${this.#accountId}/r2/buckets/${encodeURIComponent(native.name)}`
         : native.kind === "d1"
           ? `/accounts/${this.#accountId}/d1/database/${encodeURIComponent(native.name)}`
-          : `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(native.name)}`;
+          : native.kind === "kv"
+            ? `/accounts/${this.#accountId}/storage/kv/namespaces/${encodeURIComponent(native.name)}`
+            : native.kind === "queue"
+              ? `/accounts/${this.#accountId}/queues/${encodeURIComponent(native.name)}`
+              : `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(native.name)}`;
     const read = await this.#call("GET", path);
     if (!read.ok) return read.ticket;
     return succeeded({
       nativeId: input.nativeId,
-      observed: { name: native.name, present: true },
-      outputs: outputsFor(native),
+      observed: { name: native.name, present: true, ...(record(read.result) ?? {}) },
+      outputs: outputsFor(native, record(read.result)),
     });
   }
 
@@ -162,15 +439,55 @@ export class CloudflareProvider implements Provider {
     offering: ProviderOffering;
     nativeId: string;
     identity: { tenantRef: string; space: string; name: string };
+    spec?: JsonObject;
   }): Promise<ProviderTicket> {
     const native = parseNativeId(input.nativeId);
     if (!native) return failed("not_found", "unrecognised native identity");
+    if (native.kind === "version") {
+      // The stable Workers Scripts Versions API has no delete method. Preserve
+      // the immutable provider revision and record that truth in Deployment
+      // state; deleting the ModuleWorker later removes the script and all of
+      // its versions.
+      return succeeded({
+        nativeId: input.nativeId,
+        disposition: "retained",
+        observed: { scriptName: native.parent, versionId: native.name, retained: true },
+        outputs: { scriptName: native.parent, versionId: native.name },
+      });
+    }
+    if (native.kind === "cron") {
+      const path = `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(native.parent)}/schedules`;
+      const read = await this.#call("GET", path);
+      if (!read.ok && read.status !== 404) return read.ticket;
+      if (read.ok) {
+        const cron = optionalString(input.spec?.cron);
+        if (!cron) return failed("invalid_spec", "the Worker schedule is incomplete");
+        const schedules = scheduleValues(read.result)
+          .filter((value) => value !== cron)
+          .map((value) => ({ cron: value }));
+        const updated = await this.#call("PUT", path, schedules);
+        if (!updated.ok) return updated.ticket;
+      }
+      return succeeded({ nativeId: input.nativeId, observed: { deleted: true }, outputs: {} });
+    }
     const path =
-      native.kind === "r2"
-        ? `/accounts/${this.#accountId}/r2/buckets/${encodeURIComponent(native.name)}`
-        : native.kind === "d1"
-          ? `/accounts/${this.#accountId}/d1/database/${encodeURIComponent(native.name)}`
-          : `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(native.name)}`;
+      native.kind === "deployment"
+        ? `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(native.parent)}/deployments/${encodeURIComponent(native.name)}`
+        : native.kind === "endpoint"
+          ? `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(native.name)}/subdomain`
+          : native.kind === "domain"
+            ? `/accounts/${this.#accountId}/workers/domains/${encodeURIComponent(native.name)}`
+            : native.kind === "consumer"
+              ? `/accounts/${this.#accountId}/queues/${encodeURIComponent(native.parent)}/consumers/${encodeURIComponent(native.name)}`
+              : native.kind === "r2"
+                ? `/accounts/${this.#accountId}/r2/buckets/${encodeURIComponent(native.name)}`
+                : native.kind === "d1"
+                  ? `/accounts/${this.#accountId}/d1/database/${encodeURIComponent(native.name)}`
+                  : native.kind === "kv"
+                    ? `/accounts/${this.#accountId}/storage/kv/namespaces/${encodeURIComponent(native.name)}`
+                    : native.kind === "queue"
+                      ? `/accounts/${this.#accountId}/queues/${encodeURIComponent(native.name)}`
+                      : `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(native.name)}`;
     const removed = await this.#call("DELETE", path);
     // A resource that is already gone is a successful delete, not a failure.
     if (!removed.ok && removed.status !== 404) return removed.ticket;
@@ -186,6 +503,309 @@ export class CloudflareProvider implements Provider {
   }
 
   // --- object storage -------------------------------------------------------
+
+  // --- edge identity --------------------------------------------------------
+
+  async #applyModuleWorker(input: ApplyInput): Promise<ProviderTicket> {
+    const name = input.previous
+      ? (parseNativeId(input.previous.nativeId)?.name ?? "")
+      : await derivedName("tsw", input.identity);
+    if (!name) return failed("invalid_spec", "the previous native identity is unusable");
+    if (!input.previous) {
+      const form = new FormData();
+      form.set(
+        "metadata",
+        new Blob(
+          [
+            JSON.stringify({
+              main_module: BOOTSTRAP_MODULE,
+              compatibility_date: this.#workerCompatibilityDate,
+            }),
+          ],
+          { type: "application/json" },
+        ),
+      );
+      form.set(
+        BOOTSTRAP_MODULE,
+        new Blob([BOOTSTRAP_SOURCE], { type: "application/javascript+module" }),
+        BOOTSTRAP_MODULE,
+      );
+      const created = await this.#callForm(
+        "PUT",
+        `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(name)}`,
+        form,
+      );
+      if (!created.ok) return created.ticket;
+    }
+    return succeeded({
+      nativeId: `worker:${name}`,
+      observed: { scriptName: name, allocated: true },
+      outputs: { scriptName: name },
+    });
+  }
+
+  async #applyKvNamespace(input: ApplyInput): Promise<ProviderTicket> {
+    if (input.previous) {
+      return await this.observe({ ...input, nativeId: input.previous.nativeId });
+    }
+    const title = await derivedName("tskv", input.identity);
+    const created = await this.#call("POST", `/accounts/${this.#accountId}/storage/kv/namespaces`, {
+      title,
+    });
+    if (!created.ok) return created.ticket;
+    const id = optionalString(record(created.result)?.id);
+    if (!id) return failed("provider_error", "the namespace was created without an identifier");
+    return succeeded({
+      nativeId: `kv:${id}`,
+      observed: { title, id },
+      outputs: { namespaceId: id },
+    });
+  }
+
+  async #applyQueue(input: ApplyInput): Promise<ProviderTicket> {
+    if (input.previous) {
+      return await this.observe({ ...input, nativeId: input.previous.nativeId });
+    }
+    const queueName = await derivedName("tsq", input.identity);
+    const created = await this.#call("POST", `/accounts/${this.#accountId}/queues`, {
+      queue_name: queueName,
+      settings: {
+        delivery_delay: integer(input.spec.deliveryDelaySeconds) ?? 0,
+        message_retention_period: integer(input.spec.messageRetentionSeconds),
+      },
+    });
+    if (!created.ok) return created.ticket;
+    const result = record(created.result);
+    const id = optionalString(result?.queue_id);
+    if (!id) return failed("provider_error", "the queue was created without an identifier");
+    return succeeded({
+      nativeId: `queue:${id}`,
+      observed: { queueId: id, queueName },
+      outputs: { queueId: id, queueName },
+    });
+  }
+
+  async #applyWorkerVersion(input: ApplyInput): Promise<ProviderTicket> {
+    if (input.previous) return failed("invalid_spec", "Worker Versions are immutable");
+    const worker = relationDeployment(input.relations, "/worker", "worker");
+    const bundle = relationResource(input.relations, "/bundle", "WorkerBundle");
+    const manifestDigest = optionalString(bundle?.spec.manifestDigest);
+    if (!worker || !manifestDigest)
+      return failed("invalid_spec", "the Worker Version is incomplete");
+    const scriptName = worker.name;
+    const manifest = await this.#artifacts.manifest(input.identity.tenantRef, manifestDigest);
+    if (!manifest || manifest.kind !== "WorkerBundle" || !manifest.mainModule) {
+      return failed("invalid_spec", "the Worker Bundle is not available");
+    }
+    const modules = manifest.modules ?? [];
+    if (modules.length === 0) return failed("invalid_spec", "the Worker Bundle has no modules");
+
+    const bindings = edgeBindings(input.spec, input.relations);
+    if (!bindings) return failed("invalid_spec", "a Worker binding has no provider deployment");
+    const assetsSpec = record(input.spec.assets);
+    let assetToken: string | null = null;
+    if (assetsSpec) {
+      const assetsResource = relationResource(
+        input.relations,
+        "/assets/bundle",
+        "StaticAssetBundle",
+      );
+      const assetsDigest = optionalString(assetsResource?.spec.manifestDigest);
+      if (!assetsDigest) return failed("invalid_spec", "the Static Asset Bundle is unavailable");
+      const uploaded = await this.#uploadAssets(scriptName, input.identity.tenantRef, {
+        bundle: assetsDigest,
+      });
+      if (typeof uploaded !== "string") return uploaded;
+      assetToken = uploaded;
+    }
+    const form = new FormData();
+    form.set(
+      "metadata",
+      new Blob(
+        [
+          JSON.stringify({
+            main_module: manifest.mainModule,
+            compatibility_date: this.#workerCompatibilityDate,
+            bindings: [
+              ...bindings,
+              ...(assetToken ? [{ type: "assets", name: ASSETS_BINDING }] : []),
+            ],
+            keep_bindings: ["secret_text"],
+            ...(assetToken
+              ? {
+                  assets: {
+                    jwt: assetToken,
+                    config: {
+                      html_handling: "auto-trailing-slash",
+                      not_found_handling:
+                        assetsSpec?.notFoundHandling === "single_page_application"
+                          ? "single-page-application"
+                          : "none",
+                      run_worker_first: assetsSpec?.runWorkerFirst === true,
+                    },
+                  },
+                }
+              : {}),
+          }),
+        ],
+        { type: "application/json" },
+      ),
+      "metadata.json",
+    );
+    for (const module of modules) {
+      const bytes = await this.#artifacts.blob(module.digest);
+      if (!bytes) return failed("invalid_spec", `a declared module is missing: ${module.name}`);
+      form.set(
+        module.name,
+        new Blob([bytes.buffer as ArrayBuffer], { type: module.mediaType }),
+        module.name,
+      );
+    }
+    const uploaded = await this.#callForm(
+      "POST",
+      `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(scriptName)}/versions`,
+      form,
+    );
+    if (!uploaded.ok) return uploaded.ticket;
+    const versionId = optionalString(record(uploaded.result)?.id);
+    if (!versionId) return failed("provider_error", "the Worker Version has no identifier");
+    return succeeded({
+      nativeId: `version:${scriptName}:${versionId}`,
+      observed: { scriptName, versionId },
+      outputs: { scriptName, versionId },
+    });
+  }
+
+  async #applyWorkerDeployment(input: ApplyInput): Promise<ProviderTicket> {
+    const worker = relationDeployment(input.relations, "/worker", "worker");
+    const versions = Array.isArray(input.spec.versions) ? input.spec.versions : [];
+    if (!worker || versions.length === 0) {
+      return failed("invalid_spec", "the Worker Deployment is incomplete");
+    }
+    const weighted: { version_id: string; percentage: number }[] = [];
+    for (let index = 0; index < versions.length; index += 1) {
+      const relation = relationDeployment(
+        input.relations,
+        `/versions/${index}/workerVersion`,
+        "version",
+      );
+      const declared = record(versions[index]);
+      const weight = integer(declared?.weight);
+      if (!relation || relation.parent !== worker.name || weight === undefined) {
+        return failed("invalid_spec", "a deployed version does not belong to this Worker");
+      }
+      weighted.push({ version_id: relation.name, percentage: weight / 100 });
+    }
+    const deployed = await this.#call(
+      "POST",
+      `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(worker.name)}/deployments`,
+      { strategy: "percentage", versions: weighted },
+    );
+    if (!deployed.ok) return deployed.ticket;
+    const id = optionalString(record(deployed.result)?.id);
+    if (!id) return failed("provider_error", "the Worker Deployment has no identifier");
+    return succeeded({
+      nativeId: `deployment:${worker.name}:${id}`,
+      observed: { scriptName: worker.name, deploymentId: id, versions: weighted },
+      outputs: {},
+    });
+  }
+
+  async #applyWorkerEndpoint(input: ApplyInput): Promise<ProviderTicket> {
+    const worker = relationDeployment(input.relations, "/worker", "worker");
+    if (!worker || !this.#workerEndpointSuffix) {
+      return failed("invalid_spec", "this provider installation offers no Worker endpoint suffix");
+    }
+    const enabled = await this.#call(
+      "POST",
+      `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(worker.name)}/subdomain`,
+      { enabled: true, previews_enabled: false },
+    );
+    if (!enabled.ok) return enabled.ticket;
+    const hostname = `${worker.name}.${this.#workerEndpointSuffix}`.toLowerCase();
+    return succeeded({
+      nativeId: `endpoint:${worker.name}`,
+      observed: { enabled: true },
+      outputs: { hostname, url: `https://${hostname}/` },
+    });
+  }
+
+  async #applyWorkerCustomDomain(input: ApplyInput): Promise<ProviderTicket> {
+    const worker = relationDeployment(input.relations, "/worker", "worker");
+    const hostname = optionalString(input.spec.hostname)?.toLowerCase().replace(/\.$/u, "");
+    if (!worker || !hostname) return failed("invalid_spec", "the custom domain is incomplete");
+    const zone = this.#zoneFor(hostname, input.identity.tenantRef);
+    if (!zone) return failed("invalid_spec", "no configured zone serves this hostname");
+    const attached = await this.#attach(zone, hostname, worker.name);
+    if (!attached.ok) return attached.ticket;
+    const domainId = optionalString(record(attached.result)?.id);
+    if (!domainId) return failed("provider_error", "the Worker domain has no identifier");
+    return succeeded({
+      nativeId: `domain:${domainId}`,
+      observed: { domainId, hostname, scriptName: worker.name },
+      outputs: {},
+    });
+  }
+
+  async #applyWorkerCronTrigger(input: ApplyInput): Promise<ProviderTicket> {
+    const worker = relationDeployment(input.relations, "/worker", "worker");
+    const cron = optionalString(input.spec.cron);
+    if (!worker || !cron) return failed("invalid_spec", "the cron trigger is incomplete");
+    const read = await this.#call(
+      "GET",
+      `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(worker.name)}/schedules`,
+    );
+    if (!read.ok) return read.ticket;
+    const existing = scheduleValues(read.result);
+    const schedules = [...new Set([...existing, cron])].sort().map((value) => ({ cron: value }));
+    const updated = await this.#call(
+      "PUT",
+      `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(worker.name)}/schedules`,
+      schedules,
+    );
+    if (!updated.ok) return updated.ticket;
+    return succeeded({
+      nativeId: `cron:${worker.name}:${await shortDigest(cron)}`,
+      observed: { cron, scriptName: worker.name },
+      outputs: {},
+    });
+  }
+
+  async #applyQueueConsumer(input: ApplyInput): Promise<ProviderTicket> {
+    const worker = relationDeployment(input.relations, "/worker", "worker");
+    const queue = relationDeployment(input.relations, "/queue", "queue");
+    const deadLetter = relationDeployment(input.relations, "/deadLetterQueue", "queue", true);
+    if (!worker || !queue) return failed("invalid_spec", "the Queue Consumer is incomplete");
+    const body = {
+      type: "worker",
+      script_name: worker.name,
+      settings: {
+        batch_size: integer(input.spec.maxBatchSize),
+        max_wait_time_ms: (integer(input.spec.maxBatchTimeoutSeconds) ?? 0) * 1_000,
+        max_retries: integer(input.spec.maxRetries),
+        retry_delay: integer(input.spec.retryDelaySeconds),
+        max_concurrency: integer(input.spec.maxConcurrency),
+      },
+      ...(deadLetter
+        ? {
+            dead_letter_queue: relationOutputName(input.relations, "/deadLetterQueue", "queueName"),
+          }
+        : {}),
+    };
+    const created = await this.#call(
+      "POST",
+      `/accounts/${this.#accountId}/queues/${encodeURIComponent(queue.name)}/consumers`,
+      body,
+    );
+    if (!created.ok) return created.ticket;
+    const id = optionalString(record(created.result)?.consumer_id);
+    if (!id) return failed("provider_error", "the Queue Consumer has no identifier");
+    return succeeded({
+      nativeId: `consumer:${queue.name}:${id}`,
+      observed: { consumerId: id, queueId: queue.name, scriptName: worker.name },
+      outputs: {},
+    });
+  }
 
   async #applyBucket(input: ApplyInput): Promise<ProviderTicket> {
     const name = input.previous
@@ -225,7 +845,7 @@ export class CloudflareProvider implements Provider {
     const uuid = optionalString(record(created.result)?.uuid);
     if (!uuid) return failed("provider_error", "the database was created without an identifier");
     return succeeded({
-      nativeId: `d1:${name}`,
+      nativeId: `d1:${uuid}`,
       observed: { name, uuid },
       outputs: { databaseId: uuid, databaseName: name },
     });
@@ -435,8 +1055,8 @@ export class CloudflareProvider implements Provider {
       // Cloudflare identifies an asset by a 32-hex-character hash, not by the
       // full digest, so the digest is truncated consistently on both sides.
       const hash = file.digest.slice("sha256:".length, "sha256:".length + 32);
-      declared[`/${file.name}`] = { hash, size: file.size };
-      byHash.set(hash, { name: file.name, digest: file.digest, mediaType: file.mediaType });
+      declared[`/${file.path}`] = { hash, size: file.size };
+      byHash.set(hash, { name: file.path, digest: file.digest, mediaType: file.mediaType });
     }
 
     const started = await this.#call(
@@ -601,8 +1221,26 @@ export class CloudflareProvider implements Provider {
     );
   }
 
-  async #callForm(method: "PUT", path: string, form: FormData): Promise<CallResult> {
+  async #callForm(method: "POST" | "PUT", path: string, form: FormData): Promise<CallResult> {
     return await this.#send(method, path, { body: form });
+  }
+
+  async #d1Query(
+    databaseId: string,
+    body:
+      | { readonly sql: string; readonly params?: readonly (string | number)[] }
+      | {
+          readonly batch: readonly {
+            readonly sql: string;
+            readonly params?: readonly (string | number)[];
+          }[];
+        },
+  ): Promise<CallResult> {
+    return await this.#call(
+      "POST",
+      `/accounts/${this.#accountId}/d1/database/${encodeURIComponent(databaseId)}/query`,
+      body,
+    );
   }
 
   async #send(
@@ -715,6 +1353,54 @@ async function readEnvelope(
   }
 }
 
+function providerValueFailure<T>(
+  code: Parameters<typeof failed>[0],
+  message: string,
+  retryable = false,
+): ProviderValue<T> {
+  return { ok: false, failure: { code, message, retryable } };
+}
+
+function callFailure<T>(call: Extract<CallResult, { readonly ok: false }>): ProviderValue<T> {
+  return call.ticket.phase === "failed"
+    ? { ok: false, failure: call.ticket.failure }
+    : providerValueFailure("unavailable", "the backend did not settle", true);
+}
+
+function d1Results(value: unknown): readonly Record<string, unknown>[] | null {
+  if (!Array.isArray(value)) return null;
+  const results = value.map(record);
+  return results.every((result): result is Record<string, unknown> => result !== undefined)
+    ? results
+    : null;
+}
+
+function d1Rows(value: unknown): readonly unknown[] | null {
+  const results = d1Results(value);
+  if (!results || results.length !== 1 || results[0]?.success !== true) return null;
+  return Array.isArray(results[0].results) ? results[0].results : null;
+}
+
+function d1DatabaseId(nativeId: string): string | null {
+  const native = parseNativeId(nativeId);
+  return native?.kind === "d1" ? native.name : null;
+}
+
+function migrationPath(value: string | undefined): value is string {
+  return (
+    typeof value === "string" &&
+    value.length >= 1 &&
+    value.length <= 255 &&
+    !value.startsWith("/") &&
+    !value.includes("\\") &&
+    !value.split("/").includes("..")
+  );
+}
+
+function sha256Digest(value: string | undefined): value is `sha256:${string}` {
+  return typeof value === "string" && /^sha256:[0-9a-f]{64}$/u.test(value);
+}
+
 /**
  * A stable, collision-free backend name derived from the tenant and address.
  * Customer-chosen names are never used directly: two organizations may both
@@ -734,24 +1420,169 @@ async function derivedName(
   return `${prefix}-${hex}`;
 }
 
-interface NativeId {
-  readonly kind: "r2" | "d1" | "worker";
-  readonly name: string;
-}
+type NativeId =
+  | {
+      readonly kind: "r2" | "d1" | "kv" | "queue" | "worker" | "endpoint" | "domain";
+      readonly name: string;
+    }
+  | {
+      readonly kind: "version" | "deployment" | "cron" | "consumer";
+      readonly parent: string;
+      readonly name: string;
+    };
 
 function parseNativeId(value: string): NativeId | null {
-  const separator = value.indexOf(":");
-  if (separator < 0) return null;
-  const kind = value.slice(0, separator);
-  const name = value.slice(separator + 1);
-  if (kind !== "r2" && kind !== "d1" && kind !== "worker") return null;
-  return /^[A-Za-z0-9][A-Za-z0-9._-]{1,127}$/u.test(name) ? { kind, name } : null;
+  const parts = value.split(":");
+  const kind = parts[0];
+  if (
+    (kind === "r2" ||
+      kind === "d1" ||
+      kind === "kv" ||
+      kind === "queue" ||
+      kind === "worker" ||
+      kind === "endpoint" ||
+      kind === "domain") &&
+    parts.length === 2 &&
+    nativeSegment(parts[1])
+  ) {
+    return { kind, name: parts[1] };
+  }
+  if (
+    (kind === "version" || kind === "deployment" || kind === "cron" || kind === "consumer") &&
+    parts.length === 3 &&
+    nativeSegment(parts[1]) &&
+    nativeSegment(parts[2])
+  ) {
+    return { kind, parent: parts[1], name: parts[2] };
+  }
+  return null;
 }
 
-function outputsFor(native: NativeId): JsonObject {
+function outputsFor(native: NativeId, result?: Record<string, unknown>): JsonObject {
   if (native.kind === "r2") return { protocol: "s3", bucketName: native.name };
-  if (native.kind === "d1") return { databaseName: native.name };
-  return { scriptName: native.name };
+  if (native.kind === "d1") {
+    const databaseName = optionalString(result?.name);
+    return {
+      databaseId: native.name,
+      ...(databaseName ? { databaseName } : {}),
+    };
+  }
+  if (native.kind === "kv") return { namespaceId: native.name };
+  if (native.kind === "queue") {
+    const queueName = optionalString(result?.queue_name);
+    return {
+      queueId: native.name,
+      ...(queueName ? { queueName } : {}),
+    };
+  }
+  if (native.kind === "worker") return { scriptName: native.name };
+  return {};
+}
+
+function nativeSegment(value: string | undefined): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/u.test(value);
+}
+
+function scheduleValues(value: unknown): string[] {
+  const result = record(value);
+  const list = Array.isArray(value)
+    ? value
+    : Array.isArray(result?.schedules)
+      ? result.schedules
+      : [];
+  return [
+    ...new Set(list.map((item) => optionalString(record(item)?.cron)).filter(isString)),
+  ].sort();
+}
+
+function isString(value: string | undefined): value is string {
+  return value !== undefined;
+}
+
+function integer(value: unknown): number | undefined {
+  return Number.isSafeInteger(value) ? Number(value) : undefined;
+}
+
+interface RelationNative {
+  readonly kind: string;
+  readonly name: string;
+  readonly parent?: string;
+}
+
+function relationDeployment(
+  relations: readonly ProviderRelation[] | undefined,
+  pointer: string,
+  kind: string,
+  optional = false,
+): RelationNative | null {
+  const relation = relations?.find((candidate) => candidate.pointer === pointer);
+  const nativeId = relation?.deployment?.nativeId;
+  if (!nativeId) return optional ? null : null;
+  const parts = nativeId.split(":");
+  if (parts[0] !== kind) return null;
+  if (parts.length === 2 && parts[1]) return { kind, name: parts[1] };
+  if (parts.length === 3 && parts[1] && parts[2]) {
+    return { kind, parent: parts[1], name: parts[2] };
+  }
+  return null;
+}
+
+function relationResource(
+  relations: readonly ProviderRelation[] | undefined,
+  pointer: string,
+  kind: string,
+): ProviderRelation["resource"] | null {
+  const relation = relations?.find((candidate) => candidate.pointer === pointer);
+  return relation?.resource.kind === kind ? relation.resource : null;
+}
+
+function relationOutputName(
+  relations: readonly ProviderRelation[] | undefined,
+  pointer: string,
+  output: string,
+): string | undefined {
+  const relation = relations?.find((candidate) => candidate.pointer === pointer);
+  return optionalString(relation?.deployment?.outputs[output]);
+}
+
+function edgeBindings(
+  spec: JsonObject,
+  relations: readonly ProviderRelation[] | undefined,
+): readonly JsonObject[] | null {
+  const result: JsonObject[] = [];
+  const vars = record(spec.vars) ?? {};
+  for (const [name, value] of Object.entries(vars).sort(([left], [right]) =>
+    left.localeCompare(right),
+  )) {
+    result.push({ type: "plain_text", name, text: JSON.stringify(value) });
+  }
+  for (const [field, relationPrefix, type, output, targetKey] of [
+    ["kvBindings", "/kvBindings", "kv_namespace", "namespaceId", "namespace_id"],
+    ["bucketBindings", "/bucketBindings", "r2_bucket", "bucketName", "bucket_name"],
+    ["sqliteBindings", "/sqliteBindings", "d1", "databaseId", "id"],
+    ["queueProducerBindings", "/queueProducerBindings", "queue", "queueName", "queue_name"],
+    ["serviceBindings", "/serviceBindings", "service", "scriptName", "service"],
+  ] as const) {
+    const declarations = Array.isArray(spec[field]) ? spec[field] : [];
+    for (let index = 0; index < declarations.length; index += 1) {
+      const declaration = record(declarations[index]);
+      const name = optionalString(declaration?.name);
+      const target = relationOutputName(relations, `${relationPrefix}/${index}/resource`, output);
+      if (!name || !target) return null;
+      result.push({ type, name, [targetKey]: target });
+    }
+  }
+  return result;
+}
+
+async function shortDigest(value: string): Promise<string> {
+  const digest = new Uint8Array(
+    await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(value) as unknown as BufferSource,
+    ),
+  );
+  return [...digest.slice(0, 10)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 /**

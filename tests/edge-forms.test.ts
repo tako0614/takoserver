@@ -1,25 +1,22 @@
 import { describe, expect, test } from "bun:test";
-import { createCatalog } from "../src/catalog.ts";
-import { buildEdgeForms } from "../src/edge-forms.ts";
+import { buildEdgeForms, objectBucketProviderOffering } from "../src/edge-forms.ts";
 import { TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM } from "../src/takoform/official-forms.ts";
 
 describe("official Takoform catalog", () => {
   test("exposes only exact Forms carried by the released Takoform provider", async () => {
     const edge = await buildEdgeForms();
-    const catalog = createCatalog(edge.offerings);
 
-    expect(edge.forms.map((form) => form.identity)).toEqual([
-      {
-        formRef: {
-          apiVersion: TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM.apiVersion,
-          kind: TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM.kind,
-          definitionVersion: TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM.definitionVersion,
-          schemaDigest: TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM.schemaDigest,
-        },
-        packageDigest: TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM.packageDigest,
+    expect(edge.forms).toHaveLength(15);
+    expect(edge.bindings).toHaveLength(5);
+    expect(edge.objectBucket.form.identity).toEqual({
+      formRef: {
+        apiVersion: TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM.apiVersion,
+        kind: TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM.kind,
+        definitionVersion: TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM.definitionVersion,
+        schemaDigest: TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM.schemaDigest,
       },
-    ]);
-    expect(catalog.list().map((offering) => offering.id)).toEqual(["storage.object.standard"]);
+      packageDigest: TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM.packageDigest,
+    });
     expect(edge.objectBucket.form.desiredSchema).toEqual({
       $schema: "https://json-schema.org/draft/2020-12/schema",
       additionalProperties: false,
@@ -41,13 +38,18 @@ describe("official Takoform catalog", () => {
     );
   });
 
-  test("keeps price outside the portable Form identity", async () => {
-    const defaultCatalog = await buildEdgeForms();
-    const repricedCatalog = await buildEdgeForms({ objectBucketMinor: 750 });
+  test("keeps price, supply authority, and availability outside the portable Form", async () => {
+    const edge = await buildEdgeForms();
+    const technical = objectBucketProviderOffering(edge.objectBucket.form, {
+      id: "storage.object.standard",
+      displayName: "Object bucket",
+      regions: ["global"],
+    });
 
-    expect(defaultCatalog.objectBucket.form.identity).toEqual(
-      repricedCatalog.objectBucket.form.identity,
-    );
-    expect(repricedCatalog.objectBucket.offering.pricePlan.recurring.amountMinor).toBe(750);
+    for (const value of [...edge.forms, ...edge.bindings, technical]) {
+      expect(value).not.toHaveProperty("pricePlan");
+      expect(value).not.toHaveProperty("supplyContract");
+      expect(value).not.toHaveProperty("available");
+    }
   });
 });

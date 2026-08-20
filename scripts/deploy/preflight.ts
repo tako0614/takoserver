@@ -256,7 +256,8 @@ async function assertRequiredSecretsPresent(
       name: "TAKOSERVER_SIGNING_KEY",
       why: "data tokens cannot be issued without the private signing key",
     },
-    ...(target.zones !== undefined
+    ...(target.edgeSupplies ||
+    target.objectBucketSupplies?.supplies.some((supply) => supply.provider.kind === "cloudflare")
       ? [
           {
             name: "CLOUDFLARE_API_TOKEN",
@@ -269,6 +270,18 @@ async function assertRequiredSecretsPresent(
           {
             name: "TAKOSERVER_R2_PARENT_TOKEN",
             why: "standard S3 temporary credentials are enabled by this target",
+          },
+        ]
+      : []),
+    ...(target.objectBucketSupplies?.supplies.some((supply) => supply.provider.kind === "wasabi")
+      ? [
+          {
+            name: "TAKOSERVER_WASABI_ACCESS_KEY_ID",
+            why: "Wasabi ObjectBucket provisioning and scoped STS credentials are enabled",
+          },
+          {
+            name: "TAKOSERVER_WASABI_SECRET_ACCESS_KEY",
+            why: "Wasabi ObjectBucket provisioning and scoped STS credentials are enabled",
           },
         ]
       : []),

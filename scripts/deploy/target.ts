@@ -1,5 +1,13 @@
 import { readFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
+import {
+  type HostedEdgeSupplies,
+  parseHostedEdgeSupplies,
+} from "../../src/hosted-edge-supplies.ts";
+import {
+  type HostedObjectBucketSupplies,
+  parseHostedObjectBucketSupplies,
+} from "../../src/hosted-object-bucket-supplies.ts";
 import { parseOpenAiModelConfig } from "../../src/providers/openai.ts";
 import { preflightError } from "./errors.ts";
 import { REPOSITORY } from "./process.ts";
@@ -39,14 +47,6 @@ export interface DeployTarget {
    */
   readonly googleClientId?: string;
   /**
-   * Origin of the provisioner this deployment runs.
-   *
-   * Public, like the other two: it is an address. The credential that goes with
-   * it is a Worker secret and is deliberately not here, because a descriptor
-   * that carries a secret is a descriptor somebody will paste into a ticket.
-   */
-  readonly provisionerOrigin?: string;
-  /**
    * DNS zones this deployment may attach customer Workers to.
    *
    * Declared here because which domains a deployment serves is a property of
@@ -58,6 +58,12 @@ export interface DeployTarget {
   readonly aiModels?: readonly Record<string, unknown>[];
   /** Public id of the R2 parent token used to mint temporary S3 credentials. */
   readonly r2ParentAccessKeyId?: string;
+  /** Non-secret commercial/provider composition emitted by takoserver-private. */
+  readonly objectBucketSupplies?: HostedObjectBucketSupplies;
+  /** Reviewed Cloudflare sales for released edge identity Forms. */
+  readonly edgeSupplies?: HostedEdgeSupplies;
+  /** Exact workers.dev suffix assigned to the provisioning account. */
+  readonly workerEndpointSuffix?: string;
   readonly grantKeyId: string;
 }
 
@@ -119,10 +125,12 @@ function validateTarget(value: unknown, path: string): DeployTarget {
       "aliases",
       "consoleOrigin",
       "googleClientId",
-      "provisionerOrigin",
       "zones",
       "aiModels",
       "r2ParentAccessKeyId",
+      "objectBucketSupplies",
+      "edgeSupplies",
+      "workerEndpointSuffix",
     ],
   );
 
@@ -133,7 +141,7 @@ function validateTarget(value: unknown, path: string): DeployTarget {
   assertExactKeys(d1, ["databaseName", "databaseId"]);
   assertExactKeys(r2, ["bucketName"]);
 
-  return {
+  const target: DeployTarget = {
     accountId: pattern(value.accountId, ACCOUNT_ID, "accountId"),
     workerName: pattern(value.workerName, WORKER_NAME, "workerName"),
     d1: {
@@ -149,9 +157,6 @@ function validateTarget(value: unknown, path: string): DeployTarget {
     ...(value.googleClientId === undefined
       ? {}
       : { googleClientId: pattern(value.googleClientId, GOOGLE_CLIENT_ID, "googleClientId") }),
-    ...(value.provisionerOrigin === undefined
-      ? {}
-      : { provisionerOrigin: httpsOrigin(value.provisionerOrigin) }),
     ...(value.zones === undefined ? {} : { zones: zoneList(value.zones) }),
     ...(value.aiModels === undefined ? {} : { aiModels: modelList(value.aiModels) }),
     ...(value.r2ParentAccessKeyId === undefined
@@ -159,8 +164,37 @@ function validateTarget(value: unknown, path: string): DeployTarget {
       : {
           r2ParentAccessKeyId: pattern(value.r2ParentAccessKeyId, KEY_ID, "r2ParentAccessKeyId"),
         }),
+    ...(value.objectBucketSupplies === undefined
+      ? {}
+      : { objectBucketSupplies: supplyList(value.objectBucketSupplies) }),
+    ...(value.edgeSupplies === undefined
+      ? {}
+      : { edgeSupplies: edgeSupplyList(value.edgeSupplies) }),
+    ...(value.workerEndpointSuffix === undefined
+      ? {}
+      : {
+          workerEndpointSuffix: pattern(
+            value.workerEndpointSuffix,
+            HOSTNAME,
+            "workerEndpointSuffix",
+          ),
+        }),
     grantKeyId: pattern(value.grantKeyId, KEY_ID, "grantKeyId"),
   };
+  const cloudflareObjectSupply = target.objectBucketSupplies?.supplies.some(
+    (supply) => supply.provider.kind === "cloudflare",
+  );
+  if (Boolean(target.r2ParentAccessKeyId) !== Boolean(cloudflareObjectSupply)) {
+    throw preflightError(
+      "deploy target Cloudflare ObjectBucket supply and `r2ParentAccessKeyId` must be configured together",
+    );
+  }
+  if (Boolean(target.edgeSupplies) !== Boolean(target.workerEndpointSuffix)) {
+    throw preflightError(
+      "deploy target edge supplies and `workerEndpointSuffix` must be configured together",
+    );
+  }
+  return target;
 }
 
 /**
@@ -199,6 +233,22 @@ function modelList(value: unknown): readonly Record<string, unknown>[] {
     throw preflightError("deploy target `aiModels` is invalid");
   }
   return structuredClone(value) as readonly Record<string, unknown>[];
+}
+
+function supplyList(value: unknown): HostedObjectBucketSupplies {
+  try {
+    return parseHostedObjectBucketSupplies(JSON.stringify(value));
+  } catch {
+    throw preflightError("deploy target `objectBucketSupplies` is invalid");
+  }
+}
+
+function edgeSupplyList(value: unknown): HostedEdgeSupplies {
+  try {
+    return parseHostedEdgeSupplies(JSON.stringify(value));
+  } catch {
+    throw preflightError("deploy target `edgeSupplies` is invalid");
+  }
 }
 
 function assertExactKeys(

@@ -36,6 +36,23 @@ export interface InstalledTakoformForm {
   readonly validateDesired?: (spec: JsonObject) => readonly TakoformDiagnostic[];
 }
 
+/**
+ * One installed portable BindingDefinition.
+ *
+ * Forms only name accepted binding identities. The definition is separate
+ * host configuration because it owns the source role, target Interface, and
+ * allowed target Form kinds that make a relation safe to project at runtime.
+ */
+export interface InstalledTakoformBinding {
+  readonly bindingRef: TakoformBindingRef;
+  readonly sourceRole: NonNullable<InstalledTakoformForm["role"]>;
+  readonly targetInterface: TakoformInterfaceRef;
+  readonly allowedTargetForms: readonly {
+    readonly apiVersion: string;
+    readonly kind: string;
+  }[];
+}
+
 export interface TakoformDiagnostic {
   readonly severity: "error" | "warning";
   readonly field?: string;
@@ -71,6 +88,28 @@ export interface TakoformCommercialAuthority {
 export interface TakoformDriverReceipt {
   readonly observed?: JsonObject;
   readonly outputs?: JsonObject;
+  /**
+   * The provider's current portable readiness condition. Omitting it means
+   * the representation did not move; returning it lets an observe record a
+   * host-side status transition without pretending desired state changed.
+   */
+  readonly conditions?: readonly TakoformCondition[];
+}
+
+/**
+ * One relation after the Host has resolved and re-read its exact UID target.
+ *
+ * Provider adapters receive this projection instead of resolving names on
+ * their own. The relation pin remains the authority; `resource` is the exact
+ * same-tenant, same-space representation observed immediately before the
+ * provider mutation.
+ */
+export interface TakoformDriverRelation {
+  readonly pointer: string;
+  readonly relation: string;
+  readonly targetUid: string;
+  readonly resource: TakoformStoredResource;
+  readonly bindingRef?: TakoformBindingRef;
 }
 
 export interface TakoformResourceDriver {
@@ -82,6 +121,7 @@ export interface TakoformResourceDriver {
     readonly name: string;
     readonly space: string;
     readonly spec: JsonObject;
+    readonly relations: readonly TakoformDriverRelation[];
     readonly commercialAuthority?: TakoformCommercialAuthority;
     readonly previous?: TakoformStoredResource;
   }): Promise<TakoformDriverReceipt>;
@@ -89,12 +129,14 @@ export interface TakoformResourceDriver {
     readonly tenantId: string;
     readonly resourceUid: string;
     readonly resource: TakoformStoredResource;
+    readonly relations: readonly TakoformDriverRelation[];
   }): Promise<TakoformDriverReceipt>;
   delete(input: {
     readonly operationId: string;
     readonly tenantId: string;
     readonly resourceUid: string;
     readonly resource: TakoformStoredResource;
+    readonly relations: readonly TakoformDriverRelation[];
   }): Promise<void>;
   import?(input: {
     readonly operationId: string;
@@ -105,8 +147,36 @@ export interface TakoformResourceDriver {
     readonly space: string;
     readonly spec: JsonObject;
     readonly nativeId: string;
+    readonly relations: readonly TakoformDriverRelation[];
     readonly previous?: TakoformStoredResource;
   }): Promise<TakoformDriverReceipt>;
+  /**
+   * Portable SQLite migration execution against the target database itself.
+   * Each suffix item and its ledger row must commit atomically in that
+   * database; the Host control database is deliberately not used as a second
+   * source of truth for applied schema history.
+   */
+  sqliteMigrations?: {
+    readLedger(input: {
+      readonly tenantId: string;
+      readonly database: TakoformStoredResource;
+    }): Promise<readonly TakoformSqliteMigrationIdentity[]>;
+    applySuffix(input: {
+      readonly tenantId: string;
+      readonly database: TakoformStoredResource;
+      readonly expectedPrefix: readonly TakoformSqliteMigrationIdentity[];
+      readonly migrations: readonly TakoformSqliteMigration[];
+    }): Promise<void>;
+  };
+}
+
+export interface TakoformSqliteMigrationIdentity {
+  readonly path: string;
+  readonly digest: `sha256:${string}`;
+}
+
+export interface TakoformSqliteMigration extends TakoformSqliteMigrationIdentity {
+  readonly sql: Uint8Array;
 }
 
 /**
@@ -119,19 +189,27 @@ export interface TakoformResourceDriver {
  * can be described truthfully instead of being unrepresentable.
  */
 export interface TakoformCondition {
-  readonly type: "Ready";
+  readonly type: "Ready" | "Reconciling" | "Degraded" | "Drifted" | "Blocked" | "Deleting";
   readonly status: "True" | "False" | "Unknown";
   readonly reason: TakoformConditionReason;
   readonly lastTransitionTime: string;
+  readonly hostReason?: string;
   readonly message?: string;
 }
 
 export type TakoformConditionReason =
   | "Available"
   | "Provisioning"
-  | "CreateFailed"
-  | "UpdateFailed"
-  | "DeleteFailed";
+  | "Reconciling"
+  | "Failed"
+  | "BackendUnavailable"
+  | "SpecDrift"
+  | "ExternalChange"
+  | "DependencyMissing"
+  | "DependencyInUse"
+  | "PolicyDenied"
+  | "UnsupportedCapability"
+  | "Deleting";
 
 export interface TakoformStoredResource {
   readonly apiVersion: string;

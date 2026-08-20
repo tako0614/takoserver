@@ -27,6 +27,9 @@ async function fixture() {
   const sql = createEphemeralSql();
   const issues: S3CredentialIssue[] = [];
   const s3: S3CredentialIssuer = {
+    limits() {
+      return { minimumSeconds: 60, maximumSeconds: 3_600, defaultSeconds: 900 };
+    },
     async issue(input) {
       issues.push(input);
       return {

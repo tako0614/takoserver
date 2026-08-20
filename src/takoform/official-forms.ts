@@ -14,7 +14,7 @@ export const TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM = Object.freeze({
 });
 
 export const TAKOFORM_EDGE_OBJECTS_INTERFACE = Object.freeze(
-  structuredClone(RELEASED_OBJECT_BUCKET.providedInterfaces[0]),
+  releasedObjectBucketInterface(RELEASED_OBJECT_BUCKET),
 ) satisfies TakoformInterfaceRef;
 
 /**
@@ -37,4 +37,14 @@ function releasedObjectBucket(): ReleasedInstalledTakoformForm {
     throw new Error(`released_takoform_object_bucket_missing:${TAKOFORM_PROVIDER_RELEASE.version}`);
   }
   return matches[0];
+}
+
+function releasedObjectBucketInterface(form: ReleasedInstalledTakoformForm): TakoformInterfaceRef {
+  const interfaceRef = form.providedInterfaces?.[0];
+  if (!interfaceRef) {
+    throw new Error(
+      `released_takoform_object_bucket_interface_missing:${TAKOFORM_PROVIDER_RELEASE.version}`,
+    );
+  }
+  return structuredClone(interfaceRef);
 }

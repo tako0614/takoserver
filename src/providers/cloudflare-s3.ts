@@ -21,6 +21,14 @@ export function createCloudflareS3CredentialIssuer(
   const audience = new URL(endpoint).host;
 
   return {
+    limits(input) {
+      return input.providerPackRef === "cloudflare" &&
+        input.providerInstallationRef === providerInstallationRef &&
+        r2BucketOrNull(input.nativeId)
+        ? { minimumSeconds: 60, maximumSeconds: 3_600, defaultSeconds: 900 }
+        : null;
+    },
+
     async issue(input): Promise<S3CredentialSet> {
       if (
         input.providerPackRef !== "cloudflare" ||
@@ -113,8 +121,18 @@ function base64Url(bytes: Uint8Array): string {
 }
 
 function r2Bucket(nativeId: string): string {
-  if (!nativeId.startsWith("r2:")) throw new S3CredentialError("upstream_invalid");
-  return identifier(nativeId.slice("r2:".length), 255);
+  const bucket = r2BucketOrNull(nativeId);
+  if (!bucket) throw new S3CredentialError("upstream_invalid");
+  return bucket;
+}
+
+function r2BucketOrNull(nativeId: string): string | null {
+  if (!nativeId.startsWith("r2:")) return null;
+  try {
+    return identifier(nativeId.slice("r2:".length), 255);
+  } catch {
+    return null;
+  }
 }
 
 function identifier(value: string, maximum: number): string {

@@ -84,6 +84,37 @@ describe("Resource Deployments", () => {
     expect((await deployments.find("org_1", "dep_source"))?.state).toBe("retained");
   });
 
+  test("records an immutable provider revision as retained instead of pretending deletion", async () => {
+    const deployments = store();
+    await deployments.create({
+      tenantId: "org_1",
+      id: "dep_version",
+      resourceUid: "uid_version",
+      offeringId: "cloudflare.worker-version",
+      providerPackRef: "cloudflare",
+      providerInstallationRef: "cloudflare.primary",
+      nativeId: "version:script-name:version-id",
+      state: "active",
+      observed: {},
+      outputs: {},
+    });
+    expect(
+      await deployments.markRetained(
+        "org_1",
+        "dep_version",
+        "version:script-name:version-id",
+        { retained: true },
+        { versionId: "version-id" },
+      ),
+    ).toBe(true);
+    expect(await deployments.find("org_1", "dep_version")).toMatchObject({
+      state: "retained",
+      observed: { retained: true },
+      outputs: { versionId: "version-id" },
+    });
+    expect(await deployments.active("org_1", "uid_version")).toBeNull();
+  });
+
   test("refuses a second active deployment and duplicate native ownership", async () => {
     const deployments = store();
     const base = {

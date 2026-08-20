@@ -86,6 +86,10 @@ export type {
   SqlWrite,
 } from "./ports.ts";
 export {
+  createProviderMetering,
+  type ProviderMeteringReport,
+} from "./provider-metering.ts";
+export {
   type CostEstimator,
   type CredentialIssuer,
   createProviderPack,
@@ -96,12 +100,18 @@ export {
   type ResourceProvisioner,
   type TransferEndpoint,
 } from "./provider-pack.ts";
+export { createCloudflareR2MeterSource } from "./providers/cloudflare-r2-meter.ts";
 export {
   createOpenAiGateway,
   type OpenAiGatewayOptions,
   type OpenAiModelConfig,
   parseOpenAiModelConfig,
 } from "./providers/openai.ts";
+export {
+  OBJECT_STORAGE_METERS,
+  ProviderMeterError,
+} from "./providers/provider-meter.ts";
+export { createWasabiBucketMeterSource } from "./providers/wasabi-meter.ts";
 export {
   createReseller,
   type Quote,
@@ -130,12 +140,19 @@ export {
   type ResourceMigrationStore,
 } from "./resource-migrations.ts";
 export { createRouter, type Router } from "./router.ts";
+export { createS3AttachmentFactory } from "./s3-attachment-factory.ts";
+export {
+  createS3CredentialIssuerRouter,
+  type S3CredentialIssuerRoute,
+} from "./s3-issuer-router.ts";
 export {
   type S3Access,
+  type S3CredentialAuthority,
   S3CredentialError,
   type S3CredentialIssue,
   type S3CredentialIssuer,
   type S3CredentialSet,
+  type S3CredentialTtlLimits,
   validateS3CredentialSet,
 } from "./s3-port.ts";
 export { createD1Sql } from "./sql-d1.ts";
@@ -144,6 +161,7 @@ export { parseStrictJson, StrictJsonError } from "./strict-json.ts";
 export { createTakoformArtifacts } from "./takoform/artifacts.ts";
 export { InMemoryTakoformResourceDriver } from "./takoform/memory-driver.ts";
 export type {
+  InstalledTakoformBinding,
   InstalledTakoformForm,
   TakoformBindingRef,
   TakoformDiagnostic,
@@ -156,6 +174,7 @@ export type {
   TakoformV1Alpha3FormRef,
 } from "./takoform/types.ts";
 export { TakoformHostError } from "./takoform/types.ts";
+export { createJavaScriptWorkerModuleInspector } from "./takoform/worker-module-inspector.ts";
 export {
   TAKOFORM_EDGE_OBJECTS_INTERFACE,
   TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM,

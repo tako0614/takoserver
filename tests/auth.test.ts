@@ -74,6 +74,40 @@ describe("accounts", () => {
     expect(await accounts.authorize(`Bearer ${secret}`, "wallet:read")).toBeNull();
   });
 
+  test("treats each API key as a separate Host principal without changing its owner", async () => {
+    const { actor, principal, organization } = await ownerWithOrganization();
+    const first = await accounts.createApiKey({
+      actor,
+      organizationId: organization.id,
+      name: "first workload",
+      scopes: ["resources:write"],
+      expiresInSeconds: 3_600,
+    });
+    const second = await accounts.createApiKey({
+      actor,
+      organizationId: organization.id,
+      name: "second workload",
+      scopes: ["resources:write"],
+      expiresInSeconds: 3_600,
+    });
+
+    const firstActor = await accounts.authenticate(`Bearer ${first.secret}`);
+    const secondActor = await accounts.authenticate(`Bearer ${second.secret}`);
+    expect(firstActor).toMatchObject({
+      principalId: principal.id,
+      organizationId: organization.id,
+      hostPrincipalId: `api-key:${first.apiKey.id}`,
+    });
+    expect(secondActor).toMatchObject({
+      principalId: principal.id,
+      organizationId: organization.id,
+      hostPrincipalId: `api-key:${second.apiKey.id}`,
+    });
+    expect(firstActor?.hostPrincipalId).not.toBe(secondActor?.hostPrincipalId);
+    if (!firstActor) throw new Error("first API key did not authenticate");
+    await expect(accounts.requireOwner(firstActor, organization.id)).resolves.toEqual(organization);
+  });
+
   test("stops accepting a key once revoked or expired", async () => {
     const { actor, organization } = await ownerWithOrganization();
     const { apiKey, secret } = await accounts.createApiKey({

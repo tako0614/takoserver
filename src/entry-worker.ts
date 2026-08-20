@@ -4,14 +4,13 @@ import { resolveIdentity } from "./identity-setup.ts";
 import { createR2ObjectStore } from "./objects-r2.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
 import { resolvePayment } from "./payment-setup.ts";
-import type { Provider } from "./provider-port.ts";
-import { CloudflareProvider, type CloudflareZone } from "./providers/cloudflare.ts";
 import type { CloudflareWorkersAiBinding } from "./providers/cloudflare-workers-ai.ts";
-import { createRemoteProvider } from "./providers/remote.ts";
 import { loadSigningKey } from "./signing-key.ts";
 import { createD1Sql } from "./sql-d1.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
+import { createJavaScriptWorkerModuleInspector } from "./takoform/worker-module-inspector.ts";
 import { createWorkerDataServices } from "./worker-data-services.ts";
+import { createWorkerProductionComposition } from "./worker-production-composition.ts";
 
 /**
  * The Cloudflare Workers entry.
@@ -23,8 +22,9 @@ import { createWorkerDataServices } from "./worker-data-services.ts";
  * this bundle are the D1/R2 HTTP transports — the Worker has bindings for
  * both, and long-lived storage keys have no business in an edge isolate.
  *
- * A remote provisioner can still be attached for providers that need an SDK,
- * a persistent connection, or more time than an edge request allows.
+ * The private composition may enable several provider packs at once. Each pack
+ * keeps its own credential and exact Offering identity; the catalog compiler
+ * rejects a partial or ambiguous composition before the Worker serves.
  */
 
 interface WorkerEnv {
@@ -38,10 +38,6 @@ interface WorkerEnv {
   readonly OPERATOR_PUBLIC_JWK?: string;
   /** Public OAuth client id. Its presence turns Google sign-in on. */
   readonly GOOGLE_CLIENT_ID?: string;
-  /** Origin of the provisioner this deployment runs, for providers that need one. */
-  readonly TAKOSERVER_PROVISIONER_ORIGIN?: string;
-  /** Credential this deployment issued to itself for that provisioner. */
-  readonly TAKOSERVER_PROVISIONER_TOKEN?: string;
   /** The Cloudflare account this deployment provisions in. */
   readonly CLOUDFLARE_ACCOUNT_ID?: string;
   /** Scoped Cloudflare API token. A secret, never a var. */
@@ -60,6 +56,15 @@ interface WorkerEnv {
   readonly TAKOSERVER_R2_PARENT_ACCESS_KEY_ID?: string;
   /** R2 parent token. A secret distinct from the general Cloudflare API token. */
   readonly TAKOSERVER_R2_PARENT_TOKEN?: string;
+  /** Versioned, non-secret commercial composition emitted by takoserver-private. */
+  readonly TAKOSERVER_OBJECT_BUCKET_SUPPLIES?: string;
+  /** Reviewed Cloudflare sales for released identity Forms other than storage. */
+  readonly TAKOSERVER_EDGE_SUPPLIES?: string;
+  /** Exact workers.dev suffix assigned to the configured provider account. */
+  readonly TAKOSERVER_WORKER_ENDPOINT_SUFFIX?: string;
+  /** Wasabi sub-user credentials. Both are Worker secrets. */
+  readonly TAKOSERVER_WASABI_ACCESS_KEY_ID?: string;
+  readonly TAKOSERVER_WASABI_SECRET_ACCESS_KEY?: string;
 }
 
 /**
@@ -104,58 +109,6 @@ function credentials(env: WorkerEnv) {
   };
 }
 
-/**
- * What this deployment can provision on.
- *
- * Cloudflare is provisioned from here, with a scoped token held as a secret —
- * see docs/adr/0001-provision-from-the-worker.md, which retired the rule that
- * kept it out. A remote provisioner remains available for a provider that
- * cannot live at the edge; both may be present, and neither is required.
- */
-function provisioning(
-  env: WorkerEnv,
-  edge: Awaited<ReturnType<typeof buildEdgeForms>>,
-  objects: ReturnType<typeof createR2ObjectStore>,
-  artifacts: ReturnType<typeof createTakoformArtifacts>,
-): readonly Provider[] {
-  const providers: Provider[] = [];
-
-  if (env.CLOUDFLARE_ACCOUNT_ID && env.CLOUDFLARE_API_TOKEN) {
-    const token = env.CLOUDFLARE_API_TOKEN;
-    providers.push(
-      new CloudflareProvider({
-        accountId: env.CLOUDFLARE_ACCOUNT_ID,
-        offerings: edge.providerOfferings,
-        authorize: () => `Bearer ${token}`,
-        // Where tenants may be served. A platform suffix is the free address
-        // every tenant gets; a customer domain appears here only after the
-        // operator has confirmed the customer controls it.
-        zones: JSON.parse(env.TAKOSERVER_ZONES ?? "[]") as CloudflareZone[],
-        artifacts: {
-          manifest: (tenantRef, digest) => artifacts.resolveManifest(tenantRef, digest),
-          async blob(digest) {
-            const stored = await objects.get(`art/${digest.slice("sha256:".length)}`);
-            return stored ? new Uint8Array(await new Response(stored.body).arrayBuffer()) : null;
-          },
-        },
-      }),
-    );
-  }
-
-  if (env.TAKOSERVER_PROVISIONER_ORIGIN && env.TAKOSERVER_PROVISIONER_TOKEN) {
-    const token = env.TAKOSERVER_PROVISIONER_TOKEN;
-    providers.push(
-      createRemoteProvider({
-        origin: env.TAKOSERVER_PROVISIONER_ORIGIN,
-        offerings: edge.providerOfferings,
-        authorize: () => `Bearer ${token}`,
-      }),
-    );
-  }
-
-  return providers;
-}
-
 let cached: { readonly env: WorkerEnv; readonly app: App } | null = null;
 
 async function appFor(env: WorkerEnv, origin: string): Promise<App> {
@@ -175,10 +128,24 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     env.TAKOSERVER_SIGNING_KEY,
   );
   const dataServices = createWorkerDataServices(env);
+  const deployment = createWorkerProductionComposition({
+    env,
+    forms: edge.forms,
+    artifacts: {
+      manifest: (tenantRef, digest) => artifacts.resolveManifest(tenantRef, digest),
+      async blob(digest) {
+        const stored = await objects.get(`art/${digest.slice("sha256:".length)}`);
+        return stored ? new Uint8Array(await new Response(stored.body).arrayBuffer()) : null;
+      },
+    },
+    ...(dataServices.s3 ? { s3CredentialIssuer: dataServices.s3 } : {}),
+    now: new Date(),
+  });
   const app = buildApp({
     sql,
     objects,
     artifacts,
+    workerModuleInspector: createJavaScriptWorkerModuleInspector(),
     ...(signingKey ? { signingKey } : {}),
     identity,
     identityProviders,
@@ -188,8 +155,10 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     publicOrigin: origin,
     ...(env.TAKOSERVER_CONSOLE_ORIGIN ? { consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN } : {}),
     forms: edge.forms,
-    providers: provisioning(env, edge, objects, artifacts),
-    offerings: edge.offerings,
+    bindings: edge.bindings,
+    providers: deployment.providers,
+    providerPacks: deployment.providerPacks,
+    offerings: deployment.offerings,
   });
   cached = { env, app };
   return app;

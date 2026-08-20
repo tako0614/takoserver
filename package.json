@@ -1,6 +1,6 @@
 {
   "name": "@takoserver/core",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "license": "AGPL-3.0-or-later",
   "private": true,
   "type": "module",
@@ -38,5 +38,8 @@
     "@types/bun": "^1.2.20",
     "typescript": "^5.9.2",
     "wrangler": "^4.123.0"
+  },
+  "dependencies": {
+    "acorn": "^8.15.0"
   }
 }
