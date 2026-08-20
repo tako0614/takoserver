@@ -1,9 +1,11 @@
 import type { IdentityProvider } from "../api.ts";
 import { type Child, h, live } from "../dom.ts";
 import { beginGoogleSignIn } from "../google.ts";
+import { tr } from "../i18n.ts";
 import { mark } from "../mark.ts";
 import { type Resource, resource, signal } from "../reactive.ts";
 import { adoptSession, api, apiOrigin, applyTheme, setApiOrigin, theme } from "../state.ts";
+import { beginTakosIdSignIn } from "../takos-id.ts";
 import { explain, ICON, icon, toast } from "../ui.ts";
 
 /**
@@ -64,14 +66,50 @@ function wayIn(providers: Resource<{ providers: readonly IdentityProvider[] }>):
   if (state.state === "error") {
     return h("div", { class: "notice notice--bad" }, explain(state.error));
   }
-  const google = state.value.providers.find((entry) => entry.method === "oidc");
+  const takosId = state.value.providers.find(
+    (entry) => entry.id === "takos-id" && entry.method === "oidc",
+  );
+  const google = state.value.providers.find(
+    (entry) => entry.id === "google" && entry.method === "oidc",
+  );
   const operator = state.value.providers.find((entry) => entry.method === "operator-assertion");
+  if (takosId?.clientId && takosId.issuer) return takosIdRow(takosId.issuer, takosId.clientId);
   if (google?.clientId) return googleRow(google.clientId);
   if (operator) return operatorForm();
   return h(
     "div",
     { class: "notice notice--warn" },
     "この配備には ID プロバイダーが設定されていないため、まだ誰もサインインできません。",
+  );
+}
+
+function takosIdRow(issuer: string, clientId: string): Child {
+  const busy = signal(false);
+  return live(() =>
+    h(
+      "button",
+      {
+        class: "rowbutton",
+        type: "button",
+        ...(busy() ? { disabled: true } : {}),
+        onClick: () => {
+          busy.set(true);
+          void beginTakosIdSignIn(issuer, clientId, "/").catch((error: unknown) => {
+            busy.set(false);
+            toast(explain(error as Error), "bad");
+          });
+        },
+      },
+      h("span", { class: "rowbutton__glyph" }, "T"),
+      h(
+        "span",
+        { class: "rowbutton__label" },
+        busy()
+          ? tr("Takos IDに移動しています…", "Opening Takos ID…")
+          : tr("Takos IDで続ける", "Continue with Takos ID"),
+      ),
+      h("span", { class: "rowbutton__chevron" }, icon(ICON.chevron, 15)),
+    ),
   );
 }
 
@@ -164,12 +202,8 @@ function operatorForm(): Child {
     }
     busy.set(true);
     try {
-      const { sessionToken } = await api.signIn(
-        "google",
-        assertion.value.trim(),
-        "operator-assertion",
-      );
-      adoptSession(sessionToken);
+      await api.signIn("google", assertion.value.trim(), "operator-assertion");
+      adoptSession();
     } catch (error) {
       toast(explain(error as Error), "bad");
     } finally {

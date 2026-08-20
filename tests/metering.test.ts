@@ -114,6 +114,25 @@ describe("metering", () => {
     expect((await ledger.wallet("org_1")).availableMinor).toBe(99_995);
   });
 
+  test("returns an unfunded usage fold to the pending queue", async () => {
+    const { metering, ledger, sql } = await meter({
+      bytesMinorPerGibibyte: 200_000,
+    });
+    await metering.record({
+      requestId: "unfunded",
+      organizationId: "org_1",
+      resourceUid: "uid_media",
+      operation: "get",
+      bytes: gibibyte,
+    });
+
+    await expect(metering.rollUp(100)).rejects.toMatchObject({
+      code: "insufficient_funds",
+    });
+    expect(await sql.query("SELECT rollup_id FROM usage_events")).toEqual([{ rollup_id: null }]);
+    expect((await ledger.wallet("org_1")).availableMinor).toBe(100_000);
+  });
+
   test("keeps organizations apart", async () => {
     const { metering, ledger } = await meter({ bytesMinorPerGibibyte: 1_000 });
     await ledger.fund({ organizationId: "org_2", fundingRef: "seed2", amountMinor: 100_000 });

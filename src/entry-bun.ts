@@ -315,7 +315,10 @@ const unconfigured = {
 const operatorKeyPath = join(dataRoot, "operator-key.jwk");
 const publicKeyJwk = await ensureOperatorKey({
   configured: process.env.TAKOSERVER_OPERATOR_PUBLIC_JWK,
-  hasIdentityProvider: Boolean(process.env.GOOGLE_CLIENT_ID) || Boolean(sharedDatabaseId),
+  hasIdentityProvider:
+    Boolean(process.env.TAKOS_ID_ISSUER && process.env.TAKOS_ID_CLIENT_ID) ||
+    Boolean(process.env.GOOGLE_CLIENT_ID) ||
+    Boolean(sharedDatabaseId),
   path: operatorKeyPath,
   readFile: (path) =>
     readFile(path, "utf8").then(
@@ -335,6 +338,14 @@ const payment = resolvePayment({
 });
 
 const identity = resolveIdentity({
+  ...(process.env.TAKOS_ID_ISSUER && process.env.TAKOS_ID_CLIENT_ID
+    ? {
+        takosId: {
+          issuer: process.env.TAKOS_ID_ISSUER,
+          clientId: process.env.TAKOS_ID_CLIENT_ID,
+        },
+      }
+    : {}),
   googleClientId: process.env.GOOGLE_CLIENT_ID,
   operatorPublicKeyJwk: publicKeyJwk,
 });

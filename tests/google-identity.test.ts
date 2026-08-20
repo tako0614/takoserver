@@ -187,6 +187,33 @@ describe("identity setup", () => {
     expect(setup.providers[0]).toMatchObject({ clientId: CLIENT_ID });
   });
 
+  test("advertises one exact Takos ID issuer instead of a direct upstream provider", async () => {
+    const { resolveIdentity } = await import("../src/identity-setup.ts");
+    const setup = resolveIdentity({
+      takosId: { issuer: "https://id.takos.test", clientId: "takoserver" },
+      operatorPublicKeyJwk: OPERATOR_JWK,
+    });
+    expect(setup.providers).toEqual([
+      {
+        id: "takos-id",
+        displayName: "Takos ID",
+        method: "oidc",
+        issuer: "https://id.takos.test",
+        clientId: "takoserver",
+      },
+    ]);
+  });
+
+  test("refuses a dual direct-Google and Takos ID hosted configuration", async () => {
+    const { resolveIdentity } = await import("../src/identity-setup.ts");
+    expect(() =>
+      resolveIdentity({
+        takosId: { issuer: "https://id.takos.test", clientId: "takoserver" },
+        googleClientId: CLIENT_ID,
+      }),
+    ).toThrow("cannot both be configured");
+  });
+
   test("keeps the operator path usable even when it is not advertised", async () => {
     const { resolveIdentity } = await import("../src/identity-setup.ts");
     const setup = resolveIdentity({

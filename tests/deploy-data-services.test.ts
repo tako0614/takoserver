@@ -108,6 +108,48 @@ const EDGE_SUPPLIES = {
 };
 
 describe("private data service deploy configuration", () => {
+  test("realizes the exact Takos ID issuer and client without a direct upstream identity", () => {
+    const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
+    try {
+      const path = join(directory, "target.json");
+      writeFileSync(
+        path,
+        JSON.stringify({
+          ...BASE,
+          takosId: { issuer: "https://id.takos.jp", clientId: "takoserver" },
+        }),
+      );
+      const realized = deploymentVariables(loadTarget(path)) as {
+        vars: Record<string, string>;
+      };
+      expect(realized.vars).toMatchObject({
+        TAKOS_ID_ISSUER: "https://id.takos.jp",
+        TAKOS_ID_CLIENT_ID: "takoserver",
+      });
+      expect(realized.vars).not.toHaveProperty("GOOGLE_CLIENT_ID");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects two hosted identity authorities", () => {
+    const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
+    try {
+      const path = join(directory, "target.json");
+      writeFileSync(
+        path,
+        JSON.stringify({
+          ...BASE,
+          takosId: { issuer: "https://id.takos.jp", clientId: "takoserver" },
+          googleClientId: "1234-example.apps.googleusercontent.com",
+        }),
+      );
+      expect(() => loadTarget(path)).toThrow("cannot configure both");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   test("validates private prices and realizes no secret value", () => {
     const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
     try {

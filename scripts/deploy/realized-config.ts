@@ -90,6 +90,10 @@ export function deploymentVariables(target: DeployTarget): Record<string, unknow
   const vars: Record<string, string> = {};
   if (target.consoleOrigin !== undefined) vars.TAKOSERVER_CONSOLE_ORIGIN = target.consoleOrigin;
   if (target.googleClientId !== undefined) vars.GOOGLE_CLIENT_ID = target.googleClientId;
+  if (target.takosId !== undefined) {
+    vars.TAKOS_ID_ISSUER = target.takosId.issuer;
+    vars.TAKOS_ID_CLIENT_ID = target.takosId.clientId;
+  }
   // The key id is public — its public half is in the database for anyone to
   // verify against. The private half is a secret and is set separately.
   vars.TAKOSERVER_SIGNING_KEY_ID = target.grantKeyId;

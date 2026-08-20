@@ -64,13 +64,13 @@ const LAYERS: readonly Layer[] = [
   {
     name: "domain",
     match:
-      /^src\/(?:token|auth|ledger|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|provider-metering|resource-deployments|resource-migrations|attachments|s3-attachment-factory|reconcile|metering|edge-forms|ai-requests|operator-credentials|google-identity|identity-setup|stripe-settlement|signing-key|operator-key)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$)/u,
+      /^src\/(?:token|auth|ledger|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|provider-metering|resource-deployments|resource-migrations|attachments|s3-attachment-factory|reconcile|metering|edge-forms|ai-requests|operator-credentials|google-identity|takos-id-identity|identity-setup|stripe-settlement|signing-key|operator-key)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$)/u,
     may: ["core", "domain", "release-data"],
   },
   {
     name: "routes",
     match:
-      /^src\/(?:router|control|data-storage|data-ai|openapi|landing|provisioner-endpoint)\.ts$|^src\/takoform\/(?:routes|host)\.ts$/u,
+      /^src\/(?:router|control|data-storage|data-ai|openapi|landing|provisioner-endpoint|sponsorship-api)\.ts$|^src\/takoform\/(?:routes|host)\.ts$/u,
     may: ["core", "adapter", "domain", "routes"],
   },
   {

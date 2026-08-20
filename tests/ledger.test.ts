@@ -103,6 +103,100 @@ describe("prepaid wallet", () => {
     expect(await ledger.wallet("org_a")).toMatchObject({ settledMinor: 380, availableMinor: 380 });
   });
 
+  test("refuses metered usage that would overdraw prepaid funds", async () => {
+    await ledger.fund({ organizationId: "org_a", fundingRef: "pay_1", amountMinor: 100 });
+
+    expect(
+      await ledger.debitUsage({
+        organizationId: "org_a",
+        reference: "usage_too_large",
+        amountMinor: 101,
+      }),
+    ).toBe(false);
+    expect(await ledger.wallet("org_a")).toMatchObject({
+      settledMinor: 100,
+      heldMinor: 0,
+      availableMinor: 100,
+    });
+  });
+
+  test("expires only unused included credit and keeps purchased credit", async () => {
+    const durable = createEphemeralSql();
+    let now = new Date("2026-08-17T00:00:00.000Z");
+    const expiring = createLedger(durable, () => now);
+    await expiring.fund({
+      organizationId: "org_a",
+      fundingRef: "included:cycle-1",
+      amountMinor: 100,
+      kind: "plan-included",
+      expiresAt: "2026-08-17T01:00:00.000Z",
+    });
+    await expiring.fund({
+      organizationId: "org_a",
+      fundingRef: "purchase:1",
+      amountMinor: 50,
+      kind: "purchased",
+      expiresAt: null,
+    });
+    expect(
+      await expiring.debitUsage({
+        organizationId: "org_a",
+        reference: "usage_before_expiry",
+        amountMinor: 40,
+      }),
+    ).toBe(true);
+    expect(await expiring.wallet("org_a")).toMatchObject({ availableMinor: 110 });
+
+    now = new Date("2026-08-17T02:00:00.000Z");
+    expect(await expiring.wallet("org_a")).toMatchObject({ availableMinor: 50 });
+    expect(
+      await expiring.debitUsage({
+        organizationId: "org_a",
+        reference: "usage_after_expiry",
+        amountMinor: 50,
+      }),
+    ).toBe(true);
+    expect(await expiring.wallet("org_a")).toMatchObject({ availableMinor: 0 });
+  });
+
+  test("keeps an expiring credit lot reserved until its hold is captured or released", async () => {
+    const durable = createEphemeralSql();
+    let now = new Date("2026-08-17T00:00:00.000Z");
+    const expiring = createLedger(durable, () => now);
+    await expiring.fund({
+      organizationId: "org_a",
+      fundingRef: "included:cycle-1",
+      amountMinor: 100,
+      kind: "plan-included",
+      expiresAt: "2026-08-17T01:00:00.000Z",
+    });
+    await expiring.fund({
+      organizationId: "org_a",
+      fundingRef: "purchase:1",
+      amountMinor: 50,
+      kind: "purchased",
+      expiresAt: null,
+    });
+
+    expect(
+      await expiring.hold({ organizationId: "org_a", reference: "request:1", amountMinor: 80 }),
+    ).toBe(true);
+    now = new Date("2026-08-17T02:00:00.000Z");
+    expect(await expiring.wallet("org_a")).toMatchObject({
+      settledMinor: 130,
+      heldMinor: 80,
+      availableMinor: 50,
+    });
+
+    await expiring.capture({ organizationId: "org_a", reference: "request:1", amountMinor: 30 });
+    await expiring.release({ organizationId: "org_a", reference: "request:1", amountMinor: 50 });
+    expect(await expiring.wallet("org_a")).toMatchObject({
+      settledMinor: 50,
+      heldMinor: 0,
+      availableMinor: 50,
+    });
+  });
+
   test("refuses a nonsense amount rather than recording it", async () => {
     for (const amountMinor of [0, -1, 1.5, Number.NaN]) {
       await expect(

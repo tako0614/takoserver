@@ -2,6 +2,7 @@ import type { ControlRoutes } from "./control.ts";
 import type { DataAiRoutes } from "./data-ai.ts";
 import { landingHtml } from "./landing.ts";
 import { openApiDocument } from "./openapi.ts";
+import type { SponsorshipRoutes } from "./sponsorship-api.ts";
 import type { TakoformHost } from "./takoform/types.ts";
 
 /**
@@ -16,6 +17,7 @@ import type { TakoformHost } from "./takoform/types.ts";
 
 export interface CreateRouterOptions {
   readonly control: ControlRoutes;
+  readonly sponsorship?: SponsorshipRoutes;
   readonly dataAi?: DataAiRoutes;
   readonly aiAvailable?: boolean;
   readonly takoformHost?: TakoformHost;
@@ -35,18 +37,22 @@ export type Router = (request: Request) => Promise<Response>;
 
 export function createRouter(options: CreateRouterOptions): Router {
   const origin = httpsOrigin(options.publicOrigin);
+  const consoleOrigin = options.consoleOrigin;
   const route = dispatch(options, origin);
 
   return async (request) => {
     // A browser asking whether it may make the real call. Answering it is the
     // whole of preflight; nothing is routed and nothing is authenticated.
     if (request.method === "OPTIONS" && request.headers.get("origin")) {
-      return new Response(null, { status: 204, headers: crossOrigin(request) });
+      return new Response(null, {
+        status: 204,
+        headers: crossOrigin(request, consoleOrigin),
+      });
     }
     const response = await route(request);
     if (!request.headers.get("origin")) return response;
     const answered = new Response(response.body, response);
-    for (const [name, value] of Object.entries(crossOrigin(request))) {
+    for (const [name, value] of Object.entries(crossOrigin(request, consoleOrigin))) {
       answered.headers.set(name, value);
     }
     return answered;
@@ -66,10 +72,12 @@ export function createRouter(options: CreateRouterOptions): Router {
  * true. Permit them and a cookie would ride along unasked, which is exactly the
  * request a hostile page can make.
  */
-function crossOrigin(request: Request): Record<string, string> {
+function crossOrigin(request: Request, consoleOrigin: string | undefined): Record<string, string> {
   const asked = request.headers.get("access-control-request-headers");
+  const requestOrigin = request.headers.get("origin");
+  const consoleRequest = consoleOrigin !== undefined && requestOrigin === consoleOrigin;
   return {
-    "access-control-allow-origin": "*",
+    "access-control-allow-origin": consoleRequest ? consoleOrigin : "*",
     "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
     // Reflected rather than listed: the Takoform lanes are a frozen contract
     // carrying headers of their own, and a list here would quietly become the
@@ -80,6 +88,7 @@ function crossOrigin(request: Request): Record<string, string> {
     // browser can read it.
     "access-control-expose-headers": "etag, location, retry-after",
     "access-control-max-age": "600",
+    ...(consoleRequest ? { "access-control-allow-credentials": "true" } : {}),
     vary: "origin, access-control-request-headers",
   };
 }
@@ -88,6 +97,11 @@ function dispatch(options: CreateRouterOptions, origin: string): Router {
   const console = options.consoleOrigin === undefined ? null : httpsOrigin(options.consoleOrigin);
   return async (request) => {
     const url = new URL(request.url);
+
+    if (options.sponsorship) {
+      const served = await options.sponsorship(request, url);
+      if (served) return served;
+    }
 
     if (options.dataAi) {
       const served = await options.dataAi(request, url);

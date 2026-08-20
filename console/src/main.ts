@@ -24,6 +24,7 @@ import {
   signOut,
   theme,
 } from "./state.ts";
+import { readTakosIdReturn } from "./takos-id.ts";
 import { card, empty, explain, ICON, icon, mountToasts, openModal, toast } from "./ui.ts";
 
 /**
@@ -70,13 +71,26 @@ function boot(): void {
     toast(returned.message, "bad");
   } else if (returned.kind === "ok") {
     api.signIn("google", returned.value.idToken, "oidc", returned.value.nonce).then(
-      ({ sessionToken }) => {
-        adoptSession(sessionToken);
+      () => {
+        adoptSession();
         navigate(returned.value.from, { replace: true });
       },
       (error: unknown) => toast(explain(error as Error), "bad"),
     );
   }
+  void readTakosIdReturn().then((result) => {
+    if (result.kind === "error") {
+      toast(result.message, "bad");
+    } else if (result.kind === "ok") {
+      api.signIn("takos-id", result.idToken, "oidc").then(
+        () => {
+          adoptSession();
+          navigate(result.from, { replace: true });
+        },
+        (error: unknown) => toast(explain(error as Error), "bad"),
+      );
+    }
+  });
 
   const view = h("div");
   root.append(view);

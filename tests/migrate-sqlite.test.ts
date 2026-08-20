@@ -42,6 +42,43 @@ describe("bringing a local database up to date", () => {
     expect(second.alreadyApplied).toBe(MIGRATIONS.length);
   });
 
+  test("refuses credit-lot activation until predecessor wallet data was snapshotted and reset", () => {
+    const database = new Database(":memory:");
+    database.exec(`
+      CREATE TABLE applied_migrations (
+        name TEXT PRIMARY KEY NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+    const creditLots = MIGRATIONS.findIndex((migration) => migration.name.startsWith("0017_"));
+    expect(creditLots).toBeGreaterThan(0);
+    for (const migration of MIGRATIONS.slice(0, creditLots)) {
+      database.exec(migration.sql);
+      database
+        .query("INSERT INTO applied_migrations (name, applied_at) VALUES (?, 'now')")
+        .run(migration.name);
+    }
+    database
+      .query(
+        `INSERT INTO ledger
+           (id, org_id, type, ref, settled_delta, held_delta, created_at)
+         VALUES ('led_old', 'org_old', 'funding', 'old-payment', 100, 0, '2026-08-01T00:00:00.000Z')`,
+      )
+      .run();
+
+    expect(() => migrateSqlite(database)).toThrow(/0017_wallet_credit_lots\.sql failed/u);
+    expect(
+      database
+        .query(
+          "SELECT COUNT(*) AS count FROM sqlite_schema WHERE type = 'table' AND name = 'wallet_credit_lots'",
+        )
+        .get(),
+    ).toEqual({ count: 0 });
+    expect(database.query("SELECT settled_delta FROM ledger WHERE id = 'led_old'").get()).toEqual({
+      settled_delta: 100,
+    });
+  });
+
   test("refuses a database written by a newer build", () => {
     const database = new Database(":memory:");
     migrateSqlite(database);
@@ -146,7 +183,10 @@ describe("bringing a local database up to date", () => {
         "1",
         "2",
         JSON.stringify({
-          status: { observed: { region: "global" }, outputs: { bucket: "opaque" } },
+          status: {
+            observed: { region: "global" },
+            outputs: { bucket: "opaque" },
+          },
         }),
         "r2:opaque-native-id",
         42,

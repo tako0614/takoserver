@@ -1,7 +1,7 @@
 import type { AiUsage } from "./ai-port.ts";
 import type { PricedUsage } from "./catalog.ts";
 import { canonicalDigest } from "./json.ts";
-import type { Ledger } from "./ledger.ts";
+import { type Ledger, LedgerError } from "./ledger.ts";
 import type { Clock, Sql } from "./ports.ts";
 
 /**
@@ -18,11 +18,10 @@ import type { Clock, Sql } from "./ports.ts";
  * per request: a wallet that lists every object read is a wallet nobody can
  * read, and the events remain for anyone who wants the detail.
  *
- * The fold marks the rows it took before it writes the debit, and the debit's
- * reference is the fold's own id — so the ledger's uniqueness makes a repeated
- * fold a no-op, and a fold interrupted between the two steps leaves rows
- * marked with a debit that will be written by the next attempt under the same
- * reference.
+ * The fold claims rows before it writes the debit. If prepaid funds cannot
+ * cover that exact batch, it releases only its own claim and fails, leaving the
+ * usage pending for funding or suspension policy rather than silently marking
+ * uncharged usage as billed.
  */
 
 export interface MeteringRates {
@@ -167,15 +166,28 @@ export function createMetering(options: {
           [rollupId, ...entry.ids],
         );
         if (claimed.changes === 0) continue;
-        moved += claimed.changes;
-
         // Rounded once, here, for everything the fold covers. Zero is a real
         // answer and is not written: a ledger full of nothing is a ledger
         // nobody reads.
         const amountMinor = Math.round(entry.micros / 1_000_000);
         if (amountMinor > 0) {
-          await ledger.debitUsage({ organizationId, reference: rollupId, amountMinor });
+          const charged = await ledger.debitUsage({
+            organizationId,
+            reference: rollupId,
+            amountMinor,
+          });
+          if (!charged) {
+            const released = await sql.run(
+              "UPDATE usage_events SET rollup_id = NULL WHERE rollup_id = ?",
+              [rollupId],
+            );
+            if (released.changes !== claimed.changes) {
+              throw new LedgerError("conservation_violated");
+            }
+            throw new LedgerError("insufficient_funds");
+          }
         }
+        moved += claimed.changes;
       }
       return moved;
     },

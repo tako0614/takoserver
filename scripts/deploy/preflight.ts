@@ -256,6 +256,14 @@ async function assertRequiredSecretsPresent(
       name: "TAKOSERVER_SIGNING_KEY",
       why: "data tokens cannot be issued without the private signing key",
     },
+    ...(target.hostedSponsorship
+      ? [
+          {
+            name: "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN",
+            why: "Takosumi Hosted sponsorship is enabled by this target",
+          },
+        ]
+      : []),
     ...(target.edgeSupplies ||
     target.objectBucketSupplies?.supplies.some((supply) => supply.provider.kind === "cloudflare")
       ? [

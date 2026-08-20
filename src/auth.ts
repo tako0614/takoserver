@@ -11,7 +11,7 @@ import type { Clock, Sql } from "./ports.ts";
  * creator exactly once.
  */
 
-export type IdentityProvider = "google" | "github";
+export type IdentityProvider = "takos-id" | "google" | "github";
 
 /**
  * How a caller may sign in here, as the console needs to hear it.
@@ -27,6 +27,8 @@ export interface IdentityProviderDescriptor {
   readonly method: "oidc" | "operator-assertion";
   /** Public OAuth client id, present only for `oidc`. */
   readonly clientId?: string;
+  /** Exact OIDC issuer, when discovery rather than a provider-specific SDK owns sign-in. */
+  readonly issuer?: string;
 }
 
 export const API_KEY_SCOPES = [
@@ -106,6 +108,11 @@ export interface ExternalIdentityVerifier {
     readonly providerSubject: string;
     readonly email: string;
     readonly displayName: string;
+    readonly organizations?: readonly {
+      readonly id: string;
+      readonly name: string;
+      readonly role: "owner" | "member";
+    }[];
   }>;
 }
 
@@ -190,7 +197,12 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
     name: string;
     scopes: readonly ApiKeyScope[];
     expiresInSeconds: number;
-  }): Promise<{ id: string; secret: string; createdAt: string; expiresAt: string }> => {
+  }): Promise<{
+    id: string;
+    secret: string;
+    createdAt: string;
+    expiresAt: string;
+  }> => {
     const secret = randomSecret();
     const id = `${input.kind === "session" ? "ses" : "key"}_${randomId()}`;
     const createdAt = stamp();
@@ -216,8 +228,15 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
 
   const accounts: Accounts = {
     async signIn({ provider, assertion, method, nonce, sessionTtlSeconds }) {
-      if (provider !== "google" && provider !== "github") throw new AuthError("invalid");
-      const verified = await identity.verify({ provider, assertion, method, nonce });
+      if (provider !== "takos-id" && provider !== "google" && provider !== "github") {
+        throw new AuthError("invalid");
+      }
+      const verified = await identity.verify({
+        provider,
+        assertion,
+        method,
+        nonce,
+      });
       const rows = await sql.query(
         "SELECT id, email, display_name FROM principals WHERE provider = ? AND provider_subject = ?",
         [provider, verified.providerSubject],
@@ -230,6 +249,33 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
            VALUES (?, ?, ?, ?, ?, ?)`,
           [id, provider, verified.providerSubject, verified.email, verified.displayName, stamp()],
         );
+      }
+      if (provider === "takos-id") {
+        const owned = (verified.organizations ?? []).filter(
+          (organization) => organization.role === "owner",
+        );
+        const projectedAt = stamp();
+        await sql.batch([
+          {
+            sql: "DELETE FROM org_memberships WHERE principal_id = ?",
+            params: [id],
+          },
+          ...owned.flatMap((organization) => [
+            {
+              sql: `INSERT INTO orgs (id, name, owner_principal_id, created_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET name = excluded.name,
+                      owner_principal_id = excluded.owner_principal_id`,
+              params: [organization.id, organization.name, id, projectedAt],
+            },
+            {
+              sql: `INSERT INTO org_memberships (org_id, principal_id, role, created_at)
+                    VALUES (?, ?, 'owner', ?)
+                    ON CONFLICT(org_id, principal_id) DO UPDATE SET role = 'owner'`,
+              params: [organization.id, id, projectedAt],
+            },
+          ]),
+        ]);
       }
       const { secret } = await issueToken({
         kind: "session",
@@ -252,11 +298,17 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
 
     async createOrganization({ actor, name }) {
       if (name.length === 0 || name.length > 128) throw new AuthError("invalid");
+      const principal = await accounts.principal(actor.principalId);
+      if (!principal || principal.provider === "takos-id") throw new AuthError("invalid");
       const id = `org_${randomId()}`;
       const createdAt = stamp();
       await sql.run(
         "INSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES (?, ?, ?, ?)",
         [id, name, actor.principalId, createdAt],
+      );
+      await sql.run(
+        "INSERT INTO org_memberships (org_id, principal_id, role, created_at) VALUES (?, ?, 'owner', ?)",
+        [id, actor.principalId, createdAt],
       );
       return { id, name, ownerPrincipalId: actor.principalId, createdAt };
     },
@@ -296,8 +348,9 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
 
     async organizations(principalId) {
       const rows = await sql.query(
-        `SELECT id, name, owner_principal_id, created_at FROM orgs
-         WHERE owner_principal_id = ? ORDER BY created_at ASC, id ASC LIMIT 200`,
+        `SELECT o.id, o.name, o.owner_principal_id, o.created_at FROM orgs o
+         JOIN org_memberships m ON m.org_id = o.id
+         WHERE m.principal_id = ? ORDER BY o.created_at ASC, o.id ASC LIMIT 200`,
         [principalId],
       );
       return rows.map((row) => ({
@@ -406,10 +459,15 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
     },
 
     async requireOwner(actor, organizationId) {
-      const organization = await accounts.organization(organizationId);
+      const memberships = await sql.query(
+        `SELECT role FROM org_memberships
+         WHERE org_id = ? AND principal_id = ? AND role = 'owner'`,
+        [organizationId, actor.principalId],
+      );
+      const organization = memberships[0] ? await accounts.organization(organizationId) : null;
       // An unknown organization and one owned by somebody else are reported the
       // same way, so ownership cannot be probed by watching status codes.
-      if (!organization || organization.ownerPrincipalId !== actor.principalId) {
+      if (!organization) {
         throw new AuthError("not_found");
       }
       return organization;
