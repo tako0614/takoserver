@@ -34,7 +34,7 @@ export function landingHtml(options: LandingOptions): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Takoserver — portable cloud resources</title>
-<meta name="description" content="An open-source Takoform Host for placing, connecting, metering, and moving provider-backed cloud resources.">
+<meta name="description" content="Portable compute, databases, storage, queues, and AI with usage-based pricing and developer-first APIs.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@500&amp;display=swap" rel="stylesheet">
@@ -514,16 +514,16 @@ a:active { color: var(--color-accent-strong); }
   <main>
     <section class="hero">
       <div class="hero-copy">
-        <h1>Declare resources. Choose where they run.</h1>
-        <p class="hero-lede">Takoserver is an open-source Takoform Host that places logical resources on provider-backed deployments, resolves scoped attachments, and meters what runs.</p>
+        <h1>Build on a cloud that stays portable.</h1>
+        <p class="hero-lede">Create compute, databases, storage, queues, and AI services through one developer-first control plane. Connect resources explicitly and pay for measured usage.</p>
         <div class="hero-actions">
           <a class="button" href="${primaryHref}">${primaryLabel}</a>
           <a class="button button--quiet" href="${base}/openapi.json">Read API</a>
         </div>
         <div class="signals" aria-label="Product characteristics">
-          <span class="signal">Takoform v1alpha3</span>
-          <span class="signal">Open source</span>
-          <span class="signal">Self-hostable</span>
+          <span class="signal">Usage based</span>
+          <span class="signal">Portable resources</span>
+          <span class="signal">Developer API</span>
         </div>
       </div>
 
@@ -536,7 +536,7 @@ a:active { color: var(--color-accent-strong); }
           <article class="map-node">
             <span class="map-node__type">Takoform Form</span>
             <h2>ObjectBucket</h2>
-            <p>Portable resource meaning, not a provider SKU.</p>
+            <p>A durable resource contract with an independent identity.</p>
           </article>
           <div class="map-flow" aria-hidden="true"></div>
           <article class="map-node map-node--core">
@@ -550,12 +550,12 @@ a:active { color: var(--color-accent-strong); }
           </article>
           <div class="map-flow" aria-hidden="true"></div>
           <article class="map-node">
-            <span class="map-node__type">Provider execution</span>
-            <h2>Provider packs</h2>
+            <span class="map-node__type">Cloud services</span>
+            <h2>Compute · data · AI</h2>
             <ul class="map-node__list">
-              <li>Cloudflare</li>
-              <li>Wasabi</li>
-              <li>Self-hosted</li>
+              <li>Databases</li>
+              <li>Object storage</li>
+              <li>Queues and workers</li>
             </ul>
           </article>
         </div>
@@ -568,7 +568,7 @@ a:active { color: var(--color-accent-strong); }
       <div class="lanes">
         <article class="lane">
           <h3>Infrastructure through Takoform</h3>
-          <p>Exact Form references describe the resource. Offerings choose supply. Deployments record where it actually runs.</p>
+          <p>Exact Form references describe the resource. Service tiers choose region and capacity. Deployments record the running realization.</p>
           <code>Form → Offering → Deployment</code>
         </article>
         <article class="lane">
@@ -579,13 +579,25 @@ a:active { color: var(--color-accent-strong); }
       </div>
     </section>
 
+    <section class="section" aria-labelledby="billing-title">
+      <h2 id="billing-title">Pay for what you use.</h2>
+      <p class="section-intro">Takoserver pricing is expressed in stable service units. Usage is aggregated before settlement, so tiny operations stay precise instead of being rounded into oversized charges.</p>
+      <dl class="model">
+        <div class="model-row"><dt>Compute</dt><dd>Requests · CPU milliseconds</dd></div>
+        <div class="model-row"><dt>Databases</dt><dd>Rows read · rows written · storage capacity-time</dd></div>
+        <div class="model-row"><dt>Object storage</dt><dd>Storage capacity-time · Class A operations · Class B operations</dd></div>
+        <div class="model-row"><dt>Queues</dt><dd>64 KiB operations</dd></div>
+        <div class="model-row"><dt>AI</dt><dd>Input tokens · output tokens</dd></div>
+      </dl>
+    </section>
+
     <section class="section" aria-labelledby="model-title">
-      <h2 id="model-title">The resource is not the provider.</h2>
-      <p class="section-intro">Takoserver keeps meaning, supply, realization, connection, and movement separate so one concern can change without rewriting the rest.</p>
+      <h2 id="model-title">Infrastructure that stays portable.</h2>
+      <p class="section-intro">Takoserver keeps meaning, service tier, realization, connection, and movement separate so one concern can change without rewriting the rest.</p>
       <dl class="model">
         <div class="model-row"><dt>Form</dt><dd>What the resource means.</dd></div>
-        <div class="model-row"><dt>Offering</dt><dd>Which provider pack, installation, region, and commercial terms can supply it.</dd></div>
-        <div class="model-row"><dt>Deployment</dt><dd>One provider-native realization of the logical resource.</dd></div>
+        <div class="model-row"><dt>Offering</dt><dd>A selectable service tier with a region, price plan, isolation, and portability contract.</dd></div>
+        <div class="model-row"><dt>Deployment</dt><dd>One running realization of the logical resource.</dd></div>
         <div class="model-row"><dt>Attachment</dt><dd>A scoped connection between independent resources without embedding credentials in outputs.</dd></div>
         <div class="model-row"><dt>Migration</dt><dd>An explicit cutover between source and candidate Deployments, with a retained rollback window.</dd></div>
       </dl>
@@ -593,9 +605,9 @@ a:active { color: var(--color-accent-strong); }
 
     <section class="section section--compact" aria-labelledby="migration-title">
       <h2 id="migration-title">Change placement, not identity.</h2>
-      <p class="section-intro">A provider move is a lifecycle, not an opaque update. Attachments follow the active Deployment after verification.</p>
+      <p class="section-intro">Moving between service tiers is a lifecycle, not an opaque update. Attachments follow the active Deployment after verification.</p>
       <div class="migration" aria-label="Deployment migration states">
-        <div class="migration-step migration-step--active"><strong>Active</strong><span>The current provider realization keeps serving.</span></div>
+        <div class="migration-step migration-step--active"><strong>Active</strong><span>The current realization keeps serving.</span></div>
         <div class="migration-step"><strong>Candidate</strong><span>Provision, transfer, and verify independently.</span></div>
         <div class="migration-step"><strong>Retained</strong><span>Cut over, re-resolve Attachments, preserve rollback.</span></div>
       </div>
@@ -617,7 +629,7 @@ a:active { color: var(--color-accent-strong); }
   </main>
 
   <footer class="footer">
-    <span>Takoserver · open-source cloud control plane</span>
+    <span>Takoserver · developer cloud</span>
     <span class="footer-links">
       <a href="${base}/openapi.json">OpenAPI</a>
       <a href="${base}/.well-known/takoserver">Discovery</a>
