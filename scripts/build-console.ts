@@ -63,6 +63,10 @@ if (apiOrigin !== undefined) {
   );
 }
 await Bun.write(join(outDir, "index.html"), html);
+await Bun.write(
+  join(outDir, "_headers"),
+  "/*\n  Cache-Control: public, max-age=0, must-revalidate, no-transform\n",
+);
 
 function escapeHtml(input: string): string {
   return input

@@ -36,5 +36,9 @@ await Bun.write(
     apiOrigin: value("--api") ?? null,
   }),
 );
+await Bun.write(
+  join(outDir, "_headers"),
+  "/*\n  Cache-Control: public, max-age=0, must-revalidate, no-transform\n",
+);
 
 process.stdout.write(`site built into ${outDir}\n`);
