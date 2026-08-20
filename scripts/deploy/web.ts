@@ -211,6 +211,11 @@ async function buildWebSurface(
       )}\n`,
       { mode: 0o600 },
     );
+    await runChecked(
+      "preflight",
+      `${surface} Wrangler strict dry-run`,
+      wranglerCommand(["deploy", "--dry-run", "--strict", "--config", configPath]),
+    );
     return {
       surface,
       ...spec,
