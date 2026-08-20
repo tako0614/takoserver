@@ -1,5 +1,6 @@
 import type { FormRef, ResourceSummary } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
+import { tr } from "../i18n.ts";
 import { resource, signal } from "../reactive.ts";
 import { health } from "../resource-state.ts";
 import { linkProps, navigate } from "../router.ts";
@@ -52,9 +53,16 @@ export function resourceDetailPage(
             ? card(
                 null,
                 empty(
-                  "No such resource",
-                  `Nothing named ${address.name} of kind ${address.kind} exists in space ${address.space}.`,
-                  h("a", { class: "btn", ...linkProps("/resources") }, "Back to resources"),
+                  tr("リソースがありません", "No such resource"),
+                  tr(
+                    `${address.space}スペースに${address.kind} / ${address.name}は存在しません。`,
+                    `Nothing named ${address.name} of kind ${address.kind} exists in space ${address.space}.`,
+                  ),
+                  h(
+                    "a",
+                    { class: "btn", ...linkProps("/resources") },
+                    tr("リソース一覧へ戻る", "Back to resources"),
+                  ),
                 ),
               )
             : body(found, tab, page.reload, organizationId),
@@ -80,10 +88,10 @@ function body(
       { class: "tabs" },
       ...(
         [
-          ["overview", "Overview"],
-          ["spec", "Declared"],
-          ["observed", "Observed"],
-          ["identity", "Form & identity"],
+          ["overview", tr("概要", "Overview")],
+          ["spec", tr("宣言", "Declared")],
+          ["observed", tr("観測状態", "Observed")],
+          ["identity", tr("Formと識別情報", "Form & identity")],
         ] as const
       ).map(([key, label]) =>
         h(
@@ -103,10 +111,16 @@ function body(
       ? overview(found, state)
       : tab() === "spec"
         ? card(
-            "Declared spec",
+            tr("宣言した設定", "Declared spec"),
             found.spec
               ? jsonBlock(found.spec)
-              : empty("No spec recorded", "This resource was stored without a spec."),
+              : empty(
+                  tr("設定がありません", "No spec recorded"),
+                  tr(
+                    "このリソースには設定が記録されていません。",
+                    "This resource was stored without a spec.",
+                  ),
+                ),
           )
         : tab() === "observed"
           ? observed(found)
@@ -125,7 +139,7 @@ function header(found: ResourceSummary, reload: () => void, organizationId: stri
       h(
         "div",
         { class: "dim", style: { fontSize: "12.5px", marginBottom: "4px" } },
-        h("a", { ...linkProps("/resources") }, "Resources"),
+        h("a", { ...linkProps("/resources") }, tr("リソース", "Resources")),
         text(" / "),
         text(found.metadata.space),
       ),
@@ -133,8 +147,8 @@ function header(found: ResourceSummary, reload: () => void, organizationId: stri
         "h1",
         { style: { display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" } },
         h("span", { class: "mono" }, found.metadata.name),
-        badge(state.phase, state.tone, true),
-        state.stale ? badge("declaration not yet applied", "accent") : null,
+        badge(phaseLabel(state.phase), state.tone, true),
+        state.stale ? badge(tr("宣言が未適用", "declaration not yet applied"), "accent") : null,
       ),
       h("p", null, `${found.kind} · ${found.apiVersion}`),
     ),
@@ -145,7 +159,7 @@ function header(found: ResourceSummary, reload: () => void, organizationId: stri
         "button",
         { class: "btn", type: "button", onClick: reload },
         icon(ICON.refresh, 14),
-        text("Reload"),
+        text(tr("再読み込み", "Reload")),
       ),
       found.form
         ? h(
@@ -165,7 +179,7 @@ function header(found: ResourceSummary, reload: () => void, organizationId: stri
                   () => navigate("/resources"),
                 ),
             },
-            "Delete",
+            tr("削除", "Delete"),
           )
         : null,
     ),
@@ -192,9 +206,15 @@ function overview(found: ResourceSummary, state: ReturnType<typeof health>): Chi
         )
       : null,
     card(
-      "Outputs",
+      tr("出力", "Outputs"),
       Object.keys(outputs).length === 0
-        ? empty("No outputs", "This resource publishes nothing for other declarations to consume.")
+        ? empty(
+            tr("出力がありません", "No outputs"),
+            tr(
+              "このリソースはほかの宣言から利用できる値を公開していません。",
+              "This resource publishes nothing for other declarations to consume.",
+            ),
+          )
         : h(
             "div",
             { class: "card__body" },
@@ -217,9 +237,15 @@ function overview(found: ResourceSummary, state: ReturnType<typeof health>): Chi
           ),
     ),
     card(
-      "Conditions",
+      tr("状態条件", "Conditions"),
       conditions.length === 0
-        ? empty("No conditions", "The Host has not reported on this resource yet.")
+        ? empty(
+            tr("状態条件がありません", "No conditions"),
+            tr(
+              "ホストはこのリソースの状態をまだ報告していません。",
+              "The Host has not reported on this resource yet.",
+            ),
+          )
         : h(
             "div",
             { class: "table-scroll" },
@@ -232,10 +258,10 @@ function overview(found: ResourceSummary, state: ReturnType<typeof health>): Chi
                 h(
                   "tr",
                   null,
-                  h("th", null, "Type"),
-                  h("th", null, "Status"),
-                  h("th", null, "Reason"),
-                  h("th", null, "Message"),
+                  h("th", null, tr("種類", "Type")),
+                  h("th", null, tr("状態", "Status")),
+                  h("th", null, tr("理由", "Reason")),
+                  h("th", null, tr("メッセージ", "Message")),
                 ),
               ),
               h(
@@ -272,12 +298,15 @@ function overview(found: ResourceSummary, state: ReturnType<typeof health>): Chi
 function observed(found: ResourceSummary): Child {
   const value = found.status?.observed;
   return card(
-    "Observed state",
+    tr("観測状態", "Observed state"),
     value
       ? jsonBlock(value)
       : empty(
-          "Nothing observed",
-          "The Host has not read this resource back from the provider. That is normal while it is still being made.",
+          tr("まだ観測されていません", "Nothing observed"),
+          tr(
+            "ホストは実行基盤からこのリソースをまだ読み取っていません。作成中は正常な状態です。",
+            "The Host has not read this resource back from the provider. That is normal while it is still being made.",
+          ),
         ),
   );
 }
@@ -293,12 +322,12 @@ function observed(found: ResourceSummary): Child {
  */
 function identity(found: ResourceSummary): Child {
   const rows: readonly (readonly [string, Child])[] = [
-    ["Kind", h("span", { class: "mono" }, found.kind)],
-    ["API version", copyable(found.apiVersion)],
+    [tr("種類", "Kind"), h("span", { class: "mono" }, found.kind)],
+    [tr("APIバージョン", "API version"), copyable(found.apiVersion)],
     ...(found.form
       ? ([
           [
-            "Definition version",
+            tr("定義バージョン", "Definition version"),
             h(
               "span",
               null,
@@ -306,12 +335,15 @@ function identity(found: ResourceSummary): Child {
               h(
                 "span",
                 { class: "dim", style: { marginLeft: "8px" } },
-                "the definition this resource was made under",
+                tr(
+                  "このリソースの作成に使用した定義",
+                  "the definition this resource was made under",
+                ),
               ),
             ),
           ],
           [
-            "Schema digest",
+            tr("スキーマダイジェスト", "Schema digest"),
             h(
               "span",
               null,
@@ -322,17 +354,20 @@ function identity(found: ResourceSummary): Child {
               h(
                 "div",
                 { class: "dim", style: { marginTop: "2px" } },
-                "part of the Form's identity: a different schema is a different Form",
+                tr(
+                  "Form識別情報の一部です。異なるスキーマは異なるFormです。",
+                  "part of the Form's identity: a different schema is a different Form",
+                ),
               ),
             ),
           ],
         ] as const)
       : []),
-    ["Space", h("span", { class: "mono" }, found.metadata.space)],
-    ["Name", copyable(found.metadata.name)],
+    [tr("スペース", "Space"), h("span", { class: "mono" }, found.metadata.space)],
+    [tr("名前", "Name"), copyable(found.metadata.name)],
     ["UID", copyable(found.metadata.uid, shortDigest(found.metadata.uid))],
     [
-      "Generation",
+      tr("世代", "Generation"),
       h(
         "span",
         null,
@@ -340,24 +375,28 @@ function identity(found: ResourceSummary): Child {
         h(
           "span",
           { class: "dim", style: { marginLeft: "8px" } },
-          "increments when the declaration changes",
+          tr("宣言が変わると増加します", "increments when the declaration changes"),
         ),
       ),
     ],
     [
-      "Revision",
+      tr("リビジョン", "Revision"),
       h(
         "span",
         null,
         h("span", { class: "mono" }, found.metadata.revision),
-        h("span", { class: "dim", style: { marginLeft: "8px" } }, "the fence a write must present"),
+        h(
+          "span",
+          { class: "dim", style: { marginLeft: "8px" } },
+          tr("更新時に提示する競合防止値", "the fence a write must present"),
+        ),
       ),
     ],
-    ["Last change", h("span", null, when(found.metadata.updatedAt))],
+    [tr("最終更新", "Last change"), h("span", null, when(found.metadata.updatedAt))],
   ];
 
   return card(
-    "Identity",
+    tr("識別情報", "Identity"),
     h(
       "div",
       { class: "card__body" },
@@ -375,4 +414,15 @@ function identity(found: ResourceSummary): Child {
       ),
     ),
   );
+}
+
+function phaseLabel(phase: ReturnType<typeof health>["phase"]): string {
+  const japanese = {
+    Ready: "稼働中",
+    Pending: "処理中",
+    Failed: "失敗",
+    Deleting: "削除中",
+    Unknown: "不明",
+  } as const;
+  return tr(japanese[phase], phase);
 }

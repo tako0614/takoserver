@@ -107,14 +107,6 @@ export interface Operation {
   readonly createdAt: string;
 }
 
-/** What the Host says it can do with one installed Form definition. */
-export interface FormSupport {
-  readonly formRef: FormRef;
-  readonly operations: readonly string[];
-  readonly supportedBindings?: readonly string[];
-  readonly limits?: { readonly maximumBundleBytes?: number };
-}
-
 /** The exact-pin lane this console speaks. */
 const LANE = "/apis/forms.takoform.com/v1alpha3";
 
@@ -347,12 +339,6 @@ export function createApi(options: ApiOptions) {
         "GET",
         `/v1/organizations/${encodeURIComponent(organizationId)}/operations`,
       ),
-
-    // The Host's own account of what it will accept. Read from the control
-    // plane rather than the exact-pin lane, which only admits an organization
-    // key: a person holding a session would be told they are not authenticated
-    // for asking a question that has nothing to do with their organization.
-    forms: () => call<{ profiles: readonly FormSupport[] }>("GET", "/v1/forms"),
   };
 }
 

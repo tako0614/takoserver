@@ -1,5 +1,6 @@
 import type { ApiKey } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
+import { tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
 import { api } from "../state.ts";
 import {
@@ -16,19 +17,39 @@ import {
   whenReady,
 } from "../ui.ts";
 
-const SCOPES: readonly { readonly id: string; readonly blurb: string }[] = [
-  { id: "catalog:read", blurb: "See what is for sale and at what price." },
-  { id: "resources:read", blurb: "List and inspect declared resources." },
-  { id: "resources:write", blurb: "Apply and delete resources through Takoform." },
-  { id: "wallet:read", blurb: "Read the balance and the ledger." },
-  { id: "usage:read", blurb: "Read usage statements." },
-  { id: "reseller:write", blurb: "Quote, reserve, and provision on behalf of tenants." },
+const SCOPES: readonly { readonly id: string; readonly blurb: () => string }[] = [
+  {
+    id: "catalog:read",
+    blurb: () => tr("販売中の商品と料金を表示します。", "See what is for sale and at what price."),
+  },
+  {
+    id: "resources:read",
+    blurb: () => tr("宣言済みリソースを表示します。", "List and inspect declared resources."),
+  },
+  {
+    id: "resources:write",
+    blurb: () =>
+      tr("Takoformでリソースを作成・削除します。", "Apply and delete resources through Takoform."),
+  },
+  {
+    id: "wallet:read",
+    blurb: () => tr("残高と取引履歴を表示します。", "Read the balance and the ledger."),
+  },
+  { id: "usage:read", blurb: () => tr("使用量明細を表示します。", "Read usage statements.") },
+  {
+    id: "reseller:write",
+    blurb: () =>
+      tr(
+        "テナントに代わって見積・予約・作成します。",
+        "Quote, reserve, and provision on behalf of tenants.",
+      ),
+  },
 ];
 
-const LIFETIMES: readonly { readonly label: string; readonly seconds: number }[] = [
-  { label: "30 days", seconds: 30 * 86_400 },
-  { label: "90 days", seconds: 90 * 86_400 },
-  { label: "1 year", seconds: 365 * 86_400 },
+const LIFETIMES: readonly { readonly label: () => string; readonly seconds: number }[] = [
+  { label: () => tr("30日", "30 days"), seconds: 30 * 86_400 },
+  { label: () => tr("90日", "90 days"), seconds: 90 * 86_400 },
+  { label: () => tr("1年", "1 year"), seconds: 365 * 86_400 },
 ];
 
 /**
@@ -50,11 +71,14 @@ export function keysPage(organizationId: string): Child {
       h(
         "div",
         { class: "head__text" },
-        h("h1", null, "API keys"),
+        h("h1", null, tr("APIキー", "API keys")),
         h(
           "p",
           null,
-          "Keys act for this organization within the scopes they were given. A key can never administer the organization that issued it.",
+          tr(
+            "APIキーは付与されたスコープの範囲でこの組織を操作します。発行元の組織自体を管理することはできません。",
+            "Keys act for this organization within the scopes they were given. A key can never administer the organization that issued it.",
+          ),
         ),
       ),
       h(
@@ -65,7 +89,7 @@ export function keysPage(organizationId: string): Child {
           onClick: () => createKey(organizationId, keys.reload),
         },
         icon(ICON.plus, 14),
-        text("Create key"),
+        text(tr("キーを作成", "Create key")),
       ),
     ),
     live(() =>
@@ -76,8 +100,11 @@ export function keysPage(organizationId: string): Child {
             null,
             apiKeys.length === 0
               ? empty(
-                  "No keys",
-                  "Create one to let the Takoform provider, the CLI, or your own code act for this organization.",
+                  tr("APIキーがありません", "No keys"),
+                  tr(
+                    "Takoform provider、CLI、または独自コードからこの組織を操作するためのキーを作成できます。",
+                    "Create one to let the Takoform provider, the CLI, or your own code act for this organization.",
+                  ),
                 )
               : h("div", { class: "table-scroll" }, table(apiKeys, organizationId, keys.reload)),
           ),
@@ -97,10 +124,10 @@ function table(apiKeys: readonly ApiKey[], organizationId: string, reload: () =>
       h(
         "tr",
         null,
-        h("th", null, "Name"),
-        h("th", null, "Scopes"),
-        h("th", null, "Created"),
-        h("th", null, "Expires"),
+        h("th", null, tr("名前", "Name")),
+        h("th", null, tr("スコープ", "Scopes")),
+        h("th", null, tr("作成日時", "Created")),
+        h("th", null, tr("有効期限", "Expires")),
         h("th", null, ""),
       ),
     ),
@@ -131,7 +158,9 @@ function table(apiKeys: readonly ApiKey[], organizationId: string, reload: () =>
           h(
             "td",
             null,
-            expired ? badge("expired", "bad") : h("span", { class: "dim" }, when(key.expiresAt)),
+            expired
+              ? badge(tr("期限切れ", "expired"), "bad")
+              : h("span", { class: "dim" }, when(key.expiresAt)),
           ),
           h(
             "td",
@@ -143,7 +172,7 @@ function table(apiKeys: readonly ApiKey[], organizationId: string, reload: () =>
                 type: "button",
                 onClick: () => revoke(organizationId, key, reload),
               },
-              "Revoke",
+              tr("失効", "Revoke"),
             ),
           ),
         );
@@ -154,8 +183,8 @@ function table(apiKeys: readonly ApiKey[], organizationId: string, reload: () =>
 
 function revoke(organizationId: string, key: ApiKey, reload: () => void): void {
   const close = openModal({
-    title: `Revoke ${key.name}?`,
-    confirmLabel: "Revoke key",
+    title: tr(`${key.name}を失効しますか？`, `Revoke ${key.name}?`),
+    confirmLabel: tr("キーを失効", "Revoke key"),
     confirmTone: "danger",
     body: h(
       "div",
@@ -164,13 +193,16 @@ function revoke(organizationId: string, key: ApiKey, reload: () => void): void {
       h(
         "div",
         null,
-        "Anything using this key stops working immediately. This cannot be undone; issue a new key instead.",
+        tr(
+          "このキーを利用する処理は直ちに停止します。元に戻せないため、必要な場合は新しいキーを発行してください。",
+          "Anything using this key stops working immediately. This cannot be undone; issue a new key instead.",
+        ),
       ),
     ),
     onConfirm: async () => {
       try {
         await api.revokeApiKey(organizationId, key.id);
-        toast("Key revoked", "ok");
+        toast(tr("キーを失効しました", "Key revoked"), "ok");
         reload();
         close();
       } catch (error) {
@@ -190,28 +222,35 @@ function createKey(organizationId: string, reload: () => void): void {
       h(
         "option",
         { value: String(option.seconds), ...(index === 1 ? { selected: true } : {}) },
-        option.label,
+        option.label(),
       ),
     ),
   );
 
   const close = openModal({
-    title: "Create API key",
-    confirmLabel: "Create key",
+    title: tr("APIキーを作成", "Create API key"),
+    confirmLabel: tr("キーを作成", "Create key"),
     body: h(
       "div",
       { style: { display: "grid", gap: "16px" } },
       h(
         "div",
         { class: "field" },
-        h("label", null, "Name"),
+        h("label", null, tr("名前", "Name")),
         name,
-        h("small", null, "What this key is for. It appears in the list and nowhere else."),
+        h(
+          "small",
+          null,
+          tr(
+            "キーの用途を入力します。この名前は一覧だけに表示されます。",
+            "What this key is for. It appears in the list and nowhere else.",
+          ),
+        ),
       ),
       h(
         "div",
         { class: "field" },
-        h("label", null, "Scopes"),
+        h("label", null, tr("スコープ", "Scopes")),
         h(
           "div",
           { class: "checks" },
@@ -226,23 +265,30 @@ function createKey(organizationId: string, reload: () => void): void {
             });
             return h(
               "label",
-              { class: "check", title: scope.blurb },
+              { class: "check", title: scope.blurb() },
               box,
               h("span", { class: "mono", style: { fontSize: "12px" } }, scope.id),
             );
           }),
         ),
-        h("small", null, "Grant only what the caller needs. Scopes cannot be widened later."),
+        h(
+          "small",
+          null,
+          tr(
+            "必要なスコープだけを付与してください。後から権限を拡張することはできません。",
+            "Grant only what the caller needs. Scopes cannot be widened later.",
+          ),
+        ),
       ),
-      h("div", { class: "field" }, h("label", null, "Expires in"), lifetime),
+      h("div", { class: "field" }, h("label", null, tr("有効期間", "Expires in")), lifetime),
     ),
     onConfirm: async () => {
       if (name.value.trim() === "") {
-        toast("Give the key a name", "bad");
+        toast(tr("キー名を入力してください", "Give the key a name"), "bad");
         return;
       }
       if (chosen.size === 0) {
-        toast("Choose at least one scope", "bad");
+        toast(tr("スコープを1つ以上選択してください", "Choose at least one scope"), "bad");
         return;
       }
       try {
@@ -263,8 +309,8 @@ function createKey(organizationId: string, reload: () => void): void {
 
 function revealSecret(key: ApiKey, secret: string): void {
   openModal({
-    title: "Copy this key now",
-    dismissLabel: "Done",
+    title: tr("今すぐキーをコピーしてください", "Copy this key now"),
+    dismissLabel: tr("完了", "Done"),
     body: h(
       "div",
       { style: { display: "grid", gap: "14px" } },
@@ -275,7 +321,10 @@ function revealSecret(key: ApiKey, secret: string): void {
         h(
           "div",
           null,
-          "Takoserver stores only a digest of this secret. It cannot be shown again — if it is lost, revoke the key and create another.",
+          tr(
+            "Takoserverはこのシークレットのダイジェストだけを保存します。再表示できないため、紛失した場合は失効して新しいキーを作成してください。",
+            "Takoserver stores only a digest of this secret. It cannot be shown again — if it is lost, revoke the key and create another.",
+          ),
         ),
       ),
       h(
@@ -294,7 +343,7 @@ function revealSecret(key: ApiKey, secret: string): void {
             },
           },
           h("span", { class: "mono", style: { wordBreak: "break-all" } }, secret),
-          copyable(secret, "copy"),
+          copyable(secret, tr("コピー", "copy")),
         ),
       ),
     ),

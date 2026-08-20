@@ -1,5 +1,6 @@
 import type { FormRef, Offering } from "../api.ts";
 import { h } from "../dom.ts";
+import { tr } from "../i18n.ts";
 import { recurringPriceSentence } from "../offering-view.ts";
 import { signal } from "../reactive.ts";
 import { navigate, resourcePath } from "../router.ts";
@@ -21,7 +22,13 @@ import { explain, openModal, toast } from "../ui.ts";
  */
 export function createResource(organizationId: string, offerings: readonly Offering[]): void {
   if (offerings.length === 0) {
-    toast("This organization has nothing it may provision", "bad");
+    toast(
+      tr(
+        "この組織で作成できるサービスはありません",
+        "This organization has nothing it may provision",
+      ),
+      "bad",
+    );
     return;
   }
 
@@ -57,35 +64,52 @@ export function createResource(organizationId: string, offerings: readonly Offer
   );
 
   const close = openModal({
-    title: "New resource",
-    confirmLabel: "Apply",
+    title: tr("リソースを作成", "New resource"),
+    confirmLabel: tr("作成", "Apply"),
     body: h(
       "div",
       { style: { display: "grid", gap: "14px" } },
-      h("div", { class: "field" }, h("label", null, "Offering"), kind, price),
+      h("div", { class: "field" }, h("label", null, tr("サービス", "Offering")), kind, price),
       h(
         "div",
         { class: "field" },
-        h("label", null, "Name"),
+        h("label", null, tr("名前", "Name")),
         name,
-        h("small", null, "Unique within its space. It cannot be changed afterwards."),
+        h(
+          "small",
+          null,
+          tr(
+            "スペース内で一意の名前です。作成後は変更できません。",
+            "Unique within its space. It cannot be changed afterwards.",
+          ),
+        ),
       ),
       h(
         "div",
         { class: "field" },
-        h("label", null, "Space"),
+        h("label", null, tr("スペース", "Space")),
         space,
-        h("small", null, "A namespace of your choosing. `default` is a fine answer."),
+        h(
+          "small",
+          null,
+          tr(
+            "任意の名前空間です。通常は `default` のままで構いません。",
+            "A namespace of your choosing. `default` is a fine answer.",
+          ),
+        ),
       ),
       h(
         "div",
         { class: "field" },
-        h("label", null, "Spec"),
+        h("label", null, tr("設定", "Spec")),
         spec,
         h(
           "small",
           null,
-          "JSON, validated against the Form's schema. An empty object is valid for most kinds.",
+          tr(
+            "Formのスキーマで検証されるJSONです。多くの種類では空のオブジェクトを利用できます。",
+            "JSON, validated against the Form's schema. An empty object is valid for most kinds.",
+          ),
         ),
       ),
     ),
@@ -93,7 +117,7 @@ export function createResource(organizationId: string, offerings: readonly Offer
       const declaredName = name.value.trim();
       const declaredSpace = space.value.trim();
       if (declaredName === "" || declaredSpace === "") {
-        toast("A name and a space are required", "bad");
+        toast(tr("名前とスペースを入力してください", "A name and a space are required"), "bad");
         return;
       }
       let parsed: Record<string, unknown>;
@@ -102,7 +126,7 @@ export function createResource(organizationId: string, offerings: readonly Offer
       } catch {
         // Said here rather than by the server, because the server would be
         // right and unhelpful: it never saw what was typed.
-        toast("The spec is not valid JSON", "bad");
+        toast(tr("設定が正しいJSONではありません", "The spec is not valid JSON"), "bad");
         return;
       }
       try {
@@ -112,7 +136,13 @@ export function createResource(organizationId: string, offerings: readonly Offer
           name: declaredName,
           spec: parsed,
         });
-        toast(`${created.kind} ${created.metadata.name} is ready`, "ok");
+        toast(
+          tr(
+            `${created.kind} ${created.metadata.name} を作成しました`,
+            `${created.kind} ${created.metadata.name} is ready`,
+          ),
+          "ok",
+        );
         close();
         navigate(resourcePath(declaredSpace, created.kind, declaredName));
       } catch (error) {
@@ -139,8 +169,8 @@ export function deleteResource(
   done: () => void,
 ): void {
   const close = openModal({
-    title: `Delete ${declaration.name}?`,
-    confirmLabel: "Delete resource",
+    title: tr(`${declaration.name}を削除しますか？`, `Delete ${declaration.name}?`),
+    confirmLabel: tr("リソースを削除", "Delete resource"),
     confirmTone: "danger",
     body: h(
       "div",
@@ -148,7 +178,10 @@ export function deleteResource(
       h(
         "div",
         null,
-        "The backend resource is destroyed, along with anything stored in it. Nothing here can bring it back.",
+        tr(
+          "実体と保存されているデータが削除されます。この操作は元に戻せません。",
+          "The backend resource is destroyed, along with anything stored in it. Nothing here can bring it back.",
+        ),
       ),
     ),
     onConfirm: async () => {
@@ -158,7 +191,7 @@ export function deleteResource(
           { form: declaration.form, space: declaration.space, name: declaration.name },
           declaration.generation,
         );
-        toast(`${declaration.name} deleted`, "ok");
+        toast(tr(`${declaration.name}を削除しました`, `${declaration.name} deleted`), "ok");
         close();
         done();
       } catch (error) {
