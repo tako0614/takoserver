@@ -34,12 +34,12 @@ export const DEPLOY_CONTRACT = {
           "to an operator-private append-only evidence ledger under .deploy/evidence.",
         "post-conditions":
           "After publishing, the writer reads back the served Worker version id and its binding " +
-          "closure, proves all three D1 tables plus at least one active verification key, and " +
-          "then exercises the published origin as a real caller: discovery, a fresh signed " +
-          "object PUT, a GET that must return the exact bytes, replay of the consumed grant " +
-          "which must be rejected, and a control-plane route which must stay fail-closed. The " +
-          "probe registration and object are removed afterwards. No grant token or object byte " +
-          "is written to evidence.",
+          "closure, proves every product table remains present, and exercises the anonymous " +
+          "published surface: Takoserver discovery, OpenAPI, both Takoform lanes, identity " +
+          "discovery, credential-bearing route refusal, and unknown-route 404. Authenticated " +
+          "customer lifecycle, signed R2 bytes, replay rejection, AI inference, and billing are " +
+          "separate live E2E cadences because the deploy writer does not mint customer or " +
+          "commercial authority.",
         reversal:
           "The previously served Worker version id is captured before any mutation and printed " +
           "with the exact `wrangler versions deploy` command that restores it. Worker rollback " +
