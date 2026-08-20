@@ -4,17 +4,17 @@
 
 ## Repository
 
-- Scope: Independent multi-provider cloud control plane and Console for Resources, deployments, attachments, migration, usage, and billing.
+- Scope: Public OSS Takoserver cloud control plane, Takoform Host, resource graph, provider SDK, direct service, and reseller contracts.
 - Repository kind: `product`
 - Direct sibling dependencies: なし
 - Repository gate: `bun run check`
-- Canonical docs: [README.md](README.md), [docs/provisioner.md](docs/provisioner.md), [docs/adr/0001-provision-from-the-worker.md](docs/adr/0001-provision-from-the-worker.md)
+- Canonical docs: [README.md](README.md), [docs/adr/0002-separate-resource-meaning-from-supply.md](docs/adr/0002-separate-resource-meaning-from-supply.md), [docs/provisioner.md](docs/provisioner.md), [openapi/takoserver.openapi.json](openapi/takoserver.openapi.json)
 
 ## Ownership
 
-- Owns: Takoform Host lanes, catalog offerings, provider packs, placement, and provisioning / Cloud Resources, deployments, attachments, migration, credential grants, usage, wallet, and billing / Takoserver Console, Projects, API keys, direct customer and reseller lanes
-- Does not own: Takosumi OSS Run, state, output, audit, or ProviderConnection authority / Takosumi Hosted plan entitlements or sponsored-credit purchase policy / Person identity, legal Organizations, reusable payment profiles, or product-external sessions
-- Hazards: Consume Takos ID only through OIDC/HTTP; do not import Takosumi, Hosted, or Takos ID source or accept their cookies. / Shipped Form definitions are frozen by schemaDigest pins; add a definitionVersion instead of editing one. / Reseller customers cross the wire only as opaque tenantRef values and single-use provision tokens.
+- Owns: Takoserver direct Console and API-key account plane / Prepaid wallet, append-only funding/usage ledger, multi-Offering catalog, and logical Resource lifecycle / Takoform Host, ResourceDeployment, Attachment, Migration, Provider Pack, meter, and self-host models / Public AI and S3 data planes plus publishable provider adapters / Short-lived scoped reseller execution grants and public API/OpenAPI/SDK/CLI artifacts
+- Does not own: Takosumi OSS Run, state, output, audit, or ProviderConnection authority / Takosumi Hosted plan entitlements or sponsored-credit purchase policy / Person identity, legal Organizations, reusable payment profiles, or product-external sessions / Signed Supply Contracts, negotiated prices, production provider accounts, credentials, and operator-only capacity policy
+- Hazards: Consume Takos ID only through OIDC/HTTP; do not import Takosumi, Hosted, or Takos ID source or accept their cookies. / Portable Form identity must come from released Takoform packages; never mint a provider-shaped Form locally. / Provider capability does not imply resale authority; production Offerings require private Supply Contract composition. / Reseller requests carry only an opaque tenantRef and a short-lived audience-bound grant.
 
 ## Required workflow
 
