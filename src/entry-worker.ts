@@ -9,7 +9,7 @@ import { loadSigningKey } from "./signing-key.ts";
 import { createD1Sql } from "./sql-d1.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import { createWorkerDataServices } from "./worker-data-services.ts";
-import { createWorkerObjectBucketComposition } from "./worker-object-bucket-composition.ts";
+import { createWorkerProductionComposition } from "./worker-production-composition.ts";
 
 /**
  * The Cloudflare Workers entry.
@@ -57,6 +57,10 @@ interface WorkerEnv {
   readonly TAKOSERVER_R2_PARENT_TOKEN?: string;
   /** Versioned, non-secret commercial composition emitted by takoserver-private. */
   readonly TAKOSERVER_OBJECT_BUCKET_SUPPLIES?: string;
+  /** Reviewed Cloudflare sales for released identity Forms other than storage. */
+  readonly TAKOSERVER_EDGE_SUPPLIES?: string;
+  /** Exact workers.dev suffix assigned to the configured provider account. */
+  readonly TAKOSERVER_WORKER_ENDPOINT_SUFFIX?: string;
   /** Wasabi sub-user credentials. Both are Worker secrets. */
   readonly TAKOSERVER_WASABI_ACCESS_KEY_ID?: string;
   readonly TAKOSERVER_WASABI_SECRET_ACCESS_KEY?: string;
@@ -123,9 +127,9 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     env.TAKOSERVER_SIGNING_KEY,
   );
   const dataServices = createWorkerDataServices(env);
-  const deployment = createWorkerObjectBucketComposition({
+  const deployment = createWorkerProductionComposition({
     env,
-    form: edge.objectBucket.form,
+    forms: edge.forms,
     artifacts: {
       manifest: (tenantRef, digest) => artifacts.resolveManifest(tenantRef, digest),
       async blob(digest) {

@@ -57,10 +57,10 @@ function parseSupply(value: unknown): HostedObjectBucketSupply {
   ]);
   const provider = parseProvider(item.provider);
   const providerPack = providerPackRef(provider);
-  const providerInstallation = parseInstallation(item.providerInstallation);
-  const supplyContract = parseContract(item.supplyContract);
-  const pricePlan = parsePrice(item.pricePlan);
-  const placement = parsePlacement(item.placement);
+  const providerInstallation = parseHostedProviderInstallation(item.providerInstallation);
+  const supplyContract = parseHostedSupplyContract(item.supplyContract);
+  const pricePlan = parseHostedPricePlan(item.pricePlan);
+  const placement = parseHostedPlacement(item.placement);
   if (
     providerInstallation.providerPackRef !== providerPack ||
     providerInstallation.supplyContractRef !== supplyContract.id ||
@@ -104,7 +104,7 @@ function parseProvider(value: unknown): HostedObjectBucketProvider {
   invalid();
 }
 
-function parseInstallation(value: unknown): ProviderInstallation {
+export function parseHostedProviderInstallation(value: unknown): ProviderInstallation {
   const installation = record(value);
   exactKeys(installation, ["id", "providerPackRef", "supplyContractRef", "state", "regions"]);
   if (!Array.isArray(installation.regions) || installation.regions.length < 1) invalid();
@@ -124,7 +124,10 @@ function parseInstallation(value: unknown): ProviderInstallation {
   };
 }
 
-function parseContract(value: unknown): SupplyContract {
+export function parseHostedSupplyContract(
+  value: unknown,
+  requiredResourceClasses: readonly string[] = ["storage.object"],
+): SupplyContract {
   const contract = record(value);
   exactKeys(
     contract,
@@ -142,21 +145,25 @@ function parseContract(value: unknown): SupplyContract {
     ],
     ["validUntil"],
   );
+  const permittedResourceClasses = contract.permittedResourceClasses;
   if (
-    !Array.isArray(contract.permittedResourceClasses) ||
+    !Array.isArray(permittedResourceClasses) ||
+    permittedResourceClasses.length < 1 ||
+    permittedResourceClasses.length > 64 ||
     !Array.isArray(contract.deliveryModes) ||
     !Array.isArray(contract.regions) ||
-    contract.permittedResourceClasses.length !== 1 ||
-    contract.permittedResourceClasses[0] !== "storage.object" ||
+    !requiredResourceClasses.every((item) => permittedResourceClasses.includes(item)) ||
     typeof contract.whiteLabelAllowed !== "boolean" ||
     typeof contract.endUserTermsRequired !== "boolean"
   ) {
     invalid();
   }
+  const parsedResourceClasses = permittedResourceClasses.map((item) => id(item));
+  unique(parsedResourceClasses);
   return {
     id: id(contract.id),
     providerType: lowerId(contract.providerType, 64),
-    permittedResourceClasses: ["storage.object"],
+    permittedResourceClasses: parsedResourceClasses,
     deliveryModes: contract.deliveryModes.map((value) =>
       oneOf(value, [
         "embedded-binding",
@@ -181,7 +188,7 @@ function parseContract(value: unknown): SupplyContract {
   };
 }
 
-function parsePrice(value: unknown): PricePlan {
+export function parseHostedPricePlan(value: unknown): PricePlan {
   const plan = record(value);
   exactKeys(plan, ["id", "currency", "recurring", "meters"]);
   if (plan.currency !== "USD" || !Array.isArray(plan.meters) || plan.meters.length > 64) invalid();
@@ -204,7 +211,7 @@ function parseCharge(value: unknown) {
   };
 }
 
-function parsePlacement(value: unknown): ObjectBucketPlacement {
+export function parseHostedPlacement(value: unknown): ObjectBucketPlacement {
   const placement = record(value);
   exactKeys(placement, [
     "deliveryMode",

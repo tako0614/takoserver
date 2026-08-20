@@ -45,8 +45,8 @@ const SUPPLIES = {
       supplyContract: {
         id: "cloudflare.contract",
         providerType: "cloudflare",
-        permittedResourceClasses: ["storage.object"],
-        deliveryModes: ["native-credentials"],
+        permittedResourceClasses: ["storage.object", "compute.edge"],
+        deliveryModes: ["native-credentials", "embedded-binding"],
         customerAccess: "scoped-native-access",
         whiteLabelAllowed: true,
         endUserTermsRequired: false,
@@ -76,6 +76,37 @@ const SUPPLIES = {
   ],
 };
 
+const EDGE_SUPPLIES = {
+  kind: "takoserver.hosted-edge-supplies@v1",
+  providerInstallation: SUPPLIES.supplies[0]?.providerInstallation,
+  supplyContract: SUPPLIES.supplies[0]?.supplyContract,
+  offerings: [
+    {
+      formKind: "ModuleWorker",
+      offeringId: "compute.edge.cloudflare.global",
+      displayName: "Edge Worker",
+      pricePlan: {
+        id: "compute.edge.cloudflare.global.price-v1",
+        currency: "USD",
+        recurring: { meter: "worker-month", amountMinor: 500 },
+        meters: [],
+      },
+      placement: {
+        deliveryMode: "embedded-binding",
+        supportPolicyRef: "support:hosted:standard",
+        abusePolicyRef: "abuse:hosted:standard",
+        portability: {
+          api: "portable",
+          exportFormats: [],
+          importFormats: [],
+          migrationModes: ["offline"],
+        },
+        isolation: "dedicated-resource",
+      },
+    },
+  ],
+};
+
 describe("private data service deploy configuration", () => {
   test("validates private prices and realizes no secret value", () => {
     const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
@@ -88,6 +119,8 @@ describe("private data service deploy configuration", () => {
           aiModels: [MODEL],
           r2ParentAccessKeyId: "parent-key",
           objectBucketSupplies: SUPPLIES,
+          edgeSupplies: EDGE_SUPPLIES,
+          workerEndpointSuffix: "hosted.workers.dev",
         }),
       );
       const target = loadTarget(path);
@@ -98,6 +131,9 @@ describe("private data service deploy configuration", () => {
       expect(JSON.parse(realized.vars.TAKOSERVER_OBJECT_BUCKET_SUPPLIES ?? "null")).toEqual(
         SUPPLIES,
       );
+      expect(JSON.parse(realized.vars.TAKOSERVER_EDGE_SUPPLIES ?? "null")).toEqual(EDGE_SUPPLIES);
+      expect(realized.vars.TAKOSERVER_WORKER_ENDPOINT_SUFFIX).toBe("hosted.workers.dev");
+      expect(realized.vars).not.toHaveProperty("TAKOSERVER_ZONES");
       expect(JSON.stringify(realized)).not.toContain("TOKEN");
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -121,6 +157,17 @@ describe("private data service deploy configuration", () => {
       const path = join(directory, "target.json");
       writeFileSync(path, JSON.stringify({ ...BASE, objectBucketSupplies: SUPPLIES }));
       expect(() => loadTarget(path)).toThrow("must be configured together");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("will not sell edge capacity without the exact provider endpoint suffix", () => {
+    const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
+    try {
+      const path = join(directory, "target.json");
+      writeFileSync(path, JSON.stringify({ ...BASE, edgeSupplies: EDGE_SUPPLIES }));
+      expect(() => loadTarget(path)).toThrow("edge supplies and `workerEndpointSuffix`");
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
