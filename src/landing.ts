@@ -260,7 +260,7 @@ a:focus-visible {
 .map-grid { display: grid; gap: var(--space-xs); }
 .map-node {
   min-width: 0;
-  padding: var(--space-md);
+  padding: var(--space-md) var(--space-sm);
   border: var(--rule-hair) solid var(--color-rule);
   border-radius: var(--radius-sm);
   background: var(--color-paper);
@@ -276,7 +276,7 @@ a:focus-visible {
 .map-node h2 {
   min-width: 0;
   margin: 0;
-  font-size: 1.1rem;
+  font-size: 1rem;
   line-height: 1.15;
   letter-spacing: -0.035em;
   overflow-wrap: anywhere;
