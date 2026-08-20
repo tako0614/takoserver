@@ -18,11 +18,11 @@ import type { Clock, Sql } from "./ports.ts";
  * per request: a wallet that lists every object read is a wallet nobody can
  * read, and the events remain for anyone who wants the detail.
  *
- * The fold marks the rows it took before it writes the debit, and the debit's
- * reference is the fold's own id — so the ledger's uniqueness makes a repeated
- * fold a no-op, and a fold interrupted between the two steps leaves rows
- * marked with a debit that will be written by the next attempt under the same
- * reference.
+ * The fold claims rows before it writes the debit. A later attempt first
+ * recovers every claimed group without a matching ledger entry, so a process
+ * stop between those two writes cannot lose usage. The ledger accepts the
+ * debit only when prepaid funds cover it; otherwise the claim remains durable
+ * and retryable rather than overdrawing the Wallet.
  */
 
 export interface MeteringRates {
@@ -70,6 +70,21 @@ export function createMetering(options: {
   const { sql, ledger, clock, randomId } = options;
   const bytesRate = options.rates?.bytesMinorPerGibibyte ?? 0;
   const requestRate = options.rates?.requestsMinorPerThousand ?? 0;
+
+  const settleClaim = async (claim: {
+    readonly rollupId: string;
+    readonly organizationId: string;
+    readonly count: number;
+    readonly micros: number;
+  }): Promise<boolean> => {
+    const amountMinor = Math.round(claim.micros / 1_000_000);
+    if (amountMinor === 0) return true;
+    return await ledger.debitUsage({
+      organizationId: claim.organizationId,
+      reference: claim.rollupId,
+      amountMinor,
+    });
+  };
 
   return {
     async record(usage) {
@@ -142,12 +157,51 @@ export function createMetering(options: {
     },
 
     async rollUp(limit) {
+      const boundedLimit = Math.min(Math.max(limit, 1), 1_000);
+      let moved = 0;
+      const blockedOrganizations = new Set<string>();
+
+      // A prior process may have claimed rows and stopped before debiting the
+      // ledger. Resume those exact groups first. Groups that round to zero need
+      // no ledger row and are already final.
+      const recoverable = await sql.query(
+        `SELECT events.rollup_id, events.org_id, COUNT(*) AS event_count,
+                SUM(events.amount_minor) AS amount_micros
+         FROM usage_events AS events
+         LEFT JOIN ledger AS debit
+           ON debit.org_id = events.org_id
+          AND debit.type = 'usage_debit'
+          AND debit.ref = events.rollup_id
+         WHERE events.rollup_id IS NOT NULL AND debit.id IS NULL
+         GROUP BY events.rollup_id, events.org_id
+         HAVING SUM(events.amount_minor) >= 500000
+         ORDER BY MIN(events.created_at) ASC, events.rollup_id ASC
+         LIMIT ?`,
+        [boundedLimit],
+      );
+      for (const row of recoverable) {
+        const claim = {
+          rollupId: String(row.rollup_id),
+          organizationId: String(row.org_id),
+          count: Number(row.event_count),
+          micros: Number(row.amount_micros),
+        };
+        if (await settleClaim(claim)) moved += claim.count;
+        else blockedOrganizations.add(claim.organizationId);
+      }
+      if (moved >= boundedLimit) return moved;
+
+      const blockedClause =
+        blockedOrganizations.size === 0
+          ? ""
+          : ` AND org_id NOT IN (${[...blockedOrganizations].map(() => "?").join(", ")})`;
       const pending = await sql.query(
         `SELECT request_id, org_id, amount_minor FROM usage_events
-         WHERE rollup_id IS NULL ORDER BY created_at ASC LIMIT ?`,
-        [Math.min(Math.max(limit, 1), 1_000)],
+         WHERE rollup_id IS NULL${blockedClause}
+         ORDER BY created_at ASC LIMIT ?`,
+        [...blockedOrganizations, boundedLimit - moved],
       );
-      if (pending.length === 0) return 0;
+      if (pending.length === 0) return moved;
 
       const byOrg = new Map<string, { ids: string[]; micros: number }>();
       for (const row of pending) {
@@ -158,7 +212,6 @@ export function createMetering(options: {
         byOrg.set(organizationId, entry);
       }
 
-      let moved = 0;
       for (const [organizationId, entry] of byOrg) {
         const rollupId = `roll_${randomId()}`;
         const claimed = await sql.run(
@@ -167,15 +220,18 @@ export function createMetering(options: {
           [rollupId, ...entry.ids],
         );
         if (claimed.changes === 0) continue;
-        moved += claimed.changes;
-
-        // Rounded once, here, for everything the fold covers. Zero is a real
-        // answer and is not written: a ledger full of nothing is a ledger
-        // nobody reads.
-        const amountMinor = Math.round(entry.micros / 1_000_000);
-        if (amountMinor > 0) {
-          await ledger.debitUsage({ organizationId, reference: rollupId, amountMinor });
-        }
+        const actual = await sql.query(
+          `SELECT COUNT(*) AS event_count, SUM(amount_minor) AS amount_micros
+           FROM usage_events WHERE org_id = ? AND rollup_id = ?`,
+          [organizationId, rollupId],
+        );
+        const claim = {
+          rollupId,
+          organizationId,
+          count: Number(actual[0]?.event_count ?? 0),
+          micros: Number(actual[0]?.amount_micros ?? 0),
+        };
+        if (await settleClaim(claim)) moved += claim.count;
       }
       return moved;
     },

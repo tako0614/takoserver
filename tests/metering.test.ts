@@ -114,6 +114,56 @@ describe("metering", () => {
     expect((await ledger.wallet("org_1")).availableMinor).toBe(99_995);
   });
 
+  test("recovers a claimed rollup after a process stops before ledger debit", async () => {
+    const { metering, ledger, sql } = await meter({ bytesMinorPerGibibyte: 100 });
+    await metering.record({
+      requestId: "interrupted",
+      organizationId: "org_1",
+      resourceUid: "uid_media",
+      operation: "get",
+      bytes: gibibyte,
+    });
+    await sql.run("UPDATE usage_events SET rollup_id = ? WHERE request_id = ?", [
+      "roll_interrupted",
+      "interrupted",
+    ]);
+
+    expect(await metering.rollUp(100)).toBe(1);
+    expect((await ledger.wallet("org_1")).availableMinor).toBe(99_900);
+    expect(await metering.rollUp(100)).toBe(0);
+  });
+
+  test("keeps unpaid usage recoverable until prepaid funds are available", async () => {
+    const { metering, ledger, sql } = await meter({ bytesMinorPerGibibyte: 100 });
+    expect(
+      await ledger.debitUsage({
+        organizationId: "org_1",
+        reference: "drain_wallet",
+        amountMinor: 100_000,
+      }),
+    ).toBe(true);
+    await metering.record({
+      requestId: "awaiting_credit",
+      organizationId: "org_1",
+      resourceUid: "uid_media",
+      operation: "get",
+      bytes: gibibyte,
+    });
+
+    expect(await metering.rollUp(100)).toBe(0);
+    expect(await ledger.wallet("org_1")).toMatchObject({ availableMinor: 0 });
+    expect(
+      await sql.query("SELECT rollup_id FROM usage_events WHERE request_id = ?", [
+        "awaiting_credit",
+      ]),
+    ).toEqual([{ rollup_id: "roll_id1" }]);
+
+    await ledger.fund({ organizationId: "org_1", fundingRef: "refill", amountMinor: 100 });
+    expect(await metering.rollUp(100)).toBe(1);
+    expect(await ledger.wallet("org_1")).toMatchObject({ availableMinor: 0 });
+    expect(await metering.rollUp(100)).toBe(0);
+  });
+
   test("keeps organizations apart", async () => {
     const { metering, ledger } = await meter({ bytesMinorPerGibibyte: 1_000 });
     await ledger.fund({ organizationId: "org_2", fundingRef: "seed2", amountMinor: 100_000 });

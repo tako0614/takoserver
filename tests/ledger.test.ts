@@ -98,9 +98,38 @@ describe("prepaid wallet", () => {
 
   test("charges metered usage against settled funds", async () => {
     await ledger.fund({ organizationId: "org_a", fundingRef: "pay_1", amountMinor: 500 });
-    await ledger.debitUsage({ organizationId: "org_a", reference: "usage_1", amountMinor: 120 });
-    await ledger.debitUsage({ organizationId: "org_a", reference: "usage_1", amountMinor: 120 });
+    expect(
+      await ledger.debitUsage({
+        organizationId: "org_a",
+        reference: "usage_1",
+        amountMinor: 120,
+      }),
+    ).toBe(true);
+    expect(
+      await ledger.debitUsage({
+        organizationId: "org_a",
+        reference: "usage_1",
+        amountMinor: 120,
+      }),
+    ).toBe(true);
     expect(await ledger.wallet("org_a")).toMatchObject({ settledMinor: 380, availableMinor: 380 });
+  });
+
+  test("refuses metered usage that would overdraw prepaid funds", async () => {
+    await ledger.fund({ organizationId: "org_a", fundingRef: "pay_1", amountMinor: 100 });
+
+    expect(
+      await ledger.debitUsage({
+        organizationId: "org_a",
+        reference: "usage_too_large",
+        amountMinor: 101,
+      }),
+    ).toBe(false);
+    expect(await ledger.wallet("org_a")).toMatchObject({
+      settledMinor: 100,
+      heldMinor: 0,
+      availableMinor: 100,
+    });
   });
 
   test("refuses a nonsense amount rather than recording it", async () => {

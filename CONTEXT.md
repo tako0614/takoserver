@@ -60,8 +60,25 @@ portability claims.
 _Avoid_: Form, provider, deployment
 
 **Price Plan**:
-The recurring and usage meters applied to an Offering.
+The versioned customer-facing rates and settlement policy applied to an Offering.
+A Price Plan may be entirely usage-based; it does not require a flat recurring fee.
 _Avoid_: Unit price, provider invoice
+
+**Meter**:
+A stable customer-facing unit of measured service, such as `cpu.millisecond`,
+`storage.gibibyte-hour`, `rows.read`, `operations.64kib`, or `tokens.input`.
+Provider-native counters are normalized into Meters before pricing.
+_Avoid_: Provider metric name, invoice line item
+
+**Usage Window**:
+A bounded interval over which asynchronous Resource usage is finalized and priced.
+_Avoid_: Unbounded postpaid balance, billing cron run
+
+**Usage Allowance**:
+A prepaid Wallet hold that authorizes one Resource to accrue up to a bounded amount
+within one Usage Window. Closing the window captures actual usage and releases the
+remainder; insufficient funds prevent the next allowance from opening.
+_Avoid_: Credit limit, negative Wallet balance
 
 ## Access model
 

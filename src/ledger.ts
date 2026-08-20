@@ -96,12 +96,16 @@ export interface Ledger {
     readonly reference: string;
     readonly amountMinor: number;
   }): Promise<void>;
-  /** Charges metered usage directly against settled funds. */
+  /**
+   * Charges metered usage directly against available prepaid funds. Returns
+   * false without writing when the Wallet cannot cover the charge; replaying
+   * the same exact reference and amount returns true.
+   */
   debitUsage(input: {
     readonly organizationId: string;
     readonly reference: string;
     readonly amountMinor: number;
-  }): Promise<void>;
+  }): Promise<boolean>;
 }
 
 export function createLedger(sql: Sql, clock: Clock): Ledger {
@@ -216,9 +220,40 @@ export function createLedger(sql: Sql, clock: Clock): Ledger {
       await append(organizationId, "release", reference, 0, -amountMinor);
     },
 
-    async debitUsage({ organizationId, reference, amountMinor }): Promise<void> {
+    async debitUsage({ organizationId, reference, amountMinor }): Promise<boolean> {
       positiveAmount(amountMinor);
-      await append(organizationId, "usage_debit", reference, -amountMinor, 0);
+      const written = await sql.run(
+        `INSERT INTO ledger (id, org_id, type, ref, settled_delta, held_delta, created_at)
+         SELECT ?, ?, 'usage_debit', ?, ?, 0, ?
+         WHERE NOT EXISTS (
+                 SELECT 1 FROM ledger
+                 WHERE org_id = ? AND type = 'usage_debit' AND ref = ?
+               )
+           AND (SELECT COALESCE(SUM(settled_delta - held_delta), 0)
+                FROM ledger WHERE org_id = ?) >= ?`,
+        [
+          `led_${crypto.randomUUID()}`,
+          organizationId,
+          reference,
+          -amountMinor,
+          clock().toISOString(),
+          organizationId,
+          reference,
+          organizationId,
+          amountMinor,
+        ],
+      );
+      if (written.changes === 1) return true;
+      const existing = await sql.query(
+        `SELECT settled_delta, held_delta FROM ledger
+         WHERE org_id = ? AND type = 'usage_debit' AND ref = ?`,
+        [organizationId, reference],
+      );
+      return (
+        existing.length === 1 &&
+        Number(existing[0]?.settled_delta) === -amountMinor &&
+        Number(existing[0]?.held_delta) === 0
+      );
     },
   };
 }
