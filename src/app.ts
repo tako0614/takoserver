@@ -25,6 +25,7 @@ import {
 import { createRouter, type Router } from "./router.ts";
 import type { S3CredentialIssuer } from "./s3-port.ts";
 import type { TakoformArtifactTransport } from "./takoform/artifacts.ts";
+import type { WorkerModuleInspector } from "./takoform/engine.ts";
 import { sameFormRef } from "./takoform/forms.ts";
 import { createTakoformHost } from "./takoform/host.ts";
 import { createTakoformStore } from "./takoform/store.ts";
@@ -81,6 +82,8 @@ export interface AppPorts {
   readonly signingKey?: SigningKey;
   /** Shared with a provider that publishes committed bundles. */
   readonly artifacts?: TakoformArtifactTransport;
+  /** Parses committed worker bytes without executing tenant code. */
+  readonly workerModuleInspector?: WorkerModuleInspector;
   /**
    * Replaces the Takoform Host entirely. Used by conformance tests that need to
    * drive the lane with their own authentication; production never sets it.
@@ -270,6 +273,9 @@ export function buildApp(ports: AppPorts): App {
       ...(ports.bindings ? { bindings: ports.bindings } : {}),
       driver,
       ...(ports.artifacts ? { artifacts: ports.artifacts } : {}),
+      ...(ports.workerModuleInspector
+        ? { workerModuleInspector: ports.workerModuleInspector }
+        : {}),
       clock,
       randomId,
       // The redemption lane: a reseller's single-use provision token buys

@@ -23,6 +23,7 @@ import { ensureSigningKey, loadSigningKey } from "./signing-key.ts";
 import { createD1HttpSql } from "./sql-d1-http.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
+import { createJavaScriptWorkerModuleInspector } from "./takoform/worker-module-inspector.ts";
 import { createWorkerdRuntime } from "./workerd-runtime.ts";
 import { createWorkerdSupervisor, findWorkerd } from "./workerd-supervisor.ts";
 
@@ -393,6 +394,7 @@ const app = buildApp({
   providerPacks: deployment.providerPacks,
   offerings: deployment.offerings,
   artifacts: artifactStore,
+  workerModuleInspector: createJavaScriptWorkerModuleInspector(),
   clock,
 });
 

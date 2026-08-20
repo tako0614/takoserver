@@ -8,6 +8,7 @@ import type { CloudflareWorkersAiBinding } from "./providers/cloudflare-workers-
 import { loadSigningKey } from "./signing-key.ts";
 import { createD1Sql } from "./sql-d1.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
+import { createJavaScriptWorkerModuleInspector } from "./takoform/worker-module-inspector.ts";
 import { createWorkerDataServices } from "./worker-data-services.ts";
 import { createWorkerProductionComposition } from "./worker-production-composition.ts";
 
@@ -144,6 +145,7 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     sql,
     objects,
     artifacts,
+    workerModuleInspector: createJavaScriptWorkerModuleInspector(),
     ...(signingKey ? { signingKey } : {}),
     identity,
     identityProviders,

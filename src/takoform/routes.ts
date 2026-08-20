@@ -76,7 +76,7 @@ export interface ProvisionTokenClaimsView {
   readonly tenantRef: string;
   readonly reservationId: string;
   readonly offeringId: string;
-  readonly offeringDigest: string;
+  readonly offeringDigest: `sha256:${string}`;
   readonly tokenId: string;
 }
 
@@ -500,6 +500,14 @@ async function provisionRoute(
     url,
     tenantId: boundedTenantReference(claims.organizationId),
     principalId: boundedTenantReference(`provision:${claims.tokenId}`),
+    // The reservation already holds this exact Offering's price. Without this
+    // authority the provider driver treats redemption as an ordinary direct
+    // organization apply and charges the wallet a second time.
+    commercialAuthority: {
+      reservationId: claims.reservationId,
+      offeringId: claims.offeringId,
+      offeringDigest: claims.offeringDigest,
+    },
   };
 
   if (

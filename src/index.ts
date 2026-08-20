@@ -174,6 +174,7 @@ export type {
   TakoformV1Alpha3FormRef,
 } from "./takoform/types.ts";
 export { TakoformHostError } from "./takoform/types.ts";
+export { createJavaScriptWorkerModuleInspector } from "./takoform/worker-module-inspector.ts";
 export {
   TAKOFORM_EDGE_OBJECTS_INTERFACE,
   TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM,

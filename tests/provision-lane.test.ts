@@ -7,6 +7,7 @@ import {
   InMemoryTakoformResourceDriver,
   type InstalledTakoformForm,
   type TakoformHost,
+  type TakoformResourceDriver,
 } from "../src/index.ts";
 import { createLedger } from "../src/ledger.ts";
 import type { Sql } from "../src/ports.ts";
@@ -92,7 +93,9 @@ interface Lane {
   readonly quoteMeter: string;
 }
 
-async function fundedLane(): Promise<Lane> {
+async function fundedLane(
+  driver: TakoformResourceDriver = new InMemoryTakoformResourceDriver(),
+): Promise<Lane> {
   const sql = createEphemeralSql();
   const clock = () => new Date(NOW);
   const ledger = createLedger(sql, clock);
@@ -112,7 +115,7 @@ async function fundedLane(): Promise<Lane> {
     // provision token can do must not depend on any other credential.
     authenticate: async () => null,
     forms: [INSTALLED_FORM],
-    driver: new InMemoryTakoformResourceDriver(),
+    driver,
     clock,
     provision: { tokens, catalog },
   });
@@ -202,6 +205,38 @@ async function preparedDigest(
 const APPLY_PATH = `/provision/v1/resources/edge.forms.takoform.com/v1alpha1/EdgeObjectBucket/media`;
 
 describe("provision-token redemption lane", () => {
+  test("passes the reservation authority into the provider apply", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    let commercialAuthority: Parameters<TakoformResourceDriver["apply"]>[0]["commercialAuthority"];
+    const lane = await fundedLane({
+      async apply(input) {
+        commercialAuthority = input.commercialAuthority;
+        return await memory.apply(input);
+      },
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+      import: (input) => memory.import(input),
+    });
+    const token = await lane.issueToken();
+    const body = resourceBody();
+    const prepareDigest = await preparedDigest(lane.host, token, body);
+    const applied = await laneRequest(
+      lane.host,
+      "PUT",
+      APPLY_PATH,
+      token,
+      { ...body, review: { prepareDigest } },
+      { "idempotency-key": "provision-commercial-authority", "if-none-match": "*" },
+    );
+
+    expect(applied.status).toBe(201);
+    expect(commercialAuthority).toEqual({
+      reservationId: lane.reservation.id,
+      offeringId: OFFERING.id,
+      offeringDigest: lane.reservation.offeringDigest,
+    });
+  });
+
   test("a token prepares and applies exactly the purchased resource, once", async () => {
     const lane = await fundedLane();
     const token = await lane.issueToken();
