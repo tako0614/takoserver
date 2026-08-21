@@ -77,6 +77,60 @@ export function createSponsorshipRoutes(
         return Response.json({ takoformRunCredential: issued }, { status: 201 });
       }
 
+      if (request.method === "GET" && rest.length === 2 && rest[1] === "inventory") {
+        exactQuery(url, ["limit"], ["cursor"]);
+        const limit = pageLimit(url.searchParams.get("limit"));
+        const after = inventoryCursor(url.searchParams.get("cursor"));
+        const rows = await options.sql.query(
+          `SELECT resource_uid FROM sponsorship_resources
+           WHERE tenant_ref = ? AND resource_uid > ?
+           ORDER BY resource_uid
+           LIMIT ?`,
+          [tenantRef, after, limit + 1],
+        );
+        const page = rows.slice(0, limit);
+        const resources = await Promise.all(
+          page.map((row) =>
+            options.inventory.resourceByUid(organizationId, text(row.resource_uid, 256)),
+          ),
+        );
+        const items = resources.flatMap((resource) =>
+          resource === null
+            ? []
+            : [
+                {
+                  apiVersion: resource.apiVersion,
+                  kind: resource.kind,
+                  name: resource.name,
+                  formRef: {
+                    apiVersion: resource.resource.form.formRef.apiVersion,
+                    kind: resource.resource.form.formRef.kind,
+                    definitionVersion: resource.resource.form.formRef.definitionVersion,
+                    schemaDigest: resource.resource.form.formRef.schemaDigest,
+                  },
+                  uid: resource.uid,
+                  generation: resource.generation,
+                  revision: resource.revision,
+                  conditions: resource.resource.status.conditions.map(
+                    ({ type, status, reason, lastTransitionTime }) => ({
+                      type,
+                      status,
+                      reason,
+                      lastTransitionTime,
+                    }),
+                  ),
+                },
+              ],
+        );
+        const last = page.at(-1);
+        return Response.json({
+          items,
+          ...(rows.length > limit && last
+            ? { nextCursor: encodeInventoryCursor(text(last.resource_uid, 256)) }
+            : {}),
+        });
+      }
+
       if (request.method === "POST" && rest.length === 2 && rest[1] === "funding") {
         const body = await jsonObject(request, [
           "tenantRef",
@@ -208,6 +262,38 @@ function boundedTtl(value: unknown): number {
   const ttl = positiveInteger(value);
   if (ttl > 600) throw new Error();
   return ttl;
+}
+
+function pageLimit(value: string | null): number {
+  if (value === null || !/^[1-9][0-9]{0,2}$/u.test(value)) throw new Error();
+  const parsed = Number(value);
+  if (parsed > 100) throw new Error();
+  return parsed;
+}
+
+function inventoryCursor(value: string | null): string {
+  if (value === null) return "";
+  if (!/^[A-Za-z0-9_-]+$/u.test(value)) throw new Error();
+  const padded = `${value.replaceAll("-", "+").replaceAll("_", "/")}${"=".repeat((4 - (value.length % 4)) % 4)}`;
+  const decoded = atob(padded);
+  if (decoded.length === 0 || encodeInventoryCursor(decoded) !== value) throw new Error();
+  return text(decoded, 256);
+}
+
+function encodeInventoryCursor(resourceUid: string): string {
+  return btoa(resourceUid).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+}
+
+function exactQuery(url: URL, required: readonly string[], optional: readonly string[]): void {
+  const keys = [...url.searchParams.keys()];
+  const allowed = new Set([...required, ...optional]);
+  if (
+    keys.some((key) => !allowed.has(key)) ||
+    required.some((key) => url.searchParams.getAll(key).length !== 1) ||
+    optional.some((key) => url.searchParams.getAll(key).length > 1)
+  ) {
+    throw new Error();
+  }
 }
 
 async function tenant(sql: Sql, tenantRef: string): Promise<string | null> {

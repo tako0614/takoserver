@@ -108,6 +108,56 @@ describe("Hosted sponsorship owner API", () => {
       resources: [{ resourceId: "res_sponsored" }],
     });
 
+    const firstInventory = (await json(await call(route, "GET", `${base}/inventory?limit=1`))) as {
+      readonly items: readonly unknown[];
+      readonly nextCursor?: string;
+    };
+    expect(firstInventory.items).toEqual([
+      {
+        apiVersion: "edge.forms.takoform.com/v1beta1",
+        kind: "ObjectBucket",
+        name: "res_direct",
+        formRef: {
+          apiVersion: "edge.forms.takoform.com/v1beta1",
+          kind: "ObjectBucket",
+          definitionVersion: "0.1.0",
+          schemaDigest: `sha256:${"a".repeat(64)}`,
+        },
+        uid: "res_direct",
+        generation: "3",
+        revision: "7",
+        conditions: [],
+      },
+    ]);
+    expect(firstInventory.nextCursor).toBeString();
+    expect(
+      await json(
+        await call(
+          route,
+          "GET",
+          `${base}/inventory?limit=1&cursor=${encodeURIComponent(firstInventory.nextCursor ?? "")}`,
+        ),
+      ),
+    ).toEqual({
+      items: [
+        {
+          apiVersion: "edge.forms.takoform.com/v1beta1",
+          kind: "ObjectBucket",
+          name: "res_sponsored",
+          formRef: {
+            apiVersion: "edge.forms.takoform.com/v1beta1",
+            kind: "ObjectBucket",
+            definitionVersion: "0.1.0",
+            schemaDigest: `sha256:${"a".repeat(64)}`,
+          },
+          uid: "res_sponsored",
+          generation: "3",
+          revision: "7",
+          conditions: [],
+        },
+      ],
+    });
+
     const removed = await call(route, "DELETE", `${base}/resources/res_sponsored`);
     expect(removed.status).toBe(204);
     expect(lifecycleRequests).toHaveLength(1);
