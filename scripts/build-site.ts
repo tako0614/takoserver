@@ -29,12 +29,15 @@ const outDir = value("--out") ?? "site/dist";
 rmSync(outDir, { recursive: true, force: true });
 mkdirSync(outDir, { recursive: true });
 
-await Bun.write(
-  join(outDir, "index.html"),
-  landingHtml({
-    consoleOrigin: value("--console") ?? null,
-    apiOrigin: value("--api") ?? null,
-  }),
-);
+const html = landingHtml({
+  consoleOrigin: value("--console") ?? null,
+  apiOrigin: value("--api") ?? null,
+});
+await Bun.write(join(outDir, "index.html"), html);
+for (const locale of ["ja", "en"] as const) {
+  const localeDirectory = join(outDir, locale);
+  mkdirSync(localeDirectory, { recursive: true });
+  await Bun.write(join(localeDirectory, "index.html"), html);
+}
 
 process.stdout.write(`site built into ${outDir}\n`);
