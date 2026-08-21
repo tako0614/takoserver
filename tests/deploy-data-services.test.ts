@@ -159,6 +159,7 @@ describe("private data service deploy configuration", () => {
         JSON.stringify({
           ...BASE,
           aiModels: [MODEL],
+          stripeCheckout: true,
           r2ParentAccessKeyId: "parent-key",
           objectBucketSupplies: SUPPLIES,
           edgeSupplies: EDGE_SUPPLIES,
@@ -170,6 +171,7 @@ describe("private data service deploy configuration", () => {
       expect(JSON.parse(realized.vars.TAKOSERVER_AI_MODELS ?? "null")).toEqual([MODEL]);
       expect(realized.vars.CLOUDFLARE_ACCOUNT_ID).toBe(BASE.accountId);
       expect(realized.vars.TAKOSERVER_R2_PARENT_ACCESS_KEY_ID).toBe("parent-key");
+      expect(realized.vars.TAKOSERVER_STRIPE_CHECKOUT_ENABLED).toBe("1");
       expect(JSON.parse(realized.vars.TAKOSERVER_OBJECT_BUCKET_SUPPLIES ?? "null")).toEqual(
         SUPPLIES,
       );
@@ -177,6 +179,21 @@ describe("private data service deploy configuration", () => {
       expect(realized.vars.TAKOSERVER_WORKER_ENDPOINT_SUFFIX).toBe("hosted.workers.dev");
       expect(realized.vars).not.toHaveProperty("TAKOSERVER_ZONES");
       expect(JSON.stringify(realized)).not.toContain("TOKEN");
+      expect(JSON.stringify(realized)).not.toContain("sk_");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps Stripe Checkout disabled unless the target names that customer surface", () => {
+    const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
+    try {
+      const path = join(directory, "target.json");
+      writeFileSync(path, JSON.stringify(BASE));
+      const realized = deploymentVariables(loadTarget(path)) as {
+        vars: Record<string, string>;
+      };
+      expect(realized.vars).not.toHaveProperty("TAKOSERVER_STRIPE_CHECKOUT_ENABLED");
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
