@@ -13,9 +13,17 @@ describe("Takoserver public site", () => {
     expect(html).toContain("Open the console");
     expect(html).toContain('data-locale="ja"');
     expect(html).toContain('data-locale="en"');
+    expect(html).toContain("const localizedPaths=true");
+    expect(html).toContain('const pathLocale=location.pathname.split("/")[1]');
+    expect(html).toContain('history.replaceState(null,"","/"+lang+"/")');
     expect(html).toContain("https://console.takoserver.example");
     expect(html).toContain("https://api.takoserver.example/openapi.json");
     expect(html).not.toMatch(/Cloudflare|Wasabi|Aiven|UpCloud|Backblaze|OpenSRS/u);
     expect(html).not.toContain("<script src=");
+  });
+
+  test("does not invent locale paths on the API-origin landing page", () => {
+    const html = landingHtml({ consoleOrigin: null, apiOrigin: null });
+    expect(html).toContain("const localizedPaths=false");
   });
 });
