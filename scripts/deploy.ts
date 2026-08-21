@@ -137,6 +137,7 @@ async function run(mode: Mode): Promise<void> {
         worker: target.workerName,
         previousVersionId,
         alreadyCurrent: report.alreadyCurrent,
+        signingKeyRepairRequired: report.signingKeyRepairRequired,
       },
       null,
       2,
@@ -148,7 +149,7 @@ async function run(mode: Mode): Promise<void> {
     return;
   }
 
-  if (report.alreadyCurrent && previousVersionId !== null) {
+  if (report.alreadyCurrent && !report.signingKeyRepairRequired && previousVersionId !== null) {
     process.stdout.write(
       `\nalready current: version ${previousVersionId} already serves this bundle digest; ` +
         "nothing was published\n",

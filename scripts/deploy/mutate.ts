@@ -4,6 +4,7 @@ import { RemoteD1, sqlLiteral } from "./d1.ts";
 import { mutationError } from "./errors.ts";
 import type { PreflightReport } from "./preflight.ts";
 import { REPOSITORY, runChecked, wranglerCommand } from "./process.ts";
+import { inspectSigningAuthority, synchronizeSigningSecret } from "./signing-authority.ts";
 
 export const PRIVATE_KEY_DIRECTORY = resolve(REPOSITORY, ".deploy/private");
 
@@ -35,6 +36,19 @@ export async function mutate(report: PreflightReport): Promise<MutationResult> {
   );
 
   const grantKeyProvisioned = await ensureGrantKey(report);
+
+  const signingAuthority = await inspectSigningAuthority(
+    "mutation",
+    report.configPath,
+    report.target,
+  );
+  if (
+    report.signingAuthority !== null &&
+    report.signingAuthority.privateDigest !== signingAuthority.privateDigest
+  ) {
+    throw mutationError("the signing authority changed after preflight");
+  }
+  await synchronizeSigningSecret(report.configPath, signingAuthority);
 
   await runChecked(
     "mutation",
