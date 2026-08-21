@@ -1495,6 +1495,125 @@ describe("Takoserver current Takoform Host", () => {
     });
     expect(providerAuthorized.status).toBe(200);
   });
+
+  test("lets one tenant-run bearer manage multiple resources only inside its exact space", async () => {
+    const formRef = {
+      apiVersion: "edge.forms.takoform.com/v1alpha1",
+      kind: "EdgeObjectBucket",
+      definitionVersion: "1.0.0",
+      schemaDigest: `sha256:${"8".repeat(64)}`,
+    } as const;
+    const host = createInMemoryTakoformHost({
+      authenticate: async (authorization) =>
+        authorization === "Bearer tenant-run"
+          ? {
+              tenantId: "organization-a",
+              principalId: "run:run-001",
+              scope: { mode: "tenant-run", space: "workspace-a" },
+            }
+          : null,
+      forms: [
+        {
+          identity: { formRef },
+          desiredSchema: { type: "object", properties: {}, additionalProperties: false },
+          operations: ["create", "read", "delete"],
+        },
+      ],
+    });
+    const handler = handlerFor(host);
+    const auth = { authorization: "Bearer tenant-run" };
+
+    for (const [index, name] of ["assets", "backups"].entries()) {
+      const resource = {
+        apiVersion: formRef.apiVersion,
+        kind: formRef.kind,
+        form: { formRef },
+        metadata: { name, space: "workspace-a" },
+        spec: {},
+      };
+      const prepared = await jsonRequest(
+        handler,
+        "POST",
+        "/apis/forms.takoform.com/v1alpha3/resources/prepare",
+        resource,
+        auth,
+      );
+      expect(prepared.status).toBe(200);
+      const prepareDigest = requiredString(
+        requiredRecord(prepared.body, "review"),
+        "prepareDigest",
+      );
+      const created = await jsonRequest(
+        handler,
+        "PUT",
+        `/apis/forms.takoform.com/v1alpha3/resources/edge.forms.takoform.com/v1alpha1/EdgeObjectBucket/${name}`,
+        { ...resource, review: { prepareDigest } },
+        { ...auth, "idempotency-key": `tenant-run-create-${index}`, "if-none-match": "*" },
+      );
+      expect(created.status).toBe(201);
+    }
+
+    const query = new URLSearchParams({
+      space: "workspace-a",
+      group: formRef.apiVersion,
+      kind: formRef.kind,
+      definitionVersion: formRef.definitionVersion,
+      schemaDigest: formRef.schemaDigest,
+    });
+    for (const name of ["assets", "backups"]) {
+      const read = await jsonRequest(
+        handler,
+        "GET",
+        `/apis/forms.takoform.com/v1alpha3/resources/edge.forms.takoform.com/v1alpha1/EdgeObjectBucket/${name}?${query}`,
+        undefined,
+        auth,
+      );
+      expect(read.status).toBe(200);
+      expect(read.body).toMatchObject({ metadata: { name, space: "workspace-a" } });
+    }
+
+    const moduleBytes = new TextEncoder().encode("export default { fetch() {} }");
+    const moduleDigest = await digestBytes(moduleBytes);
+    const upload = await jsonRequest(
+      handler,
+      "POST",
+      "/apis/forms.takoform.com/v1alpha3/artifacts/uploads",
+      {
+        manifest: {
+          apiVersion: "artifacts.takoform.com/v1alpha1",
+          kind: "WorkerBundle",
+          mainModule: "worker.js",
+          modules: [
+            {
+              name: "worker.js",
+              mediaType: "application/javascript+module",
+              size: moduleBytes.byteLength,
+              digest: moduleDigest,
+            },
+          ],
+        },
+      },
+      { ...auth, "idempotency-key": "tenant-run-artifact-start" },
+    );
+    expect(upload.status).toBe(201);
+    expect(upload.body).toMatchObject({ missingBlobs: [moduleDigest] });
+
+    const foreignSpace = await jsonRequest(
+      handler,
+      "POST",
+      "/apis/forms.takoform.com/v1alpha3/resources/prepare",
+      {
+        apiVersion: formRef.apiVersion,
+        kind: formRef.kind,
+        form: { formRef },
+        metadata: { name: "foreign", space: "workspace-b" },
+        spec: {},
+      },
+      auth,
+    );
+    expect(foreignSpace.status).toBe(404);
+    expect(foreignSpace.body).toMatchObject({ error: { code: "resource_not_found" } });
+  });
 });
 
 async function digestBytes(bytes: Uint8Array): Promise<string> {

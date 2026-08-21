@@ -185,6 +185,22 @@ describe("provision tokens", () => {
 });
 
 describe("Takoform run tokens", () => {
+  test("bind a multi-Resource runner credential to one opaque tenant space", async () => {
+    const tokens = service(await provisionKey("sign-tenant-run"));
+    const issued = await tokens.issueTakoformTenantRunToken({
+      organizationId: "org_alpha",
+      tenantRef: "tenant_workspace_x",
+      runRef: "run_takosumi_1",
+      ttlSeconds: 300,
+    });
+    expect(await tokens.verifyTakoformTenantRunToken(issued.token)).toMatchObject({
+      organizationId: "org_alpha",
+      tenantRef: "tenant_workspace_x",
+      runRef: "run_takosumi_1",
+      mode: "tenant-run",
+    });
+  });
+
   test("bind one reusable credential to an exact reservation, Form, space, and address", async () => {
     const tokens = service(await provisionKey("sign-2026-08"));
     const formRef = {

@@ -4,6 +4,7 @@ import type { ResourceInventory } from "../src/control.ts";
 import { createLedger } from "../src/ledger.ts";
 import { createSponsorshipRoutes } from "../src/sponsorship-api.ts";
 import type { TakoformHost } from "../src/takoform/types.ts";
+import type { TokenService } from "../src/token.ts";
 
 const token = "hosted-sponsorship-service-token";
 const base = "https://api.takoserver.test/v1/sponsorship/tenants/tenant_opaque";
@@ -21,6 +22,7 @@ describe("Hosted sponsorship owner API", () => {
       ledger: createLedger(sql, () => now),
       inventory: emptyInventory(),
       lifecycle: noLifecycle(),
+      tokens: fakeTokens(),
       serviceToken: token,
       publicOrigin: "https://api.takoserver.test",
       clock: () => now,
@@ -90,6 +92,7 @@ describe("Hosted sponsorship owner API", () => {
       ledger: createLedger(sql, () => now),
       inventory,
       lifecycle,
+      tokens: fakeTokens(),
       serviceToken: token,
       publicOrigin: "https://api.takoserver.test",
       clock: () => now,
@@ -118,6 +121,61 @@ describe("Hosted sponsorship owner API", () => {
     expect(await call(route, "DELETE", `${base}/resources/res_direct`)).toMatchObject({
       status: 404,
     });
+  });
+
+  test("issues one short-lived multi-Resource credential for the exact opaque tenant", async () => {
+    const sql = createEphemeralSql();
+    const now = new Date("2026-08-20T00:00:00.000Z");
+    await sql.run(
+      "INSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES (?, ?, ?, ?)",
+      ["org_legal", "Legal Organization", "prn_1", now.toISOString()],
+    );
+    const issued: unknown[] = [];
+    const tokens = fakeTokens({
+      async issueTakoformTenantRunToken(input) {
+        issued.push(input);
+        return {
+          token: "runner-only-secret",
+          expiresAt: "2026-08-20T00:05:00.000Z",
+        };
+      },
+    });
+    const route = createSponsorshipRoutes({
+      sql,
+      ledger: createLedger(sql, () => now),
+      inventory: emptyInventory(),
+      lifecycle: noLifecycle(),
+      tokens,
+      serviceToken: token,
+      publicOrigin: "https://api.takoserver.test",
+      clock: () => now,
+    });
+    await call(route, "POST", base, { organizationId: "org_legal" });
+    const response = await call(route, "POST", `${base}/takoform-run-credentials`, {
+      runRef: "run_takosumi_1",
+      expiresInSeconds: 300,
+    });
+    expect(response.status).toBe(201);
+    expect(await json(response)).toEqual({
+      takoformRunCredential: {
+        token: "runner-only-secret",
+        expiresAt: "2026-08-20T00:05:00.000Z",
+      },
+    });
+    expect(issued).toEqual([
+      {
+        organizationId: "org_legal",
+        tenantRef: "tenant_opaque",
+        runRef: "run_takosumi_1",
+        ttlSeconds: 300,
+      },
+    ]);
+    expect(
+      await call(route, "POST", `${base}/takoform-run-credentials`, {
+        runRef: "run_takosumi_2",
+        expiresInSeconds: 601,
+      }),
+    ).toMatchObject({ status: 400 });
   });
 });
 
@@ -211,4 +269,21 @@ function noLifecycle(): TakoformHost {
       return null;
     },
   };
+}
+
+function fakeTokens(overrides: Partial<TokenService> = {}): TokenService {
+  const unavailable = async (): Promise<never> => {
+    throw new Error("not used");
+  };
+  return {
+    issueProvisionToken: unavailable,
+    verifyProvisionToken: unavailable,
+    consumeProvisionToken: unavailable,
+    issueTakoformRunToken: unavailable,
+    issueTakoformTenantRunToken: unavailable,
+    verifyTakoformTenantRunToken: unavailable,
+    verifyTakoformRunToken: unavailable,
+    claimTakoformRunTokenForCreate: unavailable,
+    ...overrides,
+  } as TokenService;
 }

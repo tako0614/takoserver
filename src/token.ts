@@ -43,6 +43,24 @@ export interface TakoformRunTokenClaims extends ProvisionTokenClaims {
   readonly resourceUid?: string;
 }
 
+/**
+ * Short-lived credential for one reseller-owned tenant space.
+ *
+ * Unlike a reservation token, this is deliberately not tied to one Resource:
+ * an ordinary OpenTofu run may create several independent Resources. It is
+ * still narrower than an organization API key because every stateful
+ * Takoform request is confined to the one opaque tenant space.
+ */
+export interface TakoformTenantRunTokenClaims {
+  readonly organizationId: string;
+  readonly tenantRef: string;
+  readonly runRef: string;
+  readonly mode: "tenant-run";
+  readonly issuedAtEpochSeconds: number;
+  readonly expiresAtEpochSeconds: number;
+  readonly tokenId: string;
+}
+
 export type TokenErrorCode =
   | "malformed_token"
   | "unknown_key"
@@ -103,6 +121,15 @@ export interface TokenService {
       | { readonly mode: "manage"; readonly resourceUid: string }
     ),
   ): Promise<{ readonly token: string; readonly expiresAt: string }>;
+
+  issueTakoformTenantRunToken(input: {
+    readonly organizationId: string;
+    readonly tenantRef: string;
+    readonly runRef: string;
+    readonly ttlSeconds: number;
+  }): Promise<{ readonly token: string; readonly expiresAt: string }>;
+
+  verifyTakoformTenantRunToken(token: string): Promise<TakoformTenantRunTokenClaims>;
 
   /** Reusable only within its short lifetime and exact Resource address. */
   verifyTakoformRunToken(token: string): Promise<TakoformRunTokenClaims>;
@@ -275,8 +302,28 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
       );
     },
 
+    async issueTakoformTenantRunToken(input) {
+      return await sign(
+        TAKOFORM_RUN_AUDIENCE,
+        {
+          mode: "tenant-run",
+          organizationId: reference(input.organizationId),
+          runRef: reference(input.runRef),
+          tenantRef: reference(input.tenantRef),
+        },
+        input.ttlSeconds,
+        maxTakoformRunLifetime,
+      );
+    },
+
     async verifyTakoformRunToken(token) {
       return takoformRunClaims(await open(token, TAKOFORM_RUN_AUDIENCE, maxTakoformRunLifetime));
+    },
+
+    async verifyTakoformTenantRunToken(token) {
+      return takoformTenantRunClaims(
+        await open(token, TAKOFORM_RUN_AUDIENCE, maxTakoformRunLifetime),
+      );
     },
 
     async claimTakoformRunTokenForCreate(token) {
@@ -558,6 +605,31 @@ function takoformRunClaims(payload: Record<string, unknown>): TakoformRunTokenCl
     resourceName: payload.resourceName,
     mode: payload.mode,
     ...(resourceUid === undefined ? {} : { resourceUid }),
+    issuedAtEpochSeconds: epochSeconds(payload.iat),
+    expiresAtEpochSeconds: epochSeconds(payload.exp),
+    tokenId: claimReference(payload.jti),
+  };
+}
+
+function takoformTenantRunClaims(payload: Record<string, unknown>): TakoformTenantRunTokenClaims {
+  exactKeys(payload, [
+    "aud",
+    "exp",
+    "iat",
+    "iss",
+    "jti",
+    "mode",
+    "nbf",
+    "organizationId",
+    "runRef",
+    "tenantRef",
+  ]);
+  if (payload.mode !== "tenant-run") fail("malformed_token");
+  return {
+    organizationId: claimReference(payload.organizationId),
+    tenantRef: claimReference(payload.tenantRef),
+    runRef: claimReference(payload.runRef),
+    mode: "tenant-run",
     issuedAtEpochSeconds: epochSeconds(payload.iat),
     expiresAtEpochSeconds: epochSeconds(payload.exp),
     tokenId: claimReference(payload.jti),

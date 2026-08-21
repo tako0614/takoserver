@@ -218,6 +218,17 @@ export function buildApp(ports: AppPorts): App {
           : null;
         if (!bearer) return null;
         try {
+          try {
+            const claims = await tokens.verifyTakoformTenantRunToken(bearer);
+            return {
+              tenantId: claims.organizationId,
+              principalId: `run:${claims.tokenId}`,
+              scope: { space: claims.tenantRef, mode: "tenant-run" as const },
+            };
+          } catch {
+            // Exact-Resource reservation tokens share the Takoform audience
+            // but have a closed, disjoint claim shape.
+          }
           const claims = await tokens.verifyTakoformRunToken(bearer);
           const reservation = await reseller.reservation({
             organizationId: claims.organizationId,
@@ -376,6 +387,7 @@ export function buildApp(ports: AppPorts): App {
           ledger,
           inventory,
           lifecycle: sponsorshipLifecycle,
+          tokens,
           serviceToken: ports.sponsorshipServiceToken,
           publicOrigin: ports.publicOrigin,
           clock,
