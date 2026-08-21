@@ -13,17 +13,27 @@ export interface CommandResult {
 /** Runs a command to completion, capturing both streams and never inheriting stdin. */
 export async function runCommand(
   command: readonly string[],
-  options: { readonly env?: Readonly<Record<string, string>> } = {},
+  options: {
+    readonly env?: Readonly<Record<string, string>>;
+    /** Exact bytes written to the child without ever placing them in argv. */
+    readonly input?: string;
+  } = {},
 ): Promise<CommandResult> {
   const [executable, ...args] = command;
   if (executable === undefined) throw new TypeError("a command is required");
   const child = Bun.spawn([executable, ...args], {
     cwd: REPOSITORY,
-    stdin: "ignore",
+    stdin: options.input === undefined ? "ignore" : "pipe",
     stdout: "pipe",
     stderr: "pipe",
     env: { ...process.env, CI: "1", ...options.env },
   });
+  if (options.input !== undefined) {
+    const stdin = child.stdin;
+    if (!stdin) throw new TypeError("the child process did not expose the requested stdin pipe");
+    stdin.write(options.input);
+    stdin.end();
+  }
   const [exitCode, stdout, stderr] = await Promise.all([
     child.exited,
     new Response(child.stdout).text(),
@@ -40,7 +50,10 @@ export async function runChecked(
   phase: DeployPhase,
   description: string,
   command: readonly string[],
-  options: { readonly env?: Readonly<Record<string, string>> } = {},
+  options: {
+    readonly env?: Readonly<Record<string, string>>;
+    readonly input?: string;
+  } = {},
 ): Promise<string> {
   const result = await runCommand(command, options);
   if (result.exitCode !== 0) {

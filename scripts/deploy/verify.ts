@@ -2,6 +2,7 @@ import { RemoteD1, sqlLiteral } from "./d1.ts";
 import { verificationError } from "./errors.ts";
 import type { PreflightReport } from "./preflight.ts";
 import { RUNTIME_TABLES } from "./preflight.ts";
+import { inspectSigningAuthority, liveSigningKeyMatches } from "./signing-authority.ts";
 import { assertBindingClosure } from "./worker-state.ts";
 
 /**
@@ -37,6 +38,26 @@ export async function verify(
     throw verificationError(`the target is missing product tables: ${JSON.stringify(tables)}`);
   }
   proven.push("every product table present");
+
+  const signingAuthority = await inspectSigningAuthority(
+    "verification",
+    report.configPath,
+    report.target,
+  );
+  const signingMatches = await liveSigningKeyMatches(
+    "verification",
+    report.configPath,
+    report.target,
+    signingAuthority,
+  );
+  if (signingMatches === false) {
+    throw verificationError("the live Worker signs with a key other than the active D1 key");
+  }
+  proven.push(
+    signingMatches === null
+      ? "signing private key synchronized to active D1 key"
+      : "live Worker signing proof matches active D1 key",
+  );
 
   proven.push(...(await probePublishedOrigin(report)));
   return proven;

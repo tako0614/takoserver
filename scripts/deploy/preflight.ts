@@ -4,6 +4,11 @@ import { assertPublishedIdentity, readLedger } from "./evidence.ts";
 import { runChecked, runCommand, wranglerCommand } from "./process.ts";
 import { buildBundleDigest, migrationProvenance, resolvePushedCommit } from "./provenance.ts";
 import { realizedConfigDigest, writeRealizedConfig } from "./realized-config.ts";
+import {
+  inspectSigningAuthority,
+  liveSigningKeyMatches,
+  type SigningAuthority,
+} from "./signing-authority.ts";
 import type { DeployTarget } from "./target.ts";
 import { servedVersionId } from "./worker-state.ts";
 
@@ -42,6 +47,8 @@ export interface PreflightReport {
   readonly live: LiveState;
   readonly alreadyCurrent: boolean;
   readonly configDigest: string;
+  readonly signingAuthority: SigningAuthority | null;
+  readonly signingKeyRepairRequired: boolean;
 }
 
 /** Read-only inspection of the realized target. Safe to run at any time. */
@@ -109,6 +116,14 @@ export async function preflight(
   await assertRequiredSecretsPresent(configPath, target);
   await assertProbeDatabaseIdentity(configPath, target);
 
+  const signingAuthority = live.activeGrantKeyIds.includes(target.grantKeyId)
+    ? await inspectSigningAuthority("preflight", configPath, target)
+    : null;
+  const liveSigningKeyMatchesAuthority = signingAuthority
+    ? await liveSigningKeyMatches("preflight", configPath, target, signingAuthority)
+    : null;
+  const signingKeyRepairRequired = liveSigningKeyMatchesAuthority === false;
+
   const { alreadyCurrent } = assertPublishedIdentity(
     readLedger(),
     live.servedVersionId,
@@ -129,6 +144,8 @@ export async function preflight(
     migrationFiles: migrations.files,
     live,
     alreadyCurrent,
+    signingAuthority,
+    signingKeyRepairRequired,
   };
 }
 

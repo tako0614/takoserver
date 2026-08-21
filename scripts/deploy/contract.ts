@@ -36,7 +36,9 @@ export const DEPLOY_CONTRACT = {
           "After publishing, the writer reads back the served Worker version id and its binding " +
           "closure, proves every product table remains present, and exercises the anonymous " +
           "published surface: Takoserver discovery, OpenAPI, both Takoform lanes, identity " +
-          "discovery, credential-bearing route refusal, and unknown-route 404. Authenticated " +
+          "discovery, credential-bearing route refusal, unknown-route 404, and—when Hosted " +
+          "sponsorship is enabled—a bounded live token whose signature is verified against the " +
+          "active D1 public key. Authenticated " +
           "customer lifecycle, signed R2 bytes, replay rejection, AI inference, and billing are " +
           "separate live E2E cadences because the deploy writer does not mint customer or " +
           "commercial authority.",
@@ -63,7 +65,8 @@ export const DEPLOY_CONTRACT = {
           "migration, both builds, Worker startup, checked OpenAPI), a strict Wrangler dry-run " +
           "of the realized configuration, and read-only inspection of the live target covering " +
           "D1 migration lineage against the local migration files, the three runtime tables, " +
-          "active key availability, R2 bucket reachability, and the currently served version.",
+          "active key availability, exact local-private/D1-public signing authority, live signing " +
+          "proof where Hosted is enabled, R2 bucket reachability, and the currently served version.",
         "independent-review":
           "This writer moves the deploy mechanism itself and rewrites durable schema, so a " +
           "reviewer who did not author it must inspect account selection, migration lineage, " +
