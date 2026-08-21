@@ -1,3 +1,5 @@
+import { tr } from "./i18n.ts";
+
 /**
  * Signing in with Google, without a script and without a secret.
  *
@@ -85,7 +87,10 @@ export function readGoogleReturn(): GoogleReturnResult {
 
   if (fragment === "") {
     clear();
-    return { kind: "error", message: "Google returned nothing." };
+    return {
+      kind: "error",
+      message: tr("Googleから応答がありませんでした。", "Google returned nothing."),
+    };
   }
   const params = new URLSearchParams(fragment);
   clear();
@@ -95,19 +100,33 @@ export function readGoogleReturn(): GoogleReturnResult {
     return {
       kind: "error",
       message:
-        failure === "access_denied" ? "Sign-in was cancelled." : `Google refused this: ${failure}`,
+        failure === "access_denied"
+          ? tr("サインインをキャンセルしました。", "Sign-in was cancelled.")
+          : tr(`Googleが拒否しました: ${failure}`, `Google refused this: ${failure}`),
     };
   }
 
   const pending = stored ? (JSON.parse(stored) as Pending) : null;
   const idToken = params.get("id_token");
   if (!pending || !idToken) {
-    return { kind: "error", message: "That sign-in did not start here. Try again." };
+    return {
+      kind: "error",
+      message: tr(
+        "このConsoleから開始したサインインではありません。やり直してください。",
+        "That sign-in did not start here. Try again.",
+      ),
+    };
   }
   if (params.get("state") !== pending.state) {
     // A response the browser never asked for. Accepting it would sign this
     // person into whichever account the response names.
-    return { kind: "error", message: "That sign-in did not start here. Try again." };
+    return {
+      kind: "error",
+      message: tr(
+        "このConsoleから開始したサインインではありません。やり直してください。",
+        "That sign-in did not start here. Try again.",
+      ),
+    };
   }
   return { kind: "ok", value: { idToken, nonce: pending.nonce, from: pending.from } };
 }

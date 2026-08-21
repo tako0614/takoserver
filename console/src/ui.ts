@@ -1,4 +1,5 @@
 import { type Child, h, svg, text } from "./dom.ts";
+import { consoleLocale, tr } from "./i18n.ts";
 import type { Async } from "./reactive.ts";
 import { signal } from "./reactive.ts";
 
@@ -10,8 +11,6 @@ export const ICON = {
   wallet:
     "M3 7.5A2.5 2.5 0 0 1 5.5 5H18v3M3 7.5V17a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-2M3 7.5h16a2 2 0 0 1 2 2V15m0 0h-4a1.5 1.5 0 0 1 0-3h4",
   key: "M15.5 3a5.5 5.5 0 1 0-4.9 8L9 12.6V15H6.5v2.5H4V21h4l7-7a5.5 5.5 0 0 0 .5-11Zm1.5 4.5h.01",
-  tag: "M3 12V4.5A1.5 1.5 0 0 1 4.5 3H12l9 9-7.5 7.5L3 12Zm4-5.5h.01",
-  form: "M4 4h16v16H4zM8 9h8M8 13h8M8 17h4",
   activity: "M3 12h3.5L9 5l4 14 2.5-7H21",
   gear: "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6ZM19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 7 19.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0-1.2-2.9H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.7 7l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 2.9-1.2V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0 1.2 2.9H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z",
   copy: "M9 9h10v10H9zM5 15V5h10",
@@ -60,16 +59,23 @@ export function copyable(value: string, display?: string): HTMLElement {
     {
       class: "copy",
       type: "button",
-      title: `Copy ${value}`,
+      title: `${tr("コピー", "Copy")} ${value}`,
       onClick: (event: Event) => {
         event.stopPropagation();
         void navigator.clipboard.writeText(value).then(
           () => {
             mark.replaceChildren(icon(ICON.check, 13));
-            toast("Copied", "ok");
+            toast(tr("コピーしました", "Copied"), "ok");
             setTimeout(() => mark.replaceChildren(icon(ICON.copy, 13)), 1_400);
           },
-          () => toast("The browser refused clipboard access", "bad"),
+          () =>
+            toast(
+              tr(
+                "ブラウザがクリップボードへのアクセスを拒否しました",
+                "The browser refused clipboard access",
+              ),
+              "bad",
+            ),
         );
       },
     },
@@ -161,7 +167,7 @@ export function whenReady<Value>(
               "button",
               { class: "btn btn--sm", type: "button", onClick: options.retry },
               icon(ICON.refresh, 13),
-              text("Try again"),
+              text(tr("再試行", "Try again")),
             ),
           )
         : null,
@@ -181,16 +187,40 @@ export function whenReady<Value>(
 export function explain(error: Error): string {
   const code = (error as { code?: string }).code ?? error.message;
   const known: Record<string, string> = {
-    unreachable: "Could not reach the API. Check the origin and your connection.",
-    unauthenticated: "Your session is no longer valid. Sign in again.",
-    permission_denied: "This account is not allowed to do that.",
-    not_found: "That does not exist, or is not yours.",
-    invalid_argument: "The request was not accepted as written.",
-    insufficient_funds: "The wallet does not hold enough available balance.",
-    form_unknown: "No installed Form matches that exact reference.",
-    conflict: "Something else changed this first. Reload and try again.",
+    unreachable: tr(
+      "APIに接続できません。接続先とネットワークを確認してください。",
+      "Could not reach the API. Check the origin and your connection.",
+    ),
+    unauthenticated: tr(
+      "セッションの有効期限が切れました。もう一度サインインしてください。",
+      "Your session is no longer valid. Sign in again.",
+    ),
+    permission_denied: tr(
+      "このアカウントには操作する権限がありません。",
+      "This account is not allowed to do that.",
+    ),
+    not_found: tr(
+      "対象が存在しないか、所有していません。",
+      "That does not exist, or is not yours.",
+    ),
+    invalid_argument: tr(
+      "入力内容を受け付けられませんでした。",
+      "The request was not accepted as written.",
+    ),
+    insufficient_funds: tr(
+      "利用可能な残高が不足しています。",
+      "The wallet does not hold enough available balance.",
+    ),
+    form_unknown: tr(
+      "指定したFormはこのホストにインストールされていません。",
+      "No installed Form matches that exact reference.",
+    ),
+    conflict: tr(
+      "先に別の変更が行われました。再読み込みしてやり直してください。",
+      "Something else changed this first. Reload and try again.",
+    ),
   };
-  return known[code] ?? `The server refused this: ${code}`;
+  return known[code] ?? tr(`サーバーが拒否しました: ${code}`, `The server refused this: ${code}`);
 }
 
 /* ------------------------------------------------------------------ json -- */
@@ -279,7 +309,7 @@ export function openModal(options: ModalOptions): () => void {
       class: `btn btn--${options.confirmTone ?? "primary"}`,
       type: "button",
     });
-    button.append(options.confirmLabel ?? "Confirm");
+    button.append(options.confirmLabel ?? tr("確認", "Confirm"));
     // A confirm that talks to the server disables itself while it does, so a
     // second click cannot issue the same mutation twice.
     button.addEventListener("click", () => {
@@ -313,7 +343,7 @@ export function openModal(options: ModalOptions): () => void {
         h(
           "button",
           { class: "btn", type: "button", onClick: close },
-          options.dismissLabel ?? "Cancel",
+          options.dismissLabel ?? tr("キャンセル", "Cancel"),
         ),
         confirm,
       ),
@@ -353,7 +383,7 @@ export function toast(message: string, tone: "ok" | "bad" | "plain" = "plain"): 
 
 /** Minor units are the ledger's truth; a person reads currency. */
 export function money(minor: number, currency = "USD"): string {
-  return new Intl.NumberFormat(undefined, {
+  return new Intl.NumberFormat(consoleLocale() === "ja" ? "ja-JP" : "en-US", {
     style: "currency",
     currency,
     minimumFractionDigits: 2,
@@ -363,7 +393,7 @@ export function money(minor: number, currency = "USD"): string {
 export function when(iso: string): string {
   const at = new Date(iso);
   if (Number.isNaN(at.getTime())) return iso;
-  return at.toLocaleString(undefined, {
+  return at.toLocaleString(consoleLocale() === "ja" ? "ja-JP" : "en-US", {
     year: "numeric",
     month: "short",
     day: "2-digit",
@@ -389,10 +419,9 @@ export function ago(iso: string): string {
   let value = seconds;
   for (const [unit, size] of steps) {
     if (Math.abs(value) < size) {
-      return new Intl.RelativeTimeFormat(undefined, { numeric: "auto" }).format(
-        Math.round(value),
-        unit,
-      );
+      return new Intl.RelativeTimeFormat(consoleLocale() === "ja" ? "ja-JP" : "en-US", {
+        numeric: "auto",
+      }).format(Math.round(value), unit);
     }
     value /= size;
   }
