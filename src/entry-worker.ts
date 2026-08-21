@@ -49,8 +49,10 @@ interface WorkerEnv {
   readonly CLOUDFLARE_API_TOKEN?: string;
   /** DNS zones this deployment may attach Workers to, as JSON. */
   readonly TAKOSERVER_ZONES?: string;
-  /** Stripe secret key. Its presence is what lets a customer pay. */
+  /** Stripe secret key. The deploy target must separately authorize Checkout. */
   readonly STRIPE_SECRET_KEY?: string;
+  /** Exact operator intent to expose Stripe Checkout on this deployment. */
+  readonly TAKOSERVER_STRIPE_CHECKOUT_ENABLED?: string;
   /** Key id whose public half is registered for verification. */
   readonly TAKOSERVER_SIGNING_KEY_ID?: string;
   /** Private half, as an Ed25519 JWK. A secret. */
@@ -99,7 +101,8 @@ function credentials(env: WorkerEnv) {
     operatorPublicKeyJwk: publicKeyJwk,
   });
   const payment = resolvePayment({
-    stripeSecretKey: env.STRIPE_SECRET_KEY,
+    stripeSecretKey:
+      env.TAKOSERVER_STRIPE_CHECKOUT_ENABLED === "1" ? env.STRIPE_SECRET_KEY : undefined,
     consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN,
   });
 

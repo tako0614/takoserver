@@ -281,6 +281,14 @@ async function assertRequiredSecretsPresent(
           },
         ]
       : []),
+    ...(target.stripeCheckout
+      ? [
+          {
+            name: "STRIPE_SECRET_KEY",
+            why: "customer Stripe Checkout funding is enabled by this target",
+          },
+        ]
+      : []),
     ...(target.edgeSupplies ||
     target.objectBucketSupplies?.supplies.some((supply) => supply.provider.kind === "cloudflare")
       ? [

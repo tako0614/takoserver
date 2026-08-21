@@ -94,6 +94,7 @@ export function deploymentVariables(target: DeployTarget): Record<string, unknow
     vars.TAKOS_ID_ISSUER = target.takosId.issuer;
     vars.TAKOS_ID_CLIENT_ID = target.takosId.clientId;
   }
+  if (target.stripeCheckout === true) vars.TAKOSERVER_STRIPE_CHECKOUT_ENABLED = "1";
   // The key id is public — its public half is in the database for anyone to
   // verify against. The private half is a secret and is set separately.
   vars.TAKOSERVER_SIGNING_KEY_ID = target.grantKeyId;

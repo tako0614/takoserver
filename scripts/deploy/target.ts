@@ -52,6 +52,8 @@ export interface DeployTarget {
   readonly takosId?: { readonly issuer: string; readonly clientId: string };
   /** Enables the private Takosumi Hosted sponsorship funding seam. */
   readonly hostedSponsorship?: boolean;
+  /** Requires the deployed Worker to offer customer Stripe Checkout funding. */
+  readonly stripeCheckout?: boolean;
   /**
    * DNS zones this deployment may attach customer Workers to.
    *
@@ -134,6 +136,7 @@ function validateTarget(value: unknown, path: string): DeployTarget {
       "googleClientId",
       "takosId",
       "hostedSponsorship",
+      "stripeCheckout",
       "zones",
       "aiModels",
       "r2ParentAccessKeyId",
@@ -171,6 +174,9 @@ function validateTarget(value: unknown, path: string): DeployTarget {
     ...(value.hostedSponsorship === undefined
       ? {}
       : { hostedSponsorship: boolean(value.hostedSponsorship, "hostedSponsorship") }),
+    ...(value.stripeCheckout === undefined
+      ? {}
+      : { stripeCheckout: boolean(value.stripeCheckout, "stripeCheckout") }),
     ...(value.zones === undefined ? {} : { zones: zoneList(value.zones) }),
     ...(value.aiModels === undefined ? {} : { aiModels: modelList(value.aiModels) }),
     ...(value.r2ParentAccessKeyId === undefined

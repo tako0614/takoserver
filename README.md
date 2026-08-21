@@ -84,6 +84,13 @@ Nothing in that table is required to start. What is absent is absent rather than
 faked: a deployment with no Stripe key does not serve the route that would begin
 a payment, and its console offers the way it does take money instead.
 
+A hosted Cloudflare deployment enables customer card funding only when its
+private deploy target explicitly sets `"stripeCheckout": true` **and** the
+Worker already has a `STRIPE_SECRET_KEY` secret. The target contains no secret
+value: the owner preflight fails if the named capability has no secret, while a
+lingering secret alone cannot expose Checkout when the target capability is
+absent.
+
 Sign-in and money are the two facts a server cannot determine for itself. With
 no identity provider configured, the operator answers the first by signature —
 so a fresh machine mints an operator key, keeps it beside its database, and
