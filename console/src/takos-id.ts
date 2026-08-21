@@ -1,4 +1,5 @@
 import { tr } from "./i18n.ts";
+import { navigate } from "./router.ts";
 
 const PENDING_KEY = "takoserver.takos-id.pending";
 export const RETURN_PATH = "/auth/takos-id";
@@ -66,7 +67,7 @@ export async function readTakosIdReturn(): Promise<TakosIdReturnResult> {
   const rawPending = sessionStorage.getItem(PENDING_KEY);
   sessionStorage.removeItem(PENDING_KEY);
   const parameters = new URLSearchParams(window.location.search);
-  window.history.replaceState({}, "", "/");
+  navigate("/", { replace: true });
 
   let pending: Pending | null = null;
   try {

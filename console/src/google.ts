@@ -1,4 +1,5 @@
 import { tr } from "./i18n.ts";
+import { navigate } from "./router.ts";
 
 /**
  * Signing in with Google, without a script and without a secret.
@@ -82,7 +83,7 @@ export function readGoogleReturn(): GoogleReturnResult {
   const stored = sessionStorage.getItem(PENDING_KEY);
   sessionStorage.removeItem(PENDING_KEY);
   const clear = (): void => {
-    window.history.replaceState({}, "", "/");
+    navigate("/", { replace: true });
   };
 
   if (fragment === "") {
