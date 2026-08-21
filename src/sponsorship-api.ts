@@ -2,6 +2,7 @@ import type { ResourceInventory } from "./control.ts";
 import type { Ledger } from "./ledger.ts";
 import type { Clock, Sql } from "./ports.ts";
 import type { TakoformHost } from "./takoform/types.ts";
+import type { TokenService } from "./token.ts";
 
 /** Private product-to-product sponsorship seam. No browser or customer key uses it. */
 export interface CreateSponsorshipRoutesOptions {
@@ -9,6 +10,7 @@ export interface CreateSponsorshipRoutesOptions {
   readonly ledger: Ledger;
   readonly inventory: ResourceInventory;
   readonly lifecycle: TakoformHost;
+  readonly tokens: TokenService;
   readonly serviceToken: string;
   readonly publicOrigin: string;
   readonly clock: Clock;
@@ -58,6 +60,21 @@ export function createSponsorshipRoutes(
           availableMinor: wallet.availableMinor,
           currency: wallet.currency,
         });
+      }
+
+      if (
+        request.method === "POST" &&
+        rest.length === 2 &&
+        rest[1] === "takoform-run-credentials"
+      ) {
+        const body = await jsonObject(request, ["runRef", "expiresInSeconds"]);
+        const issued = await options.tokens.issueTakoformTenantRunToken({
+          organizationId,
+          tenantRef,
+          runRef: text(body.runRef, 256),
+          ttlSeconds: boundedTtl(body.expiresInSeconds),
+        });
+        return Response.json({ takoformRunCredential: issued }, { status: 201 });
       }
 
       if (request.method === "POST" && rest.length === 2 && rest[1] === "funding") {
@@ -185,6 +202,12 @@ export function createSponsorshipRoutes(
       return failure("invalid", 400);
     }
   };
+}
+
+function boundedTtl(value: unknown): number {
+  const ttl = positiveInteger(value);
+  if (ttl > 600) throw new Error();
+  return ttl;
 }
 
 async function tenant(sql: Sql, tenantRef: string): Promise<string | null> {

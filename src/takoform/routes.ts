@@ -131,19 +131,20 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
 
       const principal = await authenticate(request);
       if (!principal) return failure("unauthenticated", 401);
+      const exactScope = principal.scope?.mode === "tenant-run" ? undefined : principal.scope;
       const context: EngineContext = {
         request,
         url,
         tenantId: boundedTenantReference(principal.tenantId),
         principalId: boundedTenantReference(principal.principalId),
-        ...(principal.scope?.mode === "provision" && principal.scope.claimCreate
-          ? { beforeCreate: principal.scope.claimCreate, provisionOnly: true }
+        ...(exactScope?.mode === "provision" && exactScope.claimCreate
+          ? { beforeCreate: exactScope.claimCreate, provisionOnly: true }
           : {}),
-        ...(principal.scope?.expectedResourceUid
-          ? { expectedResourceUid: principal.scope.expectedResourceUid }
+        ...(exactScope?.expectedResourceUid
+          ? { expectedResourceUid: exactScope.expectedResourceUid }
           : {}),
-        ...(principal.scope?.commercialAuthority
-          ? { commercialAuthority: principal.scope.commercialAuthority }
+        ...(exactScope?.commercialAuthority
+          ? { commercialAuthority: exactScope.commercialAuthority }
           : {}),
       };
 
@@ -336,6 +337,10 @@ async function assertPrincipalScope(
   request: Request,
   url: URL,
 ): Promise<void> {
+  if (scope.mode === "tenant-run") {
+    await assertTenantRunScope(scope.space, request, url);
+    return;
+  }
   const formPath = `${scope.formRef.apiVersion}/${scope.formRef.kind}`;
   if (request.method === "GET" && url.pathname === `${CURRENT_LANE}/forms`) {
     if (!scopeQueryMatches(scope, url)) throw new TakoformHostError("resource_not_found", 404);
@@ -398,7 +403,65 @@ async function assertPrincipalScope(
   throw new TakoformHostError("resource_not_found", 404);
 }
 
-function scopeQueryMatches(scope: NonNullable<TakoformHostPrincipal["scope"]>, url: URL): boolean {
+async function assertTenantRunScope(space: string, request: Request, url: URL): Promise<void> {
+  if (
+    request.method === "GET" &&
+    (url.pathname === `${CURRENT_LANE}/forms` ||
+      FORM_DEFINITION.test(url.pathname) ||
+      url.pathname.startsWith(`${CURRENT_LANE}/support/`))
+  ) {
+    return;
+  }
+  // Artifact access is already bound by the transport to tenantId and the
+  // run-token's unique principalId. A normal multi-Resource provider run must
+  // be able to upload Worker, asset, and migration bundles before applying the
+  // Resources that reference them.
+  if (url.pathname.startsWith(`${CURRENT_LANE}/artifacts/`)) return;
+  if (
+    request.method === "POST" &&
+    (url.pathname === `${CURRENT_LANE}/resources/validate` ||
+      url.pathname === `${CURRENT_LANE}/resources/prepare`)
+  ) {
+    if (!(await bodySpaceMatches(space, request))) {
+      throw new TakoformHostError("resource_not_found", 404);
+    }
+    return;
+  }
+  const resource = RESOURCE.exec(url.pathname);
+  if (resource) {
+    const path = parsedResourcePath(resource);
+    const bodyMutation = request.method === "PUT" || path.action === "import";
+    const matches = bodyMutation
+      ? url.search === "" && (await bodySpaceMatches(space, request))
+      : url.searchParams.get("space") === space;
+    if (!matches) throw new TakoformHostError("resource_not_found", 404);
+    return;
+  }
+  if (/\/operations\/[A-Za-z0-9._:-]+(?:\/cancel)?$/u.test(url.pathname)) return;
+  throw new TakoformHostError("resource_not_found", 404);
+}
+
+async function bodySpaceMatches(space: string, request: Request): Promise<boolean> {
+  try {
+    const value = await request.clone().json();
+    return (
+      typeof value === "object" &&
+      value !== null &&
+      !Array.isArray(value) &&
+      typeof (value as Record<string, unknown>).metadata === "object" &&
+      (value as { metadata?: { space?: unknown } }).metadata?.space === space
+    );
+  } catch {
+    return false;
+  }
+}
+
+type ExactResourcePrincipalScope = Exclude<
+  NonNullable<TakoformHostPrincipal["scope"]>,
+  { readonly mode: "tenant-run" }
+>;
+
+function scopeQueryMatches(scope: ExactResourcePrincipalScope, url: URL): boolean {
   return (
     url.searchParams.get("space") === scope.space &&
     url.searchParams.get("group") === scope.formRef.apiVersion &&
@@ -409,7 +472,7 @@ function scopeQueryMatches(scope: NonNullable<TakoformHostPrincipal["scope"]>, u
 }
 
 async function scopeBodyMatches(
-  scope: NonNullable<TakoformHostPrincipal["scope"]>,
+  scope: ExactResourcePrincipalScope,
   request: Request,
 ): Promise<boolean> {
   let value: unknown;
