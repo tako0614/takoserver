@@ -1,9 +1,14 @@
 import { type Child, h, live, text } from "./dom.ts";
 import { readGoogleReturn } from "./google.ts";
+import {
+  consoleLocale,
+  consoleNavigation,
+  setConsoleLocale,
+  syncConsoleLocale,
+  tr,
+} from "./i18n.ts";
 import { wordmark } from "./mark.ts";
 import { billingPage } from "./pages/billing.ts";
-import { catalogPage } from "./pages/catalog.ts";
-import { formsPage } from "./pages/forms.ts";
 import { keysPage } from "./pages/keys.ts";
 import { overviewPage } from "./pages/overview.ts";
 import { resourceDetailPage } from "./pages/resource-detail.ts";
@@ -36,29 +41,10 @@ import { card, empty, explain, ICON, icon, mountToasts, openModal, toast } from 
  * so scroll position and focus in the navigation survive a page change.
  */
 
-const NAV = [
-  { group: "Overview", items: [{ href: "/", label: "Home", glyph: ICON.home }] },
-  {
-    group: "Takoform",
-    items: [
-      { href: "/resources", label: "Resources", glyph: ICON.layers },
-      { href: "/forms", label: "Forms", glyph: ICON.form },
-      { href: "/catalog", label: "Catalog", glyph: ICON.tag },
-    ],
-  },
-  {
-    group: "Account",
-    items: [
-      { href: "/billing", label: "Billing", glyph: ICON.wallet },
-      { href: "/keys", label: "API keys", glyph: ICON.key },
-      { href: "/settings", label: "Settings", glyph: ICON.gear },
-    ],
-  },
-] as const;
-
 const railOpen = signal(false);
 
 function boot(): void {
+  syncConsoleLocale();
   const root = document.getElementById("root");
   if (!root) throw new Error("console root is missing");
   root.append(mountToasts());
@@ -133,10 +119,13 @@ function shell(): Child {
     live(() =>
       h(
         "nav",
-        { class: railOpen() ? "rail rail--open" : "rail", "aria-label": "Sections" },
-        ...NAV.flatMap((section) => [
+        {
+          class: railOpen() ? "rail rail--open" : "rail",
+          "aria-label": tr("セクション", "Sections"),
+        },
+        ...consoleNavigation(consoleLocale()).flatMap((section) => [
           h("div", { class: "rail__group" }, section.group),
-          ...section.items.map((item) => railLink(item.href, item.label, item.glyph)),
+          ...section.items.map((item) => railLink(item.href, item.label, ICON[item.glyph])),
         ]),
       ),
     ),
@@ -177,8 +166,21 @@ function topbar(): Child {
         {
           class: "btn btn--ghost btn--sm",
           type: "button",
-          title: `Theme: ${theme()}`,
-          "aria-label": `Theme: ${theme()}`,
+          title: tr("英語に切り替える", "Switch to Japanese"),
+          "aria-label": tr("英語に切り替える", "Switch to Japanese"),
+          onClick: () => setConsoleLocale(consoleLocale() === "ja" ? "en" : "ja"),
+        },
+        consoleLocale() === "ja" ? "EN" : "日本語",
+      ),
+    ),
+    live(() =>
+      h(
+        "button",
+        {
+          class: "btn btn--ghost btn--sm",
+          type: "button",
+          title: `${tr("テーマ", "Theme")}: ${theme()}`,
+          "aria-label": `${tr("テーマ", "Theme")}: ${theme()}`,
           onClick: () => applyTheme(theme() === "dark" ? "light" : "dark"),
         },
         icon(theme() === "dark" ? ICON.sun : ICON.moon, 16),
@@ -191,11 +193,13 @@ function topbar(): Child {
         {
           class: "btn btn--ghost btn--sm",
           type: "button",
-          title: who ? `${who.displayName} — sign out` : "Sign out",
+          title: who
+            ? `${who.displayName} — ${tr("サインアウト", "sign out")}`
+            : tr("サインアウト", "Sign out"),
           onClick: signOut,
         },
         icon(ICON.out, 15),
-        text(who ? who.displayName : "Sign out"),
+        text(who ? who.displayName : tr("サインアウト", "Sign out")),
       );
     }),
   );
@@ -209,7 +213,7 @@ function organizationPicker(): Child {
       "button",
       { class: "btn btn--sm btn--primary", type: "button", onClick: createOrganization },
       icon(ICON.plus, 13),
-      text("Create organization"),
+      text(tr("組織を作成", "Create organization")),
     );
   }
   return h(
@@ -220,7 +224,7 @@ function organizationPicker(): Child {
       {
         class: "select",
         style: { width: "auto", padding: "5px 9px" },
-        "aria-label": "Organization",
+        "aria-label": tr("組織", "Organization"),
         onChange: (event: Event) => selectOrganization((event.target as HTMLSelectElement).value),
       },
       ...all.map((organization) =>
@@ -239,8 +243,8 @@ function organizationPicker(): Child {
       {
         class: "btn btn--ghost btn--sm",
         type: "button",
-        title: "Create organization",
-        "aria-label": "Create organization",
+        title: tr("組織を作成", "Create organization"),
+        "aria-label": tr("組織を作成", "Create organization"),
         onClick: createOrganization,
       },
       icon(ICON.plus, 15),
@@ -249,31 +253,34 @@ function organizationPicker(): Child {
 }
 
 function createOrganization(): void {
-  const name = h("input", { class: "input", placeholder: "Acme production" });
+  const name = h("input", { class: "input", placeholder: tr("本番環境", "Acme production") });
   const close = openModal({
-    title: "Create organization",
-    confirmLabel: "Create",
+    title: tr("組織を作成", "Create organization"),
+    confirmLabel: tr("作成", "Create"),
     body: h(
       "div",
       { class: "field" },
-      h("label", null, "Name"),
+      h("label", null, tr("名前", "Name")),
       name,
       h(
         "small",
         null,
-        "An organization owns its own wallet, keys, and resources. Nothing is shared between them.",
+        tr(
+          "組織ごとに残高、キー、リソースを所有し、ほかの組織とは共有されません。",
+          "An organization owns its own wallet, keys, and resources. Nothing is shared between them.",
+        ),
       ),
     ),
     onConfirm: async () => {
       if (name.value.trim() === "") {
-        toast("Give the organization a name", "bad");
+        toast(tr("組織名を入力してください", "Give the organization a name"), "bad");
         return;
       }
       try {
         const { organization } = await api.createOrganization(name.value.trim());
         organizations.update((all) => [...all, organization]);
         selectOrganization(organization.id);
-        toast("Organization created", "ok");
+        toast(tr("組織を作成しました", "Organization created"), "ok");
         close();
       } catch (error) {
         toast(explain(error as Error), "bad");
@@ -287,18 +294,19 @@ function page(): Child {
   const here = route();
   const organization = currentOrganization();
 
-  if (here.segments[0] === "forms") return formsPage();
-
   if (!organization) {
     return card(
       null,
       empty(
-        "No organization yet",
-        "Everything in this console belongs to an organization — a wallet, its keys, and the resources it declares. Create one to begin.",
+        tr("組織がありません", "No organization yet"),
+        tr(
+          "Consoleの残高、キー、リソースは組織単位で管理されます。最初の組織を作成してください。",
+          "Everything in this console belongs to an organization — a wallet, its keys, and the resources it declares. Create one to begin.",
+        ),
         h(
           "button",
           { class: "btn btn--primary", type: "button", onClick: createOrganization },
-          "Create organization",
+          tr("組織を作成", "Create organization"),
         ),
       ),
     );
@@ -320,17 +328,15 @@ function page(): Child {
       return billingPage(organization.id);
     case "keys":
       return keysPage(organization.id);
-    case "catalog":
-      return catalogPage(organization.id);
     case "settings":
       return settingsPage(organization);
     default:
       return card(
         null,
         empty(
-          "No such page",
-          `Nothing is served at ${here.path}.`,
-          h("a", { class: "btn", ...linkProps("/") }, "Go to overview"),
+          tr("ページがありません", "No such page"),
+          tr(`${here.path} にはページがありません。`, `Nothing is served at ${here.path}.`),
+          h("a", { class: "btn", ...linkProps("/") }, tr("概要へ戻る", "Go to overview")),
         ),
       );
   }

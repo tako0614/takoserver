@@ -1,5 +1,6 @@
 import type { Organization } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
+import { consoleLocale, setConsoleLocale, tr } from "../i18n.ts";
 import {
   apiOrigin,
   applyTheme,
@@ -29,27 +30,37 @@ export function settingsPage(organization: Organization): Child {
       h(
         "div",
         { class: "head__text" },
-        h("h1", null, "Settings"),
-        h("p", null, "Who you are signed in as, and what this console is talking to."),
+        h("h1", null, tr("設定", "Settings")),
+        h(
+          "p",
+          null,
+          tr(
+            "サインイン中のアカウントと、このConsoleの接続先を確認します。",
+            "Who you are signed in as, and what this console is talking to.",
+          ),
+        ),
       ),
     ),
     card(
-      "Organization",
+      tr("組織", "Organization"),
       h(
         "div",
         { class: "card__body" },
         h(
           "div",
           { class: "rows" },
-          row("Name", organization.name),
-          row("Identifier", copyable(organization.id)),
-          row("Created", when(organization.createdAt)),
+          row(tr("名前", "Name"), organization.name),
+          row(tr("識別子", "Identifier"), copyable(organization.id)),
+          row(tr("作成日時", "Created"), when(organization.createdAt)),
           row(
-            "Tenant",
+            tr("テナント", "Tenant"),
             h(
               "span",
               { class: "dim" },
-              "Resources are isolated by this organization; its identifier is the tenant key the Takoform Host uses.",
+              tr(
+                "リソースは組織単位で分離され、この識別子がTakoformホストのテナントキーになります。",
+                "Resources are isolated by this organization; its identifier is the tenant key the Takoform Host uses.",
+              ),
             ),
           ),
         ),
@@ -58,17 +69,17 @@ export function settingsPage(organization: Organization): Child {
     live(() => {
       const who = principal();
       return card(
-        "Account",
+        tr("アカウント", "Account"),
         h(
           "div",
           { class: "card__body" },
           h(
             "div",
             { class: "rows" },
-            row("Signed in as", who ? who.displayName : "—"),
-            row("Email", who ? who.email : "—"),
-            row("Identity provider", who ? who.provider : "—"),
-            row("Principal", who ? copyable(who.id) : "—"),
+            row(tr("サインイン中", "Signed in as"), who ? who.displayName : "—"),
+            row(tr("メール", "Email"), who ? who.email : "—"),
+            row(tr("IDプロバイダー", "Identity provider"), who ? who.provider : "—"),
+            row(tr("プリンシパル", "Principal"), who ? copyable(who.id) : "—"),
           ),
           h(
             "div",
@@ -77,7 +88,7 @@ export function settingsPage(organization: Organization): Child {
               "button",
               { class: "btn btn--danger", type: "button", onClick: signOut },
               icon(ICON.out, 14),
-              text("Sign out"),
+              text(tr("サインアウト", "Sign out")),
             ),
           ),
         ),
@@ -85,7 +96,7 @@ export function settingsPage(organization: Organization): Child {
     }),
     live(() =>
       card(
-        "Appearance",
+        tr("表示", "Appearance"),
         h(
           "div",
           { class: "card__body" },
@@ -100,7 +111,31 @@ export function settingsPage(organization: Organization): Child {
                   type: "button",
                   onClick: () => applyTheme(option as Theme),
                 },
-                option,
+                themeLabel(option),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+    live(() =>
+      card(
+        tr("言語", "Language"),
+        h(
+          "div",
+          { class: "card__body" },
+          h(
+            "div",
+            { class: "toolbar" },
+            ...(["ja", "en"] as const).map((option) =>
+              h(
+                "button",
+                {
+                  class: consoleLocale() === option ? "btn btn--primary" : "btn",
+                  type: "button",
+                  onClick: () => setConsoleLocale(option),
+                },
+                option === "ja" ? "日本語" : "English",
               ),
             ),
           ),
@@ -110,14 +145,14 @@ export function settingsPage(organization: Organization): Child {
     live(() => {
       const input = h("input", { class: "input", value: apiOrigin() });
       return card(
-        "API endpoint",
+        tr("API接続先", "API endpoint"),
         h(
           "div",
           { class: "card__body" },
           h(
             "div",
             { class: "field" },
-            h("label", null, "Origin"),
+            h("label", null, tr("オリジン", "Origin")),
             h(
               "div",
               { style: { display: "flex", gap: "8px" } },
@@ -129,22 +164,31 @@ export function settingsPage(organization: Organization): Child {
                   type: "button",
                   onClick: () => {
                     setApiOrigin(input.value.trim());
-                    toast("Endpoint updated", "ok");
+                    toast(tr("接続先を更新しました", "Endpoint updated"), "ok");
                   },
                 },
-                "Save",
+                tr("保存", "Save"),
               ),
             ),
             h(
               "small",
               null,
-              "Every request from this console goes here. Changing it does not move any data.",
+              tr(
+                "このConsoleのすべてのリクエストがここへ送られます。変更してもデータは移動しません。",
+                "Every request from this console goes here. Changing it does not move any data.",
+              ),
             ),
           ),
         ),
       );
     }),
   );
+}
+
+function themeLabel(theme: Theme): string {
+  if (theme === "system") return tr("システム", "System");
+  if (theme === "light") return tr("ライト", "Light");
+  return tr("ダーク", "Dark");
 }
 
 function row(label: string, value: Child): Child {

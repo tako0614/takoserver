@@ -1,5 +1,6 @@
 import type { LedgerEntry } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
+import { tr } from "../i18n.ts";
 import { resource, signal } from "../reactive.ts";
 import { api } from "../state.ts";
 import {
@@ -43,11 +44,14 @@ export function billingPage(organizationId: string): Child {
       h(
         "div",
         { class: "head__text" },
-        h("h1", null, "Billing"),
+        h("h1", null, tr("使用量と請求", "Usage & billing")),
         h(
           "p",
           null,
-          "Takoserver is prepaid. Work places a hold against the available balance and captures it when it succeeds; if it fails, the hold is released and nothing is charged.",
+          tr(
+            "Takoserverは前払い制です。処理中は利用可能残高から金額を確保し、成功時に請求します。失敗時は確保を解除し、請求しません。",
+            "Takoserver is prepaid. Work places a hold against the available balance and captures it when it succeeds; if it fails, the hold is released and nothing is charged.",
+          ),
         ),
       ),
       h(
@@ -58,7 +62,7 @@ export function billingPage(organizationId: string): Child {
           onClick: () => addFunds(organizationId, wallet.reload),
         },
         icon(ICON.plus, 14),
-        text("Add funds"),
+        text(tr("残高を追加", "Add funds")),
       ),
     ),
     live(() =>
@@ -71,16 +75,31 @@ export function billingPage(organizationId: string): Child {
             h(
               "div",
               { class: "grid" },
-              stat("Available", money(held.availableMinor, held.currency), "settled − held"),
-              stat("Held", money(held.heldMinor, held.currency), "reserved against live work"),
-              stat("Settled", money(held.settledMinor, held.currency), "funded and captured"),
+              stat(
+                tr("利用可能", "Available"),
+                money(held.availableMinor, held.currency),
+                tr("確定残高 − 確保中", "settled − held"),
+              ),
+              stat(
+                tr("確保中", "Held"),
+                money(held.heldMinor, held.currency),
+                tr("処理中の操作に予約済み", "reserved against live work"),
+              ),
+              stat(
+                tr("確定残高", "Settled"),
+                money(held.settledMinor, held.currency),
+                tr("入金と確定済み請求", "funded and captured"),
+              ),
             ),
             card(
-              "Ledger",
+              tr("取引履歴", "Ledger"),
               held.entries.length === 0
                 ? empty(
-                    "No entries",
-                    "Nothing has been funded or charged on this organization yet.",
+                    tr("履歴がありません", "No entries"),
+                    tr(
+                      "この組織にはまだ入金または請求がありません。",
+                      "Nothing has been funded or charged on this organization yet.",
+                    ),
                   )
                 : h("div", { class: "table-scroll" }, ledgerTable(held.entries, held.currency)),
             ),
@@ -101,11 +120,11 @@ function ledgerTable(entries: readonly LedgerEntry[], currency: string): Child {
       h(
         "tr",
         null,
-        h("th", null, "Type"),
-        h("th", null, "Reference"),
-        h("th", { class: "num" }, "Settled"),
-        h("th", { class: "num" }, "Held"),
-        h("th", null, "When"),
+        h("th", null, tr("種類", "Type")),
+        h("th", null, tr("参照", "Reference")),
+        h("th", { class: "num" }, tr("確定", "Settled")),
+        h("th", { class: "num" }, tr("確保", "Held")),
+        h("th", null, tr("日時", "When")),
       ),
     ),
     h(
@@ -115,7 +134,7 @@ function ledgerTable(entries: readonly LedgerEntry[], currency: string): Child {
         h(
           "tr",
           null,
-          h("td", null, badge(entry.type, tone(entry.type))),
+          h("td", null, badge(entryTypeLabel(entry.type), tone(entry.type))),
           h("td", null, copyable(entry.reference)),
           h("td", { class: "num mono" }, delta(entry.settledDeltaMinor, currency)),
           h("td", { class: "num mono" }, delta(entry.heldDeltaMinor, currency)),
@@ -124,6 +143,17 @@ function ledgerTable(entries: readonly LedgerEntry[], currency: string): Child {
       ),
     ),
   );
+}
+
+function entryTypeLabel(type: string): string {
+  const japanese: Readonly<Record<string, string>> = {
+    funding: "入金",
+    hold: "確保",
+    capture: "請求確定",
+    release: "確保解除",
+    usage_debit: "使用量請求",
+  };
+  return tr(japanese[type] ?? type, type);
 }
 
 function tone(type: string): "ok" | "warn" | "bad" | "accent" | "idle" {
@@ -157,24 +187,35 @@ function addFunds(organizationId: string, reload: () => void): void {
   const busy = signal(false);
 
   const close = openModal({
-    title: "Add funds",
-    confirmLabel: "Continue to payment",
+    title: tr("残高を追加", "Add funds"),
+    confirmLabel: tr("支払いへ進む", "Continue to payment"),
     body: h(
       "div",
       { style: { display: "grid", gap: "14px" } },
       h(
         "div",
         { class: "field" },
-        h("label", null, "Amount (USD)"),
+        h("label", null, tr("金額（USD）", "Amount (USD)")),
         amount,
-        h("small", null, "Charged once. The balance is credited when the payment settles."),
+        h(
+          "small",
+          null,
+          tr(
+            "一度だけ決済します。支払い確定後に残高へ反映されます。",
+            "Charged once. The balance is credited when the payment settles.",
+          ),
+        ),
       ),
-      live(() => (busy() ? h("div", { class: "dim" }, "Opening Stripe…") : h("div"))),
+      live(() =>
+        busy()
+          ? h("div", { class: "dim" }, tr("支払い画面を開いています…", "Opening Stripe…"))
+          : h("div"),
+      ),
     ),
     onConfirm: async () => {
       const dollars = Number(amount.value);
       if (!Number.isFinite(dollars) || dollars < 5) {
-        toast("Enter an amount of at least $5", "bad");
+        toast(tr("5ドル以上の金額を入力してください", "Enter an amount of at least $5"), "bad");
         return;
       }
       busy.set(true);
@@ -206,12 +247,15 @@ function addFunds(organizationId: string, reload: () => void): void {
 function operatorFunding(organizationId: string, reload: () => void): void {
   const input = h("textarea", {
     class: "textarea",
-    placeholder: "Paste the settlement proof issued for this organization",
+    placeholder: tr(
+      "この組織に発行された入金証明を貼り付けてください",
+      "Paste the settlement proof issued for this organization",
+    ),
   });
 
   const close = openModal({
-    title: "Add funds",
-    confirmLabel: "Credit wallet",
+    title: tr("残高を追加", "Add funds"),
+    confirmLabel: tr("残高へ反映", "Credit wallet"),
     body: h(
       "div",
       { style: { display: "grid", gap: "14px" } },
@@ -222,26 +266,36 @@ function operatorFunding(organizationId: string, reload: () => void): void {
         h(
           "div",
           null,
-          "This deployment does not take card payments. The amount comes from the proof, not from you, and presenting the same proof twice credits once.",
+          tr(
+            "この環境ではカード決済を利用できません。金額は入金証明から取得し、同じ証明を複数回提示しても一度だけ反映します。",
+            "This deployment does not take card payments. The amount comes from the proof, not from you, and presenting the same proof twice credits once.",
+          ),
         ),
       ),
       h(
         "div",
         { class: "field" },
-        h("label", null, "Settlement proof"),
+        h("label", null, tr("入金証明", "Settlement proof")),
         input,
-        h("small", null, "Issued by the operator against this organization."),
+        h(
+          "small",
+          null,
+          tr(
+            "運営者がこの組織に対して発行した証明です。",
+            "Issued by the operator against this organization.",
+          ),
+        ),
       ),
     ),
     onConfirm: async () => {
       const proof = input.value.trim();
       if (proof === "") {
-        toast("Paste a settlement proof first", "bad");
+        toast(tr("入金証明を貼り付けてください", "Paste a settlement proof first"), "bad");
         return;
       }
       try {
         await api.fund(organizationId, proof);
-        toast("Wallet credited", "ok");
+        toast(tr("残高へ反映しました", "Wallet credited"), "ok");
         reload();
         close();
       } catch (error) {
@@ -266,12 +320,18 @@ function settleReturn(organizationId: string, reload: () => void): void {
   window.history.replaceState({}, "", window.location.pathname);
 
   if (checkout === "cancelled") {
-    toast("Payment cancelled. Nothing was charged.", "plain");
+    toast(
+      tr(
+        "支払いをキャンセルしました。請求はありません。",
+        "Payment cancelled. Nothing was charged.",
+      ),
+      "plain",
+    );
     return;
   }
   api.fund(organizationId, checkout).then(
     () => {
-      toast("Payment received", "ok");
+      toast(tr("支払いを受け付けました", "Payment received"), "ok");
       reload();
     },
     (error: unknown) => toast(explain(error as Error), "bad"),

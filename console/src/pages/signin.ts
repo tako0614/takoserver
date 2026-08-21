@@ -1,7 +1,7 @@
 import type { IdentityProvider } from "../api.ts";
 import { type Child, h, live } from "../dom.ts";
 import { beginGoogleSignIn } from "../google.ts";
-import { tr } from "../i18n.ts";
+import { consoleLocale, setConsoleLocale, tr } from "../i18n.ts";
 import { mark } from "../mark.ts";
 import { type Resource, resource, signal } from "../reactive.ts";
 import { adoptSession, api, apiOrigin, applyTheme, setApiOrigin, theme } from "../state.ts";
@@ -43,16 +43,23 @@ export function signInPage(): Child {
         h(
           "p",
           { class: "signin__lede" },
-          "Takoform で宣言したリソースと、前払いの残高を管理します。",
+          tr(
+            "Takoformで宣言したリソース、使用量、請求を管理します。",
+            "Manage resources declared through Takoform, usage, and billing.",
+          ),
         ),
         live(() => wayIn(providers)),
         h(
           "p",
           { class: "signin__legal" },
-          "続行すると、プロビジョニングした分の請求に同意したものとみなします。",
+          tr(
+            "続行すると、作成したリソースと使用量に応じた請求に同意したものとみなします。",
+            "By continuing, you agree to charges for the resources and usage you create.",
+          ),
         ),
       ),
       themeSwitch(),
+      languageSwitch(),
       endpointField(providers.reload),
     ),
   );
@@ -79,7 +86,10 @@ function wayIn(providers: Resource<{ providers: readonly IdentityProvider[] }>):
   return h(
     "div",
     { class: "notice notice--warn" },
-    "この配備には ID プロバイダーが設定されていないため、まだ誰もサインインできません。",
+    tr(
+      "この環境にはIDプロバイダーが設定されていないため、まだサインインできません。",
+      "No identity provider is configured for this environment, so nobody can sign in yet.",
+    ),
   );
 }
 
@@ -139,7 +149,9 @@ function googleRow(clientId: string): Child {
       h(
         "span",
         { class: "rowbutton__label" },
-        busy() ? "Google に移動しています…" : "Google で続ける",
+        busy()
+          ? tr("Googleに移動しています…", "Opening Google…")
+          : tr("Googleで続ける", "Continue with Google"),
       ),
       h("span", { class: "rowbutton__chevron" }, icon(ICON.chevron, 15)),
     ),
@@ -189,7 +201,10 @@ function operatorForm(): Child {
   const busy = signal(false);
   const assertion = h("textarea", {
     class: "textarea",
-    placeholder: "Paste the assertion the operator signed",
+    placeholder: tr(
+      "運営者が署名したassertionを貼り付けてください",
+      "Paste the assertion the operator signed",
+    ),
     autocomplete: "off",
     spellcheck: "false",
   });
@@ -197,7 +212,7 @@ function operatorForm(): Child {
   const submit = async (event: Event): Promise<void> => {
     event.preventDefault();
     if (assertion.value.trim() === "") {
-      toast("Paste an assertion first", "bad");
+      toast(tr("assertionを貼り付けてください", "Paste an assertion first"), "bad");
       return;
     }
     busy.set(true);
@@ -217,9 +232,16 @@ function operatorForm(): Child {
     h(
       "div",
       { class: "field" },
-      h("label", { for: "assertion" }, "Operator assertion"),
+      h("label", { for: "assertion" }, tr("運営者assertion", "Operator assertion")),
       assertion,
-      h("small", null, "Signed offline by the operator key this deployment is configured with."),
+      h(
+        "small",
+        null,
+        tr(
+          "この環境に設定された運営者キーでオフライン署名されたものです。",
+          "Signed offline by the operator key this deployment is configured with.",
+        ),
+      ),
     ),
     live(() =>
       h(
@@ -230,7 +252,9 @@ function operatorForm(): Child {
           style: { width: "100%" },
           ...(busy() ? { disabled: true } : {}),
         },
-        busy() ? "Signing in…" : "Sign in with assertion",
+        busy()
+          ? tr("サインインしています…", "Signing in…")
+          : tr("assertionでサインイン", "Sign in with assertion"),
       ),
     ),
   );
@@ -240,12 +264,12 @@ function themeSwitch(): Child {
   return live(() =>
     h(
       "div",
-      { class: "segmented", role: "group", "aria-label": "Appearance" },
+      { class: "segmented", role: "group", "aria-label": tr("表示", "Appearance") },
       ...(
         [
-          ["system", ICON.monitor, "System"],
-          ["light", ICON.sun, "Light"],
-          ["dark", ICON.moon, "Dark"],
+          ["system", ICON.monitor, tr("システム", "System")],
+          ["light", ICON.sun, tr("ライト", "Light")],
+          ["dark", ICON.moon, tr("ダーク", "Dark")],
         ] as const
       ).map(([value, glyph, label]) =>
         h(
@@ -265,6 +289,29 @@ function themeSwitch(): Child {
   );
 }
 
+function languageSwitch(): Child {
+  return live(() =>
+    h(
+      "div",
+      { class: "segmented", role: "group", "aria-label": tr("言語", "Language") },
+      ...(["ja", "en"] as const).map((option) =>
+        h(
+          "button",
+          {
+            class: "segmented__item",
+            type: "button",
+            title: option === "ja" ? "日本語" : "English",
+            "aria-label": option === "ja" ? "日本語" : "English",
+            "aria-pressed": consoleLocale() === option ? "true" : "false",
+            onClick: () => setConsoleLocale(option),
+          },
+          option === "ja" ? "JA" : "EN",
+        ),
+      ),
+    ),
+  );
+}
+
 /**
  * Where the API is.
  *
@@ -276,7 +323,7 @@ function endpointField(reload: () => void): Child {
   return h(
     "details",
     { class: "signin__endpoint" },
-    h("summary", null, "API endpoint"),
+    h("summary", null, tr("API接続先", "API endpoint")),
     h(
       "div",
       { style: { display: "flex", gap: "8px", marginTop: "8px" } },
@@ -289,10 +336,10 @@ function endpointField(reload: () => void): Child {
           onClick: () => {
             setApiOrigin(input.value.trim());
             reload();
-            toast("Endpoint updated", "ok");
+            toast(tr("接続先を更新しました", "Endpoint updated"), "ok");
           },
         },
-        "Save",
+        tr("保存", "Save"),
       ),
     ),
   );

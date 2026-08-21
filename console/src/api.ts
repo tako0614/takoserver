@@ -8,6 +8,9 @@
  * call succeeded.
  */
 
+import type { PricePlan } from "../../src/catalog.ts";
+import type { TakoformBindingRef, TakoformInterfaceRef } from "../../src/interface-ref.ts";
+
 /** A way in, as the server advertises it. */
 export interface IdentityProvider {
   readonly id: string;
@@ -64,13 +67,19 @@ export interface Offering {
   readonly kind: string;
   readonly displayName: string;
   readonly form: FormRef;
-  readonly price: {
-    readonly currency: string;
-    readonly unit: string;
-    readonly unitPriceMinor: number;
+  readonly pricePlan: PricePlan;
+  readonly resourceClass: string;
+  readonly deliveryMode: string;
+  readonly providedInterfaces: readonly TakoformInterfaceRef[];
+  readonly bindingRefs: readonly TakoformBindingRef[];
+  readonly regions: readonly string[];
+  readonly portability: {
+    readonly api: "native" | "portable";
+    readonly exportFormats: readonly string[];
+    readonly importFormats: readonly string[];
+    readonly migrationModes: readonly ("offline" | "online")[];
   };
-  readonly protocols: readonly string[];
-  readonly regions?: readonly string[];
+  readonly isolation: string;
   readonly digest: string;
 }
 
@@ -117,14 +126,6 @@ export interface Operation {
   readonly operation: string;
   readonly state: string;
   readonly createdAt: string;
-}
-
-/** What the Host says it can do with one installed Form definition. */
-export interface FormSupport {
-  readonly formRef: FormRef;
-  readonly operations: readonly string[];
-  readonly supportedBindings?: readonly string[];
-  readonly limits?: { readonly maximumBundleBytes?: number };
 }
 
 /** The exact-pin lane this console speaks. */
@@ -362,12 +363,6 @@ export function createApi(options: ApiOptions) {
         "GET",
         `/v1/organizations/${encodeURIComponent(organizationId)}/operations`,
       ),
-
-    // The Host's own account of what it will accept. Read from the control
-    // plane rather than the exact-pin lane, which only admits an organization
-    // key: a person holding a session would be told they are not authenticated
-    // for asking a question that has nothing to do with their organization.
-    forms: () => call<{ profiles: readonly FormSupport[] }>("GET", "/v1/forms"),
   };
 }
 
