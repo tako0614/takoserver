@@ -247,15 +247,13 @@ describe("Hosted sponsorship owner API", () => {
         expiresInSeconds: 601,
       }),
     ).toMatchObject({ status: 400 });
-    await call(route, "POST", `${base}/takoform-run-credentials`, {
-      runRef: "run_takosumi_legacy",
-      expiresInSeconds: 300,
-    });
-    expect(issued.at(-1)).toMatchObject({
-      tenantRef: "tenant_opaque",
-      spaceRef: "tenant_opaque",
-      runRef: "run_takosumi_legacy",
-    });
+    expect(
+      await call(route, "POST", `${base}/takoform-run-credentials`, {
+        runRef: "run_takosumi_legacy",
+        expiresInSeconds: 300,
+      }),
+    ).toMatchObject({ status: 400 });
+    expect(issued).toHaveLength(1);
   });
 
   test("authorizes only an active WorkerEndpoint in the exact opaque Capsule space", async () => {

@@ -74,17 +74,13 @@ export function createSponsorshipRoutes(
       ) {
         const body = await jsonObject(
           request,
-          ["runRef", "expiresInSeconds"],
-          ["spaceRef", "runtimeMaterialization"],
+          ["runRef", "spaceRef", "expiresInSeconds"],
+          ["runtimeMaterialization"],
         );
         const issued = await options.tokens.issueTakoformTenantRunToken({
           organizationId,
           tenantRef,
-          // One deploy-order transition: the predecessor Hosted Worker sent
-          // no Capsule space. It remains confined to the tenant namespace
-          // until the Hosted deployment moves first, after which this fallback
-          // is removed in the immediately following Takoserver release.
-          spaceRef: body.spaceRef === undefined ? tenantRef : text(body.spaceRef, 256),
+          spaceRef: text(body.spaceRef, 256),
           runRef: text(body.runRef, 256),
           ...(body.runtimeMaterialization === undefined
             ? {}
