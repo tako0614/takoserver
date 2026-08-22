@@ -45,8 +45,11 @@ describe("Worker data service composition", () => {
         pricePlan: {
           id: "storage.object.cloudflare.price-v1",
           currency: "USD",
-          recurring: { meter: "bucket-month", amountMinor: 500 },
-          meters: [],
+          provisioning: { meter: "resource.create", amountMinor: 0 },
+          meters: [
+            { meter: "storage.gib-hour", amountMinor: 2, quantity: 720 },
+            { meter: "requests.million", amountMinor: 50 },
+          ],
         },
         placement: {
           deliveryMode: "native-credentials",

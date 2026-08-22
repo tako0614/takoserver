@@ -136,10 +136,26 @@ provisions R2 buckets, D1 databases, and Workers in that account instead. The
 control plane itself can also run as a Worker; `bun run deploy -- --contract`
 describes what publishing that involves and what it refuses to do.
 
-The operator-private deploy target may also declare `aiModels` and
-`r2ParentAccessKeyId`. The former is the exact public-model to upstream-model
-mapping, limits, and retail token prices; the latter is only the public id of an
-R2 parent token. Realization places those non-secret values in Worker vars. AI
+The operator-private deploy target may also declare `aiModels`,
+`r2ParentAccessKeyId`, and a `hostRuntimeMaterializerService`. The former is the
+exact public-model to upstream-model mapping, limits, and retail token prices;
+the latter is only the public id of an R2 parent token. The materializer
+descriptor contains only an exact Worker service name and named entrypoint;
+realization binds it as `HOST_RUNTIME_MATERIALIZER`. The deploy writer reads the
+immutable Worker Version back and requires that exact service and entrypoint;
+it also rejects a stale materializer binding when the target declares none.
+The read-only `bun run deploy -- --status` path proves the same exact D1, R2,
+and materializer closure, so a stale operator target or an incompletely wired
+live Version cannot masquerade as a healthy recovery state.
+Runtime values cross that
+RPC boundary only while Takoserver provisions one tenant Worker and never enter
+the target, state, Output, receipt, or agent transcript. If the materializer
+changed host-side authority while deriving those values, it may return an
+opaque authenticated rollback receipt. Takoserver never interprets that
+receipt: a failed immutable Worker Version upload sends it back only to the
+same private materializer, and reports a provider error unless the exact
+compare-and-swap rollback is confirmed. Realization places the other
+non-secret values in Worker vars. AI
 uses the native Workers AI binding, so it does not copy an account API token
 into inference requests. `CLOUDFLARE_API_TOKEN` remains the provisioning
 secret, while `TAKOSERVER_R2_PARENT_TOKEN` is the parent R2 secret access key.

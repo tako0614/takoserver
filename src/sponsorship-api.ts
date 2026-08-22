@@ -1,6 +1,7 @@
 import type { ResourceInventory } from "./control.ts";
 import type { Ledger } from "./ledger.ts";
 import type { Clock, Sql } from "./ports.ts";
+import { boundedRuntimeMaterialization } from "./runtime-materialization.ts";
 import type { TakoformHost } from "./takoform/types.ts";
 import type { TokenService } from "./token.ts";
 
@@ -67,11 +68,20 @@ export function createSponsorshipRoutes(
         rest.length === 2 &&
         rest[1] === "takoform-run-credentials"
       ) {
-        const body = await jsonObject(request, ["runRef", "expiresInSeconds"]);
+        const body = await jsonObject(
+          request,
+          ["runRef", "expiresInSeconds"],
+          ["runtimeMaterialization"],
+        );
         const issued = await options.tokens.issueTakoformTenantRunToken({
           organizationId,
           tenantRef,
           runRef: text(body.runRef, 256),
+          ...(body.runtimeMaterialization === undefined
+            ? {}
+            : {
+                runtimeMaterialization: boundedRuntimeMaterialization(body.runtimeMaterialization),
+              }),
           ttlSeconds: boundedTtl(body.expiresInSeconds),
         });
         return Response.json({ takoformRunCredential: issued }, { status: 201 });
@@ -307,12 +317,19 @@ async function tenant(sql: Sql, tenantRef: string): Promise<string | null> {
 async function jsonObject(
   request: Request,
   keys: readonly string[],
+  optionalKeys: readonly string[] = [],
 ): Promise<Record<string, unknown>> {
   if (!request.headers.get("content-type")?.startsWith("application/json")) throw new Error();
   const value: unknown = await request.json();
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
   const object = value as Record<string, unknown>;
-  if (Object.keys(object).sort().join("\0") !== [...keys].sort().join("\0")) throw new Error();
+  const actual = Object.keys(object);
+  if (
+    keys.some((key) => !Object.hasOwn(object, key)) ||
+    actual.some((key) => !keys.includes(key) && !optionalKeys.includes(key))
+  ) {
+    throw new Error();
+  }
   return object;
 }
 

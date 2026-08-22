@@ -5,16 +5,32 @@ import { money } from "./ui.ts";
 
 export function offeringPriceLines(offering: Offering): readonly string[] {
   return [
-    priceLine(offering.pricePlan.recurring, offering.pricePlan.currency),
+    ...(offering.pricePlan.provisioning.amountMinor > 0
+      ? [
+          tr(
+            `${priceLine(offering.pricePlan.provisioning, offering.pricePlan.currency)}（作成時のみ）`,
+            `${priceLine(offering.pricePlan.provisioning, offering.pricePlan.currency)} one-time`,
+          ),
+        ]
+      : []),
     ...offering.pricePlan.meters.map((charge) => priceLine(charge, offering.pricePlan.currency)),
   ];
 }
 
-export function recurringPriceSentence(offering: Offering): string {
-  const charge = offering.pricePlan.recurring;
+export function provisioningPriceSentence(offering: Offering): string {
+  const charge = offering.pricePlan.provisioning;
+  if (charge.amountMinor === 0 && offering.pricePlan.meters.length > 0) {
+    return tr(
+      "作成料金なし。実測した利用量だけを請求します。",
+      "No setup charge. Pay only for measured usage.",
+    );
+  }
+  if (charge.amountMinor === 0) {
+    return tr("作成料金なし。", "No setup charge.");
+  }
   return tr(
-    `${meterUnit(charge)}あたり${money(charge.amountMinor, offering.pricePlan.currency)}。適用時に確保し、成功時に請求します。`,
-    `${money(charge.amountMinor, offering.pricePlan.currency)} per ${meterUnit(charge)} — held when you apply, charged when it succeeds.`,
+    `${meterUnit(charge)}あたり${money(charge.amountMinor, offering.pricePlan.currency)}の作成料金です。適用時に確保し、成功時に一度だけ請求します。`,
+    `${money(charge.amountMinor, offering.pricePlan.currency)} per ${meterUnit(charge)} as a one-time setup charge — held when you apply and charged once when it succeeds.`,
   );
 }
 

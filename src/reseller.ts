@@ -1,4 +1,4 @@
-import { type Catalog, priceRecurring } from "./catalog.ts";
+import { type Catalog, priceProvisioning } from "./catalog.ts";
 import type { Ledger } from "./ledger.ts";
 import type { Clock, Sql } from "./ports.ts";
 
@@ -172,7 +172,7 @@ export function createReseller(options: CreateResellerOptions): Reseller {
       if (!offering) throw new ResellerError("offering_unavailable", 503);
       let amountMinor: number;
       try {
-        amountMinor = priceRecurring(offering.pricePlan, quantity);
+        amountMinor = priceProvisioning(offering.pricePlan, quantity);
       } catch {
         throw new ResellerError("invalid_argument", 400);
       }
@@ -191,7 +191,7 @@ export function createReseller(options: CreateResellerOptions): Reseller {
           await catalog.digest(offering),
           quantity,
           amountMinor,
-          offering.pricePlan.recurring.meter,
+          offering.pricePlan.provisioning.meter,
           expiresAt,
           stamp(),
         ],
@@ -203,7 +203,7 @@ export function createReseller(options: CreateResellerOptions): Reseller {
         quantity,
         currency: "USD",
         amountMinor,
-        meter: offering.pricePlan.recurring.meter,
+        meter: offering.pricePlan.provisioning.meter,
         expiresAt,
       };
     },
@@ -232,7 +232,8 @@ export function createReseller(options: CreateResellerOptions): Reseller {
       const amountMinor = Number(quote.amount_minor);
       // The hold is taken before the reservation exists, so a reservation is
       // never visible without the funds behind it.
-      const held = await ledger.hold({ organizationId, reference: id, amountMinor });
+      const held =
+        amountMinor === 0 || (await ledger.hold({ organizationId, reference: id, amountMinor }));
       if (!held) throw new ResellerError("insufficient_funds", 402);
 
       const expiresAt = after(RESERVATION_TTL_SECONDS);
@@ -257,7 +258,9 @@ export function createReseller(options: CreateResellerOptions): Reseller {
         );
       } catch (error) {
         // The row could not be written, so the money must not stay earmarked.
-        await ledger.release({ organizationId, reference: id, amountMinor });
+        if (amountMinor > 0) {
+          await ledger.release({ organizationId, reference: id, amountMinor });
+        }
         throw error;
       }
       return {
@@ -304,11 +307,13 @@ export function createReseller(options: CreateResellerOptions): Reseller {
       );
       if (claimed.changes !== 1) throw new ResellerError("conflict", 409);
 
-      await ledger.capture({
-        organizationId,
-        reference: reservationId,
-        amountMinor: reservation.amountMinor,
-      });
+      if (reservation.amountMinor > 0) {
+        await ledger.capture({
+          organizationId,
+          reference: reservationId,
+          amountMinor: reservation.amountMinor,
+        });
+      }
       const capturedAt = stamp();
       await sql.run(
         `INSERT OR IGNORE INTO usage_statements
@@ -343,11 +348,13 @@ export function createReseller(options: CreateResellerOptions): Reseller {
         [reservationId, organizationId, tenantRef, reservationId, organizationId, tenantRef],
       );
       if (claimed.changes !== 1) throw new ResellerError("conflict", 409);
-      await ledger.release({
-        organizationId,
-        reference: reservationId,
-        amountMinor: reservation.amountMinor,
-      });
+      if (reservation.amountMinor > 0) {
+        await ledger.release({
+          organizationId,
+          reference: reservationId,
+          amountMinor: reservation.amountMinor,
+        });
+      }
       return { ...reservation, status: "released" };
     },
 

@@ -25,6 +25,8 @@ export interface MeterSource {
   readonly maximumWindowSeconds: number;
   /** Omitted only when the upstream documents unbounded historical retention. */
   readonly retentionSeconds?: number;
+  /** Daily upstream datasets are read only as complete, non-overlapping UTC days. */
+  readonly windowAlignment?: "utc-day";
   read(input: {
     readonly tenantId: string;
     readonly deployment: ProviderMeterDeployment;

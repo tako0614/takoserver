@@ -43,7 +43,7 @@ const supply = (provider: "cloudflare" | "wasabi") => ({
   pricePlan: {
     id: `storage.object.${provider}.price-v1`,
     currency: "USD",
-    recurring: { meter: "bucket-month", amountMinor: 500 },
+    provisioning: { meter: "resource.create", amountMinor: 0 },
     meters:
       provider === "cloudflare"
         ? [

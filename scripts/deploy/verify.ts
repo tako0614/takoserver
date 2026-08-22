@@ -3,7 +3,7 @@ import { verificationError } from "./errors.ts";
 import type { PreflightReport } from "./preflight.ts";
 import { RUNTIME_TABLES } from "./preflight.ts";
 import { inspectSigningAuthority, liveSigningKeyMatches } from "./signing-authority.ts";
-import { assertBindingClosure } from "./worker-state.ts";
+import { assertTargetBindingClosure } from "./worker-state.ts";
 
 /**
  * Proves the published bytes serve a real caller.
@@ -20,10 +20,7 @@ export async function verify(
 ): Promise<readonly string[]> {
   const proven: string[] = [];
 
-  await assertBindingClosure("verification", report.configPath, versionId, {
-    STATE_DB: [report.target.d1.databaseId],
-    OBJECTS: [report.target.r2.bucketName],
-  });
+  await assertTargetBindingClosure("verification", report.configPath, versionId, report.target);
   proven.push(`binding closure of version ${versionId}`);
 
   const database = new RemoteD1(report.configPath);

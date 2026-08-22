@@ -189,7 +189,7 @@ function activeAt(contract: SupplyContract, now: Date): boolean {
 }
 
 function validPricePlan(plan: PricePlan): boolean {
-  const charges = [plan.recurring, ...plan.meters];
+  const charges = [plan.provisioning, ...plan.meters];
   return (
     charges.length <= 65 &&
     new Set(charges.map((charge) => charge.meter)).size === charges.length &&

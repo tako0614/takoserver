@@ -11,6 +11,7 @@ import {
   type ProviderValue,
   succeeded,
 } from "../provider-port.ts";
+import type { RuntimeMaterializer } from "../runtime-materialization.ts";
 
 /**
  * Provisioning on Cloudflare through its REST API.
@@ -125,6 +126,8 @@ export interface CloudflareProviderOptions {
   /** Exact suffix assigned to this account, for example `team.workers.dev`. */
   readonly workerEndpointSuffix?: string;
   readonly workerCompatibilityDate?: string;
+  /** Private host capability used only while uploading one immutable Version. */
+  readonly runtimeMaterializer?: RuntimeMaterializer;
   readonly fetch?: (request: Request) => Promise<Response>;
 }
 
@@ -139,6 +142,7 @@ export class CloudflareProvider implements Provider {
   readonly #fetch: (request: Request) => Promise<Response>;
   readonly #workerEndpointSuffix: string | undefined;
   readonly #workerCompatibilityDate: string;
+  readonly #runtimeMaterializer: RuntimeMaterializer | undefined;
 
   constructor(options: CloudflareProviderOptions) {
     this.id = options.id ?? "cloudflare";
@@ -151,6 +155,7 @@ export class CloudflareProvider implements Provider {
     this.#fetch = options.fetch ?? ((request) => fetch(request));
     this.#workerEndpointSuffix = options.workerEndpointSuffix;
     this.#workerCompatibilityDate = options.workerCompatibilityDate ?? "2026-08-19";
+    this.#runtimeMaterializer = options.runtimeMaterializer;
   }
 
   readonly sqliteMigrations = {
@@ -602,6 +607,28 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
 
     const bindings = edgeBindings(input.spec, input.relations);
     if (!bindings) return failed("invalid_spec", "a Worker binding has no provider deployment");
+    const requiredSensitive = sensitiveBindingNames(input.spec.requiredSensitiveVars);
+    if (!requiredSensitive) {
+      return failed("invalid_spec", "the sensitive Worker binding declaration is invalid");
+    }
+    const runtimeMaterializer = this.#runtimeMaterializer;
+    const runtimeMaterialization = input.runtimeMaterialization;
+    let runtimeMaterializationResult:
+      | Awaited<ReturnType<RuntimeMaterializer["materializeRuntimeBindings"]>>
+      | undefined;
+    if (requiredSensitive.length > 0) {
+      if (!runtimeMaterialization || !runtimeMaterializer || !this.#workerEndpointSuffix) {
+        return failed(
+          "denied",
+          "the sensitive Worker bindings have no runtime materialization authority",
+        );
+      }
+    } else if (runtimeMaterialization) {
+      return failed(
+        "invalid_spec",
+        "runtime materialization authority requires sensitive Worker bindings",
+      );
+    }
     const assetsSpec = record(input.spec.assets);
     let assetToken: string | null = null;
     if (assetsSpec) {
@@ -618,6 +645,51 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       if (typeof uploaded !== "string") return uploaded;
       assetToken = uploaded;
     }
+    const modulePayloads: Array<{
+      readonly module: (typeof modules)[number];
+      readonly bytes: Uint8Array;
+    }> = [];
+    for (const module of modules) {
+      const bytes = await this.#artifacts.blob(module.digest);
+      if (!bytes) return failed("invalid_spec", `a declared module is missing: ${module.name}`);
+      modulePayloads.push({ module, bytes });
+    }
+    let sensitiveBindings: readonly JsonObject[] = [];
+    if (requiredSensitive.length > 0) {
+      if (!runtimeMaterializer || !runtimeMaterialization) {
+        return failed(
+          "denied",
+          "the sensitive Worker bindings have no runtime materialization authority",
+        );
+      }
+      try {
+        runtimeMaterializationResult = await runtimeMaterializer.materializeRuntimeBindings({
+          request: runtimeMaterialization,
+          resourceName: input.identity.name,
+          scriptName,
+          publicOrigin: `https://${scriptName}.${this.#workerEndpointSuffix}`,
+          bindings: requiredSensitive,
+        });
+      } catch {
+        return failed("denied", "the runtime materializer refused the Worker bindings");
+      }
+      const values = runtimeMaterializationResult.values;
+      if (!sameMaterializedBindings(values, requiredSensitive)) {
+        const rollbackFailed = await this.#rollbackRuntimeMaterialization(
+          runtimeMaterialization,
+          runtimeMaterializationResult.rollbackReceipt,
+        );
+        return (
+          rollbackFailed ??
+          failed("denied", "the runtime materializer returned different Worker bindings")
+        );
+      }
+      sensitiveBindings = requiredSensitive.map((name) => ({
+        type: "secret_text",
+        name,
+        text: values[name] as string,
+      }));
+    }
     const form = new FormData();
     form.set(
       "metadata",
@@ -628,9 +700,9 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
             compatibility_date: this.#workerCompatibilityDate,
             bindings: [
               ...bindings,
+              ...sensitiveBindings,
               ...(assetToken ? [{ type: "assets", name: ASSETS_BINDING }] : []),
             ],
-            keep_bindings: ["secret_text"],
             ...(assetToken
               ? {
                   assets: {
@@ -652,9 +724,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       ),
       "metadata.json",
     );
-    for (const module of modules) {
-      const bytes = await this.#artifacts.blob(module.digest);
-      if (!bytes) return failed("invalid_spec", `a declared module is missing: ${module.name}`);
+    for (const { module, bytes } of modulePayloads) {
       form.set(
         module.name,
         new Blob([bytes.buffer as ArrayBuffer], { type: module.mediaType }),
@@ -666,14 +736,45 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(scriptName)}/versions`,
       form,
     );
-    if (!uploaded.ok) return uploaded.ticket;
+    if (!uploaded.ok) {
+      const rollbackFailed = await this.#rollbackRuntimeMaterialization(
+        input.runtimeMaterialization,
+        runtimeMaterializationResult?.rollbackReceipt,
+      );
+      return rollbackFailed ?? uploaded.ticket;
+    }
     const versionId = optionalString(record(uploaded.result)?.id);
-    if (!versionId) return failed("provider_error", "the Worker Version has no identifier");
+    if (!versionId) {
+      const rollbackFailed = await this.#rollbackRuntimeMaterialization(
+        input.runtimeMaterialization,
+        runtimeMaterializationResult?.rollbackReceipt,
+      );
+      return rollbackFailed ?? failed("provider_error", "the Worker Version has no identifier");
+    }
     return succeeded({
       nativeId: `version:${scriptName}:${versionId}`,
       observed: { scriptName, versionId },
       outputs: { scriptName, versionId },
     });
+  }
+
+  async #rollbackRuntimeMaterialization(
+    request: JsonObject | undefined,
+    rollbackReceipt: string | undefined,
+  ): Promise<ProviderTicket | undefined> {
+    if (!request || !rollbackReceipt) return undefined;
+    try {
+      await this.#runtimeMaterializer?.rollbackRuntimeBindings({
+        request,
+        rollbackReceipt,
+      });
+      return undefined;
+    } catch {
+      return failed(
+        "provider_error",
+        "the Worker Version failed and runtime materialization rollback was not confirmed",
+      );
+    }
   }
 
   async #applyWorkerDeployment(input: ApplyInput): Promise<ProviderTicket> {
@@ -1550,11 +1651,17 @@ function edgeBindings(
   relations: readonly ProviderRelation[] | undefined,
 ): readonly JsonObject[] | null {
   const result: JsonObject[] = [];
-  const vars = record(spec.vars) ?? {};
+  const vars = (record(spec.vars) ?? {}) as Readonly<Record<string, JsonValue>>;
   for (const [name, value] of Object.entries(vars).sort(([left], [right]) =>
     left.localeCompare(right),
   )) {
-    result.push({ type: "plain_text", name, text: JSON.stringify(value) });
+    // Cloudflare's plain_text binding exposes its text byte-for-byte. Preserve
+    // strings and use a JSON binding for every other portable JsonValue.
+    result.push(
+      typeof value === "string"
+        ? { type: "plain_text", name, text: value }
+        : { type: "json", name, json: value },
+    );
   }
   for (const [field, relationPrefix, type, output, targetKey] of [
     ["kvBindings", "/kvBindings", "kv_namespace", "namespaceId", "namespace_id"],
@@ -1673,6 +1780,53 @@ function stringList(value: JsonValue | undefined): readonly string[] {
   return Array.isArray(value)
     ? value.filter((entry): entry is string => typeof entry === "string")
     : [];
+}
+
+function sensitiveBindingNames(value: JsonValue | undefined): readonly string[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return null;
+  const names = value.filter((entry): entry is string => typeof entry === "string");
+  if (
+    names.length !== value.length ||
+    new Set(names).size !== names.length ||
+    names.some((name) => !/^[A-Z_][A-Z0-9_]{0,127}$/u.test(name))
+  ) {
+    return null;
+  }
+  return names;
+}
+
+function sameMaterializedBindings(
+  values: Readonly<Record<string, string>>,
+  expected: readonly string[],
+): boolean {
+  const names = Object.keys(values);
+  return (
+    names.length === expected.length &&
+    names.every((name) => expected.includes(name)) &&
+    expected.every((name) => {
+      const value = values[name];
+      return (
+        typeof value === "string" &&
+        value.length > 0 &&
+        value.length <= 4_096 &&
+        !hasDisallowedTextControl(value)
+      );
+    })
+  );
+}
+
+function hasDisallowedTextControl(value: string): boolean {
+  return [...value].some((character) => {
+    const code = character.codePointAt(0) ?? 0;
+    return (
+      code === 0x7f ||
+      code <= 0x08 ||
+      code === 0x0b ||
+      code === 0x0c ||
+      (code >= 0x0e && code <= 0x1f)
+    );
+  });
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {

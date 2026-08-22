@@ -6,9 +6,10 @@ import {
   parseHostedSupplyContract,
 } from "./hosted-object-bucket-supplies.ts";
 import type { ObjectBucketPlacement } from "./object-bucket-deployment.ts";
+import { CLOUDFLARE_EDGE_METER_SETS } from "./providers/cloudflare-edge-meter.ts";
 import { parseStrictJson } from "./strict-json.ts";
 
-export const HOSTED_EDGE_SUPPLIES_KIND = "takoserver.hosted-edge-supplies@v1" as const;
+export const HOSTED_EDGE_SUPPLIES_KIND = "takoserver.hosted-edge-supplies@v2" as const;
 
 export const HOSTED_EDGE_IDENTITY_CLASSES = {
   ModuleWorker: "compute.edge",
@@ -81,9 +82,16 @@ function parseOffering(value: unknown): HostedEdgeOffering {
   const formKind = edgeKind(item.formKind);
   const pricePlan = parseHostedPricePlan(item.pricePlan);
   const placement = parseHostedPlacement(item.placement);
-  // Meter sources are provider-specific capabilities. They are added only
-  // once a production adapter exists; a private price cannot invent one.
-  if (pricePlan.meters.length !== 0) invalid();
+  const expectedMeters = [...CLOUDFLARE_EDGE_METER_SETS[formKind]].sort();
+  const actualMeters = pricePlan.meters.map((meter) => meter.meter).sort();
+  if (
+    pricePlan.provisioning.amountMinor !== 0 ||
+    pricePlan.provisioning.meter !== "resource.create" ||
+    actualMeters.length !== expectedMeters.length ||
+    actualMeters.some((meter, index) => meter !== expectedMeters[index])
+  ) {
+    invalid();
+  }
   return {
     formKind,
     offeringId: id(item.offeringId),

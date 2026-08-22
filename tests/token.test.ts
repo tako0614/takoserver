@@ -187,10 +187,27 @@ describe("provision tokens", () => {
 describe("Takoform run tokens", () => {
   test("bind a multi-Resource runner credential to one opaque tenant space", async () => {
     const tokens = service(await provisionKey("sign-tenant-run"));
+    const runtimeMaterialization = {
+      contract: "takosumi.host-runtime-materialization/v1",
+      installConfigId: "icfg_yurucommu",
+      workspaceId: "workspace_x",
+      capsuleId: "capsule_yurucommu",
+      installingPrincipalId: "tsub_owner",
+      requirements: [
+        {
+          kind: "generated_secret",
+          binding: "ENCRYPTION_KEY",
+          secretRef: "secret:repository/encryption-key",
+          bytes: 32,
+          encoding: "hex",
+        },
+      ],
+    } as const;
     const issued = await tokens.issueTakoformTenantRunToken({
       organizationId: "org_alpha",
       tenantRef: "tenant_workspace_x",
       runRef: "run_takosumi_1",
+      runtimeMaterialization,
       ttlSeconds: 300,
     });
     expect(await tokens.verifyTakoformTenantRunToken(issued.token)).toMatchObject({
@@ -198,6 +215,7 @@ describe("Takoform run tokens", () => {
       tenantRef: "tenant_workspace_x",
       runRef: "run_takosumi_1",
       mode: "tenant-run",
+      runtimeMaterialization,
     });
   });
 

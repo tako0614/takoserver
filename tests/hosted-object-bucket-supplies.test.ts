@@ -34,8 +34,12 @@ const SUPPLY = {
   pricePlan: {
     id: "storage.object.wasabi.eu-central-2.price-v1",
     currency: "USD",
-    recurring: { meter: "bucket-month", amountMinor: 500 },
-    meters: [],
+    provisioning: { meter: "resource.create", amountMinor: 0 },
+    meters: [
+      { meter: "storage.gib-hour", amountMinor: 3, quantity: 720 },
+      { meter: "requests.million", amountMinor: 60 },
+      { meter: "egress.gib", amountMinor: 1 },
+    ],
   },
   placement: {
     deliveryMode: "native-credentials",

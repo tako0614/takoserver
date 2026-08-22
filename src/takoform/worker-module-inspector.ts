@@ -13,10 +13,11 @@ interface AstNode {
  * Statically proves which portable handlers a JavaScript module exports.
  *
  * The source is parsed, never evaluated. A default export must be an object
- * literal or a top-level variable initialized to one; calls, spreads and
- * computed keys stay closed because inspecting them would execute tenant code
- * or guess what it returns. Cloudflare still performs its own full module
- * validation when the exact bytes are uploaded.
+ * literal, a top-level variable initialized to one, or a zero-argument call to
+ * a top-level synchronous factory whose only statement returns one. Every
+ * other call, spread and computed key stays closed because inspecting it would
+ * execute tenant code or guess what it returns. Cloudflare still performs its
+ * own full module validation when the exact bytes are uploaded.
  */
 export function createJavaScriptWorkerModuleInspector(): WorkerModuleInspector {
   return {
@@ -41,6 +42,7 @@ export function createJavaScriptWorkerModuleInspector(): WorkerModuleInspector {
       }
 
       const declarations = new Map<string, AstNode>();
+      const factories = new Map<string, AstNode>();
       let exported: AstNode | undefined;
       for (const statement of program.body) {
         if (statement.type === "VariableDeclaration") {
@@ -49,6 +51,10 @@ export function createJavaScriptWorkerModuleInspector(): WorkerModuleInspector {
             const initial = node(declaration.init);
             if (name && initial) declarations.set(name, initial);
           }
+        }
+        if (statement.type === "FunctionDeclaration") {
+          const name = identifierName(statement.id);
+          if (name) factories.set(name, statement);
         }
         if (statement.type === "ExportDefaultDeclaration") {
           if (exported) return refused();
@@ -65,7 +71,7 @@ export function createJavaScriptWorkerModuleInspector(): WorkerModuleInspector {
         }
       }
 
-      const object = resolveObject(exported, declarations, new Set());
+      const object = resolveObject(exported, declarations, factories, new Set());
       if (!object) return refused();
       const found = new Set<string>();
       for (const property of nodes(object.properties)) {
@@ -85,15 +91,29 @@ export function createJavaScriptWorkerModuleInspector(): WorkerModuleInspector {
 function resolveObject(
   candidate: AstNode | undefined,
   declarations: ReadonlyMap<string, AstNode>,
+  factories: ReadonlyMap<string, AstNode>,
   seen: Set<string>,
 ): AstNode | null {
   if (!candidate) return null;
   if (candidate.type === "ObjectExpression") return candidate;
+  if (candidate.type === "CallExpression") {
+    const argumentsValue = candidate.arguments;
+    if (!Array.isArray(argumentsValue) || argumentsValue.length !== 0) return null;
+    const name = identifierName(candidate.callee);
+    if (!name || seen.has(name)) return null;
+    const factory = factories.get(name);
+    if (!factory || factory.async === true || factory.generator === true) return null;
+    const body = node(factory.body);
+    const statements = body ? nodes(body.body) : [];
+    if (statements.length !== 1 || statements[0]?.type !== "ReturnStatement") return null;
+    seen.add(name);
+    return resolveObject(node(statements[0].argument), declarations, factories, seen);
+  }
   if (candidate.type !== "Identifier") return null;
   const name = identifierName(candidate);
   if (!name || seen.has(name)) return null;
   seen.add(name);
-  return resolveObject(declarations.get(name), declarations, seen);
+  return resolveObject(declarations.get(name), declarations, factories, seen);
 }
 
 function isFunction(value: AstNode): boolean {

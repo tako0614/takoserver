@@ -1,5 +1,8 @@
+import { asc, isNull } from "drizzle-orm";
 import type { AiUsage } from "./ai-port.ts";
 import type { PricedUsage } from "./catalog.ts";
+import { createDatabase } from "./database.ts";
+import { usageEvents } from "./database-schema.ts";
 import { canonicalDigest } from "./json.ts";
 import { type Ledger, LedgerError } from "./ledger.ts";
 import type { Clock, Sql } from "./ports.ts";
@@ -67,6 +70,7 @@ export function createMetering(options: {
   readonly rates?: MeteringRates;
 }): Metering {
   const { sql, ledger, clock, randomId } = options;
+  const db = createDatabase(sql);
   const bytesRate = options.rates?.bytesMinorPerGibibyte ?? 0;
   const requestRate = options.rates?.requestsMinorPerThousand ?? 0;
 
@@ -76,36 +80,35 @@ export function createMetering(options: {
       // per-request round to whole minor units would charge a hundredth of a
       // cent as a cent, several thousand times an hour.
       const amount = (usage.bytes / GIBIBYTE) * bytesRate + requestRate / 1_000;
-      await sql.run(
-        `INSERT OR IGNORE INTO usage_events
-           (request_id, org_id, resource_uid, meter, quantity, amount_minor, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [
-          usage.requestId,
-          usage.organizationId,
-          usage.resourceUid,
-          `object.${usage.operation}`,
-          usage.bytes,
-          Math.round(amount * 1_000_000),
-          clock().toISOString(),
-        ],
-      );
+      await db
+        .insert(usageEvents)
+        .values({
+          requestId: usage.requestId,
+          organizationId: usage.organizationId,
+          resourceUid: usage.resourceUid,
+          meter: `object.${usage.operation}`,
+          quantity: usage.bytes,
+          amountMicros: Math.round(amount * 1_000_000),
+          createdAt: clock().toISOString(),
+        })
+        .onConflictDoNothing()
+        .run();
     },
 
     async recordAi(usage) {
-      await sql.run(
-        `INSERT OR IGNORE INTO usage_events
-           (request_id, org_id, resource_uid, meter, quantity, amount_minor, created_at)
-         VALUES (?, ?, ?, ?, ?, 0, ?)`,
-        [
-          usage.requestId,
-          usage.organizationId,
-          `ai/${usage.model}`,
-          `ai.tokens.${usage.model}`,
-          usage.inputTokens + usage.outputTokens,
-          clock().toISOString(),
-        ],
-      );
+      await db
+        .insert(usageEvents)
+        .values({
+          requestId: usage.requestId,
+          organizationId: usage.organizationId,
+          resourceUid: `ai/${usage.model}`,
+          meter: `ai.tokens.${usage.model}`,
+          quantity: usage.inputTokens + usage.outputTokens,
+          amountMicros: 0,
+          createdAt: clock().toISOString(),
+        })
+        .onConflictDoNothing()
+        .run();
     },
 
     async recordProviderWindow(usage) {
@@ -118,42 +121,44 @@ export function createMetering(options: {
         until: usage.until,
       });
       for (const line of usage.priced.lines) {
-        if (!Number.isSafeInteger(line.amountMinor) || line.amountMinor < 0) {
+        if (!Number.isSafeInteger(line.amountMicros) || line.amountMicros < 0) {
           throw new TypeError("provider usage price invalid");
         }
-        const micros = line.amountMinor * 1_000_000;
-        if (!Number.isSafeInteger(micros)) throw new TypeError("provider usage price overflow");
-        await sql.run(
-          `INSERT OR IGNORE INTO usage_events
-             (request_id, org_id, resource_uid, meter, quantity, amount_minor, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          [
-            `provider:${windowDigest.slice(7)}:${line.meter}`,
-            usage.organizationId,
-            usage.resourceUid,
-            line.meter,
-            line.quantity,
-            micros,
-            clock().toISOString(),
-          ],
-        );
+        await db
+          .insert(usageEvents)
+          .values({
+            requestId: `provider:${windowDigest.slice(7)}:${line.meter}`,
+            organizationId: usage.organizationId,
+            resourceUid: usage.resourceUid,
+            meter: line.meter,
+            quantity: line.quantity,
+            amountMicros: line.amountMicros,
+            createdAt: clock().toISOString(),
+          })
+          .onConflictDoNothing()
+          .run();
       }
     },
 
     async rollUp(limit) {
-      const pending = await sql.query(
-        `SELECT request_id, org_id, amount_minor FROM usage_events
-         WHERE rollup_id IS NULL ORDER BY created_at ASC LIMIT ?`,
-        [Math.min(Math.max(limit, 1), 1_000)],
-      );
+      const pending = await db
+        .select({
+          requestId: usageEvents.requestId,
+          organizationId: usageEvents.organizationId,
+          amountMicros: usageEvents.amountMicros,
+        })
+        .from(usageEvents)
+        .where(isNull(usageEvents.rollupId))
+        .orderBy(asc(usageEvents.createdAt))
+        .limit(Math.min(Math.max(limit, 1), 1_000));
       if (pending.length === 0) return 0;
 
       const byOrg = new Map<string, { ids: string[]; micros: number }>();
       for (const row of pending) {
-        const organizationId = String(row.org_id);
+        const organizationId = row.organizationId;
         const entry = byOrg.get(organizationId) ?? { ids: [], micros: 0 };
-        entry.ids.push(String(row.request_id));
-        entry.micros += Number(row.amount_minor);
+        entry.ids.push(row.requestId);
+        entry.micros += row.amountMicros;
         byOrg.set(organizationId, entry);
       }
 

@@ -30,6 +30,9 @@ describe("Takoserver deploy entrypoint", () => {
       surfaces: { surface: string; [key: string]: unknown }[];
     };
     expect(contract.kind).toBe("takos.deploy-contract@v2");
+    const apiSurface = contract.surfaces[0] as { obligations: Record<string, string> } | undefined;
+    if (!apiSurface) throw new Error("Takoserver API deploy surface is missing");
+    const failureHandling = apiSurface.obligations["failure-handling"];
     expect(contract.surfaces[0]).toMatchObject({
       surface: "takoserver-api",
       target: "cloudflare-worker:takoserver-api",
@@ -48,6 +51,8 @@ describe("Takoserver deploy entrypoint", () => {
         "independent-review": expect.any(String),
       },
     });
+    expect(failureHandling?.includes("--status")).toBe(true);
+    expect(failureHandling?.includes("binding closure")).toBe(true);
     expect(contract.surfaces.map((surface) => surface.surface)).toEqual([
       "takoserver-api",
       "takoserver-console",

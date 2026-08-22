@@ -65,7 +65,7 @@ const SOLD: Offering = {
   pricePlan: {
     id: "storage.object.standard.price-v1",
     currency: "USD",
-    recurring: { meter: "bucket-month", amountMinor: 500 },
+    provisioning: { meter: "resource.create", amountMinor: 500 },
     meters: [],
   },
   providedInterfaces: [],
@@ -93,7 +93,7 @@ const settlement: FundingSettlementVerifier = {
   },
 };
 
-function newApp(options: { failOn?: readonly string[] } = {}) {
+function newApp(options: { failOn?: readonly string[]; usageOnly?: boolean } = {}) {
   const sql = createEphemeralSql();
   const provider = new FakeProvider({
     offerings: [PROVIDER_OFFERING],
@@ -107,7 +107,18 @@ function newApp(options: { failOn?: readonly string[] } = {}) {
     publicOrigin: "https://api.takoserver.com",
     forms: [FORM],
     providers: [provider],
-    offerings: [SOLD],
+    offerings: [
+      options.usageOnly
+        ? {
+            ...SOLD,
+            pricePlan: {
+              ...SOLD.pricePlan,
+              provisioning: { meter: "resource.create", amountMinor: 0 },
+              meters: [{ meter: "storage.gib-hour", amountMinor: 1, quantity: 1_000 }],
+            },
+          }
+        : SOLD,
+    ],
   });
   return { app, provider, ledger: createLedger(sql, () => new Date()), sql };
 }
@@ -324,6 +335,21 @@ describe("Takoform apply on a real backend", () => {
     const replayed = await created.replay();
     expect(replayed.status).toBe(201);
     expect(await ledger.wallet(organizationId)).toMatchObject({ settledMinor: 1_500 });
+  });
+
+  test("provisions a usage-only resource without a fake monthly or setup debit", async () => {
+    const { app, provider, ledger } = newApp({ usageOnly: true });
+    const { organizationId, provider: auth } = await tenant(app.fetch);
+
+    const created = await applyBucket(app.fetch, auth, "metered", {}, "apply-usage-only");
+
+    expect(created.status).toBe(201);
+    expect(provider.listResources()).toEqual([`${organizationId}/default/metered`]);
+    expect(await ledger.wallet(organizationId)).toMatchObject({
+      settledMinor: 2_000,
+      heldMinor: 0,
+      availableMinor: 2_000,
+    });
   });
 
   test("returns the hold when the backend refuses", async () => {

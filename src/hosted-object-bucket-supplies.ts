@@ -3,7 +3,7 @@ import type { ObjectBucketPlacement } from "./object-bucket-deployment.ts";
 import { parseStrictJson } from "./strict-json.ts";
 
 export const HOSTED_OBJECT_BUCKET_SUPPLIES_KIND =
-  "takoserver.hosted-object-bucket-supplies@v1" as const;
+  "takoserver.hosted-object-bucket-supplies@v2" as const;
 
 export type HostedObjectBucketProvider =
   | { readonly kind: "cloudflare" }
@@ -62,6 +62,9 @@ function parseSupply(value: unknown): HostedObjectBucketSupply {
   const pricePlan = parseHostedPricePlan(item.pricePlan);
   const placement = parseHostedPlacement(item.placement);
   if (
+    pricePlan.provisioning.meter !== "resource.create" ||
+    pricePlan.provisioning.amountMinor !== 0 ||
+    pricePlan.meters.length === 0 ||
     providerInstallation.providerPackRef !== providerPack ||
     providerInstallation.supplyContractRef !== supplyContract.id ||
     supplyContract.providerType !== providerPack ||
@@ -190,12 +193,12 @@ export function parseHostedSupplyContract(
 
 export function parseHostedPricePlan(value: unknown): PricePlan {
   const plan = record(value);
-  exactKeys(plan, ["id", "currency", "recurring", "meters"]);
+  exactKeys(plan, ["id", "currency", "provisioning", "meters"]);
   if (plan.currency !== "USD" || !Array.isArray(plan.meters) || plan.meters.length > 64) invalid();
   return {
     id: id(plan.id),
     currency: "USD",
-    recurring: parseCharge(plan.recurring),
+    provisioning: parseCharge(plan.provisioning),
     meters: plan.meters.map(parseCharge),
   };
 }

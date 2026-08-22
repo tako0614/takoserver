@@ -26,7 +26,7 @@ const OFFERING: Offering = {
   pricePlan: {
     id: "storage.object.standard.price-v1",
     currency: "USD",
-    recurring: { meter: "bucket-month", amountMinor: 500 },
+    provisioning: { meter: "resource.create", amountMinor: 500 },
     meters: [{ meter: "storage.gib-hour", amountMinor: 1, quantity: 1 }],
   },
   providedInterfaces: [],
@@ -75,6 +75,52 @@ async function activeReservation() {
 }
 
 describe("reseller lane", () => {
+  test("authorizes a usage-only resource without inventing a setup hold", async () => {
+    const usageOnly = {
+      ...OFFERING,
+      id: "storage.object.usage-only",
+      pricePlanRef: "storage.object.usage-only.price-v1",
+      pricePlan: {
+        ...OFFERING.pricePlan,
+        id: "storage.object.usage-only.price-v1",
+        provisioning: { meter: "resource.create", amountMinor: 0 },
+      },
+    } satisfies Offering;
+    const usageReseller = createReseller({
+      sql,
+      ledger,
+      catalog: createCatalog([usageOnly]),
+      clock: () => new Date(now),
+    });
+    const quote = await usageReseller.quote({
+      organizationId: "org_a",
+      tenantRef: "tenant_x",
+      offeringId: usageOnly.id,
+      quantity: 1,
+    });
+    const reservation = await usageReseller.reserve({
+      organizationId: "org_a",
+      tenantRef: "tenant_x",
+      quoteId: quote.id,
+    });
+    const statement = await usageReseller.capture({
+      organizationId: "org_a",
+      tenantRef: "tenant_x",
+      reservationId: reservation.id,
+      usage: { quantity: 1 },
+    });
+
+    expect(quote).toMatchObject({ amountMinor: 0, meter: "resource.create" });
+    expect(reservation).toMatchObject({ amountMinor: 0, status: "active" });
+    expect(statement).toMatchObject({ amountMinor: 0 });
+    expect(await ledger.wallet("org_a")).toMatchObject({
+      currency: "USD",
+      settledMinor: 0,
+      heldMinor: 0,
+      availableMinor: 0,
+    });
+  });
+
   test("prices a quote from the catalog and holds exactly that much", async () => {
     await funded(10_000);
     const { quote, reservation } = await activeReservation();
@@ -86,7 +132,7 @@ describe("reseller lane", () => {
   test("captures once, and a repeat returns the same statement", async () => {
     await funded(10_000);
     const { reservation } = await activeReservation();
-    const usage = { meter: "bucket-month", quantity: 2 };
+    const usage = { meter: "resource.create", quantity: 2 };
 
     const statement = await reseller.capture({
       organizationId: "org_a",
@@ -172,7 +218,7 @@ describe("reseller lane", () => {
         organizationId: "org_a",
         tenantRef: "tenant_x",
         reservationId: reservation.id,
-        usage: { meter: "bucket-month", quantity: 2 },
+        usage: { meter: "resource.create", quantity: 2 },
       }),
     ).resolves.toMatchObject({ reservationId: reservation.id, amountMinor: 1_000 });
   });
@@ -190,7 +236,7 @@ describe("reseller lane", () => {
         organizationId: "org_a",
         tenantRef: "tenant_x",
         reservationId: reservation.id,
-        usage: { meter: "bucket-month", quantity: 1 },
+        usage: { meter: "resource.create", quantity: 1 },
       }),
     ).rejects.toMatchObject({ code: "conflict" });
   });
@@ -242,7 +288,7 @@ describe("reseller lane", () => {
         organizationId: "org_a",
         tenantRef: "tenant_x",
         reservationId: reservation.id,
-        usage: { meter: "bucket-month", quantity: 1 },
+        usage: { meter: "resource.create", quantity: 1 },
       }),
     ).rejects.toMatchObject({ code: "conflict" });
     expect(await reseller.expireDue(16)).toBe(0);

@@ -1,5 +1,8 @@
+import { and, eq } from "drizzle-orm";
 import type { Catalog } from "./catalog.ts";
 import { priceMeteredUsage } from "./catalog.ts";
+import { createDatabase, type TakoserverDatabase } from "./database.ts";
+import { providerMeterCheckpoints, providerMeterSchedule } from "./database-schema.ts";
 import type { Metering } from "./metering.ts";
 import type { Clock, Sql } from "./ports.ts";
 import type { MeterSource, ProviderPack } from "./provider-pack.ts";
@@ -25,6 +28,7 @@ export function createProviderMetering(options: {
   readonly clock: Clock;
   readonly randomId?: () => string;
 }) {
+  const db = createDatabase(options.sql);
   const packs = new Map(options.packs.map((pack) => [pack.id, pack]));
   const randomId = options.randomId ?? (() => crypto.randomUUID().replaceAll("-", ""));
   return {
@@ -39,7 +43,7 @@ export function createProviderMetering(options: {
       for (const deployment of deployments) {
         const now = options.clock().getTime();
         const leaseToken = `meter_${randomId()}`;
-        if (!(await claim(options.sql, deployment, now, leaseToken))) continue;
+        if (!(await claim(options.sql, db, deployment, now, leaseToken))) continue;
         try {
           const pack = packs.get(deployment.providerPackRef);
           const offering = options.catalog.findOffering(deployment.offeringId);
@@ -49,11 +53,24 @@ export function createProviderMetering(options: {
             deferred += 1;
             continue;
           }
-          if (pack.meterSources.length === 0) throw new Error();
+          const pricedMeters = new Set(offering.pricePlan.meters.map((meter) => meter.meter));
+          const sources = pack.meterSources.filter(
+            (source) =>
+              source.meters.length > 0 && source.meters.every((meter) => pricedMeters.has(meter)),
+          );
+          const coveredMeters = new Set(sources.flatMap((source) => source.meters));
+          if (
+            sources.length === 0 ||
+            coveredMeters.size !== pricedMeters.size ||
+            [...pricedMeters].some((meter) => !coveredMeters.has(meter))
+          ) {
+            throw new Error();
+          }
           let nextAt = Number.POSITIVE_INFINITY;
-          for (const source of pack.meterSources) {
+          for (const source of sources) {
             const progressed = await reconcileSource({
               ...options,
+              db,
               deployment,
               source,
               now,
@@ -76,6 +93,7 @@ export function createProviderMetering(options: {
 
 async function reconcileSource(input: {
   readonly sql: Sql;
+  readonly db: TakoserverDatabase;
   readonly catalog: Catalog;
   readonly metering: Pick<Metering, "recordProviderWindow">;
   readonly deployment: ResourceDeployment;
@@ -85,20 +103,32 @@ async function reconcileSource(input: {
 }): Promise<{ readonly window: boolean; readonly nextAt: number }> {
   const createdAt = Date.parse(input.deployment.createdAt);
   if (!Number.isFinite(createdAt)) throw new Error();
-  const rows = await input.sql.query(
-    `SELECT cursor_at FROM provider_meter_checkpoints
-     WHERE tenant_id = ? AND deployment_id = ? AND meter_source_id = ? LIMIT 2`,
-    [input.deployment.tenantId, input.deployment.id, input.source.id],
-  );
+  const rows = await input.db
+    .select({ cursorAt: providerMeterCheckpoints.cursorAt })
+    .from(providerMeterCheckpoints)
+    .where(
+      and(
+        eq(providerMeterCheckpoints.tenantId, input.deployment.tenantId),
+        eq(providerMeterCheckpoints.deploymentId, input.deployment.id),
+        eq(providerMeterCheckpoints.meterSourceId, input.source.id),
+      ),
+    )
+    .limit(2);
   if (rows.length > 1) throw new Error();
-  const cursor = rows[0] ? integer(rows[0].cursor_at) : createdAt;
+  const cursor = rows[0]
+    ? integer(rows[0].cursorAt)
+    : input.source.windowAlignment === "utc-day"
+      ? startOfUtcDay(createdAt)
+      : createdAt;
   if (
     input.source.retentionSeconds !== undefined &&
     cursor < input.now - input.source.retentionSeconds * 1_000
   ) {
     throw new Error();
   }
-  const horizon = input.now - input.source.settlementDelaySeconds * 1_000;
+  const rawHorizon = input.now - input.source.settlementDelaySeconds * 1_000;
+  const horizon =
+    input.source.windowAlignment === "utc-day" ? startOfUtcDay(rawHorizon) : rawHorizon;
   if (cursor >= horizon) return { window: false, nextAt: cursor + 300_000 };
   const until = Math.min(horizon, cursor + input.source.maximumWindowSeconds * 1_000);
   const fromText = new Date(cursor).toISOString();
@@ -122,40 +152,58 @@ async function reconcileSource(input: {
     until: untilText,
     priced,
   });
-  await input.sql.run(
-    `INSERT OR IGNORE INTO provider_meter_checkpoints
-       (tenant_id, deployment_id, meter_source_id, cursor_at, updated_at)
-     VALUES (?, ?, ?, ?, ?)`,
-    [input.deployment.tenantId, input.deployment.id, input.source.id, cursor, input.now],
-  );
+  await input.db
+    .insert(providerMeterCheckpoints)
+    .values({
+      tenantId: input.deployment.tenantId,
+      deploymentId: input.deployment.id,
+      meterSourceId: input.source.id,
+      cursorAt: cursor,
+      updatedAt: input.now,
+    })
+    .onConflictDoNothing()
+    .run();
   const advanced = await input.sql.run(
     `UPDATE provider_meter_checkpoints SET cursor_at = ?, updated_at = ?
      WHERE tenant_id = ? AND deployment_id = ? AND meter_source_id = ? AND cursor_at = ?`,
     [until, input.now, input.deployment.tenantId, input.deployment.id, input.source.id, cursor],
   );
   if (advanced.changes !== 1) {
-    const current = await input.sql.query(
-      `SELECT cursor_at FROM provider_meter_checkpoints
-       WHERE tenant_id = ? AND deployment_id = ? AND meter_source_id = ? LIMIT 2`,
-      [input.deployment.tenantId, input.deployment.id, input.source.id],
-    );
-    if (current.length !== 1 || integer(current[0]?.cursor_at) < until) throw new Error();
+    const current = await input.db
+      .select({ cursorAt: providerMeterCheckpoints.cursorAt })
+      .from(providerMeterCheckpoints)
+      .where(
+        and(
+          eq(providerMeterCheckpoints.tenantId, input.deployment.tenantId),
+          eq(providerMeterCheckpoints.deploymentId, input.deployment.id),
+          eq(providerMeterCheckpoints.meterSourceId, input.source.id),
+        ),
+      )
+      .limit(2);
+    if (current.length !== 1 || integer(current[0]?.cursorAt) < until) throw new Error();
   }
   return { window: true, nextAt: until };
 }
 
 async function claim(
   sql: Sql,
+  db: TakoserverDatabase,
   deployment: ResourceDeployment,
   now: number,
   leaseToken: string,
 ): Promise<boolean> {
-  await sql.run(
-    `INSERT OR IGNORE INTO provider_meter_schedule
-       (tenant_id, deployment_id, next_at, lease_until, lease_token, updated_at)
-     VALUES (?, ?, ?, 0, NULL, ?)`,
-    [deployment.tenantId, deployment.id, Date.parse(deployment.createdAt), now],
-  );
+  await db
+    .insert(providerMeterSchedule)
+    .values({
+      tenantId: deployment.tenantId,
+      deploymentId: deployment.id,
+      nextAt: Date.parse(deployment.createdAt),
+      leaseUntil: 0,
+      leaseToken: null,
+      updatedAt: now,
+    })
+    .onConflictDoNothing()
+    .run();
   const claimed = await sql.run(
     `UPDATE provider_meter_schedule SET lease_until = ?, lease_token = ?, updated_at = ?
      WHERE tenant_id = ? AND deployment_id = ? AND lease_until <= ? AND next_at <= ?`,
@@ -203,4 +251,8 @@ function validateUsage(
 function integer(value: unknown): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new Error();
   return value;
+}
+
+function startOfUtcDay(value: number): number {
+  return Math.floor(value / 86_400_000) * 86_400_000;
 }

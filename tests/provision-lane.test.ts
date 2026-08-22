@@ -52,7 +52,7 @@ const OFFERING: Offering = {
   pricePlan: {
     id: "storage.object.standard.price-v1",
     currency: "USD",
-    recurring: { meter: "bucket-month", amountMinor: 500 },
+    provisioning: { meter: "resource.create", amountMinor: 500 },
     meters: [],
   },
   providedInterfaces: [],
@@ -356,14 +356,14 @@ describe("provision-token redemption lane", () => {
 
   test("meter rides the quote and reservation, and capture no longer needs it", async () => {
     const lane = await fundedLane();
-    expect(lane.quoteMeter).toBe("bucket-month");
+    expect(lane.quoteMeter).toBe("resource.create");
     const statement = await lane.reseller.capture({
       organizationId: ORG,
       tenantRef: TENANT,
       reservationId: lane.reservation.id,
       usage: { quantity: 1 },
     });
-    expect(statement.usage).toEqual({ meter: "bucket-month", quantity: 1 });
+    expect(statement.usage).toEqual({ meter: "resource.create", quantity: 1 });
   });
 });
 

@@ -34,7 +34,9 @@ export const DEPLOY_CONTRACT = {
           "to an operator-private append-only evidence ledger under .deploy/evidence.",
         "post-conditions":
           "After publishing, the writer reads back the served Worker version id and its binding " +
-          "closure, proves every product table remains present, and exercises the anonymous " +
+          "closure, including the exact service and named entrypoint of any Hosted runtime " +
+          "materializer and the absence of a stale materializer binding when none is declared, " +
+          "proves every product table remains present, and exercises the anonymous " +
           "published surface: Takoserver discovery, OpenAPI, both Takoform lanes, identity " +
           "discovery, credential-bearing route refusal, unknown-route 404, and—when Hosted " +
           "sponsorship is enabled—a bounded live token whose signature is verified against the " +
@@ -53,7 +55,8 @@ export const DEPLOY_CONTRACT = {
           "was touched, exit 3 means the target may have been mutated and the state is " +
           "indeterminate, exit 4 means bytes are published but the post-conditions failed. The " +
           "writer never retries on its own; exit 3 and exit 4 direct the operator to `--status` " +
-          "for an authoritative readback first.",
+          "for an authoritative readback of the served Version and its exact D1, R2, and " +
+          "runtime-materializer binding closure first.",
         "no-overwrite":
           "Publication mints a new immutable Worker version for changed bytes. If the evidence " +
           "ledger already records the served version for the same bundle digest the writer " +

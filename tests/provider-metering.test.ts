@@ -31,7 +31,7 @@ const OFFERING: Offering = {
   pricePlan: {
     id: "storage.object.test.price-v1",
     currency: "USD",
-    recurring: { meter: "bucket-month", amountMinor: 0 },
+    provisioning: { meter: "resource.create", amountMinor: 0 },
     meters: [
       { meter: "storage.gib-hour", amountMinor: 10 },
       { meter: "requests.million", amountMinor: 2 },
@@ -73,6 +73,7 @@ describe("provider usage reconciliation", () => {
       [now.getTime() - 7_200_000, now.getTime() - 7_200_000, "dep_bucket"],
     );
     let reads = 0;
+    let unrelatedReads = 0;
     const source: MeterSource = {
       id: "test-meter",
       meters: ["storage.gib-hour", "requests.million"],
@@ -86,6 +87,16 @@ describe("provider usage reconciliation", () => {
         ];
       },
     };
+    const unrelated: MeterSource = {
+      id: "worker-meter",
+      meters: ["worker.requests.million"],
+      settlementDelaySeconds: 0,
+      maximumWindowSeconds: 3_600,
+      read: async () => {
+        unrelatedReads += 1;
+        return [{ meter: "worker.requests.million", quantity: 999 }];
+      },
+    };
     const pack = createProviderPack({
       id: "test-provider",
       providerType: "test-provider",
@@ -93,7 +104,7 @@ describe("provider usage reconciliation", () => {
       attachmentFactories: [],
       transferEndpoints: [],
       credentialIssuers: [],
-      meterSources: [source],
+      meterSources: [source, unrelated],
       costEstimators: [],
     });
     const ledger = createLedger(sql, clock);
@@ -114,6 +125,7 @@ describe("provider usage reconciliation", () => {
     ]);
     expect(reports.reduce((sum, report) => sum + report.windows, 0)).toBe(1);
     expect(reads).toBe(1);
+    expect(unrelatedReads).toBe(0);
     expect(await sql.query("SELECT meter, quantity FROM usage_events ORDER BY meter")).toEqual([
       { meter: "requests.million", quantity: 3 },
       { meter: "storage.gib-hour", quantity: 2 },

@@ -112,6 +112,12 @@ export function createProviderPack(definition: ProviderPackDefinition): Provider
     positiveSeconds(source.settlementDelaySeconds, true);
     positiveSeconds(source.maximumWindowSeconds, false);
     if (source.retentionSeconds !== undefined) positiveSeconds(source.retentionSeconds, false);
+    if (
+      source.windowAlignment !== undefined &&
+      (source.windowAlignment !== "utc-day" || source.maximumWindowSeconds % 86_400 !== 0)
+    ) {
+      throw new TypeError("invalid MeterSource window");
+    }
     for (const meter of source.meters) {
       validateId(meter);
       if (ownedMeters.has(meter)) throw new TypeError(`ambiguous MeterSource meter: ${meter}`);

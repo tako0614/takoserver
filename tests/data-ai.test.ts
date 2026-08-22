@@ -177,8 +177,8 @@ describe("OpenAI-compatible AI data plane", () => {
     });
     expect(calls).toHaveLength(1);
     expect((await ledger.wallet(organization.id)).availableMinor).toBe(995);
-    expect(await sql.query("SELECT meter, quantity, amount_minor FROM usage_events")).toEqual([
-      { meter: "ai.tokens.takoserver-text", quantity: 5, amount_minor: 0 },
+    expect(await sql.query("SELECT meter, quantity, amount_micros FROM usage_events")).toEqual([
+      { meter: "ai.tokens.takoserver-text", quantity: 5, amount_micros: 0 },
     ]);
   });
 

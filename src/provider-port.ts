@@ -88,6 +88,8 @@ export interface ApplyInput {
   readonly previous?: { readonly nativeId: string; readonly spec: JsonObject };
   /** Exact Host-pinned dependencies with any active provider realization. */
   readonly relations?: readonly ProviderRelation[];
+  /** Signed, short-lived and opaque to the Provider Pack until materialization. */
+  readonly runtimeMaterialization?: JsonObject;
 }
 
 /** Exact logical target projected to a Provider Pack at the mutation barrier. */

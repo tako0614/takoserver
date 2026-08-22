@@ -1,7 +1,7 @@
 import type { FormRef, Offering } from "../api.ts";
 import { h } from "../dom.ts";
 import { tr } from "../i18n.ts";
-import { recurringPriceSentence } from "../offering-view.ts";
+import { provisioningPriceSentence } from "../offering-view.ts";
 import { signal } from "../reactive.ts";
 import { navigate, resourcePath } from "../router.ts";
 import { api } from "../state.ts";
@@ -40,7 +40,7 @@ export function createResource(organizationId: string, offerings: readonly Offer
 
   const price = h("div", { class: "dim", style: { fontSize: "12.5px" } });
   const showPrice = (offering: Offering): void => {
-    price.replaceChildren(document.createTextNode(recurringPriceSentence(offering)));
+    price.replaceChildren(document.createTextNode(provisioningPriceSentence(offering)));
   };
   showPrice(chosen());
 

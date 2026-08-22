@@ -71,6 +71,8 @@ export interface TakoformHostPrincipal {
     | {
         readonly space: string;
         readonly mode: "tenant-run";
+        /** Opaque authority signed into this exact short-lived Run token. */
+        readonly runtimeMaterialization?: JsonObject;
       }
     | {
         readonly space: string;
@@ -128,6 +130,7 @@ export interface TakoformResourceDriver {
     readonly spec: JsonObject;
     readonly relations: readonly TakoformDriverRelation[];
     readonly commercialAuthority?: TakoformCommercialAuthority;
+    readonly runtimeMaterialization?: JsonObject;
     readonly previous?: TakoformStoredResource;
   }): Promise<TakoformDriverReceipt>;
   observe(input: {

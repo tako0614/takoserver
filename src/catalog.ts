@@ -23,22 +23,24 @@ export interface PricePlanCharge {
 export interface PricePlan {
   readonly id: string;
   readonly currency: "USD";
-  readonly recurring: PricePlanCharge;
+  /** One-time charge for creating one resource. Official usage-only plans set this to zero. */
+  readonly provisioning: PricePlanCharge;
   readonly meters: readonly PricePlanCharge[];
 }
 
 export interface PricedUsage {
-  readonly amountMinor: number;
+  /** Millionths of one currency minor unit. Rounded to cents only by the ledger roll-up. */
+  readonly amountMicros: number;
   readonly lines: readonly {
     readonly meter: string;
     readonly quantity: number;
-    readonly amountMinor: number;
+    readonly amountMicros: number;
   }[];
 }
 
-export function priceRecurring(plan: PricePlan, quantity: number): number {
+export function priceProvisioning(plan: PricePlan, quantity: number): number {
   if (!Number.isSafeInteger(quantity) || quantity <= 0) throw new TypeError("invalid quantity");
-  const amount = plan.recurring.amountMinor * quantity;
+  const amount = plan.provisioning.amountMinor * quantity;
   if (!Number.isSafeInteger(amount)) throw new TypeError("price overflow");
   return amount;
 }
@@ -60,13 +62,17 @@ export function priceMeteredUsage(
     .map(([meter, quantity]) => {
       const rate = rates.get(meter);
       if (!rate) throw new TypeError(`unknown meter: ${meter}`);
-      const amountMinor = Math.ceil((quantity * rate.amountMinor) / (rate.quantity ?? 1));
-      if (!Number.isSafeInteger(amountMinor)) throw new TypeError("price overflow");
-      return { meter, quantity, amountMinor };
+      const amountMicros = Math.round(
+        (quantity * rate.amountMinor * 1_000_000) / (rate.quantity ?? 1),
+      );
+      if (!Number.isSafeInteger(amountMicros) || amountMicros < 0) {
+        throw new TypeError("price overflow");
+      }
+      return { meter, quantity, amountMicros };
     });
-  const amountMinor = lines.reduce((sum, line) => sum + line.amountMinor, 0);
-  if (!Number.isSafeInteger(amountMinor)) throw new TypeError("price overflow");
-  return { amountMinor, lines };
+  const amountMicros = lines.reduce((sum, line) => sum + line.amountMicros, 0);
+  if (!Number.isSafeInteger(amountMicros)) throw new TypeError("price overflow");
+  return { amountMicros, lines };
 }
 
 export interface Offering {

@@ -223,7 +223,13 @@ export function buildApp(ports: AppPorts): App {
             return {
               tenantId: claims.organizationId,
               principalId: `run:${claims.tokenId}`,
-              scope: { space: claims.tenantRef, mode: "tenant-run" as const },
+              scope: {
+                space: claims.tenantRef,
+                mode: "tenant-run" as const,
+                ...(claims.runtimeMaterialization
+                  ? { runtimeMaterialization: claims.runtimeMaterialization }
+                  : {}),
+              },
             };
           } catch {
             // Exact-Resource reservation tokens share the Takoform audience

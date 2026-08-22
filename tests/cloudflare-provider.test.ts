@@ -594,6 +594,10 @@ describe("released edge Form placement", () => {
           name: "bundle",
         },
         handlers: ["fetch"],
+        vars: {
+          OIDC_ISSUER_URL: "https://accounts.example",
+          FEATURES: { browser: true },
+        },
       },
       relations: [worker, bundle],
     });
@@ -623,9 +627,226 @@ describe("released edge Form placement", () => {
       result: { nativeId: "deployment:script-name:deployment-id" },
     });
     expect(calls[0]?.url).toContain("/workers/scripts/script-name/versions");
+    expect(calls[0]?.body).toContain(
+      '"type":"plain_text","name":"OIDC_ISSUER_URL","text":"https://accounts.example"',
+    );
+    expect(calls[0]?.body).toContain('"type":"json","name":"FEATURES","json":{"browser":true}');
+    expect(calls[0]?.body).not.toContain('"text":"\\"https://accounts.example\\""');
     expect(calls[1]?.url).toContain("/workers/scripts/script-name/deployments");
     expect(calls[1]?.body).toContain('"percentage":100');
     expect(calls[1]?.body).toContain('"version_id":"version-id"');
+  });
+
+  test("materializes exact sensitive bindings only inside the immutable Worker Version upload", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const versionOffering = technical("WorkerVersion");
+    const calls: Call[] = [];
+    const materialized: unknown[] = [];
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering, versionOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      workerEndpointSuffix: "workers.example",
+      runtimeMaterializer: {
+        async materializeRuntimeBindings(input) {
+          materialized.push(input);
+          return {
+            values: {
+              ENCRYPTION_KEY: "generated-encryption-key",
+              TAKOSUMI_ACCOUNTS_CLIENT_ID: "public-client-id",
+            },
+          };
+        },
+        async rollbackRuntimeBindings() {
+          throw new Error("a successful upload must not roll back");
+        },
+      },
+      async fetch(request) {
+        calls.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body: await request.clone().text(),
+        });
+        return Response.json({
+          success: true,
+          errors: [],
+          result: { id: "version-sensitive" },
+        });
+      },
+    });
+    const runtimeMaterialization = {
+      contract: "takosumi.host-runtime-materialization/v1",
+      installConfigId: "icfg_yurucommu",
+      workspaceId: "workspace_1",
+      capsuleId: "capsule_yurucommu",
+      installingPrincipalId: "tsub_owner",
+      requirements: [],
+    } as const;
+    const ticket = await provider.apply({
+      operationId: "op-version-sensitive",
+      offering: versionOffering,
+      identity: { ...IDENTITY, name: "version" },
+      spec: {
+        handlers: ["fetch"],
+        requiredSensitiveVars: ["ENCRYPTION_KEY", "TAKOSUMI_ACCOUNTS_CLIENT_ID"],
+      },
+      runtimeMaterialization,
+      relations: [
+        related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+          nativeId: "worker:script-name",
+          offeringId: workerOffering.id,
+          providerPackRef: "cloudflare",
+          outputs: { scriptName: "script-name" },
+        }),
+        related(
+          "/bundle",
+          stored("WorkerBundle", "bundle-uid", {
+            manifestDigest: `sha256:${"d".repeat(64)}`,
+          }),
+        ),
+      ],
+    });
+    expect(ticket).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: "version:script-name:version-sensitive" },
+    });
+    expect(materialized).toEqual([
+      {
+        request: runtimeMaterialization,
+        resourceName: "version",
+        scriptName: "script-name",
+        publicOrigin: "https://script-name.workers.example",
+        bindings: ["ENCRYPTION_KEY", "TAKOSUMI_ACCOUNTS_CLIENT_ID"],
+      },
+    ]);
+    expect(calls[0]?.body).toContain(
+      '"type":"secret_text","name":"ENCRYPTION_KEY","text":"generated-encryption-key"',
+    );
+    expect(calls[0]?.body).toContain(
+      '"type":"secret_text","name":"TAKOSUMI_ACCOUNTS_CLIENT_ID","text":"public-client-id"',
+    );
+    // A host-materialized WorkerVersion owns the exact sensitive binding set.
+    // Preserving older secret_text bindings would leave a removed declaration
+    // available to the next immutable Version.
+    expect(calls[0]?.body).not.toContain("keep_bindings");
+    expect(JSON.stringify(ticket)).not.toContain("generated-encryption-key");
+    expect(JSON.stringify(ticket)).not.toContain("public-client-id");
+  });
+
+  test("returns an opaque materialization receipt when Worker Version upload fails", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const versionOffering = technical("WorkerVersion");
+    const rollbacks: unknown[] = [];
+    const runtimeMaterialization = {
+      contract: "takosumi.host-runtime-materialization/v1",
+      installConfigId: "icfg_yurucommu",
+      workspaceId: "workspace_1",
+      capsuleId: "capsule_yurucommu",
+      installingPrincipalId: "tsub_owner",
+      requirements: [],
+    } as const;
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering, versionOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      workerEndpointSuffix: "workers.example",
+      runtimeMaterializer: {
+        async materializeRuntimeBindings() {
+          return {
+            values: { ENCRYPTION_KEY: "generated-encryption-key" },
+            rollbackReceipt: "opaque-rollback-receipt",
+          };
+        },
+        async rollbackRuntimeBindings(input) {
+          rollbacks.push(input);
+        },
+      },
+      async fetch() {
+        return Response.json(
+          { success: false, errors: [{ code: 10000 }], result: null },
+          { status: 503 },
+        );
+      },
+    });
+
+    const ticket = await provider.apply({
+      operationId: "op-version-upload-failed",
+      offering: versionOffering,
+      identity: { ...IDENTITY, name: "version" },
+      spec: { handlers: ["fetch"], requiredSensitiveVars: ["ENCRYPTION_KEY"] },
+      runtimeMaterialization,
+      relations: [
+        related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+          nativeId: "worker:script-name",
+          offeringId: workerOffering.id,
+          providerPackRef: "cloudflare",
+          outputs: { scriptName: "script-name" },
+        }),
+        related(
+          "/bundle",
+          stored("WorkerBundle", "bundle-uid", {
+            manifestDigest: `sha256:${"d".repeat(64)}`,
+          }),
+        ),
+      ],
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(rollbacks).toEqual([
+      {
+        request: runtimeMaterialization,
+        rollbackReceipt: "opaque-rollback-receipt",
+      },
+    ]);
+    expect(JSON.stringify(ticket)).not.toContain("generated-encryption-key");
+  });
+
+  test("refuses sensitive Worker Version declarations without exact runtime authority", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const versionOffering = technical("WorkerVersion");
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering, versionOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      workerEndpointSuffix: "workers.example",
+      async fetch() {
+        throw new Error("provider must not be reached");
+      },
+    });
+    const ticket = await provider.apply({
+      operationId: "op-version-unmaterialized",
+      offering: versionOffering,
+      identity: { ...IDENTITY, name: "version" },
+      spec: { handlers: ["fetch"], requiredSensitiveVars: ["ENCRYPTION_KEY"] },
+      relations: [
+        related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+          nativeId: "worker:script-name",
+          offeringId: workerOffering.id,
+          providerPackRef: "cloudflare",
+          outputs: { scriptName: "script-name" },
+        }),
+        related(
+          "/bundle",
+          stored("WorkerBundle", "bundle-uid", {
+            manifestDigest: `sha256:${"d".repeat(64)}`,
+          }),
+        ),
+      ],
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "denied", retryable: false },
+    });
   });
 
   test("reads and atomically appends the exact SQLite migration prefix", async () => {

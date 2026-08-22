@@ -18,9 +18,11 @@ import type { MeterSource, ProviderPack } from "./provider-pack.ts";
 import type { Provider, ProviderOffering } from "./provider-port.ts";
 import type { ArtifactBytes, CloudflareZone } from "./providers/cloudflare.ts";
 import { CloudflareProvider } from "./providers/cloudflare.ts";
+import { createCloudflareEdgeMeterSources } from "./providers/cloudflare-edge-meter.ts";
 import { createCloudflareR2MeterSource } from "./providers/cloudflare-r2-meter.ts";
 import { createWasabiProvider } from "./providers/wasabi.ts";
 import { createWasabiBucketMeterSource } from "./providers/wasabi-meter.ts";
+import type { RuntimeMaterializer } from "./runtime-materialization.ts";
 import { createS3AttachmentFactory } from "./s3-attachment-factory.ts";
 import type { S3CredentialIssuer } from "./s3-port.ts";
 import type { InstalledTakoformForm } from "./takoform/types.ts";
@@ -64,6 +66,7 @@ export function createWorkerProductionComposition(input: {
   readonly forms: readonly InstalledTakoformForm[];
   readonly artifacts: ArtifactBytes;
   readonly s3CredentialIssuer?: S3CredentialIssuer;
+  readonly runtimeMaterializer?: RuntimeMaterializer;
   readonly now: Date;
 }): WorkerProductionComposition {
   const { env } = input;
@@ -210,12 +213,21 @@ export function createWorkerProductionComposition(input: {
       ...(env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX
         ? { workerEndpointSuffix: env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX }
         : {}),
+      ...(input.runtimeMaterializer ? { runtimeMaterializer: input.runtimeMaterializer } : {}),
       artifacts: input.artifacts,
     });
     const meterSources: MeterSource[] = [];
     if (cloudflareObjects.length > 0) {
       meterSources.push(
         createCloudflareR2MeterSource({
+          accountId: credentials.left,
+          apiToken: credentials.right,
+        }),
+      );
+    }
+    if (edgeSupplies) {
+      meterSources.push(
+        ...createCloudflareEdgeMeterSources({
           accountId: credentials.left,
           apiToken: credentials.right,
         }),

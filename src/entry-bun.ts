@@ -285,7 +285,7 @@ const deployment = compileObjectBucketDeployment({
   pricePlan: {
     id: "storage.object.standard.price-v1",
     currency: "USD",
-    recurring: { meter: "bucket-month", amountMinor: 500 },
+    provisioning: { meter: "resource.create", amountMinor: 0 },
     meters: [],
   },
   placement: {

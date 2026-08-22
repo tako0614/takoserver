@@ -40,7 +40,7 @@ const OFFERING: Offering = {
   pricePlan: {
     id: "storage.object.standard.price-v1",
     currency: "USD",
-    recurring: { meter: "bucket-month", amountMinor: 500 },
+    provisioning: { meter: "resource.create", amountMinor: 500 },
     meters: [],
   },
   providedInterfaces: [],
@@ -457,7 +457,7 @@ describe("prepaid vertical over HTTP", () => {
       fetch,
       "POST",
       `/v1/reseller/reservations/${reservationId}/capture`,
-      { tenantRef: "tenant_x", usage: { meter: "bucket-month", quantity: 2 } },
+      { tenantRef: "tenant_x", usage: { meter: "resource.create", quantity: 2 } },
       keyHeaders,
     );
     expect(captured.status).toBe(200);

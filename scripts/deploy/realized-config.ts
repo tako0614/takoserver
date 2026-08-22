@@ -36,11 +36,27 @@ export function writeRealizedConfig(target: DeployTarget): string {
       },
     ],
     r2_buckets: [{ binding: "OBJECTS", bucket_name: target.r2.bucketName }],
+    ...serviceBindings(target),
     ...serviceAddress(target.publicOrigin, target.aliases ?? []),
     ...deploymentVariables(target),
   };
   writeFileSync(REALIZED_CONFIG_PATH, `${JSON.stringify(realized, null, 2)}\n`, { mode: 0o600 });
   return REALIZED_CONFIG_PATH;
+}
+
+/** Exact non-secret RPC route used to resolve opaque runtime requirements. */
+export function serviceBindings(target: DeployTarget): Record<string, unknown> {
+  const materializer = target.hostRuntimeMaterializerService;
+  if (!materializer) return {};
+  return {
+    services: [
+      {
+        binding: "HOST_RUNTIME_MATERIALIZER",
+        service: materializer.service,
+        entrypoint: materializer.entrypoint,
+      },
+    ],
+  };
 }
 
 /**
@@ -154,7 +170,14 @@ function serviceAddress(
 }
 
 function assertNeutral(neutral: Record<string, unknown>): void {
-  for (const forbidden of ["account_id", "routes", "route", "vars", "workers_dev_subdomain"]) {
+  for (const forbidden of [
+    "account_id",
+    "routes",
+    "route",
+    "vars",
+    "services",
+    "workers_dev_subdomain",
+  ]) {
     if (forbidden in neutral) {
       throw preflightError(
         `wrangler.jsonc must stay target-neutral but declares ${JSON.stringify(forbidden)}`,

@@ -77,7 +77,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     const provider = byId.get(sold.providerPackRef);
     const offering = provider?.offerings.find((candidate) => candidate.id === sold.id);
     if (!provider || !offering) throw new TakoformHostError("backend_unavailable", 503);
-    return { provider, offering, sold, priceMinor: sold.pricePlan.recurring.amountMinor };
+    return { provider, offering, sold, priceMinor: sold.pricePlan.provisioning.amountMinor };
   };
 
   const providerRelations = async (
@@ -175,6 +175,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     priceMinor: number,
     work: () => Promise<ProviderTicket>,
   ): Promise<ProviderResult> => {
+    if (priceMinor === 0) return resultOf(await work());
     const held = await ledger.hold({
       organizationId,
       reference: operationId,
@@ -335,6 +336,9 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
             identity: { tenantRef: input.tenantId, space: input.space, name: input.name },
             spec: input.spec,
             relations: relationTargets,
+            ...(input.runtimeMaterialization
+              ? { runtimeMaterialization: input.runtimeMaterialization }
+              : {}),
             ...(previous ? { previous } : {}),
           }),
         );

@@ -25,7 +25,7 @@ const OBJECTS = {
 const PRICE: PricePlan = {
   id: "storage.s3.standard.price-v1",
   currency: "USD",
-  recurring: { meter: "resource-month", amountMinor: 500 },
+  provisioning: { meter: "resource-month", amountMinor: 500 },
   meters: [
     { meter: "storage.gib-hour", amountMinor: 1, quantity: 1 },
     { meter: "egress.gib", amountMinor: 8, quantity: 1 },

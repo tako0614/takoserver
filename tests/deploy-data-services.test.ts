@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { deploymentVariables } from "../scripts/deploy/realized-config.ts";
+import { deploymentVariables, serviceBindings } from "../scripts/deploy/realized-config.ts";
 import { loadTarget } from "../scripts/deploy/target.ts";
 
 const BASE = {
@@ -29,7 +29,7 @@ const MODEL = {
 };
 
 const SUPPLIES = {
-  kind: "takoserver.hosted-object-bucket-supplies@v1",
+  kind: "takoserver.hosted-object-bucket-supplies@v2",
   supplies: [
     {
       offeringId: "storage.object.cloudflare",
@@ -57,8 +57,11 @@ const SUPPLIES = {
       pricePlan: {
         id: "storage.object.cloudflare.price-v1",
         currency: "USD",
-        recurring: { meter: "bucket-month", amountMinor: 500 },
-        meters: [],
+        provisioning: { meter: "resource.create", amountMinor: 0 },
+        meters: [
+          { meter: "storage.gib-hour", amountMinor: 2, quantity: 720 },
+          { meter: "requests.million", amountMinor: 50 },
+        ],
       },
       placement: {
         deliveryMode: "native-credentials",
@@ -77,7 +80,7 @@ const SUPPLIES = {
 };
 
 const EDGE_SUPPLIES = {
-  kind: "takoserver.hosted-edge-supplies@v1",
+  kind: "takoserver.hosted-edge-supplies@v2",
   providerInstallation: SUPPLIES.supplies[0]?.providerInstallation,
   supplyContract: SUPPLIES.supplies[0]?.supplyContract,
   offerings: [
@@ -88,8 +91,8 @@ const EDGE_SUPPLIES = {
       pricePlan: {
         id: "compute.edge.cloudflare.global.price-v1",
         currency: "USD",
-        recurring: { meter: "worker-month", amountMinor: 500 },
-        meters: [],
+        provisioning: { meter: "resource.create", amountMinor: 0 },
+        meters: [{ meter: "compute.worker.requests.million", amountMinor: 30 }],
       },
       placement: {
         deliveryMode: "embedded-binding",
@@ -164,6 +167,10 @@ describe("private data service deploy configuration", () => {
           objectBucketSupplies: SUPPLIES,
           edgeSupplies: EDGE_SUPPLIES,
           workerEndpointSuffix: "hosted.workers.dev",
+          hostRuntimeMaterializerService: {
+            service: "takosumi-platform",
+            entrypoint: "TakosumiHostRuntimeMaterializerEntrypoint",
+          },
         }),
       );
       const target = loadTarget(path);
@@ -180,6 +187,15 @@ describe("private data service deploy configuration", () => {
       expect(realized.vars).not.toHaveProperty("TAKOSERVER_ZONES");
       expect(JSON.stringify(realized)).not.toContain("TOKEN");
       expect(JSON.stringify(realized)).not.toContain("sk_");
+      expect(serviceBindings(target)).toEqual({
+        services: [
+          {
+            binding: "HOST_RUNTIME_MATERIALIZER",
+            service: "takosumi-platform",
+            entrypoint: "TakosumiHostRuntimeMaterializerEntrypoint",
+          },
+        ],
+      });
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -227,6 +243,45 @@ describe("private data service deploy configuration", () => {
       const path = join(directory, "target.json");
       writeFileSync(path, JSON.stringify({ ...BASE, edgeSupplies: EDGE_SUPPLIES }));
       expect(() => loadTarget(path)).toThrow("edge supplies and `workerEndpointSuffix`");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("will not sell edge capacity without a host runtime materializer service", () => {
+    const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
+    try {
+      const path = join(directory, "target.json");
+      writeFileSync(
+        path,
+        JSON.stringify({
+          ...BASE,
+          edgeSupplies: EDGE_SUPPLIES,
+          workerEndpointSuffix: "hosted.workers.dev",
+        }),
+      );
+      expect(() => loadTarget(path)).toThrow("edge supplies and `hostRuntimeMaterializerService`");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects an unbounded host runtime materializer service descriptor", () => {
+    const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
+    try {
+      const path = join(directory, "target.json");
+      writeFileSync(
+        path,
+        JSON.stringify({
+          ...BASE,
+          hostRuntimeMaterializerService: {
+            service: "takosumi-platform",
+            entrypoint: "TakosumiHostRuntimeMaterializerEntrypoint",
+            token: "must-not-be-here",
+          },
+        }),
+      );
+      expect(() => loadTarget(path)).toThrow("unexpected keys");
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

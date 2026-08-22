@@ -201,9 +201,26 @@ describe("Hosted sponsorship owner API", () => {
       clock: () => now,
     });
     await call(route, "POST", base, { organizationId: "org_legal" });
+    const runtimeMaterialization = {
+      contract: "takosumi.host-runtime-materialization/v1",
+      installConfigId: "icfg_yurucommu",
+      workspaceId: "workspace_1",
+      capsuleId: "capsule_yurucommu",
+      installingPrincipalId: "tsub_owner",
+      requirements: [
+        {
+          kind: "generated_secret",
+          binding: "ENCRYPTION_KEY",
+          secretRef: "secret:repository/encryption-key",
+          bytes: 32,
+          encoding: "hex",
+        },
+      ],
+    };
     const response = await call(route, "POST", `${base}/takoform-run-credentials`, {
       runRef: "run_takosumi_1",
       expiresInSeconds: 300,
+      runtimeMaterialization,
     });
     expect(response.status).toBe(201);
     expect(await json(response)).toEqual({
@@ -217,6 +234,7 @@ describe("Hosted sponsorship owner API", () => {
         organizationId: "org_legal",
         tenantRef: "tenant_opaque",
         runRef: "run_takosumi_1",
+        runtimeMaterialization,
         ttlSeconds: 300,
       },
     ]);

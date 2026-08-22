@@ -12,6 +12,14 @@ describe("Worker module inspector", () => {
     await expect(
       inspect(`const worker = { queue: async (_batch, _env) => {} }; export default worker;`),
     ).resolves.toEqual({ loadable: true, handlers: ["queue"] });
+    await expect(
+      inspect(`
+        function createWorker(dependency) {
+          return { fetch: (request, env) => dependency(request, env) };
+        }
+        export default createWorker();
+      `),
+    ).resolves.toEqual({ loadable: true, handlers: ["fetch"] });
   });
 
   test("fails closed on invalid syntax, execution, and unsupported media", async () => {
@@ -23,6 +31,11 @@ describe("Worker module inspector", () => {
       loadable: false,
       handlers: [],
     });
+    await expect(
+      inspect(
+        `function makeWorker() { sideEffect(); return { fetch() {} }; } export default makeWorker();`,
+      ),
+    ).resolves.toEqual({ loadable: false, handlers: [] });
     await expect(inspect(`export default { fetch() {} };`, "text/plain")).resolves.toEqual({
       loadable: false,
       handlers: [],

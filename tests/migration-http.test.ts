@@ -301,7 +301,7 @@ function sold(id: string, providerPackRef: string, amountMinor: number): Offerin
     pricePlan: {
       id: `${id}.price`,
       currency: "USD",
-      recurring: { meter: "database-month", amountMinor },
+      provisioning: { meter: "resource.create", amountMinor },
       meters: [],
     },
     providedInterfaces: [],

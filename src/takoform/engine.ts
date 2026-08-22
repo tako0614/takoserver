@@ -83,6 +83,7 @@ export interface EngineContext {
   readonly provisionOnly?: boolean;
   readonly expectedResourceUid?: string;
   readonly commercialAuthority?: TakoformCommercialAuthority;
+  readonly runtimeMaterialization?: JsonObject;
 }
 
 export type EngineResult =
@@ -570,6 +571,9 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         relations: await driverRelations(context.tenantId, body.metadata.space, relations),
         ...(context.commercialAuthority
           ? { commercialAuthority: context.commercialAuthority }
+          : {}),
+        ...(context.runtimeMaterialization
+          ? { runtimeMaterialization: context.runtimeMaterialization }
           : {}),
         ...(current ? { previous: structuredClone(current) } : {}),
       });

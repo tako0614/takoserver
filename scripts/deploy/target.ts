@@ -72,6 +72,16 @@ export interface DeployTarget {
   readonly edgeSupplies?: HostedEdgeSupplies;
   /** Exact workers.dev suffix assigned to the provisioning account. */
   readonly workerEndpointSuffix?: string;
+  /**
+   * Named Worker entrypoint that resolves opaque host-runtime requirements.
+   *
+   * This is routing metadata, never secret material. The materialized values
+   * cross only the Worker service-binding RPC boundary at provisioning time.
+   */
+  readonly hostRuntimeMaterializerService?: {
+    readonly service: string;
+    readonly entrypoint: string;
+  };
   readonly grantKeyId: string;
 }
 
@@ -85,6 +95,7 @@ const KEY_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/u;
 const GOOGLE_CLIENT_ID = /^[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com$/u;
 const HOSTNAME =
   /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/u;
+const ENTRYPOINT = /^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/u;
 
 export function targetPath(explicit?: string): string {
   const candidate = explicit ?? process.env.TAKOSERVER_DEPLOY_TARGET ?? DEFAULT_TARGET_PATH;
@@ -143,6 +154,7 @@ function validateTarget(value: unknown, path: string): DeployTarget {
       "objectBucketSupplies",
       "edgeSupplies",
       "workerEndpointSuffix",
+      "hostRuntimeMaterializerService",
     ],
   );
 
@@ -199,6 +211,13 @@ function validateTarget(value: unknown, path: string): DeployTarget {
             "workerEndpointSuffix",
           ),
         }),
+    ...(value.hostRuntimeMaterializerService === undefined
+      ? {}
+      : {
+          hostRuntimeMaterializerService: hostRuntimeMaterializerService(
+            value.hostRuntimeMaterializerService,
+          ),
+        }),
     grantKeyId: pattern(value.grantKeyId, KEY_ID, "grantKeyId"),
   };
   const cloudflareObjectSupply = target.objectBucketSupplies?.supplies.some(
@@ -214,10 +233,29 @@ function validateTarget(value: unknown, path: string): DeployTarget {
       "deploy target edge supplies and `workerEndpointSuffix` must be configured together",
     );
   }
+  if (target.edgeSupplies && !target.hostRuntimeMaterializerService) {
+    throw preflightError(
+      "deploy target edge supplies and `hostRuntimeMaterializerService` must be configured together",
+    );
+  }
   if (target.takosId && target.googleClientId) {
     throw preflightError("deploy target cannot configure both `takosId` and `googleClientId`");
   }
   return target;
+}
+
+function hostRuntimeMaterializerService(value: unknown): {
+  service: string;
+  entrypoint: string;
+} {
+  if (!isRecord(value)) {
+    throw preflightError("deploy target `hostRuntimeMaterializerService` must be an object");
+  }
+  assertExactKeys(value, ["service", "entrypoint"]);
+  return {
+    service: pattern(value.service, WORKER_NAME, "hostRuntimeMaterializerService.service"),
+    entrypoint: pattern(value.entrypoint, ENTRYPOINT, "hostRuntimeMaterializerService.entrypoint"),
+  };
 }
 
 function takosId(value: unknown): { issuer: string; clientId: string } {

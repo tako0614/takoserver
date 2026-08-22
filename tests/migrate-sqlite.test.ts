@@ -42,6 +42,43 @@ describe("bringing a local database up to date", () => {
     expect(second.alreadyApplied).toBe(MIGRATIONS.length);
   });
 
+  test("renames fractional usage money without changing its value", () => {
+    const database = new Database(":memory:");
+    database.exec(`
+      CREATE TABLE applied_migrations (
+        name TEXT PRIMARY KEY NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+    const usageMicros = MIGRATIONS.findIndex((migration) => migration.name.startsWith("0018_"));
+    expect(usageMicros).toBeGreaterThan(0);
+    for (const migration of MIGRATIONS.slice(0, usageMicros)) {
+      database.exec(migration.sql);
+      database
+        .query("INSERT INTO applied_migrations (name, applied_at) VALUES (?, 'now')")
+        .run(migration.name);
+    }
+    database
+      .query(
+        `INSERT INTO usage_events
+           (request_id, org_id, resource_uid, meter, quantity, amount_minor, created_at)
+         VALUES ('request_1', 'org_1', 'resource_1', 'object.get', 1, 123456, 'now')`,
+      )
+      .run();
+
+    migrateSqlite(database);
+
+    expect(database.query("SELECT amount_micros FROM usage_events").get()).toEqual({
+      amount_micros: 123456,
+    });
+    expect(
+      database
+        .query("PRAGMA table_info(usage_events)")
+        .all()
+        .map((column) => String((column as { name: unknown }).name)),
+    ).not.toContain("amount_minor");
+  });
+
   test("refuses credit-lot activation until predecessor wallet data was snapshotted and reset", () => {
     const database = new Database(":memory:");
     database.exec(`

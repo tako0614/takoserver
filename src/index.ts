@@ -47,7 +47,7 @@ export {
   type PricePlan,
   type PricePlanCharge,
   priceMeteredUsage,
-  priceRecurring,
+  priceProvisioning,
 } from "./catalog.ts";
 export {
   type CatalogCandidate,
@@ -100,6 +100,11 @@ export {
   type ResourceProvisioner,
   type TransferEndpoint,
 } from "./provider-pack.ts";
+export {
+  CLOUDFLARE_EDGE_METER_SETS,
+  CLOUDFLARE_EDGE_METERS,
+  createCloudflareEdgeMeterSources,
+} from "./providers/cloudflare-edge-meter.ts";
 export { createCloudflareR2MeterSource } from "./providers/cloudflare-r2-meter.ts";
 export {
   createOpenAiGateway,

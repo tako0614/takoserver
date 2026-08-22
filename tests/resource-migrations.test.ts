@@ -51,7 +51,7 @@ function sold(id: string, pack: string, installation: string): Offering {
     pricePlan: {
       id: `${id}.price`,
       currency: "USD",
-      recurring: { meter: "database-month", amountMinor: 500 },
+      provisioning: { meter: "resource.create", amountMinor: 500 },
       meters: [],
     },
     providedInterfaces: [],

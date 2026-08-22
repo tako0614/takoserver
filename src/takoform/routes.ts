@@ -146,6 +146,9 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
         ...(exactScope?.commercialAuthority
           ? { commercialAuthority: exactScope.commercialAuthority }
           : {}),
+        ...(principal.scope?.mode === "tenant-run" && principal.scope.runtimeMaterialization
+          ? { runtimeMaterialization: principal.scope.runtimeMaterialization }
+          : {}),
       };
 
       try {

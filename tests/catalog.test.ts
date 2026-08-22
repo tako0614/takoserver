@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { createCatalog, type Offering, priceMeteredUsage, priceRecurring } from "../src/catalog.ts";
+import {
+  createCatalog,
+  type Offering,
+  priceMeteredUsage,
+  priceProvisioning,
+} from "../src/catalog.ts";
 import type { TakoformInterfaceRef } from "../src/takoform/types.ts";
 
 const FORM = {
@@ -35,7 +40,7 @@ function offering(id: string, providerPackRef: string): Offering {
     pricePlan: {
       id: `${id}.price-v1`,
       currency: "USD",
-      recurring: { meter: "bucket-month", amountMinor: 500 },
+      provisioning: { meter: "resource.create", amountMinor: 500 },
       meters: [
         { meter: "storage.gib-hour", amountMinor: 1, quantity: 1 },
         { meter: "requests.million", amountMinor: 30, quantity: 1_000_000 },
@@ -72,10 +77,10 @@ describe("Offering catalog", () => {
     expect("forForm" in catalog).toBe(false);
   });
 
-  test("prices recurring and aggregated multi-meter usage from one Price Plan", () => {
+  test("prices provisioning once and keeps aggregated usage below one cent precise", () => {
     const plan = offering("storage.s3.wasabi.ap-northeast", "wasabi").pricePlan;
 
-    expect(priceRecurring(plan, 2)).toBe(1_000);
+    expect(priceProvisioning(plan, 2)).toBe(1_000);
     expect(
       priceMeteredUsage(plan, [
         { meter: "storage.gib-hour", quantity: 2 },
@@ -83,11 +88,15 @@ describe("Offering catalog", () => {
         { meter: "requests.million", quantity: 1_500_000 },
       ]),
     ).toEqual({
-      amountMinor: 50,
+      amountMicros: 50_000_000,
       lines: [
-        { meter: "requests.million", quantity: 1_500_000, amountMinor: 45 },
-        { meter: "storage.gib-hour", quantity: 5, amountMinor: 5 },
+        { meter: "requests.million", quantity: 1_500_000, amountMicros: 45_000_000 },
+        { meter: "storage.gib-hour", quantity: 5, amountMicros: 5_000_000 },
       ],
+    });
+    expect(priceMeteredUsage(plan, [{ meter: "requests.million", quantity: 1 }])).toEqual({
+      amountMicros: 30,
+      lines: [{ meter: "requests.million", quantity: 1, amountMicros: 30 }],
     });
     expect(() => priceMeteredUsage(plan, [{ meter: "provider.invoice", quantity: 1 }])).toThrow(
       "unknown meter",

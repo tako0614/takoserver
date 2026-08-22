@@ -5,6 +5,7 @@ import { createR2ObjectStore } from "./objects-r2.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
 import { resolvePayment } from "./payment-setup.ts";
 import type { CloudflareWorkersAiBinding } from "./providers/cloudflare-workers-ai.ts";
+import type { RuntimeMaterializer } from "./runtime-materialization.ts";
 import { loadSigningKey } from "./signing-key.ts";
 import { createD1Sql } from "./sql-d1.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
@@ -72,6 +73,8 @@ interface WorkerEnv {
   /** Wasabi sub-user credentials. Both are Worker secrets. */
   readonly TAKOSERVER_WASABI_ACCESS_KEY_ID?: string;
   readonly TAKOSERVER_WASABI_SECRET_ACCESS_KEY?: string;
+  /** Optional private Service Binding to the selected host's materializer. */
+  readonly HOST_RUNTIME_MATERIALIZER?: RuntimeMaterializer;
 }
 
 /**
@@ -155,6 +158,9 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
       },
     },
     ...(dataServices.s3 ? { s3CredentialIssuer: dataServices.s3 } : {}),
+    ...(env.HOST_RUNTIME_MATERIALIZER
+      ? { runtimeMaterializer: env.HOST_RUNTIME_MATERIALIZER }
+      : {}),
     now: new Date(),
   });
   const app = buildApp({

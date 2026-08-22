@@ -7,6 +7,7 @@ import { writeRealizedConfig } from "./deploy/realized-config.ts";
 import { loadTarget, targetPath } from "./deploy/target.ts";
 import { verify } from "./deploy/verify.ts";
 import { runWebRelease, type WebSurface } from "./deploy/web.ts";
+import { assertTargetBindingClosure } from "./deploy/worker-state.ts";
 
 const USAGE = `takoserver deploy
 
@@ -101,6 +102,9 @@ async function run(mode: Mode): Promise<void> {
   if (mode.action === "status") {
     const configPath = writeRealizedConfig(target);
     const live = await inspectLive(configPath, target);
+    if (live.servedVersionId !== null) {
+      await assertTargetBindingClosure("preflight", configPath, live.servedVersionId, target);
+    }
     process.stdout.write(
       `${JSON.stringify(
         {
@@ -108,6 +112,7 @@ async function run(mode: Mode): Promise<void> {
           worker: target.workerName,
           publicOrigin: target.publicOrigin,
           servedVersionId: live.servedVersionId,
+          bindingClosure: live.servedVersionId === null ? "not-deployed" : "verified",
           appliedMigrations: live.appliedMigrations,
           runtimeTables: live.tables.filter((name) => name.startsWith("runtime_")),
           activeGrantKeyIds: live.activeGrantKeyIds,

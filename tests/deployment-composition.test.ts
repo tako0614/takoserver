@@ -20,7 +20,7 @@ import { FakeProvider } from "../src/providers/fake.ts";
 const PRICE: PricePlan = {
   id: "storage.object.cloudflare.price-v1",
   currency: "USD",
-  recurring: { meter: "bucket-month", amountMinor: 500 },
+  provisioning: { meter: "resource.create", amountMinor: 500 },
   meters: [],
 };
 
@@ -172,7 +172,7 @@ describe("deployment composition", () => {
         pricePlan: {
           id: `${id}.price-v1`,
           currency: "USD" as const,
-          recurring: { meter: "bucket-month", amountMinor: 500 },
+          provisioning: { meter: "resource.create", amountMinor: 500 },
           meters: [],
         },
         placement: {
