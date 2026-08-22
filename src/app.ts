@@ -224,7 +224,7 @@ export function buildApp(ports: AppPorts): App {
               tenantId: claims.organizationId,
               principalId: `run:${claims.tokenId}`,
               scope: {
-                space: claims.tenantRef,
+                space: claims.spaceRef,
                 mode: "tenant-run" as const,
                 ...(claims.runtimeMaterialization
                   ? { runtimeMaterialization: claims.runtimeMaterialization }

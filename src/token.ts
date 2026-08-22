@@ -58,6 +58,8 @@ export interface TakoformRunTokenClaims extends ProvisionTokenClaims {
 export interface TakoformTenantRunTokenClaims {
   readonly organizationId: string;
   readonly tenantRef: string;
+  /** Opaque Capsule-scoped Takoform namespace selected by the reseller. */
+  readonly spaceRef: string;
   readonly runRef: string;
   readonly mode: "tenant-run";
   readonly issuedAtEpochSeconds: number;
@@ -130,6 +132,7 @@ export interface TokenService {
   issueTakoformTenantRunToken(input: {
     readonly organizationId: string;
     readonly tenantRef: string;
+    readonly spaceRef: string;
     readonly runRef: string;
     readonly runtimeMaterialization?: RuntimeMaterializationAuthority;
     readonly ttlSeconds: number;
@@ -315,6 +318,7 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
           mode: "tenant-run",
           organizationId: reference(input.organizationId),
           runRef: reference(input.runRef),
+          spaceRef: reference(input.spaceRef),
           tenantRef: reference(input.tenantRef),
           ...(input.runtimeMaterialization
             ? {
@@ -633,6 +637,7 @@ function takoformTenantRunClaims(payload: Record<string, unknown>): TakoformTena
     "nbf",
     "organizationId",
     "runRef",
+    "spaceRef",
     "tenantRef",
     ...(payload.runtimeMaterialization === undefined ? [] : ["runtimeMaterialization"]),
   ]);
@@ -640,6 +645,7 @@ function takoformTenantRunClaims(payload: Record<string, unknown>): TakoformTena
   return {
     organizationId: claimReference(payload.organizationId),
     tenantRef: claimReference(payload.tenantRef),
+    spaceRef: claimReference(payload.spaceRef),
     runRef: claimReference(payload.runRef),
     mode: "tenant-run",
     issuedAtEpochSeconds: epochSeconds(payload.iat),

@@ -1,4 +1,7 @@
+import { and, eq } from "drizzle-orm";
 import type { ResourceInventory } from "./control.ts";
+import { createDatabase } from "./database.ts";
+import { takoformResourceDeployments, takoformResources } from "./database-schema.ts";
 import type { Ledger } from "./ledger.ts";
 import type { Clock, Sql } from "./ports.ts";
 import { boundedRuntimeMaterialization } from "./runtime-materialization.ts";
@@ -23,6 +26,7 @@ export function createSponsorshipRoutes(
   options: CreateSponsorshipRoutesOptions,
 ): SponsorshipRoutes {
   const prefix = "/v1/sponsorship/tenants/";
+  const db = createDatabase(options.sql);
   return async (request, url) => {
     if (!url.pathname.startsWith(prefix)) return null;
     if (request.headers.get("authorization") !== `Bearer ${options.serviceToken}`) {
@@ -71,11 +75,16 @@ export function createSponsorshipRoutes(
         const body = await jsonObject(
           request,
           ["runRef", "expiresInSeconds"],
-          ["runtimeMaterialization"],
+          ["spaceRef", "runtimeMaterialization"],
         );
         const issued = await options.tokens.issueTakoformTenantRunToken({
           organizationId,
           tenantRef,
+          // One deploy-order transition: the predecessor Hosted Worker sent
+          // no Capsule space. It remains confined to the tenant namespace
+          // until the Hosted deployment moves first, after which this fallback
+          // is removed in the immediately following Takoserver release.
+          spaceRef: body.spaceRef === undefined ? tenantRef : text(body.spaceRef, 256),
           runRef: text(body.runRef, 256),
           ...(body.runtimeMaterialization === undefined
             ? {}
@@ -85,6 +94,40 @@ export function createSponsorshipRoutes(
           ttlSeconds: boundedTtl(body.expiresInSeconds),
         });
         return Response.json({ takoformRunCredential: issued }, { status: 201 });
+      }
+
+      if (
+        request.method === "POST" &&
+        rest.length === 3 &&
+        rest[1] === "interface-oauth-resources" &&
+        rest[2] === "authorize"
+      ) {
+        const body = await jsonObject(request, ["spaceRef", "resource"]);
+        const spaceRef = text(body.spaceRef, 256);
+        const resourceOrigin = oauthResourceOrigin(body.resource);
+        if (!resourceOrigin) return Response.json({ authorized: false });
+        const rows = await db
+          .select({ outputsJson: takoformResourceDeployments.outputsJson })
+          .from(takoformResourceDeployments)
+          .innerJoin(
+            takoformResources,
+            and(
+              eq(takoformResources.tenantId, takoformResourceDeployments.tenantId),
+              eq(takoformResources.uid, takoformResourceDeployments.resourceUid),
+            ),
+          )
+          .where(
+            and(
+              eq(takoformResourceDeployments.tenantId, organizationId),
+              eq(takoformResourceDeployments.state, "active"),
+              eq(takoformResources.space, spaceRef),
+              eq(takoformResources.kind, "WorkerEndpoint"),
+            ),
+          )
+          .limit(129);
+        if (rows.length > 128) return Response.json({ authorized: false });
+        const authorized = rows.some((row) => endpointOrigin(row.outputsJson) === resourceOrigin);
+        return Response.json({ authorized });
       }
 
       if (request.method === "GET" && rest.length === 2 && rest[1] === "inventory") {
@@ -266,6 +309,37 @@ export function createSponsorshipRoutes(
       return failure("invalid", 400);
     }
   };
+}
+
+function oauthResourceOrigin(value: unknown): string | null {
+  if (typeof value !== "string" || value.length > 2_048) return null;
+  try {
+    const url = new URL(value);
+    if (
+      url.protocol !== "https:" ||
+      url.username ||
+      url.password ||
+      url.hash ||
+      url.origin === "null"
+    ) {
+      return null;
+    }
+    return url.origin;
+  } catch {
+    return null;
+  }
+}
+
+function endpointOrigin(outputsJson: string): string | null {
+  try {
+    const outputs = JSON.parse(outputsJson) as unknown;
+    if (!outputs || typeof outputs !== "object" || Array.isArray(outputs)) {
+      return null;
+    }
+    return oauthResourceOrigin((outputs as Record<string, unknown>).url);
+  } catch {
+    return null;
+  }
 }
 
 function boundedTtl(value: unknown): number {

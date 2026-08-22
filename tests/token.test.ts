@@ -206,6 +206,7 @@ describe("Takoform run tokens", () => {
     const issued = await tokens.issueTakoformTenantRunToken({
       organizationId: "org_alpha",
       tenantRef: "tenant_workspace_x",
+      spaceRef: "tsp_capsule_yurucommu",
       runRef: "run_takosumi_1",
       runtimeMaterialization,
       ttlSeconds: 300,
@@ -213,6 +214,7 @@ describe("Takoform run tokens", () => {
     expect(await tokens.verifyTakoformTenantRunToken(issued.token)).toMatchObject({
       organizationId: "org_alpha",
       tenantRef: "tenant_workspace_x",
+      spaceRef: "tsp_capsule_yurucommu",
       runRef: "run_takosumi_1",
       mode: "tenant-run",
       runtimeMaterialization,

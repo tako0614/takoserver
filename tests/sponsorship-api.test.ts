@@ -219,6 +219,7 @@ describe("Hosted sponsorship owner API", () => {
     };
     const response = await call(route, "POST", `${base}/takoform-run-credentials`, {
       runRef: "run_takosumi_1",
+      spaceRef: "tsp_capsule_yurucommu",
       expiresInSeconds: 300,
       runtimeMaterialization,
     });
@@ -233,6 +234,7 @@ describe("Hosted sponsorship owner API", () => {
       {
         organizationId: "org_legal",
         tenantRef: "tenant_opaque",
+        spaceRef: "tsp_capsule_yurucommu",
         runRef: "run_takosumi_1",
         runtimeMaterialization,
         ttlSeconds: 300,
@@ -241,9 +243,107 @@ describe("Hosted sponsorship owner API", () => {
     expect(
       await call(route, "POST", `${base}/takoform-run-credentials`, {
         runRef: "run_takosumi_2",
+        spaceRef: "tsp_capsule_yurucommu",
         expiresInSeconds: 601,
       }),
     ).toMatchObject({ status: 400 });
+    await call(route, "POST", `${base}/takoform-run-credentials`, {
+      runRef: "run_takosumi_legacy",
+      expiresInSeconds: 300,
+    });
+    expect(issued.at(-1)).toMatchObject({
+      tenantRef: "tenant_opaque",
+      spaceRef: "tenant_opaque",
+      runRef: "run_takosumi_legacy",
+    });
+  });
+
+  test("authorizes only an active WorkerEndpoint in the exact opaque Capsule space", async () => {
+    const sql = createEphemeralSql();
+    const now = new Date("2026-08-20T00:00:00.000Z");
+    await sql.run(
+      "INSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES (?, ?, ?, ?)",
+      ["org_legal", "Legal Organization", "prn_1", now.toISOString()],
+    );
+    const route = createSponsorshipRoutes({
+      sql,
+      ledger: createLedger(sql, () => now),
+      inventory: emptyInventory(),
+      lifecycle: noLifecycle(),
+      tokens: fakeTokens(),
+      serviceToken: token,
+      publicOrigin: "https://api.takoserver.test",
+      clock: () => now,
+    });
+    await call(route, "POST", base, { organizationId: "org_legal" });
+    await sql.run(
+      `INSERT INTO tf_resources
+         (tenant_id, space, api_version, kind, name, uid, generation, revision,
+          resource_json, updated_at, relations_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        "org_legal",
+        "tsp_capsule_yurucommu",
+        "edge.forms.takoform.com/v1beta1",
+        "WorkerEndpoint",
+        "endpoint",
+        "tfres_endpoint",
+        "1",
+        "1",
+        JSON.stringify({}),
+        now.getTime(),
+        JSON.stringify([]),
+      ],
+    );
+    await sql.run(
+      `INSERT INTO tf_resource_deployments
+         (tenant_id, id, resource_uid, offering_id, provider_pack_ref,
+          provider_installation_ref, native_id, state, observed_json, outputs_json,
+          created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        "org_legal",
+        "dep_endpoint",
+        "tfres_endpoint",
+        "compute.worker.endpoint.standard",
+        "cloudflare",
+        "cloudflare.primary",
+        "endpoint:worker",
+        "active",
+        JSON.stringify({ enabled: true }),
+        JSON.stringify({
+          hostname: "storage.example.test",
+          url: "https://storage.example.test/",
+        }),
+        now.getTime(),
+        now.getTime(),
+      ],
+    );
+
+    expect(
+      await json(
+        await call(route, "POST", `${base}/interface-oauth-resources/authorize`, {
+          spaceRef: "tsp_capsule_yurucommu",
+          resource: "https://storage.example.test/mcp",
+        }),
+      ),
+    ).toEqual({ authorized: true });
+    expect(
+      await json(
+        await call(route, "POST", `${base}/interface-oauth-resources/authorize`, {
+          spaceRef: "tsp_other_capsule",
+          resource: "https://storage.example.test/mcp",
+        }),
+      ),
+    ).toEqual({ authorized: false });
+    expect(
+      await json(
+        await call(route, "POST", `${base}/interface-oauth-resources/authorize`, {
+          spaceRef: "tsp_capsule_yurucommu",
+          resource: "https://attacker.example.test/mcp",
+        }),
+      ),
+    ).toEqual({ authorized: false });
   });
 });
 
