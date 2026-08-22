@@ -97,7 +97,7 @@ export const DEPLOY_CONTRACT = {
         "no-overwrite":
           "Wrangler publishes immutable Worker versions and the append-only web ledger never overwrites an earlier publication receipt.",
         "pre-mutation-proof":
-          "The full portable gate, pushed-source proof, fresh console build, content digest and current custom-domain owner are read before publication.",
+          "The full portable gate, pushed-source proof, fresh console build, content digest and current custom-domain owner are read with CLOUDFLARE_API_TOKEN before publication.",
       },
     },
     {
@@ -126,7 +126,7 @@ export const DEPLOY_CONTRACT = {
         "no-overwrite":
           "Each publication is an immutable Worker Version with an append-only evidence receipt.",
         "pre-mutation-proof":
-          "The full portable gate, pushed-source proof, fresh site build, digest and current domain owner are read before mutation.",
+          "The full portable gate, pushed-source proof, fresh site build, digest and current domain owner are read with CLOUDFLARE_API_TOKEN before mutation.",
       },
     },
   ],
