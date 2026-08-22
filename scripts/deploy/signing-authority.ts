@@ -106,7 +106,11 @@ export async function liveSigningKeyMatches(
         authorization: `Bearer ${serviceToken}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify({ runRef: "deploy-signing-proof", expiresInSeconds: 60 }),
+      body: JSON.stringify({
+        runRef: "deploy-signing-proof",
+        spaceRef: "deploy-signing-proof",
+        expiresInSeconds: 60,
+      }),
       signal: AbortSignal.timeout(15_000),
     },
   ).catch(() => null);
