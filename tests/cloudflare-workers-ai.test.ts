@@ -71,6 +71,117 @@ describe("Cloudflare Workers AI binding adapter", () => {
     expect(JSON.stringify(result)).not.toContain("@cf/meta");
   });
 
+  test("preserves OpenAI tool calls from a modern Workers AI chat model", async () => {
+    const calls: unknown[][] = [];
+    const gateway = createCloudflareWorkersAiGateway({
+      models: [
+        {
+          ...model,
+          upstreamId: "@cf/google/gemma-4-26b-a4b-it",
+        },
+      ],
+      binding: {
+        async run(...input) {
+          calls.push(input);
+          return {
+            id: "provider-completion-id",
+            object: "chat.completion",
+            created: 1_787_040_000,
+            model: "@cf/google/gemma-4-26b-a4b-it",
+            choices: [
+              {
+                index: 0,
+                message: {
+                  role: "assistant",
+                  content: null,
+                  refusal: null,
+                  tool_calls: [
+                    {
+                      id: "call_toolbox_1",
+                      type: "function",
+                      function: {
+                        name: "toolbox",
+                        arguments: '{"action":"search","query":"storage"}',
+                      },
+                    },
+                  ],
+                },
+                finish_reason: "tool_calls",
+                logprobs: null,
+              },
+            ],
+            usage: { prompt_tokens: 12, completion_tokens: 7, total_tokens: 19 },
+          };
+        },
+      },
+      clock: () => new Date("2026-08-18T08:00:00.000Z"),
+    });
+
+    const result = await gateway.chat(
+      {
+        model: "takoserver-text",
+        messages: [{ role: "user", content: "Find storage tools" }],
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "toolbox",
+              description: "Find and call available tools",
+              parameters: {
+                type: "object",
+                properties: { action: { type: "string" } },
+                required: ["action"],
+              },
+            },
+          },
+        ],
+        tool_choice: "auto",
+        max_tokens: 64,
+      },
+      { requestId: "ai_request_tools", idempotencyKey: "chat-tools" },
+    );
+
+    expect(calls[0]?.[1]).toMatchObject({
+      tools: [
+        {
+          type: "function",
+          function: { name: "toolbox" },
+        },
+      ],
+      tool_choice: "auto",
+      stream: false,
+    });
+    expect(result).toEqual({
+      id: "chatcmpl-ai_request_tools",
+      object: "chat.completion",
+      created: 1_787_040_000,
+      model: "takoserver-text",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "call_toolbox_1",
+                type: "function",
+                function: {
+                  name: "toolbox",
+                  arguments: '{"action":"search","query":"storage"}',
+                },
+              },
+            ],
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+      usage: { prompt_tokens: 12, completion_tokens: 7, total_tokens: 19 },
+    });
+    expect(JSON.stringify(result)).not.toContain("@cf/google");
+    expect(JSON.stringify(result)).not.toContain("provider-completion-id");
+  });
+
   test("fails closed on an unknown public model or malformed native result", async () => {
     let calls = 0;
     const gateway = createCloudflareWorkersAiGateway({

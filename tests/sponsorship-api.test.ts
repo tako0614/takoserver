@@ -256,6 +256,68 @@ describe("Hosted sponsorship owner API", () => {
     expect(issued).toHaveLength(1);
   });
 
+  test("issues only a short-lived AI data credential for the bound tenant", async () => {
+    const sql = createEphemeralSql();
+    const now = new Date("2026-08-20T00:00:00.000Z");
+    await sql.run(
+      "INSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES (?, ?, ?, ?)",
+      ["org_legal", "Legal Organization", "prn_1", now.toISOString()],
+    );
+    const issued: unknown[] = [];
+    const tokens = fakeTokens({
+      async issueDataAccessToken(input) {
+        issued.push(input);
+        return {
+          token: "short-lived-ai-secret",
+          expiresAt: "2026-08-20T00:02:00.000Z",
+        };
+      },
+    });
+    const route = createSponsorshipRoutes({
+      sql,
+      ledger: createLedger(sql, () => now),
+      inventory: emptyInventory(),
+      lifecycle: noLifecycle(),
+      tokens,
+      serviceToken: token,
+      publicOrigin: "https://api.takoserver.test",
+      clock: () => now,
+    });
+    await call(route, "POST", base, { organizationId: "org_legal" });
+
+    const response = await call(route, "POST", `${base}/data-access-tokens`, {
+      scopes: ["ai:invoke"],
+      expiresInSeconds: 120,
+    });
+    expect(response.status).toBe(201);
+    expect(await json(response)).toEqual({
+      dataAccessToken: {
+        token: "short-lived-ai-secret",
+        expiresAt: "2026-08-20T00:02:00.000Z",
+      },
+    });
+    expect(issued).toEqual([
+      {
+        organizationId: "org_legal",
+        tenantRef: "tenant_opaque",
+        scopes: ["ai:invoke"],
+        ttlSeconds: 120,
+      },
+    ]);
+    expect(
+      await call(route, "POST", `${base}/data-access-tokens`, {
+        scopes: ["catalog:read"],
+        expiresInSeconds: 120,
+      }),
+    ).toMatchObject({ status: 400 });
+    expect(
+      await call(route, "POST", `${base}/data-access-tokens`, {
+        scopes: ["ai:invoke"],
+        expiresInSeconds: 121,
+      }),
+    ).toMatchObject({ status: 400 });
+  });
+
   test("authorizes only an active WorkerEndpoint in the exact opaque Capsule space", async () => {
     const sql = createEphemeralSql();
     const now = new Date("2026-08-20T00:00:00.000Z");
@@ -448,6 +510,8 @@ function fakeTokens(overrides: Partial<TokenService> = {}): TokenService {
     issueTakoformRunToken: unavailable,
     issueTakoformTenantRunToken: unavailable,
     verifyTakoformTenantRunToken: unavailable,
+    issueDataAccessToken: unavailable,
+    verifyDataAccessToken: unavailable,
     verifyTakoformRunToken: unavailable,
     claimTakoformRunTokenForCreate: unavailable,
     ...overrides,

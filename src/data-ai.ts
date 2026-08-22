@@ -16,12 +16,30 @@ import { parseStrictJson, StrictJsonError } from "./strict-json.ts";
 const PREFIX = "/v1/ai/";
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_MESSAGES = 256;
+const MAX_TOOLS = 64;
+const MAX_TOOL_CALLS = 16;
 const MAX_DURABLE_RESULT_BYTES = 64 * 1024;
 const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/u;
 const IDEMPOTENCY_KEY = /^[\x21-\x7e]{1,128}$/u;
+const TOOL_CALL_ID = /^[\x21-\x7e]{1,256}$/u;
+const TOOL_NAME = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/u;
+const CHAT_REQUEST_FIELDS = new Set([
+  "max_completion_tokens",
+  "max_tokens",
+  "messages",
+  "model",
+  "stream",
+  "temperature",
+  "tool_choice",
+  "tools",
+]);
 
 export interface DataAiOptions {
   readonly accounts: Accounts;
+  /** Optional composed authority for short-lived reseller data-plane tokens. */
+  readonly authorize?: (
+    authorization: string | null,
+  ) => Promise<{ readonly organizationId: string } | null>;
   readonly gateway?: AiGateway;
   readonly ledger: Ledger;
   readonly sql: Sql;
@@ -44,10 +62,10 @@ export function createDataAiRoutes(options: DataAiOptions): DataAiRoutes {
     if (!url.pathname.startsWith(PREFIX)) return null;
     if (!options.gateway) return openAiFailure("service_unavailable", 503);
 
-    const actor = await options.accounts.authorize(
-      request.headers.get("authorization"),
-      "ai:invoke",
-    );
+    const authorization = request.headers.get("authorization");
+    const actor = options.authorize
+      ? await options.authorize(authorization)
+      : await options.accounts.authorize(authorization, "ai:invoke");
     if (!actor?.organizationId) return openAiFailure("invalid_api_key", 401);
 
     if (request.method === "GET" && url.pathname === `${PREFIX}models`) {
@@ -68,7 +86,7 @@ export function createDataAiRoutes(options: DataAiOptions): DataAiRoutes {
     if (request.method === "POST" && url.pathname === `${PREFIX}chat/completions`) {
       let body: JsonObject;
       try {
-        const parsed = parseStrictJson(new Uint8Array(await request.arrayBuffer()), MAX_BODY_BYTES);
+        const parsed = parseStrictJson(await readRequestBodyLimited(request), MAX_BODY_BYTES);
         if (!isJsonObject(parsed)) throw new StrictJsonError();
         body = parsed;
       } catch (error) {
@@ -85,13 +103,31 @@ export function createDataAiRoutes(options: DataAiOptions): DataAiRoutes {
       ) {
         return openAiFailure("pricing_revision_conflict", 409, "model");
       }
+      if (!Object.keys(body).every((key) => CHAT_REQUEST_FIELDS.has(key))) {
+        return openAiFailure("invalid_request", 400);
+      }
       if (!validMessages(body.messages)) {
         return openAiFailure("invalid_messages", 400, "messages");
+      }
+      if (!validTools(body.tools, body.tool_choice)) {
+        return openAiFailure("invalid_tools", 400, "tools");
       }
       if (body.stream !== undefined && body.stream !== false) {
         return openAiFailure("stream_not_supported", 400, "stream");
       }
-      const maxOutputTokens = outputLimit(body.max_tokens, model);
+      if (
+        body.temperature !== undefined &&
+        (typeof body.temperature !== "number" ||
+          !Number.isFinite(body.temperature) ||
+          body.temperature < 0 ||
+          body.temperature > 2)
+      ) {
+        return openAiFailure("invalid_temperature", 400, "temperature");
+      }
+      if (body.max_tokens !== undefined && body.max_completion_tokens !== undefined) {
+        return openAiFailure("invalid_max_tokens", 400, "max_tokens");
+      }
+      const maxOutputTokens = outputLimit(body.max_tokens ?? body.max_completion_tokens, model);
       if (maxOutputTokens === null) {
         return openAiFailure("invalid_max_tokens", 400, "max_tokens");
       }
@@ -390,12 +426,146 @@ function validMessages(value: unknown): boolean {
   if (!Array.isArray(value) || value.length < 1 || value.length > MAX_MESSAGES) return false;
   return value.every((entry) => {
     if (!isJsonObject(entry)) return false;
-    if (!(["system", "user", "assistant", "tool"] as const).includes(entry.role as never)) {
+    if (entry.role === "system" || entry.role === "user") {
+      return (
+        exactKeys(entry, ["content", "role"]) &&
+        typeof entry.content === "string" &&
+        entry.content.length <= 256 * 1024
+      );
+    }
+    if (entry.role === "assistant") {
+      if (!exactKeys(entry, ["content", "role", "tool_calls"], ["content", "tool_calls"])) {
+        return false;
+      }
+      const contentValid =
+        entry.content === undefined ||
+        entry.content === null ||
+        (typeof entry.content === "string" && entry.content.length <= 256 * 1024);
+      const calls = parseToolCalls(entry.tool_calls);
+      return (
+        contentValid && calls !== null && (typeof entry.content === "string" || calls.length > 0)
+      );
+    }
+    if (entry.role === "tool") {
+      return (
+        exactKeys(entry, ["content", "role", "tool_call_id"]) &&
+        typeof entry.content === "string" &&
+        entry.content.length <= 256 * 1024 &&
+        typeof entry.tool_call_id === "string" &&
+        TOOL_CALL_ID.test(entry.tool_call_id)
+      );
+    }
+    return false;
+  });
+}
+
+function validTools(tools: unknown, choice: unknown): boolean {
+  if (tools === undefined) return choice === undefined;
+  if (!Array.isArray(tools) || tools.length < 1 || tools.length > MAX_TOOLS) return false;
+  const names = new Set<string>();
+  for (const tool of tools) {
+    if (
+      !isJsonObject(tool) ||
+      !exactKeys(tool, ["function", "type"]) ||
+      tool.type !== "function" ||
+      !isJsonObject(tool.function) ||
+      !exactKeys(tool.function, ["description", "name", "parameters"]) ||
+      typeof tool.function.name !== "string" ||
+      !TOOL_NAME.test(tool.function.name) ||
+      names.has(tool.function.name) ||
+      typeof tool.function.description !== "string" ||
+      tool.function.description.length > 8 * 1024 ||
+      !isJsonObject(tool.function.parameters)
+    ) {
       return false;
     }
-    if (typeof entry.content === "string") return entry.content.length <= 256 * 1024;
-    return Array.isArray(entry.content) && entry.content.length <= 64;
-  });
+    names.add(tool.function.name);
+  }
+  return choice === undefined || choice === "auto" || choice === "none" || choice === "required";
+}
+
+function parseToolCalls(value: unknown): readonly JsonObject[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_TOOL_CALLS) return null;
+  const calls: JsonObject[] = [];
+  for (const call of value) {
+    if (
+      !isJsonObject(call) ||
+      !exactKeys(call, ["function", "id", "type"]) ||
+      call.type !== "function" ||
+      typeof call.id !== "string" ||
+      !TOOL_CALL_ID.test(call.id) ||
+      !isJsonObject(call.function) ||
+      !exactKeys(call.function, ["arguments", "name"]) ||
+      typeof call.function.name !== "string" ||
+      !TOOL_NAME.test(call.function.name) ||
+      typeof call.function.arguments !== "string" ||
+      call.function.arguments.length > 256 * 1024
+    ) {
+      return null;
+    }
+    let args: unknown;
+    try {
+      args = JSON.parse(call.function.arguments);
+    } catch {
+      return null;
+    }
+    if (!isJsonObject(args)) return null;
+    calls.push(call);
+  }
+  return calls;
+}
+
+function exactKeys(
+  value: JsonObject,
+  allowed: readonly string[],
+  optional: readonly string[] = [],
+): boolean {
+  const actual = Object.keys(value);
+  const allowedSet = new Set(allowed);
+  const optionalSet = new Set(optional);
+  return (
+    actual.every((key) => allowedSet.has(key)) &&
+    allowed.every((key) => optionalSet.has(key) || Object.hasOwn(value, key))
+  );
+}
+
+async function readRequestBodyLimited(request: Request): Promise<Uint8Array> {
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const length = Number(declared);
+    if (!Number.isSafeInteger(length) || length < 1 || length > MAX_BODY_BYTES) {
+      await request.body?.cancel().catch(() => undefined);
+      throw new StrictJsonError();
+    }
+  }
+  if (!request.body) throw new StrictJsonError();
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const part = await reader.read();
+      if (part.done) break;
+      const chunk = part.value;
+      if (!(chunk instanceof Uint8Array) || chunk.byteLength > MAX_BODY_BYTES - total) {
+        await reader.cancel().catch(() => undefined);
+        throw new StrictJsonError();
+      }
+      chunks.push(chunk);
+      total += chunk.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  if (total < 1) throw new StrictJsonError();
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
 }
 
 function parseCompletion(

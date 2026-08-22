@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import type { AiGateway } from "../src/ai-port.ts";
 import {
   buildApp,
   createEphemeralSql,
@@ -97,7 +98,9 @@ function newApp() {
   });
 }
 
-async function newSignedApp() {
+async function newSignedApp(
+  options: { readonly ai?: AiGateway; readonly sponsorshipServiceToken?: string } = {},
+) {
   const sql = createEphemeralSql();
   const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
   const jwk = await crypto.subtle.exportKey("jwk", pair.publicKey);
@@ -116,6 +119,10 @@ async function newSignedApp() {
     providers: [new FakeProvider({ id: "cloudflare", offerings: [PROVIDER_OFFERING] })],
     offerings: [OFFERING],
     signingKey,
+    ...(options.ai ? { ai: options.ai } : {}),
+    ...(options.sponsorshipServiceToken
+      ? { sponsorshipServiceToken: options.sponsorshipServiceToken }
+      : {}),
   });
 }
 
@@ -175,6 +182,92 @@ async function fundedOrganization(fetch: (request: Request) => Promise<Response>
 }
 
 describe("prepaid vertical over HTTP", () => {
+  test("exchanges private sponsorship authority for an AI-only data bearer", async () => {
+    const gateway: AiGateway = {
+      models: [
+        {
+          id: "takoserver-text",
+          created: 1_787_054_400,
+          ownedBy: "takoserver",
+          limits: { maxInputTokens: 100, maxOutputTokens: 10 },
+          price: {
+            inputMinorPerMillionTokens: 1_000,
+            outputMinorPerMillionTokens: 1_000,
+          },
+        },
+      ],
+      async chat() {
+        throw new Error("not used by this authority proof");
+      },
+    };
+    const { fetch } = await newSignedApp({
+      ai: gateway,
+      sponsorshipServiceToken: "hosted-sponsorship",
+    });
+    const { organizationId } = await fundedOrganization(fetch);
+    const sponsor = { authorization: "Bearer hosted-sponsorship" };
+
+    expect(
+      (
+        await call(
+          fetch,
+          "POST",
+          "/v1/sponsorship/tenants/tenant_workspace_ai",
+          { organizationId },
+          sponsor,
+        )
+      ).status,
+    ).toBe(201);
+    const issued = await call(
+      fetch,
+      "POST",
+      "/v1/sponsorship/tenants/tenant_workspace_ai/data-access-tokens",
+      { scopes: ["ai:invoke"], expiresInSeconds: 120 },
+      sponsor,
+    );
+    expect(issued.status).toBe(201);
+    const token = String(
+      (issued.body.dataAccessToken as { token: string; expiresAt: string }).token,
+    );
+    const bearer = { authorization: `Bearer ${token}` };
+
+    const models = await call(fetch, "GET", "/v1/ai/models", undefined, bearer);
+    expect(models.status).toBe(200);
+    expect(models.body).toMatchObject({
+      object: "list",
+      data: [{ id: "takoserver-text" }],
+    });
+    expect((await call(fetch, "GET", "/v1/me", undefined, bearer)).status).toBe(401);
+    expect(
+      (
+        await call(
+          fetch,
+          "POST",
+          "/v1/sponsorship/tenants/tenant_other",
+          { organizationId },
+          bearer,
+        )
+      ).status,
+    ).toBe(404);
+    expect(
+      (
+        await call(
+          fetch,
+          "POST",
+          "/apis/forms.takoform.com/v1beta1/resources/prepare",
+          {
+            apiVersion: OFFERING.form.apiVersion,
+            kind: OFFERING.form.kind,
+            form: { formRef: OFFERING.form },
+            metadata: { space: "tenant_workspace_ai", name: "forbidden" },
+            spec: {},
+          },
+          bearer,
+        )
+      ).status,
+    ).toBe(401);
+  });
+
   test("issues an exact-address run bearer for ordinary Takoform provider lifecycle", async () => {
     const { fetch } = await newSignedApp();
     const { organizationId, owner, keyHeaders } = await fundedOrganization(fetch);

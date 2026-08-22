@@ -188,6 +188,8 @@ export {
 } from "./takoform-released-provider.ts";
 export {
   createTokenService,
+  type DataAccessScope,
+  type DataAccessTokenClaims,
   type SigningKey,
   TokenError,
   type TokenService,

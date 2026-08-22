@@ -4,7 +4,11 @@ import type { OpenAiModelConfig } from "./openai.ts";
 
 const UPSTREAM_REFERENCE = /^@cf\/[A-Za-z0-9][A-Za-z0-9._/-]{0,250}$/u;
 const GATEWAY_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u;
+const TOOL_CALL_ID = /^[\x21-\x7e]{1,256}$/u;
+const TOOL_NAME = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/u;
 const MAX_RESPONSE_CHARACTERS = 64 * 1024;
+const MAX_TOOL_CALLS = 16;
+const MAX_TOOL_ARGUMENT_CHARACTERS = 256 * 1024;
 
 export interface CloudflareWorkersAiBinding {
   run(
@@ -70,6 +74,18 @@ export function createCloudflareWorkersAiGateway(options: CloudflareWorkersAiOpt
         throw new AiGatewayError("unavailable");
       }
 
+      const modern = nativeChatCompletion(output);
+      if (modern) {
+        return {
+          id: `chatcmpl-${context.requestId}`,
+          object: "chat.completion",
+          created: Math.floor(clock().getTime() / 1_000),
+          model: publicModel,
+          choices: modern.choices,
+          usage: modern.usage,
+        } satisfies JsonObject;
+      }
+
       const completion = nativeCompletion(output);
       if (!completion) throw new AiGatewayError("invalid_response");
       return {
@@ -90,22 +106,104 @@ export function createCloudflareWorkersAiGateway(options: CloudflareWorkersAiOpt
   };
 }
 
-function nativeCompletion(value: unknown): {
-  readonly response: string;
-  readonly usage: {
-    readonly prompt_tokens: number;
-    readonly completion_tokens: number;
-    readonly total_tokens: number;
-  };
+function nativeChatCompletion(value: unknown): {
+  readonly choices: readonly JsonObject[];
+  readonly usage: NativeUsage;
 } | null {
-  if (!isJsonObject(value)) return null;
-  if (typeof value.response !== "string" || value.response.length > MAX_RESPONSE_CHARACTERS) {
+  if (!isJsonObject(value) || value.object !== "chat.completion") return null;
+  if (!Array.isArray(value.choices) || value.choices.length < 1 || value.choices.length > 16) {
     return null;
   }
-  if (!isJsonObject(value.usage)) return null;
-  const prompt = value.usage.prompt_tokens;
-  const completion = value.usage.completion_tokens;
-  const total = value.usage.total_tokens;
+  const usage = nativeUsage(value.usage);
+  if (!usage) return null;
+
+  const choices: JsonObject[] = [];
+  for (let index = 0; index < value.choices.length; index += 1) {
+    const candidate = value.choices[index];
+    if (!isJsonObject(candidate) || !isJsonObject(candidate.message)) return null;
+    const message = candidate.message;
+    if (message.role !== "assistant") return null;
+    if (
+      message.content !== null &&
+      (typeof message.content !== "string" || message.content.length > MAX_RESPONSE_CHARACTERS)
+    ) {
+      return null;
+    }
+    const toolCalls = nativeToolCalls(message.tool_calls);
+    if (toolCalls === null) return null;
+    if (message.content === null && toolCalls.length === 0) return null;
+    const expectedFinish = toolCalls.length > 0 ? "tool_calls" : candidate.finish_reason;
+    if (
+      candidate.finish_reason !== expectedFinish ||
+      !(
+        candidate.finish_reason === "stop" ||
+        candidate.finish_reason === "length" ||
+        candidate.finish_reason === "tool_calls"
+      )
+    ) {
+      return null;
+    }
+    choices.push({
+      index,
+      message: {
+        role: "assistant",
+        content: message.content,
+        ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+      },
+      finish_reason: candidate.finish_reason,
+    });
+  }
+  return { choices, usage };
+}
+
+function nativeToolCalls(value: unknown): JsonObject[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_TOOL_CALLS) return null;
+  const calls: JsonObject[] = [];
+  for (const candidate of value) {
+    if (
+      !isJsonObject(candidate) ||
+      candidate.type !== "function" ||
+      typeof candidate.id !== "string" ||
+      !TOOL_CALL_ID.test(candidate.id) ||
+      !isJsonObject(candidate.function) ||
+      typeof candidate.function.name !== "string" ||
+      !TOOL_NAME.test(candidate.function.name) ||
+      typeof candidate.function.arguments !== "string" ||
+      candidate.function.arguments.length > MAX_TOOL_ARGUMENT_CHARACTERS
+    ) {
+      return null;
+    }
+    let argumentsValue: unknown;
+    try {
+      argumentsValue = JSON.parse(candidate.function.arguments);
+    } catch {
+      return null;
+    }
+    if (!isJsonObject(argumentsValue)) return null;
+    calls.push({
+      id: candidate.id,
+      type: "function",
+      function: {
+        name: candidate.function.name,
+        arguments: candidate.function.arguments,
+      },
+    });
+  }
+  return calls;
+}
+
+type NativeUsage = {
+  readonly prompt_tokens: number;
+  readonly completion_tokens: number;
+  readonly total_tokens: number;
+};
+
+function nativeUsage(value: unknown): NativeUsage | null {
+  if (!isJsonObject(value)) return null;
+  const prompt = value.prompt_tokens;
+  const completion = value.completion_tokens;
+  const total = value.total_tokens;
   if (
     !nonNegativeInteger(prompt) ||
     !nonNegativeInteger(completion) ||
@@ -114,10 +212,19 @@ function nativeCompletion(value: unknown): {
   ) {
     return null;
   }
-  return {
-    response: value.response,
-    usage: { prompt_tokens: prompt, completion_tokens: completion, total_tokens: total },
-  };
+  return { prompt_tokens: prompt, completion_tokens: completion, total_tokens: total };
+}
+
+function nativeCompletion(value: unknown): {
+  readonly response: string;
+  readonly usage: NativeUsage;
+} | null {
+  if (!isJsonObject(value)) return null;
+  if (typeof value.response !== "string" || value.response.length > MAX_RESPONSE_CHARACTERS) {
+    return null;
+  }
+  const usage = nativeUsage(value.usage);
+  return usage ? { response: value.response, usage } : null;
 }
 
 function nonNegativeInteger(value: unknown): value is number {

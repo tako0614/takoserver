@@ -379,6 +379,22 @@ export function buildApp(ports: AppPorts): App {
   });
   const dataAi = createDataAiRoutes({
     accounts,
+    authorize: async (authorization) => {
+      const actor = await accounts.authorize(authorization, "ai:invoke");
+      if (actor?.organizationId) return { organizationId: actor.organizationId };
+      const bearer = authorization?.startsWith("Bearer ")
+        ? authorization.slice("Bearer ".length)
+        : null;
+      if (!bearer) return null;
+      try {
+        const claims = await tokens.verifyDataAccessToken(bearer);
+        return claims.scopes.includes("ai:invoke")
+          ? { organizationId: claims.organizationId }
+          : null;
+      } catch {
+        return null;
+      }
+    },
     ...(ports.ai ? { gateway: ports.ai } : {}),
     ledger,
     sql: ports.sql,

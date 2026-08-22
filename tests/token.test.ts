@@ -278,3 +278,30 @@ describe("Takoform run tokens", () => {
     });
   });
 });
+
+describe("data access tokens", () => {
+  test("binds short-lived AI access to one opaque sponsored tenant", async () => {
+    const tokens = service(await provisionKey("sign-data-access"));
+    const issued = await tokens.issueDataAccessToken({
+      organizationId: "org_alpha",
+      tenantRef: "tenant_workspace_x",
+      scopes: ["ai:invoke"],
+      ttlSeconds: 120,
+    });
+
+    expect(issued.expiresAt).toBe(new Date(NOW + 120_000).toISOString());
+    expect(await tokens.verifyDataAccessToken(issued.token)).toMatchObject({
+      organizationId: "org_alpha",
+      tenantRef: "tenant_workspace_x",
+      scopes: ["ai:invoke"],
+    });
+    await expect(
+      tokens.issueDataAccessToken({
+        organizationId: "org_alpha",
+        tenantRef: "tenant_workspace_x",
+        scopes: ["ai:invoke"],
+        ttlSeconds: 121,
+      }),
+    ).rejects.toMatchObject({ code: "token_lifetime_exceeded" });
+  });
+});

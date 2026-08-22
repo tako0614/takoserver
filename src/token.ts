@@ -23,6 +23,7 @@ import {
 const TOKEN_TYPE = "takoserver-token+jwt";
 const PROVISION_AUDIENCE = "tako.provision";
 const TAKOFORM_RUN_AUDIENCE = "takoform.run";
+const DATA_ACCESS_AUDIENCE = "takoserver.data";
 const REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{2,255}$/u;
 const RESOURCE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const KEY_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/u;
@@ -66,6 +67,24 @@ export interface TakoformTenantRunTokenClaims {
   readonly expiresAtEpochSeconds: number;
   readonly tokenId: string;
   readonly runtimeMaterialization?: RuntimeMaterializationAuthority;
+}
+
+export type DataAccessScope = "ai:invoke";
+
+/**
+ * Short-lived reseller data-plane authority for one opaque tenant.
+ *
+ * It is deliberately disjoint from an Organization API key and from a
+ * Takoform runner credential. The only current scope is paid AI invocation;
+ * adding another data plane requires an explicit claim and verifier change.
+ */
+export interface DataAccessTokenClaims {
+  readonly organizationId: string;
+  readonly tenantRef: string;
+  readonly scopes: readonly [DataAccessScope];
+  readonly issuedAtEpochSeconds: number;
+  readonly expiresAtEpochSeconds: number;
+  readonly tokenId: string;
 }
 
 export type TokenErrorCode =
@@ -140,6 +159,15 @@ export interface TokenService {
 
   verifyTakoformTenantRunToken(token: string): Promise<TakoformTenantRunTokenClaims>;
 
+  issueDataAccessToken(input: {
+    readonly organizationId: string;
+    readonly tenantRef: string;
+    readonly scopes: readonly [DataAccessScope];
+    readonly ttlSeconds: number;
+  }): Promise<{ readonly token: string; readonly expiresAt: string }>;
+
+  verifyDataAccessToken(token: string): Promise<DataAccessTokenClaims>;
+
   /** Reusable only within its short lifetime and exact Resource address. */
   verifyTakoformRunToken(token: string): Promise<TakoformRunTokenClaims>;
 
@@ -159,6 +187,7 @@ export interface CreateTokenServiceOptions {
   readonly clock?: Clock;
   readonly maxProvisionTokenLifetimeSeconds?: number;
   readonly maxTakoformRunTokenLifetimeSeconds?: number;
+  readonly maxDataAccessTokenLifetimeSeconds?: number;
   readonly keyCacheSeconds?: number;
 }
 
@@ -169,6 +198,7 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
   const maxTakoformRunLifetime = positiveInteger(
     options.maxTakoformRunTokenLifetimeSeconds ?? 3_600,
   );
+  const maxDataAccessLifetime = positiveInteger(options.maxDataAccessTokenLifetimeSeconds ?? 120);
   const keyCacheSeconds = options.keyCacheSeconds ?? 10;
   const keys = createKeyCache(options.sql, clock, keyCacheSeconds);
 
@@ -339,6 +369,26 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
       return takoformTenantRunClaims(
         await open(token, TAKOFORM_RUN_AUDIENCE, maxTakoformRunLifetime),
       );
+    },
+
+    async issueDataAccessToken(input) {
+      if (input.scopes.length !== 1 || input.scopes[0] !== "ai:invoke") {
+        throw new TypeError("data access scopes are invalid");
+      }
+      return await sign(
+        DATA_ACCESS_AUDIENCE,
+        {
+          organizationId: reference(input.organizationId),
+          scopes: ["ai:invoke"],
+          tenantRef: reference(input.tenantRef),
+        },
+        input.ttlSeconds,
+        maxDataAccessLifetime,
+      );
+    },
+
+    async verifyDataAccessToken(token) {
+      return dataAccessClaims(await open(token, DATA_ACCESS_AUDIENCE, maxDataAccessLifetime));
     },
 
     async claimTakoformRunTokenForCreate(token) {
@@ -656,6 +706,35 @@ function takoformTenantRunClaims(payload: Record<string, unknown>): TakoformTena
       : {
           runtimeMaterialization: boundedRuntimeMaterialization(payload.runtimeMaterialization),
         }),
+  };
+}
+
+function dataAccessClaims(payload: Record<string, unknown>): DataAccessTokenClaims {
+  exactKeys(payload, [
+    "aud",
+    "exp",
+    "iat",
+    "iss",
+    "jti",
+    "nbf",
+    "organizationId",
+    "scopes",
+    "tenantRef",
+  ]);
+  if (
+    !Array.isArray(payload.scopes) ||
+    payload.scopes.length !== 1 ||
+    payload.scopes[0] !== "ai:invoke"
+  ) {
+    fail("malformed_token");
+  }
+  return {
+    organizationId: claimReference(payload.organizationId),
+    tenantRef: claimReference(payload.tenantRef),
+    scopes: ["ai:invoke"],
+    issuedAtEpochSeconds: epochSeconds(payload.iat),
+    expiresAtEpochSeconds: epochSeconds(payload.exp),
+    tokenId: claimReference(payload.jti),
   };
 }
 

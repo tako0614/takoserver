@@ -92,6 +92,24 @@ export function createSponsorshipRoutes(
         return Response.json({ takoformRunCredential: issued }, { status: 201 });
       }
 
+      if (request.method === "POST" && rest.length === 2 && rest[1] === "data-access-tokens") {
+        const body = await jsonObject(request, ["scopes", "expiresInSeconds"]);
+        if (
+          !Array.isArray(body.scopes) ||
+          body.scopes.length !== 1 ||
+          body.scopes[0] !== "ai:invoke"
+        ) {
+          throw new Error();
+        }
+        const issued = await options.tokens.issueDataAccessToken({
+          organizationId,
+          tenantRef,
+          scopes: ["ai:invoke"],
+          ttlSeconds: boundedDataAccessTtl(body.expiresInSeconds),
+        });
+        return Response.json({ dataAccessToken: issued }, { status: 201 });
+      }
+
       if (
         request.method === "POST" &&
         rest.length === 3 &&
@@ -341,6 +359,12 @@ function endpointOrigin(outputsJson: string): string | null {
 function boundedTtl(value: unknown): number {
   const ttl = positiveInteger(value);
   if (ttl > 600) throw new Error();
+  return ttl;
+}
+
+function boundedDataAccessTtl(value: unknown): number {
+  const ttl = positiveInteger(value);
+  if (ttl > 120) throw new Error();
   return ttl;
 }
 
