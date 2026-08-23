@@ -2,9 +2,15 @@
 
 An Open Source, Self-Hostable PaaS with a [Takoform](https://takoform.com) Host
 for declarative infrastructure and ordinary data APIs for already-standardized
-services. Today its shipped infrastructure catalog is the exact ObjectBucket
-Form carried by the released Takoform provider. Object access and
-OpenAI-compatible AI inference are data services, not locally invented Forms.
+services. Its infrastructure catalog is the released Takoform Edge Family,
+exactly as the published provider carries it: on your own machine every
+identity Form — ObjectBucket, EdgeKVNamespace, SQLiteDatabase,
+AtLeastOnceQueue, and ModuleWorker with its version, deployment, and
+attachment Forms — is offered and executed locally
+(`TAKOSERVER_EDGE_FORMS=0` narrows a deliberately storage-only machine back
+to ObjectBucket); pointed at a Cloudflare account it sells what the reviewed
+hosted supplies say. Object access and OpenAI-compatible AI inference are
+data services, not locally invented Forms.
 
 ObjectBucket lifecycle stays in Takoform, while the standard data path is `POST
 /v1/organizations/{organizationId}/resources/{resourceUid}/s3-credentials`.

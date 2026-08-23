@@ -13,12 +13,12 @@ import { createR2HttpObjectStore } from "./objects-r2-http.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
 import { ensureOperatorKey, signOperatorAssertion } from "./operator-key.ts";
 import { resolvePayment } from "./payment-setup.ts";
+import type { ProviderPack } from "./provider-pack.ts";
 import type { Provider } from "./provider-port.ts";
 import { CloudflareProvider } from "./providers/cloudflare.ts";
-import { createLocalProvider } from "./providers/local.ts";
 import { createOpenAiGateway, parseOpenAiModelConfig } from "./providers/openai.ts";
-import { createWorkerdProvider } from "./providers/workerd.ts";
 import { createProvisionerEndpoint } from "./provisioner-endpoint.ts";
+import { createSelfhostComposition } from "./selfhost-composition.ts";
 import { ensureSigningKey, loadSigningKey } from "./signing-key.ts";
 import { createD1HttpSql } from "./sql-d1-http.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
@@ -151,11 +151,6 @@ const objects = sharedBucket
     : createFileObjectStore({ root: dataRoot });
 const clock = () => new Date();
 const edge = await buildEdgeForms();
-const objectBucketOffering = objectBucketProviderOffering(edge.objectBucket.form, {
-  id: "storage.object.standard",
-  displayName: "Object bucket",
-  regions: ["global"],
-});
 
 // The provider reads committed bundles through the same artifact store the
 // Host writes them to, so a Worker can only be published from bytes a tenant
@@ -166,6 +161,13 @@ const artifactStore = createTakoformArtifacts({
   clock,
   randomId: () => crypto.randomUUID(),
 });
+const providerArtifacts = {
+  manifest: (tenantRef: string, digest: string) => artifactStore.resolveManifest(tenantRef, digest),
+  async blob(digest: string) {
+    const stored = await objects.get(`art/${digest.slice("sha256:".length)}`);
+    return stored ? new Uint8Array(await new Response(stored.body).arrayBuffer()) : null;
+  },
+};
 
 /**
  * What this machine can provision on.
@@ -175,18 +177,22 @@ const artifactStore = createTakoformArtifacts({
  * provider, every apply answers that the backend is unavailable, which is true
  * and leaves nothing to run.
  *
- * The catalogue is narrowed to what the chosen provider will actually execute.
- * Listing a Worker for sale on a deployment that cannot run one sells a
- * resource that fails at apply.
+ * Standing on its own, the machine offers the whole released Edge Family —
+ * ObjectBucket through workerd-served ModuleWorkers — because a Takoform Host
+ * that cannot host a Worker is a place to keep files, not a platform.
+ * `TAKOSERVER_EDGE_FORMS=0` narrows the catalog back to object storage for an
+ * operator who deliberately runs a storage-only machine.
  */
-let objectBucketProvider: Provider;
-let providerType: string;
-let providerInstallationRef: string;
-let supplyContractRef: string;
-let deliveryMode: "embedded-binding" | "managed-endpoint";
 let providers: readonly Provider[];
+let providerPacks: readonly ProviderPack[];
+let offerings: ReturnType<typeof compileObjectBucketDeployment>["offerings"];
 if (process.env.CLOUDFLARE_ACCOUNT_ID) {
-  objectBucketProvider = new CloudflareProvider({
+  const objectBucketOffering = objectBucketProviderOffering(edge.objectBucket.form, {
+    id: "storage.object.standard",
+    displayName: "Object bucket",
+    regions: ["global"],
+  });
+  const objectBucketProvider = new CloudflareProvider({
     accountId: required("CLOUDFLARE_ACCOUNT_ID"),
     offerings: [objectBucketOffering],
     authorize: () => `Bearer ${cloudflareToken()}`,
@@ -198,110 +204,88 @@ if (process.env.CLOUDFLARE_ACCOUNT_ID) {
       zoneId: string;
       tenantRef?: string;
     }[],
-    artifacts: {
-      async manifest(tenantRef, digest) {
-        return await artifactStore.resolveManifest(tenantRef, digest);
-      },
-      async blob(digest) {
-        const stored = await objects.get(`art/${digest.slice("sha256:".length)}`);
-        return stored ? new Uint8Array(await new Response(stored.body).arrayBuffer()) : null;
-      },
-    },
+    artifacts: providerArtifacts,
   });
-  providerType = "cloudflare";
-  providerInstallationRef = "cloudflare.primary";
-  supplyContractRef = "cloudflare.operator-contract";
-  deliveryMode = "embedded-binding";
-  providers = [objectBucketProvider];
-} else {
-  objectBucketProvider = createLocalProvider({
-    offerings: [objectBucketOffering],
-    dataRoot,
-  });
-  providerType = "selfhost";
-  providerInstallationRef = "local.primary";
-  supplyContractRef = "local.ownership-contract";
-  deliveryMode = "managed-endpoint";
-  providers = [
-    objectBucketProvider,
-    createWorkerdProvider({
-      // No Worker Form is released by Takoform today. Keep the runtime
-      // available for future exact Forms without advertising a made-up one.
-      offerings: [],
-      runtime: createWorkerdRuntime({
-        root: dataRoot,
-        ...(process.env.TAKOSERVER_WORKERD_PORT
-          ? { port: Number(process.env.TAKOSERVER_WORKERD_PORT) }
-          : {}),
-        async onReload(configPath) {
-          // Started on the first publish rather than at boot, so a machine
-          // that never runs a Worker never runs a runtime for one. After
-          // that it watches the file itself: one tenant's deploy must not
-          // bounce every other tenant's in-flight requests.
-          await workerd.ensure(configPath);
-        },
-      }),
-      artifacts: {
-        manifest: (tenantRef, digest) => artifactStore.resolveManifest(tenantRef, digest),
-        async blob(digest) {
-          const stored = await objects.get(`art/${digest.slice("sha256:".length)}`);
-          return stored ? new Uint8Array(await new Response(stored.body).arrayBuffer()) : null;
-        },
-      },
-      ...(process.env.TAKOSERVER_SUFFIXES
-        ? { suffixes: process.env.TAKOSERVER_SUFFIXES.split(",").map((entry) => entry.trim()) }
-        : {}),
-    }),
-  ];
-}
-
-const deployment = compileObjectBucketDeployment({
-  form: edge.objectBucket.form,
-  provider: objectBucketProvider,
-  providerType,
-  offeringId: objectBucketOffering.id,
-  displayName: objectBucketOffering.displayName,
-  regions: ["global"],
-  providerInstallation: {
-    id: providerInstallationRef,
-    providerPackRef: objectBucketProvider.id,
-    supplyContractRef,
-    state: "active",
-    regions: [{ id: "global", capacity: "available" }],
-  },
-  supplyContract: {
-    id: supplyContractRef,
-    providerType,
-    permittedResourceClasses: ["storage.object"],
-    deliveryModes: [deliveryMode],
-    customerAccess: "operator-only",
-    whiteLabelAllowed: false,
-    endUserTermsRequired: false,
+  const deployment = compileObjectBucketDeployment({
+    form: edge.objectBucket.form,
+    provider: objectBucketProvider,
+    providerType: "cloudflare",
+    offeringId: objectBucketOffering.id,
+    displayName: objectBucketOffering.displayName,
     regions: ["global"],
-    validFrom: "2026-01-01T00:00:00.000Z",
-    evidenceRef:
-      providerType === "selfhost" ? "selfhost-ownership:local" : "operator-contract:cloudflare",
-  },
-  pricePlan: {
-    id: "storage.object.standard.price-v1",
-    currency: "USD",
-    provisioning: { meter: "resource.create", amountMinor: 0 },
-    meters: [],
-  },
-  placement: {
-    deliveryMode,
-    supportPolicyRef: "support:operator:standard",
-    abusePolicyRef: "abuse:operator:standard",
-    portability: {
-      api: "portable",
-      exportFormats: ["s3.object-set.takoform.com/v1"],
-      importFormats: ["s3.object-set.takoform.com/v1"],
-      migrationModes: ["offline", "online"],
+    providerInstallation: {
+      id: "cloudflare.primary",
+      providerPackRef: objectBucketProvider.id,
+      supplyContractRef: "cloudflare.operator-contract",
+      state: "active",
+      regions: [{ id: "global", capacity: "available" }],
     },
-    isolation: "dedicated-resource",
-  },
-  now: clock(),
-});
+    supplyContract: {
+      id: "cloudflare.operator-contract",
+      providerType: "cloudflare",
+      permittedResourceClasses: ["storage.object"],
+      deliveryModes: ["embedded-binding"],
+      customerAccess: "operator-only",
+      whiteLabelAllowed: false,
+      endUserTermsRequired: false,
+      regions: ["global"],
+      validFrom: "2026-01-01T00:00:00.000Z",
+      evidenceRef: "operator-contract:cloudflare",
+    },
+    pricePlan: {
+      id: "storage.object.standard.price-v1",
+      currency: "USD",
+      provisioning: { meter: "resource.create", amountMinor: 0 },
+      meters: [],
+    },
+    placement: {
+      deliveryMode: "embedded-binding",
+      supportPolicyRef: "support:operator:standard",
+      abusePolicyRef: "abuse:operator:standard",
+      portability: {
+        api: "portable",
+        exportFormats: ["s3.object-set.takoform.com/v1"],
+        importFormats: ["s3.object-set.takoform.com/v1"],
+        migrationModes: ["offline", "online"],
+      },
+      isolation: "dedicated-resource",
+    },
+    now: clock(),
+  });
+  providers = [objectBucketProvider];
+  providerPacks = deployment.providerPacks;
+  offerings = deployment.offerings;
+} else {
+  const composition = createSelfhostComposition({
+    edge,
+    dataRoot,
+    runtime: createWorkerdRuntime({
+      root: dataRoot,
+      ...(process.env.TAKOSERVER_WORKERD_PORT
+        ? { port: Number(process.env.TAKOSERVER_WORKERD_PORT) }
+        : {}),
+      async onReload(configPath) {
+        // Started on the first publish rather than at boot, so a machine
+        // that never runs a Worker never runs a runtime for one. After
+        // that it watches the file itself: one tenant's deploy must not
+        // bounce every other tenant's in-flight requests.
+        await workerd.ensure(configPath);
+      },
+    }),
+    artifacts: providerArtifacts,
+    edgeForms: process.env.TAKOSERVER_EDGE_FORMS !== "0",
+    ...(process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX
+      ? { workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX }
+      : {}),
+    ...(process.env.TAKOSERVER_SUFFIXES
+      ? { suffixes: process.env.TAKOSERVER_SUFFIXES.split(",").map((entry) => entry.trim()) }
+      : {}),
+    now: clock(),
+  });
+  providers = [composition.provider];
+  providerPacks = composition.providerPacks;
+  offerings = composition.offerings;
+}
 
 const unconfigured = {
   async verify(): Promise<never> {
@@ -402,8 +386,8 @@ const app = buildApp({
   forms: edge.forms,
   bindings: edge.bindings,
   providers,
-  providerPacks: deployment.providerPacks,
-  offerings: deployment.offerings,
+  providerPacks,
+  offerings,
   artifacts: artifactStore,
   workerModuleInspector: createJavaScriptWorkerModuleInspector(),
   clock,

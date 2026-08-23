@@ -1,6 +1,5 @@
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { WorkerdRuntime, WorkerdSite } from "./providers/workerd.ts";
 
 /**
  * The files and the configuration workerd runs from.
@@ -22,6 +21,35 @@ import type { WorkerdRuntime, WorkerdSite } from "./providers/workerd.ts";
  * customer's address with another customer's site is the failure worth
  * preventing, and it is silent when it happens.
  */
+
+export interface WorkerdSite {
+  /** Directory holding this script's modules. */
+  readonly directory: string;
+  readonly mainModule: string;
+  readonly hostnames: readonly string[];
+  /**
+   * How the asset layer answers a path that matches no file, when the script
+   * declared assets. Absent means it declared none.
+   */
+  readonly assets?: { readonly notFoundHandling: string };
+}
+
+/** The seam a provider publishes through: files present, config rewritten. */
+export interface WorkerdRuntime {
+  /** Makes a published script's files present, replacing whatever was there. */
+  write(
+    name: string,
+    site: WorkerdSite,
+    modules: ReadonlyMap<string, Uint8Array>,
+    assets?: ReadonlyMap<string, Uint8Array>,
+  ): Promise<void>;
+  /** Forgets a script and its files. */
+  remove(name: string): Promise<void>;
+  /** Rewrites the configuration from every script currently published. */
+  reload(): Promise<void>;
+  /** Whether a script is present, for `observe`. */
+  has(name: string): Promise<boolean>;
+}
 
 export interface WorkerdRuntimeOptions {
   /** Directory holding scripts and the generated configuration. */
