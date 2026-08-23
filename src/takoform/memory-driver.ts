@@ -1,4 +1,5 @@
 import type {
+  InstalledTakoformForm,
   TakoformDriverReceipt,
   TakoformResourceDriver,
   TakoformStoredResource,
@@ -13,6 +14,13 @@ import { TakoformHostError } from "./types.ts";
  * projection — can be exercised without a provider in the way. It is the
  * default for embedders evaluating the API and for tests that are about the
  * protocol rather than about any backend.
+ *
+ * One Form obliges even a provisionless driver to answer: `WorkerEndpoint`
+ * declares an outputSchema, and the engine refuses a receipt that omits what
+ * the Form promised. The address a real backend would assign is minted here
+ * deterministically from the resource uid, so it is complete, canonical, and
+ * immutable for the lifetime of the incarnation — exactly the properties the
+ * Form states — while plainly resolving to nothing (`.invalid`).
  */
 export class InMemoryTakoformResourceDriver implements TakoformResourceDriver {
   readonly #nativeByResource = new Map<string, string>();
@@ -61,7 +69,10 @@ export class InMemoryTakoformResourceDriver implements TakoformResourceDriver {
   async apply(
     input: Parameters<TakoformResourceDriver["apply"]>[0],
   ): Promise<TakoformDriverReceipt> {
-    return { observed: structuredClone(input.spec) };
+    return {
+      observed: structuredClone(input.spec),
+      ...mintedOutputs(input.form, input.resourceUid),
+    };
   }
 
   async observe(input: {
@@ -91,7 +102,10 @@ export class InMemoryTakoformResourceDriver implements TakoformResourceDriver {
     }
     this.#resourceByNative.set(nativeKey, resourceKey);
     this.#nativeByResource.set(resourceKey, nativeKey);
-    return { observed: structuredClone(input.spec) };
+    return {
+      observed: structuredClone(input.spec),
+      ...mintedOutputs(input.form, input.resourceUid),
+    };
   }
 
   async delete(input: Parameters<TakoformResourceDriver["delete"]>[0]): Promise<void> {
@@ -100,4 +114,26 @@ export class InMemoryTakoformResourceDriver implements TakoformResourceDriver {
     if (nativeKey !== undefined) this.#resourceByNative.delete(nativeKey);
     this.#nativeByResource.delete(resourceKey);
   }
+}
+
+/**
+ * The outputs a Form's outputSchema obliges the driver to publish.
+ *
+ * Only `WorkerEndpoint` declares one today: a complete HTTPS address the host
+ * assigned. Deterministic hex of the resource uid keeps the address stable for
+ * the incarnation and unique across incarnations, and the reserved `.invalid`
+ * TLD keeps it honest — this driver runs nothing, so the address must not look
+ * like it resolves.
+ */
+function mintedOutputs(
+  form: InstalledTakoformForm,
+  resourceUid: string,
+): Pick<TakoformDriverReceipt, "outputs"> | Record<never, never> {
+  if (!form.outputSchema || form.identity.formRef.kind !== "WorkerEndpoint") return {};
+  const hex = [...new TextEncoder().encode(resourceUid)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("")
+    .slice(0, 60);
+  const hostname = `ep-${hex}.takoform.invalid`;
+  return { outputs: { hostname, url: `https://${hostname}/` } };
 }
