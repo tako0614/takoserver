@@ -41,6 +41,6 @@
   },
   "dependencies": {
     "acorn": "^8.15.0",
-    "drizzle-orm": "0.44.7"
+    "drizzle-orm": "^0.45.2"
   }
 }
