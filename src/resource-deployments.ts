@@ -17,6 +17,13 @@ export interface ResourceDeployment {
   readonly providerPackRef: string;
   readonly providerInstallationRef: string;
   readonly nativeId: string;
+  /**
+   * Whether an IMPORT named this object. A native id this host minted for a
+   * resource it created is not an adoption, so the first import onto such a
+   * resource records a claim rather than moving one; from that claim onwards
+   * the object is immutable for this deployment.
+   */
+  readonly nativeClaimed: boolean;
   readonly state: ResourceDeploymentState;
   readonly observed: JsonObject;
   readonly outputs: JsonObject;
@@ -24,7 +31,13 @@ export interface ResourceDeployment {
   readonly updatedAt: string;
 }
 
-export type NewResourceDeployment = Omit<ResourceDeployment, "createdAt" | "updatedAt">;
+export type NewResourceDeployment = Omit<
+  ResourceDeployment,
+  "createdAt" | "updatedAt" | "nativeClaimed"
+> & {
+  /** Absent means unclaimed: only an import adopts, and creation mints. */
+  readonly nativeClaimed?: boolean;
+};
 
 export interface ResourceDeploymentStore {
   create(input: NewResourceDeployment): Promise<void>;
@@ -44,6 +57,20 @@ export interface ResourceDeploymentStore {
     observed: JsonObject,
     outputs: JsonObject,
   ): Promise<boolean>;
+  /**
+   * Record the first adoption of one live deployment: point it at the named
+   * object and mark it claimed. It applies only while the deployment is
+   * active and holds no claim yet, so a claim can never be moved by a later
+   * import — that refusal is the caller's, and this is the fence under it.
+   */
+  claimNative(input: {
+    readonly tenantId: string;
+    readonly deploymentId: string;
+    readonly expectedNativeId: string;
+    readonly nativeId: string;
+    readonly observed: JsonObject;
+    readonly outputs: JsonObject;
+  }): Promise<boolean>;
   markDeleted(tenantId: string, deploymentId: string, expectedNativeId: string): Promise<boolean>;
   markRetained(
     tenantId: string,
@@ -70,9 +97,9 @@ export function createResourceDeploymentStore(sql: Sql, clock: Clock): ResourceD
       const written = await sql.run(
         `INSERT INTO tf_resource_deployments
            (tenant_id, id, resource_uid, offering_id, provider_pack_ref,
-            provider_installation_ref, native_id, state, observed_json, outputs_json,
-            created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            provider_installation_ref, native_id, native_claimed, state, observed_json,
+            outputs_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           input.tenantId,
           input.id,
@@ -81,6 +108,7 @@ export function createResourceDeploymentStore(sql: Sql, clock: Clock): ResourceD
           input.providerPackRef,
           input.providerInstallationRef,
           input.nativeId,
+          input.nativeClaimed === true ? 1 : 0,
           input.state,
           JSON.stringify(input.observed),
           JSON.stringify(input.outputs),
@@ -100,9 +128,16 @@ export function createResourceDeploymentStore(sql: Sql, clock: Clock): ResourceD
     },
 
     async findByNative(tenantId, providerInstallationRef, nativeId) {
+      // Only a deployment that still GOVERNS its object holds it. A deleted one
+      // released its native resource when it was destroyed, a retained one
+      // deliberately stopped managing it, and a failed one never took it up;
+      // leaving any of them in the claim lookup would make a
+      // destroyed-and-re-created object unmanageable forever, and would hold it
+      // against every other Form kind as well as its own.
       const rows = await sql.query(
         `SELECT * FROM tf_resource_deployments
-         WHERE tenant_id = ? AND provider_installation_ref = ? AND native_id = ? LIMIT 2`,
+         WHERE tenant_id = ? AND provider_installation_ref = ? AND native_id = ?
+           AND state IN ('provisioning', 'candidate', 'active', 'draining') LIMIT 2`,
         [tenantId, providerInstallationRef, nativeId],
       );
       return one(rows);
@@ -163,6 +198,25 @@ export function createResourceDeploymentStore(sql: Sql, clock: Clock): ResourceD
           tenantId,
           deploymentId,
           expectedNativeId,
+        ],
+      );
+      return changed.changes === 1;
+    },
+
+    async claimNative(input) {
+      const changed = await sql.run(
+        `UPDATE tf_resource_deployments
+         SET native_id = ?, native_claimed = 1, observed_json = ?, outputs_json = ?, updated_at = ?
+         WHERE tenant_id = ? AND id = ? AND native_id = ? AND native_claimed = 0
+           AND state = 'active'`,
+        [
+          input.nativeId,
+          JSON.stringify(input.observed),
+          JSON.stringify(input.outputs),
+          now(),
+          input.tenantId,
+          input.deploymentId,
+          input.expectedNativeId,
         ],
       );
       return changed.changes === 1;
@@ -240,6 +294,7 @@ function deployment(row: Row): ResourceDeployment {
     providerPackRef: text(row.provider_pack_ref),
     providerInstallationRef: text(row.provider_installation_ref),
     nativeId: text(row.native_id),
+    nativeClaimed: integer(row.native_claimed) === 1,
     state: state(row.state),
     observed: json(row.observed_json),
     outputs: json(row.outputs_json),

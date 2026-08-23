@@ -145,4 +145,71 @@ describe("Resource Deployments", () => {
       }),
     ).rejects.toThrow();
   });
+  test("a claim belongs to a live deployment, and a minted object is no claim", async () => {
+    const deployments = store();
+    const base = {
+      tenantId: "org_1",
+      resourceUid: "uid_created",
+      offeringId: "storage.object.standard",
+      providerPackRef: "selfhost",
+      providerInstallationRef: "selfhost.primary",
+      nativeId: "bucket:minted",
+      state: "active" as const,
+      observed: {},
+      outputs: {},
+    };
+    await deployments.create({ ...base, id: "dep_created" });
+
+    // Creation mints; it adopts nothing.
+    const minted = await deployments.active("org_1", "uid_created");
+    expect(minted?.nativeClaimed).toBe(false);
+
+    // The first import records the claim and may re-point the deployment,
+    // because there was no claim to move.
+    expect(
+      await deployments.claimNative({
+        tenantId: "org_1",
+        deploymentId: "dep_created",
+        expectedNativeId: "bucket:minted",
+        nativeId: "bucket:adopted",
+        observed: {},
+        outputs: {},
+      }),
+    ).toBe(true);
+    const claimed = await deployments.active("org_1", "uid_created");
+    expect(claimed?.nativeClaimed).toBe(true);
+    expect(claimed?.nativeId).toBe("bucket:adopted");
+    expect(
+      (await deployments.findByNative("org_1", "selfhost.primary", "bucket:adopted"))?.id,
+    ).toBe("dep_created");
+
+    // From its first claim onwards the claim is immutable.
+    expect(
+      await deployments.claimNative({
+        tenantId: "org_1",
+        deploymentId: "dep_created",
+        expectedNativeId: "bucket:adopted",
+        nativeId: "bucket:moved",
+        observed: {},
+        outputs: {},
+      }),
+    ).toBe(false);
+
+    // Destroying the holder releases the object, for every kind, and the
+    // released identifier can be claimed again.
+    expect(await deployments.markDeleted("org_1", "dep_created", "bucket:adopted")).toBe(true);
+    expect(await deployments.findByNative("org_1", "selfhost.primary", "bucket:adopted")).toBe(
+      null,
+    );
+    await deployments.create({
+      ...base,
+      id: "dep_readopted",
+      resourceUid: "uid_other",
+      nativeId: "bucket:adopted",
+      nativeClaimed: true,
+    });
+    expect(
+      (await deployments.findByNative("org_1", "selfhost.primary", "bucket:adopted"))?.id,
+    ).toBe("dep_readopted");
+  });
 });

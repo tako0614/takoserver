@@ -129,6 +129,7 @@ function deployment(
   return {
     tenantId: "organization_123",
     ...identity,
+    nativeClaimed: false,
     state: "active",
     observed: {},
     outputs: {},
