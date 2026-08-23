@@ -12,10 +12,13 @@ a de-facto standard API?
 
 - **Where a standard exists, Takoserver serves that standard API itself.** The
   S3 data plane stays the S3-compatible API; the AI data plane is the
-  OpenAI-compatible Responses API; a future cache is the Redis protocol, mail
-  submission is SMTP — onward down the survey's integrate column. Takoserver
-  never mints its own surface for a category the industry already made
-  portable.
+  OpenAI-compatible API, today the non-streaming Chat Completions shape at
+  `/v1/ai/chat/completions` that `src/data-ai.ts` and the canonical OpenAPI
+  document actually serve — Responses is where that surface is headed, not
+  what it is, and this record does not pretend otherwise; a future cache is
+  the Redis protocol, mail submission is SMTP — onward down the survey's
+  integrate column. Takoserver never mints its own surface for a category the
+  industry already made portable.
 - **Where none exists, Takoserver serves Takoform.** The vendor-locked
   categories — workers, functions, containers, tables, queues, topics,
   schedules, vector indexes, and their families — reach Takoserver only as
