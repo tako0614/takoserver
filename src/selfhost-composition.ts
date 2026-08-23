@@ -1,0 +1,185 @@
+import type { PricePlan, ProviderInstallation, SupplyContract } from "./catalog-compiler.ts";
+import {
+  compileDeploymentComposition,
+  createCatalogCandidate,
+  createProvisioningProviderPack,
+  type DeploymentComposition,
+} from "./deployment-composition.ts";
+import {
+  type EdgeFormBundle,
+  edgeProviderOffering,
+  objectBucketProviderOffering,
+} from "./edge-forms.ts";
+import { HOSTED_EDGE_IDENTITY_CLASSES } from "./hosted-edge-supplies.ts";
+import type { Provider, ProviderOffering } from "./provider-port.ts";
+import {
+  createSelfhostProvider,
+  type SelfhostArtifacts,
+  type SelfhostProviderOptions,
+} from "./providers/selfhost.ts";
+import type { WorkerdRuntime } from "./workerd-runtime.ts";
+
+/**
+ * Composes what a machine standing on its own sells and executes.
+ *
+ * The whole released Edge Family goes through ONE provider and one
+ * installation, for the same reason the Worker entry holds Cloudflare to one:
+ * a Worker Version inherits the installation of every relation it binds, and
+ * two installations on one machine would refuse the version that uses a bucket
+ * and a KV namespace together.
+ *
+ * A self-hosted Takoserver that cannot host a Worker is not a Takoform Host,
+ * so the Edge Family is offered by default. `edgeForms: false` narrows the
+ * catalog back to object storage for an operator who deliberately runs a
+ * storage-only machine.
+ */
+
+const SUPPLY_CONTRACT_REF = "local.ownership-contract";
+const PROVIDER_INSTALLATION_REF = "local.primary";
+
+/** Forms the Host executes itself; they are never provider capabilities. */
+const HOST_INTRINSIC = new Set([
+  "WorkerBundle",
+  "StaticAssetBundle",
+  "SQLiteMigrationSet",
+  "SQLiteMigrationApplication",
+]);
+
+export interface SelfhostCompositionOptions {
+  readonly edge: EdgeFormBundle;
+  readonly dataRoot: string;
+  readonly runtime: WorkerdRuntime;
+  readonly artifacts: SelfhostArtifacts;
+  /** Whether the released Edge Family is offered. On by default upstream. */
+  readonly edgeForms: boolean;
+  readonly workerEndpointSuffix?: string;
+  readonly suffixes?: readonly string[];
+  readonly now: Date;
+}
+
+export interface SelfhostComposition extends DeploymentComposition {
+  readonly provider: Provider;
+}
+
+export function createSelfhostComposition(
+  options: SelfhostCompositionOptions,
+): SelfhostComposition {
+  const objectBucketOffering = objectBucketProviderOffering(options.edge.objectBucket.form, {
+    id: "storage.object.standard",
+    displayName: "Object bucket",
+    regions: ["global"],
+  });
+
+  const identityOfferings: { offering: ProviderOffering; resourceClass: string }[] = [
+    { offering: objectBucketOffering, resourceClass: "storage.object" },
+  ];
+  const technicalOfferings: ProviderOffering[] = [objectBucketOffering];
+
+  if (options.edgeForms) {
+    for (const form of options.edge.forms) {
+      const kind = form.identity.formRef.kind;
+      if (form.role === "identity") {
+        if (!(kind in HOSTED_EDGE_IDENTITY_CLASSES)) continue;
+        const resourceClass =
+          HOSTED_EDGE_IDENTITY_CLASSES[kind as keyof typeof HOSTED_EDGE_IDENTITY_CLASSES];
+        const offering = edgeProviderOffering(form, {
+          id: `${resourceClass}.standard`,
+          regions: ["global"],
+        });
+        identityOfferings.push({ offering, resourceClass });
+        technicalOfferings.push(offering);
+        continue;
+      }
+      if (HOST_INTRINSIC.has(kind)) continue;
+      // The relation-owned Forms are provider capabilities, not retail items.
+      // Exactly one technical projection per exact Form, so the provider
+      // driver can inherit it from the identity Deployment.
+      technicalOfferings.push(
+        edgeProviderOffering(form, { id: `selfhost.edge.${kind.toLowerCase()}` }),
+      );
+    }
+  }
+
+  const provider = createSelfhostProvider({
+    offerings: technicalOfferings,
+    dataRoot: options.dataRoot,
+    runtime: options.runtime,
+    artifacts: options.artifacts,
+    ...(options.workerEndpointSuffix ? { workerEndpointSuffix: options.workerEndpointSuffix } : {}),
+    ...(options.suffixes ? { suffixes: options.suffixes } : {}),
+  } satisfies SelfhostProviderOptions);
+
+  const supplyContract: SupplyContract = {
+    id: SUPPLY_CONTRACT_REF,
+    providerType: "selfhost",
+    permittedResourceClasses: [
+      ...new Set(identityOfferings.map((entry) => entry.resourceClass)),
+    ].sort(),
+    deliveryModes: ["managed-endpoint"],
+    customerAccess: "operator-only",
+    whiteLabelAllowed: false,
+    endUserTermsRequired: false,
+    regions: ["global"],
+    validFrom: "2026-01-01T00:00:00.000Z",
+    evidenceRef: "selfhost-ownership:local",
+  };
+
+  const providerInstallation: ProviderInstallation = {
+    id: PROVIDER_INSTALLATION_REF,
+    providerPackRef: provider.id,
+    supplyContractRef: supplyContract.id,
+    state: "active",
+    regions: [{ id: "global", capacity: "available" }],
+  };
+
+  const pack = createProvisioningProviderPack({ provider, providerType: "selfhost" });
+
+  const pricePlans: PricePlan[] = [];
+  const candidates = identityOfferings.map(({ offering, resourceClass }) => {
+    // Self-host sells to its own operator: creating a resource on a machine
+    // they already pay for costs nothing at the catalog.
+    const pricePlan: PricePlan = {
+      id: `${offering.id}.price-v1`,
+      currency: "USD",
+      provisioning: { meter: "resource.create", amountMinor: 0 },
+      meters: [],
+    };
+    pricePlans.push(pricePlan);
+    return createCatalogCandidate(offering, {
+      providerPackRef: pack.id,
+      providerInstallationRef: providerInstallation.id,
+      supplyContractRef: supplyContract.id,
+      pricePlanRef: pricePlan.id,
+      resourceClass,
+      deliveryMode: "managed-endpoint",
+      supportPolicyRef: "support:operator:standard",
+      abusePolicyRef: "abuse:operator:standard",
+      portability:
+        resourceClass === "storage.object"
+          ? {
+              api: "portable",
+              exportFormats: ["s3.object-set.takoform.com/v1"],
+              importFormats: ["s3.object-set.takoform.com/v1"],
+              migrationModes: ["offline", "online"],
+            }
+          : {
+              api: "portable",
+              exportFormats: [],
+              importFormats: [],
+              migrationModes: [],
+            },
+      isolation: "dedicated-resource",
+    });
+  });
+
+  const compiled = compileDeploymentComposition({
+    candidates,
+    providerPacks: [pack],
+    providerInstallations: [providerInstallation],
+    supplyContracts: [supplyContract],
+    pricePlans,
+    now: options.now,
+  });
+
+  return { ...compiled, provider };
+}
