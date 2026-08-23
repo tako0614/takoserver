@@ -468,10 +468,16 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
         input.nativeId,
       );
       const current = await deployments.active(input.tenantId, input.resourceUid);
+      // A claim is immutable from the moment it is made, but a native id this
+      // host MINTED is not a claim: the ordinary import onto an address a
+      // configuration already manages names the object for the first time, and
+      // a host that refused it could never be imported into at all. So the
+      // refusal is a claim that already exists and names another object, never
+      // the mere presence of a minted one.
       if (
         (claim && claim.resourceUid !== input.resourceUid) ||
         (current &&
-          (current.nativeId !== input.nativeId ||
+          ((current.nativeClaimed && current.nativeId !== input.nativeId) ||
             current.offeringId !== offering.id ||
             current.providerInstallationRef !== providerInstallationRef))
       ) {
@@ -492,7 +498,25 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
         throw new TakoformHostError("import_conflict", 409);
       }
       if (current) {
-        await refresh(current, result);
+        // Recording the claim is the whole point of an import, and it is
+        // recorded even when the named object is the one already deployed:
+        // otherwise the first import would leave nothing behind and the next
+        // workspace would adopt the same object unopposed. The fence is in the
+        // ledger, so a concurrent import cannot record two first claims.
+        if (current.nativeClaimed) {
+          await refresh(current, result);
+        } else if (
+          !(await deployments.claimNative({
+            tenantId: input.tenantId,
+            deploymentId: current.id,
+            expectedNativeId: current.nativeId,
+            nativeId: result.nativeId,
+            observed: result.observed,
+            outputs: result.outputs,
+          }))
+        ) {
+          throw new TakoformHostError("resource_busy", 409);
+        }
       } else {
         try {
           await deployments.create({
@@ -503,6 +527,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
             providerPackRef: provider.id,
             providerInstallationRef,
             nativeId: result.nativeId,
+            nativeClaimed: true,
             state: "active",
             observed: result.observed,
             outputs: result.outputs,

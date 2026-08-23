@@ -15,6 +15,7 @@ const deployment = (provider: "cloudflare" | "wasabi"): ResourceDeployment => ({
     provider === "cloudflare"
       ? "r2:ts-0123456789abcdef0123456789abcdef01234567"
       : "wasabi:eu-central-2:ts-0123456789abcdef0123456789abcdef01234567",
+  nativeClaimed: false,
   state: "active",
   observed: {},
   outputs: {},
@@ -30,6 +31,7 @@ const edgeDeployment = (nativeId: string): ResourceDeployment => ({
   providerPackRef: "cloudflare",
   providerInstallationRef: "cloudflare.production",
   nativeId,
+  nativeClaimed: false,
   state: "active",
   observed: {},
   outputs: {},

@@ -89,6 +89,8 @@ export const takoformResourceDeployments = sqliteTable(
     providerPackRef: text("provider_pack_ref").notNull(),
     providerInstallationRef: text("provider_installation_ref").notNull(),
     nativeId: text("native_id").notNull(),
+    /** 1 when an import named this object; a minted one is not an adoption. */
+    nativeClaimed: integer("native_claimed").notNull().default(0),
     state: text("state").notNull(),
     observedJson: text("observed_json").notNull(),
     outputsJson: text("outputs_json").notNull(),
