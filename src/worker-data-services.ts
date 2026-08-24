@@ -37,12 +37,12 @@ export interface WorkerDataServices {
  */
 export function createWorkerDataServices(env: WorkerDataServiceEnv): WorkerDataServices {
   const aiConfigured = env.TAKOSERVER_AI_MODELS !== undefined;
-  const s3Configured =
-    env.TAKOSERVER_OBJECT_BUCKET_SUPPLIES !== undefined ||
-    env.TAKOSERVER_R2_PARENT_ACCESS_KEY_ID !== undefined ||
-    env.TAKOSERVER_R2_PARENT_TOKEN !== undefined ||
-    env.TAKOSERVER_WASABI_ACCESS_KEY_ID !== undefined ||
-    env.TAKOSERVER_WASABI_SECRET_ACCESS_KEY !== undefined;
+  // Historical provider credentials are not configuration authority by
+  // themselves. Cloudflare keeps Worker secrets across Versions, so a retired
+  // ObjectBucket token can remain bound after the explicit retained supply is
+  // removed. Only that bounded supply document may activate the legacy S3
+  // credential issuer; otherwise every credential remnant is inert.
+  const s3Configured = env.TAKOSERVER_OBJECT_BUCKET_SUPPLIES !== undefined;
 
   if (!aiConfigured && !s3Configured) return {};
 
