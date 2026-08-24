@@ -289,7 +289,8 @@ async function assertRequiredSecretsPresent(
           },
         ]
       : []),
-    ...(target.edgeSupplies ||
+    ...(target.standardServiceSupplies ||
+    target.edgeSupplies ||
     target.objectBucketSupplies?.supplies.some((supply) => supply.provider.kind === "cloudflare")
       ? [
           {

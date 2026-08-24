@@ -9,6 +9,10 @@ import {
   parseHostedObjectBucketSupplies,
 } from "../../src/hosted-object-bucket-supplies.ts";
 import { parseOpenAiModelConfig } from "../../src/providers/openai.ts";
+import {
+  type ProductionStandardServiceSupplies,
+  parseProductionStandardServiceSupplies,
+} from "../../src/standard-service-production.ts";
 import { preflightError } from "./errors.ts";
 import { REPOSITORY } from "./process.ts";
 
@@ -66,6 +70,8 @@ export interface DeployTarget {
   readonly aiModels?: readonly Record<string, unknown>[];
   /** Public id of the R2 parent token used to mint temporary S3 credentials. */
   readonly r2ParentAccessKeyId?: string;
+  /** Host-owned stable protocol supplies; no Form or commercial Offering identity. */
+  readonly standardServiceSupplies?: ProductionStandardServiceSupplies;
   /** Non-secret commercial/provider composition emitted by takoserver-private. */
   readonly objectBucketSupplies?: HostedObjectBucketSupplies;
   /** Reviewed Cloudflare sales for released edge identity Forms. */
@@ -151,6 +157,7 @@ function validateTarget(value: unknown, path: string): DeployTarget {
       "zones",
       "aiModels",
       "r2ParentAccessKeyId",
+      "standardServiceSupplies",
       "objectBucketSupplies",
       "edgeSupplies",
       "workerEndpointSuffix",
@@ -195,6 +202,13 @@ function validateTarget(value: unknown, path: string): DeployTarget {
       ? {}
       : {
           r2ParentAccessKeyId: pattern(value.r2ParentAccessKeyId, KEY_ID, "r2ParentAccessKeyId"),
+        }),
+    ...(value.standardServiceSupplies === undefined
+      ? {}
+      : {
+          standardServiceSupplies: parseProductionStandardServiceSupplies(
+            value.standardServiceSupplies,
+          ),
         }),
     ...(value.objectBucketSupplies === undefined
       ? {}
