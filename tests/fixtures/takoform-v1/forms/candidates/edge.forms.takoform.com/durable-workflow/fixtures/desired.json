@@ -1,0 +1,8 @@
+{
+  "className": "OrderFulfilment",
+  "worker": {
+    "apiVersion": "edge.forms.takoform.com",
+    "kind": "ModuleWorker",
+    "name": "module-worker"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "cron": "*/5 * * * *",
+  "paused": false,
+  "retryPolicy": {
+    "maxAttempts": 3,
+    "retryDelaySeconds": 60
+  }
+}

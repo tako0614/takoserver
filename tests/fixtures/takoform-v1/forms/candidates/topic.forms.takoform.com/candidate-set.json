@@ -1,0 +1,35 @@
+{
+  "format": "takoform.form-family-candidates@v1",
+  "family": "topic.forms.takoform.com",
+  "formMaturity": "experimental",
+  "packageApiVersion": "packages.forms.takoform.com/v1alpha5",
+  "publicationStatus": "unpublished",
+  "authoringSource": "internal/topicformcatalog",
+  "authoringPolicy": "service-shape-preserving-contract",
+  "forms": [
+    {
+      "kind": "Topic",
+      "role": "identity",
+      "path": "forms/candidates/topic.forms.takoform.com/topic",
+      "formRef": {
+        "apiVersion": "topic.forms.takoform.com",
+        "kind": "Topic",
+        "definitionVersion": "0.1.0",
+        "schemaDigest": "sha256:425e21346190addd2ffb8a95d69afaa81f18f3a8d3d158de6496014482acaf80"
+      },
+      "packageDigest": "sha256:468ebf9836b45b2392a327644f989d1a2aa8fbed58efb4761a22a744ea185e4c"
+    },
+    {
+      "kind": "TopicSubscription",
+      "role": "attachment",
+      "path": "forms/candidates/topic.forms.takoform.com/topic-subscription",
+      "formRef": {
+        "apiVersion": "topic.forms.takoform.com",
+        "kind": "TopicSubscription",
+        "definitionVersion": "0.1.0",
+        "schemaDigest": "sha256:7256be928d86025e2f9ab2d711ee52f218c6c2295bea865a78602dba960da56f"
+      },
+      "packageDigest": "sha256:c40152191b8013154be18b9599af1990761672617c358ccef25796ac1117afde"
+    }
+  ]
+}

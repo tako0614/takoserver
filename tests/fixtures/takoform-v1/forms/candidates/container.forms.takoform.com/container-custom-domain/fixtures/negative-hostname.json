@@ -1,0 +1,8 @@
+{
+  "hostname": "not a hostname",
+  "service": {
+    "apiVersion": "container.forms.takoform.com",
+    "kind": "ContainerService",
+    "name": "container-service"
+  }
+}

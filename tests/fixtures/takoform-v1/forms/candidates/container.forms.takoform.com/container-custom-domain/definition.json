@@ -1,0 +1,118 @@
+{
+  "apiVersion": "container.forms.takoform.com",
+  "kind": "ContainerCustomDomain",
+  "definitionVersion": "0.1.0",
+  "title": "Container Custom Domain",
+  "description": "HTTPS attachment that serves one canonical customer-owned hostname from the active Container Traffic. ACME certificate issuance and TLS termination are host duties.",
+  "role": "attachment",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "constraints": [
+    {
+      "kind": "claim",
+      "property": "/hostname"
+    }
+  ],
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "HTTPS attachment that serves one canonical customer-owned hostname from the active Container Traffic. ACME certificate issuance and TLS termination are host duties.",
+    "properties": {
+      "hostname": {
+        "description": "Customer-owned DNS hostname served by this attachment. The host canonicalizes it before comparison and storage; ACME certificate issuance is the host's duty.",
+        "maxLength": 253,
+        "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+\\.?$",
+        "type": "string"
+      },
+      "service": {
+        "additionalProperties": false,
+        "description": "Container Service served on this hostname. Changing it replaces the attachment.",
+        "properties": {
+          "apiVersion": {
+            "const": "container.forms.takoform.com",
+            "type": "string"
+          },
+          "kind": {
+            "const": "ContainerService",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "apiVersion",
+          "kind",
+          "name"
+        ],
+        "type": "object",
+        "x-takoform-required-entrypoint": "http",
+        "x-takoform-target-formrefs": [
+          {
+            "apiVersion": "container.forms.takoform.com",
+            "definitionVersion": "0.1.0",
+            "kind": "ContainerService",
+            "schemaDigest": "sha256:710993f0cebc6c70191ff19b2399efb5c1e66af5df005a7b87ff53e6a5b7c2da"
+          }
+        ]
+      }
+    },
+    "required": [
+      "hostname",
+      "service"
+    ],
+    "title": "Container Custom Domain desired state",
+    "type": "object"
+  },
+  "immutableFields": [
+    "/hostname",
+    "/service"
+  ],
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-service",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-service.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-hostname",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-hostname.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-service",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-service.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-hostname",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-hostname.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

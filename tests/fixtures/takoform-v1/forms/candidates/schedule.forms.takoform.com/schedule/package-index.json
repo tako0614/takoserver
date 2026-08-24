@@ -1,0 +1,109 @@
+{
+  "apiVersion": "packages.forms.takoform.com/v1alpha5",
+  "kind": "FormPackage",
+  "formRef": {
+    "apiVersion": "schedule.forms.takoform.com",
+    "kind": "Schedule",
+    "definitionVersion": "0.1.0",
+    "schemaDigest": "sha256:d99904fdf12f983e3691ca8af1a3afa3baaa0c55ab966dcb6d4efab909761afb"
+  },
+  "definitionPath": "definition.json",
+  "files": [
+    {
+      "path": "definition.json",
+      "mediaType": "application/vnd.takoform.form-definition.v1+json",
+      "size": 14630,
+      "digest": "sha256:4f2f8d8de0cc016e02b7de21922697d2df8be0858b5e17e0b4e79ea6db9fed7d"
+    },
+    {
+      "path": "fixtures/desired.json",
+      "mediaType": "application/json",
+      "size": 430,
+      "digest": "sha256:91f23248adff2ac774c46ed5bd20e6927fe673af85cd088bda841eaaa97e90ee"
+    },
+    {
+      "path": "fixtures/negative-cron.json",
+      "mediaType": "application/json",
+      "size": 426,
+      "digest": "sha256:8e84c841bee38668d658d11333c61725299c32258cd7110dc0f49e8fa4de0909"
+    },
+    {
+      "path": "fixtures/negative-missing-cron.json",
+      "mediaType": "application/json",
+      "size": 405,
+      "digest": "sha256:f3c84a434232bb65f7251a9d1b36e13e7b231c5acbdc3cbc809abca37a39007e"
+    },
+    {
+      "path": "fixtures/negative-missing-paused.json",
+      "mediaType": "application/json",
+      "size": 411,
+      "digest": "sha256:b6b10355e6ea9a4810927ce2dd162bb05a849147bba2b4bcf6334bc9bed9f470"
+    },
+    {
+      "path": "fixtures/negative-missing-retry-policy.json",
+      "mediaType": "application/json",
+      "size": 356,
+      "digest": "sha256:191fc889edc6fc289cc6814d348b36fa9190f2950d04c124350bb128388fd87a"
+    },
+    {
+      "path": "fixtures/negative-missing-target.json",
+      "mediaType": "application/json",
+      "size": 121,
+      "digest": "sha256:4eaff9e38d919fab241d8bec2bd914573bb3df6ce4a59a5c0f577377b5cc8b3c"
+    },
+    {
+      "path": "fixtures/negative-retry-policy-max-attempts.json",
+      "mediaType": "application/json",
+      "size": 430,
+      "digest": "sha256:12dd31b4bd018c35f2be3721c89d890524a131ecbd9de1f906932be9ade45ec3"
+    },
+    {
+      "path": "fixtures/negative-retry-policy-retry-delay-seconds.json",
+      "mediaType": "application/json",
+      "size": 432,
+      "digest": "sha256:bf0006437e8f989701dbf16e2b7f9d70b6b84c9599a3b82c038cb025e96a1c43"
+    },
+    {
+      "path": "fixtures/negative-retry-policy.json",
+      "mediaType": "application/json",
+      "size": 411,
+      "digest": "sha256:19a4cf72e2acbbd4c318e433dbcda73811ecfa5ebf3a425be844a84f749159a0"
+    },
+    {
+      "path": "fixtures/negative-target-queuemessage-attributes.json",
+      "mediaType": "application/json",
+      "size": 434,
+      "digest": "sha256:086a51ac1fcae57a80459647d2410568ceab97aa71ace5a32fc28e0d599d7200"
+    },
+    {
+      "path": "fixtures/negative-target-queuemessage-body-utf8-data.json",
+      "mediaType": "application/json",
+      "size": 415,
+      "digest": "sha256:74daa15872f6adb190f69d482757e7aeb3b9a90d2aa28652ff1e797568be7de2"
+    },
+    {
+      "path": "fixtures/negative-target-queuemessage-body.json",
+      "mediaType": "application/json",
+      "size": 413,
+      "digest": "sha256:fca29d6f2f9ecab7f844a0eb7f05efcc53553b8b7aa710a04d034379d3d251ef"
+    },
+    {
+      "path": "fixtures/negative-target-queuemessage-queue.json",
+      "mediaType": "application/json",
+      "size": 435,
+      "digest": "sha256:5faf6ef1e1660b50b83d787d0ebdd49a2fb0c2c53885402d7460665c360bb178"
+    },
+    {
+      "path": "fixtures/negative-target.json",
+      "mediaType": "application/json",
+      "size": 177,
+      "digest": "sha256:a1fbedff317b6af02b7581cdb8e6b3ec05717dcba0824276e03ac8f73f1f379c"
+    },
+    {
+      "path": "fixtures/negative-unexpected-property.json",
+      "mediaType": "application/json",
+      "size": 460,
+      "digest": "sha256:855aac10223a013a1beb275bd8835f9dabbe686d7452041fc422ccc1375a81f1"
+    }
+  ]
+}

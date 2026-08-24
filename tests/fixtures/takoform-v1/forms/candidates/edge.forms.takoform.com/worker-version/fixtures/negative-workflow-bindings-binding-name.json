@@ -1,0 +1,106 @@
+{
+  "actorBindings": [
+    {
+      "name": "ROOMS",
+      "resource": {
+        "apiVersion": "edge.forms.takoform.com",
+        "kind": "ActorNamespace",
+        "name": "actor-namespace"
+      }
+    }
+  ],
+  "assets": {
+    "bundle": {
+      "apiVersion": "edge.forms.takoform.com",
+      "kind": "StaticAssetBundle",
+      "name": "static-asset-bundle"
+    },
+    "notFoundHandling": "single_page_application",
+    "runWorkerFirst": true
+  },
+  "bundle": {
+    "apiVersion": "edge.forms.takoform.com",
+    "kind": "WorkerBundle",
+    "name": "worker-bundle"
+  },
+  "externalServices": [
+    {
+      "name": "PRIMARY_DB",
+      "service": {
+        "apiVersion": "standards.takoform.com/v1",
+        "protocol": "org.postgresql.wire"
+      }
+    },
+    {
+      "name": "MEDIA",
+      "service": {
+        "apiVersion": "standards.takoform.com/v1",
+        "protocol": "com.amazonaws.s3"
+      }
+    }
+  ],
+  "handlers": [
+    "fetch"
+  ],
+  "kvBindings": [
+    {
+      "name": "CACHE",
+      "resource": {
+        "apiVersion": "edge.forms.takoform.com",
+        "kind": "EdgeKVNamespace",
+        "name": "edge-kv-namespace"
+      }
+    }
+  ],
+  "queueProducerBindings": [
+    {
+      "name": "EVENTS",
+      "resource": {
+        "apiVersion": "edge.forms.takoform.com",
+        "kind": "AtLeastOnceQueue",
+        "name": "at-least-once-queue"
+      }
+    }
+  ],
+  "requiredSensitiveVars": [
+    "API_SIGNING_TOKEN_NAME"
+  ],
+  "serviceBindings": [
+    {
+      "name": "AUTH",
+      "resource": {
+        "apiVersion": "edge.forms.takoform.com",
+        "kind": "ModuleWorker",
+        "name": "auth-worker"
+      }
+    }
+  ],
+  "sqliteBindings": [
+    {
+      "name": "DB",
+      "resource": {
+        "apiVersion": "edge.forms.takoform.com",
+        "kind": "SQLiteDatabase",
+        "name": "sqlite-database"
+      }
+    }
+  ],
+  "vars": {
+    "LOG_LEVEL": "info"
+  },
+  "worker": {
+    "apiVersion": "edge.forms.takoform.com",
+    "kind": "ModuleWorker",
+    "name": "module-worker"
+  },
+  "workflowBindings": [
+    {
+      "name": "1binding",
+      "resource": {
+        "apiVersion": "edge.forms.takoform.com",
+        "kind": "DurableWorkflow",
+        "name": "example-target"
+      }
+    }
+  ]
+}

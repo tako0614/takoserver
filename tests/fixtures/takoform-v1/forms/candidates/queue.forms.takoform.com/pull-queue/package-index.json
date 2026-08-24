@@ -1,0 +1,85 @@
+{
+  "apiVersion": "packages.forms.takoform.com/v1alpha5",
+  "kind": "FormPackage",
+  "formRef": {
+    "apiVersion": "queue.forms.takoform.com",
+    "kind": "PullQueue",
+    "definitionVersion": "0.1.0",
+    "schemaDigest": "sha256:1ee156919f8399cac58ecf16e73a90239224cb01c81be634d8c305dbf3156599"
+  },
+  "definitionPath": "definition.json",
+  "files": [
+    {
+      "path": "definition.json",
+      "mediaType": "application/vnd.takoform.form-definition.v1+json",
+      "size": 6828,
+      "digest": "sha256:53a140bbf9d88f6d931bf2cd8f8441d14e046887d1fecc9e2c736ed2ceb3f494"
+    },
+    {
+      "path": "fixtures/desired.json",
+      "mediaType": "application/json",
+      "size": 288,
+      "digest": "sha256:49190743a507ef502fb0c55272184a52eb01e653a9f46f5e0926e397d2e8de83"
+    },
+    {
+      "path": "fixtures/negative-dead-letter-max-receive-count.json",
+      "mediaType": "application/json",
+      "size": 288,
+      "digest": "sha256:6054178e6da1354b555d4375bb77e785fc5955543d969d2dbdd53d6dae65ace1"
+    },
+    {
+      "path": "fixtures/negative-dead-letter-queue.json",
+      "mediaType": "application/json",
+      "size": 295,
+      "digest": "sha256:a1aa241e3e661bfee197d1ee8e99e2558efb5796210dd13e2b287d7c0eb09f9d"
+    },
+    {
+      "path": "fixtures/negative-dead-letter.json",
+      "mediaType": "application/json",
+      "size": 168,
+      "digest": "sha256:572afbe899285106d5fc16765bd44aa3ea0b12e84fb936a98901d4963cca1c0c"
+    },
+    {
+      "path": "fixtures/negative-default-visibility-timeout-seconds.json",
+      "mediaType": "application/json",
+      "size": 291,
+      "digest": "sha256:82971935f3bd0fea88e601291178e464d03405ff26a7ff55005310ddd03424cc"
+    },
+    {
+      "path": "fixtures/negative-message-retention-seconds.json",
+      "mediaType": "application/json",
+      "size": 284,
+      "digest": "sha256:3c34fd1fe112a732b995a237824a7c870ed082b6a7a617e85f85a09f492a9251"
+    },
+    {
+      "path": "fixtures/negative-missing-default-visibility-timeout-seconds.json",
+      "mediaType": "application/json",
+      "size": 247,
+      "digest": "sha256:862b7e9fa05a817762b78f2c8fac71f20bab480ec050dc98e0c9554243922b64"
+    },
+    {
+      "path": "fixtures/negative-missing-message-retention-seconds.json",
+      "mediaType": "application/json",
+      "size": 251,
+      "digest": "sha256:cb2798afca7bc1caf2ca40f968489524af0ac931a50f85fbb6685cb3ebb4252b"
+    },
+    {
+      "path": "fixtures/negative-missing-receive-wait-bound-seconds.json",
+      "mediaType": "application/json",
+      "size": 255,
+      "digest": "sha256:ac63b003ef94a887e282dcba4bcd56d061cd4ffdf14c5298469a1651acdbeafb"
+    },
+    {
+      "path": "fixtures/negative-receive-wait-bound-seconds.json",
+      "mediaType": "application/json",
+      "size": 288,
+      "digest": "sha256:2b3d3755e8f552d9ef33b3c423debf3e4b30ecc372ad8ea73fc9f2dc595477b4"
+    },
+    {
+      "path": "fixtures/negative-unexpected-property.json",
+      "mediaType": "application/json",
+      "size": 318,
+      "digest": "sha256:11cf276f2eeeaeb8a333945477725d2cb8964e5950f9d10f1196ca25b5d4c0db"
+    }
+  ]
+}

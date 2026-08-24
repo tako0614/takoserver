@@ -1,0 +1,4 @@
+{
+  "deliveryDelaySeconds": 0,
+  "messageRetentionSeconds": 345600
+}

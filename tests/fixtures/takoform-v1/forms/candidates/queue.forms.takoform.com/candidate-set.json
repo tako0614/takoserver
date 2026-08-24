@@ -1,0 +1,23 @@
+{
+  "format": "takoform.form-family-candidates@v1",
+  "family": "queue.forms.takoform.com",
+  "formMaturity": "experimental",
+  "packageApiVersion": "packages.forms.takoform.com/v1alpha5",
+  "publicationStatus": "unpublished",
+  "authoringSource": "internal/queueformcatalog",
+  "authoringPolicy": "service-shape-preserving-contract",
+  "forms": [
+    {
+      "kind": "PullQueue",
+      "role": "identity",
+      "path": "forms/candidates/queue.forms.takoform.com/pull-queue",
+      "formRef": {
+        "apiVersion": "queue.forms.takoform.com",
+        "kind": "PullQueue",
+        "definitionVersion": "0.1.0",
+        "schemaDigest": "sha256:1ee156919f8399cac58ecf16e73a90239224cb01c81be634d8c305dbf3156599"
+      },
+      "packageDigest": "sha256:67f5eb98e6ac3617f383f76778a382527ab4312edd5c63ef81f49d7bda1caa82"
+    }
+  ]
+}

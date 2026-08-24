@@ -1,0 +1,34 @@
+{
+  "apiVersion": "bindings.takoform.com/v1alpha2",
+  "kind": "BindingDefinition",
+  "name": "module-worker.workflow",
+  "version": "1.0.0",
+  "title": "Module Worker durable workflow binding",
+  "description": "Projects the INSTANCE surface of worker.workflow into a Worker Version. The entrypoint half of that contract — run and the step operations — is what the host provides to the workflow CLASS, never to a consumer, so it is deliberately not projected here. Runtime surface: env.NAME is an object with create({id, params}) and get(id), each returning a promise for a WorkflowInstance. create admits an author-chosen instance id and mints one when absent; it rejects with an Error named instance_exists for an id a retained instance still holds, so a retry after a lost response does not silently start a second execution under one name. get rejects with unknown_instance when nothing holds the id. A WorkflowInstance carries id and the methods status(), sendEvent({type, payload}) and terminate(). status resolves to {status, output?, error?} over the closed vocabulary queued, running, sleeping, waiting, complete, errored, terminated — a workflow that THREW is a successful status read reporting errored, not a rejected call. sendEvent resolves once the event is durably retained, which may be before any waitForEvent consumes it, and rejects against a terminal instance. Every rejection carries an Error named for the contract's closed per-operation code; a call rejects only when the operation could not be performed.",
+  "sourceRole": "revision",
+  "targetInterface": {
+    "apiVersion": "interfaces.takoform.com/v1alpha1",
+    "name": "worker.workflow",
+    "version": "1.0.0",
+    "schemaDigest": "sha256:6b652dd311975da84469a5ec44f48acbc6db2097d1473988bd5424a85fda4294"
+  },
+  "allowedTargetForms": [
+    {
+      "apiVersion": "edge.forms.takoform.com",
+      "kind": "DurableWorkflow"
+    }
+  ],
+  "bindingNameGrammar": "^[A-Za-z_$][A-Za-z0-9_$]*$",
+  "runtimeProjection": {
+    "operations": [
+      "create",
+      "get",
+      "status",
+      "sendEvent",
+      "terminate"
+    ]
+  },
+  "lifecycle": {
+    "targetDeletion": "refuse_while_bound"
+  }
+}

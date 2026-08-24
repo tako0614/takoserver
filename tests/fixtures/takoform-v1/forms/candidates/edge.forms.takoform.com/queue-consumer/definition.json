@@ -1,0 +1,276 @@
+{
+  "apiVersion": "edge.forms.takoform.com",
+  "kind": "QueueConsumer",
+  "definitionVersion": "0.1.0",
+  "title": "Queue Consumer",
+  "description": "Attaches one Module Worker as the batch consumer of one At-Least-Once Queue, invoking its queue handler with message batches and redelivering messages that were not acknowledged. Consumption is inward activation and therefore an attachment, never a binding. One queue has at most one consumer, so a second attachment against the same queue is refused. A handler that returns normally without settling anything acknowledges the whole batch; one that throws retries every message it had not already acknowledged. maxRetries counts REDELIVERIES only — the first delivery does not count toward it — so a message is delivered at most 1 + maxRetries times, and a message that exhausts them moves to dead_letter_queue when one is declared and is dropped otherwise. The dead-letter copy is a new message there: new identity, new acceptance timestamp, and an attempt count starting again at 1 (decision 0020). Because that transfer resets the attempt count, dead_letter_queue MUST NOT lead back: a destination resolving to the queue this consumer drains, or closing a cycle of any length through the dead-letter graph, is refused before any mutation, because an exhausted message would circulate forever instead of coming to rest (decision 0026).",
+  "role": "attachment",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "constraints": [
+    {
+      "kind": "exclusive",
+      "reference": "/queue"
+    }
+  ],
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Attaches one Module Worker as the batch consumer of one At-Least-Once Queue, invoking its queue handler with message batches and redelivering messages that were not acknowledged. Consumption is inward activation and therefore an attachment, never a binding. One queue has at most one consumer, so a second attachment against the same queue is refused. A handler that returns normally without settling anything acknowledges the whole batch; one that throws retries every message it had not already acknowledged. maxRetries counts REDELIVERIES only — the first delivery does not count toward it — so a message is delivered at most 1 + maxRetries times, and a message that exhausts them moves to dead_letter_queue when one is declared and is dropped otherwise. The dead-letter copy is a new message there: new identity, new acceptance timestamp, and an attempt count starting again at 1 (decision 0020). Because that transfer resets the attempt count, dead_letter_queue MUST NOT lead back: a destination resolving to the queue this consumer drains, or closing a cycle of any length through the dead-letter graph, is refused before any mutation, because an exhausted message would circulate forever instead of coming to rest (decision 0026).",
+    "properties": {
+      "deadLetterQueue": {
+        "additionalProperties": false,
+        "description": "Queue receiving messages that exhausted their retries. Without it, exhausted messages are dropped. It must not resolve to the queue this consumer drains, or close a cycle through other consumers' dead-letter destinations; a host refuses either before any mutation.",
+        "properties": {
+          "apiVersion": {
+            "const": "edge.forms.takoform.com",
+            "type": "string"
+          },
+          "kind": {
+            "const": "AtLeastOnceQueue",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "apiVersion",
+          "kind",
+          "name"
+        ],
+        "type": "object",
+        "x-takoform-required-interface": {
+          "apiVersion": "interfaces.takoform.com/v1alpha1",
+          "name": "edge.queue",
+          "schemaDigest": "sha256:d8ed5c673cb544f5b2bd61aa66ac1c1a716276cf072232b3a0d06471403c2ff7",
+          "version": "1.0.0"
+        }
+      },
+      "maxBatchSize": {
+        "description": "Largest number of messages delivered in one batch.",
+        "maximum": 100,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "maxBatchTimeoutSeconds": {
+        "description": "Longest time the host waits to fill a batch before delivering it, in seconds.",
+        "maximum": 60,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "maxConcurrency": {
+        "description": "Largest number of concurrent batch invocations.",
+        "maximum": 250,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "maxRetries": {
+        "description": "How many times a failed batch is redelivered before its messages go to the dead-letter queue or are dropped.",
+        "maximum": 100,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "queue": {
+        "additionalProperties": false,
+        "description": "Queue this consumer drains. Changing it replaces the attachment.",
+        "properties": {
+          "apiVersion": {
+            "const": "edge.forms.takoform.com",
+            "type": "string"
+          },
+          "kind": {
+            "const": "AtLeastOnceQueue",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "apiVersion",
+          "kind",
+          "name"
+        ],
+        "type": "object",
+        "x-takoform-required-interface": {
+          "apiVersion": "interfaces.takoform.com/v1alpha1",
+          "name": "edge.queue",
+          "schemaDigest": "sha256:d8ed5c673cb544f5b2bd61aa66ac1c1a716276cf072232b3a0d06471403c2ff7",
+          "version": "1.0.0"
+        }
+      },
+      "retryDelaySeconds": {
+        "description": "Delay before a failed batch becomes deliverable again, in seconds.",
+        "maximum": 43200,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "worker": {
+        "additionalProperties": false,
+        "description": "Module Worker whose queue handler receives the batches. Changing it replaces the attachment.",
+        "properties": {
+          "apiVersion": {
+            "const": "edge.forms.takoform.com",
+            "type": "string"
+          },
+          "kind": {
+            "const": "ModuleWorker",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "apiVersion",
+          "kind",
+          "name"
+        ],
+        "type": "object",
+        "x-takoform-required-entrypoint": "queue",
+        "x-takoform-required-interface": {
+          "apiVersion": "interfaces.takoform.com/v1alpha1",
+          "name": "worker.runtime",
+          "schemaDigest": "sha256:ed2f8211aac5be94488d391945ca6aca7627a4ecbd261e39790093e887feae08",
+          "version": "1.1.0"
+        }
+      }
+    },
+    "required": [
+      "maxBatchSize",
+      "maxBatchTimeoutSeconds",
+      "maxConcurrency",
+      "maxRetries",
+      "queue",
+      "retryDelaySeconds",
+      "worker"
+    ],
+    "title": "Queue Consumer desired state",
+    "type": "object"
+  },
+  "immutableFields": [
+    "/queue",
+    "/worker"
+  ],
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "update",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-queue",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-queue.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-worker",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-worker.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-max-batch-size",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-max-batch-size.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-max-batch-timeout-seconds",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-max-batch-timeout-seconds.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-max-retries",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-max-retries.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-retry-delay-seconds",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-retry-delay-seconds.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-max-concurrency",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-max-concurrency.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-queue",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-queue.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-worker",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-worker.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-max-batch-size",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-max-batch-size.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-max-batch-timeout-seconds",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-max-batch-timeout-seconds.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-max-retries",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-max-retries.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-retry-delay-seconds",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-retry-delay-seconds.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-dead-letter-queue",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-dead-letter-queue.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-max-concurrency",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-max-concurrency.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

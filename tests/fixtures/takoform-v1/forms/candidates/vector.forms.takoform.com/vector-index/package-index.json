@@ -1,0 +1,55 @@
+{
+  "apiVersion": "packages.forms.takoform.com/v1alpha5",
+  "kind": "FormPackage",
+  "formRef": {
+    "apiVersion": "vector.forms.takoform.com",
+    "kind": "VectorIndex",
+    "definitionVersion": "0.1.0",
+    "schemaDigest": "sha256:46e4a807db0a90295c13edd82f03cf81d17df780f5d5cb7758377862205c692b"
+  },
+  "definitionPath": "definition.json",
+  "files": [
+    {
+      "path": "definition.json",
+      "mediaType": "application/vnd.takoform.form-definition.v1+json",
+      "size": 3128,
+      "digest": "sha256:b41fd3ff67ded0ffa71102f7bb8c97fae83264b13cdfdad9605902d5a1873f78"
+    },
+    {
+      "path": "fixtures/desired.json",
+      "mediaType": "application/json",
+      "size": 46,
+      "digest": "sha256:dce9f97ee887511fd678c13bd2adbc6fc8d009014a098b9e98657ced0bcfff3d"
+    },
+    {
+      "path": "fixtures/negative-dimension.json",
+      "mediaType": "application/json",
+      "size": 43,
+      "digest": "sha256:6d567072386f4693a7058b0b5b98b2cb9e5d52861a5f6c213171d50bbcb04d4f"
+    },
+    {
+      "path": "fixtures/negative-metric.json",
+      "mediaType": "application/json",
+      "size": 49,
+      "digest": "sha256:c77734984637f1a822b04cdb9b93ef39857e905ab07df919efc3aed8bf8acf47"
+    },
+    {
+      "path": "fixtures/negative-missing-dimension.json",
+      "mediaType": "application/json",
+      "size": 25,
+      "digest": "sha256:194ab9ac548be1064db1323c934d36cf84bd0818f396665e215f678cc8306edb"
+    },
+    {
+      "path": "fixtures/negative-missing-metric.json",
+      "mediaType": "application/json",
+      "size": 24,
+      "digest": "sha256:086d345b8d4d35684af7e7a02cec60d7666d52c94a8a88dc9cb4021711e0aa3d"
+    },
+    {
+      "path": "fixtures/negative-unexpected-property.json",
+      "mediaType": "application/json",
+      "size": 76,
+      "digest": "sha256:7c2a118eb1505450c672388b0344d58c9a4638208a4f799b01584c6fd27c41b2"
+    }
+  ]
+}

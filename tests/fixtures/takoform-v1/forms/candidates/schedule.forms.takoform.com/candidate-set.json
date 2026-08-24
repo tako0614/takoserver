@@ -1,0 +1,23 @@
+{
+  "format": "takoform.form-family-candidates@v1",
+  "family": "schedule.forms.takoform.com",
+  "formMaturity": "experimental",
+  "packageApiVersion": "packages.forms.takoform.com/v1alpha5",
+  "publicationStatus": "unpublished",
+  "authoringSource": "internal/scheduleformcatalog",
+  "authoringPolicy": "service-shape-preserving-contract",
+  "forms": [
+    {
+      "kind": "Schedule",
+      "role": "identity",
+      "path": "forms/candidates/schedule.forms.takoform.com/schedule",
+      "formRef": {
+        "apiVersion": "schedule.forms.takoform.com",
+        "kind": "Schedule",
+        "definitionVersion": "0.1.0",
+        "schemaDigest": "sha256:d99904fdf12f983e3691ca8af1a3afa3baaa0c55ab966dcb6d4efab909761afb"
+      },
+      "packageDigest": "sha256:5ae8be6a1102a0104c1705ae4e9ee12c6cfbc68879d02fa08897e30e4e9c09c8"
+    }
+  ]
+}

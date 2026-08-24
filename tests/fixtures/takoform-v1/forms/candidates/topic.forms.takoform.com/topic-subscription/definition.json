@@ -1,0 +1,257 @@
+{
+  "apiVersion": "topic.forms.takoform.com",
+  "kind": "TopicSubscription",
+  "definitionVersion": "0.1.0",
+  "title": "Topic Subscription",
+  "description": "Attachment that delivers each matching Topic publish into one PullQueue. Delivery is independent and at least once per subscription; retry and dead-letter behavior belong to this attachment.",
+  "role": "attachment",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "constraints": [
+    {
+      "kind": "distinctPair",
+      "references": [
+        "/target",
+        "/deadLetter"
+      ]
+    },
+    {
+      "kind": "uniquePair",
+      "references": [
+        "/topic",
+        "/target"
+      ]
+    }
+  ],
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Attachment that delivers each matching Topic publish into one PullQueue. Delivery is independent and at least once per subscription; retry and dead-letter behavior belong to this attachment.",
+    "properties": {
+      "deadLetter": {
+        "additionalProperties": false,
+        "description": "Optional PullQueue receiving messages that exhaust delivery retries. When omitted, exhausted messages are dropped. It must resolve to a different queue from target.",
+        "properties": {
+          "apiVersion": {
+            "const": "queue.forms.takoform.com",
+            "type": "string"
+          },
+          "kind": {
+            "const": "PullQueue",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "apiVersion",
+          "kind",
+          "name"
+        ],
+        "type": "object",
+        "x-takoform-required-interface": {
+          "apiVersion": "interfaces.takoform.com/v1alpha1",
+          "name": "queue.pull",
+          "schemaDigest": "sha256:93a580be2858aae5561c26488035a1ae9338754d22302c33c6c1917f7d0e94ac",
+          "version": "1.0.0"
+        }
+      },
+      "filterPolicy": {
+        "additionalProperties": {
+          "items": {
+            "maxLength": 262144,
+            "pattern": "^[\\s\\S]+$",
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "description": "Optional closed attribute-equality filter. When absent, every message matches; each named attribute must equal one of its non-empty candidate strings. There is no range, prefix, negation, or payload-path matching.",
+        "maxProperties": 10,
+        "propertyNames": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
+          "type": "string",
+          "x-takoform-fieldPolicy": "portable-data-only-v1"
+        },
+        "type": "object"
+      },
+      "maxRetries": {
+        "description": "Number of delivery retries after the first attempt. A message is attempted at most one plus this value times.",
+        "maximum": 100,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "retryDelaySeconds": {
+        "description": "Delay before a failed delivery attempt is retried, in seconds.",
+        "maximum": 3600,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "target": {
+        "additionalProperties": false,
+        "description": "PullQueue resource providing queue.pull@1.0.0. Changing it replaces the attachment.",
+        "properties": {
+          "apiVersion": {
+            "const": "queue.forms.takoform.com",
+            "type": "string"
+          },
+          "kind": {
+            "const": "PullQueue",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "apiVersion",
+          "kind",
+          "name"
+        ],
+        "type": "object",
+        "x-takoform-required-interface": {
+          "apiVersion": "interfaces.takoform.com/v1alpha1",
+          "name": "queue.pull",
+          "schemaDigest": "sha256:93a580be2858aae5561c26488035a1ae9338754d22302c33c6c1917f7d0e94ac",
+          "version": "1.0.0"
+        }
+      },
+      "topic": {
+        "additionalProperties": false,
+        "description": "Exact Topic identity whose accepted publishes this subscription receives. Changing it replaces the attachment.",
+        "properties": {
+          "apiVersion": {
+            "const": "topic.forms.takoform.com",
+            "type": "string"
+          },
+          "kind": {
+            "const": "Topic",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "apiVersion",
+          "kind",
+          "name"
+        ],
+        "type": "object",
+        "x-takoform-target-formrefs": [
+          {
+            "apiVersion": "topic.forms.takoform.com",
+            "definitionVersion": "0.1.0",
+            "kind": "Topic",
+            "schemaDigest": "sha256:425e21346190addd2ffb8a95d69afaa81f18f3a8d3d158de6496014482acaf80"
+          }
+        ]
+      }
+    },
+    "required": [
+      "maxRetries",
+      "retryDelaySeconds",
+      "target",
+      "topic"
+    ],
+    "title": "Topic Subscription desired state",
+    "type": "object"
+  },
+  "immutableFields": [
+    "/target",
+    "/topic"
+  ],
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "update",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-topic",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-topic.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-target",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-target.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-retry-delay-seconds",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-retry-delay-seconds.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-max-retries",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-max-retries.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-topic",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-topic.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-target",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-target.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-filter-policy",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-filter-policy.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-retry-delay-seconds",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-retry-delay-seconds.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-max-retries",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-max-retries.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-dead-letter",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-dead-letter.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { resolve } from "node:path";
 
 import { startStableLocalCloudflareHost } from "../src/entry-stable-local-cloudflare-host.ts";
 
-const TAKOFORM_ROOT =
-  process.env.TAKOFORM_REPOSITORY_ROOT ?? "/root/dev/takos/.worktrees/takoform-w0-shared-model";
+const TAKOFORM_ROOT = resolve(import.meta.dir, "fixtures/takoform-v1");
 
 describe("the stable local Cloudflare-backed Host", () => {
   test("installs the exact 12 Form kinds used by the 13-resource Yurucommu graph without current ObjectBucket", async () => {

@@ -1,0 +1,23 @@
+{
+  "cron": "*/5 * * * *",
+  "paused": false,
+  "retryPolicy": {
+    "maxAttempts": 3,
+    "retryDelaySeconds": 3601
+  },
+  "target": {
+    "attributes": {
+      "source": "schedule"
+    },
+    "body": {
+      "data": "scheduled.message",
+      "encoding": "utf8"
+    },
+    "queue": {
+      "apiVersion": "queue.forms.takoform.com",
+      "kind": "PullQueue",
+      "name": "scheduled-work"
+    },
+    "type": "queueMessage"
+  }
+}

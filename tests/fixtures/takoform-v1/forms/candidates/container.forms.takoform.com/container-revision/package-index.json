@@ -1,0 +1,157 @@
+{
+  "apiVersion": "packages.forms.takoform.com/v1alpha5",
+  "kind": "FormPackage",
+  "formRef": {
+    "apiVersion": "container.forms.takoform.com",
+    "kind": "ContainerRevision",
+    "definitionVersion": "0.1.0",
+    "schemaDigest": "sha256:2d453c251dec50393a042211ba24fd306f57ecd603008cc0981c274320203025"
+  },
+  "definitionPath": "definition.json",
+  "files": [
+    {
+      "path": "definition.json",
+      "mediaType": "application/vnd.takoform.form-definition.v1+json",
+      "size": 16177,
+      "digest": "sha256:63c07b742242385753cb0949651d2982a7fdbcdf6e925af381a78da748d469d2"
+    },
+    {
+      "path": "fixtures/desired.json",
+      "mediaType": "application/json",
+      "size": 765,
+      "digest": "sha256:3ed4439cf426250094ee42f2a956654fdcfc9393636de404d011a62f31965b34"
+    },
+    {
+      "path": "fixtures/negative-args.json",
+      "mediaType": "application/json",
+      "size": 749,
+      "digest": "sha256:c35089664c9a85c34f7a13ee02779b86d014a514244affefd1ee637289c671a0"
+    },
+    {
+      "path": "fixtures/negative-command.json",
+      "mediaType": "application/json",
+      "size": 756,
+      "digest": "sha256:bb6b48607f982d13207da2fc424d10bd147e0a4b3f99074e880cdaa86202fcb6"
+    },
+    {
+      "path": "fixtures/negative-concurrency-target.json",
+      "mediaType": "application/json",
+      "size": 764,
+      "digest": "sha256:aadb5e324ea91ecfd5557d4b63b59fb8c6bffff568ef6dd201ec74d2b1331388"
+    },
+    {
+      "path": "fixtures/negative-cpu.json",
+      "mediaType": "application/json",
+      "size": 762,
+      "digest": "sha256:f1bbb2144141b833ca43d46e9a8b80630546eeaed6f07362da48d9aaac5ed036"
+    },
+    {
+      "path": "fixtures/negative-external-services-invalid-protocol.json",
+      "mediaType": "application/json",
+      "size": 733,
+      "digest": "sha256:d5ef87ee4eda37bf444a9edd21069f67691fec3973ebbd5018e0c11fd94b2f5f"
+    },
+    {
+      "path": "fixtures/negative-image.json",
+      "mediaType": "application/json",
+      "size": 700,
+      "digest": "sha256:5d70996a87548417b7a26c223a1bd9b187f04c1730f1193ba6ce455cb620d021"
+    },
+    {
+      "path": "fixtures/negative-max-instances.json",
+      "mediaType": "application/json",
+      "size": 764,
+      "digest": "sha256:b8641af29046853e81b19545f998146e2754db7849e2862b51b2f773853fbbaf"
+    },
+    {
+      "path": "fixtures/negative-memory-mib.json",
+      "mediaType": "application/json",
+      "size": 765,
+      "digest": "sha256:bcad7bc9dce0c33d834da62bb6613b7bc5cc271ee2eb9e869c6ad45758196256"
+    },
+    {
+      "path": "fixtures/negative-min-instances.json",
+      "mediaType": "application/json",
+      "size": 766,
+      "digest": "sha256:6c1779c3e890b5db55d5b0c0f1d1ce34ea367e8e8fbc05af09cb96aecff20e33"
+    },
+    {
+      "path": "fixtures/negative-missing-concurrency-target.json",
+      "mediaType": "application/json",
+      "size": 738,
+      "digest": "sha256:5f5f62e3e9067372030623711dc142d5197e9e397ba9a43e08873e7f50ccad2e"
+    },
+    {
+      "path": "fixtures/negative-missing-cpu.json",
+      "mediaType": "application/json",
+      "size": 750,
+      "digest": "sha256:d61bf381e89a981a7e6a4112d064c14e93facfa2a7869caa564b627a4d191267"
+    },
+    {
+      "path": "fixtures/negative-missing-image.json",
+      "mediaType": "application/json",
+      "size": 658,
+      "digest": "sha256:483ccd700f82fd497b81d787a5483694d606479a1683903f283af3b5f5bf35b8"
+    },
+    {
+      "path": "fixtures/negative-missing-max-instances.json",
+      "mediaType": "application/json",
+      "size": 743,
+      "digest": "sha256:9a5e178b21e139c2091b91df2446b28d4c2031541cf108531f44c2ceea213891"
+    },
+    {
+      "path": "fixtures/negative-missing-memory-mib.json",
+      "mediaType": "application/json",
+      "size": 745,
+      "digest": "sha256:dec5147eacf0dbebfa678c02a5c50eea4930205db0df73ee7667a034112d99ac"
+    },
+    {
+      "path": "fixtures/negative-missing-min-instances.json",
+      "mediaType": "application/json",
+      "size": 744,
+      "digest": "sha256:d31f59621017d342e34f41acdca1370d5b5684bc536f51e63ec0aed0cdeb05b8"
+    },
+    {
+      "path": "fixtures/negative-missing-service.json",
+      "mediaType": "application/json",
+      "size": 631,
+      "digest": "sha256:dcabe458d45671641a0570739dca7f55edb5091ec59a0024768f94f11acacd8a"
+    },
+    {
+      "path": "fixtures/negative-missing-timeout-seconds.json",
+      "mediaType": "application/json",
+      "size": 741,
+      "digest": "sha256:018981c6b523bee765d45c8bba95b7abbe69c012b03d96ed47834f7e1faf889a"
+    },
+    {
+      "path": "fixtures/negative-required-sensitive-vars.json",
+      "mediaType": "application/json",
+      "size": 768,
+      "digest": "sha256:ab80c3ca8d75ca2c7e7f11a96989f59a73ad94bd1cb4d2cbbe4507faced89f4d"
+    },
+    {
+      "path": "fixtures/negative-service.json",
+      "mediaType": "application/json",
+      "size": 767,
+      "digest": "sha256:77504190bc7719d9ce6b4595ec9e32551096d188004db5e90492895753d2f776"
+    },
+    {
+      "path": "fixtures/negative-timeout-seconds.json",
+      "mediaType": "application/json",
+      "size": 764,
+      "digest": "sha256:a1fed0e1f2c100bc0dbb5a0b786f8588b61dafd3bf1f609da850be494b17f2aa"
+    },
+    {
+      "path": "fixtures/negative-unexpected-property.json",
+      "mediaType": "application/json",
+      "size": 795,
+      "digest": "sha256:dcecb5ccb19a13a63495022a68594cce9e58d157c9f49d36dca3a492a760e77a"
+    },
+    {
+      "path": "fixtures/negative-vars.json",
+      "mediaType": "application/json",
+      "size": 770,
+      "digest": "sha256:219452348ee178d7a8aa991a5e33e71945e3b26dce8a2f2916979bcfe424af3d"
+    }
+  ]
+}

@@ -1,0 +1,131 @@
+{
+  "apiVersion": "function.forms.takoform.com",
+  "kind": "FunctionEndpoint",
+  "definitionVersion": "0.1.0",
+  "title": "Function Endpoint",
+  "description": "Host-assigned HTTPS reachability for the active Function Deployment. The address is output, not desired state, and remains stable for the attachment UID.",
+  "role": "attachment",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "constraints": [
+    {
+      "kind": "exclusive",
+      "reference": "/function"
+    },
+    {
+      "kind": "hostAssigned",
+      "output": "/hostname"
+    },
+    {
+      "kind": "hostAssigned",
+      "output": "/url"
+    }
+  ],
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Host-assigned HTTPS reachability for the active Function Deployment. The address is output, not desired state, and remains stable for the attachment UID.",
+    "properties": {
+      "function": {
+        "additionalProperties": false,
+        "description": "Function whose active deployment receives HTTPS requests. Changing it replaces the endpoint.",
+        "properties": {
+          "apiVersion": {
+            "const": "function.forms.takoform.com",
+            "type": "string"
+          },
+          "kind": {
+            "const": "Function",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "apiVersion",
+          "kind",
+          "name"
+        ],
+        "type": "object",
+        "x-takoform-required-entrypoint": "http",
+        "x-takoform-target-formrefs": [
+          {
+            "apiVersion": "function.forms.takoform.com",
+            "definitionVersion": "0.1.0",
+            "kind": "Function",
+            "schemaDigest": "sha256:7811632bfa32b1ffde95bf6efc8ee67e4f6c0778e452c56e61d89dd5b4969388"
+          }
+        ]
+      }
+    },
+    "required": [
+      "function"
+    ],
+    "title": "Function Endpoint desired state",
+    "type": "object"
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Host-computed values this Form publishes in status.outputs. Every member is returned by a conforming host; the object is closed.",
+    "properties": {
+      "hostname": {
+        "description": "Canonical DNS hostname assigned by the host. Its shape is host detail and must not be reconstructed.",
+        "maxLength": 253,
+        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$",
+        "type": "string"
+      },
+      "url": {
+        "description": "Exactly https:// plus the assigned hostname and a root slash.",
+        "maxLength": 262,
+        "pattern": "^https://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+/$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "hostname",
+      "url"
+    ],
+    "title": "Function Endpoint outputs",
+    "type": "object"
+  },
+  "immutableFields": [
+    "/function"
+  ],
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-function",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-function.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-function",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-function.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

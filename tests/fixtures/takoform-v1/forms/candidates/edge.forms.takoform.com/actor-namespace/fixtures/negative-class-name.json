@@ -1,0 +1,8 @@
+{
+  "className": "1-not-an-identifier",
+  "worker": {
+    "apiVersion": "edge.forms.takoform.com",
+    "kind": "ModuleWorker",
+    "name": "module-worker"
+  }
+}

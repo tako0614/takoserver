@@ -1,0 +1,59 @@
+{
+  "format": "takoform.form-family-candidates@v1",
+  "family": "function.forms.takoform.com",
+  "formMaturity": "experimental",
+  "packageApiVersion": "packages.forms.takoform.com/v1alpha5",
+  "publicationStatus": "unpublished",
+  "authoringSource": "internal/functionformcatalog",
+  "authoringPolicy": "service-shape-preserving-contract",
+  "forms": [
+    {
+      "kind": "Function",
+      "role": "identity",
+      "path": "forms/candidates/function.forms.takoform.com/function",
+      "formRef": {
+        "apiVersion": "function.forms.takoform.com",
+        "kind": "Function",
+        "definitionVersion": "0.1.0",
+        "schemaDigest": "sha256:7811632bfa32b1ffde95bf6efc8ee67e4f6c0778e452c56e61d89dd5b4969388"
+      },
+      "packageDigest": "sha256:4aa262c080f2d2e2b26c6590ef77813a5ea94d6e5a83971d58a5d9273025cdbe"
+    },
+    {
+      "kind": "FunctionVersion",
+      "role": "revision",
+      "path": "forms/candidates/function.forms.takoform.com/function-version",
+      "formRef": {
+        "apiVersion": "function.forms.takoform.com",
+        "kind": "FunctionVersion",
+        "definitionVersion": "0.1.0",
+        "schemaDigest": "sha256:314e6c1b5c9e79dd0d8c23aeb92737d70d303c6f78a4c9729397dda5e79f2b14"
+      },
+      "packageDigest": "sha256:c5e376d6743d36617e2a893a2e8c170b8d8cd1a2f7187d7753d668b71ec7e7bf"
+    },
+    {
+      "kind": "FunctionDeployment",
+      "role": "deployment",
+      "path": "forms/candidates/function.forms.takoform.com/function-deployment",
+      "formRef": {
+        "apiVersion": "function.forms.takoform.com",
+        "kind": "FunctionDeployment",
+        "definitionVersion": "0.1.0",
+        "schemaDigest": "sha256:85e10197b9d10275da71e8291c0891b2d9b231f094be2f87d3f0b8d160a56574"
+      },
+      "packageDigest": "sha256:1d1fc99df92fd9151748183610b53f0c3b014cb16d6b46833ac81ef24e237958"
+    },
+    {
+      "kind": "FunctionEndpoint",
+      "role": "attachment",
+      "path": "forms/candidates/function.forms.takoform.com/function-endpoint",
+      "formRef": {
+        "apiVersion": "function.forms.takoform.com",
+        "kind": "FunctionEndpoint",
+        "definitionVersion": "0.1.0",
+        "schemaDigest": "sha256:b4346d86a700abbce805f4b9fe02fb03214f8aefa87ee600f2c3c21c8cba56bd"
+      },
+      "packageDigest": "sha256:03a53e9cf8256689514a5e1ac8452da5e7ec879bd40ae06d90dcca2c56333516"
+    }
+  ]
+}

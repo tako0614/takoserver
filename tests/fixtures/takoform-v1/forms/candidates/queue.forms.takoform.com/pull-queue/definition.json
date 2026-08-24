@@ -1,0 +1,180 @@
+{
+  "apiVersion": "queue.forms.takoform.com",
+  "kind": "PullQueue",
+  "definitionVersion": "0.1.0",
+  "title": "Pull Queue",
+  "description": "Unordered at-least-once pull queue with visibility timeout, receive counting, optional dead-lettering, and bounded long polling. The queue.pull Interface fixes the send, receive, delete, and changeVisibility behavior; these fields are the queue's retention and delivery-policy declaration.",
+  "role": "identity",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "constraints": [
+    {
+      "kind": "acyclic",
+      "reference": "/deadLetter/queue"
+    }
+  ],
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Unordered at-least-once pull queue with visibility timeout, receive counting, optional dead-lettering, and bounded long polling. The queue.pull Interface fixes the send, receive, delete, and changeVisibility behavior; these fields are the queue's retention and delivery-policy declaration.",
+    "properties": {
+      "deadLetter": {
+        "additionalProperties": false,
+        "description": "Optional dead-letter policy. Without it, a message that exceeds its receive count is removed only by deletion or retention expiry; when present, the host moves an exhausted message to queue as a new message after maxReceiveCount.",
+        "properties": {
+          "maxReceiveCount": {
+            "description": "Receive count at which the next receive moves the message to queue instead of delivering it again. The count starts at one on first delivery.",
+            "maximum": 1000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "queue": {
+            "additionalProperties": false,
+            "description": "PullQueue that receives exhausted messages as new messages. It must not be this queue or close a dead-letter cycle; the host rejects self and cyclic resolved-UID graphs.",
+            "properties": {
+              "apiVersion": {
+                "const": "queue.forms.takoform.com",
+                "type": "string"
+              },
+              "kind": {
+                "const": "PullQueue",
+                "type": "string"
+              },
+              "name": {
+                "maxLength": 63,
+                "minLength": 1,
+                "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "apiVersion",
+              "kind",
+              "name"
+            ],
+            "type": "object",
+            "x-takoform-required-interface": {
+              "apiVersion": "interfaces.takoform.com/v1alpha1",
+              "name": "queue.pull",
+              "schemaDigest": "sha256:93a580be2858aae5561c26488035a1ae9338754d22302c33c6c1917f7d0e94ac",
+              "version": "1.0.0"
+            }
+          }
+        },
+        "required": [
+          "maxReceiveCount",
+          "queue"
+        ],
+        "type": "object"
+      },
+      "defaultVisibilityTimeoutSeconds": {
+        "description": "Default invisibility duration, in seconds, applied by receive when its visibility timeout is omitted. A received message becomes deliverable again after this duration unless deleted or its visibility is changed.",
+        "maximum": 43200,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "messageRetentionSeconds": {
+        "description": "Maximum lifetime, in seconds, of an undeleted message. A message older than this bound expires and is removed.",
+        "maximum": 1209600,
+        "minimum": 60,
+        "type": "integer"
+      },
+      "receiveWaitBoundSeconds": {
+        "description": "Maximum long-poll wait, in seconds, accepted by receive. A receive's waitSeconds is bounded by this value; zero means receive returns without waiting.",
+        "maximum": 20,
+        "minimum": 0,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "defaultVisibilityTimeoutSeconds",
+      "messageRetentionSeconds",
+      "receiveWaitBoundSeconds"
+    ],
+    "title": "Pull Queue desired state",
+    "type": "object"
+  },
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "update",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "providedInterfaces": [
+    {
+      "apiVersion": "interfaces.takoform.com/v1alpha1",
+      "name": "queue.pull",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:93a580be2858aae5561c26488035a1ae9338754d22302c33c6c1917f7d0e94ac"
+    }
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-message-retention-seconds",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-message-retention-seconds.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-default-visibility-timeout-seconds",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-default-visibility-timeout-seconds.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-receive-wait-bound-seconds",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-receive-wait-bound-seconds.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-message-retention-seconds",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-message-retention-seconds.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-default-visibility-timeout-seconds",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-default-visibility-timeout-seconds.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-receive-wait-bound-seconds",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-receive-wait-bound-seconds.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-dead-letter",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-dead-letter.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-dead-letter-queue",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-dead-letter-queue.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-dead-letter-max-receive-count",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-dead-letter-max-receive-count.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

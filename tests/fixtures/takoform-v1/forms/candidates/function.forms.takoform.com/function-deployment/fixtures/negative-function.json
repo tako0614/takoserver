@@ -1,0 +1,17 @@
+{
+  "function": {
+    "apiVersion": "function.forms.takoform.com",
+    "kind": "Function",
+    "name": "Not A Resource Name"
+  },
+  "versions": [
+    {
+      "functionVersion": {
+        "apiVersion": "function.forms.takoform.com",
+        "kind": "FunctionVersion",
+        "name": "function-version"
+      },
+      "weight": 10000
+    }
+  ]
+}

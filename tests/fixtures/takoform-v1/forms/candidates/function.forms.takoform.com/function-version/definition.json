@@ -1,0 +1,462 @@
+{
+  "apiVersion": "function.forms.takoform.com",
+  "kind": "FunctionVersion",
+  "definitionVersion": "0.1.0",
+  "title": "Function Version",
+  "description": "Immutable content-addressed executable snapshot of one Function: artifact manifest, handler, environment declarations, sealed slots, and invocation bounds.",
+  "role": "revision",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "desiredSchema": {
+    "$defs": {
+      "jsonValueDepth1": {
+        "additionalProperties": {
+          "$ref": "#/$defs/jsonValueDepth2"
+        },
+        "items": {
+          "$ref": "#/$defs/jsonValueDepth2"
+        },
+        "maxItems": 64,
+        "maxLength": 8192,
+        "maxProperties": 64,
+        "propertyNames": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
+          "type": "string",
+          "x-takoform-fieldPolicy": "portable-data-only-v1"
+        },
+        "type": [
+          "array",
+          "boolean",
+          "null",
+          "number",
+          "object",
+          "string"
+        ]
+      },
+      "jsonValueDepth2": {
+        "additionalProperties": {
+          "$ref": "#/$defs/jsonValueDepth3"
+        },
+        "items": {
+          "$ref": "#/$defs/jsonValueDepth3"
+        },
+        "maxItems": 64,
+        "maxLength": 8192,
+        "maxProperties": 64,
+        "propertyNames": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
+          "type": "string",
+          "x-takoform-fieldPolicy": "portable-data-only-v1"
+        },
+        "type": [
+          "array",
+          "boolean",
+          "null",
+          "number",
+          "object",
+          "string"
+        ]
+      },
+      "jsonValueDepth3": {
+        "additionalProperties": {
+          "$ref": "#/$defs/jsonValueDepth4"
+        },
+        "items": {
+          "$ref": "#/$defs/jsonValueDepth4"
+        },
+        "maxItems": 64,
+        "maxLength": 8192,
+        "maxProperties": 64,
+        "propertyNames": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
+          "type": "string",
+          "x-takoform-fieldPolicy": "portable-data-only-v1"
+        },
+        "type": [
+          "array",
+          "boolean",
+          "null",
+          "number",
+          "object",
+          "string"
+        ]
+      },
+      "jsonValueDepth4": {
+        "additionalProperties": {
+          "$ref": "#/$defs/jsonValueDepth5"
+        },
+        "items": {
+          "$ref": "#/$defs/jsonValueDepth5"
+        },
+        "maxItems": 64,
+        "maxLength": 8192,
+        "maxProperties": 64,
+        "propertyNames": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
+          "type": "string",
+          "x-takoform-fieldPolicy": "portable-data-only-v1"
+        },
+        "type": [
+          "array",
+          "boolean",
+          "null",
+          "number",
+          "object",
+          "string"
+        ]
+      },
+      "jsonValueDepth5": {
+        "additionalProperties": {
+          "$ref": "#/$defs/jsonValueDepth6"
+        },
+        "items": {
+          "$ref": "#/$defs/jsonValueDepth6"
+        },
+        "maxItems": 64,
+        "maxLength": 8192,
+        "maxProperties": 64,
+        "propertyNames": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
+          "type": "string",
+          "x-takoform-fieldPolicy": "portable-data-only-v1"
+        },
+        "type": [
+          "array",
+          "boolean",
+          "null",
+          "number",
+          "object",
+          "string"
+        ]
+      },
+      "jsonValueDepth6": {
+        "additionalProperties": {
+          "$ref": "#/$defs/jsonValueDepth7"
+        },
+        "items": {
+          "$ref": "#/$defs/jsonValueDepth7"
+        },
+        "maxItems": 64,
+        "maxLength": 8192,
+        "maxProperties": 64,
+        "propertyNames": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
+          "type": "string",
+          "x-takoform-fieldPolicy": "portable-data-only-v1"
+        },
+        "type": [
+          "array",
+          "boolean",
+          "null",
+          "number",
+          "object",
+          "string"
+        ]
+      },
+      "jsonValueDepth7": {
+        "additionalProperties": {
+          "$ref": "#/$defs/jsonValueDepth8"
+        },
+        "items": {
+          "$ref": "#/$defs/jsonValueDepth8"
+        },
+        "maxItems": 64,
+        "maxLength": 8192,
+        "maxProperties": 64,
+        "propertyNames": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
+          "type": "string",
+          "x-takoform-fieldPolicy": "portable-data-only-v1"
+        },
+        "type": [
+          "array",
+          "boolean",
+          "null",
+          "number",
+          "object",
+          "string"
+        ]
+      },
+      "jsonValueDepth8": {
+        "maxLength": 8192,
+        "type": [
+          "boolean",
+          "null",
+          "number",
+          "string"
+        ]
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Immutable content-addressed executable snapshot of one Function: artifact manifest, handler, environment declarations, sealed slots, and invocation bounds.",
+    "properties": {
+      "artifact": {
+        "description": "Digest of the committed FunctionBundle artifact manifest. The host resolves and verifies the manifest before storing this revision; a mutable URL or tag is not portable state.",
+        "maxLength": 71,
+        "pattern": "^sha256:[0-9a-f]{64}$",
+        "type": "string"
+      },
+      "externalServices": {
+        "default": [],
+        "description": "Sealed slots naming only a standard protocol and a projected NAME. The host resolves endpoint and credentials out of band; neither is portable state. Omitting it declares no external service.",
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "maxLength": 64,
+              "pattern": "^[A-Z][A-Z0-9_]*$",
+              "type": "string"
+            },
+            "required": {
+              "default": true,
+              "description": "Optional, defaulting to true. A REQUIRED slot the host cannot satisfy blocks readiness; an optional one it does not satisfy projects nothing and blocks nothing.",
+              "type": "boolean"
+            },
+            "service": {
+              "additionalProperties": false,
+              "properties": {
+                "apiVersion": {
+                  "const": "standards.takoform.com/v1"
+                },
+                "protocol": {
+                  "maxLength": 253,
+                  "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?){2,}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "apiVersion",
+                "protocol"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "name",
+            "service"
+          ],
+          "type": "object"
+        },
+        "maxItems": 16,
+        "type": "array",
+        "uniqueItems": true,
+        "x-takoform-standard-services": "standards.takoform.com/v1"
+      },
+      "function": {
+        "additionalProperties": false,
+        "description": "Function identity this immutable version belongs to.",
+        "properties": {
+          "apiVersion": {
+            "const": "function.forms.takoform.com",
+            "type": "string"
+          },
+          "kind": {
+            "const": "Function",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "apiVersion",
+          "kind",
+          "name"
+        ],
+        "type": "object",
+        "x-takoform-target-formrefs": [
+          {
+            "apiVersion": "function.forms.takoform.com",
+            "definitionVersion": "0.1.0",
+            "kind": "Function",
+            "schemaDigest": "sha256:7811632bfa32b1ffde95bf6efc8ee67e4f6c0778e452c56e61d89dd5b4969388"
+          }
+        ]
+      },
+      "handler": {
+        "description": "Named export of the artifact's main module invoked for each event.",
+        "maxLength": 128,
+        "pattern": "^[A-Za-z_$][A-Za-z0-9_$]*$",
+        "type": "string"
+      },
+      "maxConcurrency": {
+        "description": "Maximum simultaneous invocations served by one version environment.",
+        "maximum": 1000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "memoryMiB": {
+        "description": "Usable memory bound for one invocation environment, in MiB.",
+        "maximum": 10240,
+        "minimum": 128,
+        "type": "integer"
+      },
+      "requiredSensitiveVars": {
+        "default": [],
+        "description": "Names of sensitive values the host must supply through its sealed path. Only names are portable state; omitting it requires no sensitive value.",
+        "items": {
+          "pattern": "^[A-Z][A-Z0-9_]{0,63}$",
+          "type": "string"
+        },
+        "maxItems": 64,
+        "type": "array",
+        "uniqueItems": true
+      },
+      "timeoutSeconds": {
+        "description": "Wall-clock invocation budget, in seconds. Expiry terminates the invocation.",
+        "maximum": 900,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "vars": {
+        "additionalProperties": {
+          "$ref": "#/$defs/jsonValueDepth1"
+        },
+        "default": {},
+        "description": "Non-secret configuration values projected into the process environment. Omitting it projects no variable; sensitive material never enters portable state.",
+        "maxProperties": 64,
+        "propertyNames": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
+          "type": "string",
+          "x-takoform-fieldPolicy": "portable-data-only-v1"
+        },
+        "type": "object"
+      }
+    },
+    "required": [
+      "artifact",
+      "function",
+      "handler",
+      "maxConcurrency",
+      "memoryMiB",
+      "timeoutSeconds"
+    ],
+    "title": "Function Version desired state",
+    "type": "object"
+  },
+  "immutableFields": [
+    "/artifact",
+    "/externalServices",
+    "/function",
+    "/handler",
+    "/maxConcurrency",
+    "/memoryMiB",
+    "/requiredSensitiveVars",
+    "/timeoutSeconds",
+    "/vars"
+  ],
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-function",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-function.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-artifact",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-artifact.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-handler",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-handler.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-memory-mib",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-memory-mib.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-timeout-seconds",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-timeout-seconds.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-max-concurrency",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-max-concurrency.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-function",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-function.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-artifact",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-artifact.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-handler",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-handler.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-vars",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-vars.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-required-sensitive-vars",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-required-sensitive-vars.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-memory-mib",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-memory-mib.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-timeout-seconds",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-timeout-seconds.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-max-concurrency",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-max-concurrency.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-external-services-invalid-protocol",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-external-services-invalid-protocol.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

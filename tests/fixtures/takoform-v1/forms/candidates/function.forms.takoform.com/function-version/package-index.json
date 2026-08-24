@@ -1,0 +1,121 @@
+{
+  "apiVersion": "packages.forms.takoform.com/v1alpha5",
+  "kind": "FormPackage",
+  "formRef": {
+    "apiVersion": "function.forms.takoform.com",
+    "kind": "FunctionVersion",
+    "definitionVersion": "0.1.0",
+    "schemaDigest": "sha256:314e6c1b5c9e79dd0d8c23aeb92737d70d303c6f78a4c9729397dda5e79f2b14"
+  },
+  "definitionPath": "definition.json",
+  "files": [
+    {
+      "path": "definition.json",
+      "mediaType": "application/vnd.takoform.form-definition.v1+json",
+      "size": 13723,
+      "digest": "sha256:5535933cc97e35c9668c488c0a589730e706b921c8f961ed2964010d324bfef0"
+    },
+    {
+      "path": "fixtures/desired.json",
+      "mediaType": "application/json",
+      "size": 612,
+      "digest": "sha256:a8fcc3a1b7ae6e9803a75cd5c762fe5b81974e2520f7fce7386adf97c3aa7579"
+    },
+    {
+      "path": "fixtures/negative-artifact.json",
+      "mediaType": "application/json",
+      "size": 569,
+      "digest": "sha256:691c6d8d035618c25844dd127edc47a3939180d861800b612a312ecfaef0e593"
+    },
+    {
+      "path": "fixtures/negative-external-services-invalid-protocol.json",
+      "mediaType": "application/json",
+      "size": 580,
+      "digest": "sha256:5af403a8b30c652788ee4bb8139a95887ff7b353c84dc50ed3506d695243eb1c"
+    },
+    {
+      "path": "fixtures/negative-function.json",
+      "mediaType": "application/json",
+      "size": 623,
+      "digest": "sha256:251652c1c9cbb7b155c3133e98119ebe56325c64838dc8740631a149c659f377"
+    },
+    {
+      "path": "fixtures/negative-handler.json",
+      "mediaType": "application/json",
+      "size": 619,
+      "digest": "sha256:8fea07ae5b764818215d277a70fce1ccb9dbd1ee60b2189311c66fad46efd586"
+    },
+    {
+      "path": "fixtures/negative-max-concurrency.json",
+      "mediaType": "application/json",
+      "size": 611,
+      "digest": "sha256:d114eecfabe7fc2ecded923d07fdb7aba98198db6d94bbca2b1085b5214add6c"
+    },
+    {
+      "path": "fixtures/negative-memory-mib.json",
+      "mediaType": "application/json",
+      "size": 612,
+      "digest": "sha256:c91ce96742c2780277625dbe65a870c50e3a8cf1291f1ef666e99c84616dc4f9"
+    },
+    {
+      "path": "fixtures/negative-missing-artifact.json",
+      "mediaType": "application/json",
+      "size": 523,
+      "digest": "sha256:76438b902be4e47f6b4df0bf554cefdab315fa333c0966f29799f5729cf13d5d"
+    },
+    {
+      "path": "fixtures/negative-missing-function.json",
+      "mediaType": "application/json",
+      "size": 495,
+      "digest": "sha256:d451fd154cac276b2714f15ad98d10f60f7b680ce56cdb340911e95a6724449f"
+    },
+    {
+      "path": "fixtures/negative-missing-handler.json",
+      "mediaType": "application/json",
+      "size": 589,
+      "digest": "sha256:2910add958a39d8fc18f3b8c8f95fc28d81a8229eee1ea01440d960ef62ce2e1"
+    },
+    {
+      "path": "fixtures/negative-missing-max-concurrency.json",
+      "mediaType": "application/json",
+      "size": 588,
+      "digest": "sha256:c3abb88aac500ee92eb88b7099d1607e4ec6a250cc7e37b3120535bda2c7dd8d"
+    },
+    {
+      "path": "fixtures/negative-missing-memory-mib.json",
+      "mediaType": "application/json",
+      "size": 592,
+      "digest": "sha256:4307d196dbb164f8115319cfc7da433c374da7f5ee68c1b8cd9bb58faec4bf6b"
+    },
+    {
+      "path": "fixtures/negative-missing-timeout-seconds.json",
+      "mediaType": "application/json",
+      "size": 588,
+      "digest": "sha256:6609a9d8ce92acf27650d100d8d0f6e354224664c7a44dbe68ca3350ad34c562"
+    },
+    {
+      "path": "fixtures/negative-required-sensitive-vars.json",
+      "mediaType": "application/json",
+      "size": 615,
+      "digest": "sha256:12a0c4a00b02dab2ec6bc464f2e01d4c6e9255f6676052d7b7bee564b7ef3de9"
+    },
+    {
+      "path": "fixtures/negative-timeout-seconds.json",
+      "mediaType": "application/json",
+      "size": 611,
+      "digest": "sha256:956a35d762c934ff80292066b86e441a8d36b7ef440dca6c347ef3538e8c9def"
+    },
+    {
+      "path": "fixtures/negative-unexpected-property.json",
+      "mediaType": "application/json",
+      "size": 642,
+      "digest": "sha256:e4c51a5161ea39a70efafb277ef222a483d086ef6c191814efd9c623bbdd0d04"
+    },
+    {
+      "path": "fixtures/negative-vars.json",
+      "mediaType": "application/json",
+      "size": 617,
+      "digest": "sha256:8cbf9888bffb8cf56c277ea8ad08ea4a4debf97ed3bab48f4146ab4a8f1474c8"
+    }
+  ]
+}

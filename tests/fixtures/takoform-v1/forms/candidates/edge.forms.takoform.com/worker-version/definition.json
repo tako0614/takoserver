@@ -1,0 +1,916 @@
+{
+  "apiVersion": "edge.forms.takoform.com",
+  "kind": "WorkerVersion",
+  "definitionVersion": "0.2.0",
+  "title": "Worker Version",
+  "description": "Immutable executable snapshot of one Module Worker: a bundle, the handlers its module exports, non-secret vars, and the typed capability bindings the code may use. A change is a new Worker Version; traffic moves only through Worker Deployments. The runtime this code runs on is not a field of this Form: it is fixed by the worker.runtime@1.1.0 contract the Module Worker identity provides, so a version carries no compatibility date and no compatibility flag (decision 0019).",
+  "role": "revision",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "desiredSchema": {
+    "$defs": {
+      "jsonValueDepth1": {
+        "additionalProperties": {
+          "$ref": "#/$defs/jsonValueDepth2"
+        },
+        "items": {
+          "$ref": "#/$defs/jsonValueDepth2"
+        },
+        "maxItems": 64,
+        "maxLength": 8192,
+        "maxProperties": 64,
+        "propertyNames": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
+          "type": "string",
+          "x-takoform-fieldPolicy": "portable-data-only-v1"
+        },
+        "type": [
+          "array",
+          "boolean",
+          "null",
+          "number",
+          "object",
+          "string"
+        ]
+      },
+      "jsonValueDepth2": {
+        "additionalProperties": {
+          "$ref": "#/$defs/jsonValueDepth3"
+        },
+        "items": {
+          "$ref": "#/$defs/jsonValueDepth3"
+        },
+        "maxItems": 64,
+        "maxLength": 8192,
+        "maxProperties": 64,
+        "propertyNames": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
+          "type": "string",
+          "x-takoform-fieldPolicy": "portable-data-only-v1"
+        },
+        "type": [
+          "array",
+          "boolean",
+          "null",
+          "number",
+          "object",
+          "string"
+        ]
+      },
+      "jsonValueDepth3": {
+        "additionalProperties": {
+          "$ref": "#/$defs/jsonValueDepth4"
+        },
+        "items": {
+          "$ref": "#/$defs/jsonValueDepth4"
+        },
+        "maxItems": 64,
+        "maxLength": 8192,
+        "maxProperties": 64,
+        "propertyNames": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
+          "type": "string",
+          "x-takoform-fieldPolicy": "portable-data-only-v1"
+        },
+        "type": [
+          "array",
+          "boolean",
+          "null",
+          "number",
+          "object",
+          "string"
+        ]
+      },
+      "jsonValueDepth4": {
+        "additionalProperties": {
+          "$ref": "#/$defs/jsonValueDepth5"
+        },
+        "items": {
+          "$ref": "#/$defs/jsonValueDepth5"
+        },
+        "maxItems": 64,
+        "maxLength": 8192,
+        "maxProperties": 64,
+        "propertyNames": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
+          "type": "string",
+          "x-takoform-fieldPolicy": "portable-data-only-v1"
+        },
+        "type": [
+          "array",
+          "boolean",
+          "null",
+          "number",
+          "object",
+          "string"
+        ]
+      },
+      "jsonValueDepth5": {
+        "additionalProperties": {
+          "$ref": "#/$defs/jsonValueDepth6"
+        },
+        "items": {
+          "$ref": "#/$defs/jsonValueDepth6"
+        },
+        "maxItems": 64,
+        "maxLength": 8192,
+        "maxProperties": 64,
+        "propertyNames": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
+          "type": "string",
+          "x-takoform-fieldPolicy": "portable-data-only-v1"
+        },
+        "type": [
+          "array",
+          "boolean",
+          "null",
+          "number",
+          "object",
+          "string"
+        ]
+      },
+      "jsonValueDepth6": {
+        "additionalProperties": {
+          "$ref": "#/$defs/jsonValueDepth7"
+        },
+        "items": {
+          "$ref": "#/$defs/jsonValueDepth7"
+        },
+        "maxItems": 64,
+        "maxLength": 8192,
+        "maxProperties": 64,
+        "propertyNames": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
+          "type": "string",
+          "x-takoform-fieldPolicy": "portable-data-only-v1"
+        },
+        "type": [
+          "array",
+          "boolean",
+          "null",
+          "number",
+          "object",
+          "string"
+        ]
+      },
+      "jsonValueDepth7": {
+        "additionalProperties": {
+          "$ref": "#/$defs/jsonValueDepth8"
+        },
+        "items": {
+          "$ref": "#/$defs/jsonValueDepth8"
+        },
+        "maxItems": 64,
+        "maxLength": 8192,
+        "maxProperties": 64,
+        "propertyNames": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
+          "type": "string",
+          "x-takoform-fieldPolicy": "portable-data-only-v1"
+        },
+        "type": [
+          "array",
+          "boolean",
+          "null",
+          "number",
+          "object",
+          "string"
+        ]
+      },
+      "jsonValueDepth8": {
+        "maxLength": 8192,
+        "type": [
+          "boolean",
+          "null",
+          "number",
+          "string"
+        ]
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Immutable executable snapshot of one Module Worker: a bundle, the handlers its module exports, non-secret vars, and the typed capability bindings the code may use. A change is a new Worker Version; traffic moves only through Worker Deployments. The runtime this code runs on is not a field of this Form: it is fixed by the worker.runtime@1.1.0 contract the Module Worker identity provides, so a version carries no compatibility date and no compatibility flag (decision 0019).",
+    "properties": {
+      "actorBindings": {
+        "default": [],
+        "description": "Typed module-worker.actor bindings projecting addressing and invocation — idFromName, newUniqueId, get. Omitting it declares no such binding.",
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "maxLength": 64,
+              "pattern": "^[A-Za-z_$][A-Za-z0-9_$]*$",
+              "type": "string"
+            },
+            "resource": {
+              "additionalProperties": false,
+              "properties": {
+                "apiVersion": {
+                  "const": "edge.forms.takoform.com",
+                  "type": "string"
+                },
+                "kind": {
+                  "const": "ActorNamespace",
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "apiVersion",
+                "kind",
+                "name"
+              ],
+              "type": "object",
+              "x-takoform-required-interface": {
+                "apiVersion": "interfaces.takoform.com/v1alpha1",
+                "name": "worker.actor",
+                "schemaDigest": "sha256:f5428fb587de80261dd7363dc5b8a3f4aab7e469fa1b5fce8441ad9acbec8218",
+                "version": "1.0.0"
+              }
+            }
+          },
+          "required": [
+            "name",
+            "resource"
+          ],
+          "type": "object"
+        },
+        "maxItems": 64,
+        "type": "array",
+        "uniqueItems": true,
+        "x-takoform-binding": "module-worker.actor"
+      },
+      "assets": {
+        "additionalProperties": false,
+        "description": "Optional static-asset attachment for this immutable version. Without it the host performs no asset lookup. When present, every member is required and the request order is closed: with runWorkerFirst=false the host tries the asset lookup before invoking fetch; with true it invokes fetch first and tries the asset lookup only when that invocation returns 404. An asset result wins; if both stages miss, the worker's 404 is preserved. The attachment never grants a hidden runtime binding and never mutates the referenced bundle.",
+        "properties": {
+          "bundle": {
+            "additionalProperties": false,
+            "description": "Static Asset Bundle whose exact manifest inventory this version serves.",
+            "properties": {
+              "apiVersion": {
+                "const": "edge.forms.takoform.com",
+                "type": "string"
+              },
+              "kind": {
+                "const": "StaticAssetBundle",
+                "type": "string"
+              },
+              "name": {
+                "maxLength": 63,
+                "minLength": 1,
+                "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "apiVersion",
+              "kind",
+              "name"
+            ],
+            "type": "object",
+            "x-takoform-target-formrefs": [
+              {
+                "apiVersion": "edge.forms.takoform.com",
+                "definitionVersion": "0.1.0",
+                "kind": "StaticAssetBundle",
+                "schemaDigest": "sha256:83142a3f824cf1fa2793fb73f4c32203ae07fb70db789d056aebe4c0ebe9334f"
+              }
+            ]
+          },
+          "notFoundHandling": {
+            "description": "Closed asset-miss behavior. none leaves a missing exact path as a miss. single_page_application serves the bundle's index.html for a missing path; a bundle without index.html is refused before this Worker Version is stored.",
+            "enum": [
+              "none",
+              "single_page_application"
+            ],
+            "type": "string"
+          },
+          "runWorkerFirst": {
+            "description": "Whether every request invokes the worker fetch handler before the asset lookup. False performs the lookup first and invokes fetch only when it misses; true performs the lookup only after fetch returns 404.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "bundle",
+          "notFoundHandling",
+          "runWorkerFirst"
+        ],
+        "type": "object"
+      },
+      "bundle": {
+        "additionalProperties": false,
+        "description": "Worker Bundle carrying the exact module bytes this version executes.",
+        "properties": {
+          "apiVersion": {
+            "const": "edge.forms.takoform.com",
+            "type": "string"
+          },
+          "kind": {
+            "const": "WorkerBundle",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "apiVersion",
+          "kind",
+          "name"
+        ],
+        "type": "object",
+        "x-takoform-target-formrefs": [
+          {
+            "apiVersion": "edge.forms.takoform.com",
+            "definitionVersion": "0.1.0",
+            "kind": "WorkerBundle",
+            "schemaDigest": "sha256:cb21984a579ae2706bddada8b44a22c0f8390994550c10d7c65df82edfa1141b"
+          }
+        ]
+      },
+      "externalServices": {
+        "default": [],
+        "description": "External standard services this version speaks, each a sealed slot naming only a runtime binding NAME and an opaque namespaced protocol. The host resolves the integration out-of-band and supplies one sealed runtime-native binding under NAME; neither its entries nor the credential is portable state. A required slot the host cannot satisfy keeps the version from becoming Ready. Omitting it declares no external service.",
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "maxLength": 64,
+              "pattern": "^[A-Z][A-Z0-9_]*$",
+              "type": "string"
+            },
+            "required": {
+              "default": true,
+              "description": "Optional, defaulting to true. A REQUIRED slot the host cannot satisfy blocks readiness; an optional one it does not satisfy projects nothing and blocks nothing.",
+              "type": "boolean"
+            },
+            "service": {
+              "additionalProperties": false,
+              "properties": {
+                "apiVersion": {
+                  "const": "standards.takoform.com/v1"
+                },
+                "protocol": {
+                  "maxLength": 253,
+                  "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?){2,}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "apiVersion",
+                "protocol"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "name",
+            "service"
+          ],
+          "type": "object"
+        },
+        "maxItems": 16,
+        "type": "array",
+        "uniqueItems": true,
+        "x-takoform-standard-services": "standards.takoform.com/v1"
+      },
+      "handlers": {
+        "description": "Module event handlers this version exports, from the closed vocabulary the worker.runtime@1.1.0 contract defines. A host rejects a handler that contract does not define, and rejects an attachment whose event kind is not declared here.",
+        "items": {
+          "enum": [
+            "fetch",
+            "scheduled",
+            "queue"
+          ],
+          "type": "string"
+        },
+        "minItems": 1,
+        "type": "array",
+        "uniqueItems": true
+      },
+      "kvBindings": {
+        "default": [],
+        "description": "Typed module-worker.edge-kv bindings projecting the edge.kv API under JavaScript identifier names. Omitting it declares no such binding.",
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "maxLength": 64,
+              "pattern": "^[A-Za-z_$][A-Za-z0-9_$]*$",
+              "type": "string"
+            },
+            "resource": {
+              "additionalProperties": false,
+              "properties": {
+                "apiVersion": {
+                  "const": "edge.forms.takoform.com",
+                  "type": "string"
+                },
+                "kind": {
+                  "const": "EdgeKVNamespace",
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "apiVersion",
+                "kind",
+                "name"
+              ],
+              "type": "object",
+              "x-takoform-required-interface": {
+                "apiVersion": "interfaces.takoform.com/v1alpha1",
+                "name": "edge.kv",
+                "schemaDigest": "sha256:231cfe2a7d8a6a9234f2ca84d4c4fc5b52857e5b632ab613ab2f9eca0116e082",
+                "version": "1.0.0"
+              }
+            }
+          },
+          "required": [
+            "name",
+            "resource"
+          ],
+          "type": "object"
+        },
+        "maxItems": 64,
+        "type": "array",
+        "uniqueItems": true,
+        "x-takoform-binding": "module-worker.edge-kv"
+      },
+      "queueProducerBindings": {
+        "default": [],
+        "description": "Typed module-worker.queue-producer bindings projecting only send and sendBatch. Omitting it declares no such binding.",
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "maxLength": 64,
+              "pattern": "^[A-Za-z_$][A-Za-z0-9_$]*$",
+              "type": "string"
+            },
+            "resource": {
+              "additionalProperties": false,
+              "properties": {
+                "apiVersion": {
+                  "const": "edge.forms.takoform.com",
+                  "type": "string"
+                },
+                "kind": {
+                  "const": "AtLeastOnceQueue",
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "apiVersion",
+                "kind",
+                "name"
+              ],
+              "type": "object",
+              "x-takoform-required-interface": {
+                "apiVersion": "interfaces.takoform.com/v1alpha1",
+                "name": "edge.queue",
+                "schemaDigest": "sha256:d8ed5c673cb544f5b2bd61aa66ac1c1a716276cf072232b3a0d06471403c2ff7",
+                "version": "1.0.0"
+              }
+            }
+          },
+          "required": [
+            "name",
+            "resource"
+          ],
+          "type": "object"
+        },
+        "maxItems": 64,
+        "type": "array",
+        "uniqueItems": true,
+        "x-takoform-binding": "module-worker.queue-producer"
+      },
+      "requiredSensitiveVars": {
+        "default": [],
+        "description": "Names of sensitive values this version requires the host to supply out-of-band. Only the names are portable state; values travel through each host's own sealed path. Omitting it requires no sensitive value.",
+        "items": {
+          "pattern": "^[A-Z][A-Z0-9_]{0,63}$",
+          "type": "string"
+        },
+        "type": "array",
+        "uniqueItems": true
+      },
+      "serviceBindings": {
+        "default": [],
+        "description": "Typed module-worker.service bindings projecting worker.service fetch toward another Module Worker. Omitting it declares no such binding.",
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "maxLength": 64,
+              "pattern": "^[A-Za-z_$][A-Za-z0-9_$]*$",
+              "type": "string"
+            },
+            "resource": {
+              "additionalProperties": false,
+              "properties": {
+                "apiVersion": {
+                  "const": "edge.forms.takoform.com",
+                  "type": "string"
+                },
+                "kind": {
+                  "const": "ModuleWorker",
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "apiVersion",
+                "kind",
+                "name"
+              ],
+              "type": "object",
+              "x-takoform-required-interface": {
+                "apiVersion": "interfaces.takoform.com/v1alpha1",
+                "name": "worker.service",
+                "schemaDigest": "sha256:8024073e25413c8906c3e189555a7485b4c7a6656e8a537fb2801f9b9682536e",
+                "version": "1.0.0"
+              }
+            }
+          },
+          "required": [
+            "name",
+            "resource"
+          ],
+          "type": "object"
+        },
+        "maxItems": 64,
+        "type": "array",
+        "uniqueItems": true,
+        "x-takoform-binding": "module-worker.service"
+      },
+      "sqliteBindings": {
+        "default": [],
+        "description": "Typed module-worker.sqlite bindings projecting the edge.sql API. Omitting it declares no such binding.",
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "maxLength": 64,
+              "pattern": "^[A-Za-z_$][A-Za-z0-9_$]*$",
+              "type": "string"
+            },
+            "resource": {
+              "additionalProperties": false,
+              "properties": {
+                "apiVersion": {
+                  "const": "edge.forms.takoform.com",
+                  "type": "string"
+                },
+                "kind": {
+                  "const": "SQLiteDatabase",
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "apiVersion",
+                "kind",
+                "name"
+              ],
+              "type": "object",
+              "x-takoform-required-interface": {
+                "apiVersion": "interfaces.takoform.com/v1alpha1",
+                "name": "edge.sql",
+                "schemaDigest": "sha256:cebd1121b1e3a5cbcb7b61ec78ad9c79ce05cda90fbc5fdb7b4edd3d59562f8f",
+                "version": "1.0.0"
+              }
+            }
+          },
+          "required": [
+            "name",
+            "resource"
+          ],
+          "type": "object"
+        },
+        "maxItems": 64,
+        "type": "array",
+        "uniqueItems": true,
+        "x-takoform-binding": "module-worker.sqlite"
+      },
+      "vars": {
+        "additionalProperties": {
+          "$ref": "#/$defs/jsonValueDepth1"
+        },
+        "default": {},
+        "description": "Non-secret configuration values projected into the module environment. Sensitive material never enters portable state. Omitting it projects no variable.",
+        "maxProperties": 64,
+        "propertyNames": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
+          "type": "string",
+          "x-takoform-fieldPolicy": "portable-data-only-v1"
+        },
+        "type": "object"
+      },
+      "worker": {
+        "additionalProperties": false,
+        "description": "Module Worker identity this version belongs to.",
+        "properties": {
+          "apiVersion": {
+            "const": "edge.forms.takoform.com",
+            "type": "string"
+          },
+          "kind": {
+            "const": "ModuleWorker",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "apiVersion",
+          "kind",
+          "name"
+        ],
+        "type": "object",
+        "x-takoform-required-interface": {
+          "apiVersion": "interfaces.takoform.com/v1alpha1",
+          "name": "worker.runtime",
+          "schemaDigest": "sha256:ed2f8211aac5be94488d391945ca6aca7627a4ecbd261e39790093e887feae08",
+          "version": "1.1.0"
+        }
+      },
+      "workflowBindings": {
+        "default": [],
+        "description": "Typed module-worker.workflow bindings projecting the instance surface — create, get, status, sendEvent, terminate. Omitting it declares no such binding.",
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "maxLength": 64,
+              "pattern": "^[A-Za-z_$][A-Za-z0-9_$]*$",
+              "type": "string"
+            },
+            "resource": {
+              "additionalProperties": false,
+              "properties": {
+                "apiVersion": {
+                  "const": "edge.forms.takoform.com",
+                  "type": "string"
+                },
+                "kind": {
+                  "const": "DurableWorkflow",
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "apiVersion",
+                "kind",
+                "name"
+              ],
+              "type": "object",
+              "x-takoform-required-interface": {
+                "apiVersion": "interfaces.takoform.com/v1alpha1",
+                "name": "worker.workflow",
+                "schemaDigest": "sha256:6b652dd311975da84469a5ec44f48acbc6db2097d1473988bd5424a85fda4294",
+                "version": "1.0.0"
+              }
+            }
+          },
+          "required": [
+            "name",
+            "resource"
+          ],
+          "type": "object"
+        },
+        "maxItems": 64,
+        "type": "array",
+        "uniqueItems": true,
+        "x-takoform-binding": "module-worker.workflow"
+      }
+    },
+    "required": [
+      "bundle",
+      "handlers",
+      "worker"
+    ],
+    "title": "Worker Version desired state",
+    "type": "object"
+  },
+  "immutableFields": [
+    "/actorBindings",
+    "/assets",
+    "/bundle",
+    "/externalServices",
+    "/handlers",
+    "/kvBindings",
+    "/queueProducerBindings",
+    "/requiredSensitiveVars",
+    "/serviceBindings",
+    "/sqliteBindings",
+    "/vars",
+    "/worker",
+    "/workflowBindings"
+  ],
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "acceptedBindings": [
+    {
+      "apiVersion": "bindings.takoform.com/v1alpha2",
+      "name": "module-worker.edge-kv",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:ca7ea8945f6f0f51949a152bee2a340e5926709f2238bb0cfc8b4d84cb006471"
+    },
+    {
+      "apiVersion": "bindings.takoform.com/v1alpha2",
+      "name": "module-worker.sqlite",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:e5793c9601ceb2fce80938282a5c7eb1e249026bd7bde70083c0e93746eae4dc"
+    },
+    {
+      "apiVersion": "bindings.takoform.com/v1alpha2",
+      "name": "module-worker.queue-producer",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:141f7413ff4dced8e379d9726100f66b584e76135156fb5a74a54e7b83edba1d"
+    },
+    {
+      "apiVersion": "bindings.takoform.com/v1alpha2",
+      "name": "module-worker.service",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:79c3a23e506ffc4607ea2921e3dbe76c7d44b20c76e6181e65c611239b9c51aa"
+    },
+    {
+      "apiVersion": "bindings.takoform.com/v1alpha2",
+      "name": "module-worker.workflow",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:208349ee6f07981bde09e4b9ee2020b86a76887540965657ed07590bc2ad5a0e"
+    },
+    {
+      "apiVersion": "bindings.takoform.com/v1alpha2",
+      "name": "module-worker.actor",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:51f447536158b393b0afb61850d69567db8de91e3a82fa9b9ebc5ab6f87f2c5d"
+    }
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-worker",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-worker.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-bundle",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-bundle.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-handlers",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-handlers.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-worker",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-worker.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-bundle",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-bundle.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-assets",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-assets.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-assets-bundle",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-assets-bundle.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-assets-not-found-handling",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-assets-not-found-handling.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-handlers",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-handlers.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-vars",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-vars.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-required-sensitive-vars",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-required-sensitive-vars.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-kv-bindings-binding-name",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-kv-bindings-binding-name.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-sqlite-bindings-binding-name",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-sqlite-bindings-binding-name.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-queue-producer-bindings-binding-name",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-queue-producer-bindings-binding-name.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-service-bindings-binding-name",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-service-bindings-binding-name.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-workflow-bindings-binding-name",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-workflow-bindings-binding-name.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-actor-bindings-binding-name",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-actor-bindings-binding-name.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-external-services-invalid-protocol",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-external-services-invalid-protocol.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

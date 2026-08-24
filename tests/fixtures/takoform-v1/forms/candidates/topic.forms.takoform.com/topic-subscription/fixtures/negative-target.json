@@ -1,0 +1,25 @@
+{
+  "deadLetter": {
+    "apiVersion": "queue.forms.takoform.com",
+    "kind": "PullQueue",
+    "name": "dead-letters"
+  },
+  "filterPolicy": {
+    "eventType": [
+      "order.created",
+      "order.updated"
+    ]
+  },
+  "maxRetries": 3,
+  "retryDelaySeconds": 60,
+  "target": {
+    "apiVersion": "queue.forms.takoform.com",
+    "kind": "PullQueue",
+    "name": "Not A Resource Name"
+  },
+  "topic": {
+    "apiVersion": "topic.forms.takoform.com",
+    "kind": "Topic",
+    "name": "topic"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "cron": "*/5 * * * *",
+  "paused": false,
+  "target": {
+    "attributes": {
+      "source": "schedule"
+    },
+    "body": {
+      "data": "scheduled.message",
+      "encoding": "utf8"
+    },
+    "queue": {
+      "apiVersion": "queue.forms.takoform.com",
+      "kind": "PullQueue",
+      "name": "scheduled-work"
+    },
+    "type": "queueMessage"
+  }
+}

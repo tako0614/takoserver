@@ -1,0 +1,8 @@
+{
+  "hostname": "app.portable-conformance.invalid",
+  "worker": {
+    "apiVersion": "edge.forms.takoform.com",
+    "kind": "ModuleWorker",
+    "name": "Not A Resource Name"
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "externalServices": [
+    {
+      "name": "PRIMARY_DB",
+      "required": true,
+      "service": {
+        "apiVersion": "standards.takoform.com/v1",
+        "protocol": "org.postgresql.wire"
+      }
+    }
+  ],
+  "function": {
+    "apiVersion": "function.forms.takoform.com",
+    "kind": "Function",
+    "name": "function"
+  },
+  "handler": "handle",
+  "maxConcurrency": 10,
+  "memoryMiB": 512,
+  "requiredSensitiveVars": [
+    "API_SIGNING_TOKEN"
+  ],
+  "timeoutSeconds": 30,
+  "vars": {
+    "LOG_LEVEL": "info"
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "apiVersion": "packages.forms.takoform.com/v1alpha5",
+  "kind": "FormPackage",
+  "formRef": {
+    "apiVersion": "edge.forms.takoform.com",
+    "kind": "WorkerCronTrigger",
+    "definitionVersion": "0.1.0",
+    "schemaDigest": "sha256:5faa838c794b3326d0377d641db6247d4320b6ce39b1b0bb660d4deec18fe5ed"
+  },
+  "definitionPath": "definition.json",
+  "files": [
+    {
+      "path": "definition.json",
+      "mediaType": "application/vnd.takoform.form-definition.v1+json",
+      "size": 6255,
+      "digest": "sha256:914359f5beb7d34d94c9358f6dd55cbbb31a9ecc15d67fb5e702c7ea998013f5"
+    },
+    {
+      "path": "fixtures/desired.json",
+      "mediaType": "application/json",
+      "size": 148,
+      "digest": "sha256:d6bb97f08349625ce12381965bdb15a1925ecb51603a35745e83c32416090fc8"
+    },
+    {
+      "path": "fixtures/negative-cron.json",
+      "mediaType": "application/json",
+      "size": 144,
+      "digest": "sha256:ea9df32e66acab4d703b46a7ec55db64f8d0eb9f4db1ec8f839ab769328f8a05"
+    },
+    {
+      "path": "fixtures/negative-missing-cron.json",
+      "mediaType": "application/json",
+      "size": 123,
+      "digest": "sha256:97115c297d510fb3506c47dd145f0ea93305795f932f9ef80a63533865934c9d"
+    },
+    {
+      "path": "fixtures/negative-missing-worker.json",
+      "mediaType": "application/json",
+      "size": 28,
+      "digest": "sha256:334a0c7aa6368706f771b7889bcdf6197a3a3d7917865df639238407137099ca"
+    },
+    {
+      "path": "fixtures/negative-unexpected-property.json",
+      "mediaType": "application/json",
+      "size": 178,
+      "digest": "sha256:ddf401b2b388eae8703dfb45396f4c6e0e3e6c6fbc0a0dcce19cff5ae9b507d2"
+    },
+    {
+      "path": "fixtures/negative-worker.json",
+      "mediaType": "application/json",
+      "size": 154,
+      "digest": "sha256:bab75c9214cb51d9ec154ba251203c3529187c4e1996d7211361f08facdb182d"
+    }
+  ]
+}

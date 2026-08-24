@@ -1,0 +1,23 @@
+{
+  "format": "takoform.form-family-candidates@v1",
+  "family": "vector.forms.takoform.com",
+  "formMaturity": "experimental",
+  "packageApiVersion": "packages.forms.takoform.com/v1alpha5",
+  "publicationStatus": "unpublished",
+  "authoringSource": "internal/vectorformcatalog",
+  "authoringPolicy": "service-shape-preserving-contract",
+  "forms": [
+    {
+      "kind": "VectorIndex",
+      "role": "identity",
+      "path": "forms/candidates/vector.forms.takoform.com/vector-index",
+      "formRef": {
+        "apiVersion": "vector.forms.takoform.com",
+        "kind": "VectorIndex",
+        "definitionVersion": "0.1.0",
+        "schemaDigest": "sha256:46e4a807db0a90295c13edd82f03cf81d17df780f5d5cb7758377862205c692b"
+      },
+      "packageDigest": "sha256:083bba1ed55f1d272df074a420464894d4d04d8afb75c4e7fad68ea6137bc1fc"
+    }
+  ]
+}

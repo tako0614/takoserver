@@ -1,0 +1,46 @@
+{
+  "apiVersion": "edge.forms.takoform.com",
+  "kind": "SQLiteDatabase",
+  "definitionVersion": "0.1.0",
+  "title": "SQLite Database",
+  "description": "Embedded SQLite database with bounded EdgeSqlValue values, rollback-only queries, and serializable all-or-none transactions, exactly as fixed by the edge.sql Interface. SQLite semantics are the identity: a database with different SQL, typing, or isolation behavior is a different Form, never an engine token. Numbers stay finite binary64 values inside Number.MAX_SAFE_INTEGER and do not expose the INTEGER/REAL storage-class distinction; BLOB uses the common canonical encoded-bytes object. Runtime SQL cannot migrate schema; SQLiteMigrationApplication owns that administrative path (decision 0034).",
+  "role": "identity",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Embedded SQLite database with bounded EdgeSqlValue values, rollback-only queries, and serializable all-or-none transactions, exactly as fixed by the edge.sql Interface. SQLite semantics are the identity: a database with different SQL, typing, or isolation behavior is a different Form, never an engine token. Numbers stay finite binary64 values inside Number.MAX_SAFE_INTEGER and do not expose the INTEGER/REAL storage-class distinction; BLOB uses the common canonical encoded-bytes object. Runtime SQL cannot migrate schema; SQLiteMigrationApplication owns that administrative path (decision 0034).",
+    "properties": {},
+    "title": "SQLite Database desired state",
+    "type": "object"
+  },
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "providedInterfaces": [
+    {
+      "apiVersion": "interfaces.takoform.com/v1alpha1",
+      "name": "edge.sql",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:cebd1121b1e3a5cbcb7b61ec78ad9c79ce05cda90fbc5fdb7b4edd3d59562f8f"
+    }
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

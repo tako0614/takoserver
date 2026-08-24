@@ -1,0 +1,9 @@
+{
+  "hostname": "app.example.invalid",
+  "service": {
+    "apiVersion": "container.forms.takoform.com",
+    "kind": "ContainerService",
+    "name": "container-service"
+  },
+  "takoformUnexpected": true
+}

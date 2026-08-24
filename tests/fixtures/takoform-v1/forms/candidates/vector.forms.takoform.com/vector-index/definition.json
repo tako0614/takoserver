@@ -1,0 +1,94 @@
+{
+  "apiVersion": "vector.forms.takoform.com",
+  "kind": "VectorIndex",
+  "definitionVersion": "0.1.0",
+  "title": "Vector Index",
+  "description": "Fixed-dimension dense vector index with a creation-time distance metric. The vector.index Interface fixes namespaced whole-record upsert, read-after-write fetch, approximate top-k query, closed metadata filtering, and deletion; this identity carries only the embedding dimension and metric.",
+  "role": "identity",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Fixed-dimension dense vector index with a creation-time distance metric. The vector.index Interface fixes namespaced whole-record upsert, read-after-write fetch, approximate top-k query, closed metadata filtering, and deletion; this identity carries only the embedding dimension and metric.",
+    "properties": {
+      "dimension": {
+        "description": "Embedding vector dimension fixed for the lifetime of this index. Changing it replaces the index and its records.",
+        "maximum": 1536,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "metric": {
+        "description": "Distance metric fixed for the lifetime of this dense index. Changing it replaces the index and its records.",
+        "enum": [
+          "cosine",
+          "euclidean",
+          "dotproduct"
+        ],
+        "type": "string"
+      }
+    },
+    "required": [
+      "dimension",
+      "metric"
+    ],
+    "title": "Vector Index desired state",
+    "type": "object"
+  },
+  "immutableFields": [
+    "/dimension",
+    "/metric"
+  ],
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "providedInterfaces": [
+    {
+      "apiVersion": "interfaces.takoform.com/v1alpha1",
+      "name": "vector.index",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:9528855824edf91dfbbf2e85a8be2bf7762dfa2abe6955a606b9e3d7d77e267e"
+    }
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-dimension",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-dimension.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-metric",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-metric.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-dimension",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-dimension.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-metric",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-metric.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

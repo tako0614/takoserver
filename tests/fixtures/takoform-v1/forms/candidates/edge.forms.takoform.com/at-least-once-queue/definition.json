@@ -1,0 +1,82 @@
+{
+  "apiVersion": "edge.forms.takoform.com",
+  "kind": "AtLeastOnceQueue",
+  "definitionVersion": "0.1.0",
+  "title": "At-Least-Once Queue",
+  "description": "Message queue with at-least-once delivery and no ordering guarantee, exactly as fixed by the edge.queue Interface. There is no ordering field: a FIFO queue is a different Form. Message bodies are opaque bytes, a message identity is stable across redeliveries, and a queue has AT MOST ONE consumer — two would split the stream between two retry policies and two dead-letter destinations, which leaves the queue's own behavior unstatable (decision 0020).",
+  "role": "identity",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Message queue with at-least-once delivery and no ordering guarantee, exactly as fixed by the edge.queue Interface. There is no ordering field: a FIFO queue is a different Form. Message bodies are opaque bytes, a message identity is stable across redeliveries, and a queue has AT MOST ONE consumer — two would split the stream between two retry policies and two dead-letter destinations, which leaves the queue's own behavior unstatable (decision 0020).",
+    "properties": {
+      "deliveryDelaySeconds": {
+        "default": 0,
+        "description": "Default delay before a sent message becomes deliverable, in seconds. Omitting it delivers immediately.",
+        "maximum": 43200,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "messageRetentionSeconds": {
+        "description": "How long an undelivered message is retained before it is dropped, in seconds.",
+        "maximum": 1209600,
+        "minimum": 60,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "messageRetentionSeconds"
+    ],
+    "title": "At-Least-Once Queue desired state",
+    "type": "object"
+  },
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "update",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "providedInterfaces": [
+    {
+      "apiVersion": "interfaces.takoform.com/v1alpha1",
+      "name": "edge.queue",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:d8ed5c673cb544f5b2bd61aa66ac1c1a716276cf072232b3a0d06471403c2ff7"
+    }
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-message-retention-seconds",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-message-retention-seconds.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-message-retention-seconds",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-message-retention-seconds.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-delivery-delay-seconds",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-delivery-delay-seconds.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

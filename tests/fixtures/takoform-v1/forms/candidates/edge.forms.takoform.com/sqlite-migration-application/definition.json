@@ -1,0 +1,145 @@
+{
+  "apiVersion": "edge.forms.takoform.com",
+  "kind": "SQLiteMigrationApplication",
+  "definitionVersion": "0.1.0",
+  "title": "SQLite Migration Application",
+  "description": "Applies one exact SQLite Migration Set to one exact SQLite Database. Both relations are immutable and UID-pinned before mutation. The database's durable migration ledger records each applied manifest entry as its ordered path+digest pair. The requested set must extend that ledger exactly; a rewrite, reorder, or removal is refused before SQL executes, and only the unapplied suffix runs. Each file and its ledger append commit atomically, so an interrupted application retries the same suffix without replaying a recorded migration. Ready means the ledger equals the referenced set. Deleting this attachment only stops managing the application resource: it never runs down-migrations, rewrites the ledger, reverts schema, or deletes the database.",
+  "role": "attachment",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "constraints": [
+    {
+      "kind": "exclusive",
+      "reference": "/database"
+    }
+  ],
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Applies one exact SQLite Migration Set to one exact SQLite Database. Both relations are immutable and UID-pinned before mutation. The database's durable migration ledger records each applied manifest entry as its ordered path+digest pair. The requested set must extend that ledger exactly; a rewrite, reorder, or removal is refused before SQL executes, and only the unapplied suffix runs. Each file and its ledger append commit atomically, so an interrupted application retries the same suffix without replaying a recorded migration. Ready means the ledger equals the referenced set. Deleting this attachment only stops managing the application resource: it never runs down-migrations, rewrites the ledger, reverts schema, or deletes the database.",
+    "properties": {
+      "database": {
+        "additionalProperties": false,
+        "description": "Exact SQLite Database whose durable migration ledger and schema this application advances.",
+        "properties": {
+          "apiVersion": {
+            "const": "edge.forms.takoform.com",
+            "type": "string"
+          },
+          "kind": {
+            "const": "SQLiteDatabase",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "apiVersion",
+          "kind",
+          "name"
+        ],
+        "type": "object",
+        "x-takoform-target-formrefs": [
+          {
+            "apiVersion": "edge.forms.takoform.com",
+            "definitionVersion": "0.1.0",
+            "kind": "SQLiteDatabase",
+            "schemaDigest": "sha256:c72eeb66ef96c4679b5c724fa1219d71c89bb7eeb9e543d73d868ec41bddddfe"
+          }
+        ]
+      },
+      "migrationSet": {
+        "additionalProperties": false,
+        "description": "Exact immutable SQLite Migration Set whose ordered manifest must extend the database ledger.",
+        "properties": {
+          "apiVersion": {
+            "const": "edge.forms.takoform.com",
+            "type": "string"
+          },
+          "kind": {
+            "const": "SQLiteMigrationSet",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "apiVersion",
+          "kind",
+          "name"
+        ],
+        "type": "object",
+        "x-takoform-target-formrefs": [
+          {
+            "apiVersion": "edge.forms.takoform.com",
+            "definitionVersion": "0.1.0",
+            "kind": "SQLiteMigrationSet",
+            "schemaDigest": "sha256:05a4aa2ebd8fbf659f05ae378288d9c9657cc7478e1437f013732199bfcce7b9"
+          }
+        ]
+      }
+    },
+    "required": [
+      "database",
+      "migrationSet"
+    ],
+    "title": "SQLite Migration Application desired state",
+    "type": "object"
+  },
+  "immutableFields": [
+    "/database",
+    "/migrationSet"
+  ],
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-database",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-database.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-migration-set",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-migration-set.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-database",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-database.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-migration-set",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-migration-set.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

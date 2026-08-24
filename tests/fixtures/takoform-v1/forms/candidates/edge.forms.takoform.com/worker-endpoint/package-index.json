@@ -1,0 +1,43 @@
+{
+  "apiVersion": "packages.forms.takoform.com/v1alpha5",
+  "kind": "FormPackage",
+  "formRef": {
+    "apiVersion": "edge.forms.takoform.com",
+    "kind": "WorkerEndpoint",
+    "definitionVersion": "0.1.0",
+    "schemaDigest": "sha256:732f60aba45ce360d5ebbc6ac2e55fe4d59b65d353f4628e93960d71fbc2870f"
+  },
+  "definitionPath": "definition.json",
+  "files": [
+    {
+      "path": "definition.json",
+      "mediaType": "application/vnd.takoform.form-definition.v1+json",
+      "size": 7867,
+      "digest": "sha256:e88fbe59674a8047ca19e4c013f7b2eb20bb9f475e825bbda7c6d14cdeb771f6"
+    },
+    {
+      "path": "fixtures/desired.json",
+      "mediaType": "application/json",
+      "size": 123,
+      "digest": "sha256:97115c297d510fb3506c47dd145f0ea93305795f932f9ef80a63533865934c9d"
+    },
+    {
+      "path": "fixtures/negative-missing-worker.json",
+      "mediaType": "application/json",
+      "size": 3,
+      "digest": "sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+    },
+    {
+      "path": "fixtures/negative-unexpected-property.json",
+      "mediaType": "application/json",
+      "size": 153,
+      "digest": "sha256:90c7d67ec6bc8d7aaca42c7d82567d84cc6d4e403c25bff7ce73366fe0c3457e"
+    },
+    {
+      "path": "fixtures/negative-worker.json",
+      "mediaType": "application/json",
+      "size": 129,
+      "digest": "sha256:d451cce3a6e5d6cacfcdcf49370e191907ca4e3a8a33813896efa5328f3e00ed"
+    }
+  ]
+}

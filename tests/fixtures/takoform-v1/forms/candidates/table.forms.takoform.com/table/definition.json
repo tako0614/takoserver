@@ -1,0 +1,227 @@
+{
+  "apiVersion": "table.forms.takoform.com",
+  "kind": "Table",
+  "definitionVersion": "0.1.0",
+  "title": "Table",
+  "description": "Key-addressed document table with a declared partition key, optional sort key, mutable secondary indexes, and optional lazy TTL. The table.document Interface fixes document values, conditional writes, consistent single-item reads, and key-ordered partition queries; this identity carries only the table's addressing declaration.",
+  "role": "identity",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "constraints": [
+    {
+      "kind": "uniqueBy",
+      "list": "/secondaryIndexes",
+      "member": "name"
+    }
+  ],
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Key-addressed document table with a declared partition key, optional sort key, mutable secondary indexes, and optional lazy TTL. The table.document Interface fixes document values, conditional writes, consistent single-item reads, and key-ordered partition queries; this identity carries only the table's addressing declaration.",
+    "properties": {
+      "partitionKey": {
+        "additionalProperties": false,
+        "description": "Immutable partition key declaration. Every item must carry this top-level attribute; changing it replaces the table.",
+        "properties": {
+          "name": {
+            "description": "Top-level document attribute used by this key.",
+            "maxLength": 255,
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,254}$",
+            "type": "string"
+          },
+          "type": {
+            "description": "Portable scalar type used to encode and order this key attribute.",
+            "enum": [
+              "string",
+              "number",
+              "bytes"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "type"
+        ],
+        "type": "object"
+      },
+      "secondaryIndexes": {
+        "default": [],
+        "description": "Secondary indexes over top-level document attributes. Adding or removing an entry is an in-place table update; an index is redefined only by removing it and adding it later. Omitting this list declares no secondary indexes.",
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "description": "Stable portable name of this secondary index.",
+              "maxLength": 63,
+              "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+              "type": "string"
+            },
+            "partitionKey": {
+              "description": "Top-level attribute forming the index partition key.",
+              "maxLength": 255,
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,254}$",
+              "type": "string"
+            },
+            "sortKey": {
+              "description": "Optional top-level attribute forming the index sort key. When absent, the index has no sort key.",
+              "maxLength": 255,
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,254}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "partitionKey"
+          ],
+          "type": "object"
+        },
+        "maxItems": 20,
+        "type": "array",
+        "uniqueItems": true
+      },
+      "sortKey": {
+        "additionalProperties": false,
+        "description": "Optional immutable sort key declaration. When absent, each partition key addresses at most one item; changing it replaces the table.",
+        "properties": {
+          "name": {
+            "description": "Top-level document attribute used by the sort key.",
+            "maxLength": 255,
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,254}$",
+            "type": "string"
+          },
+          "type": {
+            "description": "Portable scalar type used to encode and order the sort key attribute.",
+            "enum": [
+              "string",
+              "number",
+              "bytes"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "type"
+        ],
+        "type": "object"
+      },
+      "ttlAttribute": {
+        "description": "Optional top-level number attribute used for lazy epoch-second expiry. When absent, the table has no TTL policy; setting or clearing it is an in-place update.",
+        "maxLength": 255,
+        "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,254}$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "partitionKey"
+    ],
+    "title": "Table desired state",
+    "type": "object"
+  },
+  "immutableFields": [
+    "/partitionKey",
+    "/sortKey"
+  ],
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "update",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "providedInterfaces": [
+    {
+      "apiVersion": "interfaces.takoform.com/v1alpha1",
+      "name": "table.document",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:a7f183f6071598cb894ee65841dcc2b09fdd1a87bea7f65256dd3d1c844b4c14"
+    }
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-partition-key",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-partition-key.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-partition-key",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-partition-key.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-partition-key-name",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-partition-key-name.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-partition-key-type",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-partition-key-type.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-sort-key",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-sort-key.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-sort-key-name",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-sort-key-name.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-sort-key-type",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-sort-key-type.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-secondary-indexes",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-secondary-indexes.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-secondary-indexes-name",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-secondary-indexes-name.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-secondary-indexes-partition-key",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-secondary-indexes-partition-key.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-secondary-indexes-sort-key",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-secondary-indexes-sort-key.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-ttl-attribute",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-ttl-attribute.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

@@ -1,0 +1,67 @@
+{
+  "apiVersion": "packages.forms.takoform.com/v1alpha5",
+  "kind": "FormPackage",
+  "formRef": {
+    "apiVersion": "edge.forms.takoform.com",
+    "kind": "WorkerDeployment",
+    "definitionVersion": "0.1.0",
+    "schemaDigest": "sha256:0d2bca351b8ecade0a1ebbddf2463bba22910313ff916414112ec8762204e769"
+  },
+  "definitionPath": "definition.json",
+  "files": [
+    {
+      "path": "definition.json",
+      "mediaType": "application/vnd.takoform.form-definition.v1+json",
+      "size": 5836,
+      "digest": "sha256:d1fb89cbf8615961193002f83d4447b9e4b943e95fcbd29a85a9ab2d65d670d9"
+    },
+    {
+      "path": "fixtures/desired.json",
+      "mediaType": "application/json",
+      "size": 327,
+      "digest": "sha256:5fafead4a801af402e36d11ccf6b96fa3848f591119431ae0a43f43ee3c28fc5"
+    },
+    {
+      "path": "fixtures/negative-missing-versions.json",
+      "mediaType": "application/json",
+      "size": 123,
+      "digest": "sha256:97115c297d510fb3506c47dd145f0ea93305795f932f9ef80a63533865934c9d"
+    },
+    {
+      "path": "fixtures/negative-missing-worker.json",
+      "mediaType": "application/json",
+      "size": 207,
+      "digest": "sha256:39fc4e74ad96bbd19db743d49a27f405d557be261b504f02e08121e46fc541c3"
+    },
+    {
+      "path": "fixtures/negative-unexpected-property.json",
+      "mediaType": "application/json",
+      "size": 357,
+      "digest": "sha256:45e5ec7e39e90a4685af13959cef34827ee4fddea3b06514dac944a68eb51f3f"
+    },
+    {
+      "path": "fixtures/negative-versions-weight.json",
+      "mediaType": "application/json",
+      "size": 323,
+      "digest": "sha256:93aa7f770cee08a5c8790c3402c0f19256d92087efd36a9751bcfb037bf314ea"
+    },
+    {
+      "path": "fixtures/negative-versions-worker-version.json",
+      "mediaType": "application/json",
+      "size": 332,
+      "digest": "sha256:382cf1de726659740976c73335db0f1b58ef63a5d1df4a3d3190d9419eb57243"
+    },
+    {
+      "path": "fixtures/negative-versions.json",
+      "mediaType": "application/json",
+      "size": 323,
+      "digest": "sha256:93aa7f770cee08a5c8790c3402c0f19256d92087efd36a9751bcfb037bf314ea"
+    },
+    {
+      "path": "fixtures/negative-worker.json",
+      "mediaType": "application/json",
+      "size": 333,
+      "digest": "sha256:944153fdaf1f11b29ea8868a52d29c29374d83ea0b09fafcc0c9ff419afe3f10"
+    }
+  ]
+}
