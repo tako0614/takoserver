@@ -70,6 +70,16 @@ describe("Worker data service composition", () => {
     expect(createWorkerDataServices({})).toEqual({});
   });
 
+  test("keeps retired ObjectBucket credential remnants inert without an explicit supply", () => {
+    expect(
+      createWorkerDataServices({
+        CLOUDFLARE_ACCOUNT_ID: "account_01",
+        TAKOSERVER_R2_PARENT_ACCESS_KEY_ID: "retired-parent-key",
+        TAKOSERVER_R2_PARENT_TOKEN: "a".repeat(64),
+      }),
+    ).toEqual({});
+  });
+
   test("composes exact public AI models and standard S3 credentials", () => {
     const AI = { async run() {} };
     const services = createWorkerDataServices({
