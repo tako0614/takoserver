@@ -312,7 +312,7 @@ describe("private data service deploy configuration", () => {
     }
   });
 
-  test("will not sell edge capacity without a host runtime materializer service", () => {
+  test("keeps edge capacity independent from an optional runtime materializer service", () => {
     const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
     try {
       const path = join(directory, "target.json");
@@ -324,7 +324,10 @@ describe("private data service deploy configuration", () => {
           workerEndpointSuffix: "hosted.workers.dev",
         }),
       );
-      expect(() => loadTarget(path)).toThrow("edge supplies and `hostRuntimeMaterializerService`");
+      const target = loadTarget(path);
+      expect(JSON.stringify(target.edgeSupplies)).toBe(JSON.stringify(EDGE_SUPPLIES));
+      expect(target.hostRuntimeMaterializerService).toBeUndefined();
+      expect(serviceBindings(target)).toEqual({});
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
