@@ -35,6 +35,15 @@ const HOST_INTRINSIC = new Set([
   "SQLiteMigrationApplication",
 ]);
 
+const CLOUDFLARE_EDGE_RELATION_KINDS = new Set([
+  "WorkerVersion",
+  "WorkerDeployment",
+  "WorkerCustomDomain",
+  "WorkerEndpoint",
+  "WorkerCronTrigger",
+  "QueueConsumer",
+]);
+
 export interface WorkerProductionCompositionEnv {
   readonly TAKOSERVER_STANDARD_SERVICE_SUPPLIES?: string;
   readonly TAKOSERVER_OBJECT_BUCKET_SUPPLIES?: string;
@@ -67,6 +76,8 @@ export interface WorkerProductionComposition {
 export function createWorkerProductionComposition(input: {
   readonly env: WorkerProductionCompositionEnv;
   readonly forms: readonly InstalledTakoformForm[];
+  /** Exact old definitions used only to observe/delete recorded Deployments. */
+  readonly retainedForms?: readonly InstalledTakoformForm[];
   readonly artifacts: ArtifactBytes;
   readonly s3CredentialIssuer?: S3CredentialIssuer;
   readonly runtimeMaterializer?: RuntimeMaterializer;
@@ -122,8 +133,16 @@ export function createWorkerProductionComposition(input: {
     throw new TypeError("hosted ObjectBucket supplies require an S3 credential issuer");
   }
 
-  const forms = new Map(input.forms.map((form) => [form.identity.formRef.kind, form]));
-  const objectBucket = requiredForm(forms, "ObjectBucket");
+  const forms = edgeFormMap(input.forms);
+  const retainedForms = edgeFormMap(input.retainedForms ?? []);
+  const objectBucket =
+    cloudflareObjects.length > 0 || wasabiObjects.length > 0
+      ? requiredForm(
+          retainedForms.has("ObjectBucket") ? retainedForms : forms,
+          "ObjectBucket",
+          "edge.forms.takoform.com/v1beta1",
+        )
+      : undefined;
   const providers: Provider[] = [];
   const packs: ProviderPack[] = [];
   const candidates = [];
@@ -168,7 +187,7 @@ export function createWorkerProductionComposition(input: {
 
     const technical: ProviderOffering[] = [];
     for (const supply of cloudflareObjects) {
-      const offering = objectBucketProviderOffering(objectBucket, {
+      const offering = objectBucketProviderOffering(objectBucket as InstalledTakoformForm, {
         id: supply.offeringId,
         displayName: supply.displayName,
         regions: supply.providerInstallation.regions.map((region) => region.id),
@@ -212,11 +231,44 @@ export function createWorkerProductionComposition(input: {
     // The relation-owned Forms are provider capabilities, not retail items.
     // There is exactly one technical projection for each exact Form so the
     // provider driver can inherit it from the identity Deployment.
-    for (const form of input.forms) {
-      if (form.role === "identity" || HOST_INTRINSIC.has(form.identity.formRef.kind)) continue;
+    for (const form of forms.values()) {
+      if (
+        form.role === "identity" ||
+        HOST_INTRINSIC.has(form.identity.formRef.kind) ||
+        !CLOUDFLARE_EDGE_RELATION_KINDS.has(form.identity.formRef.kind)
+      ) {
+        continue;
+      }
       technical.push(
         edgeProviderOffering(form, {
-          id: `cloudflare.edge.${form.identity.formRef.kind.toLowerCase()}`,
+          id:
+            form.identity.formRef.apiVersion === "edge.forms.takoform.com"
+              ? `cloudflare.edge.stable-v1.${form.identity.formRef.kind.toLowerCase()}`
+              : `cloudflare.edge.${form.identity.formRef.kind.toLowerCase()}`,
+        }),
+      );
+    }
+    for (const form of retainedForms.values()) {
+      const kind = form.identity.formRef.kind;
+      if (HOST_INTRINSIC.has(kind)) continue;
+      if (kind === "ObjectBucket") {
+        technical.push(
+          objectBucketProviderOffering(form, {
+            id: "storage.object.cloudflare.global",
+            displayName: form.displayName ?? kind,
+          }),
+        );
+        continue;
+      }
+      if (!(kind in HOSTED_EDGE_IDENTITY_CLASSES) && !CLOUDFLARE_EDGE_RELATION_KINDS.has(kind)) {
+        continue;
+      }
+      technical.push(
+        edgeProviderOffering(form, {
+          id:
+            kind in HOSTED_EDGE_IDENTITY_CLASSES
+              ? `${HOSTED_EDGE_IDENTITY_CLASSES[kind as keyof typeof HOSTED_EDGE_IDENTITY_CLASSES]}.cloudflare.global`
+              : `cloudflare.edge.${kind.toLowerCase()}`,
         }),
       );
     }
@@ -287,7 +339,7 @@ export function createWorkerProductionComposition(input: {
       env.TAKOSERVER_WASABI_SECRET_ACCESS_KEY,
       "Wasabi provisioning",
     );
-    const technical = objectBucketProviderOffering(objectBucket, {
+    const technical = objectBucketProviderOffering(objectBucket as InstalledTakoformForm, {
       id: supply.offeringId,
       displayName: supply.displayName,
       regions: supply.providerInstallation.regions.map((region) => region.id),
@@ -353,10 +405,11 @@ export function createWorkerProductionComposition(input: {
     edgeSupplies,
     providers,
     providerPacks: compiled.providerPacks,
-    // Retain the released Provider Packs only for already-recorded Deployment
-    // observation/deletion. Their beta Form identities are not current sale or
-    // provision authority after the literal stable Host cutover.
-    offerings: [],
+    // Retained beta identities are observation/delete-only. Only exact stable
+    // identities can become current sale/provision authority.
+    offerings: compiled.offerings.filter(
+      (offering) => offering.form.apiVersion === "edge.forms.takoform.com",
+    ),
     ...(standardServiceResolver ? { standardServiceResolver } : {}),
   };
 }
@@ -364,12 +417,34 @@ export function createWorkerProductionComposition(input: {
 function requiredForm(
   forms: ReadonlyMap<string, InstalledTakoformForm>,
   kind: string,
+  apiVersion?: string,
 ): InstalledTakoformForm {
   const form = forms.get(kind);
-  if (!form || form.identity.formRef.apiVersion !== "edge.forms.takoform.com/v1beta1") {
-    throw new TypeError(`released Takoform Form missing: ${kind}`);
+  if (!form || (apiVersion !== undefined && form.identity.formRef.apiVersion !== apiVersion)) {
+    throw new TypeError(`official Takoform Edge Form missing: ${kind}`);
   }
   return form;
+}
+
+function edgeFormMap(
+  forms: readonly InstalledTakoformForm[],
+): ReadonlyMap<string, InstalledTakoformForm> {
+  const result = new Map<string, InstalledTakoformForm>();
+  for (const form of forms) {
+    if (
+      form.identity.formRef.apiVersion !== "edge.forms.takoform.com" &&
+      form.identity.formRef.apiVersion !== "edge.forms.takoform.com/v1beta1"
+    ) {
+      continue;
+    }
+    if (result.has(form.identity.formRef.kind)) {
+      throw new TypeError(
+        `official Takoform Edge Form is ambiguous: ${form.identity.formRef.kind}`,
+      );
+    }
+    result.set(form.identity.formRef.kind, form);
+  }
+  return result;
 }
 
 function requiredInterface(offering: ProviderOffering | undefined) {

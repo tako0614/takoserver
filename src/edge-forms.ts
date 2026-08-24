@@ -99,8 +99,11 @@ export function edgeProviderOffering(
   form: InstalledTakoformForm,
   options: EdgeProviderOfferingOptions,
 ): ProviderOffering {
-  if (form.identity.formRef.apiVersion !== "edge.forms.takoform.com/v1beta1") {
-    throw new TypeError("released_takoform_edge_form_required");
+  if (
+    form.identity.formRef.apiVersion !== "edge.forms.takoform.com" &&
+    form.identity.formRef.apiVersion !== "edge.forms.takoform.com/v1beta1"
+  ) {
+    throw new TypeError("official_takoform_edge_form_required");
   }
   return {
     id: options.id,

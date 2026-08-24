@@ -3,9 +3,10 @@
 An Open Source, Self-Hostable PaaS with a [Takoform](https://takoform.com) Host
 for declarative infrastructure and ordinary data APIs for already-standardized
 services. The public Host is the one literal `forms.takoform.com/v1` lane.
-Production installs no unpublished Form package: exact stable definitions must
-arrive from Takoform as released external input before they may enter the
-production catalog.
+Production installs only exact package bytes generated from one canonical,
+source-pinned Takoform commit. That downstream pin is Takoserver adoption
+authority, not a Takoform release, Form promotion, or claim that the current
+`0.x` FormRefs are no longer Experimental.
 
 The released provider-v2.1.1 Edge Family remains immutable historical input so
 Takoserver can read and drain Deployments already recorded under it. It is not
@@ -226,12 +227,13 @@ per-entry ban, so the Workers entry cannot reach a filesystem it does not have.
 
 Three properties are worth knowing before reading the code:
 
-**Shipped Form definitions come from a release.** Takoserver cannot author a
-name in the Takoform namespace. `bun run check:official-forms` still pins the
-immutable provider-v2.1.1 bytes used to manage historical records; those bytes
-carry no present sale authority. A current Form needs a released stable
-definition and an implemented backend. AI and S3 protocol operations do not
-become Forms just because Takoserver offers them.
+**Shipped Form definitions come from exact Takoform bytes.** Takoserver cannot
+author a name in the Takoform namespace. `bun run check:official-forms` pins
+both the canonical source commit and the generated catalog bytes, while still
+pinning immutable provider-v2.1.1 history used to drain old records. A current
+sale additionally needs an implemented backend and explicit operator supply;
+pinning it here does not mint or promote a Takoform release. AI and S3 protocol
+operations do not become Forms just because Takoserver offers them.
 
 **Guarded writes, not transactions.** The control database may be D1, which has
 no interactive transaction, so invariants live in `WHERE` clauses and are

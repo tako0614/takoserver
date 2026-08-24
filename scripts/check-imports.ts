@@ -46,7 +46,7 @@ interface Layer {
 const LAYERS: readonly Layer[] = [
   {
     name: "release-data",
-    match: /^vendor\/takoform\/.*\.json$/u,
+    match: /^(?:vendor\/takoform\/.*\.json|src\/generated\/takoform-stable-v1-catalog\.ts)$/u,
     may: ["release-data"],
   },
   {
