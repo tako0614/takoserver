@@ -148,10 +148,16 @@ Deployments, but their beta Forms are not republished as a sale catalog. The
 control plane itself can also run as a Worker; `bun run deploy -- --contract`
 describes what publishing that involves and what it refuses to do.
 
-The operator-private deploy target may also declare `aiModels`,
-`r2ParentAccessKeyId`, and a `hostRuntimeMaterializerService`. The former is the
-exact public-model to upstream-model mapping, limits, and retail token prices;
-the latter is only the public id of an R2 parent token. The materializer
+The operator-private deploy target may declare `aiModels`,
+`standardServiceSupplies`, and a `hostRuntimeMaterializerService`.
+`standardServiceSupplies` is a closed, non-secret operator choice. The current
+adapter accepts exactly
+`standards.takoform.com/v1/com.amazonaws.s3 -> cloudflare-r2` plus an
+operator-owned `supplyNamespace`; realization writes that exact document to
+`TAKOSERVER_STANDARD_SERVICE_SUPPLIES` and requires the ordinary
+`CLOUDFLARE_API_TOKEN` secret before publication. It does not create, sell, or
+reference a current ObjectBucket Form. `aiModels` is the exact public-model to
+upstream-model mapping, limits, and retail token prices. The materializer
 descriptor contains only an exact Worker service name and named entrypoint;
 realization binds it as `HOST_RUNTIME_MATERIALIZER`. The deploy writer reads the
 immutable Worker Version back and requires that exact service and entrypoint;
@@ -170,9 +176,10 @@ compare-and-swap rollback is confirmed. Realization places the other
 non-secret values in Worker vars. AI
 uses the native Workers AI binding, so it does not copy an account API token
 into inference requests. `CLOUDFLARE_API_TOKEN` remains the provisioning
-secret, while `TAKOSERVER_R2_PARENT_TOKEN` is the parent R2 secret access key.
-The Worker uses that key only to sign short-lived bucket-scoped session
-credentials locally; it never returns or forwards the parent key. Deploy
+secret. `r2ParentAccessKeyId` and `TAKOSERVER_R2_PARENT_TOKEN` belong only to
+the retained historical ObjectBucket credential path and must be paired with
+its historical supply record; they are not required by a stable S3 runtime
+binding. Deploy
 preflight refuses an enabled capability whose required secret is absent. With
 no such target fields, `/v1/ai` and S3 credential issuance stay absent rather
 than using a demo backend.

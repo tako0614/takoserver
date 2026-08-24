@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deploymentVariables, serviceBindings } from "../scripts/deploy/realized-config.ts";
 import { loadTarget } from "../scripts/deploy/target.ts";
+import { PRODUCTION_STANDARD_SERVICE_SUPPLIES_KIND } from "../src/standard-service-production.ts";
 
 const BASE = {
   accountId: "a10162d23653f1ad1193dabf520a5dd0",
@@ -26,6 +27,19 @@ const MODEL = {
   maxOutputTokens: 4_096,
   inputMinorPerMillionTokens: 40,
   outputMinorPerMillionTokens: 300,
+};
+
+const STANDARD_SERVICE_SUPPLIES = {
+  kind: PRODUCTION_STANDARD_SERVICE_SUPPLIES_KIND,
+  supplies: [
+    {
+      serviceRef: {
+        apiVersion: "standards.takoform.com/v1",
+        protocol: "com.amazonaws.s3",
+      },
+      backend: { kind: "cloudflare-r2", supplyNamespace: "production-primary" },
+    },
+  ],
 };
 
 const SUPPLIES = {
@@ -196,6 +210,56 @@ describe("private data service deploy configuration", () => {
           },
         ],
       });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("realizes stable S3 supply without a current ObjectBucket sale", () => {
+    const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
+    try {
+      const path = join(directory, "target.json");
+      writeFileSync(
+        path,
+        JSON.stringify({
+          ...BASE,
+          standardServiceSupplies: STANDARD_SERVICE_SUPPLIES,
+        }),
+      );
+      const realized = deploymentVariables(loadTarget(path)) as {
+        vars: Record<string, string>;
+      };
+      expect(realized.vars.CLOUDFLARE_ACCOUNT_ID).toBe(BASE.accountId);
+      expect(JSON.parse(realized.vars.TAKOSERVER_STANDARD_SERVICE_SUPPLIES ?? "null")).toEqual(
+        STANDARD_SERVICE_SUPPLIES,
+      );
+      expect(realized.vars).not.toHaveProperty("TAKOSERVER_OBJECT_BUCKET_SUPPLIES");
+      expect(realized.vars).not.toHaveProperty("TAKOSERVER_R2_PARENT_ACCESS_KEY_ID");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects an unbounded stable standard-service supply", () => {
+    const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
+    try {
+      const path = join(directory, "target.json");
+      writeFileSync(
+        path,
+        JSON.stringify({
+          ...BASE,
+          standardServiceSupplies: {
+            ...STANDARD_SERVICE_SUPPLIES,
+            supplies: [
+              {
+                ...STANDARD_SERVICE_SUPPLIES.supplies[0],
+                credential: "must-not-be-here",
+              },
+            ],
+          },
+        }),
+      );
+      expect(() => loadTarget(path)).toThrow("invalid production standard-service supplies");
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

@@ -118,6 +118,7 @@ export function deploymentVariables(target: DeployTarget): Record<string, unknow
     target.zones !== undefined ||
     target.aiModels !== undefined ||
     target.r2ParentAccessKeyId !== undefined ||
+    target.standardServiceSupplies !== undefined ||
     target.objectBucketSupplies !== undefined ||
     target.edgeSupplies !== undefined
   ) {
@@ -129,6 +130,9 @@ export function deploymentVariables(target: DeployTarget): Record<string, unknow
   if (target.aiModels !== undefined) vars.TAKOSERVER_AI_MODELS = JSON.stringify(target.aiModels);
   if (target.r2ParentAccessKeyId !== undefined) {
     vars.TAKOSERVER_R2_PARENT_ACCESS_KEY_ID = target.r2ParentAccessKeyId;
+  }
+  if (target.standardServiceSupplies !== undefined) {
+    vars.TAKOSERVER_STANDARD_SERVICE_SUPPLIES = JSON.stringify(target.standardServiceSupplies);
   }
   if (target.objectBucketSupplies !== undefined) {
     vars.TAKOSERVER_OBJECT_BUCKET_SUPPLIES = JSON.stringify(target.objectBucketSupplies);

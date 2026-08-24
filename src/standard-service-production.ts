@@ -7,6 +7,20 @@ import type { TakoformStandardServiceResolver } from "./takoform/types.ts";
 
 export const PRODUCTION_STANDARD_SERVICE_SUPPLIES_KIND = "takoserver.standard-service-supplies@v1";
 
+export interface ProductionStandardServiceSupplies {
+  readonly kind: typeof PRODUCTION_STANDARD_SERVICE_SUPPLIES_KIND;
+  readonly supplies: readonly {
+    readonly serviceRef: {
+      readonly apiVersion: "standards.takoform.com/v1";
+      readonly protocol: "com.amazonaws.s3";
+    };
+    readonly backend: {
+      readonly kind: "cloudflare-r2";
+      readonly supplyNamespace: string;
+    };
+  }[];
+}
+
 export function createProductionStandardServiceResolver(input: {
   readonly raw?: string;
   readonly cloudflare?: {
@@ -23,13 +37,28 @@ export function createProductionStandardServiceResolver(input: {
   } catch {
     throw invalid();
   }
+  const document = parseProductionStandardServiceSupplies(parsed);
+  const cloudflare = input.cloudflare;
+  if (!cloudflare) throw invalid();
+  const supplies = document.supplies.map((supply) => {
+    return createCloudflareR2StandardServiceSupply({
+      ...cloudflare,
+      supplyNamespace: supply.backend.supplyNamespace,
+    });
+  });
+  return createStandardServiceResolver(supplies);
+}
+
+export function parseProductionStandardServiceSupplies(
+  parsed: unknown,
+): ProductionStandardServiceSupplies {
   const document = object(parsed);
   if (
     !document ||
     !exactKeys(document, ["kind", "supplies"]) ||
     document.kind !== PRODUCTION_STANDARD_SERVICE_SUPPLIES_KIND ||
     !Array.isArray(document.supplies) ||
-    document.supplies.length === 0
+    document.supplies.length !== 1
   ) {
     throw invalid();
   }
@@ -47,17 +76,25 @@ export function createProductionStandardServiceResolver(input: {
       serviceRef.apiVersion !== AMAZON_S3_STANDARD_SERVICE.apiVersion ||
       serviceRef.protocol !== AMAZON_S3_STANDARD_SERVICE.protocol ||
       backend.kind !== "cloudflare-r2" ||
-      !validSupplyNamespace(backend.supplyNamespace) ||
-      !input.cloudflare
+      !validSupplyNamespace(backend.supplyNamespace)
     ) {
       throw invalid();
     }
-    return createCloudflareR2StandardServiceSupply({
-      ...input.cloudflare,
-      supplyNamespace: backend.supplyNamespace,
-    });
+    return {
+      serviceRef: {
+        apiVersion: AMAZON_S3_STANDARD_SERVICE.apiVersion,
+        protocol: AMAZON_S3_STANDARD_SERVICE.protocol,
+      },
+      backend: {
+        kind: "cloudflare-r2" as const,
+        supplyNamespace: backend.supplyNamespace,
+      },
+    };
   });
-  return createStandardServiceResolver(supplies);
+  return {
+    kind: PRODUCTION_STANDARD_SERVICE_SUPPLIES_KIND,
+    supplies,
+  };
 }
 
 function validSupplyNamespace(value: unknown): value is string {
