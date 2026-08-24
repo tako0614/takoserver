@@ -247,11 +247,6 @@ function validateTarget(value: unknown, path: string): DeployTarget {
       "deploy target edge supplies and `workerEndpointSuffix` must be configured together",
     );
   }
-  if (target.edgeSupplies && !target.hostRuntimeMaterializerService) {
-    throw preflightError(
-      "deploy target edge supplies and `hostRuntimeMaterializerService` must be configured together",
-    );
-  }
   if (target.takosId && target.googleClientId) {
     throw preflightError("deploy target cannot configure both `takosId` and `googleClientId`");
   }
