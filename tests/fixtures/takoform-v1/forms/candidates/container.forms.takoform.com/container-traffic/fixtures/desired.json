@@ -1,0 +1,17 @@
+{
+  "revisions": [
+    {
+      "containerRevision": {
+        "apiVersion": "container.forms.takoform.com",
+        "kind": "ContainerRevision",
+        "name": "container-revision"
+      },
+      "weight": 10000
+    }
+  ],
+  "service": {
+    "apiVersion": "container.forms.takoform.com",
+    "kind": "ContainerService",
+    "name": "container-service"
+  }
+}

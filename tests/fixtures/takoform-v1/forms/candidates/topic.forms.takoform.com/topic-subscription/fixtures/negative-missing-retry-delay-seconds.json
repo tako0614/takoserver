@@ -1,0 +1,24 @@
+{
+  "deadLetter": {
+    "apiVersion": "queue.forms.takoform.com",
+    "kind": "PullQueue",
+    "name": "dead-letters"
+  },
+  "filterPolicy": {
+    "eventType": [
+      "order.created",
+      "order.updated"
+    ]
+  },
+  "maxRetries": 3,
+  "target": {
+    "apiVersion": "queue.forms.takoform.com",
+    "kind": "PullQueue",
+    "name": "events"
+  },
+  "topic": {
+    "apiVersion": "topic.forms.takoform.com",
+    "kind": "Topic",
+    "name": "topic"
+  }
+}

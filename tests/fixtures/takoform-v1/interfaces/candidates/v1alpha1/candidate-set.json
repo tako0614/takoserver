@@ -1,0 +1,72 @@
+{
+  "format": "takoform.interface-candidates@v1",
+  "publicationStatus": "unpublished",
+  "authoringSource": "cmd/current-form-source",
+  "interfaces": [
+    {
+      "name": "container.runtime",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:836d475fb206081b2f33ced95237079af54baceaf2afa9f32482c1e967c5a5ce"
+    },
+    {
+      "name": "edge.kv",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:231cfe2a7d8a6a9234f2ca84d4c4fc5b52857e5b632ab613ab2f9eca0116e082"
+    },
+    {
+      "name": "edge.queue",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:d8ed5c673cb544f5b2bd61aa66ac1c1a716276cf072232b3a0d06471403c2ff7"
+    },
+    {
+      "name": "edge.sql",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:cebd1121b1e3a5cbcb7b61ec78ad9c79ce05cda90fbc5fdb7b4edd3d59562f8f"
+    },
+    {
+      "name": "function.runtime",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:32160e50c373313dcaeec7bc9a1409ffd84e96b9eac87663868d5185aa45c6e0"
+    },
+    {
+      "name": "queue.pull",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:93a580be2858aae5561c26488035a1ae9338754d22302c33c6c1917f7d0e94ac"
+    },
+    {
+      "name": "table.document",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:a7f183f6071598cb894ee65841dcc2b09fdd1a87bea7f65256dd3d1c844b4c14"
+    },
+    {
+      "name": "topic.publish",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:9540b8b0735715dd92e0c7fc2bd59b0d04abc37b1d2637a741b44604e2810845"
+    },
+    {
+      "name": "vector.index",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:9528855824edf91dfbbf2e85a8be2bf7762dfa2abe6955a606b9e3d7d77e267e"
+    },
+    {
+      "name": "worker.actor",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:f5428fb587de80261dd7363dc5b8a3f4aab7e469fa1b5fce8441ad9acbec8218"
+    },
+    {
+      "name": "worker.runtime",
+      "version": "1.1.0",
+      "schemaDigest": "sha256:ed2f8211aac5be94488d391945ca6aca7627a4ecbd261e39790093e887feae08"
+    },
+    {
+      "name": "worker.service",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:8024073e25413c8906c3e189555a7485b4c7a6656e8a537fb2801f9b9682536e"
+    },
+    {
+      "name": "worker.workflow",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:6b652dd311975da84469a5ec44f48acbc6db2097d1473988bd5424a85fda4294"
+    }
+  ]
+}

@@ -1,0 +1,71 @@
+{
+  "format": "takoform.form-family-candidates@v1",
+  "family": "container.forms.takoform.com",
+  "formMaturity": "experimental",
+  "packageApiVersion": "packages.forms.takoform.com/v1alpha5",
+  "publicationStatus": "unpublished",
+  "authoringSource": "internal/containerformcatalog",
+  "authoringPolicy": "service-shape-preserving-contract",
+  "forms": [
+    {
+      "kind": "ContainerService",
+      "role": "identity",
+      "path": "forms/candidates/container.forms.takoform.com/container-service",
+      "formRef": {
+        "apiVersion": "container.forms.takoform.com",
+        "kind": "ContainerService",
+        "definitionVersion": "0.1.0",
+        "schemaDigest": "sha256:710993f0cebc6c70191ff19b2399efb5c1e66af5df005a7b87ff53e6a5b7c2da"
+      },
+      "packageDigest": "sha256:218973ae806e3d6b24a3373e752fa8abc1eb53432eaf457cd4faa214e927d047"
+    },
+    {
+      "kind": "ContainerRevision",
+      "role": "revision",
+      "path": "forms/candidates/container.forms.takoform.com/container-revision",
+      "formRef": {
+        "apiVersion": "container.forms.takoform.com",
+        "kind": "ContainerRevision",
+        "definitionVersion": "0.1.0",
+        "schemaDigest": "sha256:2d453c251dec50393a042211ba24fd306f57ecd603008cc0981c274320203025"
+      },
+      "packageDigest": "sha256:3b777c9b7a19d8d944ccc8e7cde7555f97ba328a6cd6ef03dda1a06c89fe9b7e"
+    },
+    {
+      "kind": "ContainerTraffic",
+      "role": "deployment",
+      "path": "forms/candidates/container.forms.takoform.com/container-traffic",
+      "formRef": {
+        "apiVersion": "container.forms.takoform.com",
+        "kind": "ContainerTraffic",
+        "definitionVersion": "0.1.0",
+        "schemaDigest": "sha256:f191698b2a051f6d5375621b73d0bee14e82ec43f5f436aa90e3a74c5828d556"
+      },
+      "packageDigest": "sha256:0e70c03c242ae270b7701dac10ef5a810c83a7ec64758d2ce13e31d01e325711"
+    },
+    {
+      "kind": "ContainerEndpoint",
+      "role": "attachment",
+      "path": "forms/candidates/container.forms.takoform.com/container-endpoint",
+      "formRef": {
+        "apiVersion": "container.forms.takoform.com",
+        "kind": "ContainerEndpoint",
+        "definitionVersion": "0.1.0",
+        "schemaDigest": "sha256:06c8945bbc5d4772178a269b3e0cfd69531b476a3ed1bf32b4a9686e3f0acb99"
+      },
+      "packageDigest": "sha256:5ed173de0559148e6b10f96386f348ef240772d22c37f373ab94008b58a401d5"
+    },
+    {
+      "kind": "ContainerCustomDomain",
+      "role": "attachment",
+      "path": "forms/candidates/container.forms.takoform.com/container-custom-domain",
+      "formRef": {
+        "apiVersion": "container.forms.takoform.com",
+        "kind": "ContainerCustomDomain",
+        "definitionVersion": "0.1.0",
+        "schemaDigest": "sha256:0032d7759696f746454236001a8aec84df30d30c673b2bdfcf360086043399d9"
+      },
+      "packageDigest": "sha256:864e7b6000a22abe265eff00720de0c3ee32cb95143f2942a8c6a387a15b7169"
+    }
+  ]
+}

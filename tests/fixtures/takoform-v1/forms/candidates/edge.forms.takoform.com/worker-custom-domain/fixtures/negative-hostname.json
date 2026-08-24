@@ -1,0 +1,8 @@
+{
+  "hostname": "not a hostname",
+  "worker": {
+    "apiVersion": "edge.forms.takoform.com",
+    "kind": "ModuleWorker",
+    "name": "module-worker"
+  }
+}

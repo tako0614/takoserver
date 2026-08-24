@@ -1,0 +1,61 @@
+{
+  "format": "takoform.current-family-index@v1",
+  "families": [
+    {
+      "group": "container.forms.takoform.com",
+      "candidateSet": "forms/candidates/container.forms.takoform.com/candidate-set.json",
+      "sha256": "389fbcc5b69a5132f02fad2570b184e36c3703481713f0735568d69e67ccf85f",
+      "formCount": 5
+    },
+    {
+      "group": "edge.forms.takoform.com",
+      "candidateSet": "forms/candidates/edge.forms.takoform.com/candidate-set.json",
+      "sha256": "8e8599ca3896946dc5ac4e609ce7652f21631bd5e38dddc026db7a3febadf2f8",
+      "formCount": 16
+    },
+    {
+      "group": "function.forms.takoform.com",
+      "candidateSet": "forms/candidates/function.forms.takoform.com/candidate-set.json",
+      "sha256": "b4ed2713e2874824d0661ef1f33b0b2ff262d068f0397a20e99915d354cf463c",
+      "formCount": 4
+    },
+    {
+      "group": "queue.forms.takoform.com",
+      "candidateSet": "forms/candidates/queue.forms.takoform.com/candidate-set.json",
+      "sha256": "c636f7dce3bc649704c7eceab33d0df4217947d36837ca42e08ebbd22f2ecaf1",
+      "formCount": 1
+    },
+    {
+      "group": "schedule.forms.takoform.com",
+      "candidateSet": "forms/candidates/schedule.forms.takoform.com/candidate-set.json",
+      "sha256": "445058a4a87eb278f080e53674e77b1989c2ff1430d7cad8d4945b2d63c8f5bf",
+      "formCount": 1
+    },
+    {
+      "group": "table.forms.takoform.com",
+      "candidateSet": "forms/candidates/table.forms.takoform.com/candidate-set.json",
+      "sha256": "d953783bb41b36a8c3c07ed93afbc9eaa9d5d2c94cae65a3de2efe3b1a1b526f",
+      "formCount": 1
+    },
+    {
+      "group": "topic.forms.takoform.com",
+      "candidateSet": "forms/candidates/topic.forms.takoform.com/candidate-set.json",
+      "sha256": "9734c2df84bc19989134756cf66cf017aa9e210ed7338e0a01b974b6e7718f18",
+      "formCount": 2
+    },
+    {
+      "group": "vector.forms.takoform.com",
+      "candidateSet": "forms/candidates/vector.forms.takoform.com/candidate-set.json",
+      "sha256": "fef5dc0e5630deb3644fccaaead2a95db2977ee1f022b93cdb396492684f6fe2",
+      "formCount": 1
+    }
+  ],
+  "interfaceCandidateSet": {
+    "path": "interfaces/candidates/v1alpha1/candidate-set.json",
+    "sha256": "c0437d89efe200eabbe221cdc27cf74b7d86d32d80878dc507df168825a3da18"
+  },
+  "bindingCandidateSet": {
+    "path": "bindings/candidates/v1alpha2/candidate-set.json",
+    "sha256": "e3b4aa31d5f9f7b7f31ff70f5f805a9354abf3ccd5555cc457e2e7c395224143"
+  }
+}

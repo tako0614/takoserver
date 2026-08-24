@@ -1,0 +1,31 @@
+{
+  "apiVersion": "packages.forms.takoform.com/v1alpha5",
+  "kind": "FormPackage",
+  "formRef": {
+    "apiVersion": "container.forms.takoform.com",
+    "kind": "ContainerService",
+    "definitionVersion": "0.1.0",
+    "schemaDigest": "sha256:710993f0cebc6c70191ff19b2399efb5c1e66af5df005a7b87ff53e6a5b7c2da"
+  },
+  "definitionPath": "definition.json",
+  "files": [
+    {
+      "path": "definition.json",
+      "mediaType": "application/vnd.takoform.form-definition.v1+json",
+      "size": 1623,
+      "digest": "sha256:460c4a2ff5dabd2ca84d9fc40e0af5a6f462b11659ca682058b65444d557f3c4"
+    },
+    {
+      "path": "fixtures/desired.json",
+      "mediaType": "application/json",
+      "size": 3,
+      "digest": "sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+    },
+    {
+      "path": "fixtures/negative-unexpected-property.json",
+      "mediaType": "application/json",
+      "size": 33,
+      "digest": "sha256:d10f45f42473405c10b441faafa3d23e863d4160f2ca3a7d0c32874b386f1ae9"
+    }
+  ]
+}

@@ -1,0 +1,123 @@
+{
+  "apiVersion": "edge.forms.takoform.com",
+  "kind": "ActorNamespace",
+  "definitionVersion": "0.1.0",
+  "title": "Actor Namespace",
+  "description": "Long-lived identity of one addressable-actor id space: a class the worker's active deployment serves, with at most one live execution context per actor id, private durable storage per id, and one alarm per id. The Form fixes that model by identity through the worker.actor@1.0.0 contract in its providedInterfaces; it carries no implementation snapshot, so which code answers is whatever the worker's active Worker Deployment selects. Actors are runtime data reached through module-worker.actor bindings, never Resources: every id addresses an actor and the first delivery is its creation. One worker carries at most one Actor Namespace per class name, because two namespaces over one class would give that class two disjoint id spaces.",
+  "role": "identity",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "constraints": [
+    {
+      "kind": "exclusive",
+      "reference": "/worker",
+      "keyedBy": "/className"
+    }
+  ],
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Long-lived identity of one addressable-actor id space: a class the worker's active deployment serves, with at most one live execution context per actor id, private durable storage per id, and one alarm per id. The Form fixes that model by identity through the worker.actor@1.0.0 contract in its providedInterfaces; it carries no implementation snapshot, so which code answers is whatever the worker's active Worker Deployment selects. Actors are runtime data reached through module-worker.actor bindings, never Resources: every id addresses an actor and the first delivery is its creation. One worker carries at most one Actor Namespace per class name, because two namespaces over one class would give that class two disjoint id spaces.",
+    "properties": {
+      "className": {
+        "description": "Class export name the serving module provides, in the JavaScript identifier grammar. Every weighted version of the active deployment must export it; one that does not keeps this namespace from becoming Ready, and invoking a stub of it is refused rather than queued.",
+        "pattern": "^[A-Za-z_$][A-Za-z0-9_$]*$",
+        "type": "string"
+      },
+      "worker": {
+        "additionalProperties": false,
+        "description": "Module Worker identity whose active deployment serves this actor class. Changing it replaces the namespace.",
+        "properties": {
+          "apiVersion": {
+            "const": "edge.forms.takoform.com",
+            "type": "string"
+          },
+          "kind": {
+            "const": "ModuleWorker",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "apiVersion",
+          "kind",
+          "name"
+        ],
+        "type": "object",
+        "x-takoform-required-interface": {
+          "apiVersion": "interfaces.takoform.com/v1alpha1",
+          "name": "worker.runtime",
+          "schemaDigest": "sha256:ed2f8211aac5be94488d391945ca6aca7627a4ecbd261e39790093e887feae08",
+          "version": "1.1.0"
+        }
+      }
+    },
+    "required": [
+      "className",
+      "worker"
+    ],
+    "title": "Actor Namespace desired state",
+    "type": "object"
+  },
+  "immutableFields": [
+    "/className",
+    "/worker"
+  ],
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "providedInterfaces": [
+    {
+      "apiVersion": "interfaces.takoform.com/v1alpha1",
+      "name": "worker.actor",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:f5428fb587de80261dd7363dc5b8a3f4aab7e469fa1b5fce8441ad9acbec8218"
+    }
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-worker",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-worker.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-class-name",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-class-name.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-worker",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-worker.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-class-name",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-class-name.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

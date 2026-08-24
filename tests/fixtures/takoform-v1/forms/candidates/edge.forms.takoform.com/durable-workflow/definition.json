@@ -1,0 +1,123 @@
+{
+  "apiVersion": "edge.forms.takoform.com",
+  "kind": "DurableWorkflow",
+  "definitionVersion": "0.1.0",
+  "title": "Durable Workflow",
+  "description": "Long-lived identity of one code-defined durable workflow: a class the worker's active deployment serves, whose instances survive process death. The Form fixes the execution model by identity — the worker.workflow@1.0.0 contract in its providedInterfaces states memoized replay, at-least-once step execution, the closed status vocabulary, and the two bounds that keep an instance finite. It carries NO implementation snapshot: which code answers is whatever the worker's active Worker Deployment selects, so behavior upgrades and rollback ride the deployment like any other traffic change. Instances are runtime data reached through module-worker.workflow bindings, never Resources. One worker carries at most one Durable Workflow per class name.",
+  "role": "identity",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "constraints": [
+    {
+      "kind": "exclusive",
+      "reference": "/worker",
+      "keyedBy": "/className"
+    }
+  ],
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Long-lived identity of one code-defined durable workflow: a class the worker's active deployment serves, whose instances survive process death. The Form fixes the execution model by identity — the worker.workflow@1.0.0 contract in its providedInterfaces states memoized replay, at-least-once step execution, the closed status vocabulary, and the two bounds that keep an instance finite. It carries NO implementation snapshot: which code answers is whatever the worker's active Worker Deployment selects, so behavior upgrades and rollback ride the deployment like any other traffic change. Instances are runtime data reached through module-worker.workflow bindings, never Resources. One worker carries at most one Durable Workflow per class name.",
+    "properties": {
+      "className": {
+        "description": "Class export name the serving module provides, in the JavaScript identifier grammar. Every weighted version of the active deployment must export it; one that does not keeps this workflow from becoming Ready, and creating an instance against it is refused rather than queued.",
+        "pattern": "^[A-Za-z_$][A-Za-z0-9_$]*$",
+        "type": "string"
+      },
+      "worker": {
+        "additionalProperties": false,
+        "description": "Module Worker identity whose active deployment serves this workflow class. Changing it replaces the workflow.",
+        "properties": {
+          "apiVersion": {
+            "const": "edge.forms.takoform.com",
+            "type": "string"
+          },
+          "kind": {
+            "const": "ModuleWorker",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "apiVersion",
+          "kind",
+          "name"
+        ],
+        "type": "object",
+        "x-takoform-required-interface": {
+          "apiVersion": "interfaces.takoform.com/v1alpha1",
+          "name": "worker.runtime",
+          "schemaDigest": "sha256:ed2f8211aac5be94488d391945ca6aca7627a4ecbd261e39790093e887feae08",
+          "version": "1.1.0"
+        }
+      }
+    },
+    "required": [
+      "className",
+      "worker"
+    ],
+    "title": "Durable Workflow desired state",
+    "type": "object"
+  },
+  "immutableFields": [
+    "/className",
+    "/worker"
+  ],
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "providedInterfaces": [
+    {
+      "apiVersion": "interfaces.takoform.com/v1alpha1",
+      "name": "worker.workflow",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:6b652dd311975da84469a5ec44f48acbc6db2097d1473988bd5424a85fda4294"
+    }
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-worker",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-worker.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-class-name",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-class-name.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-worker",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-worker.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-class-name",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-class-name.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

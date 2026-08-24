@@ -1,0 +1,52 @@
+{
+  "apiVersion": "edge.forms.takoform.com",
+  "kind": "ModuleWorker",
+  "definitionVersion": "0.1.0",
+  "title": "Module Worker",
+  "description": "Long-lived logical identity of one ES Module Worker application. The Form fixes the ES Module Worker ABI by identity, and states it exactly: the runtime contract worker.runtime@1.1.0 in this Form's providedInterfaces fixes the module's default-export shape, the fetch, scheduled, and queue handler signatures, the binding environment, ctx.waitUntil, exception handling, body streaming, the minimum Web API surface, and module loading. A host supporting this Form implements that exact digest; a runtime that behaves differently is a different contract version and a different Form version, never a compatibility date. Code, configuration, and bindings live on Worker Version revisions; traffic selection lives on Worker Deployments.",
+  "role": "identity",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Long-lived logical identity of one ES Module Worker application. The Form fixes the ES Module Worker ABI by identity, and states it exactly: the runtime contract worker.runtime@1.1.0 in this Form's providedInterfaces fixes the module's default-export shape, the fetch, scheduled, and queue handler signatures, the binding environment, ctx.waitUntil, exception handling, body streaming, the minimum Web API surface, and module loading. A host supporting this Form implements that exact digest; a runtime that behaves differently is a different contract version and a different Form version, never a compatibility date. Code, configuration, and bindings live on Worker Version revisions; traffic selection lives on Worker Deployments.",
+    "properties": {},
+    "title": "Module Worker desired state",
+    "type": "object"
+  },
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "providedInterfaces": [
+    {
+      "apiVersion": "interfaces.takoform.com/v1alpha1",
+      "name": "worker.runtime",
+      "version": "1.1.0",
+      "schemaDigest": "sha256:ed2f8211aac5be94488d391945ca6aca7627a4ecbd261e39790093e887feae08"
+    },
+    {
+      "apiVersion": "interfaces.takoform.com/v1alpha1",
+      "name": "worker.service",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:8024073e25413c8906c3e189555a7485b4c7a6656e8a537fb2801f9b9682536e"
+    }
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

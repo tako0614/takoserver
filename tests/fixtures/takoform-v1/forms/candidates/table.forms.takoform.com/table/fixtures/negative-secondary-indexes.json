@@ -1,0 +1,16 @@
+{
+  "partitionKey": {
+    "name": "tenantId",
+    "type": "string"
+  },
+  "secondaryIndexes": [
+    {
+      "takoformUnexpected": true
+    }
+  ],
+  "sortKey": {
+    "name": "createdAt",
+    "type": "number"
+  },
+  "ttlAttribute": "expiresAt"
+}

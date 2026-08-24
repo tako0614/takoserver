@@ -1,0 +1,131 @@
+{
+  "format": "takoform.conformance-suite@v1",
+  "hostApiLane": "forms.takoform.com/v1",
+  "generic": {
+    "path": "conformance/takoform-v1/generic.json",
+    "sha256": "f38391d429689cf1e754cce8aa3b5721cabcacaec9b4f658ece99c443fa388ce",
+    "requiredChecks": [
+      "declared-constraint-semantics-enforced",
+      "exact-form-ref-resolution",
+      "generic-lifecycle-semantics",
+      "optional-unsupported-standard-service-omitted",
+      "required-unsupported-standard-service-refused-before-mutation",
+      "supported-standard-service-resolved"
+    ]
+  },
+  "families": [
+    {
+      "group": "container.forms.takoform.com",
+      "path": "conformance/takoform-v1/families/container.forms.takoform.com.json",
+      "sha256": "e2fb0cd67b9722036cbb759899f64a4dbc46c61002dd62170dd1b97835db36b6",
+      "requiredChecks": [
+        "candidate-desired-schema-validated",
+        "exact-form-ref-lifecycle",
+        "lifecycle-capabilities-preserved"
+      ],
+      "dependencyGroups": []
+    },
+    {
+      "group": "edge.forms.takoform.com",
+      "path": "conformance/takoform-v1/families/edge.forms.takoform.com.json",
+      "sha256": "9c7288fe103584922fb481dc6af2f1d70e0fb7b48aa3389bf817bf5626f1c873",
+      "requiredChecks": [
+        "candidate-desired-schema-validated",
+        "exact-form-ref-lifecycle",
+        "lifecycle-capabilities-preserved",
+        "stable-standard-service-support-enforced"
+      ],
+      "dependencyGroups": []
+    },
+    {
+      "group": "function.forms.takoform.com",
+      "path": "conformance/takoform-v1/families/function.forms.takoform.com.json",
+      "sha256": "1cd474a6af89c3807c78eb28468f6d871a214f8e59dcca82c071b9e1e222236d",
+      "requiredChecks": [
+        "candidate-desired-schema-validated",
+        "exact-form-ref-lifecycle",
+        "lifecycle-capabilities-preserved"
+      ],
+      "dependencyGroups": []
+    },
+    {
+      "group": "queue.forms.takoform.com",
+      "path": "conformance/takoform-v1/families/queue.forms.takoform.com.json",
+      "sha256": "d222c9f204d02d4ab928cbd6160367918cb39cd4156a4fabe370c32ae8044356",
+      "requiredChecks": [
+        "candidate-desired-schema-validated",
+        "exact-form-ref-lifecycle",
+        "lifecycle-capabilities-preserved"
+      ],
+      "dependencyGroups": []
+    },
+    {
+      "group": "schedule.forms.takoform.com",
+      "path": "conformance/takoform-v1/families/schedule.forms.takoform.com.json",
+      "sha256": "ef81fa40f6aec8af5ff8e11fdd920bffb123bb88a85c2a69c7bb1f71ded67d35",
+      "requiredChecks": [
+        "candidate-desired-schema-validated",
+        "exact-form-ref-lifecycle",
+        "lifecycle-capabilities-preserved"
+      ],
+      "dependencyGroups": [
+        "queue.forms.takoform.com",
+        "topic.forms.takoform.com"
+      ]
+    },
+    {
+      "group": "table.forms.takoform.com",
+      "path": "conformance/takoform-v1/families/table.forms.takoform.com.json",
+      "sha256": "ff1827c668eb751e33db5c20bbd61296c79b381f8c78af0d0f4b888b90230aba",
+      "requiredChecks": [
+        "candidate-desired-schema-validated",
+        "exact-form-ref-lifecycle",
+        "lifecycle-capabilities-preserved"
+      ],
+      "dependencyGroups": []
+    },
+    {
+      "group": "topic.forms.takoform.com",
+      "path": "conformance/takoform-v1/families/topic.forms.takoform.com.json",
+      "sha256": "e6d0822d19631ff8d21ea3814421d428cb60aba6f3abe617c8d7d24ab18a65f3",
+      "requiredChecks": [
+        "candidate-desired-schema-validated",
+        "exact-form-ref-lifecycle",
+        "lifecycle-capabilities-preserved"
+      ],
+      "dependencyGroups": [
+        "queue.forms.takoform.com"
+      ]
+    },
+    {
+      "group": "vector.forms.takoform.com",
+      "path": "conformance/takoform-v1/families/vector.forms.takoform.com.json",
+      "sha256": "f91df480930a1ae3c7bf8ecb8ee694483441a7f8f4c30f52bd7adeaea536f196",
+      "requiredChecks": [
+        "candidate-desired-schema-validated",
+        "exact-form-ref-lifecycle",
+        "lifecycle-capabilities-preserved"
+      ],
+      "dependencyGroups": []
+    }
+  ],
+  "composition": {
+    "path": "conformance/takoform-v1/composition.json",
+    "sha256": "ec493f220f49e0892987d7fcaf68f1af775d3384c46cb6009975a498247763dc",
+    "requiredChecks": [
+      "all-family-composition-resolves",
+      "wrong-digest-refused"
+    ]
+  },
+  "runner": {
+    "command": [
+      "go",
+      "run",
+      "./cmd/portable-host-conformance",
+      "suite",
+      "--manifest",
+      "conformance/takoform-v1/manifest.json"
+    ],
+    "reportFormat": "takoform.reference-host-suite-report@v1"
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "apiVersion": "function.forms.takoform.com",
+  "kind": "Function",
+  "definitionVersion": "0.1.0",
+  "title": "Function",
+  "description": "Logical identity of one regional JavaScript function. Code, configuration, resource bounds, and traffic are represented by the surrounding revision and deployment Forms; this identity carries no desired fields.",
+  "role": "identity",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Logical identity of one regional JavaScript function. Code, configuration, resource bounds, and traffic are represented by the surrounding revision and deployment Forms; this identity carries no desired fields.",
+    "properties": {},
+    "title": "Function desired state",
+    "type": "object"
+  },
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "providedInterfaces": [
+    {
+      "apiVersion": "interfaces.takoform.com/v1alpha1",
+      "name": "function.runtime",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:32160e50c373313dcaeec7bc9a1409ffd84e96b9eac87663868d5185aa45c6e0"
+    }
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

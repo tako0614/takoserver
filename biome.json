@@ -13,7 +13,8 @@
       "!!.deploy",
       "!!.wrangler-realized.jsonc",
       "!!src/db-schema.ts",
-      "!!vendor/takoform"
+      "!!vendor/takoform",
+      "!!tests/fixtures/takoform-v1"
     ]
   },
   "formatter": {

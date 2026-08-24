@@ -1,0 +1,110 @@
+{
+  "apiVersion": "edge.forms.takoform.com",
+  "kind": "WorkerCronTrigger",
+  "definitionVersion": "0.1.0",
+  "title": "Worker Cron Trigger",
+  "description": "Attaches one cron schedule to a Module Worker, invoking its scheduled handler at each match. Schedules are interpreted in UTC only; there is no timezone field, so two hosts can never fire the same trigger at different instants and no schedule ever skips or repeats an hour for a daylight-saving transition. The grammar is five fields separated by single spaces — minute 0-59, hour 0-23, day-of-month 1-31, month 1-12, day-of-week 0-6 with 0 Sunday — and each field is a comma-separated list of `*`, a literal, a range `low-high`, `*/step`, or `low-high/step`. Names and a step on a bare literal are not accepted, and neither is any value outside its field's own range, an inverted range, or a step outside 1..span. When day-of-month and day-of-week are BOTH restricted the trigger fires on a day either of them selects; when only one is restricted only that one constrains the day. A missed run is not made up: a host that could not fire a match — because it was unavailable, or because the previous invocation was still running — skips it rather than firing late, so a schedule never produces a backlog. At-least-once delivery applies to each match: a handler may be invoked more than once for one matched minute, and it must be idempotent. An uncaught exception in the handler is a failed invocation reported to host diagnostics; it is not retried within the matched minute and it never becomes an HTTP response.",
+  "role": "attachment",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Attaches one cron schedule to a Module Worker, invoking its scheduled handler at each match. Schedules are interpreted in UTC only; there is no timezone field, so two hosts can never fire the same trigger at different instants and no schedule ever skips or repeats an hour for a daylight-saving transition. The grammar is five fields separated by single spaces — minute 0-59, hour 0-23, day-of-month 1-31, month 1-12, day-of-week 0-6 with 0 Sunday — and each field is a comma-separated list of `*`, a literal, a range `low-high`, `*/step`, or `low-high/step`. Names and a step on a bare literal are not accepted, and neither is any value outside its field's own range, an inverted range, or a step outside 1..span. When day-of-month and day-of-week are BOTH restricted the trigger fires on a day either of them selects; when only one is restricted only that one constrains the day. A missed run is not made up: a host that could not fire a match — because it was unavailable, or because the previous invocation was still running — skips it rather than firing late, so a schedule never produces a backlog. At-least-once delivery applies to each match: a handler may be invoked more than once for one matched minute, and it must be idempotent. An uncaught exception in the handler is a failed invocation reported to host diagnostics; it is not retried within the matched minute and it never becomes an HTTP response.",
+    "properties": {
+      "cron": {
+        "description": "Portable five-field cron expression, interpreted in UTC only. The pattern bounds the shape; a host also parses it and refuses a value outside its field's range, an inverted range, or an out-of-span step.",
+        "maxLength": 64,
+        "pattern": "^(?:\\*(?:/[0-9]{1,2})?|[0-9]{1,2}(?:-[0-9]{1,2}(?:/[0-9]{1,2})?)?)(?:,(?:\\*(?:/[0-9]{1,2})?|[0-9]{1,2}(?:-[0-9]{1,2}(?:/[0-9]{1,2})?)?))*(?: (?:\\*(?:/[0-9]{1,2})?|[0-9]{1,2}(?:-[0-9]{1,2}(?:/[0-9]{1,2})?)?)(?:,(?:\\*(?:/[0-9]{1,2})?|[0-9]{1,2}(?:-[0-9]{1,2}(?:/[0-9]{1,2})?)?))*){4}$",
+        "type": "string"
+      },
+      "worker": {
+        "additionalProperties": false,
+        "description": "Module Worker whose scheduled handler this trigger invokes.",
+        "properties": {
+          "apiVersion": {
+            "const": "edge.forms.takoform.com",
+            "type": "string"
+          },
+          "kind": {
+            "const": "ModuleWorker",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "apiVersion",
+          "kind",
+          "name"
+        ],
+        "type": "object",
+        "x-takoform-required-entrypoint": "scheduled",
+        "x-takoform-required-interface": {
+          "apiVersion": "interfaces.takoform.com/v1alpha1",
+          "name": "worker.runtime",
+          "schemaDigest": "sha256:ed2f8211aac5be94488d391945ca6aca7627a4ecbd261e39790093e887feae08",
+          "version": "1.1.0"
+        }
+      }
+    },
+    "required": [
+      "cron",
+      "worker"
+    ],
+    "title": "Worker Cron Trigger desired state",
+    "type": "object"
+  },
+  "immutableFields": [
+    "/worker"
+  ],
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "update",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-worker",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-worker.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-cron",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-cron.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-worker",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-worker.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-cron",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-cron.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

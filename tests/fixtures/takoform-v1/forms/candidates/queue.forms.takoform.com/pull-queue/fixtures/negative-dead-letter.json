@@ -1,0 +1,8 @@
+{
+  "deadLetter": {
+    "takoformUnexpected": true
+  },
+  "defaultVisibilityTimeoutSeconds": 30,
+  "messageRetentionSeconds": 345600,
+  "receiveWaitBoundSeconds": 20
+}

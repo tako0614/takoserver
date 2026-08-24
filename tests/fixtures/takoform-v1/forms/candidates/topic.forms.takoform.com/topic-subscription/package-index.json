@@ -1,0 +1,91 @@
+{
+  "apiVersion": "packages.forms.takoform.com/v1alpha5",
+  "kind": "FormPackage",
+  "formRef": {
+    "apiVersion": "topic.forms.takoform.com",
+    "kind": "TopicSubscription",
+    "definitionVersion": "0.1.0",
+    "schemaDigest": "sha256:7256be928d86025e2f9ab2d711ee52f218c6c2295bea865a78602dba960da56f"
+  },
+  "definitionPath": "definition.json",
+  "files": [
+    {
+      "path": "definition.json",
+      "mediaType": "application/vnd.takoform.form-definition.v1+json",
+      "size": 7978,
+      "digest": "sha256:c65aa670664bbb31cc88c6d242850febf6b35ee533099c460c1ddc3d081a7382"
+    },
+    {
+      "path": "fixtures/desired.json",
+      "mediaType": "application/json",
+      "size": 481,
+      "digest": "sha256:b872cd624107489cb266d4d30b63f6cdf3927e02ae2b341831aac7d89627e1ad"
+    },
+    {
+      "path": "fixtures/negative-dead-letter.json",
+      "mediaType": "application/json",
+      "size": 488,
+      "digest": "sha256:04abec4bc2cabdf7ecc2133d2e9f4351d53da749e37e8edd384f5eb0e4642406"
+    },
+    {
+      "path": "fixtures/negative-filter-policy.json",
+      "mediaType": "application/json",
+      "size": 454,
+      "digest": "sha256:9209b0c9c41e08a1578bd6c09e526383ef757a00cfac6330c246a2e19350ed6f"
+    },
+    {
+      "path": "fixtures/negative-max-retries.json",
+      "mediaType": "application/json",
+      "size": 482,
+      "digest": "sha256:25252a8601292cadbcbdc461dc6c1fdbaf770eb1d8da4c999928ecbadfe525da"
+    },
+    {
+      "path": "fixtures/negative-missing-max-retries.json",
+      "mediaType": "application/json",
+      "size": 462,
+      "digest": "sha256:7876b073105332c782b53a48c9b5889ced029d1536d67fe3ccd1bf24d055cba1"
+    },
+    {
+      "path": "fixtures/negative-missing-retry-delay-seconds.json",
+      "mediaType": "application/json",
+      "size": 454,
+      "digest": "sha256:8cd505ce52898e8c345797a23c6459c1953695ef4a45923a13dd88d600bad621"
+    },
+    {
+      "path": "fixtures/negative-missing-target.json",
+      "mediaType": "application/json",
+      "size": 370,
+      "digest": "sha256:aeb70fad0e0f2a84fbb55b2c38eee202cc94902d1747087c171327067c537fa8"
+    },
+    {
+      "path": "fixtures/negative-missing-topic.json",
+      "mediaType": "application/json",
+      "size": 376,
+      "digest": "sha256:016c4976f3f5f8e08a8ac042c6941a7ac28e5f7cab1c2148cccb7ffefacc9c14"
+    },
+    {
+      "path": "fixtures/negative-retry-delay-seconds.json",
+      "mediaType": "application/json",
+      "size": 481,
+      "digest": "sha256:ab7557ec5c92f7f7ac278059be988f7a5136e571a8a325f5aa60532e6b813bc6"
+    },
+    {
+      "path": "fixtures/negative-target.json",
+      "mediaType": "application/json",
+      "size": 494,
+      "digest": "sha256:138b4e9f6016832feaf000da8da7ec5124e89f7210b8821603f9f8d0ecee5a75"
+    },
+    {
+      "path": "fixtures/negative-topic.json",
+      "mediaType": "application/json",
+      "size": 495,
+      "digest": "sha256:30d4ae61bcbb7338b6597cb19763d104e5a95b0e31215e2c0a98a3a9bf8b1bf8"
+    },
+    {
+      "path": "fixtures/negative-unexpected-property.json",
+      "mediaType": "application/json",
+      "size": 511,
+      "digest": "sha256:4ea30538c005ed6eaf6e08551817dbc21f02fcca7b2b609efd5d38a2f0190d96"
+    }
+  ]
+}

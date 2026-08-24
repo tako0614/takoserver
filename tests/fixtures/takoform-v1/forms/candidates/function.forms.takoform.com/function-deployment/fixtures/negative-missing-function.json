@@ -1,0 +1,12 @@
+{
+  "versions": [
+    {
+      "functionVersion": {
+        "apiVersion": "function.forms.takoform.com",
+        "kind": "FunctionVersion",
+        "name": "function-version"
+      },
+      "weight": 10000
+    }
+  ]
+}

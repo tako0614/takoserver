@@ -1,0 +1,12 @@
+{
+  "deadLetter": {
+    "maxReceiveCount": 5,
+    "queue": {
+      "apiVersion": "queue.forms.takoform.com",
+      "kind": "PullQueue",
+      "name": "dead-letters"
+    }
+  },
+  "defaultVisibilityTimeoutSeconds": 30,
+  "receiveWaitBoundSeconds": 20
+}

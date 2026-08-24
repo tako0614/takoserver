@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { startStableLocalWorkerHost } from "../src/entry-stable-local-worker-host.ts";
 import type {
   InstalledTakoformForm,
@@ -15,8 +15,7 @@ import {
   type StableLocalWorkerComposition,
 } from "../src/worker-stable-local-composition.ts";
 
-const TAKOFORM_ROOT =
-  process.env.TAKOFORM_REPOSITORY_ROOT ?? "/root/dev/takos/.worktrees/takoform-w0-shared-model";
+const TAKOFORM_ROOT = resolve(import.meta.dir, "fixtures/takoform-v1");
 
 let root: string;
 let composition: StableLocalWorkerComposition | undefined;

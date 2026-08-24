@@ -1,0 +1,192 @@
+{
+  "apiVersion": "function.forms.takoform.com",
+  "kind": "FunctionDeployment",
+  "definitionVersion": "0.1.0",
+  "title": "Function Deployment",
+  "description": "The one active traffic selection for a Function. One or two immutable versions carry positive basis-point weights totaling exactly 10000.",
+  "role": "deployment",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "constraints": [
+    {
+      "kind": "exclusive",
+      "reference": "/function"
+    },
+    {
+      "kind": "sum",
+      "list": "/versions",
+      "member": "weight",
+      "total": 10000
+    },
+    {
+      "kind": "sameResolvedTarget",
+      "anchor": "/function",
+      "members": "/versions/*/functionVersion",
+      "through": "/function"
+    }
+  ],
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "The one active traffic selection for a Function. One or two immutable versions carry positive basis-point weights totaling exactly 10000.",
+    "properties": {
+      "function": {
+        "additionalProperties": false,
+        "description": "Function identity governed by this deployment. There is at most one deployment per identity.",
+        "properties": {
+          "apiVersion": {
+            "const": "function.forms.takoform.com",
+            "type": "string"
+          },
+          "kind": {
+            "const": "Function",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "apiVersion",
+          "kind",
+          "name"
+        ],
+        "type": "object",
+        "x-takoform-target-formrefs": [
+          {
+            "apiVersion": "function.forms.takoform.com",
+            "definitionVersion": "0.1.0",
+            "kind": "Function",
+            "schemaDigest": "sha256:7811632bfa32b1ffde95bf6efc8ee67e4f6c0778e452c56e61d89dd5b4969388"
+          }
+        ]
+      },
+      "versions": {
+        "description": "One or two selected Function Versions and their positive basis-point weights. Weights are host-validated and must sum to exactly 10000.",
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "functionVersion": {
+              "additionalProperties": false,
+              "description": "Immutable version selected by this traffic entry.",
+              "properties": {
+                "apiVersion": {
+                  "const": "function.forms.takoform.com",
+                  "type": "string"
+                },
+                "kind": {
+                  "const": "FunctionVersion",
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "apiVersion",
+                "kind",
+                "name"
+              ],
+              "type": "object",
+              "x-takoform-target-formrefs": [
+                {
+                  "apiVersion": "function.forms.takoform.com",
+                  "definitionVersion": "0.1.0",
+                  "kind": "FunctionVersion",
+                  "schemaDigest": "sha256:314e6c1b5c9e79dd0d8c23aeb92737d70d303c6f78a4c9729397dda5e79f2b14"
+                }
+              ]
+            },
+            "weight": {
+              "description": "Positive traffic weight in basis points.",
+              "maximum": 10000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "functionVersion",
+            "weight"
+          ],
+          "type": "object"
+        },
+        "maxItems": 2,
+        "minItems": 1,
+        "type": "array",
+        "uniqueItems": true
+      }
+    },
+    "required": [
+      "function",
+      "versions"
+    ],
+    "title": "Function Deployment desired state",
+    "type": "object"
+  },
+  "immutableFields": [
+    "/function"
+  ],
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "update",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-function",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-function.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-versions",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-versions.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-function",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-function.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-versions",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-versions.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-versions-function-version",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-versions-function-version.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-versions-weight",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-versions-weight.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

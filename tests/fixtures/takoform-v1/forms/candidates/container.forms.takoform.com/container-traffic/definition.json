@@ -1,0 +1,192 @@
+{
+  "apiVersion": "container.forms.takoform.com",
+  "kind": "ContainerTraffic",
+  "definitionVersion": "0.1.0",
+  "title": "Container Traffic",
+  "description": "The one active basis-point traffic selection for a Container Service. One to eight immutable revisions carry positive weights totaling exactly 10000.",
+  "role": "deployment",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "constraints": [
+    {
+      "kind": "exclusive",
+      "reference": "/service"
+    },
+    {
+      "kind": "sum",
+      "list": "/revisions",
+      "member": "weight",
+      "total": 10000
+    },
+    {
+      "kind": "sameResolvedTarget",
+      "anchor": "/service",
+      "members": "/revisions/*/containerRevision",
+      "through": "/service"
+    }
+  ],
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "The one active basis-point traffic selection for a Container Service. One to eight immutable revisions carry positive weights totaling exactly 10000.",
+    "properties": {
+      "revisions": {
+        "description": "One to eight selected Container Revisions and their positive basis-point weights. Weights are host-validated and must sum to exactly 10000.",
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "containerRevision": {
+              "additionalProperties": false,
+              "description": "Immutable revision selected by this traffic entry.",
+              "properties": {
+                "apiVersion": {
+                  "const": "container.forms.takoform.com",
+                  "type": "string"
+                },
+                "kind": {
+                  "const": "ContainerRevision",
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "apiVersion",
+                "kind",
+                "name"
+              ],
+              "type": "object",
+              "x-takoform-target-formrefs": [
+                {
+                  "apiVersion": "container.forms.takoform.com",
+                  "definitionVersion": "0.1.0",
+                  "kind": "ContainerRevision",
+                  "schemaDigest": "sha256:2d453c251dec50393a042211ba24fd306f57ecd603008cc0981c274320203025"
+                }
+              ]
+            },
+            "weight": {
+              "description": "Positive traffic weight in basis points.",
+              "maximum": 10000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "containerRevision",
+            "weight"
+          ],
+          "type": "object"
+        },
+        "maxItems": 8,
+        "minItems": 1,
+        "type": "array",
+        "uniqueItems": true
+      },
+      "service": {
+        "additionalProperties": false,
+        "description": "Container Service governed by this traffic resource. There is at most one traffic resource per identity.",
+        "properties": {
+          "apiVersion": {
+            "const": "container.forms.takoform.com",
+            "type": "string"
+          },
+          "kind": {
+            "const": "ContainerService",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "apiVersion",
+          "kind",
+          "name"
+        ],
+        "type": "object",
+        "x-takoform-target-formrefs": [
+          {
+            "apiVersion": "container.forms.takoform.com",
+            "definitionVersion": "0.1.0",
+            "kind": "ContainerService",
+            "schemaDigest": "sha256:710993f0cebc6c70191ff19b2399efb5c1e66af5df005a7b87ff53e6a5b7c2da"
+          }
+        ]
+      }
+    },
+    "required": [
+      "revisions",
+      "service"
+    ],
+    "title": "Container Traffic desired state",
+    "type": "object"
+  },
+  "immutableFields": [
+    "/service"
+  ],
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "update",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-service",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-service.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-revisions",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-revisions.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-service",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-service.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-revisions",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-revisions.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-revisions-container-revision",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-revisions-container-revision.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-revisions-weight",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-revisions-weight.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

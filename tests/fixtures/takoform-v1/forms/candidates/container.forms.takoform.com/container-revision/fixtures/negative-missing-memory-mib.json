@@ -1,0 +1,36 @@
+{
+  "args": [
+    "--port",
+    "8080"
+  ],
+  "command": [
+    "/app/server"
+  ],
+  "concurrencyTarget": 80,
+  "cpu": 1000,
+  "externalServices": [
+    {
+      "name": "PRIMARY_DB",
+      "required": true,
+      "service": {
+        "apiVersion": "standards.takoform.com/v1",
+        "protocol": "org.postgresql.wire"
+      }
+    }
+  ],
+  "image": "registry.example/app@sha256:6a5cbf24f5d0c86479ae13b9d1731a626a1729f01aef65403c5c8ac82ed85f43",
+  "maxInstances": 20,
+  "minInstances": 0,
+  "requiredSensitiveVars": [
+    "API_SIGNING_TOKEN"
+  ],
+  "service": {
+    "apiVersion": "container.forms.takoform.com",
+    "kind": "ContainerService",
+    "name": "container-service"
+  },
+  "timeoutSeconds": 60,
+  "vars": {
+    "LOG_LEVEL": "info"
+  }
+}

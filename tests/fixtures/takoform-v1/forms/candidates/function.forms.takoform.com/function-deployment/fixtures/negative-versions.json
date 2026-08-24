@@ -1,0 +1,12 @@
+{
+  "function": {
+    "apiVersion": "function.forms.takoform.com",
+    "kind": "Function",
+    "name": "function"
+  },
+  "versions": [
+    {
+      "takoformUnexpected": true
+    }
+  ]
+}

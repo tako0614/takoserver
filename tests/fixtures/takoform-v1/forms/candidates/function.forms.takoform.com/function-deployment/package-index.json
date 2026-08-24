@@ -1,0 +1,67 @@
+{
+  "apiVersion": "packages.forms.takoform.com/v1alpha5",
+  "kind": "FormPackage",
+  "formRef": {
+    "apiVersion": "function.forms.takoform.com",
+    "kind": "FunctionDeployment",
+    "definitionVersion": "0.1.0",
+    "schemaDigest": "sha256:85e10197b9d10275da71e8291c0891b2d9b231f094be2f87d3f0b8d160a56574"
+  },
+  "definitionPath": "definition.json",
+  "files": [
+    {
+      "path": "definition.json",
+      "mediaType": "application/vnd.takoform.form-definition.v1+json",
+      "size": 5818,
+      "digest": "sha256:d6831d4adb85720fa9fc4828325f24e3f89158dcd014c54a6843b2ffaea5f0e8"
+    },
+    {
+      "path": "fixtures/desired.json",
+      "mediaType": "application/json",
+      "size": 334,
+      "digest": "sha256:524a70c05237239ad3e2103be4e8f476dd0416d597d9c6f54856d6437253e295"
+    },
+    {
+      "path": "fixtures/negative-function.json",
+      "mediaType": "application/json",
+      "size": 345,
+      "digest": "sha256:8245c5e922ca06c9654ee2b7c2ab832d032ba1b4c459d4d805f44a090aafbe85"
+    },
+    {
+      "path": "fixtures/negative-missing-function.json",
+      "mediaType": "application/json",
+      "size": 217,
+      "digest": "sha256:5ca21a467233d8351856f074cf327696d5fa1be789b7cddf29b53ad119d05e52"
+    },
+    {
+      "path": "fixtures/negative-missing-versions.json",
+      "mediaType": "application/json",
+      "size": 120,
+      "digest": "sha256:b70edf858971b655d162c6ef09c4fed722f2623bbd5e9696811534109948a860"
+    },
+    {
+      "path": "fixtures/negative-unexpected-property.json",
+      "mediaType": "application/json",
+      "size": 364,
+      "digest": "sha256:a8aa99b67d04f8ce14f36f9de8863732431f49d893d69061e7b848787d423781"
+    },
+    {
+      "path": "fixtures/negative-versions-function-version.json",
+      "mediaType": "application/json",
+      "size": 337,
+      "digest": "sha256:939388c6c77f4e2232c9a29a5ec35d55fde565224e9dca246d1194f37560809b"
+    },
+    {
+      "path": "fixtures/negative-versions-weight.json",
+      "mediaType": "application/json",
+      "size": 330,
+      "digest": "sha256:5de6b3b83c3e9afba9d019ba66270e03e3a4fc6486c460324d51b5eee17a4265"
+    },
+    {
+      "path": "fixtures/negative-versions.json",
+      "mediaType": "application/json",
+      "size": 186,
+      "digest": "sha256:229bf28274155f92fdf6212b75f8bbfe9d6773f61b638fdad64ee805f0c0b0d7"
+    }
+  ]
+}

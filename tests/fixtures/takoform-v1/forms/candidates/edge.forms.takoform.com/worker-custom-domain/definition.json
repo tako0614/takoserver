@@ -1,0 +1,116 @@
+{
+  "apiVersion": "edge.forms.takoform.com",
+  "kind": "WorkerCustomDomain",
+  "definitionVersion": "0.1.0",
+  "title": "Worker Custom Domain",
+  "description": "Attaches one DNS hostname to a Module Worker so its active deployment serves that hostname over HTTPS. Inward activation is an attachment, never a binding; deleting the attachment detaches the hostname and never deletes the worker. A hostname is a name in DNS rather than a label in this host's namespace, so it is CANONICALIZED before it is compared and before it is stored — trailing root dot removed, ASCII letters lowercased — and one canonical hostname is served by AT MOST ONE attachment per tenant, across every space. A second attachment claiming a hostname a live one already serves is refused before any mutation; releasing the holder makes the claim representable (decision 0026).",
+  "role": "attachment",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "constraints": [
+    {
+      "kind": "claim",
+      "property": "/hostname"
+    }
+  ],
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Attaches one DNS hostname to a Module Worker so its active deployment serves that hostname over HTTPS. Inward activation is an attachment, never a binding; deleting the attachment detaches the hostname and never deletes the worker. A hostname is a name in DNS rather than a label in this host's namespace, so it is CANONICALIZED before it is compared and before it is stored — trailing root dot removed, ASCII letters lowercased — and one canonical hostname is served by AT MOST ONE attachment per tenant, across every space. A second attachment claiming a hostname a live one already serves is refused before any mutation; releasing the holder makes the claim representable (decision 0026).",
+    "properties": {
+      "hostname": {
+        "description": "Dotted DNS hostname this attachment serves. Changing it replaces the attachment. The pattern admits the spellings DNS treats as one name — an uppercase letter, a trailing root dot — because a host canonicalizes rather than refusing them; it admits no non-ASCII byte, so an internationalized name travels as its A-label.",
+        "maxLength": 253,
+        "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+\\.?$",
+        "type": "string"
+      },
+      "worker": {
+        "additionalProperties": false,
+        "description": "Module Worker served on this hostname.",
+        "properties": {
+          "apiVersion": {
+            "const": "edge.forms.takoform.com",
+            "type": "string"
+          },
+          "kind": {
+            "const": "ModuleWorker",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "apiVersion",
+          "kind",
+          "name"
+        ],
+        "type": "object",
+        "x-takoform-required-entrypoint": "fetch",
+        "x-takoform-required-interface": {
+          "apiVersion": "interfaces.takoform.com/v1alpha1",
+          "name": "worker.runtime",
+          "schemaDigest": "sha256:ed2f8211aac5be94488d391945ca6aca7627a4ecbd261e39790093e887feae08",
+          "version": "1.1.0"
+        }
+      }
+    },
+    "required": [
+      "hostname",
+      "worker"
+    ],
+    "title": "Worker Custom Domain desired state",
+    "type": "object"
+  },
+  "immutableFields": [
+    "/hostname",
+    "/worker"
+  ],
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-worker",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-worker.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-hostname",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-hostname.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-worker",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-worker.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-hostname",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-hostname.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "className": "ChatRoom",
+  "worker": {
+    "apiVersion": "edge.forms.takoform.com",
+    "kind": "ModuleWorker",
+    "name": "Not A Resource Name"
+  }
+}

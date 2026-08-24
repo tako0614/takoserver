@@ -1,0 +1,62 @@
+{
+  "apiVersion": "edge.forms.takoform.com",
+  "kind": "StaticAssetBundle",
+  "definitionVersion": "0.1.0",
+  "title": "Static Asset Bundle",
+  "description": "Immutable content-addressed set of files served beside one Worker Version. The whole portable desired state is the digest of a committed artifacts.takoform.com/v1alpha1 StaticAssetBundle manifest; the manifest is the sole ordered inventory of path, media type, exact size, and sha256 digest for every file. Raw file bytes, upload locations, backend identities, and serving policy never enter this resource. Serving order and not-found behavior belong to the Worker Version attachment so the same bytes can participate in different immutable versions without giving the bundle two meanings.",
+  "role": "revision",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Immutable content-addressed set of files served beside one Worker Version. The whole portable desired state is the digest of a committed artifacts.takoform.com/v1alpha1 StaticAssetBundle manifest; the manifest is the sole ordered inventory of path, media type, exact size, and sha256 digest for every file. Raw file bytes, upload locations, backend identities, and serving policy never enter this resource. Serving order and not-found behavior belong to the Worker Version attachment so the same bytes can participate in different immutable versions without giving the bundle two meanings.",
+    "properties": {
+      "manifestDigest": {
+        "description": "Immutable identity of the committed StaticAssetBundle artifact manifest. Before mutation a host resolves it within the caller's tenant, verifies that its canonical digest matches, that its kind is StaticAssetBundle, and that every file path, media type, size, and blob digest is valid.",
+        "pattern": "^sha256:[0-9a-f]{64}$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "manifestDigest"
+    ],
+    "title": "Static Asset Bundle desired state",
+    "type": "object"
+  },
+  "immutableFields": [
+    "/manifestDigest"
+  ],
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-manifest-digest",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-manifest-digest.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-manifest-digest",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-manifest-digest.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

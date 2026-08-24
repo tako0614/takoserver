@@ -1,0 +1,381 @@
+{
+  "apiVersion": "schedule.forms.takoform.com",
+  "kind": "Schedule",
+  "definitionVersion": "0.1.0",
+  "title": "Schedule",
+  "description": "UTC five-field cron schedule that delivers one declared message at each matched window to either a PullQueue or Topic. Delivery is at least once; failed attempts use the declared bounded retry policy and missed windows are never replayed.",
+  "role": "identity",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "UTC five-field cron schedule that delivers one declared message at each matched window to either a PullQueue or Topic. Delivery is at least once; failed attempts use the declared bounded retry policy and missed windows are never replayed.",
+    "properties": {
+      "cron": {
+        "description": "Portable five-field cron expression, interpreted in UTC only. A host also parses it and refuses values outside each field's domain, inverted ranges, and out-of-span steps.",
+        "maxLength": 64,
+        "pattern": "^(?:\\*(?:/[0-9]{1,2})?|[0-9]{1,2}(?:-[0-9]{1,2}(?:/[0-9]{1,2})?)?)(?:,(?:\\*(?:/[0-9]{1,2})?|[0-9]{1,2}(?:-[0-9]{1,2}(?:/[0-9]{1,2})?)?))*(?: (?:\\*(?:/[0-9]{1,2})?|[0-9]{1,2}(?:-[0-9]{1,2}(?:/[0-9]{1,2})?)?)(?:,(?:\\*(?:/[0-9]{1,2})?|[0-9]{1,2}(?:-[0-9]{1,2}(?:/[0-9]{1,2})?)?))*){4}$",
+        "type": "string"
+      },
+      "paused": {
+        "description": "While true, matched windows are permanently skipped and are not replayed when unpaused. The field is required because the proposal declares no portable omission default.",
+        "type": "boolean"
+      },
+      "retryPolicy": {
+        "additionalProperties": false,
+        "description": "Bounded fixed-delay retry policy for one matched window. maxAttempts includes the first attempt.",
+        "properties": {
+          "maxAttempts": {
+            "description": "Maximum attempts for one matched window, counting the first attempt.",
+            "maximum": 10,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "retryDelaySeconds": {
+            "description": "Fixed delay between failed attempts, in seconds.",
+            "maximum": 3600,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "maxAttempts",
+          "retryDelaySeconds"
+        ],
+        "type": "object"
+      },
+      "target": {
+        "description": "Exactly one message target: queueMessage sends to queue.pull@1.0.0, or topicPublish publishes to topic.publish@1.0.0. The target resource reference is explicit and uid-pinned.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "attributes": {
+                "additionalProperties": {
+                  "maxLength": 262144,
+                  "pattern": "^[\\s\\S]*$",
+                  "type": "string"
+                },
+                "description": "At most ten named string attributes. Attribute names use the portable map-key grammar; values contribute to the aggregate message bound with the body.",
+                "maxProperties": 10,
+                "propertyNames": {
+                  "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
+                  "type": "string",
+                  "x-takoform-fieldPolicy": "portable-data-only-v1"
+                },
+                "type": "object"
+              },
+              "body": {
+                "description": "Message body as UTF-8 text or canonical RFC 4648 base64 bytes. The body and attributes together are bounded to 262144 bytes by the target Interface; the desired union keeps the encoding explicit.",
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "data": {
+                        "description": "RFC 4648 base64 text for opaque message bytes. Padding is canonical.",
+                        "maxLength": 349528,
+                        "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$",
+                        "type": "string"
+                      },
+                      "encoding": {
+                        "const": "base64",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "data",
+                      "encoding"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "data": {
+                        "description": "UTF-8 message text whose encoded byte length contributes to the aggregate message limit.",
+                        "maxLength": 262144,
+                        "pattern": "^[\\s\\S]*$",
+                        "type": "string"
+                      },
+                      "encoding": {
+                        "const": "utf8",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "data",
+                      "encoding"
+                    ],
+                    "type": "object"
+                  }
+                ],
+                "x-takoform-discriminator": "encoding"
+              },
+              "queue": {
+                "additionalProperties": false,
+                "description": "PullQueue providing queue.pull@1.0.0. The host pins the resolved resource's exact FormRef at admission.",
+                "properties": {
+                  "apiVersion": {
+                    "const": "queue.forms.takoform.com",
+                    "type": "string"
+                  },
+                  "kind": {
+                    "const": "PullQueue",
+                    "type": "string"
+                  },
+                  "name": {
+                    "maxLength": 63,
+                    "minLength": 1,
+                    "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "apiVersion",
+                  "kind",
+                  "name"
+                ],
+                "type": "object",
+                "x-takoform-required-interface": {
+                  "apiVersion": "interfaces.takoform.com/v1alpha1",
+                  "name": "queue.pull",
+                  "schemaDigest": "sha256:93a580be2858aae5561c26488035a1ae9338754d22302c33c6c1917f7d0e94ac",
+                  "version": "1.0.0"
+                }
+              },
+              "type": {
+                "const": "queueMessage",
+                "type": "string"
+              }
+            },
+            "required": [
+              "attributes",
+              "body",
+              "queue",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "attributes": {
+                "additionalProperties": {
+                  "maxLength": 262144,
+                  "pattern": "^[\\s\\S]*$",
+                  "type": "string"
+                },
+                "description": "At most ten named string attributes. Attribute names use the portable map-key grammar; values contribute to the aggregate message bound with the body.",
+                "maxProperties": 10,
+                "propertyNames": {
+                  "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
+                  "type": "string",
+                  "x-takoform-fieldPolicy": "portable-data-only-v1"
+                },
+                "type": "object"
+              },
+              "body": {
+                "description": "Message body as UTF-8 text or canonical RFC 4648 base64 bytes. The body and attributes together are bounded to 262144 bytes by the target Interface; the desired union keeps the encoding explicit.",
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "data": {
+                        "description": "RFC 4648 base64 text for opaque message bytes. Padding is canonical.",
+                        "maxLength": 349528,
+                        "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$",
+                        "type": "string"
+                      },
+                      "encoding": {
+                        "const": "base64",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "data",
+                      "encoding"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "data": {
+                        "description": "UTF-8 message text whose encoded byte length contributes to the aggregate message limit.",
+                        "maxLength": 262144,
+                        "pattern": "^[\\s\\S]*$",
+                        "type": "string"
+                      },
+                      "encoding": {
+                        "const": "utf8",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "data",
+                      "encoding"
+                    ],
+                    "type": "object"
+                  }
+                ],
+                "x-takoform-discriminator": "encoding"
+              },
+              "topic": {
+                "additionalProperties": false,
+                "description": "Topic providing topic.publish@1.0.0. The host pins the resolved resource's exact FormRef at admission.",
+                "properties": {
+                  "apiVersion": {
+                    "const": "topic.forms.takoform.com",
+                    "type": "string"
+                  },
+                  "kind": {
+                    "const": "Topic",
+                    "type": "string"
+                  },
+                  "name": {
+                    "maxLength": 63,
+                    "minLength": 1,
+                    "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "apiVersion",
+                  "kind",
+                  "name"
+                ],
+                "type": "object",
+                "x-takoform-required-interface": {
+                  "apiVersion": "interfaces.takoform.com/v1alpha1",
+                  "name": "topic.publish",
+                  "schemaDigest": "sha256:9540b8b0735715dd92e0c7fc2bd59b0d04abc37b1d2637a741b44604e2810845",
+                  "version": "1.0.0"
+                }
+              },
+              "type": {
+                "const": "topicPublish",
+                "type": "string"
+              }
+            },
+            "required": [
+              "attributes",
+              "body",
+              "topic",
+              "type"
+            ],
+            "type": "object"
+          }
+        ],
+        "x-takoform-discriminator": "type"
+      }
+    },
+    "required": [
+      "cron",
+      "paused",
+      "retryPolicy",
+      "target"
+    ],
+    "title": "Schedule desired state",
+    "type": "object"
+  },
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "update",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-cron",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-cron.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-target",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-target.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-retry-policy",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-retry-policy.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-paused",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-paused.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-cron",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-cron.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-target",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-target.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-target-queuemessage-queue",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-target-queuemessage-queue.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-target-queuemessage-body",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-target-queuemessage-body.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-target-queuemessage-body-utf8-data",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-target-queuemessage-body-utf8-data.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-target-queuemessage-attributes",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-target-queuemessage-attributes.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-retry-policy",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-retry-policy.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-retry-policy-max-attempts",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-retry-policy-max-attempts.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-retry-policy-retry-delay-seconds",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-retry-policy-retry-delay-seconds.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

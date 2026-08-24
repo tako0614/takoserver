@@ -1,0 +1,62 @@
+{
+  "apiVersion": "edge.forms.takoform.com",
+  "kind": "SQLiteMigrationSet",
+  "definitionVersion": "0.1.0",
+  "title": "SQLite Migration Set",
+  "description": "Immutable ordered SQLite migration history backed by one committed artifacts.takoform.com/v1alpha1 MigrationBundle manifest. The manifest files array is the migration order; every entry has a unique portable path, media type application/sql, exact size, and sha256 digest. SQL bytes travel only through the content-addressed artifact upload and never enter desired state. A new set may append entries, but an application refuses any set whose prefix rewrites, reorders, or removes an already applied path+digest pair.",
+  "role": "revision",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Immutable ordered SQLite migration history backed by one committed artifacts.takoform.com/v1alpha1 MigrationBundle manifest. The manifest files array is the migration order; every entry has a unique portable path, media type application/sql, exact size, and sha256 digest. SQL bytes travel only through the content-addressed artifact upload and never enter desired state. A new set may append entries, but an application refuses any set whose prefix rewrites, reorders, or removes an already applied path+digest pair.",
+    "properties": {
+      "manifestDigest": {
+        "description": "Immutable identity of the committed MigrationBundle artifact manifest. Before mutation a host resolves it within the caller's tenant and verifies its canonical digest, MigrationBundle kind, non-empty ordered files inventory, unique paths, application/sql media type, sizes, and blob digests.",
+        "pattern": "^sha256:[0-9a-f]{64}$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "manifestDigest"
+    ],
+    "title": "SQLite Migration Set desired state",
+    "type": "object"
+  },
+  "immutableFields": [
+    "/manifestDigest"
+  ],
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-missing-manifest-digest",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-missing-manifest-digest.json",
+      "expectedFailure": "schema_validation_failed"
+    },
+    {
+      "name": "reject-manifest-digest",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-manifest-digest.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

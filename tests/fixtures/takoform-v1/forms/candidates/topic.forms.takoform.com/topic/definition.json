@@ -1,0 +1,46 @@
+{
+  "apiVersion": "topic.forms.takoform.com",
+  "kind": "Topic",
+  "definitionVersion": "0.1.0",
+  "title": "Topic",
+  "description": "Fanout topic whose accepted publishes are delivered at least once to every matching TopicSubscription. The topic retains and replays nothing; the topic.publish Interface fixes the message and publish semantics.",
+  "role": "identity",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Fanout topic whose accepted publishes are delivered at least once to every matching TopicSubscription. The topic retains and replays nothing; the topic.publish Interface fixes the message and publish semantics.",
+    "properties": {},
+    "title": "Topic desired state",
+    "type": "object"
+  },
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "providedInterfaces": [
+    {
+      "apiVersion": "interfaces.takoform.com/v1alpha1",
+      "name": "topic.publish",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:9540b8b0735715dd92e0c7fc2bd59b0d04abc37b1d2637a741b44604e2810845"
+    }
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

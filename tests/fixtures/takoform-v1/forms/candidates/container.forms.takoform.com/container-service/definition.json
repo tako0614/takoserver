@@ -1,0 +1,46 @@
+{
+  "apiVersion": "container.forms.takoform.com",
+  "kind": "ContainerService",
+  "definitionVersion": "0.1.0",
+  "title": "Container Service",
+  "description": "Logical identity of one request-driven serverless container service. Image, process configuration, resources, scaling, and traffic are represented by immutable revisions and the active traffic Form around this identity.",
+  "role": "identity",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Logical identity of one request-driven serverless container service. Image, process configuration, resources, scaling, and traffic are represented by immutable revisions and the active traffic Form around this identity.",
+    "properties": {},
+    "title": "Container Service desired state",
+    "type": "object"
+  },
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "delete",
+    "import",
+    "observe"
+  ],
+  "providedInterfaces": [
+    {
+      "apiVersion": "interfaces.takoform.com/v1alpha1",
+      "name": "container.runtime",
+      "version": "1.0.0",
+      "schemaDigest": "sha256:836d475fb206081b2f33ced95237079af54baceaf2afa9f32482c1e967c5a5ce"
+    }
+  ],
+  "conformanceFixtures": [
+    {
+      "name": "canonical",
+      "desiredPath": "fixtures/desired.json"
+    }
+  ],
+  "negativeConformanceFixtures": [
+    {
+      "name": "reject-unexpected-property",
+      "stage": "desired",
+      "inputPath": "fixtures/negative-unexpected-property.json",
+      "expectedFailure": "schema_validation_failed"
+    }
+  ]
+}

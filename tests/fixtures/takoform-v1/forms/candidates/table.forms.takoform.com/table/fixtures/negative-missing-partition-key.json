@@ -1,0 +1,14 @@
+{
+  "secondaryIndexes": [
+    {
+      "name": "by-email",
+      "partitionKey": "email",
+      "sortKey": "createdAt"
+    }
+  ],
+  "sortKey": {
+    "name": "createdAt",
+    "type": "number"
+  },
+  "ttlAttribute": "expiresAt"
+}
