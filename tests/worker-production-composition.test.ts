@@ -3,6 +3,7 @@ import { buildEdgeForms } from "../src/edge-forms.ts";
 import { HOSTED_EDGE_SUPPLIES_KIND } from "../src/hosted-edge-supplies.ts";
 import { HOSTED_OBJECT_BUCKET_SUPPLIES_KIND } from "../src/hosted-object-bucket-supplies.ts";
 import { PRODUCTION_STANDARD_SERVICE_SUPPLIES_KIND } from "../src/standard-service-production.ts";
+import { stableProductionTakoformCatalog } from "../src/takoform/stable-production-catalog.ts";
 import { createWorkerProductionComposition } from "../src/worker-production-composition.ts";
 
 const installation = {
@@ -59,6 +60,62 @@ const edgeSupplies = {
   ],
 };
 
+const stableEdgeClasses = {
+  ModuleWorker: {
+    resourceClass: "compute.edge",
+    meters: ["compute.worker.requests.million"],
+  },
+  EdgeKVNamespace: {
+    resourceClass: "storage.kv",
+    meters: ["storage.kv.operations.million", "storage.kv.gib-hour"],
+  },
+  SQLiteDatabase: {
+    resourceClass: "database.sqlite",
+    meters: [
+      "database.sqlite.rows-read.million",
+      "database.sqlite.rows-written.million",
+      "database.sqlite.gib-hour",
+    ],
+  },
+  AtLeastOnceQueue: {
+    resourceClass: "messaging.queue",
+    meters: ["messaging.queue.operations.million", "messaging.queue.transfer.gib"],
+  },
+} as const;
+
+const stableEdgeSupplies = {
+  kind: HOSTED_EDGE_SUPPLIES_KIND,
+  providerInstallation: {
+    ...installation,
+    supplyContractRef: "cloudflare.stable-edge-contract",
+  },
+  supplyContract: {
+    ...contract,
+    id: "cloudflare.stable-edge-contract",
+    permittedResourceClasses: Object.values(stableEdgeClasses).map((entry) => entry.resourceClass),
+    deliveryModes: ["embedded-binding"],
+    customerAccess: "operator-only",
+  },
+  offerings: Object.entries(stableEdgeClasses).map(([formKind, { resourceClass, meters }]) => ({
+    formKind,
+    offeringId: `${resourceClass}.cloudflare.stable-v1`,
+    displayName: formKind,
+    pricePlan: {
+      id: `${resourceClass}.cloudflare.stable-v1.price-v1`,
+      currency: "USD",
+      provisioning: { meter: "resource.create", amountMinor: 0 },
+      meters: meters.map((meter) => ({ meter, amountMinor: 1 })),
+    },
+    placement: {
+      deliveryMode: "embedded-binding",
+      supportPolicyRef: "support:hosted:standard",
+      abusePolicyRef: "abuse:hosted:standard",
+      portability,
+      isolation: "dedicated-resource",
+    },
+  })),
+};
+
 const objectSupplies = {
   kind: HOSTED_OBJECT_BUCKET_SUPPLIES_KIND,
   supplies: [
@@ -113,6 +170,87 @@ const stableS3Supplies = (supplyNamespace = "host-primary") => ({
 });
 
 describe("Worker production composition", () => {
+  test("publishes the stable Edge provider subset without current ObjectBucket authority", () => {
+    const catalog = stableProductionTakoformCatalog();
+    const composed = createWorkerProductionComposition({
+      env: {
+        TAKOSERVER_EDGE_SUPPLIES: JSON.stringify(stableEdgeSupplies),
+        CLOUDFLARE_ACCOUNT_ID: "account-id",
+        CLOUDFLARE_API_TOKEN: "cloudflare-token",
+        TAKOSERVER_WORKER_ENDPOINT_SUFFIX: "hosted.workers.dev",
+      },
+      forms: catalog.forms,
+      artifacts: { manifest: async () => null, blob: async () => null },
+      now: new Date("2026-08-24T00:00:00.000Z"),
+    });
+
+    expect(composed.providers.map((provider) => provider.id)).toEqual(["cloudflare"]);
+    expect(composed.offerings.map((offering) => offering.form.kind).sort()).toEqual([
+      "AtLeastOnceQueue",
+      "EdgeKVNamespace",
+      "ModuleWorker",
+      "SQLiteDatabase",
+    ]);
+    expect(composed.providerPacks).toHaveLength(1);
+    expect(composed.providerPacks[0]?.descriptor.forms.map((form) => form.kind).sort()).toEqual([
+      "AtLeastOnceQueue",
+      "EdgeKVNamespace",
+      "ModuleWorker",
+      "QueueConsumer",
+      "SQLiteDatabase",
+      "WorkerCronTrigger",
+      "WorkerCustomDomain",
+      "WorkerDeployment",
+      "WorkerEndpoint",
+      "WorkerVersion",
+    ]);
+    expect(composed.providerPacks[0]?.attachmentFactories).toEqual([]);
+    expect(JSON.stringify(composed)).not.toContain("ObjectBucket");
+    expect(JSON.stringify(composed)).not.toContain("edge.objects");
+  });
+
+  test("keeps exact beta provider dispatch drain-only beside the stable sale catalog", async () => {
+    const stable = stableProductionTakoformCatalog();
+    const retained = await buildEdgeForms();
+    const composed = createWorkerProductionComposition({
+      env: {
+        TAKOSERVER_EDGE_SUPPLIES: JSON.stringify(stableEdgeSupplies),
+        CLOUDFLARE_ACCOUNT_ID: "account-id",
+        CLOUDFLARE_API_TOKEN: "cloudflare-token",
+      },
+      forms: stable.forms,
+      retainedForms: retained.forms,
+      artifacts: { manifest: async () => null, blob: async () => null },
+      now: new Date("2026-08-24T00:00:00.000Z"),
+    });
+
+    expect(composed.offerings.map((offering) => offering.form.apiVersion)).toEqual([
+      "edge.forms.takoform.com",
+      "edge.forms.takoform.com",
+      "edge.forms.takoform.com",
+      "edge.forms.takoform.com",
+    ]);
+    const retainedRefs = composed.providerPacks[0]?.descriptor.forms.filter(
+      (form) => form.apiVersion === "edge.forms.takoform.com/v1beta1",
+    );
+    expect(retainedRefs?.map((form) => form.kind).sort()).toEqual([
+      "AtLeastOnceQueue",
+      "EdgeKVNamespace",
+      "ModuleWorker",
+      "ObjectBucket",
+      "QueueConsumer",
+      "SQLiteDatabase",
+      "WorkerCronTrigger",
+      "WorkerCustomDomain",
+      "WorkerDeployment",
+      "WorkerEndpoint",
+      "WorkerVersion",
+    ]);
+    expect(composed.providerPacks[0]?.attachmentFactories).toEqual([]);
+    expect(JSON.stringify(composed.offerings)).not.toContain("ObjectBucket");
+    expect(JSON.stringify(composed.offerings)).not.toContain("edge.objects");
+  });
+
   test("revalidates and shares a Host-owned R2 slot across revisions without current ObjectBucket Forms", async () => {
     const calls: Array<{ readonly method: string; readonly url: string; readonly body: string }> =
       [];

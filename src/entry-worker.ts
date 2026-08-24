@@ -9,7 +9,7 @@ import type { RuntimeMaterializer } from "./runtime-materialization.ts";
 import { loadSigningKey } from "./signing-key.ts";
 import { createD1Sql } from "./sql-d1.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
-import { currentTakoformCatalog } from "./takoform/current-catalog.ts";
+import { stableProductionTakoformCatalog } from "./takoform/stable-production-catalog.ts";
 import { createJavaScriptWorkerModuleInspector } from "./takoform/worker-module-inspector.ts";
 import { createWorkerDataServices } from "./worker-data-services.ts";
 import { createWorkerProductionComposition } from "./worker-production-composition.ts";
@@ -136,7 +136,7 @@ let cached: { readonly env: WorkerEnv; readonly app: App } | null = null;
 async function appFor(env: WorkerEnv, origin: string): Promise<App> {
   if (cached?.env === env) return cached.app;
   const edge = await buildEdgeForms();
-  const currentHost = currentTakoformCatalog(edge);
+  const currentHost = stableProductionTakoformCatalog();
   const { identity, identityProviders, settlement, checkout } = credentials(env);
   const sql = createD1Sql(env.STATE_DB);
   const objects = createR2ObjectStore(env.OBJECTS);
@@ -153,7 +153,8 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
   const dataServices = createWorkerDataServices(env);
   const deployment = createWorkerProductionComposition({
     env,
-    forms: edge.forms,
+    forms: currentHost.forms,
+    retainedForms: edge.forms,
     artifacts: {
       manifest: (tenantRef, digest) => artifacts.resolveManifest(tenantRef, digest),
       async blob(digest) {
@@ -183,8 +184,8 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     ...(env.TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN
       ? { sponsorshipServiceToken: env.TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN }
       : {}),
-    forms: edge.forms,
-    bindings: edge.bindings,
+    forms: currentHost.forms,
+    bindings: currentHost.bindings,
     hostForms: currentHost.forms,
     hostBindings: currentHost.bindings,
     providers: deployment.providers,

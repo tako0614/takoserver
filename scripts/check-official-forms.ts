@@ -5,11 +5,15 @@ import {
   assertReleasedTakoformProviderBindings,
   assertReleasedTakoformProviderForms,
 } from "../src/takoform/released-provider-catalog.ts";
+import { stableProductionTakoformCatalog } from "../src/takoform/stable-production-catalog.ts";
 
 const VENDOR_ROOT = "vendor/takoform/v2.1.1";
 const MANIFEST_PATH = `${VENDOR_ROOT}/source-manifest.json`;
 const MANIFEST_SIZE = 9_595;
 const MANIFEST_SHA256 = "229cd5c5209fae5c1088418216f75ce1ea7d049af027c527117aff0f1137f2ad";
+const STABLE_CATALOG_PATH = "src/generated/takoform-stable-v1-catalog.ts";
+const STABLE_CATALOG_SIZE = 168_740;
+const STABLE_CATALOG_SHA256 = "b3074253acabf231265984683b8f52b48bf5c31f076bb0029b0cd7f88aea1330";
 
 interface SourceManifest {
   readonly format: "takoserver.vendored-takoform-source@v1";
@@ -40,6 +44,14 @@ if (
   source.files.length !== 36
 ) {
   throw new Error("released_takoform_source_authority_mismatch");
+}
+
+const stableCatalogBytes = readFileSync(STABLE_CATALOG_PATH);
+if (
+  stableCatalogBytes.byteLength !== STABLE_CATALOG_SIZE ||
+  createHash("sha256").update(stableCatalogBytes).digest("hex") !== STABLE_CATALOG_SHA256
+) {
+  throw new Error("stable_takoform_catalog_bytes_mismatch");
 }
 
 for (const file of source.files) {
@@ -73,8 +85,11 @@ if (
 ) {
   throw new Error("released_takoform_product_catalog_mismatch");
 }
+const stable = stableProductionTakoformCatalog();
 
 console.log(
-  `official Forms ok: ${source.repository} ${source.tag} ${source.commit}; ` +
-    `${edge.forms.length} Forms and ${edge.bindings.length} Bindings`,
+  `official Forms ok: retained ${source.repository} ${source.tag} ${source.commit} ` +
+    `${edge.forms.length} Forms/${edge.bindings.length} Bindings; stable ` +
+    `${stable.provenance.repository} ${stable.provenance.commit} ` +
+    `${stable.forms.length} Forms/${stable.bindings.length} Bindings`,
 );
