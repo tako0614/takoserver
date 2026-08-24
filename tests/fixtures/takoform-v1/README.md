@@ -1,8 +1,8 @@
 # Frozen Takoform v1 test input
 
 This directory is a test-only, content-addressed snapshot of the unpublished
-Takoform v1 candidate at commit
-`be686d1bb69e7e65c066fa6310e7f4a46f526420`.
+Takoform v1 candidate integrated on `main` at commit
+`c08651d9b39d1be34e4b803c3d32fdca82e3653e`.
 
 `worker-stable-local-composition.ts` reopens the exact family index, candidate
 sets, package indexes, package files, Interface candidate set, Binding

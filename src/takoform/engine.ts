@@ -371,6 +371,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         !diagnostics.some((entry) => entry.severity === "error") &&
         (form.constraints ?? []).some((constraint) =>
           [
+            "sum",
             "orderedPair",
             "uniqueBy",
             "acyclic",
