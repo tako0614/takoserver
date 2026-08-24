@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { buildEdgeForms } from "../src/edge-forms.ts";
 import { HOSTED_EDGE_SUPPLIES_KIND } from "../src/hosted-edge-supplies.ts";
 import { HOSTED_OBJECT_BUCKET_SUPPLIES_KIND } from "../src/hosted-object-bucket-supplies.ts";
+import { PRODUCTION_STANDARD_SERVICE_SUPPLIES_KIND } from "../src/standard-service-production.ts";
 import { createWorkerProductionComposition } from "../src/worker-production-composition.ts";
 
 const installation = {
@@ -98,8 +99,230 @@ const s3CredentialIssuer = {
   },
 };
 
+const stableS3Supplies = (supplyNamespace = "host-primary") => ({
+  kind: PRODUCTION_STANDARD_SERVICE_SUPPLIES_KIND,
+  supplies: [
+    {
+      serviceRef: {
+        apiVersion: "standards.takoform.com/v1",
+        protocol: "com.amazonaws.s3",
+      },
+      backend: { kind: "cloudflare-r2", supplyNamespace },
+    },
+  ],
+});
+
 describe("Worker production composition", () => {
-  test("joins edge and storage sales to one Cloudflare Provider installation", async () => {
+  test("revalidates and shares a Host-owned R2 slot across revisions without current ObjectBucket Forms", async () => {
+    const calls: Array<{ readonly method: string; readonly url: string; readonly body: string }> =
+      [];
+    const buckets = new Set<string>();
+    const composed = createWorkerProductionComposition({
+      env: {
+        TAKOSERVER_STANDARD_SERVICE_SUPPLIES: JSON.stringify(stableS3Supplies()),
+        CLOUDFLARE_ACCOUNT_ID: "account-id",
+        CLOUDFLARE_API_TOKEN: "cloudflare-token",
+      },
+      forms: [],
+      artifacts: { manifest: async () => null, blob: async () => null },
+      async fetch(request) {
+        const body = await request.clone().text();
+        calls.push({ method: request.method, url: request.url, body });
+        if (request.method === "GET") {
+          const name = new URL(request.url).pathname.split("/").at(-1) ?? "";
+          if (buckets.has(name)) {
+            return Response.json({ success: true, errors: [], result: { name } });
+          }
+          return Response.json(
+            { success: false, errors: [{ code: 10006 }], result: null },
+            { status: 404 },
+          );
+        }
+        const bucket = (JSON.parse(body) as { name: string }).name;
+        buckets.add(bucket);
+        return Response.json({ success: true, errors: [], result: { name: bucket } });
+      },
+      now: new Date("2026-08-19T00:00:00.000Z"),
+    });
+
+    expect(composed.providers).toEqual([]);
+    expect(composed.providerPacks).toEqual([]);
+    expect(composed.offerings).toEqual([]);
+    expect(composed.standardServiceResolver).toBeDefined();
+    expect(
+      await composed.standardServiceResolver?.satisfiable({
+        tenantId: "tenant-a",
+        space: "production",
+        serviceRef: {
+          apiVersion: "standards.takoform.com/v1",
+          protocol: "com.amazonaws.s3",
+        },
+      }),
+    ).toBe(true);
+    expect(
+      await composed.standardServiceResolver?.satisfiable({
+        tenantId: "tenant-a",
+        space: "production",
+        serviceRef: {
+          apiVersion: "standards.takoform.com/v1",
+          protocol: "com.example.unknown",
+        },
+      }),
+    ).toBe(false);
+
+    const material = await composed.standardServiceResolver?.resolve({
+      tenantId: "tenant-a",
+      space: "production",
+      form: {} as never,
+      slot: {
+        name: "MEDIA",
+        required: true,
+        service: {
+          apiVersion: "standards.takoform.com/v1",
+          protocol: "com.amazonaws.s3",
+        },
+      },
+    });
+    expect(material).toEqual({
+      endpoint: {
+        kind: "takoserver.cloudflare-r2-bucket@v1",
+        bucketName: expect.stringMatching(/^tss3-[0-9a-f]{40}$/u),
+      },
+      credential: { kind: "takoserver.cloudflare-r2-binding@v1" },
+    });
+    expect(calls.map((call) => call.method)).toEqual(["GET", "POST"]);
+    expect(calls[0]?.url).toContain("/accounts/account-id/r2/buckets/tss3-");
+    expect(calls[1]?.body).not.toContain("tenant-a");
+    expect(calls[1]?.body).not.toContain("production");
+    expect(calls[1]?.body).not.toContain("MEDIA");
+    expect(
+      await composed.standardServiceResolver?.resolve({
+        tenantId: "tenant-a",
+        space: "production",
+        // A later immutable WorkerVersion resolves the same Host-owned service.
+        // Portable Resource deletion is deliberately not bucket cleanup authority.
+        form: { revision: 2 } as never,
+        slot: {
+          name: "MEDIA",
+          required: true,
+          service: {
+            apiVersion: "standards.takoform.com/v1",
+            protocol: "com.amazonaws.s3",
+          },
+        },
+      }),
+    ).toEqual(material);
+    expect(calls.map((call) => call.method)).toEqual(["GET", "POST", "GET"]);
+    expect(calls.some((call) => call.method === "DELETE")).toBe(false);
+    const otherSpace = await composed.standardServiceResolver?.resolve({
+      tenantId: "tenant-a",
+      space: "staging",
+      form: {} as never,
+      slot: {
+        name: "MEDIA",
+        required: true,
+        service: {
+          apiVersion: "standards.takoform.com/v1",
+          protocol: "com.amazonaws.s3",
+        },
+      },
+    });
+    expect(otherSpace?.endpoint).not.toEqual(material?.endpoint);
+    expect(calls).toHaveLength(5);
+    expect(JSON.stringify(composed.offerings)).not.toContain("ObjectBucket");
+    expect(JSON.stringify(composed.providerPacks)).not.toContain("edge.objects");
+  });
+
+  test("keeps stable standard services fail-closed without explicit operator supply", () => {
+    const composed = createWorkerProductionComposition({
+      env: {},
+      forms: [],
+      artifacts: { manifest: async () => null, blob: async () => null },
+      now: new Date("2026-08-19T00:00:00.000Z"),
+    });
+    expect(composed.standardServiceResolver).toBeUndefined();
+  });
+
+  test("namespaces deterministic R2 services by the operator-owned Host supply", async () => {
+    const buckets: string[] = [];
+    const compose = (supplyNamespace: string) =>
+      createWorkerProductionComposition({
+        env: {
+          TAKOSERVER_STANDARD_SERVICE_SUPPLIES: JSON.stringify(stableS3Supplies(supplyNamespace)),
+          CLOUDFLARE_ACCOUNT_ID: "shared-account",
+          CLOUDFLARE_API_TOKEN: "cloudflare-token",
+        },
+        forms: [],
+        artifacts: { manifest: async () => null, blob: async () => null },
+        async fetch(request) {
+          if (request.method === "GET") {
+            return Response.json(
+              { success: false, errors: [{ code: 10006 }], result: null },
+              { status: 404 },
+            );
+          }
+          const body = (await request.json()) as { readonly name: string };
+          buckets.push(body.name);
+          return Response.json({ success: true, errors: [], result: { name: body.name } });
+        },
+        now: new Date("2026-08-23T00:00:00.000Z"),
+      });
+
+    for (const namespace of ["host-east", "host-west"]) {
+      await compose(namespace).standardServiceResolver?.resolve({
+        tenantId: "same-tenant",
+        space: "same-space",
+        form: {} as never,
+        slot: {
+          name: "MEDIA",
+          required: true,
+          service: {
+            apiVersion: "standards.takoform.com/v1",
+            protocol: "com.amazonaws.s3",
+          },
+        },
+      });
+    }
+
+    expect(buckets).toHaveLength(2);
+    expect(buckets[0]).toMatch(/^tss3-[0-9a-f]{40}$/u);
+    expect(buckets[1]).toMatch(/^tss3-[0-9a-f]{40}$/u);
+    expect(buckets[0]).not.toBe(buckets[1]);
+  });
+
+  test("refuses an absent or malformed Host supply namespace", () => {
+    for (const backend of [
+      { kind: "cloudflare-r2" },
+      { kind: "cloudflare-r2", supplyNamespace: "" },
+      { kind: "cloudflare-r2", supplyNamespace: "host/escape" },
+    ]) {
+      expect(() =>
+        createWorkerProductionComposition({
+          env: {
+            TAKOSERVER_STANDARD_SERVICE_SUPPLIES: JSON.stringify({
+              kind: PRODUCTION_STANDARD_SERVICE_SUPPLIES_KIND,
+              supplies: [
+                {
+                  serviceRef: {
+                    apiVersion: "standards.takoform.com/v1",
+                    protocol: "com.amazonaws.s3",
+                  },
+                  backend,
+                },
+              ],
+            }),
+            CLOUDFLARE_ACCOUNT_ID: "account-id",
+            CLOUDFLARE_API_TOKEN: "cloudflare-token",
+          },
+          forms: [],
+          artifacts: { manifest: async () => null, blob: async () => null },
+          now: new Date("2026-08-23T00:00:00.000Z"),
+        }),
+      ).toThrow("invalid production standard-service supplies");
+    }
+  });
+
+  test("keeps configured released Edge and storage providers drain-only", async () => {
     const edge = await buildEdgeForms();
     const composed = createWorkerProductionComposition({
       env: {
@@ -115,10 +338,7 @@ describe("Worker production composition", () => {
       now: new Date("2026-08-19T00:00:00.000Z"),
     });
     expect(composed.providers.map((provider) => provider.id)).toEqual(["cloudflare"]);
-    expect(composed.offerings.map((offering) => offering.id).sort()).toEqual([
-      "compute.edge.cloudflare.global",
-      "storage.object.cloudflare.global",
-    ]);
+    expect(composed.offerings).toEqual([]);
     expect(composed.providerPacks).toHaveLength(1);
     expect(composed.providerPacks[0]?.descriptor.forms.map((form) => form.kind).sort()).toEqual([
       "ModuleWorker",
@@ -131,6 +351,8 @@ describe("Worker production composition", () => {
       "WorkerVersion",
     ]);
     expect(composed.providerPacks[0]?.attachmentFactories).toHaveLength(1);
+    expect(JSON.stringify(composed.offerings)).not.toContain("ObjectBucket");
+    expect(JSON.stringify(composed.offerings)).not.toContain("edge.objects");
   });
 
   test("rejects ambient provider reach and split Cloudflare authority", async () => {

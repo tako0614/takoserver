@@ -1,7 +1,14 @@
-import type { Clock, Row, Sql } from "../ports.ts";
+import { canonicalJson } from "../json.ts";
+import type { Clock, Row, Sql, SqlParam, SqlStatement } from "../ports.ts";
+import { SqlError } from "../ports.ts";
 import { OPERATION_TTL_MILLISECONDS, REPLAY_TTL_MILLISECONDS, SWEEP_ROW_LIMIT } from "./limits.ts";
 import type { TakoformStoredRelation } from "./relations.ts";
-import type { TakoformStoredResource } from "./types.ts";
+import {
+  type TakoformDriverReceipt,
+  TakoformHostError,
+  type TakoformStoredResource,
+  type TakoformV1Alpha3FormRef,
+} from "./types.ts";
 
 /**
  * Durable Takoform state.
@@ -40,6 +47,92 @@ export interface OperationRecord {
   readonly createdAt: string;
   readonly resource?: TakoformStoredResource;
 }
+
+export type DeferredOperationPhase =
+  | "pending"
+  | "committing"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+
+/**
+ * A resumable Host mutation. Only portable desired-state bytes and the closed
+ * lifecycle headers are retained; authentication, cookies, probe headers, and
+ * resolved service credentials never cross this storage boundary.
+ */
+export interface DeferredOperationRecord {
+  readonly id: string;
+  readonly tenantId: string;
+  readonly principalId: string;
+  readonly operation: "apply" | "import" | "delete";
+  readonly phase: DeferredOperationPhase;
+  readonly requestPath: string;
+  readonly requestQuery: string;
+  readonly requestHeaders: Readonly<Record<string, string>>;
+  readonly requestBody?: string;
+  readonly fingerprint: string;
+  readonly replayKey: string;
+  readonly target: {
+    readonly space: string;
+    readonly apiVersion: string;
+    readonly kind: string;
+    readonly name: string;
+    readonly formRef: TakoformV1Alpha3FormRef;
+  };
+  readonly acceptedUid?: string;
+  readonly acceptedGeneration?: string;
+  readonly acceptedRevision?: string;
+  readonly resourceUid: string;
+  readonly pollsRemaining: number;
+  readonly leaseToken?: string;
+  readonly leaseUntil?: number;
+  readonly terminalJson?: string;
+  readonly committedUid?: string;
+  readonly createdAt: string;
+}
+
+export interface ResourceMutationCommit {
+  readonly kind: "write" | "delete";
+  readonly resourceUid: string;
+  readonly address: ResourceAddress;
+  readonly expectedRevision: string | null;
+  readonly resource?: TakoformStoredResource;
+  readonly relations?: readonly TakoformStoredRelation[];
+  readonly replayKey: string;
+  readonly replay: StoredReplay;
+  readonly providerReceipt?: TakoformDriverReceipt;
+  readonly claimKeys?: readonly string[];
+}
+
+export interface DeferredResourceCommit extends ResourceMutationCommit {
+  readonly terminalJson: string;
+}
+
+export interface ProviderMutationSaga {
+  readonly operationId: string;
+  readonly replayKey: string;
+  readonly tenantId: string;
+  readonly fingerprint: string;
+  readonly resourceUid: string;
+  readonly target: ResourceAddress;
+  readonly acceptedUid?: string;
+  readonly acceptedGeneration?: string;
+  readonly acceptedRevision?: string;
+  readonly receipt?: TakoformDriverReceipt;
+}
+
+export interface ResourceClaimReservation {
+  readonly key: string;
+  readonly tenantId: string;
+  readonly holderSpace: string;
+  readonly holderApiVersion: string;
+  readonly holderKind: string;
+  readonly holderName: string;
+  readonly holderUid: string;
+  readonly operationId: string;
+}
+
+export type ResourceClaimHolder = Omit<ResourceClaimReservation, "key" | "operationId">;
 
 /** A resource as an inventory shows it: address, lineage, and last movement. */
 export interface ResourceListing {
@@ -92,6 +185,15 @@ export interface TakoformStore {
     hostname: string,
     limit: number,
   ): Promise<readonly ResourceListing[]>;
+  /** Live holders of one Definition-declared claim value, across tenant spaces. */
+  claimHolders(input: {
+    readonly tenantId: string;
+    readonly sourceApiVersion: string;
+    readonly sourceKind: string;
+    readonly pointer: string;
+    readonly value: unknown;
+    readonly limit: number;
+  }): Promise<readonly ResourceListing[]>;
   /** Whether following QueueConsumer dead-letter edges reaches another queue. */
   queuePathReaches(input: {
     readonly tenantId: string;
@@ -109,6 +211,11 @@ export interface TakoformStore {
     readonly resource: TakoformStoredResource;
     readonly relations: readonly TakoformStoredRelation[];
     readonly expectedRevision: string | null;
+    /** Proves and finalizes Definition-declared claims in the same SQL batch. */
+    readonly claimCommit?: {
+      readonly operationId: string;
+      readonly claimKeys: readonly string[];
+    };
   }): Promise<boolean>;
   deleteResource(address: ResourceAddress, expectedRevision: string): Promise<boolean>;
 
@@ -128,6 +235,81 @@ export interface TakoformStore {
   putOperation(tenantId: string, record: OperationRecord): Promise<void>;
   readOperation(tenantId: string, id: string): Promise<OperationRecord | null>;
 
+  acceptProviderMutationSaga(record: ProviderMutationSaga): Promise<ProviderMutationSaga>;
+  readProviderMutationReceipt(
+    tenantId: string,
+    operationId: string,
+    resourceUid: string,
+  ): Promise<TakoformDriverReceipt | null>;
+  abandonProviderMutationPlan(input: {
+    readonly tenantId: string;
+    readonly operationId: string;
+    readonly replayKey: string;
+    readonly resourceUid: string;
+  }): Promise<boolean>;
+  recordProviderMutationReceipt(input: {
+    readonly tenantId: string;
+    readonly operationId: string;
+    readonly resourceUid: string;
+    readonly receipt: TakoformDriverReceipt;
+    readonly claimOwnerId?: string;
+  }): Promise<void>;
+  holdDeferredProviderRepair(input: {
+    readonly operation: DeferredOperationRecord;
+    readonly leaseToken: string;
+  }): Promise<boolean>;
+  commitImmediateMutation(input: {
+    readonly tenantId: string;
+    readonly operationId: string;
+    readonly operation: "create" | "update" | "import" | "delete";
+    readonly createdAt: string;
+    readonly mutation: ResourceMutationCommit;
+  }): Promise<void>;
+
+  acceptDeferredOperation(record: DeferredOperationRecord): Promise<DeferredOperationRecord>;
+  readDeferredOperation(
+    tenantId: string,
+    principalId: string,
+    id: string,
+  ): Promise<DeferredOperationRecord | null>;
+  deferredOperationExists(id: string): Promise<boolean>;
+  readDeferredOperationByReplay(replayKey: string): Promise<DeferredOperationRecord | null>;
+  retireDeferredOperation(id: string, replayKey: string): Promise<boolean>;
+  advanceDeferredOperation(input: {
+    readonly tenantId: string;
+    readonly principalId: string;
+    readonly id: string;
+    readonly leaseToken: string;
+    readonly leaseUntil: number;
+  }): Promise<{
+    readonly operation: DeferredOperationRecord | null;
+    readonly acquired: boolean;
+  }>;
+  cancelDeferredOperation(input: {
+    readonly tenantId: string;
+    readonly principalId: string;
+    readonly id: string;
+    readonly terminalJson: string;
+  }): Promise<"cancelled" | "settled" | "too_late" | "not_found">;
+  settleDeferredFailure(input: {
+    readonly operation: DeferredOperationRecord;
+    readonly leaseToken: string;
+    readonly terminalJson: string;
+  }): Promise<boolean>;
+  commitDeferredMutation(input: {
+    readonly operation: DeferredOperationRecord;
+    readonly leaseToken: string;
+    readonly mutation: DeferredResourceCommit;
+  }): Promise<void>;
+
+  reserveResourceClaims(
+    reservations: readonly ResourceClaimReservation[],
+    expiresAt: number,
+  ): Promise<void>;
+  resourceClaimHolder(key: string): Promise<ResourceClaimHolder | null>;
+  releaseResourceClaims(operationId: string): Promise<void>;
+  releaseCommittedResourceClaims(tenantId: string, holderUid: string): Promise<void>;
+
   /**
    * Resources whose Form is no longer installed.
    *
@@ -140,7 +322,13 @@ export interface TakoformStore {
   orphanedResources(
     installedDigests: readonly string[],
     limit: number,
-  ): Promise<readonly { readonly space: string; readonly name: string; readonly kind: string }[]>;
+  ): Promise<
+    readonly {
+      readonly space: string;
+      readonly name: string;
+      readonly kind: string;
+    }[]
+  >;
 
   /**
    * One page of a tenant's resources, newest change first.
@@ -158,7 +346,10 @@ export interface TakoformStore {
       readonly limit: number;
       readonly cursor?: string | undefined;
     },
-  ): Promise<{ readonly resources: readonly ResourceListing[]; readonly cursor: string | null }>;
+  ): Promise<{
+    readonly resources: readonly ResourceListing[];
+    readonly cursor: string | null;
+  }>;
 
   /** Exact resource lookup for a credential broker; a uid is not a list cursor. */
   resourceByUid(tenantId: string, uid: string): Promise<ResourceListing | null>;
@@ -173,6 +364,65 @@ export interface TakoformStore {
 
 export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
   const now = (): number => clock().getTime();
+
+  const readDeferredBy = async (
+    column: "replay_key",
+    value: string,
+  ): Promise<DeferredOperationRecord | null> => {
+    const rows = await sql.query(
+      `SELECT * FROM tf_deferred_operations WHERE ${column} = ? AND expires_at > ?`,
+      [value, now()],
+    );
+    return rows[0] ? deferredOperation(rows[0]) : null;
+  };
+
+  const commitFenceError = async (
+    operation: DeferredOperationRecord,
+    leaseToken: string,
+  ): Promise<TakoformHostError> => {
+    const liveOperation = await sql.query(
+      `SELECT phase, lease_token FROM tf_deferred_operations
+       WHERE id = ? AND tenant_id = ? AND principal_id = ? AND expires_at > ?`,
+      [operation.id, operation.tenantId, operation.principalId, now()],
+    );
+    if (
+      liveOperation.length !== 1 ||
+      liveOperation[0]?.phase !== "committing" ||
+      liveOperation[0]?.lease_token !== leaseToken
+    ) {
+      return new TakoformHostError("resource_busy", 409);
+    }
+    const current = await sql.query(
+      `SELECT uid, generation, revision, resource_json FROM tf_resources
+       WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?`,
+      [
+        operation.tenantId,
+        operation.target.space,
+        operation.target.apiVersion,
+        operation.target.kind,
+        operation.target.name,
+      ],
+    );
+    const row = current[0];
+    if (operation.acceptedUid === undefined) {
+      return new TakoformHostError(row ? "uid_mismatch" : "resource_busy", 409);
+    }
+    if (!row) return new TakoformHostError("resource_not_found", 404);
+    const resource = JSON.parse(text(row.resource_json)) as TakoformStoredResource;
+    if (
+      row.uid !== operation.acceptedUid ||
+      canonicalJson(resource.form.formRef) !== canonicalJson(operation.target.formRef)
+    ) {
+      return new TakoformHostError("uid_mismatch", 409);
+    }
+    if (row.generation !== operation.acceptedGeneration) {
+      return new TakoformHostError("generation_conflict", 412);
+    }
+    if (row.revision !== operation.acceptedRevision) {
+      return new TakoformHostError("revision_conflict", 412);
+    }
+    return new TakoformHostError("resource_busy", 409);
+  };
 
   return {
     async readResource(address): Promise<TakoformStoredResource | null> {
@@ -242,7 +492,8 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
                 updated_at, resource_json
          FROM tf_resources
          WHERE tenant_id = ?
-           AND api_version LIKE 'edge.forms.takoform.com/%'
+           AND (api_version = 'edge.forms.takoform.com'
+                OR api_version LIKE 'edge.forms.takoform.com/%')
            AND kind = 'WorkerCustomDomain'
            AND json_extract(resource_json, '$.spec.hostname') = ?
          ORDER BY space, name
@@ -250,6 +501,25 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         [tenantId, hostname, Math.min(Math.max(limit, 1), 2)],
       );
       return rows.map(resourceListing);
+    },
+
+    async claimHolders(input): Promise<readonly ResourceListing[]> {
+      const rows = await sql.query(
+        `SELECT space, api_version, kind, name, uid, generation, revision,
+                updated_at, resource_json
+         FROM tf_resources
+         WHERE tenant_id = ? AND api_version = ? AND kind = ?
+         ORDER BY space, name`,
+        [input.tenantId, input.sourceApiVersion, input.sourceKind],
+      );
+      const claimed = canonicalJson(input.value);
+      return rows
+        .map(resourceListing)
+        .filter((entry) => {
+          const value = pointerValue(entry.resource.spec, input.pointer);
+          return value !== undefined && canonicalJson(value) === claimed;
+        })
+        .slice(0, Math.min(Math.max(input.limit, 1), 2));
     },
 
     async queuePathReaches(input): Promise<boolean> {
@@ -262,7 +532,8 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
            JOIN tf_resources AS consumer
              ON consumer.tenant_id = ?
             AND consumer.space = ?
-            AND consumer.api_version LIKE 'edge.forms.takoform.com/%'
+            AND (consumer.api_version = 'edge.forms.takoform.com'
+                 OR consumer.api_version LIKE 'edge.forms.takoform.com/%')
             AND consumer.kind = 'QueueConsumer'
            JOIN json_each(consumer.relations_json) AS drained
              ON json_extract(drained.value, '$.relation') = '/queue'
@@ -276,8 +547,134 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       return rows.length === 1;
     },
 
-    async writeResource({ address, resource, relations, expectedRevision }): Promise<boolean> {
+    async writeResource({
+      address,
+      resource,
+      relations,
+      expectedRevision,
+      claimCommit,
+    }): Promise<boolean> {
       const key = [address.tenantId, address.space, address.apiVersion, address.kind, address.name];
+      if (claimCommit) {
+        const claimKeys = [...new Set(claimCommit.claimKeys)].sort();
+        const guard = boundedGuard(`resource_${claimCommit.operationId}`);
+        const resourceFence =
+          expectedRevision === null
+            ? `NOT EXISTS (
+                SELECT 1 FROM tf_resources
+                WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
+              )`
+            : `EXISTS (
+                SELECT 1 FROM tf_resources
+                WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
+                  AND revision = ?
+              )`;
+        const claimFence =
+          claimKeys.length === 0
+            ? "1 = 1"
+            : `(SELECT COUNT(*) FROM tf_resource_claims
+                WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
+                  AND claim_key IN (${claimKeys.map(() => "?").join(", ")})) = ?`;
+        const statements: SqlStatement[] = [
+          {
+            sql: `INSERT INTO tf_operation_commit_guards (token, valid)
+                  SELECT ?, CASE WHEN ${resourceFence} AND ${claimFence} THEN 1 ELSE 0 END`,
+            params: [
+              guard,
+              ...key,
+              ...(expectedRevision === null ? [] : [expectedRevision]),
+              ...(claimKeys.length === 0
+                ? []
+                : [
+                    claimCommit.operationId,
+                    address.tenantId,
+                    resource.metadata.uid,
+                    ...claimKeys,
+                    claimKeys.length,
+                  ]),
+            ],
+          },
+        ];
+        if (expectedRevision === null) {
+          statements.push({
+            sql: `INSERT INTO tf_resources
+                    (tenant_id, space, api_version, kind, name, uid, generation, revision,
+                     resource_json, relations_json, updated_at)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            params: [
+              ...key,
+              resource.metadata.uid,
+              resource.metadata.generation,
+              resource.metadata.revision,
+              JSON.stringify(resource),
+              JSON.stringify(relations),
+              now(),
+            ],
+          });
+        } else {
+          statements.push({
+            sql: `UPDATE tf_resources
+                  SET uid = ?, generation = ?, revision = ?, resource_json = ?,
+                      relations_json = ?, updated_at = ?
+                  WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
+                    AND revision = ?`,
+            params: [
+              resource.metadata.uid,
+              resource.metadata.generation,
+              resource.metadata.revision,
+              JSON.stringify(resource),
+              JSON.stringify(relations),
+              now(),
+              ...key,
+              expectedRevision,
+            ],
+          });
+        }
+        statements.push(
+          ...claimCommitStatements(
+            {
+              id: claimCommit.operationId,
+              tenantId: address.tenantId,
+              resourceUid: resource.metadata.uid,
+            },
+            claimKeys,
+            now(),
+          ),
+          {
+            sql: "DELETE FROM tf_operation_commit_guards WHERE token = ?",
+            params: [guard],
+          },
+        );
+        try {
+          await sql.batch(statements);
+          return true;
+        } catch (error) {
+          if (!(error instanceof SqlError) || error.code !== "constraint") throw error;
+          const current = await sql.query(
+            `SELECT revision FROM tf_resources
+             WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?`,
+            key,
+          );
+          if (
+            (expectedRevision === null && current.length > 0) ||
+            (expectedRevision !== null && current[0]?.revision !== expectedRevision)
+          ) {
+            return false;
+          }
+          if (claimKeys.length > 0) {
+            const owned = await sql.query(
+              `SELECT claim_key FROM tf_resource_claims
+               WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
+                 AND claim_key IN (${claimKeys.map(() => "?").join(", ")})`,
+              [claimCommit.operationId, address.tenantId, resource.metadata.uid, ...claimKeys],
+            );
+            if (owned.length !== claimKeys.length) {
+              throw new TakoformHostError("invalid_argument", 400);
+            }
+          }
+          throw error;
+        }
+      }
       if (expectedRevision === null) {
         const written = await sql.run(
           `INSERT OR IGNORE INTO tf_resources
@@ -422,6 +819,703 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       };
     },
 
+    async acceptProviderMutationSaga(record) {
+      const timestamp = now();
+      await sql.run(
+        `DELETE FROM tf_provider_mutation_sagas WHERE rowid IN (
+           SELECT rowid FROM tf_provider_mutation_sagas
+           WHERE phase = 'planned' AND expires_at <= ? ORDER BY expires_at LIMIT ?
+         )`,
+        [timestamp, SWEEP_ROW_LIMIT],
+      );
+      await sql.run(
+        `INSERT OR IGNORE INTO tf_provider_mutation_sagas
+           (operation_id, replay_key, tenant_id, fingerprint, resource_uid,
+            target_space, target_api_version, target_kind, target_name,
+            accepted_uid, accepted_generation, accepted_revision, phase,
+            receipt_json, created_at, updated_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', NULL, ?, ?, ?)`,
+        [
+          record.operationId,
+          record.replayKey,
+          record.tenantId,
+          record.fingerprint,
+          record.resourceUid,
+          record.target.space,
+          record.target.apiVersion,
+          record.target.kind,
+          record.target.name,
+          record.acceptedUid ?? null,
+          record.acceptedGeneration ?? null,
+          record.acceptedRevision ?? null,
+          timestamp,
+          timestamp,
+          timestamp + OPERATION_TTL_MILLISECONDS,
+        ],
+      );
+      const rows = await sql.query(
+        `SELECT * FROM tf_provider_mutation_sagas
+         WHERE replay_key = ? AND (phase = 'executed' OR expires_at > ?) LIMIT 2`,
+        [record.replayKey, timestamp],
+      );
+      const stored = rows[0] ? providerMutationSaga(rows[0]) : null;
+      if (!stored || rows.length !== 1 || !sameProviderMutationSaga(record, stored)) {
+        throw new TakoformHostError("resource_busy", 409);
+      }
+      return stored;
+    },
+
+    async readProviderMutationReceipt(tenantId, operationId, resourceUid) {
+      const rows = await sql.query(
+        `SELECT receipt_json FROM tf_provider_mutation_sagas
+         WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+           AND phase = 'executed' LIMIT 2`,
+        [tenantId, operationId, resourceUid],
+      );
+      if (rows.length > 1) throw new Error("provider_mutation_saga_ambiguous");
+      return rows[0] ? providerReceipt(rows[0].receipt_json) : null;
+    },
+
+    async abandonProviderMutationPlan(input) {
+      const removed = await sql.run(
+        `DELETE FROM tf_provider_mutation_sagas
+         WHERE tenant_id = ? AND operation_id = ? AND replay_key = ? AND resource_uid = ?
+           AND phase = 'planned' AND receipt_json IS NULL`,
+        [input.tenantId, input.operationId, input.replayKey, input.resourceUid],
+      );
+      return removed.changes === 1;
+    },
+
+    async recordProviderMutationReceipt(input) {
+      const serialized = canonicalJson(input.receipt);
+      const timestamp = now();
+      await sql.batch([
+        {
+          sql: `UPDATE tf_provider_mutation_sagas
+                SET phase = 'executed', receipt_json = ?, updated_at = ?, expires_at = NULL
+                WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+                  AND phase = 'planned' AND expires_at > ?`,
+          params: [
+            serialized,
+            timestamp,
+            input.tenantId,
+            input.operationId,
+            input.resourceUid,
+            timestamp,
+          ],
+        },
+        ...(input.claimOwnerId
+          ? [
+              {
+                sql: `UPDATE tf_resource_claims
+                      SET state = 'committed', expires_at = NULL, updated_at = ?
+                      WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
+                        AND state = 'reserved'`,
+                params: [timestamp, input.claimOwnerId, input.tenantId, input.resourceUid],
+              },
+            ]
+          : []),
+        {
+          sql: `UPDATE tf_deferred_operations
+                SET expires_at = 253402300799999, updated_at = ?
+                WHERE id = ? AND tenant_id = ? AND resource_uid = ?
+                  AND phase = 'committing'`,
+          params: [timestamp, input.operationId, input.tenantId, input.resourceUid],
+        },
+      ]);
+      const existing = await this.readProviderMutationReceipt(
+        input.tenantId,
+        input.operationId,
+        input.resourceUid,
+      );
+      if (!existing || canonicalJson(existing) !== serialized) {
+        throw new TakoformHostError("resource_busy", 409);
+      }
+    },
+
+    async holdDeferredProviderRepair(input) {
+      const held = await sql.run(
+        `UPDATE tf_deferred_operations
+         SET lease_token = NULL, lease_until = NULL,
+             expires_at = 253402300799999, updated_at = ?
+         WHERE id = ? AND tenant_id = ? AND principal_id = ?
+           AND phase = 'committing' AND lease_token = ?`,
+        [
+          now(),
+          input.operation.id,
+          input.operation.tenantId,
+          input.operation.principalId,
+          input.leaseToken,
+        ],
+      );
+      return held.changes === 1;
+    },
+
+    async commitImmediateMutation(input) {
+      const { mutation } = input;
+      const guard = boundedGuard(`guard_${input.operationId}`);
+      const statements = providerMutationCommitStatements({
+        guard,
+        tenantId: input.tenantId,
+        operationId: input.operationId,
+        operation: input.operation,
+        createdAt: input.createdAt,
+        mutation,
+        claimOwnerId: input.operationId,
+        now: now(),
+      });
+      try {
+        await sql.batch(statements);
+      } catch (error) {
+        if (!(error instanceof SqlError) || error.code !== "constraint") throw error;
+        const claimKeys = mutation.claimKeys ?? [];
+        if (claimKeys.length > 0) {
+          const owned = await sql.query(
+            `SELECT claim_key FROM tf_resource_claims
+             WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
+               AND claim_key IN (${claimKeys.map(() => "?").join(", ")})`,
+            [input.operationId, input.tenantId, mutation.resourceUid, ...claimKeys],
+          );
+          if (owned.length !== claimKeys.length) {
+            throw new TakoformHostError("invalid_argument", 400);
+          }
+        }
+        throw new TakoformHostError("resource_busy", 409);
+      }
+    },
+
+    async acceptDeferredOperation(record): Promise<DeferredOperationRecord> {
+      await sql.run(
+        `DELETE FROM tf_deferred_operations WHERE rowid IN (
+           SELECT rowid FROM tf_deferred_operations
+           WHERE expires_at <= ?
+           ORDER BY expires_at LIMIT ?
+         )`,
+        [now(), SWEEP_ROW_LIMIT],
+      );
+      await sql.run(
+        `INSERT OR IGNORE INTO tf_deferred_operations
+           (id, tenant_id, principal_id, operation, phase, request_path, request_query,
+            request_headers_json, request_body_json, fingerprint, replay_key,
+            target_space, target_api_version, target_kind, target_name,
+            target_form_ref_json, accepted_uid, accepted_generation, accepted_revision,
+            resource_uid, polls_remaining, lease_token, lease_until, terminal_json,
+            committed_uid, created_at, updated_at, expires_at)
+         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                 NULL, NULL, NULL, NULL, ?, ?, ?)`,
+        [
+          record.id,
+          record.tenantId,
+          record.principalId,
+          record.operation,
+          record.requestPath,
+          record.requestQuery,
+          JSON.stringify(record.requestHeaders),
+          record.requestBody ?? null,
+          record.fingerprint,
+          record.replayKey,
+          record.target.space,
+          record.target.apiVersion,
+          record.target.kind,
+          record.target.name,
+          JSON.stringify(record.target.formRef),
+          record.acceptedUid ?? null,
+          record.acceptedGeneration ?? null,
+          record.acceptedRevision ?? null,
+          record.resourceUid,
+          record.pollsRemaining,
+          record.createdAt,
+          now(),
+          now() + OPERATION_TTL_MILLISECONDS,
+        ],
+      );
+      const stored = await readDeferredBy("replay_key", record.replayKey);
+      if (!stored) throw new SqlError("constraint", "deferred operation identity collision");
+      return stored;
+    },
+
+    async readDeferredOperation(tenantId, principalId, id) {
+      const rows = await sql.query(
+        `SELECT * FROM tf_deferred_operations
+         WHERE tenant_id = ? AND principal_id = ? AND id = ? AND expires_at > ?`,
+        [tenantId, principalId, id, now()],
+      );
+      return rows[0] ? deferredOperation(rows[0]) : null;
+    },
+
+    async deferredOperationExists(id) {
+      const rows = await sql.query(
+        "SELECT 1 AS found FROM tf_deferred_operations WHERE id = ? AND expires_at > ? LIMIT 1",
+        [id, now()],
+      );
+      return rows.length === 1;
+    },
+
+    async readDeferredOperationByReplay(replayKey) {
+      return await readDeferredBy("replay_key", replayKey);
+    },
+
+    async retireDeferredOperation(id, replayKey) {
+      const removed = await sql.run(
+        `DELETE FROM tf_deferred_operations
+         WHERE id = ? AND replay_key = ? AND phase IN ('succeeded', 'failed', 'cancelled')`,
+        [id, replayKey],
+      );
+      return removed.changes === 1;
+    },
+
+    async advanceDeferredOperation(input) {
+      const decremented = await sql.run(
+        `UPDATE tf_deferred_operations
+         SET polls_remaining = polls_remaining - 1, updated_at = ?
+         WHERE tenant_id = ? AND principal_id = ? AND id = ?
+           AND phase = 'pending' AND polls_remaining > 1 AND expires_at > ?`,
+        [now(), input.tenantId, input.principalId, input.id, now()],
+      );
+      if (decremented.changes === 1) {
+        return {
+          operation: await this.readDeferredOperation(input.tenantId, input.principalId, input.id),
+          acquired: false,
+        };
+      }
+      // Persist the safe-stop boundary before provider work starts. A caller
+      // can now distinguish a cancellation that took from one that lost to
+      // the durable commit intent, and a restarted process can resume that
+      // intent without guessing whether cancellation was still possible.
+      const armed = await sql.run(
+        `UPDATE tf_deferred_operations
+         SET phase = 'committing', polls_remaining = 0,
+             lease_token = NULL, lease_until = NULL, updated_at = ?
+         WHERE tenant_id = ? AND principal_id = ? AND id = ?
+           AND phase = 'pending' AND polls_remaining <= 1 AND expires_at > ?`,
+        [now(), input.tenantId, input.principalId, input.id, now()],
+      );
+      if (armed.changes === 1) {
+        return {
+          operation: await this.readDeferredOperation(input.tenantId, input.principalId, input.id),
+          acquired: false,
+        };
+      }
+      const acquired = await sql.run(
+        `UPDATE tf_deferred_operations
+         SET lease_token = ?, lease_until = ?, updated_at = ?
+         WHERE tenant_id = ? AND principal_id = ? AND id = ? AND expires_at > ?
+           AND phase = 'committing' AND (lease_until IS NULL OR lease_until <= ?)`,
+        [
+          input.leaseToken,
+          input.leaseUntil,
+          now(),
+          input.tenantId,
+          input.principalId,
+          input.id,
+          now(),
+          now(),
+        ],
+      );
+      return {
+        operation: await this.readDeferredOperation(input.tenantId, input.principalId, input.id),
+        acquired: acquired.changes === 1,
+      };
+    },
+
+    async cancelDeferredOperation(input) {
+      const cancelled = await sql.run(
+        `UPDATE tf_deferred_operations
+         SET phase = 'cancelled', terminal_json = ?, lease_token = NULL, lease_until = NULL,
+             updated_at = ?
+         WHERE tenant_id = ? AND principal_id = ? AND id = ?
+           AND phase = 'pending' AND expires_at > ?`,
+        [input.terminalJson, now(), input.tenantId, input.principalId, input.id, now()],
+      );
+      if (cancelled.changes === 1) {
+        await this.putOperation(input.tenantId, {
+          id: input.id,
+          operation: "cancel",
+          state: "failed",
+          createdAt: new Date(now()).toISOString(),
+        });
+        return "cancelled";
+      }
+      const record = await this.readDeferredOperation(input.tenantId, input.principalId, input.id);
+      if (!record) return "not_found";
+      return terminalPhase(record.phase) ? "settled" : "too_late";
+    },
+
+    async settleDeferredFailure(input) {
+      const settled = await sql.run(
+        `UPDATE tf_deferred_operations
+         SET phase = 'failed', terminal_json = ?, lease_token = NULL, lease_until = NULL,
+             updated_at = ?
+         WHERE id = ? AND tenant_id = ? AND principal_id = ?
+           AND phase = 'committing' AND lease_token = ? AND expires_at > ?`,
+        [
+          input.terminalJson,
+          now(),
+          input.operation.id,
+          input.operation.tenantId,
+          input.operation.principalId,
+          input.leaseToken,
+          now(),
+        ],
+      );
+      if (settled.changes === 1) {
+        await this.putOperation(input.operation.tenantId, {
+          id: input.operation.id,
+          operation: input.operation.operation,
+          state: "failed",
+          createdAt: input.operation.createdAt,
+        });
+      }
+      return settled.changes === 1;
+    },
+
+    async commitDeferredMutation(input) {
+      const { operation, mutation, leaseToken } = input;
+      const guard = boundedGuard(`guard_${operation.id}_${leaseToken}`);
+      const target = operation.target;
+      const targetKey = [
+        operation.tenantId,
+        target.space,
+        target.apiVersion,
+        target.kind,
+        target.name,
+      ];
+      const operationFence = `EXISTS (
+        SELECT 1 FROM tf_deferred_operations
+        WHERE id = ? AND tenant_id = ? AND principal_id = ?
+          AND phase = 'committing' AND lease_token = ? AND expires_at > ?
+      )`;
+      const resourceFence =
+        operation.acceptedUid === undefined
+          ? `NOT EXISTS (
+              SELECT 1 FROM tf_resources
+              WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
+            )`
+          : `EXISTS (
+              SELECT 1 FROM tf_resources
+              WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
+                AND uid = ? AND generation = ? AND revision = ?
+                AND json_extract(resource_json, '$.form.formRef.apiVersion') = ?
+                AND json_extract(resource_json, '$.form.formRef.kind') = ?
+                AND json_extract(resource_json, '$.form.formRef.definitionVersion') = ?
+                AND json_extract(resource_json, '$.form.formRef.schemaDigest') = ?
+            )`;
+      const resourceFenceParameters: SqlParam[] =
+        operation.acceptedUid === undefined
+          ? targetKey
+          : [
+              ...targetKey,
+              operation.acceptedUid,
+              operation.acceptedGeneration ?? "",
+              operation.acceptedRevision ?? "",
+              target.formRef.apiVersion,
+              target.formRef.kind,
+              target.formRef.definitionVersion,
+              target.formRef.schemaDigest,
+            ];
+      const claimKeys = mutation.claimKeys ?? [];
+      const claimFence =
+        claimKeys.length === 0
+          ? "1 = 1"
+          : `(SELECT COUNT(*) FROM tf_resource_claims
+              WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
+                AND claim_key IN (${claimKeys.map(() => "?").join(", ")})) = ?`;
+      const receiptJson = mutation.providerReceipt
+        ? canonicalJson(mutation.providerReceipt)
+        : undefined;
+      const deployment = deploymentMutationSql(mutation.providerReceipt, now());
+      const providerSagaFence = receiptJson
+        ? `EXISTS (
+        SELECT 1 FROM tf_provider_mutation_sagas
+        WHERE operation_id = ? AND replay_key = ? AND tenant_id = ?
+          AND fingerprint = ? AND resource_uid = ? AND phase = 'executed'
+          AND receipt_json = ?
+      )`
+        : "1 = 1";
+      const statements: SqlStatement[] = [
+        {
+          sql: `INSERT INTO tf_operation_commit_guards (token, valid)
+                SELECT ?, CASE WHEN ${operationFence} AND ${resourceFence}
+                                     AND ${claimFence} AND ${providerSagaFence}
+                                     AND ${deployment.fence} THEN 1 ELSE 0 END`,
+          params: [
+            guard,
+            operation.id,
+            operation.tenantId,
+            operation.principalId,
+            leaseToken,
+            now(),
+            ...resourceFenceParameters,
+            ...(claimKeys.length === 0
+              ? []
+              : [
+                  leaseToken,
+                  operation.tenantId,
+                  operation.resourceUid,
+                  ...claimKeys,
+                  claimKeys.length,
+                ]),
+            ...(receiptJson
+              ? [
+                  operation.id,
+                  mutation.replayKey,
+                  operation.tenantId,
+                  mutation.replay.fingerprint,
+                  mutation.resourceUid,
+                  receiptJson,
+                ]
+              : []),
+            ...deployment.fenceParams,
+          ],
+        },
+        ...deployment.statements,
+      ];
+      if (mutation.kind === "write") {
+        const resource = mutation.resource;
+        if (!resource) throw new TypeError("write commit requires a resource");
+        const relations = mutation.relations ?? [];
+        if (operation.acceptedUid === undefined) {
+          statements.push({
+            sql: `INSERT INTO tf_resources
+                    (tenant_id, space, api_version, kind, name, uid, generation, revision,
+                     resource_json, relations_json, updated_at)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            params: [
+              ...targetKey,
+              resource.metadata.uid,
+              resource.metadata.generation,
+              resource.metadata.revision,
+              JSON.stringify(resource),
+              JSON.stringify(relations),
+              now(),
+            ],
+          });
+        } else {
+          statements.push({
+            sql: `UPDATE tf_resources
+                  SET uid = ?, generation = ?, revision = ?, resource_json = ?,
+                      relations_json = ?, updated_at = ?
+                  WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
+                    AND uid = ? AND generation = ? AND revision = ?`,
+            params: [
+              resource.metadata.uid,
+              resource.metadata.generation,
+              resource.metadata.revision,
+              JSON.stringify(resource),
+              JSON.stringify(relations),
+              now(),
+              ...targetKey,
+              operation.acceptedUid,
+              operation.acceptedGeneration ?? "",
+              operation.acceptedRevision ?? "",
+            ],
+          });
+        }
+      } else {
+        statements.push({
+          sql: `DELETE FROM tf_resources
+                WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
+                  AND uid = ? AND generation = ? AND revision = ?`,
+          params: [
+            ...targetKey,
+            operation.acceptedUid ?? "",
+            operation.acceptedGeneration ?? "",
+            operation.acceptedRevision ?? "",
+          ],
+        });
+      }
+      statements.push(
+        {
+          sql: `INSERT INTO tf_replays
+                  (replay_key, fingerprint, status, resource_json, bound_uid, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (replay_key) DO UPDATE SET
+                  fingerprint = excluded.fingerprint, status = excluded.status,
+                  resource_json = excluded.resource_json, bound_uid = excluded.bound_uid,
+                  expires_at = excluded.expires_at`,
+          params: [
+            mutation.replayKey,
+            mutation.replay.fingerprint,
+            mutation.replay.status,
+            mutation.replay.resource ? JSON.stringify(mutation.replay.resource) : null,
+            mutation.replay.boundUid ?? null,
+            now() + REPLAY_TTL_MILLISECONDS,
+          ],
+        },
+        ...claimCommitStatements({ ...operation, id: leaseToken }, claimKeys, now()),
+        {
+          sql: `UPDATE tf_deferred_operations
+                SET phase = 'succeeded', terminal_json = ?, committed_uid = ?,
+                    lease_token = NULL, lease_until = NULL, updated_at = ?, expires_at = ?
+                WHERE id = ? AND tenant_id = ? AND principal_id = ?
+                  AND phase = 'committing' AND lease_token = ?`,
+          params: [
+            mutation.terminalJson,
+            mutation.resource?.metadata.uid ?? null,
+            now(),
+            now() + OPERATION_TTL_MILLISECONDS,
+            operation.id,
+            operation.tenantId,
+            operation.principalId,
+            leaseToken,
+          ],
+        },
+        {
+          sql: `INSERT OR IGNORE INTO tf_operations
+                  (id, tenant_id, operation, state, resource_json, created_at, expires_at)
+                VALUES (?, ?, ?, 'succeeded', ?, ?, ?)`,
+          params: [
+            operation.id,
+            operation.tenantId,
+            operation.operation,
+            mutation.resource ? JSON.stringify(mutation.resource) : null,
+            operation.createdAt,
+            now() + OPERATION_TTL_MILLISECONDS,
+          ],
+        },
+        ...(receiptJson
+          ? [
+              {
+                sql: `DELETE FROM tf_provider_mutation_sagas
+                      WHERE operation_id = ? AND tenant_id = ? AND receipt_json = ?`,
+                params: [operation.id, operation.tenantId, receiptJson],
+              },
+            ]
+          : []),
+        {
+          sql: "DELETE FROM tf_operation_commit_guards WHERE token = ?",
+          params: [guard],
+        },
+      );
+      try {
+        await sql.batch(statements);
+      } catch (error) {
+        if (!(error instanceof SqlError) || error.code !== "constraint") throw error;
+        throw await commitFenceError(operation, leaseToken);
+      }
+    },
+
+    async resourceClaimHolder(key) {
+      const rows = await sql.query(
+        `SELECT tenant_id, holder_space, holder_api_version, holder_kind,
+                holder_name, holder_uid
+         FROM tf_resource_claims
+         WHERE claim_key = ? AND (state = 'committed' OR expires_at > ?)
+         LIMIT 1`,
+        [key, now()],
+      );
+      const row = rows[0];
+      return row
+        ? {
+            tenantId: text(row.tenant_id),
+            holderSpace: text(row.holder_space),
+            holderApiVersion: text(row.holder_api_version),
+            holderKind: text(row.holder_kind),
+            holderName: text(row.holder_name),
+            holderUid: text(row.holder_uid),
+          }
+        : null;
+    },
+
+    async reserveResourceClaims(reservations, expiresAt) {
+      if (reservations.length === 0) return;
+      const timestamp = now();
+      const statements: SqlStatement[] = [
+        {
+          sql: `DELETE FROM tf_resource_claims
+                WHERE state = 'reserved' AND expires_at <= ?`,
+          params: [timestamp],
+        },
+      ];
+      reservations.forEach((reservation, index) => {
+        const guard = boundedGuard(`claim_${reservation.operationId}_${index}`);
+        statements.push(
+          {
+            sql: `INSERT INTO tf_resource_claims
+                    (claim_key, tenant_id, holder_space, holder_api_version, holder_kind,
+                     holder_name, holder_uid, owner_operation_id, state, expires_at, updated_at)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?)
+                  ON CONFLICT (claim_key) DO UPDATE SET
+                    owner_operation_id = excluded.owner_operation_id,
+                    state = CASE
+                      WHEN tf_resource_claims.state = 'committed' THEN 'committed'
+                      ELSE 'reserved'
+                    END,
+                    expires_at = CASE
+                      WHEN tf_resource_claims.state = 'committed' THEN NULL
+                      ELSE excluded.expires_at
+                    END,
+                    updated_at = excluded.updated_at
+                  WHERE (
+                    tf_resource_claims.tenant_id = excluded.tenant_id AND
+                    tf_resource_claims.holder_space = excluded.holder_space AND
+                    tf_resource_claims.holder_api_version = excluded.holder_api_version AND
+                    tf_resource_claims.holder_kind = excluded.holder_kind AND
+                    tf_resource_claims.holder_name = excluded.holder_name AND
+                    tf_resource_claims.holder_uid = excluded.holder_uid
+                  ) OR (
+                    tf_resource_claims.state = 'reserved' AND
+                    tf_resource_claims.expires_at <= ?
+                  )`,
+            params: [
+              reservation.key,
+              reservation.tenantId,
+              reservation.holderSpace,
+              reservation.holderApiVersion,
+              reservation.holderKind,
+              reservation.holderName,
+              reservation.holderUid,
+              reservation.operationId,
+              expiresAt,
+              timestamp,
+              timestamp,
+            ],
+          },
+          {
+            sql: `INSERT INTO tf_operation_commit_guards (token, valid)
+                  SELECT ?, CASE WHEN EXISTS (
+                    SELECT 1 FROM tf_resource_claims
+                    WHERE claim_key = ? AND owner_operation_id = ?
+                      AND tenant_id = ? AND holder_space = ? AND holder_api_version = ?
+                      AND holder_kind = ? AND holder_name = ? AND holder_uid = ?
+                  ) THEN 1 ELSE 0 END`,
+            params: [
+              guard,
+              reservation.key,
+              reservation.operationId,
+              reservation.tenantId,
+              reservation.holderSpace,
+              reservation.holderApiVersion,
+              reservation.holderKind,
+              reservation.holderName,
+              reservation.holderUid,
+            ],
+          },
+          {
+            sql: "DELETE FROM tf_operation_commit_guards WHERE token = ?",
+            params: [guard],
+          },
+        );
+      });
+      await sql.batch(statements);
+    },
+
+    async releaseResourceClaims(operationId) {
+      await sql.run(
+        `DELETE FROM tf_resource_claims
+         WHERE owner_operation_id = ? AND state = 'reserved'`,
+        [operationId],
+      );
+    },
+
+    async releaseCommittedResourceClaims(tenantId, holderUid) {
+      await sql.run(
+        `DELETE FROM tf_resource_claims
+         WHERE tenant_id = ? AND holder_uid = ? AND state = 'committed'`,
+        [tenantId, holderUid],
+      );
+    },
+
     async orphanedResources(installedDigests, limit) {
       if (installedDigests.length === 0) return [];
       const placeholders = installedDigests.map(() => "?").join(", ");
@@ -465,7 +1559,10 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         resources: visible.map(resourceListing),
         cursor:
           rows.length > page && last
-            ? encodeCursor({ updatedAt: Number(last.updated_at), uid: text(last.uid) })
+            ? encodeCursor({
+                updatedAt: Number(last.updated_at),
+                uid: text(last.uid),
+              })
             : null,
       };
     },
@@ -559,6 +1656,487 @@ function storedRelations(value: string): readonly TakoformStoredRelation[] {
   return parsed as readonly TakoformStoredRelation[];
 }
 
+function providerMutationSaga(row: Row): ProviderMutationSaga {
+  const receipt =
+    typeof row.receipt_json === "string" ? providerReceipt(row.receipt_json) : undefined;
+  return {
+    operationId: text(row.operation_id),
+    replayKey: text(row.replay_key),
+    tenantId: text(row.tenant_id),
+    fingerprint: text(row.fingerprint),
+    resourceUid: text(row.resource_uid),
+    target: {
+      tenantId: text(row.tenant_id),
+      space: text(row.target_space),
+      apiVersion: text(row.target_api_version),
+      kind: text(row.target_kind),
+      name: text(row.target_name),
+    },
+    ...(typeof row.accepted_uid === "string" ? { acceptedUid: row.accepted_uid } : {}),
+    ...(typeof row.accepted_generation === "string"
+      ? { acceptedGeneration: row.accepted_generation }
+      : {}),
+    ...(typeof row.accepted_revision === "string"
+      ? { acceptedRevision: row.accepted_revision }
+      : {}),
+    ...(receipt ? { receipt } : {}),
+  };
+}
+
+function sameProviderMutationSaga(
+  left: ProviderMutationSaga,
+  right: ProviderMutationSaga,
+): boolean {
+  return (
+    left.replayKey === right.replayKey &&
+    left.tenantId === right.tenantId &&
+    left.fingerprint === right.fingerprint &&
+    left.target.tenantId === right.target.tenantId &&
+    left.target.space === right.target.space &&
+    left.target.apiVersion === right.target.apiVersion &&
+    left.target.kind === right.target.kind &&
+    left.target.name === right.target.name &&
+    left.acceptedUid === right.acceptedUid &&
+    left.acceptedGeneration === right.acceptedGeneration &&
+    left.acceptedRevision === right.acceptedRevision
+  );
+}
+
+function providerReceipt(value: unknown): TakoformDriverReceipt {
+  if (typeof value !== "string") throw new TypeError("invalid provider mutation receipt");
+  const parsed: unknown = JSON.parse(value);
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new TypeError("invalid provider mutation receipt");
+  }
+  return parsed as TakoformDriverReceipt;
+}
+
+function providerMutationCommitStatements(input: {
+  readonly guard: string;
+  readonly tenantId: string;
+  readonly operationId: string;
+  readonly operation: "create" | "update" | "apply" | "import" | "delete";
+  readonly createdAt: string;
+  readonly mutation: ResourceMutationCommit;
+  readonly claimOwnerId: string;
+  readonly now: number;
+  readonly additionalFence?: string;
+  readonly additionalFenceParams?: readonly SqlParam[];
+  readonly beforeOperationStatements?: readonly SqlStatement[];
+}): SqlStatement[] {
+  const { mutation } = input;
+  const address = mutation.address;
+  const key = [address.tenantId, address.space, address.apiVersion, address.kind, address.name];
+  const receiptJson = mutation.providerReceipt
+    ? canonicalJson(mutation.providerReceipt)
+    : undefined;
+  const claimKeys = mutation.claimKeys ?? [];
+  const claimFence =
+    claimKeys.length === 0
+      ? "1 = 1"
+      : `(SELECT COUNT(*) FROM tf_resource_claims
+          WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
+            AND claim_key IN (${claimKeys.map(() => "?").join(", ")})) = ?`;
+  const deployment = deploymentMutationSql(mutation.providerReceipt, input.now);
+  const sagaFence = receiptJson
+    ? `EXISTS (
+    SELECT 1 FROM tf_provider_mutation_sagas AS saga
+    WHERE saga.operation_id = ? AND saga.replay_key = ? AND saga.tenant_id = ?
+      AND saga.fingerprint = ? AND saga.resource_uid = ?
+      AND saga.target_space = ? AND saga.target_api_version = ?
+      AND saga.target_kind = ? AND saga.target_name = ?
+      AND saga.accepted_revision IS ?
+      AND saga.phase = 'executed' AND saga.receipt_json = ?
+      AND (
+        (saga.accepted_uid IS NULL AND NOT EXISTS (
+          SELECT 1 FROM tf_resources
+          WHERE tenant_id = saga.tenant_id AND space = saga.target_space
+            AND api_version = saga.target_api_version AND kind = saga.target_kind
+            AND name = saga.target_name
+        )) OR
+        EXISTS (
+          SELECT 1 FROM tf_resources AS resource
+          WHERE resource.tenant_id = saga.tenant_id AND resource.space = saga.target_space
+            AND resource.api_version = saga.target_api_version
+            AND resource.kind = saga.target_kind AND resource.name = saga.target_name
+            AND resource.uid = saga.accepted_uid
+            AND resource.generation = saga.accepted_generation
+            AND resource.revision = saga.accepted_revision
+        )
+      )
+  )`
+    : "1 = 1";
+  const statements: SqlStatement[] = [
+    {
+      sql: `INSERT INTO tf_operation_commit_guards (token, valid)
+            SELECT ?, CASE WHEN ${sagaFence} AND ${claimFence}
+                                 AND ${deployment.fence}
+                                 AND (${input.additionalFence ?? "1 = 1"}) THEN 1 ELSE 0 END`,
+      params: [
+        input.guard,
+        ...(receiptJson
+          ? [
+              input.operationId,
+              mutation.replayKey,
+              input.tenantId,
+              mutation.replay.fingerprint,
+              mutation.resourceUid,
+              address.space,
+              address.apiVersion,
+              address.kind,
+              address.name,
+              mutation.expectedRevision,
+              receiptJson,
+            ]
+          : []),
+        ...(claimKeys.length === 0
+          ? []
+          : [
+              input.claimOwnerId,
+              input.tenantId,
+              mutation.resourceUid,
+              ...claimKeys,
+              claimKeys.length,
+            ]),
+        ...deployment.fenceParams,
+        ...(input.additionalFenceParams ?? []),
+      ],
+    },
+    ...deployment.statements,
+  ];
+  if (mutation.kind === "write") {
+    const resource = mutation.resource;
+    if (!resource) throw new TypeError("write commit requires a resource");
+    const relations = mutation.relations ?? [];
+    if (mutation.expectedRevision === null) {
+      statements.push({
+        sql: `INSERT INTO tf_resources
+                (tenant_id, space, api_version, kind, name, uid, generation, revision,
+                 resource_json, relations_json, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        params: [
+          ...key,
+          resource.metadata.uid,
+          resource.metadata.generation,
+          resource.metadata.revision,
+          JSON.stringify(resource),
+          JSON.stringify(relations),
+          input.now,
+        ],
+      });
+    } else {
+      statements.push({
+        sql: `UPDATE tf_resources
+              SET uid = ?, generation = ?, revision = ?, resource_json = ?,
+                  relations_json = ?, updated_at = ?
+              WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
+                AND revision = ?`,
+        params: [
+          resource.metadata.uid,
+          resource.metadata.generation,
+          resource.metadata.revision,
+          JSON.stringify(resource),
+          JSON.stringify(relations),
+          input.now,
+          ...key,
+          mutation.expectedRevision,
+        ],
+      });
+    }
+  } else {
+    statements.push({
+      sql: `DELETE FROM tf_resources
+            WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
+              AND revision = ?`,
+      params: [...key, mutation.expectedRevision ?? ""],
+    });
+  }
+  statements.push(
+    {
+      sql: `INSERT INTO tf_replays
+              (replay_key, fingerprint, status, resource_json, bound_uid, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (replay_key) DO UPDATE SET
+              fingerprint = excluded.fingerprint, status = excluded.status,
+              resource_json = excluded.resource_json, bound_uid = excluded.bound_uid,
+              expires_at = excluded.expires_at`,
+      params: [
+        mutation.replayKey,
+        mutation.replay.fingerprint,
+        mutation.replay.status,
+        mutation.replay.resource ? JSON.stringify(mutation.replay.resource) : null,
+        mutation.replay.boundUid ?? null,
+        input.now + REPLAY_TTL_MILLISECONDS,
+      ],
+    },
+    ...claimCommitStatements(
+      {
+        id: input.claimOwnerId,
+        tenantId: input.tenantId,
+        resourceUid: mutation.resourceUid,
+      },
+      mutation.kind === "delete" ? [] : claimKeys,
+      input.now,
+    ),
+    ...(input.beforeOperationStatements ?? []),
+    {
+      sql: `INSERT OR IGNORE INTO tf_operations
+              (id, tenant_id, operation, state, resource_json, created_at, expires_at)
+            VALUES (?, ?, ?, 'succeeded', ?, ?, ?)`,
+      params: [
+        input.operationId,
+        input.tenantId,
+        input.operation,
+        mutation.resource ? JSON.stringify(mutation.resource) : null,
+        input.createdAt,
+        input.now + OPERATION_TTL_MILLISECONDS,
+      ],
+    },
+    ...(receiptJson
+      ? [
+          {
+            sql: `DELETE FROM tf_provider_mutation_sagas
+                  WHERE operation_id = ? AND tenant_id = ? AND receipt_json = ?`,
+            params: [input.operationId, input.tenantId, receiptJson],
+          },
+        ]
+      : []),
+    {
+      sql: "DELETE FROM tf_operation_commit_guards WHERE token = ?",
+      params: [input.guard],
+    },
+  );
+  return statements;
+}
+
+function deploymentMutationSql(
+  receipt: TakoformDriverReceipt | undefined,
+  timestamp: number,
+): {
+  readonly fence: string;
+  readonly fenceParams: readonly SqlParam[];
+  readonly statements: readonly SqlStatement[];
+} {
+  const mutation = receipt?.deploymentMutation;
+  if (!mutation) return { fence: "1 = 1", fenceParams: [], statements: [] };
+  if (mutation.kind === "create") {
+    const value = mutation.deployment;
+    return {
+      fence: `NOT EXISTS (
+        SELECT 1 FROM tf_resource_deployments
+        WHERE tenant_id = ? AND (id = ? OR (resource_uid = ? AND state = 'active'))
+      )`,
+      fenceParams: [value.tenantId, value.id, value.resourceUid],
+      statements: [
+        {
+          sql: `INSERT INTO tf_resource_deployments
+                   (tenant_id, id, resource_uid, offering_id, provider_pack_ref,
+                    provider_installation_ref, native_id, native_claimed, state,
+                    observed_json, outputs_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          params: [
+            value.tenantId,
+            value.id,
+            value.resourceUid,
+            value.offeringId,
+            value.providerPackRef,
+            value.providerInstallationRef,
+            value.nativeId,
+            value.nativeClaimed === true ? 1 : 0,
+            value.state,
+            JSON.stringify(value.observed),
+            JSON.stringify(value.outputs),
+            timestamp,
+            timestamp,
+          ],
+        },
+      ],
+    };
+  }
+  const commonFence = `EXISTS (
+    SELECT 1 FROM tf_resource_deployments
+    WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'
+  )`;
+  const commonParams = [mutation.tenantId, mutation.deploymentId, mutation.expectedNativeId];
+  if (mutation.kind === "refresh") {
+    return {
+      fence: commonFence,
+      fenceParams: commonParams,
+      statements: [
+        {
+          sql: `UPDATE tf_resource_deployments
+                SET observed_json = ?, outputs_json = ?, updated_at = ?
+                WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`,
+          params: [
+            JSON.stringify(mutation.observed),
+            JSON.stringify(mutation.outputs),
+            timestamp,
+            ...commonParams,
+          ],
+        },
+      ],
+    };
+  }
+  if (mutation.kind === "claim") {
+    return {
+      fence: `${commonFence} AND EXISTS (
+        SELECT 1 FROM tf_resource_deployments
+        WHERE tenant_id = ? AND id = ? AND native_id = ? AND native_claimed = 0
+      )`,
+      fenceParams: [...commonParams, ...commonParams],
+      statements: [
+        {
+          sql: `UPDATE tf_resource_deployments
+                SET native_id = ?, native_claimed = 1, observed_json = ?,
+                    outputs_json = ?, updated_at = ?
+                WHERE tenant_id = ? AND id = ? AND native_id = ?
+                  AND native_claimed = 0 AND state = 'active'`,
+          params: [
+            mutation.nativeId,
+            JSON.stringify(mutation.observed),
+            JSON.stringify(mutation.outputs),
+            timestamp,
+            ...commonParams,
+          ],
+        },
+      ],
+    };
+  }
+  if (mutation.kind === "retain") {
+    return {
+      fence: commonFence,
+      fenceParams: commonParams,
+      statements: [
+        {
+          sql: `UPDATE tf_resource_deployments
+                SET state = 'retained', observed_json = ?, outputs_json = ?, updated_at = ?
+                WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`,
+          params: [
+            JSON.stringify(mutation.observed),
+            JSON.stringify(mutation.outputs),
+            timestamp,
+            ...commonParams,
+          ],
+        },
+      ],
+    };
+  }
+  return {
+    fence: commonFence,
+    fenceParams: commonParams,
+    statements: [
+      {
+        sql: `UPDATE tf_resource_deployments SET state = 'deleted', updated_at = ?
+              WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`,
+        params: [timestamp, ...commonParams],
+      },
+    ],
+  };
+}
+
+function deferredOperation(row: Row): DeferredOperationRecord {
+  const headers = JSON.parse(text(row.request_headers_json)) as unknown;
+  const formRef = JSON.parse(text(row.target_form_ref_json)) as unknown;
+  if (
+    typeof headers !== "object" ||
+    headers === null ||
+    Array.isArray(headers) ||
+    typeof formRef !== "object" ||
+    formRef === null ||
+    Array.isArray(formRef)
+  ) {
+    throw new TypeError("invalid stored deferred operation");
+  }
+  const phase = text(row.phase);
+  if (!isDeferredPhase(phase)) throw new TypeError("invalid stored deferred operation phase");
+  const operation = text(row.operation);
+  if (operation !== "apply" && operation !== "import" && operation !== "delete") {
+    throw new TypeError("invalid stored deferred operation kind");
+  }
+  return {
+    id: text(row.id),
+    tenantId: text(row.tenant_id),
+    principalId: text(row.principal_id),
+    operation,
+    phase,
+    requestPath: text(row.request_path),
+    requestQuery: text(row.request_query),
+    requestHeaders: headers as Readonly<Record<string, string>>,
+    ...(typeof row.request_body_json === "string" ? { requestBody: row.request_body_json } : {}),
+    fingerprint: text(row.fingerprint),
+    replayKey: text(row.replay_key),
+    target: {
+      space: text(row.target_space),
+      apiVersion: text(row.target_api_version),
+      kind: text(row.target_kind),
+      name: text(row.target_name),
+      formRef: formRef as unknown as TakoformV1Alpha3FormRef,
+    },
+    ...(typeof row.accepted_uid === "string" ? { acceptedUid: row.accepted_uid } : {}),
+    ...(typeof row.accepted_generation === "string"
+      ? { acceptedGeneration: row.accepted_generation }
+      : {}),
+    ...(typeof row.accepted_revision === "string"
+      ? { acceptedRevision: row.accepted_revision }
+      : {}),
+    resourceUid: text(row.resource_uid),
+    pollsRemaining: Number(row.polls_remaining),
+    ...(typeof row.lease_token === "string" ? { leaseToken: row.lease_token } : {}),
+    ...(typeof row.lease_until === "number" ? { leaseUntil: row.lease_until } : {}),
+    ...(typeof row.terminal_json === "string" ? { terminalJson: row.terminal_json } : {}),
+    ...(typeof row.committed_uid === "string" ? { committedUid: row.committed_uid } : {}),
+    createdAt: text(row.created_at),
+  };
+}
+
+function isDeferredPhase(value: string): value is DeferredOperationPhase {
+  return ["pending", "committing", "succeeded", "failed", "cancelled"].includes(value);
+}
+
+function terminalPhase(phase: DeferredOperationPhase): boolean {
+  return phase === "succeeded" || phase === "failed" || phase === "cancelled";
+}
+
+function boundedGuard(value: string): string {
+  return value.replace(/[^A-Za-z0-9._-]/gu, "_").slice(0, 128);
+}
+
+function claimCommitStatements(
+  operation: {
+    readonly id: string;
+    readonly tenantId: string;
+    readonly resourceUid: string;
+  },
+  claimKeys: readonly string[],
+  timestamp: number,
+): readonly SqlStatement[] {
+  const statements: SqlStatement[] = [];
+  if (claimKeys.length > 0) {
+    const placeholders = claimKeys.map(() => "?").join(", ");
+    statements.push({
+      sql: `UPDATE tf_resource_claims
+            SET state = 'committed', expires_at = NULL, updated_at = ?
+            WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
+              AND claim_key IN (${placeholders})`,
+      params: [timestamp, operation.id, operation.tenantId, operation.resourceUid, ...claimKeys],
+    });
+    statements.push({
+      sql: `DELETE FROM tf_resource_claims
+            WHERE tenant_id = ? AND holder_uid = ?
+              AND claim_key NOT IN (${placeholders})`,
+      params: [operation.tenantId, operation.resourceUid, ...claimKeys],
+    });
+  } else {
+    statements.push({
+      sql: `DELETE FROM tf_resource_claims
+            WHERE (tenant_id = ? AND holder_uid = ?) OR
+                  (owner_operation_id = ? AND state = 'reserved')`,
+      params: [operation.tenantId, operation.resourceUid, operation.id],
+    });
+  }
+  return statements;
+}
+
 function resourceListing(row: Row): ResourceListing {
   return {
     space: text(row.space),
@@ -575,6 +2153,19 @@ function resourceListing(row: Row): ResourceListing {
 
 function text(value: unknown): string {
   if (typeof value !== "string") throw new TypeError("expected a text column");
+  return value;
+}
+
+function pointerValue(root: unknown, pointer: string): unknown {
+  if (!pointer.startsWith("/")) return undefined;
+  let value = root;
+  for (const token of pointer
+    .slice(1)
+    .split("/")
+    .map((part) => part.replaceAll("~1", "/").replaceAll("~0", "~"))) {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+    value = (value as Record<string, unknown>)[token];
+  }
   return value;
 }
 

@@ -1,13 +1,22 @@
 import { canonicalDigest, canonicalJson } from "../json.ts";
 import type { Clock, JsonObject } from "../ports.ts";
+import { SqlError } from "../ports.ts";
 import type { TakoformArtifactManifest } from "./artifacts.ts";
 import type { BindingRegistry } from "./bindings.ts";
 import { canonicalizeEdgeSpec } from "./edge-semantics.ts";
 import { exactInstalledForm, type FormRegistry, sameFormRef } from "./forms.ts";
-import { PREPARE_TTL_MILLISECONDS } from "./limits.ts";
-import { relationDrift, resolveRelations, type TakoformStoredRelation } from "./relations.ts";
+import { PREPARE_TTL_MILLISECONDS, RESOURCE_CLAIM_RESERVATION_TTL_MILLISECONDS } from "./limits.ts";
+import {
+  declaredResourceClaims,
+  relationDrift,
+  resolveRelations,
+  type TakoformStoredRelation,
+  validateDeclaredConstraintRequest,
+  validateDeclaredConstraints,
+} from "./relations.ts";
 import { materializeDefaults, validateDesired, validateSchemaValue } from "./schema.ts";
 import { applySqliteMigrationApplication, sqliteMigrationCondition } from "./sqlite-migrations.ts";
+import { resolveStandardServiceSlots } from "./standard-services.ts";
 import type { ResourceAddress, StoredReplay, TakoformStore } from "./store.ts";
 import {
   type InstalledTakoformForm,
@@ -17,6 +26,7 @@ import {
   type TakoformDriverRelation,
   TakoformHostError,
   type TakoformResourceDriver,
+  type TakoformStandardServiceResolver,
   type TakoformStoredResource,
 } from "./types.ts";
 import {
@@ -44,6 +54,7 @@ import {
   workerServiceCondition,
 } from "./worker-aggregate.ts";
 import {
+  validateClassHolderRuntime,
   validateWorkerBundleRuntime,
   validateWorkerVersionRuntime,
 } from "./worker-runtime-contract.ts";
@@ -69,7 +80,11 @@ export interface WorkerModuleInspector {
     readonly digest: string;
     readonly mediaType: string;
     readonly bytes: Uint8Array;
-  }): Promise<{ readonly loadable: boolean; readonly handlers: readonly string[] }>;
+  }): Promise<{
+    readonly loadable: boolean;
+    readonly handlers: readonly string[];
+    readonly classes?: readonly string[];
+  }>;
 }
 
 export interface EngineContext {
@@ -84,7 +99,40 @@ export interface EngineContext {
   readonly expectedResourceUid?: string;
   readonly commercialAuthority?: TakoformCommercialAuthority;
   readonly runtimeMaterialization?: JsonObject;
+  /** Stable identity and atomic commit owned by a durable Host Operation. */
+  readonly durableOperation?: {
+    readonly id: string;
+    readonly resourceUid: string;
+    /** Lease-scoped claim owner; stale workers must not release a successor's reservation. */
+    readonly claimOwnerId: string;
+    readonly commit: (mutation: EngineMutationCommit) => Promise<void>;
+  };
 }
+
+export type EngineMutationCommit =
+  | {
+      readonly kind: "write";
+      readonly resourceUid: string;
+      readonly operation: "create" | "update" | "import";
+      readonly address: ResourceAddress;
+      readonly expectedRevision: string | null;
+      readonly resource: TakoformStoredResource;
+      readonly relations: readonly TakoformStoredRelation[];
+      readonly replayKey: string;
+      readonly replay: StoredReplay;
+      readonly providerReceipt?: TakoformDriverReceipt;
+      readonly claimKeys?: readonly string[];
+    }
+  | {
+      readonly kind: "delete";
+      readonly resourceUid: string;
+      readonly operation: "delete";
+      readonly address: ResourceAddress;
+      readonly expectedRevision: string;
+      readonly replayKey: string;
+      readonly replay: StoredReplay;
+      readonly providerReceipt?: TakoformDriverReceipt;
+    };
 
 export type EngineResult =
   | {
@@ -101,7 +149,10 @@ export type EngineResult =
   | {
       readonly kind: "prepared";
       readonly resource: ParsedResource;
-      readonly review: { readonly prepareDigest: string; readonly specDigest: string };
+      readonly review: {
+        readonly prepareDigest: string;
+        readonly specDigest?: string;
+      };
     };
 
 export interface TakoformEngine {
@@ -122,6 +173,9 @@ export interface CreateTakoformEngineOptions {
   readonly clock: Clock;
   readonly randomId: () => string;
   readonly workerModuleInspector?: WorkerModuleInspector;
+  readonly allowBodyGenerationFence?: boolean;
+  readonly allowReviewSpecDigest?: boolean;
+  readonly standardServiceResolver?: TakoformStandardServiceResolver;
   /** Every live relation that must be removed before the Resource can be deleted. */
   readonly blockingRelations?: (
     tenantId: string,
@@ -206,18 +260,64 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         ...(resource ? { resource } : {}),
       });
 
+  const reserveClaims = async (input: {
+    readonly operationId: string;
+    readonly tenantId: string;
+    readonly space: string;
+    readonly name: string;
+    readonly uid: string;
+    readonly form: InstalledTakoformForm;
+    readonly spec: JsonObject;
+    readonly relations: readonly TakoformStoredRelation[];
+  }): Promise<readonly string[]> => {
+    const declarations = await declaredResourceClaims({
+      tenantId: input.tenantId,
+      space: input.space,
+      form: input.form,
+      spec: input.spec,
+      relations: input.relations,
+    });
+    const keys = [...new Set(declarations.map((claim) => claim.key))].sort();
+    try {
+      await store.reserveResourceClaims(
+        keys.map((key) => ({
+          key,
+          tenantId: input.tenantId,
+          holderSpace: input.space,
+          holderApiVersion: input.form.identity.formRef.apiVersion,
+          holderKind: input.form.identity.formRef.kind,
+          holderName: input.name,
+          holderUid: input.uid,
+          operationId: input.operationId,
+        })),
+        clock().getTime() + RESOURCE_CLAIM_RESERVATION_TTL_MILLISECONDS,
+      );
+    } catch (error) {
+      if (error instanceof SqlError && error.code === "constraint") {
+        throw new TakoformHostError("invalid_argument", 400);
+      }
+      throw error;
+    }
+    return keys;
+  };
+
   /** Persists a settled mutation, refusing to overwrite a concurrent winner. */
   const commit = async (
     address: ResourceAddress,
     resource: TakoformStoredResource,
     previous: TakoformStoredResource | undefined,
     relations: readonly TakoformStoredRelation[],
+    claimCommit?: {
+      readonly operationId: string;
+      readonly claimKeys: readonly string[];
+    },
   ): Promise<void> => {
     const written = await store.writeResource({
       address,
       resource,
       relations,
       expectedRevision: previous?.metadata.revision ?? null,
+      ...(claimCommit ? { claimCommit } : {}),
     });
     if (!written) throw new TakoformHostError("resource_busy", 409);
   };
@@ -266,7 +366,53 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         ...parsed,
         spec: canonicalizeEdgeSpec(form, materializeDefaults(form.desiredSchema, parsed.spec)),
       };
-      const diagnostics = validateDesired(form, requestResource.spec);
+      const diagnostics = [...validateDesired(form, requestResource.spec)];
+      if (
+        !diagnostics.some((entry) => entry.severity === "error") &&
+        (form.constraints ?? []).some((constraint) =>
+          [
+            "orderedPair",
+            "uniqueBy",
+            "acyclic",
+            "distinctPair",
+            "uniquePair",
+            "sameResolvedTarget",
+          ].includes(constraint.kind),
+        )
+      ) {
+        try {
+          validateDeclaredConstraintRequest({
+            resourceName: requestResource.metadata.name,
+            form,
+            spec: requestResource.spec,
+          });
+          const relations = await resolveRelations({
+            tenantId: context.tenantId,
+            space: requestResource.metadata.space,
+            form,
+            spec: requestResource.spec,
+            forms,
+            bindings,
+            store,
+          });
+          await validateDeclaredConstraints({
+            tenantId: context.tenantId,
+            space: requestResource.metadata.space,
+            resourceName: requestResource.metadata.name,
+            form,
+            spec: requestResource.spec,
+            relations,
+            forms,
+            store,
+          });
+        } catch (error) {
+          if (!(error instanceof TakoformHostError)) throw error;
+          diagnostics.push({
+            severity: "error",
+            message: error.code,
+          });
+        }
+      }
       if (mode === "validate") {
         return {
           kind: "validated",
@@ -277,6 +423,14 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       if (diagnostics.some((entry) => entry.severity === "error")) {
         throw new TakoformHostError("invalid_argument", 400, { diagnostics });
       }
+      await resolveStandardServiceSlots({
+        tenantId: context.tenantId,
+        space: requestResource.metadata.space,
+        form,
+        spec: requestResource.spec,
+        ...(options.standardServiceResolver ? { resolver: options.standardServiceResolver } : {}),
+        project: false,
+      });
       const expectedGeneration = optionalGeneration(
         context.request.headers.get("takoform-expected-generation"),
       );
@@ -315,7 +469,10 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       return {
         kind: "prepared",
         resource: structuredClone(requestResource),
-        review: { prepareDigest, specDigest },
+        review: {
+          prepareDigest,
+          ...(options.allowReviewSpecDigest ? { specDigest } : {}),
+        },
       };
     },
 
@@ -358,7 +515,11 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       const workerCondition =
         drift || migrationCondition
           ? null
-          : await workerServiceCondition({ tenantId: context.tenantId, resource, store });
+          : await workerServiceCondition({
+              tenantId: context.tenantId,
+              resource,
+              store,
+            });
       const rendered = withDerivedRendering(
         resource,
         drift ?? migrationCondition ?? workerCondition,
@@ -382,6 +543,13 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         ...parsedBody,
         spec: canonicalizeEdgeSpec(form, materializeDefaults(form.desiredSchema, parsedBody.spec)),
       };
+      if (
+        body.review.specDigest !== undefined &&
+        (!options.allowReviewSpecDigest ||
+          body.review.specDigest !== (await canonicalDigest(body.spec)))
+      ) {
+        throw new TakoformHostError();
+      }
       const address = addressOf(context.tenantId, body);
       const current = await store.readResource(address);
       if (context.provisionOnly && current !== null) {
@@ -404,6 +572,14 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         artifacts,
         ...(options.workerModuleInspector ? { inspector: options.workerModuleInspector } : {}),
       });
+      await resolveStandardServiceSlots({
+        tenantId: context.tenantId,
+        space: body.metadata.space,
+        form,
+        spec: body.spec,
+        ...(options.standardServiceResolver ? { resolver: options.standardServiceResolver } : {}),
+        project: false,
+      });
 
       const replayKey = replayKeyFor(context, body.metadata.space, "apply");
       const fingerprint = mutationFingerprint(context.request, rawBodyDigest);
@@ -418,20 +594,37 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
 
       const create = current === null;
       const createIntent = context.request.headers.get("if-none-match") === "*";
+      const generationHeader = context.request.headers.get("takoform-expected-generation");
+      if (
+        options.allowBodyGenerationFence &&
+        generationHeader !== null &&
+        body.expectedGeneration !== undefined &&
+        generationHeader !== body.expectedGeneration
+      ) {
+        throw new TakoformHostError();
+      }
+      if (
+        createIntent &&
+        options.allowBodyGenerationFence &&
+        (generationHeader !== null || body.expectedGeneration !== undefined)
+      ) {
+        throw new TakoformHostError();
+      }
       if (!create && createIntent) {
         throw new TakoformHostError("generation_conflict", 412);
       }
       if (create && !createIntent) {
-        if (
-          context.request.headers.has("takoform-expected-generation") ||
-          body.expectedGeneration !== undefined
-        ) {
+        if (generationHeader !== null || body.expectedGeneration !== undefined) {
           throw new TakoformHostError("resource_not_found", 404);
         }
         throw new TakoformHostError();
       }
       if (current) {
-        const expected = requiredExpectedGeneration(context.request, body.expectedGeneration);
+        const expected = requiredExpectedGeneration(
+          context.request,
+          body.expectedGeneration,
+          options.allowBodyGenerationFence,
+        );
         if (expected !== current.metadata.generation) {
           throw new TakoformHostError("generation_conflict", 412);
         }
@@ -483,7 +676,11 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       const currentMigrationCondition = currentWorkerCondition;
       const currentActualWorkerCondition =
         current && !currentDrift && !currentMigrationCondition
-          ? await workerServiceCondition({ tenantId: context.tenantId, resource: current, store })
+          ? await workerServiceCondition({
+              tenantId: context.tenantId,
+              resource: current,
+              store,
+            })
           : null;
       const currentDerivedReady =
         (currentMigrationCondition === null || currentMigrationCondition.status === "True") &&
@@ -501,14 +698,29 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             condition.reason === "Available",
         )
       ) {
-        const noOpId = operationId();
-        await recordOperationFor(context.tenantId)(noOpId, "update", current);
-        await store.putReplay(replayKey, {
+        const noOpId = context.durableOperation?.id ?? operationId();
+        const replayRecord: StoredReplay = {
           fingerprint,
           status: 200,
           resource: current,
           boundUid: current.metadata.uid,
-        });
+        };
+        if (context.durableOperation) {
+          await context.durableOperation.commit({
+            kind: "write",
+            resourceUid: current.metadata.uid,
+            operation: "update",
+            address,
+            expectedRevision: current.metadata.revision,
+            resource: current,
+            relations: currentRelations,
+            replayKey,
+            replay: replayRecord,
+          });
+        } else {
+          await recordOperationFor(context.tenantId)(noOpId, "update", current);
+          await store.putReplay(replayKey, replayRecord);
+        }
         return { kind: "resource", resource: current, status: 200 };
       }
       if (current && form.role === "revision") {
@@ -518,6 +730,11 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         throw new TakoformHostError("unsupported_capability", 422);
       }
 
+      validateDeclaredConstraintRequest({
+        resourceName: body.metadata.name,
+        form,
+        spec: body.spec,
+      });
       const relations = await resolveRelations({
         tenantId: context.tenantId,
         space: body.metadata.space,
@@ -525,6 +742,16 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         spec: body.spec,
         forms,
         bindings,
+        store,
+      });
+      await validateDeclaredConstraints({
+        tenantId: context.tenantId,
+        space: body.metadata.space,
+        resourceName: body.metadata.name,
+        form,
+        spec: body.spec,
+        relations,
+        forms,
         store,
       });
       await validateWorkerAggregate({
@@ -546,6 +773,58 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         artifacts,
         ...(options.workerModuleInspector ? { inspector: options.workerModuleInspector } : {}),
       });
+      await validateClassHolderRuntime({
+        tenantId: context.tenantId,
+        space: body.metadata.space,
+        form,
+        spec: body.spec,
+        relations,
+        store,
+        artifacts,
+        ...(options.workerModuleInspector ? { inspector: options.workerModuleInspector } : {}),
+      });
+      const proposedOperationId = context.durableOperation?.id ?? operationId();
+      const proposedResourceUid =
+        current?.metadata.uid ?? context.durableOperation?.resourceUid ?? nextResourceUid(randomId);
+      const saga = await store.acceptProviderMutationSaga({
+        operationId: proposedOperationId,
+        replayKey,
+        tenantId: context.tenantId,
+        fingerprint,
+        resourceUid: proposedResourceUid,
+        target: address,
+        ...(current
+          ? {
+              acceptedUid: current.metadata.uid,
+              acceptedGeneration: current.metadata.generation,
+              acceptedRevision: current.metadata.revision,
+            }
+          : {}),
+      });
+      const opId = saga.operationId;
+      const uid = saga.resourceUid;
+      const claimOwnerId = context.durableOperation?.claimOwnerId ?? opId;
+      let claimKeys: readonly string[];
+      try {
+        claimKeys = await reserveClaims({
+          operationId: claimOwnerId,
+          tenantId: context.tenantId,
+          space: body.metadata.space,
+          name: body.metadata.name,
+          uid,
+          form,
+          spec: body.spec,
+          relations,
+        });
+      } catch (error) {
+        await store.abandonProviderMutationPlan({
+          tenantId: context.tenantId,
+          operationId: opId,
+          replayKey,
+          resourceUid: uid,
+        });
+        throw error;
+      }
       await applySqliteMigrationApplication({
         tenantId: context.tenantId,
         space: body.metadata.space,
@@ -557,59 +836,118 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       });
 
       if (create) await context.beforeCreate?.();
-
-      const opId = operationId();
-      const uid = current?.metadata.uid ?? nextResourceUid(randomId);
-      const receipt = await driver.apply({
-        operationId: opId,
-        tenantId: context.tenantId,
-        resourceUid: uid,
-        form,
-        name: body.metadata.name,
-        space: body.metadata.space,
-        spec: structuredClone(body.spec),
-        relations: await driverRelations(context.tenantId, body.metadata.space, relations),
-        ...(context.commercialAuthority
-          ? { commercialAuthority: context.commercialAuthority }
-          : {}),
-        ...(context.runtimeMaterialization
-          ? { runtimeMaterialization: context.runtimeMaterialization }
-          : {}),
-        ...(current ? { previous: structuredClone(current) } : {}),
-      });
-      const materialized = materializeResource(body, form, receipt, current, clock, uid);
-      const initialMigrationCondition = await sqliteMigrationCondition({
+      const standardServices = await resolveStandardServiceSlots({
         tenantId: context.tenantId,
         space: body.metadata.space,
         form,
-        relations,
-        store,
-        artifacts,
-        driver,
+        spec: body.spec,
+        ...(options.standardServiceResolver ? { resolver: options.standardServiceResolver } : {}),
+        project: true,
       });
-      const initialWorkerCondition = initialMigrationCondition
-        ? null
-        : await workerServiceCondition({
+      let persisted = false;
+      let providerSettled = false;
+      try {
+        let receipt = await store.readProviderMutationReceipt(context.tenantId, opId, uid);
+        if (!receipt) {
+          receipt = await driver.apply({
+            operationId: opId,
             tenantId: context.tenantId,
-            resource: materialized,
-            store,
+            resourceUid: uid,
+            form,
+            name: body.metadata.name,
+            space: body.metadata.space,
+            spec: structuredClone(body.spec),
+            relations: await driverRelations(context.tenantId, body.metadata.space, relations),
+            atomicDeploymentCommit: true,
+            ...(context.commercialAuthority
+              ? { commercialAuthority: context.commercialAuthority }
+              : {}),
+            ...(context.runtimeMaterialization
+              ? { runtimeMaterialization: context.runtimeMaterialization }
+              : {}),
+            ...(standardServices.length > 0 ? { standardServices } : {}),
+            ...(current ? { previous: structuredClone(current) } : {}),
           });
-      const next = withDerivedRendering(
-        materialized,
-        initialMigrationCondition ?? initialWorkerCondition,
-        clock,
-        !create,
-      );
-      await commit(address, next, current ?? undefined, relations);
-      const status = create ? 201 : 200;
-      await recordOperationFor(context.tenantId)(opId, create ? "create" : "update", next);
-      await store.putReplay(replayKey, {
-        fingerprint,
-        status,
-        resource: next,
-        boundUid: next.metadata.uid,
-      });
-      return { kind: "resource", resource: next, status };
+        }
+        await store.recordProviderMutationReceipt({
+          tenantId: context.tenantId,
+          operationId: opId,
+          resourceUid: uid,
+          receipt,
+          claimOwnerId,
+        });
+        providerSettled = true;
+        const materialized = materializeResource(body, form, receipt, current, clock, uid);
+        const initialMigrationCondition = await sqliteMigrationCondition({
+          tenantId: context.tenantId,
+          space: body.metadata.space,
+          form,
+          relations,
+          store,
+          artifacts,
+          driver,
+        });
+        const initialWorkerCondition = initialMigrationCondition
+          ? null
+          : await workerServiceCondition({
+              tenantId: context.tenantId,
+              resource: materialized,
+              store,
+            });
+        const next = withDerivedRendering(
+          materialized,
+          initialMigrationCondition ?? initialWorkerCondition,
+          clock,
+          !create,
+        );
+        const status = create ? 201 : 200;
+        const replayRecord: StoredReplay = {
+          fingerprint,
+          status,
+          resource: next,
+          boundUid: next.metadata.uid,
+        };
+        if (context.durableOperation) {
+          await context.durableOperation.commit({
+            kind: "write",
+            resourceUid: uid,
+            operation: create ? "create" : "update",
+            address,
+            expectedRevision: current?.metadata.revision ?? null,
+            resource: next,
+            relations,
+            replayKey,
+            replay: replayRecord,
+            providerReceipt: receipt,
+            claimKeys,
+          });
+          persisted = true;
+        } else {
+          await store.commitImmediateMutation({
+            tenantId: context.tenantId,
+            operationId: opId,
+            operation: create ? "create" : "update",
+            createdAt: clock().toISOString(),
+            mutation: {
+              kind: "write",
+              resourceUid: uid,
+              address,
+              expectedRevision: current?.metadata.revision ?? null,
+              resource: next,
+              relations,
+              replayKey,
+              replay: replayRecord,
+              providerReceipt: receipt,
+              ...(claimKeys.length > 0 ? { claimKeys } : {}),
+            },
+          });
+          persisted = true;
+        }
+        return { kind: "resource", resource: next, status };
+      } catch (error) {
+        if (!persisted && !providerSettled) await store.releaseResourceClaims(claimOwnerId);
+        throw error;
+      }
     },
 
     async observe(context, path): Promise<EngineResult> {
@@ -671,7 +1009,11 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       const workerCondition =
         drift || migrationCondition
           ? null
-          : await workerServiceCondition({ tenantId: context.tenantId, resource: observed, store });
+          : await workerServiceCondition({
+              tenantId: context.tenantId,
+              resource: observed,
+              store,
+            });
       const next = withDerivedRendering(
         observed,
         drift ?? migrationCondition ?? workerCondition,
@@ -725,6 +1067,14 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         artifacts,
         ...(options.workerModuleInspector ? { inspector: options.workerModuleInspector } : {}),
       });
+      await resolveStandardServiceSlots({
+        tenantId: context.tenantId,
+        space: body.metadata.space,
+        form,
+        spec: body.spec,
+        ...(options.standardServiceResolver ? { resolver: options.standardServiceResolver } : {}),
+        project: false,
+      });
 
       const replayKey = replayKeyFor(context, body.metadata.space, "import");
       const fingerprint = mutationFingerprint(context.request, rawBodyDigest);
@@ -749,6 +1099,11 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         }
       }
 
+      validateDeclaredConstraintRequest({
+        resourceName: body.metadata.name,
+        form,
+        spec: body.spec,
+      });
       const relations = await resolveRelations({
         tenantId: context.tenantId,
         space: body.metadata.space,
@@ -756,6 +1111,16 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         spec: body.spec,
         forms,
         bindings,
+        store,
+      });
+      await validateDeclaredConstraints({
+        tenantId: context.tenantId,
+        space: body.metadata.space,
+        resourceName: body.metadata.name,
+        form,
+        spec: body.spec,
+        relations,
+        forms,
         store,
       });
       await validateWorkerAggregate({
@@ -777,6 +1142,58 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         artifacts,
         ...(options.workerModuleInspector ? { inspector: options.workerModuleInspector } : {}),
       });
+      await validateClassHolderRuntime({
+        tenantId: context.tenantId,
+        space: body.metadata.space,
+        form,
+        spec: body.spec,
+        relations,
+        store,
+        artifacts,
+        ...(options.workerModuleInspector ? { inspector: options.workerModuleInspector } : {}),
+      });
+      const proposedImportId = context.durableOperation?.id ?? operationId();
+      const proposedResourceUid =
+        current?.metadata.uid ?? context.durableOperation?.resourceUid ?? nextResourceUid(randomId);
+      const saga = await store.acceptProviderMutationSaga({
+        operationId: proposedImportId,
+        replayKey,
+        tenantId: context.tenantId,
+        fingerprint,
+        resourceUid: proposedResourceUid,
+        target: address,
+        ...(current
+          ? {
+              acceptedUid: current.metadata.uid,
+              acceptedGeneration: current.metadata.generation,
+              acceptedRevision: current.metadata.revision,
+            }
+          : {}),
+      });
+      const importId = saga.operationId;
+      const uid = saga.resourceUid;
+      const claimOwnerId = context.durableOperation?.claimOwnerId ?? importId;
+      let claimKeys: readonly string[];
+      try {
+        claimKeys = await reserveClaims({
+          operationId: claimOwnerId,
+          tenantId: context.tenantId,
+          space: body.metadata.space,
+          name: body.metadata.name,
+          uid,
+          form,
+          spec: body.spec,
+          relations,
+        });
+      } catch (error) {
+        await store.abandonProviderMutationPlan({
+          tenantId: context.tenantId,
+          operationId: importId,
+          replayKey,
+          resourceUid: uid,
+        });
+        throw error;
+      }
       await applySqliteMigrationApplication({
         tenantId: context.tenantId,
         space: body.metadata.space,
@@ -787,53 +1204,123 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         driver,
       });
 
-      const importId = operationId();
-      const uid = current?.metadata.uid ?? nextResourceUid(randomId);
-      const receipt = await driver.import({
-        operationId: importId,
-        tenantId: context.tenantId,
-        resourceUid: uid,
-        form,
-        name: body.metadata.name,
-        space: body.metadata.space,
-        spec: structuredClone(body.spec),
-        nativeId: body.nativeId,
-        relations: await driverRelations(context.tenantId, body.metadata.space, relations),
-        ...(current ? { previous: structuredClone(current) } : {}),
-      });
-      const materialized = materializeResource(body, form, receipt, current, clock, uid);
-      const initialMigrationCondition = await sqliteMigrationCondition({
+      const standardServices = await resolveStandardServiceSlots({
         tenantId: context.tenantId,
         space: body.metadata.space,
         form,
-        relations,
-        store,
-        artifacts,
-        driver,
+        spec: body.spec,
+        ...(options.standardServiceResolver ? { resolver: options.standardServiceResolver } : {}),
+        project: true,
       });
-      const initialWorkerCondition = initialMigrationCondition
-        ? null
-        : await workerServiceCondition({
+      let persisted = false;
+      let providerSettled = false;
+      try {
+        let receipt = await store.readProviderMutationReceipt(context.tenantId, importId, uid);
+        if (!receipt) {
+          receipt = await driver.import({
+            operationId: importId,
             tenantId: context.tenantId,
-            resource: materialized,
-            store,
+            resourceUid: uid,
+            form,
+            name: body.metadata.name,
+            space: body.metadata.space,
+            spec: structuredClone(body.spec),
+            nativeId: body.nativeId,
+            relations: await driverRelations(context.tenantId, body.metadata.space, relations),
+            atomicDeploymentCommit: true,
+            ...(standardServices.length > 0 ? { standardServices } : {}),
+            ...(current ? { previous: structuredClone(current) } : {}),
           });
-      const next = withDerivedRendering(
-        materialized,
-        initialMigrationCondition ?? initialWorkerCondition,
-        clock,
-        !create,
-      );
-      await commit(address, next, current ?? undefined, relations);
-      const status = create ? 201 : 200;
-      await recordOperationFor(context.tenantId)(importId, "import", next);
-      await store.putReplay(replayKey, {
-        fingerprint,
-        status,
-        resource: next,
-        boundUid: next.metadata.uid,
-      });
-      return { kind: "resource", resource: next, status };
+        }
+        await store.recordProviderMutationReceipt({
+          tenantId: context.tenantId,
+          operationId: importId,
+          resourceUid: uid,
+          receipt,
+          claimOwnerId,
+        });
+        providerSettled = true;
+        const materialized = materializeResource(body, form, receipt, current, clock, uid);
+        const initialMigrationCondition = await sqliteMigrationCondition({
+          tenantId: context.tenantId,
+          space: body.metadata.space,
+          form,
+          relations,
+          store,
+          artifacts,
+          driver,
+        });
+        const initialWorkerCondition = initialMigrationCondition
+          ? null
+          : await workerServiceCondition({
+              tenantId: context.tenantId,
+              resource: materialized,
+              store,
+            });
+        const next = withDerivedRendering(
+          materialized,
+          initialMigrationCondition ?? initialWorkerCondition,
+          clock,
+          !create,
+        );
+        const status = create ? 201 : 200;
+        const replayRecord: StoredReplay = {
+          fingerprint,
+          status,
+          resource: next,
+          boundUid: next.metadata.uid,
+        };
+        if (context.durableOperation) {
+          await context.durableOperation.commit({
+            kind: "write",
+            resourceUid: uid,
+            operation: "import",
+            address,
+            expectedRevision: current?.metadata.revision ?? null,
+            resource: next,
+            relations,
+            replayKey,
+            replay: replayRecord,
+            providerReceipt: receipt,
+            claimKeys,
+          });
+          persisted = true;
+        } else {
+          await store.commitImmediateMutation({
+            tenantId: context.tenantId,
+            operationId: importId,
+            operation: "import",
+            createdAt: clock().toISOString(),
+            mutation: {
+              kind: "write",
+              resourceUid: uid,
+              address,
+              expectedRevision: current?.metadata.revision ?? null,
+              resource: next,
+              relations,
+              replayKey,
+              replay: replayRecord,
+              providerReceipt: receipt,
+              ...(claimKeys.length > 0 ? { claimKeys } : {}),
+            },
+          });
+          persisted = true;
+        }
+        return { kind: "resource", resource: next, status };
+      } catch (error) {
+        if (!persisted && !providerSettled) {
+          await store.releaseResourceClaims(claimOwnerId);
+          if (error instanceof TakoformHostError && error.code === "import_conflict") {
+            await store.abandonProviderMutationPlan({
+              tenantId: context.tenantId,
+              operationId: importId,
+              replayKey,
+              resourceUid: uid,
+            });
+          }
+        }
+        throw error;
+      }
     },
 
     async remove(context, path): Promise<EngineResult> {
@@ -877,7 +1364,11 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       });
       const workerCondition = drift
         ? null
-        : await workerServiceCondition({ tenantId: context.tenantId, resource: current, store });
+        : await workerServiceCondition({
+            tenantId: context.tenantId,
+            resource: current,
+            store,
+          });
       const rendered = withDerivedRendering(current, drift ?? workerCondition, clock);
       if (rendered.metadata.revision !== current.metadata.revision) {
         await commit(address, rendered, current, currentRelations);
@@ -905,22 +1396,73 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         store,
       });
 
-      const deleteId = operationId();
-      await driver.delete({
-        operationId: deleteId,
+      const saga = await store.acceptProviderMutationSaga({
+        operationId: context.durableOperation?.id ?? operationId(),
+        replayKey,
         tenantId: context.tenantId,
+        fingerprint,
         resourceUid: current.metadata.uid,
-        resource: structuredClone(current),
-        relations: await driverRelations(
-          context.tenantId,
-          current.metadata.space,
-          currentRelations,
-        ),
+        target: address,
+        acceptedUid: current.metadata.uid,
+        acceptedGeneration: current.metadata.generation,
+        acceptedRevision: current.metadata.revision,
       });
-      const removed = await store.deleteResource(address, current.metadata.revision);
-      if (!removed) throw new TakoformHostError("resource_busy", 409);
-      await recordOperationFor(context.tenantId)(deleteId, "delete");
-      await store.putReplay(replayKey, { fingerprint, status: 204 });
+      const deleteId = saga.operationId;
+      let receipt = await store.readProviderMutationReceipt(
+        context.tenantId,
+        deleteId,
+        current.metadata.uid,
+      );
+      if (!receipt) {
+        receipt =
+          (await driver.delete({
+            operationId: deleteId,
+            tenantId: context.tenantId,
+            resourceUid: current.metadata.uid,
+            resource: structuredClone(current),
+            relations: await driverRelations(
+              context.tenantId,
+              current.metadata.space,
+              currentRelations,
+            ),
+            atomicDeploymentCommit: true,
+          })) ?? {};
+        await store.recordProviderMutationReceipt({
+          tenantId: context.tenantId,
+          operationId: deleteId,
+          resourceUid: current.metadata.uid,
+          receipt,
+        });
+      }
+      const replayRecord: StoredReplay = { fingerprint, status: 204 };
+      if (context.durableOperation) {
+        await context.durableOperation.commit({
+          kind: "delete",
+          resourceUid: current.metadata.uid,
+          operation: "delete",
+          address,
+          expectedRevision: current.metadata.revision,
+          replayKey,
+          replay: replayRecord,
+          providerReceipt: receipt,
+        });
+      } else {
+        await store.commitImmediateMutation({
+          tenantId: context.tenantId,
+          operationId: deleteId,
+          operation: "delete",
+          createdAt: clock().toISOString(),
+          mutation: {
+            kind: "delete",
+            resourceUid: current.metadata.uid,
+            address,
+            expectedRevision: current.metadata.revision,
+            replayKey,
+            replay: replayRecord,
+            providerReceipt: receipt,
+          },
+        });
+      }
       return { kind: "deleted" };
     },
   };
@@ -1038,7 +1580,10 @@ function withObservation(
   if (comparable(current) === comparable(candidate)) return structuredClone(current);
   return {
     ...candidate,
-    metadata: { ...candidate.metadata, revision: increment(current.metadata.revision) },
+    metadata: {
+      ...candidate.metadata,
+      revision: increment(current.metadata.revision),
+    },
   };
 }
 

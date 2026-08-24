@@ -188,7 +188,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     // catalogue in a console holds a session, and would otherwise be told they
     // are not authenticated for asking a public question.
     if (request.method === "GET" && url.pathname === "/v1/forms") {
-      return Response.json({ profiles: forms.map(formSupportProfile) });
+      return Response.json({ profiles: forms.map((form) => formSupportProfile(form)) });
     }
 
     if (request.method === "GET" && url.pathname === "/v1/identity/providers") {

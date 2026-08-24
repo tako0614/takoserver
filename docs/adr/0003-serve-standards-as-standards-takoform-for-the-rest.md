@@ -32,6 +32,13 @@ external standard-service slots (Takoform decision 0045): portable state
 carries a name and a protocol, Takoserver resolves the endpoint and the
 credential.
 
+For stable S3 that is the exact service
+`standards.takoform.com/v1/com.amazonaws.s3`. The supply and its lifetime are
+Host-owned and out of band: immutable Worker revisions in one tenant/space/slot
+share it, and deleting or failing a portable Resource is never authority to
+delete that native service. Released ObjectBucket / `edge.objects` identities
+remain historical drain-only records; they are not the current S3 model.
+
 ## Why
 
 The maintainer directed it (2026-08-23), and it is what the existing ownership

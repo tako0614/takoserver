@@ -133,9 +133,56 @@ function recorder(
 }
 
 describe("Cloudflare provider", () => {
+  test("dispatches an explicitly installed stable ModuleWorker offering", async () => {
+    const calls: Call[] = [];
+    const stable: ProviderOffering = {
+      ...offering("stable-worker", "worker_script"),
+      kind: "takoform.ModuleWorker",
+      form: {
+        apiVersion: "edge.forms.takoform.com",
+        kind: "ModuleWorker",
+        definitionVersion: "0.2.0",
+        schemaDigest: `sha256:${"1".repeat(64)}` as `sha256:${string}`,
+      },
+    };
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [stable],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        calls.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body: await request.clone().text(),
+        });
+        return Response.json({ success: true, errors: [], result: {} });
+      },
+    });
+
+    const ticket = await provider.apply({
+      operationId: "op_stable_worker",
+      offering: stable,
+      identity: { ...IDENTITY, name: "stable-worker" },
+      spec: {},
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: expect.stringMatching(/^worker:/) },
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toContain("/workers/scripts/");
+  });
+
   test("derives a backend name instead of trusting the customer's", async () => {
     const { provider, calls } = recorder([
-      { status: 200, body: { success: true, errors: [], result: { name: "ts-x" } } },
+      {
+        status: 200,
+        body: { success: true, errors: [], result: { name: "ts-x" } },
+      },
     ]);
     const ticket = await provider.apply({
       operationId: "op_1",
@@ -150,12 +197,17 @@ describe("Cloudflare provider", () => {
     // account-global, so the name is derived from the whole address.
     expect(ticket.result.nativeId).toMatch(/^r2:ts-[0-9a-f]{40}$/u);
     expect(calls[0]?.body).not.toContain("assets");
-    expect(JSON.parse(calls[0]?.body ?? "{}")).toMatchObject({ locationHint: "apac" });
+    expect(JSON.parse(calls[0]?.body ?? "{}")).toMatchObject({
+      locationHint: "apac",
+    });
   });
 
   test("publishes a Worker from a committed bundle as a multipart upload", async () => {
     const { provider, calls } = recorder([
-      { status: 200, body: { success: true, errors: [], result: { id: "script" } } },
+      {
+        status: 200,
+        body: { success: true, errors: [], result: { id: "script" } },
+      },
     ]);
     const ticket = await provider.apply({
       operationId: "op_2",
@@ -286,7 +338,10 @@ describe("Cloudflare provider", () => {
       operationId: "op_zone",
       offering: WORKER,
       identity: { tenantRef: "org_other", space: "default", name: "app" },
-      spec: { bundle: `sha256:${"d".repeat(64)}`, hostnames: ["app.acme.example"] },
+      spec: {
+        bundle: `sha256:${"d".repeat(64)}`,
+        hostnames: ["app.acme.example"],
+      },
     });
     expect(ticket.phase).toBe("failed");
     expect(calls.filter((call) => call.url.includes("/workers/domains"))).toHaveLength(0);
@@ -330,13 +385,23 @@ describe("Cloudflare provider", () => {
         { status: 200, body: { success: true, errors: [], result: {} } },
         { status: 200, body: { success: true, errors: [], result: {} } },
       ],
-      [{ suffix: "brought.example", zoneId: "zone_brought", tenantRef: "org_acme", apex: true }],
+      [
+        {
+          suffix: "brought.example",
+          zoneId: "zone_brought",
+          tenantRef: "org_acme",
+          apex: true,
+        },
+      ],
     );
     const ticket = await provider.apply({
       operationId: "op_apex",
       offering: WORKER,
       identity: IDENTITY,
-      spec: { bundle: `sha256:${"d".repeat(64)}`, hostnames: ["brought.example"] },
+      spec: {
+        bundle: `sha256:${"d".repeat(64)}`,
+        hostnames: ["brought.example"],
+      },
     });
     expect(ticket.phase).toBe("succeeded");
     const attached = calls.find((call) => call.url.includes("/workers/domains"));
@@ -349,13 +414,22 @@ describe("Cloudflare provider", () => {
   test("refuses the apex of a zone that does not offer it", async () => {
     const { provider, calls } = recorder(
       [{ status: 200, body: { success: true, errors: [], result: {} } }],
-      [{ suffix: "shared.example", zoneId: "zone_shared", tenantRef: "org_acme" }],
+      [
+        {
+          suffix: "shared.example",
+          zoneId: "zone_shared",
+          tenantRef: "org_acme",
+        },
+      ],
     );
     const ticket = await provider.apply({
       operationId: "op_apex_refused",
       offering: WORKER,
       identity: IDENTITY,
-      spec: { bundle: `sha256:${"d".repeat(64)}`, hostnames: ["shared.example"] },
+      spec: {
+        bundle: `sha256:${"d".repeat(64)}`,
+        hostnames: ["shared.example"],
+      },
     });
     expect(ticket.phase).toBe("failed");
     expect(calls.filter((call) => call.url.includes("/workers/domains"))).toHaveLength(0);
@@ -387,7 +461,10 @@ describe("Cloudflare provider", () => {
       const { provider } = recorder([
         {
           status,
-          body: { success: false, errors: [{ message: "internal cloudflare detail" }] },
+          body: {
+            success: false,
+            errors: [{ message: "internal cloudflare detail" }],
+          },
         },
       ]);
       const ticket = await provider.apply({
@@ -416,7 +493,10 @@ describe("Cloudflare provider", () => {
 
   test("reports a database identifier the caller can bind to", async () => {
     const { provider } = recorder([
-      { status: 200, body: { success: true, errors: [], result: { uuid: "db-uuid-1" } } },
+      {
+        status: 200,
+        body: { success: true, errors: [], result: { uuid: "db-uuid-1" } },
+      },
     ]);
     const ticket = await provider.apply({
       operationId: "op_5",
@@ -448,7 +528,10 @@ describe("Cloudflare provider", () => {
     });
     expect(ticket.phase).toBe("failed");
     if (ticket.phase !== "failed") throw new Error("expected failure");
-    expect(ticket.failure).toMatchObject({ code: "unavailable", retryable: true });
+    expect(ticket.failure).toMatchObject({
+      code: "unavailable",
+      retryable: true,
+    });
   });
 });
 
@@ -460,7 +543,10 @@ describe("released edge Form placement", () => {
     return found;
   };
   const technical = (kind: string) =>
-    edgeProviderOffering(form(kind), { id: `cloudflare.edge.${kind}`, regions: ["global"] });
+    edgeProviderOffering(form(kind), {
+      id: `cloudflare.edge.${kind}`,
+      regions: ["global"],
+    });
 
   test("creates the provider-backed identity Forms without inventing their schema", async () => {
     const offerings = [
@@ -489,7 +575,11 @@ describe("released edge Form placement", () => {
           authorization: request.headers.get("authorization"),
           body: await request.clone().text(),
         });
-        return Response.json({ success: true, errors: [], result: responses[calls.length - 1] });
+        return Response.json({
+          success: true,
+          errors: [],
+          result: responses[calls.length - 1],
+        });
       },
     });
     const worker = await provider.apply({
@@ -526,10 +616,16 @@ describe("released edge Form placement", () => {
       identity: { ...IDENTITY, name: "jobs" },
       spec: { messageRetentionSeconds: 86_400, deliveryDelaySeconds: 3 },
     });
-    expect(kv).toMatchObject({ phase: "succeeded", result: { nativeId: "kv:kv-id" } });
+    expect(kv).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: "kv:kv-id" },
+    });
     expect(database).toMatchObject({
       phase: "succeeded",
-      result: { nativeId: "d1:database-id", outputs: { databaseId: "database-id" } },
+      result: {
+        nativeId: "d1:database-id",
+        outputs: { databaseId: "database-id" },
+      },
     });
     expect(queue).toMatchObject({
       phase: "succeeded",
@@ -576,7 +672,9 @@ describe("released edge Form placement", () => {
     });
     const bundle = related(
       "/bundle",
-      stored("WorkerBundle", "bundle-uid", { manifestDigest: `sha256:${"d".repeat(64)}` }),
+      stored("WorkerBundle", "bundle-uid", {
+        manifestDigest: `sha256:${"d".repeat(64)}`,
+      }),
     );
     const version = await provider.apply({
       operationId: "op-version",
@@ -635,6 +733,78 @@ describe("released edge Form placement", () => {
     expect(calls[1]?.url).toContain("/workers/scripts/script-name/deployments");
     expect(calls[1]?.body).toContain('"percentage":100');
     expect(calls[1]?.body).toContain('"version_id":"version-id"');
+  });
+
+  test("projects an exact sealed S3 supply as one runtime-native R2 slot", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const versionOffering = technical("WorkerVersion");
+    const calls: Call[] = [];
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering, versionOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        calls.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body: await request.clone().text(),
+        });
+        return Response.json({
+          success: true,
+          errors: [],
+          result: { id: "version-s3" },
+        });
+      },
+    });
+    const bucketName = `tss3-${"a".repeat(40)}`;
+    const ticket = await provider.apply({
+      operationId: "op-version-s3",
+      offering: versionOffering,
+      identity: { ...IDENTITY, name: "version" },
+      spec: { handlers: ["fetch"] },
+      standardServices: [
+        {
+          name: "MEDIA",
+          required: true,
+          service: {
+            apiVersion: "standards.takoform.com/v1",
+            protocol: "com.amazonaws.s3",
+          },
+          endpoint: {
+            kind: "takoserver.cloudflare-r2-bucket@v1",
+            bucketName,
+          },
+          credential: { kind: "takoserver.cloudflare-r2-binding@v1" },
+        },
+      ],
+      relations: [
+        related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+          nativeId: "worker:script-name",
+          offeringId: workerOffering.id,
+          providerPackRef: "cloudflare",
+          outputs: { scriptName: "script-name" },
+        }),
+        related(
+          "/bundle",
+          stored("WorkerBundle", "bundle-uid", {
+            manifestDigest: `sha256:${"d".repeat(64)}`,
+          }),
+        ),
+      ],
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: "version:script-name:version-s3" },
+    });
+    expect(calls[0]?.body).toContain(
+      `"type":"r2_bucket","name":"MEDIA","bucket_name":"${bucketName}"`,
+    );
+    expect(JSON.stringify(ticket)).not.toContain(bucketName);
+    expect(JSON.stringify(ticket)).not.toContain("com.amazonaws.s3");
   });
 
   test("materializes exact sensitive bindings only inside the immutable Worker Version upload", async () => {
@@ -867,21 +1037,35 @@ describe("released edge Form placement", () => {
         const index = calls.length;
         const result =
           index === 1
-            ? [{ success: true, results: [{ name: "_takoform_sqlite_migrations" }] }]
+            ? [
+                {
+                  success: true,
+                  results: [{ name: "_takoform_sqlite_migrations" }],
+                },
+              ]
             : index === 2
               ? [
                   {
                     success: true,
                     results: [
-                      { sequence: 1, path: "0001.sql", digest: `sha256:${"a".repeat(64)}` },
+                      {
+                        sequence: 1,
+                        path: "0001.sql",
+                        digest: `sha256:${"a".repeat(64)}`,
+                      },
                     ],
                   },
                 ]
-              : Array.from({ length: 4 }, () => ({ success: true, results: [] }));
+              : Array.from({ length: 4 }, () => ({
+                  success: true,
+                  results: [],
+                }));
         return Response.json({ success: true, errors: [], result });
       },
     });
-    const ledger = await provider.sqliteMigrations.readLedger({ nativeId: "d1:database-id" });
+    const ledger = await provider.sqliteMigrations.readLedger({
+      nativeId: "d1:database-id",
+    });
     expect(ledger).toEqual({
       ok: true,
       value: [{ path: "0001.sql", digest: `sha256:${"a".repeat(64)}` }],
@@ -942,7 +1126,11 @@ describe("released edge Form placement", () => {
         const result = path.endsWith("/subdomain")
           ? { enabled: true }
           : path.endsWith("/workers/domains/domain-id")
-            ? { id: "domain-id", hostname: "api.example.com", service: "script-name" }
+            ? {
+                id: "domain-id",
+                hostname: "api.example.com",
+                service: "script-name",
+              }
             : path.endsWith("/schedules") && request.method === "GET"
               ? [{ cron: "*/5 * * * *" }, { cron: "0 0 * * *" }]
               : path.includes("/consumers/")
@@ -1014,7 +1202,13 @@ describe("released edge Form placement", () => {
       apiVersion: installed.identity.formRef.apiVersion,
       kind,
       form: installed.identity,
-      metadata: { name: kind.toLowerCase(), space: "default", uid, generation: "1", revision: "1" },
+      metadata: {
+        name: kind.toLowerCase(),
+        space: "default",
+        uid,
+        generation: "1",
+        revision: "1",
+      },
       spec,
       status: { observedGeneration: "1", conditions: [] },
     };
@@ -1093,11 +1287,16 @@ describe("overlapping zones", () => {
         operationId: "op_overlap",
         offering: WORKER,
         identity: IDENTITY,
-        spec: { bundle: `sha256:${"d".repeat(64)}`, hostnames: ["api.shared.example"] },
+        spec: {
+          bundle: `sha256:${"d".repeat(64)}`,
+          hostnames: ["api.shared.example"],
+        },
       });
       expect(ticket.phase).toBe("succeeded");
       const attached = calls.find((call) => call.url.includes("/workers/domains"));
-      expect(JSON.parse(String(attached?.body))).toMatchObject({ zone_id: "zone_operator" });
+      expect(JSON.parse(String(attached?.body))).toMatchObject({
+        zone_id: "zone_operator",
+      });
     });
   }
 
@@ -1105,7 +1304,12 @@ describe("overlapping zones", () => {
     const { provider, calls } = recorder(
       [{ status: 200, body: { success: true, errors: [], result: {} } }],
       [
-        { suffix: "shared.example", zoneId: "zone_operator", tenantRef: "org_other", apex: true },
+        {
+          suffix: "shared.example",
+          zoneId: "zone_operator",
+          tenantRef: "org_other",
+          apex: true,
+        },
         {
           suffix: "shared.example",
           zoneId: "zone_open",
@@ -1118,7 +1322,10 @@ describe("overlapping zones", () => {
       operationId: "op_overlap_denied",
       offering: WORKER,
       identity: IDENTITY,
-      spec: { bundle: `sha256:${"d".repeat(64)}`, hostnames: ["api.shared.example"] },
+      spec: {
+        bundle: `sha256:${"d".repeat(64)}`,
+        hostnames: ["api.shared.example"],
+      },
     });
     expect(ticket.phase).toBe("failed");
     expect(calls.filter((call) => call.url.includes("/workers/domains"))).toHaveLength(0);
@@ -1150,17 +1357,29 @@ describe("hostname already in use", () => {
           },
         },
       ],
-      [{ suffix: "brought.example", zoneId: "zone_brought", tenantRef: "org_acme", apex: true }],
+      [
+        {
+          suffix: "brought.example",
+          zoneId: "zone_brought",
+          tenantRef: "org_acme",
+          apex: true,
+        },
+      ],
     );
     const ticket = await provider.apply({
       operationId: "op_taken",
       offering: WORKER,
       identity: IDENTITY,
-      spec: { bundle: `sha256:${"d".repeat(64)}`, hostnames: ["brought.example"] },
+      spec: {
+        bundle: `sha256:${"d".repeat(64)}`,
+        hostnames: ["brought.example"],
+      },
     });
 
     expect(ticket.phase).toBe("failed");
-    expect(ticket).toMatchObject({ failure: { code: "invalid_spec", retryable: false } });
+    expect(ticket).toMatchObject({
+      failure: { code: "invalid_spec", retryable: false },
+    });
     // Ours, not Cloudflare's: no backend wording crosses back.
     expect(JSON.stringify(ticket)).toContain("remove them in the zone");
     expect(JSON.stringify(ticket)).not.toContain("externally managed");
@@ -1177,7 +1396,10 @@ describe("hostname already in use", () => {
 describe("asset binding", () => {
   test("hands a script that declares assets a way to reach them", async () => {
     const { provider, calls } = recorder([
-      { status: 200, body: { success: true, errors: [], result: { jwt: "asset-token" } } },
+      {
+        status: 200,
+        body: { success: true, errors: [], result: { jwt: "asset-token" } },
+      },
       { status: 200, body: { success: true, errors: [], result: {} } },
       { status: 200, body: { success: true, errors: [], result: {} } },
     ]);
@@ -1210,7 +1432,10 @@ describe("asset binding", () => {
         bindings: [{ type: "plain_text", name: "ASSETS", text: "mine" }],
       },
     });
-    expect(ticket).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec" },
+    });
   });
 });
 
@@ -1234,7 +1459,12 @@ describe("taking a hostname that already points somewhere", () => {
     status: 409,
     body: {
       success: false,
-      errors: [{ code: 100117, message: "Hostname already has externally managed DNS records" }],
+      errors: [
+        {
+          code: 100117,
+          message: "Hostname already has externally managed DNS records",
+        },
+      ],
     },
   };
   const ok = { status: 200, body: { success: true, errors: [], result: {} } };
@@ -1285,7 +1515,10 @@ describe("taking a hostname that already points somewhere", () => {
       operationId: "op_no_takeover",
       offering: WORKER,
       identity: IDENTITY,
-      spec: { bundle: `sha256:${"d".repeat(64)}`, hostnames: ["brought.example"] },
+      spec: {
+        bundle: `sha256:${"d".repeat(64)}`,
+        hostnames: ["brought.example"],
+      },
     });
 
     expect(ticket.phase).toBe("failed");

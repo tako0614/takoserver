@@ -2,21 +2,24 @@
 
 An Open Source, Self-Hostable PaaS with a [Takoform](https://takoform.com) Host
 for declarative infrastructure and ordinary data APIs for already-standardized
-services. Its infrastructure catalog is the released Takoform Edge Family,
-exactly as the published provider carries it: on your own machine every
-identity Form — ObjectBucket, EdgeKVNamespace, SQLiteDatabase,
-AtLeastOnceQueue, and ModuleWorker with its version, deployment, and
-attachment Forms — is offered and executed locally
-(`TAKOSERVER_EDGE_FORMS=0` narrows a deliberately storage-only machine back
-to ObjectBucket); pointed at a Cloudflare account it sells what the reviewed
-hosted supplies say. Object access and OpenAI-compatible AI inference are
-data services, not locally invented Forms.
+services. The public Host is the one literal `forms.takoform.com/v1` lane.
+Production installs no unpublished Form package: exact stable definitions must
+arrive from Takoform as released external input before they may enter the
+production catalog.
 
-ObjectBucket lifecycle stays in Takoform, while the standard data path is `POST
-/v1/organizations/{organizationId}/resources/{resourceUid}/s3-credentials`.
-It returns a short-lived bucket-scoped access key, secret, and session token
-that an ordinary AWS SDK, CLI, or other SigV4 S3 client uses against the
-returned endpoint. That does not create another Form.
+The released provider-v2.1.1 Edge Family remains immutable historical input so
+Takoserver can read and drain Deployments already recorded under it. It is not
+a current `/v1` sale or `/provision/v1` authority, and its ObjectBucket /
+`edge.objects` identities are not relabelled as stable. Current Worker object
+storage is a portable external-service slot containing only `{name, service,
+required}` with service `{apiVersion: "standards.takoform.com/v1", protocol:
+"com.amazonaws.s3"}`. The Host resolves that slot out of band and gives the
+runtime one sealed native binding; bucket name, endpoint, credential, FormRef,
+and resource selector never enter portable desired or observed state.
+
+The existing `/v1/organizations/{organizationId}/resources/{resourceUid}/s3-credentials`
+shape is retained only for draining historical ObjectBucket records. It does
+not create a current ObjectBucket or grant new lifecycle authority.
 
 Run it on your own machine and it uses your disk and [workerd](https://github.com/cloudflare/workerd),
 the runtime Cloudflare runs at the edge. Point it at a Cloudflare account and it
@@ -44,8 +47,9 @@ the part that owns accounts, money, and the machines.
   balance and captures it when it succeeds; if it fails, the hold is released
   and nothing is charged. There is no balance column anywhere — available is
   settled minus held, computed from entries that are only ever appended.
-- **Reach** what you provisioned. A bucket is not a name in a list: a
-  short-lived token scoped to one resource opens its data plane.
+- **Reach** standard services through sealed runtime bindings. A stable Worker
+  names the S3 protocol and its local slot; the Host owns supply selection and
+  keeps native bucket identity and credentials outside portable state.
 - **Run** the ordinary Takoform provider without handing a hosted runner the
   reseller's organization API key. A reseller reservation can mint a
   short-lived bearer pinned to one opaque tenant, exact Form, and exact
@@ -137,8 +141,10 @@ same way it does on Cloudflare.
 
 ## Running it on Cloudflare
 
-Set `CLOUDFLARE_ACCOUNT_ID` and a scoped API token, and the same server
-provisions R2 buckets, D1 databases, and Workers in that account instead. The
+Set `CLOUDFLARE_ACCOUNT_ID` and a scoped API token to make configured Host-owned
+standard-service supplies available in that account. Historical released
+provider adapters may remain installed to observe and delete recorded
+Deployments, but their beta Forms are not republished as a sale catalog. The
 control plane itself can also run as a Worker; `bun run deploy -- --contract`
 describes what publishing that involves and what it refuses to do.
 
@@ -214,11 +220,11 @@ per-entry ban, so the Workers entry cannot reach a filesystem it does not have.
 Three properties are worth knowing before reading the code:
 
 **Shipped Form definitions come from a release.** Takoserver cannot author a
-name in the Takoform namespace. `bun run check:official-forms` pins the exact
-Takoform provider tag, commit, identity ledger, definition, and package index,
-then proves the shipped catalog is an exact subset. A new Form needs a released
-provider definition and an implemented backend; AI and S3 protocol operations
-do not become Forms just because Takoserver offers them.
+name in the Takoform namespace. `bun run check:official-forms` still pins the
+immutable provider-v2.1.1 bytes used to manage historical records; those bytes
+carry no present sale authority. A current Form needs a released stable
+definition and an implemented backend. AI and S3 protocol operations do not
+become Forms just because Takoserver offers them.
 
 **Guarded writes, not transactions.** The control database may be D1, which has
 no interactive transaction, so invariants live in `WHERE` clauses and are

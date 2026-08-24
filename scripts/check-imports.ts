@@ -52,7 +52,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "core",
     match:
-      /^src\/(?:ports|json|strict-json|form-ref|interface-ref|provider-port|provider-meter-port|ai-port|s3-port|s3-issuer-router|runtime-materialization|database|database-schema|db-schema|migrate-sqlite)\.ts$/u,
+      /^src\/(?:ports|json|strict-json|form-ref|interface-ref|provider-port|provider-meter-port|standard-service-port|ai-port|s3-port|s3-issuer-router|runtime-materialization|database|database-schema|db-schema|migrate-sqlite)\.ts$/u,
     may: ["core"],
   },
   {
@@ -78,7 +78,7 @@ const LAYERS: readonly Layer[] = [
     // `payment-setup` builds the shape the routes layer asks for, which makes
     // it composition rather than domain: it is allowed to know both halves.
     match:
-      /^src\/(?:app|deployment-composition|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|selfhost-composition|worker-data-services|worker-(?:object-bucket|production)-composition)\.ts$/u,
+      /^src\/(?:app|deployment-composition|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|selfhost-composition|standard-service-production|worker-data-services|worker-(?:object-bucket|production|stable-local)-composition)\.ts$/u,
     may: ["core", "adapter", "domain", "routes", "app"],
   },
   // An entry chooses concrete implementations — that is its whole job. What it

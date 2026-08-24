@@ -4,11 +4,10 @@ import { createSelfhostComposition } from "../src/selfhost-composition.ts";
 import type { WorkerdRuntime } from "../src/workerd-runtime.ts";
 
 /**
- * A self-hosted Takoserver that cannot host a Worker is a place to keep
- * files, not a Takoform Host. The default catalog therefore sells every
- * released Edge identity Form, and every relation Form has exactly one
- * technical projection so the driver can inherit it — while the operator who
- * deliberately runs a storage-only machine can still narrow the catalog.
+ * Released provider Forms remain installed behind the Provider Pack only to
+ * drain already-recorded Deployments. They are not a current product catalog:
+ * stable S3 is a Host-owned standard service and no current ObjectBucket or
+ * edge.objects identity may regain sale/provision authority here.
  */
 
 const runtime: WorkerdRuntime = {
@@ -39,22 +38,24 @@ async function compose(edgeForms: boolean) {
 }
 
 describe("the self-host catalog", () => {
-  test("sells the released Edge identity Forms beside the bucket", async () => {
+  test("keeps every released identity Form drain-only and out of the sale catalog", async () => {
     const composition = await compose(true);
-    expect(composition.offerings.map((offering) => offering.id).sort()).toEqual([
+    expect(composition.offerings).toEqual([]);
+    expect(composition.provider.offerings.map((offering) => offering.id).sort()).toEqual([
       "compute.edge.standard",
       "database.sqlite.standard",
       "messaging.queue.standard",
+      "selfhost.edge.queueconsumer",
+      "selfhost.edge.workercrontrigger",
+      "selfhost.edge.workercustomdomain",
+      "selfhost.edge.workerdeployment",
+      "selfhost.edge.workerendpoint",
+      "selfhost.edge.workerversion",
       "storage.kv.standard",
       "storage.object.standard",
     ]);
-    for (const offering of composition.offerings) {
-      // Local supply: the operator's own machine, at no catalog price.
-      expect(offering.pricePlan.provisioning.amountMinor).toBe(0);
-      expect(offering.providerPackRef).toBe("local");
-      expect(offering.providerInstallationRef).toBe("local.primary");
-      expect(offering.deliveryMode).toBe("managed-endpoint");
-    }
+    expect(JSON.stringify(composition.offerings)).not.toContain("ObjectBucket");
+    expect(JSON.stringify(composition.offerings)).not.toContain("edge.objects");
   });
 
   test("projects exactly one technical offering per relation Form", async () => {
@@ -80,9 +81,10 @@ describe("the self-host catalog", () => {
     }
   });
 
-  test("narrows to object storage when the operator turns the Edge Family off", async () => {
+  test("keeps the legacy storage-only variant drain-only too", async () => {
     const composition = await compose(false);
-    expect(composition.offerings.map((offering) => offering.id)).toEqual([
+    expect(composition.offerings).toEqual([]);
+    expect(composition.provider.offerings.map((offering) => offering.id)).toEqual([
       "storage.object.standard",
     ]);
   });

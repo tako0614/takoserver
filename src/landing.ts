@@ -113,21 +113,21 @@ ${console_}
 <section class="grid" aria-label="Products">
 <article><h2 data-i18n="computeTitle">Compute</h2><p data-i18n="computeBody">Deploy edge services and attach the resources they use.</p></article>
 <article><h2 data-i18n="dataTitle">Data</h2><p data-i18n="dataBody">Databases, key-value storage, queues, and migration-ready state.</p></article>
-<article><h2 data-i18n="storageTitle">Object storage</h2><p data-i18n="storageBody">Standard S3 access with scoped credentials and independent lifecycle.</p></article>
+<article><h2 data-i18n="storageTitle">Object storage</h2><p data-i18n="storageBody">Host-owned standard S3 supplied to workloads as sealed native bindings.</p></article>
 <article><h2 data-i18n="aiTitle">AI</h2><p data-i18n="aiBody">OpenAI-compatible inference with explicit model prices and usage records.</p></article>
 </section>
 <section class="billing"><h2 data-i18n="billingTitle">Usage-based, prepaid billing</h2><p data-i18n="billingBody">Measured usage is accumulated at fine precision and settled to your wallet in clear rollups. You can see what was used and charged.</p></section>
 <ul>
 <li><a href="${base}/openapi.json"><code>${base}/openapi.json</code><span data-i18n="api">API description</span></a></li>
 <li><a href="${base}/.well-known/takoserver"><code>${base}/.well-known/takoserver</code><span data-i18n="product">Product discovery</span></a></li>
-<li><a href="${base}/.well-known/takoform/v1alpha3"><code>${base}/.well-known/takoform/v1alpha3</code><span data-i18n="host">Takoform Host discovery</span></a></li>
+<li><a href="${base}/.well-known/takoform/v1"><code>${base}/.well-known/takoform/v1</code><span data-i18n="host">Takoform Host discovery</span></a></li>
 </ul>
 <footer>takoserver.com</footer>
 </main>
 <script>
 const messages={
-en:{description:"A developer cloud for compute, data, storage, and AI.",console:"Open the console",eyebrow:"Developer cloud",headline:"Cloud resources, without the cloud maze.",lede:"Create compute, data, storage, and AI resources through one control plane. Fund a wallet and pay for measured usage.",computeTitle:"Compute",computeBody:"Deploy edge services and attach the resources they use.",dataTitle:"Data",dataBody:"Databases, key-value storage, queues, and migration-ready state.",storageTitle:"Object storage",storageBody:"Standard S3 access with scoped credentials and independent lifecycle.",aiTitle:"AI",aiBody:"OpenAI-compatible inference with explicit model prices and usage records.",billingTitle:"Usage-based, prepaid billing",billingBody:"Measured usage is accumulated at fine precision and settled to your wallet in clear rollups. You can see what was used and charged.",api:"API description",product:"Product discovery",host:"Takoform Host discovery"},
-ja:{description:"コンピュート、データ、ストレージ、AIのための開発者向けクラウド。",console:"コンソールを開く",eyebrow:"開発者向けクラウド",headline:"クラウドを、迷わず使える形に。",lede:"コンピュート、データ、ストレージ、AIを一つのコントロールプレーンから作成できます。ウォレットへ入金し、実際に計測した使用量に応じて支払います。",computeTitle:"コンピュート",computeBody:"エッジサービスをデプロイし、利用するリソースを接続します。",dataTitle:"データ",dataBody:"データベース、KVS、キューと、移行可能な状態管理を提供します。",storageTitle:"オブジェクトストレージ",storageBody:"スコープされた認証情報と独立したライフサイクルを持つ標準S3アクセスです。",aiTitle:"AI",aiBody:"明示されたモデル価格と使用記録を持つOpenAI互換推論です。",billingTitle:"前払い・使用量ベースの課金",billingBody:"細かな単位で利用量を蓄積し、明確な集計としてウォレットへ精算します。利用量と請求額を確認できます。",api:"API仕様",product:"製品ディスカバリー",host:"Takoform Hostディスカバリー"}
+en:{description:"A developer cloud for compute, data, storage, and AI.",console:"Open the console",eyebrow:"Developer cloud",headline:"Cloud resources, without the cloud maze.",lede:"Create compute, data, storage, and AI resources through one control plane. Fund a wallet and pay for measured usage.",computeTitle:"Compute",computeBody:"Deploy edge services and attach the resources they use.",dataTitle:"Data",dataBody:"Databases, key-value storage, queues, and migration-ready state.",storageTitle:"Object storage",storageBody:"Host-owned standard S3 supplied to workloads as sealed native bindings.",aiTitle:"AI",aiBody:"OpenAI-compatible inference with explicit model prices and usage records.",billingTitle:"Usage-based, prepaid billing",billingBody:"Measured usage is accumulated at fine precision and settled to your wallet in clear rollups. You can see what was used and charged.",api:"API description",product:"Product discovery",host:"Takoform Host discovery"},
+ja:{description:"コンピュート、データ、ストレージ、AIのための開発者向けクラウド。",console:"コンソールを開く",eyebrow:"開発者向けクラウド",headline:"クラウドを、迷わず使える形に。",lede:"コンピュート、データ、ストレージ、AIを一つのコントロールプレーンから作成できます。ウォレットへ入金し、実際に計測した使用量に応じて支払います。",computeTitle:"コンピュート",computeBody:"エッジサービスをデプロイし、利用するリソースを接続します。",dataTitle:"データ",dataBody:"データベース、KVS、キューと、移行可能な状態管理を提供します。",storageTitle:"オブジェクトストレージ",storageBody:"Host管理の標準S3をsealed native bindingとしてworkloadへ供給します。",aiTitle:"AI",aiBody:"明示されたモデル価格と使用記録を持つOpenAI互換推論です。",billingTitle:"前払い・使用量ベースの課金",billingBody:"細かな単位で利用量を蓄積し、明確な集計としてウォレットへ精算します。利用量と請求額を確認できます。",api:"API仕様",product:"製品ディスカバリー",host:"Takoform Hostディスカバリー"}
 };
 const localizedPaths=${String(options.apiOrigin !== null)};
 const pathLocale=location.pathname.split("/")[1];

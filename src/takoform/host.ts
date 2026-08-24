@@ -4,7 +4,12 @@ import { installedBindings } from "./bindings.ts";
 import type { WorkerModuleInspector } from "./engine.ts";
 import { createTakoformEngine } from "./engine.ts";
 import { installedForms } from "./forms.ts";
-import { createTakoformRoutes, type ProvisionLanePorts } from "./routes.ts";
+import { createDeferredOperations, type DeferredOperationsConfiguration } from "./operations.ts";
+import {
+  createTakoformRoutes,
+  DEFAULT_TAKOFORM_ROUTES,
+  type ProvisionLanePorts,
+} from "./routes.ts";
 import { createTakoformStore } from "./store.ts";
 import type {
   InstalledTakoformBinding,
@@ -12,6 +17,7 @@ import type {
   TakoformHost,
   TakoformHostPrincipal,
   TakoformResourceDriver,
+  TakoformStandardServiceResolver,
 } from "./types.ts";
 
 /**
@@ -32,6 +38,10 @@ export interface CreateTakoformHostOptions {
   readonly clock?: Clock;
   readonly randomId?: () => string;
   readonly workerModuleInspector?: WorkerModuleInspector;
+  /** Optional asynchronous lifecycle policy; production may compose durable operations. */
+  readonly deferredOperations?: DeferredOperationsConfiguration;
+  /** Exact Host-owned standard-service resolver, scoped by tenant and Space. */
+  readonly standardServiceResolver?: TakoformStandardServiceResolver;
   /** When present, the single-use provision-token redemption lane is served. */
   readonly provision?: ProvisionLanePorts;
   readonly blockingRelations?: (
@@ -43,25 +53,50 @@ export interface CreateTakoformHostOptions {
 export function createTakoformHost(options: CreateTakoformHostOptions): TakoformHost {
   const clock = options.clock ?? (() => new Date());
   const randomId = options.randomId ?? (() => crypto.randomUUID());
-  const forms = installedForms(options.forms);
+  // Public and production assembly has exactly one route identity. Historical
+  // engine regressions use a test-only assembler under `tests/helpers` rather
+  // than turning old lanes back into a shipped configuration capability.
+  const routes = DEFAULT_TAKOFORM_ROUTES;
+  const forms = installedForms(options.forms, routes.hostApiVersion);
   const bindings = installedBindings(options.bindings ?? []);
   const store = createTakoformStore(options.sql, clock);
   const artifacts =
     options.artifacts ??
-    createTakoformArtifacts({ sql: options.sql, objects: options.objects, clock, randomId });
+    createTakoformArtifacts({
+      sql: options.sql,
+      objects: options.objects,
+      clock,
+      randomId,
+    });
   const engine = createTakoformEngine({
     store,
     forms,
     bindings,
     driver: options.driver,
     artifacts,
+    ...(routes.bodyGenerationFence ? { allowBodyGenerationFence: true } : {}),
+    ...(routes.reviewSpecDigest ? { allowReviewSpecDigest: true } : {}),
     clock,
     randomId,
     ...(options.workerModuleInspector
       ? { workerModuleInspector: options.workerModuleInspector }
       : {}),
     ...(options.blockingRelations ? { blockingRelations: options.blockingRelations } : {}),
+    ...(options.standardServiceResolver
+      ? { standardServiceResolver: options.standardServiceResolver }
+      : {}),
   });
+  const deferredOperations = options.deferredOperations
+    ? createDeferredOperations({
+        configuration: options.deferredOperations,
+        engine,
+        store,
+        forms,
+        clock,
+        randomId,
+        ...(routes.omitObservedStatus ? { omitObservedStatus: true } : {}),
+      })
+    : undefined;
   return createTakoformRoutes({
     authenticate: options.authenticate,
     engine,
@@ -69,6 +104,10 @@ export function createTakoformHost(options: CreateTakoformHostOptions): Takoform
     forms,
     bindings,
     artifacts,
+    ...(deferredOperations ? { deferredOperations } : {}),
+    ...(options.standardServiceResolver
+      ? { standardServiceResolver: options.standardServiceResolver }
+      : {}),
     ...(options.provision ? { provision: options.provision } : {}),
   });
 }

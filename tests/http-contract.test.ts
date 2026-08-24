@@ -30,24 +30,26 @@ function handler() {
     settlement,
     publicOrigin: "https://api.takoserver.com",
     forms: [],
+    hostForms: [],
     driver: new InMemoryTakoformResourceDriver(),
     offerings: [],
   }).fetch;
 }
 
-/** Both Takoform lanes are mirrored, so the document must mirror them too. */
+/** The one stable Takoform Host lane; Form family groups are versionless. */
 const TAKOFORM_SUFFIXES = [
   "/forms",
-  "/form-definitions/{group}/{version}/{kind}",
+  "/form-definitions/{group}/{kind}",
   "/support/forms",
-  "/support/forms/{group}/{version}/{kind}/{definitionVersion}",
+  "/support/forms/{group}/{kind}/{definitionVersion}",
   "/support/interfaces/{name}/{version}",
   "/support/bindings/{name}/{version}",
+  "/support/standard-services/{protocol}",
   "/resources/validate",
   "/resources/prepare",
-  "/resources/{group}/{version}/{kind}/{name}",
-  "/resources/{group}/{version}/{kind}/{name}/observe",
-  "/resources/{group}/{version}/{kind}/{name}/import",
+  "/resources/{group}/{kind}/{name}",
+  "/resources/{group}/{kind}/{name}/observe",
+  "/resources/{group}/{kind}/{name}/import",
   "/operations/{operationId}",
   "/operations/{operationId}/cancel",
   "/artifacts/uploads",
@@ -60,8 +62,7 @@ const TAKOFORM_SUFFIXES = [
 
 const PUBLIC_PATHS = [
   "/",
-  "/.well-known/takoform/v1alpha3",
-  "/.well-known/takoform/v1beta1",
+  "/.well-known/takoform/v1",
   "/.well-known/takoserver",
   "/openapi.json",
   "/v1/catalog",
@@ -99,16 +100,16 @@ const PUBLIC_PATHS = [
 ];
 
 describe("published API description", () => {
-  test("declares exactly the surface that exists, with both lanes mirrored", () => {
+  test("declares exactly the one literal stable Host surface", () => {
     const expected = [
       ...PUBLIC_PATHS,
-      ...["v1beta1", "v1alpha3"].flatMap((lane) =>
-        TAKOFORM_SUFFIXES.map((suffix) => `/apis/forms.takoform.com/${lane}${suffix}`),
-      ),
+      ...TAKOFORM_SUFFIXES.map((suffix) => `/apis/forms.takoform.com/v1${suffix}`),
     ].sort();
     expect(openApiPaths()).toEqual(expected);
-    // The mirror is generated, so the two lanes cannot drift apart.
-    expect(TAKOFORM_SUFFIXES.length * 2 + PUBLIC_PATHS.length).toBe(openApiPaths().length);
+    expect(TAKOFORM_SUFFIXES.length + PUBLIC_PATHS.length).toBe(openApiPaths().length);
+    expect(JSON.stringify(openApiDocument)).not.toMatch(
+      /forms\.takoform\.com\/(?:v1alpha3|v1beta1|v1beta4)/u,
+    );
   });
 
   test("names one server and one bearer scheme", () => {
@@ -176,6 +177,7 @@ describe("published API description", () => {
           settlement,
           publicOrigin,
           forms: [],
+          hostForms: [],
           driver: new InMemoryTakoformResourceDriver(),
           offerings: [],
         }),
@@ -190,6 +192,7 @@ describe("published API description", () => {
         settlement,
         publicOrigin: "http://localhost:8787",
         forms: [],
+        hostForms: [],
         driver: new InMemoryTakoformResourceDriver(),
         offerings: [],
       }),

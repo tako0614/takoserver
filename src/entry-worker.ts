@@ -9,6 +9,7 @@ import type { RuntimeMaterializer } from "./runtime-materialization.ts";
 import { loadSigningKey } from "./signing-key.ts";
 import { createD1Sql } from "./sql-d1.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
+import { currentTakoformCatalog } from "./takoform/current-catalog.ts";
 import { createJavaScriptWorkerModuleInspector } from "./takoform/worker-module-inspector.ts";
 import { createWorkerDataServices } from "./worker-data-services.ts";
 import { createWorkerProductionComposition } from "./worker-production-composition.ts";
@@ -60,6 +61,8 @@ interface WorkerEnv {
   readonly TAKOSERVER_SIGNING_KEY?: string;
   /** Private model mapping and retail price configuration. */
   readonly TAKOSERVER_AI_MODELS?: string;
+  /** Explicit Host-owned standard-service supplies; absent is fail-closed. */
+  readonly TAKOSERVER_STANDARD_SERVICE_SUPPLIES?: string;
   /** Metadata identifying the R2 parent token used for temporary credentials. */
   readonly TAKOSERVER_R2_PARENT_ACCESS_KEY_ID?: string;
   /** R2 parent token. A secret distinct from the general Cloudflare API token. */
@@ -133,6 +136,7 @@ let cached: { readonly env: WorkerEnv; readonly app: App } | null = null;
 async function appFor(env: WorkerEnv, origin: string): Promise<App> {
   if (cached?.env === env) return cached.app;
   const edge = await buildEdgeForms();
+  const currentHost = currentTakoformCatalog(edge);
   const { identity, identityProviders, settlement, checkout } = credentials(env);
   const sql = createD1Sql(env.STATE_DB);
   const objects = createR2ObjectStore(env.OBJECTS);
@@ -181,9 +185,14 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
       : {}),
     forms: edge.forms,
     bindings: edge.bindings,
+    hostForms: currentHost.forms,
+    hostBindings: currentHost.bindings,
     providers: deployment.providers,
     providerPacks: deployment.providerPacks,
     offerings: deployment.offerings,
+    ...(deployment.standardServiceResolver
+      ? { standardServiceResolver: deployment.standardServiceResolver }
+      : {}),
   });
   cached = { env, app };
   return app;

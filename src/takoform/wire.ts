@@ -33,7 +33,10 @@ export interface ParsedResource {
 }
 
 export interface ParsedApply extends ParsedResource {
-  readonly review: { readonly prepareDigest: `sha256:${string}` };
+  readonly review: {
+    readonly prepareDigest: `sha256:${string}`;
+    readonly specDigest?: `sha256:${string}`;
+  };
   readonly expectedUid?: string;
   readonly expectedGeneration?: string;
 }
@@ -98,10 +101,13 @@ export function applyRequest(input: unknown): ParsedApply {
     Object.fromEntries(baseKeys.filter((key) => key !== "review").map((key) => [key, value[key]])),
   );
   const review = record(value.review);
-  exactKeys(review, ["prepareDigest"]);
+  exactKeys(review, ["prepareDigest", ...(review.specDigest === undefined ? [] : ["specDigest"])]);
   return {
     ...base,
-    review: { prepareDigest: digest(string(review.prepareDigest)) },
+    review: {
+      prepareDigest: digest(string(review.prepareDigest)),
+      ...(review.specDigest === undefined ? {} : { specDigest: digest(string(review.specDigest)) }),
+    },
     ...(value.expectedUid === undefined
       ? {}
       : { expectedUid: boundedReference(string(value.expectedUid)) }),
@@ -146,15 +152,20 @@ function validateResource(input: ParsedResource): void {
 
 export function parsedResourcePath(match: RegExpExecArray): ResourcePath {
   const group = safeSegment(match[1]);
-  const version = safeSegment(match[2]);
+  const version = match[2] === undefined ? undefined : safeSegment(match[2]);
   const kind = safeSegment(match[3]);
   const name = safeSegment(match[4]);
-  if (!isFormGroup(group) || !isFormVersion(version) || !isKind(kind) || !NAME.test(name)) {
+  if (
+    !isFormGroup(group) ||
+    (version !== undefined && !isFormVersion(version)) ||
+    !isKind(kind) ||
+    !NAME.test(name)
+  ) {
     throw new TakoformHostError();
   }
   const action = match[5];
   return {
-    apiVersion: `${group}/${version}`,
+    apiVersion: version === undefined ? group : `${group}/${version}`,
     kind,
     name,
     ...(action === "import" || action === "observe" ? { action } : {}),
@@ -202,9 +213,16 @@ export function idempotencyKey(request: Request): string {
   return key;
 }
 
-export function requiredExpectedGeneration(request: Request, body?: string): string {
+export function requiredExpectedGeneration(
+  request: Request,
+  body?: string,
+  allowBodyOnly = false,
+): string {
   const header = request.headers.get("takoform-expected-generation");
-  if (!header) throw new TakoformHostError();
+  if (!header) {
+    if (allowBodyOnly && body !== undefined) return generation(body);
+    throw new TakoformHostError();
+  }
   const parsed = generation(header);
   if (body !== undefined && body !== parsed) throw new TakoformHostError();
   return parsed;

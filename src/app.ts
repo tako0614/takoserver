@@ -35,6 +35,7 @@ import type {
   InstalledTakoformForm,
   TakoformHost,
   TakoformResourceDriver,
+  TakoformStandardServiceResolver,
 } from "./takoform/types.ts";
 import { TakoformHostError } from "./takoform/types.ts";
 import { createTokenService, type SigningKey, TokenError } from "./token.ts";
@@ -70,6 +71,11 @@ export interface AppPorts {
   readonly forms: readonly InstalledTakoformForm[];
   /** Exact portable BindingDefinitions installed by this Host composition. */
   readonly bindings?: readonly InstalledTakoformBinding[];
+  /** Literal stable-v1 public Host catalog, distinct from historical product/provider Forms. */
+  readonly hostForms: readonly InstalledTakoformForm[];
+  readonly hostBindings?: readonly InstalledTakoformBinding[];
+  /** Host-owned exact stable standard-service integrations. */
+  readonly standardServiceResolver?: TakoformStandardServiceResolver;
   /** How a caller may sign in to this deployment. */
   readonly identityProviders?: readonly IdentityProviderDescriptor[];
   /**
@@ -177,7 +183,6 @@ export function buildApp(ports: AppPorts): App {
       ledger,
       deployments,
     });
-
   const takoformHost =
     ports.takoformHost ??
     createTakoformHost({
@@ -289,12 +294,15 @@ export function buildApp(ports: AppPorts): App {
           return null;
         }
       },
-      forms: ports.forms,
-      ...(ports.bindings ? { bindings: ports.bindings } : {}),
+      forms: ports.hostForms,
+      ...(ports.hostBindings ? { bindings: ports.hostBindings } : {}),
       driver,
       ...(ports.artifacts ? { artifacts: ports.artifacts } : {}),
       ...(ports.workerModuleInspector
         ? { workerModuleInspector: ports.workerModuleInspector }
+        : {}),
+      ...(ports.standardServiceResolver
+        ? { standardServiceResolver: ports.standardServiceResolver }
         : {}),
       clock,
       randomId,

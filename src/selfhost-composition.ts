@@ -20,7 +20,7 @@ import {
 import type { WorkerdRuntime } from "./workerd-runtime.ts";
 
 /**
- * Composes what a machine standing on its own sells and executes.
+ * Composes what a machine standing on its own can still drain and execute.
  *
  * The whole released Edge Family goes through ONE provider and one
  * installation, for the same reason the Worker entry holds Cloudflare to one:
@@ -28,10 +28,9 @@ import type { WorkerdRuntime } from "./workerd-runtime.ts";
  * two installations on one machine would refuse the version that uses a bucket
  * and a KV namespace together.
  *
- * A self-hosted Takoserver that cannot host a Worker is not a Takoform Host,
- * so the Edge Family is offered by default. `edgeForms: false` narrows the
- * catalog back to object storage for an operator who deliberately runs a
- * storage-only machine.
+ * The released Edge identities are no longer sold. They stay behind the
+ * Provider Pack only so already-recorded beta Deployments can be observed and
+ * deleted. `edgeForms: false` narrows that historical drain capability.
  */
 
 const SUPPLY_CONTRACT_REF = "local.ownership-contract";
@@ -181,5 +180,10 @@ export function createSelfhostComposition(
     now: options.now,
   });
 
-  return { ...compiled, provider };
+  // The released provider catalog is historical compatibility, not current
+  // sale authority. Keep the Provider Pack so recorded Deployments can still
+  // be observed and deleted, but publish no beta identity Offering to `/v1`
+  // or `/provision/v1`. Stable S3 enters Workers through a standard-service
+  // supply; it is not a revived ObjectBucket sale.
+  return { ...compiled, offerings: [], provider };
 }

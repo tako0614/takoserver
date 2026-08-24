@@ -12,3 +12,14 @@ export interface TakoformV1Alpha3FormRef {
   readonly definitionVersion: string;
   readonly schemaDigest: `sha256:${string}`;
 }
+
+const EDGE_FORMS_GROUP = "edge.forms.takoform.com";
+
+/** Recognizes the stable Edge group and its exact retained versioned lanes. */
+export function isEdgeFormsApiVersion(apiVersion: string): boolean {
+  const separator = apiVersion.indexOf("/");
+  return (
+    apiVersion === EDGE_FORMS_GROUP ||
+    (separator > 0 && apiVersion.slice(0, separator) === EDGE_FORMS_GROUP)
+  );
+}

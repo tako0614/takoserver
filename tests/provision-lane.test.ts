@@ -434,7 +434,7 @@ describe("Takoform run-token lane", () => {
     const foreign = await laneRequest(
       host,
       "POST",
-      "/apis/forms.takoform.com/v1beta1/resources/prepare",
+      "/apis/forms.takoform.com/v1/resources/prepare",
       issued.token,
       { ...resourceBody(), metadata: { space: TENANT, name: "other" } },
     );
@@ -449,7 +449,7 @@ describe("Takoform run-token lane", () => {
       schemaDigest: FORM_REF.schemaDigest,
     });
     const mutationPath =
-      "/apis/forms.takoform.com/v1beta1/resources/edge.forms.takoform.com/v1alpha1/EdgeObjectBucket/media";
+      "/apis/forms.takoform.com/v1/resources/edge.forms.takoform.com/v1alpha1/EdgeObjectBucket/media";
     const resourcePath = `${mutationPath}?${query}`;
     const unreviewed = await laneRequest(
       host,
@@ -467,7 +467,7 @@ describe("Takoform run-token lane", () => {
     const prepared = await laneRequest(
       host,
       "POST",
-      "/apis/forms.takoform.com/v1beta1/resources/prepare",
+      "/apis/forms.takoform.com/v1/resources/prepare",
       issued.token,
       resourceBody(),
     );

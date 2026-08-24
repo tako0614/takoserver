@@ -58,20 +58,9 @@
         "security": []
       }
     },
-    "/.well-known/takoform/v1beta1": {
+    "/.well-known/takoform/v1": {
       "get": {
-        "summary": "Released Takoform lane discovery",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        },
-        "security": []
-      }
-    },
-    "/.well-known/takoform/v1alpha3": {
-      "get": {
-        "summary": "Current Takoform lane discovery",
+        "summary": "Stable Takoform Host discovery",
         "responses": {
           "200": {
             "description": "Success"
@@ -320,7 +309,7 @@
     },
     "/v1/organizations/{organizationId}/resources/{resourceUid}/s3-credentials": {
       "post": {
-        "summary": "Issue short-lived standard S3 credentials for an ObjectBucket",
+        "summary": "Issue short-lived S3 credentials for a historical ObjectBucket record",
         "responses": {
           "200": {
             "description": "Success"
@@ -458,7 +447,7 @@
         }
       }
     },
-    "/apis/forms.takoform.com/v1beta1/forms": {
+    "/apis/forms.takoform.com/v1/forms": {
       "get": {
         "summary": "Resolve one exact installed Form",
         "responses": {
@@ -468,7 +457,7 @@
         }
       }
     },
-    "/apis/forms.takoform.com/v1beta1/form-definitions/{group}/{version}/{kind}": {
+    "/apis/forms.takoform.com/v1/form-definitions/{group}/{kind}": {
       "get": {
         "summary": "Read an installed Form definition",
         "responses": {
@@ -478,7 +467,7 @@
         }
       }
     },
-    "/apis/forms.takoform.com/v1beta1/support/forms": {
+    "/apis/forms.takoform.com/v1/support/forms": {
       "get": {
         "summary": "List support profiles for installed Forms",
         "responses": {
@@ -488,7 +477,7 @@
         }
       }
     },
-    "/apis/forms.takoform.com/v1beta1/support/forms/{group}/{version}/{kind}/{definitionVersion}": {
+    "/apis/forms.takoform.com/v1/support/forms/{group}/{kind}/{definitionVersion}": {
       "get": {
         "summary": "Read one Form support profile",
         "responses": {
@@ -498,7 +487,7 @@
         }
       }
     },
-    "/apis/forms.takoform.com/v1beta1/support/interfaces/{name}/{version}": {
+    "/apis/forms.takoform.com/v1/support/interfaces/{name}/{version}": {
       "get": {
         "summary": "Read a provided Interface contract",
         "responses": {
@@ -508,7 +497,7 @@
         }
       }
     },
-    "/apis/forms.takoform.com/v1beta1/support/bindings/{name}/{version}": {
+    "/apis/forms.takoform.com/v1/support/bindings/{name}/{version}": {
       "get": {
         "summary": "Read an accepted Binding contract",
         "responses": {
@@ -518,7 +507,17 @@
         }
       }
     },
-    "/apis/forms.takoform.com/v1beta1/resources/validate": {
+    "/apis/forms.takoform.com/v1/support/standard-services/{protocol}": {
+      "get": {
+        "summary": "Read exact standard-service support",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/apis/forms.takoform.com/v1/resources/validate": {
       "post": {
         "summary": "Validate desired state without recording it",
         "responses": {
@@ -528,7 +527,7 @@
         }
       }
     },
-    "/apis/forms.takoform.com/v1beta1/resources/prepare": {
+    "/apis/forms.takoform.com/v1/resources/prepare": {
       "post": {
         "summary": "Review desired state and mint a prepare digest",
         "responses": {
@@ -538,7 +537,7 @@
         }
       }
     },
-    "/apis/forms.takoform.com/v1beta1/resources/{group}/{version}/{kind}/{name}": {
+    "/apis/forms.takoform.com/v1/resources/{group}/{kind}/{name}": {
       "get": {
         "summary": "Read a resource",
         "responses": {
@@ -564,7 +563,7 @@
         }
       }
     },
-    "/apis/forms.takoform.com/v1beta1/resources/{group}/{version}/{kind}/{name}/observe": {
+    "/apis/forms.takoform.com/v1/resources/{group}/{kind}/{name}/observe": {
       "post": {
         "summary": "Refresh observed state from the backend",
         "responses": {
@@ -574,7 +573,7 @@
         }
       }
     },
-    "/apis/forms.takoform.com/v1beta1/resources/{group}/{version}/{kind}/{name}/import": {
+    "/apis/forms.takoform.com/v1/resources/{group}/{kind}/{name}/import": {
       "post": {
         "summary": "Adopt an existing native resource",
         "responses": {
@@ -584,7 +583,7 @@
         }
       }
     },
-    "/apis/forms.takoform.com/v1beta1/operations/{operationId}": {
+    "/apis/forms.takoform.com/v1/operations/{operationId}": {
       "get": {
         "summary": "Read a settled operation",
         "responses": {
@@ -594,7 +593,7 @@
         }
       }
     },
-    "/apis/forms.takoform.com/v1beta1/operations/{operationId}/cancel": {
+    "/apis/forms.takoform.com/v1/operations/{operationId}/cancel": {
       "post": {
         "summary": "Request cancellation of an operation",
         "responses": {
@@ -604,7 +603,7 @@
         }
       }
     },
-    "/apis/forms.takoform.com/v1beta1/artifacts/uploads": {
+    "/apis/forms.takoform.com/v1/artifacts/uploads": {
       "post": {
         "summary": "Start an artifact upload",
         "responses": {
@@ -614,7 +613,7 @@
         }
       }
     },
-    "/apis/forms.takoform.com/v1beta1/artifacts/uploads/{uploadId}": {
+    "/apis/forms.takoform.com/v1/artifacts/uploads/{uploadId}": {
       "delete": {
         "summary": "Abandon an artifact upload",
         "responses": {
@@ -624,7 +623,7 @@
         }
       }
     },
-    "/apis/forms.takoform.com/v1beta1/artifacts/uploads/{uploadId}/commit": {
+    "/apis/forms.takoform.com/v1/artifacts/uploads/{uploadId}/commit": {
       "post": {
         "summary": "Commit an artifact upload",
         "responses": {
@@ -634,7 +633,7 @@
         }
       }
     },
-    "/apis/forms.takoform.com/v1beta1/artifacts/uploads/{uploadId}/blobs/{digest}": {
+    "/apis/forms.takoform.com/v1/artifacts/uploads/{uploadId}/blobs/{digest}": {
       "put": {
         "summary": "Upload one declared blob",
         "responses": {
@@ -644,7 +643,7 @@
         }
       }
     },
-    "/apis/forms.takoform.com/v1beta1/artifacts/{digest}": {
+    "/apis/forms.takoform.com/v1/artifacts/{digest}": {
       "get": {
         "summary": "Read a committed manifest",
         "responses": {
@@ -654,213 +653,7 @@
         }
       }
     },
-    "/apis/forms.takoform.com/v1beta1/artifacts/blobs/{digest}": {
-      "head": {
-        "summary": "Check whether a blob is held",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1alpha3/forms": {
-      "get": {
-        "summary": "Resolve one exact installed Form",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1alpha3/form-definitions/{group}/{version}/{kind}": {
-      "get": {
-        "summary": "Read an installed Form definition",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1alpha3/support/forms": {
-      "get": {
-        "summary": "List support profiles for installed Forms",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1alpha3/support/forms/{group}/{version}/{kind}/{definitionVersion}": {
-      "get": {
-        "summary": "Read one Form support profile",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1alpha3/support/interfaces/{name}/{version}": {
-      "get": {
-        "summary": "Read a provided Interface contract",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1alpha3/support/bindings/{name}/{version}": {
-      "get": {
-        "summary": "Read an accepted Binding contract",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1alpha3/resources/validate": {
-      "post": {
-        "summary": "Validate desired state without recording it",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1alpha3/resources/prepare": {
-      "post": {
-        "summary": "Review desired state and mint a prepare digest",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1alpha3/resources/{group}/{version}/{kind}/{name}": {
-      "get": {
-        "summary": "Read a resource",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      },
-      "put": {
-        "summary": "Apply reviewed desired state",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      },
-      "delete": {
-        "summary": "Delete a resource",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1alpha3/resources/{group}/{version}/{kind}/{name}/observe": {
-      "post": {
-        "summary": "Refresh observed state from the backend",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1alpha3/resources/{group}/{version}/{kind}/{name}/import": {
-      "post": {
-        "summary": "Adopt an existing native resource",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1alpha3/operations/{operationId}": {
-      "get": {
-        "summary": "Read a settled operation",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1alpha3/operations/{operationId}/cancel": {
-      "post": {
-        "summary": "Request cancellation of an operation",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1alpha3/artifacts/uploads": {
-      "post": {
-        "summary": "Start an artifact upload",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1alpha3/artifacts/uploads/{uploadId}": {
-      "delete": {
-        "summary": "Abandon an artifact upload",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1alpha3/artifacts/uploads/{uploadId}/commit": {
-      "post": {
-        "summary": "Commit an artifact upload",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1alpha3/artifacts/uploads/{uploadId}/blobs/{digest}": {
-      "put": {
-        "summary": "Upload one declared blob",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1alpha3/artifacts/{digest}": {
-      "get": {
-        "summary": "Read a committed manifest",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1alpha3/artifacts/blobs/{digest}": {
+    "/apis/forms.takoform.com/v1/artifacts/blobs/{digest}": {
       "head": {
         "summary": "Check whether a blob is held",
         "responses": {

@@ -2,9 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   buildApp,
   createEphemeralSql,
-  createInMemoryTakoformHost,
   createMemoryObjectStore,
-  createTakoformHost,
   type ExternalIdentityVerifier,
   type FundingSettlementVerifier,
   InMemoryTakoformResourceDriver,
@@ -16,6 +14,10 @@ import {
   type TakoformHost,
   type TakoformResourceDriver,
 } from "../src/index.ts";
+import {
+  createHistoricalInMemoryTakoformHost as createInMemoryTakoformHost,
+  createHistoricalTakoformHost as createTakoformHost,
+} from "./helpers/historical-takoform-host.ts";
 
 const OWNER_IDENTITY: ExternalIdentityVerifier = {
   async verify() {
@@ -29,6 +31,13 @@ const SETTLEMENT: FundingSettlementVerifier = {
   },
 };
 
+const HISTORICAL_V1ALPHA3_ROUTES = {
+  hostApiVersion: "forms.takoform.com/v1alpha3",
+  apiPath: "/apis/forms.takoform.com/v1alpha3",
+  aliases: ["/apis/forms.takoform.com/v1beta1"],
+  supportProfileApiVersion: "support.takoform.com/v1alpha1",
+} as const;
+
 /** Serves one Takoform Host through the real router and control plane. */
 function handlerFor(
   takoformHost: TakoformHost,
@@ -41,13 +50,14 @@ function handlerFor(
     settlement: SETTLEMENT,
     publicOrigin: "https://api.takoserver.com",
     forms: [],
+    hostForms: [],
     driver: new InMemoryTakoformResourceDriver(),
     offerings: [],
     takoformHost,
   }).fetch;
 }
 
-describe("Takoserver current Takoform Host", () => {
+describe("historical Takoform Host engine regression", () => {
   test("refuses provider deletion while a logical Attachment still references the Resource", async () => {
     const formRef = {
       apiVersion: "data.resources.takoform.com/v1alpha1",
@@ -56,6 +66,7 @@ describe("Takoserver current Takoform Host", () => {
       schemaDigest: `sha256:${"b".repeat(64)}` as const,
     };
     const host = createInMemoryTakoformHost({
+      routes: HISTORICAL_V1ALPHA3_ROUTES,
       authenticate: async () => ({ tenantId: "organization-a", principalId: "provider-key" }),
       forms: [
         {
@@ -83,7 +94,9 @@ describe("Takoserver current Takoform Host", () => {
       resource,
       auth,
     );
-    const prepareDigest = requiredString(requiredRecord(prepared.body, "review"), "prepareDigest");
+    const releasedReview = requiredRecord(prepared.body, "review");
+    expect(Object.keys(releasedReview)).toEqual(["prepareDigest"]);
+    const prepareDigest = requiredString(releasedReview, "prepareDigest");
     const created = await jsonRequest(
       handler,
       "PUT",
@@ -118,6 +131,7 @@ describe("Takoserver current Takoform Host", () => {
   test("serves the exact ObjectBucket Form used by released provider v2.1.1", async () => {
     const { packageDigest: _packageDigest, ...formRef } = TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM;
     const host = createInMemoryTakoformHost({
+      routes: HISTORICAL_V1ALPHA3_ROUTES,
       authenticate: async (authorization) =>
         authorization === "Bearer provider-v2.1.1"
           ? { tenantId: "organization-a", principalId: "provider-key" }
@@ -129,11 +143,7 @@ describe("Takoserver current Takoform Host", () => {
     const discovery = await handler(
       new Request("https://api.takoserver.com/.well-known/takoform/v1beta1"),
     );
-    expect(discovery.status).toBe(200);
-    expect(await discovery.json()).toMatchObject({
-      api_versions: ["forms.takoform.com/v1beta1"],
-      endpoints: { api: "https://api.takoserver.com/apis/forms.takoform.com/v1beta1" },
-    });
+    expect(discovery.status).toBe(404);
 
     const query = new URLSearchParams({
       space: "provider-space",
@@ -196,6 +206,7 @@ describe("Takoserver current Takoform Host", () => {
       ],
     };
     const host = createInMemoryTakoformHost({
+      routes: HISTORICAL_V1ALPHA3_ROUTES,
       authenticate: async () => ({ tenantId: "tenant-a", principalId: "principal-a" }),
       forms: [],
       bindings: [binding],
@@ -237,6 +248,7 @@ describe("Takoserver current Takoform Host", () => {
     };
     expect(() =>
       createInMemoryTakoformHost({
+        routes: HISTORICAL_V1ALPHA3_ROUTES,
         authenticate: async () => null,
         forms: [
           {
@@ -264,6 +276,7 @@ describe("Takoserver current Takoform Host", () => {
       schemaDigest: `sha256:${"7".repeat(64)}` as const,
     };
     const host = createInMemoryTakoformHost({
+      routes: HISTORICAL_V1ALPHA3_ROUTES,
       authenticate: async (authorization) =>
         authorization === "Bearer primary" || authorization === "Bearer alternate"
           ? {
@@ -332,6 +345,7 @@ describe("Takoserver current Takoform Host", () => {
       schemaDigest: `sha256:${"c".repeat(64)}` as const,
     };
     const host = createInMemoryTakoformHost({
+      routes: HISTORICAL_V1ALPHA3_ROUTES,
       authenticate: async () => ({ tenantId: "tenant-a", principalId: "primary" }),
       forms: [
         {
@@ -446,6 +460,7 @@ describe("Takoserver current Takoform Host", () => {
       "x-takoform-target-formrefs": [targetFormRef],
     } as const;
     const host = createTakoformHost({
+      routes: HISTORICAL_V1ALPHA3_ROUTES,
       sql,
       authenticate: async () => ({ tenantId: "tenant-a", principalId: "primary" }),
       forms: [
@@ -681,6 +696,7 @@ describe("Takoserver current Takoform Host", () => {
       },
     };
     const host = createTakoformHost({
+      routes: HISTORICAL_V1ALPHA3_ROUTES,
       authenticate: async () => ({ tenantId: "tenant-a", principalId: "primary" }),
       forms: [
         {
@@ -749,6 +765,7 @@ describe("Takoserver current Takoform Host", () => {
     };
     const manifestDigest = `sha256:${"4".repeat(64)}` as const;
     const host = createTakoformHost({
+      routes: HISTORICAL_V1ALPHA3_ROUTES,
       authenticate: async () => ({ tenantId: "tenant-a", principalId: "primary" }),
       forms: [
         {
@@ -812,25 +829,25 @@ describe("Takoserver current Takoform Host", () => {
     expect(applied.body).toMatchObject({ error: { code: "artifact_invalid" } });
   });
 
-  test("keeps the current versioned v1alpha3 discovery contract beside the released lane", async () => {
-    const identity: ExternalIdentityVerifier = {
-      async verify() {
-        return { providerSubject: "subject", email: "owner@example.com", displayName: "Owner" };
-      },
-    };
+  test("keeps historical engine routes explicit while public discovery is stable-only", async () => {
     const handler = handlerFor(
       createInMemoryTakoformHost({
+        routes: HISTORICAL_V1ALPHA3_ROUTES,
         authenticate: async () => null,
         forms: [],
       }),
     );
 
-    const response = await handler(
+    const retired = await handler(
       new Request("https://api.takoserver.com/.well-known/takoform/v1alpha3"),
+    );
+    expect(retired.status).toBe(404);
+    const response = await handler(
+      new Request("https://api.takoserver.com/.well-known/takoform/v1"),
     );
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
-      api_versions: ["forms.takoform.com/v1alpha3"],
+      api_versions: ["forms.takoform.com/v1"],
       features: {
         service_forms: true,
         exact_form_ref: true,
@@ -841,10 +858,7 @@ describe("Takoserver current Takoform Host", () => {
         support_profiles: true,
       },
       endpoints: {
-        api: "https://api.takoserver.com/apis/forms.takoform.com/v1alpha3",
-        artifacts: "https://api.takoserver.com/apis/forms.takoform.com/v1alpha3/artifacts",
-        operations: "https://api.takoserver.com/apis/forms.takoform.com/v1alpha3/operations",
-        support: "https://api.takoserver.com/apis/forms.takoform.com/v1alpha3/support",
+        api: "https://api.takoserver.com/apis/forms.takoform.com/v1",
       },
     });
 
@@ -869,6 +883,7 @@ describe("Takoserver current Takoform Host", () => {
       async delete() {},
     };
     const host = createTakoformHost({
+      routes: HISTORICAL_V1ALPHA3_ROUTES,
       authenticate: async () => ({ tenantId: "tenant-a", principalId: "principal-a" }),
       forms: [
         {
@@ -924,6 +939,7 @@ describe("Takoserver current Takoform Host", () => {
       schemaDigest: `sha256:${"9".repeat(64)}` as const,
     };
     const host = createInMemoryTakoformHost({
+      routes: HISTORICAL_V1ALPHA3_ROUTES,
       authenticate: async (authorization) => {
         if (authorization !== "Bearer tenant-a") return null;
         return { tenantId: "tenant-a", principalId: "principal-a" };
@@ -1182,6 +1198,7 @@ describe("Takoserver current Takoform Host", () => {
       schemaDigest: `sha256:${"3".repeat(64)}`,
     } as const;
     const host = createInMemoryTakoformHost({
+      routes: HISTORICAL_V1ALPHA3_ROUTES,
       authenticate: async (authorization) => {
         if (authorization === "Bearer tenant-a-owner") {
           return { tenantId: "tenant-a", principalId: "owner" };
@@ -1459,6 +1476,7 @@ describe("Takoserver current Takoform Host", () => {
       settlement: SETTLEMENT,
       publicOrigin: "https://api.takoserver.com",
       forms: [form],
+      hostForms: [form],
       driver: new InMemoryTakoformResourceDriver(),
       offerings: [],
     }).fetch;
@@ -1485,7 +1503,7 @@ describe("Takoserver current Takoform Host", () => {
     );
     const apiKey = { secret: String(created.body.secret) };
 
-    const query = `/apis/forms.takoform.com/v1alpha3/forms?space=provider-space&group=${encodeURIComponent(formRef.apiVersion)}&kind=${formRef.kind}&definitionVersion=${formRef.definitionVersion}&schemaDigest=${encodeURIComponent(formRef.schemaDigest)}`;
+    const query = `/apis/forms.takoform.com/v1/forms?space=provider-space&group=${encodeURIComponent(formRef.apiVersion)}&kind=${formRef.kind}&definitionVersion=${formRef.definitionVersion}&schemaDigest=${encodeURIComponent(formRef.schemaDigest)}`;
     const sessionRejected = await jsonRequest(handler, "GET", query, undefined, {
       authorization: `Bearer ${sessionToken}`,
     });
@@ -1504,6 +1522,7 @@ describe("Takoserver current Takoform Host", () => {
       schemaDigest: `sha256:${"8".repeat(64)}`,
     } as const;
     const host = createInMemoryTakoformHost({
+      routes: HISTORICAL_V1ALPHA3_ROUTES,
       authenticate: async (authorization) =>
         authorization === "Bearer tenant-run"
           ? {

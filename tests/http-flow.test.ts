@@ -92,6 +92,7 @@ function newApp() {
     settlement,
     publicOrigin: "https://api.takoserver.com",
     forms: [],
+    hostForms: [],
     driver: new InMemoryTakoformResourceDriver(),
     offerings: [OFFERING],
   });
@@ -113,6 +114,7 @@ async function newSignedApp() {
     settlement,
     publicOrigin: "https://api.takoserver.com",
     forms: [INSTALLED_FORM],
+    hostForms: [INSTALLED_FORM],
     providers: [new FakeProvider({ id: "cloudflare", offerings: [PROVIDER_OFFERING] })],
     offerings: [OFFERING],
     signingKey,
@@ -216,7 +218,7 @@ describe("prepaid vertical over HTTP", () => {
     const foreign = await call(
       fetch,
       "POST",
-      "/apis/forms.takoform.com/v1beta1/resources/prepare",
+      "/apis/forms.takoform.com/v1/resources/prepare",
       { ...resource, metadata: { space: "tenant_x", name: "other" } },
       bearer,
     );
@@ -225,7 +227,7 @@ describe("prepaid vertical over HTTP", () => {
     const prepared = await call(
       fetch,
       "POST",
-      "/apis/forms.takoform.com/v1beta1/resources/prepare",
+      "/apis/forms.takoform.com/v1/resources/prepare",
       resource,
       bearer,
     );
@@ -239,7 +241,7 @@ describe("prepaid vertical over HTTP", () => {
       schemaDigest: OFFERING.form.schemaDigest,
     });
     const mutationPath =
-      "/apis/forms.takoform.com/v1beta1/resources/edge.forms.takoform.com/v1beta1/ObjectBucket/media";
+      "/apis/forms.takoform.com/v1/resources/edge.forms.takoform.com/v1beta1/ObjectBucket/media";
     const resourcePath = `${mutationPath}?${query}`;
     const applied = await call(
       fetch,
@@ -328,7 +330,7 @@ describe("prepaid vertical over HTTP", () => {
     const replacementPrepared = await call(
       fetch,
       "POST",
-      "/apis/forms.takoform.com/v1beta1/resources/prepare",
+      "/apis/forms.takoform.com/v1/resources/prepare",
       resource,
       { ...replacementBearer, "takoform-expected-generation": generation },
     );
@@ -581,6 +583,7 @@ describe("prepaid vertical over HTTP", () => {
       settlement,
       publicOrigin: "https://api.takoserver.com",
       forms: [],
+      hostForms: [],
       driver: new InMemoryTakoformResourceDriver(),
       offerings: [OFFERING],
       clock: () => new Date(now),
