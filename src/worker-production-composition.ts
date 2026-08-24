@@ -25,7 +25,8 @@ import { createWasabiBucketMeterSource } from "./providers/wasabi-meter.ts";
 import type { RuntimeMaterializer } from "./runtime-materialization.ts";
 import { createS3AttachmentFactory } from "./s3-attachment-factory.ts";
 import type { S3CredentialIssuer } from "./s3-port.ts";
-import type { InstalledTakoformForm } from "./takoform/types.ts";
+import { createProductionStandardServiceResolver } from "./standard-service-production.ts";
+import type { InstalledTakoformForm, TakoformStandardServiceResolver } from "./takoform/types.ts";
 
 const HOST_INTRINSIC = new Set([
   "WorkerBundle",
@@ -35,6 +36,7 @@ const HOST_INTRINSIC = new Set([
 ]);
 
 export interface WorkerProductionCompositionEnv {
+  readonly TAKOSERVER_STANDARD_SERVICE_SUPPLIES?: string;
   readonly TAKOSERVER_OBJECT_BUCKET_SUPPLIES?: string;
   readonly TAKOSERVER_EDGE_SUPPLIES?: string;
   readonly CLOUDFLARE_ACCOUNT_ID?: string;
@@ -51,6 +53,7 @@ export interface WorkerProductionComposition {
   readonly providers: readonly Provider[];
   readonly providerPacks: readonly ProviderPack[];
   readonly offerings: ReturnType<typeof compileDeploymentComposition>["offerings"];
+  readonly standardServiceResolver?: TakoformStandardServiceResolver;
 }
 
 /**
@@ -67,9 +70,24 @@ export function createWorkerProductionComposition(input: {
   readonly artifacts: ArtifactBytes;
   readonly s3CredentialIssuer?: S3CredentialIssuer;
   readonly runtimeMaterializer?: RuntimeMaterializer;
+  readonly fetch?: (request: Request) => Promise<Response>;
   readonly now: Date;
 }): WorkerProductionComposition {
   const { env } = input;
+  const standardServiceResolver = createProductionStandardServiceResolver({
+    ...(env.TAKOSERVER_STANDARD_SERVICE_SUPPLIES === undefined
+      ? {}
+      : { raw: env.TAKOSERVER_STANDARD_SERVICE_SUPPLIES }),
+    ...(env.CLOUDFLARE_ACCOUNT_ID && env.CLOUDFLARE_API_TOKEN
+      ? {
+          cloudflare: {
+            accountId: env.CLOUDFLARE_ACCOUNT_ID,
+            authorize: () => `Bearer ${env.CLOUDFLARE_API_TOKEN}`,
+            ...(input.fetch ? { fetch: input.fetch } : {}),
+          },
+        }
+      : {}),
+  });
   const objectBucketSupplies = env.TAKOSERVER_OBJECT_BUCKET_SUPPLIES
     ? parseHostedObjectBucketSupplies(env.TAKOSERVER_OBJECT_BUCKET_SUPPLIES)
     : null;
@@ -85,7 +103,7 @@ export function createWorkerProductionComposition(input: {
     env.TAKOSERVER_WASABI_ACCESS_KEY_ID || env.TAKOSERVER_WASABI_SECRET_ACCESS_KEY,
   );
   if (!objectBucketSupplies && !edgeSupplies) {
-    if (hasCloudflareCredential || hasWasabiCredential) {
+    if ((hasCloudflareCredential && !standardServiceResolver) || hasWasabiCredential) {
       throw new TypeError("provider credentials require reviewed hosted supplies");
     }
     return {
@@ -94,6 +112,7 @@ export function createWorkerProductionComposition(input: {
       providers: [],
       providerPacks: [],
       offerings: [],
+      ...(standardServiceResolver ? { standardServiceResolver } : {}),
     };
   }
   if (cloudflareObjects.length > 0 && !input.s3CredentialIssuer) {
@@ -334,7 +353,11 @@ export function createWorkerProductionComposition(input: {
     edgeSupplies,
     providers,
     providerPacks: compiled.providerPacks,
-    offerings: compiled.offerings,
+    // Retain the released Provider Packs only for already-recorded Deployment
+    // observation/deletion. Their beta Form identities are not current sale or
+    // provision authority after the literal stable Host cutover.
+    offerings: [],
+    ...(standardServiceResolver ? { standardServiceResolver } : {}),
   };
 }
 

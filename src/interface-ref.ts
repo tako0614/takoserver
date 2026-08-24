@@ -7,7 +7,7 @@ export interface TakoformInterfaceRef {
 }
 
 export interface TakoformBindingRef {
-  readonly apiVersion: "bindings.takoform.com/v1alpha1";
+  readonly apiVersion: "bindings.takoform.com/v1alpha1" | "bindings.takoform.com/v1alpha2";
   readonly name: string;
   readonly version: string;
   readonly schemaDigest: `sha256:${string}`;

@@ -12,8 +12,9 @@ import {
   type InstalledTakoformForm,
   type Offering,
 } from "../src/index.ts";
+import { type Sql, SqlError } from "../src/ports.ts";
 import { createProviderDriver } from "../src/provider-driver.ts";
-import type { ProviderOffering } from "../src/provider-port.ts";
+import type { Provider, ProviderOffering } from "../src/provider-port.ts";
 import { FakeProvider } from "../src/providers/fake.ts";
 
 /**
@@ -106,6 +107,7 @@ function newApp(options: { failOn?: readonly string[]; usageOnly?: boolean } = {
     settlement,
     publicOrigin: "https://api.takoserver.com",
     forms: [FORM],
+    hostForms: [FORM],
     providers: [provider],
     offerings: [
       options.usageOnly
@@ -174,7 +176,7 @@ async function tenant(fetch: (request: Request) => Promise<Response>) {
   };
 }
 
-const LANE = "/apis/forms.takoform.com/v1alpha3";
+const LANE = "/apis/forms.takoform.com/v1";
 const QUERY =
   `space=default&group=${encodeURIComponent(FORM_REF.apiVersion)}&kind=${FORM_REF.kind}` +
   `&definitionVersion=${FORM_REF.definitionVersion}` +
@@ -337,6 +339,146 @@ describe("Takoform apply on a real backend", () => {
     expect(await ledger.wallet(organizationId)).toMatchObject({ settledMinor: 1_500 });
   });
 
+  test("resumes an executed provider receipt after the final atomic batch is lost", async () => {
+    const durable = createEphemeralSql();
+    let failFinalBatch = false;
+    const sql: Sql = {
+      query: (statement, params) => durable.query(statement, params),
+      run: (statement, params) => durable.run(statement, params),
+      async batch(statements) {
+        if (
+          failFinalBatch &&
+          statements.some((statement) =>
+            statement.sql.includes("DELETE FROM tf_provider_mutation_sagas"),
+          )
+        ) {
+          failFinalBatch = false;
+          throw new SqlError("unavailable", "simulated lost final commit acknowledgement");
+        }
+        return await durable.batch(statements);
+      },
+    };
+    const provider = new FakeProvider({ offerings: [PROVIDER_OFFERING] });
+    const clock = () => new Date("2026-08-24T00:00:00.000Z");
+    const app = buildApp({
+      sql,
+      objects: createMemoryObjectStore(),
+      identity,
+      settlement,
+      publicOrigin: "https://api.takoserver.com",
+      forms: [FORM],
+      hostForms: [FORM],
+      providers: [provider],
+      offerings: [SOLD],
+      clock,
+    });
+    const { organizationId, provider: auth } = await tenant(app.fetch);
+    failFinalBatch = true;
+
+    const first = await applyBucket(app.fetch, auth, "lost-ack", { location: "apac" }, "lost-001");
+    expect(first.status).toBe(500);
+    expect(provider.listResources()).toEqual([`${organizationId}/default/lost-ack`]);
+    expect(
+      await sql.query("SELECT phase FROM tf_provider_mutation_sagas WHERE tenant_id = ?", [
+        organizationId,
+      ]),
+    ).toEqual([{ phase: "executed" }]);
+    expect(
+      await sql.query("SELECT id FROM tf_resource_deployments WHERE tenant_id = ?", [
+        organizationId,
+      ]),
+    ).toEqual([]);
+
+    const resumed = await first.replay();
+    expect(resumed.status).toBe(201);
+    expect(provider.listResources()).toEqual([`${organizationId}/default/lost-ack`]);
+    expect(
+      await sql.query("SELECT operation_id FROM tf_provider_mutation_sagas WHERE tenant_id = ?", [
+        organizationId,
+      ]),
+    ).toEqual([]);
+    expect(
+      await sql.query(
+        "SELECT resource_uid, state FROM tf_resource_deployments WHERE tenant_id = ?",
+        [organizationId],
+      ),
+    ).toEqual([{ resource_uid: expect.any(String), state: "active" }]);
+  });
+
+  test("does not repeat a provider delete after losing its final atomic commit", async () => {
+    const durable = createEphemeralSql();
+    let failFinalBatch = false;
+    const sql: Sql = {
+      query: (statement, params) => durable.query(statement, params),
+      run: (statement, params) => durable.run(statement, params),
+      async batch(statements) {
+        if (
+          failFinalBatch &&
+          statements.some((statement) =>
+            statement.sql.includes("DELETE FROM tf_provider_mutation_sagas"),
+          )
+        ) {
+          failFinalBatch = false;
+          throw new SqlError("unavailable", "simulated lost delete commit acknowledgement");
+        }
+        return await durable.batch(statements);
+      },
+    };
+    const fake = new FakeProvider({ offerings: [PROVIDER_OFFERING] });
+    let deleteCalls = 0;
+    const provider: Provider = {
+      id: fake.id,
+      offerings: fake.offerings,
+      apply: (input) => fake.apply(input),
+      observe: (input) => fake.observe(input),
+      delete: (input) => {
+        deleteCalls += 1;
+        return fake.delete(input);
+      },
+      adopt: (input) => fake.adopt(input),
+    };
+    const app = buildApp({
+      sql,
+      objects: createMemoryObjectStore(),
+      identity,
+      settlement,
+      publicOrigin: "https://api.takoserver.com",
+      forms: [FORM],
+      hostForms: [FORM],
+      providers: [provider],
+      offerings: [SOLD],
+    });
+    const { provider: auth } = await tenant(app.fetch);
+    const created = await applyBucket(app.fetch, auth, "delete-lost", {}, "create-delete-lost");
+    expect(created.status).toBe(201);
+    const resource = created.body as unknown as {
+      metadata: { generation: string; revision: string };
+    };
+    const path = `${LANE}/resources/edge.forms.takoform.com/v1beta1/ObjectBucket/delete-lost?${QUERY}`;
+    const headers = {
+      ...auth,
+      "idempotency-key": "delete-lost-0001",
+      "if-match": `"${resource.metadata.revision}"`,
+      "takoform-expected-generation": resource.metadata.generation,
+    };
+    failFinalBatch = true;
+
+    const first = await call(app.fetch, "DELETE", path, undefined, headers);
+    expect(first.status).toBe(500);
+    expect(deleteCalls).toBe(1);
+    expect(await sql.query("SELECT state FROM tf_resource_deployments")).toEqual([
+      { state: "active" },
+    ]);
+
+    const resumed = await call(app.fetch, "DELETE", path, undefined, headers);
+    expect(resumed.status).toBe(204);
+    expect(deleteCalls).toBe(1);
+    expect(await sql.query("SELECT state FROM tf_resource_deployments")).toEqual([
+      { state: "deleted" },
+    ]);
+    expect(await sql.query("SELECT operation_id FROM tf_provider_mutation_sagas")).toEqual([]);
+  });
+
   test("provisions a usage-only resource without a fake monthly or setup debit", async () => {
     const { app, provider, ledger } = newApp({ usageOnly: true });
     const { organizationId, provider: auth } = await tenant(app.fetch);
@@ -468,7 +610,7 @@ describe("orphaned declarations", () => {
       offerings: [SOLD],
     };
 
-    const app = buildApp({ ...ports, forms: [FORM] });
+    const app = buildApp({ ...ports, forms: [FORM], hostForms: [FORM] });
     const { provider: auth } = await tenant(app.fetch);
     await applyBucket(app.fetch, auth, "assets", { location: "apac" }, "orphan-001");
     expect((await app.tick()).orphanedResources).toEqual([]);
@@ -478,6 +620,7 @@ describe("orphaned declarations", () => {
     // backend resource it describes is still running.
     const moved = buildApp({
       ...ports,
+      hostForms: [FORM],
       forms: [
         {
           ...FORM,

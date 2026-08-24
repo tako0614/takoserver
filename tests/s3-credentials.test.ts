@@ -50,6 +50,7 @@ async function fixture() {
     settlement,
     publicOrigin: "https://api.takoserver.com",
     forms: [TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_INSTALLED_FORM],
+    hostForms: [],
     driver: new InMemoryTakoformResourceDriver(),
     offerings: [],
     s3,

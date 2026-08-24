@@ -28,7 +28,7 @@ if (!origin || !apiKey || !mainModule || files.length === 0) {
 /** `--assets <root>` bundles a directory of files a browser will be served. */
 const assetMode = mainModule === "--assets";
 
-const LANE = "/apis/forms.takoform.com/v1alpha3/artifacts";
+const LANE = "/apis/forms.takoform.com/v1/artifacts";
 
 interface Blob {
   readonly name: string;

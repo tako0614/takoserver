@@ -90,6 +90,19 @@ export interface ApplyInput {
   readonly relations?: readonly ProviderRelation[];
   /** Signed, short-lived and opaque to the Provider Pack until materialization. */
   readonly runtimeMaterialization?: JsonObject;
+  /** Host-resolved runtime material. Never portable state or provider output. */
+  readonly standardServices?: readonly ProviderStandardServiceProjection[];
+}
+
+export interface ProviderStandardServiceProjection {
+  readonly name: string;
+  readonly required: boolean;
+  readonly service: {
+    readonly apiVersion: string;
+    readonly protocol: string;
+  };
+  readonly endpoint: JsonObject;
+  readonly credential: JsonObject;
 }
 
 /** Exact logical target projected to a Provider Pack at the mutation barrier. */

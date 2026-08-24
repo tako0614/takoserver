@@ -6,8 +6,8 @@ import type { SponsorshipRoutes } from "./sponsorship-api.ts";
 import type { TakoformHost } from "./takoform/types.ts";
 
 /**
- * The single HTTP entry: discovery, the direct control plane, and the two
- * Takoform lanes behind one dispatch.
+ * The single HTTP entry: discovery, the direct control plane, and the one
+ * literal stable Takoform Host lane behind one dispatch.
  *
  * Order matters. The Takoform Host is offered the request first because it owns
  * a whole path prefix and answers `null` for anything outside it; the control
@@ -129,19 +129,14 @@ function dispatch(options: CreateRouterOptions, origin: string): Router {
           api: origin,
           ...(console ? { console } : {}),
           openapi: `${origin}/openapi.json`,
-          takoform: `${origin}/apis/forms.takoform.com/v1alpha3`,
+          takoform: `${origin}/apis/forms.takoform.com/v1`,
           ...(options.aiAvailable ? { ai: `${origin}/v1/ai` } : {}),
         },
       });
     }
-    if (
-      request.method === "GET" &&
-      (url.pathname === "/.well-known/takoform/v1beta1" ||
-        url.pathname === "/.well-known/takoform/v1alpha3")
-    ) {
+    if (request.method === "GET" && url.pathname === "/.well-known/takoform/v1") {
       if (!options.takoformHost) return notFound();
-      const lane = url.pathname.endsWith("v1beta1") ? "v1beta1" : "v1alpha3";
-      return Response.json(discovery(origin, lane));
+      return Response.json(discovery(origin));
     }
 
     const control = await options.control(request, url);
@@ -151,10 +146,10 @@ function dispatch(options: CreateRouterOptions, origin: string): Router {
   };
 }
 
-function discovery(origin: string, lane: "v1beta1" | "v1alpha3"): Record<string, unknown> {
-  const base = `${origin}/apis/forms.takoform.com/${lane}`;
+function discovery(origin: string): Record<string, unknown> {
+  const base = `${origin}/apis/forms.takoform.com/v1`;
   return {
-    api_versions: [`forms.takoform.com/${lane}`],
+    api_versions: ["forms.takoform.com/v1"],
     features: {
       service_forms: true,
       exact_form_ref: true,
@@ -166,9 +161,6 @@ function discovery(origin: string, lane: "v1beta1" | "v1alpha3"): Record<string,
     },
     endpoints: {
       api: base,
-      artifacts: `${base}/artifacts`,
-      operations: `${base}/operations`,
-      support: `${base}/support`,
     },
   };
 }

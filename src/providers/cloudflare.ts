@@ -1,3 +1,4 @@
+import { isEdgeFormsApiVersion } from "../form-ref.ts";
 import type { JsonObject, JsonValue } from "../ports.ts";
 import type { ProviderRelation } from "../provider-port.ts";
 import {
@@ -12,6 +13,11 @@ import {
   succeeded,
 } from "../provider-port.ts";
 import type { RuntimeMaterializer } from "../runtime-materialization.ts";
+import {
+  AMAZON_S3_STANDARD_SERVICE,
+  CLOUDFLARE_R2_CREDENTIAL_KIND,
+  CLOUDFLARE_R2_ENDPOINT_KIND,
+} from "./cloudflare-r2-standard-service.ts";
 
 /**
  * Provisioning on Cloudflare through its REST API.
@@ -235,7 +241,10 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
         }
         let sql: string;
         try {
-          sql = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(migration.sql);
+          sql = new TextDecoder("utf-8", {
+            fatal: true,
+            ignoreBOM: false,
+          }).decode(migration.sql);
         } catch {
           return providerValueFailure("invalid_spec", "a migration is not UTF-8 SQL");
         }
@@ -267,7 +276,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
   async apply(input: ApplyInput): Promise<ProviderTicket> {
     if (
       input.offering.kind.startsWith("takoform.") &&
-      input.offering.form.apiVersion === "edge.forms.takoform.com/v1beta1"
+      isEdgeFormsApiVersion(input.offering.form.apiVersion)
     ) {
       switch (input.offering.form.kind) {
         case "ModuleWorker":
@@ -434,7 +443,11 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     if (!read.ok) return read.ticket;
     return succeeded({
       nativeId: input.nativeId,
-      observed: { name: native.name, present: true, ...(record(read.result) ?? {}) },
+      observed: {
+        name: native.name,
+        present: true,
+        ...(record(read.result) ?? {}),
+      },
       outputs: outputsFor(native, record(read.result)),
     });
   }
@@ -456,7 +469,11 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       return succeeded({
         nativeId: input.nativeId,
         disposition: "retained",
-        observed: { scriptName: native.parent, versionId: native.name, retained: true },
+        observed: {
+          scriptName: native.parent,
+          versionId: native.name,
+          retained: true,
+        },
         outputs: { scriptName: native.parent, versionId: native.name },
       });
     }
@@ -473,7 +490,11 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
         const updated = await this.#call("PUT", path, schedules);
         if (!updated.ok) return updated.ticket;
       }
-      return succeeded({ nativeId: input.nativeId, observed: { deleted: true }, outputs: {} });
+      return succeeded({
+        nativeId: input.nativeId,
+        observed: { deleted: true },
+        outputs: {},
+      });
     }
     const path =
       native.kind === "deployment"
@@ -496,7 +517,11 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     const removed = await this.#call("DELETE", path);
     // A resource that is already gone is a successful delete, not a failure.
     if (!removed.ok && removed.status !== 404) return removed.ticket;
-    return succeeded({ nativeId: input.nativeId, observed: { deleted: true }, outputs: {} });
+    return succeeded({
+      nativeId: input.nativeId,
+      observed: { deleted: true },
+      outputs: {},
+    });
   }
 
   async adopt(input: {
@@ -551,7 +576,10 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
 
   async #applyKvNamespace(input: ApplyInput): Promise<ProviderTicket> {
     if (input.previous) {
-      return await this.observe({ ...input, nativeId: input.previous.nativeId });
+      return await this.observe({
+        ...input,
+        nativeId: input.previous.nativeId,
+      });
     }
     const title = await derivedName("tskv", input.identity);
     const created = await this.#call("POST", `/accounts/${this.#accountId}/storage/kv/namespaces`, {
@@ -569,7 +597,10 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
 
   async #applyQueue(input: ApplyInput): Promise<ProviderTicket> {
     if (input.previous) {
-      return await this.observe({ ...input, nativeId: input.previous.nativeId });
+      return await this.observe({
+        ...input,
+        nativeId: input.previous.nativeId,
+      });
     }
     const queueName = await derivedName("tsq", input.identity);
     const created = await this.#call("POST", `/accounts/${this.#accountId}/queues`, {
@@ -607,6 +638,13 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
 
     const bindings = edgeBindings(input.spec, input.relations);
     if (!bindings) return failed("invalid_spec", "a Worker binding has no provider deployment");
+    const standardServiceBindings = cloudflareStandardServiceBindings(
+      input.standardServices,
+      bindings,
+    );
+    if (!standardServiceBindings) {
+      return failed("invalid_spec", "standard-service runtime material is invalid");
+    }
     const requiredSensitive = sensitiveBindingNames(input.spec.requiredSensitiveVars);
     if (!requiredSensitive) {
       return failed("invalid_spec", "the sensitive Worker binding declaration is invalid");
@@ -700,6 +738,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
             compatibility_date: this.#workerCompatibilityDate,
             bindings: [
               ...bindings,
+              ...standardServiceBindings,
               ...sensitiveBindings,
               ...(assetToken ? [{ type: "assets", name: ASSETS_BINDING }] : []),
             ],
@@ -807,7 +846,11 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     if (!id) return failed("provider_error", "the Worker Deployment has no identifier");
     return succeeded({
       nativeId: `deployment:${worker.name}:${id}`,
-      observed: { scriptName: worker.name, deploymentId: id, versions: weighted },
+      observed: {
+        scriptName: worker.name,
+        deploymentId: id,
+        versions: weighted,
+      },
       outputs: {},
     });
   }
@@ -903,7 +946,11 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     if (!id) return failed("provider_error", "the Queue Consumer has no identifier");
     return succeeded({
       nativeId: `consumer:${queue.name}:${id}`,
-      observed: { consumerId: id, queueId: queue.name, scriptName: worker.name },
+      observed: {
+        consumerId: id,
+        queueId: queue.name,
+        scriptName: worker.name,
+      },
       outputs: {},
     });
   }
@@ -935,7 +982,10 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
 
   async #applyDatabase(input: ApplyInput): Promise<ProviderTicket> {
     if (input.previous) {
-      return await this.observe({ ...input, nativeId: input.previous.nativeId });
+      return await this.observe({
+        ...input,
+        nativeId: input.previous.nativeId,
+      });
     }
     const name = await derivedName("tsdb", input.identity);
     const created = await this.#call("POST", `/accounts/${this.#accountId}/d1/database`, {
@@ -1157,7 +1207,11 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       // full digest, so the digest is truncated consistently on both sides.
       const hash = file.digest.slice("sha256:".length, "sha256:".length + 32);
       declared[`/${file.path}`] = { hash, size: file.size };
-      byHash.set(hash, { name: file.path, digest: file.digest, mediaType: file.mediaType });
+      byHash.set(hash, {
+        name: file.path,
+        digest: file.digest,
+        mediaType: file.mediaType,
+      });
     }
 
     const started = await this.#call(
@@ -1181,7 +1235,9 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
         if (!file || !bytes) return failed("invalid_spec", "a declared asset is missing");
         payload.set(
           hash,
-          new File([base64(bytes)], hash, { type: file.mediaType || "application/octet-stream" }),
+          new File([base64(bytes)], hash, {
+            type: file.mediaType || "application/octet-stream",
+          }),
           hash,
         );
       }
@@ -1201,7 +1257,10 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
           `${this.#origin}/accounts/${this.#accountId}/workers/assets/upload?base64=true`,
           {
             method: "POST",
-            headers: { accept: "application/json", authorization: `Bearer ${token}` },
+            headers: {
+              accept: "application/json",
+              authorization: `Bearer ${token}`,
+            },
             body: payload,
           },
         ),
@@ -1318,7 +1377,10 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       path,
       body === undefined
         ? undefined
-        : { body: JSON.stringify(body), type: "application/json; charset=UTF-8" },
+        : {
+            body: JSON.stringify(body),
+            type: "application/json; charset=UTF-8",
+          },
     );
   }
 
@@ -1353,7 +1415,12 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     try {
       authorization = await this.#authorize();
     } catch {
-      return { ok: false, status: 0, ticket: failed("denied", "no usable credential"), codes: [] };
+      return {
+        ok: false,
+        status: 0,
+        ticket: failed("denied", "no usable credential"),
+        codes: [],
+      };
     }
     let response: Response;
     try {
@@ -1680,6 +1747,41 @@ function edgeBindings(
     }
   }
   return result;
+}
+
+function cloudflareStandardServiceBindings(
+  services: ApplyInput["standardServices"],
+  existing: readonly JsonObject[],
+): readonly JsonObject[] | null {
+  if (!services) return [];
+  const occupied = new Set(
+    existing.flatMap((binding) => (typeof binding.name === "string" ? [binding.name] : [])),
+  );
+  const bindings: JsonObject[] = [];
+  for (const service of services) {
+    const endpoint = record(service.endpoint);
+    const credential = record(service.credential);
+    const bucketName = optionalString(endpoint?.bucketName);
+    if (
+      service.service.apiVersion !== AMAZON_S3_STANDARD_SERVICE.apiVersion ||
+      service.service.protocol !== AMAZON_S3_STANDARD_SERVICE.protocol ||
+      !/^[A-Z][A-Z0-9_]{0,63}$/u.test(service.name) ||
+      occupied.has(service.name) ||
+      endpoint?.kind !== CLOUDFLARE_R2_ENDPOINT_KIND ||
+      credential?.kind !== CLOUDFLARE_R2_CREDENTIAL_KIND ||
+      !bucketName ||
+      !/^tss3-[0-9a-f]{40}$/u.test(bucketName)
+    ) {
+      return null;
+    }
+    occupied.add(service.name);
+    bindings.push({
+      type: "r2_bucket",
+      name: service.name,
+      bucket_name: bucketName,
+    });
+  }
+  return bindings;
 }
 
 async function shortDigest(value: string): Promise<string> {

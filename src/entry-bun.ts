@@ -22,7 +22,9 @@ import { createSelfhostComposition } from "./selfhost-composition.ts";
 import { ensureSigningKey, loadSigningKey } from "./signing-key.ts";
 import { createD1HttpSql } from "./sql-d1-http.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
+import { createProductionStandardServiceResolver } from "./standard-service-production.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
+import { currentTakoformCatalog } from "./takoform/current-catalog.ts";
 import { createJavaScriptWorkerModuleInspector } from "./takoform/worker-module-inspector.ts";
 import { createWorkerdRuntime } from "./workerd-runtime.ts";
 import { createWorkerdSupervisor, findWorkerd } from "./workerd-supervisor.ts";
@@ -151,6 +153,7 @@ const objects = sharedBucket
     : createFileObjectStore({ root: dataRoot });
 const clock = () => new Date();
 const edge = await buildEdgeForms();
+const currentHost = currentTakoformCatalog(edge);
 
 // The provider reads committed bundles through the same artifact store the
 // Host writes them to, so a Worker can only be published from bytes a tenant
@@ -170,18 +173,16 @@ const providerArtifacts = {
 };
 
 /**
- * What this machine can provision on.
+ * What this machine can use to drain historical Deployments.
  *
  * A Cloudflare account if one is configured; otherwise the machine itself. The
  * second is what makes self-hosting real rather than architectural: without a
  * provider, every apply answers that the backend is unavailable, which is true
  * and leaves nothing to run.
  *
- * Standing on its own, the machine offers the whole released Edge Family —
- * ObjectBucket through workerd-served ModuleWorkers — because a Takoform Host
- * that cannot host a Worker is a place to keep files, not a platform.
- * `TAKOSERVER_EDGE_FORMS=0` narrows the catalog back to object storage for an
- * operator who deliberately runs a storage-only machine.
+ * Released provider Forms remain installed for existing Deployment
+ * observation/deletion, but publish no current catalog Offering. Stable S3 is
+ * supplied through the Host-owned standard-service resolver below.
  */
 let providers: readonly Provider[];
 let providerPacks: readonly ProviderPack[];
@@ -254,7 +255,10 @@ if (process.env.CLOUDFLARE_ACCOUNT_ID) {
   });
   providers = [objectBucketProvider];
   providerPacks = deployment.providerPacks;
-  offerings = deployment.offerings;
+  // Keep the released provider installed only to drain recorded Deployments.
+  // Stable S3 is supplied out of band; a beta ObjectBucket is no longer a
+  // current `/v1` sale or `/provision/v1` creation authority.
+  offerings = [];
 } else {
   const composition = createSelfhostComposition({
     edge,
@@ -344,6 +348,7 @@ const identity = resolveIdentity({
 const provision = createProvisionerEndpoint({
   providers,
   credential: process.env.TAKOSERVER_PROVISIONER_TOKEN,
+  applyOfferingIds: offerings.map((offering) => offering.id),
 });
 
 // A shared deployment is given its key; a machine standing on its own makes
@@ -368,6 +373,19 @@ const signingKey = sharedDatabaseId
     });
 
 const configuredAi = aiGateway();
+const standardServiceResolver = createProductionStandardServiceResolver({
+  ...(process.env.TAKOSERVER_STANDARD_SERVICE_SUPPLIES
+    ? { raw: process.env.TAKOSERVER_STANDARD_SERVICE_SUPPLIES }
+    : {}),
+  ...(process.env.CLOUDFLARE_ACCOUNT_ID
+    ? {
+        cloudflare: {
+          accountId: process.env.CLOUDFLARE_ACCOUNT_ID,
+          authorize: () => `Bearer ${cloudflareToken()}`,
+        },
+      }
+    : {}),
+});
 const app = buildApp({
   sql,
   objects,
@@ -385,6 +403,9 @@ const app = buildApp({
     : {}),
   forms: edge.forms,
   bindings: edge.bindings,
+  hostForms: currentHost.forms,
+  hostBindings: currentHost.bindings,
+  ...(standardServiceResolver ? { standardServiceResolver } : {}),
   providers,
   providerPacks,
   offerings,

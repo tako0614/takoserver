@@ -65,6 +65,7 @@ test("the ordinary control API resolves Attachments and blocks provider deletion
     settlement,
     publicOrigin: "https://api.takoserver.test",
     forms: [COMPUTE_FORM, DATABASE_FORM],
+    hostForms: [COMPUTE_FORM, DATABASE_FORM],
     driver: new InMemoryTakoformResourceDriver(),
     offerings: [],
     providerPacks: [pack],
@@ -205,7 +206,7 @@ async function createResource(
   const prepared = await request(
     fetch,
     "POST",
-    "/apis/forms.takoform.com/v1alpha3/resources/prepare",
+    "/apis/forms.takoform.com/v1/resources/prepare",
     body,
     headers,
   );
@@ -214,7 +215,7 @@ async function createResource(
   const created = await request(
     fetch,
     "PUT",
-    `/apis/forms.takoform.com/v1alpha3/resources/${formRef.apiVersion}/${formRef.kind}/${name}`,
+    `/apis/forms.takoform.com/v1/resources/${formRef.apiVersion}/${formRef.kind}/${name}`,
     { ...body, review: { prepareDigest: review.prepareDigest } },
     { ...headers, "idempotency-key": `create-${name}-0001`, "if-none-match": "*" },
   );
@@ -239,7 +240,7 @@ async function deleteResource(
   return await request(
     fetch,
     "DELETE",
-    `/apis/forms.takoform.com/v1alpha3/resources/${formRef.apiVersion}/${formRef.kind}/${name}?${query}`,
+    `/apis/forms.takoform.com/v1/resources/${formRef.apiVersion}/${formRef.kind}/${name}?${query}`,
     undefined,
     {
       ...headers,

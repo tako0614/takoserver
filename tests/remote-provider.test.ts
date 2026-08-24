@@ -143,6 +143,61 @@ describe("provisioning across the road", () => {
     expect(answered?.status).toBe(404);
   });
 
+  test("can drain a retired offering without retaining remote apply authority", async () => {
+    let applies = 0;
+    let observes = 0;
+    let deletes = 0;
+    const provider = backend({
+      async apply(input) {
+        applies += 1;
+        return succeeded({ nativeId: input.operationId, observed: {}, outputs: {} });
+      },
+      async observe(input) {
+        observes += 1;
+        return succeeded({ nativeId: input.nativeId, observed: {}, outputs: {} });
+      },
+      async delete(input) {
+        deletes += 1;
+        return succeeded({ nativeId: input.nativeId, observed: { deleted: true }, outputs: {} });
+      },
+    });
+    const endpoint = createProvisionerEndpoint({
+      providers: [provider],
+      credential: "shared-secret",
+      applyOfferingIds: [],
+    });
+    const invoke = async (operation: string, input: Record<string, unknown>) => {
+      const response = await endpoint(
+        new Request(`https://provisioner.test${PROVISIONER_PATH}`, {
+          method: "POST",
+          headers: {
+            authorization: "Bearer shared-secret",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ operation, input: { offering: OFFERING, ...input } }),
+        }),
+      );
+      return (await response?.json()) as { readonly ticket: { readonly phase: string } };
+    };
+
+    expect((await invoke("apply", { operationId: "retired-create" })).ticket.phase).toBe("failed");
+    expect(
+      (await invoke("observe", { nativeId: "r2:media", identity: IDENTITY, spec: {} })).ticket
+        .phase,
+    ).toBe("succeeded");
+    expect(
+      (
+        await invoke("delete", {
+          operationId: "retired-delete",
+          nativeId: "r2:media",
+          identity: IDENTITY,
+          spec: {},
+        })
+      ).ticket.phase,
+    ).toBe("succeeded");
+    expect({ applies, observes, deletes }).toEqual({ applies: 0, observes: 1, deletes: 1 });
+  });
+
   test("refuses to read a half-written answer as success", async () => {
     const remote = createRemoteProvider({
       origin: "https://provisioner.test",

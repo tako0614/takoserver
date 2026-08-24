@@ -81,6 +81,121 @@ export async function validateWorkerVersionRuntime(input: {
   }
 }
 
+/**
+ * A Form with an explicit worker-class family adapter may be stored before the
+ * worker is deployed. Once a deployment exists, every selected WorkerVersion
+ * must actually export that class. Generic keyed exclusivity is deliberately
+ * unrelated to this ABI rule.
+ */
+export async function validateClassHolderRuntime(input: {
+  readonly tenantId: string;
+  readonly space: string;
+  readonly form: InstalledTakoformForm;
+  readonly spec: Record<string, unknown>;
+  readonly relations: readonly TakoformStoredRelation[];
+  readonly store: Pick<TakoformStore, "readRelations" | "readResource" | "resourcesByRelation">;
+  readonly artifacts: ArtifactResolver;
+  readonly inspector?: WorkerModuleInspector;
+}): Promise<void> {
+  const contract = input.form.workerClassRuntime;
+  if (!contract) return;
+  if (
+    !(input.form.providedInterfaces ?? []).some((item) => item.name === contract.providedInterface)
+  ) {
+    throw new TakoformHostError("unsupported_capability", 422);
+  }
+  const className = pointerValue(input.spec, contract.className);
+  const worker = input.relations.find((relation) => relation.relation === contract.workerRelation);
+  if (typeof className !== "string" || !worker) {
+    throw new TakoformHostError("invalid_argument", 400);
+  }
+  const deployments = await input.store.resourcesByRelation({
+    tenantId: input.tenantId,
+    space: input.space,
+    sourceApiVersion: contract.deploymentForm.apiVersion,
+    sourceKind: contract.deploymentForm.kind,
+    relation: contract.deploymentWorkerRelation,
+    targetUid: worker.targetUid,
+    limit: 2,
+  });
+  if (deployments.length === 0) return;
+  for (const deployment of deployments) {
+    const deploymentRelations = await input.store.readRelations({
+      tenantId: input.tenantId,
+      space: deployment.resource.metadata.space,
+      apiVersion: deployment.resource.apiVersion,
+      kind: deployment.resource.kind,
+      name: deployment.resource.metadata.name,
+    });
+    const versions = deploymentRelations.filter(
+      (relation) => relation.relation === contract.deploymentVersionRelation,
+    );
+    if (versions.length === 0) throw new TakoformHostError("unsupported_capability", 422);
+    for (const relation of versions) {
+      const version = await input.store.readResource({
+        tenantId: input.tenantId,
+        space: input.space,
+        apiVersion: relation.targetApiVersion,
+        kind: relation.targetKind,
+        name: relation.targetName,
+      });
+      const versionRelations = version
+        ? await input.store.readRelations({
+            tenantId: input.tenantId,
+            space: version.metadata.space,
+            apiVersion: version.apiVersion,
+            kind: version.kind,
+            name: version.metadata.name,
+          })
+        : [];
+      const bundleRelation = versionRelations.find(
+        (candidate) => candidate.relation === contract.versionBundleRelation,
+      );
+      const bundle = bundleRelation
+        ? await input.store.readResource({
+            tenantId: input.tenantId,
+            space: input.space,
+            apiVersion: bundleRelation.targetApiVersion,
+            kind: bundleRelation.targetKind,
+            name: bundleRelation.targetName,
+          })
+        : null;
+      const manifestDigest = bundle?.spec.manifestDigest;
+      if (
+        !version ||
+        version.metadata.uid !== relation.targetUid ||
+        !bundleRelation ||
+        !bundle ||
+        bundle.metadata.uid !== bundleRelation.targetUid ||
+        typeof manifestDigest !== "string"
+      ) {
+        throw new TakoformHostError("unsupported_capability", 422);
+      }
+      const inspected = await inspectMainModule(
+        input.tenantId,
+        manifestDigest,
+        input.artifacts,
+        input.inspector,
+      );
+      if (!inspected.loadable || !inspected.classes?.includes(className)) {
+        throw new TakoformHostError("unsupported_capability", 422);
+      }
+    }
+  }
+}
+
+function pointerValue(root: unknown, pointer: string): unknown {
+  let value = root;
+  for (const token of pointer
+    .slice(1)
+    .split("/")
+    .map((part) => part.replaceAll("~1", "/").replaceAll("~0", "~"))) {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+    value = (value as Record<string, unknown>)[token];
+  }
+  return value;
+}
+
 function declaresWorkerRuntime(form: InstalledTakoformForm): boolean {
   const properties = form.desiredSchema.properties;
   return (
@@ -97,7 +212,11 @@ async function inspectMainModule(
   manifestDigest: string,
   artifacts: ArtifactResolver,
   inspector: WorkerModuleInspector | undefined,
-): Promise<{ readonly loadable: boolean; readonly handlers: readonly string[] }> {
+): Promise<{
+  readonly loadable: boolean;
+  readonly handlers: readonly string[];
+  readonly classes?: readonly string[];
+}> {
   if (!inspector) throw new Error("worker_module_inspector_missing");
   const manifest = await artifacts.resolveManifest(tenantId, manifestDigest);
   const main = workerMainModule(manifest);

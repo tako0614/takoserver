@@ -55,6 +55,7 @@ test("the migration API binds reservation, transfer, cutover, and capture", asyn
     settlement,
     publicOrigin: "https://api.takoserver.test",
     forms: [FORM],
+    hostForms: [FORM],
     driver: new InMemoryTakoformResourceDriver(),
     offerings: [sourceOffering, targetOffering],
     providerPacks: [sourcePack, targetPack],
@@ -378,7 +379,7 @@ async function createResource(
   const prepared = await request(
     fetch,
     "POST",
-    "/apis/forms.takoform.com/v1alpha3/resources/prepare",
+    "/apis/forms.takoform.com/v1/resources/prepare",
     body,
     headers,
   );
@@ -386,7 +387,7 @@ async function createResource(
   const created = await request(
     fetch,
     "PUT",
-    `/apis/forms.takoform.com/v1alpha3/resources/${formRef.apiVersion}/${formRef.kind}/main`,
+    `/apis/forms.takoform.com/v1/resources/${formRef.apiVersion}/${formRef.kind}/main`,
     { ...body, review: { prepareDigest: digest } },
     { ...headers, "idempotency-key": "create-database-main-001", "if-none-match": "*" },
   );

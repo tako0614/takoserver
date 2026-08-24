@@ -1,5 +1,6 @@
 import type { Catalog } from "./catalog.ts";
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
+import { isEdgeFormsApiVersion } from "./form-ref.ts";
 import type { Ledger } from "./ledger.ts";
 import type {
   Provider,
@@ -77,7 +78,12 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     const provider = byId.get(sold.providerPackRef);
     const offering = provider?.offerings.find((candidate) => candidate.id === sold.id);
     if (!provider || !offering) throw new TakoformHostError("backend_unavailable", 503);
-    return { provider, offering, sold, priceMinor: sold.pricePlan.provisioning.amountMinor };
+    return {
+      provider,
+      offering,
+      sold,
+      priceMinor: sold.pricePlan.provisioning.amountMinor,
+    };
   };
 
   const providerRelations = async (
@@ -186,13 +192,25 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     try {
       ticket = await work();
     } catch (error) {
-      await ledger.release({ organizationId, reference: operationId, amountMinor: priceMinor });
+      await ledger.release({
+        organizationId,
+        reference: operationId,
+        amountMinor: priceMinor,
+      });
       throw error;
     }
     if (ticket.phase === "succeeded") {
-      await ledger.capture({ organizationId, reference: operationId, amountMinor: priceMinor });
+      await ledger.capture({
+        organizationId,
+        reference: operationId,
+        amountMinor: priceMinor,
+      });
     } else {
-      await ledger.release({ organizationId, reference: operationId, amountMinor: priceMinor });
+      await ledger.release({
+        organizationId,
+        reference: operationId,
+        amountMinor: priceMinor,
+      });
     }
     return resultOf(ticket);
   };
@@ -324,7 +342,10 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
         throw new TakoformHostError("unsupported_capability", 422);
       }
       const previous = current
-        ? { nativeId: current.nativeId, spec: input.previous?.spec ?? input.spec }
+        ? {
+            nativeId: current.nativeId,
+            spec: input.previous?.spec ?? input.spec,
+          }
         : undefined;
       const work = async () =>
         await settle(
@@ -333,11 +354,18 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
           await provider.apply({
             operationId: input.operationId,
             offering,
-            identity: { tenantRef: input.tenantId, space: input.space, name: input.name },
+            identity: {
+              tenantRef: input.tenantId,
+              space: input.space,
+              name: input.name,
+            },
             spec: input.spec,
             relations: relationTargets,
             ...(input.runtimeMaterialization
               ? { runtimeMaterialization: input.runtimeMaterialization }
+              : {}),
+            ...(input.standardServices
+              ? { standardServices: structuredClone(input.standardServices) }
               : {}),
             ...(previous ? { previous } : {}),
           }),
@@ -350,6 +378,40 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
         input.commercialAuthority || priceMinor === 0
           ? resultOf(await work())
           : await charged(input.tenantId, input.operationId, priceMinor, work);
+      if (input.atomicDeploymentCommit) {
+        return {
+          ...receiptOf(result),
+          deploymentMutation: current
+            ? {
+                kind: "refresh",
+                tenantId: input.tenantId,
+                deploymentId: current.id,
+                expectedNativeId: current.nativeId,
+                observed: result.observed,
+                outputs: result.outputs,
+              }
+            : {
+                kind: "create",
+                deployment: {
+                  tenantId: input.tenantId,
+                  id: `dep_${input.operationId}`,
+                  resourceUid: input.resourceUid,
+                  offeringId: offering.id,
+                  providerPackRef: provider.id,
+                  providerInstallationRef:
+                    sold?.providerInstallationRef ??
+                    inheritedSelection?.providerInstallationRef ??
+                    (() => {
+                      throw new TakoformHostError("backend_unavailable", 503);
+                    })(),
+                  nativeId: result.nativeId,
+                  state: "active",
+                  observed: result.observed,
+                  outputs: result.outputs,
+                },
+              },
+        };
+      }
       if (current) {
         await refresh(current, result);
       } else {
@@ -407,7 +469,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
       return receiptOf(result);
     },
 
-    async delete(input): Promise<void> {
+    async delete(input): Promise<TakoformDriverReceipt | void> {
       if (intrinsicFormRef(input.resource.form.formRef)) return;
       const deployment = await active(input.tenantId, input.resourceUid);
       const { provider, offering } = installed(deployment, input.resource.form.formRef);
@@ -428,6 +490,29 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
         }),
       );
       const result = resultOf(ticket);
+      if (result.nativeId !== deployment.nativeId) {
+        throw new TakoformHostError("resource_busy", 409);
+      }
+      if (input.atomicDeploymentCommit) {
+        return {
+          deploymentMutation:
+            result.disposition === "retained"
+              ? {
+                  kind: "retain",
+                  tenantId: input.tenantId,
+                  deploymentId: deployment.id,
+                  expectedNativeId: deployment.nativeId,
+                  observed: result.observed,
+                  outputs: result.outputs,
+                }
+              : {
+                  kind: "delete",
+                  tenantId: input.tenantId,
+                  deploymentId: deployment.id,
+                  expectedNativeId: deployment.nativeId,
+                },
+        };
+      }
       const recorded =
         result.disposition === "retained"
           ? await deployments.markRetained(
@@ -438,7 +523,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
               result.outputs,
             )
           : await deployments.markDeleted(input.tenantId, deployment.id, deployment.nativeId);
-      if (result.nativeId !== deployment.nativeId || !recorded) {
+      if (!recorded) {
         throw new TakoformHostError("resource_busy", 409);
       }
     },
@@ -489,13 +574,57 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
         await provider.adopt({
           offering,
           nativeId: input.nativeId,
-          identity: { tenantRef: input.tenantId, space: input.space, name: input.name },
+          identity: {
+            tenantRef: input.tenantId,
+            space: input.space,
+            name: input.name,
+          },
           spec: input.spec,
           relations: await providerRelations(input.tenantId, input.relations),
         }),
       );
       if (result.nativeId !== input.nativeId) {
         throw new TakoformHostError("import_conflict", 409);
+      }
+      if (input.atomicDeploymentCommit) {
+        return {
+          ...receiptOf(result),
+          deploymentMutation: current
+            ? current.nativeClaimed
+              ? {
+                  kind: "refresh",
+                  tenantId: input.tenantId,
+                  deploymentId: current.id,
+                  expectedNativeId: current.nativeId,
+                  observed: result.observed,
+                  outputs: result.outputs,
+                }
+              : {
+                  kind: "claim",
+                  tenantId: input.tenantId,
+                  deploymentId: current.id,
+                  expectedNativeId: current.nativeId,
+                  nativeId: result.nativeId,
+                  observed: result.observed,
+                  outputs: result.outputs,
+                }
+            : {
+                kind: "create",
+                deployment: {
+                  tenantId: input.tenantId,
+                  id: `dep_${input.operationId}`,
+                  resourceUid: input.resourceUid,
+                  offeringId: offering.id,
+                  providerPackRef: provider.id,
+                  providerInstallationRef,
+                  nativeId: result.nativeId,
+                  nativeClaimed: true,
+                  state: "active",
+                  observed: result.observed,
+                  outputs: result.outputs,
+                },
+              },
+        };
       }
       if (current) {
         // Recording the claim is the whole point of an import, and it is
@@ -553,7 +682,7 @@ function intrinsicForm(form: InstalledTakoformForm): boolean {
 }
 
 function intrinsicFormRef(form: TakoformV1Alpha3FormRef): boolean {
-  return form.apiVersion.startsWith("edge.forms.takoform.com/") && INTRINSIC_FORMS.has(form.kind);
+  return isEdgeFormsApiVersion(form.apiVersion) && INTRINSIC_FORMS.has(form.kind);
 }
 
 function sameForm(left: TakoformV1Alpha3FormRef, right: TakoformV1Alpha3FormRef): boolean {

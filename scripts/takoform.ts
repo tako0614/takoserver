@@ -33,7 +33,7 @@ const kind: string = rawKind;
 const space: string = rawSpace;
 const name: string = rawName;
 
-const LANE = "/apis/forms.takoform.com/v1alpha3";
+const LANE = "/apis/forms.takoform.com/v1";
 
 interface FormRef {
   readonly apiVersion: string;

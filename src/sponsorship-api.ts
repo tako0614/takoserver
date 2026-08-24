@@ -271,7 +271,7 @@ export function createSponsorshipRoutes(
           const [group, version, extra] = ref.apiVersion.split("/");
           if (!group || !version || extra !== undefined) return failure("delete_failed", 409);
           const target = new URL(
-            `/apis/forms.takoform.com/v1alpha3/resources/${encodeURIComponent(group)}/${encodeURIComponent(version)}/${encodeURIComponent(ref.kind)}/${encodeURIComponent(resource.name)}`,
+            `/apis/forms.takoform.com/v1/resources/${encodeURIComponent(group)}/${encodeURIComponent(version)}/${encodeURIComponent(ref.kind)}/${encodeURIComponent(resource.name)}`,
             options.publicOrigin,
           );
           target.searchParams.set("space", resource.space);

@@ -74,6 +74,7 @@ describe("browser console session", () => {
       sql: createEphemeralSql(),
       objects: createMemoryObjectStore(),
       forms: edge.forms,
+      hostForms: edge.forms,
       providers: [],
       offerings: [],
       publicOrigin: "https://api.example.test",
@@ -151,6 +152,7 @@ describe("Form registry on the control plane", () => {
       sql: createEphemeralSql(),
       objects: createMemoryObjectStore(),
       forms: edge.forms,
+      hostForms: edge.forms,
       providers: [],
       offerings: [],
       publicOrigin: "https://api.example.test",
@@ -250,6 +252,7 @@ describe("entering the lane with a session", () => {
       sql: createEphemeralSql(),
       objects: createMemoryObjectStore(),
       forms: edge.forms,
+      hostForms: edge.forms,
       providers: [],
       offerings: [],
       publicOrigin: "https://api.example.test",
@@ -304,7 +307,7 @@ describe("entering the lane with a session", () => {
     const edge = await buildEdgeForms();
     const form = edge.objectBucket.form.identity.formRef;
     return await app.fetch(
-      new Request("https://api.example.test/apis/forms.takoform.com/v1alpha3/resources/prepare", {
+      new Request("https://api.example.test/apis/forms.takoform.com/v1/resources/prepare", {
         method: "POST",
         headers: {
           "content-type": "application/json",

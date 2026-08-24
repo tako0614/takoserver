@@ -192,7 +192,7 @@ describe("artifact paths", () => {
 
     const start = async (path: string) =>
       await artifacts.handle(
-        new Request("https://api.test/apis/forms.takoform.com/v1alpha3/artifacts/uploads", {
+        new Request("https://api.test/apis/forms.takoform.com/v1/artifacts/uploads", {
           method: "POST",
           headers: {
             "content-type": "application/json",
@@ -251,7 +251,7 @@ describe("static asset bundles", () => {
     const digest = `sha256:${hex}`;
     const send = (path: string, init: RequestInit) =>
       artifacts.handle(
-        new Request(`https://api.test/apis/forms.takoform.com/v1alpha3/artifacts/${path}`, init),
+        new Request(`https://api.test/apis/forms.takoform.com/v1/artifacts/${path}`, init),
         principal,
         fail,
       );

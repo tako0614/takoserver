@@ -25,7 +25,7 @@ const DIGEST = /^sha256:[0-9a-f]{64}$/u;
 // blocked separately: `.` and `..` segments are rejected by name.
 const PATH = /^[A-Za-z0-9_.][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_.][A-Za-z0-9._-]*)*$/u;
 const MEDIA_TYPE = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/u;
-const ARTIFACT_PREFIX = "/apis/forms.takoform.com/v1alpha3/artifacts";
+const DEFAULT_ARTIFACT_PREFIX = "/apis/forms.takoform.com/v1/artifacts";
 const REPLAY_TTL_MILLISECONDS = 24 * 60 * 60_000;
 
 const MODULE_MEDIA = new Set([
@@ -96,12 +96,16 @@ export interface CreateTakoformArtifactsOptions {
   readonly objects: ObjectStore;
   readonly clock: Clock;
   readonly randomId: () => string;
+  /** Candidate compositions can bind the same transport to another non-public lane. */
+  readonly artifactPrefix?: string;
 }
 
 export function createTakoformArtifacts(
   options: CreateTakoformArtifactsOptions,
 ): TakoformArtifactTransport {
   const { sql, objects, clock, randomId } = options;
+  const artifactPrefix = options.artifactPrefix ?? DEFAULT_ARTIFACT_PREFIX;
+  const artifactPattern = artifactPrefix.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
   const now = (): number => clock().getTime();
   const blobKey = (digest: string): string => `art/${digest.slice("sha256:".length)}`;
 
@@ -190,10 +194,12 @@ export function createTakoformArtifacts(
 
     async handle(request, principal, failure) {
       const url = new URL(request.url);
-      if (!url.pathname.startsWith(ARTIFACT_PREFIX)) return null;
+      if (url.pathname !== artifactPrefix && !url.pathname.startsWith(`${artifactPrefix}/`)) {
+        return null;
+      }
       if (url.search !== "" || url.pathname.includes("%")) return failure("invalid_argument", 400);
 
-      if (request.method === "POST" && url.pathname === `${ARTIFACT_PREFIX}/uploads`) {
+      if (request.method === "POST" && url.pathname === `${artifactPrefix}/uploads`) {
         const key = requireIdempotencyKey(request);
         const envelope = await strictJsonObject(request);
         exactKeys(envelope, ["manifest"]);
@@ -233,7 +239,7 @@ export function createTakoformArtifacts(
       }
 
       let match = new RegExp(
-        `^${ARTIFACT_PREFIX.replaceAll(".", "\\.")}/uploads/([^/]+)/blobs/(sha256:[0-9a-f]{64})$`,
+        `^${artifactPattern}/uploads/([^/]+)/blobs/(sha256:[0-9a-f]{64})$`,
         "u",
       ).exec(url.pathname);
       if (request.method === "PUT" && match) {
@@ -251,10 +257,7 @@ export function createTakoformArtifacts(
         return new Response(null, { status: 201 });
       }
 
-      match = new RegExp(
-        `^${ARTIFACT_PREFIX.replaceAll(".", "\\.")}/uploads/([^/]+)/commit$`,
-        "u",
-      ).exec(url.pathname);
+      match = new RegExp(`^${artifactPattern}/uploads/([^/]+)/commit$`, "u").exec(url.pathname);
       if (request.method === "POST" && match) {
         const key = requireIdempotencyKey(request);
         const replayKey = terminalReplayKey(principal, request, key);
@@ -321,9 +324,7 @@ export function createTakoformArtifacts(
         return replayArtifactResponse(result);
       }
 
-      match = new RegExp(`^${ARTIFACT_PREFIX.replaceAll(".", "\\.")}/uploads/([^/]+)$`, "u").exec(
-        url.pathname,
-      );
+      match = new RegExp(`^${artifactPattern}/uploads/([^/]+)$`, "u").exec(url.pathname);
       if (request.method === "DELETE" && match) {
         const key = requireIdempotencyKey(request);
         const replayKey = terminalReplayKey(principal, request, key);
@@ -336,20 +337,16 @@ export function createTakoformArtifacts(
         return new Response(null, { status: 204 });
       }
 
-      match = new RegExp(
-        `^${ARTIFACT_PREFIX.replaceAll(".", "\\.")}/(sha256:[0-9a-f]{64})$`,
-        "u",
-      ).exec(url.pathname);
+      match = new RegExp(`^${artifactPattern}/(sha256:[0-9a-f]{64})$`, "u").exec(url.pathname);
       if (request.method === "GET" && match) {
         const manifest = await this.resolveManifest(principal.tenantId, requiredDigest(match[1]));
         if (!manifest) return failure("artifact_missing", 404);
         return Response.json(manifest);
       }
 
-      match = new RegExp(
-        `^${ARTIFACT_PREFIX.replaceAll(".", "\\.")}/blobs/(sha256:[0-9a-f]{64})$`,
-        "u",
-      ).exec(url.pathname);
+      match = new RegExp(`^${artifactPattern}/blobs/(sha256:[0-9a-f]{64})$`, "u").exec(
+        url.pathname,
+      );
       if (request.method === "HEAD" && match) {
         const digest = requiredDigest(match[1]);
         if (!(await holds(principal.tenantId, digest, "blob"))) {

@@ -1,6 +1,7 @@
 import type { TakoformV1Alpha3FormRef } from "../form-ref.ts";
 import type { TakoformBindingRef, TakoformInterfaceRef } from "../interface-ref.ts";
 import type { JsonObject } from "../ports.ts";
+import type { ResourceDeploymentMutation } from "../resource-deployments.ts";
 
 export type { TakoformBindingRef, TakoformInterfaceRef, TakoformV1Alpha3FormRef };
 
@@ -21,6 +22,10 @@ export interface InstalledTakoformForm {
   };
   readonly displayName?: string;
   readonly description?: string;
+  /** Minimum Host lane required by this exact Definition. */
+  readonly requiresHostApi?: string;
+  /** Portable cross-resource/output constraints owned by the Definition. */
+  readonly constraints?: readonly TakoformConstraint[];
   readonly role?: "identity" | "revision" | "deployment" | "attachment" | "policy";
   readonly providedInterfaces?: readonly TakoformInterfaceRef[];
   readonly acceptedBindings?: readonly TakoformBindingRef[];
@@ -33,8 +38,45 @@ export interface InstalledTakoformForm {
     readonly specField: string;
     readonly kind: "WorkerBundle" | "StaticAssetBundle" | "MigrationBundle";
   };
+  /** Explicit family adapter for a Form-provided worker class Interface. */
+  readonly workerClassRuntime?: {
+    readonly providedInterface: string;
+    readonly className: `/${string}`;
+    readonly workerRelation: `/${string}`;
+    readonly deploymentForm: { readonly apiVersion: string; readonly kind: string };
+    readonly deploymentWorkerRelation: `/${string}`;
+    readonly deploymentVersionRelation: `/${string}`;
+    readonly versionBundleRelation: `/${string}`;
+  };
   readonly validateDesired?: (spec: JsonObject) => readonly TakoformDiagnostic[];
 }
+
+export type TakoformConstraint =
+  | {
+      readonly kind: "exclusive";
+      readonly reference: `/${string}`;
+      readonly keyedBy?: `/${string}`;
+    }
+  | {
+      readonly kind: "sum";
+      readonly list: `/${string}`;
+      readonly member: string;
+      readonly total: number;
+    }
+  | { readonly kind: "claim"; readonly property: `/${string}` }
+  | { readonly kind: "hostAssigned"; readonly output: `/${string}` }
+  | {
+      readonly kind: "orderedPair" | "distinctPair" | "uniquePair";
+      readonly references: readonly [`/${string}`, `/${string}`];
+    }
+  | { readonly kind: "uniqueBy"; readonly list: `/${string}`; readonly member: string }
+  | { readonly kind: "acyclic"; readonly reference: `/${string}` }
+  | {
+      readonly kind: "sameResolvedTarget";
+      readonly anchor: `/${string}`;
+      readonly members: `/${string}`;
+      readonly through: `/${string}`;
+    };
 
 /**
  * One installed portable BindingDefinition.
@@ -101,6 +143,8 @@ export interface TakoformDriverReceipt {
    * host-side status transition without pretending desired state changed.
    */
   readonly conditions?: readonly TakoformCondition[];
+  /** Host-internal provider realization; never rendered into a Resource. */
+  readonly deploymentMutation?: ResourceDeploymentMutation;
 }
 
 /**
@@ -119,6 +163,39 @@ export interface TakoformDriverRelation {
   readonly bindingRef?: TakoformBindingRef;
 }
 
+export interface TakoformStandardServiceSlot {
+  readonly name: string;
+  readonly required: boolean;
+  readonly service: {
+    readonly apiVersion: "standards.takoform.com/v1alpha1" | "standards.takoform.com/v1";
+    readonly protocol: string;
+  };
+}
+
+/** Sealed execution material. It is passed to a driver and never stored in a Resource. */
+export interface TakoformStandardServiceProjection extends TakoformStandardServiceSlot {
+  readonly endpoint: JsonObject;
+  readonly credential: JsonObject;
+}
+
+export interface TakoformStandardServiceResolver {
+  satisfiable(input: {
+    readonly tenantId: string;
+    /** Absent only on the Host-wide support profile probe. */
+    readonly space?: string;
+    readonly serviceRef: TakoformStandardServiceSlot["service"];
+  }): Promise<boolean>;
+  resolve(input: {
+    readonly tenantId: string;
+    readonly space: string;
+    readonly form: InstalledTakoformForm;
+    readonly slot: TakoformStandardServiceSlot;
+  }): Promise<{
+    readonly endpoint: JsonObject;
+    readonly credential: JsonObject;
+  } | null>;
+}
+
 export interface TakoformResourceDriver {
   apply(input: {
     readonly operationId: string;
@@ -131,7 +208,10 @@ export interface TakoformResourceDriver {
     readonly relations: readonly TakoformDriverRelation[];
     readonly commercialAuthority?: TakoformCommercialAuthority;
     readonly runtimeMaterialization?: JsonObject;
+    readonly standardServices?: readonly TakoformStandardServiceProjection[];
     readonly previous?: TakoformStoredResource;
+    /** Commit the Deployment realization with the portable Resource. */
+    readonly atomicDeploymentCommit?: true;
   }): Promise<TakoformDriverReceipt>;
   observe(input: {
     readonly tenantId: string;
@@ -145,7 +225,9 @@ export interface TakoformResourceDriver {
     readonly resourceUid: string;
     readonly resource: TakoformStoredResource;
     readonly relations: readonly TakoformDriverRelation[];
-  }): Promise<void>;
+    /** Commit the Deployment realization with the portable Resource deletion. */
+    readonly atomicDeploymentCommit?: true;
+  }): Promise<TakoformDriverReceipt | void>;
   import?(input: {
     readonly operationId: string;
     readonly tenantId: string;
@@ -156,7 +238,10 @@ export interface TakoformResourceDriver {
     readonly spec: JsonObject;
     readonly nativeId: string;
     readonly relations: readonly TakoformDriverRelation[];
+    readonly standardServices?: readonly TakoformStandardServiceProjection[];
     readonly previous?: TakoformStoredResource;
+    /** Commit the Deployment realization with the portable Resource. */
+    readonly atomicDeploymentCommit?: true;
   }): Promise<TakoformDriverReceipt>;
   /**
    * Portable SQLite migration execution against the target database itself.

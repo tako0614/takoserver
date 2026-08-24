@@ -39,6 +39,47 @@ export type NewResourceDeployment = Omit<
   readonly nativeClaimed?: boolean;
 };
 
+/**
+ * Provider-owned Deployment state to commit with the portable Resource.
+ *
+ * The provider driver may compute this only after an external mutation, but it
+ * must not write it independently. The Takoform store applies this projection
+ * in the same D1/SQLite batch as the Resource, replay, claims, and Operation.
+ */
+export type ResourceDeploymentMutation =
+  | { readonly kind: "create"; readonly deployment: NewResourceDeployment }
+  | {
+      readonly kind: "refresh";
+      readonly tenantId: string;
+      readonly deploymentId: string;
+      readonly expectedNativeId: string;
+      readonly observed: JsonObject;
+      readonly outputs: JsonObject;
+    }
+  | {
+      readonly kind: "claim";
+      readonly tenantId: string;
+      readonly deploymentId: string;
+      readonly expectedNativeId: string;
+      readonly nativeId: string;
+      readonly observed: JsonObject;
+      readonly outputs: JsonObject;
+    }
+  | {
+      readonly kind: "delete";
+      readonly tenantId: string;
+      readonly deploymentId: string;
+      readonly expectedNativeId: string;
+    }
+  | {
+      readonly kind: "retain";
+      readonly tenantId: string;
+      readonly deploymentId: string;
+      readonly expectedNativeId: string;
+      readonly observed: JsonObject;
+      readonly outputs: JsonObject;
+    };
+
 export interface ResourceDeploymentStore {
   create(input: NewResourceDeployment): Promise<void>;
   find(tenantId: string, deploymentId: string): Promise<ResourceDeployment | null>;

@@ -6,6 +6,7 @@ import {
   TAKOFORM_MAXIMUM_WORKER_BUNDLE_MODULES,
 } from "./limits.ts";
 import { validateRelationSchema } from "./relations.ts";
+import { standardServiceDeclarations } from "./standard-services.ts";
 import {
   type InstalledTakoformForm,
   TakoformHostError,
@@ -16,9 +17,10 @@ import {
  * The installed Form registry: which exact Form identities this deployment can
  * execute, and the identity rules that decide whether a request names one.
  *
- * Identity is the whole quad — group/version, kind, definition version, and
- * schema digest. A request that gets any part wrong names a Form that does not
- * exist here, which is why every lookup failure is `form_unknown` rather than a
+ * Identity is the whole quad — group, kind, definition version, and schema
+ * digest. Retained families may carry a group version, but current families do
+ * not. A request that gets any part wrong names a Form that does not exist
+ * here, which is why every lookup failure is `form_unknown` rather than a
  * validation error: the Host will not guess which Form a caller meant.
  */
 
@@ -26,6 +28,11 @@ export const DIGEST = /^sha256:[0-9a-f]{64}$/u;
 const FORM_GROUP =
   /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/u;
 const FORM_VERSION = /^v[0-9]+(?:(?:alpha|beta)[0-9]+)?$/u;
+const RESERVED_FORM_GROUPS = new Set([
+  "forms.takoform.com",
+  "packages.forms.takoform.com",
+  "trust.forms.takoform.com",
+]);
 const KIND = /^[A-Z][A-Za-z0-9]{0,63}$/u;
 const SPEC_FIELD = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/u;
 const DEFINITION_VERSION =
@@ -45,11 +52,24 @@ export type FormRegistry = ReadonlyMap<string, InstalledTakoformForm>;
  * ambiguous: two Forms with the same identity, or one definition presented
  * under two schema digests.
  */
-export function installedForms(input: readonly InstalledTakoformForm[]): FormRegistry {
+export function installedForms(
+  input: readonly InstalledTakoformForm[],
+  hostApiVersion?: string,
+): FormRegistry {
   const result = new Map<string, InstalledTakoformForm>();
   const definitionDigests = new Map<string, string>();
   for (const form of input) {
     validateFormRef(form.identity.formRef);
+    if (form.requiresHostApi !== undefined) {
+      if (
+        hostApiVersion === undefined ||
+        compareHostApiVersions(hostApiVersion, form.requiresHostApi) < 0
+      ) {
+        throw new TypeError(
+          `Form ${form.identity.formRef.kind} requires ${form.requiresHostApi} but host implements ${hostApiVersion ?? "no Host API"}`,
+        );
+      }
+    }
     if (form.identity.packageDigest && !DIGEST.test(form.identity.packageDigest)) {
       throw new TypeError("invalid package digest");
     }
@@ -62,7 +82,23 @@ export function installedForms(input: readonly InstalledTakoformForm[]): FormReg
     if (form.role === "revision" && form.operations.includes("update")) {
       throw new TypeError("revision Form cannot declare update");
     }
+    if (form.workerClassRuntime) {
+      const contract = form.workerClassRuntime;
+      const explicitInterface = (form.providedInterfaces ?? []).some(
+        (candidate) => candidate.name === contract.providedInterface,
+      );
+      const explicitConstraint = (form.constraints ?? []).some(
+        (constraint) =>
+          constraint.kind === "exclusive" &&
+          constraint.reference === contract.workerRelation &&
+          constraint.keyedBy === contract.className,
+      );
+      if (!explicitInterface || !explicitConstraint) {
+        throw new TypeError("worker class runtime must be declared by the Form");
+      }
+    }
     validateRelationSchema(form);
+    standardServiceDeclarations(form);
     const definitionKey = `${form.identity.formRef.apiVersion}\0${form.identity.formRef.kind}\0${form.identity.formRef.definitionVersion}`;
     const installedDigest = definitionDigests.get(definitionKey);
     if (installedDigest !== undefined && installedDigest !== form.identity.formRef.schemaDigest) {
@@ -127,9 +163,8 @@ export function validateFormRef(input: FormRefLike): void {
   if (
     rest.length !== 0 ||
     !group ||
-    !version ||
-    !FORM_GROUP.test(group) ||
-    !FORM_VERSION.test(version) ||
+    !isFormGroup(group) ||
+    (version !== undefined && !FORM_VERSION.test(version)) ||
     input.apiVersion === "forms.takoform.com/v1alpha1" ||
     input.apiVersion === "forms.takoform.com/v1alpha2" ||
     !KIND.test(input.kind) ||
@@ -140,8 +175,31 @@ export function validateFormRef(input: FormRefLike): void {
   }
 }
 
+/** Compares Host API lanes so `requiresHostApi` remains a lower bound. */
+export function compareHostApiVersions(current: string, required: string): number {
+  const parse = (value: string): readonly [number, number, number] => {
+    const match = /^forms\.takoform\.com\/v([0-9]+)(?:(alpha|beta)([0-9]+))?$/u.exec(value);
+    if (!match) throw new TypeError(`invalid Host API version ${value}`);
+    return [
+      Number(match[1]),
+      match[2] === "alpha" ? 0 : match[2] === "beta" ? 1 : 2,
+      Number(match[3] ?? 0),
+    ];
+  };
+  const left = parse(current);
+  const right = parse(required);
+  for (let index = 0; index < left.length; index += 1) {
+    const leftPart = left[index];
+    const rightPart = right[index];
+    if (leftPart !== undefined && rightPart !== undefined && leftPart !== rightPart) {
+      return leftPart < rightPart ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
 export function isFormGroup(value: string): boolean {
-  return FORM_GROUP.test(value);
+  return value.length <= 320 && FORM_GROUP.test(value) && !RESERVED_FORM_GROUPS.has(value);
 }
 
 export function isFormVersion(value: string): boolean {
@@ -152,9 +210,36 @@ export function isKind(value: string): boolean {
   return KIND.test(value);
 }
 
+export function isDefinitionVersion(value: string): boolean {
+  return DEFINITION_VERSION.test(value);
+}
+
+export function isFormApiVersion(value: string): boolean {
+  const [group, version, ...rest] = value.split("/");
+  return (
+    rest.length === 0 &&
+    group !== undefined &&
+    isFormGroup(group) &&
+    (version === undefined || FORM_VERSION.test(version)) &&
+    value.length <= 320
+  );
+}
+
 /** What a caller may rely on before attempting an operation on this Form. */
-export function formSupportProfile(form: InstalledTakoformForm): JsonObject {
+export function formSupportProfile(
+  form: InstalledTakoformForm,
+  apiVersion:
+    | "support.takoform.com/v1alpha1"
+    | "support.takoform.com/v1alpha2"
+    | "support.takoform.com/v1" = "support.takoform.com/v1alpha1",
+): JsonObject {
   const supportedEnums = topLevelSupportedEnums(form.desiredSchema);
+  const stableProfile = apiVersion === "support.takoform.com/v1";
+  const renderedSupportedEnums = stableProfile
+    ? Object.fromEntries(
+        Object.entries(supportedEnums).map(([name, values]) => [jsonPointer(name), values]),
+      )
+    : supportedEnums;
   const edgeForm = isEdgeFormsApiVersion(form.identity.formRef.apiVersion);
   const workerVersion = edgeForm && form.identity.formRef.kind === "WorkerVersion";
   const artifactFileLimit = edgeForm
@@ -173,11 +258,13 @@ export function formSupportProfile(form: InstalledTakoformForm): JsonObject {
         ? TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES
         : undefined);
   return {
-    apiVersion: "support.takoform.com/v1alpha1",
+    apiVersion,
     kind: "FormSupport",
     formRef: structuredClone(form.identity.formRef) as unknown as JsonObject,
     operations: [...form.operations],
-    ...(Object.keys(supportedEnums).length > 0 ? { supportedEnums } : {}),
+    ...(Object.keys(renderedSupportedEnums).length > 0
+      ? { supportedEnums: renderedSupportedEnums }
+      : {}),
     ...(form.acceptedBindings && form.acceptedBindings.length > 0
       ? {
           supportedBindings: form.acceptedBindings.map(
@@ -188,14 +275,25 @@ export function formSupportProfile(form: InstalledTakoformForm): JsonObject {
     ...(configuredArtifactFileLimit !== undefined
       ? {
           limits: {
-            maximumBundleBytes: TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
-            maximumBundleFiles: configuredArtifactFileLimit,
+            [stableProfile ? "/maximumBundleBytes" : "maximumBundleBytes"]:
+              TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
+            [stableProfile ? "/maximumBundleFiles" : "maximumBundleFiles"]:
+              configuredArtifactFileLimit,
           },
         }
       : workerVersion
-        ? { limits: { maximumBundleBytes: TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES } }
+        ? {
+            limits: {
+              [stableProfile ? "/maximumBundleBytes" : "maximumBundleBytes"]:
+                TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
+            },
+          }
         : {}),
   };
+}
+
+function jsonPointer(member: string): string {
+  return `/${member.replaceAll("~", "~0").replaceAll("/", "~1")}`;
 }
 
 function topLevelSupportedEnums(schema: JsonObject): JsonObject {

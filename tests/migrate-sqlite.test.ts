@@ -22,6 +22,9 @@ describe("bringing a local database up to date", () => {
       "tf_resources",
       "tf_resource_attachments",
       "tf_resource_deployments",
+      "tf_deferred_operations",
+      "tf_operation_commit_guards",
+      "tf_resource_claims",
       "reservations",
     ]) {
       expect(() => database.query(`SELECT 1 FROM ${table} LIMIT 1`).all()).not.toThrow();
@@ -40,6 +43,76 @@ describe("bringing a local database up to date", () => {
     const second = migrateSqlite(database);
     expect(second.applied).toEqual([]);
     expect(second.alreadyApplied).toBe(MIGRATIONS.length);
+  });
+
+  test("adds durable operations and claims without rewriting released Takoform rows", () => {
+    const database = new Database(":memory:");
+    database.exec(`
+      CREATE TABLE applied_migrations (
+        name TEXT PRIMARY KEY NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+    const durableOperations = MIGRATIONS.findIndex(
+      (migration) => migration.name === "0020_takoform_deferred_operations.sql",
+    );
+    expect(durableOperations).toBeGreaterThan(0);
+    for (const migration of MIGRATIONS.slice(0, durableOperations)) {
+      database.exec(migration.sql);
+      database
+        .query("INSERT INTO applied_migrations (name, applied_at) VALUES (?, 'now')")
+        .run(migration.name);
+    }
+    database
+      .query(
+        `INSERT INTO tf_resources
+           (tenant_id, space, api_version, kind, name, uid, generation, revision,
+            resource_json, relations_json, updated_at)
+         VALUES ('tenant-a', 'main', 'example.forms.invalid', 'Thing', 'existing',
+                 'uid_existing', '3', '7', ?, '[]', 42)`,
+      )
+      .run('{"existing":true}');
+    database.exec(`
+      INSERT INTO tf_operations
+        (id, tenant_id, operation, state, resource_json, created_at, expires_at)
+      VALUES
+        ('op_existing', 'tenant-a', 'apply', 'succeeded', '{"existing":true}',
+         '2026-08-23T00:00:00.000Z', 9999999999999)
+    `);
+
+    const report = migrateSqlite(database);
+
+    expect(report.applied).toEqual([
+      "0020_takoform_deferred_operations.sql",
+      "0021_takoform_provider_mutation_sagas.sql",
+    ]);
+    expect(
+      database
+        .query(
+          `SELECT uid, generation, revision, resource_json, relations_json, updated_at
+           FROM tf_resources WHERE name = 'existing'`,
+        )
+        .get(),
+    ).toEqual({
+      uid: "uid_existing",
+      generation: "3",
+      revision: "7",
+      resource_json: '{"existing":true}',
+      relations_json: "[]",
+      updated_at: 42,
+    });
+    expect(
+      database
+        .query("SELECT id, state, resource_json FROM tf_operations WHERE id = 'op_existing'")
+        .get(),
+    ).toEqual({ id: "op_existing", state: "succeeded", resource_json: '{"existing":true}' });
+    for (const table of [
+      "tf_deferred_operations",
+      "tf_operation_commit_guards",
+      "tf_resource_claims",
+    ]) {
+      expect(() => database.query(`SELECT 1 FROM ${table} LIMIT 1`).all()).not.toThrow();
+    }
   });
 
   test("renames fractional usage money without changing its value", () => {

@@ -43,6 +43,7 @@ export function createJavaScriptWorkerModuleInspector(): WorkerModuleInspector {
 
       const declarations = new Map<string, AstNode>();
       const factories = new Map<string, AstNode>();
+      const exportedClasses = new Set<string>();
       let exported: AstNode | undefined;
       for (const statement of program.body) {
         if (statement.type === "VariableDeclaration") {
@@ -61,6 +62,11 @@ export function createJavaScriptWorkerModuleInspector(): WorkerModuleInspector {
           exported = node(statement.declaration);
         }
         if (statement.type === "ExportNamedDeclaration") {
+          const declaration = node(statement.declaration);
+          if (declaration?.type === "ClassDeclaration") {
+            const name = identifierName(declaration.id);
+            if (name) exportedClasses.add(name);
+          }
           for (const specifier of nodes(statement.specifiers)) {
             if (identifierName(specifier.exported) === "default") {
               if (exported) return refused();
@@ -83,7 +89,11 @@ export function createJavaScriptWorkerModuleInspector(): WorkerModuleInspector {
         if (!value || !isFunction(value)) return refused();
         found.add(name);
       }
-      return { loadable: true, handlers: HANDLERS.filter((handler) => found.has(handler)) };
+      return {
+        loadable: true,
+        handlers: HANDLERS.filter((handler) => found.has(handler)),
+        ...(exportedClasses.size > 0 ? { classes: [...exportedClasses].sort() } : {}),
+      };
     },
   };
 }

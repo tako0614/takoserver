@@ -23,6 +23,12 @@ export interface ProvisionerEndpointOptions {
   readonly providers: readonly Provider[];
   /** Shared credential. Absent means the endpoint is not served. */
   readonly credential?: string | undefined;
+  /**
+   * Offerings that retain create/import authority on this endpoint. An empty
+   * list leaves observe/delete available for draining recorded Deployments.
+   * Omit only for historical callers that intentionally retain all authority.
+   */
+  readonly applyOfferingIds?: readonly string[];
 }
 
 export type ProvisionerEndpoint = (request: Request) => Promise<Response | null>;
@@ -34,6 +40,8 @@ export function createProvisionerEndpoint(
   for (const provider of options.providers) {
     for (const offering of provider.offerings) byOffering.set(offering.id, provider);
   }
+  const applyOfferingIds =
+    options.applyOfferingIds === undefined ? undefined : new Set(options.applyOfferingIds);
 
   return async (request) => {
     const url = new URL(request.url);
@@ -59,13 +67,14 @@ export function createProvisionerEndpoint(
       return Response.json({ error: { code: "invalid_argument" } }, { status: 400 });
     }
 
-    const ticket = await run(byOffering, body.operation, body.input);
+    const ticket = await run(byOffering, applyOfferingIds, body.operation, body.input);
     return Response.json({ ticket });
   };
 }
 
 async function run(
   byOffering: ReadonlyMap<string, Provider>,
+  applyOfferingIds: ReadonlySet<string> | undefined,
   operation: string,
   input: Record<string, unknown>,
 ): Promise<ProviderTicket> {
@@ -73,6 +82,13 @@ async function run(
   const provider =
     typeof offering?.id === "string" ? byOffering.get(offering.id) : firstOf(byOffering);
   if (!provider) return failed("invalid_spec", "no provisioner serves that offering");
+  if (
+    (operation === "apply" || operation === "adopt") &&
+    (typeof offering?.id !== "string" ||
+      (applyOfferingIds !== undefined && !applyOfferingIds.has(offering.id)))
+  ) {
+    return failed("invalid_spec", "that offering has no current provision authority");
+  }
 
   try {
     switch (operation) {

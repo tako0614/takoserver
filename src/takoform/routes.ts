@@ -3,7 +3,17 @@ import type { TakoformArtifactTransport } from "./artifacts.ts";
 import { ArtifactInputError } from "./artifacts.ts";
 import type { BindingRegistry } from "./bindings.ts";
 import type { EngineContext, TakoformEngine } from "./engine.ts";
-import { exactInstalledForm, type FormRegistry, formSupportProfile } from "./forms.ts";
+import {
+  DIGEST,
+  exactInstalledForm,
+  type FormRegistry,
+  formSupportProfile,
+  isDefinitionVersion,
+  isFormApiVersion,
+  isKind,
+} from "./forms.ts";
+import type { DeferredOperations } from "./operations.ts";
+import { isStableStandardServiceProtocol } from "./standard-services.ts";
 import type { OperationRecord, TakoformStore } from "./store.ts";
 import {
   type InstalledTakoformForm,
@@ -12,6 +22,7 @@ import {
   TakoformHostError,
   type TakoformHostPrincipal,
   type TakoformInterfaceRef,
+  type TakoformStandardServiceResolver,
 } from "./types.ts";
 import {
   etag,
@@ -21,38 +32,51 @@ import {
   requiredQuery,
   resourceResponse,
   safeSegment,
+  spaceId,
 } from "./wire.ts";
 
 /**
  * The Takoform Host HTTP surface.
  *
- * Two lanes are served from one engine. `v1beta1` is the released lane a
- * published Terraform provider pins; `v1alpha3` is the current one. They are
- * wire-identical, so the released lane is adapted by rewriting the path prefix
- * only — Form references inside bodies are never rewritten, because a FormRef
- * identifies a definition, not a lane.
+ * The default composition serves the one literal stable Host API lane. Retired
+ * alpha/beta paths are deliberately not aliases: a stale client must receive
+ * an exact 404 rather than believe it is still speaking its old contract.
+ * FormRef versions remain independent of this route identity.
  */
 
-const CURRENT_LANE = "/apis/forms.takoform.com/v1alpha3";
-const RELEASED_LANE = "/apis/forms.takoform.com/v1beta1";
+const STABLE_LANE = "/apis/forms.takoform.com/v1";
 
-const SUPPORT_FORM = new RegExp(
-  `^${escaped(CURRENT_LANE)}/support/forms/([^/]+)/([^/]+)/([^/]+)/([^/]+)$`,
-  "u",
-);
-const SUPPORT_CONTRACT = new RegExp(
-  `^${escaped(CURRENT_LANE)}/support/(interfaces|bindings)/([^/]+)/([^/]+)$`,
-  "u",
-);
-const FORM_DEFINITION = new RegExp(
-  `^${escaped(CURRENT_LANE)}/form-definitions/([^/]+)/([^/]+)/([^/]+)$`,
-  "u",
-);
-const RESOURCE = new RegExp(
-  `^${escaped(CURRENT_LANE)}/resources/([^/]+)/([^/]+)/([^/]+)/([^/]+)(?:/(import|observe))?$`,
-  "u",
-);
-const OPERATION = new RegExp(`^${escaped(CURRENT_LANE)}/operations/([^/]+)(/cancel)?$`, "u");
+export interface TakoformRouteConfiguration {
+  readonly hostApiVersion: string;
+  readonly apiPath: `/apis/${string}`;
+  readonly aliases?: readonly `/apis/${string}`[];
+  readonly supportProfileApiVersion:
+    | "support.takoform.com/v1alpha1"
+    | "support.takoform.com/v1alpha2"
+    | "support.takoform.com/v1";
+  readonly enumerateForms?: boolean;
+  readonly exposeDefinitionConstraints?: boolean;
+  readonly omitObservedStatus?: boolean;
+  readonly bodyGenerationFence?: boolean;
+  readonly reviewSpecDigest?: boolean;
+  readonly standardServices?: {
+    readonly apiVersion: "standards.takoform.com/v1alpha1" | "standards.takoform.com/v1";
+    /** Retained beta-only closed support set. Stable support is resolver-owned. */
+    readonly protocols?: readonly string[];
+  };
+}
+
+export const DEFAULT_TAKOFORM_ROUTES: TakoformRouteConfiguration = Object.freeze({
+  hostApiVersion: "forms.takoform.com/v1",
+  apiPath: STABLE_LANE,
+  supportProfileApiVersion: "support.takoform.com/v1",
+  enumerateForms: true,
+  exposeDefinitionConstraints: true,
+  omitObservedStatus: true,
+  bodyGenerationFence: true,
+  reviewSpecDigest: true,
+  standardServices: { apiVersion: "standards.takoform.com/v1" as const },
+});
 
 /**
  * The provision-token redemption lane.
@@ -107,15 +131,52 @@ export interface CreateTakoformRoutesOptions {
   readonly forms: FormRegistry;
   readonly bindings: BindingRegistry;
   readonly artifacts: TakoformArtifactTransport;
+  readonly routes?: TakoformRouteConfiguration;
   readonly provision?: ProvisionLanePorts;
+  readonly deferredOperations?: DeferredOperations;
+  readonly standardServiceResolver?: TakoformStandardServiceResolver;
 }
 
 export function createTakoformRoutes(options: CreateTakoformRoutesOptions): TakoformHost {
-  const { authenticate, engine, store, forms, bindings, artifacts, provision } = options;
+  const {
+    authenticate,
+    engine,
+    store,
+    forms,
+    bindings,
+    artifacts,
+    provision,
+    deferredOperations,
+    standardServiceResolver,
+  } = options;
+  const configuration = options.routes ?? DEFAULT_TAKOFORM_ROUTES;
+  const lane = configuration.apiPath;
+  const groupPath = "([^/]+)(?:/(v[0-9]+(?:(?:alpha|beta)[0-9]+)?))?";
+  const supportFormPattern = new RegExp(
+    `^${escaped(lane)}/support/forms/${groupPath}/([^/]+)/([^/]+)$`,
+    "u",
+  );
+  const supportContractPattern = new RegExp(
+    `^${escaped(lane)}/support/(interfaces|bindings)/([^/]+)/([^/]+)$`,
+    "u",
+  );
+  const standardServicePattern = new RegExp(
+    `^${escaped(lane)}/support/standard-services/([^/]+)$`,
+    "u",
+  );
+  const formDefinitionPattern = new RegExp(
+    `^${escaped(lane)}/form-definitions/${groupPath}/([^/]+)$`,
+    "u",
+  );
+  const resourcePattern = new RegExp(
+    `^${escaped(lane)}/resources/${groupPath}/([^/]+)/([^/]+)(?:/(import|observe))?$`,
+    "u",
+  );
+  const operationPattern = new RegExp(`^${escaped(lane)}/operations/([^/]+)(/cancel)?$`, "u");
 
   return {
     async handle(incoming): Promise<Response | null> {
-      const request = currentLaneRequest(incoming);
+      const request = laneRequest(incoming, configuration);
       const url = new URL(request.url);
       if (url.pathname.startsWith(`${PROVISION_LANE}/`)) {
         if (url.pathname.includes("%")) return failure("invalid_argument", 400);
@@ -126,7 +187,7 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
           return hostErrorResponse(error, request, url);
         }
       }
-      if (!url.pathname.startsWith(CURRENT_LANE)) return null;
+      if (url.pathname !== lane && !url.pathname.startsWith(`${lane}/`)) return null;
       if (url.pathname.includes("%")) return failure("invalid_argument", 400);
 
       const principal = await authenticate(request);
@@ -152,7 +213,16 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
       };
 
       try {
-        if (principal.scope) await assertPrincipalScope(principal.scope, request, url);
+        if (principal.scope) {
+          await assertPrincipalScope(
+            principal.scope,
+            request,
+            url,
+            lane,
+            formDefinitionPattern,
+            resourcePattern,
+          );
+        }
         const artifactResponse = await artifacts.handle(request, context, failure);
         if (artifactResponse) return artifactResponse;
         return await route(context, url, request);
@@ -163,13 +233,17 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
   };
 
   async function route(context: EngineContext, url: URL, request: Request): Promise<Response> {
-    if (request.method === "GET" && url.pathname === `${CURRENT_LANE}/support/forms`) {
-      return Response.json({ profiles: [...forms.values()].map(formSupportProfile) });
+    if (request.method === "GET" && url.pathname === `${lane}/support/forms`) {
+      return Response.json({
+        profiles: [...forms.values()].map((form) =>
+          formSupportProfile(form, configuration.supportProfileApiVersion),
+        ),
+      });
     }
 
-    const supportForm = SUPPORT_FORM.exec(url.pathname);
+    const supportForm = supportFormPattern.exec(url.pathname);
     if (request.method === "GET" && supportForm) {
-      const apiVersion = `${safeSegment(supportForm[1])}/${safeSegment(supportForm[2])}`;
+      const apiVersion = joinedGroup(supportForm[1], supportForm[2]);
       const kind = safeSegment(supportForm[3]);
       const definitionVersion = safeSegment(supportForm[4]);
       const candidates = [...forms.values()].filter(
@@ -180,10 +254,10 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
       );
       const candidate = candidates.length === 1 ? candidates[0] : undefined;
       if (!candidate) return failure("form_unknown", 404);
-      return Response.json(formSupportProfile(candidate));
+      return Response.json(formSupportProfile(candidate, configuration.supportProfileApiVersion));
     }
 
-    const supportContract = SUPPORT_CONTRACT.exec(url.pathname);
+    const supportContract = supportContractPattern.exec(url.pathname);
     if (request.method === "GET" && supportContract) {
       const route = supportContract[1];
       const name = safeSegment(supportContract[2]);
@@ -210,19 +284,66 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
       return Response.json(
         route === "interfaces"
           ? {
-              apiVersion: "support.takoform.com/v1alpha1",
+              apiVersion: configuration.supportProfileApiVersion,
               kind: "InterfaceSupport",
               interfaceRef: structuredClone(reference),
             }
           : {
-              apiVersion: "support.takoform.com/v1alpha1",
+              apiVersion: configuration.supportProfileApiVersion,
               kind: "BindingSupport",
               bindingRef: structuredClone(reference),
             },
       );
     }
 
-    if (request.method === "GET" && url.pathname === `${CURRENT_LANE}/forms`) {
+    const standardService = standardServicePattern.exec(url.pathname);
+    if (request.method === "GET" && standardService) {
+      const protocol = safeSegment(standardService[1]);
+      const service = configuration.standardServices;
+      if (!service) return failure("resource_not_found", 404);
+      const stable = service.apiVersion === "standards.takoform.com/v1";
+      if (
+        stable ? !isStableStandardServiceProtocol(protocol) : !service.protocols?.includes(protocol)
+      ) {
+        return stable ? failure("invalid_argument", 400) : failure("resource_not_found", 404);
+      }
+      const serviceRef = { apiVersion: service.apiVersion, protocol } as const;
+      return Response.json({
+        apiVersion: configuration.supportProfileApiVersion,
+        kind: "StandardServiceSupport",
+        serviceRef,
+        satisfiable:
+          standardServiceResolver !== undefined &&
+          (await standardServiceResolver.satisfiable({
+            tenantId: context.tenantId,
+            serviceRef,
+          })),
+      });
+    }
+
+    if (request.method === "GET" && url.pathname === `${lane}/forms`) {
+      if (configuration.enumerateForms) {
+        validateFormsFilters(url);
+        const filters = {
+          group: url.searchParams.get("group"),
+          kind: url.searchParams.get("kind"),
+          definitionVersion: url.searchParams.get("definitionVersion"),
+          schemaDigest: url.searchParams.get("schemaDigest"),
+        };
+        return Response.json({
+          forms: [...forms.values()]
+            .filter(
+              (form) =>
+                (filters.group === null || form.identity.formRef.apiVersion === filters.group) &&
+                (filters.kind === null || form.identity.formRef.kind === filters.kind) &&
+                (filters.definitionVersion === null ||
+                  form.identity.formRef.definitionVersion === filters.definitionVersion) &&
+                (filters.schemaDigest === null ||
+                  form.identity.formRef.schemaDigest === filters.schemaDigest),
+            )
+            .map(formAvailability),
+        });
+      }
       exactQuery(url, ["space", "group", "kind", "definitionVersion", "schemaDigest"]);
       requiredQuery(url, "space");
       const form = exactInstalledForm(
@@ -235,26 +356,14 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
         forms,
       );
       if (!form) return failure("form_unknown", 404);
-      return Response.json({
-        forms: [
-          {
-            identity: structuredClone(form.identity),
-            definitionKnown: true,
-            installed: true,
-            executable: true,
-            activated: true,
-            availableToPrincipal: true,
-            operations: [...form.operations],
-          },
-        ],
-      });
+      return Response.json({ forms: [formAvailability(form)] });
     }
 
-    const definition = FORM_DEFINITION.exec(url.pathname);
+    const definition = formDefinitionPattern.exec(url.pathname);
     if (request.method === "GET" && definition) {
       exactQuery(url, ["space", "group", "kind", "definitionVersion", "schemaDigest"]);
       requiredQuery(url, "space");
-      const apiVersion = `${safeSegment(definition[1])}/${safeSegment(definition[2])}`;
+      const apiVersion = joinedGroup(definition[1], definition[2]);
       const kind = safeSegment(definition[3]);
       if (requiredQuery(url, "group") !== apiVersion || requiredQuery(url, "kind") !== kind) {
         throw new TakoformHostError();
@@ -269,13 +378,13 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
         forms,
       );
       if (!form) return failure("form_unknown", 404);
-      return Response.json(formDefinition(form));
+      return Response.json(formDefinition(form, configuration.exposeDefinitionConstraints));
     }
 
     if (
       request.method === "POST" &&
-      (url.pathname === `${CURRENT_LANE}/resources/validate` ||
-        url.pathname === `${CURRENT_LANE}/resources/prepare`)
+      (url.pathname === `${lane}/resources/validate` ||
+        url.pathname === `${lane}/resources/prepare`)
     ) {
       const result = await engine.validateOrPrepare(
         context,
@@ -288,14 +397,16 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
       return Response.json({ resource: result.resource, review: result.review });
     }
 
-    const resource = RESOURCE.exec(url.pathname);
+    const resource = resourcePattern.exec(url.pathname);
     if (resource) {
       const path = parsedResourcePath(resource);
       if (request.method === "GET" && !path.action) {
-        return shaped(await engine.read(context, path));
+        return shaped(await engine.read(context, path), configuration.omitObservedStatus);
       }
       if (request.method === "PUT" && !path.action) {
-        return shaped(await engine.apply(context, path));
+        const deferred = await deferredOperations?.accept(context, path, "apply");
+        if (deferred) return deferred;
+        return shaped(await engine.apply(context, path), configuration.omitObservedStatus);
       }
       if (request.method === "POST" && path.action === "observe") {
         // Observation answers in an envelope while apply and read answer with
@@ -303,22 +414,29 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
         // so it is reproduced rather than tidied away.
         const result = await engine.observe(context, path);
         if (result.kind !== "resource") throw new TakoformHostError();
+        const resourceView = renderedResource(result.resource, configuration.omitObservedStatus);
         return Response.json(
-          { resource: result.resource },
-          { status: result.status, headers: etag(result.resource) },
+          { resource: resourceView },
+          { status: result.status, headers: etag(resourceView) },
         );
       }
       if (request.method === "POST" && path.action === "import") {
-        return shaped(await engine.importResource(context, path));
+        const deferred = await deferredOperations?.accept(context, path, "import");
+        if (deferred) return deferred;
+        return shaped(await engine.importResource(context, path), configuration.omitObservedStatus);
       }
       if (request.method === "DELETE" && !path.action) {
-        return shaped(await engine.remove(context, path));
+        const deferred = await deferredOperations?.accept(context, path, "delete");
+        if (deferred) return deferred;
+        return shaped(await engine.remove(context, path), configuration.omitObservedStatus);
       }
     }
 
-    const operation = OPERATION.exec(url.pathname);
+    const operation = operationPattern.exec(url.pathname);
     if (operation) {
       const id = safeSegment(operation[1]);
+      const deferred = await deferredOperations?.handle(context, id, operation[2] === "/cancel");
+      if (deferred) return deferred;
       const record = await store.readOperation(context.tenantId, id);
       if (!record) return failure("operation_not_found", 404);
       if (operation[2]) {
@@ -339,20 +457,30 @@ async function assertPrincipalScope(
   scope: NonNullable<TakoformHostPrincipal["scope"]>,
   request: Request,
   url: URL,
+  lane: string,
+  formDefinitionPattern: RegExp,
+  resourcePattern: RegExp,
 ): Promise<void> {
   if (scope.mode === "tenant-run") {
-    await assertTenantRunScope(scope.space, request, url);
+    await assertTenantRunScope(
+      scope.space,
+      request,
+      url,
+      lane,
+      formDefinitionPattern,
+      resourcePattern,
+    );
     return;
   }
   const formPath = `${scope.formRef.apiVersion}/${scope.formRef.kind}`;
-  if (request.method === "GET" && url.pathname === `${CURRENT_LANE}/forms`) {
+  if (request.method === "GET" && url.pathname === `${lane}/forms`) {
     if (!scopeQueryMatches(scope, url)) throw new TakoformHostError("resource_not_found", 404);
     return;
   }
 
-  const definition = FORM_DEFINITION.exec(url.pathname);
+  const definition = formDefinitionPattern.exec(url.pathname);
   if (request.method === "GET" && definition) {
-    const candidate = `${safeSegment(definition[1])}/${safeSegment(definition[2])}/${safeSegment(definition[3])}`;
+    const candidate = `${joinedGroup(definition[1], definition[2])}/${safeSegment(definition[3])}`;
     if (
       candidate !== formPath ||
       url.searchParams.get("definitionVersion") !== scope.formRef.definitionVersion ||
@@ -365,8 +493,7 @@ async function assertPrincipalScope(
 
   if (
     request.method === "POST" &&
-    (url.pathname === `${CURRENT_LANE}/resources/validate` ||
-      url.pathname === `${CURRENT_LANE}/resources/prepare`)
+    (url.pathname === `${lane}/resources/validate` || url.pathname === `${lane}/resources/prepare`)
   ) {
     if (!(await scopeBodyMatches(scope, request))) {
       throw new TakoformHostError("resource_not_found", 404);
@@ -374,7 +501,7 @@ async function assertPrincipalScope(
     return;
   }
 
-  const resource = RESOURCE.exec(url.pathname);
+  const resource = resourcePattern.exec(url.pathname);
   if (resource) {
     const path = parsedResourcePath(resource);
     const bodyMutation = request.method === "PUT" || path.action === "import";
@@ -401,17 +528,24 @@ async function assertPrincipalScope(
   }
 
   // Support profiles are public protocol metadata and carry no tenant state.
-  if (request.method === "GET" && url.pathname.startsWith(`${CURRENT_LANE}/support/`)) return;
+  if (request.method === "GET" && url.pathname.startsWith(`${lane}/support/`)) return;
 
   throw new TakoformHostError("resource_not_found", 404);
 }
 
-async function assertTenantRunScope(space: string, request: Request, url: URL): Promise<void> {
+async function assertTenantRunScope(
+  space: string,
+  request: Request,
+  url: URL,
+  lane: string,
+  formDefinitionPattern: RegExp,
+  resourcePattern: RegExp,
+): Promise<void> {
   if (
     request.method === "GET" &&
-    (url.pathname === `${CURRENT_LANE}/forms` ||
-      FORM_DEFINITION.test(url.pathname) ||
-      url.pathname.startsWith(`${CURRENT_LANE}/support/`))
+    (url.pathname === `${lane}/forms` ||
+      formDefinitionPattern.test(url.pathname) ||
+      url.pathname.startsWith(`${lane}/support/`))
   ) {
     return;
   }
@@ -419,18 +553,17 @@ async function assertTenantRunScope(space: string, request: Request, url: URL): 
   // run-token's unique principalId. A normal multi-Resource provider run must
   // be able to upload Worker, asset, and migration bundles before applying the
   // Resources that reference them.
-  if (url.pathname.startsWith(`${CURRENT_LANE}/artifacts/`)) return;
+  if (url.pathname.startsWith(`${lane}/artifacts/`)) return;
   if (
     request.method === "POST" &&
-    (url.pathname === `${CURRENT_LANE}/resources/validate` ||
-      url.pathname === `${CURRENT_LANE}/resources/prepare`)
+    (url.pathname === `${lane}/resources/validate` || url.pathname === `${lane}/resources/prepare`)
   ) {
     if (!(await bodySpaceMatches(space, request))) {
       throw new TakoformHostError("resource_not_found", 404);
     }
     return;
   }
-  const resource = RESOURCE.exec(url.pathname);
+  const resource = resourcePattern.exec(url.pathname);
   if (resource) {
     const path = parsedResourcePath(resource);
     const bodyMutation = request.method === "PUT" || path.action === "import";
@@ -651,8 +784,13 @@ function provisionTokenFailure(error: unknown): Response {
   return failure("unauthenticated", 401);
 }
 
-function shaped(result: Awaited<ReturnType<TakoformEngine["read"]>>): Response {
-  if (result.kind === "resource") return resourceResponse(result.resource, result.status);
+function shaped(
+  result: Awaited<ReturnType<TakoformEngine["read"]>>,
+  omitObservedStatus = false,
+): Response {
+  if (result.kind === "resource") {
+    return resourceResponse(renderedResource(result.resource, omitObservedStatus), result.status);
+  }
   if (result.kind === "deleted") return new Response(null, { status: 204 });
   throw new TakoformHostError();
 }
@@ -667,13 +805,38 @@ function operationView(record: OperationRecord): JsonObject {
   };
 }
 
-function formDefinition(form: InstalledTakoformForm): JsonObject {
+function formDefinition(form: InstalledTakoformForm, exposeConstraints = false): JsonObject {
   return {
     identity: structuredClone(form.identity) as unknown as JsonObject,
     ...(form.displayName ? { displayName: form.displayName } : {}),
     ...(form.description ? { description: form.description } : {}),
     desiredSchema: structuredClone(form.desiredSchema),
+    ...(exposeConstraints && form.constraints
+      ? { constraints: structuredClone(form.constraints) as unknown as JsonObject }
+      : {}),
   };
+}
+
+function formAvailability(form: InstalledTakoformForm): JsonObject {
+  return {
+    identity: structuredClone(form.identity) as unknown as JsonObject,
+    definitionKnown: true,
+    installed: true,
+    executable: true,
+    activated: true,
+    availableToPrincipal: true,
+    operations: [...form.operations],
+  };
+}
+
+function renderedResource(
+  resource: Parameters<typeof resourceResponse>[0],
+  omitObservedStatus = false,
+): Parameters<typeof resourceResponse>[0] {
+  if (!omitObservedStatus || resource.status.observed === undefined) return resource;
+  const copy = structuredClone(resource);
+  delete (copy.status as { observed?: JsonObject }).observed;
+  return copy;
 }
 
 /**
@@ -681,13 +844,40 @@ function formDefinition(form: InstalledTakoformForm): JsonObject {
  * the body, headers, and every FormRef inside them are passed through
  * unchanged.
  */
-function currentLaneRequest(request: Request): Request {
+function laneRequest(request: Request, configuration: TakoformRouteConfiguration): Request {
   const url = new URL(request.url);
-  if (!url.pathname.startsWith(`${RELEASED_LANE}/`) && url.pathname !== RELEASED_LANE) {
-    return request;
+  for (const alias of configuration.aliases ?? []) {
+    if (!url.pathname.startsWith(`${alias}/`) && url.pathname !== alias) continue;
+    url.pathname = `${configuration.apiPath}${url.pathname.slice(alias.length)}`;
+    return new Request(url, request);
   }
-  url.pathname = `${CURRENT_LANE}${url.pathname.slice(RELEASED_LANE.length)}`;
-  return new Request(url, request);
+  return request;
+}
+
+function joinedGroup(group: string | undefined, version: string | undefined): string {
+  const safeGroup = safeSegment(group);
+  return version === undefined ? safeGroup : `${safeGroup}/${safeSegment(version)}`;
+}
+
+function validateFormsFilters(url: URL): void {
+  const allowed = new Set(["space", "group", "kind", "definitionVersion", "schemaDigest"]);
+  const keys = [...url.searchParams.keys()];
+  if (keys.some((key) => !allowed.has(key)) || new Set(keys).size !== keys.length) {
+    throw new TakoformHostError();
+  }
+  spaceId(requiredQuery(url, "space"));
+  const group = url.searchParams.get("group");
+  const kind = url.searchParams.get("kind");
+  const definitionVersion = url.searchParams.get("definitionVersion");
+  const schemaDigest = url.searchParams.get("schemaDigest");
+  if (
+    (group !== null && !isFormApiVersion(group)) ||
+    (kind !== null && !isKind(kind)) ||
+    (definitionVersion !== null && !isDefinitionVersion(definitionVersion)) ||
+    (schemaDigest !== null && !DIGEST.test(schemaDigest))
+  ) {
+    throw new TakoformHostError();
+  }
 }
 
 function boundedTenantReference(value: string): string {
@@ -696,5 +886,5 @@ function boundedTenantReference(value: string): string {
 }
 
 function escaped(value: string): string {
-  return value.replaceAll(".", "\\.");
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }

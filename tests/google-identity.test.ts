@@ -301,6 +301,7 @@ describe("sign-in request", () => {
       sql: createEphemeralSql(),
       objects: createMemoryObjectStore(),
       forms: edge.forms,
+      hostForms: [],
       providers: [],
       offerings: [],
       publicOrigin: "https://api.example.test",
