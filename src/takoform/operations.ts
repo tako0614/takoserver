@@ -287,12 +287,20 @@ export function createDeferredOperations(input: {
         operation.id,
         operation.resourceUid,
       );
-      if (providerReceipt) {
+      const providerPlan = providerReceipt
+        ? false
+        : await input.store.providerMutationPlanExists(
+            operation.tenantId,
+            operation.id,
+            operation.resourceUid,
+          );
+      if (providerReceipt || providerPlan) {
         console.error(
           canonicalJson({
             event: "takoform.deferred_operation.repair_required",
             operationId: operation.id,
             operation: operation.operation,
+            boundary: providerReceipt ? "receipt" : "plan",
             errorCode: error instanceof TakoformHostError ? error.code : "internal_error",
           }),
         );

@@ -241,6 +241,11 @@ export interface TakoformStore {
     operationId: string,
     resourceUid: string,
   ): Promise<TakoformDriverReceipt | null>;
+  providerMutationPlanExists(
+    tenantId: string,
+    operationId: string,
+    resourceUid: string,
+  ): Promise<boolean>;
   abandonProviderMutationPlan(input: {
     readonly tenantId: string;
     readonly operationId: string;
@@ -874,6 +879,17 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       );
       if (rows.length > 1) throw new Error("provider_mutation_saga_ambiguous");
       return rows[0] ? providerReceipt(rows[0].receipt_json) : null;
+    },
+
+    async providerMutationPlanExists(tenantId, operationId, resourceUid) {
+      const rows = await sql.query(
+        `SELECT 1 AS found FROM tf_provider_mutation_sagas
+         WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+           AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ? LIMIT 2`,
+        [tenantId, operationId, resourceUid, now()],
+      );
+      if (rows.length > 1) throw new Error("provider_mutation_saga_ambiguous");
+      return rows.length === 1;
     },
 
     async abandonProviderMutationPlan(input) {

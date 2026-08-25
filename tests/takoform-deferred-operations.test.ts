@@ -319,6 +319,70 @@ describe("durable deferred Takoform operations", () => {
     opened.close();
   });
 
+  test("retries the exact provider plan with the same operation after a lost receipt boundary", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    const operationIds: string[] = [];
+    let attempts = 0;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      async apply(input) {
+        operationIds.push(input.operationId);
+        attempts += 1;
+        if (attempts === 1) throw new Error("provider transport ended before a receipt");
+        return await memory.apply(input);
+      },
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+    };
+    const opened = persistentHarness(undefined, driver).open();
+    const operationId = await acceptCreate(
+      opened.host,
+      "provider-plan-retry",
+      "provider-plan-retry-0001",
+    );
+    const operationPath = `${lane}/operations/${operationId}`;
+
+    await opened.host.handle(request(operationPath, "primary"));
+    await opened.host.handle(request(operationPath, "primary"));
+    const held = await opened.host.handle(request(operationPath, "primary"));
+    expect(await held?.json()).toMatchObject({ id: operationId, done: false });
+    expect(
+      opened.database
+        .query(
+          `SELECT phase, lease_token, lease_until, terminal_json
+           FROM tf_deferred_operations WHERE id = ?`,
+        )
+        .get(operationId),
+    ).toEqual({
+      phase: "committing",
+      lease_token: null,
+      lease_until: null,
+      terminal_json: null,
+    });
+    expect(
+      opened.database
+        .query(
+          `SELECT phase, receipt_json FROM tf_provider_mutation_sagas
+           WHERE operation_id = ?`,
+        )
+        .get(operationId),
+    ).toEqual({ phase: "planned", receipt_json: null });
+
+    const recovered = await opened.host.handle(request(operationPath, "primary"));
+    expect(await recovered?.json()).toMatchObject({
+      id: operationId,
+      done: true,
+      result: { resource: { metadata: { name: "provider-plan-retry" } } },
+    });
+    expect(operationIds).toEqual([operationId, operationId]);
+    expect(
+      opened.database
+        .query("SELECT operation_id FROM tf_provider_mutation_sagas WHERE operation_id = ?")
+        .all(operationId),
+    ).toEqual([]);
+    opened.close();
+  });
+
   test("a stale lease cannot release the recovered worker's claim reservation", async () => {
     let now = Date.parse("2026-08-23T00:00:00.000Z");
     const root = mkdtempSync(join(tmpdir(), "takoserver-deferred-claim-"));
