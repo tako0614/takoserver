@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
-import { DeployError, preflightError } from "./errors.ts";
+import { DeployError, type DeployPhase, preflightError } from "./errors.ts";
 import { EVIDENCE_DIRECTORY } from "./evidence.ts";
 import { REPOSITORY, runChecked, wranglerCommand } from "./process.ts";
 import { resolvePushedCommit } from "./provenance.ts";
@@ -20,6 +20,9 @@ import type { DeployTarget } from "./target.ts";
 
 export type WebSurface = "console" | "site";
 export type WebAction = "status" | "plan" | "apply";
+type WebFetcher = (input: string, init?: RequestInit) => Promise<Response>;
+
+const WEB_READBACK_TIMEOUT_MS = 15_000;
 
 interface BuiltWebSurface {
   readonly surface: WebSurface;
@@ -62,7 +65,13 @@ export async function runWebRelease(
 ): Promise<void> {
   const spec = webSurfaceSpec(surface, target);
   if (action === "status") {
-    const live = await readLive(spec.origin, spec.probePath);
+    const live = await readLive(spec.origin, spec.probePath, "preflight");
+    if (live.status !== 200) {
+      throw preflightError(
+        `public ${surface} readback returned HTTP ${live.status}`,
+        `${spec.origin}${spec.probePath} did not return the expected HTTP 200 response`,
+      );
+    }
     process.stdout.write(`${JSON.stringify({ surface, ...spec, live }, null, 2)}\n`);
     return;
   }
@@ -321,20 +330,34 @@ async function currentRouteService(hostname: string): Promise<string | null> {
   return services[0] ?? null;
 }
 
-async function readLive(
+export async function readLive(
   origin: string,
   path: string,
+  phase: DeployPhase,
+  fetcher: WebFetcher = (input, init) => fetch(input, init),
 ): Promise<{ status: number; digest: string; bytes: number }> {
-  const response = await fetch(`${origin}${path}?release-readback=${Date.now()}`, {
-    headers: { "cache-control": "no-cache" },
-    signal: AbortSignal.timeout(15_000),
-  });
-  const body = new Uint8Array(await response.arrayBuffer());
-  return {
-    status: response.status,
-    digest: `sha256:${createHash("sha256").update(body).digest("hex")}`,
-    bytes: body.byteLength,
-  };
+  const signal = AbortSignal.timeout(WEB_READBACK_TIMEOUT_MS);
+  try {
+    const response = await fetcher(`${origin}${path}?release-readback=${Date.now()}`, {
+      headers: { "cache-control": "no-cache" },
+      signal,
+    });
+    const body = new Uint8Array(await response.arrayBuffer());
+    return {
+      status: response.status,
+      digest: `sha256:${createHash("sha256").update(body).digest("hex")}`,
+      bytes: body.byteLength,
+    };
+  } catch (error) {
+    const timedOut = signal.aborted || (error instanceof Error && error.name === "TimeoutError");
+    const classification = timedOut ? "timeout" : "transport";
+    const cause = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+    throw new DeployError(
+      phase,
+      timedOut ? "public web readback timed out" : "public web readback transport failed",
+      `${classification}: ${origin}${path}: ${cause}`,
+    );
+  }
 }
 
 async function verifyPublishedBytes(built: BuiltWebSurface, commit: string): Promise<void> {
@@ -343,7 +366,7 @@ async function verifyPublishedBytes(built: BuiltWebSurface, commit: string): Pro
   );
   const expected = `sha256:${createHash("sha256").update(local).digest("hex")}`;
   for (let attempt = 0; attempt < 20; attempt += 1) {
-    const live = await readLive(built.origin, built.probePath);
+    const live = await readLive(built.origin, built.probePath, "verification");
     if (live.status === 200 && live.digest === expected && live.bytes === local.byteLength) return;
     await Bun.sleep(1_000);
   }

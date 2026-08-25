@@ -2,8 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DeployError } from "../scripts/deploy/errors.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
-import { digestDirectory, webSurfaceSpec } from "../scripts/deploy/web.ts";
+import { digestDirectory, readLive, runWebRelease, webSurfaceSpec } from "../scripts/deploy/web.ts";
 
 const target = {
   accountId: "a".repeat(32),
@@ -44,6 +45,59 @@ describe("Takoserver public web release", () => {
       expect(second.digest).not.toBe(first.digest);
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("classifies a timed out readback instead of leaking TimeoutError", async () => {
+    const timeout = new DOMException("The operation timed out", "TimeoutError");
+    const failure = await readLive(target.siteOrigin, "/", "preflight", async () => {
+      throw timeout;
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(DeployError);
+    expect(failure).not.toBe(timeout);
+    expect(failure).toMatchObject({
+      phase: "preflight",
+      message: "public web readback timed out",
+    });
+    expect((failure as DeployError).detail).toContain("timeout");
+  });
+
+  test("classifies a transport readback failure without changing its phase", async () => {
+    const failure = await readLive(target.siteOrigin, "/", "verification", async () => {
+      throw new TypeError("fetch failed");
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(DeployError);
+    expect(failure).toMatchObject({
+      phase: "verification",
+      message: "public web readback transport failed",
+    });
+    expect((failure as DeployError).detail).toContain("transport");
+  });
+
+  test("fails closed when the public site answers with an upstream error", async () => {
+    const fetchHost = globalThis as unknown as {
+      fetch: (input: string, init?: RequestInit) => Promise<Response>;
+    };
+    const originalFetch = fetchHost.fetch;
+    let requests = 0;
+    fetchHost.fetch = async () => {
+      requests += 1;
+      return new Response("upstream unavailable", { status: 522 });
+    };
+    try {
+      const failure = await runWebRelease("site", "status", target).catch(
+        (error: unknown) => error,
+      );
+      expect(failure).toBeInstanceOf(DeployError);
+      expect(failure).toMatchObject({
+        phase: "preflight",
+        message: "public site readback returned HTTP 522",
+      });
+      expect(requests).toBe(1);
+    } finally {
+      fetchHost.fetch = originalFetch;
     }
   });
 });
