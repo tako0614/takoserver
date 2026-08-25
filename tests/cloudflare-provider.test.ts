@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { buildEdgeForms, edgeProviderOffering } from "../src/edge-forms.ts";
 import type { JsonObject } from "../src/ports.ts";
 import type { ProviderOffering, ProviderRelation } from "../src/provider-port.ts";
@@ -733,6 +733,62 @@ describe("released edge Form placement", () => {
     expect(calls[1]?.url).toContain("/workers/scripts/script-name/deployments");
     expect(calls[1]?.body).toContain('"percentage":100');
     expect(calls[1]?.body).toContain('"version_id":"version-id"');
+  });
+
+  test("logs a sanitized transport exception when a Worker Version upload never gets a response", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const versionOffering = technical("WorkerVersion");
+    const log = spyOn(console, "error").mockImplementation(() => undefined);
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering, versionOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch() {
+        throw new TypeError("Network connection lost: Bearer secret-account-token");
+      },
+    });
+
+    try {
+      const ticket = await provider.apply({
+        operationId: "op-version-transport-failure",
+        offering: versionOffering,
+        identity: { ...IDENTITY, name: "v1" },
+        spec: {
+          handlers: ["fetch"],
+          vars: { PRIVATE_VALUE: "must-not-enter-the-operator-log" },
+        },
+        relations: [
+          related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+            nativeId: "worker:script-name",
+            offeringId: workerOffering.id,
+            providerPackRef: "cloudflare",
+            outputs: { scriptName: "script-name" },
+          }),
+          related(
+            "/bundle",
+            stored("WorkerBundle", "bundle-uid", {
+              manifestDigest: `sha256:${"d".repeat(64)}`,
+            }),
+          ),
+        ],
+      });
+
+      expect(ticket).toMatchObject({
+        phase: "failed",
+        failure: { code: "unavailable", retryable: true },
+      });
+      expect(log).toHaveBeenCalledTimes(1);
+      const event = String(log.mock.calls[0]?.[0]);
+      expect(event).toContain('"event":"takoserver.provider.fetch_failed"');
+      expect(event).toContain('"errorName":"TypeError"');
+      expect(event).toContain('"message":"Network connection lost: [REDACTED]"');
+      expect(event).not.toContain("secret-account-token");
+      expect(event).not.toContain("must-not-enter-the-operator-log");
+    } finally {
+      log.mockRestore();
+    }
   });
 
   test("projects an exact sealed S3 supply as one runtime-native R2 slot", async () => {

@@ -1265,7 +1265,17 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
           },
         ),
       );
-    } catch {
+    } catch (error) {
+      const transportError = sanitizedTransportError(error, `Bearer ${token}`);
+      console.error(
+        JSON.stringify({
+          event: "takoserver.provider.fetch_failed",
+          provider: this.id,
+          method: "POST",
+          path: "/workers/assets/upload",
+          ...transportError,
+        }).slice(0, 4_096),
+      );
       return {
         ok: false,
         status: 0,
@@ -1435,7 +1445,17 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
           ...(payload ? { body: payload.body } : {}),
         }),
       );
-    } catch {
+    } catch (error) {
+      const transportError = sanitizedTransportError(error, authorization);
+      console.error(
+        JSON.stringify({
+          event: "takoserver.provider.fetch_failed",
+          provider: this.id,
+          method,
+          path,
+          ...transportError,
+        }).slice(0, 4_096),
+      );
       return {
         ok: false,
         status: 0,
@@ -1468,6 +1488,27 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       codes: errorCodes(envelope?.errors),
     };
   }
+}
+
+function sanitizedTransportError(
+  error: unknown,
+  authorization: string,
+): { readonly errorName: string; readonly message: string } {
+  const errorName = error instanceof Error ? error.name : "UnknownError";
+  const rawMessage = error instanceof Error ? error.message : "non-Error transport failure";
+  const secrets = [authorization, authorization.replace(/^Bearer\s+/u, "")]
+    .filter((value) => value.length > 0)
+    .sort((left, right) => right.length - left.length);
+  let message = rawMessage;
+  for (const secret of secrets) message = message.replaceAll(secret, "[REDACTED]");
+  message = [...message.replace(/Bearer\s+[^\s]+/giu, "[REDACTED]")]
+    .map((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return codePoint <= 31 || codePoint === 127 ? " " : character;
+    })
+    .join("")
+    .slice(0, 512);
+  return { errorName, message };
 }
 
 type CallResult =
