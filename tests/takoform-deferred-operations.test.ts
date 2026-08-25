@@ -12,6 +12,7 @@ import type {
   TakoformHost,
   TakoformResourceDriver,
 } from "../src/takoform/types.ts";
+import { TakoformHostError } from "../src/takoform/types.ts";
 import { createConfiguredHistoricalTakoformHost } from "./helpers/historical-takoform-host.ts";
 
 const lane = "/apis/forms.takoform.com/v1beta4";
@@ -50,6 +51,68 @@ afterEach(() => {
 });
 
 describe("durable deferred Takoform operations", () => {
+  test("resumes the same exact provider mutation across renewed run authority", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    let providerCalls = 0;
+    const providerOperationIds: string[] = [];
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      apply: async (input) => {
+        providerCalls += 1;
+        providerOperationIds.push(input.operationId);
+        if (providerCalls === 1) {
+          throw new TakoformHostError("backend_unavailable", 503);
+        }
+        return await memory.apply(input);
+      },
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+    };
+    const opened = persistentHarness(undefined, driver).open();
+    const desired = desiredResource("renewed-authority", "same-desired-state");
+    const review = await prepareReview(opened.host, desired);
+    const path = `${lane}/resources/example.forms.invalid/DeferredThing/renewed-authority`;
+
+    const first = await opened.host.handle(
+      request(path, "primary", {
+        method: "PUT",
+        headers: {
+          "idempotency-key": "renewed-authority-first-0001",
+          "if-none-match": "*",
+        },
+        body: JSON.stringify({ ...desired, review }),
+      }),
+    );
+    expect(first?.status).toBe(503);
+    expect(providerCalls).toBe(1);
+
+    const retried = await opened.host.handle(
+      request(path, "alternate", {
+        method: "PUT",
+        headers: {
+          "idempotency-key": "renewed-authority-second-0001",
+          "if-none-match": "*",
+        },
+        body: JSON.stringify({ ...desired, review }),
+      }),
+    );
+    expect(retried?.status).toBe(201);
+    expect(providerCalls).toBe(2);
+    expect(providerOperationIds).toHaveLength(2);
+    expect(new Set(providerOperationIds).size).toBe(1);
+    expect(
+      opened.database
+        .query("SELECT operation_id FROM tf_provider_mutation_sagas WHERE target_name = ?")
+        .all("renewed-authority"),
+    ).toEqual([]);
+    expect(
+      opened.database
+        .query("SELECT name FROM tf_resources WHERE name = ?")
+        .all("renewed-authority"),
+    ).toEqual([{ name: "renewed-authority" }]);
+    opened.close();
+  });
+
   test("survives Host reconstruction and settles through the real lifecycle engine", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-deferred-operation-"));
     roots.push(root);
