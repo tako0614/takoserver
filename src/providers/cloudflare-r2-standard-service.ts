@@ -141,7 +141,7 @@ async function cloudflareCall(
     throw new Error("R2 supply authorization is unavailable");
   }
   const response = await input.fetch(
-    new Request(new URL(path, input.origin), {
+    new Request(cloudflareApiUrl(input.origin, path), {
       method,
       headers: {
         authorization,
@@ -164,6 +164,11 @@ async function cloudflareCall(
     status: response.status,
     result: record?.result,
   };
+}
+
+function cloudflareApiUrl(origin: URL, path: string): URL {
+  const basePath = origin.pathname.replace(/\/+$/u, "");
+  return new URL(`${basePath}${path}`, origin.origin);
 }
 
 function requireExactBucket(result: unknown, expected: string): void {

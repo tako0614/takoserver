@@ -329,7 +329,9 @@ describe("Worker production composition", () => {
       credential: { kind: "takoserver.cloudflare-r2-binding@v1" },
     });
     expect(calls.map((call) => call.method)).toEqual(["GET", "POST"]);
-    expect(calls[0]?.url).toContain("/accounts/account-id/r2/buckets/tss3-");
+    expect(calls[0]?.url).toContain(
+      "https://api.cloudflare.com/client/v4/accounts/account-id/r2/buckets/tss3-",
+    );
     expect(calls[1]?.body).not.toContain("tenant-a");
     expect(calls[1]?.body).not.toContain("production");
     expect(calls[1]?.body).not.toContain("MEDIA");
