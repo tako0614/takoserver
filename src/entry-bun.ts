@@ -3,28 +3,28 @@ import { mkdirSync, readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { buildApp } from "./app.ts";
-import { buildEdgeForms, objectBucketProviderOffering } from "./edge-forms.ts";
+import { buildEdgeForms } from "./edge-forms.ts";
 import { resolveIdentity } from "./identity-setup.ts";
 import { migrateSqlite } from "./migrate-sqlite.ts";
-import { compileObjectBucketDeployment } from "./object-bucket-deployment.ts";
 import { createFileObjectStore } from "./objects-fs.ts";
 import { createMemoryObjectStore } from "./objects-mem.ts";
 import { createR2HttpObjectStore } from "./objects-r2-http.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
 import { ensureOperatorKey, signOperatorAssertion } from "./operator-key.ts";
 import { resolvePayment } from "./payment-setup.ts";
-import type { ProviderPack } from "./provider-pack.ts";
-import type { Provider } from "./provider-port.ts";
-import { CloudflareProvider } from "./providers/cloudflare.ts";
 import { createOpenAiGateway, parseOpenAiModelConfig } from "./providers/openai.ts";
 import { createProvisionerEndpoint } from "./provisioner-endpoint.ts";
-import { createSelfhostComposition } from "./selfhost-composition.ts";
 import { ensureSigningKey, loadSigningKey } from "./signing-key.ts";
 import { createD1HttpSql } from "./sql-d1-http.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
+import {
+  createStandaloneProviderComposition,
+  RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN,
+  resolveStandaloneProviderMode,
+} from "./standalone-provider-composition.ts";
 import { createProductionStandardServiceResolver } from "./standard-service-production.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
-import { currentTakoformCatalog } from "./takoform/current-catalog.ts";
+import { stableProductionTakoformCatalog } from "./takoform/stable-production-catalog.ts";
 import { createJavaScriptWorkerModuleInspector } from "./takoform/worker-module-inspector.ts";
 import { createWorkerdRuntime } from "./workerd-runtime.ts";
 import { createWorkerdSupervisor, findWorkerd } from "./workerd-supervisor.ts";
@@ -41,8 +41,10 @@ import { createWorkerdSupervisor, findWorkerd } from "./workerd-supervisor.ts";
  *
  *   TAKOSERVER_PUBLIC_ORIGIN=https://api.example.com \
  *   TAKOSERVER_DB=/var/lib/takoserver/state.sqlite \
- *   CLOUDFLARE_ACCOUNT_ID=... CLOUDFLARE_API_TOKEN=... \
  *   bun src/entry-bun.ts
+ *
+ * Cloudflare account credentials may back shared D1/R2 or standard services;
+ * they never select the ordinary Provider3 execution pack.
  */
 
 function required(name: string): string {
@@ -92,6 +94,19 @@ const port = Number(process.env.PORT ?? 8787);
 
 /** Everything this machine keeps lives under one directory. */
 const dataRoot = process.env.TAKOSERVER_DATA_ROOT ?? ".takoserver";
+const providerMode = resolveStandaloneProviderMode({
+  retiredProviderMode: process.env.TAKOSERVER_RETIRED_PROVIDER_MODE,
+  cloudflareAccountId: process.env.CLOUDFLARE_ACCOUNT_ID,
+  cloudflareCredentialConfigured: Boolean(
+    process.env.CLOUDFLARE_API_TOKEN?.trim() || process.env.TAKOSERVER_CF_TOKEN_FILE?.trim(),
+  ),
+  provisionerCredentialConfigured: Boolean(process.env.TAKOSERVER_PROVISIONER_TOKEN?.trim()),
+  cloudflareZones: process.env.TAKOSERVER_ZONES,
+  legacyEdgeForms: process.env.TAKOSERVER_EDGE_FORMS,
+  workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX,
+  suffixes: process.env.TAKOSERVER_SUFFIXES,
+  workerdPort: process.env.TAKOSERVER_WORKERD_PORT,
+});
 
 // Organizations, keys, and the ledger are as durable as the files are: a
 // machine that forgets who its customers are, and what they are owed, on
@@ -153,7 +168,7 @@ const objects = sharedBucket
     : createFileObjectStore({ root: dataRoot });
 const clock = () => new Date();
 const edge = await buildEdgeForms();
-const currentHost = currentTakoformCatalog(edge);
+const currentHost = stableProductionTakoformCatalog();
 
 // The provider reads committed bundles through the same artifact store the
 // Host writes them to, so a Worker can only be published from bytes a tenant
@@ -173,123 +188,53 @@ const providerArtifacts = {
 };
 
 /**
- * What this machine can use to drain historical Deployments.
+ * Ordinary Bun always executes current Provider3 Edge Forms on the local
+ * workerd-backed provider. Generic Cloudflare credentials may separately back
+ * D1, R2, or standard services; they are not provider-selection authority.
  *
- * A Cloudflare account if one is configured; otherwise the machine itself. The
- * second is what makes self-hosting real rather than architectural: without a
- * provider, every apply answers that the backend is unavailable, which is true
- * and leaves nothing to run.
- *
- * Released provider Forms remain installed for existing Deployment
- * observation/deletion, but publish no current catalog Offering. Stable S3 is
- * supplied through the Host-owned standard-service resolver below.
+ * The old Cloudflare ObjectBucket adapter remains reachable only through the
+ * explicit recovery mode resolved before any local state is opened. That mode
+ * reconstructs historical observation/deletion authority and publishes no
+ * current Offering.
  */
-let providers: readonly Provider[];
-let providerPacks: readonly ProviderPack[];
-let offerings: ReturnType<typeof compileObjectBucketDeployment>["offerings"];
-if (process.env.CLOUDFLARE_ACCOUNT_ID) {
-  const objectBucketOffering = objectBucketProviderOffering(edge.objectBucket.form, {
-    id: "storage.object.standard",
-    displayName: "Object bucket",
-    regions: ["global"],
-  });
-  const objectBucketProvider = new CloudflareProvider({
-    accountId: required("CLOUDFLARE_ACCOUNT_ID"),
-    offerings: [objectBucketOffering],
-    authorize: () => `Bearer ${cloudflareToken()}`,
-    // Where tenants may be served. A platform suffix is the free address
-    // every tenant gets; a customer domain is added here only after the
-    // operator has confirmed the customer controls it.
-    zones: JSON.parse(process.env.TAKOSERVER_ZONES ?? "[]") as {
-      suffix: string;
-      zoneId: string;
-      tenantRef?: string;
-    }[],
-    artifacts: providerArtifacts,
-  });
-  const deployment = compileObjectBucketDeployment({
-    form: edge.objectBucket.form,
-    provider: objectBucketProvider,
-    providerType: "cloudflare",
-    offeringId: objectBucketOffering.id,
-    displayName: objectBucketOffering.displayName,
-    regions: ["global"],
-    providerInstallation: {
-      id: "cloudflare.primary",
-      providerPackRef: objectBucketProvider.id,
-      supplyContractRef: "cloudflare.operator-contract",
-      state: "active",
-      regions: [{ id: "global", capacity: "available" }],
-    },
-    supplyContract: {
-      id: "cloudflare.operator-contract",
-      providerType: "cloudflare",
-      permittedResourceClasses: ["storage.object"],
-      deliveryModes: ["embedded-binding"],
-      customerAccess: "operator-only",
-      whiteLabelAllowed: false,
-      endUserTermsRequired: false,
-      regions: ["global"],
-      validFrom: "2026-01-01T00:00:00.000Z",
-      evidenceRef: "operator-contract:cloudflare",
-    },
-    pricePlan: {
-      id: "storage.object.standard.price-v1",
-      currency: "USD",
-      provisioning: { meter: "resource.create", amountMinor: 0 },
-      meters: [],
-    },
-    placement: {
-      deliveryMode: "embedded-binding",
-      supportPolicyRef: "support:operator:standard",
-      abusePolicyRef: "abuse:operator:standard",
-      portability: {
-        api: "portable",
-        exportFormats: ["s3.object-set.takoform.com/v1"],
-        importFormats: ["s3.object-set.takoform.com/v1"],
-        migrationModes: ["offline", "online"],
-      },
-      isolation: "dedicated-resource",
-    },
-    now: clock(),
-  });
-  providers = [objectBucketProvider];
-  providerPacks = deployment.providerPacks;
-  // Keep the released provider installed only to drain recorded Deployments.
-  // Stable S3 is supplied out of band; a beta ObjectBucket is no longer a
-  // current `/v1` sale or `/provision/v1` creation authority.
-  offerings = [];
-} else {
-  const composition = createSelfhostComposition({
-    edge,
-    dataRoot,
-    runtime: createWorkerdRuntime({
-      root: dataRoot,
-      ...(process.env.TAKOSERVER_WORKERD_PORT
-        ? { port: Number(process.env.TAKOSERVER_WORKERD_PORT) }
-        : {}),
-      async onReload(configPath) {
-        // Started on the first publish rather than at boot, so a machine
-        // that never runs a Worker never runs a runtime for one. After
-        // that it watches the file itself: one tenant's deploy must not
-        // bounce every other tenant's in-flight requests.
-        await workerd.ensure(configPath);
-      },
-    }),
-    artifacts: providerArtifacts,
-    edgeForms: process.env.TAKOSERVER_EDGE_FORMS !== "0",
-    ...(process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX
-      ? { workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX }
+const providerComposition = createStandaloneProviderComposition({
+  mode: providerMode,
+  edge,
+  stableForms: currentHost.forms,
+  dataRoot,
+  runtime: createWorkerdRuntime({
+    root: dataRoot,
+    ...(process.env.TAKOSERVER_WORKERD_PORT
+      ? { port: Number(process.env.TAKOSERVER_WORKERD_PORT) }
       : {}),
-    ...(process.env.TAKOSERVER_SUFFIXES
-      ? { suffixes: process.env.TAKOSERVER_SUFFIXES.split(",").map((entry) => entry.trim()) }
-      : {}),
-    now: clock(),
-  });
-  providers = [composition.provider];
-  providerPacks = composition.providerPacks;
-  offerings = composition.offerings;
-}
+    async onReload(configPath) {
+      // Started on the first publish rather than at boot, so a machine
+      // that never runs a Worker never runs a runtime for one. After
+      // that it watches the file itself: one tenant's deploy must not
+      // bounce every other tenant's in-flight requests.
+      await workerd.ensure(configPath);
+    },
+  }),
+  artifacts: providerArtifacts,
+  ...(process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX
+    ? { workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX }
+    : {}),
+  ...(process.env.TAKOSERVER_SUFFIXES
+    ? { suffixes: process.env.TAKOSERVER_SUFFIXES.split(",").map((entry) => entry.trim()) }
+    : {}),
+  now: clock(),
+  ...(providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
+    ? {
+        retiredCloudflare: {
+          accountId: required("CLOUDFLARE_ACCOUNT_ID"),
+          authorize: () => `Bearer ${cloudflareToken()}`,
+          zones: [],
+          artifacts: providerArtifacts,
+        },
+      }
+    : {}),
+});
+const { providers, providerPacks, offerings } = providerComposition;
 
 const unconfigured = {
   async verify(): Promise<never> {
@@ -401,8 +346,8 @@ const app = buildApp({
   ...(process.env.TAKOSERVER_CONSOLE_ORIGIN
     ? { consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN }
     : {}),
-  forms: edge.forms,
-  bindings: edge.bindings,
+  forms: currentHost.forms,
+  bindings: currentHost.bindings,
   hostForms: currentHost.forms,
   hostBindings: currentHost.bindings,
   ...(standardServiceResolver ? { standardServiceResolver } : {}),

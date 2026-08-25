@@ -20,7 +20,7 @@ if (
   throw new Error(`TASK-0032 evidence is pinned to ${corpus}`);
 }
 
-const EXPECTED_TAKOFORM_COMMIT = "ce7fa1c8f608e423093d91632cd44be93d18365a";
+const EXPECTED_TAKOFORM_COMMIT = "a225cfa7c84aa551981cc8ad56c9a281fa6e051a";
 const TAKOFORM_PATHS = [
   "go.mod",
   "go.sum",

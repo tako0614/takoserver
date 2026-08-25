@@ -14,6 +14,7 @@ import { createTakoformStore } from "./store.ts";
 import type {
   InstalledTakoformBinding,
   InstalledTakoformForm,
+  TakoformFormAvailabilityResolver,
   TakoformHost,
   TakoformHostPrincipal,
   TakoformResourceDriver,
@@ -42,6 +43,8 @@ export interface CreateTakoformHostOptions {
   readonly deferredOperations?: DeferredOperationsConfiguration;
   /** Exact Host-owned standard-service resolver, scoped by tenant and Space. */
   readonly standardServiceResolver?: TakoformStandardServiceResolver;
+  /** Runtime/activation truth for exact installed Definitions. Defaults to fully available. */
+  readonly availability?: TakoformFormAvailabilityResolver;
   /** When present, the single-use provision-token redemption lane is served. */
   readonly provision?: ProvisionLanePorts;
   readonly blockingRelations?: (
@@ -76,6 +79,7 @@ export function createTakoformHost(options: CreateTakoformHostOptions): Takoform
     artifacts,
     ...(routes.bodyGenerationFence ? { allowBodyGenerationFence: true } : {}),
     ...(routes.reviewSpecDigest ? { allowReviewSpecDigest: true } : {}),
+    stableReviewConstraintPhases: true,
     clock,
     randomId,
     ...(options.workerModuleInspector
@@ -85,6 +89,7 @@ export function createTakoformHost(options: CreateTakoformHostOptions): Takoform
     ...(options.standardServiceResolver
       ? { standardServiceResolver: options.standardServiceResolver }
       : {}),
+    ...(options.availability ? { availability: options.availability } : {}),
   });
   const deferredOperations = options.deferredOperations
     ? createDeferredOperations({
@@ -108,6 +113,7 @@ export function createTakoformHost(options: CreateTakoformHostOptions): Takoform
     ...(options.standardServiceResolver
       ? { standardServiceResolver: options.standardServiceResolver }
       : {}),
+    ...(options.availability ? { availability: options.availability } : {}),
     ...(options.provision ? { provision: options.provision } : {}),
   });
 }

@@ -791,7 +791,7 @@ describe("released edge Form placement", () => {
     }
   });
 
-  test("projects an exact sealed S3 supply as one runtime-native R2 slot", async () => {
+  test("provisions a stable Worker Version without a runtime materializer", async () => {
     const workerOffering = technical("ModuleWorker");
     const versionOffering = technical("WorkerVersion");
     const calls: Call[] = [];
@@ -820,7 +820,7 @@ describe("released edge Form placement", () => {
       operationId: "op-version-s3",
       offering: versionOffering,
       identity: { ...IDENTITY, name: "version" },
-      spec: { handlers: ["fetch"] },
+      spec: { handlers: ["fetch"], requiredSensitiveVars: [] },
       standardServices: [
         {
           name: "MEDIA",
@@ -859,6 +859,7 @@ describe("released edge Form placement", () => {
     expect(calls[0]?.body).toContain(
       `"type":"r2_bucket","name":"MEDIA","bucket_name":"${bucketName}"`,
     );
+    expect(calls[0]?.body).not.toContain('"type":"secret_text"');
     expect(JSON.stringify(ticket)).not.toContain(bucketName);
     expect(JSON.stringify(ticket)).not.toContain("com.amazonaws.s3");
   });
@@ -1071,7 +1072,11 @@ describe("released edge Form placement", () => {
     });
     expect(ticket).toMatchObject({
       phase: "failed",
-      failure: { code: "denied", retryable: false },
+      failure: {
+        code: "denied",
+        retryable: false,
+        message: "the sensitive Worker bindings have no runtime materialization authority",
+      },
     });
   });
 

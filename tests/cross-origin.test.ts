@@ -254,6 +254,13 @@ describe("entering the lane with a session", () => {
       forms: edge.forms,
       hostForms: edge.forms,
       providers: [],
+      // This fixture isolates session admission from concrete provider
+      // composition. Production derives availability from its installed pack.
+      availability: {
+        async resolve() {
+          return { executable: true, activated: true, availableToPrincipal: true };
+        },
+      },
       offerings: [],
       publicOrigin: "https://api.example.test",
       identity: {

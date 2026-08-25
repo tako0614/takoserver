@@ -18,6 +18,8 @@ import type { OperationRecord, TakoformStore } from "./store.ts";
 import {
   type InstalledTakoformForm,
   type TakoformBindingRef,
+  type TakoformFormAvailability,
+  type TakoformFormAvailabilityResolver,
   type TakoformHost,
   TakoformHostError,
   type TakoformHostPrincipal,
@@ -135,6 +137,7 @@ export interface CreateTakoformRoutesOptions {
   readonly provision?: ProvisionLanePorts;
   readonly deferredOperations?: DeferredOperations;
   readonly standardServiceResolver?: TakoformStandardServiceResolver;
+  readonly availability?: TakoformFormAvailabilityResolver;
 }
 
 export function createTakoformRoutes(options: CreateTakoformRoutesOptions): TakoformHost {
@@ -148,6 +151,7 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
     provision,
     deferredOperations,
     standardServiceResolver,
+    availability,
   } = options;
   const configuration = options.routes ?? DEFAULT_TAKOFORM_ROUTES;
   const lane = configuration.apiPath;
@@ -331,17 +335,21 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
           schemaDigest: url.searchParams.get("schemaDigest"),
         };
         return Response.json({
-          forms: [...forms.values()]
-            .filter(
-              (form) =>
-                (filters.group === null || form.identity.formRef.apiVersion === filters.group) &&
-                (filters.kind === null || form.identity.formRef.kind === filters.kind) &&
-                (filters.definitionVersion === null ||
-                  form.identity.formRef.definitionVersion === filters.definitionVersion) &&
-                (filters.schemaDigest === null ||
-                  form.identity.formRef.schemaDigest === filters.schemaDigest),
-            )
-            .map(formAvailability),
+          forms: await Promise.all(
+            [...forms.values()]
+              .filter(
+                (form) =>
+                  (filters.group === null || form.identity.formRef.apiVersion === filters.group) &&
+                  (filters.kind === null || form.identity.formRef.kind === filters.kind) &&
+                  (filters.definitionVersion === null ||
+                    form.identity.formRef.definitionVersion === filters.definitionVersion) &&
+                  (filters.schemaDigest === null ||
+                    form.identity.formRef.schemaDigest === filters.schemaDigest),
+              )
+              .map(async (form) =>
+                formAvailability(form, await availabilityOf(availability, context, form)),
+              ),
+          ),
         });
       }
       exactQuery(url, ["space", "group", "kind", "definitionVersion", "schemaDigest"]);
@@ -356,7 +364,9 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
         forms,
       );
       if (!form) return failure("form_unknown", 404);
-      return Response.json({ forms: [formAvailability(form)] });
+      return Response.json({
+        forms: [formAvailability(form, await availabilityOf(availability, context, form))],
+      });
     }
 
     const definition = formDefinitionPattern.exec(url.pathname);
@@ -817,16 +827,33 @@ function formDefinition(form: InstalledTakoformForm, exposeConstraints = false):
   };
 }
 
-function formAvailability(form: InstalledTakoformForm): JsonObject {
+function formAvailability(
+  form: InstalledTakoformForm,
+  availability: TakoformFormAvailability,
+): JsonObject {
   return {
     identity: structuredClone(form.identity) as unknown as JsonObject,
     definitionKnown: true,
     installed: true,
-    executable: true,
-    activated: true,
-    availableToPrincipal: true,
+    executable: availability.executable,
+    activated: availability.activated,
+    availableToPrincipal: availability.availableToPrincipal,
     operations: [...form.operations],
   };
+}
+
+async function availabilityOf(
+  resolver: TakoformFormAvailabilityResolver | undefined,
+  context: EngineContext,
+  form: InstalledTakoformForm,
+): Promise<TakoformFormAvailability> {
+  return resolver
+    ? await resolver.resolve({
+        tenantId: context.tenantId,
+        principalId: context.principalId,
+        form,
+      })
+    : { executable: true, activated: true, availableToPrincipal: true };
 }
 
 function renderedResource(

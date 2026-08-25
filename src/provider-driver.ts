@@ -15,6 +15,7 @@ import type {
   InstalledTakoformForm,
   TakoformDriverReceipt,
   TakoformDriverRelation,
+  TakoformFormAvailabilityResolver,
   TakoformResourceDriver,
   TakoformStoredResource,
 } from "./takoform/types.ts";
@@ -666,6 +667,32 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
         }
       }
       return receiptOf(result);
+    },
+  };
+}
+
+/**
+ * Answers only for exact capabilities the concrete provider composition can
+ * execute. Definition installation remains independent, so unsupported
+ * families stay discoverable without being advertised as active runtime.
+ */
+export function createProviderFormAvailability(
+  providers: readonly Provider[],
+): TakoformFormAvailabilityResolver {
+  const backed = providers.flatMap((provider) =>
+    provider.offerings.map((offering) => offering.form),
+  );
+  return {
+    async resolve({ form }) {
+      const executable =
+        (form.identity.formRef.apiVersion === "edge.forms.takoform.com" &&
+          INTRINSIC_FORMS.has(form.identity.formRef.kind)) ||
+        backed.some((candidate) => sameForm(candidate, form.identity.formRef));
+      return {
+        executable,
+        activated: executable,
+        availableToPrincipal: executable,
+      };
     },
   };
 }

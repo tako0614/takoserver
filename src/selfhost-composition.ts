@@ -17,6 +17,7 @@ import {
   type SelfhostArtifacts,
   type SelfhostProviderOptions,
 } from "./providers/selfhost.ts";
+import type { InstalledTakoformForm } from "./takoform/types.ts";
 import type { WorkerdRuntime } from "./workerd-runtime.ts";
 
 /**
@@ -28,9 +29,10 @@ import type { WorkerdRuntime } from "./workerd-runtime.ts";
  * two installations on one machine would refuse the version that uses a bucket
  * and a KV namespace together.
  *
- * The released Edge identities are no longer sold. They stay behind the
- * Provider Pack only so already-recorded beta Deployments can be observed and
- * deleted. `edgeForms: false` narrows that historical drain capability.
+ * Stable Edge identities are the current local execution surface. Released
+ * beta identities stay behind the same Provider Pack only so already-recorded
+ * Deployments can be observed and deleted. `edgeForms: false` narrows both
+ * surfaces to the retained ObjectBucket drain capability.
  */
 
 const SUPPLY_CONTRACT_REF = "local.ownership-contract";
@@ -45,6 +47,9 @@ const HOST_INTRINSIC = new Set([
 ]);
 
 export interface SelfhostCompositionOptions {
+  /** Current stable Definitions; only the exact supported Edge subset executes locally. */
+  readonly stableForms: readonly InstalledTakoformForm[];
+  /** Retained beta catalog used only for observation/deletion of recorded Deployments. */
   readonly edge: EdgeFormBundle;
   readonly dataRoot: string;
   readonly runtime: WorkerdRuntime;
@@ -69,12 +74,30 @@ export function createSelfhostComposition(
     regions: ["global"],
   });
 
-  const identityOfferings: { offering: ProviderOffering; resourceClass: string }[] = [
-    { offering: objectBucketOffering, resourceClass: "storage.object" },
-  ];
+  const identityOfferings: { offering: ProviderOffering; resourceClass: string }[] = [];
   const technicalOfferings: ProviderOffering[] = [objectBucketOffering];
 
   if (options.edgeForms) {
+    for (const form of options.stableForms) {
+      if (form.identity.formRef.apiVersion !== "edge.forms.takoform.com") continue;
+      const kind = form.identity.formRef.kind;
+      if (form.role === "identity") {
+        if (!(kind in HOSTED_EDGE_IDENTITY_CLASSES)) continue;
+        const resourceClass =
+          HOSTED_EDGE_IDENTITY_CLASSES[kind as keyof typeof HOSTED_EDGE_IDENTITY_CLASSES];
+        const offering = edgeProviderOffering(form, {
+          id: `${resourceClass}.stable-v1.standard`,
+          regions: ["global"],
+        });
+        identityOfferings.push({ offering, resourceClass });
+        technicalOfferings.push(offering);
+        continue;
+      }
+      if (HOST_INTRINSIC.has(kind) || !SELFHOST_EDGE_RELATION_KINDS.has(kind)) continue;
+      technicalOfferings.push(
+        edgeProviderOffering(form, { id: `selfhost.edge.stable-v1.${kind.toLowerCase()}` }),
+      );
+    }
     for (const form of options.edge.forms) {
       const kind = form.identity.formRef.kind;
       if (form.role === "identity") {
@@ -85,7 +108,6 @@ export function createSelfhostComposition(
           id: `${resourceClass}.standard`,
           regions: ["global"],
         });
-        identityOfferings.push({ offering, resourceClass });
         technicalOfferings.push(offering);
         continue;
       }
@@ -112,6 +134,8 @@ export function createSelfhostComposition(
     id: SUPPLY_CONTRACT_REF,
     providerType: "selfhost",
     permittedResourceClasses: [
+      // ObjectBucket is retained drain authority, not a current catalog item.
+      "storage.object",
       ...new Set(identityOfferings.map((entry) => entry.resourceClass)),
     ].sort(),
     deliveryModes: ["managed-endpoint"],
@@ -180,10 +204,18 @@ export function createSelfhostComposition(
     now: options.now,
   });
 
-  // The released provider catalog is historical compatibility, not current
-  // sale authority. Keep the Provider Pack so recorded Deployments can still
-  // be observed and deleted, but publish no beta identity Offering to `/v1`
-  // or `/provision/v1`. Stable S3 enters Workers through a standard-service
+  // Only stable identities entered `candidates`; released beta Forms remain
+  // technical drain capabilities and therefore cannot appear at `/v1` or
+  // `/provision/v1`. Stable S3 enters Workers through a standard-service
   // supply; it is not a revived ObjectBucket sale.
-  return { ...compiled, offerings: [], provider };
+  return { ...compiled, provider };
 }
+
+const SELFHOST_EDGE_RELATION_KINDS = new Set([
+  "WorkerVersion",
+  "WorkerDeployment",
+  "WorkerCustomDomain",
+  "WorkerEndpoint",
+  "WorkerCronTrigger",
+  "QueueConsumer",
+]);

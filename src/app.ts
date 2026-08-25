@@ -12,7 +12,7 @@ import { createDataAiRoutes } from "./data-ai.ts";
 import { createLedger, type FundingSettlementVerifier } from "./ledger.ts";
 import { createMetering, type MeteringRates } from "./metering.ts";
 import type { Clock, ObjectStore, Sql } from "./ports.ts";
-import { createProviderDriver } from "./provider-driver.ts";
+import { createProviderDriver, createProviderFormAvailability } from "./provider-driver.ts";
 import { createProviderMetering } from "./provider-metering.ts";
 import type { ProviderPack } from "./provider-pack.ts";
 import type { Provider } from "./provider-port.ts";
@@ -33,6 +33,7 @@ import { createTakoformStore } from "./takoform/store.ts";
 import type {
   InstalledTakoformBinding,
   InstalledTakoformForm,
+  TakoformFormAvailabilityResolver,
   TakoformHost,
   TakoformResourceDriver,
   TakoformStandardServiceResolver,
@@ -87,6 +88,8 @@ export interface AppPorts {
   /** Capability bundles used for attachments and explicit cross-provider migration. */
   readonly providerPacks?: readonly ProviderPack[];
   readonly driver?: TakoformResourceDriver;
+  /** Explicit Host availability policy; production derives one from its provider composition. */
+  readonly availability?: TakoformFormAvailabilityResolver;
   readonly offerings: readonly Offering[];
   readonly signingKey?: SigningKey;
   /** Shared with a provider that publishes committed bundles. */
@@ -183,6 +186,11 @@ export function buildApp(ports: AppPorts): App {
       ledger,
       deployments,
     });
+  const availability =
+    ports.availability ??
+    (ports.driver === undefined
+      ? createProviderFormAvailability(ports.providers ?? [])
+      : undefined);
   const takoformHost =
     ports.takoformHost ??
     createTakoformHost({
@@ -304,6 +312,7 @@ export function buildApp(ports: AppPorts): App {
       ...(ports.standardServiceResolver
         ? { standardServiceResolver: ports.standardServiceResolver }
         : {}),
+      ...(availability ? { availability } : {}),
       clock,
       randomId,
       // The redemption lane: a reseller's single-use provision token buys
@@ -344,6 +353,7 @@ export function buildApp(ports: AppPorts): App {
         ...(ports.workerModuleInspector
           ? { workerModuleInspector: ports.workerModuleInspector }
           : {}),
+        ...(availability ? { availability } : {}),
         clock,
         randomId,
         blockingRelations: attachments.blocksDeletion,

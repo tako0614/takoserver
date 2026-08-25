@@ -301,6 +301,8 @@ export async function validateDeclaredConstraints(input: {
   readonly spec: JsonObject;
   readonly relations: readonly TakoformStoredRelation[];
   readonly forms: FormRegistry;
+  /** Review resolves only the four UID-backed mechanisms; mutation enforces the complete list. */
+  readonly resolvedUidOnly?: boolean;
   readonly store: Pick<
     TakoformStore,
     | "claimHolders"
@@ -311,6 +313,12 @@ export async function validateDeclaredConstraints(input: {
   >;
 }): Promise<void> {
   for (const constraint of input.form.constraints ?? []) {
+    if (
+      input.resolvedUidOnly &&
+      !["acyclic", "distinctPair", "uniquePair", "sameResolvedTarget"].includes(constraint.kind)
+    ) {
+      continue;
+    }
     if (constraint.kind === "orderedPair" || constraint.kind === "uniqueBy") continue;
     if (constraint.kind === "acyclic") {
       await validateAcyclicConstraint(input, constraint.reference);

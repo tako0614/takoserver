@@ -128,6 +128,21 @@ export interface TakoformHostPrincipal {
       };
 }
 
+/** Deployment- and principal-specific truth for one installed exact FormRef. */
+export interface TakoformFormAvailability {
+  readonly executable: boolean;
+  readonly activated: boolean;
+  readonly availableToPrincipal: boolean;
+}
+
+export interface TakoformFormAvailabilityResolver {
+  resolve(input: {
+    readonly tenantId: string;
+    readonly principalId: string;
+    readonly form: InstalledTakoformForm;
+  }): Promise<TakoformFormAvailability>;
+}
+
 export interface TakoformCommercialAuthority {
   readonly reservationId: string;
   readonly offeringId: string;

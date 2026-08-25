@@ -24,6 +24,7 @@ import {
   type TakoformDiagnostic,
   type TakoformDriverReceipt,
   type TakoformDriverRelation,
+  type TakoformFormAvailabilityResolver,
   TakoformHostError,
   type TakoformResourceDriver,
   type TakoformStandardServiceResolver,
@@ -176,6 +177,9 @@ export interface CreateTakoformEngineOptions {
   readonly allowBodyGenerationFence?: boolean;
   readonly allowReviewSpecDigest?: boolean;
   readonly standardServiceResolver?: TakoformStandardServiceResolver;
+  /** Stable v1 defers mutation-only declared constraints until apply/import. */
+  readonly stableReviewConstraintPhases?: boolean;
+  readonly availability?: TakoformFormAvailabilityResolver;
   /** Every live relation that must be removed before the Resource can be deleted. */
   readonly blockingRelations?: (
     tenantId: string,
@@ -187,6 +191,25 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
   const { store, forms, bindings, driver, artifacts, clock, randomId } = options;
 
   const operationId = (): string => `op_${randomId().replace(/[^A-Za-z0-9._-]/gu, "")}`;
+
+  const requireExecutable = async (
+    context: EngineContext,
+    form: InstalledTakoformForm,
+    requireActivation = false,
+  ): Promise<void> => {
+    const availability = options.availability
+      ? await options.availability.resolve({
+          tenantId: context.tenantId,
+          principalId: context.principalId,
+          form,
+        })
+      : { executable: true, activated: true, availableToPrincipal: true };
+    if (!availability.executable) throw new TakoformHostError("form_unavailable", 503);
+    if (!availability.availableToPrincipal) throw new TakoformHostError("policy_denied", 403);
+    if (requireActivation && !availability.activated) {
+      throw new TakoformHostError("policy_denied", 403);
+    }
+  };
 
   const replayKeyFor = (context: EngineContext, space: string, operation: string): string =>
     [context.tenantId, context.principalId, space, operation, idempotencyKey(context.request)].join(
@@ -362,50 +385,59 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       const parsed = resourceRequest(await jsonBody(context.request));
       const form = exactInstalledForm(parsed.form.formRef, forms);
       if (!form) throw new TakoformHostError("form_unknown", 404);
+      await requireExecutable(context, form);
       const requestResource: ParsedResource = {
         ...parsed,
         spec: canonicalizeEdgeSpec(form, materializeDefaults(form.desiredSchema, parsed.spec)),
       };
       const diagnostics = [...validateDesired(form, requestResource.spec)];
-      if (
-        !diagnostics.some((entry) => entry.severity === "error") &&
-        (form.constraints ?? []).some((constraint) =>
-          [
-            "sum",
-            "orderedPair",
-            "uniqueBy",
-            "acyclic",
-            "distinctPair",
-            "uniquePair",
-            "sameResolvedTarget",
-          ].includes(constraint.kind),
-        )
-      ) {
+      if (!diagnostics.some((entry) => entry.severity === "error")) {
         try {
           validateDeclaredConstraintRequest({
             resourceName: requestResource.metadata.name,
             form,
             spec: requestResource.spec,
           });
-          const relations = await resolveRelations({
-            tenantId: context.tenantId,
-            space: requestResource.metadata.space,
-            form,
-            spec: requestResource.spec,
-            forms,
-            bindings,
-            store,
-          });
-          await validateDeclaredConstraints({
-            tenantId: context.tenantId,
-            space: requestResource.metadata.space,
-            resourceName: requestResource.metadata.name,
-            form,
-            spec: requestResource.spec,
-            relations,
-            forms,
-            store,
-          });
+          const reviewConstraints = form.constraints ?? [];
+          const needsResolvedReview = options.stableReviewConstraintPhases
+            ? reviewConstraints.some((constraint) =>
+                ["acyclic", "distinctPair", "uniquePair", "sameResolvedTarget"].includes(
+                  constraint.kind,
+                ),
+              )
+            : reviewConstraints.some((constraint) =>
+                [
+                  "sum",
+                  "orderedPair",
+                  "uniqueBy",
+                  "acyclic",
+                  "distinctPair",
+                  "uniquePair",
+                  "sameResolvedTarget",
+                ].includes(constraint.kind),
+              );
+          if (needsResolvedReview) {
+            const relations = await resolveRelations({
+              tenantId: context.tenantId,
+              space: requestResource.metadata.space,
+              form,
+              spec: requestResource.spec,
+              forms,
+              bindings,
+              store,
+            });
+            await validateDeclaredConstraints({
+              tenantId: context.tenantId,
+              space: requestResource.metadata.space,
+              resourceName: requestResource.metadata.name,
+              form,
+              spec: requestResource.spec,
+              relations,
+              forms,
+              store,
+              ...(options.stableReviewConstraintPhases ? { resolvedUidOnly: true } : {}),
+            });
+          }
         } catch (error) {
           if (!(error instanceof TakoformHostError)) throw error;
           diagnostics.push({
@@ -449,6 +481,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       if (!current && expectedGeneration !== undefined) {
         throw new TakoformHostError("resource_not_found", 404);
       }
+      if (!current) await requireExecutable(context, form, true);
 
       const specDigest = await canonicalDigest(requestResource.spec);
       const prepareDigest = await canonicalDigest({
@@ -481,6 +514,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       exactQuery(context.url, ["space", "group", "kind", "definitionVersion", "schemaDigest"]);
       const form = formFromResourceQuery(context.url, path);
       if (!form) throw new TakoformHostError("form_unknown", 404);
+      await requireExecutable(context, form);
       const address = addressFromParts(context.tenantId, requiredQuery(context.url, "space"), path);
       let resource = await store.readResource(address);
       if (!resource || !sameFormRef(resource.form.formRef, form.identity.formRef)) {
@@ -540,6 +574,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       if (!form || !samePathResource(parsedBody, path)) {
         throw new TakoformHostError("form_unknown", 404);
       }
+      await requireExecutable(context, form);
       const body = {
         ...parsedBody,
         spec: canonicalizeEdgeSpec(form, materializeDefaults(form.desiredSchema, parsedBody.spec)),
@@ -594,6 +629,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       }
 
       const create = current === null;
+      if (create) await requireExecutable(context, form, true);
       const createIntent = context.request.headers.get("if-none-match") === "*";
       const generationHeader = context.request.headers.get("takoform-expected-generation");
       if (
@@ -955,6 +991,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       exactQuery(context.url, ["space", "group", "kind", "definitionVersion", "schemaDigest"]);
       const form = formFromResourceQuery(context.url, path);
       if (!form) throw new TakoformHostError("form_unknown", 404);
+      await requireExecutable(context, form);
       const address = addressFromParts(context.tenantId, requiredQuery(context.url, "space"), path);
       const current = await store.readResource(address);
       if (!current || !sameFormRef(current.form.formRef, form.identity.formRef)) {
@@ -1038,6 +1075,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       if (!form || !samePathResource(parsedBody, path)) {
         throw new TakoformHostError("form_unknown", 404);
       }
+      await requireExecutable(context, form);
       const body = {
         ...parsedBody,
         spec: canonicalizeEdgeSpec(form, materializeDefaults(form.desiredSchema, parsedBody.spec)),
@@ -1087,6 +1125,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       }
 
       const create = current === null;
+      if (create) await requireExecutable(context, form, true);
       if (create && context.request.headers.get("if-none-match") !== "*") {
         if (context.request.headers.has("takoform-expected-generation")) {
           throw new TakoformHostError("resource_not_found", 404);
@@ -1328,6 +1367,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       exactQuery(context.url, ["space", "group", "kind", "definitionVersion", "schemaDigest"]);
       const form = formFromResourceQuery(context.url, path);
       if (!form) throw new TakoformHostError("form_unknown", 404);
+      await requireExecutable(context, form);
       const space = requiredQuery(context.url, "space");
       const address = addressFromParts(context.tenantId, space, path);
       const expected = requiredExpectedGeneration(context.request);

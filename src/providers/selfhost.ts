@@ -49,9 +49,10 @@ import type { WorkerdRuntime } from "../workerd-runtime.ts";
  *   gate them on a serving deployment are enforced by the Host, and saying
  *   "recorded, not firing" here beats a scheduler nobody implemented.
  *
- * Version environment (`vars`, bindings) is likewise recorded but not yet
+ * Version environment (`vars`, non-sensitive bindings) is recorded but not yet
  * projected into the workerd configuration; the runtime serves modules and
- * static assets. That limitation is stated rather than hidden.
+ * static assets. Sensitive names are rejected explicitly because this provider
+ * has no runtime materialization authority.
  */
 
 const SQLITE_MIGRATION_LEDGER = "_takoform_sqlite_migrations";
@@ -254,6 +255,25 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
 
   const applyWorkerVersion = async (input: ApplyInput): Promise<ProviderTicket> => {
     if (input.previous) return failed("invalid_spec", "Worker Versions are immutable");
+    const requiredSensitive = input.spec.requiredSensitiveVars ?? [];
+    if (
+      !Array.isArray(requiredSensitive) ||
+      requiredSensitive.some((name) => typeof name !== "string")
+    ) {
+      return failed("invalid_spec", "the sensitive Worker binding declaration is invalid");
+    }
+    if (requiredSensitive.length > 0) {
+      return failed(
+        "denied",
+        "the sensitive Worker bindings have no runtime materialization authority",
+      );
+    }
+    if (input.runtimeMaterialization) {
+      return failed(
+        "invalid_spec",
+        "runtime materialization authority requires sensitive Worker bindings",
+      );
+    }
     const worker = relationResource(input.relations, "/worker", "ModuleWorker");
     const bundle = relationResource(input.relations, "/bundle", "WorkerBundle");
     const manifestDigest =
@@ -514,7 +534,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   const dispatchKind = (offering: ProviderOffering): string => {
     if (
       offering.kind.startsWith("takoform.") &&
-      offering.form.apiVersion === "edge.forms.takoform.com/v1beta1"
+      (offering.form.apiVersion === "edge.forms.takoform.com/v1beta1" ||
+        offering.form.apiVersion === "edge.forms.takoform.com")
     ) {
       return offering.form.kind;
     }

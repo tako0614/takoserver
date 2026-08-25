@@ -290,6 +290,26 @@ describe("publishing a Worker through the Edge Family", () => {
     expect(ticket).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
   });
 
+  test("refuses sensitive Worker bindings without a runtime materializer", async () => {
+    const local = provider();
+    const ticket = await local.apply({
+      operationId: "op_sensitive_version",
+      offering: offering("WorkerVersion"),
+      identity: identity("hello-sensitive"),
+      spec: {
+        bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+        handlers: ["fetch"],
+        requiredSensitiveVars: ["ENCRYPTION_KEY"],
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", "hello"),
+        relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+      ],
+    });
+    expect(ticket).toMatchObject({ phase: "failed", failure: { code: "denied" } });
+  });
+
   test("a version that declares a site carries its files to the runtime", async () => {
     const written: {
       name: string;

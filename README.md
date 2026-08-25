@@ -23,8 +23,10 @@ shape is retained only for draining historical ObjectBucket records. It does
 not create a current ObjectBucket or grant new lifecycle authority.
 
 Run it on your own machine and it uses your disk and [workerd](https://github.com/cloudflare/workerd),
-the runtime Cloudflare runs at the edge. Point it at a Cloudflare account and it
-uses R2, D1, and Workers instead. Nothing above the provider knows which.
+the runtime Cloudflare runs at the edge. A Bun process may share D1 or R2 with a
+Cloudflare deployment, but its current Worker execution remains on local
+workerd. Production execution on Cloudflare Workers belongs to the Worker
+entry, not to an ambient account credential in the Bun entry.
 
 ```
 bun install
@@ -33,6 +35,41 @@ bun src/entry-bun.ts
 
 That is the whole first run. It creates its schema, generates the keys it signs
 with, prints a sign-in you can paste into its console, and starts serving.
+Ordinary Bun always keeps the stable self-host Provider3 execution pack.
+`CLOUDFLARE_ACCOUNT_ID` may separately back shared D1, R2, or a configured
+standard-service supply, but it is not provider-selection authority and does
+not switch stable Forms off.
+
+The released Cloudflare ObjectBucket provider survives only as an explicit
+recovery lane for observing and deleting its already-recorded beta
+Deployments. An operator enters it with
+`TAKOSERVER_RETIRED_PROVIDER_MODE=cloudflare-object-bucket-drain` plus the
+Cloudflare account credential and `TAKOSERVER_PROVISIONER_TOKEN`. That lane
+publishes zero current Offerings and cannot be mixed with self-host provider
+settings. `TAKOSERVER_ZONES` is rejected because an ObjectBucket drain owns no
+DNS or Worker-route authority; the old implicit `TAKOSERVER_EDGE_FORMS` switch
+is rejected too. Recovery-mode credentials are validated before local state is
+opened.
+
+For a disposable Provider v3 integration run against the production
+Cloudflare adapter and an in-process account, use the loopback-only stable Host
+launcher:
+
+```sh
+TAKOFORM_STABLE_CATALOG_ROOT=/path/to/exact/takoform-v3.0.0 \
+TAKOSERVER_STABLE_LOCAL_TOKEN=local-test-token-at-least-16-characters \
+TAKOSERVER_STABLE_LOCAL_RUNTIME_VALUES='{"GENERIC_REQUIRED_VALUE":"local-only-value"}' \
+bun run debug:stable-local-cloudflare-host
+```
+
+The catalog loader verifies the frozen 31-Form input before listening. The
+runtime-value JSON must be a nonempty map whose names exactly match the
+`requiredSensitiveVars` requested by a test graph. Those fake/local values are
+injected directly into disposable Host authority; this command is not a deploy
+path or a production materializer. It binds `127.0.0.1` on an ephemeral port by
+default and prints one sanitized ready JSON line without the token, values, or
+value names. `TAKOSERVER_STABLE_LOCAL_SPACE` and
+`TAKOSERVER_STABLE_LOCAL_PORT` may override the local Space and port.
 
 ## What it is
 
@@ -149,8 +186,13 @@ Deployments, but their beta Forms are not republished as a sale catalog. The
 control plane itself can also run as a Worker; `bun run deploy -- --contract`
 describes what publishing that involves and what it refuses to do.
 
-The operator-private deploy target may declare `aiModels`,
-`standardServiceSupplies`, and a `hostRuntimeMaterializerService`.
+The official operator-private deploy target may declare `aiModels`,
+`standardServiceSupplies`, and one exact `hostRuntimeMaterializerService` route.
+Its hosted composition pins the internal Takosumi service and exported runtime-
+binding materializer entrypoint because the recommended applications declare
+runtime-sensitive Worker bindings. This remains an optional public composition
+port: an independent or self-hosted Takoserver target may omit it, and no
+ambient Takosumi route is inferred.
 `standardServiceSupplies` is a closed, non-secret operator choice. The current
 adapter accepts exactly
 `standards.takoform.com/v1/com.amazonaws.s3 -> cloudflare-r2` plus an
@@ -158,17 +200,23 @@ operator-owned `supplyNamespace`; realization writes that exact document to
 `TAKOSERVER_STANDARD_SERVICE_SUPPLIES` and requires the ordinary
 `CLOUDFLARE_API_TOKEN` secret before publication. It does not create, sell, or
 reference a current ObjectBucket Form. `aiModels` is the exact public-model to
-upstream-model mapping, limits, and retail token prices. The materializer
-descriptor contains only an exact Worker service name and named entrypoint;
-realization binds it as `HOST_RUNTIME_MATERIALIZER`. The deploy writer reads the
-immutable Worker Version back and requires that exact service and entrypoint;
-it also rejects a stale materializer binding when the target declares none.
+upstream-model mapping, limits, and retail token prices. Deploy realization and
+immutable Worker Version readback require the exact `HOST_RUNTIME_MATERIALIZER`
+service and entrypoint when the target selects one, and require its absence
+when the target does not.
 The read-only `bun run deploy -- --status` path proves the same exact D1, R2,
-and materializer closure, so a stale operator target or an incompletely wired
+and binding closure, so a stale operator target or an incompletely wired
 live Version cannot masquerade as a healthy recovery state.
-Runtime values cross that
-RPC boundary only while Takoserver provisions one tenant Worker and never enter
-the target, state, Output, receipt, or agent transcript. If the materializer
+Takoserver's public protocol and standalone path do not depend on Takosumi.
+Stable Worker Forms with an omitted or empty `requiredSensitiveVars`
+declaration provision normally when the target omits this service binding; a
+non-empty declaration is denied unless the request carries exact runtime
+materialization authority and the deployment selected a materializer. The
+official hosted target deliberately selects its Takosumi-owned authority for
+that latter case. Resolved values return through the internal RPC only into one
+Takoserver provisioning call and are immediately submitted as exact
+Form-declared Worker Version `secret_text` bindings. They never enter the
+target, portable state, provider ticket, Output, log, or agent transcript. If the materializer
 changed host-side authority while deriving those values, it may return an
 opaque authenticated rollback receipt. Takoserver never interprets that
 receipt: a failed immutable Worker Version upload sends it back only to the
