@@ -860,14 +860,52 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       );
       const rows = await sql.query(
         `SELECT * FROM tf_provider_mutation_sagas
-         WHERE replay_key = ? AND (phase = 'executed' OR expires_at > ?) LIMIT 2`,
-        [record.replayKey, timestamp],
+         WHERE (
+             replay_key = ? OR
+             (tenant_id = ? AND target_space = ? AND target_api_version = ?
+               AND target_kind = ? AND target_name = ?)
+           )
+           AND (phase = 'executed' OR expires_at > ?) LIMIT 3`,
+        [
+          record.replayKey,
+          record.tenantId,
+          record.target.space,
+          record.target.apiVersion,
+          record.target.kind,
+          record.target.name,
+          timestamp,
+        ],
       );
       const stored = rows[0] ? providerMutationSaga(rows[0]) : null;
-      if (!stored || rows.length !== 1 || !sameProviderMutationSaga(record, stored)) {
+      if (
+        !stored ||
+        rows.length !== 1 ||
+        !(stored.replayKey === record.replayKey
+          ? sameProviderMutationSaga(record, stored)
+          : sameProviderMutationTarget(record, stored))
+      ) {
         throw new TakoformHostError("resource_busy", 409);
       }
-      return stored;
+      if (stored.replayKey === record.replayKey) return stored;
+      const rotated = await sql.run(
+        `UPDATE tf_provider_mutation_sagas
+         SET replay_key = ?, updated_at = ?
+         WHERE operation_id = ? AND replay_key = ? AND tenant_id = ?
+           AND fingerprint = ? AND resource_uid = ?
+           AND (phase = 'executed' OR expires_at > ?)`,
+        [
+          record.replayKey,
+          timestamp,
+          stored.operationId,
+          stored.replayKey,
+          stored.tenantId,
+          stored.fingerprint,
+          stored.resourceUid,
+          timestamp,
+        ],
+      );
+      if (rotated.changes !== 1) throw new TakoformHostError("resource_busy", 409);
+      return { ...stored, replayKey: record.replayKey };
     },
 
     async readProviderMutationReceipt(tenantId, operationId, resourceUid) {
@@ -1703,8 +1741,20 @@ function sameProviderMutationSaga(
   left: ProviderMutationSaga,
   right: ProviderMutationSaga,
 ): boolean {
+  return left.replayKey === right.replayKey && sameProviderMutationTarget(left, right);
+}
+
+/**
+ * A short-lived run credential and its idempotency key may be renewed while a
+ * provider mutation is still unresolved. The target, desired bytes, tenant,
+ * and accepted incumbent are the durable identity; the renewed caller resumes
+ * the stored operation id/resource uid so provider work remains idempotent.
+ */
+function sameProviderMutationTarget(
+  left: ProviderMutationSaga,
+  right: ProviderMutationSaga,
+): boolean {
   return (
-    left.replayKey === right.replayKey &&
     left.tenantId === right.tenantId &&
     left.fingerprint === right.fingerprint &&
     left.target.tenantId === right.target.tenantId &&
