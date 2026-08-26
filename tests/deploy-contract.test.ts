@@ -58,6 +58,23 @@ describe("Takoserver deploy entrypoint", () => {
       "takoserver-console",
       "takoserver-site",
     ]);
+    const siteSurface = contract.surfaces.find(
+      (surface) => surface.surface === "takoserver-site",
+    ) as
+      | {
+          requiresEnv?: readonly string[];
+          obligations?: Record<string, string>;
+        }
+      | undefined;
+    expect(siteSurface).toBeDefined();
+    expect(siteSurface?.requiresEnv).toEqual([]);
+    expect(siteSurface?.obligations?.provenance).toContain("Wrangler-managed authentication");
+    expect(siteSurface?.obligations?.provenance).toContain("account identity");
+    expect(siteSurface?.obligations?.["post-conditions"]).toContain("exact zone route");
+    expect(siteSurface?.obligations?.reversal).toContain("restore no owner");
+    expect(siteSurface?.obligations?.reversal).toContain("reattach");
+    expect(siteSurface?.obligations?.["pre-mutation-proof"]).toContain("account-scoped");
+    expect(JSON.stringify(siteSurface)).not.toContain("CLOUDFLARE_API_TOKEN");
   });
 
   test("refuses every invocation that does not name an explicit action", async () => {

@@ -112,21 +112,21 @@ export const DEPLOY_CONTRACT = {
       ],
       requiresScripts: ["check", "deploy"],
       requiresTools: ["bun", "wrangler"],
-      requiresEnv: ["CLOUDFLARE_API_TOKEN"],
+      requiresEnv: [],
       triggers: ["published-identity"],
       obligations: {
         provenance:
-          "The owner builds the site from a clean pushed commit into a fresh private temporary directory and records its exact digest, size, origin and Worker identity.",
+          "The owner builds the site from a clean pushed commit into a fresh private temporary directory, binds the reviewed Cloudflare account and exact declared zone route, and records a value-free account identity, artifact digest, size, origin, Worker identity, previous route owner, and bounded public state. Route inventory uses Wrangler-managed authentication in memory and never prints or stores its bearer.",
         "post-conditions":
-          "The writer proves the custom domain is owned by takoserver-site and that the served index document is byte-exact with the built page.",
+          "The writer proves the account-scoped exact zone route is owned by takoserver-site and that the served index document is byte-exact with the built page.",
         reversal:
-          "The previous custom-domain service is captured and retained for reattachment; no customer or API state is changed.",
+          "When a previous exact zone-route service exists it is retained for reattachment. When no previous owner exists, reversal removes the exact route from takoserver-site to restore no owner; it never invents a previous Worker. No customer or API state is changed.",
         "failure-handling":
-          "Build and authority failures occur before publication; mutation and verification failures are terminal and require status readback.",
+          "Build, account/route-declaration, malformed Cloudflare envelope, and authenticated inventory failures occur before publication with fixed diagnostics and without disclosing credentials. Mutation and verification failures are terminal and require status readback, which reports deployment identity, route ownership, and bounded public HTTP state even when the origin is unhealthy.",
         "no-overwrite":
           "Each publication is an immutable Worker Version with an append-only evidence receipt.",
         "pre-mutation-proof":
-          "The full portable gate, pushed-source proof, fresh site build, digest and current domain owner are read with CLOUDFLARE_API_TOKEN before mutation.",
+          "The full portable gate, pushed-source proof, fresh site build, exact account_id and hostname/* zone-route declaration, strict Wrangler dry-run, account-scoped zone and route inventory, current route owner, and bounded public HTTP state are read before mutation. Cloudflare envelopes must say success=true and carry result arrays, and the returned zone must name the reviewed account. The active Wrangler profile is sufficient; no separately provisioned site credential is required.",
       },
     },
   ],

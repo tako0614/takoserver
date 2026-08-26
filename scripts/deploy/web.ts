@@ -12,6 +12,10 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
+import {
+  type CloudflareRouteTokenOptions,
+  resolveCloudflareRouteToken,
+} from "./cloudflare-auth.ts";
 import { DeployError, type DeployPhase, preflightError } from "./errors.ts";
 import { EVIDENCE_DIRECTORY } from "./evidence.ts";
 import { REPOSITORY, runChecked, wranglerCommand } from "./process.ts";
@@ -21,6 +25,51 @@ import type { DeployTarget } from "./target.ts";
 export type WebSurface = "console" | "site";
 export type WebAction = "status" | "plan" | "apply";
 type WebFetcher = (input: string, init?: RequestInit) => Promise<Response>;
+
+interface SiteRouteOwnerOptions extends CloudflareRouteTokenOptions {
+  readonly fetcher?: WebFetcher;
+}
+
+interface SiteReleaseStateOptions extends CloudflareRouteTokenOptions {
+  readonly routeFetcher?: WebFetcher;
+  readonly publicFetcher?: WebFetcher;
+}
+
+export interface SiteReleaseState {
+  readonly routeOwner: string | null;
+  readonly publicState:
+    | {
+        readonly outcome: "response";
+        readonly status: number;
+        readonly digest: string;
+        readonly bytes: number;
+      }
+    | {
+        readonly outcome: "timeout" | "transport";
+        readonly status: null;
+        readonly digest: null;
+        readonly bytes: null;
+      };
+}
+
+export type DeclaredWebRoute =
+  | {
+      readonly kind: "custom-domain";
+      readonly pattern: string;
+    }
+  | {
+      readonly kind: "zone-route";
+      readonly pattern: string;
+      readonly zoneName: string;
+    };
+
+export interface WebDeploymentDeclaration {
+  readonly accountIdentity: string;
+  readonly workerName: string;
+  readonly origin: string;
+  readonly probePath: string;
+  readonly route: DeclaredWebRoute;
+}
 
 const WEB_READBACK_TIMEOUT_MS = 15_000;
 
@@ -33,11 +82,13 @@ interface BuiltWebSurface {
   readonly digest: string;
   readonly bytes: number;
   readonly configPath: string;
+  readonly accountIdentity: string;
+  readonly declaredRoute: DeclaredWebRoute;
   readonly cleanup: () => void;
 }
 
 interface WebEvidenceRecord {
-  readonly kind: "takoserver.web-publication@v1";
+  readonly kind: "takoserver.web-publication@v2";
   readonly publishedAt: string;
   readonly commit: string;
   readonly branch: string;
@@ -45,10 +96,14 @@ interface WebEvidenceRecord {
   readonly surface: WebSurface;
   readonly workerName: string;
   readonly origin: string;
+  readonly accountIdentity: string;
   readonly bundleDigest: string;
   readonly bundleBytes: number;
+  readonly declaredRoute: DeclaredWebRoute;
+  readonly previousPublicState: SiteReleaseState["publicState"];
   readonly previousService: string | null;
   readonly currentService: string;
+  readonly reversal: string;
 }
 
 const WEB_EVIDENCE = resolve(EVIDENCE_DIRECTORY, "web-published.jsonl");
@@ -65,6 +120,26 @@ export async function runWebRelease(
 ): Promise<void> {
   const spec = webSurfaceSpec(surface, target);
   if (action === "status") {
+    if (surface === "site") {
+      const declaration = loadWebDeploymentDeclaration(surface, target);
+      const state = await inspectSiteReleaseState(
+        target.accountId,
+        declaration.origin,
+        declaration.probePath,
+      );
+      process.stdout.write(
+        `${JSON.stringify(
+          {
+            surface,
+            ...declaration,
+            ...state,
+          },
+          null,
+          2,
+        )}\n`,
+      );
+      return;
+    }
     const live = await readLive(spec.origin, spec.probePath, "preflight");
     if (live.status !== 200) {
       throw preflightError(
@@ -80,7 +155,14 @@ export async function runWebRelease(
   await runChecked("preflight", "portable gate `bun run check`", ["bun", "run", "check"]);
   const built = await buildWebSurface(surface, target, source.commit);
   try {
-    const previousService = await currentWebOwner(surface, target.accountId, built.origin);
+    const previousState =
+      surface === "site"
+        ? await inspectSiteReleaseState(target.accountId, built.origin, built.probePath)
+        : {
+            routeOwner: await currentWebOwner(surface, target.accountId, built.origin),
+            publicState: await readPublicState(built.origin, built.probePath),
+          };
+    const previousService = previousState.routeOwner;
     process.stdout.write(
       `${JSON.stringify(
         {
@@ -89,9 +171,13 @@ export async function runWebRelease(
           branch: source.branch,
           worker: built.workerName,
           origin: built.origin,
+          accountIdentity: built.accountIdentity,
           bundleDigest: built.digest,
           bundleBytes: built.bytes,
+          declaredRoute: built.declaredRoute,
           previousService,
+          previousPublicState: previousState.publicState,
+          reversal: webReversalNotice(built.workerName, built.declaredRoute, previousService),
         },
         null,
         2,
@@ -125,8 +211,9 @@ export async function runWebRelease(
       );
     }
     await verifyPublishedBytes(built, source.commit);
+    const reversal = webReversalNotice(built.workerName, built.declaredRoute, previousService);
     appendWebEvidence({
-      kind: "takoserver.web-publication@v1",
+      kind: "takoserver.web-publication@v2",
       publishedAt: new Date().toISOString(),
       commit: source.commit,
       branch: source.branch,
@@ -134,15 +221,19 @@ export async function runWebRelease(
       surface,
       workerName: built.workerName,
       origin: built.origin,
+      accountIdentity: built.accountIdentity,
       bundleDigest: built.digest,
       bundleBytes: built.bytes,
+      declaredRoute: built.declaredRoute,
+      previousPublicState: previousState.publicState,
       previousService,
       currentService,
+      reversal,
     });
     process.stdout.write(
       `\nverified: ${built.origin}${built.probePath} is byte-exact ${built.digest}\n` +
         `evidence appended to ${WEB_EVIDENCE}\n` +
-        `reversal: reattach ${new URL(built.origin).hostname} to ${previousService ?? "the previous Worker"}; no previous Worker was deleted\n`,
+        `${reversal}\n`,
     );
   } finally {
     built.cleanup();
@@ -165,12 +256,94 @@ export function webSurfaceSpec(
   return { workerName: "takoserver-site", origin: target.siteOrigin, probePath: "/" };
 }
 
+/** The one target-derived deployment identity consumed by status, plan, and apply. */
+export function loadWebDeploymentDeclaration(
+  surface: WebSurface,
+  target: DeployTarget,
+): WebDeploymentDeclaration {
+  const spec = webSurfaceSpec(surface, target);
+  const hostname = new URL(spec.origin).hostname;
+  return {
+    accountIdentity: `sha256:${createHash("sha256").update(target.accountId).digest("hex")}`,
+    ...spec,
+    route:
+      surface === "site"
+        ? { kind: "zone-route", pattern: `${hostname}/*`, zoneName: hostname }
+        : { kind: "custom-domain", pattern: hostname },
+  };
+}
+
+export function webReversalNotice(
+  workerName: string,
+  route: DeclaredWebRoute,
+  previousService: string | null,
+): string {
+  const target =
+    route.kind === "zone-route"
+      ? `Worker route ${route.pattern}`
+      : `custom domain ${route.pattern}`;
+  return previousService === null
+    ? `reversal: remove the exact ${target} from ${workerName} to restore no owner; no previous Worker was attached`
+    : `reversal: reattach ${target} to ${previousService}; no previous Worker was deleted`;
+}
+
+export function readDeclaredWebRoute(
+  surface: WebSurface,
+  origin: string,
+  accountId: string,
+  configPath: string,
+): DeclaredWebRoute {
+  let config: unknown;
+  try {
+    config = JSON.parse(readFileSync(configPath, "utf8"));
+  } catch {
+    throw preflightError(`${surface} Wrangler config is not valid JSON`);
+  }
+  if (typeof config !== "object" || config === null) {
+    throw preflightError(`${surface} Wrangler config must be an object`);
+  }
+  const record = config as Record<string, unknown>;
+  const workerName = `takoserver-${surface}`;
+  if (record.account_id !== accountId) {
+    throw preflightError(`${surface} Wrangler config must bind the exact reviewed account`);
+  }
+  if (record.name !== workerName || record.workers_dev !== false) {
+    throw preflightError(`${surface} Wrangler config does not name its exact public Worker`);
+  }
+  const hostname = new URL(origin).hostname;
+  const routes = record.routes;
+  const route = Array.isArray(routes) && routes.length === 1 ? routes[0] : null;
+  if (typeof route !== "object" || route === null) {
+    throw preflightError(
+      surface === "site"
+        ? `site Wrangler config must declare one exact zone route ${hostname}/*`
+        : `console Wrangler config must declare one exact custom domain ${hostname}`,
+    );
+  }
+  const candidate = route as Record<string, unknown>;
+  if (surface === "site") {
+    const exactKeys = Object.keys(candidate).sort().join(",") === "pattern,zone_name";
+    if (!exactKeys || candidate.pattern !== `${hostname}/*` || candidate.zone_name !== hostname) {
+      throw preflightError(`site Wrangler config must declare the exact zone route ${hostname}/*`);
+    }
+    return { kind: "zone-route", pattern: `${hostname}/*`, zoneName: hostname };
+  }
+  const exactKeys = Object.keys(candidate).sort().join(",") === "custom_domain,pattern";
+  if (!exactKeys || candidate.pattern !== hostname || candidate.custom_domain !== true) {
+    throw preflightError(
+      `console Wrangler config must declare the exact custom domain ${hostname}`,
+    );
+  }
+  return { kind: "custom-domain", pattern: hostname };
+}
+
 async function buildWebSurface(
   surface: WebSurface,
   target: DeployTarget,
   commit: string,
 ): Promise<BuiltWebSurface> {
-  const spec = webSurfaceSpec(surface, target);
+  const declaration = loadWebDeploymentDeclaration(surface, target);
+  const spec = declaration;
   const root = mkdtempSync(join(tmpdir(), `takoserver-${surface}-release-`));
   chmodSync(root, 0o700);
   const directory = join(root, "assets");
@@ -198,6 +371,7 @@ async function buildWebSurface(
       `${JSON.stringify(
         {
           $schema: resolve(REPOSITORY, "node_modules/wrangler/config-schema.json"),
+          account_id: target.accountId,
           name: spec.workerName,
           compatibility_date: "2026-08-20",
           workers_dev: false,
@@ -205,15 +379,14 @@ async function buildWebSurface(
             directory,
             not_found_handling: surface === "console" ? "single-page-application" : "404-page",
           },
-          routes:
-            surface === "console"
-              ? [{ pattern: new URL(spec.origin).hostname, custom_domain: true }]
-              : [
-                  {
-                    pattern: `${new URL(spec.origin).hostname}/*`,
-                    zone_name: new URL(spec.origin).hostname,
-                  },
-                ],
+          routes: [
+            declaration.route.kind === "custom-domain"
+              ? { pattern: declaration.route.pattern, custom_domain: true }
+              : {
+                  pattern: declaration.route.pattern,
+                  zone_name: declaration.route.zoneName,
+                },
+          ],
           observability: { enabled: true },
           annotations: { "workers/message": `${spec.workerName} ${commit}` },
         },
@@ -222,6 +395,7 @@ async function buildWebSurface(
       )}\n`,
       { mode: 0o600 },
     );
+    const declaredRoute = readDeclaredWebRoute(surface, spec.origin, target.accountId, configPath);
     await runChecked(
       "preflight",
       `${surface} Wrangler strict dry-run`,
@@ -234,6 +408,8 @@ async function buildWebSurface(
       digest,
       bytes,
       configPath,
+      accountIdentity: declaration.accountIdentity,
+      declaredRoute,
       cleanup: () => rmSync(root, { recursive: true, force: true }),
     };
   } catch (error) {
@@ -273,9 +449,8 @@ async function currentDomainService(accountId: string, hostname: string): Promis
     `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/domains`,
     { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(15_000) },
   );
-  if (!response.ok) throw preflightError("Cloudflare Worker domain inventory failed");
-  const body = (await response.json()) as { readonly result?: readonly unknown[] };
-  const matches = (body.result ?? []).filter(
+  const result = await cloudflareEnvelope(response, "Cloudflare Worker domain inventory");
+  const matches = result.filter(
     (entry): entry is { readonly hostname: string; readonly service: string } =>
       typeof entry === "object" &&
       entry !== null &&
@@ -294,33 +469,43 @@ async function currentWebOwner(
   const hostname = new URL(origin).hostname;
   return surface === "console"
     ? currentDomainService(accountId, hostname)
-    : currentRouteService(hostname);
+    : readSiteRouteOwner(accountId, hostname);
 }
 
-async function currentRouteService(hostname: string): Promise<string | null> {
-  const token = process.env.CLOUDFLARE_API_TOKEN?.trim();
-  if (!token) throw preflightError("CLOUDFLARE_API_TOKEN is required for web route authority");
+export async function readSiteRouteOwner(
+  accountId: string,
+  hostname: string,
+  options: SiteRouteOwnerOptions = {},
+): Promise<string | null> {
+  const token = await resolveCloudflareRouteToken(options);
+  const fetcher = options.fetcher ?? ((input, init) => fetch(input, init));
   const headers = { authorization: `Bearer ${token}` };
-  const zonesResponse = await fetch(
-    `https://api.cloudflare.com/client/v4/zones?name=${encodeURIComponent(hostname)}`,
-    { headers, signal: AbortSignal.timeout(15_000) },
-  );
-  if (!zonesResponse.ok) throw preflightError("Cloudflare zone inventory failed");
-  const zonesBody = (await zonesResponse.json()) as { readonly result?: readonly unknown[] };
-  const zoneIds = (zonesBody.result ?? []).flatMap((entry) => {
+  const zonesUrl = new URL("https://api.cloudflare.com/client/v4/zones");
+  zonesUrl.searchParams.set("name", hostname);
+  zonesUrl.searchParams.set("account.id", accountId);
+  const zonesResponse = await fetcher(zonesUrl.toString(), {
+    headers,
+    signal: AbortSignal.timeout(15_000),
+  });
+  const zones = await cloudflareEnvelope(zonesResponse, "Cloudflare zone inventory");
+  const zoneIds = zones.flatMap((entry) => {
     if (typeof entry !== "object" || entry === null) return [];
     const id = (entry as { id?: unknown }).id;
     const name = (entry as { name?: unknown }).name;
-    return typeof id === "string" && name === hostname ? [id] : [];
+    const account = (entry as { account?: unknown }).account;
+    const exactAccount =
+      typeof account === "object" &&
+      account !== null &&
+      (account as { id?: unknown }).id === accountId;
+    return typeof id === "string" && name === hostname && exactAccount ? [id] : [];
   });
   if (zoneIds.length !== 1) throw preflightError(`${hostname} does not resolve to one exact zone`);
-  const routesResponse = await fetch(
+  const routesResponse = await fetcher(
     `https://api.cloudflare.com/client/v4/zones/${zoneIds[0]}/workers/routes`,
     { headers, signal: AbortSignal.timeout(15_000) },
   );
-  if (!routesResponse.ok) throw preflightError("Cloudflare Worker route inventory failed");
-  const routesBody = (await routesResponse.json()) as { readonly result?: readonly unknown[] };
-  const services = (routesBody.result ?? []).flatMap((entry) => {
+  const routes = await cloudflareEnvelope(routesResponse, "Cloudflare Worker route inventory");
+  const services = routes.flatMap((entry) => {
     if (typeof entry !== "object" || entry === null) return [];
     const pattern = (entry as { pattern?: unknown }).pattern;
     const script = (entry as { script?: unknown }).script;
@@ -328,6 +513,63 @@ async function currentRouteService(hostname: string): Promise<string | null> {
   });
   if (services.length > 1) throw preflightError(`${hostname} has more than one exact Worker route`);
   return services[0] ?? null;
+}
+
+export async function inspectSiteReleaseState(
+  accountId: string,
+  origin: string,
+  path: string,
+  options: SiteReleaseStateOptions = {},
+): Promise<SiteReleaseState> {
+  const hostname = new URL(origin).hostname;
+  const [routeOwner, publicState] = await Promise.all([
+    readSiteRouteOwner(accountId, hostname, {
+      ...(options.env === undefined ? {} : { env: options.env }),
+      ...(options.run === undefined ? {} : { run: options.run }),
+      ...(options.routeFetcher === undefined ? {} : { fetcher: options.routeFetcher }),
+    }),
+    readPublicState(origin, path, options.publicFetcher),
+  ]);
+  return { routeOwner, publicState };
+}
+
+async function cloudflareEnvelope(response: Response, label: string): Promise<readonly unknown[]> {
+  if (!response.ok) throw preflightError(`${label} failed`);
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    throw preflightError(`${label} returned malformed response`);
+  }
+  if (
+    typeof body !== "object" ||
+    body === null ||
+    (body as { success?: unknown }).success !== true ||
+    !Array.isArray((body as { result?: unknown }).result)
+  ) {
+    throw preflightError(`${label} returned malformed response`);
+  }
+  return (body as { result: readonly unknown[] }).result;
+}
+
+async function readPublicState(
+  origin: string,
+  path: string,
+  fetcher?: WebFetcher,
+): Promise<SiteReleaseState["publicState"]> {
+  try {
+    const live = await readLive(origin, path, "preflight", fetcher);
+    return { outcome: "response", ...live };
+  } catch (error) {
+    if (!(error instanceof DeployError) || error.phase !== "preflight") throw error;
+    if (error.message === "public web readback timed out") {
+      return { outcome: "timeout", status: null, digest: null, bytes: null };
+    }
+    if (error.message === "public web readback transport failed") {
+      return { outcome: "transport", status: null, digest: null, bytes: null };
+    }
+    throw error;
+  }
 }
 
 export async function readLive(
