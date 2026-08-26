@@ -147,6 +147,7 @@ describe("Takoserver public web release", () => {
         message: "Cloudflare Worker route inventory returned malformed response",
       },
     ]) {
+      // takos-secret-scan: synthetic
       const failure = await readSiteRouteOwner(target.accountId, "takoserver.example", {
         env: { CLOUDFLARE_API_TOKEN: "existing-route-inventory-token" },
         fetcher: async (input) =>

@@ -64,6 +64,7 @@ test("site route authority sanitizes a failed Wrangler auth command", async () =
 
 test("site route authority accepts an existing env token without invoking Wrangler", async () => {
   let invoked = false;
+  // takos-secret-scan: synthetic
   const token = await resolveCloudflareRouteToken({
     env: { CLOUDFLARE_API_TOKEN: "existing-route-inventory-token" },
     run: async () => {
