@@ -1,8 +1,8 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Miniflare } from "miniflare";
 import { migrateSqlite } from "./migrate-sqlite.ts";
 import { createMemoryObjectStore } from "./objects-mem.ts";
@@ -37,13 +37,19 @@ const HOST_FORMS = [
   "EdgeKVNamespace",
   "AtLeastOnceQueue",
   "WorkerBundle",
+  "StaticAssetBundle",
   "WorkerVersion",
   "WorkerDeployment",
   "WorkerEndpoint",
   "QueueConsumer",
   "WorkerCronTrigger",
 ] as const;
-const INTRINSIC = new Set(["WorkerBundle", "SQLiteMigrationSet", "SQLiteMigrationApplication"]);
+const INTRINSIC = new Set([
+  "WorkerBundle",
+  "StaticAssetBundle",
+  "SQLiteMigrationSet",
+  "SQLiteMigrationApplication",
+]);
 
 export interface StableLocalCloudflareHost {
   readonly endpoint: string;
@@ -52,7 +58,7 @@ export interface StableLocalCloudflareHost {
   readonly classification: "test-only-local-cloudflare-adapter";
   report(): {
     readonly classification: "test-only-local-cloudflare-adapter";
-    readonly installedFormKindCount: 12;
+    readonly installedFormKindCount: 13;
     readonly resourceGraphCount: 13;
     readonly currentObjectBucketIdentities: 0;
     readonly currentEdgeObjectsReferences: 0;
@@ -466,6 +472,30 @@ function providerFailure(code: string): TakoformHostError {
   }
 }
 
+interface LocalAssetDeclaration {
+  readonly hash: string;
+  readonly size: number;
+}
+
+interface LocalAssetSession {
+  readonly script: string;
+  readonly manifest: Readonly<Record<string, LocalAssetDeclaration>>;
+  readonly missing: ReadonlySet<string>;
+}
+
+interface LocalVersionAssets {
+  readonly manifest: Readonly<Record<string, LocalAssetDeclaration>>;
+  readonly config: {
+    readonly htmlHandling?:
+      | "auto-trailing-slash"
+      | "drop-trailing-slash"
+      | "force-trailing-slash"
+      | "none";
+    readonly notFoundHandling?: "none" | "single-page-application" | "404-page";
+    readonly runWorkerFirst?: boolean;
+  };
+}
+
 class LocalCloudflare {
   runtime: Miniflare | undefined;
   readonly #root: string;
@@ -494,8 +524,14 @@ class LocalCloudflare {
   >();
   readonly #versions = new Map<
     string,
-    { metadata: Record<string, unknown>; modules: Map<string, Uint8Array> }
+    {
+      metadata: Record<string, unknown>;
+      modules: Map<string, Uint8Array>;
+      assets?: LocalVersionAssets;
+    }
   >();
+  readonly #assetBlobs = new Map<string, Uint8Array>();
+  readonly #assetSessions = new Map<string, LocalAssetSession>();
   readonly #deployments = new Map<string, { script: string; version: string }>();
   #active: { script: string; version: string } | undefined;
   #nextVersion = 1;
@@ -504,6 +540,7 @@ class LocalCloudflare {
   #nextNamespace = 1;
   #nextQueue = 1;
   #nextConsumer = 1;
+  #nextAssetSession = 1;
   #runtimeMigrationsApplied = false;
   #runtimeTriggerCounts = { queue: 0, scheduled: 0 };
 
@@ -530,11 +567,14 @@ class LocalCloudflare {
   }
 
   async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const path = url.pathname.replace(/^\/client\/v4/u, "");
+    if (request.method === "POST" && path === `/accounts/${ACCOUNT_ID}/workers/assets/upload`) {
+      return await this.#uploadAssets(request);
+    }
     if (request.headers.get("authorization") !== "Bearer local-cloudflare-authority") {
       return envelope(undefined, 403, [{ code: 9109 }]);
     }
-    const url = new URL(request.url);
-    const path = url.pathname.replace(/^\/client\/v4/u, "");
     let match: RegExpExecArray | null;
 
     if (request.method === "POST" && path === `/accounts/${ACCOUNT_ID}/d1/database`) {
@@ -675,6 +715,14 @@ class LocalCloudflare {
         this.#active = undefined;
       }
       return envelope({});
+    }
+
+    match = new RegExp(
+      `^/accounts/${ACCOUNT_ID}/workers/scripts/([^/]+)/assets-upload-session$`,
+      "u",
+    ).exec(path);
+    if (match && request.method === "POST") {
+      return await this.#startAssetSession(decoded(match, 1), request);
     }
 
     match = new RegExp(`^/accounts/${ACCOUNT_ID}/workers/scripts/([^/]+)/versions$`, "u").exec(
@@ -878,6 +926,56 @@ class LocalCloudflare {
     return envelope(body.batch.map(() => ({ success: true, results: [] })));
   }
 
+  async #startAssetSession(script: string, request: Request): Promise<Response> {
+    if (!this.#scripts.has(script)) return envelope(undefined, 404);
+    const body = (await request.json()) as { manifest?: unknown };
+    const manifest = localAssetManifest(body.manifest);
+    if (!manifest) return envelope(undefined, 400);
+    const token = `asset-session-${this.#nextAssetSession++}`;
+    const missing = new Set(
+      [...new Set(Object.values(manifest).map((declaration) => declaration.hash))].filter(
+        (hash) => !this.#assetBlobs.has(hash),
+      ),
+    );
+    this.#assetSessions.set(token, { script, manifest, missing });
+    return envelope({
+      jwt: token,
+      buckets: missing.size > 0 ? [[...missing].sort()] : [],
+    });
+  }
+
+  async #uploadAssets(request: Request): Promise<Response> {
+    const authorization = request.headers.get("authorization") ?? "";
+    const token = authorization.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : "";
+    const session = this.#assetSessions.get(token);
+    if (!session) return envelope(undefined, 403, [{ code: 9109 }]);
+    const form = await request.formData();
+    const received = new Set<string>();
+    for (const [hash, value] of form.entries()) {
+      if (typeof value === "string" || received.has(hash) || !session.missing.has(hash)) {
+        return envelope(undefined, 400);
+      }
+      const encoded = await (value as unknown as { text(): Promise<string> }).text();
+      const bytes = new Uint8Array(Buffer.from(encoded, "base64"));
+      const declarations = Object.values(session.manifest).filter(
+        (declaration) => declaration.hash === hash,
+      );
+      if (
+        declarations.length === 0 ||
+        declarations.some((declaration) => declaration.size !== bytes.byteLength) ||
+        createHash("sha256").update(bytes).digest("hex").slice(0, 32) !== hash
+      ) {
+        return envelope(undefined, 400);
+      }
+      received.add(hash);
+      this.#assetBlobs.set(hash, bytes);
+    }
+    if ([...session.missing].some((hash) => !this.#assetBlobs.has(hash))) {
+      return envelope(undefined, 400);
+    }
+    return envelope({ jwt: token });
+  }
+
   async #createVersion(script: string, request: Request): Promise<Response> {
     const form = await request.formData();
     const metadataPart = form.get("metadata");
@@ -885,6 +983,13 @@ class LocalCloudflare {
     const metadata = JSON.parse(
       typeof metadataPart === "string" ? metadataPart : await metadataPart.text(),
     ) as Record<string, unknown>;
+    const assets = localVersionAssets(
+      metadata.assets,
+      script,
+      this.#assetSessions,
+      this.#assetBlobs,
+    );
+    if (metadata.assets !== undefined && !assets) return envelope(undefined, 400);
     const modules = new Map<string, Uint8Array>();
     for (const [name, value] of form.entries()) {
       if (name === "metadata" || typeof value === "string") continue;
@@ -894,7 +999,7 @@ class LocalCloudflare {
       modules.set(name, new Uint8Array(bytes));
     }
     const id = `version-${this.#nextVersion++}`;
-    this.#versions.set(`${script}:${id}`, { metadata, modules });
+    this.#versions.set(`${script}:${id}`, { metadata, modules, ...(assets ? { assets } : {}) });
     return envelope({ id });
   }
 
@@ -921,8 +1026,13 @@ class LocalCloudflare {
         env[name] = { type: "kv", id: binding.namespace_id };
       } else if (binding.type === "queue") {
         env[name] = { type: "queue", name: binding.queue_name };
+      } else if (binding.type === "assets") {
+        env[name] = { type: "assets" };
       }
     }
+    const assetsDirectory = held.assets
+      ? await this.#materializeAssets(script, version, held.assets.manifest)
+      : undefined;
     const publicOrigin = `https://${script}.${WORKER_SUFFIX}`;
     const modules: Record<string, { type: "esm"; contents: string | Uint8Array }> =
       Object.fromEntries(
@@ -1015,6 +1125,15 @@ export default {
             manifest: { mainModule, modules },
             env,
             triggers,
+            ...(assetsDirectory && held.assets
+              ? {
+                  assets: {
+                    directory: assetsDirectory,
+                    hasUserWorker: true,
+                    ...held.assets.config,
+                  },
+                }
+              : {}),
           },
         },
       ],
@@ -1030,6 +1149,125 @@ export default {
       this.#runtimeMigrationsApplied = true;
     }
   }
+
+  async #materializeAssets(
+    script: string,
+    version: string,
+    manifest: Readonly<Record<string, LocalAssetDeclaration>>,
+  ): Promise<string> {
+    const directory = join(
+      this.#root,
+      "assets",
+      createHash("sha256").update(`${script}\0${version}`).digest("hex"),
+    );
+    await rm(directory, { recursive: true, force: true });
+    for (const [path, declaration] of Object.entries(manifest)) {
+      const relative = localAssetPath(path);
+      const bytes = this.#assetBlobs.get(declaration.hash);
+      if (!relative || !bytes || bytes.byteLength !== declaration.size) {
+        throw new Error("stable local asset session is incomplete");
+      }
+      const destination = join(directory, relative);
+      await mkdir(dirname(destination), { recursive: true });
+      await writeFile(destination, bytes);
+    }
+    return directory;
+  }
+}
+
+function localAssetManifest(
+  value: unknown,
+): Readonly<Record<string, LocalAssetDeclaration>> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const entries = Object.entries(value);
+  if (entries.length === 0 || entries.length > 20_000) return null;
+  const manifest: Record<string, LocalAssetDeclaration> = {};
+  for (const [path, candidate] of entries) {
+    if (
+      !localAssetPath(path) ||
+      !candidate ||
+      typeof candidate !== "object" ||
+      Array.isArray(candidate)
+    ) {
+      return null;
+    }
+    const declaration = candidate as Record<string, unknown>;
+    if (
+      JSON.stringify(Object.keys(declaration).sort()) !== JSON.stringify(["hash", "size"]) ||
+      typeof declaration.hash !== "string" ||
+      !/^[0-9a-f]{32}$/u.test(declaration.hash) ||
+      !Number.isSafeInteger(declaration.size) ||
+      (declaration.size as number) < 0 ||
+      (declaration.size as number) > 268_435_456
+    ) {
+      return null;
+    }
+    manifest[path] = {
+      hash: declaration.hash,
+      size: declaration.size as number,
+    };
+  }
+  return Object.freeze(manifest);
+}
+
+function localAssetPath(path: string): string | null {
+  if (!path.startsWith("/") || path.length < 2 || path.length > 241) return null;
+  const relative = path.slice(1);
+  if (
+    !/^[A-Za-z0-9_.][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_.][A-Za-z0-9._-]*)*$/u.test(relative) ||
+    relative.split("/").some((part) => part === "." || part === "..")
+  ) {
+    return null;
+  }
+  return relative;
+}
+
+function localVersionAssets(
+  value: unknown,
+  script: string,
+  sessions: ReadonlyMap<string, LocalAssetSession>,
+  blobs: ReadonlyMap<string, Uint8Array>,
+): LocalVersionAssets | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const token = typeof record.jwt === "string" ? record.jwt : "";
+  const session = sessions.get(token);
+  if (
+    !session ||
+    session.script !== script ||
+    [...session.missing].some((hash) => !blobs.has(hash))
+  ) {
+    return null;
+  }
+  if (!record.config || typeof record.config !== "object" || Array.isArray(record.config)) {
+    return null;
+  }
+  const raw = record.config as Record<string, unknown>;
+  const htmlHandling = raw.html_handling;
+  const notFoundHandling = raw.not_found_handling;
+  const runWorkerFirst = raw.run_worker_first;
+  if (
+    (htmlHandling !== undefined &&
+      htmlHandling !== "auto-trailing-slash" &&
+      htmlHandling !== "drop-trailing-slash" &&
+      htmlHandling !== "force-trailing-slash" &&
+      htmlHandling !== "none") ||
+    (notFoundHandling !== undefined &&
+      notFoundHandling !== "none" &&
+      notFoundHandling !== "single-page-application" &&
+      notFoundHandling !== "404-page") ||
+    (runWorkerFirst !== undefined && typeof runWorkerFirst !== "boolean")
+  ) {
+    return null;
+  }
+  return {
+    manifest: session.manifest,
+    config: {
+      ...(htmlHandling !== undefined ? { htmlHandling } : {}),
+      ...(notFoundHandling !== undefined ? { notFoundHandling } : {}),
+      ...(runWorkerFirst !== undefined ? { runWorkerFirst } : {}),
+    },
+  };
 }
 
 function stripSqlComments(value: string): string {

@@ -63,7 +63,13 @@ bun run debug:stable-local-cloudflare-host
 ```
 
 The catalog loader verifies the frozen 31-Form input before listening. The
-runtime-value JSON must be a nonempty map whose names exactly match the
+launcher installs the exact 13-Form union needed by the maintained Road to Me
+(9 Forms) and Yurucommu (12 Forms) local graphs. Its `StaticAssetBundle` path
+uses the production Cloudflare Provider upload protocol and serves the realized
+asset manifest through the disposable workerd runtime, including Worker-first
+and single-page fallback behavior.
+
+The runtime-value JSON must be a nonempty map whose names exactly match the
 `requiredSensitiveVars` requested by a test graph. Those fake/local values are
 injected directly into disposable Host authority; this command is not a deploy
 path or a production materializer. It binds `127.0.0.1` on an ephemeral port by
@@ -185,6 +191,13 @@ provider adapters may remain installed to observe and delete recorded
 Deployments, but their beta Forms are not republished as a sale catalog. The
 control plane itself can also run as a Worker; `bun run deploy -- --contract`
 describes what publishing that involves and what it refuses to do.
+
+For the owner-managed production plan/apply only, keep the existing hosted
+sponsorship bearer at `.deploy/private/hosted-sponsorship-token`, with
+`.deploy/private` mode `0700` and the file mode `0600`. Load it process-locally
+as `TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN` through the owning deploy entrypoint;
+never echo it, put it in shell history, or copy it into the target or evidence.
+Unset it immediately afterward, and never substitute a raw deploy command.
 
 The official operator-private deploy target may declare `aiModels`,
 `standardServiceSupplies`, and one exact `hostRuntimeMaterializerService` route.

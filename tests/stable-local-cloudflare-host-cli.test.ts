@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { type ChildProcessByStdio, spawn } from "node:child_process";
 import { cp, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import type { Readable } from "node:stream";
 
 import {
   parseStableLocalCloudflareHostEnvironment,
@@ -14,12 +16,14 @@ const TAKOFORM_ROOT = resolve(import.meta.dir, "fixtures/takoform-v1");
 const TOKEN = "generic-stable-local-token";
 const RUNTIME_NAME = "GENERIC_LOCAL_VALUE";
 const RUNTIME_VALUE = "generic-local-secret-value";
-const children = new Set<ReturnType<typeof Bun.spawn>>();
+type LauncherChild = ChildProcessByStdio<null, Readable, Readable>;
+
+const children = new Set<LauncherChild>();
 
 afterEach(async () => {
   for (const child of children) {
-    child.kill("SIGKILL");
-    await child.exited;
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await childExit(child);
   }
   children.clear();
 });
@@ -43,7 +47,9 @@ describe("the stable local Cloudflare Host launcher", () => {
     expect(
       parseStableLocalCloudflareHostEnvironment({
         ...base,
-        TAKOSERVER_STABLE_LOCAL_RUNTIME_VALUES: JSON.stringify({ [RUNTIME_NAME]: RUNTIME_VALUE }),
+        TAKOSERVER_STABLE_LOCAL_RUNTIME_VALUES: JSON.stringify({
+          [RUNTIME_NAME]: RUNTIME_VALUE,
+        }),
       }),
     ).toEqual({
       takoformRepositoryRoot: TAKOFORM_ROOT,
@@ -62,7 +68,7 @@ describe("the stable local Cloudflare Host launcher", () => {
       classification: "test-only-local-cloudflare-adapter",
       report: () => ({
         classification: "test-only-local-cloudflare-adapter",
-        installedFormKindCount: 12,
+        installedFormKindCount: 13,
         resourceGraphCount: 13,
         currentObjectBucketIdentities: 0,
         currentEdgeObjectsReferences: 0,
@@ -79,7 +85,7 @@ describe("the stable local Cloudflare Host launcher", () => {
       diagnosticRuntimeEndpoint: "http://127.0.0.1:43210",
       space: "local-space",
       report: {
-        installedFormKindCount: 12,
+        installedFormKindCount: 13,
         resourceGraphCount: 13,
         currentObjectBucketIdentities: 0,
         currentEdgeObjectsReferences: 0,
@@ -91,7 +97,7 @@ describe("the stable local Cloudflare Host launcher", () => {
   });
 
   test("starts on loopback, exposes literal v1 discovery, rejects bad auth, and closes on SIGTERM", async () => {
-    const child = Bun.spawn(["bun", "run", "debug:stable-local-cloudflare-host"], {
+    const child = spawn("bun", ["run", "debug:stable-local-cloudflare-host"], {
       cwd: REPOSITORY_ROOT,
       env: {
         ...process.env,
@@ -101,8 +107,7 @@ describe("the stable local Cloudflare Host launcher", () => {
           [RUNTIME_NAME]: RUNTIME_VALUE,
         }),
       },
-      stdout: "pipe",
-      stderr: "pipe",
+      stdio: ["ignore", "pipe", "pipe"],
     });
     children.add(child);
     const line = await readLine(child.stdout);
@@ -122,7 +127,9 @@ describe("the stable local Cloudflare Host launcher", () => {
     const discovery = await fetch(`${ready.endpoint}/.well-known/takoform/v1`).then((response) =>
       response.json(),
     );
-    expect(discovery).toMatchObject({ api_versions: ["forms.takoform.com/v1"] });
+    expect(discovery).toMatchObject({
+      api_versions: ["forms.takoform.com/v1"],
+    });
     for (const authorization of [undefined, "Bearer wrong-local-token"]) {
       const response = await fetch(`${ready.endpoint}/apis/forms.takoform.com/v1/forms`, {
         headers: authorization ? { authorization } : {},
@@ -178,10 +185,10 @@ describe("the stable local Cloudflare Host launcher", () => {
     expect(applied.status).toBe(201);
 
     child.kill("SIGTERM");
-    expect(await child.exited).toBe(0);
+    expect(await childExit(child)).toBe(0);
     children.delete(child);
     await expect(fetch(`${ready.endpoint}/.well-known/takoform/v1`)).rejects.toThrow();
-  });
+  }, 30_000);
 
   test("refuses a drifted frozen catalog before binding a listener", async () => {
     const root = await mkdtemp(join(tmpdir(), "takoserver-stable-catalog-drift-"));
@@ -201,22 +208,44 @@ describe("the stable local Cloudflare Host launcher", () => {
   });
 });
 
-async function readLine(stream: ReadableStream<Uint8Array>): Promise<string> {
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
-  let rendered = "";
-  const timeout = setTimeout(() => void reader.cancel(), 15_000);
-  try {
-    while (!rendered.includes("\n")) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      rendered += decoder.decode(value, { stream: true });
-    }
-  } finally {
-    clearTimeout(timeout);
-    reader.releaseLock();
-  }
-  const [line] = rendered.split("\n", 1);
-  if (!line) throw new Error("stable local launcher did not publish readiness");
-  return line;
+async function readLine(stream: Readable): Promise<string> {
+  return await new Promise<string>((resolveLine, rejectLine) => {
+    let rendered = "";
+    const finish = (): void => {
+      clearTimeout(timeout);
+      stream.off("data", onData);
+      stream.off("end", onEnd);
+      stream.off("error", onError);
+    };
+    const onData = (chunk: Buffer | string): void => {
+      rendered += chunk.toString();
+      const [line] = rendered.split("\n", 1);
+      if (!line || !rendered.includes("\n")) return;
+      finish();
+      resolveLine(line);
+    };
+    const onEnd = (): void => {
+      finish();
+      rejectLine(new Error("stable local launcher did not publish readiness"));
+    };
+    const onError = (error: Error): void => {
+      finish();
+      rejectLine(error);
+    };
+    const timeout = setTimeout(() => {
+      finish();
+      rejectLine(new Error("stable local launcher did not publish readiness"));
+    }, 15_000);
+    stream.on("data", onData);
+    stream.once("end", onEnd);
+    stream.once("error", onError);
+  });
+}
+
+async function childExit(child: LauncherChild): Promise<number | null> {
+  if (child.exitCode !== null || child.signalCode !== null) return child.exitCode;
+  return await new Promise<number | null>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", resolve);
+  });
 }
