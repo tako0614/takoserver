@@ -140,6 +140,7 @@ describe("private data service deploy configuration", () => {
         vars: Record<string, string>;
       };
       expect(realized.vars).toMatchObject({
+        PUBLIC_ORIGIN: "https://api.takoserver.com",
         TAKOS_ID_ISSUER: "https://id.takos.jp",
         TAKOS_ID_CLIENT_ID: "takoserver",
       });

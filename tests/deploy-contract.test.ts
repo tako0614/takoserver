@@ -147,8 +147,12 @@ describe("Takoserver deploy entrypoint", () => {
     const realizedPath = writeRealizedConfig(staging);
     const realized = JSON.parse(readFileSync(realizedPath, "utf8")) as {
       readonly name?: string;
+      readonly vars?: Record<string, string>;
     };
-    expect(realized.name).toBe("takoserver-api-staging");
+    expect(realized).toMatchObject({
+      name: "takoserver-api-staging",
+      vars: { PUBLIC_ORIGIN: staging.publicOrigin },
+    });
 
     const postGatePath = await realizeTargetAfterGate(staging, async () => {
       writeRealizedConfig(production);

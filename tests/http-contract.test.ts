@@ -22,13 +22,13 @@ const settlement: FundingSettlementVerifier = {
   },
 };
 
-function handler() {
+function handler(publicOrigin = "https://api.takoserver.com") {
   return buildApp({
     sql: createEphemeralSql(),
     objects: createMemoryObjectStore(),
     identity,
     settlement,
-    publicOrigin: "https://api.takoserver.com",
+    publicOrigin,
     forms: [],
     hostForms: [],
     driver: new InMemoryTakoformResourceDriver(),
@@ -132,6 +132,37 @@ describe("published API description", () => {
     expect((await response.json()) as unknown).toEqual(
       JSON.parse(JSON.stringify(openApiDocument)) as unknown,
     );
+  });
+
+  test("advertises the deployment public origin for staging and production", async () => {
+    for (const publicOrigin of [
+      "https://takoserver-api-staging.shoutatomiyama0614.workers.dev",
+      "https://api.takoserver.com",
+    ]) {
+      const fetch = handler(publicOrigin);
+      const document = await fetch(new Request(`${publicOrigin}/openapi.json`));
+      const discovery = await fetch(new Request(`${publicOrigin}/.well-known/takoserver`));
+      const body = (await document.json()) as { servers: readonly unknown[] };
+      expect(body.servers).toEqual([{ url: publicOrigin }]);
+      expect((await discovery.json()) as { endpoints: { api: string } }).toMatchObject({
+        endpoints: { api: publicOrigin },
+      });
+    }
+  });
+
+  test("keeps the configured public origin when a request arrives on an alias", async () => {
+    const publicOrigin = "https://api.takoserver.com";
+    const fetch = handler(publicOrigin);
+    const alias = "https://api-alias.takoserver.com";
+    const document = await fetch(new Request(`${alias}/openapi.json`));
+    const discovery = await fetch(new Request(`${alias}/.well-known/takoserver`));
+
+    expect(((await document.json()) as { servers: readonly unknown[] }).servers).toEqual([
+      { url: publicOrigin },
+    ]);
+    expect((await discovery.json()) as { endpoints: { api: string } }).toMatchObject({
+      endpoints: { api: publicOrigin },
+    });
   });
 
   test("answers discovery and the console without a credential", async () => {

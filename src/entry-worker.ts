@@ -133,6 +133,17 @@ function credentials(env: WorkerEnv) {
 
 let cached: { readonly env: WorkerEnv; readonly app: App } | null = null;
 
+/**
+ * The official Worker has one operator-owned public address. It is injected by
+ * the owning deploy target; deriving it from the request host would let an
+ * alias or service binding silently become the product's advertised identity.
+ */
+export function requirePublicOrigin(env: { readonly PUBLIC_ORIGIN?: string | undefined }): string {
+  const origin = env.PUBLIC_ORIGIN?.trim();
+  if (!origin) throw new Error("PUBLIC_ORIGIN is required for the official Worker");
+  return origin;
+}
+
 async function appFor(env: WorkerEnv, origin: string): Promise<App> {
   if (cached?.env === env) return cached.app;
   const edge = await buildEdgeForms();
@@ -201,14 +212,14 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
 
 export default {
   async fetch(request: Request, env: WorkerEnv): Promise<Response> {
-    const origin = env.PUBLIC_ORIGIN ?? new URL(request.url).origin;
+    const origin = requirePublicOrigin(env);
     const app = await appFor(env, origin);
     return await app.fetch(request);
   },
 
   /** Background settlement: expiring reservations return their holds. */
   async scheduled(_event: unknown, env: WorkerEnv): Promise<void> {
-    const app = await appFor(env, env.PUBLIC_ORIGIN ?? "https://api.takoserver.com");
+    const app = await appFor(env, requirePublicOrigin(env));
     await app.tick();
   },
 };
