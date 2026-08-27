@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { realizeTargetAfterGate } from "../scripts/deploy/preflight.ts";
 import { writeRealizedConfig } from "../scripts/deploy/realized-config.ts";
 import { assertOfficialApiTarget, type DeployTarget } from "../scripts/deploy/target.ts";
 
@@ -112,7 +113,7 @@ describe("Takoserver deploy entrypoint", () => {
     }
   });
 
-  test("staging cannot point at the production Worker or durable stores", () => {
+  test("staging cannot point at the production Worker or durable stores", async () => {
     const production = {
       accountId: "0".repeat(32),
       workerName: "takoserver-api",
@@ -148,6 +149,18 @@ describe("Takoserver deploy entrypoint", () => {
       readonly name?: string;
     };
     expect(realized.name).toBe("takoserver-api-staging");
+
+    const postGatePath = await realizeTargetAfterGate(staging, async () => {
+      writeRealizedConfig(production);
+    });
+    const postGate = JSON.parse(readFileSync(postGatePath, "utf8")) as {
+      readonly name?: string;
+      readonly account_id?: string;
+    };
+    expect(postGate).toMatchObject({
+      name: "takoserver-api-staging",
+      account_id: staging.accountId,
+    });
   });
 
   test("refuses before Cloudflare when the deploy target descriptor is absent", async () => {

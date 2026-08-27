@@ -99,13 +99,15 @@ export async function preflight(
   target: DeployTarget,
   options: { readonly runGate: boolean },
 ): Promise<PreflightReport> {
-  const configPath = writeRealizedConfig(target);
   const { commit, branch, remoteUrl } = await resolvePushedCommit();
-
-  if (options.runGate) {
-    await runChecked("preflight", "portable gate `bun run check`", ["bun", "run", "check"]);
-  }
-
+  const configPath = await realizeTargetAfterGate(
+    target,
+    options.runGate
+      ? async () => {
+          await runChecked("preflight", "portable gate `bun run check`", ["bun", "run", "check"]);
+        }
+      : undefined,
+  );
   const bundle = await buildBundleDigest(configPath);
   const configDigest = await realizedConfigDigest(configPath);
   const migrations = migrationProvenance();
@@ -147,6 +149,20 @@ export async function preflight(
     signingAuthority,
     signingKeyRepairRequired,
   };
+}
+
+/**
+ * The portable gate includes deploy-config tests that deliberately realize
+ * synthetic targets into the ignored output path. Re-materialize the exact
+ * operator target only after that proof completes, otherwise a test fixture
+ * can become the config Wrangler inspects and publishes.
+ */
+export async function realizeTargetAfterGate(
+  target: DeployTarget,
+  gate?: () => Promise<void>,
+): Promise<string> {
+  await gate?.();
+  return writeRealizedConfig(target);
 }
 
 /**
