@@ -1,9 +1,66 @@
 import { RemoteD1, sqlLiteral } from "./d1.ts";
 import { verificationError } from "./errors.ts";
 import type { PreflightReport } from "./preflight.ts";
-import { RUNTIME_TABLES } from "./preflight.ts";
 import { inspectSigningAuthority, liveSigningKeyMatches } from "./signing-authority.ts";
 import { assertTargetBindingClosure } from "./worker-state.ts";
+
+/**
+ * Every table produced by the current migration lineage. D1's own metadata
+ * tables are intentionally excluded: this is the product state that the
+ * published Worker must be able to serve after a deploy.
+ */
+export const PRODUCT_TABLES = [
+  "auth_tokens",
+  "idempotency",
+  "ledger",
+  "org_memberships",
+  "orgs",
+  "principals",
+  "provider_meter_checkpoints",
+  "provider_meter_schedule",
+  "provision_token_consumptions",
+  "quotes",
+  "reservations",
+  "runtime_grant_keys",
+  "runtime_grant_replays",
+  "runtime_resources",
+  "sponsorship_resources",
+  "sponsorship_tenants",
+  "tf_artifact_holds",
+  "tf_artifact_manifests",
+  "tf_artifact_replays",
+  "tf_artifact_uploads",
+  "tf_deferred_operations",
+  "tf_form_activation_events",
+  "tf_form_evacuation_events",
+  "tf_form_install_events",
+  "tf_form_package_purge_events",
+  "tf_form_publisher_events",
+  "tf_form_revocation_checkpoints",
+  "tf_form_support_events",
+  "tf_operation_commit_guards",
+  "tf_operations",
+  "tf_prepares",
+  "tf_provider_mutation_sagas",
+  "tf_replays",
+  "tf_resource_attachments",
+  "tf_resource_claims",
+  "tf_resource_deployments",
+  "tf_resource_migrations",
+  "tf_resources",
+  "usage_events",
+  "usage_statements",
+  "wallet_allocation_guards",
+  "wallet_credit_allocations",
+  "wallet_credit_lots",
+] as const;
+
+/** Fails closed when the post-deploy D1 readback omits any product table. */
+export function assertProductTablesPresent(tables: readonly string[]): void {
+  if (JSON.stringify(tables) !== JSON.stringify(PRODUCT_TABLES)) {
+    throw verificationError(`the target is missing product tables: ${JSON.stringify(tables)}`);
+  }
+}
 
 /**
  * Proves the published bytes serve a real caller.
@@ -28,12 +85,10 @@ export async function verify(
     "verification",
     "product table readback",
     "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN (" +
-      `${RUNTIME_TABLES.map((name) => sqlLiteral(name)).join(", ")}) ORDER BY name`,
+      `${PRODUCT_TABLES.map((name) => sqlLiteral(name)).join(", ")}) ORDER BY name`,
     "name",
   );
-  if (JSON.stringify(tables) !== JSON.stringify([...RUNTIME_TABLES].sort())) {
-    throw verificationError(`the target is missing product tables: ${JSON.stringify(tables)}`);
-  }
+  assertProductTablesPresent(tables);
   proven.push("every product table present");
 
   const signingAuthority = await inspectSigningAuthority(
