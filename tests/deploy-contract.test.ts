@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { writeRealizedConfig } from "../scripts/deploy/realized-config.ts";
 import { assertOfficialApiTarget, type DeployTarget } from "../scripts/deploy/target.ts";
 
 const REPOSITORY = `${import.meta.dir}/..`;
@@ -140,6 +142,12 @@ describe("Takoserver deploy entrypoint", () => {
     expect(() => assertOfficialApiTarget("production", staging)).toThrow(
       "production surface requires workerName takoserver-api",
     );
+
+    const realizedPath = writeRealizedConfig(staging);
+    const realized = JSON.parse(readFileSync(realizedPath, "utf8")) as {
+      readonly name?: string;
+    };
+    expect(realized.name).toBe("takoserver-api-staging");
   });
 
   test("refuses before Cloudflare when the deploy target descriptor is absent", async () => {

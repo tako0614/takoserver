@@ -12,20 +12,22 @@ import type { DeployTarget } from "./target.ts";
  */
 export const REALIZED_CONFIG_PATH = resolve(REPOSITORY, ".wrangler-realized.jsonc");
 export const NEUTRAL_CONFIG_PATH = resolve(REPOSITORY, "wrangler.jsonc");
+const CANONICAL_WORKER_NAME = "takoserver-api";
 
 export function writeRealizedConfig(target: DeployTarget): string {
   const neutral = readNeutralConfig();
 
-  if (neutral.name !== target.workerName) {
+  if (neutral.name !== CANONICAL_WORKER_NAME) {
     throw preflightError(
-      `worker name mismatch: wrangler.jsonc declares ${JSON.stringify(neutral.name)} but the ` +
-        `deploy target names ${JSON.stringify(target.workerName)}`,
+      `worker name mismatch: wrangler.jsonc must declare ${JSON.stringify(CANONICAL_WORKER_NAME)} ` +
+        `but declares ${JSON.stringify(neutral.name)}`,
     );
   }
   assertNeutral(neutral);
 
   const realized = {
     ...neutral,
+    name: target.workerName,
     account_id: target.accountId,
     d1_databases: [
       {
