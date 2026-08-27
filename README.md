@@ -234,7 +234,11 @@ changed host-side authority while deriving those values, it may return an
 opaque authenticated rollback receipt. Takoserver never interprets that
 receipt: a failed immutable Worker Version upload sends it back only to the
 same private materializer, and reports a provider error unless the exact
-compare-and-swap rollback is confirmed. Realization places the other
+compare-and-swap rollback is confirmed. After a successful immutable Version
+upload, Takoserver sends the exact same request, resource, script, public
+origin, and binding set to the materializer's idempotent commit operation. A
+missing or refused commit keeps the provider result failed; it can never be
+reported as a successful Worker Version. Realization places the other
 non-secret values in Worker vars. AI
 uses the native Workers AI binding, so it does not copy an account API token
 into inference requests. `CLOUDFLARE_API_TOKEN` remains the provisioning
