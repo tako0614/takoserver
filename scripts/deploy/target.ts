@@ -93,6 +93,40 @@ export interface DeployTarget {
 
 export const DEFAULT_TARGET_PATH = ".deploy/target.json";
 
+export type OfficialApiSurface = "production" | "staging";
+
+/**
+ * Keep official staging physically separate from the production Worker and
+ * durable stores before any Cloudflare read or write. The descriptor stays
+ * operator-private; only these stable resource names are public deployment
+ * identity.
+ */
+export function assertOfficialApiTarget(surface: OfficialApiSurface, target: DeployTarget): void {
+  if (surface === "production") {
+    if (target.workerName !== "takoserver-api") {
+      throw preflightError("takoserver-api production surface requires workerName takoserver-api");
+    }
+    return;
+  }
+  const mismatches = [
+    target.workerName === "takoserver-api-staging"
+      ? undefined
+      : "workerName=takoserver-api-staging",
+    target.d1.databaseName === "takoserver-runtime-staging"
+      ? undefined
+      : "d1.databaseName=takoserver-runtime-staging",
+    target.r2.bucketName === "takoserver-objects-staging"
+      ? undefined
+      : "r2.bucketName=takoserver-objects-staging",
+  ].filter((value): value is string => value !== undefined);
+  if (mismatches.length > 0) {
+    throw preflightError(
+      "takoserver-api-staging requires physically separate staging resources",
+      `required: ${mismatches.join(", ")}`,
+    );
+  }
+}
+
 const ACCOUNT_ID = /^[0-9a-f]{32}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const WORKER_NAME = /^[a-z0-9][a-z0-9-]{1,62}$/u;

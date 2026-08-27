@@ -4,7 +4,7 @@ import { appendLedger, EVIDENCE_LEDGER } from "./deploy/evidence.ts";
 import { mutate } from "./deploy/mutate.ts";
 import { inspectLive, preflight } from "./deploy/preflight.ts";
 import { writeRealizedConfig } from "./deploy/realized-config.ts";
-import { loadTarget, targetPath } from "./deploy/target.ts";
+import { assertOfficialApiTarget, loadTarget, targetPath } from "./deploy/target.ts";
 import { verify } from "./deploy/verify.ts";
 import { runWebRelease, type WebSurface } from "./deploy/web.ts";
 import { assertTargetBindingClosure } from "./deploy/worker-state.ts";
@@ -15,6 +15,9 @@ const USAGE = `takoserver deploy
   bun run deploy -- --status            read-only inspection of the realized target
   bun run deploy -- --plan              run every pre-mutation proof, publish nothing
   bun run deploy -- --apply             publish, then verify on the published origin
+  bun run deploy -- staging --status    inspect the isolated staging API target
+  bun run deploy -- staging --plan      prove the isolated staging target, publish nothing
+  bun run deploy -- staging --apply     publish and verify the isolated staging target
   bun run deploy -- console --status    inspect the public console bytes
   bun run deploy -- console --plan      build and prove the console release, publish nothing
   bun run deploy -- console --apply     publish and byte-verify the public console
@@ -44,7 +47,7 @@ const AFTERMATH: Readonly<Record<DeployPhase, string>> = {
 interface Mode {
   readonly action: "status" | "plan" | "apply";
   readonly targetPath: string;
-  readonly surface: "api" | WebSurface;
+  readonly surface: "api" | "staging" | WebSurface;
 }
 
 function parseMode(args: readonly string[]): Mode | null {
@@ -54,7 +57,7 @@ function parseMode(args: readonly string[]): Mode | null {
 
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
-    if ((argument === "console" || argument === "site") && index === 0) {
+    if ((argument === "console" || argument === "site" || argument === "staging") && index === 0) {
       surface = argument;
       continue;
     }
@@ -95,8 +98,14 @@ async function run(mode: Mode): Promise<void> {
   const target = loadTarget(mode.targetPath);
 
   if (mode.surface !== "api") {
-    await runWebRelease(mode.surface, mode.action, target);
-    return;
+    if (mode.surface === "staging") {
+      assertOfficialApiTarget("staging", target);
+    } else {
+      await runWebRelease(mode.surface, mode.action, target);
+      return;
+    }
+  } else {
+    assertOfficialApiTarget("production", target);
   }
 
   if (mode.action === "status") {

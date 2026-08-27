@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { assertOfficialApiTarget, type DeployTarget } from "../scripts/deploy/target.ts";
 
 const REPOSITORY = `${import.meta.dir}/..`;
 
@@ -55,9 +56,24 @@ describe("Takoserver deploy entrypoint", () => {
     expect(failureHandling?.includes("binding closure")).toBe(true);
     expect(contract.surfaces.map((surface) => surface.surface)).toEqual([
       "takoserver-api",
+      "takoserver-api-staging",
       "takoserver-console",
       "takoserver-site",
     ]);
+    expect(contract.surfaces[1]).toMatchObject({
+      surface: "takoserver-api-staging",
+      target: "cloudflare-worker:takoserver-api-staging",
+      triggers: ["published-identity", "authority", "irreversible"],
+      obligations: {
+        provenance: expect.any(String),
+        "post-conditions": expect.any(String),
+        reversal: expect.any(String),
+        "failure-handling": expect.any(String),
+        "no-overwrite": expect.any(String),
+        "pre-mutation-proof": expect.any(String),
+        "independent-review": expect.any(String),
+      },
+    });
     const siteSurface = contract.surfaces.find(
       (surface) => surface.surface === "takoserver-site",
     ) as
@@ -84,6 +100,7 @@ describe("Takoserver deploy entrypoint", () => {
       ["--apply", "--plan"],
       ["--nope"],
       ["console"],
+      ["staging"],
       ["console", "site", "--plan"],
     ]) {
       const refused = await deploy(args);
@@ -91,6 +108,38 @@ describe("Takoserver deploy entrypoint", () => {
       expect(refused.stdout).toBe("");
       expect(refused.stderr).toContain("no target was touched");
     }
+  });
+
+  test("staging cannot point at the production Worker or durable stores", () => {
+    const production = {
+      accountId: "0".repeat(32),
+      workerName: "takoserver-api",
+      d1: {
+        databaseName: "takoserver-runtime",
+        databaseId: "00000000-0000-0000-0000-000000000000",
+      },
+      r2: { bucketName: "takoserver-objects" },
+      publicOrigin: "https://api.takoserver.test",
+      grantKeyId: "takoserver-runtime-test",
+    } satisfies DeployTarget;
+    expect(() => assertOfficialApiTarget("staging", production)).toThrow(
+      "requires physically separate staging resources",
+    );
+    expect(() => assertOfficialApiTarget("production", production)).not.toThrow();
+
+    const staging = {
+      ...production,
+      workerName: "takoserver-api-staging",
+      d1: {
+        ...production.d1,
+        databaseName: "takoserver-runtime-staging",
+      },
+      r2: { bucketName: "takoserver-objects-staging" },
+    } satisfies DeployTarget;
+    expect(() => assertOfficialApiTarget("staging", staging)).not.toThrow();
+    expect(() => assertOfficialApiTarget("production", staging)).toThrow(
+      "production surface requires workerName takoserver-api",
+    );
   });
 
   test("refuses before Cloudflare when the deploy target descriptor is absent", async () => {
