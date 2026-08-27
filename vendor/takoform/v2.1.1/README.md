@@ -1,8 +1,10 @@
-# Takoform provider v2.1.1 release data
+# Retained Takoform provider v2.1.1 release data
 
-Takoserver implements only Forms carried by the released
-`registry.terraform.io/tako0614/takoform` provider. These JSON files are copied
-from `https://github.com/tako0614/takoform.git` tag `v2.1.1`, commit
+Takoserver retains these exact JSON files only to observe and drain already
+recorded beta Deployments. They are not current `forms.takoform.com/v1` sale or
+provision authority. The files are copied from the released
+`registry.terraform.io/tako0614/takoform` provider at
+`https://github.com/tako0614/terraform-provider-takoform.git` tag `v2.1.1`, commit
 `9810570d542434efcf177543de9d463bbfda0d09`:
 
 - `release/provider-form-identities.json`

@@ -18,8 +18,8 @@ const stableForm = (overrides: Partial<InstalledTakoformForm> = {}): InstalledTa
   ...overrides,
 });
 
-describe("current stable Takoform catalog", () => {
-  test("does not relabel immutable v1beta1 provider Forms as stable", async () => {
+describe("current staging adoption-candidate Takoform catalog", () => {
+  test("does not relabel immutable v1beta1 provider Forms as a current candidate", async () => {
     const historical = await buildEdgeForms();
     const current = currentTakoformCatalog(historical);
 
@@ -30,7 +30,7 @@ describe("current stable Takoform catalog", () => {
     );
   });
 
-  test("admits only literal stable-v1 Forms and their exact accepted bindings", async () => {
+  test("admits only literal Host API v1 candidate Forms and their exact accepted bindings", async () => {
     const historical = await buildEdgeForms();
     const accepted = historical.bindings[0];
     if (!accepted) throw new Error("historical binding fixture missing");
@@ -44,7 +44,7 @@ describe("current stable Takoform catalog", () => {
     expect(current.bindings).toEqual([accepted]);
   });
 
-  test("fails closed on ObjectBucket or edge.objects in a stable-v1 catalog", () => {
+  test("fails closed on ObjectBucket or edge.objects in the adoption-candidate catalog", () => {
     expect(() =>
       currentTakoformCatalog({
         forms: [

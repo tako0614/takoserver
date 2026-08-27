@@ -4,7 +4,7 @@ import { dirname, resolve } from "node:path";
 import { loadFrozenStableCatalog } from "../src/worker-stable-local-composition.ts";
 
 const EXPECTED_REPOSITORY = "https://github.com/tako0614/terraform-provider-takoform.git";
-const EXPECTED_COMMIT = "7e71515d0dd2899f9884e031ce63008b8597e8da";
+const EXPECTED_COMMIT = "a225cfa7c84aa551981cc8ad56c9a281fa6e051a";
 const OUTPUT = resolve(import.meta.dir, "../src/generated/takoform-stable-v1-catalog.ts");
 
 const source = resolve(requiredFlag("--source"));
@@ -12,10 +12,10 @@ const check = process.argv.includes("--check");
 const commit = git(source, "rev-parse", "HEAD");
 const repository = normalizeRepository(git(source, "remote", "get-url", "origin"));
 if (commit !== EXPECTED_COMMIT || repository !== EXPECTED_REPOSITORY) {
-  throw new Error("stable production catalog source identity drifted");
+  throw new Error("staging adoption catalog source identity drifted");
 }
 if (git(source, "status", "--porcelain", "--untracked-files=all") !== "") {
-  throw new Error("stable production catalog source must be a clean exact commit");
+  throw new Error("staging adoption catalog source must be a clean exact commit");
 }
 
 const catalog = await loadFrozenStableCatalog(source);
@@ -52,7 +52,7 @@ const formatted = execFileSync(
 
 if (check) {
   const existing = readFileSync(OUTPUT, "utf8");
-  if (existing !== formatted) throw new Error("stable production catalog is stale");
+  if (existing !== formatted) throw new Error("staging adoption catalog is stale");
 } else {
   mkdirSync(dirname(OUTPUT), { recursive: true });
   writeFileSync(OUTPUT, formatted);

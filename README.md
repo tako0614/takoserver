@@ -2,11 +2,12 @@
 
 An Open Source, Self-Hostable PaaS with a [Takoform](https://takoform.com) Host
 for declarative infrastructure and ordinary data APIs for already-standardized
-services. The public Host is the one literal `forms.takoform.com/v1` lane.
-Production installs only exact package bytes generated from one canonical,
-source-pinned Takoform commit. That downstream pin is Takoserver adoption
-authority, not a Takoform release, Form promotion, or claim that the current
-`0.x` FormRefs are no longer Experimental.
+services. The staging Host candidate exposes one literal
+`forms.takoform.com/v1` lane. Its 31-Form adoption catalog contains only exact
+package bytes generated from one canonical, source-pinned Provider v3.0.0
+commit. That downstream pin is Takoserver adoption authority, not a Takoform
+release, Host API publication, Form promotion, GA, or stable production claim;
+the current `0.x` FormRefs remain Experimental.
 
 The released provider-v2.1.1 Edge Family remains immutable historical input so
 Takoserver can read and drain Deployments already recorded under it. It is not
@@ -35,10 +36,10 @@ bun src/entry-bun.ts
 
 That is the whole first run. It creates its schema, generates the keys it signs
 with, prints a sign-in you can paste into its console, and starts serving.
-Ordinary Bun always keeps the stable self-host Provider3 execution pack.
+Ordinary Bun always keeps the exact self-host Provider3 execution pack.
 `CLOUDFLARE_ACCOUNT_ID` may separately back shared D1, R2, or a configured
 standard-service supply, but it is not provider-selection authority and does
-not switch stable Forms off.
+not switch the staging adoption catalog off.
 
 The released Cloudflare ObjectBucket provider survives only as an explicit
 recovery lane for observing and deleting its already-recorded beta
@@ -51,9 +52,8 @@ DNS or Worker-route authority; the old implicit `TAKOSERVER_EDGE_FORMS` switch
 is rejected too. Recovery-mode credentials are validated before local state is
 opened.
 
-For a disposable Provider v3 integration run against the production
-Cloudflare adapter and an in-process account, use the loopback-only stable Host
-launcher:
+For a disposable Provider v3 integration run against the Cloudflare adapter and
+an in-process account, use the loopback-only staging Host candidate launcher:
 
 ```sh
 TAKOFORM_STABLE_CATALOG_ROOT=/path/to/exact/takoform-v3.0.0 \
@@ -91,7 +91,7 @@ the part that owns accounts, money, and the machines.
   balance and captures it when it succeeds; if it fails, the hold is released
   and nothing is charged. There is no balance column anywhere — available is
   settled minus held, computed from entries that are only ever appended.
-- **Reach** standard services through sealed runtime bindings. A stable Worker
+- **Reach** standard services through sealed runtime bindings. An adopted Worker
   names the S3 protocol and its local slot; the Host owns supply selection and
   keeps native bucket identity and credentials outside portable state.
 - **Run** the ordinary Takoform provider without handing a hosted runner the
@@ -221,7 +221,7 @@ The read-only `bun run deploy -- --status` path proves the same exact D1, R2,
 and binding closure, so a stale operator target or an incompletely wired
 live Version cannot masquerade as a healthy recovery state.
 Takoserver's public protocol and standalone path do not depend on Takosumi.
-Stable Worker Forms with an omitted or empty `requiredSensitiveVars`
+Current adoption-candidate Worker Forms with an omitted or empty `requiredSensitiveVars`
 declaration provision normally when the target omits this service binding; a
 non-empty declaration is denied unless the request carries exact runtime
 materialization authority and the deployment selected a materializer. The
@@ -288,13 +288,15 @@ per-entry ban, so the Workers entry cannot reach a filesystem it does not have.
 
 Three properties are worth knowing before reading the code:
 
-**Shipped Form definitions come from exact Takoform bytes.** Takoserver cannot
-author a name in the Takoform namespace. `bun run check:official-forms` pins
-both the canonical source commit and the generated catalog bytes, while still
-pinning immutable provider-v2.1.1 history used to drain old records. A current
-sale additionally needs an implemented backend and explicit operator supply;
-pinning it here does not mint or promote a Takoform release. AI and S3 protocol
-operations do not become Forms just because Takoserver offers them.
+**Staging Form adoption uses exact Takoform bytes.** Takoserver cannot author a
+name in the Takoform namespace. `bun run check:official-forms` pins both the
+canonical Provider v3.0.0 source commit and the generated 31-Form adoption
+catalog bytes, while still pinning immutable Provider v2.1.1 history used to
+drain old records. A current sale additionally needs an implemented backend
+and explicit operator supply; pinning the adoption candidate here does not
+publish the Host API, mint or promote a Takoform release, or establish GA or
+stable production status. AI and S3 protocol operations do not become Forms
+just because Takoserver offers them.
 
 **Guarded writes, not transactions.** The control database may be D1, which has
 no interactive transaction, so invariants live in `WHERE` clauses and are

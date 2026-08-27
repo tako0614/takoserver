@@ -72,7 +72,8 @@ export interface AppPorts {
   readonly forms: readonly InstalledTakoformForm[];
   /** Exact portable BindingDefinitions installed by this Host composition. */
   readonly bindings?: readonly InstalledTakoformBinding[];
-  /** Literal stable-v1 public Host catalog, distinct from historical product/provider Forms. */
+  /** Literal Host API v1 staging-adoption catalog, distinct from historical
+   * product/provider Forms. */
   readonly hostForms: readonly InstalledTakoformForm[];
   readonly hostBindings?: readonly InstalledTakoformBinding[];
   /** Host-owned exact stable standard-service integrations. */

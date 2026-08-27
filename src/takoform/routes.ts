@@ -40,9 +40,10 @@ import {
 /**
  * The Takoform Host HTTP surface.
  *
- * The default composition serves the one literal stable Host API lane. Retired
- * alpha/beta paths are deliberately not aliases: a stale client must receive
- * an exact 404 rather than believe it is still speaking its old contract.
+ * The default composition serves the one literal staging Host API v1 candidate
+ * lane. Retired alpha/beta paths are deliberately not aliases: a stale client
+ * must receive an exact 404 rather than believe it is still speaking its old
+ * contract.
  * FormRef versions remain independent of this route identity.
  */
 

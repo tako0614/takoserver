@@ -37,8 +37,8 @@ function handler() {
   }).fetch;
 }
 
-describe("literal stable Takoform Host cutover", () => {
-  test("serves only Host v1 while preserving Takoserver product and provision routes", async () => {
+describe("literal staging Host API v1 candidate cutover", () => {
+  test("serves only Host API v1 candidate while preserving Takoserver product and provision routes", async () => {
     const fetch = handler();
 
     const discovery = await fetch(

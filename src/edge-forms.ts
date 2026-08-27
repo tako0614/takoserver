@@ -8,7 +8,7 @@ import {
 import type { InstalledTakoformBinding, InstalledTakoformForm } from "./takoform/types.ts";
 
 /**
- * The official Takoform Forms this Host can execute today.
+ * The retained Takoform provider Forms this Host can use for history/drain.
  *
  * Takoserver never authors identities in `*.forms.takoform.com`. An entry may
  * appear here only when its exact FormRef and complete installed definition

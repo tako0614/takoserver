@@ -8,8 +8,9 @@ import type { WorkerdRuntime } from "../src/workerd-runtime.ts";
 /**
  * Released provider Forms remain installed behind the Provider Pack only to
  * drain already-recorded Deployments. They are not a current product catalog:
- * stable S3 is a Host-owned standard service and no current ObjectBucket or
- * edge.objects identity may regain sale/provision authority here.
+ * the adoption-candidate S3 path is a Host-owned standard service and no
+ * current ObjectBucket or edge.objects identity may regain sale/provision
+ * authority here.
  */
 
 const runtime: WorkerdRuntime = {
@@ -41,7 +42,7 @@ async function compose(edgeForms: boolean) {
 }
 
 describe("the self-host catalog", () => {
-  test("offers stable Edge identities while keeping released beta identities drain-only", async () => {
+  test("offers adoption-candidate Edge identities while keeping released beta identities drain-only", async () => {
     const composition = await compose(true);
     expect(composition.offerings.map((offering) => offering.form.kind).sort()).toEqual([
       "AtLeastOnceQueue",
@@ -86,7 +87,7 @@ describe("the self-host catalog", () => {
     }
   });
 
-  test("executes a stable ModuleWorker through the ordinary self-host provider", async () => {
+  test("executes an adoption-candidate ModuleWorker through the ordinary self-host provider", async () => {
     const composition = await compose(true);
     const offering = composition.provider.offerings.find(
       (candidate) =>
@@ -104,7 +105,7 @@ describe("the self-host catalog", () => {
     ).toMatchObject({ phase: "succeeded" });
   });
 
-  test("advertises only the exact stable Forms the local composition executes", async () => {
+  test("advertises only the exact adoption-candidate Forms the local composition executes", async () => {
     const composition = await compose(true);
     const catalog = stableProductionTakoformCatalog();
     const availability = createProviderFormAvailability([composition.provider]);

@@ -29,10 +29,10 @@ import type { WorkerdRuntime } from "./workerd-runtime.ts";
  * two installations on one machine would refuse the version that uses a bucket
  * and a KV namespace together.
  *
- * Stable Edge identities are the current local execution surface. Released
- * beta identities stay behind the same Provider Pack only so already-recorded
- * Deployments can be observed and deleted. `edgeForms: false` narrows both
- * surfaces to the retained ObjectBucket drain capability.
+ * Staging adoption-candidate Edge identities are the current local execution
+ * surface. Released beta identities stay behind the same Provider Pack only so
+ * already-recorded Deployments can be observed and deleted. `edgeForms: false`
+ * narrows both surfaces to the retained ObjectBucket drain capability.
  */
 
 const SUPPLY_CONTRACT_REF = "local.ownership-contract";
@@ -47,7 +47,7 @@ const HOST_INTRINSIC = new Set([
 ]);
 
 export interface SelfhostCompositionOptions {
-  /** Current stable Definitions; only the exact supported Edge subset executes locally. */
+  /** Current staging adoption-candidate Definitions; only the exact supported Edge subset executes locally. */
   readonly stableForms: readonly InstalledTakoformForm[];
   /** Retained beta catalog used only for observation/deletion of recorded Deployments. */
   readonly edge: EdgeFormBundle;
@@ -204,9 +204,9 @@ export function createSelfhostComposition(
     now: options.now,
   });
 
-  // Only stable identities entered `candidates`; released beta Forms remain
+  // Only adoption-candidate identities entered `candidates`; released beta Forms remain
   // technical drain capabilities and therefore cannot appear at `/v1` or
-  // `/provision/v1`. Stable S3 enters Workers through a standard-service
+  // `/provision/v1`. Candidate S3 enters Workers through a standard-service
   // supply; it is not a revived ObjectBucket sale.
   return { ...compiled, provider };
 }

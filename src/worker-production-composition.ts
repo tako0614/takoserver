@@ -405,8 +405,8 @@ export function createWorkerProductionComposition(input: {
     edgeSupplies,
     providers,
     providerPacks: compiled.providerPacks,
-    // Retained beta identities are observation/delete-only. Only exact stable
-    // identities can become current sale/provision authority.
+    // Retained beta identities are observation/delete-only. Only exact
+    // adoption-candidate identities can become current sale/provision authority.
     offerings: compiled.offerings.filter(
       (offering) => offering.form.apiVersion === "edge.forms.takoform.com",
     ),

@@ -1,6 +1,6 @@
 {
   "format": "takoserver.vendored-takoform-source@v1",
-  "repository": "https://github.com/tako0614/takoform.git",
+  "repository": "https://github.com/tako0614/terraform-provider-takoform.git",
   "tag": "v2.1.1",
   "commit": "9810570d542434efcf177543de9d463bbfda0d09",
   "files": [

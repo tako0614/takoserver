@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { probePublishedOrigin } from "../scripts/deploy/verify.ts";
 
-describe("published stable Host postconditions", () => {
-  test("requires stable discovery, retired Host methods at 404, and surviving product v1", async () => {
+describe("staging Host candidate postconditions", () => {
+  test("requires Host API v1 candidate discovery, retired Host methods at 404, and surviving product v1", async () => {
     const seen: string[] = [];
     const proven = await probePublishedOrigin("https://api.takoserver.test", async (request) => {
       const url = new URL(request.url);
@@ -34,7 +34,7 @@ describe("published stable Host postconditions", () => {
       return Response.json({ error: { code: "not_found" } }, { status: 404 });
     });
 
-    expect(proven).toContain("literal stable Takoform Host advertised");
+    expect(proven).toContain("literal staging Host API v1 candidate advertised");
     expect(proven).toContain("retired Takoform Host lanes refuse ordinary HTTP methods");
     expect(seen).toContain("GET /v1/identity/providers");
     for (const lane of ["v1alpha3", "v1beta1", "v1beta4"]) {

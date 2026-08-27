@@ -69,8 +69,9 @@ bun src/entry-bun.ts
 
 This mode reconstructs only the historical Cloudflare technical Provider Pack
 needed to observe and delete those records. It publishes zero current
-Offerings and cannot create a current ObjectBucket or execute current stable
-Edge identities. Both the Cloudflare account token source and the private
+Offerings and cannot create a current ObjectBucket or execute current staging
+adoption-candidate Edge identities. Both the Cloudflare account token source
+and the private
 provisioner endpoint credential are mandatory. `TAKOSERVER_ZONES` and all
 stable self-host provider settings are refused: an ObjectBucket drain owns no
 DNS, Worker-route, or current Worker execution authority. Mode and

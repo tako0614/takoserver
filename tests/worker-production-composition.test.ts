@@ -209,7 +209,7 @@ describe("Worker production composition", () => {
     expect(JSON.stringify(composed)).not.toContain("edge.objects");
   });
 
-  test("keeps exact beta provider dispatch drain-only beside the stable sale catalog", async () => {
+  test("keeps exact beta provider dispatch drain-only beside the adoption-candidate catalog", async () => {
     const stable = stableProductionTakoformCatalog();
     const retained = await buildEdgeForms();
     const composed = createWorkerProductionComposition({

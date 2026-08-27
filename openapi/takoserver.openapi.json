@@ -60,7 +60,7 @@
     },
     "/.well-known/takoform/v1": {
       "get": {
-        "summary": "Stable Takoform Host discovery",
+        "summary": "Staging Host API v1 candidate discovery",
         "responses": {
           "200": {
             "description": "Success"

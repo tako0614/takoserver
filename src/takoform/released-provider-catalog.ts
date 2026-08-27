@@ -12,7 +12,7 @@ import type {
   TakoformOperation,
 } from "./types.ts";
 
-/** The released provider version whose whole portable catalog is installed. */
+/** The retained provider version installed for historical Form drain only. */
 export const TAKOFORM_PROVIDER_RELEASE = Object.freeze({
   version: "2.1.1",
   commit: "9810570d542434efcf177543de9d463bbfda0d09",
@@ -29,7 +29,7 @@ export interface ReleasedInstalledTakoformForm extends InstalledTakoformForm {
 const RELEASED_FORMS = buildReleasedForms();
 const RELEASED_BINDINGS = buildReleasedBindings(RELEASED_FORMS);
 
-/** Detached exact Forms carried by registry.terraform.io/tako0614/takoform v2.1.1. */
+/** Detached exact Forms carried by registry.terraform.io/tako0614/takoform v2.1.1 for drain. */
 export function releasedTakoformProviderForms(): readonly [
   ReleasedInstalledTakoformForm,
   ...ReleasedInstalledTakoformForm[],

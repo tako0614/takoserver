@@ -7,7 +7,7 @@ import type { TakoformHost } from "./takoform/types.ts";
 
 /**
  * The single HTTP entry: discovery, the direct control plane, and the one
- * literal stable Takoform Host lane behind one dispatch.
+ * literal staging Host API v1 candidate lane behind one dispatch.
  *
  * Order matters. The Takoform Host is offered the request first because it owns
  * a whole path prefix and answers `null` for anything outside it; the control

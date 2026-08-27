@@ -22,9 +22,9 @@ import type {
 /**
  * Test-only assembly for immutable alpha/beta engine regressions.
  *
- * Production and the public package constructor are stable-v1-only. Keeping
- * this configurable assembly under `tests/` prevents a historical fixture
- * from becoming a shipped route-selection capability again.
+ * The staging/public package constructor is Host API v1-candidate-only.
+ * Keeping this configurable assembly under `tests/` prevents a historical
+ * fixture from becoming a shipped route-selection capability again.
  */
 export interface ConfiguredHistoricalHostOptions extends Omit<CreateTakoformHostOptions, "routes"> {
   readonly routes: TakoformRouteConfiguration;

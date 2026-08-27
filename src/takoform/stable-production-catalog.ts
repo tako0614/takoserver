@@ -14,7 +14,7 @@ export interface StableProductionTakoformCatalog {
   readonly bindings: readonly InstalledTakoformBinding[];
 }
 
-/** Exact source-pinned stable catalog installed by the official service. */
+/** Exact source-pinned adoption catalog for the staging Host API v1 candidate. */
 export function stableProductionTakoformCatalog(): StableProductionTakoformCatalog {
   const catalog = structuredClone(
     STABLE_PRODUCTION_TAKOFORM_CATALOG,
@@ -32,7 +32,7 @@ export function stableProductionTakoformCatalog(): StableProductionTakoformCatal
         (form.providedInterfaces ?? []).some((provided) => provided.name === "edge.objects"),
     )
   ) {
-    throw new TypeError("stable production catalog integrity failure");
+    throw new TypeError("staging adoption catalog integrity failure");
   }
   return catalog;
 }

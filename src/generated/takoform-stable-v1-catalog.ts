@@ -3,7 +3,7 @@
 export const STABLE_PRODUCTION_TAKOFORM_CATALOG = {
   provenance: {
     repository: "https://github.com/tako0614/terraform-provider-takoform.git",
-    commit: "7e71515d0dd2899f9884e031ce63008b8597e8da",
+    commit: "a225cfa7c84aa551981cc8ad56c9a281fa6e051a",
     familyIndexSha256: "sha256:337a138c8d2561ade5b5ff44570c0d6a5543922f98d265c961874b06ef7ba703",
     familyCount: 8,
     formCount: 31,

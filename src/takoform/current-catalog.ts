@@ -10,12 +10,14 @@ export interface TakoformCatalogInput {
 }
 
 /**
- * Selects only definitions that explicitly require the literal stable Host.
+ * Selects only definitions that explicitly require the literal staging Host API
+ * v1 candidate.
  *
  * Released v1beta1 provider bytes remain useful to the product/provider plane,
- * but absence of a released stable Form package is not permission to relabel
- * those identities. The current Host therefore starts empty and fail-closed
- * until an owning Takoform release supplies exact stable-v1 definitions.
+ * but absence of a released Form package is not permission to relabel those
+ * identities. The current staging adoption catalog therefore starts empty and
+ * fail-closed until an owning Takoform release supplies exact Host API v1
+ * candidate definitions.
  */
 export function currentTakoformCatalog(input: TakoformCatalogInput): TakoformCatalogInput {
   const forms = input.forms.filter((form) => form.requiresHostApi === "forms.takoform.com/v1");

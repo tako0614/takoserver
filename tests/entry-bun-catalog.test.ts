@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-test("the standalone Bun entry installs the exact stable production Form catalog", async () => {
+test("the standalone Bun entry installs the exact staging adoption Form catalog", async () => {
   const source = await Bun.file(new URL("../src/entry-bun.ts", import.meta.url)).text();
 
   expect(source).toContain(

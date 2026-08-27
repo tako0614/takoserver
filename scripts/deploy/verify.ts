@@ -80,7 +80,9 @@ export async function probePublishedOrigin(
   // The Takoform lane is the product's primary surface. A deployment that does
   // not describe it is not this product.
   if (!paths.some((path) => path.startsWith("/apis/forms.takoform.com/v1/"))) {
-    throw verificationError("the API description does not declare the released Takoform lane");
+    throw verificationError(
+      "the API description does not declare the staging Host API v1 candidate lane",
+    );
   }
   proven.push(`API description served with ${paths.length} paths`);
 
@@ -92,9 +94,9 @@ export async function probePublishedOrigin(
     versions.length !== 1 ||
     versions[0] !== "forms.takoform.com/v1"
   ) {
-    throw verificationError("the literal stable Takoform Host did not advertise itself");
+    throw verificationError("the literal staging Host API v1 candidate did not advertise itself");
   }
-  proven.push("literal stable Takoform Host advertised");
+  proven.push("literal staging Host API v1 candidate advertised");
 
   // The router owns one global OPTIONS preflight path; it is intentionally not
   // evidence that a retired Host lane exists. Every ordinary method that could

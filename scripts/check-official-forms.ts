@@ -9,11 +9,11 @@ import { stableProductionTakoformCatalog } from "../src/takoform/stable-producti
 
 const VENDOR_ROOT = "vendor/takoform/v2.1.1";
 const MANIFEST_PATH = `${VENDOR_ROOT}/source-manifest.json`;
-const MANIFEST_SIZE = 9_595;
-const MANIFEST_SHA256 = "229cd5c5209fae5c1088418216f75ce1ea7d049af027c527117aff0f1137f2ad";
+const MANIFEST_SIZE = 9_614;
+const MANIFEST_SHA256 = "0efd67356bebd44c33607e1e518c2b30a630d5c41efa2e576b0b967919260282";
 const STABLE_CATALOG_PATH = "src/generated/takoform-stable-v1-catalog.ts";
 const STABLE_CATALOG_SIZE = 168_740;
-const STABLE_CATALOG_SHA256 = "b3074253acabf231265984683b8f52b48bf5c31f076bb0029b0cd7f88aea1330";
+const STABLE_CATALOG_SHA256 = "6f03577b12b46dba04f1d66ff7d37b0827fb0c35d4376a41f02acd03bc43c04e";
 
 interface SourceManifest {
   readonly format: "takoserver.vendored-takoform-source@v1";
@@ -38,7 +38,7 @@ if (
 const source = JSON.parse(manifestBytes.toString("utf8")) as SourceManifest;
 if (
   source.format !== "takoserver.vendored-takoform-source@v1" ||
-  source.repository !== "https://github.com/tako0614/takoform.git" ||
+  source.repository !== "https://github.com/tako0614/terraform-provider-takoform.git" ||
   source.tag !== "v2.1.1" ||
   source.commit !== "9810570d542434efcf177543de9d463bbfda0d09" ||
   source.files.length !== 36
@@ -89,7 +89,7 @@ const stable = stableProductionTakoformCatalog();
 
 console.log(
   `official Forms ok: retained ${source.repository} ${source.tag} ${source.commit} ` +
-    `${edge.forms.length} Forms/${edge.bindings.length} Bindings; stable ` +
+    `${edge.forms.length} Forms/${edge.bindings.length} Bindings; staging adoption candidate ` +
     `${stable.provenance.repository} ${stable.provenance.commit} ` +
     `${stable.forms.length} Forms/${stable.bindings.length} Bindings`,
 );
