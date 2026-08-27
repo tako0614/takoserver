@@ -102,31 +102,27 @@ export const DEPLOY_CONTRACT = {
     },
     {
       surface: "takoserver-site",
-      target: "cloudflare-worker:takoserver-site",
+      target: "cloudflare-pages:takoserver-website",
       covers: [
-        "site",
         "src/landing.ts",
         "scripts/build-site.ts",
         "scripts/deploy.ts",
-        "scripts/deploy/web.ts",
+        "scripts/deploy/static.ts",
+        "package.json",
       ],
-      requiresScripts: ["check", "deploy"],
+      requiresScripts: ["build:site", "deploy"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: [],
-      triggers: ["published-identity"],
+      triggers: [],
       obligations: {
         provenance:
-          "The owner builds the site from a clean pushed commit into a fresh private temporary directory, binds the reviewed Cloudflare account and exact declared zone route, and records a value-free account identity, artifact digest, size, origin, Worker identity, previous route owner, and bounded public state. Route inventory uses Wrangler-managed authentication in memory and never prints or stores its bearer.",
+          "The owner builds the landing site once from the selected worktree into a fresh temporary directory, records the commit, branch, dirty state, Pages project, artifact digest, byte count and immutable deployment URL, and uploads exactly once. Integration accepts a dirty non-main branch; production requires clean main equal to freshly fetched origin/main.",
         "post-conditions":
-          "The writer proves the account-scoped exact zone route is owned by takoserver-site and that the served index document is byte-exact with the built page.",
+          "The writer performs one authoritative GET of the immutable Pages deployment URL and proves the index document is byte-exact with the built page. Production additionally performs one GET of https://takoserver.com/ and proves the same bytes.",
         reversal:
-          "When a previous exact zone-route service exists it is retained for reattachment. When no previous owner exists, reversal removes the exact route from takoserver-site to restore no owner; it never invents a previous Worker. No customer or API state is changed.",
+          "Pages deployment history supplies the rollback target. The production custom-domain attachment is a separate one-time topology operation and is not changed by this routine site command.",
         "failure-handling":
-          "Build, account/route-declaration, malformed Cloudflare envelope, and authenticated inventory failures occur before publication with fixed diagnostics and without disclosing credentials. Mutation and verification failures are terminal and require status readback, which reports deployment identity, route ownership, and bounded public HTTP state even when the origin is unhealthy.",
-        "no-overwrite":
-          "Each publication is an immutable Worker Version with an append-only evidence receipt.",
-        "pre-mutation-proof":
-          "The full portable gate, pushed-source proof, fresh site build, exact account_id and hostname/* zone-route declaration, strict Wrangler dry-run, account-scoped zone and route inventory, current route owner, and bounded public HTTP state are read before mutation. Cloudflare envelopes must say success=true and carry result arrays, and the returned zone must name the reviewed account. The active Wrangler profile is sufficient; no separately provisioned site credential is required.",
+          "Build and source-guard failures occur before the Pages target is touched. A failed upload or missing immutable URL is indeterminate; the writer emits diagnostics and never retries. A readback failure means publication may have succeeded and requires provider history/readback before another upload. The command has no plan, reviewer, ledger, token parser, or API inventory path.",
       },
     },
   ],

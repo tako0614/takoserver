@@ -12,56 +12,20 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
-import {
-  type CloudflareRouteTokenOptions,
-  resolveCloudflareRouteToken,
-} from "./cloudflare-auth.ts";
 import { DeployError, type DeployPhase, preflightError } from "./errors.ts";
 import { EVIDENCE_DIRECTORY } from "./evidence.ts";
 import { REPOSITORY, runChecked, wranglerCommand } from "./process.ts";
 import { resolvePushedCommit } from "./provenance.ts";
 import type { DeployTarget } from "./target.ts";
 
-export type WebSurface = "console" | "site";
+export type WebSurface = "console";
 export type WebAction = "status" | "plan" | "apply";
 type WebFetcher = (input: string, init?: RequestInit) => Promise<Response>;
 
-interface SiteRouteOwnerOptions extends CloudflareRouteTokenOptions {
-  readonly fetcher?: WebFetcher;
+export interface DeclaredWebRoute {
+  readonly kind: "custom-domain";
+  readonly pattern: string;
 }
-
-interface SiteReleaseStateOptions extends CloudflareRouteTokenOptions {
-  readonly routeFetcher?: WebFetcher;
-  readonly publicFetcher?: WebFetcher;
-}
-
-export interface SiteReleaseState {
-  readonly routeOwner: string | null;
-  readonly publicState:
-    | {
-        readonly outcome: "response";
-        readonly status: number;
-        readonly digest: string;
-        readonly bytes: number;
-      }
-    | {
-        readonly outcome: "timeout" | "transport";
-        readonly status: null;
-        readonly digest: null;
-        readonly bytes: null;
-      };
-}
-
-export type DeclaredWebRoute =
-  | {
-      readonly kind: "custom-domain";
-      readonly pattern: string;
-    }
-  | {
-      readonly kind: "zone-route";
-      readonly pattern: string;
-      readonly zoneName: string;
-    };
 
 export interface WebDeploymentDeclaration {
   readonly accountIdentity: string;
@@ -100,11 +64,30 @@ interface WebEvidenceRecord {
   readonly bundleDigest: string;
   readonly bundleBytes: number;
   readonly declaredRoute: DeclaredWebRoute;
-  readonly previousPublicState: SiteReleaseState["publicState"];
+  readonly previousPublicState: WebPublicState;
   readonly previousService: string | null;
   readonly currentService: string;
   readonly reversal: string;
 }
+
+/**
+ * Console status keeps transport failures explicit so a missing/unhealthy
+ * origin cannot be mistaken for a successful empty response in release
+ * evidence. The Pages site has its own readback model in static.ts.
+ */
+type WebPublicState =
+  | {
+      readonly outcome: "response";
+      readonly status: number;
+      readonly digest: string;
+      readonly bytes: number;
+    }
+  | {
+      readonly outcome: "timeout" | "transport";
+      readonly status: null;
+      readonly digest: null;
+      readonly bytes: null;
+    };
 
 const WEB_EVIDENCE = resolve(EVIDENCE_DIRECTORY, "web-published.jsonl");
 
@@ -120,26 +103,6 @@ export async function runWebRelease(
 ): Promise<void> {
   const spec = webSurfaceSpec(surface, target);
   if (action === "status") {
-    if (surface === "site") {
-      const declaration = loadWebDeploymentDeclaration(surface, target);
-      const state = await inspectSiteReleaseState(
-        target.accountId,
-        declaration.origin,
-        declaration.probePath,
-      );
-      process.stdout.write(
-        `${JSON.stringify(
-          {
-            surface,
-            ...declaration,
-            ...state,
-          },
-          null,
-          2,
-        )}\n`,
-      );
-      return;
-    }
     const live = await readLive(spec.origin, spec.probePath, "preflight");
     if (live.status !== 200) {
       throw preflightError(
@@ -155,13 +118,10 @@ export async function runWebRelease(
   await runChecked("preflight", "portable gate `bun run check`", ["bun", "run", "check"]);
   const built = await buildWebSurface(surface, target, source.commit);
   try {
-    const previousState =
-      surface === "site"
-        ? await inspectSiteReleaseState(target.accountId, built.origin, built.probePath)
-        : {
-            routeOwner: await currentWebOwner(surface, target.accountId, built.origin),
-            publicState: await readPublicState(built.origin, built.probePath),
-          };
+    const previousState = {
+      routeOwner: await currentWebOwner(target.accountId, built.origin),
+      publicState: await readPublicState(built.origin, built.probePath),
+    };
     const previousService = previousState.routeOwner;
     process.stdout.write(
       `${JSON.stringify(
@@ -203,7 +163,7 @@ export async function runWebRelease(
       ]),
     );
 
-    const currentService = await currentWebOwner(surface, target.accountId, built.origin);
+    const currentService = await currentWebOwner(target.accountId, built.origin);
     if (currentService !== built.workerName) {
       throw new DeployError(
         "verification",
@@ -241,19 +201,15 @@ export async function runWebRelease(
 }
 
 export function webSurfaceSpec(
-  surface: WebSurface,
+  _surface: WebSurface,
   target: DeployTarget,
 ): { readonly workerName: string; readonly origin: string; readonly probePath: string } {
-  if (surface === "console") {
-    if (!target.consoleOrigin) throw preflightError("deploy target has no `consoleOrigin`");
-    return {
-      workerName: "takoserver-console",
-      origin: target.consoleOrigin,
-      probePath: "/console.js",
-    };
-  }
-  if (!target.siteOrigin) throw preflightError("deploy target has no `siteOrigin`");
-  return { workerName: "takoserver-site", origin: target.siteOrigin, probePath: "/" };
+  if (!target.consoleOrigin) throw preflightError("deploy target has no `consoleOrigin`");
+  return {
+    workerName: "takoserver-console",
+    origin: target.consoleOrigin,
+    probePath: "/console.js",
+  };
 }
 
 /** The one target-derived deployment identity consumed by status, plan, and apply. */
@@ -266,10 +222,7 @@ export function loadWebDeploymentDeclaration(
   return {
     accountIdentity: `sha256:${createHash("sha256").update(target.accountId).digest("hex")}`,
     ...spec,
-    route:
-      surface === "site"
-        ? { kind: "zone-route", pattern: `${hostname}/*`, zoneName: hostname }
-        : { kind: "custom-domain", pattern: hostname },
+    route: { kind: "custom-domain", pattern: hostname },
   };
 }
 
@@ -278,10 +231,7 @@ export function webReversalNotice(
   route: DeclaredWebRoute,
   previousService: string | null,
 ): string {
-  const target =
-    route.kind === "zone-route"
-      ? `Worker route ${route.pattern}`
-      : `custom domain ${route.pattern}`;
+  const target = `custom domain ${route.pattern}`;
   return previousService === null
     ? `reversal: remove the exact ${target} from ${workerName} to restore no owner; no previous Worker was attached`
     : `reversal: reattach ${target} to ${previousService}; no previous Worker was deleted`;
@@ -315,19 +265,10 @@ export function readDeclaredWebRoute(
   const route = Array.isArray(routes) && routes.length === 1 ? routes[0] : null;
   if (typeof route !== "object" || route === null) {
     throw preflightError(
-      surface === "site"
-        ? `site Wrangler config must declare one exact zone route ${hostname}/*`
-        : `console Wrangler config must declare one exact custom domain ${hostname}`,
+      `console Wrangler config must declare one exact custom domain ${hostname}`,
     );
   }
   const candidate = route as Record<string, unknown>;
-  if (surface === "site") {
-    const exactKeys = Object.keys(candidate).sort().join(",") === "pattern,zone_name";
-    if (!exactKeys || candidate.pattern !== `${hostname}/*` || candidate.zone_name !== hostname) {
-      throw preflightError(`site Wrangler config must declare the exact zone route ${hostname}/*`);
-    }
-    return { kind: "zone-route", pattern: `${hostname}/*`, zoneName: hostname };
-  }
   const exactKeys = Object.keys(candidate).sort().join(",") === "custom_domain,pattern";
   if (!exactKeys || candidate.pattern !== hostname || candidate.custom_domain !== true) {
     throw preflightError(
@@ -347,15 +288,8 @@ async function buildWebSurface(
   const root = mkdtempSync(join(tmpdir(), `takoserver-${surface}-release-`));
   chmodSync(root, 0o700);
   const directory = join(root, "assets");
-  const script = surface === "console" ? "scripts/build-console.ts" : "scripts/build-site.ts";
-  const extra =
-    surface === "console"
-      ? ["--api-origin", target.publicOrigin]
-      : [
-          ...(target.consoleOrigin ? ["--console", target.consoleOrigin] : []),
-          "--api",
-          target.publicOrigin,
-        ];
+  const script = "scripts/build-console.ts";
+  const extra = ["--api-origin", target.publicOrigin];
   try {
     await runChecked("preflight", `${surface} asset build`, [
       "bun",
@@ -377,16 +311,9 @@ async function buildWebSurface(
           workers_dev: false,
           assets: {
             directory,
-            not_found_handling: surface === "console" ? "single-page-application" : "404-page",
+            not_found_handling: "single-page-application",
           },
-          routes: [
-            declaration.route.kind === "custom-domain"
-              ? { pattern: declaration.route.pattern, custom_domain: true }
-              : {
-                  pattern: declaration.route.pattern,
-                  zone_name: declaration.route.zoneName,
-                },
-          ],
+          routes: [{ pattern: declaration.route.pattern, custom_domain: true }],
           observability: { enabled: true },
           annotations: { "workers/message": `${spec.workerName} ${commit}` },
         },
@@ -461,76 +388,9 @@ async function currentDomainService(accountId: string, hostname: string): Promis
   return matches[0]?.service ?? null;
 }
 
-async function currentWebOwner(
-  surface: WebSurface,
-  accountId: string,
-  origin: string,
-): Promise<string | null> {
+async function currentWebOwner(accountId: string, origin: string): Promise<string | null> {
   const hostname = new URL(origin).hostname;
-  return surface === "console"
-    ? currentDomainService(accountId, hostname)
-    : readSiteRouteOwner(accountId, hostname);
-}
-
-export async function readSiteRouteOwner(
-  accountId: string,
-  hostname: string,
-  options: SiteRouteOwnerOptions = {},
-): Promise<string | null> {
-  const token = await resolveCloudflareRouteToken(options);
-  const fetcher = options.fetcher ?? ((input, init) => fetch(input, init));
-  const headers = { authorization: `Bearer ${token}` };
-  const zonesUrl = new URL("https://api.cloudflare.com/client/v4/zones");
-  zonesUrl.searchParams.set("name", hostname);
-  zonesUrl.searchParams.set("account.id", accountId);
-  const zonesResponse = await fetcher(zonesUrl.toString(), {
-    headers,
-    signal: AbortSignal.timeout(15_000),
-  });
-  const zones = await cloudflareEnvelope(zonesResponse, "Cloudflare zone inventory");
-  const zoneIds = zones.flatMap((entry) => {
-    if (typeof entry !== "object" || entry === null) return [];
-    const id = (entry as { id?: unknown }).id;
-    const name = (entry as { name?: unknown }).name;
-    const account = (entry as { account?: unknown }).account;
-    const exactAccount =
-      typeof account === "object" &&
-      account !== null &&
-      (account as { id?: unknown }).id === accountId;
-    return typeof id === "string" && name === hostname && exactAccount ? [id] : [];
-  });
-  if (zoneIds.length !== 1) throw preflightError(`${hostname} does not resolve to one exact zone`);
-  const routesResponse = await fetcher(
-    `https://api.cloudflare.com/client/v4/zones/${zoneIds[0]}/workers/routes`,
-    { headers, signal: AbortSignal.timeout(15_000) },
-  );
-  const routes = await cloudflareEnvelope(routesResponse, "Cloudflare Worker route inventory");
-  const services = routes.flatMap((entry) => {
-    if (typeof entry !== "object" || entry === null) return [];
-    const pattern = (entry as { pattern?: unknown }).pattern;
-    const script = (entry as { script?: unknown }).script;
-    return pattern === `${hostname}/*` && typeof script === "string" ? [script] : [];
-  });
-  if (services.length > 1) throw preflightError(`${hostname} has more than one exact Worker route`);
-  return services[0] ?? null;
-}
-
-export async function inspectSiteReleaseState(
-  accountId: string,
-  origin: string,
-  path: string,
-  options: SiteReleaseStateOptions = {},
-): Promise<SiteReleaseState> {
-  const hostname = new URL(origin).hostname;
-  const [routeOwner, publicState] = await Promise.all([
-    readSiteRouteOwner(accountId, hostname, {
-      ...(options.env === undefined ? {} : { env: options.env }),
-      ...(options.run === undefined ? {} : { run: options.run }),
-      ...(options.routeFetcher === undefined ? {} : { fetcher: options.routeFetcher }),
-    }),
-    readPublicState(origin, path, options.publicFetcher),
-  ]);
-  return { routeOwner, publicState };
+  return currentDomainService(accountId, hostname);
 }
 
 async function cloudflareEnvelope(response: Response, label: string): Promise<readonly unknown[]> {
@@ -556,19 +416,20 @@ async function readPublicState(
   origin: string,
   path: string,
   fetcher?: WebFetcher,
-): Promise<SiteReleaseState["publicState"]> {
+): Promise<WebPublicState> {
   try {
     const live = await readLive(origin, path, "preflight", fetcher);
     return { outcome: "response", ...live };
   } catch (error) {
     if (!(error instanceof DeployError) || error.phase !== "preflight") throw error;
-    if (error.message === "public web readback timed out") {
-      return { outcome: "timeout", status: null, digest: null, bytes: null };
-    }
-    if (error.message === "public web readback transport failed") {
-      return { outcome: "transport", status: null, digest: null, bytes: null };
-    }
-    throw error;
+    const detail = error.detail ?? "";
+    const timedOut = error.message.includes("timed out") || detail.startsWith("timeout:");
+    return {
+      outcome: timedOut ? "timeout" : "transport",
+      status: null,
+      digest: null,
+      bytes: null,
+    };
   }
 }
 

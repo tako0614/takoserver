@@ -192,6 +192,11 @@ Deployments, but their beta Forms are not republished as a sale catalog. The
 control plane itself can also run as a Worker; `bun run deploy -- --contract`
 describes what publishing that involves and what it refuses to do.
 
+The public landing page is a separate routine Pages surface. Use
+[`docs/deploy-site.md`](docs/deploy-site.md) for its integration and production
+commands; it publishes the repo-owned `takoserver-website` project and does not
+attach or inspect the production custom domain.
+
 For the owner-managed production plan/apply only, keep the existing hosted
 sponsorship bearer at `.deploy/private/hosted-sponsorship-token`, with
 `.deploy/private` mode `0700` and the file mode `0600`. Load it process-locally

@@ -62,18 +62,36 @@ describe("Takoserver deploy entrypoint", () => {
       (surface) => surface.surface === "takoserver-site",
     ) as
       | {
+          target?: string;
+          covers?: readonly string[];
+          requiresScripts?: readonly string[];
           requiresEnv?: readonly string[];
+          triggers?: readonly string[];
           obligations?: Record<string, string>;
         }
       | undefined;
     expect(siteSurface).toBeDefined();
+    expect(siteSurface?.target).toBe("cloudflare-pages:takoserver-website");
+    expect(siteSurface?.covers).toEqual(
+      expect.arrayContaining([
+        "src/landing.ts",
+        "scripts/build-site.ts",
+        "scripts/deploy/static.ts",
+        "package.json",
+      ]),
+    );
+    expect(siteSurface?.covers).not.toContain("scripts/deploy/web.ts");
+    expect(siteSurface?.requiresScripts).toEqual(["build:site", "deploy"]);
     expect(siteSurface?.requiresEnv).toEqual([]);
-    expect(siteSurface?.obligations?.provenance).toContain("Wrangler-managed authentication");
-    expect(siteSurface?.obligations?.provenance).toContain("account identity");
-    expect(siteSurface?.obligations?.["post-conditions"]).toContain("exact zone route");
-    expect(siteSurface?.obligations?.reversal).toContain("restore no owner");
-    expect(siteSurface?.obligations?.reversal).toContain("reattach");
-    expect(siteSurface?.obligations?.["pre-mutation-proof"]).toContain("account-scoped");
+    expect(siteSurface?.triggers).toEqual([]);
+    expect(siteSurface?.obligations?.provenance).toContain("dirty non-main branch");
+    expect(siteSurface?.obligations?.provenance).toContain("origin/main");
+    expect(siteSurface?.obligations?.["post-conditions"]).toContain(
+      "immutable Pages deployment URL",
+    );
+    expect(siteSurface?.obligations?.["post-conditions"]).toContain("takoserver.com");
+    expect(siteSurface?.obligations?.reversal).toContain("Pages deployment history");
+    expect(siteSurface?.obligations?.["failure-handling"]).toContain("indeterminate");
     expect(JSON.stringify(siteSurface)).not.toContain("CLOUDFLARE_API_TOKEN");
   });
 
@@ -85,11 +103,16 @@ describe("Takoserver deploy entrypoint", () => {
       ["--nope"],
       ["console"],
       ["console", "site", "--plan"],
+      ["site"],
+      ["site", "--status"],
+      ["site", "--plan"],
+      ["site", "--apply"],
     ]) {
       const refused = await deploy(args);
       expect(refused.exitCode).toBe(2);
       expect(refused.stdout).toBe("");
-      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).toMatch(/target was touched/i);
+      if (args[0] === "site") expect(refused.stderr).not.toContain("--status");
     }
   });
 

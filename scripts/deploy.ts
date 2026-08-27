@@ -4,9 +4,10 @@ import { appendLedger, EVIDENCE_LEDGER } from "./deploy/evidence.ts";
 import { mutate } from "./deploy/mutate.ts";
 import { inspectLive, preflight } from "./deploy/preflight.ts";
 import { writeRealizedConfig } from "./deploy/realized-config.ts";
+import { runStaticSite } from "./deploy/static.ts";
 import { loadTarget, targetPath } from "./deploy/target.ts";
 import { verify } from "./deploy/verify.ts";
-import { runWebRelease, type WebSurface } from "./deploy/web.ts";
+import { runWebRelease } from "./deploy/web.ts";
 import { assertTargetBindingClosure } from "./deploy/worker-state.ts";
 
 const USAGE = `takoserver deploy
@@ -18,9 +19,8 @@ const USAGE = `takoserver deploy
   bun run deploy -- console --status    inspect the public console bytes
   bun run deploy -- console --plan      build and prove the console release, publish nothing
   bun run deploy -- console --apply     publish and byte-verify the public console
-  bun run deploy -- site --status       inspect the public product site bytes
-  bun run deploy -- site --plan         build and prove the site release, publish nothing
-  bun run deploy -- site --apply        publish and byte-verify the public product site
+  bun run deploy -- site --environment=integration   publish a branch preview (dirty allowed)
+  bun run deploy -- site --environment=production    publish main and verify takoserver.com
 
   --target <path>                       deploy target descriptor
                                         (default .deploy/target.json, or
@@ -41,10 +41,18 @@ const AFTERMATH: Readonly<Record<DeployPhase, string>> = {
     "repair is forward-only; do not erase R2 objects or D1 rows to undo a code change.",
 };
 
+const SITE_AFTERMATH: Readonly<Record<DeployPhase, string>> = {
+  preflight: "No Pages target was touched. Fix the source or build cause and re-run.",
+  mutation:
+    "The Pages publication may have succeeded and its state is indeterminate. Read the provider deployment history before another upload.",
+  verification:
+    "Pages bytes may be published but the readback failed. Inspect the immutable deployment and takoserver.com readback before another upload.",
+};
+
 interface Mode {
   readonly action: "status" | "plan" | "apply";
   readonly targetPath: string;
-  readonly surface: "api" | WebSurface;
+  readonly surface: "api" | "console";
 }
 
 function parseMode(args: readonly string[]): Mode | null {
@@ -54,7 +62,7 @@ function parseMode(args: readonly string[]): Mode | null {
 
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
-    if ((argument === "console" || argument === "site") && index === 0) {
+    if (argument === "console" && index === 0) {
       surface = argument;
       continue;
     }
@@ -199,6 +207,21 @@ const argv = process.argv.slice(2);
 
 if (argv.length === 1 && argv[0] === "--contract") {
   process.stdout.write(`${JSON.stringify(DEPLOY_CONTRACT, null, 2)}\n`);
+  process.exit(0);
+}
+
+if (argv[0] === "site") {
+  try {
+    await runStaticSite(argv.slice(1));
+  } catch (error) {
+    if (error instanceof DeployError) {
+      process.stderr.write(`deploy failed during ${error.phase}: ${error.message}\n`);
+      if (error.detail) process.stderr.write(`\n${error.detail}\n`);
+      process.stderr.write(`\n${(argv[0] === "site" ? SITE_AFTERMATH : AFTERMATH)[error.phase]}\n`);
+      process.exit(PHASE_EXIT_CODE[error.phase]);
+    }
+    throw error;
+  }
   process.exit(0);
 }
 
