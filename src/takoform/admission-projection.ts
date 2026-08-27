@@ -126,6 +126,11 @@ export interface AdmissionProjectionResourceIdentity {
 }
 
 export interface AdmissionProjectionInput {
+  /**
+   * Host adapters must pass bounded plain data deserialized from an immutable
+   * record (no accessors, class instances, or live/proxy-backed values).
+   * Canonicalize database/JSON results before calling this pure projection.
+   */
   readonly operation: AdmissionProjectionOperation;
   readonly context?: AdmissionProjectionContext;
   readonly formRef?: TakoformV1Alpha3FormRef;
@@ -215,6 +220,20 @@ const MAX_IDENTITY_LENGTH = 255;
 const MAX_RESOURCE_UID_LENGTH = 255;
 
 /**
+ * Authority arrays are intentionally bounded before any element enumeration.
+ * A thousand records is ample for one current-head projection while keeping a
+ * hostile sparse length from turning a pure decision into unbounded work.
+ */
+const MAX_AUTHORITY_ARRAY_LENGTH = 1024;
+
+/** Private validation sentinel; its identity must never depend on an error message. */
+class DuplicateActivationHeadError extends TypeError {
+  constructor() {
+    super("duplicate current activation head");
+  }
+}
+
+/**
  * Computes current-effective admission from immutable facts supplied by the
  * caller.  No database, clock, package bytes, or mutable registry is read.
  * Current heads are authoritative for new mutations; history is consulted
@@ -223,157 +242,370 @@ const MAX_RESOURCE_UID_LENGTH = 255;
 export function evaluateAdmissionProjection(
   input: AdmissionProjectionInput,
 ): AdmissionProjectionDecision {
-  validateInputShape(input);
-  const operation = input.operation;
+  // Materialize caller-supplied records exactly once.  Semantic validation and
+  // every later helper consume only this owned, recursively checked snapshot;
+  // no live caller object is reread after this boundary.
+  const facts = materializeAdmissionInput(input);
+  if (!facts) {
+    return deniedDecision(
+      "mutation",
+      "fact_invalid",
+      "the projection input is not plain bounded data",
+    );
+  }
+  let operation: AdmissionProjectionOperation;
+  try {
+    operation = facts.operation;
+  } catch {
+    return deniedDecision("mutation", "fact_invalid", "authority fact inspection failed closed");
+  }
+  if (!MUTATION_OPERATIONS.has(operation) && !CLEANUP_OPERATIONS.has(operation)) {
+    throw new TypeError("admission projection operation is invalid");
+  }
   const mode = CLEANUP_OPERATIONS.has(operation) ? "retained-cleanup" : "mutation";
-  const reasons: AdmissionProjectionReason[] = [];
-  const context = input.context;
-  const current = input.current;
-  const history = input.history;
 
-  addIdentityReasons(input, context, reasons);
-  addRequestFactValidityReasons(input, context, reasons);
-
-  if (mode === "retained-cleanup") {
-    addCleanupArrayElementValidityReasons(current, history, reasons);
-    const resource = input.resource;
-    if (!resource) {
-      reasons.push({
-        code: "retained_resource_required",
-        message: "observe, delete, and evacuate require an exact retained Resource identity",
-      });
-    } else {
-      addRetainedResourceReasons(input, context, resource, reasons);
-      addRetentionReasons(current, history, input, resource, reasons);
+  try {
+    const shape = inspectInputShape(facts);
+    if (!shape.valid) {
+      return deniedDecision(mode, "fact_invalid", "the projection input is not plain bounded data");
     }
+    if (!validateInputShape(facts)) {
+      return deniedDecision(
+        mode,
+        "fact_invalid",
+        "the projection input contains an invalid authority fact",
+      );
+    }
+    const reasons: AdmissionProjectionReason[] = [];
+    const context = facts.context;
+    const current = facts.current;
+    const history = facts.history;
+
+    addIdentityReasons(facts, context, reasons);
+    addRequestFactValidityReasons(facts, context, reasons);
+
+    if (mode === "retained-cleanup") {
+      addCleanupArrayElementValidityReasons(current, history, reasons);
+      const resource = facts.resource;
+      if (!resource) {
+        reasons.push({
+          code: "retained_resource_required",
+          message: "observe, delete, and evacuate require an exact retained Resource identity",
+        });
+      } else {
+        addRetainedResourceReasons(facts, context, resource, reasons);
+        addRetentionReasons(current, history, facts, resource, reasons);
+      }
+      if (reasons.length > 0) {
+        return { allowed: false, mode, reasons: freezeReasons(reasons) };
+      }
+      return {
+        allowed: true,
+        mode,
+        reasons: [
+          {
+            code: "retained_cleanup",
+            message: "exact retained Resource identity may be cleaned up",
+          },
+        ],
+      };
+    }
+
+    addCurrentFactValidityReasons(current, reasons);
+    addActivationArrayElementValidityReasons(current, facts.formRef, facts.packageDigest, reasons);
+
+    const publisher = current?.publisher ?? null;
+    const checkpoint = current?.checkpoint ?? null;
+    const install = current?.install ?? null;
+    const support = current?.support ?? null;
+
+    addPublisherReasons(publisher, install, reasons);
+    addCheckpointReasons(publisher, checkpoint, facts.packageDigest, reasons);
+    addInstallReasons(
+      install,
+      facts.formRef,
+      facts.packageDigest,
+      facts.implementationDigest,
+      reasons,
+    );
+    addSupportReasons(
+      support,
+      facts.formRef,
+      facts.packageDigest,
+      facts.implementationDigest,
+      operation,
+      reasons,
+    );
+
+    const activation = effectiveActivation(
+      current?.activations,
+      context,
+      facts.formRef,
+      facts.packageDigest,
+      reasons,
+    );
+    if (activation) {
+      if (activation.active !== true) {
+        reasons.push({
+          code: "activation_inactive",
+          message: "the effective activation is inactive",
+        });
+      }
+      if (
+        facts.implementationDigest === undefined ||
+        activation.implementationDigest !== facts.implementationDigest
+      ) {
+        reasons.push({
+          code: "activation_implementation_mismatch",
+          message: "the effective activation does not match the requested implementation",
+        });
+      }
+    }
+
     if (reasons.length > 0) {
-      return { allowed: false, mode, reasons: freezeReasons(reasons) };
+      return {
+        allowed: false,
+        mode,
+        reasons: freezeReasons(reasons),
+        ...(activation ? { effectiveAudience: cloneAudience(activation.audience) } : {}),
+      };
     }
     return {
       allowed: true,
       mode,
       reasons: [
         {
-          code: "retained_cleanup",
-          message: "exact retained Resource identity may be cleaned up",
+          code: "admitted",
+          message: "current publisher, checkpoint, package, support, and activation facts agree",
         },
       ],
-    };
-  }
-
-  addCurrentFactValidityReasons(current, reasons);
-  addActivationArrayElementValidityReasons(current, reasons);
-
-  const publisher = current?.publisher ?? null;
-  const checkpoint = current?.checkpoint ?? null;
-  const install = current?.install ?? null;
-  const support = current?.support ?? null;
-
-  addPublisherReasons(publisher, install, reasons);
-  addCheckpointReasons(publisher, checkpoint, input.packageDigest, reasons);
-  addInstallReasons(
-    install,
-    input.formRef,
-    input.packageDigest,
-    input.implementationDigest,
-    reasons,
-  );
-  addSupportReasons(
-    support,
-    input.formRef,
-    input.packageDigest,
-    input.implementationDigest,
-    operation,
-    reasons,
-  );
-
-  const activation = effectiveActivation(
-    current?.activations,
-    context,
-    input.formRef,
-    input.packageDigest,
-    reasons,
-  );
-  if (activation) {
-    if (activation.active !== true) {
-      reasons.push({
-        code: "activation_inactive",
-        message: "the effective activation is inactive",
-      });
-    }
-    if (
-      input.implementationDigest === undefined ||
-      activation.implementationDigest !== input.implementationDigest
-    ) {
-      reasons.push({
-        code: "activation_implementation_mismatch",
-        message: "the effective activation does not match the requested implementation",
-      });
-    }
-  }
-
-  if (reasons.length > 0) {
-    return {
-      allowed: false,
-      mode,
-      reasons: freezeReasons(reasons),
       ...(activation ? { effectiveAudience: cloneAudience(activation.audience) } : {}),
     };
+  } catch (error) {
+    if (error instanceof DuplicateActivationHeadError) {
+      throw error;
+    }
+    return deniedDecision(mode, "fact_invalid", "authority fact inspection failed closed");
   }
-  return {
-    allowed: true,
-    mode,
-    reasons: [
-      {
-        code: "admitted",
-        message: "current publisher, checkpoint, package, support, and activation facts agree",
-      },
-    ],
-    ...(activation ? { effectiveAudience: cloneAudience(activation.audience) } : {}),
-  };
 }
 
-function validateInputShape(input: AdmissionProjectionInput): void {
-  if (!input || typeof input !== "object") {
-    throw new TypeError("admission projection input is required");
-  }
-  if (!MUTATION_OPERATIONS.has(input.operation) && !CLEANUP_OPERATIONS.has(input.operation)) {
-    throw new TypeError("admission projection operation is invalid");
-  }
-  const current = input.current;
-  if (current !== undefined && current !== null) {
-    if (typeof current !== "object") throw new TypeError("current admission heads are invalid");
-    if (current.activations !== undefined && !Array.isArray(current.activations)) {
-      throw new TypeError("current activation heads are invalid");
+function deniedDecision(
+  mode: "mutation" | "retained-cleanup",
+  code: AdmissionProjectionReasonCode,
+  message: string,
+): AdmissionProjectionDecision {
+  return { allowed: false, mode, reasons: [{ code, message }] };
+}
+
+function inspectInputShape(input: AdmissionProjectionInput): { readonly valid: boolean } {
+  try {
+    if (!isPlainDataObject(input)) return { valid: false };
+    const context = input.context;
+    const formRef = input.formRef;
+    const current = input.current;
+    const history = input.history;
+    const resource = input.resource;
+    const nestedPlain =
+      (context === undefined || isPlainDataObject(context)) &&
+      (formRef === undefined || isPlainDataObject(formRef)) &&
+      (current === undefined || current === null || isPlainDataObject(current)) &&
+      (history === undefined || history === null || isPlainDataObject(history)) &&
+      (resource === undefined || isPlainDataObject(resource));
+    if (!nestedPlain) {
+      return { valid: false };
     }
-    if (current.retentions !== undefined && !Array.isArray(current.retentions)) {
-      throw new TypeError("current retention heads are invalid");
+    if (current !== undefined && current !== null) {
+      const activations = current.activations;
+      const retentions = current.retentions;
+      if (
+        (activations !== undefined && !isPlainAuthorityArray(activations)) ||
+        (retentions !== undefined && !isPlainAuthorityArray(retentions))
+      ) {
+        return { valid: false };
+      }
+      for (const value of [
+        current.publisher,
+        current.checkpoint,
+        current.install,
+        current.support,
+      ]) {
+        if (value !== undefined && value !== null && !isPlainDataObject(value)) {
+          return { valid: false };
+        }
+      }
+      if (
+        (activations !== undefined && !hasPlainFactElements(activations)) ||
+        (retentions !== undefined && !hasPlainFactElements(retentions))
+      ) {
+        return { valid: false };
+      }
     }
-    validateActivationHeadUniqueness(current.activations);
-    validateRetentionHeadUniqueness(current.retentions);
+    if (history !== undefined && history !== null && !validateHistoryArrays(history)) {
+      return { valid: false };
+    }
+    return { valid: true };
+  } catch {
+    return { valid: false };
   }
-  if (input.history !== undefined && input.history !== null) {
-    if (typeof input.history !== "object") throw new TypeError("admission history is invalid");
-    validateHistoryArrays(input.history);
+}
+
+/**
+ * Take one owned snapshot of the complete authority input before semantic
+ * validation.  The projection is intentionally not a Proxy sandbox: a
+ * transparent Proxy cannot be identified in JavaScript.  Instead, every
+ * property/element is inspected through a descriptor once, recursively
+ * copied into plain frozen data, and all later consumers read that snapshot.
+ * Trap failures, accessors, cycles, unsupported values, and malformed arrays
+ * fail closed at this boundary.
+ */
+function materializeAdmissionInput(value: unknown): AdmissionProjectionInput | null {
+  try {
+    const snapshots = new WeakMap<object, object>();
+    const active = new WeakSet<object>();
+    const snapshot = materializeAuthorityValue(value, snapshots, active);
+    if (!isPlainDataObject(snapshot)) return null;
+    return snapshot as unknown as AdmissionProjectionInput;
+  } catch {
+    return null;
+  }
+}
+
+function materializeAuthorityValue(
+  value: unknown,
+  snapshots: WeakMap<object, object>,
+  active: WeakSet<object>,
+): unknown {
+  if (value === null || value === undefined) return value;
+  switch (typeof value) {
+    case "string":
+    case "boolean":
+      return value;
+    case "number":
+      if (Number.isFinite(value)) return value;
+      throw new TypeError("authority fact number is not finite");
+    case "object":
+      break;
+    default:
+      throw new TypeError("authority fact contains an unsupported value");
+  }
+
+  const cached = snapshots.get(value);
+  if (cached !== undefined) return cached;
+  if (active.has(value)) throw new TypeError("cyclic authority fact");
+  active.add(value);
+  try {
+    const snapshot = Array.isArray(value)
+      ? materializeAuthorityArray(value, snapshots, active)
+      : materializeAuthorityObject(value, snapshots, active);
+    snapshots.set(value, snapshot);
+    return snapshot;
+  } finally {
+    active.delete(value);
+  }
+}
+
+function materializeAuthorityObject(
+  value: object,
+  snapshots: WeakMap<object, object>,
+  active: WeakSet<object>,
+): Record<string, unknown> {
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError("authority fact object prototype is not plain");
+  }
+  const ownKeys = Reflect.ownKeys(value);
+  const snapshot = Object.create(prototype === null ? null : Object.prototype) as Record<
+    string,
+    unknown
+  >;
+  for (const key of ownKeys) {
+    if (typeof key !== "string") throw new TypeError("authority fact contains a symbol key");
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !("value" in descriptor)) {
+      throw new TypeError("authority fact contains an accessor");
+    }
+    const child = materializeAuthorityValue(descriptor.value, snapshots, active);
+    Object.defineProperty(snapshot, key, {
+      configurable: true,
+      enumerable: descriptor.enumerable === true,
+      value: child,
+      writable: true,
+    });
+  }
+  return Object.freeze(snapshot);
+}
+
+function materializeAuthorityArray(
+  value: object,
+  snapshots: WeakMap<object, object>,
+  active: WeakSet<object>,
+): readonly unknown[] {
+  if (Object.getPrototypeOf(value) !== Array.prototype) {
+    throw new TypeError("authority fact array prototype is not plain");
+  }
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+  if (!lengthDescriptor || !("value" in lengthDescriptor)) {
+    throw new TypeError("authority fact array length is not data");
+  }
+  const length = lengthDescriptor.value;
+  if (!Number.isSafeInteger(length) || length < 0 || length > MAX_AUTHORITY_ARRAY_LENGTH) {
+    throw new TypeError("authority fact array length is out of bounds");
+  }
+  const ownKeys = Reflect.ownKeys(value);
+  if (ownKeys.length !== length + 1) {
+    throw new TypeError("authority fact array is sparse or has extra keys");
+  }
+  const indexedKeys = new Set<string>();
+  for (const key of ownKeys) {
+    if (typeof key !== "string") throw new TypeError("authority fact array contains a symbol key");
+    if (key === "length") continue;
+    const index = Number(key);
+    if (!Number.isSafeInteger(index) || index < 0 || index >= length || String(index) !== key) {
+      throw new TypeError("authority fact array contains an invalid key");
+    }
+    indexedKeys.add(key);
+  }
+  if (indexedKeys.size !== length) {
+    throw new TypeError("authority fact array is sparse");
+  }
+  const snapshot = new Array<unknown>(length);
+  for (let index = 0; index < length; index += 1) {
+    const key = String(index);
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !("value" in descriptor)) {
+      throw new TypeError("authority fact array contains an accessor");
+    }
+    snapshot[index] = materializeAuthorityValue(descriptor.value, snapshots, active);
+  }
+  return Object.freeze(snapshot);
+}
+
+function validateInputShape(input: AdmissionProjectionInput): boolean {
+  try {
+    const current = input.current;
+    if (current !== undefined && current !== null) {
+      validateActivationHeadUniqueness(current.activations);
+      validateRetentionHeadUniqueness(current.retentions);
+    }
+    return true;
+  } catch (error) {
+    if (error instanceof DuplicateActivationHeadError) throw error;
+    return false;
   }
 }
 
 function validateActivationHeadUniqueness(
   activations: readonly AdmissionProjectionActivation[] | undefined,
 ): void {
-  // Sparse arrays are denied by the projection path. Skip duplicate-head
-  // reduction here so a hole cannot alter which duplicate is observed (or
-  // turn a malformed sparse input into an order-dependent validation throw).
-  if (!isDenseArray(activations)) return;
+  const elements = authorityArraySnapshot(activations);
+  if (!elements) return;
   const seen = new Set<string>();
-  for (const activation of activations) {
-    const audience = normalizeAudience(activation?.audience);
+  for (const activation of elements) {
+    if (!validActivationFact(activation)) continue;
+    const audience = normalizeAudience(activation.audience);
     if (!audience) continue;
-    // Invalid identity/digest facts are denied by the projection path.  Do
-    // not dereference them while checking the durable uniqueness key.
-    if (!validFormRef(activation?.formRef) || !validDigest(activation?.packageDigest)) continue;
     const key = activationHeadKey(activation, audience);
-    if (seen.has(key)) throw new TypeError("duplicate current activation head");
+    if (seen.has(key)) throw new DuplicateActivationHeadError();
     seen.add(key);
   }
 }
@@ -381,28 +613,34 @@ function validateActivationHeadUniqueness(
 function validateRetentionHeadUniqueness(
   retentions: readonly AdmissionProjectionRetention[] | undefined,
 ): void {
-  if (!isDenseArray(retentions)) return;
+  const elements = authorityArraySnapshot(retentions);
+  if (!elements) return;
   const seen = new Set<string>();
-  for (const retention of retentions) {
-    if (
-      !validFormRef(retention?.formRef) ||
-      !validDigest(retention?.packageDigest) ||
-      !validDigest(retention?.implementationDigest)
-    ) {
-      continue;
-    }
+  for (const retention of elements) {
+    if (!validRetentionFact(retention)) continue;
     const key = `${formRefKey(retention?.formRef)}|${retention?.packageDigest}|${retention?.implementationDigest}`;
     if (seen.has(key)) throw new TypeError("duplicate current retention head");
     seen.add(key);
   }
 }
 
-function validateHistoryArrays(history: AdmissionProjectionHistory): void {
-  for (const [name, value] of Object.entries(history)) {
-    if (value !== undefined && !Array.isArray(value)) {
-      throw new TypeError(`admission history ${name} must be an array`);
-    }
+function validateHistoryArrays(history: AdmissionProjectionHistory): boolean {
+  const arrays: readonly unknown[] = [
+    history.publishers,
+    history.checkpoints,
+    history.installs,
+    history.supports,
+    history.activations,
+  ];
+  let result = false;
+  try {
+    result = arrays.every(
+      (value) => value === undefined || validAuthorityArray(value, isFactObject),
+    );
+  } catch {
+    return false;
   }
+  return result;
 }
 
 function addIdentityReasons(
@@ -520,18 +758,26 @@ function addCurrentFactValidityReasons(
 
 function addActivationArrayElementValidityReasons(
   current: AdmissionProjectionCurrentHeads | undefined,
+  formRef: TakoformV1Alpha3FormRef | undefined,
+  packageDigest: AdmissionProjectionDigest | undefined,
   reasons: AdmissionProjectionReason[],
 ): void {
   const activations = current?.activations;
-  if (!Array.isArray(activations)) return;
+  if (activations === undefined) return;
+  const elements = authorityArraySnapshot(activations);
   if (
-    !isDenseArray(activations) ||
-    activations.some(
-      (activation) =>
-        !isFactObject(activation) ||
-        !validFormRef(activation.formRef) ||
-        !validDigest(activation.packageDigest),
-    )
+    !elements ||
+    elements.some((activation) => {
+      if (!isFactObject(activation)) return true;
+      const candidate = activation as unknown as AdmissionProjectionActivation;
+      // A malformed head on another Form/package cannot affect this
+      // request once its exact identity is valid and has been filtered.
+      if (!validFormRef(candidate.formRef)) return true;
+      if (!formRef || !sameFormRef(candidate.formRef, formRef)) return false;
+      if (!validDigest(candidate.packageDigest)) return true;
+      if (packageDigest === undefined || candidate.packageDigest !== packageDigest) return false;
+      return !validActivationFact(candidate);
+    })
   ) {
     reasons.push({
       code: "fact_invalid",
@@ -546,10 +792,16 @@ function addCleanupArrayElementValidityReasons(
   reasons: AdmissionProjectionReason[],
 ): void {
   const retentions = current?.retentions;
+  const retentionElements =
+    retentions === undefined ? undefined : authorityArraySnapshot(retentions);
   if (
     retentions !== undefined &&
-    (!isDenseArray(retentions) ||
-      retentions.some((retention) => !isFactObject(retention) || !validRetentionFact(retention)))
+    (!retentionElements ||
+      retentionElements.some(
+        (retention) =>
+          !isFactObject(retention) ||
+          !validRetentionFact(retention as unknown as AdmissionProjectionRetention),
+      ))
   ) {
     reasons.push({
       code: "fact_invalid",
@@ -557,10 +809,15 @@ function addCleanupArrayElementValidityReasons(
     });
   }
   const installs = history?.installs;
+  const installElements = installs === undefined ? undefined : authorityArraySnapshot(installs);
   if (
     installs !== undefined &&
-    (!isDenseArray(installs) ||
-      installs.some((install) => !isFactObject(install) || !validInstallFact(install)))
+    (!installElements ||
+      installElements.some(
+        (install) =>
+          !isFactObject(install) ||
+          !validInstallFact(install as unknown as AdmissionProjectionInstall),
+      ))
   ) {
     reasons.push({
       code: "fact_invalid",
@@ -581,6 +838,7 @@ function addPublisherReasons(
     });
     return;
   }
+  if (!validPublisherFact(publisher)) return;
   if (publisher.eventType === "deny") {
     reasons.push({
       code: "publisher_denied",
@@ -592,7 +850,7 @@ function addPublisherReasons(
       message: "the current publisher policy head is invalid",
     });
   }
-  if (install && install.publisherKey !== publisher.publisherKey) {
+  if (install && validInstallFact(install) && install.publisherKey !== publisher.publisherKey) {
     reasons.push({
       code: "publisher_mismatch",
       message: "the current install head is bound to a different publisher",
@@ -613,6 +871,27 @@ function addCheckpointReasons(
     });
     return;
   }
+  const rawCheckpoint = checkpoint as unknown;
+  if (!validCheckpointFact(rawCheckpoint)) {
+    if (isPlainDataObject(rawCheckpoint)) {
+      const malformed = rawCheckpoint as unknown as AdmissionProjectionCheckpoint;
+      if (!positiveSequence(malformed.sequence)) {
+        reasons.push({
+          code: "checkpoint_sequence_invalid",
+          message: "the current revocation checkpoint sequence is invalid",
+        });
+      }
+      const revokedPackageDigests = authorityArraySnapshot(malformed.revokedPackageDigests);
+      if (!revokedPackageDigests?.every((digest) => validDigest(digest))) {
+        reasons.push({
+          code: "checkpoint_revocation_unknown",
+          message: "the checkpoint does not provide an explicit revocation set",
+        });
+      }
+    }
+    return;
+  }
+  if (publisher && !validPublisherFact(publisher)) return;
   if (checkpoint.verified !== true) {
     reasons.push({
       code: "checkpoint_unverified",
@@ -642,15 +921,17 @@ function addCheckpointReasons(
       message: "the checkpoint is not bound to the current publisher policy head",
     });
   }
-  if (!validDenseArray(checkpoint.revokedPackageDigests, validDigest)) {
+  const revokedPackageDigests = authorityArraySnapshot(checkpoint.revokedPackageDigests);
+  if (
+    !revokedPackageDigests?.every((digest): digest is AdmissionProjectionDigest =>
+      validDigest(digest),
+    )
+  ) {
     reasons.push({
       code: "checkpoint_revocation_unknown",
       message: "the checkpoint does not provide an explicit revocation set",
     });
-  } else if (
-    packageDigest !== undefined &&
-    checkpoint.revokedPackageDigests.includes(packageDigest)
-  ) {
+  } else if (packageDigest !== undefined && revokedPackageDigests.includes(packageDigest)) {
     reasons.push({
       code: "package_revoked",
       message: "the package digest is revoked by the checkpoint",
@@ -672,6 +953,7 @@ function addInstallReasons(
     });
     return;
   }
+  if (!validInstallFact(install)) return;
   if (
     install.eventType === "uninstall" &&
     sameFormRef(install.formRef, formRef) &&
@@ -718,6 +1000,19 @@ function addSupportReasons(
     reasons.push({ code: "support_missing", message: "exact implementation support is missing" });
     return;
   }
+  const rawSupport = support as unknown;
+  if (!validSupportFact(rawSupport)) {
+    if (isPlainDataObject(rawSupport)) {
+      const malformed = rawSupport as unknown as AdmissionProjectionSupport;
+      if (!validDenseArray(malformed.operations, validFormOperation)) {
+        reasons.push({
+          code: "support_operations_invalid",
+          message: "implementation support does not declare an operation set",
+        });
+      }
+    }
+    return;
+  }
   if (
     !formRef ||
     packageDigest === undefined ||
@@ -736,12 +1031,15 @@ function addSupportReasons(
       message: "the current implementation support head is disabled",
     });
   }
-  if (!validDenseArray(support.operations, validFormOperation)) {
+  const operations = authorityArraySnapshot(support.operations);
+  if (
+    !operations?.every((operation): operation is TakoformOperation => validFormOperation(operation))
+  ) {
     reasons.push({
       code: "support_operations_invalid",
       message: "implementation support does not declare an operation set",
     });
-  } else if (!support.operations.includes(operation as TakoformOperation)) {
+  } else if (!operations.includes(operation as TakoformOperation)) {
     reasons.push({
       code: "support_operation_unsupported",
       message: "the implementation support head does not list the requested operation",
@@ -762,13 +1060,8 @@ function effectiveActivation(
   packageDigest: AdmissionProjectionDigest | undefined,
   reasons: AdmissionProjectionReason[],
 ): AdmissionProjectionActivation | null {
-  if (
-    !activations ||
-    activations.length === 0 ||
-    !context ||
-    !formRef ||
-    packageDigest === undefined
-  ) {
+  const elements = authorityArraySnapshot(activations);
+  if (!elements || elements.length === 0 || !context || !formRef || packageDigest === undefined) {
     reasons.push({
       code: "activation_missing",
       message: "no current activation matches the request",
@@ -780,22 +1073,16 @@ function effectiveActivation(
     readonly activation: AdmissionProjectionActivation;
     readonly rank: number;
   }> = [];
-  for (const activation of activations) {
+  // The snapshot above has already bounded/densely inspected the array.  Do
+  // not enumerate the caller-owned array itself: a sparse/oversized/proxy
+  // array must never reach this reduction path.
+  for (const candidate of elements) {
+    if (!validActivationFact(candidate)) continue;
+    const activation = candidate;
     // Unknown audience values on another Form/package are irrelevant to this
     // request.  Validate/filter the exact identity first so an unrelated
     // corrupt head cannot deny an otherwise eligible Resource.
-    if (
-      !activation ||
-      !sameFormRef(activation.formRef, formRef) ||
-      activation.packageDigest !== packageDigest
-    ) {
-      continue;
-    }
-    if (!validActivationFact(activation)) {
-      reasons.push({
-        code: "fact_invalid",
-        message: "the relevant activation head contains malformed identity or digest facts",
-      });
+    if (!sameFormRef(activation.formRef, formRef) || activation.packageDigest !== packageDigest) {
       continue;
     }
     const audience = normalizeAudience(activation.audience);
@@ -837,6 +1124,13 @@ function addRetainedResourceReasons(
   resource: AdmissionProjectionResourceIdentity,
   reasons: AdmissionProjectionReason[],
 ): void {
+  if (!validResourceIdentity(resource)) {
+    reasons.push({
+      code: "identity_invalid",
+      message: "the retained Resource identity contains malformed or accessor-backed facts",
+    });
+    return;
+  }
   if (!boundedResourceUid(resource.resourceUid)) {
     reasons.push({
       code: "identity_invalid",
@@ -890,6 +1184,19 @@ function addRetainedResourceReasons(
   }
 }
 
+function validResourceIdentity(value: unknown): value is AdmissionProjectionResourceIdentity {
+  if (!isPlainDataObject(value)) return false;
+  const resource = value as unknown as AdmissionProjectionResourceIdentity;
+  return (
+    boundedResourceUid(resource.resourceUid) &&
+    boundedText(resource.tenantId, MAX_IDENTITY_LENGTH) &&
+    boundedText(resource.space, MAX_IDENTITY_LENGTH) &&
+    validFormRef(resource.formRef) &&
+    validDigest(resource.packageDigest) &&
+    validDigest(resource.implementationDigest)
+  );
+}
+
 function addRetentionReasons(
   current: AdmissionProjectionCurrentHeads | undefined,
   history: AdmissionProjectionHistory | undefined,
@@ -898,35 +1205,38 @@ function addRetentionReasons(
   reasons: AdmissionProjectionReason[],
 ): void {
   const retentions = current?.retentions;
-  if (!isDenseArray(retentions)) {
+  const retentionElements = authorityArraySnapshot(retentions);
+  if (!retentionElements) {
     reasons.push({
       code: "retention_missing",
       message: "the current retained-byte claim is missing",
     });
   } else {
-    const exact = retentions.find(
-      (retention) =>
-        !!retention &&
-        validRetentionFact(retention) &&
+    const exact = retentionElements.find((candidate) => {
+      if (!validRetentionFact(candidate)) return false;
+      const retention = candidate;
+      return (
         sameFormRef(retention.formRef, resource.formRef) &&
         retention.packageDigest === resource.packageDigest &&
-        retention.implementationDigest === resource.implementationDigest,
-    );
-    if (!exact) {
-      const packageClaim = retentions.some(
-        (retention) =>
-          !!retention &&
-          validRetentionFact(retention) &&
-          sameFormRef(retention.formRef, resource.formRef) &&
-          retention.packageDigest === resource.packageDigest,
+        retention.implementationDigest === resource.implementationDigest
       );
+    });
+    if (!exact) {
+      const packageClaim = retentionElements.some((candidate) => {
+        if (!validRetentionFact(candidate)) return false;
+        const retention = candidate;
+        return (
+          sameFormRef(retention.formRef, resource.formRef) &&
+          retention.packageDigest === resource.packageDigest
+        );
+      });
       reasons.push({
         code: packageClaim ? "retained_package_implementation_mismatch" : "retention_missing",
         message: packageClaim
           ? "the retained-byte claim does not match the exact Resource implementation"
           : "the current retained-byte claim is missing",
       });
-    } else if (exact.retained !== true) {
+    } else if ((exact as AdmissionProjectionRetention).retained !== true) {
       reasons.push({
         code: "package_purged",
         message: "the exact historical package bytes are no longer retained",
@@ -963,19 +1273,33 @@ function retainedPackageStatus(
 ): "matched" | "missing" | "implementation_mismatch" {
   if (!formRef || packageDigest === undefined || packageDigest !== resource.packageDigest)
     return "missing";
-  // A sparse history cannot prove which retained install events existed. The
-  // cleanup caller also records a fact_invalid reason, but keep this helper
+  // A sparse/oversized/proxy history cannot prove which retained install
+  // events existed. The cleanup caller records fact_invalid; keep this helper
   // fail-closed if it is ever reused independently.
-  if (history !== undefined && !isDenseArray(history)) return "missing";
-  const candidates = [...(currentInstall ? [currentInstall] : []), ...(history ?? [])].filter(
-    (event) =>
-      !!event &&
+  const historyElements = history === undefined ? [] : authorityArraySnapshot(history);
+  if (!historyElements) return "missing";
+  if (
+    currentInstall !== undefined &&
+    currentInstall !== null &&
+    !validInstallFact(currentInstall)
+  ) {
+    return "implementation_mismatch";
+  }
+  const candidates: AdmissionProjectionInstall[] = [];
+  for (const event of [
+    ...(currentInstall === undefined || currentInstall === null ? [] : [currentInstall]),
+    ...historyElements,
+  ]) {
+    if (!validInstallFact(event)) return "implementation_mismatch";
+    if (
       (event.eventType === "install" || event.eventType === "replace") &&
       sameFormRef(event.formRef, formRef) &&
-      event.packageDigest === packageDigest,
-  );
+      event.packageDigest === packageDigest
+    ) {
+      candidates.push(event);
+    }
+  }
   if (candidates.length === 0) return "missing";
-  if (candidates.some((event) => !validInstallFact(event))) return "implementation_mismatch";
   if (
     candidates.some(
       (event) =>
@@ -989,7 +1313,7 @@ function retainedPackageStatus(
 }
 
 function normalizeAudience(value: unknown): AdmissionProjectionAudience | null {
-  if (!value || typeof value !== "object") return null;
+  if (!isPlainDataObject(value)) return null;
   const candidate = value as Record<string, unknown>;
   if (candidate.kind === "host" && nonEmpty(candidate.hostId)) {
     return { kind: "host", hostId: candidate.hostId };
@@ -1097,7 +1421,7 @@ function boundedText(value: unknown, maximum: number): value is string {
 }
 
 function isFactObject<T>(value: T): value is T & Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  return isPlainDataObject(value);
 }
 
 function boundedResourceUid(value: unknown): value is string {
@@ -1109,29 +1433,108 @@ function positiveSequence(value: unknown): value is number {
 }
 
 /**
+ * The projection boundary is a bounded plain-data boundary.  A Host adapter
+ * must canonicalize database/JSON values before calling it; accessors and
+ * class/proxy-backed records are rejected before any authority field is read.
+ * JavaScript cannot reliably identify a transparent Proxy, so this function
+ * does not promise to sandbox arbitrary Proxy code: descriptor trap failures
+ * are caught and deny, while Host canonicalization remains mandatory.
+ */
+function isPlainDataObject(value: unknown): value is Record<string, unknown> {
+  try {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return false;
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const result = Object.values(descriptors).every(
+      (descriptor) =>
+        "value" in descriptor && descriptor.get === undefined && descriptor.set === undefined,
+    );
+    return result;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Array iteration helpers (`every`, `some`, `find`, and `for...of`) skip holes
  * or materialize them inconsistently. Authority facts must therefore carry
- * an own element at every index before any reducer can inspect their values.
+ * an own data element at every index, have no extra properties, and stay below
+ * the explicit bound before any reducer can inspect their values.
  */
-function isDenseArray<T = unknown>(value: unknown): value is readonly T[] {
-  if (!Array.isArray(value)) return false;
-  // Count and validate own indexed properties rather than probing every index:
-  // a hostile sparse array may advertise a huge length with only one element.
-  const ownElementNames = Object.getOwnPropertyNames(value).filter((name) => name !== "length");
-  if (ownElementNames.length !== value.length) return false;
-  return ownElementNames.every((name) => {
-    const index = Number(name);
-    return (
-      Number.isSafeInteger(index) && index >= 0 && index < value.length && String(index) === name
-    );
-  });
+function authorityArraySnapshot(value: unknown): readonly unknown[] | null {
+  try {
+    if (!Array.isArray(value)) return null;
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Array.prototype) {
+      return null;
+    }
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+    if (!lengthDescriptor || !("value" in lengthDescriptor)) {
+      return null;
+    }
+    const length = lengthDescriptor.value;
+    if (!Number.isSafeInteger(length) || length < 0 || length > MAX_AUTHORITY_ARRAY_LENGTH) {
+      return null;
+    }
+    const ownKeys = Reflect.ownKeys(value);
+    if (ownKeys.length !== length + 1) {
+      return null;
+    }
+    const indexedKeys = new Set<string>();
+    for (const key of ownKeys) {
+      if (typeof key !== "string") return null;
+      if (key === "length") continue;
+      const index = Number(key);
+      if (!Number.isSafeInteger(index) || index < 0 || index >= length || String(index) !== key) {
+        return null;
+      }
+      indexedKeys.add(key);
+    }
+    if (indexedKeys.size !== length) {
+      return null;
+    }
+    const elements = new Array<unknown>(length);
+    for (let index = 0; index < length; index += 1) {
+      const key = String(index);
+      if (!indexedKeys.has(key)) {
+        return null;
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !("value" in descriptor)) {
+        return null;
+      }
+      elements[index] = descriptor.value;
+    }
+    return elements;
+  } catch {
+    return null;
+  }
+}
+
+function isPlainAuthorityArray(value: unknown): value is readonly unknown[] {
+  return authorityArraySnapshot(value) !== null;
+}
+
+function hasPlainFactElements(value: unknown): boolean {
+  const elements = authorityArraySnapshot(value);
+  return elements?.every((element) => isFactObject(element)) ?? false;
 }
 
 function validDenseArray<T>(
   value: unknown,
   isElementValid: (element: unknown) => element is T,
 ): value is readonly T[] {
-  return isDenseArray(value) && value.every((element) => isElementValid(element));
+  const elements = authorityArraySnapshot(value);
+  return elements?.every((element) => isElementValid(element)) ?? false;
+}
+
+function validAuthorityArray(
+  value: unknown,
+  isElementValid: (element: unknown) => boolean,
+): boolean {
+  const elements = authorityArraySnapshot(value);
+  return elements?.every((element) => isElementValid(element)) ?? false;
 }
 
 function validDigest(value: unknown): value is AdmissionProjectionDigest {
@@ -1144,7 +1547,7 @@ function validDigest(value: unknown): value is AdmissionProjectionDigest {
 }
 
 function validFormRef(value: unknown): value is TakoformV1Alpha3FormRef {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  if (!isPlainDataObject(value)) return false;
   const keys = Object.keys(value).sort();
   if (
     keys.length !== 4 ||
@@ -1156,55 +1559,63 @@ function validFormRef(value: unknown): value is TakoformV1Alpha3FormRef {
     return false;
   }
   try {
-    validateFormRef(value as TakoformV1Alpha3FormRef);
+    validateFormRef(value as unknown as TakoformV1Alpha3FormRef);
     return true;
   } catch {
     return false;
   }
 }
 
-function validPublisherFact(value: AdmissionProjectionPublisher): boolean {
+function validPublisherFact(value: unknown): value is AdmissionProjectionPublisher {
+  if (!isPlainDataObject(value)) return false;
+  const fact = value as unknown as AdmissionProjectionPublisher;
   return (
-    boundedText(value.publisherKey, MAX_IDENTITY_LENGTH) &&
-    (value.eventType === "allow" || value.eventType === "rotate" || value.eventType === "deny") &&
-    validDigest(value.policyDigest) &&
-    validDigest(value.eventDigest)
+    boundedText(fact.publisherKey, MAX_IDENTITY_LENGTH) &&
+    (fact.eventType === "allow" || fact.eventType === "rotate" || fact.eventType === "deny") &&
+    validDigest(fact.policyDigest) &&
+    validDigest(fact.eventDigest)
   );
 }
 
-function validCheckpointFact(value: AdmissionProjectionCheckpoint): boolean {
+function validCheckpointFact(value: unknown): value is AdmissionProjectionCheckpoint {
+  if (!isPlainDataObject(value)) return false;
+  const fact = value as unknown as AdmissionProjectionCheckpoint;
   return (
-    boundedText(value.publisherKey, MAX_IDENTITY_LENGTH) &&
-    validDigest(value.policyDigest) &&
-    validDigest(value.policyEventDigest) &&
-    positiveSequence(value.sequence) &&
-    validDigest(value.checkpointDigest) &&
-    validDigest(value.eventDigest) &&
-    typeof value.verified === "boolean" &&
-    typeof value.stale === "boolean" &&
-    validDenseArray(value.revokedPackageDigests, validDigest)
+    boundedText(fact.publisherKey, MAX_IDENTITY_LENGTH) &&
+    validDigest(fact.policyDigest) &&
+    validDigest(fact.policyEventDigest) &&
+    positiveSequence(fact.sequence) &&
+    validDigest(fact.checkpointDigest) &&
+    validDigest(fact.eventDigest) &&
+    typeof fact.verified === "boolean" &&
+    typeof fact.stale === "boolean" &&
+    validDenseArray(fact.revokedPackageDigests, validDigest)
   );
 }
 
-function validInstallFact(value: AdmissionProjectionInstall): boolean {
+function validInstallFact(value: unknown): value is AdmissionProjectionInstall {
+  if (!isPlainDataObject(value)) return false;
+  const fact = value as unknown as AdmissionProjectionInstall;
   return (
-    validFormRef(value.formRef) &&
-    validDigest(value.packageDigest) &&
-    boundedText(value.publisherKey, MAX_IDENTITY_LENGTH) &&
-    (value.eventType === "install" ||
-      value.eventType === "replace" ||
-      value.eventType === "uninstall") &&
-    (value.implementationDigest === undefined || validDigest(value.implementationDigest))
+    validFormRef(fact.formRef) &&
+    validDigest(fact.packageDigest) &&
+    boundedText(fact.publisherKey, MAX_IDENTITY_LENGTH) &&
+    (fact.eventType === "install" ||
+      fact.eventType === "replace" ||
+      fact.eventType === "uninstall") &&
+    (fact.implementationDigest === undefined || validDigest(fact.implementationDigest))
   );
 }
 
-function validSupportFact(value: AdmissionProjectionSupport): boolean {
+function validSupportFact(value: unknown): value is AdmissionProjectionSupport {
+  if (!isPlainDataObject(value)) return false;
+  const fact = value as unknown as AdmissionProjectionSupport;
   return (
-    validFormRef(value.formRef) &&
-    validDigest(value.packageDigest) &&
-    validDigest(value.implementationDigest) &&
-    typeof value.supported === "boolean" &&
-    validDenseArray(value.operations, validFormOperation)
+    validFormRef(fact.formRef) &&
+    validDigest(fact.packageDigest) &&
+    validDigest(fact.implementationDigest) &&
+    typeof fact.supported === "boolean" &&
+    validDenseArray(fact.operations, validFormOperation)
   );
 }
 
@@ -1212,21 +1623,25 @@ function validFormOperation(value: unknown): value is TakoformOperation {
   return typeof value === "string" && FORM_OPERATIONS.has(value as TakoformOperation);
 }
 
-function validActivationFact(value: AdmissionProjectionActivation): boolean {
+function validActivationFact(value: unknown): value is AdmissionProjectionActivation {
+  if (!isPlainDataObject(value)) return false;
+  const fact = value as unknown as AdmissionProjectionActivation;
   return (
-    validFormRef(value.formRef) &&
-    validDigest(value.packageDigest) &&
-    validDigest(value.implementationDigest) &&
-    typeof value.active === "boolean"
+    validFormRef(fact.formRef) &&
+    validDigest(fact.packageDigest) &&
+    validDigest(fact.implementationDigest) &&
+    typeof fact.active === "boolean"
   );
 }
 
-function validRetentionFact(value: AdmissionProjectionRetention): boolean {
+function validRetentionFact(value: unknown): value is AdmissionProjectionRetention {
+  if (!isPlainDataObject(value)) return false;
+  const fact = value as unknown as AdmissionProjectionRetention;
   return (
-    validFormRef(value.formRef) &&
-    validDigest(value.packageDigest) &&
-    validDigest(value.implementationDigest) &&
-    typeof value.retained === "boolean"
+    validFormRef(fact.formRef) &&
+    validDigest(fact.packageDigest) &&
+    validDigest(fact.implementationDigest) &&
+    typeof fact.retained === "boolean"
   );
 }
 

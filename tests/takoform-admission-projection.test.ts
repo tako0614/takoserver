@@ -344,7 +344,11 @@ describe("pure current-effective Takoform admission projection", () => {
       );
       expect(decision.allowed).toBe(false);
       expect(decision.reasons.map((reason) => reason.code)).toContain("fact_invalid");
-      expect(decision.reasons.map((reason) => reason.code)).toContain("support_operations_invalid");
+      if (operations === denseUndefinedOperations) {
+        expect(decision.reasons.map((reason) => reason.code)).toContain(
+          "support_operations_invalid",
+        );
+      }
     }
 
     const sparseActivations = new Array<AdmissionProjectionActivation>(1);
@@ -410,10 +414,232 @@ describe("pure current-effective Takoform admission projection", () => {
       );
       expect(decision.allowed).toBe(false);
       expect(decision.reasons.map((reason) => reason.code)).toContain("fact_invalid");
-      expect(decision.reasons.map((reason) => reason.code)).toContain(
-        "checkpoint_revocation_unknown",
-      );
+      if (revokedPackageDigests === denseUndefinedRevocations) {
+        expect(decision.reasons.map((reason) => reason.code)).toContain(
+          "checkpoint_revocation_unknown",
+        );
+      }
     }
+  });
+
+  test("bounds a huge sparse activation array before any enumeration", () => {
+    const hugeSparseActivations = new Array<AdmissionProjectionActivation>(2 ** 32 - 1);
+    const decision = evaluateAdmissionProjection(
+      input("create", { current: current({ activations: hugeSparseActivations }) }),
+    );
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasons.map((reason) => reason.code)).toContain("fact_invalid");
+  });
+
+  test("bounds every authority array before consumers inspect it", () => {
+    const resource = {
+      resourceUid: "resource-array-bound",
+      tenantId: "tenant-a",
+      space: "space-a",
+      formRef: FORM_REF,
+      packageDigest: digest("5"),
+      implementationDigest: digest("6"),
+    } as const;
+    const overLimit = <T>(): T[] => new Array<T>(1025);
+
+    const activationDecision = evaluateAdmissionProjection(
+      input("create", {
+        current: current({ activations: overLimit<AdmissionProjectionActivation>() }),
+      }),
+    );
+    expect(activationDecision.allowed).toBe(false);
+    expect(activationDecision.reasons.map((reason) => reason.code)).toContain("fact_invalid");
+
+    const retentionDecision = evaluateAdmissionProjection(
+      input("delete", {
+        current: current({ retentions: overLimit<AdmissionProjectionRetention>() }),
+        history: { installs: [install()] },
+        resource,
+      }),
+    );
+    expect(retentionDecision.allowed).toBe(false);
+    expect(retentionDecision.reasons.map((reason) => reason.code)).toContain("fact_invalid");
+
+    const installDecision = evaluateAdmissionProjection(
+      input("delete", {
+        current: current(),
+        history: { installs: overLimit<AdmissionProjectionInstall>() },
+        resource,
+      }),
+    );
+    expect(installDecision.allowed).toBe(false);
+    expect(installDecision.reasons.map((reason) => reason.code)).toContain("fact_invalid");
+
+    const operationDecision = evaluateAdmissionProjection(
+      input("create", {
+        current: current({
+          support: support(digest("5"), digest("6"), {
+            operations: overLimit<AdmissionProjectionSupport["operations"][number]>(),
+          }),
+        }),
+      }),
+    );
+    expect(operationDecision.allowed).toBe(false);
+    expect(operationDecision.reasons.map((reason) => reason.code)).toContain("fact_invalid");
+
+    const revocationDecision = evaluateAdmissionProjection(
+      input("create", {
+        current: current({
+          checkpoint: checkpoint({
+            revokedPackageDigests:
+              overLimit<AdmissionProjectionCheckpoint["revokedPackageDigests"][number]>(),
+          }),
+        }),
+      }),
+    );
+    expect(revocationDecision.allowed).toBe(false);
+    expect(revocationDecision.reasons.map((reason) => reason.code)).toContain("fact_invalid");
+  });
+
+  test("rejects accessor-backed arrays and time-varying facts before reading authority values", () => {
+    let activationReads = 0;
+    const activationFact = activation({ kind: "host", hostId: "host-a" });
+    Object.defineProperty(activationFact, "active", {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        const read = activationReads;
+        activationReads += 1;
+        return read === 0;
+      },
+    });
+    const activationDecision = evaluateAdmissionProjection(
+      input("create", { current: current({ activations: [activationFact] }) }),
+    );
+    expect(activationDecision.allowed).toBe(false);
+    expect(activationDecision.reasons.map((reason) => reason.code)).toContain("fact_invalid");
+    expect(activationReads).toBe(0);
+
+    let supportReads = 0;
+    const supportFact = support();
+    Object.defineProperty(supportFact, "operations", {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        const read = supportReads;
+        supportReads += 1;
+        return read === 0 ? ["create", "read"] : ["update"];
+      },
+    });
+    const supportDecision = evaluateAdmissionProjection(
+      input("create", { current: current({ support: supportFact }) }),
+    );
+    expect(supportDecision.allowed).toBe(false);
+    expect(supportDecision.reasons.map((reason) => reason.code)).toContain("fact_invalid");
+    expect(supportReads).toBe(0);
+
+    let arrayReads = 0;
+    const activationArray = [activation({ kind: "host", hostId: "host-a" })];
+    Object.defineProperty(activationArray, "0", {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        arrayReads += 1;
+        return activation({ kind: "host", hostId: "host-a" });
+      },
+    });
+    const arrayDecision = evaluateAdmissionProjection(
+      input("create", { current: current({ activations: activationArray }) }),
+    );
+    expect(arrayDecision.allowed).toBe(false);
+    expect(arrayDecision.reasons.map((reason) => reason.code)).toContain("fact_invalid");
+    expect(arrayReads).toBe(0);
+  });
+
+  test("catches hostile proxy inspection without admitting", () => {
+    const hostileActivations = new Proxy([] as AdmissionProjectionActivation[], {
+      getOwnPropertyDescriptor: () => {
+        throw new Error("descriptor trap");
+      },
+    });
+    const decision = evaluateAdmissionProjection(
+      input("create", { current: current({ activations: hostileActivations }) }),
+    );
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasons.map((reason) => reason.code)).toContain("fact_invalid");
+  });
+
+  test("materializes changing activation and support proxies once before semantic reads", () => {
+    let activationDescriptorReads = 0;
+    let activationValueReads = 0;
+    const changingActivations = new Proxy([activation({ kind: "host", hostId: "host-a" })], {
+      getOwnPropertyDescriptor(target, key) {
+        const descriptor = Reflect.getOwnPropertyDescriptor(target, key);
+        if (key === "0" && descriptor) {
+          activationDescriptorReads += 1;
+          return {
+            ...descriptor,
+            value: { ...(descriptor.value as AdmissionProjectionActivation), active: false },
+          };
+        }
+        return descriptor;
+      },
+      get(target, key, receiver) {
+        if (key === "0") {
+          activationValueReads += 1;
+          return { ...target[0], active: true };
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const activationDecision = evaluateAdmissionProjection(
+      input("create", { current: current({ activations: changingActivations }) }),
+    );
+    expect(activationDecision.allowed).toBe(false);
+    expect(activationDecision.reasons.map((reason) => reason.code)).toContain(
+      "activation_inactive",
+    );
+    expect(activationDescriptorReads).toBe(1);
+    expect(activationValueReads).toBe(0);
+
+    let supportDescriptorReads = 0;
+    let supportValueReads = 0;
+    const changingSupport = new Proxy(support(), {
+      getOwnPropertyDescriptor(target, key) {
+        const descriptor = Reflect.getOwnPropertyDescriptor(target, key);
+        if (key === "supported" && descriptor) {
+          supportDescriptorReads += 1;
+          return { ...descriptor, value: false };
+        }
+        return descriptor;
+      },
+      get(target, key, receiver) {
+        if (key === "supported") {
+          supportValueReads += 1;
+          return true;
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const supportDecision = evaluateAdmissionProjection(
+      input("create", { current: current({ support: changingSupport }) }),
+    );
+    expect(supportDecision.allowed).toBe(false);
+    expect(supportDecision.reasons.map((reason) => reason.code)).toContain("support_disabled");
+    expect(supportDescriptorReads).toBe(1);
+    expect(supportValueReads).toBe(0);
+  });
+
+  test("denies a hostile duplicate-head error without trusting its forgeable message", () => {
+    const hostileActivations = new Proxy([activation({ kind: "host", hostId: "host-a" })], {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === "0") throw new TypeError("duplicate current activation head");
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    let decision: ReturnType<typeof evaluateAdmissionProjection> | undefined;
+    expect(() => {
+      decision = evaluateAdmissionProjection(
+        input("create", { current: current({ activations: hostileActivations }) }),
+      );
+    }).not.toThrow();
+    expect(decision?.allowed).toBe(false);
+    expect(decision?.reasons.map((reason) => reason.code)).toContain("fact_invalid");
   });
 
   test("rejects protocol phases that are not Resource lifecycle operations", () => {
