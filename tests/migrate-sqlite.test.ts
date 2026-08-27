@@ -85,6 +85,7 @@ describe("bringing a local database up to date", () => {
     expect(report.applied).toEqual([
       "0020_takoform_deferred_operations.sql",
       "0021_takoform_provider_mutation_sagas.sql",
+      "0022_takoform_admission.sql",
     ]);
     expect(
       database
