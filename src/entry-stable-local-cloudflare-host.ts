@@ -142,6 +142,7 @@ export async function startStableLocalCloudflareHost(input: {
         }
         return { values: structuredClone(input.runtimeValues) };
       },
+      async commitRuntimeBindings() {},
       async rollbackRuntimeBindings() {},
     },
     fetch: (request) => cloudflare.fetch(request),

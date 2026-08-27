@@ -12,7 +12,10 @@ import {
   type ProviderValue,
   succeeded,
 } from "../provider-port.ts";
-import type { RuntimeMaterializer } from "../runtime-materialization.ts";
+import type {
+  RuntimeMaterializationInput,
+  RuntimeMaterializer,
+} from "../runtime-materialization.ts";
 import {
   AMAZON_S3_STANDARD_SERVICE,
   CLOUDFLARE_R2_CREDENTIAL_KIND,
@@ -657,6 +660,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     let runtimeMaterializationResult:
       | Awaited<ReturnType<RuntimeMaterializer["materializeRuntimeBindings"]>>
       | undefined;
+    let runtimeMaterializationInput: RuntimeMaterializationInput | undefined;
     if (requiredSensitive.length > 0) {
       if (!runtimeMaterialization || !runtimeMaterializer || !this.#workerEndpointSuffix) {
         return failed(
@@ -703,14 +707,17 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
           "the sensitive Worker bindings have no runtime materialization authority",
         );
       }
+      runtimeMaterializationInput = {
+        request: runtimeMaterialization,
+        resourceName: input.identity.name,
+        scriptName,
+        publicOrigin: `https://${scriptName}.${this.#workerEndpointSuffix}`,
+        bindings: requiredSensitive,
+      };
       try {
-        runtimeMaterializationResult = await runtimeMaterializer.materializeRuntimeBindings({
-          request: runtimeMaterialization,
-          resourceName: input.identity.name,
-          scriptName,
-          publicOrigin: `https://${scriptName}.${this.#workerEndpointSuffix}`,
-          bindings: requiredSensitive,
-        });
+        runtimeMaterializationResult = await runtimeMaterializer.materializeRuntimeBindings(
+          runtimeMaterializationInput,
+        );
       } catch {
         return failed("denied", "the runtime materializer refused the Worker bindings");
       }
@@ -793,6 +800,10 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       );
       return rollbackFailed ?? failed("provider_error", "the Worker Version has no identifier");
     }
+    if (runtimeMaterializationInput) {
+      const commitFailed = await this.#commitRuntimeMaterialization(runtimeMaterializationInput);
+      if (commitFailed) return commitFailed;
+    }
     return succeeded({
       nativeId: `version:${scriptName}:${versionId}`,
       observed: { scriptName, versionId },
@@ -816,6 +827,21 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
         "provider_error",
         "the Worker Version failed and runtime materialization rollback was not confirmed",
       );
+    }
+  }
+
+  async #commitRuntimeMaterialization(
+    input: RuntimeMaterializationInput,
+  ): Promise<ProviderTicket | undefined> {
+    const materializer = this.#runtimeMaterializer;
+    if (!materializer || typeof materializer.commitRuntimeBindings !== "function") {
+      return failed("provider_error", "runtime binding activation was not confirmed by the host");
+    }
+    try {
+      await materializer.commitRuntimeBindings(input);
+      return undefined;
+    } catch {
+      return failed("provider_error", "runtime binding activation was not confirmed by the host");
     }
   }
 

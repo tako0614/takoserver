@@ -869,6 +869,8 @@ describe("released edge Form placement", () => {
     const versionOffering = technical("WorkerVersion");
     const calls: Call[] = [];
     const materialized: unknown[] = [];
+    const committed: unknown[] = [];
+    const lifecycle: string[] = [];
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
@@ -878,6 +880,7 @@ describe("released edge Form placement", () => {
       workerEndpointSuffix: "workers.example",
       runtimeMaterializer: {
         async materializeRuntimeBindings(input) {
+          lifecycle.push("materialize");
           materialized.push(input);
           return {
             values: {
@@ -886,11 +889,16 @@ describe("released edge Form placement", () => {
             },
           };
         },
+        async commitRuntimeBindings(input) {
+          lifecycle.push("commit");
+          committed.push(input);
+        },
         async rollbackRuntimeBindings() {
           throw new Error("a successful upload must not roll back");
         },
       },
       async fetch(request) {
+        lifecycle.push("upload");
         calls.push({
           method: request.method,
           url: request.url,
@@ -949,6 +957,9 @@ describe("released edge Form placement", () => {
         bindings: ["ENCRYPTION_KEY", "TAKOSUMI_ACCOUNTS_CLIENT_ID"],
       },
     ]);
+    expect(committed).toEqual(materialized);
+    expect(committed[0]).toBe(materialized[0]);
+    expect(lifecycle).toEqual(["materialize", "upload", "commit"]);
     expect(calls[0]?.body).toContain(
       '"type":"secret_text","name":"ENCRYPTION_KEY","text":"generated-encryption-key"',
     );
@@ -967,6 +978,7 @@ describe("released edge Form placement", () => {
     const workerOffering = technical("ModuleWorker");
     const versionOffering = technical("WorkerVersion");
     const rollbacks: unknown[] = [];
+    const commits: unknown[] = [];
     const runtimeMaterialization = {
       contract: "takosumi.host-runtime-materialization/v1",
       installConfigId: "icfg_yurucommu",
@@ -988,6 +1000,9 @@ describe("released edge Form placement", () => {
             values: { ENCRYPTION_KEY: "generated-encryption-key" },
             rollbackReceipt: "opaque-rollback-receipt",
           };
+        },
+        async commitRuntimeBindings(input) {
+          commits.push(input);
         },
         async rollbackRuntimeBindings(input) {
           rollbacks.push(input);
@@ -1031,6 +1046,89 @@ describe("released edge Form placement", () => {
       {
         request: runtimeMaterialization,
         rollbackReceipt: "opaque-rollback-receipt",
+      },
+    ]);
+    expect(commits).toEqual([]);
+    expect(JSON.stringify(ticket)).not.toContain("generated-encryption-key");
+  });
+
+  test("does not report a Worker Version success when runtime activation is refused", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const versionOffering = technical("WorkerVersion");
+    const commits: unknown[] = [];
+    const runtimeMaterialization = {
+      contract: "takosumi.host-runtime-materialization/v1",
+      installConfigId: "icfg_yurucommu",
+      workspaceId: "workspace_1",
+      capsuleId: "capsule_yurucommu",
+      installingPrincipalId: "tsub_owner",
+      requirements: [],
+    } as const;
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering, versionOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      workerEndpointSuffix: "workers.example",
+      runtimeMaterializer: {
+        async materializeRuntimeBindings() {
+          return { values: { ENCRYPTION_KEY: "generated-encryption-key" } };
+        },
+        async commitRuntimeBindings(input) {
+          commits.push(input);
+          throw new Error("activation RPC included generated-encryption-key");
+        },
+        async rollbackRuntimeBindings() {
+          throw new Error("an uploaded Version cannot roll back activation");
+        },
+      },
+      async fetch() {
+        return Response.json({
+          success: true,
+          errors: [],
+          result: { id: "version-commit-refused" },
+        });
+      },
+    });
+
+    const ticket = await provider.apply({
+      operationId: "op-version-commit-refused",
+      offering: versionOffering,
+      identity: { ...IDENTITY, name: "version" },
+      spec: { handlers: ["fetch"], requiredSensitiveVars: ["ENCRYPTION_KEY"] },
+      runtimeMaterialization,
+      relations: [
+        related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+          nativeId: "worker:script-name",
+          offeringId: workerOffering.id,
+          providerPackRef: "cloudflare",
+          outputs: { scriptName: "script-name" },
+        }),
+        related(
+          "/bundle",
+          stored("WorkerBundle", "bundle-uid", {
+            manifestDigest: `sha256:${"d".repeat(64)}`,
+          }),
+        ),
+      ],
+    });
+
+    expect(ticket).toEqual({
+      phase: "failed",
+      failure: {
+        code: "provider_error",
+        message: "runtime binding activation was not confirmed by the host",
+        retryable: false,
+      },
+    });
+    expect(commits).toEqual([
+      {
+        request: runtimeMaterialization,
+        resourceName: "version",
+        scriptName: "script-name",
+        publicOrigin: "https://script-name.workers.example",
+        bindings: ["ENCRYPTION_KEY"],
       },
     ]);
     expect(JSON.stringify(ticket)).not.toContain("generated-encryption-key");

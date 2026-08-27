@@ -18,7 +18,21 @@ const MAX_STRING_BYTES = 8_192;
 export type RuntimeMaterializationAuthority = JsonObject;
 
 /**
- * Values exist only long enough to build one immutable Worker Version.  A
+ * The materializer input is reused byte-for-byte for activation after the
+ * immutable Worker Version upload. Keeping one value for both calls prevents
+ * a retry from accidentally activating a different request, resource,
+ * origin, or binding set than the one whose secret values were uploaded.
+ */
+export interface RuntimeMaterializationInput {
+  readonly request: RuntimeMaterializationAuthority;
+  readonly resourceName: string;
+  readonly scriptName: string;
+  readonly publicOrigin: string;
+  readonly bindings: readonly string[];
+}
+
+/**
+ * Values exist only long enough to build one immutable Worker Version. A
  * materializer may also return an opaque receipt for host-side mutations it
  * made while deriving those values. Takoserver never interprets the receipt;
  * it only returns it to the same private materializer if the Version upload
@@ -31,13 +45,15 @@ export interface RuntimeMaterializationResult {
 
 /** Private provider-composition capability; no public HTTP route is implied. */
 export interface RuntimeMaterializer {
-  materializeRuntimeBindings(input: {
-    readonly request: RuntimeMaterializationAuthority;
-    readonly resourceName: string;
-    readonly scriptName: string;
-    readonly publicOrigin: string;
-    readonly bindings: readonly string[];
-  }): Promise<RuntimeMaterializationResult>;
+  materializeRuntimeBindings(
+    input: RuntimeMaterializationInput,
+  ): Promise<RuntimeMaterializationResult>;
+  /**
+   * Idempotently activates the host-side record for the uploaded Version.
+   * This runs only after the provider has a valid immutable Version id; a
+   * refusal therefore cannot be mistaken for a successful provider apply.
+   */
+  commitRuntimeBindings(input: RuntimeMaterializationInput): Promise<void>;
   rollbackRuntimeBindings(input: {
     readonly request: RuntimeMaterializationAuthority;
     readonly rollbackReceipt: string;
