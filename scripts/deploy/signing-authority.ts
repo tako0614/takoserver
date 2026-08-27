@@ -64,9 +64,20 @@ export async function synchronizeSigningSecret(
   await runChecked(
     "mutation",
     "Worker signing key synchronization",
-    wranglerCommand(["secret", "put", "TAKOSERVER_SIGNING_KEY", "--config", configPath]),
+    wranglerCommand(signingSecretCommand(configPath)),
     { input: raw },
   );
+}
+
+/**
+ * A deploy may intentionally stage other secrets in an unserved immutable
+ * Version before the reviewed bundle is published. The legacy `secret put`
+ * command refuses in that state because the latest Version is not serving;
+ * the Versions API is the correct non-serving writer and preserves that
+ * staged secret closure for the subsequent `wrangler deploy`.
+ */
+export function signingSecretCommand(configPath: string): readonly string[] {
+  return ["versions", "secret", "put", "TAKOSERVER_SIGNING_KEY", "--config", configPath];
 }
 
 /**

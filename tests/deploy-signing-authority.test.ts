@@ -1,8 +1,19 @@
 import { describe, expect, test } from "bun:test";
 import { shouldProbeLiveSigning } from "../scripts/deploy/preflight.ts";
-import { verifyJwtSignature } from "../scripts/deploy/signing-authority.ts";
+import { signingSecretCommand, verifyJwtSignature } from "../scripts/deploy/signing-authority.ts";
 
 describe("deploy signing authority", () => {
+  test("stages the signing key without requiring the latest Version to be served", () => {
+    expect(signingSecretCommand(".wrangler-realized.jsonc")).toEqual([
+      "versions",
+      "secret",
+      "put",
+      "TAKOSERVER_SIGNING_KEY",
+      "--config",
+      ".wrangler-realized.jsonc",
+    ]);
+  });
+
   test("defers only the first sponsorship proof until the new Version is live", () => {
     expect(shouldProbeLiveSigning(true, "version-old", false)).toBeFalse();
     expect(shouldProbeLiveSigning(true, "version-current", true)).toBeTrue();

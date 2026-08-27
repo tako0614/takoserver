@@ -366,7 +366,7 @@ async function assertRequiredSecretsPresent(
     throw preflightError(
       `required Worker secret ${secret.name} is not set`,
       `${secret.why}. Set it through the owner configuration before publishing:\n` +
-        `  wrangler secret put ${secret.name} --config .wrangler-realized.jsonc`,
+        `  wrangler versions secret put ${secret.name} --config .wrangler-realized.jsonc`,
     );
   }
 }
