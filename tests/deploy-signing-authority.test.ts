@@ -1,7 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import { shouldProbeLiveSigning } from "../scripts/deploy/preflight.ts";
 import { verifyJwtSignature } from "../scripts/deploy/signing-authority.ts";
 
 describe("deploy signing authority", () => {
+  test("defers only the first sponsorship proof until the new Version is live", () => {
+    expect(shouldProbeLiveSigning(true, "version-old", false)).toBeFalse();
+    expect(shouldProbeLiveSigning(true, "version-current", true)).toBeTrue();
+    expect(shouldProbeLiveSigning(false, "version-current", false)).toBeTrue();
+  });
+
   test("accepts only a JWT made by the exact active key id and public key", async () => {
     const expected = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
     const stale = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);

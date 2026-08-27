@@ -38,6 +38,33 @@ export async function assertBindingClosure(
   versionId: string,
   expected: ExpectedBindingClosure,
 ): Promise<void> {
+  assertVersionBindingClosure(
+    phase,
+    versionId,
+    await readVersion(phase, configPath, versionId),
+    expected,
+  );
+}
+
+export async function publishedVersionBindingDeclared(
+  phase: DeployPhase,
+  configPath: string,
+  versionId: string,
+  binding: string,
+): Promise<boolean> {
+  return versionBindingDeclared(
+    phase,
+    versionId,
+    await readVersion(phase, configPath, versionId),
+    binding,
+  );
+}
+
+async function readVersion(
+  phase: DeployPhase,
+  configPath: string,
+  versionId: string,
+): Promise<unknown> {
   const raw = await runChecked(
     phase,
     "wrangler versions view",
@@ -61,8 +88,7 @@ export async function assertBindingClosure(
       `json_bytes=${new TextEncoder().encode(raw.slice(start)).byteLength}`,
     );
   }
-
-  assertVersionBindingClosure(phase, versionId, parsed, expected);
+  return parsed;
 }
 
 export interface ExpectedBinding {
@@ -177,6 +203,25 @@ export function assertVersionBindingClosure(
       }
     }
   }
+}
+
+export function versionBindingDeclared(
+  phase: DeployPhase,
+  versionId: string,
+  version: unknown,
+  binding: string,
+): boolean {
+  const nodes = versionBindings(phase, versionId, version).filter(
+    (node) => node.name === binding || node.binding === binding,
+  );
+  if (nodes.length > 1) {
+    throw new DeployError(
+      phase,
+      `version ${versionId} declares the ${binding} binding more than once`,
+      bindingInventoryDetail(nodes),
+    );
+  }
+  return nodes.length === 1;
 }
 
 function versionBindings(

@@ -10,7 +10,9 @@ import {
   type SigningAuthority,
 } from "./signing-authority.ts";
 import type { DeployTarget } from "./target.ts";
-import { servedVersionId } from "./worker-state.ts";
+import { publishedVersionBindingDeclared, servedVersionId } from "./worker-state.ts";
+
+const HOSTED_SPONSORSHIP_SECRET = "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN";
 
 /**
  * Tables whose absence means the deployment is not the product: identity,
@@ -121,9 +123,24 @@ export async function preflight(
   const signingAuthority = live.activeGrantKeyIds.includes(target.grantKeyId)
     ? await inspectSigningAuthority("preflight", configPath, target)
     : null;
-  const liveSigningKeyMatchesAuthority = signingAuthority
-    ? await liveSigningKeyMatches("preflight", configPath, target, signingAuthority)
-    : null;
+  const liveDeclaresSponsorshipSecret =
+    target.hostedSponsorship === true && live.servedVersionId !== null
+      ? await publishedVersionBindingDeclared(
+          "preflight",
+          configPath,
+          live.servedVersionId,
+          HOSTED_SPONSORSHIP_SECRET,
+        )
+      : false;
+  const liveSigningKeyMatchesAuthority =
+    signingAuthority &&
+    shouldProbeLiveSigning(
+      target.hostedSponsorship === true,
+      live.servedVersionId,
+      liveDeclaresSponsorshipSecret,
+    )
+      ? await liveSigningKeyMatches("preflight", configPath, target, signingAuthority)
+      : null;
   const signingKeyRepairRequired = liveSigningKeyMatchesAuthority === false;
 
   const { alreadyCurrent } = assertPublishedIdentity(
@@ -149,6 +166,14 @@ export async function preflight(
     signingAuthority,
     signingKeyRepairRequired,
   };
+}
+
+export function shouldProbeLiveSigning(
+  hostedSponsorship: boolean,
+  servedVersion: string | null,
+  sponsorshipSecretDeclared: boolean,
+): boolean {
+  return !hostedSponsorship || (servedVersion !== null && sponsorshipSecretDeclared);
 }
 
 /**

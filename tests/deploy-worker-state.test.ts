@@ -3,6 +3,7 @@ import { DeployError } from "../scripts/deploy/errors.ts";
 import {
   assertVersionBindingClosure,
   expectedBindingClosureForTarget,
+  versionBindingDeclared,
 } from "../scripts/deploy/worker-state.ts";
 
 const VERSION = {
@@ -54,6 +55,34 @@ describe("immutable Worker Version binding closure", () => {
         r2: { bucketName: "objects" },
       }).HOST_RUNTIME_MATERIALIZER,
     ).toBeNull();
+  });
+
+  test("detects first-enable secret binding from the immutable Version only", () => {
+    const withSecret = {
+      ...VERSION,
+      resources: {
+        bindings: [
+          ...VERSION.resources.bindings,
+          { type: "secret_text", name: "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN" },
+        ],
+      },
+    };
+    expect(
+      versionBindingDeclared(
+        "preflight",
+        "version-1",
+        withSecret,
+        "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN",
+      ),
+    ).toBeTrue();
+    expect(
+      versionBindingDeclared(
+        "preflight",
+        "version-1",
+        VERSION,
+        "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN",
+      ),
+    ).toBeFalse();
   });
 
   test("accepts the exact named service and entrypoint", () => {
