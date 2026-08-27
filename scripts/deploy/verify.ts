@@ -67,8 +67,17 @@ export async function probePublishedOrigin(
   const proven: string[] = [];
 
   const discovery = await readJson(`${origin}/.well-known/takoserver`, call);
-  if (discovery.status !== 200 || discovery.body.product !== "takoserver") {
-    throw verificationError(`discovery did not identify the product on ${origin}`);
+  const endpoints = discovery.body.endpoints;
+  if (
+    discovery.status !== 200 ||
+    discovery.body.product !== "takoserver" ||
+    typeof endpoints !== "object" ||
+    endpoints === null ||
+    Array.isArray(endpoints) ||
+    (endpoints as { api?: unknown }).api !== origin ||
+    (endpoints as { openapi?: unknown }).openapi !== `${origin}/openapi.json`
+  ) {
+    throw verificationError(`discovery endpoints did not match the published origin ${origin}`);
   }
   proven.push("public discovery served");
 
@@ -76,6 +85,16 @@ export async function probePublishedOrigin(
   const paths = Object.keys((document.body.paths ?? {}) as Record<string, unknown>);
   if (document.status !== 200 || paths.length === 0) {
     throw verificationError("the published origin served no API description");
+  }
+  const servers = document.body.servers;
+  if (
+    !Array.isArray(servers) ||
+    servers.length !== 1 ||
+    typeof servers[0] !== "object" ||
+    servers[0] === null ||
+    (servers[0] as { url?: unknown }).url !== origin
+  ) {
+    throw verificationError(`OpenAPI server does not match the published origin ${origin}`);
   }
   // The Takoform lane is the product's primary surface. A deployment that does
   // not describe it is not this product.

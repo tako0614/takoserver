@@ -104,6 +104,10 @@ function readNeutralConfig(): NeutralConfig {
  */
 export function deploymentVariables(target: DeployTarget): Record<string, unknown> {
   const vars: Record<string, string> = {};
+  // The canonical address is deployment identity, not request metadata. Every
+  // official Worker receives it explicitly so aliases cannot rewrite discovery
+  // or the OpenAPI server URL.
+  vars.PUBLIC_ORIGIN = target.publicOrigin;
   if (target.consoleOrigin !== undefined) vars.TAKOSERVER_CONSOLE_ORIGIN = target.consoleOrigin;
   if (target.googleClientId !== undefined) vars.GOOGLE_CLIENT_ID = target.googleClientId;
   if (target.takosId !== undefined) {

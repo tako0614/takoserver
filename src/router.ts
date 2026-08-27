@@ -1,7 +1,7 @@
 import type { ControlRoutes } from "./control.ts";
 import type { DataAiRoutes } from "./data-ai.ts";
 import { landingHtml } from "./landing.ts";
-import { openApiDocument } from "./openapi.ts";
+import { createOpenApiDocument } from "./openapi.ts";
 import type { SponsorshipRoutes } from "./sponsorship-api.ts";
 import type { TakoformHost } from "./takoform/types.ts";
 
@@ -119,7 +119,7 @@ function dispatch(options: CreateRouterOptions, origin: string): Router {
       });
     }
     if (request.method === "GET" && url.pathname === "/openapi.json") {
-      return Response.json(openApiDocument);
+      return Response.json(createOpenApiDocument(origin));
     }
     if (request.method === "GET" && url.pathname === "/.well-known/takoserver") {
       return Response.json({

@@ -285,6 +285,16 @@ export const openApiDocument = {
   paths: { ...PUBLIC_PATHS, ...takoformPaths() },
 } as const;
 
+/**
+ * Build the served document for one deployment. The checked artifact keeps the
+ * stable production origin above, while each running deployment advertises the
+ * public origin selected by its environment (or by an explicit local/test
+ * composition).
+ */
+export function createOpenApiDocument(publicOrigin: string) {
+  return { ...openApiDocument, servers: [{ url: publicOrigin }] };
+}
+
 /** Every path the document declares, sorted. Used by the contract test. */
 export function openApiPaths(): readonly string[] {
   return Object.keys(openApiDocument.paths).sort();
