@@ -59,6 +59,8 @@ export function createDeferredOperations(input: {
   readonly clock: Clock;
   readonly randomId: () => string;
   readonly omitObservedStatus?: boolean;
+  /** Retained alpha/beta wire duplicated path group/kind in exact lifecycle queries. */
+  readonly resourceQueryIncludesPathIdentity?: boolean;
 }): DeferredOperations {
   const pollsBeforeCommit = boundedInteger(
     input.configuration.pollsBeforeCommit ?? DEFAULT_POLLS_BEFORE_COMMIT,
@@ -99,6 +101,7 @@ export function createDeferredOperations(input: {
         input.forms,
         input.store,
         input.authority,
+        input.resourceQueryIncludesPathIdentity,
       );
       if (
         !(await input.configuration.shouldDefer({
@@ -379,6 +382,7 @@ async function acceptedMutation(
   forms: FormRegistry,
   store: TakoformStore,
   authority?: TakoformHostAuthority,
+  resourceQueryIncludesPathIdentity = false,
 ): Promise<{
   readonly lifecycleOperation: "create" | "update" | "import" | "delete";
   readonly formRef: TakoformV1Alpha3FormRef;
@@ -427,12 +431,17 @@ async function acceptedMutation(
     };
   }
 
-  exactQuery(context.url, ["space", "group", "kind", "definitionVersion", "schemaDigest"]);
+  exactQuery(
+    context.url,
+    resourceQueryIncludesPathIdentity
+      ? ["space", "group", "kind", "definitionVersion", "schemaDigest"]
+      : ["space", "definitionVersion", "schemaDigest"],
+  );
   const space = requiredQuery(context.url, "space");
   const form = exactInstalledForm(
     {
-      apiVersion: requiredQuery(context.url, "group"),
-      kind: requiredQuery(context.url, "kind"),
+      apiVersion: path.apiVersion,
+      kind: path.kind,
       definitionVersion: requiredQuery(context.url, "definitionVersion"),
       schemaDigest: requiredQuery(context.url, "schemaDigest"),
     },
@@ -440,8 +449,9 @@ async function acceptedMutation(
   );
   if (
     !form ||
-    form.identity.formRef.apiVersion !== path.apiVersion ||
-    form.identity.formRef.kind !== path.kind
+    (resourceQueryIncludesPathIdentity &&
+      (requiredQuery(context.url, "group") !== path.apiVersion ||
+        requiredQuery(context.url, "kind") !== path.kind))
   ) {
     throw new TakoformHostError("form_unknown", 404);
   }
@@ -503,6 +513,7 @@ function storedCommit(
           resource: mutation.resource,
           relations: mutation.relations,
           ...(mutation.claimKeys ? { claimKeys: mutation.claimKeys } : {}),
+          ...(mutation.preserveClaims ? { preserveClaims: true as const } : {}),
         }
       : {}),
     replayKey: mutation.replayKey,

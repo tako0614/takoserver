@@ -456,8 +456,6 @@ describe("Takoform run-token lane", () => {
 
     const query = new URLSearchParams({
       space: TENANT,
-      group: stableFormRef.apiVersion,
-      kind: stableFormRef.kind,
       definitionVersion: stableFormRef.definitionVersion,
       schemaDigest: stableFormRef.schemaDigest,
     });

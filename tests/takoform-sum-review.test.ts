@@ -81,7 +81,7 @@ test("validate and prepare reject a desired document that violates its declared 
   expect(await prepared?.json()).toMatchObject({ error: { code: "invalid_argument" } });
 });
 
-test("stable v1 binds a schema-valid prepare and enforces the declared sum before mutation", async () => {
+test("stable v1 rejects a schema-valid invalid sum during prepare before mutation", async () => {
   let applyCalls = 0;
   const driver: TakoformResourceDriver = {
     async apply(input) {
@@ -115,27 +115,8 @@ test("stable v1 binds a schema-valid prepare and enforces the declared sum befor
       body: JSON.stringify(desired),
     }),
   );
-  expect(prepared?.status).toBe(200);
-  if (!prepared) throw new Error("stable prepare did not return a response");
-  const review = ((await prepared.json()) as { review: Record<string, string> }).review;
-
-  const applied = await host.handle(
-    new Request(
-      "https://candidate.invalid/apis/forms.takoform.com/v1/resources/example.forms.invalid/WeightedThing/stable-weighted",
-      {
-        method: "PUT",
-        headers: {
-          authorization: "Bearer primary",
-          "content-type": "application/json",
-          "idempotency-key": "stable-sum-apply-0001",
-          "if-none-match": "*",
-        },
-        body: JSON.stringify({ ...desired, review }),
-      },
-    ),
-  );
-  expect(applied?.status).toBe(400);
-  expect(await applied?.json()).toMatchObject({ error: { code: "invalid_argument" } });
+  expect(prepared?.status).toBe(400);
+  expect(await prepared?.json()).toMatchObject({ error: { code: "invalid_argument" } });
   expect(applyCalls).toBe(0);
 });
 

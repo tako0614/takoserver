@@ -748,8 +748,6 @@ describe("durable read-only Takoform Host authority", () => {
 
     const query = new URLSearchParams({
       space: CONTEXT.space,
-      group: fixture.form.identity.formRef.apiVersion,
-      kind: fixture.form.identity.formRef.kind,
       definitionVersion: fixture.form.identity.formRef.definitionVersion,
       schemaDigest: fixture.form.identity.formRef.schemaDigest,
     });

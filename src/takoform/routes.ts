@@ -224,11 +224,19 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
           }),
           true,
         )
-      : { forms, bindings, availability: new Map<string, TakoformFormAvailability>() };
+      : {
+          forms,
+          bindings,
+          availability: new Map<string, TakoformFormAvailability>(),
+        };
 
   const requestCatalog = async (context: EngineContext, space: string | null) => {
     if (!authority) {
-      return { forms, bindings, availability: new Map<string, TakoformFormAvailability>() };
+      return {
+        forms,
+        bindings,
+        availability: new Map<string, TakoformFormAvailability>(),
+      };
     }
     if (space === null) {
       const support = await authority.supportCatalog({
@@ -268,7 +276,7 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
         try {
           return await provisionRoute(provision, engine, request, url);
         } catch (error) {
-          return hostErrorResponse(error, request, url);
+          return hostErrorResponse(error, request, url, true);
         }
       }
       if (url.pathname !== lane && !url.pathname.startsWith(`${lane}/`)) return null;
@@ -311,7 +319,7 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
         if (artifactResponse) return artifactResponse;
         return await route(context, url, request);
       } catch (error) {
-        return hostErrorResponse(error, request, url);
+        return hostErrorResponse(error, request, url, principal.scope !== undefined);
       }
     },
   };
@@ -469,7 +477,12 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
 
     const definition = formDefinitionPattern.exec(url.pathname);
     if (request.method === "GET" && definition) {
-      exactQuery(url, ["space", "group", "kind", "definitionVersion", "schemaDigest"]);
+      exactQuery(
+        url,
+        strictStableLane
+          ? ["space", "definitionVersion", "schemaDigest"]
+          : ["space", "group", "kind", "definitionVersion", "schemaDigest"],
+      );
       requiredQuery(url, "space");
       const catalog = await requestCatalog(context, requiredQuery(url, "space"));
       const apiVersion = joinedGroup(
@@ -478,7 +491,10 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
         strictStableLane,
       );
       const kind = safeSegment(strictStableLane ? definition[2] : definition[3]);
-      if (requiredQuery(url, "group") !== apiVersion || requiredQuery(url, "kind") !== kind) {
+      if (
+        !strictStableLane &&
+        (requiredQuery(url, "group") !== apiVersion || requiredQuery(url, "kind") !== kind)
+      ) {
         throw new TakoformHostError();
       }
       const form = exactInstalledForm(
@@ -504,10 +520,16 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
         url.pathname.endsWith("/validate") ? "validate" : "prepare",
       );
       if (result.kind === "validated") {
-        return Response.json({ valid: result.valid, diagnostics: result.diagnostics });
+        return Response.json({
+          valid: result.valid,
+          diagnostics: result.diagnostics,
+        });
       }
       if (result.kind !== "prepared") throw new TakoformHostError();
-      return Response.json({ resource: result.resource, review: result.review });
+      return Response.json({
+        resource: result.resource,
+        review: result.review,
+      });
     }
 
     const resource = resourcePattern.exec(url.pathname);
@@ -600,6 +622,7 @@ async function assertPrincipalScope(
     )}/${safeSegment(lane === STABLE_LANE ? definition[2] : definition[3])}`;
     if (
       candidate !== formPath ||
+      url.searchParams.get("space") !== scope.space ||
       url.searchParams.get("definitionVersion") !== scope.formRef.definitionVersion ||
       url.searchParams.get("schemaDigest") !== scope.formRef.schemaDigest
     ) {
@@ -626,7 +649,9 @@ async function assertPrincipalScope(
       path.apiVersion !== scope.formRef.apiVersion ||
       path.kind !== scope.formRef.kind ||
       path.name !== scope.resourceName ||
-      (bodyMutation ? url.search !== "" : !scopeQueryMatches(scope, url))
+      (bodyMutation
+        ? url.search !== ""
+        : !scopeResourceQueryMatches(scope, url, lane === STABLE_LANE))
     ) {
       throw new TakoformHostError("resource_not_found", 404);
     }
@@ -729,6 +754,21 @@ function scopeQueryMatches(scope: ExactResourcePrincipalScope, url: URL): boolea
   );
 }
 
+function scopeResourceQueryMatches(
+  scope: ExactResourcePrincipalScope,
+  url: URL,
+  stableLane: boolean,
+): boolean {
+  return (
+    url.searchParams.get("space") === scope.space &&
+    url.searchParams.get("definitionVersion") === scope.formRef.definitionVersion &&
+    url.searchParams.get("schemaDigest") === scope.formRef.schemaDigest &&
+    (stableLane ||
+      (url.searchParams.get("group") === scope.formRef.apiVersion &&
+        url.searchParams.get("kind") === scope.formRef.kind))
+  );
+}
+
 async function scopeBodyMatches(
   scope: ExactResourcePrincipalScope,
   request: Request,
@@ -768,13 +808,22 @@ async function scopeBodyMatches(
   );
 }
 
-function hostErrorResponse(error: unknown, request: Request, url: URL): Response {
+function hostErrorResponse(
+  error: unknown,
+  request: Request,
+  url: URL,
+  redactClaimHolder = false,
+): Response {
   if (error instanceof ArtifactInputError) return failure(error.code, error.status);
   if (error instanceof TakoformHostError) {
     if (process.env.TAKOSERVER_TRACE_HOST_ERRORS) {
       console.error("host error", error.code, error.status, error.stack);
     }
-    return failure(error.code, error.status, error.details);
+    return failure(
+      error.code,
+      error.status,
+      redactClaimHolder ? withoutClaimHolder(error.details) : error.details,
+    );
   }
   // Anything else is a driver or runtime fault. The caller gets an
   // internal error with a fresh request id and no borrowed message, so a
@@ -789,6 +838,12 @@ function hostErrorResponse(error: unknown, request: Request, url: URL): Response
     }),
   );
   return failure("internal_error", 500);
+}
+
+function withoutClaimHolder(details: unknown): unknown {
+  if (typeof details !== "object" || details === null || Array.isArray(details)) return details;
+  const entries = Object.entries(details).filter(([key]) => key !== "holder");
+  return entries.length === 0 ? undefined : Object.fromEntries(entries);
 }
 
 async function provisionRoute(
@@ -842,7 +897,10 @@ async function provisionRoute(
       url.pathname.endsWith("/validate") ? "validate" : "prepare",
     );
     if (result.kind === "validated") {
-      return Response.json({ valid: result.valid, diagnostics: result.diagnostics });
+      return Response.json({
+        valid: result.valid,
+        diagnostics: result.diagnostics,
+      });
     }
     if (result.kind !== "prepared") throw new TakoformHostError();
     return Response.json({ resource: result.resource, review: result.review });
@@ -934,7 +992,9 @@ function formDefinition(form: InstalledTakoformForm, exposeConstraints = false):
     ...(form.description ? { description: form.description } : {}),
     desiredSchema: structuredClone(form.desiredSchema),
     ...(exposeConstraints && form.constraints
-      ? { constraints: structuredClone(form.constraints) as unknown as JsonObject }
+      ? {
+          constraints: structuredClone(form.constraints) as unknown as JsonObject,
+        }
       : {}),
   };
 }

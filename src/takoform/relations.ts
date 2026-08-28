@@ -245,6 +245,22 @@ export function validateDeclaredConstraintRequest(input: {
   readonly spec: JsonObject;
 }): void {
   for (const constraint of input.form.constraints ?? []) {
+    if (constraint.kind === "sum") {
+      const entries = pointerValue(input.spec, constraint.list);
+      if (
+        !Array.isArray(entries) ||
+        entries.reduce((total, entry) => {
+          if (!record(entry)) return Number.NaN;
+          const value = entry[constraint.member];
+          return typeof value === "number" && Number.isSafeInteger(value)
+            ? total + value
+            : Number.NaN;
+        }, 0) !== constraint.total
+      ) {
+        throw new TakoformHostError("invalid_argument", 400, { constraint: "sum" });
+      }
+      continue;
+    }
     if (constraint.kind === "orderedPair") {
       const [leftPointer, rightPointer] = constraint.references;
       const left = pointerValue(input.spec, leftPointer);
@@ -301,11 +317,11 @@ export async function validateDeclaredConstraints(input: {
   readonly spec: JsonObject;
   readonly relations: readonly TakoformStoredRelation[];
   readonly forms: FormRegistry;
-  /** Review resolves only the four UID-backed mechanisms; mutation enforces the complete list. */
-  readonly resolvedUidOnly?: boolean;
+  /** Review checks relation- and live-state-dependent mechanisms without reserving their claims. */
+  readonly reviewPhaseOnly?: boolean;
   readonly store: Pick<
     TakoformStore,
-    | "claimHolders"
+    | "committedResourceClaimHolder"
     | "resourcesByRelation"
     | "readResource"
     | "readRelations"
@@ -314,8 +330,10 @@ export async function validateDeclaredConstraints(input: {
 }): Promise<void> {
   for (const constraint of input.form.constraints ?? []) {
     if (
-      input.resolvedUidOnly &&
-      !["acyclic", "distinctPair", "uniquePair", "sameResolvedTarget"].includes(constraint.kind)
+      input.reviewPhaseOnly &&
+      !["claim", "acyclic", "distinctPair", "uniquePair", "sameResolvedTarget"].includes(
+        constraint.kind,
+      )
     ) {
       continue;
     }
@@ -408,21 +426,22 @@ export async function validateDeclaredConstraints(input: {
     if (constraint.kind === "claim") {
       const value = pointerValue(input.spec, constraint.property);
       if (value === undefined) throw new TakoformHostError("invalid_argument", 400);
-      const holders = await input.store.claimHolders({
-        tenantId: input.tenantId,
-        sourceApiVersion: input.form.identity.formRef.apiVersion,
-        sourceKind: input.form.identity.formRef.kind,
-        pointer: constraint.property,
-        value,
-        limit: 2,
-      });
-      const holder = holders.find(
-        (candidate) =>
-          candidate.space !== input.space ||
-          candidate.resource.metadata.name !== input.resourceName,
+      const holder = await input.store.committedResourceClaimHolder(
+        await claimConstraintKey({
+          tenantId: input.tenantId,
+          form: input.form,
+          property: constraint.property,
+          value,
+        }),
       );
-      if (holder) {
-        throw new TakoformHostError("invalid_argument", 400, { holder: holder.name });
+      if (
+        holder &&
+        (holder.holderSpace !== input.space ||
+          holder.holderApiVersion !== input.form.identity.formRef.apiVersion ||
+          holder.holderKind !== input.form.identity.formRef.kind ||
+          holder.holderName !== input.resourceName)
+      ) {
+        throw new TakoformHostError("invalid_argument", 400, { holder: holder.holderName });
       }
     }
   }
@@ -634,15 +653,12 @@ export async function declaredResourceClaims(input: {
       const value = pointerValue(input.spec, constraint.property);
       if (value === undefined) throw new TakoformHostError("invalid_argument", 400);
       claims.push({
-        key: `claim_${await canonicalDigest({
+        key: await claimConstraintKey({
           tenantId: input.tenantId,
-          form: {
-            apiVersion: input.form.identity.formRef.apiVersion,
-            kind: input.form.identity.formRef.kind,
-          },
+          form: input.form,
           property: constraint.property,
           value,
-        })}`,
+        }),
       });
       continue;
     }
@@ -671,6 +687,23 @@ export async function declaredResourceClaims(input: {
     });
   }
   return claims.sort((left, right) => left.key.localeCompare(right.key));
+}
+
+async function claimConstraintKey(input: {
+  readonly tenantId: string;
+  readonly form: InstalledTakoformForm;
+  readonly property: string;
+  readonly value: unknown;
+}): Promise<string> {
+  return `claim_${await canonicalDigest({
+    tenantId: input.tenantId,
+    form: {
+      apiVersion: input.form.identity.formRef.apiVersion,
+      kind: input.form.identity.formRef.kind,
+    },
+    property: input.property,
+    value: input.value,
+  })}`;
 }
 
 /** Renders, but never repairs, a stored UID pin whose target moved or vanished. */

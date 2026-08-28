@@ -696,8 +696,8 @@ async function addressedResource(
   };
   const current = await store.readResource(address);
   const query = {
-    apiVersion: url.searchParams.get("group"),
-    kind: url.searchParams.get("kind"),
+    apiVersion: address.apiVersion,
+    kind: address.kind,
     definitionVersion: url.searchParams.get("definitionVersion"),
     schemaDigest: url.searchParams.get("schemaDigest"),
   };

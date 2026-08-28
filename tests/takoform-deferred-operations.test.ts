@@ -600,6 +600,90 @@ describe("durable deferred Takoform operations", () => {
     database.close();
   });
 
+  test("a deferred no-op preserves the live Resource's committed claim", async () => {
+    const opened = persistentHarness(undefined, new InMemoryTakoformResourceDriver(), [
+      claimedForm,
+    ]).open();
+    const desired = (name: string) => ({
+      apiVersion: claimedForm.identity.formRef.apiVersion,
+      kind: claimedForm.identity.formRef.kind,
+      form: { formRef: claimedForm.identity.formRef },
+      metadata: { name, space: "main" },
+      spec: { value: "one-deferred-claim" },
+    });
+    const holder = desired("deferred-holder");
+    const holderReview = await prepareReviewFor(opened.host, holder);
+    const created = await opened.host.handle(
+      request(
+        `${lane}/resources/example.forms.invalid/DeferredClaimedThing/deferred-holder`,
+        "primary",
+        {
+          method: "PUT",
+          headers: {
+            "idempotency-key": "deferred-holder-create-0001",
+            "if-none-match": "*",
+          },
+          body: JSON.stringify({ ...holder, review: holderReview }),
+        },
+      ),
+    );
+    expect(created?.status).toBe(201);
+    if (!created) throw new Error("deferred claim holder create returned no response");
+    const generation = String(
+      ((await created.json()) as { metadata?: { generation?: unknown } }).metadata?.generation,
+    );
+
+    const noOpReview = await prepareReviewFor(opened.host, holder, {
+      "takoform-expected-generation": generation,
+    });
+    const accepted = await opened.host.handle(
+      request(
+        `${lane}/resources/example.forms.invalid/DeferredClaimedThing/deferred-holder`,
+        "primary",
+        {
+          method: "PUT",
+          headers: {
+            "idempotency-key": "deferred-holder-no-op-0001",
+            "takoform-conformance-probe": "async",
+            "takoform-expected-generation": generation,
+          },
+          body: JSON.stringify({ ...holder, review: noOpReview }),
+        },
+      ),
+    );
+    expect(accepted?.status).toBe(202);
+    if (!accepted) throw new Error("deferred no-op returned no response");
+    const operationId = ((await accepted.json()) as { operation: { id: string } }).operation.id;
+    const operationPath = `${lane}/operations/${operationId}`;
+    await opened.host.handle(request(operationPath, "primary"));
+    await opened.host.handle(request(operationPath, "primary"));
+    const settled = await opened.host.handle(request(operationPath, "primary"));
+    expect(await settled?.json()).toMatchObject({
+      done: true,
+      result: { resource: { metadata: { name: "deferred-holder" } } },
+    });
+
+    const contender = desired("deferred-contender");
+    const contenderReview = await prepareReviewFor(opened.host, contender);
+    const refused = await opened.host.handle(
+      request(
+        `${lane}/resources/example.forms.invalid/DeferredClaimedThing/deferred-contender`,
+        "primary",
+        {
+          method: "PUT",
+          headers: {
+            "idempotency-key": "deferred-contender-create-0001",
+            "if-none-match": "*",
+          },
+          body: JSON.stringify({ ...contender, review: contenderReview }),
+        },
+      ),
+    );
+    expect(refused?.status).toBe(400);
+    expect(await refused?.json()).toMatchObject({ error: { code: "invalid_argument" } });
+    opened.close();
+  });
+
   test("refuses a replacement incarnation before provider work and records a deterministic terminal", async () => {
     let providerCalls = 0;
     const memory = new InMemoryTakoformResourceDriver();
@@ -873,6 +957,7 @@ describe("durable deferred Takoform operations", () => {
 function persistentHarness(
   clock: () => Date = () => new Date(),
   driver: TakoformResourceDriver = new InMemoryTakoformResourceDriver(),
+  forms: readonly InstalledTakoformForm[] = [form],
 ) {
   const root = mkdtempSync(join(tmpdir(), "takoserver-deferred-operation-"));
   roots.push(root);
@@ -898,7 +983,7 @@ function persistentHarness(
           }
           return null;
         },
-        forms: [form],
+        forms,
         driver,
         routes: {
           hostApiVersion: "forms.takoform.com/v1beta4",
@@ -992,6 +1077,22 @@ function desiredResource(name: string, value: string) {
 async function prepareReview(
   host: TakoformHost,
   desired: ReturnType<typeof desiredResource>,
+  headers: Record<string, string> = {},
+): Promise<Record<string, string>> {
+  const prepared = await host.handle(
+    request(`${lane}/resources/prepare`, "primary", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(desired),
+    }),
+  );
+  if (!prepared?.ok) throw new Error(`prepare failed: ${prepared?.status}`);
+  return ((await prepared.json()) as { review: Record<string, string> }).review;
+}
+
+async function prepareReviewFor(
+  host: TakoformHost,
+  desired: Record<string, unknown>,
   headers: Record<string, string> = {},
 ): Promise<Record<string, string>> {
   const prepared = await host.handle(

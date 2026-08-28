@@ -104,6 +104,8 @@ export interface ResourceMutationCommit {
   readonly replay: StoredReplay;
   readonly providerReceipt?: TakoformDriverReceipt;
   readonly claimKeys?: readonly string[];
+  /** An identity-preserving no-op must leave the live Resource's committed claims untouched. */
+  readonly preserveClaims?: true;
   readonly authorityFence?: TakoformAuthorityFence;
 }
 
@@ -194,15 +196,6 @@ export interface TakoformStore {
     hostname: string,
     limit: number,
   ): Promise<readonly ResourceListing[]>;
-  /** Live holders of one Definition-declared claim value, across tenant spaces. */
-  claimHolders(input: {
-    readonly tenantId: string;
-    readonly sourceApiVersion: string;
-    readonly sourceKind: string;
-    readonly pointer: string;
-    readonly value: unknown;
-    readonly limit: number;
-  }): Promise<readonly ResourceListing[]>;
   /** Whether following QueueConsumer dead-letter edges reaches another queue. */
   queuePathReaches(input: {
     readonly tenantId: string;
@@ -350,6 +343,8 @@ export interface TakoformStore {
     reservations: readonly ResourceClaimReservation[],
     expiresAt: number,
   ): Promise<void>;
+  /** The live Resource that committed this canonical claim; pending reservations are invisible. */
+  committedResourceClaimHolder(key: string): Promise<ResourceClaimHolder | null>;
   resourceClaimHolder(key: string): Promise<ResourceClaimHolder | null>;
   releaseResourceClaims(operationId: string): Promise<void>;
   releaseCommittedResourceClaims(tenantId: string, holderUid: string): Promise<void>;
@@ -545,25 +540,6 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         [tenantId, hostname, Math.min(Math.max(limit, 1), 2)],
       );
       return rows.map(resourceListing);
-    },
-
-    async claimHolders(input): Promise<readonly ResourceListing[]> {
-      const rows = await sql.query(
-        `SELECT space, api_version, kind, name, uid, generation, revision,
-                updated_at, resource_json
-         FROM tf_resources
-         WHERE tenant_id = ? AND api_version = ? AND kind = ?
-         ORDER BY space, name`,
-        [input.tenantId, input.sourceApiVersion, input.sourceKind],
-      );
-      const claimed = canonicalJson(input.value);
-      return rows
-        .map(resourceListing)
-        .filter((entry) => {
-          const value = pointerValue(entry.resource.spec, input.pointer);
-          return value !== undefined && canonicalJson(value) === claimed;
-        })
-        .slice(0, Math.min(Math.max(input.limit, 1), 2));
     },
 
     async queuePathReaches(input): Promise<boolean> {
@@ -1637,7 +1613,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
             now() + REPLAY_TTL_MILLISECONDS,
           ],
         },
-        ...claimCommitStatements({ ...operation, id: leaseToken }, claimKeys, now()),
+        ...(mutation.preserveClaims
+          ? []
+          : claimCommitStatements({ ...operation, id: leaseToken }, claimKeys, now())),
         {
           sql: `UPDATE tf_deferred_operations
                 SET phase = 'succeeded', terminal_json = ?, committed_uid = ?,
@@ -1688,6 +1666,28 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         if (!(error instanceof SqlError) || error.code !== "constraint") throw error;
         throw await commitFenceError(operation, leaseToken);
       }
+    },
+
+    async committedResourceClaimHolder(key) {
+      const rows = await sql.query(
+        `SELECT tenant_id, holder_space, holder_api_version, holder_kind,
+                holder_name, holder_uid
+         FROM tf_resource_claims
+         WHERE claim_key = ? AND state = 'committed'
+         LIMIT 1`,
+        [key],
+      );
+      const row = rows[0];
+      return row
+        ? {
+            tenantId: text(row.tenant_id),
+            holderSpace: text(row.holder_space),
+            holderApiVersion: text(row.holder_api_version),
+            holderKind: text(row.holder_kind),
+            holderName: text(row.holder_name),
+            holderUid: text(row.holder_uid),
+          }
+        : null;
     },
 
     async resourceClaimHolder(key) {
@@ -2185,15 +2185,17 @@ function providerMutationCommitStatements(input: {
         input.now + REPLAY_TTL_MILLISECONDS,
       ],
     },
-    ...claimCommitStatements(
-      {
-        id: input.claimOwnerId,
-        tenantId: input.tenantId,
-        resourceUid: mutation.resourceUid,
-      },
-      mutation.kind === "delete" ? [] : claimKeys,
-      input.now,
-    ),
+    ...(mutation.preserveClaims
+      ? []
+      : claimCommitStatements(
+          {
+            id: input.claimOwnerId,
+            tenantId: input.tenantId,
+            resourceUid: mutation.resourceUid,
+          },
+          mutation.kind === "delete" ? [] : claimKeys,
+          input.now,
+        )),
     ...(input.beforeOperationStatements ?? []),
     {
       sql: `INSERT OR IGNORE INTO tf_operations
@@ -2675,19 +2677,6 @@ function resourceListing(row: Row): ResourceListing {
 
 function text(value: unknown): string {
   if (typeof value !== "string") throw new TypeError("expected a text column");
-  return value;
-}
-
-function pointerValue(root: unknown, pointer: string): unknown {
-  if (!pointer.startsWith("/")) return undefined;
-  let value = root;
-  for (const token of pointer
-    .slice(1)
-    .split("/")
-    .map((part) => part.replaceAll("~1", "/").replaceAll("~0", "~"))) {
-    if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-    value = (value as Record<string, unknown>)[token];
-  }
   return value;
 }
 

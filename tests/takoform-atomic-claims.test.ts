@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { createEphemeralSql } from "../src/compat.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
-import type { JsonObject } from "../src/ports.ts";
+import type { JsonObject, Sql } from "../src/ports.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
 import { createTakoformStore } from "../src/takoform/store.ts";
 import type {
@@ -9,7 +9,10 @@ import type {
   TakoformDriverReceipt,
   TakoformResourceDriver,
 } from "../src/takoform/types.ts";
-import { createConfiguredHistoricalTakoformHost } from "./helpers/historical-takoform-host.ts";
+import {
+  createConfiguredHistoricalTakoformHost,
+  createStaticStableTestTakoformHost,
+} from "./helpers/historical-takoform-host.ts";
 
 const lane = "/apis/forms.takoform.com/v1beta4";
 const form: InstalledTakoformForm = {
@@ -135,6 +138,163 @@ test("a create reserves a Definition claim atomically across provider await and 
   );
   expect(retried?.status).toBe(201);
   expect(importCalls).toBe(1);
+});
+
+test("stable prepare rejects a claim already held by another live resource", async () => {
+  const durable = createEphemeralSql();
+  let inspectPrepareReads = false;
+  let formResourceEnumerations = 0;
+  const sql: Sql = {
+    query: async (statement, params) => {
+      const normalized = statement.replaceAll(/\s+/gu, " ").trim();
+      if (
+        inspectPrepareReads &&
+        normalized.includes(
+          "FROM tf_resources WHERE tenant_id = ? AND api_version = ? AND kind = ?",
+        )
+      ) {
+        formResourceEnumerations += 1;
+      }
+      return durable.query(statement, params);
+    },
+    run: (statement, params) => durable.run(statement, params),
+    batch: (statements) => durable.batch(statements),
+  };
+  const host = createStaticStableTestTakoformHost({
+    sql,
+    objects: createMemoryObjectStore(),
+    authenticate: async () => ({ tenantId: "tenant-a", principalId: "principal-a" }),
+    forms: [form],
+    driver: new InMemoryTakoformResourceDriver(),
+  });
+  const stableLane = "/apis/forms.takoform.com/v1";
+  const holder = resource("stable-holder");
+  const prepared = await host.handle(
+    jsonRequest(`${stableLane}/resources/prepare`, "POST", holder),
+  );
+  expect(prepared?.status).toBe(200);
+  if (!prepared) throw new Error("stable prepare did not return a response");
+  const review = ((await prepared.json()) as { review: Record<string, string> }).review;
+  const created = await host.handle(
+    jsonRequest(
+      `${stableLane}/resources/example.forms.invalid/ClaimedName/stable-holder`,
+      "PUT",
+      { ...holder, review },
+      { "idempotency-key": "stable-claim-create-0001", "if-none-match": "*" },
+    ),
+  );
+  expect(created?.status).toBe(201);
+  if (!created) throw new Error("stable holder create did not return a response");
+  const generation = String(
+    ((await created.json()) as { metadata?: { generation?: unknown } }).metadata?.generation,
+  );
+
+  const restated = await host.handle(
+    jsonRequest(`${stableLane}/resources/prepare`, "POST", holder, {
+      "takoform-expected-generation": generation,
+    }),
+  );
+  expect(restated?.status).toBe(200);
+  if (!restated) throw new Error("stable holder restatement did not return a response");
+  const restatedReview = ((await restated.json()) as { review: Record<string, string> }).review;
+  const noOp = await host.handle(
+    jsonRequest(
+      `${stableLane}/resources/example.forms.invalid/ClaimedName/stable-holder`,
+      "PUT",
+      { ...holder, review: restatedReview },
+      {
+        "idempotency-key": "stable-claim-no-op-0001",
+        "takoform-expected-generation": generation,
+      },
+    ),
+  );
+  expect(noOp?.status).toBe(200);
+
+  inspectPrepareReads = true;
+  const collision = await host.handle(
+    jsonRequest(`${stableLane}/resources/prepare`, "POST", resource("stable-contender")),
+  );
+  expect(collision?.status).toBe(400);
+  expect(await collision?.json()).toMatchObject({
+    error: { code: "invalid_argument", details: { holder: "stable-holder" } },
+  });
+  expect(formResourceEnumerations).toBe(0);
+});
+
+test("scoped credentials do not disclose a foreign claim holder", async () => {
+  const scopedResourceName = "scoped-contender";
+  const host = createStaticStableTestTakoformHost({
+    sql: createEphemeralSql(),
+    objects: createMemoryObjectStore(),
+    authenticate: async (request) => {
+      if (request.headers.get("authorization") === "Bearer scoped") {
+        return {
+          tenantId: "tenant-a",
+          principalId: "scoped-principal",
+          scope: {
+            space: "main",
+            formRef: form.identity.formRef,
+            resourceName: scopedResourceName,
+            mode: "manage" as const,
+          },
+        };
+      }
+      if (request.headers.get("authorization") === "Bearer tenant-run") {
+        return {
+          tenantId: "tenant-a",
+          principalId: "tenant-run-principal",
+          scope: { space: "main", mode: "tenant-run" as const },
+        };
+      }
+      return { tenantId: "tenant-a", principalId: "organization-principal" };
+    },
+    forms: [form],
+    driver: new InMemoryTakoformResourceDriver(),
+  });
+  const stableLane = "/apis/forms.takoform.com/v1";
+  const foreignHolder = {
+    ...resource("foreign-holder"),
+    metadata: { name: "foreign-holder", space: "foreign" },
+  };
+  const prepared = await host.handle(
+    jsonRequest(`${stableLane}/resources/prepare`, "POST", foreignHolder),
+  );
+  expect(prepared?.status).toBe(200);
+  if (!prepared) throw new Error("foreign holder prepare did not return a response");
+  const review = ((await prepared.json()) as { review: Record<string, string> }).review;
+  const created = await host.handle(
+    jsonRequest(
+      `${stableLane}/resources/example.forms.invalid/ClaimedName/foreign-holder`,
+      "PUT",
+      { ...foreignHolder, review },
+      { "idempotency-key": "foreign-claim-create-0001", "if-none-match": "*" },
+    ),
+  );
+  expect(created?.status).toBe(201);
+
+  const collision = await host.handle(
+    jsonRequest(`${stableLane}/resources/prepare`, "POST", resource(scopedResourceName), {
+      authorization: "Bearer scoped",
+    }),
+  );
+  expect(collision?.status).toBe(400);
+  const body = (await collision?.json()) as {
+    readonly error?: { readonly code?: unknown; readonly details?: unknown };
+  };
+  expect(body.error?.code).toBe("invalid_argument");
+  expect(body.error?.details).toBeUndefined();
+
+  const tenantRunCollision = await host.handle(
+    jsonRequest(`${stableLane}/resources/prepare`, "POST", resource("tenant-run-contender"), {
+      authorization: "Bearer tenant-run",
+    }),
+  );
+  expect(tenantRunCollision?.status).toBe(400);
+  const tenantRunBody = (await tenantRunCollision?.json()) as {
+    readonly error?: { readonly code?: unknown; readonly details?: unknown };
+  };
+  expect(tenantRunBody.error?.code).toBe("invalid_argument");
+  expect(tenantRunBody.error?.details).toBeUndefined();
 });
 
 test("an expired reservation can be recovered but its stale provider winner cannot commit", async () => {

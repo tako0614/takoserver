@@ -28,7 +28,7 @@ if (
   throw new Error(`TASK-0032 evidence is pinned to ${corpus}`);
 }
 
-const EXPECTED_TAKOFORM_COMMIT = "a225cfa7c84aa551981cc8ad56c9a281fa6e051a";
+const EXPECTED_TAKOFORM_COMMIT = "c32332b550bbbc43049581d1e11766854e71fb4f";
 const TAKOFORM_PATHS = [
   "go.mod",
   "go.sum",
@@ -36,6 +36,8 @@ const TAKOFORM_PATHS = [
   "formpackage",
   "internal/currentformmodel",
   "internal/currentformregistry",
+  "internal/currentformselection",
+  "internal/currentformsnapshot",
   "internal/portableconformancev3",
   "conformance/takoform-v1",
   "forms/candidates",
@@ -50,7 +52,7 @@ const PINNED_FILES = new Map([
   ],
   [
     "conformance/takoform-v1/manifest.json",
-    "sha256:7f3547d976592c8b8e71eea20a0b9ba80c5e9aa8e649bb4943a1a155510c83f8",
+    "sha256:1651e9bb4f302a8073881d3320f3c4afed54fce56ef8bacee976e166171f3aa5",
   ],
   [
     "conformance/takoform-v1/generic-host/portable-host/manifest.json",

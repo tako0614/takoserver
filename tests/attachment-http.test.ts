@@ -232,8 +232,6 @@ async function deleteResource(
   const formRef = installed.identity.formRef;
   const query = new URLSearchParams({
     space: "production",
-    group: formRef.apiVersion,
-    kind: formRef.kind,
     definitionVersion: formRef.definitionVersion,
     schemaDigest: formRef.schemaDigest,
   });

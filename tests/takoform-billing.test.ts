@@ -180,8 +180,7 @@ async function tenant(fetch: (request: Request) => Promise<Response>) {
 
 const LANE = "/apis/forms.takoform.com/v1";
 const QUERY =
-  `space=default&group=${encodeURIComponent(FORM_REF.apiVersion)}&kind=${FORM_REF.kind}` +
-  `&definitionVersion=${FORM_REF.definitionVersion}` +
+  `space=default&definitionVersion=${FORM_REF.definitionVersion}` +
   `&schemaDigest=${encodeURIComponent(FORM_REF.schemaDigest)}`;
 
 async function applyBucket(

@@ -128,6 +128,7 @@ export type EngineMutationCommit =
       readonly replay: StoredReplay;
       readonly providerReceipt?: TakoformDriverReceipt;
       readonly claimKeys?: readonly string[];
+      readonly preserveClaims?: true;
       readonly authorityFence?: TakoformAuthorityFence;
     }
   | {
@@ -186,8 +187,10 @@ export interface CreateTakoformEngineOptions {
   readonly allowBodyGenerationFence?: boolean;
   readonly allowReviewSpecDigest?: boolean;
   readonly standardServiceResolver?: TakoformStandardServiceResolver;
-  /** Stable v1 defers mutation-only declared constraints until apply/import. */
+  /** Stable v1 resolves only relation-dependent declared constraints during review. */
   readonly stableReviewConstraintPhases?: boolean;
+  /** Retained alpha/beta wire duplicated path group/kind in exact lifecycle queries. */
+  readonly resourceQueryIncludesPathIdentity?: boolean;
   readonly availability?: TakoformFormAvailabilityResolver;
   /** Durable public authority. Omitted only by the historical in-process test harness. */
   readonly authority?: TakoformHostAuthority;
@@ -200,6 +203,9 @@ export interface CreateTakoformEngineOptions {
 
 export function createTakoformEngine(options: CreateTakoformEngineOptions): TakoformEngine {
   const { store, forms, bindings, driver, artifacts, clock, randomId } = options;
+  const resourceQueryKeys = options.resourceQueryIncludesPathIdentity
+    ? (["space", "group", "kind", "definitionVersion", "schemaDigest"] as const)
+    : (["space", "definitionVersion", "schemaDigest"] as const);
   const providerMutationLeaseMilliseconds =
     options.providerMutationLeaseMilliseconds ?? PROVIDER_MUTATION_EXECUTION_LEASE_MILLISECONDS;
   if (
@@ -435,8 +441,8 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
     path: ResourcePath,
   ): InstalledTakoformForm["identity"]["formRef"] | undefined => {
     if (
-      requiredQuery(url, "group") !== path.apiVersion ||
-      requiredQuery(url, "kind") !== path.kind
+      options.resourceQueryIncludesPathIdentity &&
+      (requiredQuery(url, "group") !== path.apiVersion || requiredQuery(url, "kind") !== path.kind)
     ) {
       return undefined;
     }
@@ -591,6 +597,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         spec: canonicalizeEdgeSpec(form, materializeDefaults(form.desiredSchema, parsed.spec)),
       };
       const diagnostics = [...validateDesired(form, requestResource.spec)];
+      let declaredConstraintError: TakoformHostError | undefined;
       if (!diagnostics.some((entry) => entry.severity === "error")) {
         try {
           validateDeclaredConstraintRequest({
@@ -601,7 +608,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           const reviewConstraints = form.constraints ?? [];
           const needsResolvedReview = options.stableReviewConstraintPhases
             ? reviewConstraints.some((constraint) =>
-                ["acyclic", "distinctPair", "uniquePair", "sameResolvedTarget"].includes(
+                ["claim", "acyclic", "distinctPair", "uniquePair", "sameResolvedTarget"].includes(
                   constraint.kind,
                 ),
               )
@@ -635,11 +642,12 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               relations,
               forms: runtime.forms,
               store,
-              ...(options.stableReviewConstraintPhases ? { resolvedUidOnly: true } : {}),
+              ...(options.stableReviewConstraintPhases ? { reviewPhaseOnly: true } : {}),
             });
           }
         } catch (error) {
           if (!(error instanceof TakoformHostError)) throw error;
+          declaredConstraintError = error;
           diagnostics.push({
             severity: "error",
             message: error.code,
@@ -654,6 +662,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         };
       }
       if (diagnostics.some((entry) => entry.severity === "error")) {
+        if (declaredConstraintError) throw declaredConstraintError;
         throw new TakoformHostError("invalid_argument", 400, { diagnostics });
       }
       await resolveStandardServiceSlots({
@@ -719,7 +728,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
     },
 
     async read(context, path): Promise<EngineResult> {
-      exactQuery(context.url, ["space", "group", "kind", "definitionVersion", "schemaDigest"]);
+      exactQuery(context.url, resourceQueryKeys);
       const space = requiredQuery(context.url, "space");
       const address = addressFromParts(context.tenantId, space, path);
       let resource = await store.readResource(address);
@@ -978,6 +987,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             relations: currentRelations,
             replayKey,
             replay: replayRecord,
+            preserveClaims: true,
             ...(authority.fence ? { authorityFence: authority.fence } : {}),
           });
         } else {
@@ -995,6 +1005,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               relations: currentRelations,
               replayKey,
               replay: replayRecord,
+              preserveClaims: true,
               ...(authority.fence ? { authorityFence: authority.fence } : {}),
             },
           });
@@ -1292,7 +1303,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
     },
 
     async observe(context, path): Promise<EngineResult> {
-      exactQuery(context.url, ["space", "group", "kind", "definitionVersion", "schemaDigest"]);
+      exactQuery(context.url, resourceQueryKeys);
       const address = addressFromParts(context.tenantId, requiredQuery(context.url, "space"), path);
       const current = await store.readResource(address);
       const queriedFormRef = formRefFromResourceQuery(context.url, path);
@@ -1744,7 +1755,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
     },
 
     async remove(context, path): Promise<EngineResult> {
-      exactQuery(context.url, ["space", "group", "kind", "definitionVersion", "schemaDigest"]);
+      exactQuery(context.url, resourceQueryKeys);
       const space = requiredQuery(context.url, "space");
       const address = addressFromParts(context.tenantId, space, path);
       const expected = requiredExpectedGeneration(context.request);

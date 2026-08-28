@@ -191,7 +191,9 @@ describe("literal stable Takoform Host cutover", () => {
 
     const noSpace = await host.handle(new Request(root, { headers }));
     expect(noSpace?.status).toBe(200);
-    expect(await noSpace?.json()).toMatchObject({ forms: [{ identity: form.identity }] });
+    expect(await noSpace?.json()).toMatchObject({
+      forms: [{ identity: form.identity }],
+    });
 
     for (const query of [
       `group=${encodeURIComponent(form.identity.formRef.apiVersion)}`,
@@ -202,13 +204,18 @@ describe("literal stable Takoform Host cutover", () => {
     ]) {
       const response = await host.handle(new Request(`${root}?${query}`, { headers }));
       expect(response?.status).toBe(200);
-      expect(await response?.json()).toMatchObject({ forms: [{ identity: form.identity }] });
+      expect(await response?.json()).toMatchObject({
+        forms: [{ identity: form.identity }],
+      });
     }
   });
 
   test("rejects empty or malformed stable Form filters", async () => {
     const host = createInMemoryTakoformHost({
-      authenticate: async () => ({ tenantId: "tenant-a", principalId: "principal-a" }),
+      authenticate: async () => ({
+        tenantId: "tenant-a",
+        principalId: "principal-a",
+      }),
       forms: [],
     });
     const root = "https://api.takoserver.com/apis/forms.takoform.com/v1/forms";
@@ -221,7 +228,9 @@ describe("literal stable Takoform Host cutover", () => {
     ]) {
       const response = await host.handle(new Request(`${root}?${query}`));
       expect(response?.status).toBe(400);
-      expect(await response?.json()).toMatchObject({ error: { code: "invalid_argument" } });
+      expect(await response?.json()).toMatchObject({
+        error: { code: "invalid_argument" },
+      });
     }
   });
 
@@ -239,14 +248,15 @@ describe("literal stable Takoform Host cutover", () => {
       operations: ["create", "read", "delete"] as const,
     };
     const host = createInMemoryTakoformHost({
-      authenticate: async () => ({ tenantId: "tenant-a", principalId: "principal-a" }),
+      authenticate: async () => ({
+        tenantId: "tenant-a",
+        principalId: "principal-a",
+      }),
       forms: [form],
     });
     const ref = form.identity.formRef;
     const query = new URLSearchParams({
       space: "main",
-      group: ref.apiVersion,
-      kind: ref.kind,
       definitionVersion: ref.definitionVersion,
       schemaDigest: ref.schemaDigest,
     });
@@ -268,7 +278,27 @@ describe("literal stable Takoform Host cutover", () => {
       ),
     );
     expect(missing?.status).toBe(404);
-    expect(await missing?.json()).toMatchObject({ error: { code: "resource_not_found" } });
+    expect(await missing?.json()).toMatchObject({
+      error: { code: "resource_not_found" },
+    });
+
+    const duplicatedPathIdentity = new URLSearchParams(query);
+    duplicatedPathIdentity.set("group", ref.apiVersion);
+    duplicatedPathIdentity.set("kind", ref.kind);
+    for (const path of [
+      `/form-definitions/${ref.apiVersion}/${ref.kind}`,
+      `/resources/${ref.apiVersion}/${ref.kind}/missing`,
+    ]) {
+      const response = await host.handle(
+        new Request(
+          `https://api.takoserver.com/apis/forms.takoform.com/v1${path}?${duplicatedPathIdentity}`,
+        ),
+      );
+      expect(response?.status).toBe(400);
+      expect(await response?.json()).toMatchObject({
+        error: { code: "invalid_argument" },
+      });
+    }
 
     const unknownQuery = new URLSearchParams(query);
     unknownQuery.set("definitionVersion", "9.9.9");
@@ -278,7 +308,9 @@ describe("literal stable Takoform Host cutover", () => {
       ),
     );
     expect(unknownForm?.status).toBe(404);
-    expect(await unknownForm?.json()).toMatchObject({ error: { code: "form_unknown" } });
+    expect(await unknownForm?.json()).toMatchObject({
+      error: { code: "form_unknown" },
+    });
 
     for (const path of [
       `/form-definitions/${ref.apiVersion}/v1beta1/${ref.kind}`,
@@ -289,7 +321,9 @@ describe("literal stable Takoform Host cutover", () => {
         new Request(`https://api.takoserver.com/apis/forms.takoform.com/v1${path}?${query}`),
       );
       expect(response?.status).toBe(404);
-      expect(await response?.json()).toMatchObject({ error: { code: "invalid_argument" } });
+      expect(await response?.json()).toMatchObject({
+        error: { code: "invalid_argument" },
+      });
     }
 
     const encodedSlash = await host.handle(
@@ -298,6 +332,53 @@ describe("literal stable Takoform Host cutover", () => {
       ),
     );
     expect(encodedSlash?.status).toBe(400);
-    expect(await encodedSlash?.json()).toMatchObject({ error: { code: "invalid_argument" } });
+    expect(await encodedSlash?.json()).toMatchObject({
+      error: { code: "invalid_argument" },
+    });
+  });
+
+  test("binds exact-principal definition reads to the authorized space", async () => {
+    const form: InstalledTakoformForm = {
+      identity: {
+        formRef: {
+          apiVersion: "function.forms.takoform.com",
+          kind: "Function",
+          definitionVersion: "0.1.0",
+          schemaDigest: `sha256:${"c".repeat(64)}`,
+        },
+      },
+      desiredSchema: { type: "object", additionalProperties: false },
+      operations: ["create", "read", "delete"] as const,
+    };
+    const ref = form.identity.formRef;
+    const host = createInMemoryTakoformHost({
+      authenticate: async () => ({
+        tenantId: "tenant-a",
+        principalId: "principal-a",
+        scope: {
+          space: "allowed-space",
+          formRef: ref,
+          resourceName: "function-a",
+          mode: "manage" as const,
+        },
+      }),
+      forms: [form],
+    });
+    const definition = `/apis/forms.takoform.com/v1/form-definitions/${ref.apiVersion}/${ref.kind}`;
+    const query = new URLSearchParams({
+      space: "allowed-space",
+      definitionVersion: ref.definitionVersion,
+      schemaDigest: ref.schemaDigest,
+    });
+
+    const allowed = await host.handle(new Request(`https://host.invalid${definition}?${query}`));
+    expect(allowed?.status).toBe(200);
+
+    query.set("space", "foreign-space");
+    const foreign = await host.handle(new Request(`https://host.invalid${definition}?${query}`));
+    expect(foreign?.status).toBe(404);
+    expect(await foreign?.json()).toMatchObject({
+      error: { code: "resource_not_found" },
+    });
   });
 });

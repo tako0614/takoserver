@@ -52,7 +52,7 @@ test("an unsupported installed Definition stays discoverable but is not advertis
 
   const definition = await host.handle(
     new Request(
-      "https://host.invalid/apis/forms.takoform.com/v1/form-definitions/function.forms.takoform.com/Function?space=main&group=function.forms.takoform.com&kind=Function&definitionVersion=0.1.0&schemaDigest=" +
+      "https://host.invalid/apis/forms.takoform.com/v1/form-definitions/function.forms.takoform.com/Function?space=main&definitionVersion=0.1.0&schemaDigest=" +
         encodeURIComponent(form.identity.formRef.schemaDigest),
       { headers },
     ),

@@ -237,8 +237,6 @@ describe("prepaid vertical over HTTP", () => {
     const prepareDigest = String((prepared.body.review as { prepareDigest: string }).prepareDigest);
     const query = new URLSearchParams({
       space: "tenant_x",
-      group: OFFERING.form.apiVersion,
-      kind: OFFERING.form.kind,
       definitionVersion: OFFERING.form.definitionVersion,
       schemaDigest: OFFERING.form.schemaDigest,
     });

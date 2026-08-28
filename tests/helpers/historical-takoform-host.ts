@@ -38,6 +38,8 @@ export function createConfiguredHistoricalTakoformHost(
   const clock = options.clock ?? (() => new Date());
   const randomId = options.randomId ?? (() => crypto.randomUUID());
   const forms = installedForms(options.forms, options.routes.hostApiVersion);
+  const resourceQueryIncludesPathIdentity =
+    options.routes.hostApiVersion !== "forms.takoform.com/v1";
   const bindings = installedBindings(options.bindings ?? []);
   const store = createTakoformStore(options.sql, clock);
   const artifacts =
@@ -60,6 +62,7 @@ export function createConfiguredHistoricalTakoformHost(
     ...(options.routes.hostApiVersion === "forms.takoform.com/v1"
       ? { stableReviewConstraintPhases: true }
       : {}),
+    ...(resourceQueryIncludesPathIdentity ? { resourceQueryIncludesPathIdentity: true } : {}),
     clock,
     randomId,
     ...(options.deferredOperations?.leaseMilliseconds
@@ -82,6 +85,7 @@ export function createConfiguredHistoricalTakoformHost(
         forms,
         clock,
         randomId,
+        ...(resourceQueryIncludesPathIdentity ? { resourceQueryIncludesPathIdentity: true } : {}),
         ...(options.routes.omitObservedStatus ? { omitObservedStatus: true } : {}),
       })
     : undefined;
