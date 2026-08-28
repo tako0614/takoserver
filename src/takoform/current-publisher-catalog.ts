@@ -1,8 +1,13 @@
 import { execFileSync } from "node:child_process";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { lstat, open, opendir } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 import { bytesDigest, canonicalDigest } from "../json.ts";
 import type { JsonObject } from "../ports.ts";
+import {
+  FORM_PACKAGE_LIMITS,
+  formPackagePayloadLimit,
+  formPackagePayloadTotal,
+} from "./form-package-limits.ts";
 import type {
   InstalledTakoformBinding,
   InstalledTakoformForm,
@@ -43,6 +48,36 @@ const FAMILY_CANDIDATE_SET = "forms/candidates/edge.forms.takoform.com/candidate
 const INTERFACE_CANDIDATE_SET = "interfaces/candidates/v1alpha1/candidate-set.json";
 const BINDING_CANDIDATE_SET = "bindings/candidates/v1alpha2/candidate-set.json";
 
+/**
+ * Bounds for walking the current publisher's checked-in Git corpus.
+ *
+ * These are publisher-source complexity limits, not additional Form Package
+ * validity rules. A package contains one package index plus at most the Core
+ * limit of 1,024 declared payload files. Directories are counted separately
+ * so a valid maximum package may put every payload beneath one directory,
+ * while a pathological tree with more than 1,024 directories still fails
+ * closed before it can be fully materialized.
+ */
+export const CURRENT_PUBLISHER_PACKAGE_FILE_ENTRY_LIMIT = FORM_PACKAGE_LIMITS.files + 1;
+export const CURRENT_PUBLISHER_PACKAGE_DIRECTORY_ENTRY_LIMIT = FORM_PACKAGE_LIMITS.files;
+/** Raw entries examined by a non-recursive catalog directory scan. */
+export const CURRENT_PUBLISHER_DIRECTORY_SCAN_ENTRY_LIMIT =
+  CURRENT_PUBLISHER_PACKAGE_FILE_ENTRY_LIMIT;
+
+export function isCurrentPublisherPackageWithinTraversalBounds(
+  fileCount: number,
+  directoryCount: number,
+): boolean {
+  return (
+    Number.isSafeInteger(fileCount) &&
+    fileCount >= 0 &&
+    fileCount <= CURRENT_PUBLISHER_PACKAGE_FILE_ENTRY_LIMIT &&
+    Number.isSafeInteger(directoryCount) &&
+    directoryCount >= 0 &&
+    directoryCount <= CURRENT_PUBLISHER_PACKAGE_DIRECTORY_ENTRY_LIMIT
+  );
+}
+
 export interface CurrentPublisherCatalog {
   readonly forms: readonly InstalledTakoformForm[];
   readonly bindings: readonly InstalledTakoformBinding[];
@@ -64,6 +99,11 @@ export interface CurrentPublisherCatalog {
   };
 }
 
+interface CurrentPublisherCatalogLoadOptions {
+  /** Deterministic test seam for racing a package closure during payload reads. */
+  readonly afterPackagePayloadRead?: (packageRoot: string) => void | Promise<void>;
+}
+
 /**
  * Load the exact current publisher corpus for generation of the stable
  * production catalog. Every input is deleted-first: only the one family and
@@ -72,11 +112,12 @@ export interface CurrentPublisherCatalog {
  */
 export async function loadCurrentPublisherCatalog(
   repositoryRoot: string,
+  options: CurrentPublisherCatalogLoadOptions = {},
 ): Promise<CurrentPublisherCatalog> {
   const root = resolve(repositoryRoot);
   assertPublisherSource(root);
 
-  const indexBytes = await requiredBytes(root, FAMILY_INDEX);
+  const indexBytes = await requiredBytes(root, FAMILY_INDEX, FORM_PACKAGE_LIMITS.indexBytes);
   if (
     (await bytesDigest(indexBytes)).slice("sha256:".length) !==
     CURRENT_PUBLISHER_FAMILY_INDEX_SHA256
@@ -98,7 +139,11 @@ export async function loadCurrentPublisherCatalog(
     mismatch();
   }
 
-  const conformanceBytes = await requiredBytes(root, FAMILY_CONFORMANCE);
+  const conformanceBytes = await requiredBytes(
+    root,
+    FAMILY_CONFORMANCE,
+    FORM_PACKAGE_LIMITS.indexBytes,
+  );
   if (
     (await bytesDigest(conformanceBytes)).slice("sha256:".length) !==
     CURRENT_PUBLISHER_FAMILY_CONFORMANCE_SHA256
@@ -117,7 +162,11 @@ export async function loadCurrentPublisherCatalog(
     mismatch();
   }
 
-  const candidateBytes = await requiredBytes(root, FAMILY_CANDIDATE_SET);
+  const candidateBytes = await requiredBytes(
+    root,
+    FAMILY_CANDIDATE_SET,
+    FORM_PACKAGE_LIMITS.indexBytes,
+  );
   if (
     (await bytesDigest(candidateBytes)).slice("sha256:".length) !==
     CURRENT_PUBLISHER_FAMILY_CANDIDATE_SET_SHA256
@@ -129,7 +178,7 @@ export async function loadCurrentPublisherCatalog(
   const candidateEntries = array(candidateSet.forms);
   if (candidateEntries.length !== CURRENT_PUBLISHER_COUNTS.formCount) incomplete();
 
-  const forms = await loadPackageForms(root, candidateEntries);
+  const forms = await loadPackageForms(root, candidateEntries, options.afterPackagePayloadRead);
   if (forms.length !== CURRENT_PUBLISHER_COUNTS.formCount) incomplete();
 
   const interfaceRef = object(index.interfaceCandidateSet);
@@ -176,6 +225,7 @@ export async function loadCurrentPublisherCatalog(
 async function loadPackageForms(
   root: string,
   candidateValues: readonly unknown[],
+  afterPackagePayloadRead?: (packageRoot: string) => void | Promise<void>,
 ): Promise<InstalledTakoformForm[]> {
   const forms: InstalledTakoformForm[] = [];
   const seenKinds = new Set<string>();
@@ -197,22 +247,45 @@ async function loadPackageForms(
     }
     seenKinds.add(kind);
 
-    const candidateIndexBytes = await requiredBytes(root, `${packageRoot}/package-index.json`);
+    const candidateIndexBytes = await requiredBytes(
+      root,
+      `${packageRoot}/package-index.json`,
+      FORM_PACKAGE_LIMITS.indexBytes,
+    );
     const candidateIndex = object(parse(candidateIndexBytes));
     await validatePackageIndex(candidateIndex, ref, packageDigest);
-    await validatePackageFiles(root, packageRoot, candidateIndex);
+    await validatePackageFiles(root, packageRoot, candidateIndex, afterPackagePayloadRead);
 
     const releaseRoot = `forms/releases/${releaseId(apiVersion, kind)}/${packageDigest.replace(
       "sha256:",
       "sha256-",
     )}`;
-    const releaseIndexBytes = await requiredBytes(root, `${releaseRoot}/package-index.json`);
+    const releaseIndexBytes = await requiredBytes(
+      root,
+      `${releaseRoot}/package-index.json`,
+      FORM_PACKAGE_LIMITS.indexBytes,
+    );
     const releaseIndex = object(parse(releaseIndexBytes));
     await validatePackageIndex(releaseIndex, ref, packageDigest);
-    await validatePackageFiles(root, releaseRoot, releaseIndex);
+    await validatePackageFiles(root, releaseRoot, releaseIndex, afterPackagePayloadRead);
 
     const definitionPath = string(releaseIndex.definitionPath);
-    const definition = object(parse(await requiredBytes(root, `${releaseRoot}/${definitionPath}`)));
+    const definitionDeclaration = array(releaseIndex.files)
+      .map(object)
+      .find((file) => file.path === definitionPath);
+    const definition = object(
+      parse(
+        await requiredBytes(
+          root,
+          `${releaseRoot}/${definitionPath}`,
+          formPackagePayloadLimit(
+            typeof definitionDeclaration?.mediaType === "string"
+              ? definitionDeclaration.mediaType
+              : undefined,
+          ),
+        ),
+      ),
+    );
     if (
       definition.apiVersion !== apiVersion ||
       definition.kind !== kind ||
@@ -234,7 +307,7 @@ async function loadPackageForms(
 }
 
 async function loadInterfaces(root: string, relative: string): Promise<number> {
-  const bytes = await requiredBytes(root, relative);
+  const bytes = await requiredBytes(root, relative, FORM_PACKAGE_LIMITS.indexBytes);
   if (
     (await bytesDigest(bytes)).slice("sha256:".length) !== CURRENT_PUBLISHER_INTERFACE_SET_SHA256
   ) {
@@ -253,7 +326,13 @@ async function loadInterfaces(root: string, relative: string): Promise<number> {
     if (seen.has(key)) mismatch();
     seen.add(key);
     const definition = object(
-      parse(await requiredBytes(root, `interfaces/candidates/v1alpha1/${name}/definition.json`)),
+      parse(
+        await requiredBytes(
+          root,
+          `interfaces/candidates/v1alpha1/${name}/definition.json`,
+          FORM_PACKAGE_LIMITS.jsonPayloadBytes,
+        ),
+      ),
     );
     if (
       definition.apiVersion !== "interfaces.takoform.com/v1alpha1" ||
@@ -274,7 +353,7 @@ async function loadBindings(
   relative: string,
   forms: readonly InstalledTakoformForm[],
 ): Promise<InstalledTakoformBinding[]> {
-  const bytes = await requiredBytes(root, relative);
+  const bytes = await requiredBytes(root, relative, FORM_PACKAGE_LIMITS.indexBytes);
   if ((await bytesDigest(bytes)).slice("sha256:".length) !== CURRENT_PUBLISHER_BINDING_SET_SHA256) {
     mismatch();
   }
@@ -293,7 +372,13 @@ async function loadBindings(
     if (seen.has(key)) mismatch();
     seen.add(key);
     const definition = object(
-      parse(await requiredBytes(root, `bindings/candidates/v1alpha2/${name}/definition.json`)),
+      parse(
+        await requiredBytes(
+          root,
+          `bindings/candidates/v1alpha2/${name}/definition.json`,
+          FORM_PACKAGE_LIMITS.jsonPayloadBytes,
+        ),
+      ),
     );
     const ref = accepted.find(
       (candidate) =>
@@ -354,6 +439,7 @@ async function validatePackageIndex(
   ) {
     mismatch();
   }
+  if (formPackagePayloadTotal(packageIndex.files) === null) mismatch();
   if ((await canonicalDigest(packageIndex)) !== packageDigest) mismatch();
 }
 
@@ -361,14 +447,41 @@ async function validatePackageFiles(
   root: string,
   packageRoot: string,
   packageIndex: Record<string, unknown>,
+  afterPackagePayloadRead?: (packageRoot: string) => void | Promise<void>,
 ): Promise<void> {
-  for (const value of array(packageIndex.files)) {
+  const declarations = array(packageIndex.files);
+  const actual = await inventoryPackageFiles(root, packageRoot);
+  const expected = new Set(["package-index.json"]);
+  if (declarations.length > FORM_PACKAGE_LIMITS.files) mismatch();
+  for (const value of declarations) {
     const file = object(value);
     const relative = string(file.path);
-    const bytes = await requiredBytes(root, `${packageRoot}/${relative}`);
+    if (
+      !isSafePackagePath(relative) ||
+      relative === "package-index.json" ||
+      expected.has(relative)
+    ) {
+      mismatch();
+    }
+    expected.add(relative);
+  }
+  if (actual.length !== expected.size || actual.some((path) => !expected.has(path))) mismatch();
+  for (const value of declarations) {
+    const file = object(value);
+    const relative = string(file.path);
+    const bytes = await requiredBytes(
+      root,
+      `${packageRoot}/${relative}`,
+      formPackagePayloadLimit(typeof file.mediaType === "string" ? file.mediaType : undefined),
+    );
     if (bytes.byteLength !== number(file.size) || (await bytesDigest(bytes)) !== file.digest) {
       mismatch();
     }
+  }
+  if (afterPackagePayloadRead) await afterPackagePayloadRead(packageRoot);
+  const finalActual = await inventoryPackageFiles(root, packageRoot);
+  if (finalActual.length !== expected.size || finalActual.some((path) => !expected.has(path))) {
+    mismatch();
   }
 }
 
@@ -523,26 +636,176 @@ function releaseId(group: string, kind: string): string {
 }
 
 async function directories(root: string, relative: string): Promise<string[]> {
+  let directory: Awaited<ReturnType<typeof opendir>> | undefined;
   try {
-    return (await readdir(resolve(root, relative), { withFileTypes: true }))
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => entry.name);
-  } catch {
+    directory = await opendir(resolve(root, relative));
+    const found: string[] = [];
+    let rawEntryCount = 0;
+    let directoryCount = 0;
+    for await (const entry of directory) {
+      rawEntryCount += 1;
+      if (rawEntryCount > CURRENT_PUBLISHER_DIRECTORY_SCAN_ENTRY_LIMIT) mismatch();
+      if (entry.isDirectory()) {
+        directoryCount += 1;
+        if (!isCurrentPublisherPackageWithinTraversalBounds(0, directoryCount)) {
+          mismatch();
+        }
+        found.push(entry.name);
+      }
+    }
+    return found;
+  } catch (error) {
+    if (error instanceof Error && error.message === "current_publisher_input_mismatch") {
+      throw error;
+    }
     throw new Error("current_publisher_input_missing");
+  } finally {
+    if (directory) {
+      try {
+        await directory.close();
+      } catch {
+        // The async iterator may have closed the directory already.
+      }
+    }
   }
 }
 
-async function requiredBytes(root: string, relative: string): Promise<Uint8Array> {
+async function inventoryPackageFiles(root: string, packageRoot: string): Promise<string[]> {
+  const directory = resolve(root, packageRoot);
+  const found: string[] = [];
+  let fileCount = 0;
+  let directoryCount = 0;
+  const visit = async (current: string, relativeDirectory: string): Promise<void> => {
+    let handle: Awaited<ReturnType<typeof opendir>> | undefined;
+    try {
+      handle = await opendir(current);
+      for await (const entry of handle) {
+        const relativePath = relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) {
+          directoryCount += 1;
+          if (!isCurrentPublisherPackageWithinTraversalBounds(fileCount, directoryCount)) {
+            mismatch();
+          }
+          await visit(resolve(current, entry.name), relativePath);
+        } else if (entry.isFile()) {
+          fileCount += 1;
+          if (!isCurrentPublisherPackageWithinTraversalBounds(fileCount, directoryCount)) {
+            mismatch();
+          }
+          found.push(relativePath);
+        } else {
+          mismatch();
+        }
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message === "current_publisher_input_mismatch") {
+        throw error;
+      }
+      throw new Error("current_publisher_input_missing");
+    } finally {
+      if (handle) {
+        try {
+          await handle.close();
+        } catch {
+          // The async iterator may have closed the directory already.
+        }
+      }
+    }
+  };
+  await visit(directory, "");
+  found.sort();
+  return found;
+}
+
+async function requiredBytes(
+  root: string,
+  relative: string,
+  maxBytes = FORM_PACKAGE_LIMITS.payloadBytes,
+): Promise<Uint8Array> {
   const path = resolve(root, relative);
   if (path !== root && !path.startsWith(`${root}${sep}`)) {
     throw new Error("current_publisher_input_missing");
   }
+  let handle: Awaited<ReturnType<typeof open>>;
+  let beforePath: Awaited<ReturnType<typeof lstat>>;
   try {
-    if (!(await stat(path)).isFile()) throw new Error("not a file");
-    return new Uint8Array(await readFile(path));
+    beforePath = await lstat(path);
   } catch {
     throw new Error("current_publisher_input_missing");
   }
+  if (!beforePath.isFile() || beforePath.isSymbolicLink()) mismatch();
+  try {
+    handle = await open(path, "r");
+  } catch {
+    throw new Error("current_publisher_input_missing");
+  }
+  try {
+    const metadata = await handle.stat();
+    if (
+      !metadata.isFile() ||
+      !Number.isSafeInteger(metadata.size) ||
+      metadata.size < 0 ||
+      metadata.size > maxBytes
+    ) {
+      mismatch();
+    }
+    if (!sameFile(beforePath, metadata) || !sameStableMetadata(beforePath, metadata)) {
+      mismatch();
+    }
+    const bytes = new Uint8Array(metadata.size);
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      const result = await handle.read(bytes, offset, bytes.byteLength - offset, offset);
+      if (result.bytesRead <= 0) mismatch();
+      offset += result.bytesRead;
+    }
+    const after = await handle.stat();
+    const afterPath = await lstat(path);
+    if (
+      !after.isFile() ||
+      !afterPath.isFile() ||
+      afterPath.isSymbolicLink() ||
+      !sameFile(metadata, after) ||
+      !sameFile(metadata, afterPath) ||
+      !sameStableMetadata(metadata, after) ||
+      !sameStableMetadata(metadata, afterPath)
+    ) {
+      mismatch();
+    }
+    return bytes;
+  } catch (error) {
+    if (error instanceof Error && error.message === "current_publisher_input_mismatch") {
+      throw error;
+    }
+    throw new Error("current_publisher_input_missing");
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+function sameFile(
+  left: Awaited<ReturnType<typeof lstat>>,
+  right: Awaited<ReturnType<typeof lstat>>,
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function sameStableMetadata(
+  left: Awaited<ReturnType<typeof lstat>>,
+  right: Awaited<ReturnType<typeof lstat>>,
+): boolean {
+  return left.mode === right.mode && left.size === right.size && left.mtimeMs === right.mtimeMs;
+}
+
+function isSafePackagePath(value: string): boolean {
+  return (
+    value.length > 0 &&
+    value.length <= 512 &&
+    !value.startsWith("/") &&
+    !value.includes("\\") &&
+    !value.includes("\u0000") &&
+    value.split("/").every((segment) => segment.length > 0 && segment !== "." && segment !== "..")
+  );
 }
 
 function parse(bytes: Uint8Array): unknown {

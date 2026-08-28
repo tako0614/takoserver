@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -8,7 +8,10 @@ import {
   CURRENT_PUBLISHER_COMMIT,
   CURRENT_PUBLISHER_FAMILY_CONFORMANCE_SHA256,
   CURRENT_PUBLISHER_FAMILY_INDEX_SHA256,
+  CURRENT_PUBLISHER_PACKAGE_DIRECTORY_ENTRY_LIMIT,
+  CURRENT_PUBLISHER_PACKAGE_FILE_ENTRY_LIMIT,
   CURRENT_PUBLISHER_REPOSITORY,
+  isCurrentPublisherPackageWithinTraversalBounds,
   loadCurrentPublisherCatalog,
 } from "../src/takoform/current-publisher-catalog.ts";
 
@@ -101,6 +104,90 @@ describe("current publisher package corpus", () => {
       "--assume-unchanged",
       "forms/candidates/edge.forms.takoform.com/candidate-set.json",
     );
+
+    await expect(loadCurrentPublisherCatalog(root)).rejects.toThrow(
+      "current_publisher_input_mismatch",
+    );
+  });
+
+  test("rejects an extra package file added after payload reads", async () => {
+    const root = clonePublisher();
+    let injected = false;
+    await expect(
+      loadCurrentPublisherCatalog(root, {
+        afterPackagePayloadRead: (packageRoot) => {
+          if (injected) return;
+          injected = true;
+          writeFileSync(join(root, packageRoot, ".late-extra"), "added during load\n");
+        },
+      }),
+    ).rejects.toThrow("current_publisher_input_mismatch");
+    expect(injected).toBe(true);
+  });
+
+  test("bounds recursive package closure before walking an unbounded tree", async () => {
+    const root = clonePublisher();
+    const candidatePath = join(root, "forms/candidates/edge.forms.takoform.com/candidate-set.json");
+    const candidateSet = JSON.parse(await Bun.file(candidatePath).text()) as {
+      forms: Array<{ path: string }>;
+    };
+    const packageRoot = candidateSet.forms[0]?.path;
+    if (!packageRoot) throw new Error("publisher candidate package is missing");
+    const pattern = `${packageRoot}/.closure-overflow-*`;
+    writeFileSync(join(root, ".git/info/exclude"), `${pattern}\n`, { flag: "a" });
+    for (let index = 0; index <= 1_025; index += 1) {
+      writeFileSync(join(root, packageRoot, `.closure-overflow-${index}`), "x");
+    }
+
+    await expect(loadCurrentPublisherCatalog(root)).rejects.toThrow(
+      "current_publisher_input_mismatch",
+    );
+  });
+
+  test("keeps publisher traversal caps separate from Form Package validity", () => {
+    // The current publisher corpus is a Git source, not a runtime package
+    // store: its explicit complexity policy is one package index plus the
+    // 1,024 declared payload files and at most 1,024 directories.
+    expect(CURRENT_PUBLISHER_PACKAGE_FILE_ENTRY_LIMIT).toBe(1_025);
+    expect(CURRENT_PUBLISHER_PACKAGE_DIRECTORY_ENTRY_LIMIT).toBe(1_024);
+    expect(isCurrentPublisherPackageWithinTraversalBounds(1_025, 1)).toBe(true);
+    expect(isCurrentPublisherPackageWithinTraversalBounds(1_026, 1)).toBe(false);
+    expect(isCurrentPublisherPackageWithinTraversalBounds(1_025, 1_024)).toBe(true);
+    expect(isCurrentPublisherPackageWithinTraversalBounds(1_025, 1_025)).toBe(false);
+  });
+
+  test("accepts a maximum package closure with payloads under one directory", () => {
+    // package-index.json + 1,024 payload files + one directory is a valid
+    // closure and must not be rejected as a combined raw-entry count.
+    expect(isCurrentPublisherPackageWithinTraversalBounds(1_025, 1)).toBe(true);
+  });
+
+  test("bounds recursive package directory entries, not just files", async () => {
+    const root = clonePublisher();
+    const candidatePath = join(root, "forms/candidates/edge.forms.takoform.com/candidate-set.json");
+    const candidateSet = JSON.parse(await Bun.file(candidatePath).text()) as {
+      forms: Array<{ path: string }>;
+    };
+    const packageRoot = candidateSet.forms[0]?.path;
+    if (!packageRoot) throw new Error("publisher candidate package is missing");
+    const pattern = `${packageRoot}/.directory-overflow-*`;
+    writeFileSync(join(root, ".git/info/exclude"), `${pattern}\n`, { flag: "a" });
+    for (let index = 0; index <= CURRENT_PUBLISHER_PACKAGE_DIRECTORY_ENTRY_LIMIT; index += 1) {
+      mkdirSync(join(root, packageRoot, `.directory-overflow-${index}`));
+    }
+
+    await expect(loadCurrentPublisherCatalog(root)).rejects.toThrow(
+      "current_publisher_input_mismatch",
+    );
+  });
+
+  test("bounds raw entries while enumerating publisher directories", async () => {
+    const root = clonePublisher();
+    const pattern = "forms/releases/.raw-entry-overflow-*";
+    writeFileSync(join(root, ".git/info/exclude"), `${pattern}\n`, { flag: "a" });
+    for (let index = 0; index < 1_100; index += 1) {
+      writeFileSync(join(root, "forms/releases", `.raw-entry-overflow-${index}`), "x");
+    }
 
     await expect(loadCurrentPublisherCatalog(root)).rejects.toThrow(
       "current_publisher_input_mismatch",

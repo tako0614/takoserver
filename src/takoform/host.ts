@@ -1,4 +1,4 @@
-import type { Clock, ObjectStore, Sql } from "../ports.ts";
+import type { Clock, ObjectStoreAccess, Sql } from "../ports.ts";
 import { createTakoformArtifacts, type TakoformArtifactTransport } from "./artifacts.ts";
 import { installedBindings } from "./bindings.ts";
 import type { WorkerModuleInspector } from "./engine.ts";
@@ -31,7 +31,7 @@ import type {
  */
 export interface CreateTakoformHostOptions {
   readonly sql: Sql;
-  readonly objects: ObjectStore;
+  readonly objects: ObjectStoreAccess;
   readonly authenticate: (request: Request) => Promise<TakoformHostPrincipal | null>;
   readonly forms: readonly InstalledTakoformForm[];
   readonly bindings?: readonly InstalledTakoformBinding[];

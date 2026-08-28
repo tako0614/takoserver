@@ -82,6 +82,7 @@ export type {
   JsonObject,
   JsonValue,
   ObjectStore,
+  ObjectStoreAccess,
   Sql,
   SqlWrite,
 } from "./ports.ts";

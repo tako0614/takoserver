@@ -1,5 +1,5 @@
 import { bytesDigest, canonicalDigest } from "../json.ts";
-import type { Clock, ObjectStore, Sql } from "../ports.ts";
+import type { Clock, ObjectStoreAccess, Sql } from "../ports.ts";
 import { parseStrictJson, StrictJsonError } from "../strict-json.ts";
 import {
   MAXIMUM_REQUEST_BODY_BYTES,
@@ -93,7 +93,7 @@ export class ArtifactInputError extends Error {
 
 export interface CreateTakoformArtifactsOptions {
   readonly sql: Sql;
-  readonly objects: ObjectStore;
+  readonly objects: Pick<ObjectStoreAccess, "put" | "get" | "head">;
   readonly clock: Clock;
   readonly randomId: () => string;
   /** Candidate compositions can bind the same transport to another non-public lane. */

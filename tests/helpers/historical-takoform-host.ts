@@ -1,6 +1,6 @@
 import { createEphemeralSql } from "../../src/compat.ts";
 import { createMemoryObjectStore } from "../../src/objects-mem.ts";
-import type { ObjectStore, Sql } from "../../src/ports.ts";
+import type { ObjectStoreAccess, Sql } from "../../src/ports.ts";
 import { createTakoformArtifacts } from "../../src/takoform/artifacts.ts";
 import { installedBindings } from "../../src/takoform/bindings.ts";
 import { createTakoformEngine } from "../../src/takoform/engine.ts";
@@ -117,7 +117,7 @@ export interface HistoricalEphemeralHostOptions
   readonly authenticate: (authorization: string | null) => Promise<TakoformHostPrincipal | null>;
   readonly driver: TakoformResourceDriver;
   readonly sql?: Sql;
-  readonly objects?: ObjectStore;
+  readonly objects?: ObjectStoreAccess;
 }
 
 export function createHistoricalTakoformHost(

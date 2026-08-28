@@ -6,7 +6,16 @@ import {
   isJsonObject,
   isSha256Digest,
 } from "../json.ts";
-import type { JsonObject, ObjectStore } from "../ports.ts";
+import type { JsonObject, ObjectStoreAccess } from "../ports.ts";
+import {
+  cancelFormPackageStream,
+  FORM_PACKAGE_LIMITS,
+  FormPackageStreamLimitError,
+  formPackagePayloadLimit,
+  formPackagePayloadTotal,
+  hasExactFormPackageObjectClosure,
+  readBoundedFormPackageStream,
+} from "./form-package-limits.ts";
 import { validateFormRef } from "./forms.ts";
 
 /** Operator-owned package bytes never share the tenant artifact namespace. */
@@ -58,9 +67,14 @@ export function readOnlyFormPackageKey(packageDigest: string, relativePath: stri
   return `${readOnlyFormPackagePrefix(packageDigest)}/${validateRelativePath(relativePath)}`;
 }
 
-export function createFormPackageReader(objects: Pick<ObjectStore, "get">): FormPackageReader {
-  if (!objects || typeof objects.get !== "function") {
-    throw new FormPackageReadError("package_store_unavailable", "an object reader is required");
+export function createFormPackageReader(
+  objects: Pick<ObjectStoreAccess, "get" | "list">,
+): FormPackageReader {
+  if (!objects || typeof objects.get !== "function" || typeof objects.list !== "function") {
+    throw new FormPackageReadError(
+      "package_store_unavailable",
+      "an object reader with bounded listing is required",
+    );
   }
   return {
     async read(input): Promise<ReadOnlyStoredFormPackage | null> {
@@ -72,14 +86,28 @@ export function createFormPackageReader(objects: Pick<ObjectStore, "get">): Form
 }
 
 async function readPackage(
-  objects: Pick<ObjectStore, "get">,
+  objects: Pick<ObjectStoreAccess, "get" | "list">,
   packageDigest: FormPackageDigest,
   expectedFormRef?: TakoformV1Alpha3FormRef,
 ): Promise<ReadOnlyStoredFormPackage | null> {
   const prefix = readOnlyFormPackagePrefix(packageDigest);
   const index = await objects.get(`${prefix}/package-index.json`);
   if (!index) return null;
-  const indexBytes = new Uint8Array(await new Response(index.body).arrayBuffer());
+  if (!validObjectSize(index.size) || index.size > FORM_PACKAGE_LIMITS.indexBytes) {
+    cancelFormPackageStream(index.body);
+    return null;
+  }
+  let indexBytes: Uint8Array;
+  try {
+    indexBytes = await readBoundedFormPackageStream(
+      index.body,
+      FORM_PACKAGE_LIMITS.indexBytes,
+      index.size > 0 ? index.size : undefined,
+    );
+  } catch (error) {
+    if (error instanceof FormPackageStreamLimitError) return null;
+    throw error;
+  }
   let manifest: JsonObject;
   try {
     const parsed: unknown = JSON.parse(new TextDecoder().decode(indexBytes));
@@ -96,9 +124,17 @@ async function readPackage(
   if (expectedFormRef && canonicalJson(formRef) !== canonicalJson(expectedFormRef)) return null;
 
   const declarations = manifest.files;
-  if (!Array.isArray(declarations) || declarations.length === 0) return null;
+  if (
+    !Array.isArray(declarations) ||
+    declarations.length === 0 ||
+    declarations.length > FORM_PACKAGE_LIMITS.files
+  ) {
+    return null;
+  }
+  if (formPackagePayloadTotal(declarations) === null) return null;
   const files: ReadOnlyFormPackageFile[] = [];
   const seen = new Set<string>();
+  let declaredPayloadBytes = 0;
   for (const value of declarations) {
     if (!isJsonObject(value) || !exactFileKeys(value)) return null;
     const path = value.path;
@@ -118,6 +154,13 @@ async function readPackage(
     ) {
       return null;
     }
+    const limit = formPackagePayloadLimit(
+      typeof value.mediaType === "string" ? value.mediaType : undefined,
+    );
+    if (size > limit || size > FORM_PACKAGE_LIMITS.packagePayloadBytes - declaredPayloadBytes) {
+      return null;
+    }
+    declaredPayloadBytes += size;
     let safePath: string;
     try {
       safePath = validateRelativePath(path);
@@ -128,8 +171,18 @@ async function readPackage(
     seen.add(safePath);
     const object = await objects.get(readOnlyFormPackageKey(packageDigest, safePath));
     if (!object) return null;
-    const bytes = new Uint8Array(await new Response(object.body).arrayBuffer());
-    if (bytes.byteLength !== size || (await bytesDigest(bytes)) !== digest) return null;
+    if (!validObjectSize(object.size) || object.size > limit) {
+      cancelFormPackageStream(object.body);
+      return null;
+    }
+    let bytes: Uint8Array;
+    try {
+      bytes = await readBoundedFormPackageStream(object.body, limit, size);
+    } catch (error) {
+      if (error instanceof FormPackageStreamLimitError) return null;
+      throw error;
+    }
+    if ((await bytesDigest(bytes)) !== digest) return null;
     files.push({
       path: safePath,
       digest,
@@ -140,6 +193,19 @@ async function readPackage(
   }
   files.sort((left, right) => left.path.localeCompare(right.path));
   if (!validateManifest(manifest, formRef, files)) return null;
+  const expectedKeys = new Set<string>([
+    `${prefix}/package-index.json`,
+    ...files.map((file) => readOnlyFormPackageKey(packageDigest, file.path)),
+  ]);
+  if (
+    !(await hasExactFormPackageObjectClosure(
+      (input) => objects.list(input),
+      `${prefix}/`,
+      expectedKeys,
+    ))
+  ) {
+    return null;
+  }
 
   return {
     packageDigest,
@@ -251,6 +317,10 @@ function isSafeManifestPath(value: string): boolean {
 
 function requireDigest(value: string): asserts value is FormPackageDigest {
   if (!isSha256Digest(value)) throw new FormPackageReadError("invalid_package", "invalid digest");
+}
+
+function validObjectSize(value: number): boolean {
+  return Number.isSafeInteger(value) && value >= 0;
 }
 
 function validateRelativePath(value: string): string {

@@ -1,6 +1,6 @@
 import type { TakoformV1Alpha3FormRef } from "../form-ref.ts";
 import { canonicalDigest, canonicalJson, isJsonObject, isSha256Digest } from "../json.ts";
-import type { ObjectStore, Row, Sql } from "../ports.ts";
+import type { ObjectStoreAccess, Row, Sql } from "../ports.ts";
 import {
   ADMISSION_GENESIS_DIGEST,
   type AdmissionDigest,
@@ -156,7 +156,7 @@ export interface TakoformHostAuthority {
 
 export interface CreateTakoformHostAuthorityOptions {
   readonly sql: Sql;
-  readonly objects?: ObjectStore;
+  readonly objects?: Pick<ObjectStoreAccess, "get" | "list">;
   readonly packages?: FormPackageReader;
   readonly hostId: string;
   /** Build/operator inputs only; these bytes do not confer any runtime authority. */

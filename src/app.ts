@@ -11,7 +11,7 @@ import { type Checkout, createControlRoutes } from "./control.ts";
 import { createDataAiRoutes } from "./data-ai.ts";
 import { createLedger, type FundingSettlementVerifier } from "./ledger.ts";
 import { createMetering, type MeteringRates } from "./metering.ts";
-import type { Clock, ObjectStore, Sql } from "./ports.ts";
+import type { Clock, ObjectStoreAccess, Sql } from "./ports.ts";
 import { createProviderDriver, createProviderFormAvailability } from "./provider-driver.ts";
 import { createProviderMetering } from "./provider-metering.ts";
 import type { ProviderPack } from "./provider-pack.ts";
@@ -60,7 +60,7 @@ import { createTokenService, type SigningKey, TokenError } from "./token.ts";
 
 export interface AppPorts {
   readonly sql: Sql;
-  readonly objects: ObjectStore;
+  readonly objects: ObjectStoreAccess;
   readonly identity: ExternalIdentityVerifier;
   readonly settlement: FundingSettlementVerifier;
   /** Starts a payment, where this deployment can take one. */

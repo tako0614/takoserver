@@ -5,10 +5,20 @@ describe("R2 object adapter", () => {
   test("maps create-only to R2's conditional put and preserves the winner", async () => {
     const held = new Map<string, Uint8Array>();
     const puts: unknown[] = [];
+    let contenders = 0;
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
     const bucket: R2BucketLike = {
       async put(key, body, options) {
         puts.push(options);
-        if (options?.onlyIf?.etagDoesNotMatch === "*" && held.has(key)) return null;
+        if (options?.onlyIf?.etagDoesNotMatch === "*") {
+          contenders += 1;
+          if (contenders === 2) release();
+          await barrier;
+          if (held.has(key)) return null;
+        }
         const bytes =
           body instanceof Uint8Array
             ? body.slice()
@@ -43,9 +53,13 @@ describe("R2 object adapter", () => {
     };
     const store = createR2ObjectStore(bucket);
 
-    expect(await store.create("formpkg/exact", new TextEncoder().encode("first"))).not.toBeNull();
-    expect(await store.create("formpkg/exact", new TextEncoder().encode("second"))).toBeNull();
-    expect(await new Response((await store.get("formpkg/exact"))?.body).text()).toBe("first");
+    const results = await Promise.all([
+      store.create("formpkg/exact", new TextEncoder().encode("first")),
+      store.create("formpkg/exact", new TextEncoder().encode("second")),
+    ]);
+    expect(results.filter((result) => result !== null)).toHaveLength(1);
+    const winner = await new Response((await store.get("formpkg/exact"))?.body).text();
+    expect(["first", "second"]).toContain(winner);
     expect(puts).toEqual([
       { onlyIf: { etagDoesNotMatch: "*" } },
       { onlyIf: { etagDoesNotMatch: "*" } },

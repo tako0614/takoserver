@@ -82,21 +82,11 @@ export interface ObjectListPage {
 }
 
 /**
- * The bytes seam. Artifacts live under `art/`, resource data planes under
- * `res/`; both are content- or tenant-addressed by their callers, never by the
- * implementation.
+ * The non-atomic bytes seam. Artifacts live under `art/`, resource data planes
+ * under `res/`; both are content- or tenant-addressed by their callers, never
+ * by the implementation. HTTP-backed hosts only need this capability.
  */
-export interface ObjectStore {
-  /**
-   * Creates one object only when its key is absent. A null result is the
-   * storage-level exact-existing signal; callers must read and compare before
-   * treating it as success. This is the content-addressed import primitive.
-   */
-  create(
-    key: string,
-    body: ArrayBuffer | Uint8Array | ReadableStream<Uint8Array>,
-    options?: { readonly contentType?: string },
-  ): Promise<StoredObject | null>;
+export interface ObjectStoreAccess {
   put(
     key: string,
     body: ArrayBuffer | Uint8Array | ReadableStream<Uint8Array>,
@@ -110,6 +100,24 @@ export interface ObjectStore {
     readonly limit: number;
     readonly cursor?: string;
   }): Promise<ObjectListPage>;
+}
+
+/**
+ * Full bytes seam with the content-addressed import primitive. `create` is a
+ * stronger storage capability than ordinary object access and must not be
+ * claimed by transports whose remote API cannot provide an atomic winner.
+ */
+export interface ObjectStore extends ObjectStoreAccess {
+  /**
+   * Creates one object only when its key is absent. A null result is the
+   * storage-level exact-existing signal; callers must read and compare before
+   * treating it as success. This is the content-addressed import primitive.
+   */
+  create(
+    key: string,
+    body: ArrayBuffer | Uint8Array | ReadableStream<Uint8Array>,
+    options?: { readonly contentType?: string },
+  ): Promise<StoredObject | null>;
 }
 
 export class ObjectStoreError extends Error {

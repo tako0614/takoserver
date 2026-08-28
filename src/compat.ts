@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { MIGRATIONS } from "./db-schema.ts";
 import { createMemoryObjectStore } from "./objects-mem.ts";
-import type { Clock, ObjectStore, Sql } from "./ports.ts";
+import type { Clock, ObjectStoreAccess, Sql } from "./ports.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import type { TakoformArtifactTransport } from "./takoform/artifacts.ts";
 import type { WorkerModuleInspector } from "./takoform/engine.ts";
@@ -40,7 +40,7 @@ export interface EphemeralTakoformHostOptions {
   readonly bindings?: readonly InstalledTakoformBinding[];
   readonly driver: TakoformResourceDriver;
   readonly sql?: Sql;
-  readonly objects?: ObjectStore;
+  readonly objects?: ObjectStoreAccess;
   readonly artifacts?: TakoformArtifactTransport;
   readonly clock?: Clock;
   readonly randomId?: () => string;

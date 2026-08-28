@@ -7,6 +7,15 @@ import {
   isSha256Digest,
 } from "../json.ts";
 import type { JsonObject, ObjectStore } from "../ports.ts";
+import {
+  cancelFormPackageStream,
+  FORM_PACKAGE_LIMITS,
+  FormPackageStreamLimitError,
+  formPackagePayloadLimit,
+  formPackagePayloadTotal,
+  hasExactFormPackageObjectClosure,
+  readBoundedFormPackageStream,
+} from "./form-package-limits.ts";
 import { validateFormRef } from "./forms.ts";
 
 /**
@@ -104,9 +113,12 @@ export function packageManifest(input: {
   readonly files: readonly Pick<FormPackageFile, "path" | "digest" | "size" | "mediaType">[];
   readonly manifest?: JsonObject;
 }): JsonObject {
+  assertPackageFileLimits(input.files);
   if (input.manifest !== undefined) {
     if (!isJsonObject(input.manifest)) throw new FormPackageError("invalid_package");
-    return validatePackageManifest(input.manifest, input.formRef, input.files);
+    const manifest = validatePackageManifest(input.manifest, input.formRef, input.files);
+    assertPackageIndexSize(manifest);
+    return manifest;
   }
   const manifest = {
     apiVersion: "packages.forms.takoform.com/v1alpha1",
@@ -119,7 +131,9 @@ export function packageManifest(input: {
       ...(file.mediaType === undefined ? {} : { mediaType: file.mediaType }),
     })),
   };
-  return validatePackageManifest(manifest, input.formRef, input.files);
+  const validated = validatePackageManifest(manifest, input.formRef, input.files);
+  assertPackageIndexSize(validated);
+  return validated;
 }
 
 export function createFormPackageStore(objects: ObjectStore): FormPackageStore {
@@ -137,6 +151,9 @@ export function createFormPackageStore(objects: ObjectStore): FormPackageStore {
 
   return {
     async put(input): Promise<StoredFormPackage> {
+      if (input?.manifest !== undefined) {
+        assertDeclaredManifestLimits(input.manifest);
+      }
       const normal = await materialize(input);
       const manifest = packageManifest({
         formRef: normal.formRef,
@@ -154,6 +171,12 @@ export function createFormPackageStore(objects: ObjectStore): FormPackageStore {
       const prefix = formPackagePrefix(input.packageDigest);
       const indexKey = `${prefix}/package-index.json`;
       const indexBytes = new TextEncoder().encode(canonicalJson(manifest));
+      if (indexBytes.byteLength > FORM_PACKAGE_LIMITS.indexBytes) {
+        throw new FormPackageError(
+          "invalid_package",
+          `package index exceeds ${FORM_PACKAGE_LIMITS.indexBytes} bytes`,
+        );
+      }
 
       // The index is the package visibility point. If it already exists, this
       // import is an exact-existing read only; a malformed or different prefix
@@ -224,7 +247,19 @@ async function createExactObject(
       "create-only package object disappeared",
     );
   }
-  const existingBytes = new Uint8Array(await new Response(existing.body).arrayBuffer());
+  let existingBytes: Uint8Array;
+  try {
+    existingBytes = await readBoundedFormPackageStream(
+      existing.body,
+      bytes.byteLength,
+      bytes.byteLength,
+    );
+  } catch (error) {
+    if (error instanceof FormPackageStreamLimitError) {
+      throw new FormPackageError("package_readback_mismatch", error.message);
+    }
+    throw error;
+  }
   if (!sameBytes(existingBytes, bytes)) {
     throw new FormPackageError(
       "package_readback_mismatch",
@@ -295,6 +330,14 @@ async function materialize(input: FormPackageInput): Promise<{
   }
   const seen = new Set<string>();
   const files: FormPackageFile[] = [];
+  if (input.files.length > FORM_PACKAGE_LIMITS.files) {
+    throw new FormPackageError(
+      "invalid_package",
+      `package lists ${input.files.length} files; maximum is ${FORM_PACKAGE_LIMITS.files}`,
+    );
+  }
+  let payloadBytes = 0;
+  const declaredFiles = declaredManifestFiles(input.manifest);
   for (const file of input.files) {
     if (!file || typeof file !== "object" || typeof file.path !== "string") {
       throw new FormPackageError("invalid_package", "package file declaration is invalid");
@@ -305,24 +348,37 @@ async function materialize(input: FormPackageInput): Promise<{
     }
     if (seen.has(path)) throw new FormPackageError("invalid_package", "duplicate package path");
     seen.add(path);
-    const bytes = await bytesOf(file.bytes);
+    const mediaType =
+      file.mediaType === undefined ? undefined : validateInputMediaType(file.mediaType);
+    const declared = declaredFiles.get(path);
+    const declaredSize = declared?.size;
+    const boundedMediaType = mediaType ?? declared?.mediaType;
+    const maximum = Math.min(
+      formPackagePayloadLimit(boundedMediaType),
+      FORM_PACKAGE_LIMITS.packagePayloadBytes - payloadBytes,
+    );
+    let bytes: Uint8Array;
+    try {
+      bytes = await bytesOf(file.bytes, maximum, declaredSize);
+    } catch (error) {
+      if (error instanceof FormPackageStreamLimitError) {
+        throw new FormPackageError("invalid_package", error.message);
+      }
+      throw error;
+    }
     const digest = await bytesDigest(bytes);
     if (file.digest !== undefined && file.digest !== digest) {
       throw new FormPackageError("package_digest_mismatch", `payload digest mismatch for ${path}`);
     }
-    if (
-      file.mediaType !== undefined &&
-      (typeof file.mediaType !== "string" ||
-        file.mediaType.length === 0 ||
-        file.mediaType.length > 255)
-    ) {
-      throw new FormPackageError("invalid_package", "package media type is invalid");
+    if (bytes.byteLength > FORM_PACKAGE_LIMITS.packagePayloadBytes - payloadBytes) {
+      throw new FormPackageError("invalid_package", "package payload total exceeds 256 MiB");
     }
+    payloadBytes += bytes.byteLength;
     files.push({
       path,
       digest,
       size: bytes.byteLength,
-      ...(file.mediaType === undefined ? {} : { mediaType: file.mediaType }),
+      ...(mediaType === undefined ? {} : { mediaType: mediaType }),
       bytes,
     });
   }
@@ -338,7 +394,21 @@ async function readPackage(
   const prefix = formPackagePrefix(packageDigest);
   const index = await objects.get(`${prefix}/package-index.json`);
   if (!index) return null;
-  const indexBytes = new Uint8Array(await new Response(index.body).arrayBuffer());
+  if (!validObjectSize(index.size) || index.size > FORM_PACKAGE_LIMITS.indexBytes) {
+    cancelFormPackageStream(index.body);
+    return null;
+  }
+  let indexBytes: Uint8Array;
+  try {
+    indexBytes = await readBoundedFormPackageStream(
+      index.body,
+      FORM_PACKAGE_LIMITS.indexBytes,
+      index.size > 0 ? index.size : undefined,
+    );
+  } catch (error) {
+    if (error instanceof FormPackageStreamLimitError) return null;
+    throw error;
+  }
   let manifest: JsonObject;
   try {
     const parsed: unknown = JSON.parse(new TextDecoder().decode(indexBytes));
@@ -353,9 +423,17 @@ async function readPackage(
   if (!isFormRef(formRef)) return null;
   if (expectedFormRef && canonicalJson(formRef) !== canonicalJson(expectedFormRef)) return null;
   const declarations = manifest.files;
-  if (!Array.isArray(declarations) || declarations.length === 0) return null;
+  if (
+    !Array.isArray(declarations) ||
+    declarations.length === 0 ||
+    declarations.length > FORM_PACKAGE_LIMITS.files
+  ) {
+    return null;
+  }
+  if (formPackagePayloadTotal(declarations) === null) return null;
   const files: FormPackageFile[] = [];
   const seen = new Set<string>();
+  let declaredPayloadBytes = 0;
   for (const value of declarations) {
     if (!isJsonObject(value)) return null;
     const path = value.path;
@@ -365,17 +443,40 @@ async function readPackage(
       typeof path !== "string" ||
       !isSha256Digest(digest) ||
       typeof size !== "number" ||
-      !Number.isSafeInteger(size)
+      !Number.isSafeInteger(size) ||
+      size < 0 ||
+      (value.mediaType !== undefined &&
+        (typeof value.mediaType !== "string" ||
+          value.mediaType.length === 0 ||
+          value.mediaType.length > 255 ||
+          !ALLOWED_MEDIA_TYPES.has(value.mediaType)))
     ) {
       return null;
     }
     const safePath = validateRelativePath(path);
-    if (safePath === "package-index.json" || seen.has(safePath) || size < 0) return null;
+    if (safePath === "package-index.json" || seen.has(safePath)) return null;
+    const limit = formPackagePayloadLimit(
+      typeof value.mediaType === "string" ? value.mediaType : undefined,
+    );
+    if (size > limit || size > FORM_PACKAGE_LIMITS.packagePayloadBytes - declaredPayloadBytes) {
+      return null;
+    }
+    declaredPayloadBytes += size;
     seen.add(safePath);
     const object = await objects.get(formPackageKey(packageDigest, safePath));
     if (!object) return null;
-    const bytes = new Uint8Array(await new Response(object.body).arrayBuffer());
-    if (bytes.byteLength !== size || (await bytesDigest(bytes)) !== digest) return null;
+    if (!validObjectSize(object.size) || object.size > limit) {
+      cancelFormPackageStream(object.body);
+      return null;
+    }
+    let bytes: Uint8Array;
+    try {
+      bytes = await readBoundedFormPackageStream(object.body, limit, size);
+    } catch (error) {
+      if (error instanceof FormPackageStreamLimitError) return null;
+      throw error;
+    }
+    if ((await bytesDigest(bytes)) !== digest) return null;
     files.push({
       path: safePath,
       digest,
@@ -390,20 +491,19 @@ async function readPackage(
   } catch {
     return null;
   }
-  const expectedKeys = new Set([
+  const expectedKeys = new Set<string>([
     `${prefix}/package-index.json`,
     ...files.map((file) => formPackageKey(packageDigest, file.path)),
   ]);
-  let cursor: string | undefined;
-  do {
-    const page = await objects.list({
-      prefix: `${prefix}/`,
-      limit: 100,
-      ...(cursor === undefined ? {} : { cursor }),
-    });
-    if (page.objects.some((object) => !expectedKeys.has(object.key))) return null;
-    cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor !== undefined);
+  if (
+    !(await hasExactFormPackageObjectClosure(
+      (input) => objects.list(input),
+      `${prefix}/`,
+      expectedKeys,
+    ))
+  ) {
+    return null;
+  }
   return {
     packageDigest,
     formRef: structuredClone(formRef),
@@ -467,6 +567,13 @@ function validatePackageManifest(
   if (!Array.isArray(value.files) || value.files.length === 0) {
     throw new FormPackageError("invalid_package", "package manifest files are invalid");
   }
+  assertPackageFileLimits(value.files);
+  if (expectedFiles.length > FORM_PACKAGE_LIMITS.files) {
+    throw new FormPackageError(
+      "invalid_package",
+      `package lists ${expectedFiles.length} files; maximum is ${FORM_PACKAGE_LIMITS.files}`,
+    );
+  }
   if (value.files.length !== expectedFiles.length) {
     throw new FormPackageError(
       "invalid_package",
@@ -528,6 +635,77 @@ function validatePackageManifest(
   return structuredClone(value);
 }
 
+function assertPackageIndexSize(value: JsonObject): void {
+  let bytes: Uint8Array;
+  try {
+    bytes = new TextEncoder().encode(canonicalJson(value));
+  } catch {
+    throw new FormPackageError("invalid_package", "package index cannot be encoded");
+  }
+  if (bytes.byteLength > FORM_PACKAGE_LIMITS.indexBytes) {
+    throw new FormPackageError(
+      "invalid_package",
+      `package index exceeds ${FORM_PACKAGE_LIMITS.indexBytes} bytes`,
+    );
+  }
+}
+
+function assertDeclaredManifestLimits(value: unknown): void {
+  if (!isJsonObject(value)) {
+    throw new FormPackageError("invalid_package", "package manifest is invalid");
+  }
+  assertPackageIndexSize(value);
+  if (Array.isArray(value.files)) assertPackageFileLimits(value.files);
+}
+
+function assertPackageFileLimits(files: readonly unknown[]): void {
+  if (files.length > FORM_PACKAGE_LIMITS.files) {
+    throw new FormPackageError(
+      "invalid_package",
+      `package lists ${files.length} files; maximum is ${FORM_PACKAGE_LIMITS.files}`,
+    );
+  }
+  let total = 0;
+  for (const value of files) {
+    if (!isJsonObject(value)) continue;
+    const size = value.size;
+    if (typeof size !== "number" || !Number.isSafeInteger(size) || size < 0) continue;
+    const mediaType = typeof value.mediaType === "string" ? value.mediaType : undefined;
+    const limit = formPackagePayloadLimit(mediaType);
+    if (size > limit) {
+      throw new FormPackageError(
+        "invalid_package",
+        `package payload exceeds ${limit} bytes for ${mediaType ?? "untyped"} content`,
+      );
+    }
+    if (size > FORM_PACKAGE_LIMITS.packagePayloadBytes - total) {
+      throw new FormPackageError(
+        "invalid_package",
+        `package payload total exceeds ${FORM_PACKAGE_LIMITS.packagePayloadBytes} bytes`,
+      );
+    }
+    total += size;
+  }
+}
+
+function declaredManifestFiles(
+  manifest: JsonObject | undefined,
+): ReadonlyMap<string, { readonly size: number; readonly mediaType?: string }> {
+  if (!manifest || !Array.isArray(manifest.files)) return new Map();
+  const declared = new Map<string, { readonly size: number; readonly mediaType?: string }>();
+  for (const value of manifest.files) {
+    if (!isJsonObject(value) || typeof value.path !== "string") continue;
+    if (typeof value.size !== "number" || !Number.isSafeInteger(value.size) || value.size < 0) {
+      continue;
+    }
+    declared.set(value.path, {
+      size: value.size,
+      ...(typeof value.mediaType === "string" ? { mediaType: value.mediaType } : {}),
+    });
+  }
+  return declared;
+}
+
 const ALLOWED_MEDIA_TYPES = new Set([
   "application/vnd.takoform.form-definition.v1+json",
   "application/schema+json",
@@ -571,6 +749,10 @@ function isSafeManifestPath(value: string): boolean {
 function requireDigest(value: string): asserts value is FormPackageDigest {
   if (!isSha256Digest(value))
     throw new FormPackageError("invalid_package", "invalid sha256 digest");
+}
+
+function validObjectSize(value: number): boolean {
+  return Number.isSafeInteger(value) && value >= 0;
 }
 
 function validateRelativePath(value: string): string {
@@ -630,15 +812,52 @@ function sameFormRefKeys(value: object): boolean {
   );
 }
 
+function validateInputMediaType(value: string): string {
+  if (value.length === 0 || value.length > 255 || !ALLOWED_MEDIA_TYPES.has(value)) {
+    throw new FormPackageError("invalid_package", "package media type is invalid");
+  }
+  return value;
+}
+
 async function bytesOf(
   value: ArrayBuffer | Uint8Array | ReadableStream<Uint8Array>,
+  maxBytes: number,
+  expectedBytes?: number,
 ): Promise<Uint8Array> {
-  if (value instanceof Uint8Array) return value.slice();
-  if (value instanceof ArrayBuffer) return new Uint8Array(value.slice(0));
+  if (value instanceof Uint8Array) {
+    if (value.byteLength > maxBytes) {
+      throw new FormPackageStreamLimitError(
+        "overrun",
+        `Form Package payload exceeds ${maxBytes} bytes`,
+      );
+    }
+    if (expectedBytes !== undefined && value.byteLength !== expectedBytes) {
+      throw new FormPackageStreamLimitError(
+        value.byteLength < expectedBytes ? "underrun" : "overrun",
+        `Form Package payload has ${value.byteLength} bytes; declared ${expectedBytes}`,
+      );
+    }
+    return value.slice();
+  }
+  if (value instanceof ArrayBuffer) {
+    if (value.byteLength > maxBytes) {
+      throw new FormPackageStreamLimitError(
+        "overrun",
+        `Form Package payload exceeds ${maxBytes} bytes`,
+      );
+    }
+    if (expectedBytes !== undefined && value.byteLength !== expectedBytes) {
+      throw new FormPackageStreamLimitError(
+        value.byteLength < expectedBytes ? "underrun" : "overrun",
+        `Form Package payload has ${value.byteLength} bytes; declared ${expectedBytes}`,
+      );
+    }
+    return new Uint8Array(value.slice(0));
+  }
   if (!(value instanceof ReadableStream)) {
     throw new FormPackageError("invalid_package", "package payload bytes are invalid");
   }
-  return new Uint8Array(await new Response(value).arrayBuffer());
+  return await readBoundedFormPackageStream(value, maxBytes, expectedBytes);
 }
 
 function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
