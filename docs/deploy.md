@@ -7,12 +7,23 @@ The contract is read-only:
 bun run deploy -- --contract
 ```
 
-Every status or apply invocation has exactly this shape:
+Every routine status or apply invocation has exactly this shape:
 
 ```sh
 bun run deploy -- <surface> --status --environment=<integration|rehearsal|production> --commit=<40-hex-sha>
 bun run deploy -- <surface> --apply --environment=<integration|rehearsal|production> --commit=<40-hex-sha>
 ```
+
+One bootstrap exception exists for an already deployed integration Worker whose
+Version predates canonical artifact annotations. Only
+`takoserver-worker-authority-cutover` with `--environment=integration` may add
+`--legacy-predecessor-version=<uuid>`. The UUID must equal the authoritative
+current Version immediately before upload, all binding/config/secret/domain and
+migration closure remains strict, and an independent reviewer is required. A
+missing or malformed annotation is reported as
+`legacy-unattributed-predecessor` with `authorityScope` set to the entire Worker
+artifact; no predecessor source diff is invented. Routine Worker, rehearsal,
+and production invocations never accept this selector.
 
 The environment selects only `.deploy/targets/<environment>.json` (or the
 matching absolute `TAKOSERVER_DEPLOY_TARGET_<ENVIRONMENT>` path). There is no
@@ -69,10 +80,12 @@ provider readback plus the surface's bounded public readback. Worker version
 identity is internal deployment history, not a consumer-pinned published
 identity.
 
-Cloudflare list state is consumed exhaustively and pagination metadata is
-mandatory. Child commands receive a sanitized process substrate plus only the
-credential explicitly supplied for that call; ambient deploy credentials are
-not inherited.
+Paginated Cloudflare list state is consumed exhaustively and its pagination
+coordinates are mandatory. Endpoint-specific closed shapes are used for the
+non-paginated Worker deployment-history envelope and secret inventory. Child
+commands receive a sanitized process substrate plus only the credential
+explicitly supplied for that call; ambient deploy credentials are not
+inherited.
 
 ## Operator-private inputs
 
@@ -100,3 +113,10 @@ the same surface with `--status`. A failed post-condition means the mutation
 was acknowledged but must be repaired or rolled back explicitly. Routine
 Worker, Console, and Pages output the immediately previous provider-history
 identity; irreversible surfaces state their forward-repair boundary.
+
+For an integration legacy Worker cutover, repeat `--status` with the same
+`--legacy-predecessor-version` after an indeterminate acknowledgement. The
+readback distinguishes the legacy predecessor still being current, its direct
+canonical successor matching the selected commit, and a direct successor from
+a different commit. An unrelated history advance or malformed successor fails
+closed. The status path never retries the upload.

@@ -103,4 +103,63 @@ describe("Takoserver split deploy entrypoint", () => {
       expect(refused.stderr).toContain("no target was touched");
     }
   });
+
+  test("accepts the legacy predecessor selector only for integration authority cutover", async () => {
+    const sha = "a".repeat(40);
+    const version = "00000000-0000-4000-8000-000000000001";
+    const accepted = await deploy([
+      "takoserver-worker-authority-cutover",
+      "--status",
+      "--environment=integration",
+      `--commit=${sha}`,
+      `--legacy-predecessor-version=${version}`,
+    ]);
+    expect(accepted.exitCode).toBe(2);
+    expect(accepted.stderr).toContain("deploy target descriptor not found");
+    expect(accepted.stderr).not.toContain("no target was touched");
+
+    for (const args of [
+      [
+        "takoserver-worker",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--legacy-predecessor-version=${version}`,
+      ],
+      [
+        "takoserver-worker-authority-cutover",
+        "--status",
+        "--environment=rehearsal",
+        `--commit=${sha}`,
+        `--legacy-predecessor-version=${version}`,
+      ],
+      [
+        "takoserver-worker-authority-cutover",
+        "--status",
+        "--environment=production",
+        `--commit=${sha}`,
+        `--legacy-predecessor-version=${version}`,
+      ],
+      [
+        "takoserver-worker-authority-cutover",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        "--legacy-predecessor-version=not-a-version-id",
+      ],
+      [
+        "takoserver-worker-authority-cutover",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--legacy-predecessor-version=${version}`,
+        `--legacy-predecessor-version=${version}`,
+      ],
+    ] as const) {
+      const refused = await deploy(args);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+    }
+  });
 });

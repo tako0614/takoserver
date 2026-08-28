@@ -22,9 +22,9 @@ interface Pagination {
 }
 
 /**
- * Read-only Cloudflare adapter with one small interface: exhaustive lists and
- * singular state. Every list proves its pagination closure before a caller may
- * make an ownership or rollback decision from it.
+ * Read-only Cloudflare adapter with one small interface: paginated lists prove
+ * their pagination closure, while endpoint-specific single-page inventories,
+ * singular state, and Worker deployment history use their own response shapes.
  */
 export class CloudflareState {
   readonly #accountId: string;
@@ -118,11 +118,13 @@ export class CloudflareState {
     });
   }
 
-  workerDeployments(workerName: string): Promise<readonly unknown[]> {
-    return this.list(
+  async workerDeployments(workerName: string): Promise<readonly unknown[]> {
+    const label = `${workerName} deployment history`;
+    const result = await this.read(
       `/workers/scripts/${encodeURIComponent(workerName)}/deployments`,
-      `${workerName} deployment history`,
+      label,
     );
+    return parseDeploymentHistory(result, label);
   }
 
   workerVersions(workerName: string): Promise<readonly unknown[]> {
@@ -139,11 +141,13 @@ export class CloudflareState {
     );
   }
 
-  workerSecrets(workerName: string): Promise<readonly unknown[]> {
-    return this.list(
+  async workerSecrets(workerName: string): Promise<readonly unknown[]> {
+    const label = `${workerName} secret inventory`;
+    const result = await this.read(
       `/workers/scripts/${encodeURIComponent(workerName)}/secrets`,
-      `${workerName} secret inventory`,
+      label,
     );
+    return parseSecretInventory(result, label);
   }
 
   workerSettings(workerName: string): Promise<unknown> {
@@ -201,19 +205,50 @@ export class CloudflareState {
 
 function parsePagination(value: unknown, label: string): Pagination {
   if (!isRecord(value)) throw preflightError(`${label} returned no pagination metadata`);
-  const coordinates = {
-    page: value.page,
-    perPage: value.per_page,
-    count: value.count,
-    totalCount: value.total_count,
-    totalPages: value.total_pages,
-  };
+  const page = value.page;
+  const perPage = value.per_page;
+  const count = value.count;
+  const totalCount = value.total_count;
   if (
-    Object.values(coordinates).some((entry) => !Number.isSafeInteger(entry) || Number(entry) < 0)
+    !isNonNegativeSafeInteger(page) ||
+    !isNonNegativeSafeInteger(perPage) ||
+    !isNonNegativeSafeInteger(count) ||
+    !isNonNegativeSafeInteger(totalCount)
   ) {
     throw preflightError(`${label} returned invalid pagination metadata`);
   }
-  return coordinates as Pagination;
+  if (perPage === 0) {
+    throw preflightError(`${label} returned invalid pagination metadata`);
+  }
+  const derivedTotalPages = Math.ceil(totalCount / perPage);
+  const suppliedTotalPages = value.total_pages;
+  if (suppliedTotalPages !== undefined && !isNonNegativeSafeInteger(suppliedTotalPages)) {
+    throw preflightError(`${label} returned invalid pagination metadata`);
+  }
+  const totalPages = suppliedTotalPages ?? derivedTotalPages;
+  if (totalPages !== derivedTotalPages) {
+    throw preflightError(`${label} returned invalid pagination metadata`);
+  }
+  return { page, perPage, count, totalCount, totalPages };
+}
+
+function parseDeploymentHistory(value: unknown, label: string): readonly unknown[] {
+  if (
+    !isRecord(value) ||
+    Object.keys(value).length !== 1 ||
+    !Object.hasOwn(value, "deployments") ||
+    !Array.isArray(value.deployments)
+  ) {
+    throw preflightError(`${label} returned an invalid deployment history envelope`);
+  }
+  return value.deployments;
+}
+
+function parseSecretInventory(value: unknown, label: string): readonly unknown[] {
+  if (!Array.isArray(value)) {
+    throw preflightError(`${label} returned an invalid secret inventory result`);
+  }
+  return value;
 }
 
 function errorSummary(value: unknown): string | undefined {
@@ -227,4 +262,8 @@ function errorSummary(value: unknown): string | undefined {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
 }

@@ -7,13 +7,14 @@ import { runD1Schema } from "./deploy/schema.ts";
 import { runSigning } from "./deploy/signing.ts";
 import { runStaticSite } from "./deploy/static.ts";
 import { loadTarget, targetPath } from "./deploy/target.ts";
-import { runWorker } from "./deploy/worker.ts";
+import { isWorkerVersionId, runWorker } from "./deploy/worker.ts";
 
 const USAGE = `takoserver deploy
 
   bun run deploy -- --contract
   bun run deploy -- <surface> --status --environment=<integration|rehearsal|production> --commit=<sha>
   bun run deploy -- <surface> --apply  --environment=<integration|rehearsal|production> --commit=<sha>
+  The authority cutover may add --legacy-predecessor-version=<uuid> for integration bootstrap.
 
 The target descriptor is selected only by the exact environment. There is no
 plan, ledger, target override or mixed mutation controller.
@@ -26,15 +27,17 @@ interface Invocation {
   readonly action: "status" | "apply";
   readonly environment: DeployEnvironment;
   readonly commit: string;
+  readonly legacyPredecessorVersionId?: string;
 }
 
 function parseInvocation(args: readonly string[]): Invocation | null {
-  if (args.length !== 4) return null;
+  if (args.length < 4 || args.length > 5) return null;
   const [surfaceValue, ...flags] = args;
   if (!isSurface(surfaceValue)) return null;
   let action: Invocation["action"] | null = null;
   let environment: DeployEnvironment | null = null;
   let commit: string | null = null;
+  let legacyPredecessorVersionId: string | null = null;
   for (const flag of flags) {
     if (flag === "--status" || flag === "--apply") {
       if (action !== null) return null;
@@ -57,11 +60,29 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       commit = value;
       continue;
     }
+    if (flag.startsWith("--legacy-predecessor-version=")) {
+      if (legacyPredecessorVersionId !== null) return null;
+      const value = flag.slice("--legacy-predecessor-version=".length);
+      if (!isWorkerVersionId(value)) return null;
+      legacyPredecessorVersionId = value;
+      continue;
+    }
     return null;
   }
-  return action && environment && commit
-    ? { surface: surfaceValue, action, environment, commit }
-    : null;
+  if (!action || !environment || !commit) return null;
+  if (
+    legacyPredecessorVersionId !== null &&
+    (surfaceValue !== "takoserver-worker-authority-cutover" || environment !== "integration")
+  ) {
+    return null;
+  }
+  return {
+    surface: surfaceValue,
+    action,
+    environment,
+    commit,
+    ...(legacyPredecessorVersionId === null ? {} : { legacyPredecessorVersionId }),
+  };
 }
 
 function isSurface(value: string | undefined): value is Surface {
@@ -79,6 +100,9 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
           action: invocation.action,
           environment: invocation.environment,
           commit: invocation.commit,
+          ...(invocation.legacyPredecessorVersionId === undefined
+            ? {}
+            : { legacyPredecessorVersionId: invocation.legacyPredecessorVersionId }),
         },
         target,
       );

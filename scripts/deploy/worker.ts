@@ -42,8 +42,16 @@ export type WorkerProcess = (
 ) => Promise<CommandResult>;
 
 export type { WorkerState } from "./worker-live.ts";
+export { isWorkerVersionId } from "./worker-live.ts";
 
-import { inspectLiveWorkerVersion, type WorkerState } from "./worker-live.ts";
+import {
+  inspectLiveWorkerVersion,
+  inspectLiveWorkerVersionForLegacyStatus,
+  inspectLiveWorkerVersionWithLegacyPredecessor,
+  isWorkerVersionId,
+  LEGACY_UNATTRIBUTED_PREDECESSOR,
+  type WorkerState,
+} from "./worker-live.ts";
 
 export interface WorkerMigrationReader {
   read(): Promise<{ readonly local: readonly string[]; readonly applied: readonly string[] }>;
@@ -54,6 +62,7 @@ export interface WorkerInvocation {
   readonly action: "status" | "apply";
   readonly environment: DeployEnvironment;
   readonly commit: string;
+  readonly legacyPredecessorVersionId?: string;
 }
 
 export interface WorkerOptions {
@@ -68,8 +77,9 @@ export interface WorkerOptions {
 
 interface WorkerInspection {
   readonly history: WorkerDeploymentHistory;
-  readonly commit: string;
-  readonly bundleDigestHex: string;
+  readonly commit: string | null;
+  readonly bundleDigestHex: string | null;
+  readonly predecessorIdentity?: typeof LEGACY_UNATTRIBUTED_PREDECESSOR;
   readonly migrations: { readonly local: readonly string[]; readonly applied: readonly string[] };
   readonly pending: readonly string[];
 }
@@ -89,6 +99,19 @@ export async function runWorker(
 ): Promise<Record<string, unknown>> {
   if (target.environment !== invocation.environment) {
     throw preflightError("Worker invocation and target environments differ");
+  }
+  if (invocation.legacyPredecessorVersionId !== undefined) {
+    if (invocation.surface !== "takoserver-worker-authority-cutover") {
+      throw preflightError(
+        "legacy predecessor bootstrap requires takoserver-worker-authority-cutover",
+      );
+    }
+    if (invocation.environment !== "integration") {
+      throw preflightError("legacy predecessor bootstrap is integration-only");
+    }
+    if (!isWorkerVersionId(invocation.legacyPredecessorVersionId)) {
+      throw preflightError("legacy predecessor Version ID must be one exact UUID");
+    }
   }
   const run = options.run ?? runCommand;
   const environment =
@@ -111,9 +134,25 @@ export async function runWorker(
     });
     const migrations =
       options.migrations ?? remoteMigrationReader(inspectionConfig, environment, run);
-    const before = await inspectWorker("preflight", target, state, migrations);
+    const before = await inspectWorker(
+      "preflight",
+      target,
+      state,
+      migrations,
+      invocation.legacyPredecessorVersionId === undefined
+        ? {}
+        : {
+            legacyPredecessorVersionId: invocation.legacyPredecessorVersionId,
+            reconcileStatus: invocation.action === "status",
+          },
+    );
 
     if (invocation.action === "status") {
+      const advancedFromSelector =
+        invocation.legacyPredecessorVersionId !== undefined &&
+        before.history.versionId !== invocation.legacyPredecessorVersionId;
+      const reconcilingLegacyCutover =
+        advancedFromSelector || before.predecessorIdentity !== undefined;
       return {
         kind: "takoserver.worker-status@v2",
         surface: invocation.surface,
@@ -124,10 +163,31 @@ export async function runWorker(
         deploymentId: before.history.deploymentId,
         versionId: before.history.versionId,
         previousVersionId: before.history.previousVersionId,
-        artifactDigest: `sha256:${before.bundleDigestHex}`,
+        artifactDigest: before.bundleDigestHex === null ? null : `sha256:${before.bundleDigestHex}`,
         appliedMigrations: before.migrations.applied,
         pendingMigrations: before.pending,
-        ready: before.pending.length === 0,
+        ready:
+          before.pending.length === 0 &&
+          (!reconcilingLegacyCutover || before.commit === invocation.commit),
+        ...(advancedFromSelector
+          ? {
+              legacyPredecessorVersionId: invocation.legacyPredecessorVersionId,
+              cutoverState:
+                before.commit === invocation.commit
+                  ? "selected-commit-current"
+                  : "different-commit-current",
+            }
+          : {}),
+        ...(before.predecessorIdentity === undefined
+          ? {}
+          : {
+              ...(invocation.legacyPredecessorVersionId === undefined
+                ? {}
+                : { legacyPredecessorVersionId: invocation.legacyPredecessorVersionId }),
+              predecessorIdentity: before.predecessorIdentity ?? LEGACY_UNATTRIBUTED_PREDECESSOR,
+              authorityScope: "entire-worker-artifact",
+              cutoverState: "legacy-predecessor-current",
+            }),
       };
     }
 
@@ -142,10 +202,22 @@ export async function runWorker(
         JSON.stringify(before.pending),
       );
     }
-    const changedPaths = await sourceDiff(run, before.commit, source.commit, source.changedPaths);
-    const authorityPaths = authoritySensitiveWorkerPaths(changedPaths);
+    const legacyBootstrap = before.predecessorIdentity !== undefined;
+    const changedPaths = legacyBootstrap
+      ? null
+      : before.commit === null
+        ? (() => {
+            throw preflightError("Worker predecessor identity is unavailable");
+          })()
+        : await sourceDiff(run, before.commit, source.commit, source.changedPaths);
+    const authorityPaths =
+      changedPaths === null ? null : authoritySensitiveWorkerPaths(changedPaths);
     let reviewer: string | null = null;
-    if (invocation.surface === "takoserver-worker" && authorityPaths.length > 0) {
+    if (
+      invocation.surface === "takoserver-worker" &&
+      authorityPaths !== null &&
+      authorityPaths.length > 0
+    ) {
       throw preflightError(
         "authority-sensitive Worker diff requires takoserver-worker-authority-cutover",
         JSON.stringify(authorityPaths),
@@ -169,6 +241,25 @@ export async function runWorker(
     const { bundlePath, configPath, bundleDigestHex } = prepared;
     const artifact = prepared.seal();
     artifact.assertUnchanged();
+    if (legacyBootstrap) {
+      const selector = invocation.legacyPredecessorVersionId;
+      if (selector === undefined) {
+        throw preflightError("Worker legacy predecessor selector is unavailable");
+      }
+      const last = await inspectLiveWorkerVersionWithLegacyPredecessor("preflight", target, state, {
+        hostedTopology: "desired",
+        legacyPredecessorVersionId: selector,
+      });
+      if (
+        last.history.versionId !== before.history.versionId ||
+        last.commit !== null ||
+        last.predecessorIdentity !== LEGACY_UNATTRIBUTED_PREDECESSOR
+      ) {
+        throw preflightError(
+          "pinned legacy predecessor is no longer the same unattributed Worker Version",
+        );
+      }
+    }
     const message = `takoserver-worker:${source.commit}:${bundleDigestHex}`;
     const upload = await run(
       wranglerCommand([
@@ -218,6 +309,7 @@ export async function runWorker(
       remoteRef: source.remoteRef,
       changedPaths,
       authorityPaths,
+      ...(legacyBootstrap ? { worktreePaths: source.changedPaths } : {}),
       reviewer,
       artifactDigest: artifact.digest,
       artifactBytes: artifact.bytes,
@@ -227,6 +319,15 @@ export async function runWorker(
       deploymentId: after.history.deploymentId,
       versionId: after.history.versionId,
       probe,
+      ...(before.predecessorIdentity === undefined
+        ? {}
+        : {
+            ...(invocation.legacyPredecessorVersionId === undefined
+              ? {}
+              : { legacyPredecessorVersionId: invocation.legacyPredecessorVersionId }),
+            predecessorIdentity: before.predecessorIdentity ?? LEGACY_UNATTRIBUTED_PREDECESSOR,
+            authorityScope: "entire-worker-artifact",
+          }),
       rollback:
         `wrangler versions deploy ${before.history.versionId}@100% --yes ` +
         `--name ${target.workerName}`,
@@ -241,16 +342,32 @@ async function inspectWorker(
   target: DeployTarget,
   state: WorkerState,
   migrations: WorkerMigrationReader,
+  options: {
+    readonly legacyPredecessorVersionId?: string;
+    readonly reconcileStatus?: boolean;
+  } = {},
 ): Promise<WorkerInspection> {
-  const live = await inspectLiveWorkerVersion(phase, target, state, {
-    hostedTopology: "desired",
-  });
+  const live =
+    options.legacyPredecessorVersionId === undefined
+      ? await inspectLiveWorkerVersion(phase, target, state, {
+          hostedTopology: "desired",
+        })
+      : options.reconcileStatus === true
+        ? await inspectLiveWorkerVersionForLegacyStatus(phase, target, state, {
+            hostedTopology: "desired",
+            legacyPredecessorVersionId: options.legacyPredecessorVersionId,
+          })
+        : await inspectLiveWorkerVersionWithLegacyPredecessor(phase, target, state, {
+            hostedTopology: "desired",
+            legacyPredecessorVersionId: options.legacyPredecessorVersionId,
+          });
   const migrationState = await migrations.read();
   const pending = pendingMigrations(migrationState.local, migrationState.applied);
   return {
     history: live.history,
     commit: live.commit,
     bundleDigestHex: live.bundleDigestHex,
+    ...(live.commit === null ? { predecessorIdentity: LEGACY_UNATTRIBUTED_PREDECESSOR } : {}),
     migrations: migrationState,
     pending,
   };

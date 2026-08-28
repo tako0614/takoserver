@@ -209,9 +209,10 @@ export interface WorkerDeploymentHistory {
 }
 
 /**
- * Reduces exhaustive Cloudflare deployment history to the active and rollback
- * identities. A gradual or malformed deployment is not silently treated as a
- * single-version routine target.
+ * Reduces Cloudflare's endpoint-provided deployment history to the active and
+ * rollback identities. The endpoint exposes a bounded, non-paginated history;
+ * a gradual or malformed deployment is not silently treated as a single-version
+ * routine target.
  */
 export function parseWorkerDeploymentHistory(
   value: readonly unknown[],

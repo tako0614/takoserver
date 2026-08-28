@@ -10,6 +10,9 @@ import {
 } from "./worker-state.ts";
 
 const WORKER_MESSAGE = /^takoserver-worker:([0-9a-f]{40}):([0-9a-f]{64})$/u;
+const WORKER_VERSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+
+export const LEGACY_UNATTRIBUTED_PREDECESSOR = "legacy-unattributed-predecessor" as const;
 
 export interface WorkerState {
   workerDomains(): Promise<readonly { readonly hostname: string; readonly service: string }[]>;
@@ -24,6 +27,13 @@ export interface LiveWorkerVersion {
   readonly bundleDigestHex: string;
 }
 
+export interface LegacyLiveWorkerVersion {
+  readonly history: WorkerDeploymentHistory;
+  readonly commit: null;
+  readonly bundleDigestHex: null;
+  readonly predecessorIdentity: typeof LEGACY_UNATTRIBUTED_PREDECESSOR;
+}
+
 /** Exact authoritative code/config/secret/domain state for one served Version. */
 export async function inspectLiveWorkerVersion(
   phase: DeployPhase,
@@ -35,8 +45,91 @@ export async function inspectLiveWorkerVersion(
     readonly expectedSecrets?: readonly string[];
   },
 ): Promise<LiveWorkerVersion> {
+  const inspected = await inspectLiveWorkerVersionCore(phase, target, state, input, "strict");
+  if (inspected.commit === null) {
+    throw phaseError(phase, "Worker version has no exact commit and artifact annotation");
+  }
+  return inspected;
+}
+
+/**
+ * Reads one explicitly pinned integration predecessor while permitting only a
+ * missing or malformed identity annotation. Binding, secret, domain, and
+ * target closure checks remain identical to the strict path.
+ */
+export async function inspectLiveWorkerVersionWithLegacyPredecessor(
+  phase: DeployPhase,
+  target: DeployTarget,
+  state: WorkerState,
+  input: {
+    readonly hostedTopology: "desired" | "absent";
+    readonly signingKeyId?: string;
+    readonly expectedSecrets?: readonly string[];
+    readonly legacyPredecessorVersionId: string;
+  },
+): Promise<LiveWorkerVersion | LegacyLiveWorkerVersion> {
+  if (!isWorkerVersionId(input.legacyPredecessorVersionId)) {
+    throw phaseError(phase, "legacy predecessor Version ID must be one exact UUID");
+  }
+  return await inspectLiveWorkerVersionCore(phase, target, state, input, "pinned-current");
+}
+
+/**
+ * Reconciles a selector-bearing read after an upload acknowledgement may have
+ * been lost. Only the selected current Version or its exact direct successor
+ * is related to that attempt; an advanced Version is always read strictly.
+ */
+export async function inspectLiveWorkerVersionForLegacyStatus(
+  phase: DeployPhase,
+  target: DeployTarget,
+  state: WorkerState,
+  input: {
+    readonly hostedTopology: "desired" | "absent";
+    readonly signingKeyId?: string;
+    readonly expectedSecrets?: readonly string[];
+    readonly legacyPredecessorVersionId: string;
+  },
+): Promise<LiveWorkerVersion | LegacyLiveWorkerVersion> {
+  if (!isWorkerVersionId(input.legacyPredecessorVersionId)) {
+    throw phaseError(phase, "legacy predecessor Version ID must be one exact UUID");
+  }
+  return await inspectLiveWorkerVersionCore(phase, target, state, input, "status-reconciliation");
+}
+
+async function inspectLiveWorkerVersionCore(
+  phase: DeployPhase,
+  target: DeployTarget,
+  state: WorkerState,
+  input: {
+    readonly hostedTopology: "desired" | "absent";
+    readonly signingKeyId?: string;
+    readonly expectedSecrets?: readonly string[];
+    readonly legacyPredecessorVersionId?: string;
+  },
+  mode: "strict" | "pinned-current" | "status-reconciliation",
+): Promise<LiveWorkerVersion | LegacyLiveWorkerVersion> {
   const history = parseWorkerDeploymentHistory(await state.workerDeployments(target.workerName));
   if (history === null) throw phaseError(phase, "Worker has no authoritative current deployment");
+  const selector = input.legacyPredecessorVersionId;
+  const selectorIsCurrent = selector !== undefined && history.versionId === selector;
+  if (mode === "pinned-current" && !selectorIsCurrent) {
+    throw phaseError(
+      phase,
+      "authoritative current Worker Version does not match the pinned legacy predecessor",
+      `expected=${selector} actual=${history.versionId}`,
+    );
+  }
+  if (
+    mode === "status-reconciliation" &&
+    !selectorIsCurrent &&
+    history.previousVersionId !== selector
+  ) {
+    throw phaseError(
+      phase,
+      "authoritative current Worker Version is not the direct successor of the pinned legacy predecessor",
+      `expected_previous=${selector} actual_previous=${history.previousVersionId ?? "none"} current=${history.versionId}`,
+    );
+  }
   const version = await state.workerVersion(target.workerName, history.versionId);
   assertExactVersionBindingClosure(
     phase,
@@ -54,8 +147,19 @@ export async function inspectLiveWorkerVersion(
     phase,
   );
   assertDomainClosure(phase, target, await state.workerDomains());
-  const identity = workerVersionIdentity(phase, version);
-  return { history, ...identity };
+  if (mode === "strict" || !selectorIsCurrent) {
+    const identity = workerVersionIdentity(phase, version);
+    return { history, ...identity };
+  }
+  const identity = workerVersionIdentityOrLegacy(phase, version);
+  return identity.kind === "canonical"
+    ? { history, ...identity }
+    : {
+        history,
+        commit: null,
+        bundleDigestHex: null,
+        predecessorIdentity: LEGACY_UNATTRIBUTED_PREDECESSOR,
+      };
 }
 
 export function workerVersionIdentity(
@@ -71,6 +175,27 @@ export function workerVersionIdentity(
     throw phaseError(phase, "Worker version has no exact commit and artifact annotation");
   }
   return { commit: match[1], bundleDigestHex: match[2] };
+}
+
+function workerVersionIdentityOrLegacy(
+  _phase: DeployPhase,
+  value: unknown,
+):
+  | { readonly kind: "canonical"; readonly commit: string; readonly bundleDigestHex: string }
+  | { readonly kind: typeof LEGACY_UNATTRIBUTED_PREDECESSOR } {
+  if (!isRecord(value) || !isRecord(value.annotations)) {
+    return { kind: LEGACY_UNATTRIBUTED_PREDECESSOR };
+  }
+  const message = value.annotations["workers/message"];
+  const match = typeof message === "string" ? WORKER_MESSAGE.exec(message) : null;
+  if (!match?.[1] || !match[2]) {
+    return { kind: LEGACY_UNATTRIBUTED_PREDECESSOR };
+  }
+  return { kind: "canonical", commit: match[1], bundleDigestHex: match[2] };
+}
+
+export function isWorkerVersionId(value: string): boolean {
+  return WORKER_VERSION_ID.test(value);
 }
 
 export function assertDomainClosure(
