@@ -1,244 +1,144 @@
+import { runConsole } from "./deploy/console.ts";
 import { DEPLOY_CONTRACT } from "./deploy/contract.ts";
-import { DeployError, type DeployPhase, PHASE_EXIT_CODE } from "./deploy/errors.ts";
-import { appendLedger, EVIDENCE_LEDGER } from "./deploy/evidence.ts";
-import { mutate } from "./deploy/mutate.ts";
-import { inspectLive, preflight } from "./deploy/preflight.ts";
-import { writeRealizedConfig } from "./deploy/realized-config.ts";
+import { DeployError, PHASE_EXIT_CODE } from "./deploy/errors.ts";
+import { runHosted } from "./deploy/hosted.ts";
+import type { DeployEnvironment } from "./deploy/qualification.ts";
+import { runD1Schema } from "./deploy/schema.ts";
+import { runSigning } from "./deploy/signing.ts";
 import { runStaticSite } from "./deploy/static.ts";
 import { loadTarget, targetPath } from "./deploy/target.ts";
-import { verify } from "./deploy/verify.ts";
-import { runWebRelease } from "./deploy/web.ts";
-import { assertTargetBindingClosure } from "./deploy/worker-state.ts";
+import { runWorker } from "./deploy/worker.ts";
 
 const USAGE = `takoserver deploy
 
-  bun run deploy -- --contract          print the deploy contract; touches nothing
-  bun run deploy -- --status            read-only inspection of the realized target
-  bun run deploy -- --plan              run every pre-mutation proof, publish nothing
-  bun run deploy -- --apply             publish, then verify on the published origin
-  bun run deploy -- console --status    inspect the public console bytes
-  bun run deploy -- console --plan      build and prove the console release, publish nothing
-  bun run deploy -- console --apply     publish and byte-verify the public console
-  bun run deploy -- site --environment=integration   publish a branch preview (dirty allowed)
-  bun run deploy -- site --environment=production    publish main and verify takoserver.com
+  bun run deploy -- --contract
+  bun run deploy -- <surface> --status --environment=<integration|rehearsal|production> --commit=<sha>
+  bun run deploy -- <surface> --apply  --environment=<integration|rehearsal|production> --commit=<sha>
 
-  --target <path>                       deploy target descriptor
-                                        (default .deploy/target.json, or
-                                        TAKOSERVER_DEPLOY_TARGET)
-
-Exit codes: 2 nothing was touched, 3 the target may have been mutated and the
-state is indeterminate, 4 bytes are published but post-conditions failed.
+The target descriptor is selected only by the exact environment. There is no
+plan, ledger, target override or mixed mutation controller.
 `;
 
-const AFTERMATH: Readonly<Record<DeployPhase, string>> = {
-  preflight: "No Cloudflare target was touched. Fix the cause and re-run.",
-  mutation:
-    "The target may have been mutated and its state is indeterminate. Do not re-run --apply " +
-    "yet: run `bun run deploy -- --status` for an authoritative readback first.",
-  verification:
-    "Bytes are published but the post-conditions failed. Run `bun run deploy -- --status`, then " +
-    "either repair forward or roll the Worker back to the previous version printed above. D1 " +
-    "repair is forward-only; do not erase R2 objects or D1 rows to undo a code change.",
-};
+type Surface = (typeof DEPLOY_CONTRACT.surfaces)[number]["surface"];
 
-const SITE_AFTERMATH: Readonly<Record<DeployPhase, string>> = {
-  preflight: "No Pages target was touched. Fix the source or build cause and re-run.",
-  mutation:
-    "The Pages publication may have succeeded and its state is indeterminate. Read the provider deployment history before another upload.",
-  verification:
-    "Pages bytes may be published but the readback failed. Inspect the immutable deployment and takoserver.com readback before another upload.",
-};
-
-interface Mode {
-  readonly action: "status" | "plan" | "apply";
-  readonly targetPath: string;
-  readonly surface: "api" | "console";
+interface Invocation {
+  readonly surface: Surface;
+  readonly action: "status" | "apply";
+  readonly environment: DeployEnvironment;
+  readonly commit: string;
 }
 
-function parseMode(args: readonly string[]): Mode | null {
-  let action: Mode["action"] | null = null;
-  let explicitTarget: string | undefined;
-  let surface: Mode["surface"] = "api";
-
-  for (let index = 0; index < args.length; index += 1) {
-    const argument = args[index];
-    if (argument === "console" && index === 0) {
-      surface = argument;
-      continue;
-    }
-    if (argument === "--status" || argument === "--plan" || argument === "--apply") {
+function parseInvocation(args: readonly string[]): Invocation | null {
+  if (args.length !== 4) return null;
+  const [surfaceValue, ...flags] = args;
+  if (!isSurface(surfaceValue)) return null;
+  let action: Invocation["action"] | null = null;
+  let environment: DeployEnvironment | null = null;
+  let commit: string | null = null;
+  for (const flag of flags) {
+    if (flag === "--status" || flag === "--apply") {
       if (action !== null) return null;
-      action = argument.slice(2) as Mode["action"];
+      action = flag.slice(2) as Invocation["action"];
       continue;
     }
-    if (argument === "--target") {
-      const value = args[index + 1];
-      if (value === undefined || value.startsWith("--")) return null;
-      explicitTarget = value;
-      index += 1;
+    if (flag.startsWith("--environment=")) {
+      if (environment !== null) return null;
+      const value = flag.slice("--environment=".length);
+      if (value !== "integration" && value !== "rehearsal" && value !== "production") {
+        return null;
+      }
+      environment = value;
+      continue;
+    }
+    if (flag.startsWith("--commit=")) {
+      if (commit !== null) return null;
+      const value = flag.slice("--commit=".length);
+      if (!/^[0-9a-f]{40}$/u.test(value)) return null;
+      commit = value;
       continue;
     }
     return null;
   }
-  if (action === null) return null;
-  return { action, targetPath: targetPath(explicitTarget), surface };
+  return action && environment && commit
+    ? { surface: surfaceValue, action, environment, commit }
+    : null;
 }
 
-function reversalNotice(previousVersionId: string | null, workerName: string): string {
-  if (previousVersionId === null) {
-    return (
-      "reversal: this is the first published version of this Worker, so there is no earlier " +
-      "version to return to. Forward repair is the only path; the Worker can be withdrawn with " +
-      `\`wrangler delete --name ${workerName}\`, which does not erase D1 or R2 state.`
-    );
-  }
-  return (
-    "reversal: restore the previous version with `wrangler versions deploy " +
-    `${previousVersionId}@100% --yes --config .wrangler-realized.jsonc\`. D1 repair is ` +
-    "forward-only and is not part of this rollback."
-  );
+function isSurface(value: string | undefined): value is Surface {
+  return DEPLOY_CONTRACT.surfaces.some(({ surface }) => surface === value);
 }
 
-async function run(mode: Mode): Promise<void> {
-  const target = loadTarget(mode.targetPath);
-
-  if (mode.surface !== "api") {
-    await runWebRelease(mode.surface, mode.action, target);
-    return;
-  }
-
-  if (mode.action === "status") {
-    const configPath = writeRealizedConfig(target);
-    const live = await inspectLive(configPath, target);
-    if (live.servedVersionId !== null) {
-      await assertTargetBindingClosure("preflight", configPath, live.servedVersionId, target);
-    }
-    process.stdout.write(
-      `${JSON.stringify(
+async function dispatch(invocation: Invocation): Promise<Record<string, unknown>> {
+  const target = loadTarget(targetPath(invocation.environment), invocation.environment);
+  switch (invocation.surface) {
+    case "takoserver-worker":
+    case "takoserver-worker-authority-cutover":
+      return await runWorker(
         {
-          account: target.accountId,
-          worker: target.workerName,
-          publicOrigin: target.publicOrigin,
-          servedVersionId: live.servedVersionId,
-          bindingClosure: live.servedVersionId === null ? "not-deployed" : "verified",
-          appliedMigrations: live.appliedMigrations,
-          runtimeTables: live.tables.filter((name) => name.startsWith("runtime_")),
-          activeGrantKeyIds: live.activeGrantKeyIds,
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
         },
-        null,
-        2,
-      )}\n`,
-    );
-    return;
+        target,
+      );
+    case "takoserver-site":
+      return await runStaticSite(invocation, { accountId: target.accountId });
+    case "takoserver-console":
+      return await runConsole(invocation, target);
+    case "takoserver-d1-schema":
+      return await runD1Schema(invocation, target);
+    case "takoserver-signing-key-register":
+    case "takoserver-signing-repair":
+    case "takoserver-signing-rotation":
+      return await runSigning(
+        {
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
+        },
+        target,
+      );
+    case "takoserver-hosted-token-cutover":
+    case "takoserver-hosted-topology-cutover":
+      return await runHosted(
+        {
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
+        },
+        target,
+      );
   }
-
-  const report = await preflight(target, { runGate: true });
-  const previousVersionId = report.live.servedVersionId;
-
-  process.stdout.write(
-    `${JSON.stringify(
-      {
-        commit: report.commit,
-        branch: report.branch,
-        bundleDigest: report.bundleDigest,
-        bundleBytes: report.bundleBytes,
-        migrationDigest: report.migrationDigest,
-        pendingMigrations: report.migrationFiles.filter(
-          (name) => !report.live.appliedMigrations.includes(name),
-        ),
-        account: target.accountId,
-        worker: target.workerName,
-        previousVersionId,
-        alreadyCurrent: report.alreadyCurrent,
-        signingKeyRepairRequired: report.signingKeyRepairRequired,
-      },
-      null,
-      2,
-    )}\n`,
-  );
-
-  if (mode.action === "plan") {
-    process.stdout.write("\nplan only: every pre-mutation proof passed; nothing was published\n");
-    return;
-  }
-
-  if (report.alreadyCurrent && !report.signingKeyRepairRequired && previousVersionId !== null) {
-    process.stdout.write(
-      `\nalready current: version ${previousVersionId} already serves this bundle digest; ` +
-        "nothing was published\n",
-    );
-    return;
-  }
-
-  const result = await mutate(report);
-  process.stdout.write(`\npublished version ${result.versionId}\n`);
-  if (result.grantKeyProvisioned) {
-    process.stdout.write(`provisioned verification key ${target.grantKeyId}\n`);
-  }
-  process.stdout.write(`${reversalNotice(previousVersionId, target.workerName)}\n`);
-
-  const postConditions = await verify(report, result.versionId);
-  for (const proven of postConditions) process.stdout.write(`verified: ${proven}\n`);
-
-  appendLedger({
-    publishedAt: new Date().toISOString(),
-    commit: report.commit,
-    branch: report.branch,
-    remoteUrl: report.remoteUrl,
-    accountId: target.accountId,
-    workerName: target.workerName,
-    versionId: result.versionId,
-    previousVersionId,
-    bundleDigest: report.bundleDigest,
-    bundleBytes: report.bundleBytes,
-    configDigest: report.configDigest,
-    migrationDigest: report.migrationDigest,
-    migrationFiles: report.migrationFiles,
-    d1DatabaseId: target.d1.databaseId,
-    r2BucketName: target.r2.bucketName,
-    publicOrigin: target.publicOrigin,
-    grantKeyId: target.grantKeyId,
-    postConditions,
-  });
-  process.stdout.write(`\nevidence appended to ${EVIDENCE_LEDGER}\n`);
 }
 
 const argv = process.argv.slice(2);
-
 if (argv.length === 1 && argv[0] === "--contract") {
   process.stdout.write(`${JSON.stringify(DEPLOY_CONTRACT, null, 2)}\n`);
   process.exit(0);
 }
 
-if (argv[0] === "site") {
-  try {
-    await runStaticSite(argv.slice(1));
-  } catch (error) {
-    if (error instanceof DeployError) {
-      process.stderr.write(`deploy failed during ${error.phase}: ${error.message}\n`);
-      if (error.detail) process.stderr.write(`\n${error.detail}\n`);
-      process.stderr.write(`\n${(argv[0] === "site" ? SITE_AFTERMATH : AFTERMATH)[error.phase]}\n`);
-      process.exit(PHASE_EXIT_CODE[error.phase]);
-    }
-    throw error;
-  }
-  process.exit(0);
-}
-
-const mode = parseMode(argv);
-if (mode === null) {
+const invocation = parseInvocation(argv);
+if (invocation === null) {
   process.stderr.write(`deploy refused: no target was touched\n\n${USAGE}`);
   process.exit(2);
 }
 
 try {
-  await run(mode);
+  const result = await dispatch(invocation);
+  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 } catch (error) {
-  if (error instanceof DeployError) {
-    process.stderr.write(`deploy failed during ${error.phase}: ${error.message}\n`);
-    if (error.detail) process.stderr.write(`\n${error.detail}\n`);
-    process.stderr.write(`\n${AFTERMATH[error.phase]}\n`);
-    process.exit(PHASE_EXIT_CODE[error.phase]);
-  }
-  throw error;
+  if (!(error instanceof DeployError)) throw error;
+  process.stderr.write(`deploy failed during ${error.phase}: ${error.message}\n`);
+  if (error.detail) process.stderr.write(`\n${error.detail}\n`);
+  const aftermath =
+    error.phase === "preflight"
+      ? "No target was touched. Fix the cause and re-run the exact surface."
+      : error.phase === "mutation"
+        ? "The target may have changed. Do not retry; run this surface with --status for authoritative readback."
+        : "The mutation was acknowledged but its post-conditions failed. Inspect --status and repair or roll back explicitly.";
+  process.stderr.write(`\n${aftermath}\n`);
+  process.exit(PHASE_EXIT_CODE[error.phase]);
 }

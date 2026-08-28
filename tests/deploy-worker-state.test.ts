@@ -1,15 +1,20 @@
 import { describe, expect, test } from "bun:test";
 import { DeployError } from "../scripts/deploy/errors.ts";
+import type { DeployTarget } from "../scripts/deploy/target.ts";
 import {
+  assertExactSecretInventory,
+  assertExactVersionBindingClosure,
   assertVersionBindingClosure,
   expectedBindingClosureForTarget,
+  expectedExactBindingClosure,
+  parseWorkerDeploymentHistory,
 } from "../scripts/deploy/worker-state.ts";
 
 const VERSION = {
   id: "version-1",
   resources: {
     bindings: [
-      { type: "d1", name: "STATE_DB", database_id: "database-id" },
+      { type: "d1", name: "STATE_DB", id: "database-id" },
       { type: "r2_bucket", name: "OBJECTS", bucket_name: "objects" },
       {
         type: "service",
@@ -22,7 +27,7 @@ const VERSION = {
 };
 
 const EXPECTED = {
-  STATE_DB: { type: "d1", fields: { database_id: "database-id" } },
+  STATE_DB: { type: "d1", fields: { id: "database-id" } },
   OBJECTS: { type: "r2_bucket", fields: { bucket_name: "objects" } },
   HOST_RUNTIME_MATERIALIZER: {
     type: "service",
@@ -39,7 +44,7 @@ describe("immutable Worker Version binding closure", () => {
       expectedBindingClosureForTarget({
         d1: { databaseId: "database-id" },
         r2: { bucketName: "objects" },
-        hostRuntimeMaterializerService: {
+        hostedTopology: {
           service: "takosumi-platform",
           entrypoint: "TakosumiHostRuntimeMaterializerEntrypoint",
         },
@@ -115,6 +120,45 @@ describe("immutable Worker Version binding closure", () => {
     ).toThrow("does not declare the HOST_RUNTIME_MATERIALIZER binding");
   });
 
+  test("exact closure refuses a stale extra variable or secret binding", () => {
+    const target = {
+      kind: "takoserver.deploy-target@v2",
+      environment: "integration",
+      accountId: "a".repeat(32),
+      workerName: "takoserver-api-integration",
+      d1: { databaseName: "runtime-db", databaseId: "database-id" },
+      r2: { bucketName: "objects" },
+      publicOrigin: "https://api.integration.example.test",
+      signing: { currentKeyId: "key-current" },
+    } satisfies DeployTarget;
+    const exact = expectedExactVersion(target);
+    expect(() =>
+      assertExactVersionBindingClosure(
+        "preflight",
+        "version-1",
+        exact,
+        expectedExactBindingClosure(target, { hostedTopology: "desired" }),
+      ),
+    ).not.toThrow();
+    const drifted = {
+      ...exact,
+      resources: {
+        bindings: [
+          ...exact.resources.bindings,
+          { type: "plain_text", name: "STALE_CONFIGURATION", text: "1" },
+        ],
+      },
+    };
+    expect(() =>
+      assertExactVersionBindingClosure(
+        "preflight",
+        "version-1",
+        drifted,
+        expectedExactBindingClosure(target, { hostedTopology: "desired" }),
+      ),
+    ).toThrow("exact selected target closure");
+  });
+
   test("missing-binding diagnostics never disclose unrelated binding values", () => {
     const version = {
       ...VERSION,
@@ -146,5 +190,82 @@ describe("immutable Worker Version binding closure", () => {
         { HOST_RUNTIME_MATERIALIZER: null },
       ),
     ).toThrow("has no canonical binding inventory");
+  });
+});
+
+function expectedExactVersion(target: DeployTarget) {
+  return {
+    resources: {
+      bindings: [
+        { type: "ai", name: "AI" },
+        { type: "d1", name: "STATE_DB", id: target.d1.databaseId },
+        { type: "r2_bucket", name: "OBJECTS", bucket_name: target.r2.bucketName },
+        {
+          type: "plain_text",
+          name: "TAKOSERVER_SIGNING_KEY_ID",
+          text: target.signing.currentKeyId,
+        },
+        { type: "secret_text", name: "TAKOSERVER_SIGNING_KEY" },
+      ],
+    },
+  };
+}
+
+describe("authoritative Worker history and secret closure", () => {
+  test("requires one 100 percent version and preserves the previous rollback id", () => {
+    expect(
+      parseWorkerDeploymentHistory([
+        {
+          id: "deployment-current",
+          created_on: "2026-08-28T02:00:00Z",
+          versions: [{ version_id: "version-current", percentage: 100 }],
+        },
+        {
+          id: "deployment-previous",
+          created_on: "2026-08-28T01:00:00Z",
+          versions: [{ version_id: "version-previous", percentage: 100 }],
+        },
+      ]),
+    ).toEqual({
+      deploymentId: "deployment-current",
+      versionId: "version-current",
+      previousVersionId: "version-previous",
+    });
+  });
+
+  test("refuses a gradual or malformed active deployment", () => {
+    expect(() =>
+      parseWorkerDeploymentHistory([
+        {
+          id: "deployment-current",
+          created_on: "2026-08-28T02:00:00Z",
+          versions: [
+            { version_id: "one", percentage: 50 },
+            { version_id: "two", percentage: 50 },
+          ],
+        },
+      ]),
+    ).toThrow("exactly one");
+  });
+
+  test("compares the exhaustive secret-name set without reading values", () => {
+    expect(() =>
+      assertExactSecretInventory(
+        [
+          { name: "TAKOSERVER_SIGNING_KEY", type: "secret_text" },
+          { name: "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN", type: "secret_text" },
+        ],
+        ["TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN", "TAKOSERVER_SIGNING_KEY"],
+      ),
+    ).not.toThrow();
+    expect(() =>
+      assertExactSecretInventory(
+        [
+          { name: "TAKOSERVER_SIGNING_KEY", type: "secret_text" },
+          { name: "RETIRED_SECRET", type: "secret_text" },
+        ],
+        ["TAKOSERVER_SIGNING_KEY"],
+      ),
+    ).toThrow("secret inventory drift");
   });
 });

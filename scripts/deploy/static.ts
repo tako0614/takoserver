@@ -1,356 +1,334 @@
 import { createHash } from "node:crypto";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { join } from "node:path";
+import { CloudflareState } from "./cloudflare-state.ts";
 import { DeployError, mutationError, preflightError, verificationError } from "./errors.ts";
-import { type CommandResult, runCommand, wranglerCommand } from "./process.ts";
+import {
+  type CommandResult,
+  cloudflareChildEnvironment,
+  runCommand,
+  wranglerCommand,
+} from "./process.ts";
+import {
+  type DeployEnvironment,
+  qualifySource,
+  type SourceQualification,
+  sealDirectory,
+} from "./qualification.ts";
 
-/** The single repo-owned Pages project for the public Takoserver landing site. */
 export const PAGES_PROJECT = "takoserver-website";
-export const PRODUCTION_BRANCH = "main";
-export const PRODUCTION_ORIGIN = "https://takoserver.com";
+export const SITE_ORIGIN = "https://takoserver.com";
 export const CONSOLE_ORIGIN = "https://console.takoserver.com";
 export const API_ORIGIN = "https://api.takoserver.com";
 
-export type StaticSiteEnvironment = "integration" | "production";
-
-export interface StaticSiteResult {
-  readonly kind: "takos.static-site-deploy@v1";
-  readonly surface: "takoserver-site";
-  readonly environment: StaticSiteEnvironment;
-  readonly project: string;
-  readonly branch: string;
-  readonly commit: string;
-  readonly commitDirty: boolean;
-  readonly artifactDigest: string;
-  readonly artifactBytes: number;
-  readonly artifactFiles: number;
-  readonly immutableUrl: string;
-  readonly readback: Readonly<{
-    readonly immutable: Readonly<PublicReadback>;
-    readonly production?: Readonly<PublicReadback>;
-  }>;
-}
-
-export interface PublicReadback {
-  readonly url: string;
-  readonly status: number;
-  readonly digest: string;
-  readonly bytes: number;
-}
-
-export interface StaticProcessOptions {
-  readonly env?: Readonly<Record<string, string>>;
-  readonly input?: string;
-}
-
 export type StaticProcess = (
   command: readonly string[],
-  options?: StaticProcessOptions,
+  options?: { readonly env?: Readonly<Record<string, string>>; readonly input?: string },
 ) => Promise<CommandResult>;
-
-export interface StaticSiteOptions {
-  /** Replace child-process execution in focused tests. */
-  readonly run?: StaticProcess;
-  /** Replace HTTP readback in focused tests. */
-  readonly fetcher?: StaticFetcher;
-  /** Use an existing output directory instead of creating a temporary one. */
-  readonly outputDirectory?: string;
-}
 
 export type StaticFetcher = (input: string, init?: RequestInit) => Promise<Response>;
 
-interface SourceRevision {
-  readonly branch: string;
+export interface SiteState {
+  pagesDeployments(project: string): Promise<readonly unknown[]>;
+}
+
+export interface StaticSiteInvocation {
+  readonly action: "status" | "apply";
+  readonly environment: DeployEnvironment;
   readonly commit: string;
-  readonly commitDirty: boolean;
 }
 
-interface ArtifactIdentity {
-  readonly digest: string;
-  readonly bytes: number;
-  readonly files: number;
+export interface StaticSiteOptions {
+  readonly run?: StaticProcess;
+  readonly fetcher?: StaticFetcher;
+  readonly outputDirectory?: string;
+  readonly state?: SiteState;
+  readonly accountId?: string;
+  readonly cloudflareEnvironment?: Readonly<Record<string, string>>;
 }
 
-/**
- * Deploy the landing page through one direct Pages upload.
- *
- * Integration is deliberately iteration-friendly: a dirty non-main worktree
- * is built exactly once and uploaded to the current branch preview. Production
- * is the narrow release lane: clean `main`, freshly fetched `origin/main`, one
- * scoped build, one upload, and one immutable plus custom-domain readback.
- */
+interface PagesDeployment {
+  readonly id: string;
+  readonly url: string;
+  readonly commit: string | null;
+  readonly createdOn: string;
+  readonly environment: "production" | "preview";
+  readonly successful: boolean;
+}
+
+/** One routine Pages status or direct upload. There is no plan/review/record path. */
 export async function runStaticSite(
-  args: readonly string[],
+  invocation: StaticSiteInvocation,
   options: StaticSiteOptions = {},
-): Promise<StaticSiteResult> {
-  const environment = parseEnvironment(args);
-  const run = options.run ?? runCommand;
-  const source = await resolveSource(environment, run);
-  const temporary = options.outputDirectory === undefined;
-  const outputDirectory =
-    options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-site-"));
+): Promise<Record<string, unknown>> {
+  const environment =
+    options.cloudflareEnvironment ??
+    (options.state !== undefined && invocation.action === "status"
+      ? {}
+      : cloudflareChildEnvironment());
+  const state =
+    options.state ??
+    new CloudflareState({
+      accountId: exactAccount(options.accountId),
+      token: exactToken(environment),
+    });
+  const lane = invocation.environment === "production" ? "production" : "preview";
+  const before = pagesHistory(await state.pagesDeployments(PAGES_PROJECT)).filter(
+    (deployment) => deployment.environment === lane && deployment.successful,
+  );
+  const previous = before[0] ?? null;
+  if (invocation.action === "status") {
+    return {
+      kind: "takoserver.site-status@v2",
+      surface: "takoserver-site",
+      environment: invocation.environment,
+      selectedCommit: invocation.commit,
+      project: PAGES_PROJECT,
+      currentDeploymentId: previous?.id ?? null,
+      currentUrl: previous?.url ?? null,
+      currentCommit: previous?.commit ?? null,
+      commitMatches: previous?.commit === invocation.commit,
+      rollbackDeploymentId: before[1]?.id ?? null,
+    };
+  }
 
+  const run = options.run ?? runCommand;
+  const source = await qualifySource({
+    environment: invocation.environment,
+    commit: invocation.commit,
+    run,
+  });
+  const temporary = options.outputDirectory === undefined;
+  const output = options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-site-"));
   try {
-    await checked(run, "preflight", "site build", [
+    await checked(run, "preflight", "scoped site build", [
       "bun",
       "scripts/build-site.ts",
       "--out",
-      outputDirectory,
+      output,
       "--console",
       CONSOLE_ORIGIN,
       "--api",
       API_ORIGIN,
     ]);
-    const artifact = artifactIdentity(outputDirectory);
-    const upload = await uploadPages(environment, source, outputDirectory, run);
-    const immutableUrl = parseImmutableUrl(`${upload.stdout}\n${upload.stderr}`, source.branch);
-    const fetcher = options.fetcher ?? ((input, init) => fetch(input, init));
-    const index = readFileSync(join(outputDirectory, "index.html"));
-    const immutable = await readback(immutableUrl, index, fetcher);
-    const production =
-      environment === "production"
-        ? await readback(`${PRODUCTION_ORIGIN}/`, index, fetcher)
-        : undefined;
-    const result: StaticSiteResult = {
-      kind: "takos.static-site-deploy@v1",
+    const artifact = sealDirectory(output, ["index.html"]);
+    artifact.assertUnchanged();
+    const branch = pagesBranch(invocation.environment, source);
+    const upload = await run(
+      wranglerCommand([
+        "pages",
+        "deploy",
+        output,
+        "--project-name",
+        PAGES_PROJECT,
+        "--branch",
+        branch,
+        "--commit-hash",
+        source.commit,
+        `--commit-dirty=${source.dirty ? "true" : "false"}`,
+      ]),
+      { env: environment },
+    );
+    if (upload.exitCode !== 0) {
+      throw mutationError(
+        "Pages upload acknowledgement is indeterminate; do not retry before --status",
+        `${upload.stdout}${upload.stderr}`.trim(),
+      );
+    }
+    const immutableUrl = parseImmutableUrl(`${upload.stdout}\n${upload.stderr}`);
+    const index = readFileSync(join(output, "index.html"));
+    const readback = await readbackOnce(
+      immutableUrl,
+      index,
+      options.fetcher ?? ((input, init) => fetch(input, init)),
+    );
+    const productionReadback =
+      invocation.environment === "production"
+        ? await readbackOnce(
+            `${SITE_ORIGIN}/`,
+            index,
+            options.fetcher ?? ((input, init) => fetch(input, init)),
+          )
+        : null;
+    const after = pagesHistory(await state.pagesDeployments(PAGES_PROJECT));
+    const deployed = after.find(
+      (candidate) =>
+        candidate.environment === lane &&
+        candidate.successful &&
+        candidate.commit === source.commit &&
+        sameOrigin(candidate.url, immutableUrl),
+    );
+    if (!deployed) {
+      throw verificationError(
+        "Pages authoritative history does not contain the acknowledged commit and immutable URL",
+      );
+    }
+    return {
+      kind: "takoserver.site-apply@v2",
       surface: "takoserver-site",
-      environment,
+      environment: invocation.environment,
       project: PAGES_PROJECT,
-      branch: source.branch,
       commit: source.commit,
-      commitDirty: source.commitDirty,
+      branch,
+      dirty: source.dirty,
       artifactDigest: artifact.digest,
       artifactBytes: artifact.bytes,
       artifactFiles: artifact.files,
+      previousDeploymentId: previous?.id ?? null,
+      deploymentId: deployed.id,
       immutableUrl,
-      readback: {
-        immutable,
-        ...(production === undefined ? {} : { production }),
-      },
+      readback,
+      productionReadback,
+      rollback: pagesRollback(
+        invocation.environment,
+        options.accountId,
+        deployed.id,
+        previous?.id ?? null,
+      ),
     };
-    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-    return result;
   } finally {
-    if (temporary) rmSync(outputDirectory, { recursive: true, force: true });
+    if (temporary) rmSync(output, { recursive: true, force: true });
   }
 }
 
-/** Parse the one explicit environment flag accepted by the site entrypoint. */
-export function parseEnvironment(args: readonly string[]): StaticSiteEnvironment {
-  let environment: StaticSiteEnvironment | undefined;
-  for (let index = 0; index < args.length; index += 1) {
-    const argument = args[index];
-    if (argument === undefined) throw preflightError("site environment argument is missing");
-    if (argument === "--environment") {
-      const value = args[index + 1];
-      if (value === undefined)
-        throw preflightError("site requires --environment=integration|production");
-      index += 1;
-      if (environment !== undefined) throw preflightError("site environment was specified twice");
-      environment = parseEnvironmentValue(value);
-      continue;
-    }
-    if (argument.startsWith("--environment=")) {
-      if (environment !== undefined) throw preflightError("site environment was specified twice");
-      environment = parseEnvironmentValue(argument.slice("--environment=".length));
-      continue;
-    }
-    throw preflightError(
-      "site accepts only --environment=integration or --environment=production; no target, plan, or reviewer is used",
+function pagesHistory(value: readonly unknown[]): readonly PagesDeployment[] {
+  return value
+    .map((entry) => {
+      if (
+        !isRecord(entry) ||
+        typeof entry.id !== "string" ||
+        typeof entry.url !== "string" ||
+        typeof entry.created_on !== "string" ||
+        !Number.isFinite(Date.parse(entry.created_on))
+      ) {
+        throw preflightError("Pages deployment history contains a malformed entry");
+      }
+      if (!/^[A-Za-z0-9][A-Za-z0-9_-]{2,127}$/u.test(entry.id)) {
+        throw preflightError("Pages deployment history contains an invalid deployment id");
+      }
+      if (entry.environment !== "production" && entry.environment !== "preview") {
+        throw preflightError("Pages deployment history contains an invalid environment");
+      }
+      const environment: PagesDeployment["environment"] = entry.environment;
+      const latestStage = isRecord(entry.latest_stage) ? entry.latest_stage : null;
+      if (!latestStage || typeof latestStage.status !== "string") {
+        throw preflightError("Pages deployment history contains an invalid latest stage");
+      }
+      let url: URL;
+      try {
+        url = new URL(entry.url);
+      } catch {
+        throw preflightError("Pages deployment history contains an invalid URL");
+      }
+      if (url.protocol !== "https:" || !url.hostname.endsWith(`.${PAGES_PROJECT}.pages.dev`)) {
+        throw preflightError("Pages deployment history contains an unexpected deployment URL");
+      }
+      const trigger = isRecord(entry.deployment_trigger) ? entry.deployment_trigger : null;
+      const metadata = trigger && isRecord(trigger.metadata) ? trigger.metadata : null;
+      const commit =
+        metadata && typeof metadata.commit_hash === "string" ? metadata.commit_hash : null;
+      return {
+        id: entry.id,
+        url: `${url.origin}/`,
+        commit,
+        createdOn: entry.created_on,
+        environment,
+        successful: latestStage.status === "success",
+      };
+    })
+    .sort((left, right) => right.createdOn.localeCompare(left.createdOn));
+}
+
+function pagesRollback(
+  environment: DeployEnvironment,
+  accountId: string | undefined,
+  deployedId: string,
+  previousId: string | null,
+): string {
+  if (environment !== "production") {
+    return (
+      `wrangler pages deployment delete ${deployedId} --project-name ${PAGES_PROJECT} --force` +
+      (previousId ? ` # previous provider-history deployment: ${previousId}` : "")
     );
   }
-  if (environment === undefined) {
-    throw preflightError("site requires --environment=integration|production");
+  if (previousId === null) {
+    return "forward repair only: no previous production Pages deployment exists";
   }
-  return environment;
-}
-
-function parseEnvironmentValue(value: string): StaticSiteEnvironment {
-  if (value === "integration" || value === "production") return value;
-  throw preflightError(`unknown site environment ${JSON.stringify(value)}`);
-}
-
-async function resolveSource(
-  environment: StaticSiteEnvironment,
-  run: StaticProcess,
-): Promise<SourceRevision> {
-  const branch = (
-    await checked(run, "preflight", "current git branch", ["git", "branch", "--show-current"])
-  ).trim();
-  if (branch.length === 0) {
-    throw preflightError("site deployment requires a named git branch");
-  }
-  const commit = (
-    await checked(run, "preflight", "current git commit", ["git", "rev-parse", "HEAD"])
-  ).trim();
-  if (commit.length === 0) throw preflightError("site deployment could not resolve HEAD");
-  const dirtyOutput = await checked(run, "preflight", "git worktree status", [
-    "git",
-    "status",
-    "--porcelain",
-  ]);
-  const commitDirty = dirtyOutput.trim().length > 0;
-
-  if (environment === "integration") {
-    if (branch === PRODUCTION_BRANCH) {
-      throw preflightError("integration site deployment requires a non-main Pages branch");
-    }
-    return { branch, commit, commitDirty };
-  }
-
-  if (branch !== PRODUCTION_BRANCH) {
-    throw preflightError("production site deployment requires the main branch");
-  }
-  if (commitDirty) {
-    throw preflightError(
-      "production site deployment requires a clean worktree",
-      dirtyOutput.trim(),
-    );
-  }
-  await checked(run, "preflight", "fresh origin/main", [
-    "git",
-    "fetch",
-    "--quiet",
-    "origin",
-    "main",
-  ]);
-  const remoteCommit = (
-    await checked(run, "preflight", "origin/main commit", ["git", "rev-parse", "origin/main"])
-  ).trim();
-  if (remoteCommit !== commit) {
-    throw preflightError(
-      `production HEAD ${commit} does not equal freshly fetched origin/main ${remoteCommit}`,
-    );
-  }
-  return { branch, commit, commitDirty: false };
-}
-
-async function uploadPages(
-  environment: StaticSiteEnvironment,
-  source: SourceRevision,
-  outputDirectory: string,
-  run: StaticProcess,
-): Promise<CommandResult> {
-  const command = wranglerCommand([
-    "pages",
-    "deploy",
-    outputDirectory,
-    "--project-name",
-    PAGES_PROJECT,
-    "--branch",
-    source.branch,
-    "--commit-hash",
-    source.commit,
-    `--commit-dirty=${environment === "integration" ? "true" : "false"}`,
-  ]);
-  const result = await run(command);
-  if (result.exitCode !== 0) {
-    throw mutationError(
-      "Pages publication is indeterminate; do not retry before readback",
-      `${result.stdout}${result.stderr}`.trim(),
-    );
-  }
-  return result;
-}
-
-function parseImmutableUrl(output: string, branch: string): string {
-  const urls = [...output.matchAll(/https:\/\/[^\s"'<>]+\.pages\.dev(?:\/)?/gu)].map(
-    (match) => match[0],
+  const account = exactAccount(accountId);
+  const endpoint =
+    `https://api.cloudflare.com/client/v4/accounts/${account}/pages/projects/${PAGES_PROJECT}` +
+    `/deployments/${encodeURIComponent(previousId)}/rollback`;
+  return (
+    'curl --fail-with-body --request POST --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" ' +
+    `--header "Content-Type: application/json" --data '{}' "${endpoint}"`
   );
-  const branchUrls = new Set(
-    [branch, branch.replaceAll(/[^a-z0-9-]+/giu, "-")]
-      .map((value) => value.replaceAll(/^-+|-+$/gu, "").toLowerCase())
-      .filter((value) => value.length > 0)
-      .map((value) => `${value}.${PAGES_PROJECT}.pages.dev`),
-  );
-  const projectUrl = `${PAGES_PROJECT}.pages.dev`;
-  for (const candidate of urls) {
-    let url: URL;
-    try {
-      url = new URL(candidate);
-    } catch {
-      continue;
-    }
-    const hostname = url.hostname.toLowerCase();
+}
+
+function pagesBranch(environment: DeployEnvironment, source: SourceQualification): string {
+  if (environment === "production") return "main";
+  if (environment === "rehearsal") return "rehearsal";
+  const branch = source.branch.replaceAll(/[^a-z0-9-]+/giu, "-").replaceAll(/^-+|-+$/gu, "");
+  if (branch.length === 0 || branch === "main") {
+    return `integration-${source.commit.slice(0, 12)}`;
+  }
+  return branch;
+}
+
+function parseImmutableUrl(output: string): string {
+  for (const match of output.matchAll(/https:\/\/[^\s"'<>]+\.pages\.dev\/?/gu)) {
+    const candidate = match[0];
+    if (!candidate) continue;
+    const url = new URL(candidate);
     if (
-      url.protocol !== "https:" ||
-      url.username !== "" ||
-      url.password !== "" ||
-      url.port !== "" ||
-      url.search !== "" ||
-      url.hash !== "" ||
-      (url.pathname !== "/" && url.pathname !== "") ||
-      branchUrls.has(hostname) ||
-      hostname === projectUrl ||
-      !hostname.endsWith(`.${PAGES_PROJECT}.pages.dev`)
+      url.protocol === "https:" &&
+      url.hostname.endsWith(`.${PAGES_PROJECT}.pages.dev`) &&
+      url.hostname !== `${PAGES_PROJECT}.pages.dev`
     ) {
-      continue;
+      return `${url.origin}/`;
     }
-    return `${url.origin}/`;
   }
   throw mutationError(
-    "Pages publication returned no immutable deployment URL",
-    "The upload may be live. Read the provider deployment history before retrying.",
+    "Pages upload returned no immutable deployment URL; inspect history before retrying",
   );
 }
 
-async function readback(
+async function readbackOnce(
   url: string,
   expected: Uint8Array,
   fetcher: StaticFetcher,
-): Promise<PublicReadback> {
+): Promise<{
+  readonly url: string;
+  readonly status: number;
+  readonly digest: string;
+  readonly bytes: number;
+}> {
   let response: Response;
   try {
     response = await fetcher(url, {
       method: "GET",
       headers: { "cache-control": "no-cache" },
-      redirect: "follow",
+      redirect: "error",
     });
   } catch (error) {
     throw verificationError(
-      `site readback failed for ${url}`,
+      `Pages immutable readback failed for ${url}`,
       error instanceof Error ? `${error.name}: ${error.message}` : String(error),
     );
   }
   const body = new Uint8Array(await response.arrayBuffer());
-  if (response.status !== 200) {
-    throw verificationError(`site readback returned HTTP ${response.status} for ${url}`);
-  }
-  const digest = `sha256:${createHash("sha256").update(body).digest("hex")}`;
-  const expectedDigest = `sha256:${createHash("sha256").update(expected).digest("hex")}`;
-  if (digest !== expectedDigest || body.byteLength !== expected.byteLength) {
+  const digest = sha256(body);
+  if (
+    response.status !== 200 ||
+    digest !== sha256(expected) ||
+    body.byteLength !== expected.byteLength
+  ) {
     throw verificationError(
-      `site readback bytes differ for ${url}`,
-      `expected ${expectedDigest}/${expected.byteLength}, received ${digest}/${body.byteLength}`,
+      `Pages immutable readback differs for ${url}`,
+      `status=${response.status} digest=${digest} bytes=${body.byteLength}`,
     );
   }
   return { url, status: response.status, digest, bytes: body.byteLength };
-}
-
-function artifactIdentity(directory: string): ArtifactIdentity {
-  const paths = walk(directory).sort();
-  if (paths.length === 0 || !paths.some((path) => relative(directory, path) === "index.html")) {
-    throw preflightError("site build produced no index.html");
-  }
-  const hash = createHash("sha256");
-  let bytes = 0;
-  for (const path of paths) {
-    const name = relative(directory, path).replaceAll("\\", "/");
-    const contents = readFileSync(path);
-    hash.update(name);
-    hash.update("\0");
-    hash.update(contents);
-    bytes += contents.byteLength;
-  }
-  return { digest: `sha256:${hash.digest("hex")}`, bytes, files: paths.length };
-}
-
-function walk(directory: string): string[] {
-  return readdirSync(directory).flatMap((name) => {
-    const path = join(directory, name);
-    return statSync(path).isDirectory() ? walk(path) : [path];
-  });
 }
 
 async function checked(
@@ -368,4 +346,27 @@ async function checked(
     );
   }
   return result.stdout;
+}
+
+function exactAccount(value: string | undefined): string {
+  if (value === undefined) throw preflightError("site status requires the selected target account");
+  return value;
+}
+
+function exactToken(environment: Readonly<Record<string, string>>): string {
+  const value = environment.CLOUDFLARE_API_TOKEN;
+  if (!value) throw preflightError("CLOUDFLARE_API_TOKEN is required");
+  return value;
+}
+
+function sameOrigin(left: string, right: string): boolean {
+  return new URL(left).origin === new URL(right).origin;
+}
+
+function sha256(value: Uint8Array): string {
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

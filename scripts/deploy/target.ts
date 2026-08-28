@@ -15,6 +15,7 @@ import {
 } from "../../src/standard-service-production.ts";
 import { preflightError } from "./errors.ts";
 import { REPOSITORY } from "./process.ts";
+import type { DeployEnvironment } from "./qualification.ts";
 
 /**
  * The realized deploy target. It names one Cloudflare account and the exact
@@ -22,6 +23,8 @@ import { REPOSITORY } from "./process.ts";
  * never committed: the repository stays account-neutral.
  */
 export interface DeployTarget {
+  readonly kind: "takoserver.deploy-target@v2";
+  readonly environment: DeployEnvironment;
   readonly accountId: string;
   readonly workerName: string;
   readonly d1: { readonly databaseName: string; readonly databaseId: string };
@@ -52,8 +55,6 @@ export interface DeployTarget {
   readonly googleClientId?: string;
   /** Exact Takos ID issuer and this deployment's public OIDC client id. */
   readonly takosId?: { readonly issuer: string; readonly clientId: string };
-  /** Enables the private Takosumi Hosted sponsorship funding seam. */
-  readonly hostedSponsorship?: boolean;
   /** Requires the deployed Worker to offer customer Stripe Checkout funding. */
   readonly stripeCheckout?: boolean;
   /**
@@ -82,14 +83,22 @@ export interface DeployTarget {
    * This is routing metadata, never secret material. The materialized values
    * cross only the Worker service-binding RPC boundary at provisioning time.
    */
-  readonly hostRuntimeMaterializerService?: {
+  readonly hostedTopology?: {
     readonly service: string;
     readonly entrypoint: string;
   };
-  readonly grantKeyId: string;
+  /**
+   * `nextKeyId` is present only while an explicit rotation is pending. The
+   * routine Worker target is then the next id, but only the rotation surface
+   * may bridge the live current id to it.
+   */
+  readonly signing: {
+    readonly currentKeyId: string;
+    readonly nextKeyId?: string;
+  };
 }
 
-export const DEFAULT_TARGET_PATH = ".deploy/target.json";
+export const DEPLOY_TARGET_KIND = "takoserver.deploy-target@v2";
 
 const ACCOUNT_ID = /^[0-9a-f]{32}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
@@ -101,12 +110,13 @@ const HOSTNAME =
   /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/u;
 const ENTRYPOINT = /^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/u;
 
-export function targetPath(explicit?: string): string {
-  const candidate = explicit ?? process.env.TAKOSERVER_DEPLOY_TARGET ?? DEFAULT_TARGET_PATH;
+export function targetPath(environment: DeployEnvironment): string {
+  const variable = `TAKOSERVER_DEPLOY_TARGET_${environment.toUpperCase()}`;
+  const candidate = process.env[variable] ?? `.deploy/targets/${environment}.json`;
   return isAbsolute(candidate) ? candidate : resolve(REPOSITORY, candidate);
 }
 
-export function loadTarget(path: string): DeployTarget {
+export function loadTarget(path: string, environment: DeployEnvironment): DeployTarget {
   let raw: string;
   try {
     raw = readFileSync(path, "utf8");
@@ -117,12 +127,14 @@ export function loadTarget(path: string): DeployTarget {
         "account-specific values:\n" +
         JSON.stringify(
           {
+            kind: DEPLOY_TARGET_KIND,
+            environment,
             accountId: "<32 hex characters>",
-            workerName: "takoserver-api",
-            d1: { databaseName: "takoserver-runtime", databaseId: "<uuid>" },
-            r2: { bucketName: "takoserver-objects" },
-            publicOrigin: "https://<worker>.<subdomain>.workers.dev",
-            grantKeyId: "takoserver-runtime-<yyyy-mm>",
+            workerName: `takoserver-api-${environment}`,
+            d1: { databaseName: `takoserver-runtime-${environment}`, databaseId: "<uuid>" },
+            r2: { bucketName: `takoserver-objects-${environment}` },
+            publicOrigin: `https://<${environment}-worker>.<subdomain>.workers.dev`,
+            signing: { currentKeyId: `takoserver-${environment}-<yyyy-mm>` },
           },
           null,
           2,
@@ -136,20 +148,23 @@ export function loadTarget(path: string): DeployTarget {
   } catch {
     throw preflightError(`deploy target descriptor is not valid JSON: ${path}`);
   }
-  return validateTarget(parsed, path);
+  return validateTarget(parsed, path, environment);
 }
 
-function validateTarget(value: unknown, path: string): DeployTarget {
+function validateTarget(
+  value: unknown,
+  path: string,
+  environment: DeployEnvironment,
+): DeployTarget {
   if (!isRecord(value)) throw preflightError(`deploy target descriptor must be an object: ${path}`);
   assertExactKeys(
     value,
-    ["accountId", "workerName", "d1", "r2", "publicOrigin", "grantKeyId"],
+    ["kind", "environment", "accountId", "workerName", "d1", "r2", "publicOrigin", "signing"],
     [
       "aliases",
       "consoleOrigin",
       "googleClientId",
       "takosId",
-      "hostedSponsorship",
       "stripeCheckout",
       "zones",
       "aiModels",
@@ -158,9 +173,18 @@ function validateTarget(value: unknown, path: string): DeployTarget {
       "objectBucketSupplies",
       "edgeSupplies",
       "workerEndpointSuffix",
-      "hostRuntimeMaterializerService",
+      "hostedTopology",
     ],
   );
+
+  if (value.kind !== DEPLOY_TARGET_KIND) {
+    throw preflightError(`deploy target kind must be ${DEPLOY_TARGET_KIND}`);
+  }
+  if (value.environment !== environment) {
+    throw preflightError(
+      `deploy target environment ${JSON.stringify(value.environment)} does not match selected ${environment}`,
+    );
+  }
 
   const d1 = value.d1;
   const r2 = value.r2;
@@ -170,6 +194,8 @@ function validateTarget(value: unknown, path: string): DeployTarget {
   assertExactKeys(r2, ["bucketName"]);
 
   const target: DeployTarget = {
+    kind: DEPLOY_TARGET_KIND,
+    environment,
     accountId: pattern(value.accountId, ACCOUNT_ID, "accountId"),
     workerName: pattern(value.workerName, WORKER_NAME, "workerName"),
     d1: {
@@ -186,9 +212,6 @@ function validateTarget(value: unknown, path: string): DeployTarget {
       ? {}
       : { googleClientId: pattern(value.googleClientId, GOOGLE_CLIENT_ID, "googleClientId") }),
     ...(value.takosId === undefined ? {} : { takosId: takosId(value.takosId) }),
-    ...(value.hostedSponsorship === undefined
-      ? {}
-      : { hostedSponsorship: boolean(value.hostedSponsorship, "hostedSponsorship") }),
     ...(value.stripeCheckout === undefined
       ? {}
       : { stripeCheckout: boolean(value.stripeCheckout, "stripeCheckout") }),
@@ -221,14 +244,12 @@ function validateTarget(value: unknown, path: string): DeployTarget {
             "workerEndpointSuffix",
           ),
         }),
-    ...(value.hostRuntimeMaterializerService === undefined
+    ...(value.hostedTopology === undefined
       ? {}
       : {
-          hostRuntimeMaterializerService: hostRuntimeMaterializerService(
-            value.hostRuntimeMaterializerService,
-          ),
+          hostedTopology: hostedTopology(value.hostedTopology),
         }),
-    grantKeyId: pattern(value.grantKeyId, KEY_ID, "grantKeyId"),
+    signing: signing(value.signing),
   };
   const cloudflareObjectSupply = target.objectBucketSupplies?.supplies.some(
     (supply) => supply.provider.kind === "cloudflare",
@@ -249,18 +270,30 @@ function validateTarget(value: unknown, path: string): DeployTarget {
   return target;
 }
 
-function hostRuntimeMaterializerService(value: unknown): {
+function hostedTopology(value: unknown): {
   service: string;
   entrypoint: string;
 } {
   if (!isRecord(value)) {
-    throw preflightError("deploy target `hostRuntimeMaterializerService` must be an object");
+    throw preflightError("deploy target `hostedTopology` must be an object");
   }
   assertExactKeys(value, ["service", "entrypoint"]);
   return {
-    service: pattern(value.service, WORKER_NAME, "hostRuntimeMaterializerService.service"),
-    entrypoint: pattern(value.entrypoint, ENTRYPOINT, "hostRuntimeMaterializerService.entrypoint"),
+    service: pattern(value.service, WORKER_NAME, "hostedTopology.service"),
+    entrypoint: pattern(value.entrypoint, ENTRYPOINT, "hostedTopology.entrypoint"),
   };
+}
+
+function signing(value: unknown): { currentKeyId: string; nextKeyId?: string } {
+  if (!isRecord(value)) throw preflightError("deploy target `signing` must be an object");
+  assertExactKeys(value, ["currentKeyId"], ["nextKeyId"]);
+  const currentKeyId = pattern(value.currentKeyId, KEY_ID, "signing.currentKeyId");
+  if (value.nextKeyId === undefined) return { currentKeyId };
+  const nextKeyId = pattern(value.nextKeyId, KEY_ID, "signing.nextKeyId");
+  if (nextKeyId === currentKeyId) {
+    throw preflightError("deploy target signing currentKeyId and nextKeyId must differ");
+  }
+  return { currentKeyId, nextKeyId };
 }
 
 function takosId(value: unknown): { issuer: string; clientId: string } {

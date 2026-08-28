@@ -7,6 +7,8 @@ import { loadTarget } from "../scripts/deploy/target.ts";
 import { PRODUCTION_STANDARD_SERVICE_SUPPLIES_KIND } from "../src/standard-service-production.ts";
 
 const BASE = {
+  kind: "takoserver.deploy-target@v2",
+  environment: "production",
   accountId: "a10162d23653f1ad1193dabf520a5dd0",
   workerName: "takoserver-api",
   d1: {
@@ -15,7 +17,7 @@ const BASE = {
   },
   r2: { bucketName: "takoserver-objects" },
   publicOrigin: "https://api.takoserver.com",
-  grantKeyId: "takoserver-runtime-2026-08",
+  signing: { currentKeyId: "takoserver-runtime-2026-08" },
 };
 
 const MODEL = {
@@ -136,7 +138,7 @@ describe("private data service deploy configuration", () => {
           takosId: { issuer: "https://id.takos.jp", clientId: "takoserver" },
         }),
       );
-      const realized = deploymentVariables(loadTarget(path)) as {
+      const realized = deploymentVariables(loadTarget(path, "production")) as {
         vars: Record<string, string>;
       };
       expect(realized.vars).toMatchObject({
@@ -162,7 +164,7 @@ describe("private data service deploy configuration", () => {
           googleClientId: "1234-example.apps.googleusercontent.com",
         }),
       );
-      expect(() => loadTarget(path)).toThrow("cannot configure both");
+      expect(() => loadTarget(path, "production")).toThrow("cannot configure both");
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -182,13 +184,13 @@ describe("private data service deploy configuration", () => {
           objectBucketSupplies: SUPPLIES,
           edgeSupplies: EDGE_SUPPLIES,
           workerEndpointSuffix: "hosted.workers.dev",
-          hostRuntimeMaterializerService: {
+          hostedTopology: {
             service: "takosumi-platform",
             entrypoint: "TakosumiHostRuntimeMaterializerEntrypoint",
           },
         }),
       );
-      const target = loadTarget(path);
+      const target = loadTarget(path, "production");
       const realized = deploymentVariables(target) as { vars: Record<string, string> };
       expect(JSON.parse(realized.vars.TAKOSERVER_AI_MODELS ?? "null")).toEqual([MODEL]);
       expect(realized.vars.CLOUDFLARE_ACCOUNT_ID).toBe(BASE.accountId);
@@ -227,7 +229,7 @@ describe("private data service deploy configuration", () => {
           standardServiceSupplies: STANDARD_SERVICE_SUPPLIES,
         }),
       );
-      const realized = deploymentVariables(loadTarget(path)) as {
+      const realized = deploymentVariables(loadTarget(path, "production")) as {
         vars: Record<string, string>;
       };
       expect(realized.vars.CLOUDFLARE_ACCOUNT_ID).toBe(BASE.accountId);
@@ -260,7 +262,9 @@ describe("private data service deploy configuration", () => {
           },
         }),
       );
-      expect(() => loadTarget(path)).toThrow("invalid production standard-service supplies");
+      expect(() => loadTarget(path, "production")).toThrow(
+        "invalid production standard-service supplies",
+      );
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -271,7 +275,7 @@ describe("private data service deploy configuration", () => {
     try {
       const path = join(directory, "target.json");
       writeFileSync(path, JSON.stringify(BASE));
-      const realized = deploymentVariables(loadTarget(path)) as {
+      const realized = deploymentVariables(loadTarget(path, "production")) as {
         vars: Record<string, string>;
       };
       expect(realized.vars).not.toHaveProperty("TAKOSERVER_STRIPE_CHECKOUT_ENABLED");
@@ -285,7 +289,7 @@ describe("private data service deploy configuration", () => {
     try {
       const path = join(directory, "target.json");
       writeFileSync(path, JSON.stringify({ ...BASE, aiModels: [{ ...MODEL, surprise: true }] }));
-      expect(() => loadTarget(path)).toThrow("deploy target `aiModels` is invalid");
+      expect(() => loadTarget(path, "production")).toThrow("deploy target `aiModels` is invalid");
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -296,7 +300,7 @@ describe("private data service deploy configuration", () => {
     try {
       const path = join(directory, "target.json");
       writeFileSync(path, JSON.stringify({ ...BASE, objectBucketSupplies: SUPPLIES }));
-      expect(() => loadTarget(path)).toThrow("must be configured together");
+      expect(() => loadTarget(path, "production")).toThrow("must be configured together");
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -307,7 +311,9 @@ describe("private data service deploy configuration", () => {
     try {
       const path = join(directory, "target.json");
       writeFileSync(path, JSON.stringify({ ...BASE, edgeSupplies: EDGE_SUPPLIES }));
-      expect(() => loadTarget(path)).toThrow("edge supplies and `workerEndpointSuffix`");
+      expect(() => loadTarget(path, "production")).toThrow(
+        "edge supplies and `workerEndpointSuffix`",
+      );
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -325,9 +331,9 @@ describe("private data service deploy configuration", () => {
           workerEndpointSuffix: "hosted.workers.dev",
         }),
       );
-      const target = loadTarget(path);
+      const target = loadTarget(path, "production");
       expect(JSON.stringify(target.edgeSupplies)).toBe(JSON.stringify(EDGE_SUPPLIES));
-      expect(target.hostRuntimeMaterializerService).toBeUndefined();
+      expect(target.hostedTopology).toBeUndefined();
       expect(serviceBindings(target)).toEqual({});
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -342,14 +348,14 @@ describe("private data service deploy configuration", () => {
         path,
         JSON.stringify({
           ...BASE,
-          hostRuntimeMaterializerService: {
+          hostedTopology: {
             service: "takosumi-platform",
             entrypoint: "TakosumiHostRuntimeMaterializerEntrypoint",
             token: "must-not-be-here",
           },
         }),
       );
-      expect(() => loadTarget(path)).toThrow("unexpected keys");
+      expect(() => loadTarget(path, "production")).toThrow("unexpected keys");
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

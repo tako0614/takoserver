@@ -4,110 +4,81 @@ import { preflightError } from "./errors.ts";
 import { REPOSITORY } from "./process.ts";
 import type { DeployTarget } from "./target.ts";
 
+const NEUTRAL_CONFIG_PATH = resolve(REPOSITORY, "wrangler.jsonc");
+
+export interface WorkerConfigOptions {
+  readonly path: string;
+  readonly main: string;
+  readonly commit: string;
+  readonly hostedTopology: "desired" | "absent";
+  readonly signingKeyId?: string;
+}
+
 /**
- * The checked `wrangler.jsonc` is deliberately target-neutral: it carries the
- * binding shape but no account, database, or bucket identity. Realization joins
- * it with one operator-private target into a gitignored config that Wrangler
- * reads from the repository root, so every relative path still resolves.
+ * Realizes one target into a caller-owned temporary path. The caller seals the
+ * resulting config beside the exact bundle; this module never writes mutable
+ * deploy state into the repository.
  */
-export const REALIZED_CONFIG_PATH = resolve(REPOSITORY, ".wrangler-realized.jsonc");
-export const NEUTRAL_CONFIG_PATH = resolve(REPOSITORY, "wrangler.jsonc");
-
-export function writeRealizedConfig(target: DeployTarget): string {
-  const neutral = readNeutralConfig();
-
-  if (neutral.name !== target.workerName) {
-    throw preflightError(
-      `worker name mismatch: wrangler.jsonc declares ${JSON.stringify(neutral.name)} but the ` +
-        `deploy target names ${JSON.stringify(target.workerName)}`,
-    );
+export function writeWorkerConfig(target: DeployTarget, options: WorkerConfigOptions): string {
+  if (!/^[0-9a-f]{40}$/u.test(options.commit)) {
+    throw preflightError("Worker config requires one exact commit");
   }
+  const neutral = readNeutralConfig();
   assertNeutral(neutral);
-
+  const { $schema: _schema, ...neutralConfig } = neutral;
+  const signingKeyId = options.signingKeyId ?? effectiveSigningKeyId(target);
   const realized = {
-    ...neutral,
+    ...neutralConfig,
+    name: target.workerName,
+    main: options.main,
     account_id: target.accountId,
     d1_databases: [
       {
         binding: "STATE_DB",
         database_name: target.d1.databaseName,
         database_id: target.d1.databaseId,
-        migrations_dir: "migrations",
       },
     ],
     r2_buckets: [{ binding: "OBJECTS", bucket_name: target.r2.bucketName }],
-    ...serviceBindings(target),
     ...serviceAddress(target.publicOrigin, target.aliases ?? []),
-    ...deploymentVariables(target),
+    ...deploymentVariables(target, signingKeyId),
+    ...(options.hostedTopology === "desired" ? serviceBindings(target) : {}),
+    secrets: { required: expectedWorkerSecrets(target) },
   };
-  writeFileSync(REALIZED_CONFIG_PATH, `${JSON.stringify(realized, null, 2)}\n`, { mode: 0o600 });
-  return REALIZED_CONFIG_PATH;
+  writeFileSync(options.path, `${JSON.stringify(realized, null, 2)}\n`, { mode: 0o600 });
+  return options.path;
 }
 
-/** Exact non-secret RPC route used to resolve opaque runtime requirements. */
+export function effectiveSigningKeyId(target: DeployTarget): string {
+  // `nextKeyId` is a rotation proposal, never routine desired state. Only the
+  // signing-rotation surface may pass it explicitly to writeWorkerConfig.
+  return target.signing.currentKeyId;
+}
+
+/** Exact non-secret RPC route selected only by the topology surface. */
 export function serviceBindings(target: DeployTarget): Record<string, unknown> {
-  const materializer = target.hostRuntimeMaterializerService;
-  if (!materializer) return {};
+  const topology = target.hostedTopology;
+  if (!topology) return {};
   return {
     services: [
       {
         binding: "HOST_RUNTIME_MATERIALIZER",
-        service: materializer.service,
-        entrypoint: materializer.entrypoint,
+        service: topology.service,
+        entrypoint: topology.entrypoint,
       },
     ],
   };
 }
 
-/**
- * Digest of what the bundle will run under.
- *
- * A deployment is the bytes and the wiring together. Naming the wiring lets the
- * publish decision notice when only the wiring moved — turning a feature on
- * through a variable is a change that has to reach production, not one that
- * reports itself as already deployed.
- */
-export async function realizedConfigDigest(configPath: string): Promise<string> {
-  const bytes = new TextEncoder().encode(readFileSync(configPath, "utf8"));
-  const hash = await crypto.subtle.digest("SHA-256", bytes as unknown as BufferSource);
-  return `sha256:${[...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
-}
-
-interface NeutralConfig extends Record<string, unknown> {
-  readonly name: string;
-}
-
-function readNeutralConfig(): NeutralConfig {
-  const raw = readFileSync(NEUTRAL_CONFIG_PATH, "utf8");
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw preflightError(
-      "wrangler.jsonc must stay comment-free JSON so realization can join it with a target",
-    );
-  }
-  if (!isRecord(parsed) || typeof parsed.name !== "string") {
-    throw preflightError("wrangler.jsonc must declare a string `name`");
-  }
-  return parsed as NeutralConfig;
-}
-
-/** Guards the claim that the committed configuration carries no realized identity. */
-/**
- * Per-deployment values the Worker reads, and that are not secrets.
- *
- * Both are public by nature — one is an address, the other is an OAuth client
- * id that ships in every page offering the button. They are here rather than in
- * the repository because they differ per deployment, which is the same reason
- * the account and the database are.
- */
-export function deploymentVariables(target: DeployTarget): Record<string, unknown> {
-  const vars: Record<string, string> = {};
-  // The canonical address is deployment identity, not request metadata. Every
-  // official Worker receives it explicitly so aliases cannot rewrite discovery
-  // or the OpenAPI server URL.
-  vars.PUBLIC_ORIGIN = target.publicOrigin;
+/** Public per-deployment values. Secret bytes never enter this object. */
+export function deploymentVariables(
+  target: DeployTarget,
+  signingKeyId = effectiveSigningKeyId(target),
+): Record<string, unknown> {
+  const vars: Record<string, string> = {
+    PUBLIC_ORIGIN: target.publicOrigin,
+    TAKOSERVER_SIGNING_KEY_ID: signingKeyId,
+  };
   if (target.consoleOrigin !== undefined) vars.TAKOSERVER_CONSOLE_ORIGIN = target.consoleOrigin;
   if (target.googleClientId !== undefined) vars.GOOGLE_CLIENT_ID = target.googleClientId;
   if (target.takosId !== undefined) {
@@ -115,9 +86,6 @@ export function deploymentVariables(target: DeployTarget): Record<string, unknow
     vars.TAKOS_ID_CLIENT_ID = target.takosId.clientId;
   }
   if (target.stripeCheckout === true) vars.TAKOSERVER_STRIPE_CHECKOUT_ENABLED = "1";
-  // The key id is public — its public half is in the database for anyone to
-  // verify against. The private half is a secret and is set separately.
-  vars.TAKOSERVER_SIGNING_KEY_ID = target.grantKeyId;
   if (
     target.zones !== undefined ||
     target.aiModels !== undefined ||
@@ -126,8 +94,6 @@ export function deploymentVariables(target: DeployTarget): Record<string, unknow
     target.objectBucketSupplies !== undefined ||
     target.edgeSupplies !== undefined
   ) {
-    // The account the Worker provisions in is the account it is deployed to;
-    // saying so once here keeps the provider from having to be told twice.
     vars.CLOUDFLARE_ACCOUNT_ID = target.accountId;
   }
   if (target.zones !== undefined) vars.TAKOSERVER_ZONES = JSON.stringify(target.zones);
@@ -147,34 +113,44 @@ export function deploymentVariables(target: DeployTarget): Record<string, unknow
   if (target.workerEndpointSuffix !== undefined) {
     vars.TAKOSERVER_WORKER_ENDPOINT_SUFFIX = target.workerEndpointSuffix;
   }
-  return Object.keys(vars).length === 0 ? {} : { vars };
+  return { vars };
 }
 
-/**
- * Makes the target's `publicOrigin` true.
- *
- * The origin is not a label for a deployment, it is the address callers use, so
- * publishing has to put the Worker there. A `workers.dev` origin is served by
- * the subdomain that flag turns on; anything else is a domain in the account,
- * attached as a custom domain — and the subdomain is then switched off, because
- * leaving it on publishes the same API at a second address that spells out the
- * operator's account name.
- */
-function serviceAddress(
-  publicOrigin: string,
-  aliases: readonly string[] = [],
-): Record<string, unknown> {
-  const { hostname } = new URL(publicOrigin);
-  if (hostname.endsWith(".workers.dev")) {
-    if (aliases.length > 0) {
-      throw preflightError("a workers.dev origin cannot carry aliases; name a real origin first");
-    }
-    return { workers_dev: true };
+/** Names only; Cloudflare never returns or receives secret bytes here. */
+export function expectedWorkerSecrets(target: DeployTarget): readonly string[] {
+  const names = new Set<string>(["TAKOSERVER_SIGNING_KEY"]);
+  if (target.hostedTopology !== undefined) names.add("TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN");
+  if (target.stripeCheckout === true) names.add("STRIPE_SECRET_KEY");
+  if (
+    target.standardServiceSupplies !== undefined ||
+    target.edgeSupplies !== undefined ||
+    target.objectBucketSupplies?.supplies.some((supply) => supply.provider.kind === "cloudflare")
+  ) {
+    names.add("CLOUDFLARE_API_TOKEN");
   }
-  return {
-    workers_dev: false,
-    routes: [hostname, ...aliases].map((pattern) => ({ pattern, custom_domain: true })),
-  };
+  if (target.r2ParentAccessKeyId !== undefined) names.add("TAKOSERVER_R2_PARENT_TOKEN");
+  if (target.objectBucketSupplies?.supplies.some((supply) => supply.provider.kind === "wasabi")) {
+    names.add("TAKOSERVER_WASABI_ACCESS_KEY_ID");
+    names.add("TAKOSERVER_WASABI_SECRET_ACCESS_KEY");
+  }
+  return [...names].sort();
+}
+
+interface NeutralConfig extends Record<string, unknown> {
+  readonly name: string;
+}
+
+function readNeutralConfig(): NeutralConfig {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(NEUTRAL_CONFIG_PATH, "utf8"));
+  } catch {
+    throw preflightError("wrangler.jsonc must stay comment-free JSON");
+  }
+  if (!isRecord(parsed) || typeof parsed.name !== "string") {
+    throw preflightError("wrangler.jsonc must declare a string `name`");
+  }
+  return parsed as NeutralConfig;
 }
 
 function assertNeutral(neutral: Record<string, unknown>): void {
@@ -184,6 +160,8 @@ function assertNeutral(neutral: Record<string, unknown>): void {
     "route",
     "vars",
     "services",
+    "secrets",
+    "annotations",
     "workers_dev_subdomain",
   ]) {
     if (forbidden in neutral) {
@@ -204,6 +182,23 @@ function assertNeutral(neutral: Record<string, unknown>): void {
       }
     }
   }
+}
+
+function serviceAddress(
+  publicOrigin: string,
+  aliases: readonly string[] = [],
+): Record<string, unknown> {
+  const { hostname } = new URL(publicOrigin);
+  if (hostname.endsWith(".workers.dev")) {
+    if (aliases.length > 0) {
+      throw preflightError("a workers.dev origin cannot carry aliases; name a real origin first");
+    }
+    return { workers_dev: true };
+  }
+  return {
+    workers_dev: false,
+    routes: [hostname, ...aliases].map((pattern) => ({ pattern, custom_domain: true })),
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

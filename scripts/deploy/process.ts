@@ -10,6 +10,62 @@ export interface CommandResult {
   readonly stderr: string;
 }
 
+const CHILD_SUBSTRATE = [
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "XDG_CONFIG_HOME",
+  "XDG_CACHE_HOME",
+  "LANG",
+  "LC_ALL",
+  "TERM",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "NODE_EXTRA_CA_CERTS",
+] as const;
+
+/**
+ * Builds the complete environment for a deploy child.
+ *
+ * A deploy process often holds unrelated operator credentials. Children get
+ * only the process substrate needed to execute plus authority the caller names
+ * for this exact command; ambient tokens never cross accidentally.
+ */
+export function sanitizedChildEnvironment(
+  explicit: Readonly<Record<string, string>> = {},
+): Record<string, string> {
+  const environment: Record<string, string> = { CI: "1", NO_COLOR: "1" };
+  for (const name of CHILD_SUBSTRATE) {
+    const value = process.env[name];
+    if (value !== undefined) environment[name] = value;
+  }
+  for (const [name, value] of Object.entries(explicit)) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(name) || value.includes("\u0000")) {
+      throw new TypeError(`invalid child environment entry ${JSON.stringify(name)}`);
+    }
+    environment[name] = value;
+  }
+  return environment;
+}
+
+/** Read one exact operator input without ever echoing its value. */
+export function requireEnvironment(name: string): string {
+  const value = process.env[name];
+  if (value === undefined || value.length === 0 || value.trim() !== value) {
+    throw new DeployError("preflight", `${name} is required and must not have outer whitespace`);
+  }
+  return value;
+}
+
+/** The only ambient credential forwarded to Cloudflare commands. */
+export function cloudflareChildEnvironment(): Readonly<Record<string, string>> {
+  return { CLOUDFLARE_API_TOKEN: requireEnvironment("CLOUDFLARE_API_TOKEN") };
+}
+
 /** Runs a command to completion, capturing both streams and never inheriting stdin. */
 export async function runCommand(
   command: readonly string[],
@@ -26,7 +82,7 @@ export async function runCommand(
     stdin: options.input === undefined ? "ignore" : "pipe",
     stdout: "pipe",
     stderr: "pipe",
-    env: { ...process.env, CI: "1", ...options.env },
+    env: sanitizedChildEnvironment(options.env),
   });
   if (options.input !== undefined) {
     const stdin = child.stdin;

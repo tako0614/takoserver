@@ -1,31 +1,33 @@
 # Takoserver landing site deployment
 
 The landing site is a routine Cloudflare Pages surface owned by this
-repository. Its Pages project is fixed as `takoserver-website`; the deploy
-entrypoint does not discover or mutate Cloudflare routes, zones, or domains.
+repository. Its Pages project is fixed as `takoserver-website`. This routine
+surface never mutates Cloudflare routes, zones, or domain attachment.
 
 ## Commands
 
 ```sh
-bun run deploy -- site --environment=integration
-bun run deploy -- site --environment=production
+bun run deploy -- takoserver-site --status --environment=integration --commit=<40-hex-sha>
+bun run deploy -- takoserver-site --apply --environment=integration --commit=<40-hex-sha>
+bun run deploy -- takoserver-site --status --environment=production --commit=<40-hex-sha>
+bun run deploy -- takoserver-site --apply --environment=production --commit=<40-hex-sha>
 ```
 
-Integration is the iteration lane. It accepts a dirty worktree, requires a
-non-`main` branch, builds the site once, uploads once to that branch's Pages
-preview, and performs one immutable deployment URL GET.
+Integration is the iteration lane. It may use a dirty exact HEAD, builds the
+site once, seals the link-free output, uploads it once, and performs one
+byte-exact immutable deployment URL readback.
 
-Production is intentionally narrower. It requires a clean `main` worktree,
-fetches `origin/main`, and refuses unless `HEAD` equals that freshly fetched
-commit. It then builds once, uploads once, and performs one immutable deployment
-URL GET plus one `https://takoserver.com/` GET. Both readbacks must return the
-same bytes as the built `index.html`.
+Production requires either clean `main` equal to freshly fetched `origin/main`,
+or a clean exact HEAD proven reachable from an exact remote ref. It builds and
+uploads once, then requires both the immutable deployment URL and
+`https://takoserver.com/` to return the sealed `index.html` bytes exactly. The
+custom-domain read is a post-condition, not attachment authority.
 
-The command has no `status`, `plan`, or `apply` mode, reviewer/ledger state, or
-Cloudflare API-token inventory. A build or source guard failure occurs before
-the Pages mutation. If upload acknowledgement or the immutable URL is
-indeterminate, do not retry blindly; inspect Pages deployment history first.
+This routine surface has no reviewer, plan, ledger, journal, or capability
+burden. `--status` is read-only. A build or source guard failure occurs before
+the Pages mutation. An upload acknowledgement failure is indeterminate: do not
+retry; run the same surface with `--status` and inspect exhaustive Pages
+deployment history first.
 
-The production custom-domain attachment is a separate one-time topology
-operation. This routine site command only publishes the Pages project and
-verifies its public bytes.
+Custom-domain attachment is outside this routine surface. The command publishes
+only Pages project bytes and verifies the existing production domain.

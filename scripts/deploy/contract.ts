@@ -1,128 +1,286 @@
-/**
- * The side-effect-free declaration of what this entrypoint publishes, which
- * triggers stand on it, and how each obligation is discharged. `--contract`
- * prints exactly this and touches nothing.
- */
+const routineFailure =
+  "Pre-upload failures touch nothing. An upload acknowledgement failure is indeterminate; " +
+  "the command never retries and directs the operator to the same surface's --status readback.";
+const highRiskFailure =
+  "Pre-mutation failures touch nothing. A mutation acknowledgement failure is indeterminate; " +
+  "the command stops without retry and requires authoritative --status before forward repair.";
+const exactSource =
+  "The explicit 40-hex commit must equal HEAD. Production requires a clean main equal to freshly " +
+  "fetched origin/main, or a clean HEAD proven reachable from an exact remote ref.";
+const review =
+  "TAKOSERVER_INDEPENDENT_REVIEW names the reviewer that did not author the change and is printed " +
+  "without granting deploy authority.";
+
+/** Side-effect-free live declaration for the repository's only deploy entrypoint. */
 export const DEPLOY_CONTRACT = {
   kind: "takos.deploy-contract@v2",
   surfaces: [
     {
-      surface: "takoserver-api",
-      target: "cloudflare-worker:takoserver-api",
+      surface: "takoserver-worker",
+      target: "cloudflare-worker:environment-selected-takoserver-worker",
       covers: [
-        "wrangler.jsonc",
-        "migrations",
-        "src/entry-worker.ts",
         "src",
+        "wrangler.jsonc",
         "scripts/build-worker.ts",
-        "scripts/check-d1-migrations.ts",
-        "scripts/check-worker-startup.ts",
         "scripts/deploy.ts",
-        "scripts/deploy",
-        "package.json",
+        "scripts/deploy/worker.ts",
+        "scripts/deploy/qualification.ts",
       ],
       requiresScripts: ["check", "deploy"],
       requiresTools: ["bun", "wrangler"],
-      requiresEnv: [],
-      triggers: ["published-identity", "authority", "irreversible"],
+      requiresEnv: ["CLOUDFLARE_API_TOKEN"],
+      triggers: [],
       obligations: {
         provenance:
-          "Publication refuses unless the worktree is clean and HEAD is already contained in " +
-          "its upstream branch. The uploaded bytes are built from that worktree by one strict " +
-          "Wrangler dry-run and digested; the commit, branch, remote, bundle digest and size, " +
-          "migration bytes digest, selected account, D1 database id, and R2 bucket are written " +
-          "to an operator-private append-only evidence ledger under .deploy/evidence.",
+          `${exactSource} The owner gate runs once, then the exact link-free bundle and realized ` +
+          "configuration are sealed and requalified immediately before one upload.",
         "post-conditions":
-          "After publishing, the writer reads back the served Worker version id and its binding " +
-          "closure, including the exact service and named entrypoint of any Hosted runtime " +
-          "materializer and the absence of a stale materializer binding when none is declared, " +
-          "proves every product table remains present, and exercises the anonymous " +
-          "published surface: Takoserver discovery, OpenAPI, both Takoform lanes, identity " +
-          "discovery, credential-bearing route refusal, unknown-route 404, and—when Hosted " +
-          "sponsorship is enabled—a bounded live token whose signature is verified against the " +
-          "active D1 public key. Authenticated " +
-          "customer lifecycle, signed R2 bytes, replay rejection, AI inference, and billing are " +
-          "separate live E2E cadences because the deploy writer does not mint customer or " +
-          "commercial authority.",
+          "Authoritative deployment/version state, exact binding/configuration closure and the " +
+          "public product probe identify the selected commit and uploaded artifact.",
         reversal:
-          "The previously served Worker version id is captured before any mutation and printed " +
-          "with the exact `wrangler versions deploy` command that restores it. Worker rollback " +
-          "is separate from D1: schema repair is forward-only, and no R2 object or D1 row is " +
-          "erased to undo a code change.",
+          "The immediately previous Cloudflare Worker version is printed as the provider-history rollback target.",
         "failure-handling":
-          "Every invocation without an explicit `--apply` refuses before touching a target. " +
-          "Failures are classified by phase and carry the raw diagnostics: exit 2 means nothing " +
-          "was touched, exit 3 means the target may have been mutated and the state is " +
-          "indeterminate, exit 4 means bytes are published but the post-conditions failed. The " +
-          "writer never retries on its own; exit 3 and exit 4 direct the operator to `--status` " +
-          "for an authoritative readback of the served Version and its exact D1, R2, and " +
-          "runtime-materializer binding closure first.",
-        "no-overwrite":
-          "Publication mints a new immutable Worker version for changed bytes. If the evidence " +
-          "ledger already records the served version for the same bundle digest the writer " +
-          "reports the target as current and publishes nothing, and it refuses outright when a " +
-          "recorded version id is claimed by a different bundle digest.",
-        "pre-mutation-proof":
-          "Before the first writer runs: the portable gate `bun run check` (format, lint, import " +
-          "boundary, generated Worker types, both type worlds, tests, disposable local D1 " +
-          "migration, both builds, Worker startup, checked OpenAPI), a strict Wrangler dry-run " +
-          "of the realized configuration, and read-only inspection of the live target covering " +
-          "D1 migration lineage against the local migration files, the three runtime tables, " +
-          "active key availability, exact local-private/D1-public signing authority, live signing " +
-          "proof where Hosted is enabled, R2 bucket reachability, and the currently served version.",
-        "independent-review":
-          "This writer moves the deploy mechanism itself and rewrites durable schema, so a " +
-          "reviewer who did not author it must inspect account selection, migration lineage, " +
-          "key provisioning and custody, replay semantics, R2 scoping, immutable artifact " +
-          "identity, reversal, and readback evidence before it is used again.",
+          `${routineFailure} The surface refuses pending migrations and any configuration, secret, ` +
+          "signing or Hosted topology drift before upload. A diff that changes authentication, " +
+          "authorization or the deploy mechanism is refused and routed to the authority cutover surface.",
       },
     },
     {
-      surface: "takoserver-console",
-      target: "cloudflare-worker:takoserver-console",
-      covers: ["console", "scripts/build-console.ts", "scripts/deploy.ts", "scripts/deploy/web.ts"],
+      surface: "takoserver-worker-authority-cutover",
+      target: "cloudflare-worker:environment-selected-takoserver-worker-authority-code",
+      covers: [
+        "src",
+        "wrangler.jsonc",
+        "scripts/build-worker.ts",
+        "scripts/deploy.ts",
+        "scripts/deploy/worker.ts",
+        "scripts/deploy/qualification.ts",
+      ],
       requiresScripts: ["check", "deploy"],
       requiresTools: ["bun", "wrangler"],
-      requiresEnv: ["CLOUDFLARE_API_TOKEN"],
-      triggers: ["published-identity"],
+      requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
+      triggers: ["authority"],
       obligations: {
         provenance:
-          "The owner builds console assets from a clean pushed commit into a fresh private temporary directory and records the commit, exact asset digest, byte count, Worker name and public origin.",
+          `${exactSource} The scoped owner gate runs once, then the exact link-free bundle and ` +
+          "realized configuration are sealed and requalified immediately before one upload.",
         "post-conditions":
-          "The writer proves the custom domain is owned by takoserver-console and that the live console.js body is byte-exact with the just-built artifact.",
+          "Authoritative deployment/version state, exact binding/configuration closure and the " +
+          "public product probe identify the selected authority-sensitive commit and uploaded artifact.",
         reversal:
-          "The previous custom-domain service is captured before publication and no previous Worker is deleted, so the hostname can be reattached without reconstructing old bytes.",
+          "The immediately previous Cloudflare Worker version is printed as the provider-history rollback target.",
         "failure-handling":
-          "Build and authority failures occur before publication; a failed mutation or byte readback is classified and never retried automatically.",
-        "no-overwrite":
-          "Wrangler publishes immutable Worker versions and the append-only web ledger never overwrites an earlier publication receipt.",
-        "pre-mutation-proof":
-          "The full portable gate, pushed-source proof, fresh console build, content digest and current custom-domain owner are read with CLOUDFLARE_API_TOKEN before publication.",
+          `${highRiskFailure} Pending schema and any configuration, secret, signing or Hosted topology ` +
+          "drift are still refused; this surface changes authority-sensitive code bytes only.",
+        "independent-review": review,
       },
     },
     {
       surface: "takoserver-site",
-      target: "cloudflare-pages:takoserver-website",
+      target: "cloudflare-pages:environment-selected-takoserver-site",
       covers: [
         "src/landing.ts",
         "scripts/build-site.ts",
         "scripts/deploy.ts",
         "scripts/deploy/static.ts",
-        "package.json",
+        "scripts/deploy/qualification.ts",
       ],
       requiresScripts: ["build:site", "deploy"],
       requiresTools: ["bun", "wrangler"],
-      requiresEnv: [],
+      requiresEnv: ["CLOUDFLARE_API_TOKEN"],
       triggers: [],
       obligations: {
         provenance:
-          "The owner builds the landing site once from the selected worktree into a fresh temporary directory, records the commit, branch, dirty state, Pages project, artifact digest, byte count and immutable deployment URL, and uploads exactly once. Integration accepts a dirty non-main branch; production requires clean main equal to freshly fetched origin/main.",
+          `${exactSource} The scoped site build runs once into a fresh link-free directory; its ` +
+          "sealed digest is sent by one Pages upload.",
         "post-conditions":
-          "The writer performs one authoritative GET of the immutable Pages deployment URL and proves the index document is byte-exact with the built page. Production additionally performs one GET of https://takoserver.com/ and proves the same bytes.",
+          "The immutable Pages deployment URL is read once and must be byte-exact with the sealed index. " +
+          "Production additionally requires a byte-exact https://takoserver.com/ readback.",
         reversal:
-          "Pages deployment history supplies the rollback target. The production custom-domain attachment is a separate one-time topology operation and is not changed by this routine site command.",
-        "failure-handling":
-          "Build and source-guard failures occur before the Pages target is touched. A failed upload or missing immutable URL is indeterminate; the writer emits diagnostics and never retries. A readback failure means publication may have succeeded and requires provider history/readback before another upload. The command has no plan, reviewer, ledger, token parser, or API inventory path.",
+          "The previous Pages deployment id from authoritative project history is printed as the rollback target.",
+        "failure-handling": routineFailure,
+      },
+    },
+    {
+      surface: "takoserver-console",
+      target: "cloudflare-worker:environment-selected-takoserver-console",
+      covers: [
+        "console",
+        "scripts/build-console.ts",
+        "scripts/deploy.ts",
+        "scripts/deploy/console.ts",
+        "scripts/deploy/cloudflare-state.ts",
+      ],
+      requiresScripts: ["build:console", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: ["CLOUDFLARE_API_TOKEN"],
+      triggers: [],
+      obligations: {
+        provenance:
+          `${exactSource} The scoped Console build runs once and the sealed link-free assets are ` +
+          "sent by one Worker upload whose configuration contains no route or domain mutation.",
+        "post-conditions":
+          "Exhaustive paginated domain state must name the same pre-existing Console owner before " +
+          "and after upload, and the public console.js must be byte-exact.",
+        reversal:
+          "The previous Console Worker version is printed; the command never changes its domain owner.",
+        "failure-handling": routineFailure,
+      },
+    },
+    {
+      surface: "takoserver-d1-schema",
+      target: "cloudflare-d1:environment-selected-takoserver-state",
+      covers: ["migrations", "scripts/deploy/schema.ts", "scripts/deploy/d1.ts"],
+      requiresScripts: ["check:migrations", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+        "TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH",
+      ],
+      triggers: ["irreversible"],
+      obligations: {
+        provenance:
+          `${exactSource} Migration names, bytes, lineage and canonical schema shape are digested ` +
+          "before the forward-only apply.",
+        "post-conditions":
+          "D1 lineage and canonical schema shape are read authoritatively after the deliberate last mutation.",
+        reversal:
+          "There is no down migration. Failure is repaired forward from the authoritative D1 lineage and schema shape.",
+        "failure-handling": highRiskFailure,
+        "pre-mutation-proof":
+          "Rehearsal writes a 0600 receipt outside every repository. Production requires that exact " +
+          "commit, migration digest, pre-shape and expected post-shape before applying the same bytes.",
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-signing-key-register",
+      target: "cloudflare-d1:environment-selected-public-signing-key",
+      covers: ["scripts/deploy/signing.ts", "scripts/deploy/d1.ts"],
+      requiresScripts: ["deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+        "TAKOSERVER_SIGNING_PUBLIC_JWK_PATH",
+      ],
+      triggers: ["irreversible", "authority", "published-identity"],
+      obligations: {
+        provenance:
+          "The selected target names the key id and the input file must contain only its exact Ed25519 public JWK; no private member is accepted or read.",
+        "post-conditions":
+          "D1 returns exactly one byte-identical public key row for the selected id; this surface performs no Worker secret or configuration mutation.",
+        reversal:
+          "Registration is append-only. A mistaken public identity is not overwritten or deleted; repair forward with a new key id.",
+        "failure-handling": highRiskFailure,
+        "pre-mutation-proof":
+          "The exact public-JWK digest, canonical Ed25519 shape and key-id absence are proven, then absence is rechecked immediately before insert.",
+        "independent-review": review,
+        "no-overwrite":
+          "The selected key id must be absent. Registration uses an insert-only statement; an existing identical or different row is never rewritten.",
+      },
+    },
+    {
+      surface: "takoserver-hosted-topology-cutover",
+      target: "cloudflare-worker:environment-selected-hosted-materializer-topology",
+      covers: [
+        "scripts/deploy/hosted.ts",
+        "scripts/deploy/realized-config.ts",
+        "scripts/deploy/worker-state.ts",
+      ],
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+        "TAKOSERVER_HOSTED_TOKEN_PATH",
+      ],
+      triggers: ["irreversible", "authority"],
+      obligations: {
+        provenance:
+          `${exactSource} The sealed currently selected Worker artifact is joined only with the ` +
+          "explicit Hosted materializer service and entrypoint.",
+        "post-conditions":
+          "The immutable Worker version readback contains the exact materializer binding and all " +
+          "other configuration remains byte-for-byte equivalent.",
+        reversal:
+          "Topology is forward-repair only; no automatic removal or fallback service is attempted.",
+        "failure-handling": highRiskFailure,
+        "pre-mutation-proof":
+          "The Hosted token cutover and bounded signing proof must already pass while the materializer binding is still absent.",
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-signing-repair",
+      target: "cloudflare-worker-secret:environment-selected-current-signing-key",
+      covers: ["scripts/deploy/signing.ts", "scripts/deploy/worker-live.ts"],
+      requiresScripts: ["deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+        "TAKOSERVER_SIGNING_PRIVATE_JWK_PATH",
+      ],
+      triggers: ["authority"],
+      obligations: {
+        provenance:
+          "The current key id must already exist in D1 and the owned 0600 private JWK must prove its exact public half before stdin-only secret repair.",
+        "post-conditions":
+          "The exact Worker secret-name inventory and a new immutable version are read back while code/config stay unchanged, and the D1 row remains byte-identical.",
+        reversal:
+          "Reapply the previous exact secret only through this same repair surface; the command prints no secret bytes.",
+        "failure-handling": highRiskFailure,
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-signing-rotation",
+      target: "cloudflare-worker-secret:environment-selected-next-signing-key",
+      covers: ["scripts/deploy/signing.ts", "scripts/deploy/worker-live.ts"],
+      requiresScripts: ["deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+        "TAKOSERVER_SIGNING_NEXT_PRIVATE_JWK_PATH",
+      ],
+      triggers: ["authority", "published-identity"],
+      obligations: {
+        provenance:
+          "The target explicitly names different current and next ids; both public keys must be pre-registered and the owned 0600 next private JWK must prove the next public half.",
+        "post-conditions":
+          "The immutable Worker version explicitly names the next id with the exact secret inventory and unchanged code, while both public rows remain byte-identical.",
+        reversal:
+          "The explicit current key remains pre-registered, so an operator may run a separately reviewed inverse rotation; no silent switch or key deletion occurs.",
+        "failure-handling": highRiskFailure,
+        "independent-review": review,
+        "no-overwrite":
+          "Rotation consumes a separately pre-registered next id, retains the current public row, and never overwrites either identity.",
+      },
+    },
+    {
+      surface: "takoserver-hosted-token-cutover",
+      target: "cloudflare-worker-secret:environment-selected-hosted-token",
+      covers: ["scripts/deploy/hosted.ts", "scripts/deploy/signing.ts"],
+      requiresScripts: ["deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+        "TAKOSERVER_HOSTED_TOKEN_PATH",
+      ],
+      triggers: ["authority"],
+      obligations: {
+        provenance:
+          "The owned 0600 token file is sent only on stdin while the Hosted topology binding is authoritatively absent.",
+        "post-conditions":
+          "Before any topology cutover, the bounded sponsorship route accepts the exact token and returns a credential whose signature matches the current D1 public key.",
+        reversal:
+          "Before topology cutover, remove the newly added named secret through an explicit Cloudflare secret deletion; token bytes are never printed.",
+        "failure-handling": highRiskFailure,
+        "independent-review": review,
       },
     },
   ],

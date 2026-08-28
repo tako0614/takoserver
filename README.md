@@ -189,23 +189,16 @@ Set `CLOUDFLARE_ACCOUNT_ID` and a scoped API token to make configured Host-owned
 standard-service supplies available in that account. Historical released
 provider adapters may remain installed to observe and delete recorded
 Deployments, but their beta Forms are not republished as a sale catalog. The
-control plane itself can also run as a Worker; `bun run deploy -- --contract`
-describes what publishing that involves and what it refuses to do.
-
-The public landing page is a separate routine Pages surface. Use
-[`docs/deploy-site.md`](docs/deploy-site.md) for its integration and production
-commands; it publishes the repo-owned `takoserver-website` project and does not
-attach or inspect the production custom domain.
-
-For the owner-managed production plan/apply only, keep the existing hosted
-sponsorship bearer at `.deploy/private/hosted-sponsorship-token`, with
-`.deploy/private` mode `0700` and the file mode `0600`. Load it process-locally
-as `TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN` through the owning deploy entrypoint;
-never echo it, put it in shell history, or copy it into the target or evidence.
-Unset it immediately afterward, and never substitute a raw deploy command.
+control plane itself can also run as a Worker. `bun run deploy -- --contract`
+prints the side-effect-free split deploy contract. Every operation then names
+one surface, one `--status` or `--apply` action, an exact environment, and an
+exact 40-hex commit; there is no mixed controller, plan, ledger, journal, or
+target override. See [`docs/deploy.md`](docs/deploy.md) for the surface list,
+ordering, private inputs, and failure rules. The landing-page details are in
+[`docs/deploy-site.md`](docs/deploy-site.md).
 
 The official operator-private deploy target may declare `aiModels`,
-`standardServiceSupplies`, and one exact `hostRuntimeMaterializerService` route.
+`standardServiceSupplies`, and one exact `hostedTopology` route.
 Its hosted composition pins the internal Takosumi service and exported runtime-
 binding materializer entrypoint because the recommended applications declare
 runtime-sensitive Worker bindings. This remains an optional public composition
@@ -222,9 +215,10 @@ upstream-model mapping, limits, and retail token prices. Deploy realization and
 immutable Worker Version readback require the exact `HOST_RUNTIME_MATERIALIZER`
 service and entrypoint when the target selects one, and require its absence
 when the target does not.
-The read-only `bun run deploy -- --status` path proves the same exact D1, R2,
-and binding closure, so a stale operator target or an incompletely wired
-live Version cannot masquerade as a healthy recovery state.
+The read-only surface-specific `--status` path proves the applicable exact D1,
+R2, secret-name, domain-owner, deployment-history, and binding closure, so a
+stale operator target or an incompletely wired live Version cannot masquerade
+as healthy state.
 Takoserver's public protocol and standalone path do not depend on Takosumi.
 Stable Worker Forms with an omitted or empty `requiredSensitiveVars`
 declaration provision normally when the target omits this service binding; a

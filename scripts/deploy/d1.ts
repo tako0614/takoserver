@@ -1,5 +1,15 @@
 import { DeployError, type DeployPhase } from "./errors.ts";
-import { runChecked, wranglerCommand } from "./process.ts";
+import {
+  type CommandResult,
+  cloudflareChildEnvironment,
+  runCommand,
+  wranglerCommand,
+} from "./process.ts";
+
+export type D1Process = (
+  command: readonly string[],
+  options?: { readonly env?: Readonly<Record<string, string>>; readonly input?: string },
+) => Promise<CommandResult>;
 
 /**
  * Read and write access to the realized D1 database through Wrangler.
@@ -13,9 +23,19 @@ import { runChecked, wranglerCommand } from "./process.ts";
  */
 export class RemoteD1 {
   readonly #configPath: string;
+  readonly #environment: Readonly<Record<string, string>>;
+  readonly #run: D1Process;
 
-  constructor(configPath: string) {
+  constructor(
+    configPath: string,
+    options: {
+      readonly environment?: Readonly<Record<string, string>>;
+      readonly run?: D1Process;
+    } = {},
+  ) {
     this.#configPath = configPath;
+    this.#environment = options.environment ?? cloudflareChildEnvironment();
+    this.#run = options.run ?? runCommand;
   }
 
   /**
@@ -61,9 +81,7 @@ export class RemoteD1 {
     sql: string,
     json: boolean,
   ): Promise<string> {
-    return await runChecked(
-      phase,
-      description,
+    const result = await this.#run(
       wranglerCommand([
         "d1",
         "execute",
@@ -76,7 +94,16 @@ export class RemoteD1 {
         "--command",
         sql,
       ]),
+      { env: this.#environment },
     );
+    if (result.exitCode !== 0) {
+      throw new DeployError(
+        phase,
+        `${description} failed (exit ${result.exitCode})`,
+        `${result.stdout}${result.stderr}`.trim(),
+      );
+    }
+    return result.stdout;
   }
 }
 
@@ -95,14 +122,17 @@ function parseResults(
   } catch {
     throw new DeployError(phase, `${description} returned unparsable JSON`, raw);
   }
-  if (!Array.isArray(parsed) || parsed.length === 0) {
+  if (!Array.isArray(parsed) || parsed.length !== 1) {
     throw new DeployError(phase, `${description} returned an unexpected shape`, raw);
   }
   const first = parsed[0];
-  if (!isRecord(first) || !Array.isArray(first.results)) {
+  if (!isRecord(first) || first.success !== true || !Array.isArray(first.results)) {
     throw new DeployError(phase, `${description} returned an unexpected shape`, raw);
   }
-  const rows = first.results.filter(isRecord);
+  if (!first.results.every(isRecord)) {
+    throw new DeployError(phase, `${description} returned an unexpected shape`, raw);
+  }
+  const rows = first.results;
   for (const row of rows) {
     if ("Total queries executed" in row) {
       throw new DeployError(
