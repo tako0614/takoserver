@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createRouter } from "../src/router.ts";
+import { createStaticStableTestTakoformHost } from "./helpers/historical-takoform-host.ts";
 
 /**
  * The console is served from its own hostname, so every call it makes is
@@ -71,6 +72,7 @@ describe("browser console session", () => {
     const { createMemoryObjectStore } = await import("../src/objects-mem.ts");
     const edge = await buildEdgeForms();
     const app = buildApp({
+      takoformHostFactory: createStaticStableTestTakoformHost,
       sql: createEphemeralSql(),
       objects: createMemoryObjectStore(),
       forms: edge.forms,
@@ -149,6 +151,7 @@ describe("Form registry on the control plane", () => {
     const edge = await buildEdgeForms();
 
     const app = buildApp({
+      takoformHostFactory: createStaticStableTestTakoformHost,
       sql: createEphemeralSql(),
       objects: createMemoryObjectStore(),
       forms: edge.forms,
@@ -249,6 +252,7 @@ describe("entering the lane with a session", () => {
     const { createMemoryObjectStore } = await import("../src/objects-mem.ts");
     const edge = await buildEdgeForms();
     const app = buildApp({
+      takoformHostFactory: createStaticStableTestTakoformHost,
       sql: createEphemeralSql(),
       objects: createMemoryObjectStore(),
       forms: edge.forms,

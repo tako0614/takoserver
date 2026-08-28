@@ -1,0 +1,54 @@
+import { describe, expect, test } from "bun:test";
+import { createR2ObjectStore, type R2BucketLike } from "../src/objects-r2.ts";
+
+describe("R2 object adapter", () => {
+  test("maps create-only to R2's conditional put and preserves the winner", async () => {
+    const held = new Map<string, Uint8Array>();
+    const puts: unknown[] = [];
+    const bucket: R2BucketLike = {
+      async put(key, body, options) {
+        puts.push(options);
+        if (options?.onlyIf?.etagDoesNotMatch === "*" && held.has(key)) return null;
+        const bytes =
+          body instanceof Uint8Array
+            ? body.slice()
+            : body instanceof ArrayBuffer
+              ? new Uint8Array(body.slice(0))
+              : new Uint8Array(await new Response(body).arrayBuffer());
+        held.set(key, bytes);
+        return { key, size: bytes.byteLength, etag: `etag-${bytes.byteLength}` };
+      },
+      async get(key) {
+        const bytes = held.get(key);
+        if (!bytes) return null;
+        const response = new Response(bytes as unknown as BodyInit);
+        if (!response.body) throw new Error("R2 fixture response body missing");
+        return {
+          key,
+          size: bytes.byteLength,
+          etag: `etag-${bytes.byteLength}`,
+          body: response.body,
+        };
+      },
+      async head(key) {
+        const bytes = held.get(key);
+        return bytes ? { key, size: bytes.byteLength, etag: `etag-${bytes.byteLength}` } : null;
+      },
+      async delete(key) {
+        held.delete(key);
+      },
+      async list() {
+        return { objects: [], truncated: false };
+      },
+    };
+    const store = createR2ObjectStore(bucket);
+
+    expect(await store.create("formpkg/exact", new TextEncoder().encode("first"))).not.toBeNull();
+    expect(await store.create("formpkg/exact", new TextEncoder().encode("second"))).toBeNull();
+    expect(await new Response((await store.get("formpkg/exact"))?.body).text()).toBe("first");
+    expect(puts).toEqual([
+      { onlyIf: { etagDoesNotMatch: "*" } },
+      { onlyIf: { etagDoesNotMatch: "*" } },
+    ]);
+  });
+});

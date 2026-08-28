@@ -16,6 +16,7 @@ import {
 } from "../src/index.ts";
 import {
   createHistoricalInMemoryTakoformHost as createInMemoryTakoformHost,
+  createStaticStableTestTakoformHost,
   createHistoricalTakoformHost as createTakoformHost,
 } from "./helpers/historical-takoform-host.ts";
 
@@ -1470,6 +1471,7 @@ describe("historical Takoform Host engine regression", () => {
     // No Host is injected here: the app wires the lane to its own control
     // plane, which is exactly the policy under test.
     const handler = buildApp({
+      takoformHostFactory: createStaticStableTestTakoformHost,
       sql: createEphemeralSql(),
       objects: createMemoryObjectStore(),
       identity: OWNER_IDENTITY,
@@ -1591,6 +1593,37 @@ describe("historical Takoform Host engine regression", () => {
       expect(read.body).toMatchObject({ metadata: { name, space: "workspace-a" } });
     }
 
+    const foreignForms = await jsonRequest(
+      handler,
+      "GET",
+      `/apis/forms.takoform.com/v1alpha3/forms?${new URLSearchParams({
+        ...Object.fromEntries(query),
+        space: "workspace-b",
+      })}`,
+      undefined,
+      auth,
+    );
+    expect(foreignForms.status).toBe(404);
+    expect(foreignForms.body).toMatchObject({ error: { code: "resource_not_found" } });
+
+    const foreignDefinition = await jsonRequest(
+      handler,
+      "GET",
+      `/apis/forms.takoform.com/v1alpha3/form-definitions/${formRef.apiVersion}/${formRef.kind}?${new URLSearchParams(
+        {
+          space: "workspace-b",
+          group: formRef.apiVersion,
+          kind: formRef.kind,
+          definitionVersion: formRef.definitionVersion,
+          schemaDigest: formRef.schemaDigest,
+        },
+      )}`,
+      undefined,
+      auth,
+    );
+    expect(foreignDefinition.status).toBe(404);
+    expect(foreignDefinition.body).toMatchObject({ error: { code: "resource_not_found" } });
+
     const moduleBytes = new TextEncoder().encode("export default { fetch() {} }");
     const moduleDigest = await digestBytes(moduleBytes);
     const upload = await jsonRequest(
@@ -1632,6 +1665,65 @@ describe("historical Takoform Host engine regression", () => {
     );
     expect(foreignSpace.status).toBe(404);
     expect(foreignSpace.body).toMatchObject({ error: { code: "resource_not_found" } });
+  });
+
+  test("does not let tenant-run discovery inspect another space", async () => {
+    const formRef = {
+      apiVersion: "edge.forms.takoform.com/v1alpha1",
+      kind: "EdgeObjectBucket",
+      definitionVersion: "1.0.0",
+      schemaDigest: `sha256:${"9".repeat(64)}`,
+    } as const;
+    const host = createInMemoryTakoformHost({
+      routes: { ...HISTORICAL_V1ALPHA3_ROUTES, enumerateForms: true },
+      authenticate: async (authorization) =>
+        authorization === "Bearer tenant-run"
+          ? {
+              tenantId: "organization-a",
+              principalId: "run:run-002",
+              scope: { mode: "tenant-run", space: "workspace-a" },
+            }
+          : null,
+      forms: [
+        {
+          identity: { formRef },
+          desiredSchema: { type: "object", properties: {}, additionalProperties: false },
+          operations: ["create", "read", "delete"],
+        },
+      ],
+    });
+    const handler = handlerFor(host);
+    const auth = { authorization: "Bearer tenant-run" };
+
+    const ownSpace = await jsonRequest(
+      handler,
+      "GET",
+      "/apis/forms.takoform.com/v1alpha3/forms?space=workspace-a",
+      undefined,
+      auth,
+    );
+    expect(ownSpace.status).toBe(200);
+    expect(ownSpace.body).toMatchObject({ forms: [{ identity: { formRef } }] });
+
+    const foreignSpace = await jsonRequest(
+      handler,
+      "GET",
+      "/apis/forms.takoform.com/v1alpha3/forms?space=workspace-b",
+      undefined,
+      auth,
+    );
+    expect(foreignSpace.status).toBe(404);
+    expect(foreignSpace.body).toMatchObject({ error: { code: "resource_not_found" } });
+
+    const omittedSpace = await jsonRequest(
+      handler,
+      "GET",
+      "/apis/forms.takoform.com/v1alpha3/forms",
+      undefined,
+      auth,
+    );
+    expect(omittedSpace.status).toBe(404);
+    expect(omittedSpace.body).toMatchObject({ error: { code: "resource_not_found" } });
   });
 });
 

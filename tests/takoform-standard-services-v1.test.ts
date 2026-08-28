@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { createEphemeralSql } from "../src/compat.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
-import { createTakoformHost } from "../src/takoform/host.ts";
 import type { InstalledTakoformForm, TakoformResourceDriver } from "../src/takoform/types.ts";
+import { createStaticStableTestTakoformHost as createTakoformHost } from "./helpers/historical-takoform-host.ts";
 
 const lane = "/apis/forms.takoform.com/v1";
 const serviceApiVersion = "standards.takoform.com/v1";

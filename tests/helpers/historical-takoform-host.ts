@@ -10,6 +10,7 @@ import { InMemoryTakoformResourceDriver } from "../../src/takoform/memory-driver
 import { createDeferredOperations } from "../../src/takoform/operations.ts";
 import {
   createTakoformRoutes,
+  DEFAULT_TAKOFORM_ROUTES,
   type TakoformRouteConfiguration,
 } from "../../src/takoform/routes.ts";
 import { createTakoformStore } from "../../src/takoform/store.ts";
@@ -26,7 +27,8 @@ import type {
  * this configurable assembly under `tests/` prevents a historical fixture
  * from becoming a shipped route-selection capability again.
  */
-export interface ConfiguredHistoricalHostOptions extends Omit<CreateTakoformHostOptions, "routes"> {
+export interface ConfiguredHistoricalHostOptions
+  extends Omit<CreateTakoformHostOptions, "authority"> {
   readonly routes: TakoformRouteConfiguration;
 }
 
@@ -55,6 +57,9 @@ export function createConfiguredHistoricalTakoformHost(
     artifacts,
     ...(options.routes.bodyGenerationFence ? { allowBodyGenerationFence: true } : {}),
     ...(options.routes.reviewSpecDigest ? { allowReviewSpecDigest: true } : {}),
+    ...(options.routes.hostApiVersion === "forms.takoform.com/v1"
+      ? { stableReviewConstraintPhases: true }
+      : {}),
     clock,
     randomId,
     ...(options.workerModuleInspector
@@ -64,6 +69,7 @@ export function createConfiguredHistoricalTakoformHost(
     ...(options.standardServiceResolver
       ? { standardServiceResolver: options.standardServiceResolver }
       : {}),
+    ...(options.availability ? { availability: options.availability } : {}),
   });
   const deferredOperations = options.deferredOperations
     ? createDeferredOperations({
@@ -89,6 +95,17 @@ export function createConfiguredHistoricalTakoformHost(
       ? { standardServiceResolver: options.standardServiceResolver }
       : {}),
     ...(options.provision ? { provision: options.provision } : {}),
+    ...(options.availability ? { availability: options.availability } : {}),
+  });
+}
+
+/** Explicit static stable-lane harness. It is test source and never reachable from product entries. */
+export function createStaticStableTestTakoformHost(
+  options: Omit<ConfiguredHistoricalHostOptions, "routes">,
+): TakoformHost {
+  return createConfiguredHistoricalTakoformHost({
+    ...options,
+    routes: DEFAULT_TAKOFORM_ROUTES,
   });
 }
 
@@ -115,6 +132,24 @@ export function createHistoricalInMemoryTakoformHost(
   options: Omit<HistoricalEphemeralHostOptions, "driver">,
 ): TakoformHost {
   return createHistoricalTakoformHost({
+    ...options,
+    driver: new InMemoryTakoformResourceDriver(),
+  });
+}
+
+export function createStaticStableEphemeralTakoformHost(
+  options: Omit<HistoricalEphemeralHostOptions, "routes">,
+): TakoformHost {
+  return createHistoricalTakoformHost({
+    ...options,
+    routes: DEFAULT_TAKOFORM_ROUTES,
+  });
+}
+
+export function createStaticStableInMemoryTakoformHost(
+  options: Omit<HistoricalEphemeralHostOptions, "routes" | "driver">,
+): TakoformHost {
+  return createStaticStableEphemeralTakoformHost({
     ...options,
     driver: new InMemoryTakoformResourceDriver(),
   });

@@ -21,6 +21,18 @@ export function createMemoryObjectStore(): ObjectStore {
   const objects = new Map<string, HeldObject>();
 
   return {
+    async create(key, body, options): Promise<StoredObject | null> {
+      if (objects.has(key)) return null;
+      const bytes = await collect(body);
+      // Recheck after a streamed body was collected: another create may have
+      // won while this call yielded.
+      if (objects.has(key)) return null;
+      const etag = await digest(bytes);
+      const contentType = options?.contentType;
+      objects.set(key, { bytes, etag, ...(contentType ? { contentType } : {}) });
+      return { key, size: bytes.byteLength, etag, ...(contentType ? { contentType } : {}) };
+    },
+
     async put(key, body, options): Promise<StoredObject> {
       const bytes = await collect(body);
       const etag = await digest(bytes);

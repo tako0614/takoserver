@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { dirname, relative, resolve } from "node:path";
+import { createStaticTestTakoformHost as createTakoformHost } from "./app.ts";
 import {
   bytesDigest,
   canonicalDigest,
@@ -14,7 +15,6 @@ import { createFileObjectStore } from "./objects-fs.ts";
 import type { JsonObject } from "./ports.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
-import { createTakoformHost } from "./takoform/host.ts";
 import { InMemoryTakoformResourceDriver } from "./takoform/memory-driver.ts";
 import type { TakoformRouteConfiguration } from "./takoform/routes.ts";
 import { createTakoformStore, type ResourceAddress } from "./takoform/store.ts";

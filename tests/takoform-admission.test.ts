@@ -5,19 +5,23 @@ import { bytesDigest, canonicalDigest } from "../src/json.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { type ObjectStore, type Sql, SqlError } from "../src/ports.ts";
 import {
-  ADMISSION_GENESIS_DIGEST,
   type AdmissionDigest,
   type AdmissionHandle,
   type AdmissionHandleClaims,
   type AdmissionPublisherPin,
   type AdmissionReport,
   createAdmissionHandleIssuer,
+  TAKOFORM_REVOCATION_V1,
+  TAKOFORM_REVOCATION_V1_EMPTY_ENTRIES_DIGEST,
+  TAKOFORM_REVOCATION_V1_GENESIS_DIGEST,
+  TAKOFORM_REVOCATION_V1ALPHA1,
 } from "../src/takoform/admission.ts";
 import { createFormAdmissionStore } from "../src/takoform/admission-store.ts";
 import {
   createFormPackageStore,
   type FormPackageInput,
   type FormPackageStore,
+  formPackageKey,
   formPackagePrefix,
   packageManifest,
 } from "../src/takoform/form-packages.ts";
@@ -43,8 +47,9 @@ function publisher(overrides: Partial<AdmissionPublisherPin> = {}): AdmissionPub
     ref: "refs/tags/v1.0.0",
     identity: "external",
     trustedRootDigest: digest("2"),
-    sourceCommit: "git:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    workflowCommit: "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    sourceCommit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    workflowCommit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    buildConfigCommit: "cccccccccccccccccccccccccccccccccccccccc",
     repositoryIdentifier: "repo:example/forms",
     ownerIdentifier: "owner:example",
     group: "example.forms.test",
@@ -74,6 +79,32 @@ async function packageInput(
   const packageDigest = (await canonicalDigest(manifest)) as AdmissionDigest;
   return { packageDigest, formRef, files: [file], manifest };
 }
+
+test("Form Package import is create-only and accepts only exact existing bytes", async () => {
+  const objects = createMemoryObjectStore();
+  const packages = createFormPackageStore(objects);
+  const pkg = await packageInput();
+  const first = await packages.put(pkg);
+  const repeated = await packages.put(pkg);
+  expect(repeated.packageDigest).toBe(first.packageDigest);
+  expect(repeated.files.map((file) => file.bytes)).toEqual(first.files.map((file) => file.bytes));
+
+  const conflictingObjects = createMemoryObjectStore();
+  const conflictingPackages = createFormPackageStore(conflictingObjects);
+  const file = pkg.files[0];
+  if (!file) throw new Error("package fixture has no files");
+  const key = formPackageKey(pkg.packageDigest, file.path);
+  await conflictingObjects.put(key, new TextEncoder().encode("different existing bytes"));
+  await expect(conflictingPackages.put(pkg)).rejects.toMatchObject({
+    code: "package_readback_mismatch",
+  });
+  expect(await new Response((await conflictingObjects.get(key))?.body).text()).toBe(
+    "different existing bytes",
+  );
+  expect(
+    await conflictingObjects.get(`${formPackagePrefix(pkg.packageDigest)}/package-index.json`),
+  ).toBeNull();
+});
 
 function admissionReport(
   pkg: FormPackageInput,
@@ -106,6 +137,7 @@ function admissionReport(
     source: {
       sourceCommit: pub.sourceCommit,
       workflowCommit: pub.workflowCommit,
+      buildConfigCommit: pub.buildConfigCommit,
       repositoryIdentifier: pub.repositoryIdentifier,
       ownerIdentifier: pub.ownerIdentifier,
     },
@@ -119,6 +151,7 @@ function admissionReport(
       trustedRootDigest: pub.trustedRootDigest,
     },
     revocation: {
+      checkpointApiVersion: TAKOFORM_REVOCATION_V1ALPHA1,
       sequence: 1,
       checkpointDigest: digest("4"),
       entriesDigest: digest("5"),
@@ -155,12 +188,13 @@ async function fixture(
   const checkpointReceipt = await host.execute({
     kind: "AppendCheckpoint",
     publisherKey: "pub",
+    checkpointApiVersion: TAKOFORM_REVOCATION_V1ALPHA1,
     policyDigest: pub.policyDigest,
     policyEventDigest: allow.eventDigest,
     sequence: 1,
     checkpointDigest: checkpoint,
     entriesDigest: entries,
-    previousCheckpointDigest: ADMISSION_GENESIS_DIGEST,
+    previousCheckpointDigest: null,
     actor: "test-operator",
     reason: "focused test",
   });
@@ -173,6 +207,7 @@ async function fixture(
     publisherKey: "pub",
     publisher: pub,
     policyEventDigest: allow.eventDigest,
+    checkpointApiVersion: TAKOFORM_REVOCATION_V1ALPHA1,
     checkpointSequence: 1,
     checkpointDigest: checkpoint,
     checkpointEventDigest: checkpointReceipt.eventDigest,
@@ -208,8 +243,8 @@ async function insertResource(
   await sql.run(
     `INSERT INTO tf_resources
        (tenant_id, space, api_version, kind, name, uid, generation, revision,
-        resource_json, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        resource_json, package_digest, implementation_digest, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       "tenant-a",
       "default",
@@ -221,13 +256,13 @@ async function insertResource(
       "rev-a",
       JSON.stringify({
         form: {
-          identity: {
-            formRef: FORM_REF,
-            packageDigest,
-            implementationDigest,
-          },
+          formRef: FORM_REF,
+          packageDigest,
+          implementationDigest,
         },
       }),
+      packageDigest,
+      implementationDigest,
       1,
     ],
   );
@@ -411,12 +446,17 @@ describe("private Takoform Host admission substrate", () => {
       [
         "source commit",
         (value) =>
-          publisher({ ...value, sourceCommit: "git:cccccccccccccccccccccccccccccccccccccccc" }),
+          publisher({ ...value, sourceCommit: "dddddddddddddddddddddddddddddddddddddddd" }),
       ],
       [
         "workflow commit",
         (value) =>
-          publisher({ ...value, workflowCommit: "git:dddddddddddddddddddddddddddddddddddddddd" }),
+          publisher({ ...value, workflowCommit: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" }),
+      ],
+      [
+        "build config commit",
+        (value) =>
+          publisher({ ...value, buildConfigCommit: "ffffffffffffffffffffffffffffffffffffffff" }),
       ],
       [
         "repository identifier",
@@ -502,6 +542,7 @@ describe("private Takoform Host admission substrate", () => {
       f.host.execute({
         kind: "AppendCheckpoint" as const,
         publisherKey: "pub",
+        checkpointApiVersion: TAKOFORM_REVOCATION_V1ALPHA1,
         policyDigest: f.pub.policyDigest,
         policyEventDigest: f.allow.eventDigest,
         sequence: 2,
@@ -517,6 +558,79 @@ describe("private Takoform Host admission substrate", () => {
     expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
     expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
     expect(await count(f.sql, "tf_form_revocation_checkpoints")).toBe(2);
+  });
+
+  test("accepts sequence zero only as the exact stable signed genesis lane", async () => {
+    const f = await fixture();
+    await expect(
+      f.host.execute({
+        kind: "AppendCheckpoint",
+        publisherKey: "pub",
+        checkpointApiVersion: TAKOFORM_REVOCATION_V1,
+        policyDigest: f.pub.policyDigest,
+        policyEventDigest: f.allow.eventDigest,
+        sequence: 0,
+        checkpointDigest: digest("9"),
+        entriesDigest: TAKOFORM_REVOCATION_V1_EMPTY_ENTRIES_DIGEST,
+        previousCheckpointDigest: null,
+        actor: "test-operator",
+        reason: "wrong stable genesis",
+      }),
+    ).rejects.toMatchObject({ code: "checkpoint_invalid" });
+
+    const stable = await f.host.execute({
+      kind: "AppendCheckpoint",
+      publisherKey: "pub",
+      checkpointApiVersion: TAKOFORM_REVOCATION_V1,
+      policyDigest: f.pub.policyDigest,
+      policyEventDigest: f.allow.eventDigest,
+      sequence: 0,
+      checkpointDigest: TAKOFORM_REVOCATION_V1_GENESIS_DIGEST,
+      entriesDigest: TAKOFORM_REVOCATION_V1_EMPTY_ENTRIES_DIGEST,
+      previousCheckpointDigest: null,
+      revokedPackageDigests: [],
+      actor: "test-operator",
+      reason: "exact stable genesis",
+    });
+    expect(stable.changed).toBe(true);
+
+    await expect(
+      f.host.execute({
+        kind: "AppendCheckpoint",
+        publisherKey: "pub",
+        checkpointApiVersion: TAKOFORM_REVOCATION_V1ALPHA1,
+        policyDigest: f.pub.policyDigest,
+        policyEventDigest: f.allow.eventDigest,
+        sequence: 0,
+        checkpointDigest: TAKOFORM_REVOCATION_V1_GENESIS_DIGEST,
+        entriesDigest: TAKOFORM_REVOCATION_V1_EMPTY_ENTRIES_DIGEST,
+        previousCheckpointDigest: null,
+        actor: "test-operator",
+        reason: "cross-profile sequence zero",
+      }),
+    ).rejects.toMatchObject({ code: "checkpoint_invalid" });
+  });
+
+  test("rejects missing, decorated, or non-lowercase publisher commit identities", async () => {
+    const sql = createEphemeralSql();
+    const handles = createAdmissionHandleIssuer();
+    const host = createFormAdmissionStore({ sql, objects: createMemoryObjectStore(), handles });
+    const invalidPublishers = [
+      publisher({ sourceCommit: "git:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }),
+      publisher({ workflowCommit: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" }),
+      { ...publisher(), buildConfigCommit: undefined } as unknown as AdmissionPublisherPin,
+    ];
+    for (const [index, invalid] of invalidPublishers.entries()) {
+      await expect(
+        host.execute({
+          kind: "AllowPublisher",
+          publisher: { ...invalid, publisherKey: `invalid-${index}` },
+          actor: "test-operator",
+          reason: "invalid immutable commit",
+        }),
+      ).rejects.toMatchObject({ code: "invalid_command" });
+    }
+    expect(await count(sql, "tf_form_publisher_events")).toBe(0);
   });
 
   test("object bytes may remain unreferenced when the guarded SQL insert fails", async () => {
@@ -812,6 +926,7 @@ describe("private Takoform Host admission substrate", () => {
       publisherKey: "pub",
       publisher: f.pub,
       policyEventDigest: f.allow.eventDigest,
+      checkpointApiVersion: TAKOFORM_REVOCATION_V1ALPHA1,
       checkpointSequence: 1,
       checkpointDigest: digest("4"),
       checkpointEventDigest: f.checkpointReceipt.eventDigest,
@@ -1214,10 +1329,8 @@ describe("private Takoform Host admission substrate", () => {
         "rev-a",
         JSON.stringify({
           form: {
-            identity: {
-              formRef: FORM_REF,
-              packageDigest: f.pkg.packageDigest,
-            },
+            formRef: FORM_REF,
+            packageDigest: f.pkg.packageDigest,
           },
         }),
         1,

@@ -16,6 +16,7 @@ import { type Sql, SqlError } from "../src/ports.ts";
 import { createProviderDriver } from "../src/provider-driver.ts";
 import type { Provider, ProviderOffering } from "../src/provider-port.ts";
 import { FakeProvider } from "../src/providers/fake.ts";
+import { createStaticStableTestTakoformHost } from "./helpers/historical-takoform-host.ts";
 
 /**
  * The join the old design was missing: declaring a resource through Takoform
@@ -108,6 +109,7 @@ function newApp(options: { failOn?: readonly string[]; usageOnly?: boolean } = {
     publicOrigin: "https://api.takoserver.com",
     forms: [FORM],
     hostForms: [FORM],
+    takoformHostFactory: createStaticStableTestTakoformHost,
     providers: [provider],
     offerings: [
       options.usageOnly
@@ -368,6 +370,7 @@ describe("Takoform apply on a real backend", () => {
       publicOrigin: "https://api.takoserver.com",
       forms: [FORM],
       hostForms: [FORM],
+      takoformHostFactory: createStaticStableTestTakoformHost,
       providers: [provider],
       offerings: [SOLD],
       clock,
@@ -445,6 +448,7 @@ describe("Takoform apply on a real backend", () => {
       publicOrigin: "https://api.takoserver.com",
       forms: [FORM],
       hostForms: [FORM],
+      takoformHostFactory: createStaticStableTestTakoformHost,
       providers: [provider],
       offerings: [SOLD],
     });
@@ -610,7 +614,12 @@ describe("orphaned declarations", () => {
       offerings: [SOLD],
     };
 
-    const app = buildApp({ ...ports, forms: [FORM], hostForms: [FORM] });
+    const app = buildApp({
+      ...ports,
+      forms: [FORM],
+      hostForms: [FORM],
+      takoformHostFactory: createStaticStableTestTakoformHost,
+    });
     const { provider: auth } = await tenant(app.fetch);
     await applyBucket(app.fetch, auth, "assets", { location: "apac" }, "orphan-001");
     expect((await app.tick()).orphanedResources).toEqual([]);
@@ -621,6 +630,7 @@ describe("orphaned declarations", () => {
     const moved = buildApp({
       ...ports,
       hostForms: [FORM],
+      takoformHostFactory: createStaticStableTestTakoformHost,
       forms: [
         {
           ...FORM,

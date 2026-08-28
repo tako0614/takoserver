@@ -11,6 +11,7 @@ import {
   type InstalledTakoformForm,
   type TakoformInterfaceRef,
 } from "../src/index.ts";
+import { createStaticStableTestTakoformHost } from "./helpers/historical-takoform-host.ts";
 
 const NOW = Date.UTC(2026, 7, 18, 12);
 const POSTGRES = {
@@ -57,6 +58,7 @@ test("the ordinary control API resolves Attachments and blocks provider deletion
     ],
   });
   const app = buildApp({
+    takoformHostFactory: createStaticStableTestTakoformHost,
     sql,
     objects: createMemoryObjectStore(),
     identity,

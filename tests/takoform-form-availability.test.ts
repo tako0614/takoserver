@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
 import { createEphemeralSql } from "../src/compat.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
-import { createTakoformHost } from "../src/takoform/host.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
 import type { InstalledTakoformForm } from "../src/takoform/types.ts";
+import { createStaticStableTestTakoformHost as createTakoformHost } from "./helpers/historical-takoform-host.ts";
 
 const form: InstalledTakoformForm = {
   identity: {

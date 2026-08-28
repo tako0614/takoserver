@@ -149,6 +149,12 @@ describe("ObjectStore port", () => {
     const store = createMemoryObjectStore();
     const body = new TextEncoder().encode("takoform artifact");
 
+    expect(await store.create("art/create-only", body)).not.toBeNull();
+    expect(await store.create("art/create-only", new TextEncoder().encode("different"))).toBeNull();
+    expect(await new Response((await store.get("art/create-only"))?.body).text()).toBe(
+      "takoform artifact",
+    );
+
     const written = await store.put("art/one", body, { contentType: "text/plain" });
     expect(written.size).toBe(body.byteLength);
     expect(written.contentType).toBe("text/plain");
@@ -162,7 +168,7 @@ describe("ObjectStore port", () => {
     expect(await store.head("art/absent")).toBeNull();
 
     const first = await store.list({ prefix: "art/", limit: 1 });
-    expect(first.objects.map((object) => object.key)).toEqual(["art/one"]);
+    expect(first.objects.map((object) => object.key)).toEqual(["art/create-only"]);
     expect(first.truncated).toBe(true);
 
     const second = await store.list({
@@ -170,8 +176,8 @@ describe("ObjectStore port", () => {
       limit: 1,
       ...(first.cursor ? { cursor: first.cursor } : {}),
     });
-    expect(second.objects.map((object) => object.key)).toEqual(["art/two"]);
-    expect(second.truncated).toBe(false);
+    expect(second.objects.map((object) => object.key)).toEqual(["art/one"]);
+    expect(second.truncated).toBe(true);
 
     expect(await store.delete("art/one")).toBe(true);
     expect(await store.delete("art/one")).toBe(false);

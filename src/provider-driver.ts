@@ -470,6 +470,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
       return receiptOf(result);
     },
 
+    // biome-ignore lint/suspicious/noConfusingVoidType: the driver contract intentionally allows no receipt for intrinsic resources
     async delete(input): Promise<TakoformDriverReceipt | void> {
       if (intrinsicFormRef(input.resource.form.formRef)) return;
       const deployment = await active(input.tenantId, input.resourceUid);

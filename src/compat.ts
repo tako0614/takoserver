@@ -6,6 +6,7 @@ import { createSqliteSql } from "./sql-sqlite.ts";
 import type { TakoformArtifactTransport } from "./takoform/artifacts.ts";
 import type { WorkerModuleInspector } from "./takoform/engine.ts";
 import { createTakoformHost as assembleTakoformHost } from "./takoform/host.ts";
+import { createTakoformHostAuthority } from "./takoform/host-authority.ts";
 import { InMemoryTakoformResourceDriver } from "./takoform/memory-driver.ts";
 import type { ProvisionLanePorts } from "./takoform/routes.ts";
 import type {
@@ -52,15 +53,29 @@ export interface EphemeralTakoformHostOptions {
 }
 
 export function createTakoformHost(options: EphemeralTakoformHostOptions): TakoformHost {
+  const sql = options.sql ?? createEphemeralSql();
+  const objects = options.objects ?? createMemoryObjectStore();
   return assembleTakoformHost({
-    sql: options.sql ?? createEphemeralSql(),
-    objects: options.objects ?? createMemoryObjectStore(),
+    sql,
+    objects,
     // Tests and the conformance suite authenticate on the header alone; the
     // lane now hands over the whole request so a session can name the
     // organization it is acting for. Adapting here keeps every existing caller
     // spelled the way it was written.
     authenticate: (request: Request) => options.authenticate(request.headers.get("authorization")),
     forms: options.forms,
+    authority: createTakoformHostAuthority({
+      sql,
+      objects,
+      hostId: "https://ephemeral.takoserver.invalid",
+      candidates: options.forms,
+      bindings: options.bindings ?? [],
+      technicalAvailability: {
+        async resolve() {
+          return { executable: true, activated: true, availableToPrincipal: true };
+        },
+      },
+    }),
     ...(options.bindings ? { bindings: options.bindings } : {}),
     driver: options.driver,
     ...(options.artifacts ? { artifacts: options.artifacts } : {}),

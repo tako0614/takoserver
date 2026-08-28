@@ -3,7 +3,6 @@ import { createCatalog, type Offering } from "../src/catalog.ts";
 import { createEphemeralSql } from "../src/compat.ts";
 import {
   createMemoryObjectStore,
-  createTakoformHost,
   InMemoryTakoformResourceDriver,
   type InstalledTakoformForm,
   type TakoformHost,
@@ -13,6 +12,7 @@ import { createLedger } from "../src/ledger.ts";
 import type { Sql } from "../src/ports.ts";
 import { createReseller } from "../src/reseller.ts";
 import { createTokenService, type SigningKey, type TokenService } from "../src/token.ts";
+import { createStaticStableEphemeralTakoformHost as createTakoformHost } from "./helpers/historical-takoform-host.ts";
 
 const ISSUER = "https://api.takoserver.test";
 const NOW = Date.UTC(2026, 7, 18, 12, 0, 0);

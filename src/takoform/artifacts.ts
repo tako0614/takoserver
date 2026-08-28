@@ -409,7 +409,7 @@ function refuse(
   detail: string,
   declaration: BlobDeclaration,
 ): Response {
-  if (process.env?.["TAKOSERVER_TRACE_HOST_ERRORS"]) {
+  if (process.env?.TAKOSERVER_TRACE_HOST_ERRORS) {
     console.warn(
       `takoserver.artifacts.refused ${code} ${detail} name=${declaration.name} size=${declaration.size} digest=${declaration.digest}`,
     );

@@ -19,6 +19,8 @@ export interface InstalledTakoformForm {
   readonly identity: {
     readonly formRef: TakoformV1Alpha3FormRef;
     readonly packageDigest?: `sha256:${string}`;
+    /** Exact Host implementation selected by the durable support head. */
+    readonly implementationDigest?: `sha256:${string}`;
   };
   readonly displayName?: string;
   readonly description?: string;
@@ -242,6 +244,7 @@ export interface TakoformResourceDriver {
     readonly relations: readonly TakoformDriverRelation[];
     /** Commit the Deployment realization with the portable Resource deletion. */
     readonly atomicDeploymentCommit?: true;
+    // biome-ignore lint/suspicious/noConfusingVoidType: intrinsic Resource deletion has no provider receipt
   }): Promise<TakoformDriverReceipt | void>;
   import?(input: {
     readonly operationId: string;

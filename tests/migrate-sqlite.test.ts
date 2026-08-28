@@ -86,6 +86,7 @@ describe("bringing a local database up to date", () => {
       "0020_takoform_deferred_operations.sql",
       "0021_takoform_provider_mutation_sagas.sql",
       "0022_takoform_admission.sql",
+      "0023_takoform_host_authority.sql",
     ]);
     expect(
       database
@@ -114,6 +115,82 @@ describe("bringing a local database up to date", () => {
     ]) {
       expect(() => database.query(`SELECT 1 FROM ${table} LIMIT 1`).all()).not.toThrow();
     }
+  });
+
+  test("preserves every applied 0022 checkpoint predecessor when adding profile identity", () => {
+    const database = new Database(":memory:");
+    database.exec(`
+      CREATE TABLE applied_migrations (
+        name TEXT PRIMARY KEY NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+    const authorityMigration = MIGRATIONS.findIndex(
+      (migration) => migration.name === "0023_takoform_host_authority.sql",
+    );
+    expect(authorityMigration).toBeGreaterThan(0);
+    for (const migration of MIGRATIONS.slice(0, authorityMigration)) {
+      database.exec(migration.sql);
+      database
+        .query("INSERT INTO applied_migrations (name, applied_at) VALUES (?, 'now')")
+        .run(migration.name);
+    }
+    const sha = (letter: string) => `sha256:${letter.repeat(64)}`;
+    database
+      .query(
+        `INSERT INTO tf_form_revocation_checkpoints
+           (id, publisher_key, sequence, checkpoint_digest, entries_digest,
+            previous_checkpoint_digest, revoked_package_digests_json,
+            policy_digest, policy_event_digest, actor, reason, event_at,
+            event_digest, predecessor_digest)
+         VALUES (?, ?, 1, ?, ?, ?, '[]', ?, ?, ?, ?, 7, ?, ?)`,
+      )
+      .run(
+        "checkpoint_legacy",
+        "publisher-legacy",
+        sha("1"),
+        sha("2"),
+        sha("f"),
+        sha("3"),
+        sha("4"),
+        "legacy-operator",
+        "preserve protected row",
+        sha("5"),
+        sha("0"),
+      );
+
+    const report = migrateSqlite(database);
+
+    expect(report.applied).toEqual(["0023_takoform_host_authority.sql"]);
+    expect(
+      database
+        .query(
+          `SELECT checkpoint_api_version, sequence, previous_checkpoint_digest,
+                  event_digest
+           FROM tf_form_revocation_checkpoints WHERE id = 'checkpoint_legacy'`,
+        )
+        .get(),
+    ).toEqual({
+      checkpoint_api_version: "trust.forms.takoform.com/v1alpha1",
+      sequence: 1,
+      previous_checkpoint_digest: sha("f"),
+      event_digest: sha("5"),
+    });
+    expect(() =>
+      database.exec(`
+        INSERT INTO tf_form_revocation_checkpoints
+          (id, publisher_key, checkpoint_api_version, sequence,
+           checkpoint_digest, entries_digest, previous_checkpoint_digest,
+           revoked_package_digests_json, policy_digest, policy_event_digest,
+           actor, reason, event_at, event_digest, predecessor_digest)
+        VALUES
+          ('checkpoint_canonical', 'publisher-canonical',
+           'trust.forms.takoform.com/v1alpha1', 1,
+           '${sha("6")}', '${sha("7")}', NULL, '[]', '${sha("8")}',
+           '${sha("9")}', 'legacy-operator', 'canonical legacy genesis', 8,
+           '${sha("a")}', '${sha("0")}')
+      `),
+    ).not.toThrow();
   });
 
   test("renames fractional usage money without changing its value", () => {

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { link, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, relative, sep } from "node:path";
 import {
   type ObjectListPage,
@@ -56,6 +56,38 @@ export function createFileObjectStore(options: FileObjectStoreOptions): ObjectSt
   };
 
   return {
+    async create(key, body, opts): Promise<StoredObject | null> {
+      const { body: path, meta } = pathFor(key);
+      const bytes = await collect(body);
+      await mkdir(dirname(path), { recursive: true });
+      const staging = `${path}.${process.pid}.${Date.now()}.partial`;
+      try {
+        await writeFile(staging, bytes, { flag: "wx" });
+        try {
+          // A hard link publishes the complete staging inode without replacing
+          // an existing key. Both paths are in the same directory/filesystem.
+          await link(staging, path);
+        } catch (error) {
+          if (isAlreadyExists(error)) return null;
+          throw error;
+        }
+        const contentType = opts?.contentType;
+        if (contentType) await writeFile(meta, contentType, "utf8");
+        else await rm(meta, { force: true });
+        return {
+          key,
+          size: bytes.byteLength,
+          etag: digest(bytes),
+          ...(contentType ? { contentType } : {}),
+        };
+      } catch (error) {
+        if (isAlreadyExists(error)) return null;
+        throw new ObjectStoreError("unavailable", `the disk refused the create: ${String(error)}`);
+      } finally {
+        await rm(staging, { force: true });
+      }
+    },
+
     async put(key, body, opts): Promise<StoredObject> {
       const { body: path, meta } = pathFor(key);
       const bytes = await collect(body);
@@ -101,7 +133,8 @@ export function createFileObjectStore(options: FileObjectStoreOptions): ObjectSt
     async head(key): Promise<StoredObject | null> {
       const { body: path, meta } = pathFor(key);
       const found = await stat(path).catch(() => null);
-      if (!found || !found.isFile()) return null;
+      if (!found) return null;
+      if (!found.isFile()) return null;
       // The etag is content-derived, so it is read rather than remembered.
       // A store that guessed here would report a match for changed bytes.
       const bytes = await readFile(path).catch(() => null);
@@ -156,6 +189,15 @@ export function createFileObjectStore(options: FileObjectStoreOptions): ObjectSt
       };
     },
   };
+}
+
+function isAlreadyExists(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { readonly code?: unknown }).code === "EEXIST"
+  );
 }
 
 async function walk(directory: string, base: string): Promise<string[]> {

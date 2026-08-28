@@ -630,7 +630,10 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       return failed("invalid_spec", "the Worker Version is incomplete");
     const scriptName = worker.name;
     const manifest = await this.#artifacts.manifest(input.identity.tenantRef, manifestDigest);
-    if (!manifest || manifest.kind !== "WorkerBundle" || !manifest.mainModule) {
+    if (!manifest) {
+      return failed("invalid_spec", "the Worker Bundle is not available");
+    }
+    if (manifest.kind !== "WorkerBundle" || !manifest.mainModule) {
       return failed("invalid_spec", "the Worker Bundle is not available");
     }
     const modules = manifest.modules ?? [];
@@ -1013,7 +1016,10 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     const bundleDigest = optionalString(input.spec.bundle);
     if (!bundleDigest) return failed("invalid_spec", "a bundle digest is required");
     const manifest = await this.#artifacts.manifest(input.identity.tenantRef, bundleDigest);
-    if (!manifest || manifest.kind !== "WorkerBundle") {
+    if (!manifest) {
+      return failed("invalid_spec", "the declared bundle is not a committed WorkerBundle");
+    }
+    if (manifest.kind !== "WorkerBundle") {
       return failed("invalid_spec", "the declared bundle is not a committed WorkerBundle");
     }
     const mainModule = manifest.mainModule;
@@ -1194,7 +1200,10 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     const digest = optionalString(assets.bundle);
     if (!digest) return failed("invalid_spec", "an asset bundle digest is required");
     const manifest = await this.#artifacts.manifest(tenantRef, digest);
-    if (!manifest || manifest.kind !== "StaticAssetBundle") {
+    if (!manifest) {
+      return failed("invalid_spec", "the declared assets are not a committed StaticAssetBundle");
+    }
+    if (manifest.kind !== "StaticAssetBundle") {
       return failed("invalid_spec", "the declared assets are not a committed StaticAssetBundle");
     }
     const files = manifest.files ?? [];
@@ -1586,7 +1595,8 @@ function d1Results(value: unknown): readonly Record<string, unknown>[] | null {
 
 function d1Rows(value: unknown): readonly unknown[] | null {
   const results = d1Results(value);
-  if (!results || results.length !== 1 || results[0]?.success !== true) return null;
+  if (!results) return null;
+  if (results.length !== 1 || results[0]?.success !== true) return null;
   return Array.isArray(results[0].results) ? results[0].results : null;
 }
 

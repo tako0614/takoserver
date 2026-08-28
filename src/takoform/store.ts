@@ -1,6 +1,7 @@
-import { canonicalJson } from "../json.ts";
+import { canonicalDigest, canonicalJson } from "../json.ts";
 import type { Clock, Row, Sql, SqlParam, SqlStatement } from "../ports.ts";
 import { SqlError } from "../ports.ts";
+import type { TakoformAuthorityFence } from "./host-authority.ts";
 import { OPERATION_TTL_MILLISECONDS, REPLAY_TTL_MILLISECONDS, SWEEP_ROW_LIMIT } from "./limits.ts";
 import type { TakoformStoredRelation } from "./relations.ts";
 import {
@@ -36,6 +37,7 @@ export interface ResourceAddress {
 
 export interface StoredPrepare {
   readonly fingerprint: string;
+  readonly authorityHeadDigest?: `sha256:${string}`;
   readonly expectedGeneration?: string;
   readonly currentUid?: string;
 }
@@ -102,6 +104,7 @@ export interface ResourceMutationCommit {
   readonly replay: StoredReplay;
   readonly providerReceipt?: TakoformDriverReceipt;
   readonly claimKeys?: readonly string[];
+  readonly authorityFence?: TakoformAuthorityFence;
 }
 
 export interface DeferredResourceCommit extends ResourceMutationCommit {
@@ -114,6 +117,7 @@ export interface ProviderMutationSaga {
   readonly tenantId: string;
   readonly fingerprint: string;
   readonly resourceUid: string;
+  readonly authorityHeadDigest?: `sha256:${string}`;
   readonly target: ResourceAddress;
   readonly acceptedUid?: string;
   readonly acceptedGeneration?: string;
@@ -216,6 +220,7 @@ export interface TakoformStore {
       readonly operationId: string;
       readonly claimKeys: readonly string[];
     };
+    readonly authorityFence?: TakoformAuthorityFence;
   }): Promise<boolean>;
   deleteResource(address: ResourceAddress, expectedRevision: string): Promise<boolean>;
 
@@ -257,6 +262,7 @@ export interface TakoformStore {
     readonly operationId: string;
     readonly resourceUid: string;
     readonly receipt: TakoformDriverReceipt;
+    readonly authorityHeadDigest?: `sha256:${string}`;
     readonly claimOwnerId?: string;
   }): Promise<void>;
   holdDeferredProviderRepair(input: {
@@ -432,12 +438,12 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
   return {
     async readResource(address): Promise<TakoformStoredResource | null> {
       const rows = await sql.query(
-        `SELECT resource_json FROM tf_resources
+        `SELECT resource_json, package_digest, implementation_digest FROM tf_resources
          WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?`,
         [address.tenantId, address.space, address.apiVersion, address.kind, address.name],
       );
       const row = rows[0];
-      return row ? (JSON.parse(text(row.resource_json)) as TakoformStoredResource) : null;
+      return row ? storedResource(row) : null;
     },
 
     async readRelations(address): Promise<readonly TakoformStoredRelation[]> {
@@ -558,11 +564,18 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       relations,
       expectedRevision,
       claimCommit,
+      authorityFence,
     }): Promise<boolean> {
       const key = [address.tenantId, address.space, address.apiVersion, address.kind, address.name];
-      if (claimCommit) {
-        const claimKeys = [...new Set(claimCommit.claimKeys)].sort();
-        const guard = boundedGuard(`resource_${claimCommit.operationId}`);
+      const [packageDigest, implementationDigest] = exactResourceDigests(resource);
+      if (claimCommit || authorityFence) {
+        const claimKeys = [...new Set(claimCommit?.claimKeys ?? [])].sort();
+        const authority = authorityFence
+          ? await authorityFenceSql(authorityFence)
+          : { sql: "1 = 1", params: [] as readonly SqlParam[] };
+        const guard = boundedGuard(
+          `resource_${claimCommit?.operationId ?? authorityFence?.headDigest ?? "fence"}`,
+        );
         const resourceFence =
           expectedRevision === null
             ? `NOT EXISTS (
@@ -583,7 +596,8 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         const statements: SqlStatement[] = [
           {
             sql: `INSERT INTO tf_operation_commit_guards (token, valid)
-                  SELECT ?, CASE WHEN ${resourceFence} AND ${claimFence} THEN 1 ELSE 0 END`,
+                  SELECT ?, CASE WHEN ${resourceFence} AND ${claimFence}
+                                      AND (${authority.sql}) THEN 1 ELSE 0 END`,
             params: [
               guard,
               ...key,
@@ -591,12 +605,13 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
               ...(claimKeys.length === 0
                 ? []
                 : [
-                    claimCommit.operationId,
+                    claimCommit?.operationId ?? "",
                     address.tenantId,
                     resource.metadata.uid,
                     ...claimKeys,
                     claimKeys.length,
                   ]),
+              ...authority.params,
             ],
           },
         ];
@@ -604,8 +619,8 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           statements.push({
             sql: `INSERT INTO tf_resources
                     (tenant_id, space, api_version, kind, name, uid, generation, revision,
-                     resource_json, relations_json, updated_at)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                     resource_json, relations_json, package_digest, implementation_digest, updated_at)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             params: [
               ...key,
               resource.metadata.uid,
@@ -613,6 +628,8 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
               resource.metadata.revision,
               JSON.stringify(resource),
               JSON.stringify(relations),
+              packageDigest,
+              implementationDigest,
               now(),
             ],
           });
@@ -620,7 +637,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           statements.push({
             sql: `UPDATE tf_resources
                   SET uid = ?, generation = ?, revision = ?, resource_json = ?,
-                      relations_json = ?, updated_at = ?
+                      relations_json = ?, package_digest = ?, implementation_digest = ?, updated_at = ?
                   WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
                     AND revision = ?`,
             params: [
@@ -629,6 +646,8 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
               resource.metadata.revision,
               JSON.stringify(resource),
               JSON.stringify(relations),
+              packageDigest,
+              implementationDigest,
               now(),
               ...key,
               expectedRevision,
@@ -636,15 +655,17 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           });
         }
         statements.push(
-          ...claimCommitStatements(
-            {
-              id: claimCommit.operationId,
-              tenantId: address.tenantId,
-              resourceUid: resource.metadata.uid,
-            },
-            claimKeys,
-            now(),
-          ),
+          ...(claimCommit
+            ? claimCommitStatements(
+                {
+                  id: claimCommit.operationId,
+                  tenantId: address.tenantId,
+                  resourceUid: resource.metadata.uid,
+                },
+                claimKeys,
+                now(),
+              )
+            : []),
           {
             sql: "DELETE FROM tf_operation_commit_guards WHERE token = ?",
             params: [guard],
@@ -666,7 +687,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           ) {
             return false;
           }
-          if (claimKeys.length > 0) {
+          if (claimCommit && claimKeys.length > 0) {
             const owned = await sql.query(
               `SELECT claim_key FROM tf_resource_claims
                WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
@@ -684,8 +705,8 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         const written = await sql.run(
           `INSERT OR IGNORE INTO tf_resources
              (tenant_id, space, api_version, kind, name, uid, generation, revision,
-              resource_json, relations_json, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              resource_json, relations_json, package_digest, implementation_digest, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             ...key,
             resource.metadata.uid,
@@ -693,6 +714,8 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
             resource.metadata.revision,
             JSON.stringify(resource),
             JSON.stringify(relations),
+            packageDigest,
+            implementationDigest,
             now(),
           ],
         );
@@ -700,7 +723,8 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       }
       const written = await sql.run(
         `UPDATE tf_resources
-         SET uid = ?, generation = ?, revision = ?, resource_json = ?, relations_json = ?, updated_at = ?
+         SET uid = ?, generation = ?, revision = ?, resource_json = ?, relations_json = ?,
+             package_digest = ?, implementation_digest = ?, updated_at = ?
          WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
            AND revision = ?`,
         [
@@ -709,6 +733,8 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           resource.metadata.revision,
           JSON.stringify(resource),
           JSON.stringify(relations),
+          packageDigest,
+          implementationDigest,
           now(),
           ...key,
           expectedRevision,
@@ -746,12 +772,14 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       );
       await sql.run(
         `INSERT INTO tf_prepares
-           (tenant_id, prepare_digest, fingerprint, expected_generation, current_uid, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+           (tenant_id, prepare_digest, fingerprint, expected_generation, current_uid,
+            authority_head_digest, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (tenant_id, prepare_digest) DO UPDATE SET
            fingerprint = excluded.fingerprint,
            expected_generation = excluded.expected_generation,
            current_uid = excluded.current_uid,
+           authority_head_digest = excluded.authority_head_digest,
            expires_at = excluded.expires_at`,
         [
           tenantId,
@@ -759,6 +787,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           prepare.fingerprint,
           prepare.expectedGeneration ?? null,
           prepare.currentUid ?? null,
+          prepare.authorityHeadDigest ?? null,
           expiresAt,
         ],
       );
@@ -766,7 +795,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async readPrepare(tenantId, prepareDigest): Promise<StoredPrepare | null> {
       const rows = await sql.query(
-        `SELECT fingerprint, expected_generation, current_uid FROM tf_prepares
+        `SELECT fingerprint, expected_generation, current_uid, authority_head_digest FROM tf_prepares
          WHERE tenant_id = ? AND prepare_digest = ? AND expires_at > ?`,
         [tenantId, prepareDigest, now()],
       );
@@ -776,6 +805,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       const currentUid = row.current_uid;
       return {
         fingerprint: text(row.fingerprint),
+        ...(row.authority_head_digest === null
+          ? {}
+          : { authorityHeadDigest: digestText(row.authority_head_digest) }),
         ...(typeof expectedGeneration === "string" ? { expectedGeneration } : {}),
         ...(typeof currentUid === "string" ? { currentUid } : {}),
       };
@@ -838,8 +870,8 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
            (operation_id, replay_key, tenant_id, fingerprint, resource_uid,
             target_space, target_api_version, target_kind, target_name,
             accepted_uid, accepted_generation, accepted_revision, phase,
-            receipt_json, created_at, updated_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', NULL, ?, ?, ?)`,
+            receipt_json, authority_head_digest, created_at, updated_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', NULL, ?, ?, ?, ?)`,
         [
           record.operationId,
           record.replayKey,
@@ -853,6 +885,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           record.acceptedUid ?? null,
           record.acceptedGeneration ?? null,
           record.acceptedRevision ?? null,
+          record.authorityHeadDigest ?? null,
           timestamp,
           timestamp,
           timestamp + OPERATION_TTL_MILLISECONDS,
@@ -948,6 +981,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           sql: `UPDATE tf_provider_mutation_sagas
                 SET phase = 'executed', receipt_json = ?, updated_at = ?, expires_at = NULL
                 WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+                  AND authority_head_digest IS ?
                   AND phase = 'planned' AND expires_at > ?`,
           params: [
             serialized,
@@ -955,6 +989,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
             input.tenantId,
             input.operationId,
             input.resourceUid,
+            input.authorityHeadDigest ?? null,
             timestamp,
           ],
         },
@@ -1008,6 +1043,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
     async commitImmediateMutation(input) {
       const { mutation } = input;
       const guard = boundedGuard(`guard_${input.operationId}`);
+      const authority = mutation.authorityFence
+        ? await authorityFenceSql(mutation.authorityFence)
+        : { sql: "1 = 1", params: [] as readonly SqlParam[] };
       const statements = providerMutationCommitStatements({
         guard,
         tenantId: input.tenantId,
@@ -1017,6 +1055,8 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         mutation,
         claimOwnerId: input.operationId,
         now: now(),
+        additionalFence: authority.sql,
+        additionalFenceParams: authority.params,
       });
       try {
         await sql.batch(statements);
@@ -1278,6 +1318,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         ? canonicalJson(mutation.providerReceipt)
         : undefined;
       const deployment = deploymentMutationSql(mutation.providerReceipt, now());
+      const authority = mutation.authorityFence
+        ? await authorityFenceSql(mutation.authorityFence)
+        : { sql: "1 = 1", params: [] as readonly SqlParam[] };
       const providerSagaFence = receiptJson
         ? `EXISTS (
         SELECT 1 FROM tf_provider_mutation_sagas
@@ -1291,7 +1334,8 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           sql: `INSERT INTO tf_operation_commit_guards (token, valid)
                 SELECT ?, CASE WHEN ${operationFence} AND ${resourceFence}
                                      AND ${claimFence} AND ${providerSagaFence}
-                                     AND ${deployment.fence} THEN 1 ELSE 0 END`,
+                                     AND ${deployment.fence}
+                                     AND (${authority.sql}) THEN 1 ELSE 0 END`,
           params: [
             guard,
             operation.id,
@@ -1320,6 +1364,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
                 ]
               : []),
             ...deployment.fenceParams,
+            ...authority.params,
           ],
         },
         ...deployment.statements,
@@ -1328,12 +1373,13 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         const resource = mutation.resource;
         if (!resource) throw new TypeError("write commit requires a resource");
         const relations = mutation.relations ?? [];
+        const [packageDigest, implementationDigest] = exactResourceDigests(resource);
         if (operation.acceptedUid === undefined) {
           statements.push({
             sql: `INSERT INTO tf_resources
                     (tenant_id, space, api_version, kind, name, uid, generation, revision,
-                     resource_json, relations_json, updated_at)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                     resource_json, relations_json, package_digest, implementation_digest, updated_at)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             params: [
               ...targetKey,
               resource.metadata.uid,
@@ -1341,6 +1387,8 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
               resource.metadata.revision,
               JSON.stringify(resource),
               JSON.stringify(relations),
+              packageDigest,
+              implementationDigest,
               now(),
             ],
           });
@@ -1348,7 +1396,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           statements.push({
             sql: `UPDATE tf_resources
                   SET uid = ?, generation = ?, revision = ?, resource_json = ?,
-                      relations_json = ?, updated_at = ?
+                      relations_json = ?, package_digest = ?, implementation_digest = ?, updated_at = ?
                   WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
                     AND uid = ? AND generation = ? AND revision = ?`,
             params: [
@@ -1357,6 +1405,8 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
               resource.metadata.revision,
               JSON.stringify(resource),
               JSON.stringify(relations),
+              packageDigest,
+              implementationDigest,
               now(),
               ...targetKey,
               operation.acceptedUid,
@@ -1719,6 +1769,9 @@ function providerMutationSaga(row: Row): ProviderMutationSaga {
     tenantId: text(row.tenant_id),
     fingerprint: text(row.fingerprint),
     resourceUid: text(row.resource_uid),
+    ...(row.authority_head_digest === null
+      ? {}
+      : { authorityHeadDigest: digestText(row.authority_head_digest) }),
     target: {
       tenantId: text(row.tenant_id),
       space: text(row.target_space),
@@ -1757,6 +1810,7 @@ function sameProviderMutationTarget(
   return (
     left.tenantId === right.tenantId &&
     left.fingerprint === right.fingerprint &&
+    left.authorityHeadDigest === right.authorityHeadDigest &&
     left.target.tenantId === right.target.tenantId &&
     left.target.space === right.target.space &&
     left.target.apiVersion === right.target.apiVersion &&
@@ -1874,12 +1928,13 @@ function providerMutationCommitStatements(input: {
     const resource = mutation.resource;
     if (!resource) throw new TypeError("write commit requires a resource");
     const relations = mutation.relations ?? [];
+    const [packageDigest, implementationDigest] = exactResourceDigests(resource);
     if (mutation.expectedRevision === null) {
       statements.push({
         sql: `INSERT INTO tf_resources
                 (tenant_id, space, api_version, kind, name, uid, generation, revision,
-                 resource_json, relations_json, updated_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                 resource_json, relations_json, package_digest, implementation_digest, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         params: [
           ...key,
           resource.metadata.uid,
@@ -1887,6 +1942,8 @@ function providerMutationCommitStatements(input: {
           resource.metadata.revision,
           JSON.stringify(resource),
           JSON.stringify(relations),
+          packageDigest,
+          implementationDigest,
           input.now,
         ],
       });
@@ -1894,7 +1951,7 @@ function providerMutationCommitStatements(input: {
       statements.push({
         sql: `UPDATE tf_resources
               SET uid = ?, generation = ?, revision = ?, resource_json = ?,
-                  relations_json = ?, updated_at = ?
+                  relations_json = ?, package_digest = ?, implementation_digest = ?, updated_at = ?
               WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
                 AND revision = ?`,
         params: [
@@ -1903,6 +1960,8 @@ function providerMutationCommitStatements(input: {
           resource.metadata.revision,
           JSON.stringify(resource),
           JSON.stringify(relations),
+          packageDigest,
+          implementationDigest,
           input.now,
           ...key,
           mutation.expectedRevision,
@@ -2161,6 +2220,212 @@ function isDeferredPhase(value: string): value is DeferredOperationPhase {
 
 function terminalPhase(phase: DeferredOperationPhase): boolean {
   return phase === "succeeded" || phase === "failed" || phase === "cancelled";
+}
+
+async function authorityFenceSql(fence: TakoformAuthorityFence): Promise<{
+  readonly sql: string;
+  readonly params: readonly SqlParam[];
+}> {
+  if (
+    fence.version !== "takoserver.takoform-authority-fence@v1" ||
+    !isDigest(fence.headDigest) ||
+    !isDigest(fence.packageDigest) ||
+    !isDigest(fence.implementationDigest) ||
+    !Array.isArray(fence.heads) ||
+    fence.heads.length === 0 ||
+    fence.heads.length > 16
+  ) {
+    throw new TakoformHostError("form_unavailable", 503);
+  }
+  const normalized = [...fence.heads].sort((left, right) =>
+    `${left.kind}\u0000${left.key}`.localeCompare(`${right.kind}\u0000${right.key}`),
+  );
+  if (
+    canonicalJson(normalized) !== canonicalJson(fence.heads) ||
+    (await canonicalDigest({
+      version: fence.version,
+      mode: fence.mode,
+      packageDigest: fence.packageDigest,
+      implementationDigest: fence.implementationDigest,
+      heads: normalized,
+    })) !== fence.headDigest
+  ) {
+    throw new TakoformHostError("form_unavailable", 503);
+  }
+  const clauses: string[] = [];
+  const params: SqlParam[] = [];
+  const seen = new Set<string>();
+  for (const head of fence.heads) {
+    const identity = `${head.kind}\u0000${head.key}`;
+    if (
+      seen.has(identity) ||
+      head.key.length === 0 ||
+      head.key.length > 512 ||
+      (head.eventDigest !== null && !isDigest(head.eventDigest))
+    ) {
+      throw new TakoformHostError("form_unavailable", 503);
+    }
+    seen.add(identity);
+    if (head.kind === "install-event") {
+      if (head.eventDigest === null || head.key !== head.eventDigest) {
+        throw new TakoformHostError("form_unavailable", 503);
+      }
+      clauses.push("(SELECT COUNT(*) FROM tf_form_install_events WHERE event_digest = ?) = 1");
+      params.push(head.eventDigest);
+      continue;
+    }
+    if (head.kind === "checkpoint") {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(head.key);
+      } catch {
+        throw new TakoformHostError("form_unavailable", 503);
+      }
+      if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        Array.isArray(parsed) ||
+        typeof (parsed as { publisherKey?: unknown }).publisherKey !== "string" ||
+        !["trust.forms.takoform.com/v1", "trust.forms.takoform.com/v1alpha1"].includes(
+          String((parsed as { checkpointApiVersion?: unknown }).checkpointApiVersion),
+        )
+      ) {
+        throw new TakoformHostError("form_unavailable", 503);
+      }
+      const publisherKey = (parsed as { publisherKey: string }).publisherKey;
+      const apiVersion = String((parsed as { checkpointApiVersion: string }).checkpointApiVersion);
+      clauses.push(
+        currentHeadCountClause(
+          "tf_form_revocation_checkpoints",
+          "publisher_key = ? AND checkpoint_api_version = ?",
+          "successor.publisher_key = current.publisher_key AND successor.checkpoint_api_version = current.checkpoint_api_version",
+          head.eventDigest,
+        ),
+      );
+      params.push(
+        publisherKey,
+        apiVersion,
+        ...(head.eventDigest === null ? [] : [publisherKey, apiVersion, head.eventDigest]),
+      );
+      continue;
+    }
+    if (head.kind === "purge") {
+      const [formRefKey, packageDigest, extra] = head.key.split("\u0000");
+      if (extra !== undefined || !isDigest(formRefKey) || !isDigest(packageDigest)) {
+        throw new TakoformHostError("form_unavailable", 503);
+      }
+      clauses.push(
+        currentHeadCountClause(
+          "tf_form_package_purge_events",
+          "form_ref_key = ? AND package_digest = ?",
+          "successor.form_ref_key = current.form_ref_key AND successor.package_digest = current.package_digest",
+          head.eventDigest,
+        ),
+      );
+      params.push(
+        formRefKey,
+        packageDigest,
+        ...(head.eventDigest === null ? [] : [formRefKey, packageDigest, head.eventDigest]),
+      );
+      continue;
+    }
+    const tableAndColumn =
+      head.kind === "publisher"
+        ? (["tf_form_publisher_events", "publisher_key"] as const)
+        : head.kind === "install"
+          ? (["tf_form_install_events", "form_ref_key"] as const)
+          : head.kind === "support"
+            ? (["tf_form_support_events", "support_key"] as const)
+            : head.kind === "activation"
+              ? (["tf_form_activation_events", "activation_key"] as const)
+              : null;
+    if (!tableAndColumn) throw new TakoformHostError("form_unavailable", 503);
+    const [table, column] = tableAndColumn;
+    clauses.push(
+      currentHeadCountClause(
+        table,
+        `${column} = ?`,
+        `successor.${column} = current.${column}`,
+        head.eventDigest,
+      ),
+    );
+    params.push(head.key, ...(head.eventDigest === null ? [] : [head.key, head.eventDigest]));
+  }
+  return { sql: clauses.join(" AND "), params };
+}
+
+function currentHeadCountClause(
+  table: string,
+  keyPredicate: string,
+  successorKeyPredicate: string,
+  eventDigest: string | null,
+): string {
+  const current = `(SELECT COUNT(*) FROM ${table} AS current
+    WHERE ${keyPredicate}
+      AND NOT EXISTS (
+        SELECT 1 FROM ${table} AS successor
+        WHERE ${successorKeyPredicate}
+          AND successor.predecessor_digest = current.event_digest
+      ))`;
+  if (eventDigest === null) return `${current} = 0`;
+  return `(${current} = 1 AND EXISTS (
+    SELECT 1 FROM ${table} AS current
+    WHERE ${keyPredicate}
+      AND current.event_digest = ?
+      AND NOT EXISTS (
+        SELECT 1 FROM ${table} AS successor
+        WHERE ${successorKeyPredicate}
+          AND successor.predecessor_digest = current.event_digest
+      )))`;
+}
+
+function exactResourceDigests(
+  resource: TakoformStoredResource,
+): readonly [`sha256:${string}` | null, `sha256:${string}` | null] {
+  const packageDigest = resource.form.packageDigest;
+  const implementationDigest = resource.form.implementationDigest;
+  if (packageDigest === undefined && implementationDigest === undefined) {
+    return [null, null];
+  }
+  if (!isDigest(packageDigest) || !isDigest(implementationDigest)) {
+    throw new TakoformHostError("form_unavailable", 503);
+  }
+  return [packageDigest, implementationDigest];
+}
+
+function storedResource(row: Row): TakoformStoredResource {
+  const resource = JSON.parse(text(row.resource_json)) as TakoformStoredResource;
+  const packageDigest = row.package_digest;
+  const implementationDigest = row.implementation_digest;
+  if (packageDigest === null && implementationDigest === null) {
+    const {
+      packageDigest: _legacyPackageDigest,
+      implementationDigest: _legacyImplementationDigest,
+      ...formRef
+    } = resource.form;
+    return {
+      ...resource,
+      form: formRef,
+    };
+  }
+  if (
+    !isDigest(packageDigest) ||
+    !isDigest(implementationDigest) ||
+    resource.form.packageDigest !== packageDigest ||
+    resource.form.implementationDigest !== implementationDigest
+  ) {
+    throw new TakoformHostError("form_unavailable", 503);
+  }
+  return resource;
+}
+
+function digestText(value: unknown): `sha256:${string}` {
+  if (!isDigest(value)) throw new TakoformHostError("form_unavailable", 503);
+  return value;
+}
+
+function isDigest(value: unknown): value is `sha256:${string}` {
+  return typeof value === "string" && /^sha256:[0-9a-f]{64}$/u.test(value);
 }
 
 function boundedGuard(value: string): string {

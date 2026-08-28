@@ -13,6 +13,7 @@ import {
 } from "../src/index.ts";
 import type { ProviderOffering } from "../src/provider-port.ts";
 import { FakeProvider } from "../src/providers/fake.ts";
+import { createStaticStableTestTakoformHost } from "./helpers/historical-takoform-host.ts";
 
 const NOW = Date.UTC(2026, 7, 18, 12);
 const FORMAT = "sqlite.sql-dump.takoform.com/v1";
@@ -49,6 +50,7 @@ test("the migration API binds reservation, transfer, cutover, and capture", asyn
   const sourcePack = pack("source", sourceOffering, transferEvents);
   const targetPack = pack("target", targetOffering, transferEvents);
   const app = buildApp({
+    takoformHostFactory: createStaticStableTestTakoformHost,
     sql,
     objects: createMemoryObjectStore(),
     identity,

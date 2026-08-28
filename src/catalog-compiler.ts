@@ -124,8 +124,8 @@ function firstProblem(input: {
   ) {
     return "binding_not_implemented";
   }
+  if (!installation) return "provider_installation_inactive";
   if (
-    !installation ||
     installation.state !== "active" ||
     installation.providerPackRef !== pack.id ||
     installation.supplyContractRef !== candidate.supplyContractRef

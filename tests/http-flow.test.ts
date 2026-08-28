@@ -12,6 +12,7 @@ import {
 } from "../src/index.ts";
 import type { ProviderOffering } from "../src/provider-port.ts";
 import { FakeProvider } from "../src/providers/fake.ts";
+import { createStaticStableTestTakoformHost } from "./helpers/historical-takoform-host.ts";
 
 /**
  * The prepaid vertical, driven end to end over HTTP exactly as a customer
@@ -115,6 +116,7 @@ async function newSignedApp() {
     publicOrigin: "https://api.takoserver.com",
     forms: [INSTALLED_FORM],
     hostForms: [INSTALLED_FORM],
+    takoformHostFactory: createStaticStableTestTakoformHost,
     providers: [new FakeProvider({ id: "cloudflare", offerings: [PROVIDER_OFFERING] })],
     offerings: [OFFERING],
     signingKey,

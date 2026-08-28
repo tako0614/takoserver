@@ -2,6 +2,7 @@ import { canonicalJson } from "../json.ts";
 import type { Clock, JsonObject } from "../ports.ts";
 import type { EngineContext, EngineMutationCommit, TakoformEngine } from "./engine.ts";
 import { exactInstalledForm, type FormRegistry, sameFormRef } from "./forms.ts";
+import type { TakoformHostAuthority } from "./host-authority.ts";
 import type { DeferredOperationRecord, ResourceAddress, TakoformStore } from "./store.ts";
 import { TakoformHostError, type TakoformV1Alpha3FormRef } from "./types.ts";
 import {
@@ -54,6 +55,7 @@ export function createDeferredOperations(input: {
   readonly engine: TakoformEngine;
   readonly store: TakoformStore;
   readonly forms: FormRegistry;
+  readonly authority?: TakoformHostAuthority;
   readonly clock: Clock;
   readonly randomId: () => string;
   readonly omitObservedStatus?: boolean;
@@ -90,7 +92,14 @@ export function createDeferredOperations(input: {
       ) {
         return null;
       }
-      const accepted = await acceptedMutation(context, path, operation, input.forms, input.store);
+      const accepted = await acceptedMutation(
+        context,
+        path,
+        operation,
+        input.forms,
+        input.store,
+        input.authority,
+      );
       if (
         !(await input.configuration.shouldDefer({
           request: context.request,
@@ -369,6 +378,7 @@ async function acceptedMutation(
   operation: "apply" | "import" | "delete",
   forms: FormRegistry,
   store: TakoformStore,
+  authority?: TakoformHostAuthority,
 ): Promise<{
   readonly lifecycleOperation: "create" | "update" | "import" | "delete";
   readonly formRef: TakoformV1Alpha3FormRef;
@@ -396,6 +406,17 @@ async function acceptedMutation(
     const current = await store.readResource(address);
     if (current && !sameFormRef(current.form.formRef, parsed.form.formRef)) {
       throw new TakoformHostError("resource_not_found", 404);
+    }
+    if (authority) {
+      await authority.authorizeMutation({
+        operation: operation === "import" ? "import" : current ? "update" : "create",
+        context: {
+          tenantId: context.tenantId,
+          principalId: context.principalId,
+          space: parsed.metadata.space,
+        },
+        formRef: parsed.form.formRef,
+      });
     }
     return {
       lifecycleOperation: operation === "import" ? "import" : current ? "update" : "create",
@@ -433,6 +454,17 @@ async function acceptedMutation(
   });
   if (!current || !sameFormRef(current.form.formRef, form.identity.formRef)) {
     throw new TakoformHostError("resource_not_found", 404);
+  }
+  if (authority) {
+    await authority.authorizeRetained({
+      operation: "delete",
+      context: {
+        tenantId: context.tenantId,
+        principalId: context.principalId,
+        space,
+      },
+      resource: current,
+    });
   }
   return {
     lifecycleOperation: "delete",
@@ -476,6 +508,7 @@ function storedCommit(
     replayKey: mutation.replayKey,
     replay: mutation.replay,
     ...(mutation.providerReceipt ? { providerReceipt: mutation.providerReceipt } : {}),
+    ...(mutation.authorityFence ? { authorityFence: mutation.authorityFence } : {}),
     terminalJson,
   };
 }

@@ -2,11 +2,11 @@ import { Database } from "bun:sqlite";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createStaticTestTakoformHost as createTakoformHost } from "./app.ts";
 import { migrateSqlite } from "./migrate-sqlite.ts";
 import { createMemoryObjectStore } from "./objects-mem.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
-import { createTakoformHost } from "./takoform/host.ts";
 import { createJavaScriptWorkerModuleInspector } from "./takoform/worker-module-inspector.ts";
 import {
   createStableLocalS3Resolver,

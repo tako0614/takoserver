@@ -2,11 +2,11 @@ import { describe, expect, test } from "bun:test";
 import {
   buildApp,
   createEphemeralSql,
-  createInMemoryTakoformHost,
   createMemoryObjectStore,
   InMemoryTakoformResourceDriver,
   type InstalledTakoformForm,
 } from "../src/index.ts";
+import { createStaticStableInMemoryTakoformHost as createInMemoryTakoformHost } from "./helpers/historical-takoform-host.ts";
 
 function handler() {
   return buildApp({

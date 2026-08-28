@@ -25,10 +25,17 @@ import {
 import { createRouter, type Router } from "./router.ts";
 import type { S3CredentialIssuer } from "./s3-port.ts";
 import { createSponsorshipRoutes } from "./sponsorship-api.ts";
-import type { TakoformArtifactTransport } from "./takoform/artifacts.ts";
-import type { WorkerModuleInspector } from "./takoform/engine.ts";
-import { sameFormRef } from "./takoform/forms.ts";
-import { createTakoformHost } from "./takoform/host.ts";
+import { createTakoformArtifacts, type TakoformArtifactTransport } from "./takoform/artifacts.ts";
+import { installedBindings } from "./takoform/bindings.ts";
+import { createTakoformEngine, type WorkerModuleInspector } from "./takoform/engine.ts";
+import { installedForms, sameFormRef } from "./takoform/forms.ts";
+import { type CreateTakoformHostOptions, createTakoformHost } from "./takoform/host.ts";
+import {
+  createTakoformHostAuthority,
+  type TakoformHostAuthority,
+} from "./takoform/host-authority.ts";
+import { createDeferredOperations } from "./takoform/operations.ts";
+import { createTakoformRoutes, DEFAULT_TAKOFORM_ROUTES } from "./takoform/routes.ts";
 import { createTakoformStore } from "./takoform/store.ts";
 import type {
   InstalledTakoformBinding,
@@ -90,6 +97,8 @@ export interface AppPorts {
   readonly driver?: TakoformResourceDriver;
   /** Explicit Host availability policy; production derives one from its provider composition. */
   readonly availability?: TakoformFormAvailabilityResolver;
+  /** Explicit authority override for conformance tests; production derives D1/R2 authority here. */
+  readonly hostAuthority?: TakoformHostAuthority;
   readonly offerings: readonly Offering[];
   readonly signingKey?: SigningKey;
   /** Shared with a provider that publishes committed bundles. */
@@ -101,6 +110,10 @@ export interface AppPorts {
    * drive the lane with their own authentication; production never sets it.
    */
   readonly takoformHost?: TakoformHost;
+  /** Explicit assembly seam for tests; production entries never provide it. */
+  readonly takoformHostFactory?: (
+    options: Omit<CreateTakoformHostOptions, "authority">,
+  ) => TakoformHost;
   readonly clock?: Clock;
   readonly randomId?: () => string;
 }
@@ -191,173 +204,201 @@ export function buildApp(ports: AppPorts): App {
     (ports.driver === undefined
       ? createProviderFormAvailability(ports.providers ?? [])
       : undefined);
-  const takoformHost =
-    ports.takoformHost ??
-    createTakoformHost({
-      sql: ports.sql,
-      objects: ports.objects,
-      // The ordinary organization lane accepts a resources:write API key. A
-      // reseller may instead issue a short-lived run token pinned to one paid
-      // reservation and one exact Resource address. The latter is useful to a
-      // hosted runner because it never receives the reseller's organization
-      // key and cannot cross into another opaque tenant space.
-      //
-      // A signed-in person may enter it too, and must say which organization
-      // they are acting for. A key names one organization by existing; a
-      // session names a person, who may own several, and guessing which of
-      // somebody's organizations to bill is not a guess worth making. The
-      // header is ignored for a key, whose organization is not up for
-      // discussion.
-      authenticate: async (request) => {
-        const authorization = request.headers.get("authorization");
-        const actor = await accounts.authenticate(authorization);
-        if (actor?.kind === "api_key") {
-          return actor.organizationId && grants(actor.scopes, "resources:write")
-            ? { tenantId: actor.organizationId, principalId: actor.hostPrincipalId }
-            : null;
-        }
-        if (actor?.kind === "session") {
-          const organizationId = request.headers.get("takoform-organization");
-          if (!organizationId) return null;
-          const owned = await accounts
-            .requireOwner(actor, organizationId)
-            .then(() => true)
-            .catch(() => false);
-          return owned ? { tenantId: organizationId, principalId: actor.hostPrincipalId } : null;
-        }
-
-        const bearer = authorization?.startsWith("Bearer ")
-          ? authorization.slice("Bearer ".length)
+  const hostAuthority =
+    ports.hostAuthority ??
+    (ports.takoformHostFactory
+      ? undefined
+      : createTakoformHostAuthority({
+          sql: ports.sql,
+          objects: ports.objects,
+          hostId: ports.publicOrigin,
+          candidates: ports.hostForms,
+          bindings: ports.hostBindings ?? [],
+          technicalAvailability: availability ?? {
+            async resolve() {
+              return { executable: false, activated: false, availableToPrincipal: false };
+            },
+          },
+        }));
+  const hostOptions: Omit<CreateTakoformHostOptions, "authority"> = {
+    sql: ports.sql,
+    objects: ports.objects,
+    // The ordinary organization lane accepts a resources:write API key. A
+    // reseller may instead issue a short-lived run token pinned to one paid
+    // reservation and one exact Resource address. The latter is useful to a
+    // hosted runner because it never receives the reseller's organization
+    // key and cannot cross into another opaque tenant space.
+    //
+    // A signed-in person may enter it too, and must say which organization
+    // they are acting for. A key names one organization by existing; a
+    // session names a person, who may own several, and guessing which of
+    // somebody's organizations to bill is not a guess worth making. The
+    // header is ignored for a key, whose organization is not up for
+    // discussion.
+    authenticate: async (request) => {
+      const authorization = request.headers.get("authorization");
+      const actor = await accounts.authenticate(authorization);
+      if (actor?.kind === "api_key") {
+        return actor.organizationId && grants(actor.scopes, "resources:write")
+          ? { tenantId: actor.organizationId, principalId: actor.hostPrincipalId }
           : null;
-        if (!bearer) return null;
+      }
+      if (actor?.kind === "session") {
+        const organizationId = request.headers.get("takoform-organization");
+        if (!organizationId) return null;
+        const owned = await accounts
+          .requireOwner(actor, organizationId)
+          .then(() => true)
+          .catch(() => false);
+        return owned ? { tenantId: organizationId, principalId: actor.hostPrincipalId } : null;
+      }
+
+      const bearer = authorization?.startsWith("Bearer ")
+        ? authorization.slice("Bearer ".length)
+        : null;
+      if (!bearer) return null;
+      try {
         try {
-          try {
-            const claims = await tokens.verifyTakoformTenantRunToken(bearer);
-            return {
-              tenantId: claims.organizationId,
-              principalId: `run:${claims.tokenId}`,
-              scope: {
-                space: claims.spaceRef,
-                mode: "tenant-run" as const,
-                ...(claims.runtimeMaterialization
-                  ? { runtimeMaterialization: claims.runtimeMaterialization }
-                  : {}),
-              },
-            };
-          } catch {
-            // Exact-Resource reservation tokens share the Takoform audience
-            // but have a closed, disjoint claim shape.
-          }
-          const claims = await tokens.verifyTakoformRunToken(bearer);
-          const reservation = await reseller.reservation({
-            organizationId: claims.organizationId,
-            tenantRef: claims.tenantRef,
-            reservationId: claims.reservationId,
-          });
-          if (
-            reservation.offeringId !== claims.offeringId ||
-            reservation.offeringDigest !== claims.offeringDigest ||
-            (claims.mode === "provision"
-              ? reservation.status !== "active"
-              : reservation.status !== "captured")
-          ) {
-            return null;
-          }
+          const claims = await tokens.verifyTakoformTenantRunToken(bearer);
           return {
             tenantId: claims.organizationId,
             principalId: `run:${claims.tokenId}`,
             scope: {
-              space: claims.tenantRef,
-              formRef: claims.formRef,
-              resourceName: claims.resourceName,
-              mode: claims.mode,
-              ...(claims.resourceUid === undefined
-                ? {}
-                : { expectedResourceUid: claims.resourceUid }),
-              commercialAuthority: {
-                reservationId: claims.reservationId,
-                offeringId: claims.offeringId,
-                offeringDigest: claims.offeringDigest,
-              },
-              ...(claims.mode === "provision"
-                ? {
-                    claimCreate: async () => {
-                      try {
-                        await tokens.claimTakoformRunTokenForCreate(bearer);
-                      } catch (error) {
-                        if (error instanceof TokenError && error.code === "token_replayed") {
-                          throw new TakoformHostError("resource_busy", 409);
-                        }
-                        if (error instanceof TokenError && error.code === "state_unavailable") {
-                          throw new TakoformHostError("unavailable", 503);
-                        }
-                        throw new TakoformHostError("unauthenticated", 401);
-                      }
-                    },
-                  }
+              space: claims.spaceRef,
+              mode: "tenant-run" as const,
+              ...(claims.runtimeMaterialization
+                ? { runtimeMaterialization: claims.runtimeMaterialization }
                 : {}),
             },
           };
         } catch {
+          // Exact-Resource reservation tokens share the Takoform audience
+          // but have a closed, disjoint claim shape.
+        }
+        const claims = await tokens.verifyTakoformRunToken(bearer);
+        const reservation = await reseller.reservation({
+          organizationId: claims.organizationId,
+          tenantRef: claims.tenantRef,
+          reservationId: claims.reservationId,
+        });
+        if (
+          reservation.offeringId !== claims.offeringId ||
+          reservation.offeringDigest !== claims.offeringDigest ||
+          (claims.mode === "provision"
+            ? reservation.status !== "active"
+            : reservation.status !== "captured")
+        ) {
           return null;
         }
-      },
-      forms: ports.hostForms,
-      ...(ports.hostBindings ? { bindings: ports.hostBindings } : {}),
-      driver,
-      ...(ports.artifacts ? { artifacts: ports.artifacts } : {}),
-      ...(ports.workerModuleInspector
-        ? { workerModuleInspector: ports.workerModuleInspector }
-        : {}),
-      ...(ports.standardServiceResolver
-        ? { standardServiceResolver: ports.standardServiceResolver }
-        : {}),
-      ...(availability ? { availability } : {}),
-      clock,
-      randomId,
-      // The redemption lane: a reseller's single-use provision token buys
-      // exactly one apply of the offering it names, in the tenant's space.
-      provision: { tokens, catalog },
-      blockingRelations: attachments.blocksDeletion,
-    });
+        return {
+          tenantId: claims.organizationId,
+          principalId: `run:${claims.tokenId}`,
+          scope: {
+            space: claims.tenantRef,
+            formRef: claims.formRef,
+            resourceName: claims.resourceName,
+            mode: claims.mode,
+            ...(claims.resourceUid === undefined
+              ? {}
+              : { expectedResourceUid: claims.resourceUid }),
+            commercialAuthority: {
+              reservationId: claims.reservationId,
+              offeringId: claims.offeringId,
+              offeringDigest: claims.offeringDigest,
+            },
+            ...(claims.mode === "provision"
+              ? {
+                  claimCreate: async () => {
+                    try {
+                      await tokens.claimTakoformRunTokenForCreate(bearer);
+                    } catch (error) {
+                      if (error instanceof TokenError && error.code === "token_replayed") {
+                        throw new TakoformHostError("resource_busy", 409);
+                      }
+                      if (error instanceof TokenError && error.code === "state_unavailable") {
+                        throw new TakoformHostError("unavailable", 503);
+                      }
+                      throw new TakoformHostError("unauthenticated", 401);
+                    }
+                  },
+                }
+              : {}),
+          },
+        };
+      } catch {
+        return null;
+      }
+    },
+    forms: ports.hostForms,
+    ...(ports.hostBindings ? { bindings: ports.hostBindings } : {}),
+    driver,
+    ...(ports.artifacts ? { artifacts: ports.artifacts } : {}),
+    ...(ports.workerModuleInspector ? { workerModuleInspector: ports.workerModuleInspector } : {}),
+    ...(ports.standardServiceResolver
+      ? { standardServiceResolver: ports.standardServiceResolver }
+      : {}),
+    ...(availability ? { availability } : {}),
+    clock,
+    randomId,
+    // The redemption lane: a reseller's single-use provision token buys
+    // exactly one apply of the offering it names, in the tenant's space.
+    provision: { tokens, catalog },
+    blockingRelations: attachments.blocksDeletion,
+  };
+  const createDerivedTakoformHost = (
+    options: Omit<CreateTakoformHostOptions, "authority">,
+  ): TakoformHost => {
+    if (!hostAuthority) throw new Error("Takoform Host authority is unavailable");
+    return createTakoformHost({ ...options, authority: hostAuthority });
+  };
+  const takoformHost =
+    ports.takoformHost ??
+    (ports.takoformHostFactory
+      ? ports.takoformHostFactory(hostOptions)
+      : createDerivedTakoformHost(hostOptions));
 
   const sponsorshipLifecycle = ports.sponsorshipServiceToken
-    ? createTakoformHost({
-        sql: ports.sql,
-        objects: ports.objects,
-        authenticate: async (request) => {
-          if (request.headers.get("authorization") !== "Bearer internal-sponsorship-lifecycle") {
-            return null;
-          }
-          const tenantId = request.headers.get("x-takoserver-sponsorship-organization");
-          const expectedResourceUid = request.headers.get("x-takoserver-sponsorship-resource");
-          if (!tenantId || !expectedResourceUid) return null;
-          const listing = await inventory.resourceByUid(tenantId, expectedResourceUid);
-          if (!listing) return null;
-          return {
-            tenantId,
-            principalId: "service:takosumi-hosted-sponsorship",
-            scope: {
-              space: listing.space,
-              formRef: listing.resource.form.formRef,
-              resourceName: listing.name,
-              mode: "manage",
-              expectedResourceUid,
-            },
-          };
-        },
-        forms: ports.forms,
-        ...(ports.bindings ? { bindings: ports.bindings } : {}),
-        driver,
-        ...(ports.artifacts ? { artifacts: ports.artifacts } : {}),
-        ...(ports.workerModuleInspector
-          ? { workerModuleInspector: ports.workerModuleInspector }
-          : {}),
-        ...(availability ? { availability } : {}),
-        clock,
-        randomId,
-        blockingRelations: attachments.blocksDeletion,
-      })
+    ? (() => {
+        const sponsorshipOptions: Omit<CreateTakoformHostOptions, "authority"> = {
+          sql: ports.sql,
+          objects: ports.objects,
+          authenticate: async (request) => {
+            if (request.headers.get("authorization") !== "Bearer internal-sponsorship-lifecycle") {
+              return null;
+            }
+            const tenantId = request.headers.get("x-takoserver-sponsorship-organization");
+            const expectedResourceUid = request.headers.get("x-takoserver-sponsorship-resource");
+            if (!tenantId || !expectedResourceUid) return null;
+            const listing = await inventory.resourceByUid(tenantId, expectedResourceUid);
+            if (!listing) return null;
+            return {
+              tenantId,
+              principalId: "service:takosumi-hosted-sponsorship",
+              scope: {
+                space: listing.space,
+                formRef: listing.resource.form.formRef,
+                resourceName: listing.name,
+                mode: "manage",
+                expectedResourceUid,
+              },
+            };
+          },
+          forms: ports.forms,
+          ...(ports.bindings ? { bindings: ports.bindings } : {}),
+          driver,
+          ...(ports.artifacts ? { artifacts: ports.artifacts } : {}),
+          ...(ports.workerModuleInspector
+            ? { workerModuleInspector: ports.workerModuleInspector }
+            : {}),
+          ...(availability ? { availability } : {}),
+          clock,
+          randomId,
+          blockingRelations: attachments.blocksDeletion,
+        };
+        return ports.takoformHostFactory
+          ? ports.takoformHostFactory(sponsorshipOptions)
+          : createDerivedTakoformHost(sponsorshipOptions);
+      })()
     : null;
 
   const control = createControlRoutes({
@@ -457,4 +498,73 @@ export function buildApp(ports: AppPorts): App {
       };
     },
   };
+}
+
+/**
+ * Static stable-lane assembly for disposable conformance/local-provider
+ * fixtures. It is intentionally kept in the composition root rather than the
+ * Takoform domain modules, and is not part of the package's public exports.
+ */
+export function createStaticTestTakoformHost(
+  options: Omit<CreateTakoformHostOptions, "authority">,
+): TakoformHost {
+  const clock = options.clock ?? (() => new Date());
+  const randomId = options.randomId ?? (() => crypto.randomUUID());
+  const routes = DEFAULT_TAKOFORM_ROUTES;
+  const forms = installedForms(options.forms, routes.hostApiVersion);
+  const bindings = installedBindings(options.bindings ?? []);
+  const store = createTakoformStore(options.sql, clock);
+  const artifacts =
+    options.artifacts ??
+    createTakoformArtifacts({
+      sql: options.sql,
+      objects: options.objects,
+      clock,
+      randomId,
+    });
+  const engine = createTakoformEngine({
+    store,
+    forms,
+    bindings,
+    driver: options.driver,
+    artifacts,
+    allowBodyGenerationFence: true,
+    allowReviewSpecDigest: true,
+    stableReviewConstraintPhases: true,
+    clock,
+    randomId,
+    ...(options.workerModuleInspector
+      ? { workerModuleInspector: options.workerModuleInspector }
+      : {}),
+    ...(options.blockingRelations ? { blockingRelations: options.blockingRelations } : {}),
+    ...(options.standardServiceResolver
+      ? { standardServiceResolver: options.standardServiceResolver }
+      : {}),
+    ...(options.availability ? { availability: options.availability } : {}),
+  });
+  const deferredOperations = options.deferredOperations
+    ? createDeferredOperations({
+        configuration: options.deferredOperations,
+        engine,
+        store,
+        forms,
+        clock,
+        randomId,
+        omitObservedStatus: true,
+      })
+    : undefined;
+  return createTakoformRoutes({
+    authenticate: options.authenticate,
+    engine,
+    store,
+    forms,
+    bindings,
+    artifacts,
+    ...(deferredOperations ? { deferredOperations } : {}),
+    ...(options.standardServiceResolver
+      ? { standardServiceResolver: options.standardServiceResolver }
+      : {}),
+    ...(options.availability ? { availability: options.availability } : {}),
+    ...(options.provision ? { provision: options.provision } : {}),
+  });
 }

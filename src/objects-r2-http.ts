@@ -36,6 +36,7 @@ export function createR2HttpObjectStore(options: R2HttpOptions): ObjectStore {
     key: string,
     body?: BodyInit,
     contentType?: string,
+    createOnly = false,
   ): Promise<Response> => {
     const path = key
       .split("/")
@@ -48,6 +49,7 @@ export function createR2HttpObjectStore(options: R2HttpOptions): ObjectStore {
           headers: {
             authorization: await options.authorize(),
             ...(contentType ? { "content-type": contentType } : {}),
+            ...(createOnly ? { "if-none-match": "*" } : {}),
           },
           ...(body === undefined ? {} : { body }),
         }),
@@ -58,6 +60,28 @@ export function createR2HttpObjectStore(options: R2HttpOptions): ObjectStore {
   };
 
   return {
+    async create(key, body, opts): Promise<StoredObject | null> {
+      const bytes = await collect(body);
+      const response = await call(
+        "PUT",
+        key,
+        bytes as unknown as BodyInit,
+        opts?.contentType ?? "application/octet-stream",
+        true,
+      );
+      if (response.status === 412) return null;
+      if (!response.ok) {
+        throw new ObjectStoreError("unavailable", `R2 refused the create (${response.status})`);
+      }
+      const contentType = opts?.contentType;
+      return {
+        key,
+        size: bytes.byteLength,
+        etag: await digest(bytes),
+        ...(contentType ? { contentType } : {}),
+      };
+    },
+
     async put(key, body, opts): Promise<StoredObject> {
       const bytes = await collect(body);
       const response = await call(
@@ -112,9 +136,13 @@ export function createR2HttpObjectStore(options: R2HttpOptions): ObjectStore {
       const etag = response.headers.get("etag") ?? "";
       // Content length is not always present; falling back to reading the body
       // keeps the size honest rather than reporting zero.
-      const size = Number.isSafeInteger(declared)
-        ? (await response.body?.cancel(), declared)
-        : (await response.arrayBuffer()).byteLength;
+      let size: number;
+      if (Number.isSafeInteger(declared)) {
+        await response.body?.cancel();
+        size = declared;
+      } else {
+        size = (await response.arrayBuffer()).byteLength;
+      }
       return {
         key,
         size,

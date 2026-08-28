@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Miniflare } from "miniflare";
+import { createStaticTestTakoformHost as createTakoformHost } from "./app.ts";
 import { migrateSqlite } from "./migrate-sqlite.ts";
 import { createMemoryObjectStore } from "./objects-mem.ts";
 import type {
@@ -15,7 +16,6 @@ import type {
 import { CloudflareProvider } from "./providers/cloudflare.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
-import { createTakoformHost } from "./takoform/host.ts";
 import type {
   InstalledTakoformForm,
   TakoformDriverRelation,

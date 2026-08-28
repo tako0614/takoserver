@@ -25,6 +25,10 @@ import {
   type SetActivation,
   type SetSupport,
   type SettleEvacuation,
+  TAKOFORM_REVOCATION_V1,
+  TAKOFORM_REVOCATION_V1_EMPTY_ENTRIES_DIGEST,
+  TAKOFORM_REVOCATION_V1_GENESIS_DIGEST,
+  TAKOFORM_REVOCATION_V1ALPHA1,
   type UninstallPackage,
   validateDigest,
 } from "./admission.ts";
@@ -203,10 +207,10 @@ async function executePublisher(
       `INSERT INTO ${PUBLISHER_TABLE}
          (id, publisher_key, event_type, policy_digest, policy_json,
           oidc_issuer, source_repository, workflow, ref, publisher_identity,
-          source_commit, workflow_commit, repository_identifier, owner_identifier,
+          source_commit, workflow_commit, build_config_commit, repository_identifier, owner_identifier,
           namespace_group, namespace_grant_digest, trusted_root_digest,
           actor, reason, event_at, event_digest, predecessor_digest)
-       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
        WHERE ${
          eventType === "allow"
            ? `NOT EXISTS (
@@ -236,6 +240,7 @@ async function executePublisher(
         publisher.identity,
         publisher.sourceCommit,
         publisher.workflowCommit,
+        publisher.buildConfigCommit,
         publisher.repositoryIdentifier,
         publisher.ownerIdentifier,
         publisher.group,
@@ -265,37 +270,19 @@ async function executeCheckpoint(
   randomId: () => string,
 ): Promise<AdmissionReceipt> {
   requireText(command.publisherKey, "publisher key");
+  if (
+    command.checkpointApiVersion !== TAKOFORM_REVOCATION_V1 &&
+    command.checkpointApiVersion !== TAKOFORM_REVOCATION_V1ALPHA1
+  ) {
+    throw new AdmissionError("checkpoint_invalid", "checkpoint profile is unsupported");
+  }
   requireInteger(command.sequence, "checkpoint sequence");
-  if (command.sequence < 1)
-    throw new AdmissionError("checkpoint_invalid", "sequence starts at one");
   validateDigest(command.policyDigest, "policy digest");
   validateDigest(command.policyEventDigest, "policy event digest");
   validateDigest(command.checkpointDigest, "checkpoint digest");
   validateDigest(command.entriesDigest, "entries digest");
-  validateDigest(command.previousCheckpointDigest, "previous checkpoint digest");
-  const currentCheckpoint = await head(
-    sql,
-    CHECKPOINT_TABLE,
-    "publisher_key",
-    command.publisherKey,
-  );
-  const currentPublisher = await head(sql, PUBLISHER_TABLE, "publisher_key", command.publisherKey);
-  if (!currentPublisher)
-    throw new AdmissionError("admission_missing", "publisher policy is missing");
-  const predecessor =
-    command.predecessorDigest ??
-    (currentCheckpoint ? text(currentCheckpoint.event_digest) : ADMISSION_GENESIS_DIGEST);
-  const expectedPrevious = currentCheckpoint
-    ? text(currentCheckpoint.checkpoint_digest)
-    : ADMISSION_GENESIS_DIGEST;
-  if (
-    predecessor !==
-    (currentCheckpoint ? text(currentCheckpoint.event_digest) : ADMISSION_GENESIS_DIGEST)
-  ) {
-    throw new AdmissionError("admission_conflict", "checkpoint predecessor moved");
-  }
-  if (command.previousCheckpointDigest !== expectedPrevious) {
-    throw new AdmissionError("checkpoint_invalid", "checkpoint sequence predecessor mismatch");
+  if (command.previousCheckpointDigest !== null) {
+    validateDigest(command.previousCheckpointDigest, "previous checkpoint digest");
   }
   if (
     command.revokedPackageDigests !== undefined &&
@@ -305,6 +292,50 @@ async function executeCheckpoint(
   }
   const revoked = [...(command.revokedPackageDigests ?? [])];
   for (const digest of revoked) validateDigest(digest, "revoked package digest");
+  if (new Set(revoked).size !== revoked.length) {
+    throw new AdmissionError("checkpoint_invalid", "revoked package digests must be unique");
+  }
+  const stableGenesis =
+    command.checkpointApiVersion === TAKOFORM_REVOCATION_V1 && command.sequence === 0;
+  if (
+    command.sequence < (command.checkpointApiVersion === TAKOFORM_REVOCATION_V1 ? 0 : 1) ||
+    (stableGenesis &&
+      (command.checkpointDigest !== TAKOFORM_REVOCATION_V1_GENESIS_DIGEST ||
+        command.entriesDigest !== TAKOFORM_REVOCATION_V1_EMPTY_ENTRIES_DIGEST ||
+        command.previousCheckpointDigest !== null ||
+        revoked.length !== 0))
+  ) {
+    throw new AdmissionError("checkpoint_invalid", "checkpoint profile identity is invalid");
+  }
+  const currentCheckpoint = await checkpointHead(
+    sql,
+    command.publisherKey,
+    command.checkpointApiVersion,
+  );
+  const currentPublisher = await head(sql, PUBLISHER_TABLE, "publisher_key", command.publisherKey);
+  if (!currentPublisher)
+    throw new AdmissionError("admission_missing", "publisher policy is missing");
+  const predecessor =
+    command.predecessorDigest ??
+    (currentCheckpoint ? text(currentCheckpoint.event_digest) : ADMISSION_GENESIS_DIGEST);
+  const expectedPrevious = currentCheckpoint ? text(currentCheckpoint.checkpoint_digest) : null;
+  const expectedSequence = currentCheckpoint
+    ? Number(currentCheckpoint.sequence) + 1
+    : command.checkpointApiVersion === TAKOFORM_REVOCATION_V1
+      ? 0
+      : 1;
+  if (
+    predecessor !==
+    (currentCheckpoint ? text(currentCheckpoint.event_digest) : ADMISSION_GENESIS_DIGEST)
+  ) {
+    throw new AdmissionError("admission_conflict", "checkpoint predecessor moved");
+  }
+  if (
+    command.sequence !== expectedSequence ||
+    command.previousCheckpointDigest !== expectedPrevious
+  ) {
+    throw new AdmissionError("checkpoint_invalid", "checkpoint sequence predecessor mismatch");
+  }
   const revokedJson = canonicalJson(revoked);
   const id = eventId(randomId);
   const eventAt = eventTime(command, clock);
@@ -312,6 +343,7 @@ async function executeCheckpoint(
     chain: "checkpoint",
     id,
     publisherKey: command.publisherKey,
+    checkpointApiVersion: command.checkpointApiVersion,
     sequence: command.sequence,
     checkpointDigest: command.checkpointDigest,
     entriesDigest: command.entriesDigest,
@@ -330,9 +362,11 @@ async function executeCheckpoint(
          SELECT sequence, checkpoint_digest, event_digest
          FROM ${CHECKPOINT_TABLE} AS current
          WHERE current.publisher_key = ?
+           AND current.checkpoint_api_version = ?
            AND NOT EXISTS (
              SELECT 1 FROM ${CHECKPOINT_TABLE} AS successor
              WHERE successor.publisher_key = current.publisher_key
+               AND successor.checkpoint_api_version = current.checkpoint_api_version
                AND successor.predecessor_digest = current.event_digest
            )
          LIMIT 1
@@ -348,21 +382,23 @@ async function executeCheckpoint(
          LIMIT 1
        )
        INSERT INTO ${CHECKPOINT_TABLE}
-         (id, publisher_key, sequence, checkpoint_digest, entries_digest,
+         (id, publisher_key, checkpoint_api_version, sequence, checkpoint_digest, entries_digest,
           previous_checkpoint_digest, revoked_package_digests_json,
           policy_digest, policy_event_digest, actor, reason, event_at,
           event_digest, predecessor_digest)
-       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-       WHERE COALESCE((SELECT sequence FROM checkpoint_head), 0) + 1 = ?
-         AND COALESCE((SELECT checkpoint_digest FROM checkpoint_head), ?) = ?
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+       WHERE COALESCE((SELECT sequence FROM checkpoint_head), ?) + 1 = ?
+         AND (SELECT checkpoint_digest FROM checkpoint_head) IS ?
          AND COALESCE((SELECT event_digest FROM checkpoint_head), ?) = ?
          AND (SELECT event_digest FROM publisher_head) = ?
          AND (SELECT policy_digest FROM publisher_head) = ?`,
       [
         command.publisherKey,
+        command.checkpointApiVersion,
         command.publisherKey,
         id,
         command.publisherKey,
+        command.checkpointApiVersion,
         command.sequence,
         command.checkpointDigest,
         command.entriesDigest,
@@ -375,8 +411,8 @@ async function executeCheckpoint(
         eventAt,
         eventDigest,
         predecessor,
+        command.checkpointApiVersion === TAKOFORM_REVOCATION_V1 ? -1 : 0,
         command.sequence,
-        ADMISSION_GENESIS_DIGEST,
         command.previousCheckpointDigest,
         ADMISSION_GENESIS_DIGEST,
         predecessor,
@@ -473,6 +509,7 @@ async function executeInstall(
     report,
     publisher: claims.publisher,
     policyEventDigest: claims.policyEventDigest,
+    checkpointApiVersion: claims.checkpointApiVersion,
     checkpointSequence: claims.checkpointSequence,
     checkpointDigest: claims.checkpointDigest,
     checkpointEventDigest: claims.checkpointEventDigest,
@@ -501,7 +538,7 @@ async function executeInstall(
        ), publisher_head AS (
          SELECT event_digest, event_type, policy_digest,
                 oidc_issuer, source_repository, workflow, ref,
-                publisher_identity, source_commit, workflow_commit,
+                publisher_identity, source_commit, workflow_commit, build_config_commit,
                 repository_identifier, owner_identifier, namespace_group,
                 namespace_grant_digest, trusted_root_digest
          FROM ${PUBLISHER_TABLE} AS current
@@ -513,13 +550,15 @@ async function executeInstall(
            )
          LIMIT 1
        ), checkpoint_head AS (
-         SELECT event_digest, sequence, checkpoint_digest, entries_digest,
+         SELECT event_digest, checkpoint_api_version, sequence, checkpoint_digest, entries_digest,
                 revoked_package_digests_json
          FROM ${CHECKPOINT_TABLE} AS current
          WHERE current.publisher_key = ?
+           AND current.checkpoint_api_version = ?
            AND NOT EXISTS (
              SELECT 1 FROM ${CHECKPOINT_TABLE} AS successor
              WHERE successor.publisher_key = current.publisher_key
+               AND successor.checkpoint_api_version = current.checkpoint_api_version
                AND successor.predecessor_digest = current.event_digest
            )
          LIMIT 1
@@ -540,12 +579,13 @@ async function executeInstall(
          (id, form_ref_key, form_ref_json, form_api_version, form_kind,
           form_definition_version, schema_digest, package_digest, event_type,
           replaces_package_digest, admission_report_digest, admission_report_json,
-          publisher_key, policy_digest, policy_event_digest, checkpoint_sequence,
-          checkpoint_digest, checkpoint_event_digest, source_commit, workflow_commit,
+          publisher_key, policy_digest, policy_event_digest, checkpoint_api_version,
+          checkpoint_sequence, checkpoint_digest, checkpoint_event_digest, source_commit, workflow_commit,
+          build_config_commit,
           repository_identifier, owner_identifier, namespace_group,
           namespace_grant_digest, implementation_digest, retention_ref,
           retention_until, actor, reason, event_at, event_digest, predecessor_digest)
-       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
        WHERE COALESCE((SELECT event_digest FROM install_head), ?) = ?
          AND (CASE WHEN ? = 'install' THEN (SELECT event_digest FROM install_head) IS NULL
                    ELSE COALESCE((SELECT event_type FROM install_head), '') IN ('install', 'replace', 'uninstall') END)
@@ -559,12 +599,14 @@ async function executeInstall(
          AND (SELECT publisher_identity FROM publisher_head) = ?
          AND (SELECT source_commit FROM publisher_head) = ?
          AND (SELECT workflow_commit FROM publisher_head) = ?
+         AND (SELECT build_config_commit FROM publisher_head) = ?
          AND (SELECT repository_identifier FROM publisher_head) = ?
          AND (SELECT owner_identifier FROM publisher_head) = ?
          AND (SELECT namespace_group FROM publisher_head) = ?
          AND (SELECT namespace_grant_digest FROM publisher_head) = ?
          AND (SELECT trusted_root_digest FROM publisher_head) = ?
          AND (SELECT event_digest FROM checkpoint_head) = ?
+         AND (SELECT checkpoint_api_version FROM checkpoint_head) = ?
          AND (SELECT sequence FROM checkpoint_head) = ?
          AND (SELECT checkpoint_digest FROM checkpoint_head) = ?
          AND (SELECT entries_digest FROM checkpoint_head) = ?
@@ -577,6 +619,7 @@ async function executeInstall(
           formRefKey,
           claims.publisherKey,
           claims.publisherKey,
+          claims.checkpointApiVersion,
           formRefKey,
           claims.packageDigest,
           id,
@@ -594,11 +637,13 @@ async function executeInstall(
           claims.publisherKey,
           claims.publisher.policyDigest,
           claims.policyEventDigest,
+          claims.checkpointApiVersion,
           claims.checkpointSequence,
           claims.checkpointDigest,
           claims.checkpointEventDigest,
           claims.publisher.sourceCommit,
           claims.publisher.workflowCommit,
+          claims.publisher.buildConfigCommit,
           claims.publisher.repositoryIdentifier,
           claims.publisher.ownerIdentifier,
           claims.publisher.group,
@@ -623,12 +668,14 @@ async function executeInstall(
           claims.publisher.identity,
           claims.publisher.sourceCommit,
           claims.publisher.workflowCommit,
+          claims.publisher.buildConfigCommit,
           claims.publisher.repositoryIdentifier,
           claims.publisher.ownerIdentifier,
           claims.publisher.group,
           claims.publisher.namespaceGrantDigest,
           claims.publisher.trustedRootDigest,
           claims.checkpointEventDigest,
+          claims.checkpointApiVersion,
           claims.checkpointSequence,
           claims.checkpointDigest,
           claims.report.revocation.entriesDigest,
@@ -700,16 +747,18 @@ async function executeUninstall(
          (id, form_ref_key, form_ref_json, form_api_version, form_kind,
           form_definition_version, schema_digest, package_digest, event_type,
           replaces_package_digest, admission_report_digest, admission_report_json,
-          publisher_key, policy_digest, policy_event_digest, checkpoint_sequence,
-          checkpoint_digest, checkpoint_event_digest, source_commit, workflow_commit,
+          publisher_key, policy_digest, policy_event_digest, checkpoint_api_version,
+          checkpoint_sequence, checkpoint_digest, checkpoint_event_digest, source_commit, workflow_commit,
+          build_config_commit,
           repository_identifier, owner_identifier, namespace_group,
           namespace_grant_digest, implementation_digest, retention_ref,
           retention_until, actor, reason, event_at, event_digest, predecessor_digest)
        SELECT ?, form_ref_key, form_ref_json, form_api_version, form_kind,
           form_definition_version, schema_digest, package_digest, 'uninstall',
           replaces_package_digest, admission_report_digest, admission_report_json,
-          publisher_key, policy_digest, policy_event_digest, checkpoint_sequence,
-          checkpoint_digest, checkpoint_event_digest, source_commit, workflow_commit,
+          publisher_key, policy_digest, policy_event_digest, checkpoint_api_version,
+          checkpoint_sequence, checkpoint_digest, checkpoint_event_digest, source_commit, workflow_commit,
+          build_config_commit,
           repository_identifier, owner_identifier, namespace_group,
           namespace_grant_digest, implementation_digest, retention_ref,
           retention_until, ?, ?, ?, ?, ?
@@ -825,8 +874,8 @@ async function executePurge(
            (id, form_ref_key, form_ref_json, form_api_version, form_kind,
             form_definition_version, schema_digest, package_digest,
             implementation_digest, publisher_key, policy_digest,
-            policy_event_digest, checkpoint_sequence, checkpoint_digest,
-            checkpoint_event_digest, source_commit, workflow_commit,
+            policy_event_digest, checkpoint_api_version, checkpoint_sequence, checkpoint_digest,
+            checkpoint_event_digest, source_commit, workflow_commit, build_config_commit,
             repository_identifier, owner_identifier, namespace_group,
             namespace_grant_digest, admission_report_digest, admission_report_json,
             retention_ref, retention_until, event_type, source_install_event_digest,
@@ -834,9 +883,10 @@ async function executePurge(
          SELECT ?, source.form_ref_key, source.form_ref_json, source.form_api_version,
             source.form_kind, source.form_definition_version, source.schema_digest,
             source.package_digest, source.implementation_digest, source.publisher_key,
-            source.policy_digest, source.policy_event_digest, source.checkpoint_sequence,
+            source.policy_digest, source.policy_event_digest, source.checkpoint_api_version,
+            source.checkpoint_sequence,
             source.checkpoint_digest, source.checkpoint_event_digest, source.source_commit,
-            source.workflow_commit, source.repository_identifier, source.owner_identifier,
+            source.workflow_commit, source.build_config_commit, source.repository_identifier, source.owner_identifier,
             source.namespace_group, source.namespace_grant_digest,
             source.admission_report_digest, source.admission_report_json,
             source.retention_ref, source.retention_until, 'purge-pending',
@@ -864,9 +914,9 @@ async function executePurge(
            AND NOT EXISTS (SELECT 1 FROM purge_head)
            AND NOT EXISTS (
              SELECT 1 FROM tf_resources AS resource
-             WHERE json_extract(resource.resource_json, '$.form.identity.packageDigest') = source.package_digest
-                OR json_extract(resource.resource_json, '$.form.packageDigest') = source.package_digest
-                OR json_extract(resource.resource_json, '$.packageDigest') = source.package_digest
+             WHERE resource.package_digest = source.package_digest
+                OR (resource.package_digest IS NULL
+                    AND json_extract(resource.resource_json, '$.form.packageDigest') = source.package_digest)
            )
            AND NOT EXISTS (
              SELECT 1 FROM ${SUPPORT_TABLE} AS support
@@ -971,8 +1021,8 @@ async function executePurge(
          (id, form_ref_key, form_ref_json, form_api_version, form_kind,
           form_definition_version, schema_digest, package_digest,
           implementation_digest, publisher_key, policy_digest,
-          policy_event_digest, checkpoint_sequence, checkpoint_digest,
-          checkpoint_event_digest, source_commit, workflow_commit,
+          policy_event_digest, checkpoint_api_version, checkpoint_sequence, checkpoint_digest,
+          checkpoint_event_digest, source_commit, workflow_commit, build_config_commit,
           repository_identifier, owner_identifier, namespace_group,
           namespace_grant_digest, admission_report_digest, admission_report_json,
           retention_ref, retention_until, event_type, source_install_event_digest,
@@ -980,8 +1030,8 @@ async function executePurge(
        SELECT ?, form_ref_key, form_ref_json, form_api_version, form_kind,
           form_definition_version, schema_digest, package_digest,
           implementation_digest, publisher_key, policy_digest,
-          policy_event_digest, checkpoint_sequence, checkpoint_digest,
-          checkpoint_event_digest, source_commit, workflow_commit,
+          policy_event_digest, checkpoint_api_version, checkpoint_sequence, checkpoint_digest,
+          checkpoint_event_digest, source_commit, workflow_commit, build_config_commit,
           repository_identifier, owner_identifier, namespace_group,
           namespace_grant_digest, admission_report_digest, admission_report_json,
           retention_ref, retention_until, 'purged', source_install_event_digest,
@@ -1070,7 +1120,7 @@ async function executeSupport(
   const written = await guarded(
     sql.run(
       `WITH install_head AS (
-         SELECT event_type, package_digest, publisher_key
+         SELECT event_type, package_digest, publisher_key, checkpoint_api_version
          FROM ${INSTALL_TABLE} AS current
          WHERE current.form_ref_key = ?
            AND NOT EXISTS (
@@ -1111,9 +1161,11 @@ async function executeSupport(
          SELECT policy_event_digest, revoked_package_digests_json
          FROM ${CHECKPOINT_TABLE} AS current
          WHERE current.publisher_key = (SELECT publisher_key FROM install_head)
+           AND current.checkpoint_api_version = (SELECT checkpoint_api_version FROM install_head)
            AND NOT EXISTS (
              SELECT 1 FROM ${CHECKPOINT_TABLE} AS successor
              WHERE successor.publisher_key = current.publisher_key
+               AND successor.checkpoint_api_version = current.checkpoint_api_version
                AND successor.predecessor_digest = current.event_digest
            )
          LIMIT 1
@@ -1242,7 +1294,7 @@ async function executeActivation(
   const written = await guarded(
     sql.run(
       `WITH install_head AS (
-         SELECT event_type, package_digest, publisher_key
+         SELECT event_type, package_digest, publisher_key, checkpoint_api_version
          FROM ${INSTALL_TABLE} AS current
          WHERE current.form_ref_key = ?
            AND NOT EXISTS (
@@ -1283,9 +1335,11 @@ async function executeActivation(
          SELECT policy_event_digest, revoked_package_digests_json
          FROM ${CHECKPOINT_TABLE} AS current
          WHERE current.publisher_key = (SELECT publisher_key FROM install_head)
+           AND current.checkpoint_api_version = (SELECT checkpoint_api_version FROM install_head)
            AND NOT EXISTS (
              SELECT 1 FROM ${CHECKPOINT_TABLE} AS successor
              WHERE successor.publisher_key = current.publisher_key
+               AND successor.checkpoint_api_version = current.checkpoint_api_version
                AND successor.predecessor_digest = current.event_digest
            )
          LIMIT 1
@@ -1422,12 +1476,12 @@ async function executeBeginEvacuation(
          AND EXISTS (
            SELECT 1 FROM tf_resources AS resource
            WHERE resource.uid = ?
-             AND json_extract(resource.resource_json, '$.form.identity.formRef.apiVersion') = ?
-             AND json_extract(resource.resource_json, '$.form.identity.formRef.kind') = ?
-             AND json_extract(resource.resource_json, '$.form.identity.formRef.definitionVersion') = ?
-             AND json_extract(resource.resource_json, '$.form.identity.formRef.schemaDigest') = ?
-             AND json_extract(resource.resource_json, '$.form.identity.packageDigest') = ?
-             AND json_extract(resource.resource_json, '$.form.identity.implementationDigest') = ?
+             AND json_extract(resource.resource_json, '$.form.formRef.apiVersion') = ?
+             AND json_extract(resource.resource_json, '$.form.formRef.kind') = ?
+             AND json_extract(resource.resource_json, '$.form.formRef.definitionVersion') = ?
+             AND json_extract(resource.resource_json, '$.form.formRef.schemaDigest') = ?
+             AND resource.package_digest = ?
+             AND resource.implementation_digest = ?
          )
          AND NOT EXISTS (
            SELECT 1 FROM ${EVACUATION_TABLE} WHERE resource_uid = ?
@@ -1687,6 +1741,7 @@ function normalizePublisher(input: AdmissionPublisherPin): AdmissionPublisherPin
     "trustedRootDigest",
     "sourceCommit",
     "workflowCommit",
+    "buildConfigCommit",
     "repositoryIdentifier",
     "ownerIdentifier",
     "group",
@@ -1712,6 +1767,15 @@ function normalizePublisher(input: AdmissionPublisherPin): AdmissionPublisherPin
     }
   }
   if (input.publisherKey !== undefined) requireText(input.publisherKey, "publisher key");
+  for (const [label, commit] of [
+    ["source commit", input.sourceCommit],
+    ["workflow commit", input.workflowCommit],
+    ["build config commit", input.buildConfigCommit],
+  ] as const) {
+    if (!/^[0-9a-f]{40}$/u.test(commit)) {
+      throw new AdmissionError("invalid_command", `${label} must be a raw lowercase Git commit`);
+    }
+  }
   requireText(input.group, "publisher namespace group");
   if (!isFormGroup(input.group)) {
     throw new AdmissionError("invalid_command", "publisher namespace group is invalid");
@@ -1743,11 +1807,13 @@ function installEventMaterial(row: Row): Record<string, unknown> {
     publisherKey: text(row.publisher_key),
     policyDigest: text(row.policy_digest),
     policyEventDigest: text(row.policy_event_digest),
+    checkpointApiVersion: text(row.checkpoint_api_version),
     checkpointSequence: Number(row.checkpoint_sequence),
     checkpointDigest: text(row.checkpoint_digest),
     checkpointEventDigest: text(row.checkpoint_event_digest),
     sourceCommit: text(row.source_commit),
     workflowCommit: text(row.workflow_commit),
+    buildConfigCommit: text(row.build_config_commit),
     repositoryIdentifier: text(row.repository_identifier),
     ownerIdentifier: text(row.owner_identifier),
     namespaceGroup: text(row.namespace_group),
@@ -1768,11 +1834,13 @@ function purgeEventMaterial(row: Row): Record<string, unknown> {
     publisherKey: text(row.publisher_key),
     policyDigest: text(row.policy_digest),
     policyEventDigest: text(row.policy_event_digest),
+    checkpointApiVersion: text(row.checkpoint_api_version),
     checkpointSequence: Number(row.checkpoint_sequence),
     checkpointDigest: text(row.checkpoint_digest),
     checkpointEventDigest: text(row.checkpoint_event_digest),
     sourceCommit: text(row.source_commit),
     workflowCommit: text(row.workflow_commit),
+    buildConfigCommit: text(row.build_config_commit),
     repositoryIdentifier: text(row.repository_identifier),
     ownerIdentifier: text(row.owner_identifier),
     namespaceGroup: text(row.namespace_group),
@@ -1937,6 +2005,30 @@ async function head(sql: Sql, table: string, keyColumn: string, key: string): Pr
      LIMIT 2`,
     [key],
   );
+  return rows[0] ?? null;
+}
+
+async function checkpointHead(
+  sql: Sql,
+  publisherKey: string,
+  checkpointApiVersion: typeof TAKOFORM_REVOCATION_V1 | typeof TAKOFORM_REVOCATION_V1ALPHA1,
+): Promise<Row | null> {
+  const rows = await sql.query(
+    `SELECT * FROM ${CHECKPOINT_TABLE} AS current
+     WHERE current.publisher_key = ?
+       AND current.checkpoint_api_version = ?
+       AND NOT EXISTS (
+         SELECT 1 FROM ${CHECKPOINT_TABLE} AS successor
+         WHERE successor.publisher_key = current.publisher_key
+           AND successor.checkpoint_api_version = current.checkpoint_api_version
+           AND successor.predecessor_digest = current.event_digest
+       )
+     LIMIT 2`,
+    [publisherKey, checkpointApiVersion],
+  );
+  if (rows.length > 1) {
+    throw new AdmissionError("admission_conflict", "checkpoint lane has multiple heads");
+  }
   return rows[0] ?? null;
 }
 

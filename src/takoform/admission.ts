@@ -1,17 +1,31 @@
 import type { TakoformV1Alpha3FormRef } from "../form-ref.ts";
 import { canonicalDigest, canonicalJson, isJsonObject, isSha256Digest } from "../json.ts";
+import {
+  type AdmissionDigest,
+  TAKOFORM_REVOCATION_V1,
+  TAKOFORM_REVOCATION_V1_EMPTY_ENTRIES_DIGEST,
+  TAKOFORM_REVOCATION_V1_GENESIS_DIGEST,
+  TAKOFORM_REVOCATION_V1ALPHA1,
+  type TakoformRevocationCheckpointApiVersion,
+} from "./admission-digest.ts";
 import type { FormPackageInput } from "./form-packages.ts";
 import { formGroupFromApiVersion, isFormGroup, validateFormRef } from "./forms.ts";
 
-export type AdmissionDigest = `sha256:${string}`;
-
-/** The zero predecessor makes the first event in every chain explicit. */
-export const ADMISSION_GENESIS_DIGEST = `sha256:${"0".repeat(64)}` as AdmissionDigest;
+export {
+  ADMISSION_GENESIS_DIGEST,
+  type AdmissionDigest,
+  TAKOFORM_REVOCATION_V1,
+  TAKOFORM_REVOCATION_V1_EMPTY_ENTRIES_DIGEST,
+  TAKOFORM_REVOCATION_V1_GENESIS_DIGEST,
+  TAKOFORM_REVOCATION_V1ALPHA1,
+  type TakoformRevocationCheckpointApiVersion,
+} from "./admission-digest.ts";
 
 /** Exact immutable source identity bound into a publisher policy. */
 export interface AdmissionSourcePin {
   readonly sourceCommit: string;
   readonly workflowCommit: string;
+  readonly buildConfigCommit: string;
   readonly repositoryIdentifier: string;
   readonly ownerIdentifier: string;
 }
@@ -43,6 +57,7 @@ export interface AdmissionSignaturePin {
 }
 
 export interface AdmissionRevocationPin {
+  readonly checkpointApiVersion: TakoformRevocationCheckpointApiVersion;
   readonly sequence: number;
   readonly checkpointDigest: AdmissionDigest;
   readonly entriesDigest: AdmissionDigest;
@@ -87,6 +102,7 @@ export interface AdmissionHandleClaims {
   readonly publisherKey: string;
   readonly publisher: AdmissionPublisherPin;
   readonly policyEventDigest: AdmissionDigest;
+  readonly checkpointApiVersion: TakoformRevocationCheckpointApiVersion;
   readonly checkpointSequence: number;
   readonly checkpointDigest: AdmissionDigest;
   readonly checkpointEventDigest: AdmissionDigest;
@@ -181,12 +197,13 @@ export interface AppendCheckpoint extends AdmissionCommandMetadata {
   readonly kind?: "AppendCheckpoint";
   readonly type?: "AppendCheckpoint";
   readonly publisherKey: string;
+  readonly checkpointApiVersion: TakoformRevocationCheckpointApiVersion;
   readonly policyDigest: AdmissionDigest;
   readonly policyEventDigest: AdmissionDigest;
   readonly sequence: number;
   readonly checkpointDigest: AdmissionDigest;
   readonly entriesDigest: AdmissionDigest;
-  readonly previousCheckpointDigest: AdmissionDigest;
+  readonly previousCheckpointDigest: AdmissionDigest | null;
   readonly revokedPackageDigests?: readonly AdmissionDigest[];
 }
 
@@ -383,6 +400,13 @@ function validateHandleClaims(claims: AdmissionHandleClaims): void {
   validateHandleDigest(claims.policyEventDigest, "policy event digest");
   validateHandleDigest(claims.checkpointDigest, "checkpoint digest");
   validateHandleDigest(claims.checkpointEventDigest, "checkpoint event digest");
+  validateCheckpointPin(
+    claims.checkpointApiVersion,
+    claims.checkpointSequence,
+    claims.checkpointDigest,
+    claims.report?.revocation?.entriesDigest,
+    "invalid_handle",
+  );
   if (!claims.publisher || typeof claims.publisher !== "object") {
     throw new FormAdmissionError("invalid_handle", "publisher claims are missing");
   }
@@ -395,9 +419,6 @@ function validateHandleClaims(claims: AdmissionHandleClaims): void {
     throw new FormAdmissionError("invalid_handle", "incomplete handle claims");
   }
   validateHandlePublisher(claims.publisher, claims.publisherKey);
-  if (claims.checkpointSequence < 1) {
-    throw new FormAdmissionError("invalid_handle", "checkpoint sequence must be positive");
-  }
   try {
     if (!isJsonObject(claims.formRef) || !sameFormRefKeys(claims.formRef)) {
       throw new TypeError("invalid Form identity");
@@ -430,6 +451,7 @@ function validateHandleClaims(claims: AdmissionHandleClaims): void {
       canonicalJson({
         sourceCommit: claims.publisher.sourceCommit,
         workflowCommit: claims.publisher.workflowCommit,
+        buildConfigCommit: claims.publisher.buildConfigCommit,
         repositoryIdentifier: claims.publisher.repositoryIdentifier,
         ownerIdentifier: claims.publisher.ownerIdentifier,
       }) ||
@@ -439,6 +461,7 @@ function validateHandleClaims(claims: AdmissionHandleClaims): void {
         namespaceGrantDigest: claims.publisher.namespaceGrantDigest,
       }) ||
     claims.report.signature.trustedRootDigest !== claims.publisher.trustedRootDigest ||
+    claims.report.revocation?.checkpointApiVersion !== claims.checkpointApiVersion ||
     claims.report.revocation?.sequence !== claims.checkpointSequence ||
     claims.report.revocation?.checkpointDigest !== claims.checkpointDigest
   ) {
@@ -501,6 +524,7 @@ function validateAdmissionReportShape(report: AdmissionReport): void {
   exactKeys(report.source, [
     "sourceCommit",
     "workflowCommit",
+    "buildConfigCommit",
     "repositoryIdentifier",
     "ownerIdentifier",
   ]);
@@ -512,6 +536,7 @@ function validateAdmissionReportShape(report: AdmissionReport): void {
     ...(report.signature.tlogThreshold === undefined ? [] : ["tlogThreshold"]),
   ]);
   exactKeys(report.revocation, [
+    "checkpointApiVersion",
     "sequence",
     "checkpointDigest",
     "entriesDigest",
@@ -544,13 +569,19 @@ function validateAdmissionReportShape(report: AdmissionReport): void {
       (!Number.isSafeInteger(report.signature.tlogThreshold) ||
         report.signature.tlogThreshold < 1)) ||
     !Number.isSafeInteger(report.revocation.sequence) ||
-    report.revocation.sequence < 1 ||
     !isSha256Digest(report.revocation.checkpointDigest) ||
     !isSha256Digest(report.revocation.entriesDigest) ||
     report.revocation.revoked === true
   ) {
     throw new FormAdmissionError("invalid_handle", "handle report pins are invalid");
   }
+  validateCheckpointPin(
+    report.revocation.checkpointApiVersion,
+    report.revocation.sequence,
+    report.revocation.checkpointDigest,
+    report.revocation.entriesDigest,
+    "invalid_handle",
+  );
   for (const [label, value] of Object.entries(report.publisher)) {
     if (typeof value !== "string" || value.length === 0 || value.length > 4_096) {
       throw new FormAdmissionError("invalid_handle", `handle report publisher ${label} is invalid`);
@@ -599,6 +630,7 @@ function validateHandlePublisher(publisher: AdmissionPublisherPin, publisherKey:
     "trustedRootDigest",
     "sourceCommit",
     "workflowCommit",
+    "buildConfigCommit",
     "repositoryIdentifier",
     "ownerIdentifier",
     "group",
@@ -620,6 +652,15 @@ function validateHandlePublisher(publisher: AdmissionPublisherPin, publisherKey:
   if (!isFormGroup(publisher.group)) {
     throw new FormAdmissionError("invalid_handle", "publisher namespace group is invalid");
   }
+  for (const [label, commit] of [
+    ["source commit", publisher.sourceCommit],
+    ["workflow commit", publisher.workflowCommit],
+    ["build config commit", publisher.buildConfigCommit],
+  ] as const) {
+    if (!/^[0-9a-f]{40}$/u.test(commit)) {
+      throw new FormAdmissionError("invalid_handle", `publisher ${label} is invalid`);
+    }
+  }
   if (publisher.policy !== undefined) {
     if (!isJsonObject(publisher.policy)) {
       throw new FormAdmissionError("invalid_handle", "publisher policy claim is not a JSON object");
@@ -633,4 +674,35 @@ function validateHandlePublisher(publisher: AdmissionPublisherPin, publisherKey:
 /** Convenience for adapters to bind a report digest without exposing authority. */
 export async function digestAdmissionReport(report: AdmissionReport): Promise<AdmissionDigest> {
   return canonicalDigest(report);
+}
+
+function validateCheckpointPin(
+  apiVersion: unknown,
+  sequence: unknown,
+  checkpointDigest: unknown,
+  entriesDigest: unknown,
+  code: "invalid_handle" | "invalid_command",
+): void {
+  const fail = (): never => {
+    throw new FormAdmissionError(code, "revocation checkpoint profile is invalid");
+  };
+  if (
+    !Number.isSafeInteger(sequence) ||
+    !isSha256Digest(checkpointDigest) ||
+    !isSha256Digest(entriesDigest)
+  ) {
+    fail();
+  }
+  if (apiVersion === TAKOFORM_REVOCATION_V1ALPHA1) {
+    if ((sequence as number) < 1) fail();
+    return;
+  }
+  if (apiVersion !== TAKOFORM_REVOCATION_V1 || (sequence as number) < 0) fail();
+  if (
+    sequence === 0 &&
+    (checkpointDigest !== TAKOFORM_REVOCATION_V1_GENESIS_DIGEST ||
+      entriesDigest !== TAKOFORM_REVOCATION_V1_EMPTY_ENTRIES_DIGEST)
+  ) {
+    fail();
+  }
 }

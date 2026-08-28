@@ -24,7 +24,7 @@ import {
 } from "./standalone-provider-composition.ts";
 import { createProductionStandardServiceResolver } from "./standard-service-production.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
-import { stableProductionTakoformCatalog } from "./takoform/stable-production-catalog.ts";
+import { currentTakoformCandidates } from "./takoform/current-candidates.ts";
 import { createJavaScriptWorkerModuleInspector } from "./takoform/worker-module-inspector.ts";
 import { createWorkerdRuntime } from "./workerd-runtime.ts";
 import { createWorkerdSupervisor, findWorkerd } from "./workerd-supervisor.ts";
@@ -168,7 +168,7 @@ const objects = sharedBucket
     : createFileObjectStore({ root: dataRoot });
 const clock = () => new Date();
 const edge = await buildEdgeForms();
-const currentHost = stableProductionTakoformCatalog();
+const currentCandidates = currentTakoformCandidates();
 
 // The provider reads committed bundles through the same artifact store the
 // Host writes them to, so a Worker can only be published from bytes a tenant
@@ -200,7 +200,7 @@ const providerArtifacts = {
 const providerComposition = createStandaloneProviderComposition({
   mode: providerMode,
   edge,
-  stableForms: currentHost.forms,
+  stableForms: currentCandidates.forms,
   dataRoot,
   runtime: createWorkerdRuntime({
     root: dataRoot,
@@ -346,10 +346,10 @@ const app = buildApp({
   ...(process.env.TAKOSERVER_CONSOLE_ORIGIN
     ? { consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN }
     : {}),
-  forms: currentHost.forms,
-  bindings: currentHost.bindings,
-  hostForms: currentHost.forms,
-  hostBindings: currentHost.bindings,
+  forms: currentCandidates.forms,
+  bindings: currentCandidates.bindings,
+  hostForms: currentCandidates.forms,
+  hostBindings: currentCandidates.bindings,
   ...(standardServiceResolver ? { standardServiceResolver } : {}),
   providers,
   providerPacks,

@@ -292,7 +292,8 @@ export function createSponsorshipRoutes(
               },
             }),
           );
-          if (!deleted || deleted.status !== 204) return deleted ?? failure("delete_failed", 409);
+          if (!deleted) return failure("delete_failed", 409);
+          if (deleted.status !== 204) return deleted;
           await options.sql.run(
             "DELETE FROM sponsorship_resources WHERE tenant_ref = ? AND resource_uid = ?",
             [tenantRef, resourceUid],

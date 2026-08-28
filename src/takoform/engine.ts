@@ -2,9 +2,10 @@ import { canonicalDigest, canonicalJson } from "../json.ts";
 import type { Clock, JsonObject } from "../ports.ts";
 import { SqlError } from "../ports.ts";
 import type { TakoformArtifactManifest } from "./artifacts.ts";
-import type { BindingRegistry } from "./bindings.ts";
+import { type BindingRegistry, installedBindings } from "./bindings.ts";
 import { canonicalizeEdgeSpec } from "./edge-semantics.ts";
-import { exactInstalledForm, type FormRegistry, sameFormRef } from "./forms.ts";
+import { exactInstalledForm, type FormRegistry, installedForms, sameFormRef } from "./forms.ts";
+import type { TakoformAuthorityFence, TakoformHostAuthority } from "./host-authority.ts";
 import { PREPARE_TTL_MILLISECONDS, RESOURCE_CLAIM_RESERVATION_TTL_MILLISECONDS } from "./limits.ts";
 import {
   declaredResourceClaims,
@@ -123,6 +124,7 @@ export type EngineMutationCommit =
       readonly replay: StoredReplay;
       readonly providerReceipt?: TakoformDriverReceipt;
       readonly claimKeys?: readonly string[];
+      readonly authorityFence?: TakoformAuthorityFence;
     }
   | {
       readonly kind: "delete";
@@ -133,6 +135,7 @@ export type EngineMutationCommit =
       readonly replayKey: string;
       readonly replay: StoredReplay;
       readonly providerReceipt?: TakoformDriverReceipt;
+      readonly authorityFence?: TakoformAuthorityFence;
     };
 
 export type EngineResult =
@@ -180,6 +183,8 @@ export interface CreateTakoformEngineOptions {
   /** Stable v1 defers mutation-only declared constraints until apply/import. */
   readonly stableReviewConstraintPhases?: boolean;
   readonly availability?: TakoformFormAvailabilityResolver;
+  /** Durable public authority. Omitted only by the historical in-process test harness. */
+  readonly authority?: TakoformHostAuthority;
   /** Every live relation that must be removed before the Resource can be deleted. */
   readonly blockingRelations?: (
     tenantId: string,
@@ -189,6 +194,51 @@ export interface CreateTakoformEngineOptions {
 
 export function createTakoformEngine(options: CreateTakoformEngineOptions): TakoformEngine {
   const { store, forms, bindings, driver, artifacts, clock, randomId } = options;
+
+  type RuntimeRegistry = {
+    readonly forms: FormRegistry;
+    readonly bindings: BindingRegistry;
+  };
+
+  const authorityContext = (context: EngineContext, space: string) => ({
+    tenantId: context.tenantId,
+    principalId: context.principalId,
+    space: spaceId(space),
+  });
+
+  const runtimeRegistry = async (
+    context: EngineContext,
+    space: string,
+  ): Promise<RuntimeRegistry> => {
+    if (!options.authority) return { forms, bindings };
+    const catalog = await options.authority.catalog(authorityContext(context, space));
+    return {
+      forms: installedForms(
+        catalog.forms.map((entry) => entry.form),
+        "forms.takoform.com/v1",
+      ),
+      bindings: installedBindings(catalog.bindings),
+    };
+  };
+
+  const authorizeMutation = async (
+    context: EngineContext,
+    operation: "create" | "update" | "import",
+    space: string,
+    formRef: InstalledTakoformForm["identity"]["formRef"],
+  ): Promise<{ readonly form: InstalledTakoformForm; readonly fence?: TakoformAuthorityFence }> => {
+    if (options.authority) {
+      return options.authority.authorizeMutation({
+        operation,
+        context: authorityContext(context, space),
+        formRef,
+      });
+    }
+    const form = exactInstalledForm(formRef, forms);
+    if (!form) throw new TakoformHostError("form_unknown", 404);
+    await requireExecutable(context, form, operation === "create");
+    return { form: historicalForm(form) };
+  };
 
   const operationId = (): string => `op_${randomId().replace(/[^A-Za-z0-9._-]/gu, "")}`;
 
@@ -211,6 +261,50 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
     }
   };
 
+  const authorizeRetained = async (
+    context: EngineContext,
+    operation: "observe" | "delete" | "evacuate",
+    resource: TakoformStoredResource,
+  ): Promise<{
+    readonly form: InstalledTakoformForm;
+    readonly fence?: TakoformAuthorityFence;
+  }> => {
+    if (options.authority) {
+      return options.authority.authorizeRetained({
+        operation,
+        context: authorityContext(context, resource.metadata.space),
+        resource,
+      });
+    }
+    const form = exactInstalledForm(resource.form.formRef, forms);
+    if (!form) throw new TakoformHostError("form_unknown", 404);
+    await requireExecutable(context, form);
+    return { form: historicalForm(form) };
+  };
+
+  const refreshMutation = async (
+    context: EngineContext,
+    operation: "create" | "update" | "import",
+    space: string,
+    formRef: InstalledTakoformForm["identity"]["formRef"],
+    accepted: { readonly fence?: TakoformAuthorityFence },
+  ): Promise<{ readonly form: InstalledTakoformForm; readonly fence?: TakoformAuthorityFence }> => {
+    const fresh = await authorizeMutation(context, operation, space, formRef);
+    requireSameAuthority(accepted.fence, fresh.fence);
+    return fresh;
+  };
+
+  const refreshRetained = async (
+    context: EngineContext,
+    operation: "observe" | "delete" | "evacuate",
+    resource: TakoformStoredResource,
+    accepted: { readonly fence?: TakoformAuthorityFence },
+  ): Promise<{ readonly form: InstalledTakoformForm; readonly fence?: TakoformAuthorityFence }> => {
+    const fresh = await authorizeRetained(context, operation, resource);
+    requireSameAuthority(accepted.fence, fresh.fence);
+    return fresh;
+  };
+
   const replayKeyFor = (context: EngineContext, space: string, operation: string): string =>
     [context.tenantId, context.principalId, space, operation, idempotencyKey(context.request)].join(
       "\u0000",
@@ -230,25 +324,22 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
     if (manifest.kind !== requirement.kind) throw new TakoformHostError("artifact_invalid", 400);
   };
 
-  const formFromResourceQuery = (
+  const formRefFromResourceQuery = (
     url: URL,
     path: ResourcePath,
-  ): InstalledTakoformForm | undefined => {
+  ): InstalledTakoformForm["identity"]["formRef"] | undefined => {
     if (
       requiredQuery(url, "group") !== path.apiVersion ||
       requiredQuery(url, "kind") !== path.kind
     ) {
       return undefined;
     }
-    return exactInstalledForm(
-      {
-        apiVersion: path.apiVersion,
-        kind: path.kind,
-        definitionVersion: requiredQuery(url, "definitionVersion"),
-        schemaDigest: requiredQuery(url, "schemaDigest"),
-      },
-      forms,
-    );
+    return {
+      apiVersion: path.apiVersion,
+      kind: path.kind,
+      definitionVersion: requiredQuery(url, "definitionVersion"),
+      schemaDigest: requiredQuery(url, "schemaDigest") as `sha256:${string}`,
+    };
   };
 
   const addressOf = (tenantId: string, resource: ParsedResource): ResourceAddress => ({
@@ -334,6 +425,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       readonly operationId: string;
       readonly claimKeys: readonly string[];
     },
+    authorityFence?: TakoformAuthorityFence,
   ): Promise<void> => {
     const written = await store.writeResource({
       address,
@@ -341,6 +433,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       relations,
       expectedRevision: previous?.metadata.revision ?? null,
       ...(claimCommit ? { claimCommit } : {}),
+      ...(authorityFence ? { authorityFence } : {}),
     });
     if (!written) throw new TakoformHostError("resource_busy", 409);
   };
@@ -383,7 +476,8 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
   return {
     async validateOrPrepare(context, mode): Promise<EngineResult> {
       const parsed = resourceRequest(await jsonBody(context.request));
-      const form = exactInstalledForm(parsed.form.formRef, forms);
+      const runtime = await runtimeRegistry(context, parsed.metadata.space);
+      let form = exactInstalledForm(parsed.form.formRef, runtime.forms);
       if (!form) throw new TakoformHostError("form_unknown", 404);
       await requireExecutable(context, form);
       const requestResource: ParsedResource = {
@@ -422,8 +516,8 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               space: requestResource.metadata.space,
               form,
               spec: requestResource.spec,
-              forms,
-              bindings,
+              forms: runtime.forms,
+              bindings: runtime.bindings,
               store,
             });
             await validateDeclaredConstraints({
@@ -433,7 +527,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               form,
               spec: requestResource.spec,
               relations,
-              forms,
+              forms: runtime.forms,
               store,
               ...(options.stableReviewConstraintPhases ? { resolvedUidOnly: true } : {}),
             });
@@ -481,7 +575,13 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       if (!current && expectedGeneration !== undefined) {
         throw new TakoformHostError("resource_not_found", 404);
       }
-      if (!current) await requireExecutable(context, form, true);
+      const authority = await authorizeMutation(
+        context,
+        current ? "update" : "create",
+        requestResource.metadata.space,
+        form.identity.formRef,
+      );
+      form = authority.form;
 
       const specDigest = await canonicalDigest(requestResource.spec);
       const prepareDigest = await canonicalDigest({
@@ -489,12 +589,14 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         resource: requestResource,
         expectedGeneration: expectedGeneration ?? null,
         currentUid: current?.metadata.uid ?? null,
+        authorityHeadDigest: authority.fence?.headDigest ?? null,
       });
       await store.putPrepare(
         context.tenantId,
         prepareDigest,
         {
           fingerprint: canonicalJson(requestResource),
+          ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
           ...(expectedGeneration === undefined ? {} : { expectedGeneration }),
           ...(current ? { currentUid: current.metadata.uid } : {}),
         },
@@ -512,14 +614,14 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
 
     async read(context, path): Promise<EngineResult> {
       exactQuery(context.url, ["space", "group", "kind", "definitionVersion", "schemaDigest"]);
-      const form = formFromResourceQuery(context.url, path);
-      if (!form) throw new TakoformHostError("form_unknown", 404);
-      await requireExecutable(context, form);
       const address = addressFromParts(context.tenantId, requiredQuery(context.url, "space"), path);
       let resource = await store.readResource(address);
-      if (!resource || !sameFormRef(resource.form.formRef, form.identity.formRef)) {
+      const queriedFormRef = formRefFromResourceQuery(context.url, path);
+      if (!resource || !queriedFormRef || !sameFormRef(resource.form.formRef, queriedFormRef)) {
         throw new TakoformHostError("resource_not_found", 404);
       }
+      const authority = await authorizeRetained(context, "observe", resource);
+      const form = authority.form;
       if (
         context.expectedResourceUid !== undefined &&
         resource.metadata.uid !== context.expectedResourceUid
@@ -561,7 +663,8 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         clock,
       );
       if (rendered.metadata.revision !== resource.metadata.revision) {
-        await commit(address, rendered, resource, relations);
+        const fresh = await refreshRetained(context, "observe", resource, authority);
+        await commit(address, rendered, resource, relations, undefined, fresh.fence);
         resource = rendered;
       }
       return { kind: "resource", resource, status: 200 };
@@ -570,7 +673,8 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
     async apply(context, path): Promise<EngineResult> {
       const rawBodyDigest = await requestBodyDigest(context.request);
       const parsedBody = applyRequest(await jsonBody(context.request));
-      const form = exactInstalledForm(parsedBody.form.formRef, forms);
+      const runtime = await runtimeRegistry(context, parsedBody.metadata.space);
+      let form = exactInstalledForm(parsedBody.form.formRef, runtime.forms);
       if (!form || !samePathResource(parsedBody, path)) {
         throw new TakoformHostError("form_unknown", 404);
       }
@@ -629,7 +733,13 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       }
 
       const create = current === null;
-      if (create) await requireExecutable(context, form, true);
+      const authority = await authorizeMutation(
+        context,
+        create ? "create" : "update",
+        body.metadata.space,
+        form.identity.formRef,
+      );
+      form = authority.form;
       const createIntent = context.request.headers.get("if-none-match") === "*";
       const generationHeader = context.request.headers.get("takoform-expected-generation");
       if (
@@ -679,7 +789,8 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         !review ||
         review.fingerprint !== canonicalJson(stripApplyReview(body)) ||
         review.expectedGeneration !== (current?.metadata.generation ?? undefined) ||
-        review.currentUid !== (current?.metadata.uid ?? undefined)
+        review.currentUid !== (current?.metadata.uid ?? undefined) ||
+        review.authorityHeadDigest !== authority.fence?.headDigest
       ) {
         throw new TakoformHostError();
       }
@@ -753,10 +864,26 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             relations: currentRelations,
             replayKey,
             replay: replayRecord,
+            ...(authority.fence ? { authorityFence: authority.fence } : {}),
           });
         } else {
-          await recordOperationFor(context.tenantId)(noOpId, "update", current);
-          await store.putReplay(replayKey, replayRecord);
+          await store.commitImmediateMutation({
+            tenantId: context.tenantId,
+            operationId: noOpId,
+            operation: "update",
+            createdAt: clock().toISOString(),
+            mutation: {
+              kind: "write",
+              resourceUid: current.metadata.uid,
+              address,
+              expectedRevision: current.metadata.revision,
+              resource: current,
+              relations: currentRelations,
+              replayKey,
+              replay: replayRecord,
+              ...(authority.fence ? { authorityFence: authority.fence } : {}),
+            },
+          });
         }
         return { kind: "resource", resource: current, status: 200 };
       }
@@ -777,8 +904,8 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         space: body.metadata.space,
         form,
         spec: body.spec,
-        forms,
-        bindings,
+        forms: runtime.forms,
+        bindings: runtime.bindings,
         store,
       });
       await validateDeclaredConstraints({
@@ -788,7 +915,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         form,
         spec: body.spec,
         relations,
-        forms,
+        forms: runtime.forms,
         store,
       });
       await validateWorkerAggregate({
@@ -829,6 +956,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         tenantId: context.tenantId,
         fingerprint,
         resourceUid: proposedResourceUid,
+        ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
         target: address,
         ...(current
           ? {
@@ -862,30 +990,68 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         });
         throw error;
       }
-      await applySqliteMigrationApplication({
-        tenantId: context.tenantId,
-        space: body.metadata.space,
-        form,
-        relations,
-        store,
-        artifacts,
-        driver,
-      });
-
-      if (create) await context.beforeCreate?.();
-      const standardServices = await resolveStandardServiceSlots({
-        tenantId: context.tenantId,
-        space: body.metadata.space,
-        form,
-        spec: body.spec,
-        ...(options.standardServiceResolver ? { resolver: options.standardServiceResolver } : {}),
-        project: true,
-      });
+      let standardServices: Awaited<ReturnType<typeof resolveStandardServiceSlots>>;
+      try {
+        await applySqliteMigrationApplication({
+          tenantId: context.tenantId,
+          space: body.metadata.space,
+          form,
+          relations,
+          store,
+          artifacts,
+          driver,
+          ...(authority.fence
+            ? {
+                beforeSideEffect: async () => {
+                  await refreshMutation(
+                    context,
+                    create ? "create" : "update",
+                    body.metadata.space,
+                    form.identity.formRef,
+                    authority,
+                  );
+                },
+              }
+            : {}),
+        });
+        if (create) await context.beforeCreate?.();
+        standardServices = await resolveStandardServiceSlots({
+          tenantId: context.tenantId,
+          space: body.metadata.space,
+          form,
+          spec: body.spec,
+          ...(options.standardServiceResolver ? { resolver: options.standardServiceResolver } : {}),
+          project: true,
+        });
+      } catch (error) {
+        await store.releaseResourceClaims(claimOwnerId);
+        await store.abandonProviderMutationPlan({
+          tenantId: context.tenantId,
+          operationId: opId,
+          replayKey,
+          resourceUid: uid,
+        });
+        throw error;
+      }
       let persisted = false;
       let providerSettled = false;
+      let providerAttempted = false;
       try {
         let receipt = await store.readProviderMutationReceipt(context.tenantId, opId, uid);
         if (!receipt) {
+          const driverInputRelations = await driverRelations(
+            context.tenantId,
+            body.metadata.space,
+            relations,
+          );
+          await refreshMutation(
+            context,
+            create ? "create" : "update",
+            body.metadata.space,
+            form.identity.formRef,
+            authority,
+          );
+          providerAttempted = true;
           receipt = await driver.apply({
             operationId: opId,
             tenantId: context.tenantId,
@@ -894,7 +1060,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             name: body.metadata.name,
             space: body.metadata.space,
             spec: structuredClone(body.spec),
-            relations: await driverRelations(context.tenantId, body.metadata.space, relations),
+            relations: driverInputRelations,
             atomicDeploymentCommit: true,
             ...(context.commercialAuthority
               ? { commercialAuthority: context.commercialAuthority }
@@ -912,6 +1078,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           resourceUid: uid,
           receipt,
           claimOwnerId,
+          ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
         });
         providerSettled = true;
         const materialized = materializeResource(body, form, receipt, current, clock, uid);
@@ -957,6 +1124,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             replay: replayRecord,
             providerReceipt: receipt,
             claimKeys,
+            ...(authority.fence ? { authorityFence: authority.fence } : {}),
           });
           persisted = true;
         } else {
@@ -976,27 +1144,38 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               replay: replayRecord,
               providerReceipt: receipt,
               ...(claimKeys.length > 0 ? { claimKeys } : {}),
+              ...(authority.fence ? { authorityFence: authority.fence } : {}),
             },
           });
           persisted = true;
         }
         return { kind: "resource", resource: next, status };
       } catch (error) {
-        if (!persisted && !providerSettled) await store.releaseResourceClaims(claimOwnerId);
+        if (!persisted && !providerSettled) {
+          await store.releaseResourceClaims(claimOwnerId);
+          if (!providerAttempted) {
+            await store.abandonProviderMutationPlan({
+              tenantId: context.tenantId,
+              operationId: opId,
+              replayKey,
+              resourceUid: uid,
+            });
+          }
+        }
         throw error;
       }
     },
 
     async observe(context, path): Promise<EngineResult> {
       exactQuery(context.url, ["space", "group", "kind", "definitionVersion", "schemaDigest"]);
-      const form = formFromResourceQuery(context.url, path);
-      if (!form) throw new TakoformHostError("form_unknown", 404);
-      await requireExecutable(context, form);
       const address = addressFromParts(context.tenantId, requiredQuery(context.url, "space"), path);
       const current = await store.readResource(address);
-      if (!current || !sameFormRef(current.form.formRef, form.identity.formRef)) {
+      const queriedFormRef = formRefFromResourceQuery(context.url, path);
+      if (!current || !queriedFormRef || !sameFormRef(current.form.formRef, queriedFormRef)) {
         throw new TakoformHostError("resource_not_found", 404);
       }
+      const authority = await authorizeRetained(context, "observe", current);
+      const form = authority.form;
       if (
         context.expectedResourceUid !== undefined &&
         current.metadata.uid !== context.expectedResourceUid
@@ -1020,11 +1199,17 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
 
       const relations = await store.readRelations(address);
       const observeId = operationId();
+      const providerRelations = await driverRelations(
+        context.tenantId,
+        current.metadata.space,
+        relations,
+      );
+      const fresh = await refreshRetained(context, "observe", current, authority);
       const receipt = await driver.observe({
         tenantId: context.tenantId,
         resourceUid: current.metadata.uid,
         resource: structuredClone(current),
-        relations: await driverRelations(context.tenantId, current.metadata.space, relations),
+        relations: providerRelations,
       });
       const observed = withObservation(current, form, receipt);
       const drift = await relationDrift({
@@ -1057,7 +1242,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         drift ?? migrationCondition ?? workerCondition,
         clock,
       );
-      await commit(address, next, current, relations);
+      await commit(address, next, current, relations, undefined, fresh.fence);
       await recordOperationFor(context.tenantId)(observeId, "observe", next);
       await store.putReplay(replayKey, {
         fingerprint,
@@ -1071,7 +1256,8 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
     async importResource(context, path): Promise<EngineResult> {
       const rawBodyDigest = await requestBodyDigest(context.request);
       const parsedBody = importRequest(await jsonBody(context.request));
-      const form = exactInstalledForm(parsedBody.form.formRef, forms);
+      const runtime = await runtimeRegistry(context, parsedBody.metadata.space);
+      let form = exactInstalledForm(parsedBody.form.formRef, runtime.forms);
       if (!form || !samePathResource(parsedBody, path)) {
         throw new TakoformHostError("form_unknown", 404);
       }
@@ -1098,6 +1284,13 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       if (current && !sameFormRef(current.form.formRef, form.identity.formRef)) {
         throw new TakoformHostError("resource_not_found", 404);
       }
+      const authority = await authorizeMutation(
+        context,
+        "import",
+        body.metadata.space,
+        form.identity.formRef,
+      );
+      form = authority.form;
       await requireArtifact(form, body.spec, context.tenantId);
       await validateWorkerBundleRuntime({
         tenantId: context.tenantId,
@@ -1125,7 +1318,6 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       }
 
       const create = current === null;
-      if (create) await requireExecutable(context, form, true);
       if (create && context.request.headers.get("if-none-match") !== "*") {
         if (context.request.headers.has("takoform-expected-generation")) {
           throw new TakoformHostError("resource_not_found", 404);
@@ -1149,8 +1341,8 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         space: body.metadata.space,
         form,
         spec: body.spec,
-        forms,
-        bindings,
+        forms: runtime.forms,
+        bindings: runtime.bindings,
         store,
       });
       await validateDeclaredConstraints({
@@ -1160,7 +1352,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         form,
         spec: body.spec,
         relations,
-        forms,
+        forms: runtime.forms,
         store,
       });
       await validateWorkerAggregate({
@@ -1201,6 +1393,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         tenantId: context.tenantId,
         fingerprint,
         resourceUid: proposedResourceUid,
+        ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
         target: address,
         ...(current
           ? {
@@ -1234,29 +1427,67 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         });
         throw error;
       }
-      await applySqliteMigrationApplication({
-        tenantId: context.tenantId,
-        space: body.metadata.space,
-        form,
-        relations,
-        store,
-        artifacts,
-        driver,
-      });
-
-      const standardServices = await resolveStandardServiceSlots({
-        tenantId: context.tenantId,
-        space: body.metadata.space,
-        form,
-        spec: body.spec,
-        ...(options.standardServiceResolver ? { resolver: options.standardServiceResolver } : {}),
-        project: true,
-      });
+      let standardServices: Awaited<ReturnType<typeof resolveStandardServiceSlots>>;
+      try {
+        await applySqliteMigrationApplication({
+          tenantId: context.tenantId,
+          space: body.metadata.space,
+          form,
+          relations,
+          store,
+          artifacts,
+          driver,
+          ...(authority.fence
+            ? {
+                beforeSideEffect: async () => {
+                  await refreshMutation(
+                    context,
+                    "import",
+                    body.metadata.space,
+                    form.identity.formRef,
+                    authority,
+                  );
+                },
+              }
+            : {}),
+        });
+        standardServices = await resolveStandardServiceSlots({
+          tenantId: context.tenantId,
+          space: body.metadata.space,
+          form,
+          spec: body.spec,
+          ...(options.standardServiceResolver ? { resolver: options.standardServiceResolver } : {}),
+          project: true,
+        });
+      } catch (error) {
+        await store.releaseResourceClaims(claimOwnerId);
+        await store.abandonProviderMutationPlan({
+          tenantId: context.tenantId,
+          operationId: importId,
+          replayKey,
+          resourceUid: uid,
+        });
+        throw error;
+      }
       let persisted = false;
       let providerSettled = false;
+      let providerAttempted = false;
       try {
         let receipt = await store.readProviderMutationReceipt(context.tenantId, importId, uid);
         if (!receipt) {
+          const providerRelations = await driverRelations(
+            context.tenantId,
+            body.metadata.space,
+            relations,
+          );
+          await refreshMutation(
+            context,
+            "import",
+            body.metadata.space,
+            form.identity.formRef,
+            authority,
+          );
+          providerAttempted = true;
           receipt = await driver.import({
             operationId: importId,
             tenantId: context.tenantId,
@@ -1266,7 +1497,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             space: body.metadata.space,
             spec: structuredClone(body.spec),
             nativeId: body.nativeId,
-            relations: await driverRelations(context.tenantId, body.metadata.space, relations),
+            relations: providerRelations,
             atomicDeploymentCommit: true,
             ...(standardServices.length > 0 ? { standardServices } : {}),
             ...(current ? { previous: structuredClone(current) } : {}),
@@ -1278,6 +1509,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           resourceUid: uid,
           receipt,
           claimOwnerId,
+          ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
         });
         providerSettled = true;
         const materialized = materializeResource(body, form, receipt, current, clock, uid);
@@ -1323,6 +1555,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             replay: replayRecord,
             providerReceipt: receipt,
             claimKeys,
+            ...(authority.fence ? { authorityFence: authority.fence } : {}),
           });
           persisted = true;
         } else {
@@ -1342,6 +1575,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               replay: replayRecord,
               providerReceipt: receipt,
               ...(claimKeys.length > 0 ? { claimKeys } : {}),
+              ...(authority.fence ? { authorityFence: authority.fence } : {}),
             },
           });
           persisted = true;
@@ -1350,7 +1584,10 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       } catch (error) {
         if (!persisted && !providerSettled) {
           await store.releaseResourceClaims(claimOwnerId);
-          if (error instanceof TakoformHostError && error.code === "import_conflict") {
+          if (
+            !providerAttempted ||
+            (error instanceof TakoformHostError && error.code === "import_conflict")
+          ) {
             await store.abandonProviderMutationPlan({
               tenantId: context.tenantId,
               operationId: importId,
@@ -1365,9 +1602,6 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
 
     async remove(context, path): Promise<EngineResult> {
       exactQuery(context.url, ["space", "group", "kind", "definitionVersion", "schemaDigest"]);
-      const form = formFromResourceQuery(context.url, path);
-      if (!form) throw new TakoformHostError("form_unknown", 404);
-      await requireExecutable(context, form);
       const space = requiredQuery(context.url, "space");
       const address = addressFromParts(context.tenantId, space, path);
       const expected = requiredExpectedGeneration(context.request);
@@ -1384,9 +1618,12 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         if (replay.fingerprint !== fingerprint) throw new TakoformHostError();
         return { kind: "deleted" };
       }
-      if (!current || !sameFormRef(current.form.formRef, form.identity.formRef)) {
+      const queriedFormRef = formRefFromResourceQuery(context.url, path);
+      if (!current || !queriedFormRef || !sameFormRef(current.form.formRef, queriedFormRef)) {
         throw new TakoformHostError("resource_not_found", 404);
       }
+      let authority = await authorizeRetained(context, "delete", current);
+      const form = authority.form;
       if (
         context.expectedResourceUid !== undefined &&
         current.metadata.uid !== context.expectedResourceUid
@@ -1412,8 +1649,10 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           });
       const rendered = withDerivedRendering(current, drift ?? workerCondition, clock);
       if (rendered.metadata.revision !== current.metadata.revision) {
-        await commit(address, rendered, current, currentRelations);
+        const fresh = await refreshRetained(context, "delete", current, authority);
+        await commit(address, rendered, current, currentRelations, undefined, fresh.fence);
         current = rendered;
+        authority = await authorizeRetained(context, "delete", current);
       }
       if (expected !== current.metadata.generation) {
         throw new TakoformHostError("generation_conflict", 412);
@@ -1447,6 +1686,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         acceptedUid: current.metadata.uid,
         acceptedGeneration: current.metadata.generation,
         acceptedRevision: current.metadata.revision,
+        ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
       });
       const deleteId = saga.operationId;
       let receipt = await store.readProviderMutationReceipt(
@@ -1455,17 +1695,29 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         current.metadata.uid,
       );
       if (!receipt) {
+        const providerRelations = await driverRelations(
+          context.tenantId,
+          current.metadata.space,
+          currentRelations,
+        );
+        try {
+          await refreshRetained(context, "delete", current, authority);
+        } catch (error) {
+          await store.abandonProviderMutationPlan({
+            tenantId: context.tenantId,
+            operationId: deleteId,
+            replayKey,
+            resourceUid: current.metadata.uid,
+          });
+          throw error;
+        }
         receipt =
           (await driver.delete({
             operationId: deleteId,
             tenantId: context.tenantId,
             resourceUid: current.metadata.uid,
             resource: structuredClone(current),
-            relations: await driverRelations(
-              context.tenantId,
-              current.metadata.space,
-              currentRelations,
-            ),
+            relations: providerRelations,
             atomicDeploymentCommit: true,
           })) ?? {};
         await store.recordProviderMutationReceipt({
@@ -1473,6 +1725,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           operationId: deleteId,
           resourceUid: current.metadata.uid,
           receipt,
+          ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
         });
       }
       const replayRecord: StoredReplay = { fingerprint, status: 204 };
@@ -1486,6 +1739,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           replayKey,
           replay: replayRecord,
           providerReceipt: receipt,
+          ...(authority.fence ? { authorityFence: authority.fence } : {}),
         });
       } else {
         await store.commitImmediateMutation({
@@ -1501,11 +1755,45 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             replayKey,
             replay: replayRecord,
             providerReceipt: receipt,
+            ...(authority.fence ? { authorityFence: authority.fence } : {}),
           },
         });
       }
       return { kind: "deleted" };
     },
+  };
+}
+
+function requireSameAuthority(
+  accepted: TakoformAuthorityFence | undefined,
+  fresh: TakoformAuthorityFence | undefined,
+): void {
+  if (accepted === undefined && fresh === undefined) return;
+  if (
+    accepted === undefined ||
+    fresh === undefined ||
+    accepted.headDigest !== fresh.headDigest ||
+    canonicalJson(accepted) !== canonicalJson(fresh)
+  ) {
+    throw new TakoformHostError("form_unavailable", 503);
+  }
+}
+
+/** Keeps the historical test harness from partially persisting an authority identity. */
+function historicalForm(form: InstalledTakoformForm): InstalledTakoformForm {
+  const packageDigest = form.identity.packageDigest;
+  const implementationDigest = form.identity.implementationDigest;
+  if (
+    typeof packageDigest === "string" &&
+    /^sha256:[0-9a-f]{64}$/u.test(packageDigest) &&
+    typeof implementationDigest === "string" &&
+    /^sha256:[0-9a-f]{64}$/u.test(implementationDigest)
+  ) {
+    return form;
+  }
+  return {
+    ...structuredClone(form),
+    identity: { formRef: structuredClone(form.identity.formRef) },
   };
 }
 

@@ -125,8 +125,10 @@ export function packageManifest(input: {
 export function createFormPackageStore(objects: ObjectStore): FormPackageStore {
   if (
     !objects ||
+    typeof objects.create !== "function" ||
     typeof objects.put !== "function" ||
     typeof objects.get !== "function" ||
+    typeof objects.head !== "function" ||
     typeof objects.list !== "function" ||
     typeof objects.delete !== "function"
   ) {
@@ -150,39 +152,40 @@ export function createFormPackageStore(objects: ObjectStore): FormPackageStore {
       }
 
       const prefix = formPackagePrefix(input.packageDigest);
+      const indexKey = `${prefix}/package-index.json`;
       const indexBytes = new TextEncoder().encode(canonicalJson(manifest));
-      await objects.put(`${prefix}/package-index.json`, indexBytes, {
-        contentType: "application/json",
-      });
-      for (const file of normal.files) {
-        await objects.put(formPackageKey(input.packageDigest, file.path), file.bytes, {
-          ...(file.mediaType === undefined ? {} : { contentType: file.mediaType }),
-        });
+
+      // The index is the package visibility point. If it already exists, this
+      // import is an exact-existing read only; a malformed or different prefix
+      // is never repaired by overwriting it.
+      if (await objects.head(indexKey)) {
+        return exactReadback(
+          await readPackage(objects, input.packageDigest, input.formRef),
+          manifest,
+          normal.files,
+        );
       }
+
+      // Payloads are created first, then the canonical index publishes the
+      // complete prefix. Concurrent identical imports converge through the
+      // exact-existing branch; a different existing byte fails closed.
+      for (const file of normal.files) {
+        await createExactObject(
+          objects,
+          formPackageKey(input.packageDigest, file.path),
+          file.bytes,
+          file.mediaType,
+        );
+      }
+      await createExactObject(objects, indexKey, indexBytes, "application/json");
 
       // The write is not an install.  It becomes usable only after the full
       // readback below verifies the index and every payload digest.
-      const readback = await readPackage(objects, input.packageDigest, input.formRef);
-      if (!readback) {
-        throw new FormPackageError("package_readback_mismatch", "package index disappeared");
-      }
-      if (readback.files.length !== normal.files.length) {
-        throw new FormPackageError("package_readback_mismatch", "package file count changed");
-      }
-      for (let index = 0; index < normal.files.length; index += 1) {
-        const expected = normal.files[index];
-        const actual = readback.files[index];
-        if (
-          !actual ||
-          actual.path !== expected?.path ||
-          actual.digest !== expected?.digest ||
-          actual.size !== expected?.size ||
-          !sameBytes(actual.bytes, expected.bytes)
-        ) {
-          throw new FormPackageError("package_readback_mismatch", "package payload changed");
-        }
-      }
-      return readback;
+      return exactReadback(
+        await readPackage(objects, input.packageDigest, input.formRef),
+        manifest,
+        normal.files,
+      );
     },
 
     async read(input): Promise<StoredFormPackage | null> {
@@ -202,6 +205,59 @@ export function createFormPackageStore(objects: ObjectStore): FormPackageStore {
       } while (cursor !== undefined);
     },
   };
+}
+
+async function createExactObject(
+  objects: ObjectStore,
+  key: string,
+  bytes: Uint8Array,
+  contentType?: string,
+): Promise<void> {
+  const created = await objects.create(key, bytes, {
+    ...(contentType === undefined ? {} : { contentType }),
+  });
+  if (created) return;
+  const existing = await objects.get(key);
+  if (!existing) {
+    throw new FormPackageError(
+      "package_readback_mismatch",
+      "create-only package object disappeared",
+    );
+  }
+  const existingBytes = new Uint8Array(await new Response(existing.body).arrayBuffer());
+  if (!sameBytes(existingBytes, bytes)) {
+    throw new FormPackageError(
+      "package_readback_mismatch",
+      "existing package object has different bytes",
+    );
+  }
+}
+
+function exactReadback(
+  readback: StoredFormPackage | null,
+  manifest: JsonObject,
+  files: readonly FormPackageFile[],
+): StoredFormPackage {
+  if (!readback || canonicalJson(readback.manifest) !== canonicalJson(manifest)) {
+    throw new FormPackageError("package_readback_mismatch", "package index changed");
+  }
+  if (readback.files.length !== files.length) {
+    throw new FormPackageError("package_readback_mismatch", "package file count changed");
+  }
+  for (let index = 0; index < files.length; index += 1) {
+    const expected = files[index];
+    const actual = readback.files[index];
+    if (
+      !actual ||
+      actual.path !== expected?.path ||
+      actual.digest !== expected?.digest ||
+      actual.size !== expected?.size ||
+      !sameBytes(actual.bytes, expected.bytes)
+    ) {
+      throw new FormPackageError("package_readback_mismatch", "package payload changed");
+    }
+  }
+  return readback;
 }
 
 async function materialize(input: FormPackageInput): Promise<{

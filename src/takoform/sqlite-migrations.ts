@@ -24,6 +24,8 @@ interface MigrationContext {
   readonly store: Pick<TakoformStore, "readResource">;
   readonly artifacts: ArtifactResolver;
   readonly driver: TakoformResourceDriver;
+  /** Fresh Host admission check immediately before the target DB is changed. */
+  readonly beforeSideEffect?: () => Promise<void>;
 }
 
 interface MigrationPlan {
@@ -54,6 +56,7 @@ export async function applySqliteMigrationApplication(input: MigrationContext): 
     migrations.push({ ...migration, sql });
   }
   if (migrations.length > 0) {
+    await input.beforeSideEffect?.();
     await executor.applySuffix({
       tenantId: input.tenantId,
       database: plan.database,

@@ -4,6 +4,7 @@ import { installedBindings } from "./bindings.ts";
 import type { WorkerModuleInspector } from "./engine.ts";
 import { createTakoformEngine } from "./engine.ts";
 import { installedForms } from "./forms.ts";
+import type { TakoformHostAuthority } from "./host-authority.ts";
 import { createDeferredOperations, type DeferredOperationsConfiguration } from "./operations.ts";
 import {
   createTakoformRoutes,
@@ -45,6 +46,8 @@ export interface CreateTakoformHostOptions {
   readonly standardServiceResolver?: TakoformStandardServiceResolver;
   /** Runtime/activation truth for exact installed Definitions. Defaults to fully available. */
   readonly availability?: TakoformFormAvailabilityResolver;
+  /** Durable public authority. Static composition exists only under tests/helpers. */
+  readonly authority: TakoformHostAuthority;
   /** When present, the single-use provision-token redemption lane is served. */
   readonly provision?: ProvisionLanePorts;
   readonly blockingRelations?: (
@@ -90,6 +93,7 @@ export function createTakoformHost(options: CreateTakoformHostOptions): Takoform
       ? { standardServiceResolver: options.standardServiceResolver }
       : {}),
     ...(options.availability ? { availability: options.availability } : {}),
+    authority: options.authority,
   });
   const deferredOperations = options.deferredOperations
     ? createDeferredOperations({
@@ -97,6 +101,7 @@ export function createTakoformHost(options: CreateTakoformHostOptions): Takoform
         engine,
         store,
         forms,
+        authority: options.authority,
         clock,
         randomId,
         ...(routes.omitObservedStatus ? { omitObservedStatus: true } : {}),
@@ -114,6 +119,7 @@ export function createTakoformHost(options: CreateTakoformHostOptions): Takoform
       ? { standardServiceResolver: options.standardServiceResolver }
       : {}),
     ...(options.availability ? { availability: options.availability } : {}),
+    authority: options.authority,
     ...(options.provision ? { provision: options.provision } : {}),
   });
 }

@@ -17,10 +17,11 @@ import { createEphemeralSql } from "../src/compat.ts";
 import { buildEdgeForms } from "../src/edge-forms.ts";
 import { bytesDigest, canonicalDigest } from "../src/json.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
+import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
 import { createFormPackageStore, packageManifest } from "../src/takoform/form-packages.ts";
 import { createTakoformHost } from "../src/takoform/host.ts";
+import { createTakoformHostAuthority } from "../src/takoform/host-authority.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
-import { stableProductionTakoformCatalog } from "../src/takoform/stable-production-catalog.ts";
 
 /**
  * W17 characterization: the current production Host is still assembled from
@@ -93,31 +94,36 @@ async function reachableModules(entrypoints: readonly string[]): Promise<Readonl
   return new Set([...visited].map((path) => relative(repositoryRoot, path)));
 }
 
-test("current executable and discovery Forms use source-pinned and retained catalogs", async () => {
+test("the generated 16-Form corpus is candidate input, never runtime admission", async () => {
   const [appSource, bunEntrySource, workerEntrySource, edge] = await Promise.all([
     source("src/app.ts"),
     source("src/entry-bun.ts"),
     source("src/entry-worker.ts"),
     buildEdgeForms(),
   ]);
-  const stable = stableProductionTakoformCatalog();
+  const candidates = currentTakoformCandidates();
 
   expect(appSource).toMatch(/readonly\s+forms\s*:\s*readonly\s+InstalledTakoformForm\[\]/u);
   expect(appSource).toMatch(/readonly\s+hostForms\s*:\s*readonly\s+InstalledTakoformForm\[\]/u);
   expect(appSource).toMatch(/forms\s*:\s*ports\.hostForms\b/u);
   expect(appSource).toMatch(/forms\s*:\s*ports\.forms\b/u);
+  expect(appSource).toContain("createTakoformHostAuthority");
+  expect(appSource).toMatch(/candidates\s*:\s*ports\.hostForms\b/u);
   expect(bunEntrySource).toMatch(
-    /const\s+currentHost\s*=\s*stableProductionTakoformCatalog\s*\(\s*\)/u,
+    /const\s+currentCandidates\s*=\s*currentTakoformCandidates\s*\(\s*\)/u,
   );
-  expect(bunEntrySource).toMatch(/stableForms\s*:\s*currentHost\.forms\b/u);
-  expect(bunEntrySource).toMatch(/forms\s*:\s*currentHost\.forms\b/u);
-  expect(bunEntrySource).toMatch(/hostForms\s*:\s*currentHost\.forms\b/u);
+  expect(bunEntrySource).toMatch(/stableForms\s*:\s*currentCandidates\.forms\b/u);
+  expect(bunEntrySource).toMatch(/forms\s*:\s*currentCandidates\.forms\b/u);
+  expect(bunEntrySource).toMatch(/hostForms\s*:\s*currentCandidates\.forms\b/u);
   expect(workerEntrySource).toMatch(
-    /const\s+currentHost\s*=\s*stableProductionTakoformCatalog\s*\(\s*\)/u,
+    /const\s+currentCandidates\s*=\s*currentTakoformCandidates\s*\(\s*\)/u,
   );
-  expect(workerEntrySource).toMatch(/forms\s*:\s*currentHost\.forms\b/u);
+  expect(workerEntrySource).toMatch(/forms\s*:\s*currentCandidates\.forms\b/u);
   expect(workerEntrySource).toMatch(/retainedForms\s*:\s*edge\.forms\b/u);
-  expect(workerEntrySource).toMatch(/hostForms\s*:\s*currentHost\.forms\b/u);
+  expect(workerEntrySource).toMatch(/hostForms\s*:\s*currentCandidates\.forms\b/u);
+  expect(bunEntrySource).not.toContain("stableProductionTakoformCatalog");
+  expect(workerEntrySource).not.toContain("stableProductionTakoformCatalog");
+  expect(appSource).not.toContain("stableProductionTakoformCatalog");
 
   // The vendored provider release is retained historical supply. Its beta
   // identity is observable there, but the current stable Host catalog is a
@@ -126,21 +132,28 @@ test("current executable and discovery Forms use source-pinned and retained cata
     true,
   );
   expect(edge.forms.some((form) => form.identity.formRef.kind === "ObjectBucket")).toBe(true);
-  expect(stable.forms.every((form) => form.requiresHostApi === "forms.takoform.com/v1")).toBe(true);
-  expect(stable.forms.some((form) => form.identity.formRef.apiVersion.endsWith("/v1beta1"))).toBe(
+  expect(candidates.forms).toHaveLength(16);
+  expect(new Set(candidates.forms.map((form) => form.identity.formRef.kind)).size).toBe(16);
+  expect(candidates.forms.every((form) => form.requiresHostApi === "forms.takoform.com/v1")).toBe(
+    true,
+  );
+  expect(
+    candidates.forms.some((form) => form.identity.formRef.apiVersion.endsWith("/v1beta1")),
+  ).toBe(false);
+  expect(candidates.forms.some((form) => form.identity.formRef.kind === "ObjectBucket")).toBe(
     false,
   );
-  expect(stable.forms.some((form) => form.identity.formRef.kind === "ObjectBucket")).toBe(false);
 });
 
-test("private admission and package stores remain outside public runtime graphs", async () => {
-  const reachable = await reachableModules([
-    "src/entry-bun.ts",
-    "src/entry-worker.ts",
-    "src/index.ts",
-  ]);
+test("public entries reach the reader but never writer, issuer, or static authority", async () => {
+  const reachable = await reachableModules(["src/entry-bun.ts", "src/entry-worker.ts"]);
+  expect(reachable.has("src/takoform/host-authority.ts")).toBe(true);
+  expect(reachable.has("src/takoform/form-package-reader.ts")).toBe(true);
+  expect(reachable.has("src/takoform/current-candidates.ts")).toBe(true);
   expect(reachable.has("src/takoform/admission-store.ts")).toBe(false);
+  expect(reachable.has("src/takoform/admission.ts")).toBe(false);
   expect(reachable.has("src/takoform/form-packages.ts")).toBe(false);
+  expect(reachable.has("src/takoform/stable-production-catalog.ts")).toBe(false);
 });
 
 test("writing a Form Package does not create executable support or activation", async () => {
@@ -168,11 +181,26 @@ test("writing a Form Package does not create executable support or activation", 
   expect(stored.packageDigest).toBe(packageDigest);
   expect(await packages.read({ packageDigest, formRef })).not.toBeNull();
 
+  const candidates = currentTakoformCandidates();
+  const sql = createEphemeralSql();
   const host = createTakoformHost({
-    sql: createEphemeralSql(),
+    sql,
     objects,
     authenticate: async () => ({ tenantId: "tenant-a", principalId: "principal-a" }),
-    forms: [],
+    forms: candidates.forms,
+    bindings: candidates.bindings,
+    authority: createTakoformHostAuthority({
+      sql,
+      objects,
+      hostId: "https://host.invalid",
+      candidates: candidates.forms,
+      bindings: candidates.bindings,
+      technicalAvailability: {
+        async resolve() {
+          return { executable: true, activated: true, availableToPrincipal: true };
+        },
+      },
+    }),
     driver: new InMemoryTakoformResourceDriver(),
   });
   const headers = { authorization: "Bearer characterization" };

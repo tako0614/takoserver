@@ -42,6 +42,12 @@ describe("objects on a disk", () => {
     expect(await new Response(read?.body).text()).toBe("still here");
   });
 
+  test("publishes a complete create-only object without replacing an existing key", async () => {
+    expect(await store.create("immutable", new TextEncoder().encode("first"))).not.toBeNull();
+    expect(await store.create("immutable", new TextEncoder().encode("second"))).toBeNull();
+    expect(await new Response((await store.get("immutable"))?.body).text()).toBe("first");
+  });
+
   test("reports absence rather than inventing an object", async () => {
     expect(await store.get("never")).toBeNull();
     expect(await store.head("never")).toBeNull();

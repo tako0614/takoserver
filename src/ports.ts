@@ -87,6 +87,16 @@ export interface ObjectListPage {
  * implementation.
  */
 export interface ObjectStore {
+  /**
+   * Creates one object only when its key is absent. A null result is the
+   * storage-level exact-existing signal; callers must read and compare before
+   * treating it as success. This is the content-addressed import primitive.
+   */
+  create(
+    key: string,
+    body: ArrayBuffer | Uint8Array | ReadableStream<Uint8Array>,
+    options?: { readonly contentType?: string },
+  ): Promise<StoredObject | null>;
   put(
     key: string,
     body: ArrayBuffer | Uint8Array | ReadableStream<Uint8Array>,

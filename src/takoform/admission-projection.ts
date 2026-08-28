@@ -1,6 +1,13 @@
 import type { TakoformV1Alpha3FormRef } from "../form-ref.ts";
-import type { AdmissionDigest } from "./admission.ts";
-import { validateDigest } from "./admission.ts";
+import {
+  type AdmissionDigest,
+  assertAdmissionDigest,
+  TAKOFORM_REVOCATION_V1,
+  TAKOFORM_REVOCATION_V1_EMPTY_ENTRIES_DIGEST,
+  TAKOFORM_REVOCATION_V1_GENESIS_DIGEST,
+  TAKOFORM_REVOCATION_V1ALPHA1,
+  type TakoformRevocationCheckpointApiVersion,
+} from "./admission-digest.ts";
 import { validateFormRef } from "./forms.ts";
 import type { TakoformOperation } from "./types.ts";
 
@@ -46,10 +53,12 @@ export interface AdmissionProjectionPublisher {
 /** One current or historical revocation checkpoint verification result. */
 export interface AdmissionProjectionCheckpoint {
   readonly publisherKey: string;
+  readonly checkpointApiVersion: TakoformRevocationCheckpointApiVersion;
   readonly policyDigest: AdmissionProjectionDigest;
   readonly policyEventDigest: AdmissionProjectionDigest;
   readonly sequence: number;
   readonly checkpointDigest: AdmissionProjectionDigest;
+  readonly entriesDigest: AdmissionProjectionDigest;
   readonly eventDigest: AdmissionProjectionDigest;
   readonly verified: boolean;
   readonly stale: boolean;
@@ -61,6 +70,7 @@ export interface AdmissionProjectionInstall {
   readonly formRef: TakoformV1Alpha3FormRef;
   readonly packageDigest: AdmissionProjectionDigest;
   readonly publisherKey: string;
+  readonly checkpointApiVersion: TakoformRevocationCheckpointApiVersion;
   readonly eventType: "install" | "replace" | "uninstall";
   readonly implementationDigest?: AdmissionProjectionDigest;
 }
@@ -159,6 +169,7 @@ export type AdmissionProjectionReasonCode =
   | "checkpoint_unverified"
   | "checkpoint_stale"
   | "checkpoint_policy_mismatch"
+  | "checkpoint_profile_mismatch"
   | "checkpoint_sequence_invalid"
   | "checkpoint_revocation_unknown"
   | "package_not_current"
@@ -320,7 +331,7 @@ export function evaluateAdmissionProjection(
     const support = current?.support ?? null;
 
     addPublisherReasons(publisher, install, reasons);
-    addCheckpointReasons(publisher, checkpoint, facts.packageDigest, reasons);
+    addCheckpointReasons(publisher, checkpoint, install, facts.packageDigest, reasons);
     addInstallReasons(
       install,
       facts.formRef,
@@ -861,6 +872,7 @@ function addPublisherReasons(
 function addCheckpointReasons(
   publisher: AdmissionProjectionPublisher | null,
   checkpoint: AdmissionProjectionCheckpoint | null,
+  install: AdmissionProjectionInstall | null,
   packageDigest: AdmissionProjectionDigest | undefined,
   reasons: AdmissionProjectionReason[],
 ): void {
@@ -875,7 +887,7 @@ function addCheckpointReasons(
   if (!validCheckpointFact(rawCheckpoint)) {
     if (isPlainDataObject(rawCheckpoint)) {
       const malformed = rawCheckpoint as unknown as AdmissionProjectionCheckpoint;
-      if (!positiveSequence(malformed.sequence)) {
+      if (!validCheckpointProfile(malformed)) {
         reasons.push({
           code: "checkpoint_sequence_invalid",
           message: "the current revocation checkpoint sequence is invalid",
@@ -904,7 +916,7 @@ function addCheckpointReasons(
       message: "the current revocation checkpoint is stale",
     });
   }
-  if (!positiveSequence(checkpoint.sequence)) {
+  if (!validCheckpointProfile(checkpoint)) {
     reasons.push({
       code: "checkpoint_sequence_invalid",
       message: "the current revocation checkpoint sequence is invalid",
@@ -919,6 +931,16 @@ function addCheckpointReasons(
     reasons.push({
       code: "checkpoint_policy_mismatch",
       message: "the checkpoint is not bound to the current publisher policy head",
+    });
+  }
+  if (
+    install &&
+    validInstallFact(install) &&
+    install.checkpointApiVersion !== checkpoint.checkpointApiVersion
+  ) {
+    reasons.push({
+      code: "checkpoint_profile_mismatch",
+      message: "the install and revocation checkpoint use different trust profiles",
     });
   }
   const revokedPackageDigests = authorityArraySnapshot(checkpoint.revokedPackageDigests);
@@ -1428,10 +1450,6 @@ function boundedResourceUid(value: unknown): value is string {
   return typeof value === "string" && value.length >= 3 && value.length <= MAX_RESOURCE_UID_LENGTH;
 }
 
-function positiveSequence(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1;
-}
-
 /**
  * The projection boundary is a bounded plain-data boundary.  A Host adapter
  * must canonicalize database/JSON values before calling it; accessors and
@@ -1539,7 +1557,7 @@ function validAuthorityArray(
 
 function validDigest(value: unknown): value is AdmissionProjectionDigest {
   try {
-    validateDigest(value);
+    assertAdmissionDigest(value);
     return true;
   } catch {
     return false;
@@ -1582,10 +1600,11 @@ function validCheckpointFact(value: unknown): value is AdmissionProjectionCheckp
   const fact = value as unknown as AdmissionProjectionCheckpoint;
   return (
     boundedText(fact.publisherKey, MAX_IDENTITY_LENGTH) &&
+    validCheckpointProfile(fact) &&
     validDigest(fact.policyDigest) &&
     validDigest(fact.policyEventDigest) &&
-    positiveSequence(fact.sequence) &&
     validDigest(fact.checkpointDigest) &&
+    validDigest(fact.entriesDigest) &&
     validDigest(fact.eventDigest) &&
     typeof fact.verified === "boolean" &&
     typeof fact.stale === "boolean" &&
@@ -1600,10 +1619,36 @@ function validInstallFact(value: unknown): value is AdmissionProjectionInstall {
     validFormRef(fact.formRef) &&
     validDigest(fact.packageDigest) &&
     boundedText(fact.publisherKey, MAX_IDENTITY_LENGTH) &&
+    (fact.checkpointApiVersion === TAKOFORM_REVOCATION_V1 ||
+      fact.checkpointApiVersion === TAKOFORM_REVOCATION_V1ALPHA1) &&
     (fact.eventType === "install" ||
       fact.eventType === "replace" ||
       fact.eventType === "uninstall") &&
     (fact.implementationDigest === undefined || validDigest(fact.implementationDigest))
+  );
+}
+
+function validCheckpointProfile(value: {
+  readonly checkpointApiVersion?: unknown;
+  readonly sequence?: unknown;
+  readonly checkpointDigest?: unknown;
+  readonly entriesDigest?: unknown;
+  readonly revokedPackageDigests?: unknown;
+}): boolean {
+  if (!Number.isSafeInteger(value.sequence)) return false;
+  if (value.checkpointApiVersion === TAKOFORM_REVOCATION_V1ALPHA1) {
+    return (value.sequence as number) >= 1;
+  }
+  if (value.checkpointApiVersion !== TAKOFORM_REVOCATION_V1 || (value.sequence as number) < 0) {
+    return false;
+  }
+  if (value.sequence !== 0) return true;
+  const revoked = authorityArraySnapshot(value.revokedPackageDigests);
+  return (
+    value.checkpointDigest === TAKOFORM_REVOCATION_V1_GENESIS_DIGEST &&
+    value.entriesDigest === TAKOFORM_REVOCATION_V1_EMPTY_ENTRIES_DIGEST &&
+    revoked !== null &&
+    revoked.length === 0
   );
 }
 

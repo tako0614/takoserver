@@ -287,7 +287,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       name: input.identity.name,
     });
     const manifest = await artifacts.manifest(input.identity.tenantRef, manifestDigest);
-    if (!manifest || manifest.kind !== "WorkerBundle" || !manifest.mainModule) {
+    if (!manifest) {
+      return failed("invalid_spec", "the Worker Bundle is not available");
+    }
+    if (manifest.kind !== "WorkerBundle" || !manifest.mainModule) {
       return failed("invalid_spec", "the Worker Bundle is not available");
     }
     const modules = manifest.modules ?? [];
@@ -317,8 +320,11 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           : null;
       if (!assetsDigest) return failed("invalid_spec", "the Static Asset Bundle is unavailable");
       const assetManifest = await artifacts.manifest(input.identity.tenantRef, assetsDigest);
+      if (!assetManifest) {
+        return failed("invalid_spec", "the Static Asset Bundle is unavailable");
+      }
       const files = assetManifest?.files ?? [];
-      if (!assetManifest || assetManifest.kind !== "StaticAssetBundle" || files.length === 0) {
+      if (assetManifest.kind !== "StaticAssetBundle" || files.length === 0) {
         return failed("invalid_spec", "the Static Asset Bundle is unavailable");
       }
       for (const file of files) {

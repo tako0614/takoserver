@@ -35,7 +35,10 @@ export interface R2BucketLike {
   put(
     key: string,
     body: ArrayBuffer | Uint8Array | ReadableStream<Uint8Array>,
-    options?: { readonly httpMetadata?: { readonly contentType?: string } },
+    options?: {
+      readonly httpMetadata?: { readonly contentType?: string };
+      readonly onlyIf?: { readonly etagDoesNotMatch: "*" };
+    },
   ): Promise<R2ObjectLike | null>;
   get(key: string): Promise<R2ObjectBodyLike | null>;
   head(key: string): Promise<R2ObjectLike | null>;
@@ -61,6 +64,15 @@ export function createR2ObjectStore(bucket: R2BucketLike): ObjectStore {
   }
 
   return {
+    async create(key, body, options): Promise<StoredObject | null> {
+      const contentType = options?.contentType;
+      const written = await bucket.put(key, body, {
+        ...(contentType ? { httpMetadata: { contentType } } : {}),
+        onlyIf: { etagDoesNotMatch: "*" },
+      });
+      return written ? described(written) : null;
+    },
+
     async put(key, body, options): Promise<StoredObject> {
       const contentType = options?.contentType;
       const written = await bucket.put(

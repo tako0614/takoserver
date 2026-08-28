@@ -1,12 +1,13 @@
 import { expect, test } from "bun:test";
 
-test("the standalone Bun entry installs the exact stable production Form catalog", async () => {
+test("the standalone Bun entry uses the generated corpus only as current candidates", async () => {
   const source = await Bun.file(new URL("../src/entry-bun.ts", import.meta.url)).text();
 
   expect(source).toContain(
-    'import { stableProductionTakoformCatalog } from "./takoform/stable-production-catalog.ts";',
+    'import { currentTakoformCandidates } from "./takoform/current-candidates.ts";',
   );
-  expect(source).toContain("const currentHost = stableProductionTakoformCatalog();");
+  expect(source).toContain("const currentCandidates = currentTakoformCandidates();");
+  expect(source).not.toContain("stableProductionTakoformCatalog");
   expect(source).not.toContain("currentTakoformCatalog(edge)");
   expect(source).toContain('from "./standalone-provider-composition.ts";');
   expect(source).toContain("createStandaloneProviderComposition");
@@ -22,9 +23,9 @@ test("the standalone Bun entry installs the exact stable production Form catalog
   expect(source).not.toContain("if (process.env.CLOUDFLARE_ACCOUNT_ID) {");
   expect(source).not.toContain("edgeForms: process.env.TAKOSERVER_EDGE_FORMS");
   expect(source).not.toContain("JSON.parse(process.env.TAKOSERVER_ZONES");
-  expect(source).toContain("stableForms: currentHost.forms,");
-  expect(source).toContain("forms: currentHost.forms,");
-  expect(source).toContain("bindings: currentHost.bindings,");
-  expect(source).toContain("hostForms: currentHost.forms,");
-  expect(source).toContain("hostBindings: currentHost.bindings,");
+  expect(source).toContain("stableForms: currentCandidates.forms,");
+  expect(source).toContain("forms: currentCandidates.forms,");
+  expect(source).toContain("bindings: currentCandidates.bindings,");
+  expect(source).toContain("hostForms: currentCandidates.forms,");
+  expect(source).toContain("hostBindings: currentCandidates.bindings,");
 });

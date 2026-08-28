@@ -1,18 +1,21 @@
 import type { JsonObject } from "../ports.ts";
 import type { TakoformArtifactTransport } from "./artifacts.ts";
 import { ArtifactInputError } from "./artifacts.ts";
-import type { BindingRegistry } from "./bindings.ts";
+import { type BindingRegistry, installedBindings } from "./bindings.ts";
 import type { EngineContext, TakoformEngine } from "./engine.ts";
 import {
   DIGEST,
   exactInstalledForm,
   type FormRegistry,
+  formKey,
   formSupportProfile,
+  installedForms,
   isDefinitionVersion,
   isFormApiVersion,
   isFormGroup,
   isKind,
 } from "./forms.ts";
+import type { TakoformAuthorityCatalog, TakoformHostAuthority } from "./host-authority.ts";
 import type { DeferredOperations } from "./operations.ts";
 import { isStableStandardServiceProtocol } from "./standard-services.ts";
 import type { OperationRecord, TakoformStore } from "./store.ts";
@@ -139,6 +142,8 @@ export interface CreateTakoformRoutesOptions {
   readonly deferredOperations?: DeferredOperations;
   readonly standardServiceResolver?: TakoformStandardServiceResolver;
   readonly availability?: TakoformFormAvailabilityResolver;
+  /** Durable public discovery/support/activation authority. */
+  readonly authority?: TakoformHostAuthority;
 }
 
 export function createTakoformRoutes(options: CreateTakoformRoutesOptions): TakoformHost {
@@ -153,6 +158,7 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
     deferredOperations,
     standardServiceResolver,
     availability,
+    authority,
   } = options;
   const configuration = options.routes ?? DEFAULT_TAKOFORM_ROUTES;
   const lane = configuration.apiPath;
@@ -185,6 +191,72 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
     "u",
   );
   const operationPattern = new RegExp(`^${escaped(lane)}/operations/([^/]+)(/cancel)?$`, "u");
+
+  const catalogRegistry = (
+    catalog: TakoformAuthorityCatalog,
+    supportedOnly: boolean,
+  ): {
+    readonly forms: FormRegistry;
+    readonly bindings: BindingRegistry;
+    readonly availability: ReadonlyMap<string, TakoformFormAvailability>;
+  } => {
+    const entries = supportedOnly
+      ? catalog.forms.filter((entry) => entry.supported)
+      : catalog.forms;
+    return {
+      forms: installedForms(
+        entries.map((entry) => entry.form),
+        configuration.hostApiVersion,
+      ),
+      bindings: installedBindings(catalog.bindings),
+      availability: new Map(
+        entries.map((entry) => [formKey(entry.form.identity.formRef), entry.availability]),
+      ),
+    };
+  };
+
+  const supportRegistry = async (context: EngineContext) =>
+    authority
+      ? catalogRegistry(
+          await authority.supportCatalog({
+            tenantId: context.tenantId,
+            principalId: context.principalId,
+          }),
+          true,
+        )
+      : { forms, bindings, availability: new Map<string, TakoformFormAvailability>() };
+
+  const requestCatalog = async (context: EngineContext, space: string | null) => {
+    if (!authority) {
+      return { forms, bindings, availability: new Map<string, TakoformFormAvailability>() };
+    }
+    if (space === null) {
+      const support = await authority.supportCatalog({
+        tenantId: context.tenantId,
+        principalId: context.principalId,
+      });
+      const inactive: TakoformAuthorityCatalog = {
+        ...support,
+        forms: support.forms.map((entry) => ({
+          ...entry,
+          availability: {
+            executable: entry.supported && entry.availability.executable,
+            activated: false,
+            availableToPrincipal: false,
+          },
+        })),
+      };
+      return catalogRegistry(inactive, false);
+    }
+    return catalogRegistry(
+      await authority.catalog({
+        tenantId: context.tenantId,
+        principalId: context.principalId,
+        space: spaceId(space),
+      }),
+      false,
+    );
+  };
 
   return {
     async handle(incoming): Promise<Response | null> {
@@ -246,8 +318,9 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
 
   async function route(context: EngineContext, url: URL, request: Request): Promise<Response> {
     if (request.method === "GET" && url.pathname === `${lane}/support/forms`) {
+      const registry = await supportRegistry(context);
       return Response.json({
-        profiles: [...forms.values()].map((form) =>
+        profiles: [...registry.forms.values()].map((form) =>
           formSupportProfile(form, configuration.supportProfileApiVersion),
         ),
       });
@@ -255,6 +328,7 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
 
     const supportForm = supportFormPattern.exec(url.pathname);
     if (request.method === "GET" && supportForm) {
+      const registry = await supportRegistry(context);
       const apiVersion = joinedGroup(
         supportForm[1],
         strictStableLane ? undefined : supportForm[2],
@@ -262,7 +336,7 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
       );
       const kind = safeSegment(strictStableLane ? supportForm[2] : supportForm[3]);
       const definitionVersion = safeSegment(strictStableLane ? supportForm[3] : supportForm[4]);
-      const candidates = [...forms.values()].filter(
+      const candidates = [...registry.forms.values()].filter(
         (form) =>
           form.identity.formRef.apiVersion === apiVersion &&
           form.identity.formRef.kind === kind &&
@@ -275,16 +349,17 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
 
     const supportContract = supportContractPattern.exec(url.pathname);
     if (request.method === "GET" && supportContract) {
+      const registry = await supportRegistry(context);
       const route = supportContract[1];
       const name = safeSegment(supportContract[2]);
       const version = safeSegment(supportContract[3]);
       const references: readonly (TakoformInterfaceRef | TakoformBindingRef)[] =
         route === "interfaces"
           ? [
-              ...[...forms.values()].flatMap((form) => form.providedInterfaces ?? []),
-              ...[...bindings.values()].map((binding) => binding.targetInterface),
+              ...[...registry.forms.values()].flatMap((form) => form.providedInterfaces ?? []),
+              ...[...registry.bindings.values()].map((binding) => binding.targetInterface),
             ]
-          : [...bindings.values()].map((binding) => binding.bindingRef);
+          : [...registry.bindings.values()].map((binding) => binding.bindingRef);
       const matches = references.filter(
         (reference) => reference.name === name && reference.version === version,
       );
@@ -338,6 +413,7 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
     }
 
     if (request.method === "GET" && url.pathname === `${lane}/forms`) {
+      const catalog = await requestCatalog(context, url.searchParams.get("space"));
       if (configuration.enumerateForms) {
         validateFormsFilters(url);
         const filters = {
@@ -348,7 +424,7 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
         };
         return Response.json({
           forms: await Promise.all(
-            [...forms.values()]
+            [...catalog.forms.values()]
               .filter(
                 (form) =>
                   (filters.group === null || form.identity.formRef.apiVersion === filters.group) &&
@@ -359,7 +435,11 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
                     form.identity.formRef.schemaDigest === filters.schemaDigest),
               )
               .map(async (form) =>
-                formAvailability(form, await availabilityOf(availability, context, form)),
+                formAvailability(
+                  form,
+                  catalog.availability.get(formKey(form.identity.formRef)) ??
+                    (await availabilityOf(availability, context, form)),
+                ),
               ),
           ),
         });
@@ -373,11 +453,17 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
           definitionVersion: requiredQuery(url, "definitionVersion"),
           schemaDigest: requiredQuery(url, "schemaDigest"),
         },
-        forms,
+        catalog.forms,
       );
       if (!form) return failure("form_unknown", 404);
       return Response.json({
-        forms: [formAvailability(form, await availabilityOf(availability, context, form))],
+        forms: [
+          formAvailability(
+            form,
+            catalog.availability.get(formKey(form.identity.formRef)) ??
+              (await availabilityOf(availability, context, form)),
+          ),
+        ],
       });
     }
 
@@ -385,6 +471,7 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
     if (request.method === "GET" && definition) {
       exactQuery(url, ["space", "group", "kind", "definitionVersion", "schemaDigest"]);
       requiredQuery(url, "space");
+      const catalog = await requestCatalog(context, requiredQuery(url, "space"));
       const apiVersion = joinedGroup(
         definition[1],
         strictStableLane ? undefined : definition[2],
@@ -401,7 +488,7 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
           definitionVersion: requiredQuery(url, "definitionVersion"),
           schemaDigest: requiredQuery(url, "schemaDigest"),
         },
-        forms,
+        catalog.forms,
       );
       if (!form) return failure("form_unknown", 404);
       return Response.json(formDefinition(form, configuration.exposeDefinitionConstraints));
@@ -573,10 +660,15 @@ async function assertTenantRunScope(
 ): Promise<void> {
   if (
     request.method === "GET" &&
-    (url.pathname === `${lane}/forms` ||
-      formDefinitionPattern.test(url.pathname) ||
-      url.pathname.startsWith(`${lane}/support/`))
+    (url.pathname === `${lane}/forms` || formDefinitionPattern.test(url.pathname))
   ) {
+    if (url.searchParams.get("space") !== space) {
+      throw new TakoformHostError("resource_not_found", 404);
+    }
+    return;
+  }
+  // Support profiles are public protocol metadata and carry no tenant state.
+  if (request.method === "GET" && url.pathname.startsWith(`${lane}/support/`)) {
     return;
   }
   // Artifact access is already bound by the transport to tenantId and the

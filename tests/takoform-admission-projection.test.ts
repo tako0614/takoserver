@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
+  TAKOFORM_REVOCATION_V1,
+  TAKOFORM_REVOCATION_V1_EMPTY_ENTRIES_DIGEST,
+  TAKOFORM_REVOCATION_V1_GENESIS_DIGEST,
+  TAKOFORM_REVOCATION_V1ALPHA1,
+} from "../src/takoform/admission-digest.ts";
+import {
   type AdmissionProjectionActivation,
   type AdmissionProjectionCheckpoint,
   type AdmissionProjectionCurrentHeads,
@@ -38,10 +44,12 @@ const checkpoint = (
   overrides: Partial<AdmissionProjectionCheckpoint> = {},
 ): AdmissionProjectionCheckpoint => ({
   publisherKey: "external.publisher",
+  checkpointApiVersion: TAKOFORM_REVOCATION_V1ALPHA1,
   policyDigest: digest("1"),
   policyEventDigest: digest("2"),
   sequence: 1,
   checkpointDigest: digest("3"),
+  entriesDigest: digest("7"),
   eventDigest: digest("4"),
   verified: true,
   stale: false,
@@ -56,6 +64,7 @@ const install = (
   formRef: FORM_REF,
   packageDigest,
   publisherKey: "external.publisher",
+  checkpointApiVersion: TAKOFORM_REVOCATION_V1ALPHA1,
   eventType: "install",
   ...overrides,
 });
@@ -839,6 +848,62 @@ describe("pure current-effective Takoform admission projection", () => {
       }),
     );
     expect(packageLevel.allowed).toBe(true);
+  });
+
+  test("accepts only the exact v1 sequence-zero genesis and rejects cross-profile installs", () => {
+    const genesis = checkpoint({
+      checkpointApiVersion: TAKOFORM_REVOCATION_V1,
+      sequence: 0,
+      checkpointDigest: TAKOFORM_REVOCATION_V1_GENESIS_DIGEST,
+      entriesDigest: TAKOFORM_REVOCATION_V1_EMPTY_ENTRIES_DIGEST,
+      revokedPackageDigests: [],
+    });
+    const admitted = evaluateAdmissionProjection(
+      input("create", {
+        current: current({
+          checkpoint: genesis,
+          install: install(digest("5"), { checkpointApiVersion: TAKOFORM_REVOCATION_V1 }),
+        }),
+      }),
+    );
+    expect(admitted.allowed).toBe(true);
+
+    for (const malformed of [
+      checkpoint({
+        checkpointApiVersion: TAKOFORM_REVOCATION_V1,
+        sequence: 0,
+        checkpointDigest: digest("8"),
+        entriesDigest: TAKOFORM_REVOCATION_V1_EMPTY_ENTRIES_DIGEST,
+      }),
+      checkpoint({
+        checkpointApiVersion: TAKOFORM_REVOCATION_V1,
+        sequence: 0,
+        checkpointDigest: TAKOFORM_REVOCATION_V1_GENESIS_DIGEST,
+        entriesDigest: TAKOFORM_REVOCATION_V1_EMPTY_ENTRIES_DIGEST,
+        revokedPackageDigests: [digest("5")],
+      }),
+    ]) {
+      const denied = evaluateAdmissionProjection(
+        input("create", {
+          current: current({
+            checkpoint: malformed,
+            install: install(digest("5"), { checkpointApiVersion: TAKOFORM_REVOCATION_V1 }),
+          }),
+        }),
+      );
+      expect(denied.allowed).toBe(false);
+      expect(denied.reasons.map((reason) => reason.code)).toContain("checkpoint_sequence_invalid");
+    }
+
+    const crossProfile = evaluateAdmissionProjection(
+      input("create", {
+        current: current({ checkpoint: genesis }),
+      }),
+    );
+    expect(crossProfile.allowed).toBe(false);
+    expect(crossProfile.reasons.map((reason) => reason.code)).toContain(
+      "checkpoint_profile_mismatch",
+    );
   });
 
   test("fails closed without throwing for malformed form, digest, sequence, or bounded identity facts", () => {

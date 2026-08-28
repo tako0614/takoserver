@@ -288,7 +288,10 @@ export function createResourceMigrationService(options: {
         });
         target = await options.deployments.find(tenantId, migration.targetDeploymentId);
       }
-      if (!target || target.state !== "candidate") {
+      if (!target) {
+        throw new ResourceMigrationError("migration_conflict");
+      }
+      if (target.state !== "candidate") {
         throw new ResourceMigrationError("migration_conflict");
       }
       if (migration.state === "provisioning" && !(await options.store.transferring(tenantId, id))) {
@@ -341,7 +344,10 @@ export function createResourceMigrationService(options: {
     async cutover(tenantId: string, id: string): Promise<ResourceMigration> {
       const migration = await options.store.read(tenantId, id);
       if (migration?.state === "completed") return migration;
-      if (!migration || migration.state !== "verified") {
+      if (!migration) {
+        throw new ResourceMigrationError("migration_conflict");
+      }
+      if (migration.state !== "verified") {
         throw new ResourceMigrationError("migration_conflict");
       }
       const [source, target] = await Promise.all([
@@ -383,7 +389,10 @@ export function createResourceMigrationService(options: {
     async rollback(tenantId: string, id: string): Promise<ResourceMigration> {
       const migration = await options.store.read(tenantId, id);
       if (migration?.state === "rolled_back") return migration;
-      if (!migration || migration.state !== "completed") {
+      if (!migration) {
+        throw new ResourceMigrationError("migration_conflict");
+      }
+      if (migration.state !== "completed") {
         throw new ResourceMigrationError("migration_conflict");
       }
       if (
