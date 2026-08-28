@@ -33,6 +33,7 @@ const ROAD_FORM_KINDS = [
 const HOST_FORM_KINDS = [...new Set([...YURU_FORM_KINDS, ...ROAD_FORM_KINDS])].sort();
 const TOKEN = "stable-local-cloudflare-token";
 const LANE = "/apis/forms.takoform.com/v1";
+type HostResourceKind = (typeof YURU_FORM_KINDS)[number] | (typeof ROAD_FORM_KINDS)[number];
 
 interface FormRef {
   readonly apiVersion: string;
@@ -208,6 +209,187 @@ export { index_default as default };`,
       await host.close();
     }
   }, 120_000);
+
+  test("applies Yurucommu's 13-resource graph and exercises native queue and schedule handlers", async () => {
+    const host = await startStableLocalCloudflareHost({
+      takoformRepositoryRoot: TAKOFORM_ROOT,
+      token: TOKEN,
+      runtimeValues: { TEST_RUNTIME_VALUE: "fixture-value" },
+    });
+    try {
+      const forms = await installedForms(host.endpoint);
+      const reference = (kind: HostResourceKind, name: string) => ({
+        apiVersion: requiredForm(forms, kind).apiVersion,
+        kind,
+        name,
+      });
+      const migrationDigest = await uploadArtifact(host.endpoint, {
+        kind: "MigrationBundle",
+        files: [
+          {
+            path: "0000_native_handler_probe.sql",
+            mediaType: "application/sql",
+            bytes: "CREATE TABLE native_handler_probe (id TEXT PRIMARY KEY);",
+          },
+        ],
+      });
+      const workerDigest = await uploadArtifact(host.endpoint, {
+        kind: "WorkerBundle",
+        mainModule: "worker.js",
+        modules: [
+          {
+            name: "worker.js",
+            mediaType: "application/javascript+module",
+            bytes: `const assertRuntimeBindings = async (env, mediaKey) => {
+  const table = await env.DB.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'native_handler_probe'",
+  ).first();
+  if (table?.name !== "native_handler_probe") throw new Error("D1 migration binding unavailable");
+  if (typeof env.KV?.put !== "function") throw new Error("KV binding unavailable");
+  if (typeof env.DELIVERY_QUEUE?.send !== "function") {
+    throw new Error("queue binding unavailable");
+  }
+  if (
+    typeof env.MEDIA?.put !== "function" ||
+    typeof env.MEDIA?.get !== "function" ||
+    typeof env.MEDIA?.delete !== "function"
+  ) {
+    throw new Error("MEDIA binding unavailable");
+  }
+  await env.MEDIA.put(mediaKey, "ready");
+  const mediaObject = await env.MEDIA.get(mediaKey);
+  if (!mediaObject || (await mediaObject.text()) !== "ready") {
+    throw new Error("MEDIA read unavailable");
+  }
+  await env.MEDIA.delete(mediaKey);
+  if ((await env.MEDIA.get(mediaKey)) !== null) throw new Error("MEDIA delete unavailable");
+};
+
+export default {
+  async fetch(request, env) {
+    if (new URL(request.url).pathname !== "/native-handler-probe") {
+      return new Response("ok");
+    }
+    return Response.json({
+      migrated: (await env.DB.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'native_handler_probe'",
+      ).first())?.name === "native_handler_probe",
+      queue: await env.KV.get("queue-handler"),
+      scheduled: await env.KV.get("scheduled-handler"),
+    });
+  },
+  async queue(_batch, env) {
+    await assertRuntimeBindings(env, "queue-media");
+    await env.KV.put("queue-handler", "ready");
+  },
+  async scheduled(_controller, env) {
+    await assertRuntimeBindings(env, "scheduled-media");
+    await env.KV.put("scheduled-handler", "ready");
+  },
+};`,
+          },
+        ],
+      });
+
+      const worker = "yuru-local";
+      const database = "yuru-local-db";
+      const migrationSet = "yuru-local-migration-set";
+      const migrationApplication = "yuru-local-migrations";
+      const kv = "yuru-local-kv";
+      const deliveryQueue = "yuru-local-delivery";
+      const deadLetterQueue = "yuru-local-dlq";
+      const bundle = "yuru-local-bundle";
+      const version = "yuru-local-version";
+      const deployment = "yuru-local-deployment";
+      const endpoint = "yuru-local-endpoint";
+      const consumer = "yuru-local-consumer";
+      const schedule = "yuru-local-cron";
+
+      await applyResource(host.endpoint, forms, "ModuleWorker", worker, {});
+      await applyResource(host.endpoint, forms, "SQLiteDatabase", database, {});
+      await applyResource(host.endpoint, forms, "SQLiteMigrationSet", migrationSet, {
+        manifestDigest: migrationDigest,
+      });
+      await applyResource(
+        host.endpoint,
+        forms,
+        "SQLiteMigrationApplication",
+        migrationApplication,
+        {
+          database: reference("SQLiteDatabase", database),
+          migrationSet: reference("SQLiteMigrationSet", migrationSet),
+        },
+      );
+      await applyResource(host.endpoint, forms, "EdgeKVNamespace", kv, {});
+      await applyResource(host.endpoint, forms, "AtLeastOnceQueue", deliveryQueue, {
+        deliveryDelaySeconds: 0,
+        messageRetentionSeconds: 60,
+      });
+      await applyResource(host.endpoint, forms, "AtLeastOnceQueue", deadLetterQueue, {
+        deliveryDelaySeconds: 0,
+        messageRetentionSeconds: 60,
+      });
+      await applyResource(host.endpoint, forms, "WorkerBundle", bundle, {
+        manifestDigest: workerDigest,
+      });
+      await applyResource(host.endpoint, forms, "WorkerVersion", version, {
+        worker: reference("ModuleWorker", worker),
+        bundle: reference("WorkerBundle", bundle),
+        externalServices: [
+          {
+            name: "MEDIA",
+            service: {
+              apiVersion: "standards.takoform.com/v1",
+              protocol: "com.amazonaws.s3",
+            },
+          },
+        ],
+        handlers: ["fetch", "queue", "scheduled"],
+        requiredSensitiveVars: ["TEST_RUNTIME_VALUE"],
+        kvBindings: [{ name: "KV", resource: reference("EdgeKVNamespace", kv) }],
+        queueProducerBindings: [
+          { name: "DELIVERY_DLQ", resource: reference("AtLeastOnceQueue", deadLetterQueue) },
+          { name: "DELIVERY_QUEUE", resource: reference("AtLeastOnceQueue", deliveryQueue) },
+        ],
+        sqliteBindings: [{ name: "DB", resource: reference("SQLiteDatabase", database) }],
+      });
+      await applyResource(host.endpoint, forms, "WorkerDeployment", deployment, {
+        worker: reference("ModuleWorker", worker),
+        versions: [{ workerVersion: reference("WorkerVersion", version), weight: 10_000 }],
+      });
+      await applyResource(host.endpoint, forms, "WorkerEndpoint", endpoint, {
+        worker: reference("ModuleWorker", worker),
+      });
+      await applyResource(host.endpoint, forms, "QueueConsumer", consumer, {
+        deadLetterQueue: reference("AtLeastOnceQueue", deadLetterQueue),
+        maxBatchSize: 10,
+        maxBatchTimeoutSeconds: 0,
+        maxConcurrency: 1,
+        maxRetries: 0,
+        queue: reference("AtLeastOnceQueue", deliveryQueue),
+        retryDelaySeconds: 0,
+        worker: reference("ModuleWorker", worker),
+      });
+      await applyResource(host.endpoint, forms, "WorkerCronTrigger", schedule, {
+        cron: "0 3 * * *",
+        worker: reference("ModuleWorker", worker),
+      });
+
+      await expect(host.exerciseNativeHandlers()).resolves.toEqual({
+        queueHandlerInvocations: 1,
+        scheduledHandlerInvocations: 1,
+      });
+      const probe = await fetch(`${host.endpoint}/native-handler-probe`);
+      expect(probe.status).toBe(200);
+      expect(await probe.json()).toEqual({
+        migrated: true,
+        queue: "ready",
+        scheduled: "ready",
+      });
+    } finally {
+      await host.close();
+    }
+  }, 120_000);
 });
 
 async function installedForms(endpoint: string): Promise<ReadonlyMap<string, FormRef>> {
@@ -230,7 +412,7 @@ function requiredForm(forms: ReadonlyMap<string, FormRef>, kind: string): FormRe
 async function applyResource(
   endpoint: string,
   forms: ReadonlyMap<string, FormRef>,
-  kind: (typeof ROAD_FORM_KINDS)[number],
+  kind: HostResourceKind,
   name: string,
   spec: Record<string, unknown>,
 ): Promise<void> {
