@@ -729,6 +729,33 @@ class LocalCloudflare {
     match = new RegExp(`^/accounts/${ACCOUNT_ID}/workers/scripts/([^/]+)/versions$`, "u").exec(
       path,
     );
+    if (match && request.method === "GET") {
+      const script = decoded(match, 1);
+      const page = Number(url.searchParams.get("page") ?? "1");
+      const perPage = Number(url.searchParams.get("per_page") ?? "20");
+      if (
+        !Number.isSafeInteger(page) ||
+        page < 1 ||
+        !Number.isSafeInteger(perPage) ||
+        perPage < 1 ||
+        perPage > 100
+      ) {
+        return envelope(undefined, 400);
+      }
+      const versionIds = [...this.#versions.keys()]
+        .filter((key) => key.startsWith(`${script}:`))
+        .map((key) => key.slice(script.length + 1))
+        .reverse();
+      const offset = (page - 1) * perPage;
+      const items = versionIds.slice(offset, offset + perPage).map((id) => ({ id }));
+      return envelope({ items }, 200, [], {
+        page,
+        per_page: perPage,
+        count: items.length,
+        total_count: versionIds.length,
+        total_pages: Math.ceil(versionIds.length / perPage),
+      });
+    }
     if (match && request.method === "POST") {
       return await this.#createVersion(decoded(match, 1), request);
     }
@@ -737,8 +764,16 @@ class LocalCloudflare {
       "u",
     ).exec(path);
     if (match && request.method === "GET") {
-      const key = `${decoded(match, 1)}:${decoded(match, 2)}`;
-      return this.#versions.has(key) ? envelope({ id: match[2] }) : envelope(undefined, 404);
+      const id = decoded(match, 2);
+      const held = this.#versions.get(`${decoded(match, 1)}:${id}`);
+      return held
+        ? envelope({
+            id,
+            ...(held.metadata.annotations !== undefined
+              ? { annotations: structuredClone(held.metadata.annotations) }
+              : {}),
+          })
+        : envelope(undefined, 404);
     }
 
     match = new RegExp(`^/accounts/${ACCOUNT_ID}/workers/scripts/([^/]+)/deployments$`, "u").exec(
@@ -1324,9 +1359,20 @@ function decoded(match: RegExpExecArray, index: number): string {
   return decodeURIComponent(value);
 }
 
-function envelope(result?: unknown, status = 200, errors: unknown[] = []): Response {
+function envelope(
+  result?: unknown,
+  status = 200,
+  errors: unknown[] = [],
+  resultInfo?: Readonly<Record<string, unknown>>,
+): Response {
   return Response.json(
-    status >= 200 && status < 300 ? { success: true, result } : { success: false, errors },
+    status >= 200 && status < 300
+      ? {
+          success: true,
+          result,
+          ...(resultInfo ? { result_info: resultInfo } : {}),
+        }
+      : { success: false, errors },
     { status },
   );
 }

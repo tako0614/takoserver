@@ -651,16 +651,27 @@ describe("released edge Form placement", () => {
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
       async fetch(request) {
+        const url = new URL(request.url);
         calls.push({
           method: request.method,
           url: request.url,
           authorization: request.headers.get("authorization"),
           body: await request.clone().text(),
         });
+        if (request.method === "GET" && url.pathname.endsWith("/versions")) {
+          return Response.json({
+            success: true,
+            errors: [],
+            result: { items: [] },
+            result_info: { page: 1, per_page: 100 },
+          });
+        }
         return Response.json({
           success: true,
           errors: [],
-          result: calls.length === 1 ? { id: "version-id" } : { id: "deployment-id" },
+          result: url.pathname.endsWith("/versions")
+            ? { id: "version-id" }
+            : { id: "deployment-id" },
         });
       },
     });
@@ -724,15 +735,610 @@ describe("released edge Form placement", () => {
       phase: "succeeded",
       result: { nativeId: "deployment:script-name:deployment-id" },
     });
-    expect(calls[0]?.url).toContain("/workers/scripts/script-name/versions");
-    expect(calls[0]?.body).toContain(
+    const versionUpload = calls.find(
+      (call) => call.method === "POST" && call.url.includes("/versions"),
+    );
+    const deployment = calls.find(
+      (call) => call.method === "POST" && call.url.includes("/deployments"),
+    );
+    expect(versionUpload?.url).toContain("/workers/scripts/script-name/versions");
+    expect(versionUpload?.body).toContain(
       '"type":"plain_text","name":"OIDC_ISSUER_URL","text":"https://accounts.example"',
     );
-    expect(calls[0]?.body).toContain('"type":"json","name":"FEATURES","json":{"browser":true}');
-    expect(calls[0]?.body).not.toContain('"text":"\\"https://accounts.example\\""');
-    expect(calls[1]?.url).toContain("/workers/scripts/script-name/deployments");
-    expect(calls[1]?.body).toContain('"percentage":100');
-    expect(calls[1]?.body).toContain('"version_id":"version-id"');
+    expect(versionUpload?.body).toContain(
+      '"type":"json","name":"FEATURES","json":{"browser":true}',
+    );
+    expect(versionUpload?.body).not.toContain('"text":"\\"https://accounts.example\\""');
+    expect(deployment?.url).toContain("/workers/scripts/script-name/deployments");
+    expect(deployment?.body).toContain('"percentage":100');
+    expect(deployment?.body).toContain('"version_id":"version-id"');
+  });
+
+  test("tags a new immutable Worker Version with the stable provider operation", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const versionOffering = technical("WorkerVersion");
+    const calls: Call[] = [];
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering, versionOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        calls.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body: await request.clone().text(),
+        });
+        if (request.method === "GET") {
+          return Response.json({
+            success: true,
+            errors: [],
+            result: { items: [] },
+            result_info: { page: 1, per_page: 100 },
+          });
+        }
+        return Response.json({
+          success: true,
+          errors: [],
+          result: { id: "version-tagged" },
+        });
+      },
+    });
+
+    const ticket = await provider.apply({
+      operationId: "op-version-tagged",
+      offering: versionOffering,
+      identity: { ...IDENTITY, name: "version" },
+      spec: { handlers: ["fetch"] },
+      relations: [
+        related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+          nativeId: "worker:script-name",
+          offeringId: workerOffering.id,
+          providerPackRef: "cloudflare",
+          outputs: { scriptName: "script-name" },
+        }),
+        related(
+          "/bundle",
+          stored("WorkerBundle", "bundle-uid", {
+            manifestDigest: `sha256:${"d".repeat(64)}`,
+          }),
+        ),
+      ],
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: "version:script-name:version-tagged" },
+    });
+    expect(calls.map((call) => call.method)).toEqual(["GET", "POST"]);
+    expect(new URL(calls[0]?.url ?? "https://invalid.test").searchParams).toMatchObject(
+      new URLSearchParams({ page: "1", per_page: "100" }),
+    );
+    expect(calls[1]?.body).toContain('"annotations":{"workers/tag":"op-version-tagged"}');
+  });
+
+  test("refuses an operation identity that cannot fit in the Worker Version tag", async () => {
+    const versionOffering = technical("WorkerVersion");
+    let requests = 0;
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [versionOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch() {
+        requests += 1;
+        throw new Error("an invalid tag must fail before Cloudflare is reached");
+      },
+    });
+
+    expect(
+      await provider.apply({
+        operationId: "あ".repeat(34),
+        offering: versionOffering,
+        identity: { ...IDENTITY, name: "version" },
+        spec: {},
+      }),
+    ).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", retryable: false },
+    });
+    expect(requests).toBe(0);
+  });
+
+  test("retries a refused runtime commit by recovering the Version and committing only", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const versionOffering = technical("WorkerVersion");
+    const requests: Request[] = [];
+    const materialized: unknown[] = [];
+    const committed: unknown[] = [];
+    let storedVersion: { id: string; tag: string } | undefined;
+    let refuseFirstCommit = true;
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering, versionOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      workerEndpointSuffix: "workers.example",
+      runtimeMaterializer: {
+        async materializeRuntimeBindings(input) {
+          materialized.push(input);
+          return { values: { ENCRYPTION_KEY: "generated-encryption-key" } };
+        },
+        async commitRuntimeBindings(input) {
+          committed.push(input);
+          if (refuseFirstCommit) {
+            refuseFirstCommit = false;
+            throw new Error("commit acknowledgement lost");
+          }
+        },
+        async rollbackRuntimeBindings() {
+          throw new Error("an uploaded immutable Version must not be rolled back");
+        },
+      },
+      async fetch(request) {
+        requests.push(request.clone());
+        const url = new URL(request.url);
+        if (request.method === "GET" && url.pathname.endsWith("/versions")) {
+          const page = Number(url.searchParams.get("page"));
+          return Response.json({
+            success: true,
+            errors: [],
+            result: {
+              items: page === 1 && storedVersion ? [{ id: storedVersion.id }] : [],
+            },
+            result_info: { page, per_page: 100 },
+          });
+        }
+        if (request.method === "GET" && url.pathname.includes("/versions/")) {
+          return Response.json({
+            success: true,
+            errors: [],
+            result: storedVersion
+              ? {
+                  id: storedVersion.id,
+                  annotations: { "workers/tag": storedVersion.tag },
+                  resources: { bindings: [], script: {}, script_runtime: {} },
+                }
+              : null,
+          });
+        }
+        if (request.method === "POST" && url.pathname.endsWith("/versions")) {
+          const form = await request.formData();
+          const part = form.get("metadata");
+          const metadata = JSON.parse(
+            typeof part === "string" ? part : await (part as Blob).text(),
+          ) as { annotations?: { "workers/tag"?: string } };
+          storedVersion = {
+            id: "version-commit-retry",
+            tag: metadata.annotations?.["workers/tag"] ?? "",
+          };
+          return Response.json({
+            success: true,
+            errors: [],
+            result: { id: storedVersion.id },
+          });
+        }
+        throw new Error(`unexpected Cloudflare request: ${request.method} ${url.pathname}`);
+      },
+    });
+    const runtimeMaterialization = {
+      contract: "takosumi.host-runtime-materialization/v1",
+      installConfigId: "icfg_yurucommu",
+      workspaceId: "workspace_1",
+      capsuleId: "capsule_yurucommu",
+      installingPrincipalId: "tsub_owner",
+      requirements: [],
+    } as const;
+    const apply = () =>
+      provider.apply({
+        operationId: "op-version-commit-retry",
+        offering: versionOffering,
+        identity: { ...IDENTITY, name: "version" },
+        spec: { handlers: ["fetch"], requiredSensitiveVars: ["ENCRYPTION_KEY"] },
+        runtimeMaterialization,
+        relations: [
+          related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+            nativeId: "worker:script-name",
+            offeringId: workerOffering.id,
+            providerPackRef: "cloudflare",
+            outputs: { scriptName: "script-name" },
+          }),
+          related(
+            "/bundle",
+            stored("WorkerBundle", "bundle-uid", {
+              manifestDigest: `sha256:${"d".repeat(64)}`,
+            }),
+          ),
+        ],
+      });
+
+    expect(await apply()).toMatchObject({
+      phase: "failed",
+      failure: { code: "provider_error" },
+    });
+    expect(await apply()).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: "version:script-name:version-commit-retry" },
+    });
+    expect(requests.filter((request) => request.method === "POST")).toHaveLength(1);
+    expect(materialized).toHaveLength(1);
+    expect(committed).toHaveLength(2);
+    expect(committed[1]).toEqual(materialized[0]);
+  });
+
+  test("recovers the one tagged Version after its upload response is lost", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const versionOffering = technical("WorkerVersion");
+    let storedVersion: { id: string; tag: string } | undefined;
+    let uploads = 0;
+    const log = spyOn(console, "error").mockImplementation(() => undefined);
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering, versionOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "GET" && url.pathname.endsWith("/versions")) {
+          const page = Number(url.searchParams.get("page"));
+          return Response.json({
+            success: true,
+            errors: [],
+            result: {
+              items: page === 1 && storedVersion ? [{ id: storedVersion.id }] : [],
+            },
+            result_info: { page, per_page: 100 },
+          });
+        }
+        if (request.method === "GET" && url.pathname.includes("/versions/")) {
+          return Response.json({
+            success: true,
+            errors: [],
+            result: storedVersion
+              ? {
+                  id: storedVersion.id,
+                  annotations: { "workers/tag": storedVersion.tag },
+                  resources: { bindings: [], script: {}, script_runtime: {} },
+                }
+              : null,
+          });
+        }
+        if (request.method === "POST" && url.pathname.endsWith("/versions")) {
+          uploads += 1;
+          const form = await request.formData();
+          const part = form.get("metadata");
+          const metadata = JSON.parse(
+            typeof part === "string" ? part : await (part as Blob).text(),
+          ) as { annotations?: { "workers/tag"?: string } };
+          storedVersion = {
+            id: "version-lost-response",
+            tag: metadata.annotations?.["workers/tag"] ?? "",
+          };
+          throw new TypeError("connection closed after upload");
+        }
+        throw new Error(`unexpected Cloudflare request: ${request.method} ${url.pathname}`);
+      },
+    });
+    const apply = () =>
+      provider.apply({
+        operationId: "op-version-lost-response",
+        offering: versionOffering,
+        identity: { ...IDENTITY, name: "version" },
+        spec: { handlers: ["fetch"] },
+        relations: [
+          related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+            nativeId: "worker:script-name",
+            offeringId: workerOffering.id,
+            providerPackRef: "cloudflare",
+            outputs: { scriptName: "script-name" },
+          }),
+          related(
+            "/bundle",
+            stored("WorkerBundle", "bundle-uid", {
+              manifestDigest: `sha256:${"d".repeat(64)}`,
+            }),
+          ),
+        ],
+      });
+
+    try {
+      expect(await apply()).toMatchObject({
+        phase: "failed",
+        failure: { code: "unavailable", retryable: true },
+      });
+      expect(await apply()).toMatchObject({
+        phase: "succeeded",
+        result: { nativeId: "version:script-name:version-lost-response" },
+      });
+      expect(uploads).toBe(1);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test("refuses a mismatched recovery page without uploading", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const versionOffering = technical("WorkerVersion");
+    let uploads = 0;
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering, versionOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        if (request.method === "POST") uploads += 1;
+        return Response.json({
+          success: true,
+          errors: [],
+          result: request.method === "GET" ? { items: [] } : { id: "must-not-upload" },
+          result_info: { page: 2, per_page: 100 },
+        });
+      },
+    });
+
+    const ticket = await provider.apply({
+      operationId: "op-version-page-mismatch",
+      offering: versionOffering,
+      identity: { ...IDENTITY, name: "version" },
+      spec: { handlers: ["fetch"] },
+      relations: [
+        related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+          nativeId: "worker:script-name",
+          offeringId: workerOffering.id,
+          providerPackRef: "cloudflare",
+          outputs: { scriptName: "script-name" },
+        }),
+        related(
+          "/bundle",
+          stored("WorkerBundle", "bundle-uid", {
+            manifestDigest: `sha256:${"d".repeat(64)}`,
+          }),
+        ),
+      ],
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "provider_error" },
+    });
+    expect(uploads).toBe(0);
+  });
+
+  test("keeps an unacknowledged upload indeterminate instead of rolling materialization back", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const versionOffering = technical("WorkerVersion");
+    const rollbacks: unknown[] = [];
+    let uploads = 0;
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering, versionOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      workerEndpointSuffix: "workers.example",
+      runtimeMaterializer: {
+        async materializeRuntimeBindings() {
+          return {
+            values: { ENCRYPTION_KEY: "generated-encryption-key" },
+            rollbackReceipt: "opaque-read-receipt",
+          };
+        },
+        async commitRuntimeBindings() {
+          throw new Error("an unacknowledged Version must not be committed");
+        },
+        async rollbackRuntimeBindings(input) {
+          rollbacks.push(input);
+        },
+      },
+      async fetch(request) {
+        if (request.method === "GET") {
+          return Response.json({ success: true, errors: [], result: { items: [] } });
+        }
+        uploads += 1;
+        return Response.json({ success: true, errors: [], result: {} });
+      },
+    });
+    const runtimeMaterialization = {
+      contract: "takosumi.host-runtime-materialization/v1",
+      installConfigId: "icfg_yurucommu",
+      workspaceId: "workspace_1",
+      capsuleId: "capsule_yurucommu",
+      installingPrincipalId: "tsub_owner",
+      requirements: [],
+    } as const;
+
+    const ticket = await provider.apply({
+      operationId: "op-version-ambiguous-upload",
+      offering: versionOffering,
+      identity: { ...IDENTITY, name: "version" },
+      spec: { handlers: ["fetch"], requiredSensitiveVars: ["ENCRYPTION_KEY"] },
+      runtimeMaterialization,
+      relations: [
+        related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+          nativeId: "worker:script-name",
+          offeringId: workerOffering.id,
+          providerPackRef: "cloudflare",
+          outputs: { scriptName: "script-name" },
+        }),
+        related(
+          "/bundle",
+          stored("WorkerBundle", "bundle-uid", {
+            manifestDigest: `sha256:${"d".repeat(64)}`,
+          }),
+        ),
+      ],
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(uploads).toBe(1);
+    expect(rollbacks).toEqual([]);
+  });
+
+  for (const scenario of [
+    {
+      name: "duplicate matching tags",
+      items: [{ id: "version-duplicate-a" }, { id: "version-duplicate-b" }],
+      detail(id: string) {
+        return { id, annotations: { "workers/tag": "op-version-recovery-refusal" } };
+      },
+    },
+    {
+      name: "a malformed matching annotation",
+      items: [{ id: "version-malformed-tag" }],
+      detail(id: string) {
+        return { id, annotations: { "workers/tag": 42 } };
+      },
+    },
+    {
+      name: "a mismatched detail identity",
+      items: [{ id: "version-listed" }],
+      detail() {
+        return {
+          id: "version-different",
+          annotations: { "workers/tag": "op-version-recovery-refusal" },
+        };
+      },
+    },
+  ] as const) {
+    test(`refuses ${scenario.name} without uploading`, async () => {
+      const workerOffering = technical("ModuleWorker");
+      const versionOffering = technical("WorkerVersion");
+      let uploads = 0;
+      const provider = new CloudflareProvider({
+        accountId: "acct_1",
+        offerings: [workerOffering, versionOffering],
+        artifacts,
+        authorize: () => "Bearer secret-account-token",
+        apiOrigin: "https://api.cloudflare.test/client/v4",
+        async fetch(request) {
+          const url = new URL(request.url);
+          if (request.method === "GET" && url.pathname.endsWith("/versions")) {
+            const page = Number(url.searchParams.get("page"));
+            return Response.json({
+              success: true,
+              errors: [],
+              result: { items: page === 1 ? scenario.items : [] },
+              result_info: { page, per_page: 100 },
+            });
+          }
+          if (request.method === "GET" && url.pathname.includes("/versions/")) {
+            const id = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
+            return Response.json({
+              success: true,
+              errors: [],
+              result: scenario.detail(id),
+            });
+          }
+          uploads += 1;
+          return Response.json({
+            success: true,
+            errors: [],
+            result: { id: "must-not-upload" },
+          });
+        },
+      });
+
+      const ticket = await provider.apply({
+        operationId: "op-version-recovery-refusal",
+        offering: versionOffering,
+        identity: { ...IDENTITY, name: "version" },
+        spec: { handlers: ["fetch"] },
+        relations: [
+          related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+            nativeId: "worker:script-name",
+            offeringId: workerOffering.id,
+            providerPackRef: "cloudflare",
+            outputs: { scriptName: "script-name" },
+          }),
+          related(
+            "/bundle",
+            stored("WorkerBundle", "bundle-uid", {
+              manifestDigest: `sha256:${"d".repeat(64)}`,
+            }),
+          ),
+        ],
+      });
+
+      expect(ticket).toMatchObject({
+        phase: "failed",
+        failure: { code: "provider_error" },
+      });
+      expect(uploads).toBe(0);
+    });
+  }
+
+  test("refuses an unbounded recovery listing without uploading", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const versionOffering = technical("WorkerVersion");
+    let listings = 0;
+    let details = 0;
+    let uploads = 0;
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering, versionOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "GET" && url.pathname.endsWith("/versions")) {
+          listings += 1;
+          const page = Number(url.searchParams.get("page"));
+          return Response.json({
+            success: true,
+            errors: [],
+            result: { items: [{ id: `version-page-${page}` }] },
+            result_info: { page, per_page: 100 },
+          });
+        }
+        if (request.method === "GET" && url.pathname.includes("/versions/")) {
+          details += 1;
+          return Response.json({
+            success: true,
+            errors: [],
+            result: { id: decodeURIComponent(url.pathname.split("/").at(-1) ?? "") },
+          });
+        }
+        uploads += 1;
+        return Response.json({ success: true, errors: [], result: { id: "must-not-upload" } });
+      },
+    });
+
+    const ticket = await provider.apply({
+      operationId: "op-version-unbounded-recovery",
+      offering: versionOffering,
+      identity: { ...IDENTITY, name: "version" },
+      spec: { handlers: ["fetch"] },
+      relations: [
+        related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+          nativeId: "worker:script-name",
+          offeringId: workerOffering.id,
+          providerPackRef: "cloudflare",
+          outputs: { scriptName: "script-name" },
+        }),
+        related(
+          "/bundle",
+          stored("WorkerBundle", "bundle-uid", {
+            manifestDigest: `sha256:${"d".repeat(64)}`,
+          }),
+        ),
+      ],
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "provider_error" },
+    });
+    expect({ listings, details, uploads }).toEqual({ listings: 10, details: 10, uploads: 0 });
   });
 
   test("logs a sanitized transport exception when a Worker Version upload never gets a response", async () => {
@@ -745,7 +1351,16 @@ describe("released edge Form placement", () => {
       artifacts,
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
-      async fetch() {
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "GET" && url.pathname.endsWith("/versions")) {
+          return Response.json({
+            success: true,
+            errors: [],
+            result: { items: [] },
+            result_info: { page: 1, per_page: 100 },
+          });
+        }
         throw new TypeError("Network connection lost: Bearer secret-account-token");
       },
     });
@@ -802,12 +1417,21 @@ describe("released edge Form placement", () => {
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
       async fetch(request) {
+        const url = new URL(request.url);
         calls.push({
           method: request.method,
           url: request.url,
           authorization: request.headers.get("authorization"),
           body: await request.clone().text(),
         });
+        if (request.method === "GET" && url.pathname.endsWith("/versions")) {
+          return Response.json({
+            success: true,
+            errors: [],
+            result: { items: [] },
+            result_info: { page: 1, per_page: 100 },
+          });
+        }
         return Response.json({
           success: true,
           errors: [],
@@ -856,10 +1480,13 @@ describe("released edge Form placement", () => {
       phase: "succeeded",
       result: { nativeId: "version:script-name:version-s3" },
     });
-    expect(calls[0]?.body).toContain(
+    const versionUpload = calls.find(
+      (call) => call.method === "POST" && call.url.includes("/versions"),
+    );
+    expect(versionUpload?.body).toContain(
       `"type":"r2_bucket","name":"MEDIA","bucket_name":"${bucketName}"`,
     );
-    expect(calls[0]?.body).not.toContain('"type":"secret_text"');
+    expect(versionUpload?.body).not.toContain('"type":"secret_text"');
     expect(JSON.stringify(ticket)).not.toContain(bucketName);
     expect(JSON.stringify(ticket)).not.toContain("com.amazonaws.s3");
   });
@@ -871,6 +1498,7 @@ describe("released edge Form placement", () => {
     const materialized: unknown[] = [];
     const committed: unknown[] = [];
     const lifecycle: string[] = [];
+    let uploadMetadata: Record<string, unknown> | undefined;
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
@@ -898,7 +1526,21 @@ describe("released edge Form placement", () => {
         },
       },
       async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "GET" && url.pathname.endsWith("/versions")) {
+          return Response.json({
+            success: true,
+            errors: [],
+            result: { items: [] },
+            result_info: { page: 1, per_page: 100 },
+          });
+        }
         lifecycle.push("upload");
+        const form = await request.clone().formData();
+        const metadataPart = form.get("metadata");
+        uploadMetadata = JSON.parse(
+          typeof metadataPart === "string" ? metadataPart : await (metadataPart as Blob).text(),
+        ) as Record<string, unknown>;
         calls.push({
           method: request.method,
           url: request.url,
@@ -966,6 +1608,12 @@ describe("released edge Form placement", () => {
     expect(calls[0]?.body).toContain(
       '"type":"secret_text","name":"TAKOSUMI_ACCOUNTS_CLIENT_ID","text":"public-client-id"',
     );
+    expect(uploadMetadata?.annotations).toEqual({
+      "workers/tag": "op-version-sensitive",
+    });
+    expect(JSON.stringify(uploadMetadata?.annotations)).toBe(
+      '{"workers/tag":"op-version-sensitive"}',
+    );
     // A host-materialized WorkerVersion owns the exact sensitive binding set.
     // Preserving older secret_text bindings would leave a removed declaration
     // available to the next immutable Version.
@@ -1008,7 +1656,16 @@ describe("released edge Form placement", () => {
           rollbacks.push(input);
         },
       },
-      async fetch() {
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "GET" && url.pathname.endsWith("/versions")) {
+          return Response.json({
+            success: true,
+            errors: [],
+            result: { items: [] },
+            result_info: { page: 1, per_page: 100 },
+          });
+        }
         return Response.json(
           { success: false, errors: [{ code: 10000 }], result: null },
           { status: 503 },
@@ -1083,7 +1740,16 @@ describe("released edge Form placement", () => {
           throw new Error("an uploaded Version cannot roll back activation");
         },
       },
-      async fetch() {
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "GET" && url.pathname.endsWith("/versions")) {
+          return Response.json({
+            success: true,
+            errors: [],
+            result: { items: [] },
+            result_info: { page: 1, per_page: 100 },
+          });
+        }
         return Response.json({
           success: true,
           errors: [],

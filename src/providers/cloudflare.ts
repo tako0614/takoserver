@@ -50,6 +50,10 @@ const BOOTSTRAP_MODULE = "takoserver-bootstrap.mjs";
 const BOOTSTRAP_SOURCE =
   'export default { async fetch() { return new Response("Not deployed", { status: 503 }); } };\n';
 
+const WORKER_VERSION_RECOVERY_PAGE_SIZE = 100;
+const WORKER_VERSION_RECOVERY_PAGE_LIMIT = 10;
+const WORKER_VERSION_TAG_BYTE_LIMIT = 100;
+
 const SQLITE_MIGRATION_LEDGER = "_takoform_sqlite_migrations";
 const SQLITE_MIGRATION_LEDGER_DDL = `CREATE TABLE IF NOT EXISTS ${SQLITE_MIGRATION_LEDGER} (
   sequence INTEGER PRIMARY KEY NOT NULL CHECK (sequence > 0),
@@ -626,6 +630,10 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
 
   async #applyWorkerVersion(input: ApplyInput): Promise<ProviderTicket> {
     if (input.previous) return failed("invalid_spec", "Worker Versions are immutable");
+    const operationTag = workerVersionTag(input.operationId);
+    if (!operationTag) {
+      return failed("invalid_spec", "the Worker Version operation identity is invalid");
+    }
     const worker = relationDeployment(input.relations, "/worker", "worker");
     const bundle = relationResource(input.relations, "/bundle", "WorkerBundle");
     const manifestDigest = optionalString(bundle?.spec.manifestDigest);
@@ -668,6 +676,13 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
           "the sensitive Worker bindings have no runtime materialization authority",
         );
       }
+      runtimeMaterializationInput = {
+        request: runtimeMaterialization,
+        resourceName: input.identity.name,
+        scriptName,
+        publicOrigin: `https://${scriptName}.${this.#workerEndpointSuffix}`,
+        bindings: requiredSensitive,
+      };
     } else if (runtimeMaterialization) {
       return failed(
         "invalid_spec",
@@ -675,6 +690,30 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       );
     }
     const assetsSpec = record(input.spec.assets);
+    if (assetsSpec) {
+      const assetsResource = relationResource(
+        input.relations,
+        "/assets/bundle",
+        "StaticAssetBundle",
+      );
+      const assetsDigest = optionalString(assetsResource?.spec.manifestDigest);
+      if (!assetsDigest) return failed("invalid_spec", "the Static Asset Bundle is unavailable");
+    }
+
+    const recovered = await this.#recoverWorkerVersion(scriptName, operationTag);
+    if (!recovered.ok) return { phase: "failed", failure: recovered.failure };
+    if (recovered.value) {
+      if (runtimeMaterializationInput) {
+        const commitFailed = await this.#commitRuntimeMaterialization(runtimeMaterializationInput);
+        if (commitFailed) return commitFailed;
+      }
+      return succeeded({
+        nativeId: `version:${scriptName}:${recovered.value}`,
+        observed: { scriptName, versionId: recovered.value },
+        outputs: { scriptName, versionId: recovered.value },
+      });
+    }
+
     let assetToken: string | null = null;
     if (assetsSpec) {
       const assetsResource = relationResource(
@@ -701,19 +740,12 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     }
     let sensitiveBindings: readonly JsonObject[] = [];
     if (requiredSensitive.length > 0) {
-      if (!runtimeMaterializer || !runtimeMaterialization) {
+      if (!runtimeMaterializer || !runtimeMaterialization || !runtimeMaterializationInput) {
         return failed(
           "denied",
           "the sensitive Worker bindings have no runtime materialization authority",
         );
       }
-      runtimeMaterializationInput = {
-        request: runtimeMaterialization,
-        resourceName: input.identity.name,
-        scriptName,
-        publicOrigin: `https://${scriptName}.${this.#workerEndpointSuffix}`,
-        bindings: requiredSensitive,
-      };
       try {
         runtimeMaterializationResult = await runtimeMaterializer.materializeRuntimeBindings(
           runtimeMaterializationInput,
@@ -745,6 +777,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
         [
           JSON.stringify({
             main_module: manifest.mainModule,
+            annotations: { "workers/tag": operationTag },
             compatibility_date: this.#workerCompatibilityDate,
             bindings: [
               ...bindings,
@@ -786,19 +819,18 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       form,
     );
     if (!uploaded.ok) {
+      if (uploaded.indeterminate === true) {
+        return failed("unavailable", "the Worker Version upload outcome is indeterminate", true);
+      }
       const rollbackFailed = await this.#rollbackRuntimeMaterialization(
         input.runtimeMaterialization,
         runtimeMaterializationResult?.rollbackReceipt,
       );
       return rollbackFailed ?? uploaded.ticket;
     }
-    const versionId = optionalString(record(uploaded.result)?.id);
+    const versionId = workerVersionId(record(uploaded.result)?.id);
     if (!versionId) {
-      const rollbackFailed = await this.#rollbackRuntimeMaterialization(
-        input.runtimeMaterialization,
-        runtimeMaterializationResult?.rollbackReceipt,
-      );
-      return rollbackFailed ?? failed("provider_error", "the Worker Version has no identifier");
+      return failed("unavailable", "the Worker Version upload outcome is indeterminate", true);
     }
     if (runtimeMaterializationInput) {
       const commitFailed = await this.#commitRuntimeMaterialization(runtimeMaterializationInput);
@@ -809,6 +841,90 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       observed: { scriptName, versionId },
       outputs: { scriptName, versionId },
     });
+  }
+
+  async #recoverWorkerVersion(
+    scriptName: string,
+    operationTag: string,
+  ): Promise<ProviderValue<string | null>> {
+    const versionPath = `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(scriptName)}/versions`;
+    const seen = new Set<string>();
+    let recovered: string | null = null;
+    for (let page = 1; page <= WORKER_VERSION_RECOVERY_PAGE_LIMIT; page += 1) {
+      const listed = await this.#call(
+        "GET",
+        `${versionPath}?page=${page}&per_page=${WORKER_VERSION_RECOVERY_PAGE_SIZE}`,
+      );
+      if (!listed.ok) return callFailure(listed);
+      const resultInfoValue = listed.resultInfo;
+      const resultInfo = resultInfoValue === undefined ? undefined : record(resultInfoValue);
+      const reportedPage = resultInfo ? integer(resultInfo.page) : undefined;
+      const reportedPageSize = resultInfo ? integer(resultInfo.per_page) : undefined;
+      if (
+        (resultInfoValue !== undefined && !resultInfo) ||
+        (resultInfo?.page !== undefined && reportedPage !== page) ||
+        (resultInfo?.per_page !== undefined &&
+          (reportedPageSize === undefined ||
+            reportedPageSize < 1 ||
+            reportedPageSize > WORKER_VERSION_RECOVERY_PAGE_SIZE))
+      ) {
+        return providerValueFailure(
+          "provider_error",
+          "the Worker Version recovery pagination is mismatched",
+        );
+      }
+      const items = record(listed.result)?.items;
+      if (
+        !Array.isArray(items) ||
+        items.length > (reportedPageSize ?? WORKER_VERSION_RECOVERY_PAGE_SIZE)
+      ) {
+        return providerValueFailure(
+          "provider_error",
+          "the Worker Version recovery listing is malformed",
+        );
+      }
+      if (items.length === 0) return { ok: true, value: recovered };
+      for (const item of items) {
+        const versionId = workerVersionId(record(item)?.id);
+        if (!versionId || seen.has(versionId)) {
+          return providerValueFailure(
+            "provider_error",
+            "the Worker Version recovery listing is ambiguous",
+          );
+        }
+        seen.add(versionId);
+        const read = await this.#call("GET", `${versionPath}/${encodeURIComponent(versionId)}`);
+        if (!read.ok) return callFailure(read);
+        const detail = record(read.result);
+        if (workerVersionId(detail?.id) !== versionId) {
+          return providerValueFailure(
+            "provider_error",
+            "the Worker Version recovery detail is mismatched",
+          );
+        }
+        if (detail?.annotations === undefined) continue;
+        const annotations = record(detail.annotations);
+        const tag = annotations?.["workers/tag"];
+        if (!annotations || (tag !== undefined && !workerVersionTag(tag))) {
+          return providerValueFailure(
+            "provider_error",
+            "the Worker Version recovery annotation is malformed",
+          );
+        }
+        if (tag !== operationTag) continue;
+        if (recovered) {
+          return providerValueFailure(
+            "provider_error",
+            "the Worker Version recovery annotation is ambiguous",
+          );
+        }
+        recovered = versionId;
+      }
+    }
+    return providerValueFailure(
+      "provider_error",
+      "the Worker Version recovery scan exceeded its bound",
+    );
   }
 
   async #rollbackRuntimeMaterialization(
@@ -1496,11 +1612,17 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
         status: 0,
         ticket: failed("unavailable", "the backend is unreachable", true),
         codes: [],
+        ...(method === "GET" ? {} : { indeterminate: true }),
       };
     }
     const envelope = await readEnvelope(response);
     if (response.ok && envelope?.success === true) {
-      return { ok: true, status: response.status, result: envelope.result };
+      return {
+        ok: true,
+        status: response.status,
+        result: envelope.result,
+        resultInfo: envelope.result_info,
+      };
     }
     // The backend's own words are written for an operator of that cloud, not
     // for our customer, so they never cross back in the ticket. They are
@@ -1521,6 +1643,9 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       status: response.status,
       ticket: classify(response.status),
       codes: errorCodes(envelope?.errors),
+      ...(method !== "GET" && response.ok && envelope?.success !== false
+        ? { indeterminate: true }
+        : {}),
     };
   }
 }
@@ -1547,7 +1672,12 @@ function sanitizedTransportError(
 }
 
 type CallResult =
-  | { readonly ok: true; readonly status: number; readonly result?: unknown }
+  | {
+      readonly ok: true;
+      readonly status: number;
+      readonly result?: unknown;
+      readonly resultInfo?: unknown;
+    }
   | {
       readonly ok: false;
       readonly status: number;
@@ -1559,6 +1689,8 @@ type CallResult =
        * vocabulary rather than a generic refusal.
        */
       readonly codes: readonly number[];
+      /** The request may have reached a mutating provider endpoint. */
+      readonly indeterminate?: true;
     };
 
 /** The numeric codes in a Cloudflare error envelope, if it carried any. */
@@ -1579,9 +1711,12 @@ function classify(status: number): ProviderTicket {
   return failed("unavailable", "the backend could not serve the request", status >= 500);
 }
 
-async function readEnvelope(
-  response: Response,
-): Promise<{ success?: unknown; result?: unknown; errors?: unknown } | null> {
+async function readEnvelope(response: Response): Promise<{
+  success?: unknown;
+  result?: unknown;
+  result_info?: unknown;
+  errors?: unknown;
+} | null> {
   let bytes: ArrayBuffer;
   try {
     bytes = await response.arrayBuffer();
@@ -2022,4 +2157,24 @@ function base64(bytes: Uint8Array): string {
 
 function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 && value.length <= 4_096 ? value : undefined;
+}
+
+function workerVersionTag(value: unknown): string | null {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    [...value].some((character) => {
+      const code = character.codePointAt(0) ?? 0;
+      return code <= 0x1f || code === 0x7f;
+    })
+  ) {
+    return null;
+  }
+  return new TextEncoder().encode(value).byteLength <= WORKER_VERSION_TAG_BYTE_LIMIT ? value : null;
+}
+
+function workerVersionId(value: unknown): string | null {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(value)
+    ? value
+    : null;
 }
