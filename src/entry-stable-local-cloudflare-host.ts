@@ -300,6 +300,7 @@ function localProviderDriver(
       const result = ticketResult(
         await provider.apply({
           operationId: value.operationId,
+          ...(value.operationMode ? { operationMode: value.operationMode } : {}),
           offering: selected,
           identity: {
             tenantRef: value.tenantId,

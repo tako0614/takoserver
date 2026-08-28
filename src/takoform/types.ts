@@ -216,6 +216,8 @@ export interface TakoformStandardServiceResolver {
 export interface TakoformResourceDriver {
   apply(input: {
     readonly operationId: string;
+    /** Durable saga evidence: only `initial` may dispatch a new provider mutation. */
+    readonly operationMode?: "initial" | "recovery";
     readonly tenantId: string;
     readonly resourceUid: string;
     readonly form: InstalledTakoformForm;

@@ -204,8 +204,8 @@ test("an expired reservation can be recovered but its stale provider winner cann
 
   releaseFirst();
   const stale = await creating;
-  expect(stale?.status).toBe(400);
-  expect(await stale?.json()).toMatchObject({ error: { code: "invalid_argument" } });
+  expect(stale?.status).toBe(409);
+  expect(await stale?.json()).toMatchObject({ error: { code: "resource_busy" } });
   expect(
     await sql.query(
       `SELECT name FROM tf_resources

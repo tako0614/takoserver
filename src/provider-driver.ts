@@ -354,6 +354,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
           input.operationId,
           await provider.apply({
             operationId: input.operationId,
+            ...(input.operationMode ? { operationMode: input.operationMode } : {}),
             offering,
             identity: {
               tenantRef: input.tenantId,

@@ -85,6 +85,9 @@ export function createTakoformHost(options: CreateTakoformHostOptions): Takoform
     stableReviewConstraintPhases: true,
     clock,
     randomId,
+    ...(options.deferredOperations?.leaseMilliseconds
+      ? { providerMutationLeaseMilliseconds: options.deferredOperations.leaseMilliseconds }
+      : {}),
     ...(options.workerModuleInspector
       ? { workerModuleInspector: options.workerModuleInspector }
       : {}),

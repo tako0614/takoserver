@@ -689,6 +689,7 @@ describe("released edge Form placement", () => {
     );
     const version = await provider.apply({
       operationId: "op-version",
+      operationMode: "initial",
       offering: versionOffering,
       identity: { ...IDENTITY, name: "v1" },
       spec: {
@@ -754,10 +755,11 @@ describe("released edge Form placement", () => {
     expect(deployment?.body).toContain('"version_id":"version-id"');
   });
 
-  test("tags a new immutable Worker Version with the stable provider operation", async () => {
+  test("marks a first Worker Version dispatch without scanning existing history", async () => {
     const workerOffering = technical("ModuleWorker");
     const versionOffering = technical("WorkerVersion");
     const calls: Call[] = [];
+    let uploadMetadata: Record<string, unknown> | undefined;
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
@@ -772,13 +774,13 @@ describe("released edge Form placement", () => {
           body: await request.clone().text(),
         });
         if (request.method === "GET") {
-          return Response.json({
-            success: true,
-            errors: [],
-            result: { items: [] },
-            result_info: { page: 1, per_page: 100 },
-          });
+          throw new Error("a brand-new leased dispatch must not scan Worker Version history");
         }
+        const form = await request.formData();
+        const metadata = form.get("metadata");
+        uploadMetadata = JSON.parse(
+          typeof metadata === "string" ? metadata : await (metadata as Blob).text(),
+        ) as Record<string, unknown>;
         return Response.json({
           success: true,
           errors: [],
@@ -789,6 +791,7 @@ describe("released edge Form placement", () => {
 
     const ticket = await provider.apply({
       operationId: "op-version-tagged",
+      operationMode: "initial",
       offering: versionOffering,
       identity: { ...IDENTITY, name: "version" },
       spec: { handlers: ["fetch"] },
@@ -812,34 +815,196 @@ describe("released edge Form placement", () => {
       phase: "succeeded",
       result: { nativeId: "version:script-name:version-tagged" },
     });
-    expect(calls.map((call) => call.method)).toEqual(["GET", "POST"]);
-    expect(new URL(calls[0]?.url ?? "https://invalid.test").searchParams).toMatchObject(
-      new URLSearchParams({ page: "1", per_page: "100" }),
-    );
-    expect(calls[1]?.body).toContain('"annotations":{"workers/tag":"op-version-tagged"}');
+    expect(calls.map((call) => call.method)).toEqual(["POST"]);
+    expect(uploadMetadata).not.toHaveProperty("annotations");
+    expect(uploadMetadata?.bindings).toContainEqual({
+      type: "plain_text",
+      name: "TAKOSERVER_INTERNAL_OPERATION_MARKER",
+      text: "tsop-v1:97121f2b71233d7f95df7a5bbcd4b228b9804d80cfda21c25eabdb452e612db9",
+    });
   });
 
-  test("refuses an operation identity that cannot fit in the Worker Version tag", async () => {
+  test("recovers only from the official Version GET resources binding shape", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const versionOffering = technical("WorkerVersion");
+    let uploads = 0;
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering, versionOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "GET" && url.pathname.endsWith("/versions")) {
+          const page = Number(url.searchParams.get("page"));
+          return Response.json({
+            success: true,
+            errors: [],
+            result: { items: page === 1 ? [{ id: "version-official-shape" }] : [] },
+            result_info: { page, per_page: 100 },
+          });
+        }
+        if (request.method === "GET" && url.pathname.includes("/versions/")) {
+          return Response.json({
+            success: true,
+            errors: [],
+            result: {
+              id: "version-official-shape",
+              resources: {
+                bindings: [
+                  {
+                    type: "plain_text",
+                    name: "TAKOSERVER_INTERNAL_OPERATION_MARKER",
+                    text: "tsop-v1:04976831663cd11567d29c11e858e442a576472042bca36820c6bea5d897b2f7",
+                  },
+                ],
+              },
+              metadata: {},
+              number: 42,
+            },
+          });
+        }
+        uploads += 1;
+        return Response.json({ success: true, errors: [], result: { id: "duplicate" } });
+      },
+    });
+
+    const ticket = await provider.apply({
+      operationId: "op-version-official-shape",
+      operationMode: "recovery",
+      offering: versionOffering,
+      identity: { ...IDENTITY, name: "version" },
+      spec: { handlers: ["fetch"] },
+      relations: [
+        related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+          nativeId: "worker:script-name",
+          offeringId: workerOffering.id,
+          providerPackRef: "cloudflare",
+          outputs: { scriptName: "script-name" },
+        }),
+        related(
+          "/bundle",
+          stored("WorkerBundle", "bundle-uid", {
+            manifestDigest: `sha256:${"d".repeat(64)}`,
+          }),
+        ),
+      ],
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: "version:script-name:version-official-shape" },
+    });
+    expect(uploads).toBe(0);
+  });
+
+  test("does not invent root annotations on Version GET", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const versionOffering = technical("WorkerVersion");
+    let uploads = 0;
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering, versionOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "GET" && url.pathname.endsWith("/versions")) {
+          const page = Number(url.searchParams.get("page"));
+          return Response.json({
+            success: true,
+            errors: [],
+            result: { items: page === 1 ? [{ id: "version-root-annotation" }] : [] },
+            result_info: { page, per_page: 100 },
+          });
+        }
+        if (request.method === "GET" && url.pathname.includes("/versions/")) {
+          return Response.json({
+            success: true,
+            errors: [],
+            result: {
+              id: "version-root-annotation",
+              annotations: { "workers/tag": "op-version-official-shape" },
+              resources: { bindings: [] },
+            },
+          });
+        }
+        uploads += 1;
+        return Response.json({ success: true, errors: [], result: { id: "duplicate" } });
+      },
+    });
+
+    const ticket = await provider.apply({
+      operationId: "op-version-official-shape",
+      operationMode: "recovery",
+      offering: versionOffering,
+      identity: { ...IDENTITY, name: "version" },
+      spec: { handlers: ["fetch"] },
+      relations: [
+        related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+          nativeId: "worker:script-name",
+          offeringId: workerOffering.id,
+          providerPackRef: "cloudflare",
+          outputs: { scriptName: "script-name" },
+        }),
+        related(
+          "/bundle",
+          stored("WorkerBundle", "bundle-uid", {
+            manifestDigest: `sha256:${"d".repeat(64)}`,
+          }),
+        ),
+      ],
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(uploads).toBe(0);
+  });
+
+  test("refuses a customer binding that collides with the reserved operation marker", async () => {
+    const workerOffering = technical("ModuleWorker");
     const versionOffering = technical("WorkerVersion");
     let requests = 0;
     const provider = new CloudflareProvider({
       accountId: "acct_1",
-      offerings: [versionOffering],
+      offerings: [workerOffering, versionOffering],
       artifacts,
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
       async fetch() {
         requests += 1;
-        throw new Error("an invalid tag must fail before Cloudflare is reached");
+        throw new Error("a reserved binding collision must fail before Cloudflare is reached");
       },
     });
 
     expect(
       await provider.apply({
-        operationId: "あ".repeat(34),
+        operationId: "op-version-marker-collision",
+        operationMode: "initial",
         offering: versionOffering,
         identity: { ...IDENTITY, name: "version" },
-        spec: {},
+        spec: {
+          handlers: ["fetch"],
+          vars: { TAKOSERVER_INTERNAL_OPERATION_MARKER: "customer-controlled" },
+        },
+        relations: [
+          related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+            nativeId: "worker:script-name",
+            offeringId: workerOffering.id,
+            providerPackRef: "cloudflare",
+            outputs: { scriptName: "script-name" },
+          }),
+          related(
+            "/bundle",
+            stored("WorkerBundle", "bundle-uid", {
+              manifestDigest: `sha256:${"d".repeat(64)}`,
+            }),
+          ),
+        ],
       }),
     ).toMatchObject({
       phase: "failed",
@@ -854,7 +1019,7 @@ describe("released edge Form placement", () => {
     const requests: Request[] = [];
     const materialized: unknown[] = [];
     const committed: unknown[] = [];
-    let storedVersion: { id: string; tag: string } | undefined;
+    let storedVersion: { id: string; marker: string } | undefined;
     let refuseFirstCommit = true;
     const provider = new CloudflareProvider({
       accountId: "acct_1",
@@ -900,8 +1065,17 @@ describe("released edge Form placement", () => {
             result: storedVersion
               ? {
                   id: storedVersion.id,
-                  annotations: { "workers/tag": storedVersion.tag },
-                  resources: { bindings: [], script: {}, script_runtime: {} },
+                  resources: {
+                    bindings: [
+                      {
+                        type: "plain_text",
+                        name: "TAKOSERVER_INTERNAL_OPERATION_MARKER",
+                        text: storedVersion.marker,
+                      },
+                    ],
+                    script: {},
+                    script_runtime: {},
+                  },
                 }
               : null,
           });
@@ -911,10 +1085,13 @@ describe("released edge Form placement", () => {
           const part = form.get("metadata");
           const metadata = JSON.parse(
             typeof part === "string" ? part : await (part as Blob).text(),
-          ) as { annotations?: { "workers/tag"?: string } };
+          ) as { bindings?: Array<{ name?: string; text?: string }> };
           storedVersion = {
             id: "version-commit-retry",
-            tag: metadata.annotations?.["workers/tag"] ?? "",
+            marker:
+              metadata.bindings?.find(
+                (binding) => binding.name === "TAKOSERVER_INTERNAL_OPERATION_MARKER",
+              )?.text ?? "",
           };
           return Response.json({
             success: true,
@@ -933,9 +1110,10 @@ describe("released edge Form placement", () => {
       installingPrincipalId: "tsub_owner",
       requirements: [],
     } as const;
-    const apply = () =>
+    const apply = (operationMode: "initial" | "recovery") =>
       provider.apply({
         operationId: "op-version-commit-retry",
+        operationMode,
         offering: versionOffering,
         identity: { ...IDENTITY, name: "version" },
         spec: { handlers: ["fetch"], requiredSensitiveVars: ["ENCRYPTION_KEY"] },
@@ -956,11 +1134,11 @@ describe("released edge Form placement", () => {
         ],
       });
 
-    expect(await apply()).toMatchObject({
+    expect(await apply("initial")).toMatchObject({
       phase: "failed",
       failure: { code: "provider_error" },
     });
-    expect(await apply()).toMatchObject({
+    expect(await apply("recovery")).toMatchObject({
       phase: "succeeded",
       result: { nativeId: "version:script-name:version-commit-retry" },
     });
@@ -973,7 +1151,7 @@ describe("released edge Form placement", () => {
   test("recovers the one tagged Version after its upload response is lost", async () => {
     const workerOffering = technical("ModuleWorker");
     const versionOffering = technical("WorkerVersion");
-    let storedVersion: { id: string; tag: string } | undefined;
+    let storedVersion: { id: string; marker: string } | undefined;
     let uploads = 0;
     const log = spyOn(console, "error").mockImplementation(() => undefined);
     const provider = new CloudflareProvider({
@@ -1002,8 +1180,17 @@ describe("released edge Form placement", () => {
             result: storedVersion
               ? {
                   id: storedVersion.id,
-                  annotations: { "workers/tag": storedVersion.tag },
-                  resources: { bindings: [], script: {}, script_runtime: {} },
+                  resources: {
+                    bindings: [
+                      {
+                        type: "plain_text",
+                        name: "TAKOSERVER_INTERNAL_OPERATION_MARKER",
+                        text: storedVersion.marker,
+                      },
+                    ],
+                    script: {},
+                    script_runtime: {},
+                  },
                 }
               : null,
           });
@@ -1014,19 +1201,23 @@ describe("released edge Form placement", () => {
           const part = form.get("metadata");
           const metadata = JSON.parse(
             typeof part === "string" ? part : await (part as Blob).text(),
-          ) as { annotations?: { "workers/tag"?: string } };
+          ) as { bindings?: Array<{ name?: string; text?: string }> };
           storedVersion = {
             id: "version-lost-response",
-            tag: metadata.annotations?.["workers/tag"] ?? "",
+            marker:
+              metadata.bindings?.find(
+                (binding) => binding.name === "TAKOSERVER_INTERNAL_OPERATION_MARKER",
+              )?.text ?? "",
           };
           throw new TypeError("connection closed after upload");
         }
         throw new Error(`unexpected Cloudflare request: ${request.method} ${url.pathname}`);
       },
     });
-    const apply = () =>
+    const apply = (operationMode: "initial" | "recovery") =>
       provider.apply({
         operationId: "op-version-lost-response",
+        operationMode,
         offering: versionOffering,
         identity: { ...IDENTITY, name: "version" },
         spec: { handlers: ["fetch"] },
@@ -1047,11 +1238,11 @@ describe("released edge Form placement", () => {
       });
 
     try {
-      expect(await apply()).toMatchObject({
+      expect(await apply("initial")).toMatchObject({
         phase: "failed",
         failure: { code: "unavailable", retryable: true },
       });
-      expect(await apply()).toMatchObject({
+      expect(await apply("recovery")).toMatchObject({
         phase: "succeeded",
         result: { nativeId: "version:script-name:version-lost-response" },
       });
@@ -1155,6 +1346,7 @@ describe("released edge Form placement", () => {
 
     const ticket = await provider.apply({
       operationId: "op-version-ambiguous-upload",
+      operationMode: "initial",
       offering: versionOffering,
       identity: { ...IDENTITY, name: "version" },
       spec: { handlers: ["fetch"], requiredSensitiveVars: ["ENCRYPTION_KEY"] },
@@ -1185,17 +1377,39 @@ describe("released edge Form placement", () => {
 
   for (const scenario of [
     {
-      name: "duplicate matching tags",
+      name: "duplicate matching markers",
       items: [{ id: "version-duplicate-a" }, { id: "version-duplicate-b" }],
       detail(id: string) {
-        return { id, annotations: { "workers/tag": "op-version-recovery-refusal" } };
+        return {
+          id,
+          resources: {
+            bindings: [
+              {
+                type: "plain_text",
+                name: "TAKOSERVER_INTERNAL_OPERATION_MARKER",
+                text: "tsop-v1:2498eb0818830b5389ee0a3d130902477a5897c00d76ee4d7ed126076892a53e",
+              },
+            ],
+          },
+        };
       },
     },
     {
-      name: "a malformed matching annotation",
+      name: "a malformed reserved marker binding",
       items: [{ id: "version-malformed-tag" }],
       detail(id: string) {
-        return { id, annotations: { "workers/tag": 42 } };
+        return {
+          id,
+          resources: {
+            bindings: [
+              {
+                type: "plain_text",
+                name: "TAKOSERVER_INTERNAL_OPERATION_MARKER",
+                text: 42,
+              },
+            ],
+          },
+        };
       },
     },
     {
@@ -1204,7 +1418,15 @@ describe("released edge Form placement", () => {
       detail() {
         return {
           id: "version-different",
-          annotations: { "workers/tag": "op-version-recovery-refusal" },
+          resources: {
+            bindings: [
+              {
+                type: "plain_text",
+                name: "TAKOSERVER_INTERNAL_OPERATION_MARKER",
+                text: "tsop-v1:2498eb0818830b5389ee0a3d130902477a5897c00d76ee4d7ed126076892a53e",
+              },
+            ],
+          },
         };
       },
     },
@@ -1249,6 +1471,7 @@ describe("released edge Form placement", () => {
 
       const ticket = await provider.apply({
         operationId: "op-version-recovery-refusal",
+        operationMode: "recovery",
         offering: versionOffering,
         identity: { ...IDENTITY, name: "version" },
         spec: { handlers: ["fetch"] },
@@ -1276,7 +1499,7 @@ describe("released edge Form placement", () => {
     });
   }
 
-  test("refuses an unbounded recovery listing without uploading", async () => {
+  test("keeps a bounded recovery indeterminate without uploading again", async () => {
     const workerOffering = technical("ModuleWorker");
     const versionOffering = technical("WorkerVersion");
     let listings = 0;
@@ -1305,7 +1528,11 @@ describe("released edge Form placement", () => {
           return Response.json({
             success: true,
             errors: [],
-            result: { id: decodeURIComponent(url.pathname.split("/").at(-1) ?? "") },
+            result: {
+              id: decodeURIComponent(url.pathname.split("/").at(-1) ?? ""),
+              resources: { bindings: [] },
+              metadata: {},
+            },
           });
         }
         uploads += 1;
@@ -1315,6 +1542,7 @@ describe("released edge Form placement", () => {
 
     const ticket = await provider.apply({
       operationId: "op-version-unbounded-recovery",
+      operationMode: "recovery",
       offering: versionOffering,
       identity: { ...IDENTITY, name: "version" },
       spec: { handlers: ["fetch"] },
@@ -1336,7 +1564,7 @@ describe("released edge Form placement", () => {
 
     expect(ticket).toMatchObject({
       phase: "failed",
-      failure: { code: "provider_error" },
+      failure: { code: "unavailable", retryable: true },
     });
     expect({ listings, details, uploads }).toEqual({ listings: 10, details: 10, uploads: 0 });
   });
@@ -1368,6 +1596,7 @@ describe("released edge Form placement", () => {
     try {
       const ticket = await provider.apply({
         operationId: "op-version-transport-failure",
+        operationMode: "initial",
         offering: versionOffering,
         identity: { ...IDENTITY, name: "v1" },
         spec: {
@@ -1442,6 +1671,7 @@ describe("released edge Form placement", () => {
     const bucketName = `tss3-${"a".repeat(40)}`;
     const ticket = await provider.apply({
       operationId: "op-version-s3",
+      operationMode: "initial",
       offering: versionOffering,
       identity: { ...IDENTITY, name: "version" },
       spec: { handlers: ["fetch"], requiredSensitiveVars: [] },
@@ -1489,6 +1719,84 @@ describe("released edge Form placement", () => {
     expect(versionUpload?.body).not.toContain('"type":"secret_text"');
     expect(JSON.stringify(ticket)).not.toContain(bucketName);
     expect(JSON.stringify(ticket)).not.toContain("com.amazonaws.s3");
+  });
+
+  test("ignores unused runtime authority for a fetch-only Worker Version", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const versionOffering = technical("WorkerVersion");
+    let materializerCalls = 0;
+    let uploadBody = "";
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering, versionOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      workerEndpointSuffix: "workers.example",
+      runtimeMaterializer: {
+        async materializeRuntimeBindings() {
+          materializerCalls += 1;
+          throw new Error("unused authority must not be materialized");
+        },
+        async commitRuntimeBindings() {
+          materializerCalls += 1;
+          throw new Error("unused authority must not be committed");
+        },
+        async rollbackRuntimeBindings() {
+          materializerCalls += 1;
+          throw new Error("unused authority must not be rolled back");
+        },
+      },
+      async fetch(request) {
+        if (request.method !== "POST") {
+          throw new Error("a first dispatch must not enter recovery");
+        }
+        uploadBody = await request.clone().text();
+        return Response.json({
+          success: true,
+          errors: [],
+          result: { id: "version-fetch-only" },
+        });
+      },
+    });
+    const runtimeMaterialization = {
+      contract: "takosumi.host-runtime-materialization/v1",
+      installConfigId: "icfg_yurucommu",
+      workspaceId: "workspace_1",
+      capsuleId: "capsule_yurucommu",
+      installingPrincipalId: "tsub_owner",
+      requirements: [],
+    } as const;
+
+    const ticket = await provider.apply({
+      operationId: "op-version-fetch-only",
+      operationMode: "initial",
+      offering: versionOffering,
+      identity: { ...IDENTITY, name: "version" },
+      spec: { handlers: ["fetch"], requiredSensitiveVars: [] },
+      runtimeMaterialization,
+      relations: [
+        related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+          nativeId: "worker:script-name",
+          offeringId: workerOffering.id,
+          providerPackRef: "cloudflare",
+          outputs: { scriptName: "script-name" },
+        }),
+        related(
+          "/bundle",
+          stored("WorkerBundle", "bundle-uid", {
+            manifestDigest: `sha256:${"d".repeat(64)}`,
+          }),
+        ),
+      ],
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: "version:script-name:version-fetch-only" },
+    });
+    expect(materializerCalls).toBe(0);
+    expect(uploadBody).not.toContain('"type":"secret_text"');
   });
 
   test("materializes exact sensitive bindings only inside the immutable Worker Version upload", async () => {
@@ -1564,6 +1872,7 @@ describe("released edge Form placement", () => {
     } as const;
     const ticket = await provider.apply({
       operationId: "op-version-sensitive",
+      operationMode: "initial",
       offering: versionOffering,
       identity: { ...IDENTITY, name: "version" },
       spec: {
@@ -1608,12 +1917,12 @@ describe("released edge Form placement", () => {
     expect(calls[0]?.body).toContain(
       '"type":"secret_text","name":"TAKOSUMI_ACCOUNTS_CLIENT_ID","text":"public-client-id"',
     );
-    expect(uploadMetadata?.annotations).toEqual({
-      "workers/tag": "op-version-sensitive",
+    expect(uploadMetadata).not.toHaveProperty("annotations");
+    expect(uploadMetadata?.bindings).toContainEqual({
+      type: "plain_text",
+      name: "TAKOSERVER_INTERNAL_OPERATION_MARKER",
+      text: "tsop-v1:8f0fa7feeca8c241ad945d9775309bb2e3f5331d6a0bedb4e30453cdea472801",
     });
-    expect(JSON.stringify(uploadMetadata?.annotations)).toBe(
-      '{"workers/tag":"op-version-sensitive"}',
-    );
     // A host-materialized WorkerVersion owns the exact sensitive binding set.
     // Preserving older secret_text bindings would leave a removed declaration
     // available to the next immutable Version.
@@ -1675,6 +1984,7 @@ describe("released edge Form placement", () => {
 
     const ticket = await provider.apply({
       operationId: "op-version-upload-failed",
+      operationMode: "initial",
       offering: versionOffering,
       identity: { ...IDENTITY, name: "version" },
       spec: { handlers: ["fetch"], requiredSensitiveVars: ["ENCRYPTION_KEY"] },
@@ -1760,6 +2070,7 @@ describe("released edge Form placement", () => {
 
     const ticket = await provider.apply({
       operationId: "op-version-commit-refused",
+      operationMode: "initial",
       offering: versionOffering,
       identity: { ...IDENTITY, name: "version" },
       spec: { handlers: ["fetch"], requiredSensitiveVars: ["ENCRYPTION_KEY"] },

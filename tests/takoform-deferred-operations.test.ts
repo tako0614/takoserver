@@ -51,6 +51,57 @@ afterEach(() => {
 });
 
 describe("durable deferred Takoform operations", () => {
+  test("serializes concurrent same-operation provider execution in the real store", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    const entered = deferred();
+    const release = deferred();
+    let providerCalls = 0;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      apply: async (input) => {
+        providerCalls += 1;
+        entered.resolve();
+        await release.promise;
+        return await memory.apply(input);
+      },
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+    };
+    const opened = persistentHarness(undefined, driver).open();
+    const desired = desiredResource("concurrent", "one-provider-call");
+    const review = await prepareReview(opened.host, desired);
+    const path = `${lane}/resources/example.forms.invalid/DeferredThing/concurrent`;
+    const apply = () =>
+      opened.host.handle(
+        request(path, "primary", {
+          method: "PUT",
+          headers: {
+            "idempotency-key": "concurrent-provider-operation-0001",
+            "if-none-match": "*",
+          },
+          body: JSON.stringify({ ...desired, review }),
+        }),
+      );
+
+    const first = apply();
+    await entered.promise;
+    const second = apply();
+    const earlySecond = await Promise.race([
+      second,
+      new Promise<undefined>((resolve) => setTimeout(resolve, 50)),
+    ]);
+    release.resolve();
+    const [firstResponse, secondResponse] = await Promise.all([first, second]);
+
+    expect(providerCalls).toBe(1);
+    expect(firstResponse?.status).toBe(201);
+    expect(earlySecond?.status).toBe(503);
+    expect(secondResponse?.status).toBe(503);
+    expect((await apply())?.status).toBe(201);
+    expect(providerCalls).toBe(1);
+    opened.close();
+  });
+
   test("resumes the same exact provider mutation across renewed run authority", async () => {
     const memory = new InMemoryTakoformResourceDriver();
     let providerCalls = 0;

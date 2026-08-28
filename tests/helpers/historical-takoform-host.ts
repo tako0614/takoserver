@@ -62,6 +62,9 @@ export function createConfiguredHistoricalTakoformHost(
       : {}),
     clock,
     randomId,
+    ...(options.deferredOperations?.leaseMilliseconds
+      ? { providerMutationLeaseMilliseconds: options.deferredOperations.leaseMilliseconds }
+      : {}),
     ...(options.workerModuleInspector
       ? { workerModuleInspector: options.workerModuleInspector }
       : {}),

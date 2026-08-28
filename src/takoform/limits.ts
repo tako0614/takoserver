@@ -32,3 +32,6 @@ export const OPERATION_TTL_MILLISECONDS = 7 * 24 * 60 * 60_000;
 
 /** Long enough for one provider call; expired reservations are recoverable. */
 export const RESOURCE_CLAIM_RESERVATION_TTL_MILLISECONDS = 5 * 60_000;
+
+/** Long enough for one provider request; ownership remains recoverable after a crash. */
+export const PROVIDER_MUTATION_EXECUTION_LEASE_MILLISECONDS = 30_000;

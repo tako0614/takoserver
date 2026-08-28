@@ -87,6 +87,7 @@ describe("bringing a local database up to date", () => {
       "0021_takoform_provider_mutation_sagas.sql",
       "0022_takoform_admission.sql",
       "0023_takoform_host_authority.sql",
+      "0024_takoform_provider_execution_leases.sql",
     ]);
     expect(
       database
@@ -161,7 +162,10 @@ describe("bringing a local database up to date", () => {
 
     const report = migrateSqlite(database);
 
-    expect(report.applied).toEqual(["0023_takoform_host_authority.sql"]);
+    expect(report.applied).toEqual([
+      "0023_takoform_host_authority.sql",
+      "0024_takoform_provider_execution_leases.sql",
+    ]);
     expect(
       database
         .query(
@@ -191,6 +195,70 @@ describe("bringing a local database up to date", () => {
            '${sha("a")}', '${sha("0")}')
       `),
     ).not.toThrow();
+  });
+
+  test("adds provider execution leases without rewriting planned or executed sagas", () => {
+    const database = new Database(":memory:");
+    database.exec(`
+      CREATE TABLE applied_migrations (
+        name TEXT PRIMARY KEY NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+    const executionLeaseMigration = MIGRATIONS.findIndex(
+      (migration) => migration.name === "0024_takoform_provider_execution_leases.sql",
+    );
+    expect(executionLeaseMigration).toBeGreaterThan(0);
+    for (const migration of MIGRATIONS.slice(0, executionLeaseMigration)) {
+      database.exec(migration.sql);
+      database
+        .query("INSERT INTO applied_migrations (name, applied_at) VALUES (?, 'now')")
+        .run(migration.name);
+    }
+    database.exec(`
+      INSERT INTO tf_provider_mutation_sagas
+        (operation_id, replay_key, tenant_id, fingerprint, resource_uid,
+         target_space, target_api_version, target_kind, target_name,
+         accepted_uid, accepted_generation, accepted_revision, phase,
+         receipt_json, authority_head_digest, created_at, updated_at, expires_at)
+      VALUES
+        ('op_planned', 'replay-planned', 'tenant-a', '{}', 'uid_planned',
+         'main', 'example.forms.invalid', 'Thing', 'planned',
+         NULL, NULL, NULL, 'planned', NULL, NULL, 100, 100, 999),
+        ('op_executed', 'replay-executed', 'tenant-a', '{}', 'uid_executed',
+         'main', 'example.forms.invalid', 'Thing', 'executed',
+         NULL, NULL, NULL, 'executed', '{"observed":{}}', NULL, 100, 100, NULL);
+    `);
+
+    const report = migrateSqlite(database);
+
+    expect(report.applied).toEqual(["0024_takoform_provider_execution_leases.sql"]);
+    expect(
+      database
+        .query(
+          `SELECT operation_id, phase, receipt_json, execution_lease_token,
+                  execution_lease_until, execution_started_at
+           FROM tf_provider_mutation_sagas ORDER BY operation_id`,
+        )
+        .all(),
+    ).toEqual([
+      {
+        operation_id: "op_executed",
+        phase: "executed",
+        receipt_json: '{"observed":{}}',
+        execution_lease_token: null,
+        execution_lease_until: null,
+        execution_started_at: null,
+      },
+      {
+        operation_id: "op_planned",
+        phase: "planned",
+        receipt_json: null,
+        execution_lease_token: null,
+        execution_lease_until: null,
+        execution_started_at: null,
+      },
+    ]);
   });
 
   test("renames fractional usage money without changing its value", () => {

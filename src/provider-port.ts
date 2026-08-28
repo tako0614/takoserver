@@ -80,6 +80,12 @@ export interface ResourceIdentity {
 export interface ApplyInput {
   /** Stable across retries of the same logical operation. */
   readonly operationId: string;
+  /**
+   * `initial` is granted only by the durable Host execution lease and may
+   * cross the provider mutation boundary once. An absent value is treated as
+   * recovery so callers that do not own that lease fail closed.
+   */
+  readonly operationMode?: "initial" | "recovery";
   readonly offering: ProviderOffering;
   readonly identity: ResourceIdentity;
   readonly spec: JsonObject;

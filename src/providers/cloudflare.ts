@@ -52,7 +52,9 @@ const BOOTSTRAP_SOURCE =
 
 const WORKER_VERSION_RECOVERY_PAGE_SIZE = 100;
 const WORKER_VERSION_RECOVERY_PAGE_LIMIT = 10;
-const WORKER_VERSION_TAG_BYTE_LIMIT = 100;
+const WORKER_VERSION_OPERATION_ID_BYTE_LIMIT = 512;
+const WORKER_VERSION_OPERATION_MARKER_BINDING = "TAKOSERVER_INTERNAL_OPERATION_MARKER";
+const WORKER_VERSION_OPERATION_MARKER_PREFIX = "tsop-v1:";
 
 const SQLITE_MIGRATION_LEDGER = "_takoform_sqlite_migrations";
 const SQLITE_MIGRATION_LEDGER_DDL = `CREATE TABLE IF NOT EXISTS ${SQLITE_MIGRATION_LEDGER} (
@@ -630,8 +632,8 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
 
   async #applyWorkerVersion(input: ApplyInput): Promise<ProviderTicket> {
     if (input.previous) return failed("invalid_spec", "Worker Versions are immutable");
-    const operationTag = workerVersionTag(input.operationId);
-    if (!operationTag) {
+    const operationMarker = await workerVersionOperationMarker(input.operationId);
+    if (!operationMarker) {
       return failed("invalid_spec", "the Worker Version operation identity is invalid");
     }
     const worker = relationDeployment(input.relations, "/worker", "worker");
@@ -663,6 +665,14 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     if (!requiredSensitive) {
       return failed("invalid_spec", "the sensitive Worker binding declaration is invalid");
     }
+    if (
+      [...bindings, ...standardServiceBindings].some(
+        (binding) => binding.name === WORKER_VERSION_OPERATION_MARKER_BINDING,
+      ) ||
+      requiredSensitive.includes(WORKER_VERSION_OPERATION_MARKER_BINDING)
+    ) {
+      return failed("invalid_spec", "the Worker Version operation marker binding is reserved");
+    }
     const runtimeMaterializer = this.#runtimeMaterializer;
     const runtimeMaterialization = input.runtimeMaterialization;
     let runtimeMaterializationResult:
@@ -683,11 +693,6 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
         publicOrigin: `https://${scriptName}.${this.#workerEndpointSuffix}`,
         bindings: requiredSensitive,
       };
-    } else if (runtimeMaterialization) {
-      return failed(
-        "invalid_spec",
-        "runtime materialization authority requires sensitive Worker bindings",
-      );
     }
     const assetsSpec = record(input.spec.assets);
     if (assetsSpec) {
@@ -700,9 +705,9 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       if (!assetsDigest) return failed("invalid_spec", "the Static Asset Bundle is unavailable");
     }
 
-    const recovered = await this.#recoverWorkerVersion(scriptName, operationTag);
-    if (!recovered.ok) return { phase: "failed", failure: recovered.failure };
-    if (recovered.value) {
+    if (input.operationMode !== "initial") {
+      const recovered = await this.#recoverWorkerVersion(scriptName, operationMarker);
+      if (!recovered.ok) return { phase: "failed", failure: recovered.failure };
       if (runtimeMaterializationInput) {
         const commitFailed = await this.#commitRuntimeMaterialization(runtimeMaterializationInput);
         if (commitFailed) return commitFailed;
@@ -777,11 +782,15 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
         [
           JSON.stringify({
             main_module: manifest.mainModule,
-            annotations: { "workers/tag": operationTag },
             compatibility_date: this.#workerCompatibilityDate,
             bindings: [
               ...bindings,
               ...standardServiceBindings,
+              {
+                type: "plain_text",
+                name: WORKER_VERSION_OPERATION_MARKER_BINDING,
+                text: operationMarker,
+              },
               ...sensitiveBindings,
               ...(assetToken ? [{ type: "assets", name: ASSETS_BINDING }] : []),
             ],
@@ -845,8 +854,8 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
 
   async #recoverWorkerVersion(
     scriptName: string,
-    operationTag: string,
-  ): Promise<ProviderValue<string | null>> {
+    operationMarker: string,
+  ): Promise<ProviderValue<string>> {
     const versionPath = `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(scriptName)}/versions`;
     const seen = new Set<string>();
     let recovered: string | null = null;
@@ -883,7 +892,15 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
           "the Worker Version recovery listing is malformed",
         );
       }
-      if (items.length === 0) return { ok: true, value: recovered };
+      if (items.length === 0) {
+        return recovered
+          ? { ok: true, value: recovered }
+          : providerValueFailure(
+              "unavailable",
+              "the Worker Version upload outcome is indeterminate",
+              true,
+            );
+      }
       for (const item of items) {
         const versionId = workerVersionId(record(item)?.id);
         if (!versionId || seen.has(versionId)) {
@@ -902,29 +919,53 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
             "the Worker Version recovery detail is mismatched",
           );
         }
-        if (detail?.annotations === undefined) continue;
-        const annotations = record(detail.annotations);
-        const tag = annotations?.["workers/tag"];
-        if (!annotations || (tag !== undefined && !workerVersionTag(tag))) {
+        const resources = record(detail?.resources);
+        const bindingsValue = resources?.bindings;
+        if (!resources || (bindingsValue !== undefined && !Array.isArray(bindingsValue))) {
           return providerValueFailure(
             "provider_error",
-            "the Worker Version recovery annotation is malformed",
+            "the Worker Version recovery resources are malformed",
           );
         }
-        if (tag !== operationTag) continue;
+        const markerBindings = (bindingsValue ?? []).filter(
+          (binding) => record(binding)?.name === WORKER_VERSION_OPERATION_MARKER_BINDING,
+        );
+        if (markerBindings.length > 1) {
+          return providerValueFailure(
+            "provider_error",
+            "the Worker Version recovery marker is ambiguous",
+          );
+        }
+        if (markerBindings.length === 0) continue;
+        const markerBinding = record(markerBindings[0]);
+        const marker = markerBinding?.text;
+        if (
+          markerBinding?.type !== "plain_text" ||
+          typeof marker !== "string" ||
+          !workerVersionOperationMarkerValue(marker)
+        ) {
+          return providerValueFailure(
+            "provider_error",
+            "the Worker Version recovery marker is malformed",
+          );
+        }
+        if (marker !== operationMarker) continue;
         if (recovered) {
           return providerValueFailure(
             "provider_error",
-            "the Worker Version recovery annotation is ambiguous",
+            "the Worker Version recovery marker is ambiguous",
           );
         }
         recovered = versionId;
       }
     }
-    return providerValueFailure(
-      "provider_error",
-      "the Worker Version recovery scan exceeded its bound",
-    );
+    return recovered
+      ? { ok: true, value: recovered }
+      : providerValueFailure(
+          "unavailable",
+          "the Worker Version upload outcome is indeterminate",
+          true,
+        );
   }
 
   async #rollbackRuntimeMaterialization(
@@ -2159,7 +2200,7 @@ function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 && value.length <= 4_096 ? value : undefined;
 }
 
-function workerVersionTag(value: unknown): string | null {
+async function workerVersionOperationMarker(value: unknown): Promise<string | null> {
   if (
     typeof value !== "string" ||
     value.length === 0 ||
@@ -2170,7 +2211,18 @@ function workerVersionTag(value: unknown): string | null {
   ) {
     return null;
   }
-  return new TextEncoder().encode(value).byteLength <= WORKER_VERSION_TAG_BYTE_LIMIT ? value : null;
+  const bytes = new TextEncoder().encode(value);
+  if (bytes.byteLength > WORKER_VERSION_OPERATION_ID_BYTE_LIMIT) return null;
+  const digest = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", bytes as unknown as BufferSource),
+  );
+  return `${WORKER_VERSION_OPERATION_MARKER_PREFIX}${[...digest]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("")}`;
+}
+
+function workerVersionOperationMarkerValue(value: string): boolean {
+  return new RegExp(`^${WORKER_VERSION_OPERATION_MARKER_PREFIX}[0-9a-f]{64}$`, "u").test(value);
 }
 
 function workerVersionId(value: unknown): string | null {

@@ -125,6 +125,11 @@ export interface ProviderMutationSaga {
   readonly receipt?: TakoformDriverReceipt;
 }
 
+export type ProviderMutationExecution =
+  | { readonly kind: "acquired"; readonly mode: "initial" | "recovery" }
+  | { readonly kind: "busy" }
+  | { readonly kind: "executed"; readonly receipt: TakoformDriverReceipt };
+
 export interface ResourceClaimReservation {
   readonly key: string;
   readonly tenantId: string;
@@ -241,6 +246,25 @@ export interface TakoformStore {
   readOperation(tenantId: string, id: string): Promise<OperationRecord | null>;
 
   acceptProviderMutationSaga(record: ProviderMutationSaga): Promise<ProviderMutationSaga>;
+  acquireProviderMutationExecution(input: {
+    readonly tenantId: string;
+    readonly operationId: string;
+    readonly resourceUid: string;
+    readonly leaseToken: string;
+    readonly leaseUntil: number;
+  }): Promise<ProviderMutationExecution>;
+  markProviderMutationDispatch(input: {
+    readonly tenantId: string;
+    readonly operationId: string;
+    readonly resourceUid: string;
+    readonly leaseToken: string;
+  }): Promise<boolean>;
+  releaseProviderMutationExecution(input: {
+    readonly tenantId: string;
+    readonly operationId: string;
+    readonly resourceUid: string;
+    readonly leaseToken: string;
+  }): Promise<boolean>;
   readProviderMutationReceipt(
     tenantId: string,
     operationId: string,
@@ -261,6 +285,7 @@ export interface TakoformStore {
     readonly tenantId: string;
     readonly operationId: string;
     readonly resourceUid: string;
+    readonly leaseToken: string;
     readonly receipt: TakoformDriverReceipt;
     readonly authorityHeadDigest?: `sha256:${string}`;
     readonly claimOwnerId?: string;
@@ -941,6 +966,100 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       return { ...stored, replayKey: record.replayKey };
     },
 
+    async acquireProviderMutationExecution(input) {
+      const timestamp = now();
+      if (input.leaseUntil <= timestamp)
+        throw new TypeError("provider lease must be in the future");
+      const initial = await sql.run(
+        `UPDATE tf_provider_mutation_sagas
+         SET execution_lease_token = ?, execution_lease_until = ?,
+             updated_at = ?
+         WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+           AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
+           AND execution_started_at IS NULL
+           AND (execution_lease_token IS NULL OR execution_lease_until <= ?)`,
+        [
+          input.leaseToken,
+          input.leaseUntil,
+          timestamp,
+          input.tenantId,
+          input.operationId,
+          input.resourceUid,
+          timestamp,
+          timestamp,
+        ],
+      );
+      if (initial.changes === 1) return { kind: "acquired", mode: "initial" };
+
+      const recovery = await sql.run(
+        `UPDATE tf_provider_mutation_sagas
+         SET execution_lease_token = ?, execution_lease_until = ?, updated_at = ?
+         WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+           AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
+           AND execution_started_at IS NOT NULL
+           AND (execution_lease_token IS NULL OR execution_lease_until <= ?)`,
+        [
+          input.leaseToken,
+          input.leaseUntil,
+          timestamp,
+          input.tenantId,
+          input.operationId,
+          input.resourceUid,
+          timestamp,
+          timestamp,
+        ],
+      );
+      if (recovery.changes === 1) return { kind: "acquired", mode: "recovery" };
+
+      const rows = await sql.query(
+        `SELECT phase, receipt_json FROM tf_provider_mutation_sagas
+         WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+           AND (phase = 'executed' OR expires_at > ?) LIMIT 2`,
+        [input.tenantId, input.operationId, input.resourceUid, timestamp],
+      );
+      if (rows.length > 1) throw new Error("provider_mutation_saga_ambiguous");
+      const row = rows[0];
+      if (row?.phase === "executed") {
+        return { kind: "executed", receipt: providerReceipt(row.receipt_json) };
+      }
+      return { kind: "busy" };
+    },
+
+    async markProviderMutationDispatch(input) {
+      const timestamp = now();
+      const marked = await sql.run(
+        `UPDATE tf_provider_mutation_sagas
+         SET execution_started_at = ?, updated_at = ?
+         WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+           AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
+           AND execution_lease_token = ? AND execution_lease_until > ?
+           AND execution_started_at IS NULL`,
+        [
+          timestamp,
+          timestamp,
+          input.tenantId,
+          input.operationId,
+          input.resourceUid,
+          timestamp,
+          input.leaseToken,
+          timestamp,
+        ],
+      );
+      return marked.changes === 1;
+    },
+
+    async releaseProviderMutationExecution(input) {
+      const released = await sql.run(
+        `UPDATE tf_provider_mutation_sagas
+         SET execution_lease_token = NULL, execution_lease_until = NULL, updated_at = ?
+         WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+           AND phase = 'planned' AND receipt_json IS NULL
+           AND execution_lease_token = ?`,
+        [now(), input.tenantId, input.operationId, input.resourceUid, input.leaseToken],
+      );
+      return released.changes === 1;
+    },
+
     async readProviderMutationReceipt(tenantId, operationId, resourceUid) {
       const rows = await sql.query(
         `SELECT receipt_json FROM tf_provider_mutation_sagas
@@ -967,7 +1086,8 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       const removed = await sql.run(
         `DELETE FROM tf_provider_mutation_sagas
          WHERE tenant_id = ? AND operation_id = ? AND replay_key = ? AND resource_uid = ?
-           AND phase = 'planned' AND receipt_json IS NULL`,
+           AND phase = 'planned' AND receipt_json IS NULL
+           AND execution_lease_token IS NULL AND execution_started_at IS NULL`,
         [input.tenantId, input.operationId, input.replayKey, input.resourceUid],
       );
       return removed.changes === 1;
@@ -976,48 +1096,88 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
     async recordProviderMutationReceipt(input) {
       const serialized = canonicalJson(input.receipt);
       const timestamp = now();
-      await sql.batch([
-        {
-          sql: `UPDATE tf_provider_mutation_sagas
-                SET phase = 'executed', receipt_json = ?, updated_at = ?, expires_at = NULL
-                WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
-                  AND authority_head_digest IS ?
-                  AND phase = 'planned' AND expires_at > ?`,
-          params: [
-            serialized,
-            timestamp,
-            input.tenantId,
-            input.operationId,
-            input.resourceUid,
-            input.authorityHeadDigest ?? null,
-            timestamp,
-          ],
-        },
-        ...(input.claimOwnerId
-          ? [
-              {
-                sql: `UPDATE tf_resource_claims
-                      SET state = 'committed', expires_at = NULL, updated_at = ?
-                      WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
-                        AND state = 'reserved'`,
-                params: [timestamp, input.claimOwnerId, input.tenantId, input.resourceUid],
-              },
-            ]
-          : []),
-        {
-          sql: `UPDATE tf_deferred_operations
-                SET expires_at = 253402300799999, updated_at = ?
-                WHERE id = ? AND tenant_id = ? AND resource_uid = ?
-                  AND phase = 'committing'`,
-          params: [timestamp, input.operationId, input.tenantId, input.resourceUid],
-        },
-      ]);
-      const existing = await this.readProviderMutationReceipt(
-        input.tenantId,
-        input.operationId,
-        input.resourceUid,
-      );
-      if (!existing || canonicalJson(existing) !== serialized) {
+      const guard = boundedGuard(`receipt_${input.leaseToken}`);
+      try {
+        await sql.batch([
+          {
+            sql: `INSERT INTO tf_operation_commit_guards (token, valid)
+                  SELECT ?, CASE WHEN EXISTS (
+                    SELECT 1 FROM tf_provider_mutation_sagas
+                    WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+                      AND authority_head_digest IS ?
+                      AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
+                      AND execution_lease_token = ? AND execution_lease_until > ?
+                      AND execution_started_at IS NOT NULL
+                  ) THEN 1 ELSE 0 END`,
+            params: [
+              guard,
+              input.tenantId,
+              input.operationId,
+              input.resourceUid,
+              input.authorityHeadDigest ?? null,
+              timestamp,
+              input.leaseToken,
+              timestamp,
+            ],
+          },
+          {
+            sql: `UPDATE tf_provider_mutation_sagas
+                  SET phase = 'executed', receipt_json = ?, updated_at = ?, expires_at = NULL,
+                      execution_lease_token = NULL, execution_lease_until = NULL
+                  WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+                    AND authority_head_digest IS ?
+                    AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
+                    AND execution_lease_token = ? AND execution_lease_until > ?
+                    AND execution_started_at IS NOT NULL`,
+            params: [
+              serialized,
+              timestamp,
+              input.tenantId,
+              input.operationId,
+              input.resourceUid,
+              input.authorityHeadDigest ?? null,
+              timestamp,
+              input.leaseToken,
+              timestamp,
+            ],
+          },
+          ...(input.claimOwnerId
+            ? [
+                {
+                  sql: `UPDATE tf_resource_claims
+                        SET state = 'committed', expires_at = NULL, updated_at = ?
+                        WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
+                          AND state = 'reserved'`,
+                  params: [timestamp, input.claimOwnerId, input.tenantId, input.resourceUid],
+                },
+                {
+                  sql: `UPDATE tf_deferred_operations
+                        SET expires_at = 253402300799999, updated_at = ?
+                        WHERE id = ? AND tenant_id = ? AND resource_uid = ?
+                          AND phase = 'committing' AND lease_token = ?`,
+                  params: [
+                    timestamp,
+                    input.operationId,
+                    input.tenantId,
+                    input.resourceUid,
+                    input.claimOwnerId,
+                  ],
+                },
+              ]
+            : []),
+          {
+            sql: "DELETE FROM tf_operation_commit_guards WHERE token = ?",
+            params: [guard],
+          },
+        ]);
+      } catch (error) {
+        if (!(error instanceof SqlError) || error.code !== "constraint") throw error;
+        const existing = await this.readProviderMutationReceipt(
+          input.tenantId,
+          input.operationId,
+          input.resourceUid,
+        );
+        if (existing && canonicalJson(existing) === serialized) return;
         throw new TakoformHostError("resource_busy", 409);
       }
     },

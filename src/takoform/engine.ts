@@ -6,7 +6,11 @@ import { type BindingRegistry, installedBindings } from "./bindings.ts";
 import { canonicalizeEdgeSpec } from "./edge-semantics.ts";
 import { exactInstalledForm, type FormRegistry, installedForms, sameFormRef } from "./forms.ts";
 import type { TakoformAuthorityFence, TakoformHostAuthority } from "./host-authority.ts";
-import { PREPARE_TTL_MILLISECONDS, RESOURCE_CLAIM_RESERVATION_TTL_MILLISECONDS } from "./limits.ts";
+import {
+  PREPARE_TTL_MILLISECONDS,
+  PROVIDER_MUTATION_EXECUTION_LEASE_MILLISECONDS,
+  RESOURCE_CLAIM_RESERVATION_TTL_MILLISECONDS,
+} from "./limits.ts";
 import {
   declaredResourceClaims,
   relationDrift,
@@ -176,6 +180,8 @@ export interface CreateTakoformEngineOptions {
   readonly artifacts: ArtifactResolver;
   readonly clock: Clock;
   readonly randomId: () => string;
+  /** Test/host override; normally aligned with the durable operation lease. */
+  readonly providerMutationLeaseMilliseconds?: number;
   readonly workerModuleInspector?: WorkerModuleInspector;
   readonly allowBodyGenerationFence?: boolean;
   readonly allowReviewSpecDigest?: boolean;
@@ -194,6 +200,15 @@ export interface CreateTakoformEngineOptions {
 
 export function createTakoformEngine(options: CreateTakoformEngineOptions): TakoformEngine {
   const { store, forms, bindings, driver, artifacts, clock, randomId } = options;
+  const providerMutationLeaseMilliseconds =
+    options.providerMutationLeaseMilliseconds ?? PROVIDER_MUTATION_EXECUTION_LEASE_MILLISECONDS;
+  if (
+    !Number.isSafeInteger(providerMutationLeaseMilliseconds) ||
+    providerMutationLeaseMilliseconds < 1 ||
+    providerMutationLeaseMilliseconds > 3_600_000
+  ) {
+    throw new TypeError("providerMutationLeaseMilliseconds must be an integer from 1 to 3600000");
+  }
 
   type RuntimeRegistry = {
     readonly forms: FormRegistry;
@@ -241,6 +256,78 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
   };
 
   const operationId = (): string => `op_${randomId().replace(/[^A-Za-z0-9._-]/gu, "")}`;
+  let providerMutationLeaseSequence = 0;
+
+  const executeProviderMutation = async (input: {
+    readonly tenantId: string;
+    readonly operationId: string;
+    readonly resourceUid: string;
+    readonly authorityHeadDigest?: `sha256:${string}`;
+    readonly claimOwnerId?: string;
+    readonly onContention?: () => void;
+    readonly onDispatch?: () => void;
+    readonly onReceiptReady?: () => void;
+    readonly prepare?: () => Promise<void>;
+    readonly execute: (mode: "initial" | "recovery") => Promise<TakoformDriverReceipt>;
+  }): Promise<TakoformDriverReceipt> => {
+    providerMutationLeaseSequence += 1;
+    const leaseToken =
+      `pmlease_${providerMutationLeaseSequence.toString(36)}_${randomId().replace(/[^A-Za-z0-9._-]/gu, "")}`.slice(
+        0,
+        128,
+      );
+    const execution = await store.acquireProviderMutationExecution({
+      tenantId: input.tenantId,
+      operationId: input.operationId,
+      resourceUid: input.resourceUid,
+      leaseToken,
+      leaseUntil: clock().getTime() + providerMutationLeaseMilliseconds,
+    });
+    if (execution.kind === "executed") return execution.receipt;
+    if (execution.kind === "busy") {
+      input.onContention?.();
+      throw new TakoformHostError("backend_unavailable", 503);
+    }
+    try {
+      if (execution.mode === "recovery") input.onDispatch?.();
+      await input.prepare?.();
+      if (execution.mode === "initial") {
+        if (
+          !(await store.markProviderMutationDispatch({
+            tenantId: input.tenantId,
+            operationId: input.operationId,
+            resourceUid: input.resourceUid,
+            leaseToken,
+          }))
+        ) {
+          input.onContention?.();
+          throw new TakoformHostError("resource_busy", 409);
+        }
+        input.onDispatch?.();
+      }
+      const receipt = await input.execute(execution.mode);
+      input.onReceiptReady?.();
+      await store.recordProviderMutationReceipt({
+        tenantId: input.tenantId,
+        operationId: input.operationId,
+        resourceUid: input.resourceUid,
+        leaseToken,
+        receipt,
+        ...(input.claimOwnerId ? { claimOwnerId: input.claimOwnerId } : {}),
+        ...(input.authorityHeadDigest ? { authorityHeadDigest: input.authorityHeadDigest } : {}),
+      });
+      return receipt;
+    } catch (error) {
+      const released = await store.releaseProviderMutationExecution({
+        tenantId: input.tenantId,
+        operationId: input.operationId,
+        resourceUid: input.resourceUid,
+        leaseToken,
+      });
+      if (!released) input.onContention?.();
+      throw error;
+    }
+  };
 
   const requireExecutable = async (
     context: EngineContext,
@@ -1043,50 +1130,61 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       }
       let persisted = false;
       let providerSettled = false;
-      let providerAttempted = false;
+      let providerDispatched = false;
+      let releaseClaimsOnFailure = true;
       try {
-        let receipt = await store.readProviderMutationReceipt(context.tenantId, opId, uid);
-        if (!receipt) {
-          const driverInputRelations = await driverRelations(
-            context.tenantId,
-            body.metadata.space,
-            relations,
-          );
-          await refreshMutation(
-            context,
-            create ? "create" : "update",
-            body.metadata.space,
-            form.identity.formRef,
-            authority,
-          );
-          providerAttempted = true;
-          receipt = await driver.apply({
-            operationId: opId,
-            tenantId: context.tenantId,
-            resourceUid: uid,
-            form,
-            name: body.metadata.name,
-            space: body.metadata.space,
-            spec: structuredClone(body.spec),
-            relations: driverInputRelations,
-            atomicDeploymentCommit: true,
-            ...(context.commercialAuthority
-              ? { commercialAuthority: context.commercialAuthority }
-              : {}),
-            ...(context.runtimeMaterialization
-              ? { runtimeMaterialization: context.runtimeMaterialization }
-              : {}),
-            ...(standardServices.length > 0 ? { standardServices } : {}),
-            ...(current ? { previous: structuredClone(current) } : {}),
-          });
-        }
-        await store.recordProviderMutationReceipt({
+        let preparedDriverRelations: readonly TakoformDriverRelation[] = [];
+        const receipt = await executeProviderMutation({
           tenantId: context.tenantId,
           operationId: opId,
           resourceUid: uid,
-          receipt,
           claimOwnerId,
+          onContention: () => {
+            releaseClaimsOnFailure = false;
+          },
+          onReceiptReady: () => {
+            releaseClaimsOnFailure = false;
+          },
+          onDispatch: () => {
+            providerDispatched = true;
+          },
           ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
+          prepare: async () => {
+            preparedDriverRelations = await driverRelations(
+              context.tenantId,
+              body.metadata.space,
+              relations,
+            );
+            await refreshMutation(
+              context,
+              create ? "create" : "update",
+              body.metadata.space,
+              form.identity.formRef,
+              authority,
+            );
+          },
+          execute: async (operationMode) => {
+            return await driver.apply({
+              operationId: opId,
+              operationMode,
+              tenantId: context.tenantId,
+              resourceUid: uid,
+              form,
+              name: body.metadata.name,
+              space: body.metadata.space,
+              spec: structuredClone(body.spec),
+              relations: preparedDriverRelations,
+              atomicDeploymentCommit: true,
+              ...(context.commercialAuthority
+                ? { commercialAuthority: context.commercialAuthority }
+                : {}),
+              ...(context.runtimeMaterialization
+                ? { runtimeMaterialization: context.runtimeMaterialization }
+                : {}),
+              ...(standardServices.length > 0 ? { standardServices } : {}),
+              ...(current ? { previous: structuredClone(current) } : {}),
+            });
+          },
         });
         providerSettled = true;
         const materialized = materializeResource(body, form, receipt, current, clock, uid);
@@ -1159,9 +1257,9 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         }
         return { kind: "resource", resource: next, status };
       } catch (error) {
-        if (!persisted && !providerSettled) {
+        if (!persisted && !providerSettled && releaseClaimsOnFailure) {
           await store.releaseResourceClaims(claimOwnerId);
-          if (!providerAttempted) {
+          if (!providerDispatched) {
             await store.abandonProviderMutationPlan({
               tenantId: context.tenantId,
               operationId: opId,
@@ -1274,7 +1372,8 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         ...parsedBody,
         spec: canonicalizeEdgeSpec(form, materializeDefaults(form.desiredSchema, parsedBody.spec)),
       };
-      if (!form.operations.includes("import") || !driver.import) {
+      const importProviderResource = driver.import?.bind(driver);
+      if (!form.operations.includes("import") || !importProviderResource) {
         throw new TakoformHostError("unsupported_capability", 422);
       }
       const diagnostics = validateDesired(form, body.spec);
@@ -1479,45 +1578,55 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       }
       let persisted = false;
       let providerSettled = false;
-      let providerAttempted = false;
+      let providerDispatched = false;
+      let releaseClaimsOnFailure = true;
       try {
-        let receipt = await store.readProviderMutationReceipt(context.tenantId, importId, uid);
-        if (!receipt) {
-          const providerRelations = await driverRelations(
-            context.tenantId,
-            body.metadata.space,
-            relations,
-          );
-          await refreshMutation(
-            context,
-            "import",
-            body.metadata.space,
-            form.identity.formRef,
-            authority,
-          );
-          providerAttempted = true;
-          receipt = await driver.import({
-            operationId: importId,
-            tenantId: context.tenantId,
-            resourceUid: uid,
-            form,
-            name: body.metadata.name,
-            space: body.metadata.space,
-            spec: structuredClone(body.spec),
-            nativeId: body.nativeId,
-            relations: providerRelations,
-            atomicDeploymentCommit: true,
-            ...(standardServices.length > 0 ? { standardServices } : {}),
-            ...(current ? { previous: structuredClone(current) } : {}),
-          });
-        }
-        await store.recordProviderMutationReceipt({
+        let preparedDriverRelations: readonly TakoformDriverRelation[] = [];
+        const receipt = await executeProviderMutation({
           tenantId: context.tenantId,
           operationId: importId,
           resourceUid: uid,
-          receipt,
           claimOwnerId,
+          onContention: () => {
+            releaseClaimsOnFailure = false;
+          },
+          onReceiptReady: () => {
+            releaseClaimsOnFailure = false;
+          },
+          onDispatch: () => {
+            providerDispatched = true;
+          },
           ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
+          prepare: async () => {
+            preparedDriverRelations = await driverRelations(
+              context.tenantId,
+              body.metadata.space,
+              relations,
+            );
+            await refreshMutation(
+              context,
+              "import",
+              body.metadata.space,
+              form.identity.formRef,
+              authority,
+            );
+          },
+          execute: async () => {
+            return await importProviderResource({
+              operationId: importId,
+              tenantId: context.tenantId,
+              resourceUid: uid,
+              form,
+              name: body.metadata.name,
+              space: body.metadata.space,
+              spec: structuredClone(body.spec),
+              nativeId: body.nativeId,
+              relations: preparedDriverRelations,
+              atomicDeploymentCommit: true,
+              ...(standardServices.length > 0 ? { standardServices } : {}),
+              ...(current ? { previous: structuredClone(current) } : {}),
+            });
+          },
         });
         providerSettled = true;
         const materialized = materializeResource(body, form, receipt, current, clock, uid);
@@ -1590,10 +1699,10 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         }
         return { kind: "resource", resource: next, status };
       } catch (error) {
-        if (!persisted && !providerSettled) {
+        if (!persisted && !providerSettled && releaseClaimsOnFailure) {
           await store.releaseResourceClaims(claimOwnerId);
           if (
-            !providerAttempted ||
+            !providerDispatched ||
             (error instanceof TakoformHostError && error.code === "import_conflict")
           ) {
             await store.abandonProviderMutationPlan({
@@ -1697,44 +1806,54 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
       });
       const deleteId = saga.operationId;
-      let receipt = await store.readProviderMutationReceipt(
-        context.tenantId,
-        deleteId,
-        current.metadata.uid,
-      );
-      if (!receipt) {
-        const providerRelations = await driverRelations(
-          context.tenantId,
-          current.metadata.space,
-          currentRelations,
-        );
-        try {
-          await refreshRetained(context, "delete", current, authority);
-        } catch (error) {
+      let preparedDriverRelations: readonly TakoformDriverRelation[] = [];
+      let providerDispatched = false;
+      let providerContended = false;
+      let receipt: TakoformDriverReceipt;
+      try {
+        receipt = await executeProviderMutation({
+          tenantId: context.tenantId,
+          operationId: deleteId,
+          resourceUid: current.metadata.uid,
+          claimOwnerId: context.durableOperation?.claimOwnerId ?? deleteId,
+          onContention: () => {
+            providerContended = true;
+          },
+          onDispatch: () => {
+            providerDispatched = true;
+          },
+          ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
+          prepare: async () => {
+            preparedDriverRelations = await driverRelations(
+              context.tenantId,
+              current.metadata.space,
+              currentRelations,
+            );
+            await refreshRetained(context, "delete", current, authority);
+          },
+          execute: async () => {
+            return (
+              (await driver.delete({
+                operationId: deleteId,
+                tenantId: context.tenantId,
+                resourceUid: current.metadata.uid,
+                resource: structuredClone(current),
+                relations: preparedDriverRelations,
+                atomicDeploymentCommit: true,
+              })) ?? {}
+            );
+          },
+        });
+      } catch (error) {
+        if (!providerDispatched && !providerContended) {
           await store.abandonProviderMutationPlan({
             tenantId: context.tenantId,
             operationId: deleteId,
             replayKey,
             resourceUid: current.metadata.uid,
           });
-          throw error;
         }
-        receipt =
-          (await driver.delete({
-            operationId: deleteId,
-            tenantId: context.tenantId,
-            resourceUid: current.metadata.uid,
-            resource: structuredClone(current),
-            relations: providerRelations,
-            atomicDeploymentCommit: true,
-          })) ?? {};
-        await store.recordProviderMutationReceipt({
-          tenantId: context.tenantId,
-          operationId: deleteId,
-          resourceUid: current.metadata.uid,
-          receipt,
-          ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
-        });
+        throw error;
       }
       const replayRecord: StoredReplay = { fingerprint, status: 204 };
       if (context.durableOperation) {
