@@ -225,6 +225,28 @@ export function isFormApiVersion(value: string): boolean {
   );
 }
 
+/**
+ * Extracts the Form family group from a stable or retained Form apiVersion.
+ *
+ * Stable v1 families are versionless (`forms.example.com`), while retained
+ * predecessor families may carry one API version (`forms.example.com/v1beta1`).
+ * Parse the complete value before extracting the group so an invalid ref can
+ * never be turned into a seemingly valid namespace by truncation.
+ */
+export function formGroupFromApiVersion(apiVersion: string): string | null {
+  if (typeof apiVersion !== "string") return null;
+  const [group, version, ...rest] = apiVersion.split("/");
+  if (
+    rest.length !== 0 ||
+    group === undefined ||
+    !isFormGroup(group) ||
+    (version !== undefined && !isFormVersion(version))
+  ) {
+    return null;
+  }
+  return group;
+}
+
 /** What a caller may rely on before attempting an operation on this Form. */
 export function formSupportProfile(
   form: InstalledTakoformForm,

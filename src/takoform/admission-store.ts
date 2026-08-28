@@ -35,7 +35,7 @@ import {
   type FormPackageStore,
   type StoredFormPackage,
 } from "./form-packages.ts";
-import { isFormGroup, validateFormRef } from "./forms.ts";
+import { formGroupFromApiVersion, isFormGroup, validateFormRef } from "./forms.ts";
 
 const PUBLISHER_TABLE = "tf_form_publisher_events" as const;
 const CHECKPOINT_TABLE = "tf_form_revocation_checkpoints" as const;
@@ -1650,8 +1650,8 @@ function assertHandleForCommand(
   if (canonicalJson(claims.formRef) !== canonicalJson(command.package.formRef)) {
     throw new AdmissionError("handle_mismatch", "handle FormRef mismatch");
   }
-  const formGroup = claims.formRef.apiVersion.slice(0, claims.formRef.apiVersion.indexOf("/"));
-  if (claims.publisher.group !== formGroup) {
+  const formGroup = formGroupFromApiVersion(claims.formRef.apiVersion);
+  if (formGroup === null || claims.publisher.group !== formGroup) {
     throw new AdmissionError("handle_mismatch", "publisher namespace does not match Form group");
   }
   if (claims.report.status !== "admitted") {

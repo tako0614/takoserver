@@ -1,7 +1,7 @@
 import type { TakoformV1Alpha3FormRef } from "../form-ref.ts";
 import { canonicalDigest, canonicalJson, isJsonObject, isSha256Digest } from "../json.ts";
 import type { FormPackageInput } from "./form-packages.ts";
-import { isFormGroup, validateFormRef } from "./forms.ts";
+import { formGroupFromApiVersion, isFormGroup, validateFormRef } from "./forms.ts";
 
 export type AdmissionDigest = `sha256:${string}`;
 
@@ -406,8 +406,8 @@ function validateHandleClaims(claims: AdmissionHandleClaims): void {
   } catch {
     throw new FormAdmissionError("invalid_handle", "invalid FormRef in handle claims");
   }
-  const formGroup = claims.formRef.apiVersion.slice(0, claims.formRef.apiVersion.indexOf("/"));
-  if (claims.publisher.group !== formGroup) {
+  const formGroup = formGroupFromApiVersion(claims.formRef.apiVersion);
+  if (formGroup === null || claims.publisher.group !== formGroup) {
     throw new FormAdmissionError("invalid_handle", "publisher namespace does not match Form group");
   }
   if (!isJsonObject(claims.report) || claims.report.status !== "admitted") {

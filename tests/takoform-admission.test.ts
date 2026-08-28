@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createEphemeralSql } from "../src/compat.ts";
+import type { TakoformV1Alpha3FormRef } from "../src/form-ref.ts";
 import { bytesDigest, canonicalDigest } from "../src/json.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { type ObjectStore, type Sql, SqlError } from "../src/ports.ts";
@@ -20,6 +21,7 @@ import {
   formPackagePrefix,
   packageManifest,
 } from "../src/takoform/form-packages.ts";
+import { formGroupFromApiVersion } from "../src/takoform/forms.ts";
 
 const digest = (hex: string): AdmissionDigest => `sha256:${hex.repeat(64)}` as AdmissionDigest;
 
@@ -51,7 +53,10 @@ function publisher(overrides: Partial<AdmissionPublisherPin> = {}): AdmissionPub
   };
 }
 
-async function packageInput(formRef = FORM_REF, marker = "payload"): Promise<FormPackageInput> {
+async function packageInput(
+  formRef: TakoformV1Alpha3FormRef = FORM_REF,
+  marker = "payload",
+): Promise<FormPackageInput> {
   const bytes = new TextEncoder().encode(marker);
   const fileDigest = (await bytesDigest(bytes)) as AdmissionDigest;
   const file = {
@@ -86,7 +91,7 @@ function admissionReport(
     operation,
     package: {
       packageDigest: pkg.packageDigest,
-      formRef: FORM_REF,
+      formRef: pkg.formRef,
       fileCount: pkg.files.length,
       payloadBytes,
     },
@@ -128,14 +133,17 @@ async function fixture(
     readonly sql?: Sql;
     readonly objects?: ObjectStore;
     readonly packages?: FormPackageStore;
+    readonly formRef?: TakoformV1Alpha3FormRef;
+    readonly publisherOverrides?: Partial<AdmissionPublisherPin>;
   } = {},
 ) {
+  const formRef = options.formRef ?? FORM_REF;
   const sql = options.sql ?? createEphemeralSql();
   const objects = options.objects ?? createMemoryObjectStore();
   const packages = options.packages ?? createFormPackageStore(objects);
   const handles = createAdmissionHandleIssuer();
   const host = createFormAdmissionStore({ sql, objects, packages, handles });
-  const pub = publisher();
+  const pub = publisher(options.publisherOverrides);
   const allow = await host.execute({
     kind: "AllowPublisher",
     publisher: pub,
@@ -156,12 +164,12 @@ async function fixture(
     actor: "test-operator",
     reason: "focused test",
   });
-  const pkg = await packageInput();
+  const pkg = await packageInput(formRef);
   const report = admissionReport(pkg, pub, allow, checkpointReceipt);
   const handleClaims: AdmissionHandleClaims = {
     operation: "install",
     packageDigest: pkg.packageDigest,
-    formRef: FORM_REF,
+    formRef,
     publisherKey: "pub",
     publisher: pub,
     policyEventDigest: allow.eventDigest,
@@ -226,6 +234,74 @@ async function insertResource(
 }
 
 describe("private Takoform Host admission substrate", () => {
+  test("extracts exact stable and retained Form family groups", () => {
+    expect(formGroupFromApiVersion("edge.forms.takoform.com")).toBe("edge.forms.takoform.com");
+    expect(formGroupFromApiVersion("edge.forms.takoform.com/v1beta1")).toBe(
+      "edge.forms.takoform.com",
+    );
+    expect(formGroupFromApiVersion("edge.forms.takoform.com/v1beta1/extra")).toBeNull();
+    expect(formGroupFromApiVersion("edge.forms.takoform.com/not-a-version")).toBeNull();
+  });
+
+  test("admits an exact versionless family and retains the legacy versioned family", async () => {
+    const stableFormRef = { ...FORM_REF, apiVersion: "edge.forms.takoform.com" };
+    const stable = await fixture({
+      formRef: stableFormRef,
+      publisherOverrides: { group: stableFormRef.apiVersion },
+    });
+    const stableInstall = await stable.host.execute({
+      kind: "InstallPackage",
+      package: stable.pkg,
+      handle: stable.handle,
+      actor: "test-operator",
+      reason: "install stable versionless package",
+    });
+    expect(stableInstall.state).toBe("install");
+
+    const legacy = await fixture();
+    const legacyInstall = await legacy.host.execute({
+      kind: "InstallPackage",
+      package: legacy.pkg,
+      handle: legacy.handle,
+      actor: "test-operator",
+      reason: "install retained versioned package",
+    });
+    expect(legacyInstall.state).toBe("install");
+  });
+
+  test("denies namespace prefixes and malformed apiVersions instead of truncating them", async () => {
+    const stableFormRef = { ...FORM_REF, apiVersion: "edge.forms.takoform.com" };
+    const f = await fixture({
+      formRef: stableFormRef,
+      publisherOverrides: { group: stableFormRef.apiVersion },
+    });
+    const truncatedPublisher = publisher({ ...f.pub, group: "edge.forms.takoform.co" });
+    const truncatedReport = admissionReport(
+      f.pkg,
+      truncatedPublisher,
+      f.allow,
+      f.checkpointReceipt,
+    );
+    expect(() =>
+      f.handles.issue({
+        ...f.handleClaims,
+        publisher: truncatedPublisher,
+        report: truncatedReport,
+      }),
+    ).toThrow("publisher namespace does not match Form group");
+
+    const malformedFormRef = {
+      ...stableFormRef,
+      apiVersion: "edge.forms.takoform.com/v1beta1/extra",
+    };
+    expect(() =>
+      f.handles.issue({
+        ...f.handleClaims,
+        formRef: malformedFormRef,
+      }),
+    ).toThrow("invalid FormRef in handle claims");
+  });
+
   test("a forged or JSON-round-tripped report/handle cannot install", async () => {
     const f = await fixture();
     const forged = JSON.parse(JSON.stringify(f.handle)) as AdmissionHandle;
