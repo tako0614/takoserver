@@ -200,6 +200,7 @@ function expectedExactVersion(target: DeployTarget) {
         { type: "ai", name: "AI" },
         { type: "d1", name: "STATE_DB", id: target.d1.databaseId },
         { type: "r2_bucket", name: "OBJECTS", bucket_name: target.r2.bucketName },
+        { type: "plain_text", name: "PUBLIC_ORIGIN", text: target.publicOrigin },
         {
           type: "plain_text",
           name: "TAKOSERVER_SIGNING_KEY_ID",
