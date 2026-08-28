@@ -268,6 +268,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
     readonly onDispatch?: () => void;
     readonly onReceiptReady?: () => void;
     readonly prepare?: () => Promise<void>;
+    readonly settleDefinitiveImportConflict?: (leaseToken: string) => Promise<boolean>;
     readonly execute: (mode: "initial" | "recovery") => Promise<TakoformDriverReceipt>;
   }): Promise<TakoformDriverReceipt> => {
     providerMutationLeaseSequence += 1;
@@ -288,6 +289,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       input.onContention?.();
       throw new TakoformHostError("backend_unavailable", 503);
     }
+    let executeEntered = false;
     try {
       if (execution.mode === "recovery") input.onDispatch?.();
       await input.prepare?.();
@@ -305,6 +307,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         }
         input.onDispatch?.();
       }
+      executeEntered = true;
       const receipt = await input.execute(execution.mode);
       input.onReceiptReady?.();
       await store.recordProviderMutationReceipt({
@@ -318,6 +321,22 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       });
       return receipt;
     } catch (error) {
+      if (
+        executeEntered &&
+        input.settleDefinitiveImportConflict &&
+        error instanceof TakoformHostError &&
+        error.code === "import_conflict"
+      ) {
+        let settled: boolean;
+        try {
+          settled = await input.settleDefinitiveImportConflict(leaseToken);
+        } catch (settlementError) {
+          input.onContention?.();
+          throw settlementError;
+        }
+        if (settled) throw error;
+        input.onContention?.();
+      }
       const released = await store.releaseProviderMutationExecution({
         tenantId: input.tenantId,
         operationId: input.operationId,
@@ -1611,6 +1630,16 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               authority,
             );
           },
+          settleDefinitiveImportConflict: async (leaseToken) => {
+            return await store.settleDefinitiveProviderImportConflict({
+              tenantId: context.tenantId,
+              operationId: importId,
+              replayKey,
+              resourceUid: uid,
+              leaseToken,
+              outcome: "import_conflict",
+            });
+          },
           execute: async () => {
             return await importProviderResource({
               operationId: importId,
@@ -1701,10 +1730,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       } catch (error) {
         if (!persisted && !providerSettled && releaseClaimsOnFailure) {
           await store.releaseResourceClaims(claimOwnerId);
-          if (
-            !providerDispatched ||
-            (error instanceof TakoformHostError && error.code === "import_conflict")
-          ) {
+          if (!providerDispatched) {
             await store.abandonProviderMutationPlan({
               tenantId: context.tenantId,
               operationId: importId,

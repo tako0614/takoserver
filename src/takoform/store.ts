@@ -281,6 +281,14 @@ export interface TakoformStore {
     readonly replayKey: string;
     readonly resourceUid: string;
   }): Promise<boolean>;
+  settleDefinitiveProviderImportConflict(input: {
+    readonly tenantId: string;
+    readonly operationId: string;
+    readonly replayKey: string;
+    readonly resourceUid: string;
+    readonly leaseToken: string;
+    readonly outcome: "import_conflict";
+  }): Promise<boolean>;
   recordProviderMutationReceipt(input: {
     readonly tenantId: string;
     readonly operationId: string;
@@ -1089,6 +1097,29 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
            AND phase = 'planned' AND receipt_json IS NULL
            AND execution_lease_token IS NULL AND execution_started_at IS NULL`,
         [input.tenantId, input.operationId, input.replayKey, input.resourceUid],
+      );
+      return removed.changes === 1;
+    },
+
+    async settleDefinitiveProviderImportConflict(input) {
+      if (input.outcome !== "import_conflict") {
+        throw new TypeError("provider import outcome must be import_conflict");
+      }
+      const timestamp = now();
+      const removed = await sql.run(
+        `DELETE FROM tf_provider_mutation_sagas
+         WHERE tenant_id = ? AND operation_id = ? AND replay_key = ? AND resource_uid = ?
+           AND phase = 'planned' AND receipt_json IS NULL
+           AND execution_lease_token = ? AND execution_lease_until > ?
+           AND execution_started_at IS NOT NULL`,
+        [
+          input.tenantId,
+          input.operationId,
+          input.replayKey,
+          input.resourceUid,
+          input.leaseToken,
+          timestamp,
+        ],
       );
       return removed.changes === 1;
     },

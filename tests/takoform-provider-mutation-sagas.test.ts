@@ -286,4 +286,85 @@ describe("provider mutation saga execution leases", () => {
     ).toEqual({ kind: "acquired", mode: "recovery" });
     database.close();
   });
+
+  test("a stale import refusal cannot erase recovery after the newer lease releases", async () => {
+    const database = new Database(":memory:");
+    migrateSqlite(database);
+    let now = 1_000;
+    const store = createTakoformStore(createSqliteSql(database), () => new Date(now));
+    const staleImportSaga: ProviderMutationSaga = {
+      ...saga,
+      operationId: "op_stale_import_conflict",
+      replayKey: "replay-stale-import-conflict",
+      resourceUid: "uid_stale_import_conflict",
+      target: { ...saga.target, name: "stale-import-conflict" },
+    };
+    await store.acceptProviderMutationSaga(staleImportSaga);
+    expect(
+      await store.acquireProviderMutationExecution({
+        tenantId: staleImportSaga.tenantId,
+        operationId: staleImportSaga.operationId,
+        resourceUid: staleImportSaga.resourceUid,
+        leaseToken: "lease_stale_import",
+        leaseUntil: 2_000,
+      }),
+    ).toEqual({ kind: "acquired", mode: "initial" });
+    expect(
+      await store.markProviderMutationDispatch({
+        tenantId: staleImportSaga.tenantId,
+        operationId: staleImportSaga.operationId,
+        resourceUid: staleImportSaga.resourceUid,
+        leaseToken: "lease_stale_import",
+      }),
+    ).toBe(true);
+
+    now = 2_001;
+    expect(
+      await store.acquireProviderMutationExecution({
+        tenantId: staleImportSaga.tenantId,
+        operationId: staleImportSaga.operationId,
+        resourceUid: staleImportSaga.resourceUid,
+        leaseToken: "lease_recovered_import",
+        leaseUntil: 3_001,
+      }),
+    ).toEqual({ kind: "acquired", mode: "recovery" });
+    expect(
+      await store.settleDefinitiveProviderImportConflict({
+        tenantId: staleImportSaga.tenantId,
+        operationId: staleImportSaga.operationId,
+        replayKey: staleImportSaga.replayKey,
+        resourceUid: staleImportSaga.resourceUid,
+        leaseToken: "lease_stale_import",
+        outcome: "import_conflict",
+      }),
+    ).toBe(false);
+    expect(
+      await store.releaseProviderMutationExecution({
+        tenantId: staleImportSaga.tenantId,
+        operationId: staleImportSaga.operationId,
+        resourceUid: staleImportSaga.resourceUid,
+        leaseToken: "lease_recovered_import",
+      }),
+    ).toBe(true);
+    expect(
+      await store.settleDefinitiveProviderImportConflict({
+        tenantId: staleImportSaga.tenantId,
+        operationId: staleImportSaga.operationId,
+        replayKey: staleImportSaga.replayKey,
+        resourceUid: staleImportSaga.resourceUid,
+        leaseToken: "lease_stale_import",
+        outcome: "import_conflict",
+      }),
+    ).toBe(false);
+    expect(
+      await store.acquireProviderMutationExecution({
+        tenantId: staleImportSaga.tenantId,
+        operationId: staleImportSaga.operationId,
+        resourceUid: staleImportSaga.resourceUid,
+        leaseToken: "lease_after_stale_import",
+        leaseUntil: 3_001,
+      }),
+    ).toEqual({ kind: "acquired", mode: "recovery" });
+    database.close();
+  });
 });

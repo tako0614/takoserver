@@ -436,11 +436,13 @@ describe("durable deferred Takoform operations", () => {
   test("retries the exact provider plan with the same operation after a lost receipt boundary", async () => {
     const memory = new InMemoryTakoformResourceDriver();
     const operationIds: string[] = [];
+    const operationModes: Array<"initial" | "recovery" | undefined> = [];
     let attempts = 0;
     const driver: TakoformResourceDriver = {
       ...memory,
       async apply(input) {
         operationIds.push(input.operationId);
+        operationModes.push(input.operationMode);
         attempts += 1;
         if (attempts === 1) throw new Error("provider transport ended before a receipt");
         return await memory.apply(input);
@@ -489,6 +491,7 @@ describe("durable deferred Takoform operations", () => {
       result: { resource: { metadata: { name: "provider-plan-retry" } } },
     });
     expect(operationIds).toEqual([operationId, operationId]);
+    expect(operationModes).toEqual(["initial", "recovery"]);
     expect(
       opened.database
         .query("SELECT operation_id FROM tf_provider_mutation_sagas WHERE operation_id = ?")

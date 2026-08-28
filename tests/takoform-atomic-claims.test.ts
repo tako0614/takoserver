@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { createEphemeralSql } from "../src/compat.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import type { JsonObject } from "../src/ports.ts";
+import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
 import { createTakoformStore } from "../src/takoform/store.ts";
 import type {
   InstalledTakoformForm,
@@ -213,6 +214,92 @@ test("an expired reservation can be recovered but its stale provider winner cann
          AND kind = 'ClaimedName' ORDER BY name`,
     ),
   ).toEqual([{ name: "recovered-import-holder" }]);
+});
+
+test("a definitive wrong-native import does not block a same-native re-import", async () => {
+  const sql = createEphemeralSql();
+  const host = createConfiguredHistoricalTakoformHost({
+    sql,
+    objects: createMemoryObjectStore(),
+    authenticate: async () => ({ tenantId: "tenant-a", principalId: "principal-a" }),
+    forms: [form],
+    driver: new InMemoryTakoformResourceDriver(),
+    routes: {
+      hostApiVersion: "forms.takoform.com/v1beta4",
+      apiPath: lane,
+      supportProfileApiVersion: "support.takoform.com/v1alpha2",
+      reviewSpecDigest: true,
+    },
+  });
+  const name = "native-reimport";
+  const desired = resource(name);
+  const path = `${lane}/resources/example.forms.invalid/ClaimedName/${name}`;
+  const prepared = await host.handle(jsonRequest(`${lane}/resources/prepare`, "POST", desired));
+  if (!prepared?.ok) throw new Error("prepare failed");
+  const review = ((await prepared.json()) as { review: Record<string, string> }).review;
+
+  const created = await host.handle(
+    jsonRequest(
+      path,
+      "PUT",
+      { ...desired, review },
+      { "idempotency-key": "native-reimport-create", "if-none-match": "*" },
+    ),
+  );
+  if (!created) throw new Error("create route missing");
+  expect(created.status).toBe(201);
+  const createdGeneration = String(
+    ((await created.json()) as { metadata?: { generation?: unknown } }).metadata?.generation,
+  );
+  const claimed = await host.handle(
+    jsonRequest(
+      `${path}/import`,
+      "POST",
+      { ...desired, nativeId: "native-one" },
+      {
+        "idempotency-key": "native-reimport-claim",
+        "takoform-expected-generation": createdGeneration,
+      },
+    ),
+  );
+  if (!claimed) throw new Error("import route missing");
+  expect(claimed.status).toBe(200);
+  const claimedGeneration = String(
+    ((await claimed.json()) as { metadata?: { generation?: unknown } }).metadata?.generation,
+  );
+
+  const conflict = await host.handle(
+    jsonRequest(
+      `${path}/import`,
+      "POST",
+      { ...desired, nativeId: "native-wrong" },
+      {
+        "idempotency-key": "native-reimport-conflict",
+        "takoform-expected-generation": claimedGeneration,
+      },
+    ),
+  );
+  expect(conflict?.status).toBe(409);
+  expect(await conflict?.json()).toMatchObject({ error: { code: "import_conflict" } });
+
+  expect(
+    (
+      await host.handle(
+        jsonRequest(
+          `${path}/import`,
+          "POST",
+          { ...desired, nativeId: "native-one" },
+          {
+            "idempotency-key": "native-reimport-same",
+            "takoform-expected-generation": claimedGeneration,
+          },
+        ),
+      )
+    )?.status,
+  ).toBe(200);
+  expect(
+    Number((await sql.query("SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas"))[0]?.n),
+  ).toBe(0);
 });
 
 test("a failed same-claim update cannot release the live Resource's committed claim", async () => {
