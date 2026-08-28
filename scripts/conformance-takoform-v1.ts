@@ -1,6 +1,6 @@
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { bytesDigest, canonicalDigest, canonicalJson, isJsonObject } from "../src/json.ts";
 import type { JsonObject } from "../src/ports.ts";
 
@@ -11,7 +11,15 @@ import type { JsonObject } from "../src/ports.ts";
  */
 
 const repository = resolve(import.meta.dir, "..");
-const takoform = resolve(process.env.TAKOFORM_REPOSITORY_ROOT ?? join(repository, "../takoform"));
+const takoform = resolve(
+  process.env.TAKOFORM_PROVIDER_REPOSITORY_ROOT ??
+    join(
+      dirname(
+        dirname(gitAt(repository, "rev-parse", "--path-format=absolute", "--git-common-dir")),
+      ),
+      "terraform-provider-takoform",
+    ),
+);
 const corpus = resolve(takoform, "conformance/takoform-v1/generic-host/portable-host");
 if (
   process.env.TAKOFORM_CONFORMANCE_ROOT !== undefined &&

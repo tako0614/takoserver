@@ -270,6 +270,16 @@ describe("literal stable Takoform Host cutover", () => {
     expect(missing?.status).toBe(404);
     expect(await missing?.json()).toMatchObject({ error: { code: "resource_not_found" } });
 
+    const unknownQuery = new URLSearchParams(query);
+    unknownQuery.set("definitionVersion", "9.9.9");
+    const unknownForm = await host.handle(
+      new Request(
+        `https://api.takoserver.com/apis/forms.takoform.com/v1/resources/${ref.apiVersion}/${ref.kind}/missing?${unknownQuery}`,
+      ),
+    );
+    expect(unknownForm?.status).toBe(404);
+    expect(await unknownForm?.json()).toMatchObject({ error: { code: "form_unknown" } });
+
     for (const path of [
       `/form-definitions/${ref.apiVersion}/v1beta1/${ref.kind}`,
       `/support/forms/${ref.apiVersion}/v1beta1/${ref.kind}/${ref.definitionVersion}`,

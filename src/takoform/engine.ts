@@ -614,10 +614,18 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
 
     async read(context, path): Promise<EngineResult> {
       exactQuery(context.url, ["space", "group", "kind", "definitionVersion", "schemaDigest"]);
-      const address = addressFromParts(context.tenantId, requiredQuery(context.url, "space"), path);
+      const space = requiredQuery(context.url, "space");
+      const address = addressFromParts(context.tenantId, space, path);
       let resource = await store.readResource(address);
       const queriedFormRef = formRefFromResourceQuery(context.url, path);
-      if (!resource || !queriedFormRef || !sameFormRef(resource.form.formRef, queriedFormRef)) {
+      if (!queriedFormRef) {
+        throw new TakoformHostError("resource_not_found", 404);
+      }
+      if (!resource || !sameFormRef(resource.form.formRef, queriedFormRef)) {
+        const runtime = await runtimeRegistry(context, space);
+        if (!exactInstalledForm(queriedFormRef, runtime.forms)) {
+          throw new TakoformHostError("form_unknown", 404);
+        }
         throw new TakoformHostError("resource_not_found", 404);
       }
       const authority = await authorizeRetained(context, "observe", resource);
