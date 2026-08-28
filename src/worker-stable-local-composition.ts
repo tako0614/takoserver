@@ -85,7 +85,13 @@ type StableFetchHandler = (
   },
 ) => Response | Promise<Response>;
 
-export async function loadFrozenStableCatalog(repositoryRoot: string): Promise<StableLocalCatalog> {
+/**
+ * Load the provider-era 31/8 local fixture. This corpus is intentionally
+ * test-only and is not the source for the generated production catalog.
+ */
+export async function loadProviderEraTestCatalog(
+  repositoryRoot: string,
+): Promise<StableLocalCatalog> {
   const root = resolve(repositoryRoot);
   const indexBytes = await requiredBytes(root, FAMILY_INDEX);
   const suiteBytes = await requiredBytes(root, SUITE_MANIFEST);

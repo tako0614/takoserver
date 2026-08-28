@@ -11,7 +11,7 @@ import { createJavaScriptWorkerModuleInspector } from "./takoform/worker-module-
 import {
   createStableLocalS3Resolver,
   createStableLocalWorkerComposition,
-  loadFrozenStableCatalog,
+  loadProviderEraTestCatalog,
 } from "./worker-stable-local-composition.ts";
 
 const STABLE_API_PATH = "/apis/forms.takoform.com/v1";
@@ -55,7 +55,7 @@ export async function startStableLocalWorkerHost(input: {
     throw new Error("stable local Host Space is invalid");
   }
 
-  const catalog = await loadFrozenStableCatalog(input.takoformRepositoryRoot);
+  const catalog = await loadProviderEraTestCatalog(input.takoformRepositoryRoot);
   const database = new Database(":memory:");
   migrateSqlite(database);
   const sql = createSqliteSql(database);

@@ -23,7 +23,7 @@ import type {
 } from "./takoform/types.ts";
 import { TakoformHostError } from "./takoform/types.ts";
 import { createJavaScriptWorkerModuleInspector } from "./takoform/worker-module-inspector.ts";
-import { loadFrozenStableCatalog } from "./worker-stable-local-composition.ts";
+import { loadProviderEraTestCatalog } from "./worker-stable-local-composition.ts";
 
 const STABLE_API_PATH = "/apis/forms.takoform.com/v1";
 const STABLE_DISCOVERY_PATH = "/.well-known/takoform/v1";
@@ -103,7 +103,7 @@ export async function startStableLocalCloudflareHost(input: {
     throw new Error("stable local runtime values are invalid");
   }
 
-  const catalog = await loadFrozenStableCatalog(input.takoformRepositoryRoot);
+  const catalog = await loadProviderEraTestCatalog(input.takoformRepositoryRoot);
   const forms = HOST_FORMS.map((kind) => exactForm(catalog.forms, kind));
   const database = new Database(":memory:");
   migrateSqlite(database);

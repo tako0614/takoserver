@@ -11,7 +11,7 @@ import type {
 import {
   createStableLocalS3Resolver,
   createStableLocalWorkerComposition,
-  loadFrozenStableCatalog,
+  loadProviderEraTestCatalog,
   type StableLocalWorkerComposition,
 } from "../src/worker-stable-local-composition.ts";
 
@@ -28,7 +28,7 @@ afterEach(async () => {
 
 describe("the disposable stable local catalog", () => {
   test("loads and byte-verifies all 31 externally supplied frozen Form packages", async () => {
-    const catalog = await loadFrozenStableCatalog(TAKOFORM_ROOT);
+    const catalog = await loadProviderEraTestCatalog(TAKOFORM_ROOT);
 
     expect(catalog.provenance).toEqual({
       classification: "external-unpublished-test-input",
@@ -52,7 +52,7 @@ describe("the disposable stable local catalog", () => {
 
   test("fails closed when the exact frozen catalog input is absent", async () => {
     root = mkdtempSync(join(tmpdir(), "takoserver-stable-catalog-missing-"));
-    await expect(loadFrozenStableCatalog(root)).rejects.toThrow("frozen_stable_input_missing");
+    await expect(loadProviderEraTestCatalog(root)).rejects.toThrow("frozen_stable_input_missing");
   });
 });
 
@@ -257,7 +257,7 @@ describe("the test-only stable worker runtime", () => {
   });
 
   test("refuses a catalog that is not the verified external 31-Form tuple", async () => {
-    const catalog = await loadFrozenStableCatalog(TAKOFORM_ROOT);
+    const catalog = await loadProviderEraTestCatalog(TAKOFORM_ROOT);
     root = mkdtempSync(join(tmpdir(), "takoserver-stable-local-invalid-catalog-"));
     expect(() =>
       createStableLocalWorkerComposition({
@@ -272,7 +272,7 @@ describe("the test-only stable worker runtime", () => {
 async function localComposition(moduleBytes: Uint8Array) {
   root = mkdtempSync(join(tmpdir(), "takoserver-stable-local-worker-"));
   composition = createStableLocalWorkerComposition({
-    catalog: await loadFrozenStableCatalog(TAKOFORM_ROOT),
+    catalog: await loadProviderEraTestCatalog(TAKOFORM_ROOT),
     artifacts: artifacts(moduleBytes),
     dataRoot: root,
   });
