@@ -32,7 +32,7 @@ const OFFERING: Offering = {
   kind: "object_bucket",
   displayName: "Object bucket",
   form: {
-    apiVersion: "edge.forms.takoform.com/v1beta1",
+    apiVersion: "edge.forms.takoform.com",
     kind: "ObjectBucket",
     definitionVersion: "0.1.0",
     schemaDigest: `sha256:${"a".repeat(64)}`,
@@ -241,7 +241,7 @@ describe("prepaid vertical over HTTP", () => {
       schemaDigest: OFFERING.form.schemaDigest,
     });
     const mutationPath =
-      "/apis/forms.takoform.com/v1/resources/edge.forms.takoform.com/v1beta1/ObjectBucket/media";
+      "/apis/forms.takoform.com/v1/resources/edge.forms.takoform.com/ObjectBucket/media";
     const resourcePath = `${mutationPath}?${query}`;
     const applied = await call(
       fetch,

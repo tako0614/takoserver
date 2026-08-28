@@ -369,16 +369,29 @@ describe("provision-token redemption lane", () => {
 
 describe("Takoform run-token lane", () => {
   test("reuses a short-lived bearer only for its exact Form, space, and resource address", async () => {
+    const stableFormRef = { ...FORM_REF, apiVersion: "edge.forms.takoform.com" } as const;
+    const stableInstalledForm: InstalledTakoformForm = {
+      ...INSTALLED_FORM,
+      identity: { formRef: stableFormRef },
+    };
+    const stableOffering: Offering = { ...OFFERING, form: stableFormRef };
+    const stableResourceBody = (space = TENANT): Record<string, unknown> => ({
+      apiVersion: stableFormRef.apiVersion,
+      kind: stableFormRef.kind,
+      form: { formRef: stableFormRef },
+      metadata: { space, name: "media" },
+      spec: { location: "eu" },
+    });
     const sql = createEphemeralSql();
     const clock = () => new Date(NOW);
-    const catalog = createCatalog([OFFERING]);
+    const catalog = createCatalog([stableOffering]);
     const ledger = createLedger(sql, clock);
     const reseller = createReseller({ sql, ledger, catalog, clock });
     await ledger.fund({ organizationId: ORG, fundingRef: "pay_run", amountMinor: 10_000 });
     const quote = await reseller.quote({
       organizationId: ORG,
       tenantRef: TENANT,
-      offeringId: OFFERING.id,
+      offeringId: stableOffering.id,
       quantity: 1,
     });
     const reservation = await reseller.reserve({
@@ -397,9 +410,9 @@ describe("Takoform run-token lane", () => {
       organizationId: ORG,
       tenantRef: TENANT,
       reservationId: reservation.id,
-      offeringId: OFFERING.id,
-      offeringDigest: await catalog.digest(OFFERING),
-      formRef: FORM_REF,
+      offeringId: stableOffering.id,
+      offeringDigest: await catalog.digest(stableOffering),
+      formRef: stableFormRef,
       resourceName: "media",
       mode: "provision",
       ttlSeconds: 600,
@@ -426,7 +439,7 @@ describe("Takoform run-token lane", () => {
           },
         };
       },
-      forms: [INSTALLED_FORM],
+      forms: [stableInstalledForm],
       driver: new InMemoryTakoformResourceDriver(),
       clock,
     });
@@ -436,27 +449,26 @@ describe("Takoform run-token lane", () => {
       "POST",
       "/apis/forms.takoform.com/v1/resources/prepare",
       issued.token,
-      { ...resourceBody(), metadata: { space: TENANT, name: "other" } },
+      { ...stableResourceBody(), metadata: { space: TENANT, name: "other" } },
     );
     expect(foreign.status).toBe(404);
     expect(foreign.body).toMatchObject({ error: { code: "resource_not_found" } });
 
     const query = new URLSearchParams({
       space: TENANT,
-      group: FORM_REF.apiVersion,
-      kind: FORM_REF.kind,
-      definitionVersion: FORM_REF.definitionVersion,
-      schemaDigest: FORM_REF.schemaDigest,
+      group: stableFormRef.apiVersion,
+      kind: stableFormRef.kind,
+      definitionVersion: stableFormRef.definitionVersion,
+      schemaDigest: stableFormRef.schemaDigest,
     });
-    const mutationPath =
-      "/apis/forms.takoform.com/v1/resources/edge.forms.takoform.com/v1alpha1/EdgeObjectBucket/media";
+    const mutationPath = `/apis/forms.takoform.com/v1/resources/${stableFormRef.apiVersion}/${stableFormRef.kind}/media`;
     const resourcePath = `${mutationPath}?${query}`;
     const unreviewed = await laneRequest(
       host,
       "PUT",
       mutationPath,
       issued.token,
-      { ...resourceBody(), review: { prepareDigest: `sha256:${"f".repeat(64)}` } },
+      { ...stableResourceBody(), review: { prepareDigest: `sha256:${"f".repeat(64)}` } },
       { "idempotency-key": "run-unreviewed", "if-none-match": "*" },
     );
     expect(unreviewed.status).toBe(400);
@@ -469,7 +481,7 @@ describe("Takoform run-token lane", () => {
       "POST",
       "/apis/forms.takoform.com/v1/resources/prepare",
       issued.token,
-      resourceBody(),
+      stableResourceBody(),
     );
     expect(prepared.status).toBe(200);
     const prepareDigest = String((prepared.body.review as { prepareDigest: string }).prepareDigest);
@@ -478,7 +490,7 @@ describe("Takoform run-token lane", () => {
       "PUT",
       mutationPath,
       issued.token,
-      { ...resourceBody(), review: { prepareDigest } },
+      { ...stableResourceBody(), review: { prepareDigest } },
       { "idempotency-key": "run-apply-1", "if-none-match": "*" },
     );
     expect(applied.status).toBe(201);

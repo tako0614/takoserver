@@ -23,7 +23,7 @@ import { FakeProvider } from "../src/providers/fake.ts";
  */
 
 const FORM_REF = {
-  apiVersion: "edge.forms.takoform.com/v1beta1",
+  apiVersion: "edge.forms.takoform.com",
   kind: "ObjectBucket",
   definitionVersion: "0.1.0",
   schemaDigest: "sha256:3383a60c12bdc5a853868bd7ccab3670e1aff7b3eca889583b86d11ac0f90494",
@@ -199,7 +199,7 @@ async function applyBucket(
   const prepared = await call(fetch, "POST", `${LANE}/resources/prepare`, resource, auth);
   const review = prepared.body.review as { prepareDigest: string } | undefined;
   if (!review) throw new Error(`prepare failed: ${JSON.stringify(prepared)}`);
-  const path = `${LANE}/resources/edge.forms.takoform.com/v1beta1/ObjectBucket/${name}?${QUERY}`;
+  const path = `${LANE}/resources/${FORM_REF.apiVersion}/${FORM_REF.kind}/${name}?${QUERY}`;
   const body = { ...resource, review: { prepareDigest: review.prepareDigest } };
   const headers = { ...auth, "idempotency-key": idempotencyKey, "if-none-match": "*" };
   const response = await call(fetch, "PUT", path, body, headers);
@@ -454,7 +454,7 @@ describe("Takoform apply on a real backend", () => {
     const resource = created.body as unknown as {
       metadata: { generation: string; revision: string };
     };
-    const path = `${LANE}/resources/edge.forms.takoform.com/v1beta1/ObjectBucket/delete-lost?${QUERY}`;
+    const path = `${LANE}/resources/${FORM_REF.apiVersion}/${FORM_REF.kind}/delete-lost?${QUERY}`;
     const headers = {
       ...auth,
       "idempotency-key": "delete-lost-0001",
@@ -509,7 +509,7 @@ describe("Takoform apply on a real backend", () => {
     const read = await call(
       app.fetch,
       "GET",
-      `${LANE}/resources/edge.forms.takoform.com/v1beta1/ObjectBucket/doomed?${QUERY}`,
+      `${LANE}/resources/${FORM_REF.apiVersion}/${FORM_REF.kind}/doomed?${QUERY}`,
       undefined,
       auth,
     );
@@ -563,7 +563,7 @@ describe("Takoform apply on a real backend", () => {
     const observed = await call(
       app.fetch,
       "POST",
-      `${LANE}/resources/edge.forms.takoform.com/v1beta1/ObjectBucket/assets/observe?${QUERY}`,
+      `${LANE}/resources/${FORM_REF.apiVersion}/${FORM_REF.kind}/assets/observe?${QUERY}`,
       undefined,
       { ...auth, "idempotency-key": "observe-001", "takoform-expected-generation": "1" },
     );
@@ -582,7 +582,7 @@ describe("Takoform apply on a real backend", () => {
     const deleted = await call(
       app.fetch,
       "DELETE",
-      `${LANE}/resources/edge.forms.takoform.com/v1beta1/ObjectBucket/assets?${QUERY}`,
+      `${LANE}/resources/${FORM_REF.apiVersion}/${FORM_REF.kind}/assets?${QUERY}`,
       undefined,
       { ...auth, "idempotency-key": "delete-001", "takoform-expected-generation": "1" },
     );

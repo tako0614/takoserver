@@ -19,10 +19,8 @@ const POSTGRES = {
   version: "1.0.0",
   schemaDigest: `sha256:${"a".repeat(64)}`,
 } as const satisfies TakoformInterfaceRef;
-const COMPUTE_FORM = form("compute.resources.takoform.com/v1alpha1", "LinuxVirtualMachine", "b");
-const DATABASE_FORM = form("data.resources.takoform.com/v1alpha1", "PostgresDatabase", "c", [
-  POSTGRES,
-]);
+const COMPUTE_FORM = form("compute.resources.takoform.com", "LinuxVirtualMachine", "b");
+const DATABASE_FORM = form("data.resources.takoform.com", "PostgresDatabase", "c", [POSTGRES]);
 
 const identity: ExternalIdentityVerifier = {
   async verify() {

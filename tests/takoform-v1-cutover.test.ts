@@ -5,6 +5,7 @@ import {
   createInMemoryTakoformHost,
   createMemoryObjectStore,
   InMemoryTakoformResourceDriver,
+  type InstalledTakoformForm,
 } from "../src/index.ts";
 
 function handler() {
@@ -156,5 +157,137 @@ describe("literal stable Takoform Host cutover", () => {
         )
       )?.status,
     ).toBe(401);
+  });
+
+  test("enumerates stable Forms without a space and accepts each optional filter", async () => {
+    const form: InstalledTakoformForm = {
+      identity: {
+        formRef: {
+          apiVersion: "function.forms.takoform.com",
+          kind: "Function",
+          definitionVersion: "0.1.0",
+          schemaDigest: `sha256:${"a".repeat(64)}`,
+        },
+      },
+      desiredSchema: { type: "object", additionalProperties: false },
+      operations: ["create", "read", "delete"] as const,
+    };
+    const host = createInMemoryTakoformHost({
+      authenticate: async (authorization) =>
+        authorization === "Bearer stable"
+          ? { tenantId: "tenant-a", principalId: "principal-a" }
+          : null,
+      forms: [form],
+    });
+    const headers = { authorization: "Bearer stable" };
+    const root = "https://api.takoserver.com/apis/forms.takoform.com/v1/forms";
+    const filters = new URLSearchParams({
+      group: form.identity.formRef.apiVersion,
+      kind: form.identity.formRef.kind,
+      definitionVersion: form.identity.formRef.definitionVersion,
+      schemaDigest: form.identity.formRef.schemaDigest,
+      space: "main",
+    });
+
+    const noSpace = await host.handle(new Request(root, { headers }));
+    expect(noSpace?.status).toBe(200);
+    expect(await noSpace?.json()).toMatchObject({ forms: [{ identity: form.identity }] });
+
+    for (const query of [
+      `group=${encodeURIComponent(form.identity.formRef.apiVersion)}`,
+      `kind=${form.identity.formRef.kind}`,
+      `definitionVersion=${form.identity.formRef.definitionVersion}`,
+      `schemaDigest=${encodeURIComponent(form.identity.formRef.schemaDigest)}`,
+      filters.toString(),
+    ]) {
+      const response = await host.handle(new Request(`${root}?${query}`, { headers }));
+      expect(response?.status).toBe(200);
+      expect(await response?.json()).toMatchObject({ forms: [{ identity: form.identity }] });
+    }
+  });
+
+  test("rejects empty or malformed stable Form filters", async () => {
+    const host = createInMemoryTakoformHost({
+      authenticate: async () => ({ tenantId: "tenant-a", principalId: "principal-a" }),
+      forms: [],
+    });
+    const root = "https://api.takoserver.com/apis/forms.takoform.com/v1/forms";
+    for (const query of [
+      "space=",
+      "group=not_a_dns_group",
+      "kind=function",
+      "definitionVersion=latest",
+      "schemaDigest=sha256:short",
+    ]) {
+      const response = await host.handle(new Request(`${root}?${query}`));
+      expect(response?.status).toBe(400);
+      expect(await response?.json()).toMatchObject({ error: { code: "invalid_argument" } });
+    }
+  });
+
+  test("uses one versionless family path on stable definition, support, and resource routes", async () => {
+    const form: InstalledTakoformForm = {
+      identity: {
+        formRef: {
+          apiVersion: "function.forms.takoform.com",
+          kind: "Function",
+          definitionVersion: "0.1.0",
+          schemaDigest: `sha256:${"b".repeat(64)}`,
+        },
+      },
+      desiredSchema: { type: "object", additionalProperties: false },
+      operations: ["create", "read", "delete"] as const,
+    };
+    const host = createInMemoryTakoformHost({
+      authenticate: async () => ({ tenantId: "tenant-a", principalId: "principal-a" }),
+      forms: [form],
+    });
+    const ref = form.identity.formRef;
+    const query = new URLSearchParams({
+      space: "main",
+      group: ref.apiVersion,
+      kind: ref.kind,
+      definitionVersion: ref.definitionVersion,
+      schemaDigest: ref.schemaDigest,
+    });
+    const definition = await host.handle(
+      new Request(
+        `https://api.takoserver.com/apis/forms.takoform.com/v1/form-definitions/${ref.apiVersion}/${ref.kind}?${query}`,
+      ),
+    );
+    expect(definition?.status).toBe(200);
+    const support = await host.handle(
+      new Request(
+        `https://api.takoserver.com/apis/forms.takoform.com/v1/support/forms/${ref.apiVersion}/${ref.kind}/${ref.definitionVersion}`,
+      ),
+    );
+    expect(support?.status).toBe(200);
+    const missing = await host.handle(
+      new Request(
+        `https://api.takoserver.com/apis/forms.takoform.com/v1/resources/${ref.apiVersion}/${ref.kind}/missing?${query}`,
+      ),
+    );
+    expect(missing?.status).toBe(404);
+    expect(await missing?.json()).toMatchObject({ error: { code: "resource_not_found" } });
+
+    for (const path of [
+      `/form-definitions/${ref.apiVersion}/v1beta1/${ref.kind}`,
+      `/support/forms/${ref.apiVersion}/v1beta1/${ref.kind}/${ref.definitionVersion}`,
+      `/resources/${ref.apiVersion}/v1beta1/${ref.kind}/missing`,
+    ]) {
+      const response = await host.handle(
+        new Request(`https://api.takoserver.com/apis/forms.takoform.com/v1${path}?${query}`),
+      );
+      expect(response?.status).toBe(404);
+      expect(await response?.json()).toMatchObject({ error: { code: "invalid_argument" } });
+    }
+
+    const encodedSlash = await host.handle(
+      new Request(
+        `https://api.takoserver.com/apis/forms.takoform.com/v1/resources/${encodeURIComponent(`${ref.apiVersion}/v1beta1`)}/${ref.kind}/missing?${query}`,
+      ),
+    );
+    expect(encodedSlash?.status).toBe(400);
+    expect(await encodedSlash?.json()).toMatchObject({ error: { code: "invalid_argument" } });
   });
 });

@@ -10,6 +10,7 @@ import {
   formSupportProfile,
   isDefinitionVersion,
   isFormApiVersion,
+  isFormGroup,
   isKind,
 } from "./forms.ts";
 import type { DeferredOperations } from "./operations.ts";
@@ -155,7 +156,14 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
   } = options;
   const configuration = options.routes ?? DEFAULT_TAKOFORM_ROUTES;
   const lane = configuration.apiPath;
-  const groupPath = "([^/]+)(?:/(v[0-9]+(?:(?:alpha|beta)[0-9]+)?))?";
+  const strictStableLane = lane === STABLE_LANE;
+  // The stable lane carries the complete versionless Form family as one path
+  // segment. Retained historical lanes keep their predecessor's optional
+  // family-version segment so their old fixtures remain reachable only when
+  // explicitly composed.
+  const groupPath = strictStableLane
+    ? "([^/]+)"
+    : "([^/]+)(?:/(v[0-9]+(?:(?:alpha|beta)[0-9]+)?))?";
   const supportFormPattern = new RegExp(
     `^${escaped(lane)}/support/forms/${groupPath}/([^/]+)/([^/]+)$`,
     "u",
@@ -247,9 +255,13 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
 
     const supportForm = supportFormPattern.exec(url.pathname);
     if (request.method === "GET" && supportForm) {
-      const apiVersion = joinedGroup(supportForm[1], supportForm[2]);
-      const kind = safeSegment(supportForm[3]);
-      const definitionVersion = safeSegment(supportForm[4]);
+      const apiVersion = joinedGroup(
+        supportForm[1],
+        strictStableLane ? undefined : supportForm[2],
+        strictStableLane,
+      );
+      const kind = safeSegment(strictStableLane ? supportForm[2] : supportForm[3]);
+      const definitionVersion = safeSegment(strictStableLane ? supportForm[3] : supportForm[4]);
       const candidates = [...forms.values()].filter(
         (form) =>
           form.identity.formRef.apiVersion === apiVersion &&
@@ -373,8 +385,12 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
     if (request.method === "GET" && definition) {
       exactQuery(url, ["space", "group", "kind", "definitionVersion", "schemaDigest"]);
       requiredQuery(url, "space");
-      const apiVersion = joinedGroup(definition[1], definition[2]);
-      const kind = safeSegment(definition[3]);
+      const apiVersion = joinedGroup(
+        definition[1],
+        strictStableLane ? undefined : definition[2],
+        strictStableLane,
+      );
+      const kind = safeSegment(strictStableLane ? definition[2] : definition[3]);
       if (requiredQuery(url, "group") !== apiVersion || requiredQuery(url, "kind") !== kind) {
         throw new TakoformHostError();
       }
@@ -409,7 +425,7 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
 
     const resource = resourcePattern.exec(url.pathname);
     if (resource) {
-      const path = parsedResourcePath(resource);
+      const path = parsedResourcePathForLane(resource, strictStableLane);
       if (request.method === "GET" && !path.action) {
         return shaped(await engine.read(context, path), configuration.omitObservedStatus);
       }
@@ -490,7 +506,11 @@ async function assertPrincipalScope(
 
   const definition = formDefinitionPattern.exec(url.pathname);
   if (request.method === "GET" && definition) {
-    const candidate = `${joinedGroup(definition[1], definition[2])}/${safeSegment(definition[3])}`;
+    const candidate = `${joinedGroup(
+      definition[1],
+      lane === STABLE_LANE ? undefined : definition[2],
+      lane === STABLE_LANE,
+    )}/${safeSegment(lane === STABLE_LANE ? definition[2] : definition[3])}`;
     if (
       candidate !== formPath ||
       url.searchParams.get("definitionVersion") !== scope.formRef.definitionVersion ||
@@ -513,7 +533,7 @@ async function assertPrincipalScope(
 
   const resource = resourcePattern.exec(url.pathname);
   if (resource) {
-    const path = parsedResourcePath(resource);
+    const path = parsedResourcePathForLane(resource, lane === STABLE_LANE);
     const bodyMutation = request.method === "PUT" || path.action === "import";
     if (
       path.apiVersion !== scope.formRef.apiVersion ||
@@ -575,7 +595,7 @@ async function assertTenantRunScope(
   }
   const resource = resourcePattern.exec(url.pathname);
   if (resource) {
-    const path = parsedResourcePath(resource);
+    const path = parsedResourcePathForLane(resource, lane === STABLE_LANE);
     const bodyMutation = request.method === "PUT" || path.action === "import";
     const matches = bodyMutation
       ? url.search === "" && (await bodySpaceMatches(space, request))
@@ -881,8 +901,32 @@ function laneRequest(request: Request, configuration: TakoformRouteConfiguration
   return request;
 }
 
-function joinedGroup(group: string | undefined, version: string | undefined): string {
+function parsedResourcePathForLane(
+  match: RegExpExecArray,
+  strictStableLane: boolean,
+): ReturnType<typeof parsedResourcePath> {
+  if (!strictStableLane) return parsedResourcePath(match);
+  // `parsedResourcePath` also serves retained lanes and therefore keeps the
+  // historical group/version/kind/name capture positions. Supply the omitted
+  // stable version slot explicitly rather than making the stable matcher
+  // consume a second path segment.
+  return parsedResourcePath([
+    match[0],
+    match[1],
+    undefined,
+    match[2],
+    match[3],
+    match[4],
+  ] as unknown as RegExpExecArray);
+}
+
+function joinedGroup(
+  group: string | undefined,
+  version: string | undefined,
+  strictStableLane = false,
+): string {
   const safeGroup = safeSegment(group);
+  if (strictStableLane && !isFormGroup(safeGroup)) throw new TakoformHostError();
   return version === undefined ? safeGroup : `${safeGroup}/${safeSegment(version)}`;
 }
 
@@ -892,7 +936,8 @@ function validateFormsFilters(url: URL): void {
   if (keys.some((key) => !allowed.has(key)) || new Set(keys).size !== keys.length) {
     throw new TakoformHostError();
   }
-  spaceId(requiredQuery(url, "space"));
+  const space = url.searchParams.get("space");
+  if (space !== null) spaceId(space);
   const group = url.searchParams.get("group");
   const kind = url.searchParams.get("kind");
   const definitionVersion = url.searchParams.get("definitionVersion");

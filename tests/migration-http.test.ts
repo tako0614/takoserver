@@ -19,7 +19,7 @@ const FORMAT = "sqlite.sql-dump.takoform.com/v1";
 const FORM: InstalledTakoformForm = {
   identity: {
     formRef: {
-      apiVersion: "data.resources.takoform.com/v1alpha1",
+      apiVersion: "data.resources.takoform.com",
       kind: "SqliteDatabase",
       definitionVersion: "1.0.0",
       schemaDigest: `sha256:${"a".repeat(64)}`,
