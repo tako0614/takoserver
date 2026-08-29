@@ -159,6 +159,8 @@ export interface CreateTakoformHostAuthorityOptions {
   readonly objects?: Pick<ObjectStoreAccess, "get" | "list">;
   readonly packages?: FormPackageReader;
   readonly hostId: string;
+  /** Current public Worker Version; a stale authority profile is unsupported. */
+  readonly publicWorkerVersionId?: string;
   /** Build/operator inputs only; these bytes do not confer any runtime authority. */
   readonly candidates: readonly InstalledTakoformForm[];
   readonly bindings?: readonly InstalledTakoformBinding[];
@@ -194,6 +196,14 @@ export function createTakoformHostAuthority(
   options: CreateTakoformHostAuthorityOptions,
 ): TakoformHostAuthority {
   requireIdentity(options.hostId, "host id");
+  if (
+    options.publicWorkerVersionId !== undefined &&
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(
+      options.publicWorkerVersionId,
+    )
+  ) {
+    throw new TypeError("public Worker Version identity is invalid");
+  }
   if (
     !options.technicalAvailability ||
     typeof options.technicalAvailability.resolve !== "function"
@@ -255,6 +265,11 @@ export function createTakoformHostAuthority(
     const publisher = readPublisher(publisherRow, install.publisherKey);
     const checkpoint = readCheckpoint(checkpointRow, install.publisherKey);
     const support = readSupport(supportRow, supportKey, formRefKey, formRef, install.packageDigest);
+    const currentImplementationProfile = supportProfileMatchesPublicWorker(
+      supportRow,
+      support.implementationDigest,
+      options.publicWorkerVersionId,
+    );
     await validateEvidencePins({
       publisherRow,
       checkpointRow,
@@ -319,6 +334,7 @@ export function createTakoformHostAuthority(
       checkpointCurrent &&
       installCurrent &&
       support.supported &&
+      currentImplementationProfile &&
       implementationCandidate !== null &&
       narrowedOperations.length > 0;
     return {
@@ -672,6 +688,23 @@ export function createTakoformHostAuthority(
       });
     },
   };
+}
+
+function supportProfileMatchesPublicWorker(
+  row: Row,
+  implementationDigest: AdmissionDigest,
+  publicWorkerVersionId: string | undefined,
+): boolean {
+  if (publicWorkerVersionId === undefined) return true;
+  const profile = parseJson(row.profile_json);
+  return (
+    isJsonObject(profile) &&
+    profile.kind === "takoserver.form-support@v1" &&
+    profile.publicWorkerVersionId === publicWorkerVersionId &&
+    isSha256Digest(profile.workerArtifactDigest) &&
+    isSha256Digest(profile.capabilityDigest) &&
+    profile.implementationDigest === implementationDigest
+  );
 }
 
 /** Canonical durable audience values used by the private writer/operator tool. */

@@ -145,15 +145,60 @@ test("the generated 16-Form corpus is candidate input, never runtime admission",
   );
 });
 
-test("public entries reach the reader but never writer, issuer, or static authority", async () => {
-  const reachable = await reachableModules(["src/entry-bun.ts", "src/entry-worker.ts"]);
+test("public Worker, router, and OpenAPI graphs reach readers but never Form authority", async () => {
+  const reachable = await reachableModules([
+    "src/entry-bun.ts",
+    "src/entry-cloudflare-worker.ts",
+    "src/entry-worker.ts",
+    "src/router.ts",
+    "src/openapi.ts",
+  ]);
   expect(reachable.has("src/takoform/host-authority.ts")).toBe(true);
   expect(reachable.has("src/takoform/form-package-reader.ts")).toBe(true);
   expect(reachable.has("src/takoform/current-candidates.ts")).toBe(true);
   expect(reachable.has("src/takoform/admission-store.ts")).toBe(false);
   expect(reachable.has("src/takoform/admission.ts")).toBe(false);
   expect(reachable.has("src/takoform/form-packages.ts")).toBe(false);
+  expect(reachable.has("src/takoform/operator-authority.ts")).toBe(false);
+  expect(reachable.has("src/takoform/operator-endpoint.ts")).toBe(false);
+  expect(reachable.has("src/takoform/integration-operator-endpoint.ts")).toBe(false);
+  expect(reachable.has("src/form-authority-operator-proof.ts")).toBe(false);
   expect(reachable.has("src/takoform/stable-production-catalog.ts")).toBe(false);
+});
+
+test("route-less Form authority Workers own the writer graph and no public routes", async () => {
+  const [production, integration] = await Promise.all([
+    reachableModules(["src/entry-form-authority-worker.ts"]),
+    reachableModules(["src/entry-integration-form-authority-worker.ts"]),
+  ]);
+  for (const reachable of [production, integration]) {
+    expect(reachable.has("src/takoform/admission-store.ts")).toBe(true);
+    expect(reachable.has("src/takoform/admission.ts")).toBe(true);
+    expect(reachable.has("src/takoform/form-packages.ts")).toBe(true);
+    expect(reachable.has("src/app.ts")).toBe(false);
+    expect(reachable.has("src/router.ts")).toBe(false);
+    expect(reachable.has("src/openapi.ts")).toBe(false);
+  }
+  expect(production.has("src/takoform/integration-operator-endpoint.ts")).toBe(false);
+  expect(production.has("src/form-authority-operator-proof.ts")).toBe(false);
+  expect(production.has("src/generated/takoform-integration-form-packages.ts")).toBe(false);
+  expect(integration.has("src/form-authority-operator-proof.ts")).toBe(true);
+  expect(integration.has("src/generated/takoform-integration-form-packages.ts")).toBe(true);
+});
+
+test("authenticated operator gateway is isolated from both storage writers and customer routes", async () => {
+  const reachable = await reachableModules([
+    "src/entry-integration-form-authority-operator-worker.ts",
+  ]);
+  expect(reachable.has("src/integration-form-authority-gateway.ts")).toBe(true);
+  expect(reachable.has("src/form-authority-operator-proof.ts")).toBe(true);
+  expect(reachable.has("src/takoform/operator-authority.ts")).toBe(false);
+  expect(reachable.has("src/takoform/admission-store.ts")).toBe(false);
+  expect(reachable.has("src/takoform/admission.ts")).toBe(false);
+  expect(reachable.has("src/takoform/form-packages.ts")).toBe(false);
+  expect(reachable.has("src/app.ts")).toBe(false);
+  expect(reachable.has("src/router.ts")).toBe(false);
+  expect(reachable.has("src/openapi.ts")).toBe(false);
 });
 
 test("writing a Form Package does not create executable support or activation", async () => {

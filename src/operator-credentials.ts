@@ -46,6 +46,22 @@ interface Verified {
   readonly claims: Record<string, unknown>;
 }
 
+export interface OperatorPurposeVerifier {
+  verify(assertion: string, purpose: string): Promise<Readonly<Record<string, unknown>>>;
+}
+
+/** Verifies one bounded offline operator assertion without granting product sign-in/funding. */
+export function createOperatorPurposeVerifier(
+  options: OperatorCredentialOptions,
+): OperatorPurposeVerifier {
+  const verify = createVerifier(options);
+  return {
+    async verify(assertion, purpose) {
+      return structuredClone((await verify(assertion, purpose)).claims);
+    },
+  };
+}
+
 function createVerifier(options: OperatorCredentialOptions) {
   const clock = options.clock ?? (() => new Date());
   const maxLifetime = options.maxLifetimeSeconds ?? 900;
@@ -102,8 +118,12 @@ function createVerifier(options: OperatorCredentialOptions) {
       throw new OperatorAssertionError("malformed");
     }
     const now = Math.floor(clock().getTime() / 1_000);
-    if ((expiresAt as number) <= now) throw new OperatorAssertionError("expired");
-    if ((expiresAt as number) - (issuedAt as number) > maxLifetime) {
+    if (
+      (expiresAt as number) <= now ||
+      (issuedAt as number) > now + 30 ||
+      (expiresAt as number) <= (issuedAt as number) ||
+      (expiresAt as number) - (issuedAt as number) > maxLifetime
+    ) {
       throw new OperatorAssertionError("expired");
     }
     return { purpose, claims: record };

@@ -29,10 +29,11 @@ import { createWorkerProductionComposition } from "./worker-production-compositi
  * rejects a partial or ambiguous composition before the Worker serves.
  */
 
-interface WorkerEnv {
+export interface WorkerEnv {
   readonly AI?: CloudflareWorkersAiBinding;
   readonly STATE_DB: Parameters<typeof createD1Sql>[0];
   readonly OBJECTS: Parameters<typeof createR2ObjectStore>[0];
+  readonly WORKER_VERSION: { readonly id: string };
   readonly PUBLIC_ORIGIN?: string;
   /** Where this deployment's console is served, if it has one. */
   readonly TAKOSERVER_CONSOLE_ORIGIN?: string;
@@ -221,6 +222,7 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
   const app = buildApp({
     sql,
     objects,
+    publicWorkerVersionId: env.WORKER_VERSION.id,
     artifacts,
     workerModuleInspector: createJavaScriptWorkerModuleInspector(),
     ...(signingKey ? { signingKey } : {}),

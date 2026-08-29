@@ -72,7 +72,7 @@ interface IdentityInspection extends LiveWorkerVersion {
   readonly version: unknown;
 }
 
-interface PrivateKeyInput {
+export interface PrivateKeyInput {
   readonly jwk: JsonWebKey & { readonly x: string; readonly d: string };
 }
 
@@ -313,7 +313,7 @@ function sha256(value: string): string {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
 
-function readPrivateJwk(path: string): PrivateKeyInput {
+export function readPrivateJwk(path: string): PrivateKeyInput {
   let descriptor: number | null = null;
   let raw: string;
   try {
@@ -362,9 +362,9 @@ function readPrivateJwk(path: string): PrivateKeyInput {
   };
 }
 
-async function provePrivateMatchesPublic(
+export async function provePrivateMatchesPublic(
   input: PrivateKeyInput,
-  publicJwk: NonNullable<DeployTarget["operatorIdentity"]>["publicJwk"],
+  publicJwk: { readonly kty: "OKP"; readonly crv: "Ed25519"; readonly x: string },
 ): Promise<void> {
   if (input.jwk.x !== publicJwk.x) {
     throw preflightError("operator private JWK does not match target public JWK");

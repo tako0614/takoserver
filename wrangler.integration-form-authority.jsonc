@@ -1,0 +1,49 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "takoserver-integration-form-authority",
+  "main": "src/entry-integration-form-authority-worker.ts",
+  "compatibility_date": "2026-08-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "vars": {
+    "TAKOSERVER_ENVIRONMENT": "integration",
+    "TAKOSERVER_FORM_AUTHORITY_HOST_ID": "unconfigured.invalid",
+    "TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST": "unconfigured",
+    "TAKOSERVER_PUBLIC_WORKER_VERSION_ID": "00000000-0000-0000-0000-000000000000",
+    "TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST": "unconfigured",
+    "TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK": "unconfigured",
+    "TAKOSERVER_FORM_AUTHORITY_OPERATOR_TENANT_ID": "unconfigured",
+    "TAKOSERVER_FORM_AUTHORITY_OPERATOR_SPACE": "unconfigured"
+  },
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": true
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.01
+    }
+  },
+  "d1_databases": [
+    {
+      "binding": "STATE_DB",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "OBJECTS"
+    }
+  ],
+  "services": [
+    {
+      "binding": "PUBLIC_HOST_IDENTITY",
+      "service": "takoserver-api",
+      "entrypoint": "PublicHostIdentityEntrypoint"
+    }
+  ]
+}

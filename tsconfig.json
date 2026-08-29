@@ -15,5 +15,15 @@
     "types": ["bun"]
   },
   "include": ["src/**/*.ts", "scripts/**/*.ts", "tests/**/*.ts"],
-  "exclude": ["src/entry-worker.ts", "worker-configuration.d.ts"]
+  "exclude": [
+    "src/entry-worker.ts",
+    "src/entry-cloudflare-worker.ts",
+    "src/entry-form-authority-worker.ts",
+    "src/entry-integration-form-authority-worker.ts",
+    "src/entry-integration-form-authority-operator-worker.ts",
+    "worker-configuration.d.ts",
+    "form-authority-worker-configuration.d.ts",
+    "integration-form-authority-worker-configuration.d.ts",
+    "integration-form-authority-operator-worker-configuration.d.ts"
+  ]
 }

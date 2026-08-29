@@ -4,6 +4,6 @@
     "lib": ["ES2022"],
     "types": ["@cloudflare/workers-types"]
   },
-  "include": ["worker-configuration.d.ts", "src/entry-worker.ts"],
+  "include": ["worker-configuration.d.ts", "src/entry-cloudflare-worker.ts"],
   "exclude": []
 }

@@ -135,4 +135,88 @@ describe("environment-exact deploy target", () => {
       (path) => expect(() => loadTarget(path, "rehearsal")).toThrow("integration-only"),
     );
   });
+
+  test("validates distinct route-less Form authority targets", () => {
+    const formAuthority = {
+      workerName: "takoserver-form-authority-integration",
+      integrationWorkerName: "takoserver-form-fixture-integration",
+      hostId: "https://takoserver-api-rehearsal.example.workers.dev",
+      operatorOperations: { ModuleWorker: ["create", "read"] as const },
+    };
+    withTarget(descriptor({ environment: "integration", formAuthority }), (path) =>
+      expect(loadTarget(path, "integration").formAuthority).toEqual(formAuthority),
+    );
+    withTarget(descriptor({ formAuthority }), (path) =>
+      expect(() => loadTarget(path, "rehearsal")).toThrow("integration-only"),
+    );
+    withTarget(
+      descriptor({
+        formAuthority: {
+          workerName: "takoserver-api-rehearsal",
+          hostId: "https://takoserver-api-rehearsal.example.workers.dev",
+        },
+      }),
+      (path) => expect(() => loadTarget(path, "rehearsal")).toThrow("must be distinct"),
+    );
+    withTarget(
+      descriptor({
+        formAuthority: {
+          workerName: "takoserver-form-authority-rehearsal",
+          hostId: "https://another-host.example.test",
+        },
+      }),
+      (path) => expect(() => loadTarget(path, "rehearsal")).toThrow("public Takoserver Host"),
+    );
+    withTarget(
+      descriptor({
+        formAuthority: {
+          workerName: "takoserver-form-authority-rehearsal",
+          hostId: "https://takoserver-api-rehearsal.example.workers.dev",
+          operatorOperations: { ModuleWorker: ["read", "read"] },
+        },
+      }),
+      (path) => expect(() => loadTarget(path, "rehearsal")).toThrow("operator operations"),
+    );
+  });
+
+  test("accepts only the dedicated integration Form-authority gateway key and custom origin", () => {
+    const operatorPublicJwk = {
+      kty: "OKP" as const,
+      crv: "Ed25519" as const,
+      x: "A".repeat(43),
+    };
+    const formAuthority = {
+      workerName: "takoserver-form-authority-integration",
+      integrationWorkerName: "takoserver-form-fixture-integration",
+      integrationOperatorWorkerName: "takoserver-form-operator-integration",
+      integrationOperatorOrigin: "https://form-authority.integration.takoserver.com",
+      integrationOperatorScope: {
+        tenantId: "tenant-yurucommu-integration",
+        space: "space-yurucommu-integration",
+      },
+      operatorPublicJwk,
+      hostId: "https://takoserver-api-rehearsal.example.workers.dev",
+    };
+    withTarget(descriptor({ environment: "integration", formAuthority }), (path) => {
+      expect(loadTarget(path, "integration").formAuthority).toEqual(formAuthority);
+    });
+
+    for (const rejected of [
+      { ...formAuthority, operatorPublicJwk: undefined },
+      { ...formAuthority, integrationOperatorScope: undefined },
+      { ...formAuthority, operatorPublicJwk: { ...operatorPublicJwk, d: "private-material" } },
+      {
+        ...formAuthority,
+        integrationOperatorOrigin: "https://operator.example.workers.dev",
+      },
+    ]) {
+      withTarget(descriptor({ environment: "integration", formAuthority: rejected }), (path) => {
+        expect(() => loadTarget(path, "integration")).toThrow();
+      });
+    }
+
+    withTarget(descriptor({ formAuthority }), (path) => {
+      expect(() => loadTarget(path, "rehearsal")).toThrow("integration-only");
+    });
+  });
 });

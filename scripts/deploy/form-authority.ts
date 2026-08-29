@@ -1,0 +1,1046 @@
+import { createHash } from "node:crypto";
+import {
+  copyFileSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { canonicalDigest, canonicalJson } from "../../src/json.ts";
+import {
+  type TakoformLifecycleCapabilityManifest,
+  YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
+  type YurucommuIdentityCapabilityKind,
+  yurucommuLifecycleCapabilityManifest,
+} from "../../src/takoform/implementation-catalog.ts";
+import { deriveFormAuthorityIdentity } from "../../src/takoform/operator-endpoint.ts";
+import { CloudflareState } from "./cloudflare-state.ts";
+import {
+  type DeployError,
+  type DeployPhase,
+  mutationError,
+  preflightError,
+  verificationError,
+} from "./errors.ts";
+import {
+  type CommandResult,
+  cloudflareChildEnvironment,
+  REPOSITORY,
+  requireEnvironment,
+  runCommand,
+  wranglerCommand,
+} from "./process.ts";
+import { type DeployEnvironment, qualifySource, sealDirectory } from "./qualification.ts";
+import type { DeployTarget } from "./target.ts";
+import { prepareWorkerArtifact } from "./worker-artifact.ts";
+import { inspectLiveWorkerVersion } from "./worker-live.ts";
+import {
+  assertExactSecretInventory,
+  assertExactVersionBindingClosure,
+  parseWorkerDeploymentHistory,
+  type WorkerDeploymentHistory,
+} from "./worker-state.ts";
+
+export type FormAuthoritySurface =
+  | "takoserver-form-authority-worker"
+  | "takoserver-integration-form-authority-worker"
+  | "takoserver-integration-form-authority-operator-worker";
+
+export interface FormAuthorityDeployInvocation {
+  readonly surface: FormAuthoritySurface;
+  readonly action: "status" | "apply";
+  readonly environment: DeployEnvironment;
+  readonly commit: string;
+}
+
+export type FormAuthorityProcess = (
+  command: readonly string[],
+  options?: { readonly env?: Readonly<Record<string, string>>; readonly input?: string },
+) => Promise<CommandResult>;
+
+export interface FormAuthorityDeployState {
+  workerScripts(): Promise<readonly string[]>;
+  workerDeployments(workerName: string): Promise<readonly unknown[]>;
+  workerVersion(workerName: string, versionId: string): Promise<unknown>;
+  workerSecrets(workerName: string): Promise<readonly unknown[]>;
+  workerDomains(): Promise<readonly { readonly hostname: string; readonly service: string }[]>;
+  workerSubdomain(workerName: string): Promise<{
+    readonly enabled: boolean;
+    readonly previewsEnabled: boolean;
+  }>;
+  workerRoutes(): Promise<
+    readonly {
+      readonly zoneId: string;
+      readonly id: string;
+      readonly pattern: string;
+      readonly script: string | null;
+    }[]
+  >;
+}
+
+export interface FormAuthorityDeployOptions {
+  readonly run?: FormAuthorityProcess;
+  readonly state?: FormAuthorityDeployState;
+  readonly outputDirectory?: string;
+  readonly cloudflareEnvironment?: Readonly<Record<string, string>>;
+  readonly review?: string;
+}
+
+export interface SelectedFormAuthorityTarget {
+  readonly kind: "authority" | "operator-gateway";
+  readonly workerName: string;
+  readonly hostId: string;
+  readonly main: string;
+  readonly admissionMode: "released-core-unavailable" | "integration-fixture";
+  readonly productionEligible: false;
+  readonly operatorOrigin?: string;
+  readonly authorityWorkerName?: string;
+  readonly operatorPublicJwk?: {
+    readonly kty: "OKP";
+    readonly crv: "Ed25519";
+    readonly x: string;
+  };
+  readonly operatorScope?: {
+    readonly tenantId: string;
+    readonly space: string;
+  };
+}
+
+interface FormAuthorityInspection {
+  readonly history: WorkerDeploymentHistory;
+  readonly commit: string;
+  readonly authorityArtifactDigest: `sha256:${string}`;
+}
+
+interface PublicWorkerInspection {
+  readonly history: WorkerDeploymentHistory;
+  readonly commit: string;
+  readonly workerArtifactDigest: `sha256:${string}`;
+}
+
+/**
+ * Deploys the isolated authority composition or its authenticated integration
+ * operator gateway. The gateway is a separate custom-domain Worker and never
+ * joins the customer/public Worker graph. Integration is fenced before
+ * credentials, state adapters, or storage target data are read.
+ */
+export async function runFormAuthority(
+  invocation: FormAuthorityDeployInvocation,
+  target: DeployTarget,
+  options: FormAuthorityDeployOptions = {},
+): Promise<Record<string, unknown>> {
+  if (isIntegrationOnlySurface(invocation.surface) && invocation.environment !== "integration") {
+    throw preflightError("integration Form authority deploy surface is integration-only");
+  }
+  if (target.environment !== invocation.environment) {
+    throw preflightError("Form authority invocation and target environments differ");
+  }
+  const selected = selectTarget(invocation, target);
+  const capabilityManifest = targetCapabilityManifest(target);
+  const capabilityManifestJson = canonicalJson(capabilityManifest);
+  const capabilityDigest = await canonicalDigest(capabilityManifest);
+  const run = options.run ?? runCommand;
+  const environment =
+    options.cloudflareEnvironment ??
+    (options.state !== undefined && invocation.action === "status"
+      ? {}
+      : cloudflareChildEnvironment());
+  const state =
+    options.state ??
+    new CloudflareState({ accountId: target.accountId, token: exactToken(environment) });
+  const publicBefore = await inspectPublicWorker("preflight", target, state);
+  const operatorIdentity = await deriveFormAuthorityIdentity({
+    environment: invocation.environment,
+    hostId: selected.hostId,
+    workerArtifactDigest: publicBefore.workerArtifactDigest,
+    publicWorkerVersionId: publicBefore.history.versionId,
+    capabilities: capabilityManifest,
+  });
+  const dependencySelected =
+    selected.kind === "operator-gateway"
+      ? selectTarget(
+          { ...invocation, surface: "takoserver-integration-form-authority-worker" },
+          target,
+        )
+      : null;
+  const dependencyBefore = dependencySelected
+    ? await inspectFormAuthority(
+        "preflight",
+        { ...invocation, surface: "takoserver-integration-form-authority-worker" },
+        target,
+        dependencySelected,
+        publicBefore.workerArtifactDigest,
+        publicBefore.history.versionId,
+        capabilityManifestJson,
+        state,
+      )
+    : null;
+  const before = await inspectFormAuthority(
+    "preflight",
+    invocation,
+    target,
+    selected,
+    publicBefore.workerArtifactDigest,
+    publicBefore.history.versionId,
+    capabilityManifestJson,
+    state,
+  );
+
+  if (invocation.action === "status") {
+    return {
+      kind: "takoserver.form-authority-worker-status@v1",
+      surface: invocation.surface,
+      environment: invocation.environment,
+      workerName: selected.workerName,
+      hostId: selected.hostId,
+      selectedCommit: invocation.commit,
+      deployedCommit: before?.commit ?? null,
+      commitMatches: before?.commit === invocation.commit,
+      deploymentId: before?.history.deploymentId ?? null,
+      versionId: before?.history.versionId ?? null,
+      previousVersionId: before?.history.previousVersionId ?? null,
+      authorityArtifactDigest: before?.authorityArtifactDigest ?? null,
+      workerArtifactDigest: publicBefore.workerArtifactDigest,
+      publicWorkerCommit: publicBefore.commit,
+      publicWorkerVersionId: publicBefore.history.versionId,
+      publicWorkerCommitMatches: publicBefore.commit === invocation.commit,
+      capabilityDigest,
+      implementationDigest: operatorIdentity.implementationDigest,
+      routeMode: routeMode(selected),
+      ...(selected.operatorOrigin ? { operatorOrigin: selected.operatorOrigin } : {}),
+      ...(dependencySelected
+        ? {
+            authorityWorkerName: dependencySelected.workerName,
+            authorityDeployedCommit: dependencyBefore?.commit ?? null,
+            authorityVersionId: dependencyBefore?.history.versionId ?? null,
+            authorityCommitMatches: dependencyBefore?.commit === invocation.commit,
+          }
+        : {}),
+      admissionMode: selected.admissionMode,
+      productionEligible: selected.productionEligible,
+      ready:
+        before?.commit === invocation.commit &&
+        publicBefore.commit === invocation.commit &&
+        (dependencySelected === null || dependencyBefore?.commit === invocation.commit),
+    };
+  }
+
+  const reviewer = exactReviewer(
+    options.review ?? requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW"),
+  );
+  const source = await qualifySource({
+    environment: invocation.environment,
+    commit: invocation.commit,
+    run,
+  });
+  if (publicBefore.commit !== source.commit) {
+    throw preflightError(
+      "served public Worker commit differs from the Form authority source commit",
+    );
+  }
+  if (dependencySelected && dependencyBefore?.commit !== source.commit) {
+    throw preflightError(
+      "served integration Form authority Worker differs from the operator gateway source commit",
+    );
+  }
+  await checked(run, "scoped Form authority owner gate `bun run check`", ["bun", "run", "check"]);
+
+  const temporary = options.outputDirectory === undefined;
+  const root = options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-form-authority-"));
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  try {
+    const publicProof = await prepareWorkerArtifact({
+      root: join(root, "public-worker-proof"),
+      target,
+      commit: source.commit,
+      hostedTopology: "desired",
+      run,
+    });
+    const expectedPublicDigest = `sha256:${publicProof.bundleDigestHex}` as const;
+    if (expectedPublicDigest !== publicBefore.workerArtifactDigest) {
+      throw preflightError(
+        "served public Worker artifact differs from the exact Form authority source build",
+      );
+    }
+    const publicProofArtifact = publicProof.seal();
+    publicProofArtifact.assertUnchanged();
+    const prepared = await prepareFormAuthorityArtifact({
+      root,
+      invocation,
+      target,
+      selected,
+      commit: source.commit,
+      workerArtifactDigest: publicBefore.workerArtifactDigest,
+      publicWorkerVersionId: publicBefore.history.versionId,
+      capabilityManifestJson,
+      run,
+    });
+    const artifact = sealDirectory(prepared.releaseDirectory, ["worker.js", "wrangler.jsonc"]);
+    artifact.assertUnchanged();
+
+    const publicLast = await inspectPublicWorker("preflight", target, state);
+    assertSamePublicWorker("preflight", publicBefore, publicLast);
+    const last = await inspectFormAuthority(
+      "preflight",
+      invocation,
+      target,
+      selected,
+      publicBefore.workerArtifactDigest,
+      publicBefore.history.versionId,
+      capabilityManifestJson,
+      state,
+    );
+    assertSameVersion(before, last);
+    if (dependencySelected) {
+      const dependencyLast = await inspectFormAuthority(
+        "preflight",
+        { ...invocation, surface: "takoserver-integration-form-authority-worker" },
+        target,
+        dependencySelected,
+        publicBefore.workerArtifactDigest,
+        publicBefore.history.versionId,
+        capabilityManifestJson,
+        state,
+      );
+      assertSameVersion(dependencyBefore, dependencyLast);
+    }
+    const upload = await run(
+      wranglerCommand([
+        "deploy",
+        prepared.bundlePath,
+        "--no-bundle",
+        "--config",
+        prepared.configPath,
+        "--strict",
+        "--message",
+        message(invocation.surface, source.commit, prepared.authorityArtifactDigest),
+      ]),
+      { env: environment },
+    );
+    if (upload.exitCode !== 0) {
+      throw mutationError(
+        "Form authority Worker upload acknowledgement is indeterminate; do not retry before --status",
+        `${upload.stdout}${upload.stderr}`.trim(),
+      );
+    }
+
+    const publicAfter = await inspectPublicWorker("verification", target, state);
+    assertSamePublicWorker("verification", publicBefore, publicAfter);
+    if (dependencySelected) {
+      const dependencyAfter = await inspectFormAuthority(
+        "verification",
+        { ...invocation, surface: "takoserver-integration-form-authority-worker" },
+        target,
+        dependencySelected,
+        publicBefore.workerArtifactDigest,
+        publicBefore.history.versionId,
+        capabilityManifestJson,
+        state,
+      );
+      if (
+        !dependencyAfter ||
+        dependencyAfter.history.versionId !== dependencyBefore?.history.versionId ||
+        dependencyAfter.commit !== source.commit
+      ) {
+        throw verificationError(
+          "integration Form authority Worker changed during operator gateway deployment",
+        );
+      }
+    }
+    const after = await inspectFormAuthority(
+      "verification",
+      invocation,
+      target,
+      selected,
+      publicBefore.workerArtifactDigest,
+      publicBefore.history.versionId,
+      capabilityManifestJson,
+      state,
+    );
+    if (
+      !after ||
+      after.history.versionId === before?.history.versionId ||
+      (before !== null && after.history.previousVersionId !== before.history.versionId) ||
+      after.commit !== source.commit ||
+      after.authorityArtifactDigest !== prepared.authorityArtifactDigest
+    ) {
+      throw verificationError(
+        "Form authority authoritative history does not identify the exact uploaded successor",
+      );
+    }
+    return {
+      kind: "takoserver.form-authority-worker-apply@v1",
+      surface: invocation.surface,
+      environment: invocation.environment,
+      workerName: selected.workerName,
+      hostId: selected.hostId,
+      commit: source.commit,
+      dirty: source.dirty,
+      remoteRef: source.remoteRef,
+      reviewer,
+      authorityArtifactDigest: prepared.authorityArtifactDigest,
+      workerArtifactDigest: publicBefore.workerArtifactDigest,
+      publicWorkerVersionId: publicBefore.history.versionId,
+      capabilityDigest,
+      implementationDigest: operatorIdentity.implementationDigest,
+      artifactBytes: artifact.bytes,
+      artifactFiles: artifact.files,
+      previousVersionId: before?.history.versionId ?? null,
+      deploymentId: after.history.deploymentId,
+      versionId: after.history.versionId,
+      routeMode: routeMode(selected),
+      ...(selected.operatorOrigin ? { operatorOrigin: selected.operatorOrigin } : {}),
+      ...(dependencySelected
+        ? {
+            authorityWorkerName: dependencySelected.workerName,
+            authorityVersionId: dependencyBefore?.history.versionId ?? null,
+          }
+        : {}),
+      admissionMode: selected.admissionMode,
+      productionEligible: selected.productionEligible,
+      rollback: before
+        ? `wrangler versions deploy ${before.history.versionId}@100% --yes --name ${selected.workerName}`
+        : "forward repair only: no previous Form authority Worker version exists",
+    };
+  } finally {
+    if (temporary) rmSync(root, { recursive: true, force: true });
+  }
+}
+
+export function writeFormAuthorityConfig(input: {
+  readonly path: string;
+  readonly main: string;
+  readonly invocation: FormAuthorityDeployInvocation;
+  readonly target: DeployTarget;
+  readonly selected: SelectedFormAuthorityTarget;
+  readonly workerArtifactDigest: `sha256:${string}`;
+  readonly publicWorkerVersionId: string;
+  readonly capabilityManifestJson: string;
+}): string {
+  if (!/^[0-9a-f]{40}$/u.test(input.invocation.commit)) {
+    throw preflightError("Form authority config requires one exact commit");
+  }
+  if (!/^sha256:[0-9a-f]{64}$/u.test(input.workerArtifactDigest)) {
+    throw preflightError("Form authority config requires one exact public Worker artifact digest");
+  }
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(
+      input.publicWorkerVersionId,
+    )
+  ) {
+    throw preflightError("Form authority config requires one exact public Worker Version id");
+  }
+  if (canonicalJson(targetCapabilityManifest(input.target)) !== input.capabilityManifestJson) {
+    throw preflightError("Form authority config requires one canonical capability manifest");
+  }
+  const shared = {
+    account_id: input.target.accountId,
+    name: input.selected.workerName,
+    main: input.main,
+    compatibility_date: "2026-08-17",
+    compatibility_flags: ["nodejs_compat"],
+    workers_dev: false,
+    preview_urls: false,
+    observability: { enabled: true },
+  } as const;
+  const configuration =
+    input.selected.kind === "operator-gateway"
+      ? operatorGatewayConfiguration(input, shared)
+      : {
+          ...shared,
+          vars: {
+            TAKOSERVER_ENVIRONMENT: input.invocation.environment,
+            TAKOSERVER_FORM_AUTHORITY_HOST_ID: input.selected.hostId,
+            TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST: input.workerArtifactDigest,
+            TAKOSERVER_PUBLIC_WORKER_VERSION_ID: input.publicWorkerVersionId,
+            TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST: input.capabilityManifestJson,
+            ...(input.invocation.surface === "takoserver-integration-form-authority-worker"
+              ? {
+                  TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK: canonicalJson(
+                    requiredOperatorPublicJwk(input.selected),
+                  ),
+                  TAKOSERVER_FORM_AUTHORITY_OPERATOR_TENANT_ID: requiredOperatorScope(
+                    input.selected,
+                  ).tenantId,
+                  TAKOSERVER_FORM_AUTHORITY_OPERATOR_SPACE: requiredOperatorScope(input.selected)
+                    .space,
+                }
+              : {}),
+          },
+          d1_databases: [
+            {
+              binding: "STATE_DB",
+              database_name: input.target.d1.databaseName,
+              database_id: input.target.d1.databaseId,
+              migrations_dir: resolve(REPOSITORY, "migrations"),
+            },
+          ],
+          r2_buckets: [{ binding: "OBJECTS", bucket_name: input.target.r2.bucketName }],
+          services: [
+            {
+              binding: "PUBLIC_HOST_IDENTITY",
+              service: input.target.workerName,
+              entrypoint: "PublicHostIdentityEntrypoint",
+            },
+          ],
+        };
+  writeFileSync(input.path, `${JSON.stringify(configuration, null, 2)}\n`, { mode: 0o600 });
+  return input.path;
+}
+
+function operatorGatewayConfiguration(
+  input: Parameters<typeof writeFormAuthorityConfig>[0],
+  shared: Readonly<Record<string, unknown>>,
+): Readonly<Record<string, unknown>> {
+  const origin = input.selected.operatorOrigin;
+  const authorityWorkerName = input.selected.authorityWorkerName;
+  const operatorPublicJwk = input.selected.operatorPublicJwk;
+  const operatorScope = input.selected.operatorScope;
+  if (
+    input.invocation.environment !== "integration" ||
+    !origin ||
+    !authorityWorkerName ||
+    !operatorPublicJwk ||
+    !operatorScope
+  ) {
+    throw preflightError("integration Form authority operator gateway target is incomplete");
+  }
+  return {
+    ...shared,
+    vars: {
+      TAKOSERVER_ENVIRONMENT: "integration",
+      TAKOSERVER_FORM_AUTHORITY_HOST_ID: input.selected.hostId,
+      TAKOSERVER_FORM_AUTHORITY_OPERATOR_ORIGIN: origin,
+      TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST: input.workerArtifactDigest,
+      TAKOSERVER_PUBLIC_WORKER_VERSION_ID: input.publicWorkerVersionId,
+      TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK: canonicalJson(operatorPublicJwk),
+      TAKOSERVER_FORM_AUTHORITY_OPERATOR_TENANT_ID: operatorScope.tenantId,
+      TAKOSERVER_FORM_AUTHORITY_OPERATOR_SPACE: operatorScope.space,
+    },
+    routes: [{ pattern: new URL(origin).hostname, custom_domain: true }],
+    services: [
+      {
+        binding: "FORM_AUTHORITY",
+        service: authorityWorkerName,
+        entrypoint: "IntegrationFormAuthorityEntrypoint",
+      },
+      {
+        binding: "PUBLIC_HOST_IDENTITY",
+        service: input.target.workerName,
+        entrypoint: "PublicHostIdentityEntrypoint",
+      },
+    ],
+  };
+}
+
+async function prepareFormAuthorityArtifact(input: {
+  readonly root: string;
+  readonly invocation: FormAuthorityDeployInvocation;
+  readonly target: DeployTarget;
+  readonly selected: SelectedFormAuthorityTarget;
+  readonly commit: string;
+  readonly workerArtifactDigest: `sha256:${string}`;
+  readonly publicWorkerVersionId: string;
+  readonly capabilityManifestJson: string;
+  readonly run: FormAuthorityProcess;
+}): Promise<{
+  readonly releaseDirectory: string;
+  readonly bundlePath: string;
+  readonly configPath: string;
+  readonly authorityArtifactDigest: `sha256:${string}`;
+}> {
+  const build = join(input.root, "build");
+  const release = join(input.root, "release");
+  mkdirSync(build, { recursive: true, mode: 0o700 });
+  mkdirSync(release, { recursive: true, mode: 0o700 });
+  const buildConfig = writeFormAuthorityConfig({
+    path: join(input.root, "build-wrangler.jsonc"),
+    main: resolve(REPOSITORY, input.selected.main),
+    invocation: { ...input.invocation, commit: input.commit },
+    target: input.target,
+    selected: input.selected,
+    workerArtifactDigest: input.workerArtifactDigest,
+    publicWorkerVersionId: input.publicWorkerVersionId,
+    capabilityManifestJson: input.capabilityManifestJson,
+  });
+  const built = await input.run(
+    wranglerCommand([
+      "deploy",
+      "--dry-run",
+      "--strict",
+      "--config",
+      buildConfig,
+      "--outdir",
+      build,
+    ]),
+  );
+  if (built.exitCode !== 0) {
+    throw preflightError(
+      `exact Form authority Worker bundle build failed (exit ${built.exitCode})`,
+      `${built.stdout}${built.stderr}`.trim(),
+    );
+  }
+  const source = exactBundle(build);
+  const bundlePath = join(release, "worker.js");
+  copyFileSync(source, bundlePath);
+  const authorityArtifactDigest = `sha256:${createHash("sha256")
+    .update(readFileSync(bundlePath))
+    .digest("hex")}` as const;
+  const configPath = writeFormAuthorityConfig({
+    path: join(release, "wrangler.jsonc"),
+    main: "worker.js",
+    invocation: { ...input.invocation, commit: input.commit },
+    target: input.target,
+    selected: input.selected,
+    workerArtifactDigest: input.workerArtifactDigest,
+    publicWorkerVersionId: input.publicWorkerVersionId,
+    capabilityManifestJson: input.capabilityManifestJson,
+  });
+  return { releaseDirectory: release, bundlePath, configPath, authorityArtifactDigest };
+}
+
+async function inspectFormAuthority(
+  phase: DeployPhase,
+  invocation: FormAuthorityDeployInvocation,
+  target: DeployTarget,
+  selected: SelectedFormAuthorityTarget,
+  workerArtifactDigest: `sha256:${string}`,
+  publicWorkerVersionId: string,
+  capabilityManifestJson: string,
+  state: FormAuthorityDeployState,
+): Promise<FormAuthorityInspection | null> {
+  const scripts = await state.workerScripts();
+  if (scripts.length !== new Set(scripts).size) {
+    throw phaseError(phase, "Cloudflare Worker script inventory contains duplicates");
+  }
+  const scriptPresent = scripts.includes(selected.workerName);
+  const domains = await state.workerDomains();
+  const ownedDomains = domains.filter(({ service }) => service === selected.workerName);
+  if (selected.kind === "operator-gateway") {
+    const expectedHostname = new URL(selected.operatorOrigin as string).hostname;
+    const expectedDomains = domains.filter(({ hostname }) => hostname === expectedHostname);
+    if (expectedDomains.length > 1) {
+      throw phaseError(
+        phase,
+        "Form authority operator gateway custom domain topology is ambiguous",
+      );
+    }
+    const expectedDomain = expectedDomains[0];
+    if (expectedDomain && expectedDomain.service !== selected.workerName) {
+      throw phaseError(phase, "Form authority operator gateway custom domain has a foreign owner");
+    }
+    const domainPresent = expectedDomain?.service === selected.workerName;
+    if (
+      ownedDomains.length !== (domainPresent ? 1 : 0) ||
+      (domainPresent && ownedDomains[0]?.hostname !== expectedHostname) ||
+      scriptPresent !== domainPresent
+    ) {
+      throw phaseError(
+        phase,
+        "Form authority operator gateway script/custom domain topology is partial",
+      );
+    }
+  } else if (ownedDomains.length > 0) {
+    throw phaseError(phase, "route-less Form authority Worker unexpectedly owns a public domain");
+  }
+  const routes = (await state.workerRoutes()).filter(
+    ({ script }) => script === selected.workerName,
+  );
+  if (routes.length > 0) {
+    throw phaseError(phase, "Form authority Worker unexpectedly owns a zone route");
+  }
+  if (!scriptPresent) return null;
+  const history = parseWorkerDeploymentHistory(await state.workerDeployments(selected.workerName));
+  if (!history) throw phaseError(phase, "Form authority Worker has no served deployment");
+  const version = await state.workerVersion(selected.workerName, history.versionId);
+  const identity = versionIdentity(phase, invocation.surface, version);
+  assertExactVersionBindingClosure(
+    phase,
+    history.versionId,
+    version,
+    expectedBindings(
+      invocation.environment,
+      target,
+      selected,
+      workerArtifactDigest,
+      publicWorkerVersionId,
+      capabilityManifestJson,
+    ),
+  );
+  assertExactSecretInventory(await state.workerSecrets(selected.workerName), [], phase);
+  const subdomain = await state.workerSubdomain(selected.workerName);
+  if (subdomain.enabled || subdomain.previewsEnabled) {
+    throw phaseError(phase, "Form authority Worker has a workers.dev or preview subdomain enabled");
+  }
+  return { history, ...identity };
+}
+
+function expectedBindings(
+  environment: DeployEnvironment,
+  target: DeployTarget,
+  selected: SelectedFormAuthorityTarget,
+  workerArtifactDigest: `sha256:${string}`,
+  publicWorkerVersionId: string,
+  capabilityManifestJson: string,
+) {
+  if (selected.kind === "operator-gateway") {
+    if (
+      !selected.authorityWorkerName ||
+      !selected.operatorOrigin ||
+      !selected.operatorPublicJwk ||
+      !selected.operatorScope
+    ) {
+      throw preflightError("integration Form authority operator gateway target is incomplete");
+    }
+    return {
+      FORM_AUTHORITY: {
+        type: "service",
+        fields: {
+          service: selected.authorityWorkerName,
+          entrypoint: "IntegrationFormAuthorityEntrypoint",
+        },
+      },
+      PUBLIC_HOST_IDENTITY: {
+        type: "service",
+        fields: {
+          service: target.workerName,
+          entrypoint: "PublicHostIdentityEntrypoint",
+        },
+      },
+      TAKOSERVER_ENVIRONMENT: { type: "plain_text", fields: { text: "integration" } },
+      TAKOSERVER_FORM_AUTHORITY_HOST_ID: {
+        type: "plain_text",
+        fields: { text: selected.hostId },
+      },
+      TAKOSERVER_FORM_AUTHORITY_OPERATOR_ORIGIN: {
+        type: "plain_text",
+        fields: { text: selected.operatorOrigin },
+      },
+      TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST: {
+        type: "plain_text",
+        fields: { text: workerArtifactDigest },
+      },
+      TAKOSERVER_PUBLIC_WORKER_VERSION_ID: {
+        type: "plain_text",
+        fields: { text: publicWorkerVersionId },
+      },
+      TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK: {
+        type: "plain_text",
+        fields: { text: canonicalJson(selected.operatorPublicJwk) },
+      },
+      TAKOSERVER_FORM_AUTHORITY_OPERATOR_TENANT_ID: {
+        type: "plain_text",
+        fields: { text: requiredOperatorScope(selected).tenantId },
+      },
+      TAKOSERVER_FORM_AUTHORITY_OPERATOR_SPACE: {
+        type: "plain_text",
+        fields: { text: requiredOperatorScope(selected).space },
+      },
+    } as const;
+  }
+  return {
+    STATE_DB: { type: "d1", fields: { id: target.d1.databaseId } },
+    OBJECTS: { type: "r2_bucket", fields: { bucket_name: target.r2.bucketName } },
+    PUBLIC_HOST_IDENTITY: {
+      type: "service",
+      fields: {
+        service: target.workerName,
+        entrypoint: "PublicHostIdentityEntrypoint",
+      },
+    },
+    TAKOSERVER_ENVIRONMENT: { type: "plain_text", fields: { text: environment } },
+    TAKOSERVER_FORM_AUTHORITY_HOST_ID: {
+      type: "plain_text",
+      fields: { text: selected.hostId },
+    },
+    TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST: {
+      type: "plain_text",
+      fields: { text: workerArtifactDigest },
+    },
+    TAKOSERVER_PUBLIC_WORKER_VERSION_ID: {
+      type: "plain_text",
+      fields: { text: publicWorkerVersionId },
+    },
+    TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST: {
+      type: "plain_text",
+      fields: { text: capabilityManifestJson },
+    },
+    ...(invocationSurfaceIsIntegrationAuthority(selected)
+      ? {
+          TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK: {
+            type: "plain_text",
+            fields: { text: canonicalJson(requiredOperatorPublicJwk(selected)) },
+          },
+          TAKOSERVER_FORM_AUTHORITY_OPERATOR_TENANT_ID: {
+            type: "plain_text",
+            fields: { text: requiredOperatorScope(selected).tenantId },
+          },
+          TAKOSERVER_FORM_AUTHORITY_OPERATOR_SPACE: {
+            type: "plain_text",
+            fields: { text: requiredOperatorScope(selected).space },
+          },
+        }
+      : {}),
+  } as const;
+}
+
+function selectTarget(
+  invocation: FormAuthorityDeployInvocation,
+  target: DeployTarget,
+): SelectedFormAuthorityTarget {
+  const authority = target.formAuthority;
+  if (!authority) throw preflightError("selected target has no formAuthority configuration");
+  if (invocation.surface === "takoserver-integration-form-authority-operator-worker") {
+    if (
+      !authority.integrationWorkerName ||
+      !authority.integrationOperatorWorkerName ||
+      !authority.integrationOperatorOrigin ||
+      !authority.operatorPublicJwk ||
+      !authority.integrationOperatorScope
+    ) {
+      throw preflightError(
+        "selected integration target has no complete Form authority operator gateway",
+      );
+    }
+    return {
+      kind: "operator-gateway",
+      workerName: authority.integrationOperatorWorkerName,
+      hostId: authority.hostId,
+      main: "src/entry-integration-form-authority-operator-worker.ts",
+      operatorOrigin: authority.integrationOperatorOrigin,
+      authorityWorkerName: authority.integrationWorkerName,
+      operatorPublicJwk: authority.operatorPublicJwk,
+      operatorScope: authority.integrationOperatorScope,
+      admissionMode: "integration-fixture",
+      productionEligible: false,
+    };
+  }
+  if (invocation.surface === "takoserver-integration-form-authority-worker") {
+    if (
+      !authority.integrationWorkerName ||
+      !authority.operatorPublicJwk ||
+      !authority.integrationOperatorScope
+    ) {
+      throw preflightError(
+        "selected integration target has no authenticated integration Form authority Worker",
+      );
+    }
+    return {
+      kind: "authority",
+      workerName: authority.integrationWorkerName,
+      hostId: authority.hostId,
+      main: "src/entry-integration-form-authority-worker.ts",
+      operatorPublicJwk: authority.operatorPublicJwk,
+      operatorScope: authority.integrationOperatorScope,
+      admissionMode: "integration-fixture",
+      productionEligible: false,
+    };
+  }
+  return {
+    kind: "authority",
+    workerName: authority.workerName,
+    hostId: authority.hostId,
+    main: "src/entry-form-authority-worker.ts",
+    admissionMode: "released-core-unavailable",
+    productionEligible: false,
+  };
+}
+
+function invocationSurfaceIsIntegrationAuthority(selected: SelectedFormAuthorityTarget): boolean {
+  return selected.kind === "authority" && selected.admissionMode === "integration-fixture";
+}
+
+function requiredOperatorPublicJwk(
+  selected: SelectedFormAuthorityTarget,
+): NonNullable<SelectedFormAuthorityTarget["operatorPublicJwk"]> {
+  if (!selected.operatorPublicJwk) {
+    throw preflightError("integration Form authority Worker has no dedicated operator public key");
+  }
+  return selected.operatorPublicJwk;
+}
+
+function requiredOperatorScope(
+  selected: SelectedFormAuthorityTarget,
+): NonNullable<SelectedFormAuthorityTarget["operatorScope"]> {
+  if (!selected.operatorScope) {
+    throw preflightError("integration Form authority Worker has no sealed operator scope");
+  }
+  return selected.operatorScope;
+}
+
+function isIntegrationOnlySurface(surface: FormAuthoritySurface): boolean {
+  return surface !== "takoserver-form-authority-worker";
+}
+
+function routeMode(selected: SelectedFormAuthorityTarget): string {
+  return selected.kind === "operator-gateway"
+    ? "authenticated-integration-custom-domain"
+    : "service-binding-rpc-only";
+}
+
+export function targetCapabilityManifest(
+  target: DeployTarget,
+): TakoformLifecycleCapabilityManifest {
+  const kinds = target.edgeSupplies?.offerings.map(({ formKind }) => formKind) ?? [];
+  const actual = [...kinds].sort();
+  const expected = [...YURUCOMMU_IDENTITY_CAPABILITY_KINDS].sort();
+  if (actual.length !== expected.length || actual.some((kind, index) => kind !== expected[index])) {
+    throw preflightError(
+      "Form authority requires the exact four realized Yurucommu identity capabilities",
+    );
+  }
+  return yurucommuLifecycleCapabilityManifest(
+    kinds as YurucommuIdentityCapabilityKind[],
+    target.formAuthority?.operatorOperations,
+  );
+}
+
+async function inspectPublicWorker(
+  phase: DeployPhase,
+  target: DeployTarget,
+  state: FormAuthorityDeployState,
+): Promise<PublicWorkerInspection> {
+  const live = await inspectLiveWorkerVersion(phase, target, state, {
+    hostedTopology: "desired",
+  });
+  return {
+    history: live.history,
+    commit: live.commit,
+    workerArtifactDigest: `sha256:${live.bundleDigestHex}`,
+  };
+}
+
+function assertSamePublicWorker(
+  phase: DeployPhase,
+  before: PublicWorkerInspection,
+  after: PublicWorkerInspection,
+): void {
+  if (
+    before.history.deploymentId !== after.history.deploymentId ||
+    before.history.versionId !== after.history.versionId ||
+    before.commit !== after.commit ||
+    before.workerArtifactDigest !== after.workerArtifactDigest
+  ) {
+    throw phaseError(phase, "public Takoserver Worker changed during Form authority qualification");
+  }
+}
+
+function versionIdentity(
+  phase: DeployPhase,
+  surface: FormAuthoritySurface,
+  value: unknown,
+): { readonly commit: string; readonly authorityArtifactDigest: `sha256:${string}` } {
+  if (!isRecord(value) || !isRecord(value.annotations)) {
+    throw phaseError(phase, "Form authority Worker version has no canonical annotations");
+  }
+  const annotation = value.annotations["workers/message"];
+  const match =
+    typeof annotation === "string"
+      ? /^form-authority:([^:]+):([0-9a-f]{40}):(sha256:[0-9a-f]{64})$/u.exec(annotation)
+      : null;
+  if (!match?.[1] || match[1] !== surface || !match[2] || !match[3]) {
+    throw phaseError(phase, "Form authority Worker version identity is missing or mismatched");
+  }
+  return { commit: match[2], authorityArtifactDigest: match[3] as `sha256:${string}` };
+}
+
+function message(
+  surface: FormAuthoritySurface,
+  commit: string,
+  authorityArtifactDigest: `sha256:${string}`,
+): string {
+  return `form-authority:${surface}:${commit}:${authorityArtifactDigest}`;
+}
+
+function assertSameVersion(
+  before: FormAuthorityInspection | null,
+  last: FormAuthorityInspection | null,
+): void {
+  if (
+    (before === null) !== (last === null) ||
+    (before !== null &&
+      last !== null &&
+      (before.history.versionId !== last.history.versionId ||
+        before.history.deploymentId !== last.history.deploymentId ||
+        before.commit !== last.commit ||
+        before.authorityArtifactDigest !== last.authorityArtifactDigest))
+  ) {
+    throw preflightError("Form authority Worker changed during qualification");
+  }
+}
+
+function exactBundle(root: string): string {
+  const files = regularFiles(root);
+  const bundles = files.filter((path) => path.endsWith(".js"));
+  if (bundles.length !== 1) {
+    throw preflightError("Form authority dry-run must produce exactly one JavaScript bundle");
+  }
+  const bundle = bundles[0] as string;
+  const allowed = new Set([bundle, `${bundle}.map`, join(root, "README.md")]);
+  if (files.some((path) => !allowed.has(path))) {
+    throw preflightError("Form authority dry-run produced an unexpected ancillary file");
+  }
+  return bundle;
+}
+
+function regularFiles(root: string): string[] {
+  const files: string[] = [];
+  const visit = (directory: string): void => {
+    for (const name of readdirSync(directory).sort()) {
+      const path = join(directory, name);
+      const status = lstatSync(path);
+      if (status.isSymbolicLink() || (status.isFile() && status.nlink !== 1)) {
+        throw preflightError(`Form authority build output is not link-free: ${path}`);
+      }
+      if (status.isDirectory()) visit(path);
+      else if (status.isFile()) files.push(path);
+      else throw preflightError(`Form authority build output is not a regular file: ${path}`);
+    }
+  };
+  visit(root);
+  return files;
+}
+
+async function checked(
+  run: FormAuthorityProcess,
+  description: string,
+  command: readonly string[],
+): Promise<void> {
+  const result = await run(command);
+  if (result.exitCode !== 0) {
+    throw preflightError(
+      `${description} failed (exit ${result.exitCode})`,
+      `${result.stdout}${result.stderr}`.trim(),
+    );
+  }
+}
+
+function exactReviewer(value: string): string {
+  if (value.trim() !== value || value.length < 1 || value.length > 256 || value.includes("\n")) {
+    throw preflightError("TAKOSERVER_INDEPENDENT_REVIEW must name one reviewer");
+  }
+  return value;
+}
+
+function exactToken(environment: Readonly<Record<string, string>>): string {
+  const value = environment.CLOUDFLARE_API_TOKEN;
+  if (!value) throw preflightError("CLOUDFLARE_API_TOKEN is required");
+  return value;
+}
+
+function phaseError(phase: DeployPhase, message: string): DeployError {
+  return phase === "preflight"
+    ? preflightError(message)
+    : phase === "mutation"
+      ? mutationError(message)
+      : verificationError(message);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}

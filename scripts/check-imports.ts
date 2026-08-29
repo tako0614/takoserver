@@ -46,13 +46,14 @@ interface Layer {
 const LAYERS: readonly Layer[] = [
   {
     name: "release-data",
-    match: /^(?:vendor\/takoform\/.*\.json|src\/generated\/takoform-stable-v1-catalog\.ts)$/u,
+    match:
+      /^(?:vendor\/takoform\/.*\.json|src\/generated\/takoform-(?:stable-v1-catalog|integration-form-packages)\.ts)$/u,
     may: ["release-data"],
   },
   {
     name: "core",
     match:
-      /^src\/(?:ports|json|strict-json|form-ref|interface-ref|provider-port|provider-meter-port|standard-service-port|ai-port|s3-port|s3-issuer-router|runtime-materialization|database|database-schema|db-schema|migrate-sqlite)\.ts$/u,
+      /^src\/(?:ports|json|strict-json|public-host-identity|form-ref|interface-ref|provider-port|provider-meter-port|standard-service-port|ai-port|s3-port|s3-issuer-router|runtime-materialization|database|database-schema|db-schema|migrate-sqlite)\.ts$/u,
     may: ["core"],
   },
   {
@@ -64,7 +65,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "domain",
     match:
-      /^src\/(?:token|auth|ledger|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|provider-metering|resource-deployments|resource-migrations|attachments|s3-attachment-factory|reconcile|metering|edge-forms|ai-requests|operator-credentials|google-identity|takos-id-identity|identity-setup|stripe-settlement|signing-key|operator-key)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$)/u,
+      /^src\/(?:token|auth|ledger|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|provider-metering|resource-deployments|resource-migrations|attachments|s3-attachment-factory|reconcile|metering|edge-forms|ai-requests|operator-credentials|form-authority-operator-proof|google-identity|takos-id-identity|identity-setup|stripe-settlement|signing-key|operator-key)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$|(?:integration-)?operator-endpoint\.ts$)/u,
     may: ["core", "domain", "release-data"],
   },
   {
@@ -78,8 +79,8 @@ const LAYERS: readonly Layer[] = [
     // `payment-setup` builds the shape the routes layer asks for, which makes
     // it composition rather than domain: it is allowed to know both halves.
     match:
-      /^src\/(?:app|deployment-composition|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|selfhost-composition|standalone-provider-composition|standard-service-production|worker-data-services|worker-(?:object-bucket|production|stable-local)-composition)\.ts$/u,
-    may: ["core", "adapter", "domain", "routes", "app"],
+      /^src\/(?:app|deployment-composition|form-authority-worker-composition|integration-form-authority-gateway|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|selfhost-composition|standalone-provider-composition|standard-service-production|worker-data-services|worker-(?:object-bucket|production|stable-local)-composition)\.ts$|^src\/takoform\/(?:integration-)?operator-endpoint\.ts$/u,
+    may: ["core", "adapter", "domain", "routes", "app", "release-data"],
   },
   // An entry chooses concrete implementations — that is its whole job. What it
   // may not do is reach something its host cannot support, which the
@@ -87,7 +88,10 @@ const LAYERS: readonly Layer[] = [
   {
     name: "entry",
     match: /^src\/entry-[^/]+\.ts$/u,
-    may: ["core", "adapter", "domain", "routes", "app"],
+    // A runtime-specific wrapper may re-export the host-independent entry it
+    // adapts (for example Cloudflare's WorkerEntrypoint intrinsic). Both remain
+    // composition roots and the host-only graph checks below still apply.
+    may: ["core", "adapter", "domain", "routes", "app", "entry"],
   },
 ];
 
@@ -120,7 +124,7 @@ for (const path of walk("src")) {
 // bytes; this checks the graph, so the mistake is caught before a build.
 // ---------------------------------------------------------------------------
 
-const WORKER_ENTRY = "src/entry-worker.ts";
+const WORKER_ENTRY = "src/entry-cloudflare-worker.ts";
 const HOST_ONLY = [
   "src/sql-sqlite.ts",
   "src/objects-mem.ts",
@@ -139,17 +143,92 @@ const HOST_ONLY = [
 ];
 
 if (existsSync(WORKER_ENTRY)) {
-  const reachable = new Set<string>();
-  const pending = [WORKER_ENTRY];
-  while (pending.length > 0) {
-    const path = pending.pop();
-    if (path === undefined || reachable.has(path)) continue;
-    reachable.add(path);
-    pending.push(...localImportsOf(path));
-  }
+  const reachable = reachableFrom([WORKER_ENTRY]);
   for (const banned of HOST_ONLY) {
     if (reachable.has(banned)) {
       violations.push(`${WORKER_ENTRY} transitively imports host-only module ${banned}`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Form authority separation: every customer/public graph is reader-only. The
+// route-less service-binding Workers are the only graphs allowed to reach the
+// admission writer and package store.
+// ---------------------------------------------------------------------------
+
+const PUBLIC_READER_ENTRIES = [
+  "src/entry-bun.ts",
+  "src/entry-cloudflare-worker.ts",
+  "src/entry-worker.ts",
+  "src/router.ts",
+  "src/openapi.ts",
+];
+const FORM_AUTHORITY_ENTRIES = [
+  "src/entry-form-authority-worker.ts",
+  "src/entry-integration-form-authority-worker.ts",
+];
+const FORM_AUTHORITY_OPERATOR_GATEWAY_ENTRIES = [
+  "src/entry-integration-form-authority-operator-worker.ts",
+];
+const FORM_AUTHORITY_WRITERS = [
+  "src/takoform/admission-store.ts",
+  "src/takoform/admission.ts",
+  "src/takoform/form-packages.ts",
+];
+const FORM_AUTHORITY_RPC_MODULES = [
+  "src/form-authority-operator-proof.ts",
+  "src/form-authority-worker-composition.ts",
+  "src/takoform/operator-authority.ts",
+  "src/takoform/operator-endpoint.ts",
+  "src/takoform/integration-operator-endpoint.ts",
+];
+
+for (const entry of PUBLIC_READER_ENTRIES.filter(existsSync)) {
+  const reachable = reachableFrom([entry]);
+  for (const writer of [...FORM_AUTHORITY_WRITERS, ...FORM_AUTHORITY_RPC_MODULES]) {
+    if (reachable.has(writer)) {
+      violations.push(`${entry} transitively imports private Form authority module ${writer}`);
+    }
+  }
+}
+
+for (const entry of FORM_AUTHORITY_ENTRIES.filter(existsSync)) {
+  const reachable = reachableFrom([entry]);
+  for (const writer of FORM_AUTHORITY_WRITERS) {
+    if (!reachable.has(writer)) {
+      violations.push(`${entry} does not reach required Form authority module ${writer}`);
+    }
+  }
+  for (const route of ["src/app.ts", "src/router.ts", "src/openapi.ts"]) {
+    if (reachable.has(route)) {
+      violations.push(`${entry} transitively imports public route module ${route}`);
+    }
+  }
+}
+
+for (const entry of FORM_AUTHORITY_OPERATOR_GATEWAY_ENTRIES.filter(existsSync)) {
+  const reachable = reachableFrom([entry]);
+  for (const writer of FORM_AUTHORITY_WRITERS) {
+    if (reachable.has(writer)) {
+      violations.push(`${entry} transitively imports Form authority storage writer ${writer}`);
+    }
+  }
+  for (const route of ["src/app.ts", "src/router.ts", "src/openapi.ts"]) {
+    if (reachable.has(route)) {
+      violations.push(`${entry} transitively imports customer/public route module ${route}`);
+    }
+  }
+}
+
+if (existsSync("src/entry-form-authority-worker.ts")) {
+  const production = reachableFrom(["src/entry-form-authority-worker.ts"]);
+  for (const fixture of [
+    "src/takoform/integration-operator-endpoint.ts",
+    "src/generated/takoform-integration-form-packages.ts",
+  ]) {
+    if (production.has(fixture)) {
+      violations.push(`production Form authority Worker imports integration fixture ${fixture}`);
     }
   }
 }
@@ -176,6 +255,18 @@ function localImportsOf(path: string): readonly string[] {
   return importsOf(path)
     .filter((specifier) => specifier.startsWith("."))
     .map((specifier) => normalize(relative(resolve("."), resolve(dirname(path), specifier))));
+}
+
+function reachableFrom(entries: readonly string[]): ReadonlySet<string> {
+  const reachable = new Set<string>();
+  const pending = [...entries];
+  while (pending.length > 0) {
+    const path = pending.pop();
+    if (path === undefined || reachable.has(path) || !existsSync(path)) continue;
+    reachable.add(path);
+    pending.push(...localImportsOf(path));
+  }
+  return reachable;
 }
 
 function walk(directory: string): string[] {

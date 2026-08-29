@@ -76,6 +76,143 @@ export const DEPLOY_CONTRACT = {
       },
     },
     {
+      surface: "takoserver-form-authority-worker",
+      target: "cloudflare-worker:environment-selected-route-less-form-authority",
+      covers: [
+        "src/entry-form-authority-worker.ts",
+        "src/takoform/operator-authority.ts",
+        "src/takoform/operator-endpoint.ts",
+        "src/takoform/core-admission-adapter.ts",
+        "src/takoform/implementation-catalog.ts",
+        "wrangler.form-authority.jsonc",
+        "scripts/deploy/form-authority.ts",
+      ],
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
+      triggers: ["authority"],
+      obligations: {
+        provenance:
+          `${exactSource} The exact route-less Worker bundle, target D1/R2 bindings, Host identity ` +
+          "and code-derived capability/implementation identities are sealed before one upload.",
+        "post-conditions":
+          "Authoritative Worker history must name the exact commit/artifact. The immutable Version " +
+          "must contain exactly STATE_DB, OBJECTS, PUBLIC_HOST_IDENTITY and the five plain-text " +
+          "variables TAKOSERVER_ENVIRONMENT, TAKOSERVER_FORM_AUTHORITY_HOST_ID, " +
+          "TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST, TAKOSERVER_PUBLIC_WORKER_VERSION_ID and " +
+          "TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST, with no secret or public-domain ownership.",
+        reversal:
+          "The immediately previous Form authority Worker version is printed as the provider-history rollback target.",
+        "failure-handling":
+          `${highRiskFailure} Deploying this shell does not enable Form mutation: RPC apply remains ` +
+          "fail-closed until both a released Takoform Core EvaluateAdmission adapter and signed trust evidence adapter are present.",
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-integration-form-authority-worker",
+      target: "cloudflare-worker:integration-route-less-form-authority-fixture",
+      covers: [
+        "src/entry-integration-form-authority-worker.ts",
+        "src/form-authority-worker-composition.ts",
+        "src/takoform/integration-operator-endpoint.ts",
+        "src/generated/takoform-integration-form-packages.ts",
+        "wrangler.integration-form-authority.jsonc",
+        "scripts/deploy/form-authority.ts",
+      ],
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
+      triggers: ["authority"],
+      obligations: {
+        provenance:
+          `${exactSource} Integration only. The generated exact 12-package unsigned fixture corpus, ` +
+          "route-less bundle, target D1/R2 bindings and Host identity are sealed before one upload.",
+        "post-conditions":
+          "Authoritative Worker history and exact binding closure identify the uploaded integration fixture; " +
+          "the closure includes PUBLIC_HOST_IDENTITY, the dedicated operator public JWK, and the exact " +
+          "operator tenant and Space plain-text bindings. The Worker owns no public domain, and every " +
+          "authority receipt remains integration-fixture and non-production.",
+        reversal:
+          "The immediately previous integration Form authority Worker version is printed as the provider-history rollback target.",
+        "failure-handling":
+          `${highRiskFailure} The entry hard-refuses every environment except integration before ` +
+          "reading D1 or R2 bindings. It independently rejects every signed plan/apply/readback body " +
+          "outside its sealed tenant/Space; partial Form mutation requires authoritative readback and replan.",
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-integration-form-authority-operator-worker",
+      target: "cloudflare-worker:integration-authenticated-form-authority-operator-gateway",
+      covers: [
+        "src/entry-integration-form-authority-operator-worker.ts",
+        "src/integration-form-authority-gateway.ts",
+        "src/public-host-identity.ts",
+        "wrangler.integration-form-authority-operator.jsonc",
+        "scripts/deploy/form-authority.ts",
+      ],
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
+      triggers: ["authority"],
+      obligations: {
+        provenance:
+          `${exactSource} Integration only. The gateway bundle, dedicated operator public key, ` +
+          "exact tenant/Space, exact custom domain, private authority service binding and current " +
+          "public Worker identity are sealed before one upload.",
+        "post-conditions":
+          "Authoritative Worker history and exhaustive domain/binding state must identify the exact " +
+          "custom-domain gateway, current public Worker Version, route-less integration authority " +
+          "dependency and exact operator tenant/Space. A clean first upload is allowed only when both " +
+          "the script and configured custom domain are absent; the same exact closure is read back after upload.",
+        reversal:
+          "The immediately previous operator gateway Worker version is printed as the provider-history rollback target.",
+        "failure-handling":
+          `${highRiskFailure} The gateway hard-refuses non-integration environments before key or ` +
+          "service reads, accepts only short-lived body/method/path-bound Ed25519 proofs, independently " +
+          "rejects every body outside its sealed tenant/Space, and rechecks the live public Host identity " +
+          "before every RPC. Foreign domain ownership and every script/domain partial topology are refused.",
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-integration-form-authority",
+      target: "https:integration-signed-form-authority-plan-apply-readback",
+      covers: [
+        "scripts/deploy/form-authority-invoke.ts",
+        "src/form-authority-operator-proof.ts",
+        "src/takoform/operator-authority.ts",
+        "scripts/deploy/target.ts",
+        "scripts/deploy.ts",
+      ],
+      requiresScripts: ["deploy"],
+      requiresTools: ["bun"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+      ],
+      triggers: ["authority"],
+      obligations: {
+        provenance:
+          `${exactSource} Integration only. Exhaustive gateway/authority/public-Worker readback ` +
+          "must identify that commit before the owned 0600 Ed25519 key signs any request.",
+        "post-conditions":
+          "Status performs one signed authoritative readback. Apply obtains one signed canonical plan, " +
+          "passes that exact plan digest once to apply, and finishes with a separately signed readback of the exact 12 Space-scoped non-production fixtures.",
+        reversal:
+          "Authority events are repaired forward: an acknowledged partial apply preserves every sanitized " +
+          "action receipt and its next-plan digest for an explicit later readback/replan.",
+        "failure-handling":
+          "No HTTP mutation is retried. An apply transport or acknowledgement failure is indeterminate; " +
+          "run status for authoritative readback before an explicit fresh apply. An acknowledged partial " +
+          "apply performs its separate readback and exits as a verification failure with only sanitized " +
+          "receipts and next-plan diagnostics. Assertion and private-key bytes are always redacted.",
+        "independent-review": review,
+      },
+    },
+    {
       surface: "takoserver-site",
       target: "cloudflare-pages:environment-selected-takoserver-site",
       covers: [

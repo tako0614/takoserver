@@ -1,6 +1,8 @@
 import { runConsole } from "./deploy/console.ts";
 import { DEPLOY_CONTRACT } from "./deploy/contract.ts";
 import { DeployError, PHASE_EXIT_CODE } from "./deploy/errors.ts";
+import { runFormAuthority } from "./deploy/form-authority.ts";
+import { runFormAuthorityInvoke } from "./deploy/form-authority-invoke.ts";
 import { runHosted } from "./deploy/hosted.ts";
 import { runOperatorIdentity } from "./deploy/identity.ts";
 import type { DeployEnvironment } from "./deploy/qualification.ts";
@@ -18,7 +20,7 @@ const USAGE = `takoserver deploy
   The authority cutover may add --legacy-predecessor-version=<uuid> for integration bootstrap.
 
 The target descriptor is selected only by the exact environment. There is no
-plan, ledger, target override or mixed mutation controller.
+deploy-plan flag, ledger, target override or mixed mutation controller.
 `;
 
 type Surface = (typeof DEPLOY_CONTRACT.surfaces)[number]["surface"];
@@ -72,7 +74,10 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   }
   if (!action || !environment || !commit) return null;
   if (
-    surfaceValue === "takoserver-integration-operator-identity" &&
+    (surfaceValue === "takoserver-integration-operator-identity" ||
+      surfaceValue === "takoserver-integration-form-authority-worker" ||
+      surfaceValue === "takoserver-integration-form-authority-operator-worker" ||
+      surfaceValue === "takoserver-integration-form-authority") &&
     environment !== "integration"
   ) {
     return null;
@@ -144,6 +149,28 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
       );
     case "takoserver-integration-operator-identity":
       return await runOperatorIdentity(
+        {
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
+        },
+        target,
+      );
+    case "takoserver-form-authority-worker":
+    case "takoserver-integration-form-authority-worker":
+    case "takoserver-integration-form-authority-operator-worker":
+      return await runFormAuthority(
+        {
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
+        },
+        target,
+      );
+    case "takoserver-integration-form-authority":
+      return await runFormAuthorityInvoke(
         {
           surface: invocation.surface,
           action: invocation.action,

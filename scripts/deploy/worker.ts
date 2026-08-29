@@ -32,8 +32,8 @@ const AUTHORITY_PATHS = [
   /^scripts\/build-worker\.ts$/u,
   /^scripts\/deploy(?:\.ts|\/)/u,
   /^src\/(?:app|auth|control|deployment-composition|google-identity|identity-setup|operator-credentials|operator-key|provider-driver|provider-port|reseller|resource-deployments|resource-migrations|runtime-grants|runtime-materialization|signing-key|sponsorship-api|takos-id-identity|token)\.ts$/u,
-  /^src\/(?:entry-worker|router|worker-production-composition)\.ts$/u,
-  /^src\/takoform\/(?:admission|admission-projection|routes)(?:\.|\/)/u,
+  /^src\/(?:entry-cloudflare-worker|entry-worker|public-host-identity|router|worker-production-composition)\.ts$/u,
+  /^src\/takoform\/(?:admission|admission-projection|host-authority|routes)(?:\.|\/)/u,
 ] as const;
 
 export type WorkerProcess = (
@@ -128,7 +128,7 @@ export async function runWorker(
   try {
     const inspectionConfig = writeWorkerConfig(target, {
       path: join(root, "inspect-wrangler.jsonc"),
-      main: resolve(REPOSITORY, "src/entry-worker.ts"),
+      main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
       commit: invocation.commit,
       hostedTopology: "desired",
     });

@@ -39,7 +39,7 @@ export async function prepareWorkerArtifact(input: {
   mkdirSync(release, { recursive: true, mode: 0o700 });
   const buildConfig = writeWorkerConfig(input.target, {
     path: join(input.root, "build-wrangler.jsonc"),
-    main: resolve(REPOSITORY, "src/entry-worker.ts"),
+    main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
     commit: input.commit,
     hostedTopology: input.hostedTopology,
     ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),

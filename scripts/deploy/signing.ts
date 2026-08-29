@@ -90,7 +90,7 @@ export async function runSigning(
   try {
     const configPath = writeWorkerConfig(target, {
       path: join(root, "inspect-wrangler.jsonc"),
-      main: resolve(REPOSITORY, "src/entry-worker.ts"),
+      main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
       commit: invocation.commit,
       hostedTopology: "desired",
       signingKeyId: target.signing.currentKeyId,

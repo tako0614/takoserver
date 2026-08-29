@@ -73,6 +73,8 @@ export interface AppPorts {
   /** Short-lived standard S3 credentials for a provisioned ObjectBucket. */
   readonly s3?: S3CredentialIssuer;
   readonly publicOrigin: string;
+  /** Current Cloudflare Worker Version; fences Form support written for a stale public artifact. */
+  readonly publicWorkerVersionId?: string;
   /** Where this deployment's console is served, if it has one. */
   readonly consoleOrigin?: string;
   /** Private Hosted-to-Takoserver sponsorship bearer; absent disables the seam. */
@@ -213,6 +215,9 @@ export function buildApp(ports: AppPorts): App {
           sql: ports.sql,
           objects: ports.objects,
           hostId: ports.publicOrigin,
+          ...(ports.publicWorkerVersionId
+            ? { publicWorkerVersionId: ports.publicWorkerVersionId }
+            : {}),
           candidates: ports.hostForms,
           bindings: ports.hostBindings ?? [],
           technicalAvailability: availability ?? {

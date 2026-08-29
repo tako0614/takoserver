@@ -699,12 +699,14 @@ export function createProviderFormAvailability(
   };
 }
 
-const INTRINSIC_FORMS = new Set([
+export const TAKOSERVER_INTRINSIC_HANDLER_KINDS = [
   "WorkerBundle",
   "StaticAssetBundle",
   "SQLiteMigrationSet",
   "SQLiteMigrationApplication",
-]);
+] as const;
+
+const INTRINSIC_FORMS = new Set<string>(TAKOSERVER_INTRINSIC_HANDLER_KINDS);
 
 function intrinsicForm(form: InstalledTakoformForm): boolean {
   return intrinsicFormRef(form.identity.formRef);

@@ -1,6 +1,6 @@
 # Takoserver deploy surfaces
 
-This repository owns one deploy entrypoint and eleven separate mutation surfaces.
+This repository owns one deploy entrypoint and fifteen separate mutation surfaces.
 The contract is read-only:
 
 ```sh
@@ -27,8 +27,8 @@ and production invocations never accept this selector.
 
 The environment selects only `.deploy/targets/<environment>.json` (or the
 matching absolute `TAKOSERVER_DEPLOY_TARGET_<ENVIRONMENT>` path). There is no
-target flag, mixed preflight/apply controller, plan, evidence ledger, journal,
-capability, or implied deploy authority.
+target flag, mixed preflight/apply controller, deploy-plan flag, evidence
+ledger, journal, capability token, or implied deploy authority.
 
 ## Surfaces
 
@@ -46,6 +46,49 @@ The separate authority and irreversible surfaces are:
 
 - `takoserver-worker-authority-cutover`: reviewed publication of
   authority-sensitive Worker code only.
+- `takoserver-form-authority-worker`: one reviewed route-less service-binding
+  RPC Worker upload. Exact D1/R2 and identity bindings are read back with no
+  secret or public-domain, zone-route, workers.dev, or preview ownership. The
+  served public Worker artifact is rebuilt from the same commit and must match
+  byte-for-byte before upload. Its Form `apply` remains fail-closed until
+  released Core admission and signed trust adapters exist; deploying the shell
+  does not grant Form mutation authority.
+- `takoserver-integration-form-authority-worker`: integration only. It packages
+  the exact generated 12-Form unsigned fixture corpus, hard-refuses any other
+  environment before binding reads, and remains permanently non-production.
+  It has no public route or privileged publisher branch. Form execution and
+  partial convergence are described in [form-authority.md](form-authority.md).
+- `takoserver-integration-form-authority-operator-worker`: integration only.
+  It owns only the dedicated custom domain
+  `https://form-authority.integration.takoserver.com`, with workers.dev and
+  previews disabled. It has service bindings to the route-less integration
+  authority and the public Host identity RPC, but no D1/R2 bindings and no
+  customer routes. Each POST to `/v1/plan`, `/v1/apply`, or `/v1/readback`
+  requires exact `application/json`, a bounded body, and a short-lived Ed25519
+  proof bound to method, path, canonical body digest, environment, Host id,
+  public Worker artifact digest, and public Worker Version. The public key is
+  target-owned and dedicated to this purpose; its private half remains
+  operator-private. The gateway forwards the original signed request envelope;
+  the route-less authority independently verifies the same proof against its
+  own sealed copy of that key before any D1/R2 read. The exact target-owned
+  tenant and Space are also sealed independently into both Workers; each
+  rejects every signed plan/apply/readback activation outside that scope before
+  its RPC or storage boundary. Both Workers recheck the live public Worker
+  Version, and apply checks again after trust/Core preparation and immediately
+  before every durable command. A clean first deployment is allowed only when
+  both the gateway script and configured custom domain are absent. Foreign
+  ownership and every script/domain partial topology are refused, and a
+  successful upload must pass the normal exact post-upload readback.
+- `takoserver-integration-form-authority`: integration only. This owner CLI
+  verifies the exhaustive gateway, route-less authority, and public Worker
+  identity closure before using the dedicated private key. Status sends one
+  signed readback request. Apply qualifies the exact source and reviewer,
+  obtains one signed canonical plan, submits that exact plan once, and then
+  performs one independently signed readback. It never calls D1/R2 directly or
+  retries an HTTP mutation; a lost apply acknowledgement is indeterminate. An
+  acknowledged partial apply still performs the separate readback, preserves
+  only sanitized action receipts and next-plan diagnostics, and exits nonzero
+  as a verification failure.
 - `takoserver-d1-schema`: ordered, forward-only D1 migration apply and exact
   post-lineage/schema-shape readback.
 - `takoserver-signing-key-register`: append-only public Ed25519 JWK registration
@@ -116,6 +159,13 @@ tracked repository. Depending on the surface, the operator supplies:
 - `TAKOSERVER_SIGNING_NEXT_PRIVATE_JWK_PATH`
 - `TAKOSERVER_HOSTED_TOKEN_PATH`
 - `TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH`
+- `TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH`
+
+The Form authority surfaces must read the exhaustive account Worker script,
+domain, subdomain, secret, Version, zone, and Worker-route inventories before
+claiming route-less closure. Their Cloudflare token therefore needs the
+corresponding account Workers Scripts access plus Zone Read and Workers Routes
+Read for every zone in the selected account; a narrower token fails closed.
 
 Secret inputs must be owned, link-free regular files with mode `0600`. They are
 sent only through stdin or an ephemeral sealed Wrangler secrets file, never as
@@ -133,6 +183,14 @@ by that replay rather than a blind retry. Assertion and session bytes are
 redacted from both success output and diagnostics. Every later session and API
 key issued through the operator identity must be revoked before a separately
 reviewed identity-removal transition.
+
+`TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH` is a separate,
+operator-private Ed25519 key dedicated to the integration Form-authority
+gateway. The signed invocation surface opens the link-free `0600` file, proves
+its public half against the target-owned key, and keeps both the private JWK and
+short-lived assertions out of output and diagnostics. The deploy target fixes
+the exact integration tenant/Space activation audience; neither an environment
+variable nor a request can widen that scope.
 
 ## Failure handling
 

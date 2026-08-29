@@ -37,6 +37,23 @@ import {
 
 const API_ORIGIN = "https://api.cloudflare.com/client/v4";
 
+/** Same concrete kind set consumed by `apply`'s provider dispatch below. */
+export const CLOUDFLARE_TAKOFORM_HANDLER_KINDS = [
+  "ModuleWorker",
+  "EdgeKVNamespace",
+  "SQLiteDatabase",
+  "AtLeastOnceQueue",
+  "ObjectBucket",
+  "WorkerVersion",
+  "WorkerDeployment",
+  "WorkerEndpoint",
+  "WorkerCustomDomain",
+  "WorkerCronTrigger",
+  "QueueConsumer",
+] as const;
+
+const cloudflareTakoformHandlerKinds = new Set<string>(CLOUDFLARE_TAKOFORM_HANDLER_KINDS);
+
 /** The name a script reaches its own static assets by. */
 const ASSETS_BINDING = "ASSETS";
 
@@ -285,7 +302,8 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
   async apply(input: ApplyInput): Promise<ProviderTicket> {
     if (
       input.offering.kind.startsWith("takoform.") &&
-      isEdgeFormsApiVersion(input.offering.form.apiVersion)
+      isEdgeFormsApiVersion(input.offering.form.apiVersion) &&
+      cloudflareTakoformHandlerKinds.has(input.offering.form.kind)
     ) {
       switch (input.offering.form.kind) {
         case "ModuleWorker":

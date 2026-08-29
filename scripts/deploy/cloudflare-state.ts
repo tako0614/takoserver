@@ -48,20 +48,24 @@ export class CloudflareState {
   }
 
   async list(path: string, label: string): Promise<readonly unknown[]> {
+    return await this.#list(this.#url(path), label);
+  }
+
+  async #list(baseUrl: URL, label: string, pageSize = PAGE_SIZE): Promise<readonly unknown[]> {
     const collected: unknown[] = [];
     let expectedTotal: number | null = null;
     let totalPages: number | null = null;
     for (let page = 1; page <= (totalPages ?? 1); page += 1) {
       if (page > MAX_PAGES) throw preflightError(`${label} exceeded the pagination safety bound`);
-      const url = this.#url(path);
+      const url = new URL(baseUrl);
       url.searchParams.set("page", String(page));
-      url.searchParams.set("per_page", String(PAGE_SIZE));
+      url.searchParams.set("per_page", String(pageSize));
       const envelope = await this.#request(url, label);
       if (!Array.isArray(envelope.result)) {
         throw preflightError(`${label} returned a non-list result`);
       }
       const pagination = parsePagination(envelope.result_info, label);
-      if (pagination.page !== page || pagination.perPage !== PAGE_SIZE) {
+      if (pagination.page !== page || pagination.perPage !== pageSize) {
         throw preflightError(`${label} returned inconsistent pagination coordinates`);
       }
       if (pagination.count !== envelope.result.length) {
@@ -127,6 +131,20 @@ export class CloudflareState {
     return parseDeploymentHistory(result, label);
   }
 
+  async workerScripts(): Promise<readonly string[]> {
+    const entries = await this.list("/workers/scripts", "Cloudflare Worker script inventory");
+    const names = entries.map((entry) => {
+      if (!isRecord(entry) || typeof entry.id !== "string" || entry.id.length === 0) {
+        throw preflightError("Cloudflare Worker script inventory returned a malformed entry");
+      }
+      return entry.id;
+    });
+    if (new Set(names).size !== names.length) {
+      throw preflightError("Cloudflare Worker script inventory contains a duplicate name");
+    }
+    return names.sort();
+  }
+
   workerVersions(workerName: string): Promise<readonly unknown[]> {
     return this.list(
       `/workers/scripts/${encodeURIComponent(workerName)}/versions`,
@@ -155,6 +173,80 @@ export class CloudflareState {
       `/workers/scripts/${encodeURIComponent(workerName)}/settings`,
       `${workerName} settings`,
     );
+  }
+
+  async workerSubdomain(workerName: string): Promise<{
+    readonly enabled: boolean;
+    readonly previewsEnabled: boolean;
+  }> {
+    const result = await this.read(
+      `/workers/scripts/${encodeURIComponent(workerName)}/subdomain`,
+      `${workerName} subdomain state`,
+    );
+    if (
+      !isRecord(result) ||
+      typeof result.enabled !== "boolean" ||
+      typeof result.previews_enabled !== "boolean"
+    ) {
+      throw preflightError(`${workerName} subdomain state returned a malformed result`);
+    }
+    return { enabled: result.enabled, previewsEnabled: result.previews_enabled };
+  }
+
+  /** Exhaustive account-zone inventory followed by each zone's complete route list. */
+  async workerRoutes(): Promise<
+    readonly {
+      readonly zoneId: string;
+      readonly id: string;
+      readonly pattern: string;
+      readonly script: string | null;
+    }[]
+  > {
+    const zonesUrl = new URL(`${API}/zones`);
+    zonesUrl.searchParams.set("account.id", this.#accountId);
+    const internalZonesUrl = new URL(zonesUrl);
+    internalZonesUrl.searchParams.set("type", "internal");
+    const zoneEntries = [
+      ...(await this.#list(zonesUrl, "Cloudflare account zone inventory", 50)),
+      ...(await this.#list(internalZonesUrl, "Cloudflare account internal-zone inventory", 50)),
+    ];
+    const zoneIds = zoneEntries.map((entry) => {
+      if (!isRecord(entry) || typeof entry.id !== "string" || entry.id.length === 0) {
+        throw preflightError("Cloudflare account zone inventory returned a malformed entry");
+      }
+      return entry.id;
+    });
+    if (new Set(zoneIds).size !== zoneIds.length) {
+      throw preflightError("Cloudflare account zone inventory contains a duplicate id");
+    }
+    const routes = await Promise.all(
+      zoneIds.sort().map(async (zoneId) => {
+        const label = `Cloudflare zone ${zoneId} Worker route inventory`;
+        const envelope = await this.#request(
+          new URL(`${API}/zones/${encodeURIComponent(zoneId)}/workers/routes`),
+          label,
+        );
+        if (!Array.isArray(envelope.result)) {
+          throw preflightError(`${label} returned a non-list result`);
+        }
+        return envelope.result.map((entry) => {
+          if (
+            !isRecord(entry) ||
+            typeof entry.id !== "string" ||
+            typeof entry.pattern !== "string" ||
+            (entry.script !== null && typeof entry.script !== "string")
+          ) {
+            throw preflightError(`${label} returned a malformed entry`);
+          }
+          return { zoneId, id: entry.id, pattern: entry.pattern, script: entry.script };
+        });
+      }),
+    );
+    const flattened = routes.flat();
+    if (new Set(flattened.map(({ zoneId, id }) => `${zoneId}\0${id}`)).size !== flattened.length) {
+      throw preflightError("Cloudflare Worker route inventory contains a duplicate id");
+    }
+    return flattened;
   }
 
   pagesDeployments(project: string): Promise<readonly unknown[]> {

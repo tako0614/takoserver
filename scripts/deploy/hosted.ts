@@ -81,7 +81,7 @@ export async function runHosted(
   try {
     const configPath = writeWorkerConfig(target, {
       path: join(root, "inspect-wrangler.jsonc"),
-      main: resolve(REPOSITORY, "src/entry-worker.ts"),
+      main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
       commit: invocation.commit,
       hostedTopology: "absent",
       signingKeyId: target.signing.currentKeyId,

@@ -142,6 +142,7 @@ export function expectedExactBindingClosure(
   const topology = expectedBindingClosureForTarget(topologyTarget);
   return {
     AI: { type: "ai", fields: {} },
+    WORKER_VERSION: { type: "version_metadata", fields: {} },
     ...topology,
     ...Object.fromEntries(
       Object.entries(entries).map(([name, value]) => [

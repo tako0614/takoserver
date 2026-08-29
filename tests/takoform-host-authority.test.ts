@@ -38,6 +38,8 @@ const technicallyAvailable = {
 };
 
 const digest = (hex: string): AdmissionDigest => `sha256:${hex.repeat(64)}` as AdmissionDigest;
+const PUBLIC_WORKER_VERSION_ID = "11111111-1111-4111-8111-111111111111";
+const STALE_PUBLIC_WORKER_VERSION_ID = "22222222-2222-4222-8222-222222222222";
 
 function first<T>(values: readonly T[], label: string): T {
   const value = values[0];
@@ -209,7 +211,13 @@ async function committedAuthority() {
     packageDigest: pkg.packageDigest,
     implementationDigest,
     supported: true,
-    profile: { profile: "focused" },
+    profile: {
+      kind: "takoserver.form-support@v1",
+      workerArtifactDigest: digest("7"),
+      publicWorkerVersionId: PUBLIC_WORKER_VERSION_ID,
+      capabilityDigest: digest("8"),
+      implementationDigest,
+    },
     operations: ["create", "read", "delete", "observe"],
     actor: "test-operator",
     reason: "reader fixture",
@@ -439,6 +447,45 @@ describe("durable read-only Takoform Host authority", () => {
     expect(catalog.forms[0]?.form.desiredSchema).toEqual(fixture.form.desiredSchema);
     await expect(
       withoutImplementation.authorizeMutation({
+        operation: "create",
+        context: CONTEXT,
+        formRef: fixture.form.identity.formRef,
+      }),
+    ).rejects.toMatchObject({ code: "form_unavailable", status: 503 });
+  });
+
+  test("treats support sealed to another public Worker Version as unsupported", async () => {
+    const fixture = await committedAuthority();
+    const current = createTakoformHostAuthority({
+      sql: fixture.sql,
+      objects: fixture.objects,
+      hostId: "host-a",
+      publicWorkerVersionId: PUBLIC_WORKER_VERSION_ID,
+      candidates: fixture.catalog.forms,
+      bindings: fixture.catalog.bindings,
+      technicalAvailability: technicallyAvailable,
+    });
+    const stale = createTakoformHostAuthority({
+      sql: fixture.sql,
+      objects: fixture.objects,
+      hostId: "host-a",
+      publicWorkerVersionId: STALE_PUBLIC_WORKER_VERSION_ID,
+      candidates: fixture.catalog.forms,
+      bindings: fixture.catalog.bindings,
+      technicalAvailability: technicallyAvailable,
+    });
+
+    expect((await current.catalog(CONTEXT)).forms[0]?.supported).toBe(true);
+    expect((await stale.catalog(CONTEXT)).forms[0]).toMatchObject({
+      supported: false,
+      availability: {
+        executable: false,
+        activated: false,
+        availableToPrincipal: false,
+      },
+    });
+    await expect(
+      stale.authorizeMutation({
         operation: "create",
         context: CONTEXT,
         formRef: fixture.form.identity.formRef,

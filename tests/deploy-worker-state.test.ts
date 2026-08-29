@@ -198,6 +198,7 @@ function expectedExactVersion(target: DeployTarget) {
     resources: {
       bindings: [
         { type: "ai", name: "AI" },
+        { type: "version_metadata", name: "WORKER_VERSION" },
         { type: "d1", name: "STATE_DB", id: target.d1.databaseId },
         { type: "r2_bucket", name: "OBJECTS", bucket_name: target.r2.bucketName },
         { type: "plain_text", name: "PUBLIC_ORIGIN", text: target.publicOrigin },

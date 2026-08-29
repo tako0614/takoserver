@@ -17,6 +17,8 @@ import { preflightError } from "./errors.ts";
 import { REPOSITORY } from "./process.ts";
 import type { DeployEnvironment } from "./qualification.ts";
 
+type FormAuthorityOperation = "create" | "read" | "update" | "delete" | "import" | "observe";
+
 /**
  * The realized deploy target. It names one Cloudflare account and the exact
  * resources this repository may publish onto. It is operator-private and is
@@ -86,6 +88,27 @@ export interface DeployTarget {
   readonly hostedTopology?: {
     readonly service: string;
     readonly entrypoint: string;
+  };
+  /** Route-less Form authority Workers sharing this target's existing D1/R2. */
+  readonly formAuthority?: {
+    readonly workerName: string;
+    readonly integrationWorkerName?: string;
+    readonly integrationOperatorWorkerName?: string;
+    readonly integrationOperatorOrigin?: string;
+    /** Exact integration Space that the signed operator invocation may activate. */
+    readonly integrationOperatorScope?: {
+      readonly tenantId: string;
+      readonly space: string;
+    };
+    /** Public half of the dedicated integration Form-authority operator key. */
+    readonly operatorPublicJwk?: {
+      readonly kty: "OKP";
+      readonly crv: "Ed25519";
+      readonly x: string;
+    };
+    readonly hostId: string;
+    /** Target-owned narrowing policy; omission keeps the code-derived intersection. */
+    readonly operatorOperations?: Readonly<Record<string, readonly FormAuthorityOperation[]>>;
   };
   /**
    * Public half of the integration operator's identity-only proof key.
@@ -191,6 +214,7 @@ function validateTarget(
       "edgeSupplies",
       "workerEndpointSuffix",
       "hostedTopology",
+      "formAuthority",
       "operatorIdentity",
     ],
   );
@@ -267,6 +291,11 @@ function validateTarget(
       : {
           hostedTopology: hostedTopology(value.hostedTopology),
         }),
+    ...(value.formAuthority === undefined
+      ? {}
+      : {
+          formAuthority: formAuthority(value.formAuthority, environment),
+        }),
     ...(value.operatorIdentity === undefined
       ? {}
       : { operatorIdentity: operatorIdentity(value.operatorIdentity) }),
@@ -291,7 +320,201 @@ function validateTarget(
   if (target.operatorIdentity && environment !== "integration") {
     throw preflightError("deploy target `operatorIdentity` is integration-only");
   }
+  if (target.formAuthority) {
+    if (target.formAuthority.hostId !== target.publicOrigin) {
+      throw preflightError(
+        "deploy target `formAuthority.hostId` must equal the public Takoserver Host origin",
+      );
+    }
+    const names = [
+      target.workerName,
+      target.formAuthority.workerName,
+      ...(target.formAuthority.integrationWorkerName
+        ? [target.formAuthority.integrationWorkerName]
+        : []),
+      ...(target.formAuthority.integrationOperatorWorkerName
+        ? [target.formAuthority.integrationOperatorWorkerName]
+        : []),
+    ];
+    if (new Set(names).size !== names.length) {
+      throw preflightError("deploy target Form authority Worker names must be distinct");
+    }
+    if (
+      target.formAuthority.integrationOperatorOrigin &&
+      (target.formAuthority.integrationOperatorOrigin === target.publicOrigin ||
+        target.aliases?.includes(new URL(target.formAuthority.integrationOperatorOrigin).hostname))
+    ) {
+      throw preflightError("deploy target Form authority operator origin must be separate");
+    }
+    if (
+      target.formAuthority.integrationOperatorWorkerName &&
+      !target.formAuthority.operatorPublicJwk
+    ) {
+      throw preflightError(
+        "deploy target Form authority operator gateway requires its dedicated operatorPublicJwk",
+      );
+    }
+  }
   return target;
+}
+
+function formAuthority(
+  value: unknown,
+  environment: DeployEnvironment,
+): NonNullable<DeployTarget["formAuthority"]> {
+  if (!isRecord(value)) {
+    throw preflightError("deploy target `formAuthority` must be an object");
+  }
+  assertExactKeys(
+    value,
+    ["workerName", "hostId"],
+    [
+      "integrationWorkerName",
+      "integrationOperatorWorkerName",
+      "integrationOperatorOrigin",
+      "integrationOperatorScope",
+      "operatorPublicJwk",
+      "operatorOperations",
+    ],
+  );
+  const integrationWorkerName =
+    value.integrationWorkerName === undefined
+      ? undefined
+      : pattern(value.integrationWorkerName, WORKER_NAME, "formAuthority.integrationWorkerName");
+  if (integrationWorkerName !== undefined && environment !== "integration") {
+    throw preflightError("deploy target `formAuthority.integrationWorkerName` is integration-only");
+  }
+  const integrationOperatorWorkerName =
+    value.integrationOperatorWorkerName === undefined
+      ? undefined
+      : pattern(
+          value.integrationOperatorWorkerName,
+          WORKER_NAME,
+          "formAuthority.integrationOperatorWorkerName",
+        );
+  const integrationOperatorOrigin =
+    value.integrationOperatorOrigin === undefined
+      ? undefined
+      : httpsOrigin(value.integrationOperatorOrigin);
+  if (Boolean(integrationOperatorWorkerName) !== Boolean(integrationOperatorOrigin)) {
+    throw preflightError(
+      "deploy target Form authority integration operator Worker and origin must be configured together",
+    );
+  }
+  if (
+    integrationOperatorWorkerName !== undefined &&
+    (environment !== "integration" || integrationOperatorOrigin?.endsWith(".workers.dev"))
+  ) {
+    throw preflightError(
+      "deploy target Form authority operator gateway is integration-only and requires a custom origin",
+    );
+  }
+  const operatorPublicJwk =
+    value.operatorPublicJwk === undefined
+      ? undefined
+      : publicEd25519Jwk(value.operatorPublicJwk, "formAuthority.operatorPublicJwk");
+  const integrationOperatorScope =
+    value.integrationOperatorScope === undefined
+      ? undefined
+      : formAuthorityOperatorScope(value.integrationOperatorScope);
+  if (
+    Boolean(integrationOperatorWorkerName) !== Boolean(operatorPublicJwk) ||
+    Boolean(integrationOperatorWorkerName) !== Boolean(integrationOperatorScope)
+  ) {
+    throw preflightError(
+      "deploy target Form authority operator gateway, operatorPublicJwk and integrationOperatorScope must be configured together",
+    );
+  }
+  if (
+    typeof value.hostId !== "string" ||
+    value.hostId.length === 0 ||
+    value.hostId.length > 255 ||
+    value.hostId.trim() !== value.hostId ||
+    [...value.hostId].some((character) => {
+      const code = character.charCodeAt(0);
+      return code <= 31 || code === 127;
+    })
+  ) {
+    throw preflightError("deploy target `formAuthority.hostId` is invalid");
+  }
+  return {
+    workerName: pattern(value.workerName, WORKER_NAME, "formAuthority.workerName"),
+    ...(integrationWorkerName === undefined ? {} : { integrationWorkerName }),
+    ...(integrationOperatorWorkerName === undefined
+      ? {}
+      : {
+          integrationOperatorWorkerName,
+          integrationOperatorOrigin: integrationOperatorOrigin as string,
+          integrationOperatorScope: integrationOperatorScope as NonNullable<
+            NonNullable<DeployTarget["formAuthority"]>["integrationOperatorScope"]
+          >,
+          operatorPublicJwk: operatorPublicJwk as NonNullable<
+            NonNullable<DeployTarget["formAuthority"]>["operatorPublicJwk"]
+          >,
+        }),
+    hostId: value.hostId,
+    ...(value.operatorOperations === undefined
+      ? {}
+      : { operatorOperations: formAuthorityOperatorOperations(value.operatorOperations) }),
+  };
+}
+
+function formAuthorityOperatorScope(
+  value: unknown,
+): NonNullable<NonNullable<DeployTarget["formAuthority"]>["integrationOperatorScope"]> {
+  if (!isRecord(value) || !exactKeySet(value, ["tenantId", "space"])) {
+    throw preflightError(
+      "deploy target `formAuthority.integrationOperatorScope` must contain exact tenantId/space members",
+    );
+  }
+  return {
+    tenantId: boundedTargetIdentity(value.tenantId, "integrationOperatorScope.tenantId"),
+    space: boundedTargetIdentity(value.space, "integrationOperatorScope.space"),
+  };
+}
+
+function boundedTargetIdentity(value: unknown, field: string): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 255 ||
+    value.trim() !== value ||
+    !/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/u.test(value) ||
+    [...value].some((character) => {
+      const code = character.charCodeAt(0);
+      return code <= 31 || code === 127;
+    })
+  ) {
+    throw preflightError(`deploy target \`formAuthority.${field}\` is invalid`);
+  }
+  return value;
+}
+
+function formAuthorityOperatorOperations(
+  value: unknown,
+): Readonly<Record<string, readonly FormAuthorityOperation[]>> {
+  if (!isRecord(value)) {
+    throw preflightError("deploy target `formAuthority.operatorOperations` must be an object");
+  }
+  const order = ["create", "read", "update", "delete", "import", "observe"] as const;
+  const result: Record<string, readonly FormAuthorityOperation[]> = {};
+  for (const [kind, operations] of Object.entries(value)) {
+    if (kind.length === 0 || kind.length > 255 || !Array.isArray(operations)) {
+      throw preflightError("deploy target Form authority operator operations are invalid");
+    }
+    const typed = operations as unknown[];
+    if (
+      typed.some(
+        (operation) =>
+          typeof operation !== "string" || !order.includes(operation as FormAuthorityOperation),
+      ) ||
+      new Set(typed).size !== typed.length
+    ) {
+      throw preflightError("deploy target Form authority operator operations are invalid");
+    }
+    result[kind] = order.filter((operation) => typed.includes(operation));
+  }
+  return result;
 }
 
 function operatorIdentity(value: unknown): NonNullable<DeployTarget["operatorIdentity"]> {
@@ -301,28 +524,30 @@ function operatorIdentity(value: unknown): NonNullable<DeployTarget["operatorIde
   if (!exactKeySet(value, ["publicJwk"])) {
     throw preflightError("deploy target `operatorIdentity` must contain only `publicJwk`");
   }
-  const publicJwk = value.publicJwk;
-  if (!isRecord(publicJwk)) {
-    throw preflightError("deploy target `operatorIdentity.publicJwk` must be an object");
+  return { publicJwk: publicEd25519Jwk(value.publicJwk, "operatorIdentity.publicJwk") };
+}
+
+function publicEd25519Jwk(
+  value: unknown,
+  field: string,
+): { readonly kty: "OKP"; readonly crv: "Ed25519"; readonly x: string } {
+  if (!isRecord(value)) {
+    throw preflightError(`deploy target \`${field}\` must be an object`);
   }
-  if (!exactKeySet(publicJwk, ["kty", "crv", "x"])) {
+  if (!exactKeySet(value, ["kty", "crv", "x"])) {
     throw preflightError(
-      "deploy target `operatorIdentity.publicJwk` must be public-only with exact kty/crv/x members",
+      `deploy target \`${field}\` must be public-only with exact kty/crv/x members`,
     );
   }
   if (
-    publicJwk.kty !== "OKP" ||
-    publicJwk.crv !== "Ed25519" ||
-    typeof publicJwk.x !== "string" ||
-    !BASE64URL_32.test(publicJwk.x)
+    value.kty !== "OKP" ||
+    value.crv !== "Ed25519" ||
+    typeof value.x !== "string" ||
+    !BASE64URL_32.test(value.x)
   ) {
-    throw preflightError(
-      "deploy target `operatorIdentity.publicJwk` must be one exact public Ed25519 JWK",
-    );
+    throw preflightError(`deploy target \`${field}\` must be one exact public Ed25519 JWK`);
   }
-  return {
-    publicJwk: { kty: "OKP", crv: "Ed25519", x: publicJwk.x },
-  };
+  return { kty: "OKP", crv: "Ed25519", x: value.x };
 }
 
 function exactKeySet(value: Record<string, unknown>, keys: readonly string[]): boolean {

@@ -9,6 +9,7 @@ function envelope(
   page: number,
   totalPages: number,
   totalCount: number,
+  perPage = 100,
 ): Response {
   return Response.json({
     success: true,
@@ -17,7 +18,7 @@ function envelope(
     result,
     result_info: {
       page,
-      per_page: 100,
+      per_page: perPage,
       count: result.length,
       total_count: totalCount,
       total_pages: totalPages,
@@ -261,5 +262,70 @@ describe("strict paginated Cloudflare state", () => {
     await expect(
       state.read("/workers/scripts/takoserver/settings", "Worker settings"),
     ).rejects.toThrow("failed");
+  });
+
+  test("reads disabled Worker subdomain state exactly", async () => {
+    const state = new CloudflareState({
+      accountId: ACCOUNT,
+      token: "token",
+      fetcher: async () =>
+        Response.json({
+          success: true,
+          result: { enabled: false, previews_enabled: false },
+        }),
+    });
+    expect(await state.workerSubdomain("takoserver-form-authority")).toEqual({
+      enabled: false,
+      previewsEnabled: false,
+    });
+  });
+
+  test("uses the Zones API limit and reads default plus internal zone routes exhaustively", async () => {
+    const requests: Request[] = [];
+    const defaultZones = Array.from({ length: 51 }, (_, index) => ({ id: `zone-${index}` }));
+    const state = new CloudflareState({
+      accountId: ACCOUNT,
+      token: "token",
+      fetcher: async (request) => {
+        requests.push(request);
+        const url = new URL(request.url);
+        if (url.pathname === "/client/v4/zones") {
+          if (url.searchParams.get("type") === "internal") {
+            return envelope([{ id: "zone-internal" }], 1, 1, 1, 50);
+          }
+          const page = Number(url.searchParams.get("page"));
+          return page === 1
+            ? envelope(defaultZones.slice(0, 50), 1, 2, 51, 50)
+            : envelope(defaultZones.slice(50), 2, 2, 51, 50);
+        }
+        const zoneId = /^\/client\/v4\/zones\/([^/]+)\/workers\/routes$/u.exec(url.pathname)?.[1];
+        if (!zoneId) throw new Error(`unexpected request ${url}`);
+        return Response.json({
+          success: true,
+          result:
+            zoneId === "zone-50" || zoneId === "zone-internal"
+              ? [
+                  {
+                    id: `route-${zoneId}`,
+                    pattern: `${zoneId}.example.test/*`,
+                    script: "takoserver-form-authority",
+                  },
+                ]
+              : [],
+        });
+      },
+    });
+
+    expect(await state.workerRoutes()).toHaveLength(2);
+    const zoneRequests = requests.filter(
+      (request) => new URL(request.url).pathname === "/client/v4/zones",
+    );
+    expect(zoneRequests).toHaveLength(3);
+    expect(
+      zoneRequests.every((request) => new URL(request.url).searchParams.get("per_page") === "50"),
+    ).toBe(true);
+    expect(
+      zoneRequests.some((request) => new URL(request.url).searchParams.get("type") === "internal"),
+    ).toBe(true);
   });
 });

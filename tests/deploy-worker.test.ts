@@ -180,7 +180,10 @@ describe("split Takoserver Worker surfaces", () => {
         "src/auth.ts",
         "src/app.ts",
         "src/control.ts",
+        "src/entry-cloudflare-worker.ts",
+        "src/public-host-identity.ts",
         "src/takoform/admission.ts",
+        "src/takoform/host-authority.ts",
         "scripts/deploy/worker.ts",
         "wrangler.jsonc",
         "src/catalog.ts",
@@ -190,9 +193,44 @@ describe("split Takoserver Worker surfaces", () => {
       "src/app.ts",
       "src/auth.ts",
       "src/control.ts",
+      "src/entry-cloudflare-worker.ts",
+      "src/public-host-identity.ts",
       "src/takoform/admission.ts",
+      "src/takoform/host-authority.ts",
       "wrangler.jsonc",
     ]);
+  });
+
+  test("routine cannot publish public Form-authority fences without the reviewed cutover", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-worker-public-authority-"));
+    try {
+      const current = fixture({
+        diff: [
+          "src/entry-cloudflare-worker.ts",
+          "src/public-host-identity.ts",
+          "src/takoform/host-authority.ts",
+        ].join("\n"),
+      });
+      const failure = await runWorker(
+        {
+          surface: "takoserver-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target,
+        {
+          ...current,
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      ).catch((error) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect(failure.message).toContain("takoserver-worker-authority-cutover");
+      expect(current.calls.some((call) => call.join(" ") === "bun run check")).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("routine refuses pending migrations before its gate or upload", async () => {

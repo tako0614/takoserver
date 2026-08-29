@@ -1,0 +1,32 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "takoserver-integration-form-authority-operator",
+  "main": "src/entry-integration-form-authority-operator-worker.ts",
+  "compatibility_date": "2026-08-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "unconfigured.invalid", "custom_domain": true }],
+  "vars": {
+    "TAKOSERVER_ENVIRONMENT": "integration",
+    "TAKOSERVER_FORM_AUTHORITY_HOST_ID": "unconfigured.invalid",
+    "TAKOSERVER_FORM_AUTHORITY_OPERATOR_ORIGIN": "https://unconfigured.invalid",
+    "TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST": "unconfigured",
+    "TAKOSERVER_PUBLIC_WORKER_VERSION_ID": "00000000-0000-0000-0000-000000000000",
+    "TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK": "unconfigured",
+    "TAKOSERVER_FORM_AUTHORITY_OPERATOR_TENANT_ID": "unconfigured",
+    "TAKOSERVER_FORM_AUTHORITY_OPERATOR_SPACE": "unconfigured"
+  },
+  "services": [
+    {
+      "binding": "FORM_AUTHORITY",
+      "service": "takoserver-integration-form-authority",
+      "entrypoint": "IntegrationFormAuthorityEntrypoint"
+    },
+    {
+      "binding": "PUBLIC_HOST_IDENTITY",
+      "service": "takoserver-api",
+      "entrypoint": "PublicHostIdentityEntrypoint"
+    }
+  ]
+}

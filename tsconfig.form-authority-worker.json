@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2022"],
+    "types": ["@cloudflare/workers-types"]
+  },
+  "include": ["form-authority-worker-configuration.d.ts", "src/entry-form-authority-worker.ts"],
+  "exclude": []
+}

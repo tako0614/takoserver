@@ -25,6 +25,10 @@ async function deploy(args: readonly string[]): Promise<{
 const SURFACES = [
   ["takoserver-worker", []],
   ["takoserver-worker-authority-cutover", ["authority"]],
+  ["takoserver-form-authority-worker", ["authority"]],
+  ["takoserver-integration-form-authority-worker", ["authority"]],
+  ["takoserver-integration-form-authority-operator-worker", ["authority"]],
+  ["takoserver-integration-form-authority", ["authority"]],
   ["takoserver-site", []],
   ["takoserver-console", []],
   ["takoserver-d1-schema", ["irreversible"]],
@@ -54,6 +58,29 @@ describe("Takoserver split deploy entrypoint", () => {
       SURFACES.map(([surface, triggers]) => [surface, [...triggers]]),
     );
     expect(contract.surfaces.some(({ surface }) => surface === "takoserver-api")).toBe(false);
+
+    const integrationAuthority = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-integration-form-authority-worker",
+    );
+    const gateway = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-integration-form-authority-operator-worker",
+    );
+    const invocation = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-integration-form-authority",
+    );
+    expect(integrationAuthority?.obligations["post-conditions"]).toContain(
+      "exact operator tenant and Space plain-text bindings",
+    );
+    expect(integrationAuthority?.obligations["failure-handling"]).toContain(
+      "outside its sealed tenant/Space",
+    );
+    expect(gateway?.obligations["post-conditions"]).toContain(
+      "only when both the script and configured custom domain are absent",
+    );
+    expect(gateway?.obligations["failure-handling"]).toContain("script/domain partial topology");
+    expect(invocation?.obligations["failure-handling"]).toContain(
+      "exits as a verification failure",
+    );
 
     for (const surface of contract.surfaces) {
       expect(surface.obligations).toMatchObject({
@@ -179,6 +206,84 @@ describe("Takoserver split deploy entrypoint", () => {
     for (const environment of ["rehearsal", "production"] as const) {
       const refused = await deploy([
         "takoserver-integration-operator-identity",
+        "--status",
+        `--environment=${environment}`,
+        `--commit=${sha}`,
+      ]);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
+    }
+  });
+
+  test("parses the fixture Form authority surface only for integration", async () => {
+    const sha = "a".repeat(40);
+    const accepted = await deploy([
+      "takoserver-integration-form-authority-worker",
+      "--status",
+      "--environment=integration",
+      `--commit=${sha}`,
+    ]);
+    expect(accepted.exitCode).toBe(2);
+    expect(accepted.stderr).toContain("deploy target descriptor not found");
+    expect(accepted.stderr).not.toContain("no target was touched");
+
+    for (const environment of ["rehearsal", "production"] as const) {
+      const refused = await deploy([
+        "takoserver-integration-form-authority-worker",
+        "--status",
+        `--environment=${environment}`,
+        `--commit=${sha}`,
+      ]);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
+    }
+  });
+
+  test("parses the authenticated Form authority operator gateway only for integration", async () => {
+    const sha = "a".repeat(40);
+    const accepted = await deploy([
+      "takoserver-integration-form-authority-operator-worker",
+      "--status",
+      "--environment=integration",
+      `--commit=${sha}`,
+    ]);
+    expect(accepted.exitCode).toBe(2);
+    expect(accepted.stderr).toContain("deploy target descriptor not found");
+    expect(accepted.stderr).not.toContain("no target was touched");
+
+    for (const environment of ["rehearsal", "production"] as const) {
+      const refused = await deploy([
+        "takoserver-integration-form-authority-operator-worker",
+        "--status",
+        `--environment=${environment}`,
+        `--commit=${sha}`,
+      ]);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
+    }
+  });
+
+  test("parses the signed Form authority invocation only for integration", async () => {
+    const sha = "a".repeat(40);
+    const accepted = await deploy([
+      "takoserver-integration-form-authority",
+      "--status",
+      "--environment=integration",
+      `--commit=${sha}`,
+    ]);
+    expect(accepted.exitCode).toBe(2);
+    expect(accepted.stderr).toContain("deploy target descriptor not found");
+    expect(accepted.stderr).not.toContain("no target was touched");
+
+    for (const environment of ["rehearsal", "production"] as const) {
+      const refused = await deploy([
+        "takoserver-integration-form-authority",
         "--status",
         `--environment=${environment}`,
         `--commit=${sha}`,
