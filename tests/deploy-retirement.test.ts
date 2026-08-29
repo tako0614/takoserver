@@ -17,9 +17,11 @@ import {
 } from "../scripts/deploy/worker-state.ts";
 
 const COMMIT = "a".repeat(40);
+const LEGACY_COMMIT = "b".repeat(40);
 const DIGEST = createHash("sha256")
   .update("export default {fetch(){return new Response('ok')}};\n")
   .digest("hex");
+const LEGACY_DIGEST = "c".repeat(64);
 const VERSION_LEGACY = "00000000-0000-4000-8000-000000000001";
 const VERSION_CANDIDATE = "00000000-0000-4000-8000-000000000002";
 const VERSION_TOPOLOGY = "00000000-0000-4000-8000-000000000003";
@@ -225,6 +227,50 @@ describe("reviewed Hosted legacy-edge retirement", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test("topology status accepts a direct candidate with changed canonical identity", async () => {
+    const fixture = stateFixture("candidate");
+    const state: RetirementState = {
+      ...fixture.state,
+      async workerVersion(_worker, versionId) {
+        if (versionId === VERSION_LEGACY) {
+          return versionShape({
+            serviceBinding: { service: SERVICE, entrypoint: ENTRYPOINT },
+            includeHostedSecret: true,
+            message: `takoserver-worker:${LEGACY_COMMIT}:${LEGACY_DIGEST}`,
+          });
+        }
+        if (versionId === VERSION_CANDIDATE) {
+          return versionShape({
+            serviceBinding: { service: SERVICE, entrypoint: ENTRYPOINT },
+            includeHostedSecret: true,
+            message: `takoserver-worker:${COMMIT}:${DIGEST}`,
+          });
+        }
+        return await fixture.state.workerVersion(_worker, versionId);
+      },
+    };
+    const status = await runRetirement(
+      {
+        surface: "takoserver-host-runtime-topology-retirement",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+        legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+      },
+      target,
+      { run: fixture.run, state },
+    );
+    expect(status).toMatchObject({
+      state: "candidate",
+      versionId: VERSION_CANDIDATE,
+      deployedCommit: COMMIT,
+      artifactDigest: `sha256:${DIGEST}`,
+      service: SERVICE,
+      entrypoint: ENTRYPOINT,
+    });
+    expect(fixture.mutations).toHaveLength(0);
   });
 
   test("topology retirement rechecks authoritative state after sealing the artifact", async () => {

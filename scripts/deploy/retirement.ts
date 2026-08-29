@@ -638,7 +638,6 @@ async function runTopologyRetirement(
       target,
       state,
       beforeHistory,
-      before,
     );
     if (predecessor.service !== service.service || predecessor.entrypoint !== service.entrypoint) {
       throw preflightError(
@@ -730,7 +729,6 @@ async function runTopologyRetirement(
       target,
       state,
       fresh.history,
-      fresh,
     );
     if (
       freshPredecessor.service !== service.service ||
@@ -975,7 +973,6 @@ async function runTokenRetirement(
           target,
           state,
           beforeHistory,
-          before,
         );
         directTokenRetirement = true;
       } else {
@@ -1086,7 +1083,6 @@ async function runTokenRetirement(
       target,
       state,
       fresh.history,
-      fresh,
     );
     if (
       freshPredecessorService.service !== predecessorService.service ||
@@ -1464,7 +1460,6 @@ async function requireDirectServicePredecessor(
   target: DeployTarget,
   state: RetirementState,
   history: WorkerDeploymentHistory,
-  current: RetirementLiveWorkerVersion,
 ): Promise<LegacyHostServiceBinding> {
   const predecessorId = history.previousVersionId;
   if (predecessorId === null) {
@@ -1472,7 +1467,7 @@ async function requireDirectServicePredecessor(
   }
   const predecessor = await readVersionAt(phase, target, state, predecessorId);
   const service = extractLegacyHostServiceBinding(phase, predecessorId, predecessor);
-  const previous = await inspectRetirementVersionAt(
+  await inspectRetirementVersionAt(
     phase,
     target,
     state,
@@ -1482,13 +1477,6 @@ async function requireDirectServicePredecessor(
     hostedVersionSecrets(target),
     predecessor,
   );
-  if (
-    current.commit !== null &&
-    previous.commit !== null &&
-    (current.commit !== previous.commit || current.bundleDigestHex !== previous.bundleDigestHex)
-  ) {
-    throw phaseError(phase, "retirement candidate and direct predecessor identities differ");
-  }
   return service;
 }
 
