@@ -28,6 +28,7 @@ import type { DeployTarget } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import {
   inspectLiveWorkerVersionForRetirement,
+  isWorkerVersionId,
   type RetirementLiveWorkerVersion,
   type WorkerState,
 } from "./worker-live.ts";
@@ -41,6 +42,14 @@ import {
 } from "./worker-state.ts";
 
 export const HOSTED_SPONSORSHIP_SECRET = "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN" as const;
+
+/**
+ * Retirement only follows the known provider-history suffix. Older history is
+ * intentionally ignored once the pinned predecessor is reached, but no
+ * mutation may rely on a longer or untyped ancestry walk. The longest
+ * accepted word is the five-edge C' -> T' -> R -> T -> C -> P suffix.
+ */
+const MAX_RETIREMENT_ANCESTRY_DISTANCE = 5;
 
 function legacyServiceBindingName(): string {
   return ["HOST", "RUNTIME", "MATERIALIZER"].join("_");
@@ -124,6 +133,9 @@ export async function runAuthorityTransition(
     throw preflightError(
       "authority transition requires --legacy-host-runtime-predecessor-version=<uuid>",
     );
+  }
+  if (!isWorkerVersionId(selector)) {
+    throw preflightError("legacy Host-runtime predecessor Version ID must be one exact UUID");
   }
   const root =
     options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-authority-transition-"));
@@ -472,6 +484,7 @@ async function runTopologyRetirement(
   run: RetirementProcess,
   options: RetirementOptions,
 ): Promise<Record<string, unknown>> {
+  const selector = requiredPredecessorSelector(invocation);
   const root =
     options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-topology-retirement-"));
   const temporary = options.outputDirectory === undefined;
@@ -489,7 +502,7 @@ async function runTopologyRetirement(
         state,
         beforeHistory,
         null,
-        versionSecretsForRetiredToken(target, beforeVersion),
+        beforeHasToken ? hostedVersionSecrets(target) : baseWorkerSecrets(target),
         beforeHasToken ? hostedVersionSecrets(target) : baseWorkerSecrets(target),
       );
       if (invocation.action === "status") {
@@ -504,6 +517,7 @@ async function runTopologyRetirement(
           state,
           beforeHistory,
           before,
+          selector,
         );
         const predecessorId = candidate.versionId;
         if (
@@ -541,6 +555,7 @@ async function runTopologyRetirement(
         state,
         beforeHistory,
         before,
+        selector,
       );
       return await reverseTopology(
         invocation,
@@ -554,6 +569,7 @@ async function runTopologyRetirement(
         root,
         options,
         candidate.versionId,
+        selector,
       );
     }
     const service = extractLegacyHostServiceBinding(
@@ -569,6 +585,53 @@ async function runTopologyRetirement(
       service,
       hostedVersionSecrets(target),
       hostedVersionSecrets(target),
+    );
+    const directPredecessorId = beforeHistory.previousVersionId;
+    if (directPredecessorId !== null) {
+      const directPredecessor = await readVersionAt(
+        "preflight",
+        target,
+        state,
+        directPredecessorId,
+      );
+      if (!hasMaterializerBinding(directPredecessor)) {
+        const restored = await topologyCandidateRestored(
+          "preflight",
+          target,
+          state,
+          beforeHistory,
+          before,
+          selector,
+        );
+        if (invocation.action === "status") {
+          return {
+            kind: "takoserver.host-runtime-topology-retirement-status@v1",
+            surface: invocation.surface,
+            environment: invocation.environment,
+            selectedCommit: invocation.commit,
+            state: "candidate-restored",
+            ready: restored.commit === invocation.commit,
+            versionId: before.history.versionId,
+            previousVersionId: restored.versionId,
+            deployedCommit: restored.commit,
+            artifactDigest: digestValue(restored.bundleDigestHex),
+            service: service.service,
+            entrypoint: service.entrypoint,
+          };
+        }
+        throw preflightError(
+          "topology retirement requires a fresh authority rebase after candidate restoration",
+        );
+      }
+    }
+    await assertPinnedLineage(
+      "preflight",
+      target,
+      state,
+      beforeHistory,
+      selector,
+      1,
+      "topology retirement requires the pinned legacy predecessor as the candidate's direct predecessor",
     );
     const predecessor = await requireDirectServicePredecessor(
       "preflight",
@@ -643,6 +706,38 @@ async function runTopologyRetirement(
     }
     const artifact = prepared.seal();
     artifact.assertUnchanged();
+    const fresh = await assertCurrentRetirementState(
+      "preflight",
+      target,
+      state,
+      beforeHistory,
+      before,
+      service,
+      hostedVersionSecrets(target),
+      hostedVersionSecrets(target),
+    );
+    await assertPinnedLineage(
+      "preflight",
+      target,
+      state,
+      fresh.history,
+      selector,
+      1,
+      "topology retirement requires the pinned legacy predecessor as the candidate's direct predecessor",
+    );
+    const freshPredecessor = await requireDirectServicePredecessor(
+      "preflight",
+      target,
+      state,
+      fresh.history,
+      fresh,
+    );
+    if (
+      freshPredecessor.service !== service.service ||
+      freshPredecessor.entrypoint !== service.entrypoint
+    ) {
+      throw preflightError("topology retirement predecessor service changed before mutation");
+    }
     const upload = await run(
       wranglerCommand([
         "deploy",
@@ -719,7 +814,8 @@ async function reverseTopology(
   reviewer: string,
   root: string,
   options: RetirementOptions,
-  candidateVersionId?: string,
+  candidateVersionId: string | undefined,
+  selector: string,
 ): Promise<Record<string, unknown>> {
   const predecessorId = candidateVersionId ?? beforeHistory.previousVersionId;
   if (predecessorId === null) {
@@ -748,6 +844,33 @@ async function reverseTopology(
     transitionServiceBinding: service,
     transitionExpectedSecrets: hostedVersionSecrets(target),
   });
+  const fresh = await assertCurrentRetirementState(
+    "preflight",
+    target,
+    state,
+    beforeHistory,
+    before,
+    null,
+    hostedVersionSecrets(target),
+    hostedVersionSecrets(target),
+  );
+  const freshCandidate = await topologyReverseCandidate(
+    "preflight",
+    target,
+    state,
+    fresh.history,
+    fresh,
+    selector,
+  );
+  if (freshCandidate.versionId !== predecessorId) {
+    throw preflightError("topology retirement reverse candidate changed before mutation");
+  }
+  if (
+    freshCandidate.service.service !== service.service ||
+    freshCandidate.service.entrypoint !== service.entrypoint
+  ) {
+    throw preflightError("topology retirement reverse service changed before mutation");
+  }
   const mutation = await run(
     wranglerCommand([
       "versions",
@@ -800,6 +923,7 @@ async function runTokenRetirement(
   run: RetirementProcess,
   options: RetirementOptions,
 ): Promise<Record<string, unknown>> {
+  const selector = requiredPredecessorSelector(invocation);
   const root =
     options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-token-retirement-"));
   const temporary = options.outputDirectory === undefined;
@@ -820,12 +944,70 @@ async function runTokenRetirement(
       state,
       beforeHistory,
       null,
-      versionSecretsForRetiredToken(target, beforeVersion),
+      beforeHasToken ? hostedVersionSecrets(target) : baseWorkerSecrets(target),
       beforeHasToken ? hostedVersionSecrets(target) : baseWorkerSecrets(target),
     );
-    const predecessorService = beforeHasToken
-      ? await requireDirectServicePredecessor("preflight", target, state, beforeHistory, before)
-      : await requireDirectTopologyPredecessor("preflight", target, state, beforeHistory, before);
+    let predecessorService: LegacyHostServiceBinding;
+    let directTokenRetirement = false;
+    if (beforeHasToken) {
+      const directPredecessorId = beforeHistory.previousVersionId;
+      if (directPredecessorId === null) {
+        throw preflightError("token retirement requires one direct candidate predecessor");
+      }
+      const directPredecessor = await readVersionAt(
+        "preflight",
+        target,
+        state,
+        directPredecessorId,
+      );
+      if (hasMaterializerBinding(directPredecessor)) {
+        await assertPinnedLineage(
+          "preflight",
+          target,
+          state,
+          beforeHistory,
+          selector,
+          2,
+          "token retirement requires the pinned legacy predecessor behind the candidate topology",
+        );
+        predecessorService = await requireDirectServicePredecessor(
+          "preflight",
+          target,
+          state,
+          beforeHistory,
+          before,
+        );
+        directTokenRetirement = true;
+      } else {
+        // A token reverse creates T' on top of the already retired R. Status
+        // may reconcile that bounded extension, but another forward/delete
+        // must first restore the topology and establish a fresh direct chain.
+        const candidate = await topologyReverseCandidate(
+          "preflight",
+          target,
+          state,
+          beforeHistory,
+          before,
+          selector,
+        );
+        predecessorService = candidate.service;
+        if (invocation.action !== "status") {
+          throw preflightError(
+            "Hosted token retirement requires topology reverse before another token transition",
+          );
+        }
+      }
+    } else {
+      predecessorService = await requireDirectTopologyPredecessor(
+        "preflight",
+        target,
+        state,
+        beforeHistory,
+        before,
+        selector,
+      );
+    }
+    await assertPinnedSelectorVersion("preflight", target, state, selector, predecessorService);
     if (invocation.action === "status") {
       return {
         kind: "takoserver.hosted-token-retirement-status@v1",
@@ -842,6 +1024,11 @@ async function runTokenRetirement(
         predecessorService: predecessorService.service,
         predecessorEntrypoint: predecessorService.entrypoint,
       };
+    }
+    if (beforeHasToken && !directTokenRetirement) {
+      throw preflightError(
+        "Hosted token retirement requires topology reverse before another token transition",
+      );
     }
     const reviewer = exactReviewer(
       options.review ?? requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW"),
@@ -864,6 +1051,7 @@ async function runTokenRetirement(
         before,
         reviewer,
         configPath,
+        selector,
       );
     }
     if (!beforeHasToken) {
@@ -874,6 +1062,45 @@ async function runTokenRetirement(
         "Hosted token retirement commit must equal the currently served candidate",
       );
     }
+    const fresh = await assertCurrentRetirementState(
+      "preflight",
+      target,
+      state,
+      beforeHistory,
+      before,
+      null,
+      hostedVersionSecrets(target),
+      hostedVersionSecrets(target),
+    );
+    await assertPinnedLineage(
+      "preflight",
+      target,
+      state,
+      fresh.history,
+      selector,
+      2,
+      "token retirement requires the pinned legacy predecessor behind the candidate topology",
+    );
+    const freshPredecessorService = await requireDirectServicePredecessor(
+      "preflight",
+      target,
+      state,
+      fresh.history,
+      fresh,
+    );
+    if (
+      freshPredecessorService.service !== predecessorService.service ||
+      freshPredecessorService.entrypoint !== predecessorService.entrypoint
+    ) {
+      throw preflightError("token retirement predecessor service changed before mutation");
+    }
+    await assertPinnedSelectorVersion(
+      "preflight",
+      target,
+      state,
+      selector,
+      freshPredecessorService,
+    );
     const mutation = await run(
       wranglerCommand([
         "secret",
@@ -899,14 +1126,13 @@ async function runTokenRetirement(
     ) {
       throw verificationError("Hosted token retirement did not create the exact direct successor");
     }
-    const afterVersion = await readVersionAt("verification", target, state, afterHistory.versionId);
     const after = await inspectRetirementVersionAt(
       "verification",
       target,
       state,
       afterHistory,
       null,
-      versionSecretsForRetiredToken(target, afterVersion),
+      baseWorkerSecrets(target),
       baseWorkerSecrets(target),
     );
     if (after.commit !== before.commit || after.bundleDigestHex !== before.bundleDigestHex) {
@@ -939,6 +1165,7 @@ async function reverseToken(
   before: RetirementLiveWorkerVersion,
   reviewer: string,
   configPath: string,
+  selector: string,
 ): Promise<Record<string, unknown>> {
   if (inventoryHasSecret(await state.workerSecrets(target.workerName), HOSTED_SPONSORSHIP_SECRET)) {
     throw preflightError("Hosted token retirement reverse requires the legacy secret to be absent");
@@ -946,6 +1173,26 @@ async function reverseToken(
   const token = readHostedToken(
     options.tokenPath ?? requireEnvironment("TAKOSERVER_HOSTED_TOKEN_PATH"),
   );
+  const fresh = await assertCurrentRetirementState(
+    "preflight",
+    target,
+    state,
+    beforeHistory,
+    before,
+    null,
+    baseWorkerSecrets(target),
+    baseWorkerSecrets(target),
+  );
+  await assertPinnedLineage(
+    "preflight",
+    target,
+    state,
+    fresh.history,
+    selector,
+    3,
+    "token retirement reverse requires the pinned legacy predecessor behind the retired topology",
+  );
+  await topologyReverseCandidate("preflight", target, state, fresh.history, fresh, selector);
   const mutation = await run(
     wranglerCommand([
       "secret",
@@ -973,14 +1220,13 @@ async function reverseToken(
       "Hosted token retirement reverse did not create the exact direct successor",
     );
   }
-  const afterVersion = await readVersionAt("verification", target, state, afterHistory.versionId);
   const after = await inspectRetirementVersionAt(
     "verification",
     target,
     state,
     afterHistory,
     null,
-    versionSecretsForRetiredToken(target, afterVersion),
+    hostedVersionSecrets(target),
     hostedVersionSecrets(target),
   );
   if (after.commit !== before.commit || after.bundleDigestHex !== before.bundleDigestHex) {
@@ -1052,6 +1298,58 @@ async function inspectRetirementVersionAt(
     expectedInventorySecrets,
     signingKeyId: target.signing.currentKeyId,
   });
+}
+
+/**
+ * Re-reads the authoritative current Version and its closure immediately
+ * before a retirement mutation. Provider APIs do not expose a CAS token, so
+ * comparing every returned history identity is the fail-closed serialization
+ * boundary available to this command.
+ */
+async function assertCurrentRetirementState(
+  phase: DeployPhase,
+  target: DeployTarget,
+  state: RetirementState,
+  expectedHistory: WorkerDeploymentHistory,
+  expected: RetirementLiveWorkerVersion,
+  expectedServiceBinding: LegacyHostServiceBinding | null,
+  expectedVersionSecrets: readonly string[],
+  expectedInventorySecrets: readonly string[],
+): Promise<RetirementLiveWorkerVersion> {
+  const freshHistory = await currentHistory(phase, target, state);
+  if (!sameDeploymentHistory(freshHistory, expectedHistory)) {
+    throw phaseError(phase, "retirement Worker changed before mutation");
+  }
+  const fresh = await inspectRetirementVersionAt(
+    phase,
+    target,
+    state,
+    freshHistory,
+    expectedServiceBinding,
+    expectedVersionSecrets,
+    expectedInventorySecrets,
+  );
+  if (!sameDeploymentHistory(fresh.history, expectedHistory)) {
+    throw phaseError(phase, "retirement Worker changed during pre-mutation inspection");
+  }
+  if (fresh.commit !== expected.commit || fresh.bundleDigestHex !== expected.bundleDigestHex) {
+    throw phaseError(phase, "retirement Worker code identity changed before mutation");
+  }
+  if (fresh.hostedTokenPresent !== expected.hostedTokenPresent) {
+    throw phaseError(phase, "retirement Worker secret state changed before mutation");
+  }
+  return fresh;
+}
+
+function sameDeploymentHistory(
+  left: WorkerDeploymentHistory,
+  right: WorkerDeploymentHistory,
+): boolean {
+  return (
+    left.deploymentId === right.deploymentId &&
+    left.versionId === right.versionId &&
+    left.previousVersionId === right.previousVersionId
+  );
 }
 
 function assertRetirementVersionShape(
@@ -1126,12 +1424,6 @@ function baseWorkerSecrets(target: DeployTarget): readonly string[] {
   return expectedWorkerSecrets(target).filter((name) => name !== HOSTED_SPONSORSHIP_SECRET);
 }
 
-function versionSecretsForRetiredToken(target: DeployTarget, version: unknown): readonly string[] {
-  return hasSecretBinding(version, HOSTED_SPONSORSHIP_SECRET)
-    ? hostedVersionSecrets(target)
-    : baseWorkerSecrets(target);
-}
-
 function hasSecretBinding(version: unknown, name: string): boolean {
   if (
     !isRecord(version) ||
@@ -1200,6 +1492,25 @@ async function requireDirectServicePredecessor(
   return service;
 }
 
+async function assertPinnedSelectorVersion(
+  phase: DeployPhase,
+  target: DeployTarget,
+  state: RetirementState,
+  selector: string,
+  service: LegacyHostServiceBinding,
+): Promise<void> {
+  const predecessor = await readVersionAt(phase, target, state, selector);
+  assertRetirementVersionShape(
+    phase,
+    target,
+    state,
+    selector,
+    predecessor,
+    service,
+    hostedVersionSecrets(target),
+  );
+}
+
 /** Verifies the topology-retired Version immediately before token reverse. */
 async function requireDirectTopologyPredecessor(
   phase: DeployPhase,
@@ -1207,7 +1518,17 @@ async function requireDirectTopologyPredecessor(
   state: RetirementState,
   history: WorkerDeploymentHistory,
   current: RetirementLiveWorkerVersion,
+  selector: string,
 ): Promise<LegacyHostServiceBinding> {
+  await assertPinnedLineage(
+    phase,
+    target,
+    state,
+    history,
+    selector,
+    3,
+    "token retirement requires the pinned legacy predecessor behind the retired topology",
+  );
   const predecessorId = history.previousVersionId;
   if (predecessorId === null) {
     throw phaseError(phase, "token retirement requires one direct topology predecessor");
@@ -1237,7 +1558,14 @@ async function requireDirectTopologyPredecessor(
       ? hostedVersionSecrets(target)
       : baseWorkerSecrets(target),
   );
-  const candidate = await topologyReverseCandidate(phase, target, state, history, current);
+  const candidate = await topologyReverseCandidate(
+    phase,
+    target,
+    state,
+    history,
+    current,
+    selector,
+  );
   return candidate.service;
 }
 
@@ -1252,8 +1580,11 @@ interface TopologyReverseCandidate {
 /**
  * Finds the candidate code Version for topology reverse. A token reverse
  * creates T' as a new Version, so the candidate is no longer the immediate
- * deployment predecessor; every intervening Version must still be the same
- * code identity and carry only the expected service/secret transition shape.
+ * deployment predecessor. The only accepted ancestry is the bounded
+ * L -> C -> T -> R chain (or its token-reverse T' -> R extension); every
+ * intervening Version must carry the exact semantic binding/secret shape.
+ * The walk is capped at the known four-edge suffix and never scans older
+ * provider history for a shape that merely happens to look like a candidate.
  */
 async function topologyReverseCandidate(
   phase: DeployPhase,
@@ -1261,60 +1592,313 @@ async function topologyReverseCandidate(
   state: RetirementState,
   currentHistory: WorkerDeploymentHistory,
   current: RetirementLiveWorkerVersion,
+  selector: string,
 ): Promise<TopologyReverseCandidate> {
   const chain = await deploymentChain(phase, target, state);
-  if (chain[0]?.versionId !== currentHistory.versionId) {
+  if (
+    chain[0]?.versionId !== currentHistory.versionId ||
+    chain[0]?.deploymentId !== currentHistory.deploymentId
+  ) {
     throw phaseError(phase, "retirement deployment history changed during predecessor inspection");
   }
-  for (let index = 1; index < chain.length; index += 1) {
-    const versionId = chain[index]?.versionId;
-    if (versionId === undefined) continue;
-    const version = await readVersionAt(phase, target, state, versionId);
-    const identity = versionIdentity(version);
-    if (
-      current.commit !== null &&
-      current.bundleDigestHex !== null &&
-      (identity === null ||
-        identity.commit !== current.commit ||
-        identity.bundleDigestHex !== current.bundleDigestHex)
-    ) {
-      throw phaseError(phase, "retirement predecessor identity changed across a direct successor");
+  const first = chain[1];
+  if (first === undefined) {
+    throw phaseError(phase, "retirement requires one direct candidate predecessor");
+  }
+
+  let candidateIndex: 1 | 2 | 3;
+  const firstVersion = await readVersionAt(phase, target, state, first.versionId);
+  if (hasMaterializerBinding(firstVersion)) {
+    if (!current.hostedTokenPresent) {
+      throw phaseError(phase, "token-retired topology has no direct topology predecessor");
     }
-    if (hasMaterializerBinding(version)) {
-      const service = extractLegacyHostServiceBinding(phase, versionId, version);
-      assertRetirementVersionShape(
-        phase,
-        target,
-        state,
-        versionId,
-        version,
-        service,
-        hostedVersionSecrets(target),
-      );
-      return {
-        versionId,
-        version,
-        service,
-        commit: identity?.commit ?? null,
-        bundleDigestHex: identity?.bundleDigestHex ?? null,
-      };
-    }
-    // Intervening token/topology Versions are valid only when their binding
-    // closure remains the selected target and their secret presence is
-    // explicit. This rejects unrelated history instead of guessing a rollback.
-    assertRetirementVersionShape(
+    candidateIndex = 1;
+  } else if (current.hostedTokenPresent) {
+    // R' -> R -> T -> C -> L after token reverse. The current Version is
+    // topology-shaped again, while its direct predecessor is token-shaped.
+    await assertReverseAncestor(
       phase,
       target,
       state,
-      versionId,
-      version,
-      null,
-      hasSecretBinding(version, HOSTED_SPONSORSHIP_SECRET)
-        ? hostedVersionSecrets(target)
-        : baseWorkerSecrets(target),
+      current,
+      chain,
+      1,
+      false,
+      "topology retirement reverse contains an unrelated token predecessor",
+    );
+    await assertReverseAncestor(
+      phase,
+      target,
+      state,
+      current,
+      chain,
+      2,
+      true,
+      "topology retirement reverse contains an unrelated topology predecessor",
+    );
+    candidateIndex = 3;
+  } else {
+    // R -> T -> C -> L after token retirement.
+    await assertReverseAncestor(
+      phase,
+      target,
+      state,
+      current,
+      chain,
+      1,
+      true,
+      "token-retired topology has an unrelated direct predecessor",
+    );
+    candidateIndex = 2;
+  }
+
+  const candidateEntry = chain[candidateIndex];
+  if (candidateEntry === undefined || chain[candidateIndex + 1]?.versionId !== selector) {
+    throw phaseError(
+      phase,
+      "retirement candidate is not the direct successor of the pinned legacy predecessor",
     );
   }
-  throw phaseError(phase, "retirement requires one direct candidate predecessor");
+  assertUniqueLineage(phase, chain, candidateIndex + 1);
+  const version = await readVersionAt(phase, target, state, candidateEntry.versionId);
+  const identity = versionIdentity(version);
+  if (
+    current.commit !== null &&
+    current.bundleDigestHex !== null &&
+    (identity === null ||
+      identity.commit !== current.commit ||
+      identity.bundleDigestHex !== current.bundleDigestHex)
+  ) {
+    throw phaseError(phase, "retirement predecessor identity changed across a direct successor");
+  }
+  const service = extractLegacyHostServiceBinding(phase, candidateEntry.versionId, version);
+  assertRetirementVersionShape(
+    phase,
+    target,
+    state,
+    candidateEntry.versionId,
+    version,
+    service,
+    hostedVersionSecrets(target),
+  );
+  const selectorVersion = await readVersionAt(phase, target, state, selector);
+  assertRetirementVersionShape(
+    phase,
+    target,
+    state,
+    selector,
+    selectorVersion,
+    service,
+    hostedVersionSecrets(target),
+  );
+  return {
+    versionId: candidateEntry.versionId,
+    version,
+    service,
+    commit: identity?.commit ?? null,
+    bundleDigestHex: identity?.bundleDigestHex ?? null,
+  };
+}
+
+/**
+ * Reconciles a topology reverse that already became current before its
+ * acknowledgement was lost. The current candidate is the C' head of either
+ * bounded rollback suffix C' -> T -> C -> P or
+ * C' -> T' -> R -> T -> C -> P. This is intentionally a separate classifier
+ * from topologyReverseCandidate: the latter starts at a retired topology head
+ * (T, R, or T'), whereas this branch starts after provider history has
+ * restored a service-bearing candidate.
+ */
+async function topologyCandidateRestored(
+  phase: DeployPhase,
+  target: DeployTarget,
+  state: RetirementState,
+  currentHistory: WorkerDeploymentHistory,
+  current: RetirementLiveWorkerVersion,
+  selector: string,
+): Promise<TopologyReverseCandidate> {
+  const chain = await deploymentChain(phase, target, state);
+  if (
+    chain[0]?.versionId !== currentHistory.versionId ||
+    chain[0]?.deploymentId !== currentHistory.deploymentId
+  ) {
+    throw phaseError(phase, "retirement deployment history changed during predecessor inspection");
+  }
+  // Direct topology reverse: C' -> T -> C -> P. The same immutable C may be
+  // redeployed as C'; that is the one permitted Version-ID repetition.
+  const directCandidateEntry = chain[2];
+  if (directCandidateEntry !== undefined) {
+    const directCandidate = await readVersionAt(
+      phase,
+      target,
+      state,
+      directCandidateEntry.versionId,
+    );
+    if (hasMaterializerBinding(directCandidate)) {
+      if (chain[3]?.versionId !== selector) {
+        throw phaseError(
+          phase,
+          "topology retirement restored candidate is not anchored to the pinned legacy predecessor",
+        );
+      }
+      if (chain[0]?.versionId !== directCandidateEntry.versionId) {
+        throw phaseError(
+          phase,
+          "topology retirement reverse minted an unexpected candidate Version",
+        );
+      }
+      const candidateEntry = directCandidateEntry;
+      assertUniqueLineage(phase, chain, 3, [0, 2]);
+      await assertReverseAncestor(
+        phase,
+        target,
+        state,
+        current,
+        chain,
+        1,
+        true,
+        "topology retirement restored candidate contains an unrelated topology predecessor",
+      );
+      return await readRestoredCandidate(phase, target, state, current, selector, candidateEntry);
+    }
+  }
+
+  // Full reverse: C' -> T' -> R -> T -> C -> P. T' retained the token, R
+  // removed it, and T retained it again before the original candidate C.
+  const candidateEntry = chain[4];
+  if (candidateEntry === undefined) {
+    throw phaseError(phase, "topology retirement reverse minted an unexpected candidate Version");
+  }
+  if (chain[5]?.versionId !== selector) {
+    throw phaseError(
+      phase,
+      "topology retirement restored candidate is not anchored to the pinned legacy predecessor",
+    );
+  }
+  if (chain[0]?.versionId !== candidateEntry.versionId) {
+    throw phaseError(phase, "topology retirement reverse minted an unexpected candidate Version");
+  }
+  assertUniqueLineage(phase, chain, 5, [0, 4]);
+  await assertReverseAncestor(
+    phase,
+    target,
+    state,
+    current,
+    chain,
+    1,
+    true,
+    "topology retirement restored candidate contains an unrelated token predecessor",
+  );
+  await assertReverseAncestor(
+    phase,
+    target,
+    state,
+    current,
+    chain,
+    2,
+    false,
+    "topology retirement restored candidate contains an unrelated retired token Version",
+  );
+  await assertReverseAncestor(
+    phase,
+    target,
+    state,
+    current,
+    chain,
+    3,
+    true,
+    "topology retirement restored candidate contains an unrelated topology Version",
+  );
+  return await readRestoredCandidate(phase, target, state, current, selector, candidateEntry);
+}
+
+async function readRestoredCandidate(
+  phase: DeployPhase,
+  target: DeployTarget,
+  state: RetirementState,
+  current: RetirementLiveWorkerVersion,
+  selector: string,
+  candidateEntry: DeploymentChainEntry,
+): Promise<TopologyReverseCandidate> {
+  const version = await readVersionAt(phase, target, state, candidateEntry.versionId);
+  const identity = versionIdentity(version);
+  if (
+    current.commit !== null &&
+    current.bundleDigestHex !== null &&
+    (identity === null ||
+      identity.commit !== current.commit ||
+      identity.bundleDigestHex !== current.bundleDigestHex)
+  ) {
+    throw phaseError(
+      phase,
+      "retirement restored candidate identity changed across provider history",
+    );
+  }
+  const service = extractLegacyHostServiceBinding(phase, candidateEntry.versionId, version);
+  assertRetirementVersionShape(
+    phase,
+    target,
+    state,
+    candidateEntry.versionId,
+    version,
+    service,
+    hostedVersionSecrets(target),
+  );
+  const selectorVersion = await readVersionAt(phase, target, state, selector);
+  assertRetirementVersionShape(
+    phase,
+    target,
+    state,
+    selector,
+    selectorVersion,
+    service,
+    hostedVersionSecrets(target),
+  );
+  return {
+    versionId: candidateEntry.versionId,
+    version,
+    service,
+    commit: identity?.commit ?? null,
+    bundleDigestHex: identity?.bundleDigestHex ?? null,
+  };
+}
+
+async function assertReverseAncestor(
+  phase: DeployPhase,
+  target: DeployTarget,
+  state: RetirementState,
+  current: RetirementLiveWorkerVersion,
+  chain: readonly DeploymentChainEntry[],
+  index: number,
+  hostedToken: boolean,
+  message: string,
+): Promise<void> {
+  const entry = chain[index];
+  if (entry === undefined) throw phaseError(phase, message);
+  const version = await readVersionAt(phase, target, state, entry.versionId);
+  const identity = versionIdentity(version);
+  if (
+    current.commit !== null &&
+    current.bundleDigestHex !== null &&
+    (identity === null ||
+      identity.commit !== current.commit ||
+      identity.bundleDigestHex !== current.bundleDigestHex)
+  ) {
+    throw phaseError(phase, "retirement predecessor identity changed across a direct successor");
+  }
+  if (hasMaterializerBinding(version)) throw phaseError(phase, message);
+  if (hasSecretBinding(version, HOSTED_SPONSORSHIP_SECRET) !== hostedToken) {
+    throw phaseError(phase, message);
+  }
+  assertRetirementVersionShape(
+    phase,
+    target,
+    state,
+    entry.versionId,
+    version,
+    null,
+    hostedToken ? hostedVersionSecrets(target) : baseWorkerSecrets(target),
+  );
 }
 
 interface DeploymentChainEntry {
@@ -1337,6 +1921,9 @@ async function deploymentChain(
     if (parsed === null) {
       throw phaseError(phase, "Worker deployment history contains no Version for retirement");
     }
+    if (!isWorkerVersionId(parsed.versionId)) {
+      throw phaseError(phase, "Worker deployment history contains an invalid Version ID");
+    }
     return {
       deploymentId: parsed.deploymentId,
       versionId: parsed.versionId,
@@ -1344,11 +1931,66 @@ async function deploymentChain(
     };
   });
   entries.sort((left, right) => right.createdOn.localeCompare(left.createdOn));
-  const ids = entries.map((entry) => entry.versionId);
-  if (new Set(ids).size !== ids.length) {
-    throw phaseError(phase, "Worker deployment history contains duplicate retirement Versions");
+  // A provider-history rollback can legitimately surface the same immutable
+  // Version more than once under distinct deployments. Deployment identities
+  // remain unique and are checked globally; repeated Version IDs are valid
+  // rollback history and are classified by their bounded semantic position.
+  const deploymentIds = entries.map(({ deploymentId }) => deploymentId);
+  if (new Set(deploymentIds).size !== deploymentIds.length) {
+    throw phaseError(phase, "Worker deployment history contains duplicate deployment IDs");
   }
   return entries;
+}
+
+async function assertPinnedLineage(
+  phase: DeployPhase,
+  target: DeployTarget,
+  state: RetirementState,
+  current: WorkerDeploymentHistory,
+  selector: string,
+  distance: 1 | 2 | 3,
+  message: string,
+): Promise<void> {
+  const chain = await deploymentChain(phase, target, state);
+  if (
+    chain[0]?.versionId !== current.versionId ||
+    chain[0]?.deploymentId !== current.deploymentId
+  ) {
+    throw phaseError(phase, "retirement deployment history changed during predecessor inspection");
+  }
+  assertUniqueLineage(phase, chain, distance);
+  if (chain[distance]?.versionId !== selector) {
+    throw phaseError(phase, message);
+  }
+}
+
+function assertUniqueLineage(
+  phase: DeployPhase,
+  chain: readonly DeploymentChainEntry[],
+  throughIndex: number,
+  allowedVersionRepeat?: readonly [number, number],
+): void {
+  if (throughIndex > MAX_RETIREMENT_ANCESTRY_DISTANCE) {
+    throw phaseError(phase, "retirement lineage exceeds the bounded ancestry depth");
+  }
+  const deploymentIds = chain.slice(0, throughIndex + 1).map(({ deploymentId }) => deploymentId);
+  if (new Set(deploymentIds).size !== deploymentIds.length) {
+    throw phaseError(phase, "retirement lineage contains a duplicate deployment");
+  }
+  const versionIds = chain.slice(0, throughIndex + 1).map(({ versionId }) => versionId);
+  for (let left = 0; left < versionIds.length; left += 1) {
+    for (let right = left + 1; right < versionIds.length; right += 1) {
+      if (versionIds[left] === versionIds[right]) {
+        const permitted =
+          allowedVersionRepeat !== undefined &&
+          ((left === allowedVersionRepeat[0] && right === allowedVersionRepeat[1]) ||
+            (left === allowedVersionRepeat[1] && right === allowedVersionRepeat[0]));
+        if (!permitted) {
+          throw phaseError(phase, "retirement lineage contains an unexpected Version cycle");
+        }
+      }
+    }
+  }
 }
 
 function versionIdentity(
@@ -1365,6 +2007,19 @@ function digestValue(digest: string | null): string | null {
   return digest === null ? null : `sha256:${digest}`;
 }
 
+function requiredPredecessorSelector(invocation: RetirementInvocation): string {
+  const selector = invocation.legacyHostRuntimePredecessorVersionId;
+  if (selector === undefined) {
+    throw preflightError(
+      `${invocation.surface} requires --legacy-host-runtime-predecessor-version=<uuid>`,
+    );
+  }
+  if (!isWorkerVersionId(selector)) {
+    throw preflightError("legacy Host-runtime predecessor Version ID must be one exact UUID");
+  }
+  return selector;
+}
+
 function validateInvocation(invocation: RetirementInvocation, target: DeployTarget): void {
   if (target.environment !== invocation.environment) {
     throw preflightError("retirement invocation and target environments differ");
@@ -1377,26 +2032,13 @@ function validateInvocation(invocation: RetirementInvocation, target: DeployTarg
   }
   if (
     invocation.surface !== "takoserver-worker-authority-cutover" &&
+    invocation.surface !== "takoserver-host-runtime-topology-retirement" &&
+    invocation.surface !== "takoserver-hosted-token-retirement" &&
     invocation.legacyHostRuntimePredecessorVersionId !== undefined
   ) {
-    throw preflightError("legacy Host-runtime predecessor selector is authority-transition-only");
+    throw preflightError("legacy Host-runtime predecessor selector is retirement-only");
   }
-  if (
-    invocation.legacyHostRuntimePredecessorVersionId !== undefined &&
-    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(
-      invocation.legacyHostRuntimePredecessorVersionId,
-    )
-  ) {
-    throw preflightError("legacy Host-runtime predecessor Version ID must be one exact UUID");
-  }
-  if (
-    invocation.surface === "takoserver-worker-authority-cutover" &&
-    invocation.legacyHostRuntimePredecessorVersionId === undefined
-  ) {
-    throw preflightError(
-      "authority transition requires the legacy Host-runtime predecessor selector",
-    );
-  }
+  requiredPredecessorSelector(invocation);
 }
 
 function exactReviewer(value: string): string {

@@ -25,6 +25,9 @@ const VERSION_CANDIDATE = "00000000-0000-4000-8000-000000000002";
 const VERSION_TOPOLOGY = "00000000-0000-4000-8000-000000000003";
 const VERSION_TOKEN = "00000000-0000-4000-8000-000000000004";
 const VERSION_TOKEN_RESTORED = "00000000-0000-4000-8000-000000000005";
+const VERSION_WRONG = "00000000-0000-4000-8000-000000000009";
+const VERSION_INTERLEAVED = "00000000-0000-4000-8000-00000000000a";
+const VERSION_REBOUND = "00000000-0000-4000-8000-00000000000b";
 const SERVICE = "takosumi-platform";
 const ENTRYPOINT = "TakosumiHostRuntimeMaterializerEntrypoint";
 
@@ -131,6 +134,21 @@ describe("reviewed Hosted legacy-edge retirement", () => {
       expect(
         fixture.mutations.filter(({ command }) => command.includes("--no-bundle")),
       ).toHaveLength(1);
+      const status = await runRetirement(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+        },
+        target,
+        { run: fixture.run, state: fixture.state },
+      );
+      expect(status).toMatchObject({
+        state: "candidate",
+        versionId: VERSION_CANDIDATE,
+      });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -183,6 +201,7 @@ describe("reviewed Hosted legacy-edge retirement", () => {
           action: "apply",
           environment: "integration",
           commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
         },
         target,
         {
@@ -208,6 +227,55 @@ describe("reviewed Hosted legacy-edge retirement", () => {
     }
   });
 
+  test("topology retirement rechecks authoritative state after sealing the artifact", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-topology-race-"));
+    try {
+      const fixture = stateFixture("candidate");
+      let raced = false;
+      const run: RetirementProcess = async (command, options) => {
+        const result = await fixture.run(command, options);
+        if (command.join(" ") === "bun run check") raced = true;
+        return result;
+      };
+      const state: RetirementState = {
+        ...fixture.state,
+        async workerDeployments(workerName) {
+          const history = await fixture.state.workerDeployments(workerName);
+          if (!raced) return history;
+          return [
+            deployment("deployment-topology", VERSION_TOPOLOGY, "2026-08-29T06:00:00Z"),
+            deployment("deployment-candidate", VERSION_CANDIDATE, "2026-08-29T05:00:00Z"),
+            deployment("deployment-legacy", VERSION_LEGACY, "2026-08-29T04:00:00Z"),
+          ];
+        },
+      };
+      await expect(
+        runRetirement(
+          {
+            surface: "takoserver-host-runtime-topology-retirement",
+            action: "apply",
+            environment: "integration",
+            commit: COMMIT,
+            legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+          },
+          target,
+          {
+            run,
+            state,
+            outputDirectory: root,
+            review: "reviewer@example.test",
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          },
+        ),
+      ).rejects.toThrow("changed before mutation");
+      expect(
+        fixture.mutations.filter(({ command }) => command.includes("--no-bundle")),
+      ).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("topology upload acknowledgement loss stops without a second mutation", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-topology-ack-loss-"));
     try {
@@ -219,6 +287,7 @@ describe("reviewed Hosted legacy-edge retirement", () => {
             action: "apply",
             environment: "integration",
             commit: COMMIT,
+            legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
           },
           target,
           {
@@ -233,6 +302,21 @@ describe("reviewed Hosted legacy-edge retirement", () => {
       expect(
         fixture.mutations.filter(({ command }) => command.includes("--no-bundle")),
       ).toHaveLength(1);
+      const status = await runRetirement(
+        {
+          surface: "takoserver-host-runtime-topology-retirement",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+        },
+        target,
+        { run: fixture.run, state: fixture.state },
+      );
+      expect(status).toMatchObject({
+        state: "topology-retired",
+        versionId: VERSION_TOPOLOGY,
+      });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -249,6 +333,7 @@ describe("reviewed Hosted legacy-edge retirement", () => {
           reverse: true,
           environment: "integration",
           commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
         },
         target,
         {
@@ -274,6 +359,194 @@ describe("reviewed Hosted legacy-edge retirement", () => {
     }
   });
 
+  test("topology reverse acknowledgement loss is reconciled on the direct retained history", async () => {
+    const root = mkdtempSync(
+      join(tmpdir(), "takoserver-retirement-topology-reverse-direct-ack-loss-"),
+    );
+    try {
+      const fixture = stateFixture("topology", "topology-reverse-ack-loss");
+      await expect(
+        runRetirement(
+          {
+            surface: "takoserver-host-runtime-topology-retirement",
+            action: "apply",
+            reverse: true,
+            environment: "integration",
+            commit: COMMIT,
+            legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+          },
+          target,
+          {
+            run: fixture.run,
+            state: fixture.state,
+            outputDirectory: root,
+            review: "reviewer@example.test",
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          },
+        ),
+      ).rejects.toThrow("indeterminate");
+      const status = await runRetirement(
+        {
+          surface: "takoserver-host-runtime-topology-retirement",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+        },
+        target,
+        { run: fixture.run, state: fixture.state },
+      );
+      expect(status).toMatchObject({
+        state: "candidate-restored",
+        versionId: VERSION_CANDIDATE,
+        previousVersionId: VERSION_CANDIDATE,
+      });
+      expect(
+        fixture.mutations.filter(
+          ({ command }) => command.includes("versions") && command.includes("deploy"),
+        ),
+      ).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("topology reverse rechecks authoritative state immediately before redeploy", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-topology-reverse-race-"));
+    try {
+      const fixture = stateFixture("topology");
+      let deploymentReads = 0;
+      const state: RetirementState = {
+        ...fixture.state,
+        async workerDeployments(workerName) {
+          deploymentReads += 1;
+          const history = await fixture.state.workerDeployments(workerName);
+          if (deploymentReads < 5) return history;
+          return [
+            deployment("deployment-candidate-race", VERSION_CANDIDATE, "2026-08-29T06:00:00Z"),
+            deployment("deployment-topology", VERSION_TOPOLOGY, "2026-08-29T05:00:00Z"),
+            deployment("deployment-candidate", VERSION_CANDIDATE, "2026-08-29T04:00:00Z"),
+            deployment("deployment-legacy", VERSION_LEGACY, "2026-08-29T03:00:00Z"),
+          ];
+        },
+      };
+      await expect(
+        runRetirement(
+          {
+            surface: "takoserver-host-runtime-topology-retirement",
+            action: "apply",
+            reverse: true,
+            environment: "integration",
+            commit: COMMIT,
+            legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+          },
+          target,
+          {
+            run: fixture.run,
+            state,
+            outputDirectory: root,
+            review: "reviewer@example.test",
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          },
+        ),
+      ).rejects.toThrow("changed before mutation");
+      expect(
+        fixture.mutations.filter(
+          ({ command }) => command.includes("versions") && command.includes("deploy"),
+        ),
+      ).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("topology reverse walks the bounded token-reverse ancestry", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-topology-reverse-token-"));
+    try {
+      const fixture = stateFixture("tokenRestored");
+      const result = await runRetirement(
+        {
+          surface: "takoserver-host-runtime-topology-retirement",
+          action: "apply",
+          reverse: true,
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+        },
+        target,
+        {
+          run: fixture.run,
+          state: fixture.state,
+          outputDirectory: root,
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+      expect(result).toMatchObject({
+        state: "candidate-restored",
+        versionId: VERSION_CANDIDATE,
+        reverse: { exactVersionId: VERSION_CANDIDATE },
+      });
+      expect(
+        fixture.mutations.filter(
+          ({ command }) => command.includes("versions") && command.includes("deploy"),
+        ),
+      ).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("topology reverse acknowledgement loss is reconciled on the full retained history", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-topology-reverse-ack-loss-"));
+    try {
+      const fixture = stateFixture("tokenRestored", "topology-reverse-ack-loss");
+      await expect(
+        runRetirement(
+          {
+            surface: "takoserver-host-runtime-topology-retirement",
+            action: "apply",
+            reverse: true,
+            environment: "integration",
+            commit: COMMIT,
+            legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+          },
+          target,
+          {
+            run: fixture.run,
+            state: fixture.state,
+            outputDirectory: root,
+            review: "reviewer@example.test",
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          },
+        ),
+      ).rejects.toThrow("indeterminate");
+      const status = await runRetirement(
+        {
+          surface: "takoserver-host-runtime-topology-retirement",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+        },
+        target,
+        { run: fixture.run, state: fixture.state },
+      );
+      expect(status).toMatchObject({
+        state: "candidate-restored",
+        versionId: VERSION_CANDIDATE,
+        previousVersionId: VERSION_CANDIDATE,
+      });
+      expect(
+        fixture.mutations.filter(
+          ({ command }) => command.includes("versions") && command.includes("deploy"),
+        ),
+      ).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("token retirement deletes last and reverse re-puts the owned token", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-token-"));
     try {
@@ -286,6 +559,7 @@ describe("reviewed Hosted legacy-edge retirement", () => {
           action: "apply",
           environment: "integration",
           commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
         },
         target,
         {
@@ -308,7 +582,6 @@ describe("reviewed Hosted legacy-edge retirement", () => {
       expect(mutations).toHaveLength(1);
       expect(mutations[0]?.command.join(" ")).toContain("secret delete");
 
-      const reverseFixture = stateFixture("token");
       const reversed = await runRetirement(
         {
           surface: "takoserver-hosted-token-retirement",
@@ -316,11 +589,12 @@ describe("reviewed Hosted legacy-edge retirement", () => {
           reverse: true,
           environment: "integration",
           commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
         },
         target,
         {
-          run: reverseFixture.run,
-          state: reverseFixture.state,
+          run: fixture.run,
+          state: fixture.state,
           tokenPath,
           outputDirectory: join(root, "reverse"),
           review: "reviewer@example.test",
@@ -332,12 +606,36 @@ describe("reviewed Hosted legacy-edge retirement", () => {
         versionId: VERSION_TOKEN_RESTORED,
         previousVersionId: VERSION_TOKEN,
       });
-      const reverseMutations = reverseFixture.mutations.filter(
+      const reverseMutations = fixture.mutations.filter(
         ({ command }) => command.includes("secret") && command.includes("put"),
       );
       expect(reverseMutations).toHaveLength(1);
       expect(reverseMutations[0]?.command.join(" ")).toContain("secret put");
       expect(reverseMutations[0]?.input).toBe("hosted-token-exact");
+
+      const topologyReversed = await runRetirement(
+        {
+          surface: "takoserver-host-runtime-topology-retirement",
+          action: "apply",
+          reverse: true,
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+        },
+        target,
+        {
+          run: fixture.run,
+          state: fixture.state,
+          outputDirectory: join(root, "topology-reverse"),
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+      expect(topologyReversed).toMatchObject({
+        state: "candidate-restored",
+        versionId: VERSION_CANDIDATE,
+        reverse: { exactVersionId: VERSION_CANDIDATE },
+      });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -354,6 +652,7 @@ describe("reviewed Hosted legacy-edge retirement", () => {
             action: "apply",
             environment: "integration",
             commit: COMMIT,
+            legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
           },
           target,
           {
@@ -370,9 +669,368 @@ describe("reviewed Hosted legacy-edge retirement", () => {
           ({ command }) => command.includes("secret") && command.includes("delete"),
         ),
       ).toHaveLength(1);
+      const status = await runRetirement(
+        {
+          surface: "takoserver-hosted-token-retirement",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+        },
+        target,
+        { run: fixture.run, state: fixture.state },
+      );
+      expect(status).toMatchObject({
+        state: "token-retired",
+        versionId: VERSION_TOKEN,
+        secretPresent: false,
+      });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test("token retirement rechecks authoritative state immediately before deleting", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-token-race-"));
+    try {
+      const fixture = stateFixture("topology");
+      let deploymentReads = 0;
+      const state: RetirementState = {
+        ...fixture.state,
+        async workerDeployments(workerName) {
+          deploymentReads += 1;
+          const history = await fixture.state.workerDeployments(workerName);
+          if (deploymentReads < 5) return history;
+          return [
+            deployment("deployment-token-race", VERSION_TOKEN, "2026-08-29T06:00:00Z"),
+            deployment("deployment-topology", VERSION_TOPOLOGY, "2026-08-29T05:00:00Z"),
+            deployment("deployment-candidate", VERSION_CANDIDATE, "2026-08-29T04:00:00Z"),
+            deployment("deployment-legacy", VERSION_LEGACY, "2026-08-29T03:00:00Z"),
+          ];
+        },
+      };
+      await expect(
+        runRetirement(
+          {
+            surface: "takoserver-hosted-token-retirement",
+            action: "apply",
+            environment: "integration",
+            commit: COMMIT,
+            legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+          },
+          target,
+          {
+            run: fixture.run,
+            state,
+            outputDirectory: root,
+            review: "reviewer@example.test",
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          },
+        ),
+      ).rejects.toThrow("changed before mutation");
+      expect(fixture.mutations.filter(({ command }) => command.includes("secret"))).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("token reverse acknowledgement loss is reconciled by status on T-prime history", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-token-reverse-ack-loss-"));
+    try {
+      const tokenPath = join(root, "token");
+      writeFileSync(tokenPath, "hosted-token-exact", { mode: 0o600 });
+      const fixture = stateFixture("token", "secret-put-ack-loss");
+      await expect(
+        runRetirement(
+          {
+            surface: "takoserver-hosted-token-retirement",
+            action: "apply",
+            reverse: true,
+            environment: "integration",
+            commit: COMMIT,
+            legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+          },
+          target,
+          {
+            run: fixture.run,
+            state: fixture.state,
+            tokenPath,
+            outputDirectory: root,
+            review: "reviewer@example.test",
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          },
+        ),
+      ).rejects.toThrow("indeterminate");
+
+      const status = await runRetirement(
+        {
+          surface: "takoserver-hosted-token-retirement",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+        },
+        target,
+        { run: fixture.run, state: fixture.state },
+      );
+      expect(status).toMatchObject({
+        state: "topology-retired",
+        versionId: VERSION_TOKEN_RESTORED,
+        secretPresent: true,
+      });
+      expect(
+        fixture.mutations.filter(
+          ({ command }) => command.includes("secret") && command.includes("put"),
+        ),
+      ).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("token reverse rechecks authoritative state immediately before re-putting", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-token-reverse-race-"));
+    try {
+      const tokenPath = join(root, "token");
+      writeFileSync(tokenPath, "hosted-token-exact", { mode: 0o600 });
+      const fixture = stateFixture("token");
+      let deploymentReads = 0;
+      const state: RetirementState = {
+        ...fixture.state,
+        async workerDeployments(workerName) {
+          deploymentReads += 1;
+          const history = await fixture.state.workerDeployments(workerName);
+          if (deploymentReads < 6) return history;
+          return [
+            deployment("deployment-topology-race", VERSION_TOPOLOGY, "2026-08-29T06:00:00Z"),
+            deployment("deployment-token", VERSION_TOKEN, "2026-08-29T05:00:00Z"),
+            deployment("deployment-topology", VERSION_TOPOLOGY, "2026-08-29T04:00:00Z"),
+            deployment("deployment-candidate", VERSION_CANDIDATE, "2026-08-29T03:00:00Z"),
+            deployment("deployment-legacy", VERSION_LEGACY, "2026-08-29T02:00:00Z"),
+          ];
+        },
+      };
+      await expect(
+        runRetirement(
+          {
+            surface: "takoserver-hosted-token-retirement",
+            action: "apply",
+            reverse: true,
+            environment: "integration",
+            commit: COMMIT,
+            legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+          },
+          target,
+          {
+            run: fixture.run,
+            state,
+            tokenPath,
+            outputDirectory: root,
+            review: "reviewer@example.test",
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          },
+        ),
+      ).rejects.toThrow("changed before mutation");
+      expect(
+        fixture.mutations.filter(
+          ({ command }) => command.includes("secret") && command.includes("put"),
+        ),
+      ).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("retirement rejects a valid selector that does not pin the L-to-C-to-T-to-R chain", async () => {
+    const cases = [
+      {
+        surface: "takoserver-host-runtime-topology-retirement",
+        stage: "candidate",
+      },
+      {
+        surface: "takoserver-host-runtime-topology-retirement",
+        stage: "topology",
+      },
+      {
+        surface: "takoserver-hosted-token-retirement",
+        stage: "topology",
+      },
+      {
+        surface: "takoserver-hosted-token-retirement",
+        stage: "token",
+      },
+      {
+        surface: "takoserver-host-runtime-topology-retirement",
+        stage: "tokenRestored",
+      },
+    ] as const;
+
+    for (const { surface, stage } of cases) {
+      const fixture = stateFixture(stage);
+      await expect(
+        runRetirement(
+          {
+            surface,
+            action: "status",
+            environment: "integration",
+            commit: COMMIT,
+            legacyHostRuntimePredecessorVersionId: VERSION_WRONG,
+          },
+          target,
+          { run: fixture.run, state: fixture.state },
+        ),
+      ).rejects.toThrow("pinned legacy predecessor");
+      expect(
+        fixture.mutations.filter(
+          ({ command }) =>
+            command.includes("--no-bundle") ||
+            (command.includes("secret") && (command.includes("delete") || command.includes("put"))),
+        ),
+      ).toHaveLength(0);
+    }
+  });
+
+  test("retirement rejects an interleaved lookalike Version before mutation", async () => {
+    const fixture = stateFixture("topology");
+    const state: RetirementState = {
+      ...fixture.state,
+      async workerDeployments() {
+        return [
+          deployment("deployment-topology", VERSION_TOPOLOGY, "2026-08-29T05:00:00Z"),
+          deployment("deployment-interleaved", VERSION_INTERLEAVED, "2026-08-29T04:00:00Z"),
+          deployment("deployment-candidate", VERSION_CANDIDATE, "2026-08-29T03:00:00Z"),
+          deployment("deployment-legacy", VERSION_LEGACY, "2026-08-29T02:00:00Z"),
+        ];
+      },
+      async workerVersion(workerName, versionId) {
+        if (versionId === VERSION_INTERLEAVED) {
+          return versionShape({ message: `takoserver-worker:${COMMIT}:${DIGEST}` });
+        }
+        return await fixture.state.workerVersion(workerName, versionId);
+      },
+    };
+    await expect(
+      runRetirement(
+        {
+          surface: "takoserver-host-runtime-topology-retirement",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+        },
+        target,
+        { run: fixture.run, state },
+      ),
+    ).rejects.toThrow("unrelated");
+    expect(
+      fixture.mutations.filter(
+        ({ command }) => command.includes("--no-bundle") || command.includes("secret"),
+      ),
+    ).toHaveLength(0);
+  });
+
+  test("retirement rejects an unpermitted rebound Version or cycle before mutation", async () => {
+    const cases = [
+      {
+        history: [
+          deployment("deployment-rebound", VERSION_REBOUND, "2026-08-29T05:00:00Z"),
+          deployment("deployment-topology", VERSION_TOPOLOGY, "2026-08-29T04:00:00Z"),
+          deployment("deployment-candidate", VERSION_CANDIDATE, "2026-08-29T03:00:00Z"),
+          deployment("deployment-legacy", VERSION_LEGACY, "2026-08-29T02:00:00Z"),
+        ],
+        message: "unexpected candidate Version",
+      },
+      {
+        history: [
+          deployment("deployment-rebound", VERSION_CANDIDATE, "2026-08-29T05:00:00Z"),
+          deployment("deployment-token-restored", VERSION_TOPOLOGY, "2026-08-29T04:00:00Z"),
+          deployment("deployment-token", VERSION_TOKEN, "2026-08-29T03:00:00Z"),
+          deployment("deployment-topology", VERSION_TOPOLOGY, "2026-08-29T02:00:00Z"),
+          deployment("deployment-candidate", VERSION_CANDIDATE, "2026-08-29T01:00:00Z"),
+          deployment("deployment-legacy", VERSION_LEGACY, "2026-08-29T00:00:00Z"),
+        ],
+        message: "Version cycle",
+      },
+      {
+        history: [
+          deployment("deployment-rebound", VERSION_CANDIDATE, "2026-08-29T05:00:00Z"),
+          deployment("deployment-token-restored", VERSION_TOKEN_RESTORED, "2026-08-29T04:00:00Z"),
+          deployment("deployment-token", VERSION_TOKEN, "2026-08-29T03:00:00Z"),
+          deployment("deployment-topology", VERSION_TOPOLOGY, "2026-08-29T02:00:00Z"),
+          deployment("deployment-legacy-candidate", VERSION_LEGACY, "2026-08-29T01:00:00Z"),
+          deployment("deployment-legacy", VERSION_LEGACY, "2026-08-29T00:00:00Z"),
+        ],
+        message: "unexpected candidate Version",
+      },
+    ] as const;
+
+    for (const { history, message } of cases) {
+      const fixture = stateFixture("topology");
+      const state: RetirementState = {
+        ...fixture.state,
+        async workerDeployments() {
+          return history;
+        },
+        async workerVersion(workerName, versionId) {
+          if (versionId === VERSION_REBOUND) {
+            return versionShape({
+              serviceBinding: { service: SERVICE, entrypoint: ENTRYPOINT },
+            });
+          }
+          return await fixture.state.workerVersion(workerName, versionId);
+        },
+      };
+      await expect(
+        runRetirement(
+          {
+            surface: "takoserver-host-runtime-topology-retirement",
+            action: "status",
+            environment: "integration",
+            commit: COMMIT,
+            legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+          },
+          target,
+          { run: fixture.run, state },
+        ),
+      ).rejects.toThrow(message);
+      expect(
+        fixture.mutations.filter(
+          ({ command }) => command.includes("--no-bundle") || command.includes("secret"),
+        ),
+      ).toHaveLength(0);
+    }
+  });
+
+  test("retirement rejects duplicate provider deployment identities before mutation", async () => {
+    const fixture = stateFixture("topology");
+    const state: RetirementState = {
+      ...fixture.state,
+      async workerDeployments() {
+        return [
+          deployment("deployment-duplicate", VERSION_TOPOLOGY, "2026-08-29T05:00:00Z"),
+          deployment("deployment-duplicate", VERSION_CANDIDATE, "2026-08-29T04:00:00Z"),
+          deployment("deployment-legacy", VERSION_LEGACY, "2026-08-29T03:00:00Z"),
+        ];
+      },
+    };
+    await expect(
+      runRetirement(
+        {
+          surface: "takoserver-host-runtime-topology-retirement",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+        },
+        target,
+        { run: fixture.run, state },
+      ),
+    ).rejects.toThrow("duplicate deployment IDs");
+    expect(
+      fixture.mutations.filter(
+        ({ command }) => command.includes("--no-bundle") || command.includes("secret"),
+      ),
+    ).toHaveLength(0);
   });
 
   test("retirement refuses a topology without a direct service predecessor", async () => {
@@ -390,6 +1048,7 @@ describe("reviewed Hosted legacy-edge retirement", () => {
           action: "status",
           environment: "integration",
           commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
         },
         target,
         {
@@ -405,11 +1064,21 @@ describe("reviewed Hosted legacy-edge retirement", () => {
 
 function stateFixture(
   stage: "legacy" | "candidate" | "topology" | "token" | "tokenRestored",
-  failure?: "upload-ack-loss" | "secret-delete-ack-loss",
+  failure?:
+    | "upload-ack-loss"
+    | "secret-delete-ack-loss"
+    | "secret-put-ack-loss"
+    | "topology-reverse-ack-loss",
 ) {
   let current = stage;
+  let history = initialHistory(stage);
+  let deploymentSequence = history.length;
   const mutations: { command: string[]; input?: string }[] = [];
   let buildConfig: string | undefined;
+  const appendDeployment = (versionId: string): void => {
+    deploymentSequence += 1;
+    history = [{ deploymentId: `deployment-${deploymentSequence}`, versionId }, ...history];
+  };
   const run: RetirementProcess = async (command, options): Promise<CommandResult> => {
     mutations.push({
       command: [...command],
@@ -431,22 +1100,34 @@ function stateFixture(
       return ok("built\n");
     }
     if (command.includes("deploy") && command.includes("--no-bundle")) {
-      if (failure === "upload-ack-loss") return { exitCode: 1, stdout: "", stderr: "closed" };
       current = stage === "legacy" ? "candidate" : "topology";
+      appendDeployment(current === "candidate" ? VERSION_CANDIDATE : VERSION_TOPOLOGY);
+      if (failure === "upload-ack-loss") return { exitCode: 1, stdout: "", stderr: "closed" };
       return ok("uploaded\n");
     }
     if (command.includes("secret") && command.includes("delete")) {
+      current = "token";
+      appendDeployment(VERSION_TOKEN);
       if (failure === "secret-delete-ack-loss")
         return { exitCode: 1, stdout: "", stderr: "closed" };
-      current = "token";
       return ok("deleted\n");
     }
     if (command.includes("versions") && command.includes("deploy")) {
-      current = stage === "topology" || stage === "tokenRestored" ? "candidate" : "legacy";
+      const selected = command.find((entry) => entry.endsWith("@100%"))?.slice(0, -5);
+      if (!selected) throw new Error("missing rollback Version");
+      appendDeployment(selected);
+      current = selected === VERSION_LEGACY ? "legacy" : "candidate";
+      if (failure === "topology-reverse-ack-loss") {
+        return { exitCode: 1, stdout: "", stderr: "closed" };
+      }
       return ok("restored\n");
     }
     if (command.includes("secret") && command.includes("put")) {
       current = "tokenRestored";
+      appendDeployment(VERSION_TOKEN_RESTORED);
+      if (failure === "secret-put-ack-loss") {
+        return { exitCode: 1, stdout: "", stderr: "closed" };
+      }
       return ok("put\n");
     }
     throw new Error(`unexpected command: ${key}`);
@@ -456,24 +1137,12 @@ function stateFixture(
       return [{ hostname: "api.integration.example.test", service: target.workerName }];
     },
     async workerDeployments() {
-      const chain =
-        current === "legacy"
-          ? [VERSION_LEGACY]
-          : current === "candidate"
-            ? [VERSION_CANDIDATE, VERSION_LEGACY]
-            : current === "topology"
-              ? [VERSION_TOPOLOGY, VERSION_CANDIDATE, VERSION_LEGACY]
-              : current === "token"
-                ? [VERSION_TOKEN, VERSION_TOPOLOGY, VERSION_CANDIDATE, VERSION_LEGACY]
-                : [
-                    VERSION_TOKEN_RESTORED,
-                    VERSION_TOKEN,
-                    VERSION_TOPOLOGY,
-                    VERSION_CANDIDATE,
-                    VERSION_LEGACY,
-                  ];
-      return chain.map((id, index) =>
-        deployment(`deployment-${index}`, id, `2026-08-29T0${5 - index}:00:00Z`),
+      return history.map(({ deploymentId, versionId }, index) =>
+        deployment(
+          deploymentId,
+          versionId,
+          new Date(Date.parse("2026-08-29T12:00:00Z") - index * 60_000).toISOString(),
+        ),
       );
     },
     async workerVersion(_worker, versionId) {
@@ -496,6 +1165,31 @@ function stateFixture(
     },
   };
   return { run, state, mutations, buildConfig };
+}
+
+function initialHistory(
+  stage: "legacy" | "candidate" | "topology" | "token" | "tokenRestored",
+): { deploymentId: string; versionId: string }[] {
+  const chain =
+    stage === "legacy"
+      ? [VERSION_LEGACY]
+      : stage === "candidate"
+        ? [VERSION_CANDIDATE, VERSION_LEGACY]
+        : stage === "topology"
+          ? [VERSION_TOPOLOGY, VERSION_CANDIDATE, VERSION_LEGACY]
+          : stage === "token"
+            ? [VERSION_TOKEN, VERSION_TOPOLOGY, VERSION_CANDIDATE, VERSION_LEGACY]
+            : [
+                VERSION_TOKEN_RESTORED,
+                VERSION_TOKEN,
+                VERSION_TOPOLOGY,
+                VERSION_CANDIDATE,
+                VERSION_LEGACY,
+              ];
+  return chain.map((versionId, index) => ({
+    deploymentId: `deployment-${index + 1}`,
+    versionId,
+  }));
 }
 
 function versionShape(input: {

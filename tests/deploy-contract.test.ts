@@ -125,6 +125,18 @@ describe("Takoserver split deploy entrypoint", () => {
         `--commit=${sha}`,
         "--target=.deploy/target.json",
       ],
+      [
+        "takoserver-host-runtime-topology-retirement",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+      ],
+      [
+        "takoserver-hosted-token-retirement",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+      ],
     ]) {
       const refused = await deploy(args);
       expect(refused.exitCode).toBe(2);
@@ -192,30 +204,27 @@ describe("Takoserver split deploy entrypoint", () => {
     }
   });
 
-  test("accepts the reviewed Hosted-edge retirement selector and reverse only on retirement surfaces", async () => {
+  test("accepts the reviewed Hosted-edge retirement selector only on retirement surfaces", async () => {
     const sha = "a".repeat(40);
     const version = "00000000-0000-4000-8000-000000000001";
-    const accepted = await deploy([
+    for (const surface of [
       "takoserver-worker-authority-cutover",
-      "--status",
-      "--environment=integration",
-      `--commit=${sha}`,
-      `--legacy-host-runtime-predecessor-version=${version}`,
-    ]);
-    expect(accepted.exitCode).toBe(2);
-    expect(accepted.stderr).toContain("deploy target descriptor not found");
-    expect(accepted.stderr).not.toContain("no target was touched");
-
-    const productionAccepted = await deploy([
-      "takoserver-worker-authority-cutover",
-      "--status",
-      "--environment=production",
-      `--commit=${sha}`,
-      `--legacy-host-runtime-predecessor-version=${version}`,
-    ]);
-    expect(productionAccepted.exitCode).toBe(2);
-    expect(productionAccepted.stderr).toContain("deploy target descriptor not found");
-    expect(productionAccepted.stderr).not.toContain("no target was touched");
+      "takoserver-host-runtime-topology-retirement",
+      "takoserver-hosted-token-retirement",
+    ] as const) {
+      for (const environment of ["integration", "production"] as const) {
+        const accepted = await deploy([
+          surface,
+          "--status",
+          `--environment=${environment}`,
+          `--commit=${sha}`,
+          `--legacy-host-runtime-predecessor-version=${version}`,
+        ]);
+        expect(accepted.exitCode).toBe(2);
+        expect(accepted.stderr).toContain("deploy target descriptor not found");
+        expect(accepted.stderr).not.toContain("no target was touched");
+      }
+    }
 
     for (const args of [
       [
@@ -239,6 +248,34 @@ describe("Takoserver split deploy entrypoint", () => {
         "--environment=integration",
         `--commit=${sha}`,
         "--reverse",
+      ],
+      [
+        "takoserver-worker",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--legacy-host-runtime-predecessor-version=${version}`,
+      ],
+      [
+        "takoserver-hosted-token-cutover",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--legacy-host-runtime-predecessor-version=${version}`,
+      ],
+      [
+        "takoserver-host-runtime-topology-retirement",
+        "--status",
+        "--environment=rehearsal",
+        `--commit=${sha}`,
+        `--legacy-host-runtime-predecessor-version=${version}`,
+      ],
+      [
+        "takoserver-hosted-token-retirement",
+        "--status",
+        "--environment=rehearsal",
+        `--commit=${sha}`,
+        `--legacy-host-runtime-predecessor-version=${version}`,
       ],
     ] as const) {
       const refused = await deploy(args);

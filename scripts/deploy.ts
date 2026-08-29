@@ -112,8 +112,19 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   }
   if (
     legacyHostRuntimePredecessorVersionId !== null &&
-    (surfaceValue !== "takoserver-worker-authority-cutover" ||
+    (!(
+      surfaceValue === "takoserver-worker-authority-cutover" ||
+      surfaceValue === "takoserver-host-runtime-topology-retirement" ||
+      surfaceValue === "takoserver-hosted-token-retirement"
+    ) ||
       (environment !== "integration" && environment !== "production"))
+  ) {
+    return null;
+  }
+  if (
+    legacyHostRuntimePredecessorVersionId === null &&
+    (surfaceValue === "takoserver-host-runtime-topology-retirement" ||
+      surfaceValue === "takoserver-hosted-token-retirement")
   ) {
     return null;
   }
@@ -221,6 +232,12 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
           action: invocation.action,
           environment: invocation.environment,
           commit: invocation.commit,
+          ...(invocation.legacyHostRuntimePredecessorVersionId === undefined
+            ? {}
+            : {
+                legacyHostRuntimePredecessorVersionId:
+                  invocation.legacyHostRuntimePredecessorVersionId,
+              }),
           ...(invocation.reverse ? { reverse: true } : {}),
         },
         target,
