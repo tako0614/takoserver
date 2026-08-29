@@ -84,4 +84,48 @@ describe("realized Worker configuration", () => {
       }),
     ).toEqual(["STRIPE_SECRET_KEY", "TAKOSERVER_R2_PARENT_TOKEN", "TAKOSERVER_SIGNING_KEY"]);
   });
+
+  test("adds the canonical operator public JWK only in desired identity state", () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-config-identity-"));
+    try {
+      const identityTarget = {
+        ...target,
+        environment: "integration",
+        operatorIdentity: {
+          publicJwk: { kty: "OKP" as const, crv: "Ed25519" as const, x: "A".repeat(43) },
+        },
+      } satisfies DeployTarget;
+      const desiredPath = writeWorkerConfig(identityTarget, {
+        path: join(root, "desired.json"),
+        main: join(root, "worker.js"),
+        commit: "a".repeat(40),
+        hostedTopology: "desired",
+      });
+      const { operatorIdentity: _operatorIdentity, ...withoutOperatorIdentity } = identityTarget;
+      const absentPath = writeWorkerConfig(withoutOperatorIdentity, {
+        path: join(root, "absent.json"),
+        main: join(root, "worker.js"),
+        commit: "a".repeat(40),
+        hostedTopology: "desired",
+      });
+      const desired = JSON.parse(readFileSync(desiredPath, "utf8")) as {
+        vars: Record<string, string>;
+      };
+      const absent = JSON.parse(readFileSync(absentPath, "utf8")) as {
+        vars: Record<string, string>;
+      };
+      expect(desired.vars.OPERATOR_IDENTITY_PUBLIC_JWK).toBe(
+        JSON.stringify(identityTarget.operatorIdentity.publicJwk),
+      );
+      expect(desired.vars).not.toHaveProperty("OPERATOR_PUBLIC_JWK");
+      expect(absent.vars).not.toHaveProperty("OPERATOR_IDENTITY_PUBLIC_JWK");
+      const {
+        OPERATOR_IDENTITY_PUBLIC_JWK: _operatorIdentityPublicJwk,
+        ...desiredWithoutIdentity
+      } = desired.vars;
+      expect(desiredWithoutIdentity).toEqual(absent.vars);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

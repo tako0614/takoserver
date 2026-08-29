@@ -283,5 +283,39 @@ export const DEPLOY_CONTRACT = {
         "independent-review": review,
       },
     },
+    {
+      surface: "takoserver-integration-operator-identity",
+      target: "cloudflare-worker:integration-takoserver-operator-identity",
+      covers: [
+        "scripts/deploy.ts",
+        "scripts/deploy/identity.ts",
+        "scripts/deploy/target.ts",
+        "scripts/deploy/realized-config.ts",
+      ],
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+        "TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH",
+      ],
+      triggers: ["authority"],
+      obligations: {
+        provenance:
+          "Integration only. The selected commit must already be the served Worker commit. The " +
+          "owner gate rebuilds it once, requires the exact served bundle digest, and proves the " +
+          "owned 0600 private JWK against the target's exact public Ed25519 JWK.",
+        "post-conditions":
+          "One immutable Worker Version adds only OPERATOR_IDENTITY_PUBLIC_JWK. Code, every other variable " +
+          "and binding, secrets, domains, D1, R2 and Hosted topology remain exact; a short-lived " +
+          "redacted operator assertion must create a session whose redacted bearer succeeds at /v1/me, " +
+          "is then revoked, and fails a replay.",
+        reversal:
+          "Before removing this identity, revoke every session and API key issued through it. " +
+          "Identity removal is a separate reviewed configuration transition; this surface never deletes it.",
+        "failure-handling": highRiskFailure,
+        "independent-review": review,
+      },
+    },
   ],
 } as const;

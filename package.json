@@ -21,6 +21,7 @@
     "check:migrations": "bun scripts/check-d1-migrations.ts",
     "check:openapi": "bun scripts/check-openapi.ts",
     "check:worker-startup": "bun scripts/check-worker-startup.ts",
+    "integration:e2e:credentials": "bun scripts/integration-e2e-credentials.ts",
     "conformance:takoform-v1": "bun scripts/conformance-takoform-v1.ts",
     "check:worker-types": "wrangler types worker-configuration.d.ts --check --include-runtime=false --config wrangler.jsonc",
     "debug:stable-local-cloudflare-host": "bun scripts/stable-local-cloudflare-host.ts",

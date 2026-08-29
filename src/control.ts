@@ -233,8 +233,10 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     }
 
     if (request.method === "DELETE" && url.pathname === "/v1/session") {
-      const actor = await accounts.authenticate(authorization(request));
+      const credential = authorization(request);
+      const actor = await accounts.authenticate(credential);
       if (actor?.kind !== "session") throw new AuthError("unauthenticated");
+      await accounts.revokeSession(credential);
       return new Response(null, {
         status: 204,
         headers: {

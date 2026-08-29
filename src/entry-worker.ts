@@ -38,6 +38,13 @@ interface WorkerEnv {
   readonly TAKOSERVER_CONSOLE_ORIGIN?: string;
   /** Public half of the operator key, as an Ed25519 JWK. */
   readonly OPERATOR_PUBLIC_JWK?: string;
+  /**
+   * Public half of an identity-only operator key.
+   *
+   * Unlike the legacy OPERATOR_PUBLIC_JWK, this key may sign login assertions
+   * but never wallet-funding assertions.
+   */
+  readonly OPERATOR_IDENTITY_PUBLIC_JWK?: string;
   /** Public OAuth client id. Its presence turns Google sign-in on. */
   readonly GOOGLE_CLIENT_ID?: string;
   /** Shared company identity issuer and this product's public OIDC client. */
@@ -89,11 +96,43 @@ interface WorkerEnv {
  * refusal is the point: a stub that said yes would credit any amount while
  * looking exactly like a finished product.
  */
-function credentials(env: WorkerEnv) {
-  const raw = env.OPERATOR_PUBLIC_JWK;
-  const publicKeyJwk = raw
-    ? (JSON.parse(raw) as { kty: string; crv: string; x: string })
+export function operatorCredentialKeys(env: {
+  readonly OPERATOR_PUBLIC_JWK?: string;
+  readonly OPERATOR_IDENTITY_PUBLIC_JWK?: string;
+}): {
+  readonly identity?: { readonly kty: string; readonly crv: string; readonly x: string };
+  readonly settlement?: { readonly kty: string; readonly crv: string; readonly x: string };
+} {
+  const legacy = env.OPERATOR_PUBLIC_JWK
+    ? (JSON.parse(env.OPERATOR_PUBLIC_JWK) as { kty: string; crv: string; x: string })
     : undefined;
+  const identity = env.OPERATOR_IDENTITY_PUBLIC_JWK
+    ? (JSON.parse(env.OPERATOR_IDENTITY_PUBLIC_JWK) as {
+        kty: string;
+        crv: string;
+        x: string;
+      })
+    : legacy;
+  return {
+    ...(identity ? { identity } : {}),
+    ...(legacy ? { settlement: legacy } : {}),
+  };
+}
+
+export function workerCredentials(
+  env: Pick<
+    WorkerEnv,
+    | "OPERATOR_PUBLIC_JWK"
+    | "OPERATOR_IDENTITY_PUBLIC_JWK"
+    | "TAKOS_ID_ISSUER"
+    | "TAKOS_ID_CLIENT_ID"
+    | "GOOGLE_CLIENT_ID"
+    | "STRIPE_SECRET_KEY"
+    | "TAKOSERVER_STRIPE_CHECKOUT_ENABLED"
+    | "TAKOSERVER_CONSOLE_ORIGIN"
+  >,
+) {
+  const operatorKeys = operatorCredentialKeys(env);
   const identity = resolveIdentity({
     ...(env.TAKOS_ID_ISSUER && env.TAKOS_ID_CLIENT_ID
       ? {
@@ -104,7 +143,7 @@ function credentials(env: WorkerEnv) {
         }
       : {}),
     googleClientId: env.GOOGLE_CLIENT_ID,
-    operatorPublicKeyJwk: publicKeyJwk,
+    operatorPublicKeyJwk: operatorKeys.identity,
   });
   const payment = resolvePayment({
     stripeSecretKey:
@@ -121,8 +160,8 @@ function credentials(env: WorkerEnv) {
     // would credit any amount while looking exactly like a finished product.
     settlement:
       payment.settlement ??
-      (publicKeyJwk
-        ? createOperatorSettlement({ publicKeyJwk })
+      (operatorKeys.settlement
+        ? createOperatorSettlement({ publicKeyJwk: operatorKeys.settlement })
         : {
             async verify(): Promise<never> {
               throw new Error("settlement credentials are not configured");
@@ -148,7 +187,7 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
   if (cached?.env === env) return cached.app;
   const edge = await buildEdgeForms();
   const currentCandidates = currentTakoformCandidates();
-  const { identity, identityProviders, settlement, checkout } = credentials(env);
+  const { identity, identityProviders, settlement, checkout } = workerCredentials(env);
   const sql = createD1Sql(env.STATE_DB);
   const objects = createR2ObjectStore(env.OBJECTS);
   const artifacts = createTakoformArtifacts({

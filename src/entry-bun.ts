@@ -10,7 +10,11 @@ import { createFileObjectStore } from "./objects-fs.ts";
 import { createMemoryObjectStore } from "./objects-mem.ts";
 import { createR2HttpObjectStore } from "./objects-r2-http.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
-import { ensureOperatorKey, signOperatorAssertion } from "./operator-key.ts";
+import {
+  ensureOperatorKey,
+  parseOperatorPublicKey,
+  signOperatorAssertion,
+} from "./operator-key.ts";
 import { resolvePayment } from "./payment-setup.ts";
 import { createOpenAiGateway, parseOpenAiModelConfig } from "./providers/openai.ts";
 import { createProvisionerEndpoint } from "./provisioner-endpoint.ts";
@@ -246,9 +250,16 @@ const unconfigured = {
 // every sign-in, so it mints an operator key and offers that instead. A shared
 // deployment is given its public half and generates nothing.
 const operatorKeyPath = join(dataRoot, "operator-key.jwk");
-const publicKeyJwk = await ensureOperatorKey({
+const identityOnlyPublicKeyJwk = process.env.TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK
+  ? parseOperatorPublicKey(
+      process.env.TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK,
+      "TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK",
+    )
+  : undefined;
+const legacyPublicKeyJwk = await ensureOperatorKey({
   configured: process.env.TAKOSERVER_OPERATOR_PUBLIC_JWK,
   hasIdentityProvider:
+    Boolean(identityOnlyPublicKeyJwk) ||
     Boolean(process.env.TAKOS_ID_ISSUER && process.env.TAKOS_ID_CLIENT_ID) ||
     Boolean(process.env.GOOGLE_CLIENT_ID) ||
     Boolean(sharedDatabaseId),
@@ -264,6 +275,7 @@ const publicKeyJwk = await ensureOperatorKey({
     process.stdout.write(`generated an operator key at ${path}\n`);
   },
 });
+const identityPublicKeyJwk = identityOnlyPublicKeyJwk ?? legacyPublicKeyJwk;
 
 const payment = resolvePayment({
   stripeSecretKey: process.env.STRIPE_SECRET_KEY,
@@ -280,7 +292,7 @@ const identity = resolveIdentity({
       }
     : {}),
   googleClientId: process.env.GOOGLE_CLIENT_ID,
-  operatorPublicKeyJwk: publicKeyJwk,
+  operatorPublicKeyJwk: identityPublicKeyJwk,
 });
 
 /**
@@ -340,7 +352,9 @@ const app = buildApp({
   ...(configuredAi ? { ai: configuredAi } : {}),
   settlement:
     payment.settlement ??
-    (publicKeyJwk ? createOperatorSettlement({ publicKeyJwk }) : unconfigured),
+    (legacyPublicKeyJwk
+      ? createOperatorSettlement({ publicKeyJwk: legacyPublicKeyJwk })
+      : unconfigured),
   ...(payment.checkout ? { checkout: payment.checkout } : {}),
   publicOrigin,
   ...(process.env.TAKOSERVER_CONSOLE_ORIGIN

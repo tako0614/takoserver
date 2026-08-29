@@ -201,6 +201,24 @@ describe("accounts", () => {
     expect(await accounts.authenticate(`Bearer ${secret}`)).toBeNull();
   });
 
+  test("revokes only the exact session bearer", async () => {
+    const first = await accounts.signIn({
+      provider: "google",
+      assertion: "first-session",
+    });
+    const second = await accounts.signIn({
+      provider: "google",
+      assertion: "second-session",
+    });
+
+    await accounts.revokeSession(`Bearer ${first.sessionToken}`);
+
+    expect(await accounts.authenticate(`Bearer ${first.sessionToken}`)).toBeNull();
+    expect(await accounts.authenticate(`Bearer ${second.sessionToken}`)).not.toBeNull();
+    const revoked = await sql.query("SELECT revoked_at FROM auth_tokens WHERE id LIKE 'ses_%'");
+    expect(revoked.filter((row) => row.revoked_at !== null)).toHaveLength(1);
+  });
+
   test("refuses to act on an organization the caller does not own", async () => {
     const { organization } = await ownerWithOrganization();
     const intruder = await accounts.signIn({

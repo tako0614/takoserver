@@ -33,6 +33,7 @@ const SURFACES = [
   ["takoserver-signing-repair", ["authority"]],
   ["takoserver-signing-rotation", ["authority", "published-identity"]],
   ["takoserver-hosted-token-cutover", ["authority"]],
+  ["takoserver-integration-operator-identity", ["authority"]],
 ] as const;
 
 describe("Takoserver split deploy entrypoint", () => {
@@ -160,6 +161,32 @@ describe("Takoserver split deploy entrypoint", () => {
       expect(refused.exitCode).toBe(2);
       expect(refused.stdout).toBe("");
       expect(refused.stderr).toContain("no target was touched");
+    }
+  });
+
+  test("parses the operator identity surface only for integration", async () => {
+    const sha = "a".repeat(40);
+    const accepted = await deploy([
+      "takoserver-integration-operator-identity",
+      "--status",
+      "--environment=integration",
+      `--commit=${sha}`,
+    ]);
+    expect(accepted.exitCode).toBe(2);
+    expect(accepted.stderr).toContain("deploy target descriptor not found");
+    expect(accepted.stderr).not.toContain("no target was touched");
+
+    for (const environment of ["rehearsal", "production"] as const) {
+      const refused = await deploy([
+        "takoserver-integration-operator-identity",
+        "--status",
+        `--environment=${environment}`,
+        `--commit=${sha}`,
+      ]);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
     }
   });
 });

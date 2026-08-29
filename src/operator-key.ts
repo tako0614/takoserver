@@ -36,7 +36,9 @@ export interface EnsureOperatorKeyInput {
 export async function ensureOperatorKey(
   input: EnsureOperatorKeyInput,
 ): Promise<OperatorPublicKey | undefined> {
-  if (input.configured) return parsePublicKey(input.configured);
+  if (input.configured) {
+    return parseOperatorPublicKey(input.configured, "TAKOSERVER_OPERATOR_PUBLIC_JWK");
+  }
   // An existing key is honoured whatever else is configured: it may be the way
   // the operator gets in when the identity provider is the thing that broke.
   const stored = await input.readFile(input.path);
@@ -96,16 +98,19 @@ async function publicHalfOf(privateJwk: string): Promise<OperatorPublicKey> {
   return { kty: "OKP", crv: "Ed25519", x: jwk.x };
 }
 
-function parsePublicKey(configured: string): OperatorPublicKey {
+export function parseOperatorPublicKey(
+  configured: string,
+  variable = "TAKOSERVER_OPERATOR_PUBLIC_JWK",
+): OperatorPublicKey {
   let parsed: unknown;
   try {
     parsed = JSON.parse(configured);
   } catch {
-    throw new Error("TAKOSERVER_OPERATOR_PUBLIC_JWK is not valid JSON");
+    throw new Error(`${variable} is not valid JSON`);
   }
   const jwk = parsed as Partial<OperatorPublicKey>;
   if (typeof jwk.x !== "string" || typeof jwk.kty !== "string" || typeof jwk.crv !== "string") {
-    throw new Error("TAKOSERVER_OPERATOR_PUBLIC_JWK is not an Ed25519 public JWK");
+    throw new Error(`${variable} is not an Ed25519 public JWK`);
   }
   return { kty: jwk.kty, crv: jwk.crv, x: jwk.x };
 }

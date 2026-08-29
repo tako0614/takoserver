@@ -102,6 +102,11 @@ the part that owns accounts, money, and the machines.
   Resource UID before it may read, observe, update, or delete that incarnation.
   The first create atomically marks the reservation consumed before provider
   side effects, so a release can never leave an unpaid Resource.
+- **Scope** organization API keys by resource intent. `resources:read` may call
+  Host read routes (including validate and observe); `resources:write` retains
+  that read access and additionally permits prepare, PUT/POST mutations, and
+  DELETE. Missing scopes are refused before resource lookup, while wrong-tenant,
+  revoked, and expired credentials remain non-enumerating failures.
 - **Attach** independent resources by exact Interface reference. An Attachment
   stores only resource/deployment identity and an opaque grant, endpoint,
   secret, or native-binding reference; it never embeds a provider credential.
@@ -127,6 +132,7 @@ Everything lives under one directory, `.takoserver` by default.
 | `TAKOSERVER_WORKERD_PORT` | Where published Workers are served. |
 | `TAKOSERVER_SUFFIXES` | Hostname suffixes this deployment will serve. Empty means any. |
 | `TAKOSERVER_OPERATOR_PUBLIC_JWK` | Public half of the operator key. Generated under the data root if unset. |
+| `TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK` | Optional identity-only operator key. It overrides the login key without granting wallet-funding authority. |
 | `GOOGLE_CLIENT_ID` | Turns on Google sign-in. Its absence leaves the operator path. |
 | `STRIPE_SECRET_KEY` | Turns on card payment. Its absence leaves operator-signed funding. |
 | `TAKOSERVER_AI_BASE_URL` | HTTPS base path of an OpenAI-compatible upstream. |
@@ -155,10 +161,13 @@ TAKOSERVER_OPERATOR_KEY=.takoserver/operator-key.jwk \
   bun scripts/operator-key.ts sign-in google operator operator@localhost Operator
 ```
 
-The same key credits the wallet (`operator-key.ts funding <org> <ref> <minor>`)
-until Stripe is configured. It is the operator vouching in a form the server can
-check and nobody else can forge — not an identity provider, and it stops being
-the way in the moment a real one is configured.
+The legacy/generated key also credits the wallet
+(`operator-key.ts funding <org> <ref> <minor>`) until Stripe is configured. An
+explicit `TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK` is login-only: it takes
+precedence for operator sign-in but cannot verify funding assertions. This is
+the operator vouching in a form the server can check and nobody else can forge
+— not an identity provider, and it stops being the way in the moment a real one
+is configured.
 
 Everything durable is under that one directory, so backing up a deployment is
 copying it and moving one is moving it:

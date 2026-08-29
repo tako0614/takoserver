@@ -175,6 +175,7 @@ export type {
   TakoformDriverReceipt,
   TakoformHost,
   TakoformHostPrincipal,
+  TakoformHostResourceScope,
   TakoformInterfaceRef,
   TakoformResourceDriver,
   TakoformStoredResource,

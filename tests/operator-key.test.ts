@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { createOperatorIdentity } from "../src/operator-credentials.ts";
-import { ensureOperatorKey, signOperatorAssertion } from "../src/operator-key.ts";
+import {
+  ensureOperatorKey,
+  parseOperatorPublicKey,
+  signOperatorAssertion,
+} from "../src/operator-key.ts";
 
 /**
  * A machine standing on its own has to let its operator in.
@@ -122,6 +126,12 @@ describe("ensureOperatorKey", () => {
         writeFile: store.writeFile,
       }),
     ).rejects.toThrow(/TAKOSERVER_OPERATOR_PUBLIC_JWK/);
+  });
+
+  test("names the additive identity-only variable in configuration failures", () => {
+    expect(() =>
+      parseOperatorPublicKey("not json", "TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK"),
+    ).toThrow(/TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK/);
   });
 });
 

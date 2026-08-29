@@ -31,6 +31,7 @@ pack. Relevant variables are:
 | `TAKOSERVER_D1_DATABASE_ID` | Optional control database shared with the Worker. Requires a Cloudflare account and token source. |
 | `TAKOSERVER_R2_BUCKET` | Optional artifact store shared with the Worker. Requires a Cloudflare account and token source. |
 | `TAKOSERVER_OPERATOR_PUBLIC_JWK` | Public half of the operator key. |
+| `TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK` | Optional login-only operator key; never authorizes funding. |
 | `PORT` | Where to listen. |
 
 `CLOUDFLARE_ACCOUNT_ID` is storage/control-plane input only in this mode. It is

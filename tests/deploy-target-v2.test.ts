@@ -93,4 +93,46 @@ describe("environment-exact deploy target", () => {
     expect(targetPath("rehearsal")).toEndWith("/.deploy/targets/rehearsal.json");
     expect(targetPath("production")).toEndWith("/.deploy/targets/production.json");
   });
+
+  test("accepts only one exact public Ed25519 operator identity on integration", () => {
+    const publicJwk = {
+      kty: "OKP" as const,
+      crv: "Ed25519" as const,
+      x: "A".repeat(43),
+    };
+    withTarget(
+      descriptor({
+        environment: "integration",
+        operatorIdentity: { publicJwk },
+      }),
+      (path) => {
+        expect(loadTarget(path, "integration").operatorIdentity).toEqual({ publicJwk });
+      },
+    );
+
+    for (const rejected of [
+      { ...publicJwk, d: "private-material" },
+      { ...publicJwk, kid: "unexpected" },
+      { kty: "OKP", crv: "Ed25519", x: `${"A".repeat(42)}=` },
+    ]) {
+      withTarget(
+        descriptor({
+          environment: "integration",
+          operatorIdentity: { publicJwk: rejected },
+        }),
+        (path) => expect(() => loadTarget(path, "integration")).toThrow("operatorIdentity"),
+      );
+    }
+  });
+
+  test("refuses operator identity in a non-integration target", () => {
+    withTarget(
+      descriptor({
+        operatorIdentity: {
+          publicJwk: { kty: "OKP", crv: "Ed25519", x: "A".repeat(43) },
+        },
+      }),
+      (path) => expect(() => loadTarget(path, "rehearsal")).toThrow("integration-only"),
+    );
+  });
 });

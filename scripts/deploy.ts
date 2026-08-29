@@ -2,6 +2,7 @@ import { runConsole } from "./deploy/console.ts";
 import { DEPLOY_CONTRACT } from "./deploy/contract.ts";
 import { DeployError, PHASE_EXIT_CODE } from "./deploy/errors.ts";
 import { runHosted } from "./deploy/hosted.ts";
+import { runOperatorIdentity } from "./deploy/identity.ts";
 import type { DeployEnvironment } from "./deploy/qualification.ts";
 import { runD1Schema } from "./deploy/schema.ts";
 import { runSigning } from "./deploy/signing.ts";
@@ -71,6 +72,12 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   }
   if (!action || !environment || !commit) return null;
   if (
+    surfaceValue === "takoserver-integration-operator-identity" &&
+    environment !== "integration"
+  ) {
+    return null;
+  }
+  if (
     legacyPredecessorVersionId !== null &&
     (surfaceValue !== "takoserver-worker-authority-cutover" || environment !== "integration")
   ) {
@@ -127,6 +134,16 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
     case "takoserver-hosted-token-cutover":
     case "takoserver-hosted-topology-cutover":
       return await runHosted(
+        {
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
+        },
+        target,
+      );
+    case "takoserver-integration-operator-identity":
+      return await runOperatorIdentity(
         {
           surface: invocation.surface,
           action: invocation.action,

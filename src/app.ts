@@ -42,6 +42,7 @@ import type {
   InstalledTakoformForm,
   TakoformFormAvailabilityResolver,
   TakoformHost,
+  TakoformHostResourceScope,
   TakoformResourceDriver,
   TakoformStandardServiceResolver,
 } from "./takoform/types.ts";
@@ -223,8 +224,9 @@ export function buildApp(ports: AppPorts): App {
   const hostOptions: Omit<CreateTakoformHostOptions, "authority"> = {
     sql: ports.sql,
     objects: ports.objects,
-    // The ordinary organization lane accepts a resources:write API key. A
-    // reseller may instead issue a short-lived run token pinned to one paid
+    // The ordinary organization lane accepts an API key carrying
+    // resources:read or resources:write (a writer retains read compatibility).
+    // A reseller may instead issue a short-lived run token pinned to one paid
     // reservation and one exact Resource address. The latter is useful to a
     // hosted runner because it never receives the reseller's organization
     // key and cannot cross into another opaque tenant space.
@@ -239,8 +241,16 @@ export function buildApp(ports: AppPorts): App {
       const authorization = request.headers.get("authorization");
       const actor = await accounts.authenticate(authorization);
       if (actor?.kind === "api_key") {
-        return actor.organizationId && grants(actor.scopes, "resources:write")
-          ? { tenantId: actor.organizationId, principalId: actor.hostPrincipalId }
+        const resourceScopes = actor.scopes.filter(
+          (scope): scope is TakoformHostResourceScope =>
+            scope === "resources:read" || scope === "resources:write",
+        );
+        return actor.organizationId && grants(actor.scopes, "resources:read")
+          ? {
+              tenantId: actor.organizationId,
+              principalId: actor.hostPrincipalId,
+              scopes: resourceScopes,
+            }
           : null;
       }
       if (actor?.kind === "session") {

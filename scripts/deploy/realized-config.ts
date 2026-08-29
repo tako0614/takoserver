@@ -113,6 +113,9 @@ export function deploymentVariables(
   if (target.workerEndpointSuffix !== undefined) {
     vars.TAKOSERVER_WORKER_ENDPOINT_SUFFIX = target.workerEndpointSuffix;
   }
+  if (target.operatorIdentity !== undefined) {
+    vars.OPERATOR_IDENTITY_PUBLIC_JWK = JSON.stringify(target.operatorIdentity.publicJwk);
+  }
   return { vars };
 }
 

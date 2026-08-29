@@ -107,9 +107,15 @@ export interface TakoformHostPrincipal {
   readonly tenantId: string;
   readonly principalId: string;
   /**
+   * Resource-plane scopes carried by an organization API key. An omitted
+   * value is the legacy/internal Host principal, which retains full access;
+   * when present, the router enforces the exact read/write boundary.
+   */
+  readonly scopes?: readonly TakoformHostResourceScope[];
+  /**
    * A reseller-issued run credential may operate only one exact Resource
-   * address. Organization sessions/API keys omit this and retain their normal
-   * organization-wide authority.
+   * address. Organization sessions/API keys omit this and use the optional
+   * resource-plane scopes above (or legacy unrestricted access when omitted).
    */
   readonly scope?:
     | {
@@ -129,6 +135,8 @@ export interface TakoformHostPrincipal {
         readonly claimCreate?: () => Promise<void>;
       };
 }
+
+export type TakoformHostResourceScope = "resources:read" | "resources:write";
 
 /** Deployment- and principal-specific truth for one installed exact FormRef. */
 export interface TakoformFormAvailability {

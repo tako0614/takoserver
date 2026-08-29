@@ -1,6 +1,6 @@
 # Takoserver deploy surfaces
 
-This repository owns one deploy entrypoint and ten separate mutation surfaces.
+This repository owns one deploy entrypoint and eleven separate mutation surfaces.
 The contract is read-only:
 
 ```sh
@@ -62,11 +62,27 @@ The separate authority and irreversible surfaces are:
   is explicit deletion of that newly added named secret.
 - `takoserver-hosted-topology-cutover`: after that token proof, uploads identical
   Worker code with only the exact Hosted service and entrypoint binding added.
+- `takoserver-integration-operator-identity`: integration only. It rebuilds the
+  already served commit once, requires the exact served bundle digest, and
+  uploads one immutable Worker Version that adds only the target's canonical
+  public Ed25519 `OPERATOR_IDENTITY_PUBLIC_JWK` variable. Every other variable, binding,
+  secret name/type, domain, D1/R2 identity, and Hosted topology must remain
+  exact. It never writes a credential to D1 and never enables the separate
+  wallet-funding authority retained by the legacy `OPERATOR_PUBLIC_JWK`.
+  A live Worker carrying that legacy funding binding is refused as unrelated
+  authority; replacing or removing it requires its own reviewed transition.
 
 The intended forward order is schema, public-key registration, any required
 authority-sensitive Worker code, signing repair or explicit rotation, Hosted
 token, then Hosted topology. Status must show the required predecessor state
 before each apply. Registration, topology, and schema are forward-repair only.
+
+The operator-identity surface is deliberately outside that production order.
+Its invocation parser accepts only `--environment=integration`; rehearsal and
+production are refused before a target descriptor is opened. Its status path
+is read-only and reports the desired public-JWK digest, whether that exact
+variable is already configured, the served Version, and readiness without
+reading the private key or requiring review evidence.
 
 ## Source, artifacts, and readback
 
@@ -99,11 +115,24 @@ tracked repository. Depending on the surface, the operator supplies:
 - `TAKOSERVER_SIGNING_PRIVATE_JWK_PATH`
 - `TAKOSERVER_SIGNING_NEXT_PRIVATE_JWK_PATH`
 - `TAKOSERVER_HOSTED_TOKEN_PATH`
+- `TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH`
 
 Secret inputs must be owned, link-free regular files with mode `0600`. They are
 sent only through stdin or an ephemeral sealed Wrangler secrets file, never as
 command arguments or output. A successful task, branch, check, or review does
 not authorize a deploy.
+
+`TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH` is never sent to Cloudflare. Apply opens
+the link-free `0600` file without following symlinks, accepts only the exact
+Ed25519 private JWK shape, and proves it against the target's public half. It
+then mints a 60-second operator assertion in memory, exchanges it at
+`POST /v1/sessions`, and uses the returned bearer at `GET /v1/me`. Before
+success it revokes that proof bearer through `DELETE /v1/session` and requires
+replay at `GET /v1/me` to return `401`; a lost delete acknowledgement is settled
+by that replay rather than a blind retry. Assertion and session bytes are
+redacted from both success output and diagnostics. Every later session and API
+key issued through the operator identity must be revoked before a separately
+reviewed identity-removal transition.
 
 ## Failure handling
 
@@ -120,3 +149,9 @@ readback distinguishes the legacy predecessor still being current, its direct
 canonical successor matching the selected commit, and a direct successor from
 a different commit. An unrelated history advance or malformed successor fails
 closed. The status path never retries the upload.
+
+For an operator-identity upload acknowledgement failure, do not retry apply.
+Run the same surface with `--status`: an exact configured digest means the
+single-variable Version is current, while absence means the selected
+predecessor remains current. Any unrelated configuration or Version advance is
+refused rather than attributed to the interrupted attempt.

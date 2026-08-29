@@ -27,6 +27,7 @@ import {
   type TakoformHost,
   TakoformHostError,
   type TakoformHostPrincipal,
+  type TakoformHostResourceScope,
   type TakoformInterfaceRef,
   type TakoformStandardServiceResolver,
 } from "./types.ts";
@@ -284,6 +285,14 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
 
       const principal = await authenticate(request);
       if (!principal) return failure("unauthenticated", 401);
+      const requiredScope = requiredResourceScope(request, url, lane);
+      if (
+        requiredScope !== undefined &&
+        principal.scopes !== undefined &&
+        !principalGrants(principal.scopes, requiredScope)
+      ) {
+        return failure("permission_denied", 403);
+      }
       const exactScope = principal.scope?.mode === "tenant-run" ? undefined : principal.scope;
       const context: EngineContext = {
         request,
@@ -586,6 +595,31 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
 
     return failure("invalid_argument", 404);
   }
+}
+
+function requiredResourceScope(
+  request: Request,
+  url: URL,
+  lane: string,
+): TakoformHostResourceScope | undefined {
+  if (url.pathname !== lane && !url.pathname.startsWith(`${lane}/`)) return undefined;
+  if (request.method === "GET") return "resources:read";
+  if (
+    request.method === "POST" &&
+    (url.pathname === `${lane}/resources/validate` || url.pathname.endsWith("/observe"))
+  ) {
+    return "resources:read";
+  }
+  return "resources:write";
+}
+
+function principalGrants(
+  scopes: readonly TakoformHostResourceScope[],
+  wanted: TakoformHostResourceScope,
+): boolean {
+  return (
+    scopes.includes(wanted) || (wanted === "resources:read" && scopes.includes("resources:write"))
+  );
 }
 
 async function assertPrincipalScope(

@@ -167,6 +167,8 @@ export interface Accounts {
   }): Promise<ApiKey>;
   /** Resolves a bearer credential. Returns null for anything unusable. */
   authenticate(authorization: string | null): Promise<Actor | null>;
+  /** Revokes exactly one live session represented by a bearer authorization. */
+  revokeSession(authorization: string | null): Promise<void>;
   /** Resolves and requires a scope on one organization. */
   authorize(authorization: string | null, scope: ApiKeyScope): Promise<Actor | null>;
   /** Refuses unless the actor owns the organization outright. */
@@ -428,6 +430,18 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
         createdAt: String(row.created_at),
         expiresAt: String(row.expires_at),
       };
+    },
+
+    async revokeSession(authorization) {
+      const secret = bearer(authorization);
+      if (!secret) throw new AuthError("unauthenticated");
+      const revokedAt = stamp();
+      const result = await sql.run(
+        `UPDATE auth_tokens SET revoked_at = ?
+         WHERE secret_digest = ? AND kind = 'session' AND revoked_at IS NULL AND expires_at > ?`,
+        [revokedAt, await bytesDigest(new TextEncoder().encode(secret)), revokedAt],
+      );
+      if (result.changes !== 1) throw new AuthError("unauthenticated");
     },
 
     async authenticate(authorization) {

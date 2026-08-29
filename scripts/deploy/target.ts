@@ -88,6 +88,22 @@ export interface DeployTarget {
     readonly entrypoint: string;
   };
   /**
+   * Public half of the integration operator's identity-only proof key.
+   *
+   * This is deliberately target data rather than a Worker secret: the Worker
+   * verifies an offline login assertion and never receives the private half.
+   * It does not enable the legacy wallet-funding verifier. Only
+   * the dedicated integration authority surface may bridge its absence to the
+   * exact value declared here.
+   */
+  readonly operatorIdentity?: {
+    readonly publicJwk: {
+      readonly kty: "OKP";
+      readonly crv: "Ed25519";
+      readonly x: string;
+    };
+  };
+  /**
    * `nextKeyId` is present only while an explicit rotation is pending. The
    * routine Worker target is then the next id, but only the rotation surface
    * may bridge the live current id to it.
@@ -109,6 +125,7 @@ const GOOGLE_CLIENT_ID = /^[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com$/u;
 const HOSTNAME =
   /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/u;
 const ENTRYPOINT = /^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/u;
+const BASE64URL_32 = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/u;
 
 export function targetPath(environment: DeployEnvironment): string {
   const variable = `TAKOSERVER_DEPLOY_TARGET_${environment.toUpperCase()}`;
@@ -174,6 +191,7 @@ function validateTarget(
       "edgeSupplies",
       "workerEndpointSuffix",
       "hostedTopology",
+      "operatorIdentity",
     ],
   );
 
@@ -249,6 +267,9 @@ function validateTarget(
       : {
           hostedTopology: hostedTopology(value.hostedTopology),
         }),
+    ...(value.operatorIdentity === undefined
+      ? {}
+      : { operatorIdentity: operatorIdentity(value.operatorIdentity) }),
     signing: signing(value.signing),
   };
   const cloudflareObjectSupply = target.objectBucketSupplies?.supplies.some(
@@ -267,7 +288,45 @@ function validateTarget(
   if (target.takosId && target.googleClientId) {
     throw preflightError("deploy target cannot configure both `takosId` and `googleClientId`");
   }
+  if (target.operatorIdentity && environment !== "integration") {
+    throw preflightError("deploy target `operatorIdentity` is integration-only");
+  }
   return target;
+}
+
+function operatorIdentity(value: unknown): NonNullable<DeployTarget["operatorIdentity"]> {
+  if (!isRecord(value)) {
+    throw preflightError("deploy target `operatorIdentity` must be an object");
+  }
+  if (!exactKeySet(value, ["publicJwk"])) {
+    throw preflightError("deploy target `operatorIdentity` must contain only `publicJwk`");
+  }
+  const publicJwk = value.publicJwk;
+  if (!isRecord(publicJwk)) {
+    throw preflightError("deploy target `operatorIdentity.publicJwk` must be an object");
+  }
+  if (!exactKeySet(publicJwk, ["kty", "crv", "x"])) {
+    throw preflightError(
+      "deploy target `operatorIdentity.publicJwk` must be public-only with exact kty/crv/x members",
+    );
+  }
+  if (
+    publicJwk.kty !== "OKP" ||
+    publicJwk.crv !== "Ed25519" ||
+    typeof publicJwk.x !== "string" ||
+    !BASE64URL_32.test(publicJwk.x)
+  ) {
+    throw preflightError(
+      "deploy target `operatorIdentity.publicJwk` must be one exact public Ed25519 JWK",
+    );
+  }
+  return {
+    publicJwk: { kty: "OKP", crv: "Ed25519", x: publicJwk.x },
+  };
+}
+
+function exactKeySet(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  return JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...keys].sort());
 }
 
 function hostedTopology(value: unknown): {
