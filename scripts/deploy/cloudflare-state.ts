@@ -132,7 +132,11 @@ export class CloudflareState {
   }
 
   async workerScripts(): Promise<readonly string[]> {
-    const entries = await this.list("/workers/scripts", "Cloudflare Worker script inventory");
+    const result = await this.read("/workers/scripts", "Cloudflare Worker script inventory");
+    if (!Array.isArray(result)) {
+      throw preflightError("Cloudflare Worker script inventory returned a non-list result");
+    }
+    const entries = result;
     const names = entries.map((entry) => {
       if (!isRecord(entry) || typeof entry.id !== "string" || entry.id.length === 0) {
         throw preflightError("Cloudflare Worker script inventory returned a malformed entry");

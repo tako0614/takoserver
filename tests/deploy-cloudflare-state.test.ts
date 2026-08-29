@@ -96,6 +96,44 @@ describe("strict paginated Cloudflare state", () => {
     expect(url.search).toBe("");
   });
 
+  test("reads the documented single-page Worker script inventory without pagination", async () => {
+    const requests: Request[] = [];
+    const state = new CloudflareState({
+      accountId: ACCOUNT,
+      token: "operator-token",
+      fetcher: async (request) => {
+        requests.push(request);
+        return Response.json({
+          success: true,
+          errors: [],
+          messages: [],
+          result: [{ id: "worker-b" }, { id: "worker-a" }],
+        });
+      },
+    });
+
+    expect(await state.workerScripts()).toEqual(["worker-a", "worker-b"]);
+    expect(requests).toHaveLength(1);
+    const url = new URL(requests[0]?.url ?? "");
+    expect(url.pathname).toBe(`/client/v4/accounts/${ACCOUNT}/workers/scripts`);
+    expect(url.search).toBe("");
+  });
+
+  test("rejects malformed or duplicate single-page Worker script inventories", async () => {
+    for (const result of [
+      { scripts: [] },
+      [{ id: "worker-a" }, { id: "worker-a" }],
+      [{ id: null }],
+    ]) {
+      const state = new CloudflareState({
+        accountId: ACCOUNT,
+        token: "token",
+        fetcher: async () => Response.json({ success: true, result }),
+      });
+      await expect(state.workerScripts()).rejects.toThrow();
+    }
+  });
+
   test("rejects non-array Worker secret inventory results", async () => {
     for (const result of [{ secrets: [] }, null]) {
       const state = new CloudflareState({
