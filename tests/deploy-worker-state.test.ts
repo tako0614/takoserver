@@ -7,6 +7,7 @@ import {
   assertVersionBindingClosure,
   expectedBindingClosureForTarget,
   expectedExactBindingClosure,
+  expectedLegacyPreVersionMetadataBindingClosure,
   parseWorkerDeploymentHistory,
 } from "../scripts/deploy/worker-state.ts";
 
@@ -157,6 +158,48 @@ describe("immutable Worker Version binding closure", () => {
         expectedExactBindingClosure(target, { hostedTopology: "desired" }),
       ),
     ).toThrow("exact selected target closure");
+  });
+
+  test("legacy predecessor closure requires exactly the pre-version-metadata shape", () => {
+    const target = {
+      kind: "takoserver.deploy-target@v2",
+      environment: "integration",
+      accountId: "a".repeat(32),
+      workerName: "takoserver-api-integration",
+      d1: { databaseName: "runtime-db", databaseId: "database-id" },
+      r2: { bucketName: "objects" },
+      publicOrigin: "https://api.integration.example.test",
+      signing: { currentKeyId: "key-current" },
+    } satisfies DeployTarget;
+    const current = expectedExactVersion(target);
+    const legacy = {
+      ...current,
+      resources: {
+        bindings: current.resources.bindings.filter(({ name }) => name !== "WORKER_VERSION"),
+      },
+    };
+    const closure = expectedLegacyPreVersionMetadataBindingClosure(target, {
+      hostedTopology: "desired",
+    });
+    expect(() =>
+      assertExactVersionBindingClosure("preflight", "version-1", legacy, closure),
+    ).not.toThrow();
+    expect(() =>
+      assertExactVersionBindingClosure("preflight", "version-1", current, closure),
+    ).toThrow("unexpectedly declares the WORKER_VERSION binding");
+    expect(() =>
+      assertExactVersionBindingClosure(
+        "preflight",
+        "version-1",
+        {
+          ...legacy,
+          resources: {
+            bindings: legacy.resources.bindings.filter(({ name }) => name !== "STATE_DB"),
+          },
+        },
+        closure,
+      ),
+    ).toThrow("does not declare the STATE_DB binding");
   });
 
   test("missing-binding diagnostics never disclose unrelated binding values", () => {

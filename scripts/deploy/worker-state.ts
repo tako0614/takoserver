@@ -159,6 +159,25 @@ export function expectedExactBindingClosure(
   };
 }
 
+/**
+ * Exact binding closure of the one pinned integration predecessor that
+ * predates Cloudflare Worker Version metadata. Every desired binding remains
+ * strict; the self-version binding must be absent, not optional.
+ */
+export function expectedLegacyPreVersionMetadataBindingClosure(
+  target: DeployTarget,
+  input: {
+    readonly hostedTopology: "desired" | "absent";
+    readonly signingKeyId?: string;
+    readonly expectedSecrets?: readonly string[];
+  },
+): ExpectedBindingClosure {
+  return {
+    ...expectedExactBindingClosure(target, input),
+    WORKER_VERSION: null,
+  };
+}
+
 /** Exact means no unnamed, duplicate, or target-unexpected binding survives. */
 export function assertExactVersionBindingClosure(
   phase: DeployPhase,

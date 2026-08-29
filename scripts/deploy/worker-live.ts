@@ -5,6 +5,7 @@ import {
   assertExactSecretInventory,
   assertExactVersionBindingClosure,
   expectedExactBindingClosure,
+  expectedLegacyPreVersionMetadataBindingClosure,
   parseWorkerDeploymentHistory,
   type WorkerDeploymentHistory,
 } from "./worker-state.ts";
@@ -54,8 +55,9 @@ export async function inspectLiveWorkerVersion(
 
 /**
  * Reads one explicitly pinned integration predecessor while permitting only a
- * missing or malformed identity annotation. Binding, secret, domain, and
- * target closure checks remain identical to the strict path.
+ * missing or malformed identity annotation and the exact known absence of the
+ * pre-version-metadata self binding. Every other binding, secret, domain, and
+ * target check remains identical to the strict path.
  */
 export async function inspectLiveWorkerVersionWithLegacyPredecessor(
   phase: DeployPhase,
@@ -131,15 +133,26 @@ async function inspectLiveWorkerVersionCore(
     );
   }
   const version = await state.workerVersion(target.workerName, history.versionId);
+  const legacyIdentity =
+    mode !== "strict" && selectorIsCurrent ? workerVersionIdentityOrLegacy(phase, version) : null;
+  const canonicalIdentity =
+    legacyIdentity === null
+      ? workerVersionIdentity(phase, version)
+      : legacyIdentity.kind === "canonical"
+        ? legacyIdentity
+        : null;
+  const bindingInput = {
+    hostedTopology: input.hostedTopology,
+    ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
+    ...(input.expectedSecrets === undefined ? {} : { expectedSecrets: input.expectedSecrets }),
+  } as const;
   assertExactVersionBindingClosure(
     phase,
     history.versionId,
     version,
-    expectedExactBindingClosure(target, {
-      hostedTopology: input.hostedTopology,
-      ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
-      ...(input.expectedSecrets === undefined ? {} : { expectedSecrets: input.expectedSecrets }),
-    }),
+    legacyIdentity?.kind === LEGACY_UNATTRIBUTED_PREDECESSOR
+      ? expectedLegacyPreVersionMetadataBindingClosure(target, bindingInput)
+      : expectedExactBindingClosure(target, bindingInput),
   );
   assertExactSecretInventory(
     await state.workerSecrets(target.workerName),
@@ -147,13 +160,8 @@ async function inspectLiveWorkerVersionCore(
     phase,
   );
   assertDomainClosure(phase, target, await state.workerDomains());
-  if (mode === "strict" || !selectorIsCurrent) {
-    const identity = workerVersionIdentity(phase, version);
-    return { history, ...identity };
-  }
-  const identity = workerVersionIdentityOrLegacy(phase, version);
-  return identity.kind === "canonical"
-    ? { history, ...identity }
+  return canonicalIdentity !== null
+    ? { history, ...canonicalIdentity }
     : {
         history,
         commit: null,

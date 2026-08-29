@@ -50,6 +50,9 @@ function fixture(
     readonly current?: "before" | "after" | "unrelated";
     readonly advanceDuringBuild?: boolean;
     readonly secretsAfterBuild?: readonly unknown[];
+    readonly legacyBeforeWithoutVersionMetadata?: boolean;
+    readonly beforeVersionMetadataAfterBuild?: boolean;
+    readonly afterWithoutVersionMetadata?: boolean;
   } = {},
 ): {
   readonly run: WorkerProcess;
@@ -130,6 +133,13 @@ function fixture(
             : input.unrelatedMessage === undefined
               ? `takoserver-worker:${OTHER_COMMIT}:${"e".repeat(64)}`
               : input.unrelatedMessage,
+        versionId === VERSION_BEFORE &&
+          input.legacyBeforeWithoutVersionMetadata === true &&
+          !(built && input.beforeVersionMetadataAfterBuild === true)
+          ? "legacy-pre-version-metadata"
+          : versionId === VERSION_AFTER && input.afterWithoutVersionMetadata === true
+            ? "legacy-pre-version-metadata"
+            : "current",
       );
     },
     async workerSecrets() {
@@ -356,7 +366,11 @@ describe("split Takoserver Worker surfaces", () => {
   test("integration authority cutover can bootstrap an exact unannotated predecessor", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-legacy-"));
     try {
-      const current = fixture({ beforeMessage: null, dirty: " M src/catalog.ts\0" });
+      const current = fixture({
+        beforeMessage: null,
+        dirty: " M src/catalog.ts\0",
+        legacyBeforeWithoutVersionMetadata: true,
+      });
       const result = await runWorker(
         {
           surface: "takoserver-worker-authority-cutover",
@@ -409,7 +423,10 @@ describe("split Takoserver Worker surfaces", () => {
   test("selector status reports that the exact legacy predecessor remains current", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-legacy-status-current-"));
     try {
-      const current = fixture({ beforeMessage: null });
+      const current = fixture({
+        beforeMessage: null,
+        legacyBeforeWithoutVersionMetadata: true,
+      });
       const status = await runWorker(
         {
           surface: "takoserver-worker-authority-cutover",
@@ -440,6 +457,62 @@ describe("split Takoserver Worker surfaces", () => {
       });
       expect(current.calls.filter((call) => call.join(" ") === "bun run check")).toHaveLength(0);
       expect(current.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("selector status rejects an unattributed predecessor with the successor metadata binding", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-worker-legacy-status-new-binding-"));
+    try {
+      const current = fixture({ beforeMessage: null });
+      const failure = await runWorker(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyPredecessorVersionId: VERSION_BEFORE,
+        },
+        target,
+        {
+          ...current,
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      ).catch((error) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect(failure.message).toContain("unexpectedly declares the WORKER_VERSION binding");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("selector status requires the direct successor to add version metadata", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-worker-legacy-status-successor-binding-"));
+    try {
+      const current = fixture({
+        current: "after",
+        afterMessage: `takoserver-worker:${COMMIT}:${"f".repeat(64)}`,
+        afterWithoutVersionMetadata: true,
+      });
+      const failure = await runWorker(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyPredecessorVersionId: VERSION_BEFORE,
+        },
+        target,
+        {
+          ...current,
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      ).catch((error) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect(failure.message).toContain("does not declare the WORKER_VERSION binding");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -618,6 +691,7 @@ describe("split Takoserver Worker surfaces", () => {
         beforeMessage: null,
         advanceDuringBuild: true,
         afterMessage: `takoserver-worker:${OTHER_COMMIT}:${"e".repeat(64)}`,
+        legacyBeforeWithoutVersionMetadata: true,
       });
       const failure = await runWorker(
         {
@@ -652,6 +726,8 @@ describe("split Takoserver Worker surfaces", () => {
       const current = fixture({
         beforeMessage: null,
         beforeMessageAfterBuild: `takoserver-worker:${LIVE_COMMIT}:${"c".repeat(64)}`,
+        legacyBeforeWithoutVersionMetadata: true,
+        beforeVersionMetadataAfterBuild: true,
       });
       const failure = await runWorker(
         {
@@ -681,7 +757,11 @@ describe("split Takoserver Worker surfaces", () => {
   test("legacy bootstrap rechecks exact live closure immediately before upload", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-legacy-closure-race-"));
     try {
-      const current = fixture({ beforeMessage: null, secretsAfterBuild: [] });
+      const current = fixture({
+        beforeMessage: null,
+        secretsAfterBuild: [],
+        legacyBeforeWithoutVersionMetadata: true,
+      });
       const failure = await runWorker(
         {
           surface: "takoserver-worker-authority-cutover",
@@ -769,7 +849,10 @@ describe("split Takoserver Worker surfaces", () => {
   test("legacy bootstrap refuses an unannotated predecessor without the exact selector", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-legacy-no-selector-"));
     try {
-      const current = fixture({ beforeMessage: null });
+      const current = fixture({
+        beforeMessage: null,
+        legacyBeforeWithoutVersionMetadata: true,
+      });
       const failure = await runWorker(
         {
           surface: "takoserver-worker-authority-cutover",
@@ -797,7 +880,10 @@ describe("split Takoserver Worker surfaces", () => {
   test("legacy bootstrap refuses a selector that does not match the current Version", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-legacy-mismatch-"));
     try {
-      const current = fixture({ beforeMessage: null });
+      const current = fixture({
+        beforeMessage: null,
+        legacyBeforeWithoutVersionMetadata: true,
+      });
       const failure = await runWorker(
         {
           surface: "takoserver-worker-authority-cutover",
@@ -826,7 +912,10 @@ describe("split Takoserver Worker surfaces", () => {
   test("legacy bootstrap requires an independent reviewer before its gate or upload", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-legacy-review-"));
     try {
-      const current = fixture({ beforeMessage: "not-canonical" });
+      const current = fixture({
+        beforeMessage: "not-canonical",
+        legacyBeforeWithoutVersionMetadata: true,
+      });
       const failure = await runWorker(
         {
           surface: "takoserver-worker-authority-cutover",
@@ -854,7 +943,11 @@ describe("split Takoserver Worker surfaces", () => {
   test("legacy bootstrap never accepts a malformed annotation after upload", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-legacy-post-"));
     try {
-      const current = fixture({ beforeMessage: null, afterMessage: "not-canonical" });
+      const current = fixture({
+        beforeMessage: null,
+        afterMessage: "not-canonical",
+        legacyBeforeWithoutVersionMetadata: true,
+      });
       const failure = await runWorker(
         {
           surface: "takoserver-worker-authority-cutover",
@@ -884,7 +977,11 @@ describe("split Takoserver Worker surfaces", () => {
   test("an advanced malformed Version cannot be re-adopted with the old selector", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-legacy-advanced-"));
     try {
-      const current = fixture({ beforeMessage: null, afterMessage: "not-canonical" });
+      const current = fixture({
+        beforeMessage: null,
+        afterMessage: "not-canonical",
+        legacyBeforeWithoutVersionMetadata: true,
+      });
       const first = await runWorker(
         {
           surface: "takoserver-worker-authority-cutover",
@@ -961,15 +1058,23 @@ function deployment(id: string, versionId: string, created: string) {
   };
 }
 
-function version(id: string, message: string | null) {
+function version(
+  id: string,
+  message: string | null,
+  bindingProfile: "current" | "legacy-pre-version-metadata" = "current",
+) {
   const expected = expectedExactBindingClosure(target, { hostedTopology: "desired" });
   return {
     id,
     ...(message === null ? {} : { annotations: { "workers/message": message } }),
     resources: {
-      bindings: Object.entries(expected).flatMap(([name, requirement]) =>
-        requirement === null ? [] : [{ name, type: requirement.type, ...requirement.fields }],
-      ),
+      bindings: Object.entries(expected).flatMap(([name, requirement]) => {
+        if (requirement === null) return [];
+        if (bindingProfile === "legacy-pre-version-metadata" && name === "WORKER_VERSION") {
+          return [];
+        }
+        return [{ name, type: requirement.type, ...requirement.fields }];
+      }),
     },
   };
 }
