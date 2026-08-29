@@ -10,8 +10,9 @@ The Bun process can expose that provider through one authenticated endpoint for
 an explicitly composed external control-plane client. A provider call enters,
 and a classified ticket leaves. No current official Takoserver Worker composes
 that remote client. Generic Cloudflare credentials may let the process share
-D1, R2, or an explicitly configured standard-service supply; they never switch
-current Worker execution from workerd to Cloudflare.
+R2 or an explicitly configured standard-service supply; control state remains
+local SQLite, and they never switch current Worker execution from workerd to
+Cloudflare.
 
 Most providers will not need this. One that reaches its backend by calling an
 HTTP API with a credential fits a Worker exactly, and adding it means adding a
@@ -28,15 +29,17 @@ pack. Relevant variables are:
 | `TAKOSERVER_DATA_ROOT` / `TAKOSERVER_DB` | Durable local state. |
 | `TAKOSERVER_WORKERD_BINARY` | Optional explicit workerd binary. |
 | `TAKOSERVER_WORKER_ENDPOINT_SUFFIX` / `TAKOSERVER_SUFFIXES` | Addresses the local provider may issue. |
-| `TAKOSERVER_D1_DATABASE_ID` | Optional control database shared with the Worker. Requires a Cloudflare account and token source. |
 | `TAKOSERVER_R2_BUCKET` | Optional artifact store shared with the Worker. Requires a Cloudflare account and token source. |
 | `TAKOSERVER_OPERATOR_PUBLIC_JWK` | Public half of the operator key. |
 | `TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK` | Optional login-only operator key; never authorizes funding. |
 | `PORT` | Where to listen. |
 
 `CLOUDFLARE_ACCOUNT_ID` is storage/control-plane input only in this mode. It is
-not provider-selection authority. `TAKOSERVER_ZONES` is rejected because DNS
-and Worker-route authority belongs to the production Worker entry. The retired
+not provider-selection authority. `TAKOSERVER_D1_DATABASE_ID` is not supported
+by the Bun entry: it is rejected before any local directory, database, or key is
+opened because the D1 HTTP API cannot provide the atomic batch capability the
+control plane requires. `TAKOSERVER_ZONES` is rejected because DNS and
+Worker-route authority belongs to the production Worker entry. The retired
 implicit `TAKOSERVER_EDGE_FORMS` switch is rejected as well.
 
 ### The Cloudflare token
@@ -44,7 +47,6 @@ implicit `TAKOSERVER_EDGE_FORMS` switch is rejected as well.
 Use a token created for the exact optional adapter, not a `wrangler login`
 session. Grant only what the selected Bun inputs use:
 
-- Account · D1 · Edit, only when `TAKOSERVER_D1_DATABASE_ID` is set;
 - Account · Workers R2 Storage · Edit, only when an R2 artifact store, stable S3
   supply, or the retired ObjectBucket drain is selected.
 

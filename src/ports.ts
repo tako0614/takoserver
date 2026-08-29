@@ -34,7 +34,19 @@ export interface SqlWrite {
 }
 
 /**
- * The single storage seam.
+ * The non-atomic storage access seam.
+ *
+ * HTTP-backed hosts can provide reads and guarded single-statement writes, but
+ * not the stronger all-or-none capability. Keeping that distinction in the
+ * type prevents a transport from claiming a guarantee it cannot provide.
+ */
+export interface SqlAccess {
+  query(sql: string, params?: readonly SqlParam[]): Promise<readonly Row[]>;
+  run(sql: string, params?: readonly SqlParam[]): Promise<SqlWrite>;
+}
+
+/**
+ * Full storage seam with an atomic batch capability.
  *
  * There is deliberately no interactive transaction. D1 cannot offer one, and an
  * abstraction that pretends otherwise would be a lie that only shows up in
@@ -47,9 +59,7 @@ export interface SqlWrite {
  * - a claim: take ownership of a row with a guarded `UPDATE`, do the slow or
  *   external work outside any transaction, then settle with a guarded batch.
  */
-export interface Sql {
-  query(sql: string, params?: readonly SqlParam[]): Promise<readonly Row[]>;
-  run(sql: string, params?: readonly SqlParam[]): Promise<SqlWrite>;
+export interface Sql extends SqlAccess {
   /** Commits all statements or none, in order. */
   batch(statements: readonly SqlStatement[]): Promise<readonly SqlWrite[]>;
 }

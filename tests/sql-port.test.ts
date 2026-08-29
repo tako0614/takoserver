@@ -1,7 +1,9 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
+import type { AppPorts } from "../src/app.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { type Sql, SqlError } from "../src/ports.ts";
+import { createD1HttpSql } from "../src/sql-d1-http.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 
 function ledgerSql(): Sql {
@@ -28,6 +30,36 @@ function ledgerSql(): Sql {
 }
 
 describe("Sql port", () => {
+  test("does not expose a batch capability over D1 HTTP", async () => {
+    const sql = createD1HttpSql({
+      accountId: "account",
+      databaseId: "database",
+      authorize: () => "Bearer token",
+      fetch: async () =>
+        Response.json({
+          success: true,
+          result: [{ results: [{ value: 1 }], meta: { changes: 0 } }],
+        }),
+    });
+
+    expect("batch" in sql).toBe(false);
+    expect(await sql.query("SELECT 1")).toEqual([{ value: 1 }]);
+  });
+
+  test("keeps D1 HTTP access incompatible with the atomic AppPorts SQL seam", () => {
+    const access = createD1HttpSql({
+      accountId: "account",
+      databaseId: "database",
+      authorize: () => "Bearer token",
+    });
+
+    // The HTTP transport deliberately has no atomic batch capability. This
+    // assertion is checked by the repository typecheck, not by runtime shape.
+    // @ts-expect-error SqlAccess cannot satisfy AppPorts.sql, which requires atomic batch.
+    const appSql: AppPorts["sql"] = access;
+    void appSql;
+  });
+
   test("reports the rows a write actually changed", async () => {
     const sql = ledgerSql();
 

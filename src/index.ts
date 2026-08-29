@@ -84,6 +84,7 @@ export type {
   ObjectStore,
   ObjectStoreAccess,
   Sql,
+  SqlAccess,
   SqlWrite,
 } from "./ports.ts";
 export {

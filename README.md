@@ -23,10 +23,11 @@ shape is retained only for draining historical ObjectBucket records. It does
 not create a current ObjectBucket or grant new lifecycle authority.
 
 Run it on your own machine and it uses your disk and [workerd](https://github.com/cloudflare/workerd),
-the runtime Cloudflare runs at the edge. A Bun process may share D1 or R2 with a
-Cloudflare deployment, but its current Worker execution remains on local
-workerd. Production execution on Cloudflare Workers belongs to the Worker
-entry, not to an ambient account credential in the Bun entry.
+the runtime Cloudflare runs at the edge. A Bun process may share R2 with a
+Cloudflare deployment, but its control state stays in local SQLite and its
+current Worker execution remains on local workerd. Production execution on
+Cloudflare Workers belongs to the Worker entry, not to an ambient account
+credential in the Bun entry.
 
 ```
 bun install
@@ -36,9 +37,10 @@ bun src/entry-bun.ts
 That is the whole first run. It creates its schema, generates the keys it signs
 with, prints a sign-in you can paste into its console, and starts serving.
 Ordinary Bun always keeps the stable self-host Provider3 execution pack.
-`CLOUDFLARE_ACCOUNT_ID` may separately back shared D1, R2, or a configured
+`CLOUDFLARE_ACCOUNT_ID` may separately back shared R2 or a configured
 standard-service supply, but it is not provider-selection authority and does
-not switch stable Forms off.
+not switch stable Forms off. `TAKOSERVER_D1_DATABASE_ID` is rejected by the Bun
+entry before it opens local state; use the Worker entry for D1-bound execution.
 
 The released Cloudflare ObjectBucket provider survives only as an explicit
 recovery lane for observing and deleting its already-recorded beta
@@ -283,11 +285,13 @@ operator reconciliation rather than being reported as a successful cancellation.
 
 ## How it is built
 
-Six ports, and everything above them is provider-neutral.
+Six provider-neutral ports; the SQL port is shown at both capability levels
+below, and everything above them remains provider-neutral.
 
 | Port | Implementations |
 |---|---|
-| `Sql` | SQLite, D1 binding, D1 over HTTP |
+| `Sql` | SQLite, D1 binding (including atomic batch) |
+| `SqlAccess` | D1 over HTTP (query/run only; no atomic batch) |
 | `ObjectStore` | filesystem, R2 binding, R2 over HTTP, memory |
 | `Provider Pack` | provisioning, Attachment, transfer, credential, meter, and cost capabilities |
 | `ExternalIdentityVerifier` | Google ID tokens, operator signature |
@@ -308,10 +312,12 @@ sale additionally needs an implemented backend and explicit operator supply;
 pinning it here does not mint or promote a Takoform release. AI and S3 protocol
 operations do not become Forms just because Takoserver offers them.
 
-**Guarded writes, not transactions.** The control database may be D1, which has
-no interactive transaction, so invariants live in `WHERE` clauses and are
-verified by counting the rows a write actually changed. A hold that cannot be
-covered is not written at all.
+**Guarded writes and atomic batches.** The control database has no interactive
+transaction, so invariants live in `WHERE` clauses and are verified by counting
+the rows a write actually changed. SQLite and the Worker D1 binding also expose
+an all-or-none `Sql.batch` for multi-statement commits. The D1 HTTP maintenance
+adapter intentionally exposes only `SqlAccess` (query/run); it cannot claim
+that atomic capability. A hold that cannot be covered is not written at all.
 
 **Failure is a value.** A provider returns a classified ticket rather than
 throwing, so the engine, the ledger, and the operation record all see the same

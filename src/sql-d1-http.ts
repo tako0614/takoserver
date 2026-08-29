@@ -1,32 +1,21 @@
-import {
-  type Row,
-  type Sql,
-  SqlError,
-  type SqlParam,
-  type SqlStatement,
-  type SqlWrite,
-} from "./ports.ts";
+import { type Row, type SqlAccess, SqlError, type SqlParam, type SqlWrite } from "./ports.ts";
 
 /**
- * `Sql` over the D1 HTTP API, for a host that has no binding.
+ * `SqlAccess` over the D1 HTTP API, for a host that has no binding.
  *
- * The self-hosted provisioner has to read and write the same state the Worker
- * serves, or the product would be two products with two truths — an
- * organization created through the API would be invisible to the process that
- * provisions for it. A Worker reaches D1 through a binding; a host can only
- * reach it over HTTP, so this adapter exists.
+ * Operator maintenance scripts can read and write the same state the Worker
+ * serves when an explicit migration or transfer needs it. A Worker reaches D1
+ * through a binding; a script can only reach it over HTTP, so this adapter
+ * exists.
  *
  * It is host-only for the same reason the Cloudflare provider is: it needs an
  * account credential, which must never be reachable from a Worker bundle. The
  * import gate enforces that.
  *
- * **`batch` is not atomic on this transport.** The HTTP API offers no
- * equivalent of the binding's implicit batch transaction, so the statements are
- * sent in order and a failure part-way leaves earlier ones applied. Nothing in
- * the product depends on batch atomicity today — every invariant is carried by
- * a single guarded statement — and this refuses rather than pretending: a batch
- * of more than one statement is rejected, so a future caller that does need
- * atomicity finds out here instead of in production.
+ * The HTTP API has no equivalent of the binding's implicit batch transaction,
+ * so this adapter intentionally exposes only the non-atomic access seam. A
+ * caller that needs atomicity cannot accept this result as a `Sql` value and
+ * therefore finds out at composition time instead of in production.
  */
 export interface D1HttpOptions {
   readonly accountId: string;
@@ -37,7 +26,7 @@ export interface D1HttpOptions {
   readonly fetch?: (request: Request) => Promise<Response>;
 }
 
-export function createD1HttpSql(options: D1HttpOptions): Sql {
+export function createD1HttpSql(options: D1HttpOptions): SqlAccess {
   const origin = options.apiOrigin ?? "https://api.cloudflare.com/client/v4";
   const endpoint = `${origin}/accounts/${options.accountId}/d1/database/${options.databaseId}/query`;
   const send = options.fetch ?? ((request: Request) => fetch(request));
@@ -93,19 +82,6 @@ export function createD1HttpSql(options: D1HttpOptions): Sql {
 
     async run(sql, params): Promise<SqlWrite> {
       return await execute(sql, params ?? []);
-    },
-
-    async batch(statements: readonly SqlStatement[]): Promise<readonly SqlWrite[]> {
-      if (statements.length === 0) return [];
-      if (statements.length > 1) {
-        throw new SqlError(
-          "invalid",
-          "the D1 HTTP transport cannot commit a batch atomically; use guarded single statements",
-        );
-      }
-      const only = statements[0];
-      if (!only) return [];
-      return [await execute(only.sql, only.params ?? [])];
     },
   };
 }

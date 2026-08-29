@@ -18,8 +18,7 @@ import {
 import { resolvePayment } from "./payment-setup.ts";
 import { createOpenAiGateway, parseOpenAiModelConfig } from "./providers/openai.ts";
 import { createProvisionerEndpoint } from "./provisioner-endpoint.ts";
-import { ensureSigningKey, loadSigningKey } from "./signing-key.ts";
-import { createD1HttpSql } from "./sql-d1-http.ts";
+import { ensureSigningKey } from "./signing-key.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import {
   createStandaloneProviderComposition,
@@ -47,8 +46,8 @@ import { createWorkerdSupervisor, findWorkerd } from "./workerd-supervisor.ts";
  *   TAKOSERVER_DB=/var/lib/takoserver/state.sqlite \
  *   bun src/entry-bun.ts
  *
- * Cloudflare account credentials may back shared D1/R2 or standard services;
- * they never select the ordinary Provider3 execution pack.
+ * Cloudflare account credentials may back shared R2 or standard services; they
+ * never select the ordinary Provider3 execution pack.
  */
 
 function required(name: string): string {
@@ -93,6 +92,12 @@ function aiGateway() {
   });
 }
 
+if (process.env.TAKOSERVER_D1_DATABASE_ID !== undefined) {
+  throw new Error(
+    "TAKOSERVER_D1_DATABASE_ID is not supported by the Bun entry; use local SQLite control state",
+  );
+}
+
 const publicOrigin = process.env.TAKOSERVER_PUBLIC_ORIGIN ?? "http://localhost:8787";
 const port = Number(process.env.PORT ?? 8787);
 
@@ -121,36 +126,27 @@ const databasePath =
   (dataRoot === ":memory:" ? ":memory:" : `${dataRoot}/control.sqlite`);
 if (databasePath !== ":memory:") mkdirSync(dirname(databasePath), { recursive: true });
 
-/**
- * State comes from the same D1 the Worker serves when one is configured. A
- * provisioner with its own database would be a second product with a second
- * truth: an organization created through the public API would be invisible to
- * the process that provisions for it.
- */
-const sharedDatabaseId = process.env.TAKOSERVER_D1_DATABASE_ID;
-const sql = sharedDatabaseId
-  ? createD1HttpSql({
-      accountId: required("CLOUDFLARE_ACCOUNT_ID"),
-      databaseId: sharedDatabaseId,
-      authorize: () => `Bearer ${cloudflareToken()}`,
-    })
-  : (() => {
-      const database = new Database(databasePath);
-      // A self-hosted deployment starts with an empty file, so it is brought up
-      // to this build's schema here. Forward only and recorded, so running it
-      // again applies nothing and a database from a newer build is refused
-      // rather than repaired.
-      const migrated = migrateSqlite(database);
-      if (migrated.applied.length > 0) {
-        process.stdout.write(
-          `applied ${migrated.applied.length} migration(s): ${migrated.applied.join(", ")}\n`,
-        );
-      }
-      return createSqliteSql(database);
-    })();
-// Bytes come from the same bucket the Worker writes to, for the same reason
-// the rows do: a bundle committed through the public API has to be there when
-// the provisioner goes to publish it.
+// The Bun control plane always uses local SQLite. Shared D1 is not accepted
+// here because its HTTP API cannot provide the atomic batch capability the app
+// requires; the guard above runs before this database is opened or migrated.
+const sql = (() => {
+  const database = new Database(databasePath);
+  // A self-hosted deployment starts with an empty file, so it is brought up
+  // to this build's schema here. Forward only and recorded, so running it
+  // again applies nothing and a database from a newer build is refused
+  // rather than repaired.
+  const migrated = migrateSqlite(database);
+  if (migrated.applied.length > 0) {
+    process.stdout.write(
+      `applied ${migrated.applied.length} migration(s): ${migrated.applied.join(", ")}\n`,
+    );
+  }
+  return createSqliteSql(database);
+})();
+// Artifact bytes may come from the same R2 bucket the Worker writes to. Bun's
+// control rows remain in local SQLite while the Worker keeps its rows in D1;
+// sharing only bytes ensures a bundle committed through the public API is there
+// when the provisioner goes to publish it.
 const workerd = createWorkerdSupervisor({
   binary: process.env.TAKOSERVER_WORKERD_BINARY ?? findWorkerd(process.cwd()),
   spawn: (command) => Bun.spawn(command as string[], { stdout: "inherit", stderr: "inherit" }),
@@ -194,7 +190,7 @@ const providerArtifacts = {
 /**
  * Ordinary Bun always executes current Provider3 Edge Forms on the local
  * workerd-backed provider. Generic Cloudflare credentials may separately back
- * D1, R2, or standard services; they are not provider-selection authority.
+ * R2 or standard services; they are not provider-selection authority.
  *
  * The old Cloudflare ObjectBucket adapter remains reachable only through the
  * explicit recovery mode resolved before any local state is opened. That mode
@@ -247,8 +243,7 @@ const unconfigured = {
 };
 
 // A machine with no identity provider would advertise no way in and refuse
-// every sign-in, so it mints an operator key and offers that instead. A shared
-// deployment is given its public half and generates nothing.
+// every sign-in, so it mints an operator key and offers that instead.
 const operatorKeyPath = join(dataRoot, "operator-key.jwk");
 const identityOnlyPublicKeyJwk = process.env.TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK
   ? parseOperatorPublicKey(
@@ -261,8 +256,7 @@ const legacyPublicKeyJwk = await ensureOperatorKey({
   hasIdentityProvider:
     Boolean(identityOnlyPublicKeyJwk) ||
     Boolean(process.env.TAKOS_ID_ISSUER && process.env.TAKOS_ID_CLIENT_ID) ||
-    Boolean(process.env.GOOGLE_CLIENT_ID) ||
-    Boolean(sharedDatabaseId),
+    Boolean(process.env.GOOGLE_CLIENT_ID),
   path: operatorKeyPath,
   readFile: (path) =>
     readFile(path, "utf8").then(
@@ -308,26 +302,24 @@ const provision = createProvisionerEndpoint({
   applyOfferingIds: offerings.map((offering) => offering.id),
 });
 
-// A shared deployment is given its key; a machine standing on its own makes
-// one, keeps it under the data root, and registers the half that verifies it.
-const signingKey = sharedDatabaseId
-  ? await loadSigningKey(process.env.TAKOSERVER_SIGNING_KEY_ID, process.env.TAKOSERVER_SIGNING_KEY)
-  : await ensureSigningKey({
-      keyId: process.env.TAKOSERVER_SIGNING_KEY_ID ?? "takoserver-local",
-      privateJwk: process.env.TAKOSERVER_SIGNING_KEY,
-      path: join(dataRoot, "signing-key.jwk"),
-      sql,
-      readFile: (path) =>
-        readFile(path, "utf8").then(
-          (text) => text,
-          () => null,
-        ),
-      async writeFile(path, contents) {
-        await mkdir(dirname(path), { recursive: true });
-        await writeFile(path, contents, { mode: 0o600 });
-        process.stdout.write(`generated a signing key at ${path}\n`);
-      },
-    });
+// A machine standing on its own makes a signing key, keeps it under the data
+// root, and registers the half that verifies it.
+const signingKey = await ensureSigningKey({
+  keyId: process.env.TAKOSERVER_SIGNING_KEY_ID ?? "takoserver-local",
+  privateJwk: process.env.TAKOSERVER_SIGNING_KEY,
+  path: join(dataRoot, "signing-key.jwk"),
+  sql,
+  readFile: (path) =>
+    readFile(path, "utf8").then(
+      (text) => text,
+      () => null,
+    ),
+  async writeFile(path, contents) {
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, contents, { mode: 0o600 });
+    process.stdout.write(`generated a signing key at ${path}\n`);
+  },
+});
 
 const configuredAi = aiGateway();
 const standardServiceResolver = createProductionStandardServiceResolver({
