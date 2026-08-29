@@ -8,12 +8,14 @@ import {
   expectedLegacyPreVersionMetadataBindingClosure,
   parseWorkerDeploymentHistory,
   type WorkerDeploymentHistory,
+  workerVersionMetadataBindingProfile,
 } from "./worker-state.ts";
 
 const WORKER_MESSAGE = /^takoserver-worker:([0-9a-f]{40}):([0-9a-f]{64})$/u;
 const WORKER_VERSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
 export const LEGACY_UNATTRIBUTED_PREDECESSOR = "legacy-unattributed-predecessor" as const;
+export const LEGACY_PRE_VERSION_METADATA_PROFILE = "pre-version-metadata" as const;
 
 export interface WorkerState {
   workerDomains(): Promise<readonly { readonly hostname: string; readonly service: string }[]>;
@@ -26,6 +28,7 @@ export interface LiveWorkerVersion {
   readonly history: WorkerDeploymentHistory;
   readonly commit: string;
   readonly bundleDigestHex: string;
+  readonly legacyPredecessorProfile?: typeof LEGACY_PRE_VERSION_METADATA_PROFILE;
 }
 
 export interface LegacyLiveWorkerVersion {
@@ -33,6 +36,7 @@ export interface LegacyLiveWorkerVersion {
   readonly commit: null;
   readonly bundleDigestHex: null;
   readonly predecessorIdentity: typeof LEGACY_UNATTRIBUTED_PREDECESSOR;
+  readonly legacyPredecessorProfile: typeof LEGACY_PRE_VERSION_METADATA_PROFILE;
 }
 
 /** Exact authoritative code/config/secret/domain state for one served Version. */
@@ -55,9 +59,10 @@ export async function inspectLiveWorkerVersion(
 
 /**
  * Reads one explicitly pinned integration predecessor while permitting only a
- * missing or malformed identity annotation and the exact known absence of the
- * pre-version-metadata self binding. Every other binding, secret, domain, and
- * target check remains identical to the strict path.
+ * the exact known absence of the pre-version-metadata self binding. Artifact
+ * identity is retained when canonical and represented as unattributed only
+ * when its annotation is missing or malformed. Every other binding, secret,
+ * domain, and target check remains identical to the strict path.
  */
 export async function inspectLiveWorkerVersionWithLegacyPredecessor(
   phase: DeployPhase,
@@ -133,14 +138,19 @@ async function inspectLiveWorkerVersionCore(
     );
   }
   const version = await state.workerVersion(target.workerName, history.versionId);
-  const legacyIdentity =
-    mode !== "strict" && selectorIsCurrent ? workerVersionIdentityOrLegacy(phase, version) : null;
-  const canonicalIdentity =
-    legacyIdentity === null
-      ? workerVersionIdentity(phase, version)
-      : legacyIdentity.kind === "canonical"
-        ? legacyIdentity
-        : null;
+  const metadataBindingProfile = workerVersionMetadataBindingProfile(
+    phase,
+    history.versionId,
+    version,
+  );
+  const legacyPredecessorProfile =
+    mode !== "strict" && selectorIsCurrent && metadataBindingProfile === "pre-version-metadata"
+      ? LEGACY_PRE_VERSION_METADATA_PROFILE
+      : null;
+  const identity =
+    legacyPredecessorProfile === null
+      ? { kind: "canonical" as const, ...workerVersionIdentity(phase, version) }
+      : workerVersionIdentityOrLegacy(phase, version);
   const bindingInput = {
     hostedTopology: input.hostedTopology,
     ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
@@ -150,7 +160,7 @@ async function inspectLiveWorkerVersionCore(
     phase,
     history.versionId,
     version,
-    legacyIdentity?.kind === LEGACY_UNATTRIBUTED_PREDECESSOR
+    legacyPredecessorProfile !== null
       ? expectedLegacyPreVersionMetadataBindingClosure(target, bindingInput)
       : expectedExactBindingClosure(target, bindingInput),
   );
@@ -160,13 +170,35 @@ async function inspectLiveWorkerVersionCore(
     phase,
   );
   assertDomainClosure(phase, target, await state.workerDomains());
-  return canonicalIdentity !== null
-    ? { history, ...canonicalIdentity }
+  if (mode === "pinned-current") {
+    const historyAfterClosure = parseWorkerDeploymentHistory(
+      await state.workerDeployments(target.workerName),
+    );
+    if (
+      historyAfterClosure === null ||
+      historyAfterClosure.deploymentId !== history.deploymentId ||
+      historyAfterClosure.versionId !== history.versionId ||
+      historyAfterClosure.previousVersionId !== history.previousVersionId
+    ) {
+      throw phaseError(
+        phase,
+        "authoritative Worker deployment history changed during closure inspection",
+      );
+    }
+  }
+  return identity.kind === "canonical"
+    ? {
+        history,
+        commit: identity.commit,
+        bundleDigestHex: identity.bundleDigestHex,
+        ...(legacyPredecessorProfile === null ? {} : { legacyPredecessorProfile }),
+      }
     : {
         history,
         commit: null,
         bundleDigestHex: null,
         predecessorIdentity: LEGACY_UNATTRIBUTED_PREDECESSOR,
+        legacyPredecessorProfile: LEGACY_PRE_VERSION_METADATA_PROFILE,
       };
 }
 

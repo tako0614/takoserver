@@ -49,6 +49,7 @@ import {
   inspectLiveWorkerVersionForLegacyStatus,
   inspectLiveWorkerVersionWithLegacyPredecessor,
   isWorkerVersionId,
+  type LEGACY_PRE_VERSION_METADATA_PROFILE,
   LEGACY_UNATTRIBUTED_PREDECESSOR,
   type WorkerState,
 } from "./worker-live.ts";
@@ -80,6 +81,7 @@ interface WorkerInspection {
   readonly commit: string | null;
   readonly bundleDigestHex: string | null;
   readonly predecessorIdentity?: typeof LEGACY_UNATTRIBUTED_PREDECESSOR;
+  readonly legacyPredecessorProfile?: typeof LEGACY_PRE_VERSION_METADATA_PROFILE;
   readonly migrations: { readonly local: readonly string[]; readonly applied: readonly string[] };
   readonly pending: readonly string[];
 }
@@ -151,8 +153,7 @@ export async function runWorker(
       const advancedFromSelector =
         invocation.legacyPredecessorVersionId !== undefined &&
         before.history.versionId !== invocation.legacyPredecessorVersionId;
-      const reconcilingLegacyCutover =
-        advancedFromSelector || before.predecessorIdentity !== undefined;
+      const legacyProfileCurrent = before.legacyPredecessorProfile !== undefined;
       return {
         kind: "takoserver.worker-status@v2",
         surface: invocation.surface,
@@ -168,7 +169,8 @@ export async function runWorker(
         pendingMigrations: before.pending,
         ready:
           before.pending.length === 0 &&
-          (!reconcilingLegacyCutover || before.commit === invocation.commit),
+          !legacyProfileCurrent &&
+          (!advancedFromSelector || before.commit === invocation.commit),
         ...(advancedFromSelector
           ? {
               legacyPredecessorVersionId: invocation.legacyPredecessorVersionId,
@@ -178,13 +180,15 @@ export async function runWorker(
                   : "different-commit-current",
             }
           : {}),
-        ...(before.predecessorIdentity === undefined
+        ...(!legacyProfileCurrent
           ? {}
           : {
               ...(invocation.legacyPredecessorVersionId === undefined
                 ? {}
                 : { legacyPredecessorVersionId: invocation.legacyPredecessorVersionId }),
-              predecessorIdentity: before.predecessorIdentity ?? LEGACY_UNATTRIBUTED_PREDECESSOR,
+              ...(before.predecessorIdentity === undefined
+                ? {}
+                : { predecessorIdentity: before.predecessorIdentity }),
               authorityScope: "entire-worker-artifact",
               cutoverState: "legacy-predecessor-current",
             }),
@@ -202,7 +206,7 @@ export async function runWorker(
         JSON.stringify(before.pending),
       );
     }
-    const legacyBootstrap = before.predecessorIdentity !== undefined;
+    const legacyBootstrap = before.legacyPredecessorProfile !== undefined;
     const changedPaths = legacyBootstrap
       ? null
       : before.commit === null
@@ -252,11 +256,14 @@ export async function runWorker(
       });
       if (
         last.history.versionId !== before.history.versionId ||
-        last.commit !== null ||
-        last.predecessorIdentity !== LEGACY_UNATTRIBUTED_PREDECESSOR
+        last.legacyPredecessorProfile !== before.legacyPredecessorProfile ||
+        last.commit !== before.commit ||
+        last.bundleDigestHex !== before.bundleDigestHex ||
+        ("predecessorIdentity" in last ? last.predecessorIdentity : undefined) !==
+          before.predecessorIdentity
       ) {
         throw preflightError(
-          "pinned legacy predecessor is no longer the same unattributed Worker Version",
+          "pinned legacy predecessor identity or binding profile changed before upload",
         );
       }
     }
@@ -319,13 +326,15 @@ export async function runWorker(
       deploymentId: after.history.deploymentId,
       versionId: after.history.versionId,
       probe,
-      ...(before.predecessorIdentity === undefined
+      ...(!legacyBootstrap
         ? {}
         : {
             ...(invocation.legacyPredecessorVersionId === undefined
               ? {}
               : { legacyPredecessorVersionId: invocation.legacyPredecessorVersionId }),
-            predecessorIdentity: before.predecessorIdentity ?? LEGACY_UNATTRIBUTED_PREDECESSOR,
+            ...(before.predecessorIdentity === undefined
+              ? {}
+              : { predecessorIdentity: before.predecessorIdentity }),
             authorityScope: "entire-worker-artifact",
           }),
       rollback:
@@ -368,6 +377,9 @@ async function inspectWorker(
     commit: live.commit,
     bundleDigestHex: live.bundleDigestHex,
     ...(live.commit === null ? { predecessorIdentity: LEGACY_UNATTRIBUTED_PREDECESSOR } : {}),
+    ...(live.legacyPredecessorProfile === undefined
+      ? {}
+      : { legacyPredecessorProfile: live.legacyPredecessorProfile }),
     migrations: migrationState,
     pending,
   };

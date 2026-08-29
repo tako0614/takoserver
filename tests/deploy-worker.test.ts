@@ -53,6 +53,7 @@ function fixture(
     readonly legacyBeforeWithoutVersionMetadata?: boolean;
     readonly beforeVersionMetadataAfterBuild?: boolean;
     readonly afterWithoutVersionMetadata?: boolean;
+    readonly replaceDeploymentDuringFinalInspection?: boolean;
   } = {},
 ): {
   readonly run: WorkerProcess;
@@ -63,6 +64,7 @@ function fixture(
   const calls: string[][] = [];
   let current = input.current ?? "before";
   let built = false;
+  let replacementObserved = false;
   let uploadMessage: string | null = null;
   const run: WorkerProcess = async (command): Promise<CommandResult> => {
     calls.push([...command]);
@@ -100,6 +102,9 @@ function fixture(
     },
     async workerDeployments() {
       if (current === "before") {
+        if (replacementObserved) {
+          return [deployment("deployment-before-replaced", VERSION_BEFORE, "2026-08-28T04:00:00Z")];
+        }
         return [deployment("deployment-before", VERSION_BEFORE, "2026-08-28T01:00:00Z")];
       }
       if (current === "unrelated") {
@@ -118,7 +123,7 @@ function fixture(
       ];
     },
     async workerVersion(_worker, versionId) {
-      return version(
+      const result = version(
         versionId,
         versionId === VERSION_BEFORE
           ? built && input.beforeMessageAfterBuild !== undefined
@@ -141,6 +146,14 @@ function fixture(
             ? "legacy-pre-version-metadata"
             : "current",
       );
+      if (
+        built &&
+        versionId === VERSION_BEFORE &&
+        input.replaceDeploymentDuringFinalInspection === true
+      ) {
+        replacementObserved = true;
+      }
+      return result;
     },
     async workerSecrets() {
       if (built && input.secretsAfterBuild !== undefined) return input.secretsAfterBuild;
@@ -462,6 +475,87 @@ describe("split Takoserver Worker surfaces", () => {
     }
   });
 
+  test("selector status preserves canonical identity but never marks a pre-metadata predecessor ready", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-worker-legacy-canonical-status-"));
+    try {
+      const current = fixture({
+        beforeMessage: `takoserver-worker:${COMMIT}:${"c".repeat(64)}`,
+        legacyBeforeWithoutVersionMetadata: true,
+      });
+      const status = await runWorker(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyPredecessorVersionId: VERSION_BEFORE,
+        },
+        target,
+        {
+          ...current,
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+      expect(status).toMatchObject({
+        kind: "takoserver.worker-status@v2",
+        legacyPredecessorVersionId: VERSION_BEFORE,
+        cutoverState: "legacy-predecessor-current",
+        deployedCommit: COMMIT,
+        artifactDigest: `sha256:${"c".repeat(64)}`,
+        commitMatches: true,
+        ready: false,
+        versionId: VERSION_BEFORE,
+        authorityScope: "entire-worker-artifact",
+      });
+      expect(status).not.toHaveProperty("predecessorIdentity");
+      expect(current.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("integration authority cutover bootstraps a canonical pre-metadata predecessor as one artifact", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-worker-legacy-canonical-apply-"));
+    try {
+      const current = fixture({
+        dirty: " M src/catalog.ts\0",
+        legacyBeforeWithoutVersionMetadata: true,
+      });
+      const result = await runWorker(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          legacyPredecessorVersionId: VERSION_BEFORE,
+        },
+        target,
+        {
+          ...current,
+          review: "reviewer@example.test",
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          fetcher: publishedProductFetcher(),
+        },
+      );
+      expect(result).toMatchObject({
+        authorityScope: "entire-worker-artifact",
+        legacyPredecessorVersionId: VERSION_BEFORE,
+        changedPaths: null,
+        authorityPaths: null,
+        worktreePaths: ["src/catalog.ts"],
+        previousVersionId: VERSION_BEFORE,
+        versionId: VERSION_AFTER,
+      });
+      expect(result).not.toHaveProperty("predecessorIdentity");
+      expect(current.calls.some((call) => call.join(" ").includes("git diff"))).toBe(false);
+      expect(current.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("selector status rejects an unattributed predecessor with the successor metadata binding", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-legacy-status-new-binding-"));
     try {
@@ -482,7 +576,7 @@ describe("split Takoserver Worker surfaces", () => {
         },
       ).catch((error) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(failure.message).toContain("unexpectedly declares the WORKER_VERSION binding");
+      expect(failure.message).toContain("canonical annotation inventory");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -720,7 +814,7 @@ describe("split Takoserver Worker surfaces", () => {
     }
   });
 
-  test("legacy bootstrap still requires the pinned Version to be unattributed before upload", async () => {
+  test("legacy bootstrap rejects identity and binding-profile transition before upload", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-legacy-attribution-race-"));
     try {
       const current = fixture({
@@ -747,7 +841,71 @@ describe("split Takoserver Worker surfaces", () => {
       ).catch((error) => error);
       expect(failure).toBeInstanceOf(DeployError);
       expect(failure.phase).toBe("preflight");
-      expect(failure.message).toContain("no longer the same unattributed Worker Version");
+      expect(failure.message).toContain("identity or binding profile changed");
+      expect(current.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("canonical legacy bootstrap rejects identity drift before upload", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-worker-legacy-canonical-race-"));
+    try {
+      const current = fixture({
+        beforeMessageAfterBuild: `takoserver-worker:${OTHER_COMMIT}:${"e".repeat(64)}`,
+        legacyBeforeWithoutVersionMetadata: true,
+      });
+      const failure = await runWorker(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          legacyPredecessorVersionId: VERSION_BEFORE,
+        },
+        target,
+        {
+          ...current,
+          review: "reviewer@example.test",
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      ).catch((error) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect(failure.phase).toBe("preflight");
+      expect(failure.message).toContain("identity or binding profile changed");
+      expect(current.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("legacy bootstrap rejects a same-Version deployment replacement during final inspection", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-worker-legacy-history-race-"));
+    try {
+      const current = fixture({
+        legacyBeforeWithoutVersionMetadata: true,
+        replaceDeploymentDuringFinalInspection: true,
+      });
+      const failure = await runWorker(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          legacyPredecessorVersionId: VERSION_BEFORE,
+        },
+        target,
+        {
+          ...current,
+          review: "reviewer@example.test",
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      ).catch((error) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect(failure.phase).toBe("preflight");
+      expect(failure.message).toContain("deployment history changed during closure inspection");
       expect(current.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });

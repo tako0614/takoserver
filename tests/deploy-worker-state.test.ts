@@ -9,6 +9,7 @@ import {
   expectedExactBindingClosure,
   expectedLegacyPreVersionMetadataBindingClosure,
   parseWorkerDeploymentHistory,
+  workerVersionMetadataBindingProfile,
 } from "../scripts/deploy/worker-state.ts";
 
 const VERSION = {
@@ -200,6 +201,39 @@ describe("immutable Worker Version binding closure", () => {
         closure,
       ),
     ).toThrow("does not declare the STATE_DB binding");
+  });
+
+  test("classifies the version-metadata binding profile structurally", () => {
+    const current = {
+      ...VERSION,
+      resources: {
+        bindings: [
+          ...VERSION.resources.bindings,
+          { type: "version_metadata", name: "WORKER_VERSION" },
+        ],
+      },
+    };
+    expect(workerVersionMetadataBindingProfile("preflight", "version-1", VERSION)).toBe(
+      "pre-version-metadata",
+    );
+    expect(workerVersionMetadataBindingProfile("preflight", "version-1", current)).toBe("current");
+    expect(() =>
+      workerVersionMetadataBindingProfile("preflight", "version-1", {
+        ...current,
+        resources: {
+          bindings: [
+            ...current.resources.bindings,
+            { type: "version_metadata", binding: "WORKER_VERSION" },
+          ],
+        },
+      }),
+    ).toThrow("WORKER_VERSION binding more than once");
+    expect(() =>
+      workerVersionMetadataBindingProfile("preflight", "version-1", {
+        id: "version-1",
+        resources: { bindings: [null] },
+      }),
+    ).toThrow("invalid binding inventory");
   });
 
   test("missing-binding diagnostics never disclose unrelated binding values", () => {

@@ -15,7 +15,7 @@ bun run deploy -- <surface> --apply --environment=<integration|rehearsal|product
 ```
 
 One bootstrap exception exists for the already deployed integration Worker whose
-Version predates canonical artifact annotations and the `WORKER_VERSION`
+Version predates the `WORKER_VERSION`
 metadata binding. Only
 `takoserver-worker-authority-cutover` with `--environment=integration` may add
 `--legacy-predecessor-version=<uuid>`. The UUID must equal the authoritative
@@ -23,10 +23,13 @@ current Version immediately before upload. The predecessor must match the exact
 known pre-version-metadata closure: `WORKER_VERSION` is required to be absent,
 while every other binding/config/secret/domain and migration check remains
 strict. The direct successor must add the binding and match the full current
-closure. An independent reviewer is required. A missing or malformed annotation is reported as
-`legacy-unattributed-predecessor` with `authorityScope` set to the entire Worker
-artifact; no predecessor source diff is invented. Routine Worker, rehearsal,
-and production invocations never accept this selector.
+closure. A canonical predecessor commit and artifact digest remain attributed
+and are rechecked immediately before upload; binding generation does not alter
+artifact identity. An independent reviewer is required. A missing or malformed
+annotation is reported as `legacy-unattributed-predecessor` with
+`authorityScope` set to the entire Worker artifact; no predecessor source diff
+is invented. Routine Worker, rehearsal, and production invocations never accept
+this selector.
 
 The environment selects only `.deploy/targets/<environment>.json` (or the
 matching absolute `TAKOSERVER_DEPLOY_TARGET_<ENVIRONMENT>` path). There is no

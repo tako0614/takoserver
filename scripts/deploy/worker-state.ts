@@ -78,6 +78,8 @@ export interface ExpectedBinding {
  */
 export type ExpectedBindingClosure = Readonly<Record<string, ExpectedBinding | null>>;
 
+export type WorkerVersionMetadataBindingProfile = "current" | "pre-version-metadata";
+
 export interface WorkerBindingTarget {
   readonly d1: { readonly databaseId: string };
   readonly r2: { readonly bucketName: string };
@@ -176,6 +178,30 @@ export function expectedLegacyPreVersionMetadataBindingClosure(
     ...expectedExactBindingClosure(target, input),
     WORKER_VERSION: null,
   };
+}
+
+/**
+ * Classifies only the structural generation of the immutable Version binding
+ * inventory. Artifact identity is a separate fact and must not be inferred
+ * from whether the self-version binding exists.
+ */
+export function workerVersionMetadataBindingProfile(
+  phase: DeployPhase,
+  versionId: string,
+  version: unknown,
+): WorkerVersionMetadataBindingProfile {
+  const bindings = versionBindings(phase, versionId, version);
+  const nodes = bindings.filter(
+    (node) => node.name === "WORKER_VERSION" || node.binding === "WORKER_VERSION",
+  );
+  if (nodes.length > 1) {
+    throw new DeployError(
+      phase,
+      `version ${versionId} declares the WORKER_VERSION binding more than once`,
+      bindingInventoryDetail(nodes),
+    );
+  }
+  return nodes.length === 0 ? "pre-version-metadata" : "current";
 }
 
 /** Exact means no unnamed, duplicate, or target-unexpected binding survives. */
