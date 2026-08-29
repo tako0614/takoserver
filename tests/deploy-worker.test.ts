@@ -1221,7 +1221,7 @@ function version(
   message: string | null,
   bindingProfile: "current" | "legacy-pre-version-metadata" = "current",
 ) {
-  const expected = expectedExactBindingClosure(target, { hostedTopology: "desired" });
+  const expected = expectedExactBindingClosure(target);
   return {
     id,
     ...(message === null ? {} : { annotations: { "workers/message": message } }),

@@ -26,7 +26,8 @@ import { parseStrictJson, StrictJsonError } from "./strict-json.ts";
 import { formSupportProfile, sameFormRef } from "./takoform/forms.ts";
 import { TAKOFORM_EDGE_OBJECTS_INTERFACE } from "./takoform/official-forms.ts";
 import type { OperationListing, ResourceListing } from "./takoform/store.ts";
-import type { InstalledTakoformForm } from "./takoform/types.ts";
+import type { InstalledTakoformForm, TakoformNativeAbsenceEvidence } from "./takoform/types.ts";
+import { TakoformHostError } from "./takoform/types.ts";
 import { TakosIdIdentityError } from "./takos-id-identity.ts";
 import { TokenError, type TokenService } from "./token.ts";
 
@@ -62,6 +63,16 @@ export interface ResourceInventory {
   ): Promise<{ readonly resources: readonly ResourceListing[]; readonly cursor: string | null }>;
   resourceByUid(tenantId: string, uid: string): Promise<ResourceListing | null>;
   listOperations(tenantId: string, limit: number): Promise<readonly OperationListing[]>;
+}
+
+/** Host-owned, read-only native absence proof for a deleted Resource. */
+export interface NativeResidualReader {
+  verify(input: {
+    readonly tenantId: string;
+    readonly resourceUid: string;
+    readonly space: string;
+    readonly name: string;
+  }): Promise<TakoformNativeAbsenceEvidence>;
 }
 
 /** Starting a payment. Everything about the payment processor stays behind it. */
@@ -100,6 +111,8 @@ export interface CreateControlRoutesOptions {
   readonly clock: Clock;
   /** Exact browser console origin allowed to carry the HttpOnly session cookie. */
   readonly consoleOrigin?: string;
+  /** Optional provider-backed residual proof; absent means unavailable. */
+  readonly nativeResidual?: NativeResidualReader;
 }
 
 export type ControlRoutes = (request: Request, url: URL) => Promise<Response | null>;
@@ -121,6 +134,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     s3,
     clock,
     consoleOrigin,
+    nativeResidual,
   } = options;
 
   const authorization = (request: Request): string | null => {
@@ -552,6 +566,26 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       return Response.json({ resource: presentResource(resource) });
     }
 
+    const organizationNativeResidual =
+      /^\/v1\/organizations\/([^/]+)\/resources\/([^/]+)\/native-residual$/u.exec(url.pathname);
+    if (request.method === "GET" && organizationNativeResidual) {
+      const organizationId = segment(organizationNativeResidual[1]);
+      const resourceUid = segment(organizationNativeResidual[2]);
+      await scoped(request, organizationId, "resources:read");
+      const allowed = new Set(["space", "name"]);
+      if ([...url.searchParams.keys()].some((key) => !allowed.has(key))) {
+        controlError("invalid_argument", 400);
+      }
+      if (!nativeResidual) controlError("backend_unavailable", 503);
+      const evidence = await nativeResidual.verify({
+        tenantId: organizationId,
+        resourceUid,
+        space: text(requiredQuery(url, "space")),
+        name: resourceName(requiredQuery(url, "name")),
+      });
+      return Response.json({ residual: evidence }, { headers: { "cache-control": "no-store" } });
+    }
+
     const organizationAttachments = /^\/v1\/organizations\/([^/]+)\/attachments$/u.exec(
       url.pathname,
     );
@@ -698,14 +732,59 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
             targetOfferingId: held.targetOfferingId,
             allowCaptured: true,
           });
-          const migration = await migrations.cutover(organizationId, migrationId);
-          const statement = await reseller.capture({
+          const settlementKey = migrationSettlementKey(
+            migrationId,
+            held.commercialAuthorizationRef,
+            held.targetOfferingId,
+          );
+          await reseller.beginSettlement({
             organizationId,
             tenantRef: held.commercialTenantRef,
             reservationId: held.commercialAuthorizationRef,
-            usage: { quantity: reservation.quantity },
+            offeringId: held.targetOfferingId,
+            usage: { meter: reservation.meter, quantity: reservation.quantity },
+            idempotencyKey: settlementKey,
+            authorityRef: migrationId,
           });
-          return Response.json({ migration, statement });
+          try {
+            const migration = await migrations.cutover(organizationId, migrationId);
+            await reseller.commitSettlement({
+              organizationId,
+              tenantRef: held.commercialTenantRef,
+              reservationId: held.commercialAuthorizationRef,
+              idempotencyKey: settlementKey,
+            });
+            const statement = await reseller.capture({
+              organizationId,
+              tenantRef: held.commercialTenantRef,
+              reservationId: held.commercialAuthorizationRef,
+              usage: { quantity: reservation.quantity },
+              settlementKey,
+            });
+            return Response.json({ migration, statement });
+          } catch (error) {
+            // A failed cutover may be an ordinary precondition refusal, or a
+            // lost response after the store committed. Read the migration's
+            // authoritative state before compensating; billing state is not a
+            // substitute for this proof.
+            const authoritative = await migrations
+              .read(organizationId, migrationId)
+              .catch(() => null);
+            if (authoritative && authoritative.state !== "completed") {
+              try {
+                await reseller.cancelSettlement({
+                  organizationId,
+                  tenantRef: held.commercialTenantRef,
+                  reservationId: held.commercialAuthorizationRef,
+                  idempotencyKey: settlementKey,
+                });
+              } catch {
+                // If compensation cannot be recorded, the intent remains
+                // recoverable and a later reconciler will use the same key.
+              }
+            }
+            throw error;
+          }
         }
         if (action === "cancel") {
           if (!held.commercialTenantRef) controlError("migration_conflict", 409);
@@ -922,6 +1001,7 @@ export function controlErrorResponse(error: unknown): Response {
 
 function classify(error: unknown): { code: string; status: number } {
   if (error instanceof ControlError) return { code: error.code, status: error.status };
+  if (error instanceof TakoformHostError) return { code: error.code, status: error.status };
   if (error instanceof ResellerError) return { code: error.code, status: error.status };
   if (error instanceof AuthError) {
     const status =
@@ -1140,6 +1220,14 @@ function stringList(value: unknown): readonly string[] {
 function segment(value: string | undefined): string {
   if (!value || value.includes("%") || value.length > 128) controlError("invalid_argument", 400);
   return value;
+}
+
+function migrationSettlementKey(
+  migrationId: string,
+  reservationId: string,
+  offeringId: string,
+): string {
+  return `migration:${migrationId}:${reservationId}:${offeringId}`;
 }
 
 function requiredQuery(url: URL, key: string): string {

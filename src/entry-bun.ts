@@ -147,10 +147,29 @@ const sql = (() => {
 // control rows remain in local SQLite while the Worker keeps its rows in D1;
 // sharing only bytes ensures a bundle committed through the public API is there
 // when the provisioner goes to publish it.
+const workerdPort = process.env.TAKOSERVER_WORKERD_PORT
+  ? Number(process.env.TAKOSERVER_WORKERD_PORT)
+  : 8788;
 const workerd = createWorkerdSupervisor({
   binary: process.env.TAKOSERVER_WORKERD_BINARY ?? findWorkerd(process.cwd()),
   spawn: (command) => Bun.spawn(command as string[], { stdout: "inherit", stderr: "inherit" }),
   log: (message) => process.stdout.write(`${message}\n`),
+  readiness: async () => {
+    // A successful HTTP response (including the router's honest 404) proves
+    // that the child is listening. Retry briefly to cover workerd startup
+    // without recording a serving marker before a real liveness check.
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      try {
+        const response = await fetch(`http://127.0.0.1:${workerdPort}/`, {
+          signal: AbortSignal.timeout(250),
+        });
+        return response.status >= 100;
+      } catch {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      }
+    }
+    return false;
+  },
 });
 
 const sharedBucket = process.env.TAKOSERVER_R2_BUCKET;
@@ -204,9 +223,8 @@ const providerComposition = createStandaloneProviderComposition({
   dataRoot,
   runtime: createWorkerdRuntime({
     root: dataRoot,
-    ...(process.env.TAKOSERVER_WORKERD_PORT
-      ? { port: Number(process.env.TAKOSERVER_WORKERD_PORT) }
-      : {}),
+    port: workerdPort,
+    isReady: () => workerd.isReady(),
     async onReload(configPath) {
       // Started on the first publish rather than at boot, so a machine
       // that never runs a Worker never runs a runtime for one. After

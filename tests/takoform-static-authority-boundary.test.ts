@@ -35,6 +35,31 @@ async function source(path: string): Promise<string> {
 
 const repositoryRoot = fileURLToPath(new URL("../", import.meta.url));
 
+test("Form authority source contains no fictional Core admission seam", async () => {
+  const retired = [
+    ["Evaluate", "Admission"].join(""),
+    ["Core", "AdmissionAdapter"].join(""),
+    ["released", "core", "unavailable"].join("-"),
+  ];
+  const retained: string[] = [];
+  for (const pattern of ["src/**/*.ts", "scripts/**/*.ts", "docs/**/*.md"]) {
+    for await (const path of new Bun.Glob(pattern).scan({ cwd: repositoryRoot })) {
+      const text = await Bun.file(resolve(repositoryRoot, path)).text();
+      for (const name of retired) {
+        if (text.includes(name)) retained.push(`${path}: ${name}`);
+      }
+    }
+  }
+  for (const retiredPath of [
+    "src/takoform/core-admission-adapter.ts",
+    "src/takoform/operator-authority.ts",
+    "src/takoform/operator-endpoint.ts",
+  ]) {
+    expect(await Bun.file(resolve(repositoryRoot, retiredPath)).exists()).toBe(false);
+  }
+  expect(retained).toEqual([]);
+});
+
 function importedSpecifiers(path: string, text: string): readonly string[] {
   const parsed = createSourceFile(path, text, ScriptTarget.Latest, true, ScriptKind.TS);
   const specifiers = new Set<string>();
@@ -159,8 +184,8 @@ test("public Worker, router, and OpenAPI graphs reach readers but never Form aut
   expect(reachable.has("src/takoform/admission-store.ts")).toBe(false);
   expect(reachable.has("src/takoform/admission.ts")).toBe(false);
   expect(reachable.has("src/takoform/form-packages.ts")).toBe(false);
-  expect(reachable.has("src/takoform/operator-authority.ts")).toBe(false);
-  expect(reachable.has("src/takoform/operator-endpoint.ts")).toBe(false);
+  expect(reachable.has("src/takoform/host-admission-coordinator.ts")).toBe(false);
+  expect(reachable.has("src/takoform/host-admission-endpoint.ts")).toBe(false);
   expect(reachable.has("src/takoform/integration-operator-endpoint.ts")).toBe(false);
   expect(reachable.has("src/form-authority-operator-proof.ts")).toBe(false);
   expect(reachable.has("src/takoform/stable-production-catalog.ts")).toBe(false);
@@ -192,7 +217,7 @@ test("authenticated operator gateway is isolated from both storage writers and c
   ]);
   expect(reachable.has("src/integration-form-authority-gateway.ts")).toBe(true);
   expect(reachable.has("src/form-authority-operator-proof.ts")).toBe(true);
-  expect(reachable.has("src/takoform/operator-authority.ts")).toBe(false);
+  expect(reachable.has("src/takoform/host-admission-coordinator.ts")).toBe(false);
   expect(reachable.has("src/takoform/admission-store.ts")).toBe(false);
   expect(reachable.has("src/takoform/admission.ts")).toBe(false);
   expect(reachable.has("src/takoform/form-packages.ts")).toBe(false);

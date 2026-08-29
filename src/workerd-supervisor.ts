@@ -9,14 +9,23 @@ import { join } from "node:path";
  * rewritten configuration is picked up without bouncing the process — one
  * tenant's deploy must not drop every other tenant's in-flight requests.
  *
- * If the binary is missing it says so once and the deployment carries on
- * serving everything else. A machine that refuses to start because it cannot
- * run Workers is a machine that also stopped serving the storage it could.
+ * A serving activation is not recorded until the spawned child passes a
+ * liveness/readiness probe. A machine that cannot start workerd therefore
+ * fails the Worker operation explicitly instead of reporting a false serving
+ * state.
  */
+
+export interface WorkerdProcess {
+  kill(): void;
+  /** Bun exposes this promise; test doubles may omit it. */
+  readonly exited?: Promise<number>;
+}
 
 export interface WorkerdSupervisor {
   /** Starts the runtime if it is not already running. Safe to call repeatedly. */
   ensure(configPath: string): Promise<void>;
+  /** Whether the child is currently alive and has passed readiness. */
+  isReady(): boolean;
   stop(): void;
 }
 
@@ -31,32 +40,59 @@ export function findWorkerd(repositoryRoot: string): string | null {
 
 export function createWorkerdSupervisor(options: {
   readonly binary: string | null;
-  readonly spawn: (command: readonly string[]) => { kill(): void };
+  readonly spawn: (command: readonly string[]) => WorkerdProcess;
+  /** A real listener/readiness check supplied by the serving composition. */
+  readonly readiness?: (configPath: string) => Promise<boolean>;
   readonly log?: (message: string) => void;
 }): WorkerdSupervisor {
-  let running: { kill(): void } | null = null;
-  let complained = false;
+  let running: { readonly process: WorkerdProcess; ready: boolean } | null = null;
+  let starting: Promise<void> | null = null;
 
   return {
     async ensure(configPath) {
-      if (running) return;
+      if (running?.ready) return;
+      if (starting) return await starting;
       if (!options.binary) {
-        if (!complained) {
-          complained = true;
-          options.log?.(
-            "no workerd binary found; Workers will not be served. Storage and databases are unaffected.",
-          );
-        }
-        return;
+        throw new Error("workerd runtime binary is required to activate Worker serving");
       }
+      if (!options.readiness) {
+        throw new Error("workerd runtime readiness probe is required to activate Worker serving");
+      }
+      const readiness = options.readiness;
       // `--watch` is why a redeploy does not restart anything: workerd reads
       // the rewritten configuration itself.
-      running = options.spawn([options.binary, "serve", "--watch", configPath]);
-      options.log?.(`workerd started against ${configPath}`);
+      const child = options.spawn([options.binary, "serve", "--watch", configPath]);
+      const entry = { process: child, ready: false };
+      running = entry;
+      child.exited?.then(() => {
+        if (running?.process === child) running = null;
+      });
+      starting = (async () => {
+        const ready = await readiness(configPath);
+        if (!ready || running?.process !== child) {
+          child.kill();
+          if (running?.process === child) running = null;
+          throw new Error("workerd runtime failed its serving readiness check");
+        }
+        entry.ready = true;
+        options.log?.(`workerd started against ${configPath}`);
+      })();
+      try {
+        await starting;
+      } catch (error) {
+        if (running?.process === child) running = null;
+        throw error;
+      } finally {
+        starting = null;
+      }
+    },
+
+    isReady() {
+      return running?.ready === true;
     },
 
     stop() {
-      running?.kill();
+      running?.process.kill();
       running = null;
     },
   };

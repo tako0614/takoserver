@@ -6,6 +6,9 @@ import {
   assertExactVersionBindingClosure,
   expectedExactBindingClosure,
   expectedLegacyPreVersionMetadataBindingClosure,
+  expectedTransitionBindingClosure,
+  extractLegacyHostServiceBinding,
+  type LegacyHostServiceBinding,
   parseWorkerDeploymentHistory,
   type WorkerDeploymentHistory,
   workerVersionMetadataBindingProfile,
@@ -39,13 +42,89 @@ export interface LegacyLiveWorkerVersion {
   readonly legacyPredecessorProfile: typeof LEGACY_PRE_VERSION_METADATA_PROFILE;
 }
 
+export interface RetirementLiveWorkerVersion {
+  readonly history: WorkerDeploymentHistory;
+  readonly commit: string | null;
+  readonly bundleDigestHex: string | null;
+  readonly serviceBinding: LegacyHostServiceBinding | null;
+  readonly hostedTokenPresent: boolean;
+}
+
+/**
+ * Reads the exact code/binding/secret closure used by the three Hosted-edge
+ * retirement transitions. The service identity is supplied only by the
+ * transition caller; ordinary target inspection never accepts it.
+ */
+export async function inspectLiveWorkerVersionForRetirement(
+  phase: DeployPhase,
+  target: DeployTarget,
+  state: WorkerState,
+  input: {
+    readonly expectedServiceBinding: LegacyHostServiceBinding | null;
+    readonly expectedSecrets: readonly string[];
+    readonly expectedInventorySecrets?: readonly string[];
+    readonly expectedVersionId?: string;
+    readonly signingKeyId?: string;
+  },
+): Promise<RetirementLiveWorkerVersion> {
+  const history = parseWorkerDeploymentHistory(await state.workerDeployments(target.workerName));
+  if (history === null) throw phaseError(phase, "Worker has no authoritative current deployment");
+  if (input.expectedVersionId !== undefined && history.versionId !== input.expectedVersionId) {
+    throw phaseError(
+      phase,
+      "authoritative current Worker Version does not match the selected retirement predecessor",
+      `expected=${input.expectedVersionId} actual=${history.versionId}`,
+    );
+  }
+  const version = await state.workerVersion(target.workerName, history.versionId);
+  const metadataProfile = workerVersionMetadataBindingProfile(phase, history.versionId, version);
+  assertExactVersionBindingClosure(
+    phase,
+    history.versionId,
+    version,
+    expectedTransitionBindingClosure(target, {
+      serviceBinding: input.expectedServiceBinding,
+      expectedSecrets: input.expectedSecrets,
+      metadataProfile,
+      ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
+    }),
+  );
+  const inventorySecrets = input.expectedInventorySecrets ?? input.expectedSecrets;
+  assertExactSecretInventory(await state.workerSecrets(target.workerName), inventorySecrets, phase);
+  assertDomainClosure(phase, target, await state.workerDomains());
+  const historyAfter = parseWorkerDeploymentHistory(
+    await state.workerDeployments(target.workerName),
+  );
+  if (
+    historyAfter === null ||
+    historyAfter.deploymentId !== history.deploymentId ||
+    historyAfter.versionId !== history.versionId ||
+    historyAfter.previousVersionId !== history.previousVersionId
+  ) {
+    throw phaseError(
+      phase,
+      "authoritative Worker deployment history changed during retirement inspection",
+    );
+  }
+  const identity = workerVersionIdentityOrLegacy(phase, version);
+  return {
+    history,
+    commit: identity.kind === "canonical" ? identity.commit : null,
+    bundleDigestHex: identity.kind === "canonical" ? identity.bundleDigestHex : null,
+    serviceBinding:
+      input.expectedServiceBinding === null
+        ? null
+        : extractLegacyHostServiceBinding(phase, history.versionId, version),
+    hostedTokenPresent: inventorySecrets.includes("TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN"),
+  };
+}
+
 /** Exact authoritative code/config/secret/domain state for one served Version. */
 export async function inspectLiveWorkerVersion(
   phase: DeployPhase,
   target: DeployTarget,
   state: WorkerState,
   input: {
-    readonly hostedTopology: "desired" | "absent";
     readonly signingKeyId?: string;
     readonly expectedSecrets?: readonly string[];
   },
@@ -69,7 +148,6 @@ export async function inspectLiveWorkerVersionWithLegacyPredecessor(
   target: DeployTarget,
   state: WorkerState,
   input: {
-    readonly hostedTopology: "desired" | "absent";
     readonly signingKeyId?: string;
     readonly expectedSecrets?: readonly string[];
     readonly legacyPredecessorVersionId: string;
@@ -91,7 +169,6 @@ export async function inspectLiveWorkerVersionForLegacyStatus(
   target: DeployTarget,
   state: WorkerState,
   input: {
-    readonly hostedTopology: "desired" | "absent";
     readonly signingKeyId?: string;
     readonly expectedSecrets?: readonly string[];
     readonly legacyPredecessorVersionId: string;
@@ -108,7 +185,6 @@ async function inspectLiveWorkerVersionCore(
   target: DeployTarget,
   state: WorkerState,
   input: {
-    readonly hostedTopology: "desired" | "absent";
     readonly signingKeyId?: string;
     readonly expectedSecrets?: readonly string[];
     readonly legacyPredecessorVersionId?: string;
@@ -152,7 +228,6 @@ async function inspectLiveWorkerVersionCore(
       ? { kind: "canonical" as const, ...workerVersionIdentity(phase, version) }
       : workerVersionIdentityOrLegacy(phase, version);
   const bindingInput = {
-    hostedTopology: input.hostedTopology,
     ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
     ...(input.expectedSecrets === undefined ? {} : { expectedSecrets: input.expectedSecrets }),
   } as const;

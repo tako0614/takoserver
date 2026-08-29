@@ -88,6 +88,59 @@ describe("Wasabi ObjectBucket provisioner", () => {
     expect(requests.map((request) => request.method)).toEqual(["PUT", "HEAD"]);
   });
 
+  test("recovers an apply by HEAD without replaying a PUT", async () => {
+    const { provider, offering, requests } = await fixture([200]);
+    const result = await provider.apply({
+      operationId: "op_recover_readback",
+      operationMode: "recovery",
+      offering,
+      identity: { tenantRef: "tenant_alpha", space: "default", name: "assets" },
+      spec: {},
+      region: "eu-central-1",
+    });
+
+    expect(result).toMatchObject({ phase: "succeeded" });
+    expect(requests.map((request) => request.method)).toEqual(["HEAD"]);
+  });
+
+  test("keeps an unprovable recovery apply retryable without a PUT", async () => {
+    const { provider, offering, requests } = await fixture([404]);
+    const result = await provider.apply({
+      operationId: "op_recover_missing",
+      operationMode: "recovery",
+      offering,
+      identity: { tenantRef: "tenant_alpha", space: "default", name: "assets" },
+      spec: {},
+      region: "eu-central-1",
+    });
+
+    expect(result).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(requests.map((request) => request.method)).toEqual(["HEAD"]);
+  });
+
+  test("verifies bucket absence with HEAD only and reports transport uncertainty", async () => {
+    const { provider, offering, requests } = await fixture([200, 404, 503]);
+    if (!provider.createNativeReadbackDescriptor || !provider.verifyNativeAbsence) {
+      throw new Error("Wasabi provider must expose native absence readback");
+    }
+    const descriptor = provider.createNativeReadbackDescriptor({
+      offering,
+      nativeId: `wasabi:eu-central-1:ts-${"a".repeat(40)}`,
+      identity: { tenantRef: "tenant_alpha", space: "default", name: "assets" },
+    });
+    const present = await provider.verifyNativeAbsence({ offering, descriptor });
+    expect(present).toMatchObject({ outcome: "present", evidence: { kind: "ObjectBucket" } });
+    const absent = await provider.verifyNativeAbsence({ offering, descriptor });
+    expect(absent).toMatchObject({ outcome: "absent" });
+    const unknown = await provider.verifyNativeAbsence({ offering, descriptor });
+    expect(unknown).toEqual({ outcome: "unknown", reason: "transport", retryable: true });
+    expect(requests.map((request) => request.method)).toEqual(["HEAD", "HEAD", "HEAD"]);
+    expect(JSON.stringify(present)).not.toContain("ts-");
+  });
+
   test("keeps upstream error bodies behind the provider boundary", async () => {
     const edge = await buildEdgeForms();
     const offering = objectBucketProviderOffering(edge.objectBucket.form, {

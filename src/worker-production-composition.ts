@@ -22,7 +22,6 @@ import { createCloudflareEdgeMeterSources } from "./providers/cloudflare-edge-me
 import { createCloudflareR2MeterSource } from "./providers/cloudflare-r2-meter.ts";
 import { createWasabiProvider } from "./providers/wasabi.ts";
 import { createWasabiBucketMeterSource } from "./providers/wasabi-meter.ts";
-import type { RuntimeMaterializer } from "./runtime-materialization.ts";
 import { createS3AttachmentFactory } from "./s3-attachment-factory.ts";
 import type { S3CredentialIssuer } from "./s3-port.ts";
 import { createProductionStandardServiceResolver } from "./standard-service-production.ts";
@@ -80,7 +79,6 @@ export function createWorkerProductionComposition(input: {
   readonly retainedForms?: readonly InstalledTakoformForm[];
   readonly artifacts: ArtifactBytes;
   readonly s3CredentialIssuer?: S3CredentialIssuer;
-  readonly runtimeMaterializer?: RuntimeMaterializer;
   readonly fetch?: (request: Request) => Promise<Response>;
   readonly now: Date;
 }): WorkerProductionComposition {
@@ -284,7 +282,6 @@ export function createWorkerProductionComposition(input: {
       ...(env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX
         ? { workerEndpointSuffix: env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX }
         : {}),
-      ...(input.runtimeMaterializer ? { runtimeMaterializer: input.runtimeMaterializer } : {}),
       artifacts: input.artifacts,
     });
     const meterSources: MeterSource[] = [];

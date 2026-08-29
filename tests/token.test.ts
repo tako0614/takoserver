@@ -185,40 +185,25 @@ describe("provision tokens", () => {
 });
 
 describe("Takoform run tokens", () => {
-  test("bind a multi-Resource runner credential to one opaque tenant space", async () => {
+  test("bind a multi-Resource runner credential without a private materialization claim", async () => {
     const tokens = service(await provisionKey("sign-tenant-run"));
-    const runtimeMaterialization = {
-      contract: "takosumi.host-runtime-materialization/v1",
-      installConfigId: "icfg_yurucommu",
-      workspaceId: "workspace_x",
-      capsuleId: "capsule_yurucommu",
-      installingPrincipalId: "tsub_owner",
-      requirements: [
-        {
-          kind: "generated_secret",
-          binding: "ENCRYPTION_KEY",
-          secretRef: "secret:repository/encryption-key",
-          bytes: 32,
-          encoding: "hex",
-        },
-      ],
-    } as const;
     const issued = await tokens.issueTakoformTenantRunToken({
       organizationId: "org_alpha",
       tenantRef: "tenant_workspace_x",
       spaceRef: "tsp_capsule_yurucommu",
-      runRef: "run_takosumi_1",
-      runtimeMaterialization,
+      runRef: "run_host_1",
+      runtimeMaterialization: { kind: "retired" },
       ttlSeconds: 300,
-    });
-    expect(await tokens.verifyTakoformTenantRunToken(issued.token)).toMatchObject({
+    } as never);
+    const claims = await tokens.verifyTakoformTenantRunToken(issued.token);
+    expect(claims).toMatchObject({
       organizationId: "org_alpha",
       tenantRef: "tenant_workspace_x",
       spaceRef: "tsp_capsule_yurucommu",
-      runRef: "run_takosumi_1",
+      runRef: "run_host_1",
       mode: "tenant-run",
-      runtimeMaterialization,
     });
+    expect(claims).not.toHaveProperty("runtimeMaterialization");
   });
 
   test("bind one reusable credential to an exact reservation, Form, space, and address", async () => {

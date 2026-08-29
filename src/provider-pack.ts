@@ -2,12 +2,37 @@ import type { AttachmentFactory } from "./attachments.ts";
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import type { TakoformBindingRef, TakoformInterfaceRef } from "./interface-ref.ts";
 import type { MeterSource } from "./provider-meter-port.ts";
-import type { Provider } from "./provider-port.ts";
+import type { Provider, ProviderFailure } from "./provider-port.ts";
 import type { ResourceDeployment } from "./resource-deployments.ts";
 
 export type { MeterSource } from "./provider-meter-port.ts";
 
 export type ResourceProvisioner = Provider;
+
+export type TransferOperationTicket<Receipt> =
+  | { readonly phase: "succeeded"; readonly receipt: Receipt }
+  | { readonly phase: "failed"; readonly failure: ProviderFailure }
+  | {
+      readonly phase: "running";
+      readonly handle: string;
+      readonly pollAfterMs: number;
+    };
+
+export interface TransferImportReceipt {
+  /** Optional provider evidence retained only as an opaque recovery reference. */
+  readonly receiptRef?: string;
+}
+
+export interface TransferExportReceipt {
+  readonly transferRef: string;
+}
+
+export interface TransferVerificationReceipt {
+  readonly schema: boolean;
+  readonly rowCounts: boolean;
+  readonly checksums: boolean;
+  readonly evidenceDigest: `sha256:${string}`;
+}
 
 export interface ProviderPackDescriptor {
   readonly id: string;
@@ -26,21 +51,48 @@ export interface TransferEndpoint {
   export(input: {
     /** Stable across retries of one Migration phase. */
     readonly operationId: string;
+    /** Initial may mutate; recovery must only poll, adopt, or read back. */
+    readonly operationMode: "initial";
     readonly tenantId: string;
     readonly source: ResourceDeployment;
     readonly format: string;
-  }): Promise<{ readonly transferRef: string }>;
+  }): Promise<TransferExportReceipt | TransferOperationTicket<TransferExportReceipt>>;
+  recoverExport?(input: {
+    /** The exact identity durably recorded before initial dispatch. */
+    readonly operationId: string;
+    readonly operationMode: "recovery";
+    /** Present after an acknowledged asynchronous response; absent for lost acknowledgement. */
+    readonly handle?: string;
+    readonly tenantId: string;
+    readonly source: ResourceDeployment;
+    readonly format: string;
+  }): Promise<TransferOperationTicket<TransferExportReceipt>>;
   import(input: {
     /** Stable across retries of one Migration phase. */
     readonly operationId: string;
+    /** Initial may mutate; recovery must only poll, adopt, or read back. */
+    readonly operationMode: "initial";
     readonly tenantId: string;
     readonly target: ResourceDeployment;
     readonly transferRef: string;
     readonly format: string;
-  }): Promise<void>;
+  }): Promise<void> | Promise<TransferOperationTicket<TransferImportReceipt>>;
+  recoverImport?(input: {
+    /** The exact identity durably recorded before initial dispatch. */
+    readonly operationId: string;
+    readonly operationMode: "recovery";
+    /** Present after an acknowledged asynchronous response; absent for lost acknowledgement. */
+    readonly handle?: string;
+    readonly tenantId: string;
+    readonly target: ResourceDeployment;
+    readonly transferRef: string;
+    readonly format: string;
+  }): Promise<TransferOperationTicket<TransferImportReceipt>>;
   verify(input: {
     /** Stable across retries of one Migration phase. */
     readonly operationId: string;
+    /** Initial may start provider work; recovery must only poll, adopt, or read back. */
+    readonly operationMode: "initial";
     readonly tenantId: string;
     readonly source: ResourceDeployment;
     readonly target: ResourceDeployment;
@@ -49,12 +101,22 @@ export interface TransferEndpoint {
       readonly rowCounts: boolean;
       readonly checksums: boolean;
     };
-  }): Promise<{
-    readonly schema: boolean;
-    readonly rowCounts: boolean;
-    readonly checksums: boolean;
-    readonly evidenceDigest: `sha256:${string}`;
-  }>;
+  }): Promise<TransferVerificationReceipt | TransferOperationTicket<TransferVerificationReceipt>>;
+  recoverVerify?(input: {
+    /** The exact identity durably recorded before initial dispatch. */
+    readonly operationId: string;
+    readonly operationMode: "recovery";
+    /** Present after an acknowledged asynchronous response; absent for lost acknowledgement. */
+    readonly handle?: string;
+    readonly tenantId: string;
+    readonly source: ResourceDeployment;
+    readonly target: ResourceDeployment;
+    readonly requirements: {
+      readonly schema: boolean;
+      readonly rowCounts: boolean;
+      readonly checksums: boolean;
+    };
+  }): Promise<TransferOperationTicket<TransferVerificationReceipt>>;
 }
 
 export interface CredentialIssuer {

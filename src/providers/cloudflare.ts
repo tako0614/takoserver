@@ -4,18 +4,20 @@ import type { ProviderRelation } from "../provider-port.ts";
 import {
   type ApplyInput,
   failed,
+  PROVIDER_READBACK_API_VERSION,
   type Provider,
+  type ProviderNativeAbsence,
+  type ProviderNativeAbsenceUnknownReason,
+  type ProviderNativeReadbackDescriptor,
+  type ProviderNativeReadbackInput,
   type ProviderOffering,
+  ProviderReadbackDescriptorError,
   type ProviderSqliteMigration,
   type ProviderSqliteMigrationIdentity,
   type ProviderTicket,
   type ProviderValue,
   succeeded,
 } from "../provider-port.ts";
-import type {
-  RuntimeMaterializationInput,
-  RuntimeMaterializer,
-} from "../runtime-materialization.ts";
 import {
   AMAZON_S3_STANDARD_SERVICE,
   CLOUDFLARE_R2_CREDENTIAL_KIND,
@@ -158,8 +160,6 @@ export interface CloudflareProviderOptions {
   /** Exact suffix assigned to this account, for example `team.workers.dev`. */
   readonly workerEndpointSuffix?: string;
   readonly workerCompatibilityDate?: string;
-  /** Private host capability used only while uploading one immutable Version. */
-  readonly runtimeMaterializer?: RuntimeMaterializer;
   readonly fetch?: (request: Request) => Promise<Response>;
 }
 
@@ -174,7 +174,6 @@ export class CloudflareProvider implements Provider {
   readonly #fetch: (request: Request) => Promise<Response>;
   readonly #workerEndpointSuffix: string | undefined;
   readonly #workerCompatibilityDate: string;
-  readonly #runtimeMaterializer: RuntimeMaterializer | undefined;
 
   constructor(options: CloudflareProviderOptions) {
     this.id = options.id ?? "cloudflare";
@@ -187,7 +186,6 @@ export class CloudflareProvider implements Provider {
     this.#fetch = options.fetch ?? ((request) => fetch(request));
     this.#workerEndpointSuffix = options.workerEndpointSuffix;
     this.#workerCompatibilityDate = options.workerCompatibilityDate ?? "2026-08-19";
-    this.#runtimeMaterializer = options.runtimeMaterializer;
   }
 
   readonly sqliteMigrations = {
@@ -300,6 +298,21 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
   };
 
   async apply(input: ApplyInput): Promise<ProviderTicket> {
+    const canRecoverWorkerVersion =
+      input.offering.kind.startsWith("takoform.") &&
+      isEdgeFormsApiVersion(input.offering.form.apiVersion) &&
+      input.offering.form.kind === "WorkerVersion";
+    if (input.operationMode === "recovery" && !canRecoverWorkerVersion) {
+      // The request may have crossed a mutating Cloudflare endpoint before its
+      // response was lost. Unless this operation has a deterministic recovery
+      // identity, a second POST/PUT would be an unbounded duplicate mutation.
+      // Leave the durable Host saga in its repair state instead.
+      return failed(
+        "unavailable",
+        "the provider mutation outcome is indeterminate; operator repair is required",
+        true,
+      );
+    }
     if (
       input.offering.kind.startsWith("takoform.") &&
       isEdgeFormsApiVersion(input.offering.form.apiVersion) &&
@@ -340,6 +353,90 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       default:
         return failed("invalid_spec", "this offering kind is not provisionable here");
     }
+  }
+
+  /**
+   * Recovery is deliberately a separate capability from `apply`: Cloudflare
+   * resource POST/PUT calls are not generally safe to replay after a lost
+   * response. The Worker Version endpoint carries a deterministic operation
+   * marker, so its recovery path only lists and reads matching versions.
+   */
+  async recoverApply(input: ApplyInput): Promise<ProviderTicket> {
+    const deterministicWorkerVersion =
+      input.offering.kind.startsWith("takoform.") &&
+      isEdgeFormsApiVersion(input.offering.form.apiVersion) &&
+      input.offering.form.kind === "WorkerVersion";
+    if (!deterministicWorkerVersion) {
+      return failed(
+        "unavailable",
+        "the provider mutation outcome is indeterminate; operator repair is required",
+        true,
+      );
+    }
+    return await this.#applyWorkerVersion({ ...input, operationMode: "recovery" });
+  }
+
+  /**
+   * Capture only the exact Cloudflare address needed for a later readback.
+   * This intentionally performs no API call: the Host records this descriptor
+   * before removing its logical Resource row, and the provider validates it
+   * again when it is used.
+   */
+  createNativeReadbackDescriptor(
+    input: ProviderNativeReadbackInput,
+  ): ProviderNativeReadbackDescriptor {
+    const native = parseNativeId(input.nativeId);
+    if (!native || !cloudflareKindMatches(providerKind(input.offering), native.kind)) {
+      throw new ProviderReadbackDescriptorError();
+    }
+    const data = cloudflareReadbackData(native, input.spec);
+    if (!data) throw new ProviderReadbackDescriptorError();
+    return {
+      apiVersion: PROVIDER_READBACK_API_VERSION,
+      provider: this.id,
+      kind: providerKind(input.offering),
+      nativeId: input.nativeId,
+      data,
+    };
+  }
+
+  /**
+   * Read Cloudflare's exact native identity and return a closed tri-state
+   * result.  This path is intentionally independent of `recoverDelete`: it
+   * never issues DELETE/PUT/POST, retries, or mutates any local/provider state.
+   */
+  async verifyNativeAbsence(input: {
+    offering: ProviderOffering;
+    descriptor: ProviderNativeReadbackDescriptor;
+  }): Promise<ProviderNativeAbsence> {
+    const native = validateCloudflareReadbackDescriptor(this.id, input.offering, input.descriptor);
+    if (!native) return unknownAbsence("malformed", false);
+    const path = cloudflareReadbackPath(this.#accountId, native);
+    if (!path) return unknownAbsence("unsupported", false);
+    const read = await this.#call("GET", path);
+    if (!read.ok) {
+      if (read.status === 404) return absenceResult("absent", input.descriptor);
+      if (read.status === 0 || read.status >= 500 || read.status === 429) {
+        return unknownAbsence("transport", true);
+      }
+      if (read.status === 401 || read.status === 403) {
+        return unknownAbsence("authority_unavailable", false);
+      }
+      // A successful HTTP status with no valid provider envelope is a
+      // malformed readback, not proof that the native object is absent.
+      if (read.status >= 200 && read.status < 300) {
+        return unknownAbsence("malformed", false);
+      }
+      return unknownAbsence("authority_unavailable", false);
+    }
+    const state = cloudflareReadbackState(
+      native,
+      read.result,
+      typeof input.descriptor.data.cron === "string" ? input.descriptor.data.cron : undefined,
+    );
+    if (state === "malformed") return unknownAbsence("malformed", false);
+    if (state === "absent") return absenceResult("absent", input.descriptor);
+    return absenceResult("present", input.descriptor);
   }
 
   async observe(input: {
@@ -481,11 +578,22 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
 
   async delete(input: {
     operationId: string;
+    operationMode?: "initial" | "recovery";
+    providerHandle?: string;
     offering: ProviderOffering;
     nativeId: string;
     identity: { tenantRef: string; space: string; name: string };
     spec?: JsonObject;
   }): Promise<ProviderTicket> {
+    if (input.operationMode === "recovery" && !input.providerHandle) {
+      // Cloudflare exposes no opaque delete handle. A transport close after a
+      // DELETE therefore cannot be safely replayed; leave recovery to an
+      // operator/readback path rather than sending the mutation twice.
+      return failed("unavailable", "provider mutation recovery requires an opaque handle", true);
+    }
+    if (input.providerHandle) {
+      return failed("unavailable", "Cloudflare delete recovery cannot poll this handle", true);
+    }
     const native = parseNativeId(input.nativeId);
     if (!native) return failed("not_found", "unrecognised native identity");
     if (native.kind === "version") {
@@ -551,11 +659,70 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     });
   }
 
-  async adopt(input: {
+  /** Read-only delete recovery for resources with an authoritative GET path. */
+  async recoverDelete(input: {
+    operationId: string;
+    operationMode?: "initial" | "recovery";
+    providerHandle?: string;
     offering: ProviderOffering;
     nativeId: string;
-    spec: JsonObject;
+    identity: { tenantRef: string; space: string; name: string };
+    spec?: JsonObject;
   }): Promise<ProviderTicket> {
+    if (input.providerHandle) {
+      return failed("unavailable", "Cloudflare delete recovery cannot poll this handle", true);
+    }
+    const observed = await this.observe({
+      offering: input.offering,
+      nativeId: input.nativeId,
+      spec: input.spec ?? {},
+    });
+    if (observed.phase === "failed" && observed.failure.code === "not_found") {
+      return succeeded({ nativeId: input.nativeId, observed: { deleted: true }, outputs: {} });
+    }
+    if (observed.phase === "succeeded") {
+      return failed(
+        "unavailable",
+        "the delete outcome is not proven; operator repair is required",
+        true,
+      );
+    }
+    return observed;
+  }
+
+  async adopt(input: {
+    operationId: string;
+    operationMode?: "initial" | "recovery";
+    providerHandle?: string;
+    offering: ProviderOffering;
+    nativeId: string;
+    identity: { tenantRef: string; space: string; name: string };
+    spec: JsonObject;
+    relations?: readonly ProviderRelation[];
+  }): Promise<ProviderTicket> {
+    if (input.operationMode === "recovery" && !input.providerHandle) {
+      return failed("unavailable", "provider mutation recovery requires an opaque handle", true);
+    }
+    if (input.providerHandle) {
+      return failed("unavailable", "Cloudflare adopt recovery cannot poll this handle", true);
+    }
+    return await this.observe(input);
+  }
+
+  /** Read-only adoption recovery through the provider's observe path. */
+  async recoverAdopt(input: {
+    operationId: string;
+    operationMode?: "initial" | "recovery";
+    providerHandle?: string;
+    offering: ProviderOffering;
+    nativeId: string;
+    identity: { tenantRef: string; space: string; name: string };
+    spec: JsonObject;
+    relations?: readonly ProviderRelation[];
+  }): Promise<ProviderTicket> {
+    if (input.providerHandle) {
+      return failed("unavailable", "Cloudflare adoption recovery cannot poll this handle", true);
+    }
     return await this.observe(input);
   }
 
@@ -683,34 +850,15 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     if (!requiredSensitive) {
       return failed("invalid_spec", "the sensitive Worker binding declaration is invalid");
     }
+    if (requiredSensitive.length > 0) {
+      return failed("denied", "sensitive Worker bindings are unsupported by this Host");
+    }
     if (
       [...bindings, ...standardServiceBindings].some(
         (binding) => binding.name === WORKER_VERSION_OPERATION_MARKER_BINDING,
-      ) ||
-      requiredSensitive.includes(WORKER_VERSION_OPERATION_MARKER_BINDING)
+      )
     ) {
       return failed("invalid_spec", "the Worker Version operation marker binding is reserved");
-    }
-    const runtimeMaterializer = this.#runtimeMaterializer;
-    const runtimeMaterialization = input.runtimeMaterialization;
-    let runtimeMaterializationResult:
-      | Awaited<ReturnType<RuntimeMaterializer["materializeRuntimeBindings"]>>
-      | undefined;
-    let runtimeMaterializationInput: RuntimeMaterializationInput | undefined;
-    if (requiredSensitive.length > 0) {
-      if (!runtimeMaterialization || !runtimeMaterializer || !this.#workerEndpointSuffix) {
-        return failed(
-          "denied",
-          "the sensitive Worker bindings have no runtime materialization authority",
-        );
-      }
-      runtimeMaterializationInput = {
-        request: runtimeMaterialization,
-        resourceName: input.identity.name,
-        scriptName,
-        publicOrigin: `https://${scriptName}.${this.#workerEndpointSuffix}`,
-        bindings: requiredSensitive,
-      };
     }
     const assetsSpec = record(input.spec.assets);
     if (assetsSpec) {
@@ -726,10 +874,6 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     if (input.operationMode !== "initial") {
       const recovered = await this.#recoverWorkerVersion(scriptName, operationMarker);
       if (!recovered.ok) return { phase: "failed", failure: recovered.failure };
-      if (runtimeMaterializationInput) {
-        const commitFailed = await this.#commitRuntimeMaterialization(runtimeMaterializationInput);
-        if (commitFailed) return commitFailed;
-      }
       return succeeded({
         nativeId: `version:${scriptName}:${recovered.value}`,
         observed: { scriptName, versionId: recovered.value },
@@ -761,38 +905,6 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       if (!bytes) return failed("invalid_spec", `a declared module is missing: ${module.name}`);
       modulePayloads.push({ module, bytes });
     }
-    let sensitiveBindings: readonly JsonObject[] = [];
-    if (requiredSensitive.length > 0) {
-      if (!runtimeMaterializer || !runtimeMaterialization || !runtimeMaterializationInput) {
-        return failed(
-          "denied",
-          "the sensitive Worker bindings have no runtime materialization authority",
-        );
-      }
-      try {
-        runtimeMaterializationResult = await runtimeMaterializer.materializeRuntimeBindings(
-          runtimeMaterializationInput,
-        );
-      } catch {
-        return failed("denied", "the runtime materializer refused the Worker bindings");
-      }
-      const values = runtimeMaterializationResult.values;
-      if (!sameMaterializedBindings(values, requiredSensitive)) {
-        const rollbackFailed = await this.#rollbackRuntimeMaterialization(
-          runtimeMaterialization,
-          runtimeMaterializationResult.rollbackReceipt,
-        );
-        return (
-          rollbackFailed ??
-          failed("denied", "the runtime materializer returned different Worker bindings")
-        );
-      }
-      sensitiveBindings = requiredSensitive.map((name) => ({
-        type: "secret_text",
-        name,
-        text: values[name] as string,
-      }));
-    }
     const form = new FormData();
     form.set(
       "metadata",
@@ -809,7 +921,6 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
                 name: WORKER_VERSION_OPERATION_MARKER_BINDING,
                 text: operationMarker,
               },
-              ...sensitiveBindings,
               ...(assetToken ? [{ type: "assets", name: ASSETS_BINDING }] : []),
             ],
             ...(assetToken
@@ -849,19 +960,11 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       if (uploaded.indeterminate === true) {
         return failed("unavailable", "the Worker Version upload outcome is indeterminate", true);
       }
-      const rollbackFailed = await this.#rollbackRuntimeMaterialization(
-        input.runtimeMaterialization,
-        runtimeMaterializationResult?.rollbackReceipt,
-      );
-      return rollbackFailed ?? uploaded.ticket;
+      return uploaded.ticket;
     }
     const versionId = workerVersionId(record(uploaded.result)?.id);
     if (!versionId) {
       return failed("unavailable", "the Worker Version upload outcome is indeterminate", true);
-    }
-    if (runtimeMaterializationInput) {
-      const commitFailed = await this.#commitRuntimeMaterialization(runtimeMaterializationInput);
-      if (commitFailed) return commitFailed;
     }
     return succeeded({
       nativeId: `version:${scriptName}:${versionId}`,
@@ -984,40 +1087,6 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
           "the Worker Version upload outcome is indeterminate",
           true,
         );
-  }
-
-  async #rollbackRuntimeMaterialization(
-    request: JsonObject | undefined,
-    rollbackReceipt: string | undefined,
-  ): Promise<ProviderTicket | undefined> {
-    if (!request || !rollbackReceipt) return undefined;
-    try {
-      await this.#runtimeMaterializer?.rollbackRuntimeBindings({
-        request,
-        rollbackReceipt,
-      });
-      return undefined;
-    } catch {
-      return failed(
-        "provider_error",
-        "the Worker Version failed and runtime materialization rollback was not confirmed",
-      );
-    }
-  }
-
-  async #commitRuntimeMaterialization(
-    input: RuntimeMaterializationInput,
-  ): Promise<ProviderTicket | undefined> {
-    const materializer = this.#runtimeMaterializer;
-    if (!materializer || typeof materializer.commitRuntimeBindings !== "function") {
-      return failed("provider_error", "runtime binding activation was not confirmed by the host");
-    }
-    try {
-      await materializer.commitRuntimeBindings(input);
-      return undefined;
-    } catch {
-      return failed("provider_error", "runtime binding activation was not confirmed by the host");
-    }
   }
 
   async #applyWorkerDeployment(input: ApplyInput): Promise<ProviderTicket> {
@@ -1752,6 +1821,262 @@ type CallResult =
       readonly indeterminate?: true;
     };
 
+type CloudflareReadbackState = "absent" | "present" | "malformed";
+
+function unknownAbsence(
+  reason: ProviderNativeAbsenceUnknownReason,
+  retryable: boolean,
+): ProviderNativeAbsence {
+  return { outcome: "unknown", reason, retryable };
+}
+
+function absenceResult(
+  outcome: "absent" | "present",
+  descriptor: ProviderNativeReadbackDescriptor,
+): ProviderNativeAbsence {
+  // `nativeId` is deliberately omitted. The descriptor itself remains
+  // Host-private, while this evidence is safe to aggregate into a public
+  // absence receipt.
+  return {
+    outcome,
+    evidence: {
+      provider: descriptor.provider,
+      kind: descriptor.kind,
+      state: outcome,
+    },
+  };
+}
+
+function providerKind(offering: ProviderOffering): string {
+  return offering.kind.startsWith("takoform.") && isEdgeFormsApiVersion(offering.form.apiVersion)
+    ? offering.form.kind
+    : offering.kind;
+}
+
+function cloudflareKindMatches(kind: string, nativeKind: NativeId["kind"]): boolean {
+  switch (nativeKind) {
+    case "r2":
+      return kind === "ObjectBucket" || kind === "object_bucket";
+    case "d1":
+      return kind === "SQLiteDatabase" || kind === "sql_database";
+    case "kv":
+      return kind === "EdgeKVNamespace";
+    case "queue":
+      return kind === "AtLeastOnceQueue";
+    case "worker":
+      return kind === "ModuleWorker" || kind === "worker_script";
+    case "version":
+      return kind === "WorkerVersion";
+    case "deployment":
+      return kind === "WorkerDeployment";
+    case "endpoint":
+      return kind === "WorkerEndpoint";
+    case "domain":
+      return kind === "WorkerCustomDomain";
+    case "cron":
+      return kind === "WorkerCronTrigger";
+    case "consumer":
+      return kind === "QueueConsumer";
+  }
+}
+
+function cloudflareReadbackData(native: NativeId, spec?: JsonObject): JsonObject | null {
+  switch (native.kind) {
+    case "r2":
+      return { bucketName: native.name };
+    case "d1":
+      return { databaseId: native.name };
+    case "kv":
+      return { namespaceId: native.name };
+    case "queue":
+      return { queueId: native.name };
+    case "worker":
+      return { scriptName: native.name };
+    case "version":
+      return { scriptName: native.parent, versionId: native.name };
+    case "deployment":
+      return { scriptName: native.parent, deploymentId: native.name };
+    case "endpoint":
+      return { scriptName: native.name };
+    case "domain":
+      return { domainId: native.name };
+    case "cron": {
+      const cron = optionalString(spec?.cron);
+      return cron ? { scriptName: native.parent, cron } : null;
+    }
+    case "consumer":
+      return { queueId: native.parent, consumerId: native.name };
+  }
+}
+
+function validateCloudflareReadbackDescriptor(
+  provider: string,
+  offering: ProviderOffering,
+  descriptor: ProviderNativeReadbackDescriptor,
+): NativeId | null {
+  const raw = record(descriptor);
+  if (!raw) return null;
+  if (
+    raw.apiVersion !== PROVIDER_READBACK_API_VERSION ||
+    raw.provider !== provider ||
+    raw.kind !== providerKind(offering) ||
+    typeof raw.nativeId !== "string" ||
+    raw.nativeId.length < 1 ||
+    raw.nativeId.length > 4_096
+  ) {
+    // The parser below enforces the exact native kind/parent shape; this
+    // branch only bounds the opaque descriptor value before parsing it.
+    return null;
+  }
+  const native = parseNativeId(raw.nativeId);
+  if (!native || !cloudflareKindMatches(providerKind(offering), native.kind)) return null;
+  const data = record(raw.data);
+  if (!data || !cloudflareReadbackDataMatches(native, data)) return null;
+  return native;
+}
+
+function cloudflareReadbackDataMatches(native: NativeId, data: Record<string, unknown>): boolean {
+  switch (native.kind) {
+    case "r2":
+      return exactData(data, { bucketName: native.name });
+    case "d1":
+      return exactData(data, { databaseId: native.name });
+    case "kv":
+      return exactData(data, { namespaceId: native.name });
+    case "queue":
+      return exactData(data, { queueId: native.name });
+    case "worker":
+      return exactData(data, { scriptName: native.name });
+    case "version":
+      return exactData(data, { scriptName: native.parent, versionId: native.name });
+    case "deployment":
+      return exactData(data, { scriptName: native.parent, deploymentId: native.name });
+    case "endpoint":
+      return exactData(data, { scriptName: native.name });
+    case "domain":
+      return exactData(data, { domainId: native.name });
+    case "cron":
+      return (
+        exactKeys(data, ["scriptName", "cron"]) &&
+        data.scriptName === native.parent &&
+        typeof data.cron === "string" &&
+        data.cron.length > 0 &&
+        data.cron.length <= 4_096
+      );
+    case "consumer":
+      return exactData(data, { queueId: native.parent, consumerId: native.name });
+  }
+}
+
+function exactData(data: Record<string, unknown>, expected: Record<string, string>): boolean {
+  return (
+    exactKeys(data, Object.keys(expected)) &&
+    Object.entries(expected).every(([key, value]) => data[key] === value)
+  );
+}
+
+function exactKeys(data: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(data).sort();
+  return (
+    actual.length === keys.length && actual.every((key, index) => key === [...keys].sort()[index])
+  );
+}
+
+function cloudflareReadbackPath(accountId: string, native: NativeId): string | null {
+  const account = `/accounts/${accountId}`;
+  switch (native.kind) {
+    case "r2":
+      return `${account}/r2/buckets/${encodeURIComponent(native.name)}`;
+    case "d1":
+      return `${account}/d1/database/${encodeURIComponent(native.name)}`;
+    case "kv":
+      return `${account}/storage/kv/namespaces/${encodeURIComponent(native.name)}`;
+    case "queue":
+      return `${account}/queues/${encodeURIComponent(native.name)}`;
+    case "worker":
+      return `${account}/workers/scripts/${encodeURIComponent(native.name)}`;
+    case "version":
+      return `${account}/workers/scripts/${encodeURIComponent(native.parent)}/versions/${encodeURIComponent(native.name)}`;
+    case "deployment":
+      return `${account}/workers/scripts/${encodeURIComponent(native.parent)}/deployments/${encodeURIComponent(native.name)}`;
+    case "endpoint":
+      return `${account}/workers/scripts/${encodeURIComponent(native.name)}/subdomain`;
+    case "domain":
+      return `${account}/workers/domains/${encodeURIComponent(native.name)}`;
+    case "cron":
+      return `${account}/workers/scripts/${encodeURIComponent(native.parent)}/schedules`;
+    case "consumer":
+      return `${account}/queues/${encodeURIComponent(native.parent)}/consumers/${encodeURIComponent(native.name)}`;
+  }
+}
+
+function cloudflareReadbackState(
+  native: NativeId,
+  value: unknown,
+  expectedCron?: string,
+): CloudflareReadbackState {
+  if (native.kind === "endpoint") {
+    const result = record(value);
+    if (!result || typeof result.enabled !== "boolean") return "malformed";
+    return result.enabled ? "present" : "absent";
+  }
+  if (native.kind === "cron") {
+    const values = strictScheduleValues(value);
+    if (!values) return "malformed";
+    return expectedCron !== undefined && values.includes(expectedCron) ? "present" : "absent";
+  }
+  const result = record(value);
+  if (!result) return "malformed";
+  const identityChecks: readonly [string, string][] =
+    native.kind === "worker"
+      ? [
+          ["id", native.name],
+          ["name", native.name],
+          ["script_name", native.name],
+        ]
+      : native.kind === "version"
+        ? [["id", native.name]]
+        : native.kind === "deployment"
+          ? [["id", native.name]]
+          : native.kind === "domain"
+            ? [["id", native.name]]
+            : native.kind === "consumer"
+              ? [["consumer_id", native.name]]
+              : native.kind === "r2"
+                ? [["name", native.name]]
+                : native.kind === "d1"
+                  ? [
+                      ["uuid", native.name],
+                      ["id", native.name],
+                    ]
+                  : native.kind === "kv"
+                    ? [["id", native.name]]
+                    : native.kind === "queue"
+                      ? [
+                          ["queue_id", native.name],
+                          ["id", native.name],
+                        ]
+                      : [];
+  for (const [field, expected] of identityChecks) {
+    if (field in result && result[field] !== expected) return "malformed";
+    if (field in result && typeof result[field] !== "string") return "malformed";
+  }
+  return "present";
+}
+
+function strictScheduleValues(value: unknown): readonly string[] | null {
+  const result = record(value);
+  const list = Array.isArray(value) ? value : result?.schedules;
+  if (!Array.isArray(list)) return null;
+  const values: string[] = [];
+  for (const item of list) {
+    const cron = optionalString(record(item)?.cron);
+    if (!cron) return null;
+    values.push(cron);
+  }
+  return [...new Set(values)].sort();
+}
+
 /** The numeric codes in a Cloudflare error envelope, if it carried any. */
 function errorCodes(errors: unknown): readonly number[] {
   if (!Array.isArray(errors)) return [];
@@ -2167,39 +2492,6 @@ function sensitiveBindingNames(value: JsonValue | undefined): readonly string[] 
     return null;
   }
   return names;
-}
-
-function sameMaterializedBindings(
-  values: Readonly<Record<string, string>>,
-  expected: readonly string[],
-): boolean {
-  const names = Object.keys(values);
-  return (
-    names.length === expected.length &&
-    names.every((name) => expected.includes(name)) &&
-    expected.every((name) => {
-      const value = values[name];
-      return (
-        typeof value === "string" &&
-        value.length > 0 &&
-        value.length <= 4_096 &&
-        !hasDisallowedTextControl(value)
-      );
-    })
-  );
-}
-
-function hasDisallowedTextControl(value: string): boolean {
-  return [...value].some((character) => {
-    const code = character.codePointAt(0) ?? 0;
-    return (
-      code === 0x7f ||
-      code <= 0x08 ||
-      code === 0x0b ||
-      code === 0x0c ||
-      (code >= 0x0e && code <= 0x1f)
-    );
-  });
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {

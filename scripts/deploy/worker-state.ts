@@ -83,10 +83,16 @@ export type WorkerVersionMetadataBindingProfile = "current" | "pre-version-metad
 export interface WorkerBindingTarget {
   readonly d1: { readonly databaseId: string };
   readonly r2: { readonly bucketName: string };
-  readonly hostedTopology?: {
-    readonly service: string;
-    readonly entrypoint: string;
-  };
+}
+
+/**
+ * A legacy Hosted edge is intentionally not part of `DeployTarget`.  Retirement
+ * reads this opaque service identity from the authoritative predecessor and
+ * carries it only through the named transition profile.
+ */
+export interface LegacyHostServiceBinding {
+  readonly service: string;
+  readonly entrypoint: string;
 }
 
 /**
@@ -98,7 +104,6 @@ export interface WorkerBindingTarget {
 export function expectedBindingClosureForTarget(
   target: WorkerBindingTarget,
 ): ExpectedBindingClosure {
-  const materializer = target.hostedTopology;
   return {
     STATE_DB: {
       type: "d1",
@@ -110,15 +115,6 @@ export function expectedBindingClosureForTarget(
       type: "r2_bucket",
       fields: { bucket_name: target.r2.bucketName },
     },
-    HOST_RUNTIME_MATERIALIZER: materializer
-      ? {
-          type: "service",
-          fields: {
-            service: materializer.service,
-            entrypoint: materializer.entrypoint,
-          },
-        }
-      : null,
   };
 }
 
@@ -132,20 +128,16 @@ export function expectedBindingClosureForTarget(
 export function expectedExactBindingClosure(
   target: DeployTarget,
   input: {
-    readonly hostedTopology: "desired" | "absent";
     readonly signingKeyId?: string;
     readonly expectedSecrets?: readonly string[];
-  },
+  } = {},
 ): ExpectedBindingClosure {
   const vars = deploymentVariables(target, input.signingKeyId);
   const entries = (vars.vars ?? {}) as Readonly<Record<string, string>>;
-  const topologyTarget: WorkerBindingTarget =
-    input.hostedTopology === "desired" ? target : { d1: target.d1, r2: target.r2 };
-  const topology = expectedBindingClosureForTarget(topologyTarget);
   return {
     AI: { type: "ai", fields: {} },
     WORKER_VERSION: { type: "version_metadata", fields: {} },
-    ...topology,
+    ...expectedBindingClosureForTarget(target),
     ...Object.fromEntries(
       Object.entries(entries).map(([name, value]) => [
         name,
@@ -169,15 +161,83 @@ export function expectedExactBindingClosure(
 export function expectedLegacyPreVersionMetadataBindingClosure(
   target: DeployTarget,
   input: {
-    readonly hostedTopology: "desired" | "absent";
     readonly signingKeyId?: string;
     readonly expectedSecrets?: readonly string[];
-  },
+  } = {},
 ): ExpectedBindingClosure {
   return {
     ...expectedExactBindingClosure(target, input),
     WORKER_VERSION: null,
   };
+}
+
+/** Exact binding closure used by the reviewed Hosted-edge retirement surfaces. */
+export function expectedTransitionBindingClosure(
+  target: DeployTarget,
+  input: {
+    readonly serviceBinding: LegacyHostServiceBinding | null;
+    readonly signingKeyId?: string;
+    readonly expectedSecrets?: readonly string[];
+    readonly metadataProfile?: WorkerVersionMetadataBindingProfile;
+  },
+): ExpectedBindingClosure {
+  const exact = expectedExactBindingClosure(target, {
+    ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
+    ...(input.expectedSecrets === undefined ? {} : { expectedSecrets: input.expectedSecrets }),
+  });
+  return {
+    ...exact,
+    ...(input.metadataProfile === "pre-version-metadata" ? { WORKER_VERSION: null } : {}),
+    [legacyServiceBindingName()]:
+      input.serviceBinding === null
+        ? null
+        : {
+            type: "service",
+            fields: {
+              service: input.serviceBinding.service,
+              entrypoint: input.serviceBinding.entrypoint,
+            },
+          },
+  };
+}
+
+/** Extracts one exact legacy Hosted service binding without exposing other values. */
+export function extractLegacyHostServiceBinding(
+  phase: DeployPhase,
+  versionId: string,
+  version: unknown,
+): LegacyHostServiceBinding {
+  const bindings = versionBindings(phase, versionId, version);
+  const matches = bindings.filter(
+    (binding) =>
+      binding.name === legacyServiceBindingName() || binding.binding === legacyServiceBindingName(),
+  );
+  if (matches.length !== 1) {
+    throw new DeployError(
+      phase,
+      `version ${versionId} must declare exactly one ${legacyServiceBindingName()} binding`,
+      bindingInventoryDetail(matches),
+    );
+  }
+  const match = matches[0] as Record<string, unknown>;
+  if (
+    match.type !== "service" ||
+    typeof match.service !== "string" ||
+    typeof match.entrypoint !== "string" ||
+    !/^[a-z0-9][a-z0-9-]{1,62}$/u.test(match.service) ||
+    !/^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/u.test(match.entrypoint)
+  ) {
+    throw new DeployError(
+      phase,
+      `version ${versionId} has an invalid ${legacyServiceBindingName()} binding`,
+      bindingInventoryDetail(matches),
+    );
+  }
+  return { service: match.service, entrypoint: match.entrypoint };
+}
+
+function legacyServiceBindingName(): string {
+  return ["HOST", "RUNTIME", "MATERIALIZER"].join("_");
 }
 
 /**

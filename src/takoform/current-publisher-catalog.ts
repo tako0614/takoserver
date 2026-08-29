@@ -23,7 +23,7 @@ import type {
  */
 export const CURRENT_PUBLISHER_REPOSITORY =
   "https://github.com/tako0614/takoform-forms.git" as const;
-export const CURRENT_PUBLISHER_COMMIT = "026f862975b9adb0e2bfd9c6214a5e6691dfb596" as const;
+export const CURRENT_PUBLISHER_COMMIT = "3a395e4d7f9f652a942da52905857fccc41b467e" as const;
 export const CURRENT_PUBLISHER_FAMILY_INDEX_SHA256 =
   "c3c59a01fb90ab967c3765ff1dd15ca4af4062cba9b38c0a3b97a168822ffb32" as const;
 export const CURRENT_PUBLISHER_FAMILY_CONFORMANCE_SHA256 =

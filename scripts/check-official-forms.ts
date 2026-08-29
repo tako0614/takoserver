@@ -13,7 +13,7 @@ const MANIFEST_SIZE = 9_595;
 const MANIFEST_SHA256 = "229cd5c5209fae5c1088418216f75ce1ea7d049af027c527117aff0f1137f2ad";
 const STABLE_CATALOG_PATH = "src/generated/takoform-stable-v1-catalog.ts";
 const STABLE_CATALOG_SIZE = 94_342;
-const STABLE_CATALOG_SHA256 = "43299a9323ac7e009db81ea8024c45618eae1b783893e99ae96e6dae893b5649";
+const STABLE_CATALOG_SHA256 = "36940db6d2dcfb950ab8df04efceeb68d5655b302c6cc17a8b9ed63af095e5b3";
 
 interface SourceManifest {
   readonly format: "takoserver.vendored-takoform-source@v1";

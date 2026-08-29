@@ -1,10 +1,6 @@
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import { base64UrlDecode, base64UrlEncode, isSha256Digest } from "./json.ts";
 import type { Clock, Sql } from "./ports.ts";
-import {
-  boundedRuntimeMaterialization,
-  type RuntimeMaterializationAuthority,
-} from "./runtime-materialization.ts";
 
 /**
  * Every signed credential Takoserver issues, in one module.
@@ -65,7 +61,6 @@ export interface TakoformTenantRunTokenClaims {
   readonly issuedAtEpochSeconds: number;
   readonly expiresAtEpochSeconds: number;
   readonly tokenId: string;
-  readonly runtimeMaterialization?: RuntimeMaterializationAuthority;
 }
 
 export type TokenErrorCode =
@@ -134,7 +129,6 @@ export interface TokenService {
     readonly tenantRef: string;
     readonly spaceRef: string;
     readonly runRef: string;
-    readonly runtimeMaterialization?: RuntimeMaterializationAuthority;
     readonly ttlSeconds: number;
   }): Promise<{ readonly token: string; readonly expiresAt: string }>;
 
@@ -320,11 +314,6 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
           runRef: reference(input.runRef),
           spaceRef: reference(input.spaceRef),
           tenantRef: reference(input.tenantRef),
-          ...(input.runtimeMaterialization
-            ? {
-                runtimeMaterialization: boundedRuntimeMaterialization(input.runtimeMaterialization),
-              }
-            : {}),
         },
         input.ttlSeconds,
         maxTakoformRunLifetime,
@@ -639,7 +628,6 @@ function takoformTenantRunClaims(payload: Record<string, unknown>): TakoformTena
     "runRef",
     "spaceRef",
     "tenantRef",
-    ...(payload.runtimeMaterialization === undefined ? [] : ["runtimeMaterialization"]),
   ]);
   if (payload.mode !== "tenant-run") fail("malformed_token");
   return {
@@ -651,11 +639,6 @@ function takoformTenantRunClaims(payload: Record<string, unknown>): TakoformTena
     issuedAtEpochSeconds: epochSeconds(payload.iat),
     expiresAtEpochSeconds: epochSeconds(payload.exp),
     tokenId: claimReference(payload.jti),
-    ...(payload.runtimeMaterialization === undefined
-      ? {}
-      : {
-          runtimeMaterialization: boundedRuntimeMaterialization(payload.runtimeMaterialization),
-        }),
   };
 }
 

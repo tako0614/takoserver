@@ -3,21 +3,22 @@
 Takoserver’s public Worker, router, and OpenAPI surface are read-only consumers
 of durable Form admission state. They may reach `host-authority.ts` and the
 package reader, but they must not import `admission-store.ts`, `admission.ts`,
-`form-packages.ts`, or the operator modules. `bun run check:imports` and
+`form-packages.ts`, or the Host admission modules. `bun run check:imports` and
 `tests/takoform-static-authority-boundary.test.ts` enforce that graph.
 
 Form mutation belongs to two separately named, route-less Cloudflare Workers:
 
 - `takoserver-form-authority-worker` exposes only service-binding RPC methods
   `plan`, `apply`, and `readback`. Its production composition can plan and read
-  the exact durable state, but `apply` fails closed because no released
-  Takoform Core `EvaluateAdmission` adapter or signed trust-evidence adapter is
-  available. Takoserver does not reimplement that evaluator in TypeScript, and
-  persisted `AdmissionReport` JSON is never accepted as authority.
+  the exact durable state, but `apply` fails closed because no released Form
+  package verifier is available. Released Core may supply signature,
+  provenance, namespace, and revocation verification; Takoserver Host owns the
+  admission policy decision and private in-process handle. Persisted
+  verification evidence or `AdmissionReport` JSON is never authority.
 - `takoserver-integration-form-authority-worker` is an integration-only fixture
   bridge. It checks the exact environment before reading D1 or R2 bindings and
-  permanently reports `admissionMode: integration-fixture` and
-  `productionEligible: false`.
+  permanently reports `policyAuthority: takoserver-host`,
+  `verificationMode: integration-fixture`, and `productionEligible: false`.
 
 Neither authority Worker has a public route, `fetch` method, `workers.dev`
 address, preview URL, customer handler, or secret binding. Both use the selected
@@ -55,7 +56,7 @@ public JWK before reading capability, D1, R2, or public identity bindings. Both
 Workers independently call the public Worker’s named
 `PublicHostIdentityEntrypoint` before every plan/apply/readback and require the
 same immutable Worker Version. Apply checks that identity again after
-trust/Core preparation and current-head reread, then immediately before every
+verification and the Host policy decision plus current-head reread, then immediately before every
 durable command. A later ordinary public Worker deploy therefore closes the
 stale operator path immediately. Public Host readers also treat a support
 profile sealed to another Worker Version as unsupported until the authority is
@@ -135,8 +136,10 @@ publisher corpus:
 `ActorNamespace`, `DurableWorkflow`, `StaticAssetBundle`, and
 `WorkerCustomDomain` are excluded. The generator derives package, schema, and
 payload digests from `tests/fixtures/takoform-v1`; literals in the operator do
-not confer trust. The synthetic handle issuer accepts only those exact package
+not confer trust. The integration verifier accepts only those exact package
 closures, stable-v1 empty revocation genesis, and matching namespace evidence.
+The Host then makes its own policy decision and issues the private handle shared
+only with its admission store.
 Activation is always scoped to one exact tenant/Space audience. There is no
 official, first-party, or privileged publisher branch.
 

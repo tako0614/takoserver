@@ -95,6 +95,10 @@ export async function validateWorkerAggregate(input: {
     return;
   }
   if (input.form.identity.formRef.kind === "WorkerVersion" && input.form.role === "revision") {
+    const requiredSensitiveVars = input.spec.requiredSensitiveVars;
+    if (Array.isArray(requiredSensitiveVars) && requiredSensitiveVars.length > 0) {
+      throw new TakoformHostError("unsupported_capability", 422);
+    }
     validateEnvironmentNamespace(input.spec);
     for (const relation of input.relations) {
       if (relation.relation !== SERVICE_BINDING_RELATION) continue;

@@ -1,14 +1,14 @@
 import { INTEGRATION_FORM_PACKAGES } from "../generated/takoform-integration-form-packages.ts";
 import type { JsonObject, ObjectStore, Sql } from "../ports.ts";
 import type { PublicHostIdentityRpc } from "../public-host-identity.ts";
-import { createIntegrationFixtureAdmissionAdapters } from "./core-admission-adapter.ts";
+import { createIntegrationFixtureEvidenceVerifier } from "./form-authority-verification.ts";
 import type { FormPackageInput } from "./form-packages.ts";
 import {
   createExactFormPackageSource,
   createFormAuthorityComposition,
   type FormAuthorityComposition,
   type FormAuthorityEndpointConfiguration,
-} from "./operator-endpoint.ts";
+} from "./host-admission-endpoint.ts";
 
 /**
  * Integration-only fixture bridge. Callers must reject the environment before
@@ -27,7 +27,7 @@ export async function createIntegrationFormAuthorityComposition(input: {
     throw new TypeError("integration Form authority refuses every non-integration environment");
   }
   const packages = integrationFormPackages();
-  const adapters = createIntegrationFixtureAdmissionAdapters({
+  const verifier = createIntegrationFixtureEvidenceVerifier({
     packages: packages.map((pkg) => ({
       formRef: pkg.formRef,
       packageDigest: pkg.packageDigest,
@@ -35,7 +35,7 @@ export async function createIntegrationFormAuthorityComposition(input: {
   });
   return createFormAuthorityComposition({
     ...input,
-    ...adapters,
+    verifier,
     packages: createExactFormPackageSource(packages),
   });
 }

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProviderOffering, ProviderRelation } from "../src/provider-port.ts";
@@ -14,7 +14,7 @@ import {
 /**
  * Running somebody's Worker on a machine you own is what makes a self-hosted
  * deployment a platform rather than a place to keep files. The chain under
- * test is the released Edge Family's: a WorkerVersion materializes a committed
+ * test is the released Edge Family's: a WorkerVersion stores a committed
  * bundle, a WorkerDeployment publishes the winning version into workerd, and
  * the endpoint and domain attachments decide which hostnames route to it.
  */
@@ -90,12 +90,58 @@ interface ProviderCase {
   readonly missingBlobs?: boolean;
 }
 
+interface FlakyRuntimeState {
+  serving: boolean;
+  failNextWrite: boolean;
+  failNextReload: boolean;
+  writes: number;
+  reloads: number;
+}
+
+function flakyRuntime(): { runtime: WorkerdRuntime; state: FlakyRuntimeState } {
+  const state: FlakyRuntimeState = {
+    serving: false,
+    failNextWrite: false,
+    failNextReload: false,
+    writes: 0,
+    reloads: 0,
+  };
+  return {
+    state,
+    runtime: {
+      async write() {
+        state.writes += 1;
+        if (state.failNextWrite) {
+          state.failNextWrite = false;
+          state.serving = false;
+          throw new Error("runtime write failed");
+        }
+      },
+      async remove() {
+        state.serving = false;
+      },
+      async reload() {
+        state.reloads += 1;
+        if (state.failNextReload) {
+          state.failNextReload = false;
+          state.serving = false;
+          throw new Error("runtime reload failed");
+        }
+        state.serving = true;
+      },
+      async has() {
+        return state.serving;
+      },
+    },
+  };
+}
+
 function provider(options: ProviderCase = {}) {
   const modules = options.modules ?? { "index.js": "export default {}" };
   return createSelfhostProvider({
     offerings: [],
     dataRoot: root,
-    runtime: options.runtime ?? createWorkerdRuntime({ root }),
+    runtime: options.runtime ?? createWorkerdRuntime({ root, isReady: () => true }),
     ...(options.suffixes ? { suffixes: options.suffixes } : {}),
     artifacts: {
       async manifest(_tenant, digest) {
@@ -205,6 +251,40 @@ describe("publishing a Worker through the Edge Family", () => {
     expect(config).not.toContain(`embed "${root}`);
   });
 
+  test("reports malformed durable script state instead of observing an empty deployment", async () => {
+    const local = provider();
+    const worker = await local.apply({
+      operationId: "op_worker_corrupt_state",
+      offering: offering("ModuleWorker"),
+      identity: identity("hello"),
+      spec: {},
+    });
+    if (worker.phase !== "succeeded") throw new Error("the worker allocation failed");
+    const script = String(worker.result.outputs.scriptName);
+    const stateRoot = join(root, "selfhost", "scripts");
+    const statePath = join(stateRoot, `${script}.json`);
+    await mkdir(stateRoot, { recursive: true });
+    await writeFile(statePath, '{"activeVersion":"v-truncated","domains":[', "utf8");
+
+    const observed = await local.observe({
+      offering: offering("WorkerDeployment"),
+      nativeId: `selfhost-deployment:${script}:op_deploy`,
+      identity: identity("hello-live"),
+      spec: {},
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+    });
+
+    expect(observed).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "provider_error",
+        message: "the durable Worker script state is malformed",
+        retryable: false,
+      },
+    });
+    expect(await readFile(statePath, "utf8")).toBe('{"activeVersion":"v-truncated","domains":[');
+  });
+
   test("the endpoint attachment assigns a stable HTTPS address and routes it", async () => {
     const local = provider();
     const script = await publish(local);
@@ -269,6 +349,159 @@ describe("publishing a Worker through the Edge Family", () => {
     expect(ticket).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
   });
 
+  test("republishes an endpoint after a runtime reload failure persisted its desired state", async () => {
+    const runtime = flakyRuntime();
+    const local = provider({ runtime: runtime.runtime });
+    const script = await publish(local);
+    runtime.state.failNextReload = true;
+
+    const endpointInput = {
+      offering: offering("WorkerEndpoint"),
+      identity: identity("hello-endpoint"),
+      spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" } },
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+    } as const;
+    const failedApply = await local.apply({
+      ...endpointInput,
+      operationId: "op_endpoint_reload_failure",
+    });
+    expect(failedApply).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(runtime.state.serving).toBe(false);
+
+    const retried = await local.apply({
+      ...endpointInput,
+      operationId: "op_endpoint_reload_retry",
+    });
+    expect(retried).toMatchObject({
+      phase: "succeeded",
+      result: { outputs: { hostname: `${script}.localhost` } },
+    });
+    expect(runtime.state.serving).toBe(true);
+    expect(runtime.state.reloads).toBe(3);
+  });
+
+  test("republishes a custom domain after a runtime write failure persisted its desired state", async () => {
+    const runtime = flakyRuntime();
+    const local = provider({ runtime: runtime.runtime });
+    await publish(local);
+    runtime.state.failNextWrite = true;
+
+    const domainInput = {
+      offering: offering("WorkerCustomDomain"),
+      identity: identity("hello-domain"),
+      spec: {
+        hostname: "www.example.test",
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+      },
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+    } as const;
+    const failedApply = await local.apply({
+      ...domainInput,
+      operationId: "op_domain_write_failure",
+    });
+    expect(failedApply).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(runtime.state.serving).toBe(false);
+
+    const retried = await local.apply({ ...domainInput, operationId: "op_domain_write_retry" });
+    expect(retried).toMatchObject({
+      phase: "succeeded",
+      result: { observed: { hostname: "www.example.test" } },
+    });
+    expect(runtime.state.serving).toBe(true);
+  });
+
+  test("observes runtime truth instead of treating durable endpoint state as served", async () => {
+    const runtime = flakyRuntime();
+    const local = provider({ runtime: runtime.runtime });
+    await publish(local);
+    const endpoint = await local.apply({
+      operationId: "op_endpoint_observe_truth",
+      offering: offering("WorkerEndpoint"),
+      identity: identity("hello-endpoint"),
+      spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" } },
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+    });
+    expect(endpoint.phase).toBe("succeeded");
+    runtime.state.serving = false;
+
+    const observed = await local.observe({
+      offering: offering("WorkerEndpoint"),
+      nativeId: "whatever-was-recorded",
+      identity: identity("hello-endpoint"),
+      spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" } },
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+    });
+    expect(observed).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+  });
+
+  test("does not treat a staged manifest as serving after reload fails", async () => {
+    let failNextReload = false;
+    const runtime = createWorkerdRuntime({
+      root,
+      isReady: () => true,
+      onReload: async () => {
+        if (failNextReload) {
+          failNextReload = false;
+          throw new Error("runtime reload failed after staging");
+        }
+      },
+    });
+    const local = provider({ runtime });
+    await publish(local);
+    failNextReload = true;
+
+    const endpointInput = {
+      offering: offering("WorkerEndpoint"),
+      identity: identity("hello-endpoint"),
+      spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" } },
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+    } as const;
+    const failedApply = await local.apply({
+      ...endpointInput,
+      operationId: "op_endpoint_staged_reload_failure",
+    });
+    expect(failedApply).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+
+    const observed = await local.observe({
+      offering: offering("WorkerEndpoint"),
+      nativeId: "whatever-was-recorded",
+      identity: identity("hello-endpoint"),
+      spec: endpointInput.spec,
+      relations: endpointInput.relations,
+    });
+    expect(observed).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+  });
+
+  test("removes an activation marker when the serving process is no longer ready", async () => {
+    let ready = true;
+    const runtime = createWorkerdRuntime({ root, isReady: () => ready });
+    await runtime.write(
+      "hello",
+      { directory: "unused", mainModule: "index.js", hostnames: ["hello.test"], generation: "v1" },
+      new Map([["index.js", new TextEncoder().encode("export default {}")]]),
+    );
+    await runtime.reload();
+    expect(await runtime.has("hello", "v1")).toBe(true);
+    ready = false;
+    expect(await runtime.has("hello", "v1")).toBe(false);
+    expect(await runtime.has("hello", "v1")).toBe(false);
+  });
+
   test("refuses a bundle whose modules the store cannot produce", async () => {
     const local = provider({ missingBlobs: true });
     const ticket = await local.apply({
@@ -290,7 +523,7 @@ describe("publishing a Worker through the Edge Family", () => {
     expect(ticket).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
   });
 
-  test("refuses sensitive Worker bindings without a runtime materializer", async () => {
+  test("refuses unsupported sensitive Worker bindings", async () => {
     const local = provider();
     const ticket = await local.apply({
       operationId: "op_sensitive_version",
@@ -307,7 +540,13 @@ describe("publishing a Worker through the Edge Family", () => {
         relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
       ],
     });
-    expect(ticket).toMatchObject({ phase: "failed", failure: { code: "denied" } });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "denied",
+        message: "sensitive Worker bindings are unsupported by this Host",
+      },
+    });
   });
 
   test("a version that declares a site carries its files to the runtime", async () => {
@@ -346,6 +585,41 @@ describe("publishing a Worker through the Edge Family", () => {
     expect(deleted.phase).toBe("succeeded");
     const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
     expect(config).not.toContain(`embed "${script}/index.js"`);
+  });
+
+  test("recovers a local worker delete by readback without repeating the mutation", async () => {
+    let reloads = 0;
+    const runtime = createWorkerdRuntime({
+      root,
+      isReady: () => true,
+      onReload: async () => {
+        reloads += 1;
+      },
+    });
+    const local = provider({ runtime });
+    const script = await publish(local);
+    const input = {
+      operationId: "op_worker_delete_recovery",
+      operationMode: "initial" as const,
+      offering: offering("ModuleWorker"),
+      nativeId: `selfhost-worker:${script}:op_worker`,
+      identity: identity("hello"),
+    };
+    const deleted = await local.delete(input);
+    expect(deleted).toMatchObject({ phase: "succeeded" });
+    const afterDeleteReloads = reloads;
+
+    if (!local.recoverDelete) throw new Error("selfhost provider missing delete recovery seam");
+    const recovered = await local.recoverDelete({
+      ...input,
+      operationMode: "recovery",
+    });
+    expect(recovered).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: input.nativeId, observed: { deleted: true } },
+    });
+    // Recovery is a readback-only seam: no second remove/reload is allowed.
+    expect(reloads).toBe(afterDeleteReloads);
   });
 });
 
@@ -395,6 +669,81 @@ describe("local namespaces", () => {
       protocol: "s3",
       bucketName: "org_demo-default-media",
     });
+  });
+});
+
+describe("read-only native absence verification", () => {
+  test("reads worker Version state, then proves it absent after parent deletion", async () => {
+    const runtime = flakyRuntime();
+    const local = provider({ runtime: runtime.runtime });
+    const worker = await local.apply({
+      operationId: "op_readback_worker",
+      offering: offering("ModuleWorker"),
+      identity: identity("hello"),
+      spec: {},
+    });
+    if (worker.phase !== "succeeded") throw new Error("worker allocation failed");
+    const script = String(worker.result.outputs.scriptName);
+    const version = await local.apply({
+      operationId: "op_readback_version",
+      offering: offering("WorkerVersion"),
+      identity: identity("hello-v1"),
+      spec: {
+        bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", "hello"),
+        relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+      ],
+    });
+    if (version.phase !== "succeeded") throw new Error("version materialization failed");
+    if (!local.createNativeReadbackDescriptor || !local.verifyNativeAbsence) {
+      throw new Error("selfhost provider must expose native absence readback");
+    }
+    const descriptor = local.createNativeReadbackDescriptor({
+      offering: offering("WorkerVersion"),
+      nativeId: version.result.nativeId,
+      identity: identity("hello-v1"),
+    });
+    const writes = runtime.state.writes;
+    const reloads = runtime.state.reloads;
+    const present = await local.verifyNativeAbsence({
+      offering: offering("WorkerVersion"),
+      descriptor,
+    });
+    expect(present).toEqual({
+      outcome: "present",
+      evidence: { provider: "local", kind: "WorkerVersion", state: "present" },
+    });
+    expect(runtime.state.writes).toBe(writes);
+    expect(runtime.state.reloads).toBe(reloads);
+
+    const deleted = await local.delete({
+      operationId: "op_readback_parent_delete",
+      offering: offering("ModuleWorker"),
+      nativeId: worker.result.nativeId,
+      identity: identity("hello"),
+    });
+    expect(deleted.phase).toBe("succeeded");
+    const writesAfterDelete = runtime.state.writes;
+    const reloadsAfterDelete = runtime.state.reloads;
+    const absent = await local.verifyNativeAbsence({
+      offering: offering("WorkerVersion"),
+      descriptor,
+    });
+    expect(absent).toEqual({
+      outcome: "absent",
+      evidence: { provider: "local", kind: "WorkerVersion", state: "absent" },
+    });
+    expect(JSON.stringify(absent)).not.toContain(script);
+    expect(runtime.state.writes).toBe(writesAfterDelete);
+    expect(runtime.state.reloads).toBe(reloadsAfterDelete);
+
+    const malformed = await local.verifyNativeAbsence({
+      offering: offering("WorkerVersion"),
+      descriptor: { ...descriptor, data: { scriptName: "not-the-parent", versionId: "bad" } },
+    });
+    expect(malformed).toEqual({ outcome: "unknown", reason: "malformed", retryable: false });
   });
 });
 

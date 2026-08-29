@@ -337,7 +337,6 @@ function deployment(id: string, versionId: string, created: string) {
 
 function workerVersion(target: DeployTarget, signingKeyId: string, message: string) {
   const expected = expectedExactBindingClosure(target, {
-    hostedTopology: "desired",
     signingKeyId,
   });
   return {

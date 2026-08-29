@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
+import { ProviderMutationRecoveryError } from "../src/provider-driver.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
 import type {
@@ -437,14 +438,18 @@ describe("durable deferred Takoform operations", () => {
     const memory = new InMemoryTakoformResourceDriver();
     const operationIds: string[] = [];
     const operationModes: Array<"initial" | "recovery" | undefined> = [];
+    const providerHandles: Array<string | undefined> = [];
     let attempts = 0;
     const driver: TakoformResourceDriver = {
       ...memory,
       async apply(input) {
         operationIds.push(input.operationId);
         operationModes.push(input.operationMode);
+        providerHandles.push(input.providerHandle);
         attempts += 1;
-        if (attempts === 1) throw new Error("provider transport ended before a receipt");
+        if (attempts === 1) {
+          throw new ProviderMutationRecoveryError("running", "opaque-provider-handle");
+        }
         return await memory.apply(input);
       },
       observe: (input) => memory.observe(input),
@@ -483,7 +488,23 @@ describe("durable deferred Takoform operations", () => {
         )
         .get(operationId),
     ).toEqual({ phase: "planned", receipt_json: null });
+    expect(
+      opened.database
+        .query(
+          `SELECT provider_handle, provider_outcome
+           FROM tf_provider_mutation_sagas WHERE operation_id = ?`,
+        )
+        .get(operationId),
+    ).toEqual({ provider_handle: "opaque-provider-handle", provider_outcome: "running" });
 
+    // Exercise the same path after the provider-mutation lease has expired:
+    // recovery must still carry the durable handle and never dispatch again.
+    opened.database
+      .query(
+        `UPDATE tf_provider_mutation_sagas
+         SET execution_lease_until = 0 WHERE operation_id = ?`,
+      )
+      .run(operationId);
     const recovered = await opened.host.handle(request(operationPath, "primary"));
     expect(await recovered?.json()).toMatchObject({
       id: operationId,
@@ -492,6 +513,7 @@ describe("durable deferred Takoform operations", () => {
     });
     expect(operationIds).toEqual([operationId, operationId]);
     expect(operationModes).toEqual(["initial", "recovery"]);
+    expect(providerHandles).toEqual([undefined, "opaque-provider-handle"]);
     expect(
       opened.database
         .query("SELECT operation_id FROM tf_provider_mutation_sagas WHERE operation_id = ?")

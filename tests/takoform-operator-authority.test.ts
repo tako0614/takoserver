@@ -4,30 +4,30 @@ import { canonicalDigest } from "../src/json.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import type { JsonObject, ObjectStore } from "../src/ports.ts";
 import {
+  createAdmissionHandleIssuer,
   type FormAdmissionHost,
   TAKOFORM_REVOCATION_V1,
   TAKOFORM_REVOCATION_V1_EMPTY_ENTRIES_DIGEST,
   TAKOFORM_REVOCATION_V1_GENESIS_DIGEST,
 } from "../src/takoform/admission.ts";
 import { createFormAdmissionStore } from "../src/takoform/admission-store.ts";
-import {
-  createIntegrationFixtureAdmissionAdapters,
-  createUnavailableCoreAdmissionAdapter,
-  createUnavailableSignedTrustEvidenceAdapter,
-  type FormAuthorityTrustEvidence,
-} from "../src/takoform/core-admission-adapter.ts";
 import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
+import {
+  createIntegrationFixtureEvidenceVerifier,
+  createUnavailableFormAuthorityEvidenceVerifier,
+  type FormAuthorityVerificationEvidence,
+} from "../src/takoform/form-authority-verification.ts";
 import { createFormPackageStore, type FormPackageInput } from "../src/takoform/form-packages.ts";
+import {
+  canonicalFormAuthorityPlanDigest,
+  createHostAdmissionCoordinator,
+  type FormAuthorityIdentity,
+  type FormAuthorityPlanRequest,
+} from "../src/takoform/host-admission-coordinator.ts";
 import {
   deriveImplementationCatalog,
   yurucommuFormCandidates,
 } from "../src/takoform/implementation-catalog.ts";
-import {
-  canonicalFormAuthorityPlanDigest,
-  createFormAuthorityOperator,
-  type FormAuthorityIdentity,
-  type FormAuthorityPlanRequest,
-} from "../src/takoform/operator-authority.ts";
 
 const digest = (hex: string) => `sha256:${hex.repeat(64)}` as const;
 const PUBLIC_VERSION_ID = "00000000-0000-4000-8000-000000000001";
@@ -62,7 +62,7 @@ async function moduleWorkerPackage(): Promise<FormPackageInput> {
   };
 }
 
-function evidence(identity = "external-integration-publisher"): FormAuthorityTrustEvidence {
+function evidence(identity = "external-integration-publisher"): FormAuthorityVerificationEvidence {
   return {
     publisher: {
       publisherKey: `publisher-${identity}`,
@@ -131,39 +131,30 @@ async function fixture(
     capabilityDigest: catalog.capabilityDigest,
     implementationDigest: catalog.implementationDigest,
   };
-  const adapters = input.unavailable
-    ? {
-        core: createUnavailableCoreAdmissionAdapter(),
-        trust: createUnavailableSignedTrustEvidenceAdapter(),
-      }
-    : createIntegrationFixtureAdmissionAdapters({
+  const baseVerifier = input.unavailable
+    ? createUnavailableFormAuthorityEvidenceVerifier()
+    : createIntegrationFixtureEvidenceVerifier({
         packages: [{ formRef: pkg.formRef, packageDigest: pkg.packageDigest }],
       });
-  const adapterCalls = { corePrepare: 0, trustVerify: 0 };
-  const core = {
-    ...adapters.core,
-    async prepare(request: Parameters<typeof adapters.core.prepare>[0]) {
-      adapterCalls.corePrepare += 1;
-      return await adapters.core.prepare(request);
-    },
-  };
-  const trust = {
-    ...adapters.trust,
-    async verify(request: Parameters<typeof adapters.trust.verify>[0]) {
-      adapterCalls.trustVerify += 1;
-      return await adapters.trust.verify(request);
+  const adapterCalls = { verify: 0 };
+  const verifier = {
+    ...baseVerifier,
+    async verify(request: Parameters<typeof baseVerifier.verify>[0]) {
+      adapterCalls.verify += 1;
+      return await baseVerifier.verify(request);
     },
   };
   const sql = createEphemeralSql();
   const objects = input.objects ?? createMemoryObjectStore();
   const storedPackages = createFormPackageStore(objects);
+  const handles = createAdmissionHandleIssuer();
   const durable = createFormAdmissionStore({
     sql,
     packages: storedPackages,
-    handles: core.handles,
+    handles,
   });
   const admission = input.admissionWrapper?.(durable) ?? durable;
-  const operator = createFormAuthorityOperator({
+  const operator = createHostAdmissionCoordinator({
     identity,
     catalog,
     packages: {
@@ -179,8 +170,8 @@ async function fixture(
     },
     storedPackages,
     admission,
-    core,
-    trust,
+    handles,
+    verifier,
     assertMutationAuthority: input.assertMutationAuthority ?? (async () => {}),
   });
   const request: FormAuthorityPlanRequest = {
@@ -194,7 +185,7 @@ async function fixture(
   return { operator, request, sql, objects, durable, pkg, identity, adapterCalls };
 }
 
-describe("route-less Form authority operator", () => {
+describe("route-less Takoserver Host admission coordinator", () => {
   test("plans and converges through real package, admission, support, and Space activation paths", async () => {
     const f = await fixture();
     const plan = await f.operator.plan(f.request);
@@ -219,12 +210,29 @@ describe("route-less Form authority operator", () => {
       expect.objectContaining({ installed: true, supported: true, active: true }),
     ]);
     expect(applied.receipts).toHaveLength(5);
+    expect(applied).toMatchObject({
+      policyAuthority: "takoserver-host",
+      verificationMode: "integration-fixture",
+      productionEligible: false,
+    });
+    expect(applied).not.toHaveProperty("admissionMode");
     expect(
       applied.receipts.every(
         (receipt) =>
-          receipt.admissionMode === "integration-fixture" && receipt.productionEligible === false,
+          receipt.policyAuthority === "takoserver-host" &&
+          receipt.verificationMode === "integration-fixture" &&
+          receipt.productionEligible === false,
       ),
     ).toBe(true);
+    const reports = await f.sql.query(
+      "SELECT admission_report_json FROM tf_form_install_events LIMIT 1",
+    );
+    const report = JSON.parse(String(reports[0]?.admission_report_json)) as {
+      checks?: readonly { readonly code?: string }[];
+    };
+    expect(report.checks?.map(({ code }) => code)).toContain(
+      "host-policy-verification-evidence-accepted",
+    );
     const activation = await f.sql.query(
       "SELECT audience_kind, audience_value FROM tf_form_activation_events",
     );
@@ -236,7 +244,7 @@ describe("route-less Form authority operator", () => {
     ]);
   });
 
-  test("fails production apply before any D1 or R2 mutation without released adapters", async () => {
+  test("fails production apply before any D1 or R2 mutation without released verification", async () => {
     let creates = 0;
     const memory = createMemoryObjectStore();
     const objects: ObjectStore = {
@@ -253,7 +261,22 @@ describe("route-less Form authority operator", () => {
     expect(await f.sql.query("SELECT * FROM tf_form_publisher_events")).toEqual([]);
   });
 
-  test("rechecks live public identity after Core/trust preparation and before durable mutation", async () => {
+  test("never accepts serialized verification evidence as Host policy", async () => {
+    const f = await fixture();
+    const forgedEvidence = {
+      ...f.request.evidence,
+      policyAuthority: "takoserver-host",
+      status: "admitted",
+    } as FormAuthorityVerificationEvidence;
+    const forgedRequest = { ...f.request, evidence: forgedEvidence };
+    const plan = await f.operator.plan(forgedRequest);
+    await expect(f.operator.apply(plan)).rejects.toMatchObject({
+      code: "verification_evidence_refused",
+    });
+    expect(await f.sql.query("SELECT * FROM tf_form_publisher_events")).toEqual([]);
+  });
+
+  test("rechecks live public identity after verification and Host policy before durable mutation", async () => {
     let fences = 0;
     let executions = 0;
     const f = await fixture({
@@ -272,7 +295,7 @@ describe("route-less Form authority operator", () => {
       }),
     });
     const applied = await f.operator.apply(await f.operator.plan(f.request));
-    expect(f.adapterCalls).toEqual({ corePrepare: 1, trustVerify: 1 });
+    expect(f.adapterCalls).toEqual({ verify: 1 });
     expect(applied).toMatchObject({
       status: "partial",
       receipts: [],
@@ -392,18 +415,17 @@ describe("route-less Form authority operator", () => {
       "SetActivation",
     ]);
 
-    f.adapterCalls.corePrepare = 0;
-    f.adapterCalls.trustVerify = 0;
+    f.adapterCalls.verify = 0;
     const second = await f.operator.apply(first.nextPlan);
     expect(second.status).toBe("converged");
     expect(second.receipts.map((receipt) => receipt.kind)).toEqual(["SetSupport", "SetActivation"]);
-    expect(f.adapterCalls).toEqual({ corePrepare: 1, trustVerify: 1 });
+    expect(f.adapterCalls).toEqual({ verify: 1 });
     expect(await canonicalDigest(second.readback.currentHeads)).toBe(
       second.readback.currentHeadDigest,
     );
   });
 
-  test("requires a fresh Core evaluation when signed bundle evidence changes", async () => {
+  test("requires fresh verification and a new Host decision when bundle evidence changes", async () => {
     const f = await fixture();
     expect((await f.operator.apply(await f.operator.plan(f.request))).status).toBe("converged");
     const changed = {

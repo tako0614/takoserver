@@ -60,7 +60,6 @@ launcher:
 ```sh
 TAKOFORM_STABLE_CATALOG_ROOT=/path/to/exact/takoform-v3.0.0 \
 TAKOSERVER_STABLE_LOCAL_TOKEN=local-test-token-at-least-16-characters \
-TAKOSERVER_STABLE_LOCAL_RUNTIME_VALUES='{"GENERIC_REQUIRED_VALUE":"local-only-value"}' \
 bun run debug:stable-local-cloudflare-host
 ```
 
@@ -71,12 +70,11 @@ uses the production Cloudflare Provider upload protocol and serves the realized
 asset manifest through the disposable workerd runtime, including Worker-first
 and single-page fallback behavior.
 
-The runtime-value JSON must be a nonempty map whose names exactly match the
-`requiredSensitiveVars` requested by a test graph. Those fake/local values are
-injected directly into disposable Host authority; this command is not a deploy
-path or a production materializer. It binds `127.0.0.1` on an ephemeral port by
-default and prints one sanitized ready JSON line without the token, values, or
-value names. `TAKOSERVER_STABLE_LOCAL_SPACE` and
+The disposable Host accepts only Worker Versions whose
+`requiredSensitiveVars` declaration is omitted or empty, matching the public
+Host support profile. This command is not a deploy path. It binds `127.0.0.1`
+on an ephemeral port by default and prints one sanitized ready JSON line
+without the token. `TAKOSERVER_STABLE_LOCAL_SPACE` and
 `TAKOSERVER_STABLE_LOCAL_PORT` may override the local Space and port.
 
 ## What it is
@@ -186,8 +184,9 @@ copying it and moving one is moving it:
 
 Published Workers are served by a workerd process Takoserver starts on the first
 publish and leaves watching its configuration — a deploy rewrites the config,
-and no other tenant's in-flight requests are dropped for it. A machine with no
-workerd binary says so once and keeps serving storage and databases.
+and no other tenant's in-flight requests are dropped for it. A machine without
+the workerd binary fails Worker serving activation, rather than recording a
+false serving state; storage and databases remain independently available.
 
 A Worker that declares static assets gets them: the files are served ahead of
 the script through an `ASSETS` binding, and `notFoundHandling` decides what an
@@ -209,12 +208,10 @@ ordering, private inputs, and failure rules. The landing-page details are in
 [`docs/deploy-site.md`](docs/deploy-site.md).
 
 The official operator-private deploy target may declare `aiModels`,
-`standardServiceSupplies`, and one exact `hostedTopology` route.
-Its hosted composition pins the internal Takosumi service and exported runtime-
-binding materializer entrypoint because the recommended applications declare
-runtime-sensitive Worker bindings. This remains an optional public composition
-port: an independent or self-hosted Takoserver target may omit it, and no
-ambient Takosumi route is inferred.
+`standardServiceSupplies`, and whether hosted sponsorship is enabled.
+Sponsorship adds only the product-owned bearer secret required by that API; it
+does not add a service binding or an external entrypoint to the Takoserver
+Worker.
 `standardServiceSupplies` is a closed, non-secret operator choice. The current
 adapter accepts exactly
 `standards.takoform.com/v1/com.amazonaws.s3 -> cloudflare-r2` plus an
@@ -223,33 +220,18 @@ operator-owned `supplyNamespace`; realization writes that exact document to
 `CLOUDFLARE_API_TOKEN` secret before publication. It does not create, sell, or
 reference a current ObjectBucket Form. `aiModels` is the exact public-model to
 upstream-model mapping, limits, and retail token prices. Deploy realization and
-immutable Worker Version readback require the exact `HOST_RUNTIME_MATERIALIZER`
-service and entrypoint when the target selects one, and require its absence
-when the target does not.
+immutable Worker Version readback require the exact D1, R2, and secret-name
+closure and reject unexpected bindings.
 The read-only surface-specific `--status` path proves the applicable exact D1,
 R2, secret-name, domain-owner, deployment-history, and binding closure, so a
 stale operator target or an incompletely wired live Version cannot masquerade
 as healthy state.
 Takoserver's public protocol and standalone path do not depend on Takosumi.
 Stable Worker Forms with an omitted or empty `requiredSensitiveVars`
-declaration provision normally when the target omits this service binding; a
-non-empty declaration is denied unless the request carries exact runtime
-materialization authority and the deployment selected a materializer. The
-official hosted target deliberately selects its Takosumi-owned authority for
-that latter case. Resolved values return through the internal RPC only into one
-Takoserver provisioning call and are immediately submitted as exact
-Form-declared Worker Version `secret_text` bindings. They never enter the
-target, portable state, provider ticket, Output, log, or agent transcript. If the materializer
-changed host-side authority while deriving those values, it may return an
-opaque authenticated rollback receipt. Takoserver never interprets that
-receipt: a failed immutable Worker Version upload sends it back only to the
-same private materializer, and reports a provider error unless the exact
-compare-and-swap rollback is confirmed. After a successful immutable Version
-upload, Takoserver sends the exact same request, resource, script, public
-origin, and binding set to the materializer's idempotent commit operation. A
-missing or refused commit keeps the provider result failed; it can never be
-reported as a successful Worker Version. Realization places the other
-non-secret values in Worker vars. AI
+declaration provision normally. A non-empty declaration is advertised as
+unsupported and rejected by Host admission before any provider mutation or
+Offering claim. Takoserver does not resolve or inject those values. Realization
+places the other non-secret values in Worker vars. AI
 uses the native Workers AI binding, so it does not copy an account API token
 into inference requests. `CLOUDFLARE_API_TOKEN` remains the provisioning
 secret. `r2ParentAccessKeyId` and `TAKOSERVER_R2_PARENT_TOKEN` belong only to

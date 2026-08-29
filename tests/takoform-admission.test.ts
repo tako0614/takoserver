@@ -337,9 +337,16 @@ describe("private Takoform Host admission substrate", () => {
     ).toThrow("invalid FormRef in handle claims");
   });
 
-  test("a forged or JSON-round-tripped report/handle cannot install", async () => {
+  test("serialized verification evidence cannot forge the Host private handle", async () => {
     const f = await fixture();
-    const forged = JSON.parse(JSON.stringify(f.handle)) as AdmissionHandle;
+    const forged = JSON.parse(
+      JSON.stringify({
+        report: f.handleClaims.report,
+        publisher: f.handleClaims.publisher,
+        policyEventDigest: f.handleClaims.policyEventDigest,
+        checkpointEventDigest: f.handleClaims.checkpointEventDigest,
+      }),
+    ) as AdmissionHandle;
 
     await expect(
       f.host.execute({
@@ -349,7 +356,10 @@ describe("private Takoform Host admission substrate", () => {
         actor: "test-operator",
         reason: "forged report",
       }),
-    ).rejects.toMatchObject({ code: "invalid_handle" });
+    ).rejects.toMatchObject({
+      code: "invalid_handle",
+      message: "package install needs a Host-issued private handle",
+    });
     expect(await count(f.sql, "tf_form_install_events")).toBe(0);
   });
 
@@ -405,7 +415,7 @@ describe("private Takoform Host admission substrate", () => {
     expect(await count(f.sql, "tf_form_install_events")).toBe(0);
   });
 
-  test("a policy head change between evaluation and commit rejects the stale handle", async () => {
+  test("a policy head change between Host decision and commit rejects the stale handle", async () => {
     const f = await fixture();
     await f.host.execute({
       kind: "RotatePublisher",

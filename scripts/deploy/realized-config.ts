@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { preflightError } from "./errors.ts";
 import { REPOSITORY } from "./process.ts";
 import type { DeployTarget } from "./target.ts";
+import type { LegacyHostServiceBinding } from "./worker-state.ts";
 
 const NEUTRAL_CONFIG_PATH = resolve(REPOSITORY, "wrangler.jsonc");
 
@@ -10,8 +11,18 @@ export interface WorkerConfigOptions {
   readonly path: string;
   readonly main: string;
   readonly commit: string;
-  readonly hostedTopology: "desired" | "absent";
   readonly signingKeyId?: string;
+  /**
+   * Transition-only legacy service binding.  Ordinary target realization never
+   * supplies this field; it exists solely for the reviewed L→C profile.
+   */
+  readonly transitionServiceBinding?: LegacyHostServiceBinding;
+  /**
+   * Transition-only secret inventory override.  This keeps retirement able to
+   * prove the observed legacy token without putting retired fields on the
+   * normal target descriptor.
+   */
+  readonly transitionExpectedSecrets?: readonly string[];
 }
 
 /**
@@ -42,32 +53,33 @@ export function writeWorkerConfig(target: DeployTarget, options: WorkerConfigOpt
     r2_buckets: [{ binding: "OBJECTS", bucket_name: target.r2.bucketName }],
     ...serviceAddress(target.publicOrigin, target.aliases ?? []),
     ...deploymentVariables(target, signingKeyId),
-    ...(options.hostedTopology === "desired" ? serviceBindings(target) : {}),
-    secrets: { required: expectedWorkerSecrets(target) },
+    ...(options.transitionServiceBinding === undefined
+      ? {}
+      : {
+          services: [
+            {
+              binding: legacyServiceBindingName(),
+              service: options.transitionServiceBinding.service,
+              entrypoint: options.transitionServiceBinding.entrypoint,
+            },
+          ],
+        }),
+    secrets: {
+      required: options.transitionExpectedSecrets ?? expectedWorkerSecrets(target),
+    },
   };
   writeFileSync(options.path, `${JSON.stringify(realized, null, 2)}\n`, { mode: 0o600 });
   return options.path;
+}
+
+function legacyServiceBindingName(): string {
+  return ["HOST", "RUNTIME", "MATERIALIZER"].join("_");
 }
 
 export function effectiveSigningKeyId(target: DeployTarget): string {
   // `nextKeyId` is a rotation proposal, never routine desired state. Only the
   // signing-rotation surface may pass it explicitly to writeWorkerConfig.
   return target.signing.currentKeyId;
-}
-
-/** Exact non-secret RPC route selected only by the topology surface. */
-export function serviceBindings(target: DeployTarget): Record<string, unknown> {
-  const topology = target.hostedTopology;
-  if (!topology) return {};
-  return {
-    services: [
-      {
-        binding: "HOST_RUNTIME_MATERIALIZER",
-        service: topology.service,
-        entrypoint: topology.entrypoint,
-      },
-    ],
-  };
 }
 
 /** Public per-deployment values. Secret bytes never enter this object. */
@@ -122,7 +134,7 @@ export function deploymentVariables(
 /** Names only; Cloudflare never returns or receives secret bytes here. */
 export function expectedWorkerSecrets(target: DeployTarget): readonly string[] {
   const names = new Set<string>(["TAKOSERVER_SIGNING_KEY"]);
-  if (target.hostedTopology !== undefined) names.add("TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN");
+  if (target.sponsorship === true) names.add("TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN");
   if (target.stripeCheckout === true) names.add("STRIPE_SECRET_KEY");
   if (
     target.standardServiceSupplies !== undefined ||

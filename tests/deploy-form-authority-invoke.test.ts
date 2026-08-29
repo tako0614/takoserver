@@ -13,9 +13,9 @@ import { createEphemeralSql } from "../src/compat.ts";
 import { verifyFormAuthorityOperatorAssertion } from "../src/form-authority-operator-proof.ts";
 import { canonicalJson } from "../src/json.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
+import { deriveFormAuthorityIdentity } from "../src/takoform/host-admission-endpoint.ts";
 import { YURUCOMMU_IDENTITY_CAPABILITY_KINDS } from "../src/takoform/implementation-catalog.ts";
 import { createIntegrationFormAuthorityComposition } from "../src/takoform/integration-operator-endpoint.ts";
-import { deriveFormAuthorityIdentity } from "../src/takoform/operator-endpoint.ts";
 
 const COMMIT = "a".repeat(40);
 const NOW = new Date("2026-08-29T02:00:00Z");
@@ -72,7 +72,8 @@ describe("signed Form authority operator invocation", () => {
         tenantId: "tenant-yurucommu-integration",
         space: "space-yurucommu-integration",
       },
-      admissionMode: "integration-fixture",
+      policyAuthority: "takoserver-host",
+      verificationMode: "integration-fixture",
       productionEligible: false,
       credentialsRedacted: true,
       ready: true,
@@ -81,7 +82,8 @@ describe("signed Form authority operator invocation", () => {
         status: "converged",
         planDigest: expect.stringMatching(/^sha256:/),
         receipts: expect.any(Array),
-        admissionMode: "integration-fixture",
+        policyAuthority: "takoserver-host",
+        verificationMode: "integration-fixture",
         productionEligible: false,
         replanRequired: false,
       },
@@ -356,7 +358,9 @@ async function invocationFixture(
         capabilityDigest: identity.capabilityDigest,
         implementationDigest: identity.implementationDigest,
         routeMode: "authenticated-integration-custom-domain",
-        admissionMode: "integration-fixture",
+        policyAuthority: "takoserver-host",
+        verificationMode: "integration-fixture",
+        verificationAvailable: true,
         productionEligible: false,
         ready: true,
       }),

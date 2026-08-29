@@ -20,7 +20,6 @@ import {
   type SigningPublicKeyRow,
 } from "./signing.ts";
 import type { DeployTarget } from "./target.ts";
-import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import {
   inspectLiveWorkerVersion,
   type LiveWorkerVersion,
@@ -40,7 +39,7 @@ export type HostedProcess = (
 ) => Promise<CommandResult>;
 
 export interface HostedInvocation {
-  readonly surface: "takoserver-hosted-token-cutover" | "takoserver-hosted-topology-cutover";
+  readonly surface: "takoserver-hosted-token-cutover";
   readonly action: "status" | "apply";
   readonly environment: DeployEnvironment;
   readonly commit: string;
@@ -57,7 +56,7 @@ export interface HostedOptions {
   readonly fetcher?: (input: string, init?: RequestInit) => Promise<Response>;
 }
 
-/** Hosted bearer authority first; Host-runtime service routing second. */
+/** Installs and proves the product-owned sponsorship bearer. */
 export async function runHosted(
   invocation: HostedInvocation,
   target: DeployTarget,
@@ -66,8 +65,8 @@ export async function runHosted(
   if (target.environment !== invocation.environment) {
     throw preflightError("Hosted invocation and target environments differ");
   }
-  if (!target.hostedTopology) {
-    throw preflightError("Hosted cutover requires one explicit target service and entrypoint");
+  if (target.sponsorship !== true) {
+    throw preflightError("Hosted token cutover requires target sponsorship");
   }
   const run = options.run ?? runCommand;
   const environment =
@@ -83,7 +82,6 @@ export async function runHosted(
       path: join(root, "inspect-wrangler.jsonc"),
       main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
       commit: invocation.commit,
-      hostedTopology: "absent",
       signingKeyId: target.signing.currentKeyId,
     });
     const state =
@@ -96,26 +94,14 @@ export async function runHosted(
     if (invocation.action === "status") {
       return await hostedStatus(invocation, target, state);
     }
-    if (invocation.surface === "takoserver-hosted-token-cutover") {
-      return await cutoverHostedToken(
-        invocation,
-        target,
-        state,
-        database,
-        configPath,
-        environment,
-        run,
-        options,
-      );
-    }
-    return await cutoverHostedTopology(
+    return await cutoverHostedToken(
       invocation,
       target,
       state,
       database,
+      configPath,
       environment,
       run,
-      root,
       options,
     );
   } finally {
@@ -130,61 +116,29 @@ async function hostedStatus(
 ): Promise<Record<string, unknown>> {
   const desiredSecrets = expectedWorkerSecrets(target);
   const preTokenSecrets = desiredSecrets.filter((name) => name !== HOSTED_SECRET);
-  if (invocation.surface === "takoserver-hosted-token-cutover") {
-    let tokenPresent = true;
-    let live: LiveWorkerVersion;
-    try {
-      live = await inspectLiveWorkerVersion("preflight", target, state, {
-        hostedTopology: "absent",
-        signingKeyId: target.signing.currentKeyId,
-        expectedSecrets: desiredSecrets,
-      });
-    } catch {
-      tokenPresent = false;
-      live = await inspectLiveWorkerVersion("preflight", target, state, {
-        hostedTopology: "absent",
-        signingKeyId: target.signing.currentKeyId,
-        expectedSecrets: preTokenSecrets,
-      });
-    }
-    return {
-      kind: "takoserver.hosted-token-cutover-status@v2",
-      surface: invocation.surface,
-      environment: invocation.environment,
-      selectedCommit: invocation.commit,
-      deployedCommit: live.commit,
-      versionId: live.history.versionId,
-      hostedTokenPresent: tokenPresent,
-      topology: "absent",
-      ready: live.commit === invocation.commit && !tokenPresent,
-    };
-  }
-  let topology: "desired" | "absent" = "desired";
+  let tokenPresent = true;
   let live: LiveWorkerVersion;
   try {
     live = await inspectLiveWorkerVersion("preflight", target, state, {
-      hostedTopology: "desired",
       signingKeyId: target.signing.currentKeyId,
       expectedSecrets: desiredSecrets,
     });
   } catch {
-    topology = "absent";
+    tokenPresent = false;
     live = await inspectLiveWorkerVersion("preflight", target, state, {
-      hostedTopology: "absent",
       signingKeyId: target.signing.currentKeyId,
-      expectedSecrets: desiredSecrets,
+      expectedSecrets: preTokenSecrets,
     });
   }
   return {
-    kind: "takoserver.hosted-topology-cutover-status@v2",
+    kind: "takoserver.hosted-token-cutover-status@v2",
     surface: invocation.surface,
     environment: invocation.environment,
     selectedCommit: invocation.commit,
     deployedCommit: live.commit,
     versionId: live.history.versionId,
-    hostedTokenPresent: true,
-    topology,
-    ready: live.commit === invocation.commit && topology === "absent",
+    hostedTokenPresent: tokenPresent,
+    ready: live.commit === invocation.commit && !tokenPresent,
   };
 }
 
@@ -201,7 +155,6 @@ async function cutoverHostedToken(
   const desiredSecrets = expectedWorkerSecrets(target);
   const preTokenSecrets = desiredSecrets.filter((name) => name !== HOSTED_SECRET);
   const before = await inspectLiveWorkerVersion("preflight", target, state, {
-    hostedTopology: "absent",
     signingKeyId: target.signing.currentKeyId,
     expectedSecrets: preTokenSecrets,
   });
@@ -244,7 +197,6 @@ async function cutoverHostedToken(
     );
   }
   const after = await inspectLiveWorkerVersion("verification", target, state, {
-    hostedTopology: "absent",
     signingKeyId: target.signing.currentKeyId,
     expectedSecrets: desiredSecrets,
   });
@@ -266,126 +218,10 @@ async function cutoverHostedToken(
     reviewer,
     previousVersionId: before.history.versionId,
     versionId: after.history.versionId,
-    topology: "absent",
     proof,
     rollback:
-      `before topology cutover, remove the newly added secret with ` +
+      `remove the newly added secret with ` +
       `wrangler secret delete ${HOSTED_SECRET} --name ${target.workerName}`,
-  };
-}
-
-async function cutoverHostedTopology(
-  invocation: HostedInvocation,
-  target: DeployTarget,
-  state: WorkerState,
-  database: HostedDatabase,
-  environment: Readonly<Record<string, string>>,
-  run: HostedProcess,
-  root: string,
-  options: HostedOptions,
-): Promise<Record<string, unknown>> {
-  const desiredSecrets = expectedWorkerSecrets(target);
-  const before = await inspectLiveWorkerVersion("preflight", target, state, {
-    hostedTopology: "absent",
-    signingKeyId: target.signing.currentKeyId,
-    expectedSecrets: desiredSecrets,
-  });
-  const source = await qualifySource({
-    environment: invocation.environment === "integration" ? "integration" : "production",
-    commit: invocation.commit,
-    run,
-  });
-  if (before.commit !== source.commit) {
-    throw preflightError(
-      "Hosted topology cutover commit must equal the currently served Worker commit",
-    );
-  }
-  const reviewer = exactReviewer(
-    options.review ?? requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW"),
-  );
-  const token = readHostedToken(
-    options.tokenPath ?? requireEnvironment("TAKOSERVER_HOSTED_TOKEN_PATH"),
-  );
-  const row = await database.readSigningKey(target.signing.currentKeyId, "preflight");
-  if (row === null) throw preflightError("current signing identity disappeared before cutover");
-  const publicJwk = activePublicJwk(row, target.signing.currentKeyId);
-  const tenantRef = await database.proofTenant("preflight");
-  const proofBefore = await proveHostedCredential(
-    target.publicOrigin,
-    tenantRef,
-    token,
-    target.signing.currentKeyId,
-    publicJwk,
-    options.fetcher ?? ((input, init) => fetch(input, init)),
-  );
-  const gate = await run(["bun", "run", "check"]);
-  if (gate.exitCode !== 0) {
-    throw preflightError(
-      `scoped owner gate \`bun run check\` failed (exit ${gate.exitCode})`,
-      `${gate.stdout}${gate.stderr}`.trim(),
-    );
-  }
-  const prepared = await prepareWorkerArtifact({
-    root,
-    target,
-    commit: source.commit,
-    hostedTopology: "desired",
-    signingKeyId: target.signing.currentKeyId,
-    run,
-  });
-  if (prepared.bundleDigestHex !== before.bundleDigestHex) {
-    throw preflightError("Hosted topology cutover refuses to carry different Worker code bytes");
-  }
-  const artifact = prepared.seal();
-  artifact.assertUnchanged();
-  const upload = await run(
-    wranglerCommand([
-      "deploy",
-      prepared.bundlePath,
-      "--no-bundle",
-      "--config",
-      prepared.configPath,
-      "--strict",
-      "--message",
-      `takoserver-worker:${source.commit}:${prepared.bundleDigestHex}`,
-    ]),
-    { env: environment },
-  );
-  if (upload.exitCode !== 0) {
-    throw mutationError(
-      "Hosted topology upload acknowledgement is indeterminate; do not retry before --status",
-      `${upload.stdout}${upload.stderr}`.trim(),
-    );
-  }
-  const after = await inspectLiveWorkerVersion("verification", target, state, {
-    hostedTopology: "desired",
-    signingKeyId: target.signing.currentKeyId,
-    expectedSecrets: desiredSecrets,
-  });
-  assertOnlyConfiguredStateAdvance(before, after, "Hosted topology cutover");
-  const proofAfter = await proveHostedCredential(
-    target.publicOrigin,
-    tenantRef,
-    token,
-    target.signing.currentKeyId,
-    publicJwk,
-    options.fetcher ?? ((input, init) => fetch(input, init)),
-  );
-  assertSigningRow(await database.readSigningKey(target.signing.currentKeyId, "verification"), row);
-  return {
-    kind: "takoserver.hosted-topology-cutover-apply@v2",
-    surface: invocation.surface,
-    environment: invocation.environment,
-    commit: source.commit,
-    reviewer,
-    previousVersionId: before.history.versionId,
-    versionId: after.history.versionId,
-    topology: "desired",
-    service: target.hostedTopology?.service,
-    entrypoint: target.hostedTopology?.entrypoint,
-    proofBefore,
-    proofAfter,
-    rollback: "forward repair only: no automatic Hosted topology removal or fallback is attempted",
   };
 }
 
@@ -531,7 +367,7 @@ function assertSigningRow(actual: SigningPublicKeyRow | null, expected: SigningP
   }
 }
 
-function readHostedToken(path: string): string {
+export function readHostedToken(path: string): string {
   let status: ReturnType<typeof lstatSync>;
   let raw: string;
   try {

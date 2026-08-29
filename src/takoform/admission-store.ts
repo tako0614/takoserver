@@ -61,7 +61,7 @@ export interface CreateFormAdmissionStoreOptions {
 /**
  * Creates the private, durable Host substrate.  This function is intentionally
  * not imported by the public router: callers must be explicit operator code
- * with a Core-issued in-process handle for package installation.
+ * with a Host-issued in-process handle for package installation.
  */
 export function createFormAdmissionStore(
   options: CreateFormAdmissionStoreOptions,
@@ -442,7 +442,10 @@ async function executeInstall(
   }
   const claims = handles.inspect(command.handle);
   if (!claims)
-    throw new AdmissionError("invalid_handle", "package install needs a Core-issued handle");
+    throw new AdmissionError(
+      "invalid_handle",
+      "package install needs a Host-issued private handle",
+    );
   assertHandleForCommand(claims, command, operation);
   const formRefKey = await canonicalDigest(claims.formRef);
   const purgeHead = await packagePurgeHead(sql, formRefKey, claims.packageDigest);
@@ -465,7 +468,7 @@ async function executeInstall(
     stored.packageDigest !== claims.packageDigest ||
     canonicalJson(stored.formRef) !== canonicalJson(claims.formRef)
   ) {
-    throw new AdmissionError("handle_mismatch", "package bytes do not match the Core handle");
+    throw new AdmissionError("handle_mismatch", "package bytes do not match the Host handle");
   }
 
   const current = await head(sql, INSTALL_TABLE, "form_ref_key", formRefKey);
@@ -1709,7 +1712,7 @@ function assertHandleForCommand(
     throw new AdmissionError("handle_mismatch", "publisher namespace does not match Form group");
   }
   if (claims.report.status !== "admitted") {
-    throw new AdmissionError("invalid_handle", "the Core report did not admit the package");
+    throw new AdmissionError("invalid_handle", "the Host report did not admit the package");
   }
 }
 

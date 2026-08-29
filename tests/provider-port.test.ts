@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { ProviderOffering, ProviderTicket } from "../src/provider-port.ts";
-import { FakeProvider } from "../src/providers/fake.ts";
+import { createFakeProviderState, FakeProvider } from "../src/providers/fake.ts";
 
 const OFFERING: ProviderOffering = {
   id: "storage.object.standard",
@@ -65,6 +65,58 @@ describe("provider port", () => {
     // A settled handle is consumed; polling it again is not a second success.
     const after = await provider.poll({ operationId: "op_1", handle: started.handle });
     expect(after.phase).toBe("failed");
+  });
+
+  test("recovers the same unfinished operation without repeating its side effect", async () => {
+    const state = createFakeProviderState();
+    const provider = new FakeProvider({
+      offerings: [OFFERING],
+      mode: "async",
+      pollsToSettle: 4,
+      state,
+    });
+    const initial = await provider.apply(
+      applyInput({ operationId: "op_recovery", operationMode: "initial" }),
+    );
+    expect(initial.phase).toBe("running");
+    if (initial.phase !== "running") throw new Error("expected running");
+
+    // An inline caller exhausted its poll budget while the provider was still
+    // working. A retry carries the same durable operation identity and must
+    // adopt that pending handle instead of creating the resource again.
+    const firstPoll = await provider.poll({
+      operationId: "op_recovery",
+      handle: initial.handle,
+    });
+    expect(firstPoll).toMatchObject({ phase: "running", handle: initial.handle });
+
+    // Recreate the adapter as a process restart would. The durable provider
+    // state still owns the opaque handle, so recovery must not dispatch apply.
+    const restarted = new FakeProvider({
+      offerings: [OFFERING],
+      mode: "async",
+      pollsToSettle: 4,
+      state,
+    });
+    const recovered = await restarted.apply(
+      applyInput({ operationId: "op_recovery", operationMode: "recovery" }),
+    );
+    expect(recovered).toMatchObject({ phase: "running", handle: initial.handle });
+    if (recovered.phase !== "running") throw new Error("expected recovery to remain running");
+
+    let settled: ProviderTicket = recovered;
+    while (settled.phase === "running") {
+      settled = await restarted.poll({
+        operationId: "op_recovery",
+        handle: settled.handle,
+      });
+    }
+    expect(settled).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: "fake:tenant_x/default/assets" },
+    });
+    expect(restarted.listResources()).toEqual(["tenant_x/default/assets"]);
+    expect(restarted.sideEffectCount).toBe(1);
   });
 
   test("reports failure as a classified value rather than throwing", async () => {
@@ -132,5 +184,141 @@ describe("provider port", () => {
       spec: {},
     });
     expect(missing.phase).toBe("failed");
+  });
+
+  test("deletes through one durable handle after a process restart", async () => {
+    const state = createFakeProviderState();
+    const creator = new FakeProvider({ offerings: [OFFERING], state });
+    const created = await creator.apply(applyInput({ operationId: "op_delete_seed" }));
+    if (created.phase !== "succeeded") throw new Error("expected seed success");
+
+    const initialProvider = new FakeProvider({
+      offerings: [OFFERING],
+      mode: "async",
+      pollsToSettle: 3,
+      state,
+    });
+    const initial = await initialProvider.delete({
+      operationId: "op_delete_restart",
+      operationMode: "initial",
+      offering: OFFERING,
+      nativeId: created.result.nativeId,
+      identity: IDENTITY,
+    });
+    expect(initial).toMatchObject({ phase: "running", handle: "handle_op_delete_restart" });
+    if (initial.phase !== "running") throw new Error("expected delete to be running");
+
+    const restarted = new FakeProvider({
+      offerings: [OFFERING],
+      mode: "async",
+      pollsToSettle: 3,
+      state,
+    });
+    const recovered = await restarted.delete({
+      operationId: "op_delete_restart",
+      operationMode: "recovery",
+      providerHandle: initial.handle,
+      offering: OFFERING,
+      nativeId: created.result.nativeId,
+      identity: IDENTITY,
+    });
+    expect(recovered).toMatchObject({ phase: "running", handle: initial.handle });
+    if (recovered.phase !== "running") throw new Error("expected recovery to remain running");
+    let settled: ProviderTicket = recovered;
+    while (settled.phase === "running") {
+      settled = await restarted.poll({
+        operationId: "op_delete_restart",
+        handle: settled.handle,
+      });
+    }
+    expect(settled).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: created.result.nativeId, observed: { deleted: true } },
+    });
+    expect(restarted.sideEffectCount).toBe(2);
+
+    const stillThere = await creator.apply(applyInput({ operationId: "op_delete_missing_handle" }));
+    if (stillThere.phase !== "succeeded") throw new Error("expected second seed success");
+    const missingHandle = await restarted.delete({
+      operationId: "op_delete_missing_handle",
+      operationMode: "recovery",
+      offering: OFFERING,
+      nativeId: stillThere.result.nativeId,
+      identity: IDENTITY,
+    });
+    expect(missingHandle).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(restarted.listResources()).toEqual(["tenant_x/default/assets"]);
+    expect(restarted.sideEffectCount).toBe(3);
+  });
+
+  test("adopts through one durable handle after a process restart", async () => {
+    const state = createFakeProviderState();
+    const creator = new FakeProvider({ offerings: [OFFERING], state });
+    const created = await creator.apply(applyInput({ operationId: "op_adopt_seed" }));
+    if (created.phase !== "succeeded") throw new Error("expected seed success");
+
+    const initialProvider = new FakeProvider({
+      offerings: [OFFERING],
+      mode: "async",
+      pollsToSettle: 3,
+      state,
+    });
+    const initial = await initialProvider.adopt({
+      operationId: "op_adopt_restart",
+      operationMode: "initial",
+      offering: OFFERING,
+      nativeId: created.result.nativeId,
+      identity: IDENTITY,
+      spec: { location: "apac" },
+    });
+    expect(initial).toMatchObject({ phase: "running", handle: "handle_op_adopt_restart" });
+    if (initial.phase !== "running") throw new Error("expected adopt to be running");
+
+    const restarted = new FakeProvider({
+      offerings: [OFFERING],
+      mode: "async",
+      pollsToSettle: 3,
+      state,
+    });
+    const recovered = await restarted.adopt({
+      operationId: "op_adopt_restart",
+      operationMode: "recovery",
+      providerHandle: initial.handle,
+      offering: OFFERING,
+      nativeId: created.result.nativeId,
+      identity: IDENTITY,
+      spec: { location: "apac" },
+    });
+    expect(recovered).toMatchObject({ phase: "running", handle: initial.handle });
+    if (recovered.phase !== "running") throw new Error("expected recovery to remain running");
+    let settled: ProviderTicket = recovered;
+    while (settled.phase === "running") {
+      settled = await restarted.poll({
+        operationId: "op_adopt_restart",
+        handle: settled.handle,
+      });
+    }
+    expect(settled).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: created.result.nativeId, observed: { location: "apac" } },
+    });
+    expect(restarted.adoptCount).toBe(1);
+
+    const missingHandle = await restarted.adopt({
+      operationId: "op_adopt_missing_handle",
+      operationMode: "recovery",
+      offering: OFFERING,
+      nativeId: created.result.nativeId,
+      identity: IDENTITY,
+      spec: { location: "apac" },
+    });
+    expect(missingHandle).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(restarted.adoptCount).toBe(1);
   });
 });

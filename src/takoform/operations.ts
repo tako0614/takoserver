@@ -83,15 +83,9 @@ export function createDeferredOperations(input: {
 
   return {
     async accept(context, path, operation) {
-      // Provision redemption and runtime materialization carry non-replayable
-      // authority. They stay synchronous until those authorities have their
-      // own durable resumption contract.
-      if (
-        context.beforeCreate ||
-        context.commercialAuthority ||
-        context.runtimeMaterialization ||
-        context.provisionOnly
-      ) {
+      // Provision redemption carries non-replayable authority and stays
+      // synchronous until it has its own durable resumption contract.
+      if (context.beforeCreate || context.commercialAuthority || context.provisionOnly) {
         return null;
       }
       const accepted = await acceptedMutation(
@@ -519,6 +513,9 @@ function storedCommit(
     replayKey: mutation.replayKey,
     replay: mutation.replay,
     ...(mutation.providerReceipt ? { providerReceipt: mutation.providerReceipt } : {}),
+    ...(mutation.kind === "delete" && mutation.deletionTombstone
+      ? { deletionTombstone: mutation.deletionTombstone }
+      : {}),
     ...(mutation.authorityFence ? { authorityFence: mutation.authorityFence } : {}),
     terminalJson,
   };

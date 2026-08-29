@@ -120,11 +120,18 @@ export {
 } from "./providers/provider-meter.ts";
 export { createWasabiBucketMeterSource } from "./providers/wasabi-meter.ts";
 export {
+  type CancellationPhase,
   createReseller,
   type Quote,
   type Reseller,
   ResellerError,
   type Reservation,
+  SETTLEMENT_LEASE_MILLISECONDS,
+  type SettlementAuthorityDecision,
+  type SettlementAuthorityResolver,
+  type SettlementDirection,
+  type SettlementIntent,
+  type SettlementIntentState,
   type UsageStatement,
 } from "./reseller.ts";
 export {
@@ -178,6 +185,7 @@ export type {
   TakoformHostPrincipal,
   TakoformHostResourceScope,
   TakoformInterfaceRef,
+  TakoformNativeAbsenceEvidence,
   TakoformResourceDriver,
   TakoformStoredResource,
   TakoformV1Alpha3FormRef,

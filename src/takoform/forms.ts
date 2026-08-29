@@ -279,6 +279,18 @@ export function formSupportProfile(
       : form.artifactRequirement !== undefined
         ? TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES
         : undefined);
+  const limits: Record<string, number> = {};
+  if (configuredArtifactFileLimit !== undefined || workerVersion) {
+    limits[stableProfile ? "/maximumBundleBytes" : "maximumBundleBytes"] =
+      TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES;
+  }
+  if (configuredArtifactFileLimit !== undefined) {
+    limits[stableProfile ? "/maximumBundleFiles" : "maximumBundleFiles"] =
+      configuredArtifactFileLimit;
+  }
+  if (workerVersion) {
+    limits[stableProfile ? "/requiredSensitiveVars" : "requiredSensitiveVars"] = 0;
+  }
   return {
     apiVersion,
     kind: "FormSupport",
@@ -294,23 +306,7 @@ export function formSupportProfile(
           ),
         }
       : {}),
-    ...(configuredArtifactFileLimit !== undefined
-      ? {
-          limits: {
-            [stableProfile ? "/maximumBundleBytes" : "maximumBundleBytes"]:
-              TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
-            [stableProfile ? "/maximumBundleFiles" : "maximumBundleFiles"]:
-              configuredArtifactFileLimit,
-          },
-        }
-      : workerVersion
-        ? {
-            limits: {
-              [stableProfile ? "/maximumBundleBytes" : "maximumBundleBytes"]:
-                TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
-            },
-          }
-        : {}),
+    ...(Object.keys(limits).length > 0 ? { limits } : {}),
   };
 }
 

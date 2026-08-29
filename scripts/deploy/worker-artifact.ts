@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { copyFileSync, lstatSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { lstatSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { DeployError, preflightError } from "./errors.ts";
 import { type CommandResult, REPOSITORY, wranglerCommand } from "./process.ts";
 import { type SealedArtifact, sealDirectory } from "./qualification.ts";
@@ -11,6 +11,13 @@ export type WorkerArtifactProcess = (
   command: readonly string[],
   options?: { readonly env?: Readonly<Record<string, string>>; readonly input?: string },
 ) => Promise<CommandResult>;
+
+export interface WorkerArtifactConfigInput {
+  readonly path: string;
+  readonly main: string;
+}
+
+export type WorkerArtifactConfigWriter = (input: WorkerArtifactConfigInput) => string;
 
 export interface PreparedWorkerArtifact {
   readonly releaseDirectory: string;
@@ -29,20 +36,29 @@ export async function prepareWorkerArtifact(input: {
   readonly root: string;
   readonly target: DeployTarget;
   readonly commit: string;
-  readonly hostedTopology: "desired" | "absent";
   readonly signingKeyId?: string;
+  /** Absolute entrypoint used for the dry-run build. */
+  readonly main?: string;
+  /** Optional target-specific config writer; the default realizes a public Worker config. */
+  readonly writeConfig?: WorkerArtifactConfigWriter;
   readonly run: WorkerArtifactProcess;
 }): Promise<PreparedWorkerArtifact> {
   const build = join(input.root, "build");
   const release = join(input.root, "release");
   mkdirSync(build, { recursive: true, mode: 0o700 });
   mkdirSync(release, { recursive: true, mode: 0o700 });
-  const buildConfig = writeWorkerConfig(input.target, {
+  const main = input.main ?? resolve(REPOSITORY, "src/entry-cloudflare-worker.ts");
+  const writeConfig =
+    input.writeConfig ??
+    ((config: WorkerArtifactConfigInput) =>
+      writeWorkerConfig(input.target, {
+        ...config,
+        commit: input.commit,
+        ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
+      }));
+  const buildConfig = writeConfig({
     path: join(input.root, "build-wrangler.jsonc"),
-    main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
-    commit: input.commit,
-    hostedTopology: input.hostedTopology,
-    ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
+    main,
   });
   const built = await input.run(
     wranglerCommand([
@@ -64,14 +80,11 @@ export async function prepareWorkerArtifact(input: {
   }
   const source = exactBundle(build);
   const bundlePath = join(release, "worker.js");
-  copyFileSync(source, bundlePath);
+  writeFileSync(bundlePath, canonicalizeWorkerBundleSource(readFileSync(source, "utf8"), source));
   const bundleDigestHex = createHash("sha256").update(readFileSync(bundlePath)).digest("hex");
-  const configPath = writeWorkerConfig(input.target, {
+  const configPath = writeConfig({
     path: join(release, "wrangler.jsonc"),
     main: "worker.js",
-    commit: input.commit,
-    hostedTopology: input.hostedTopology,
-    ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
   });
   let sealed = false;
   return {
@@ -85,6 +98,34 @@ export async function prepareWorkerArtifact(input: {
       return sealDirectory(release, ["worker.js", "wrangler.jsonc", ...additionalRequiredFiles]);
     },
   };
+}
+
+/**
+ * Esbuild emits source-label comments relative to the temporary output path.
+ * Preserve the labels while making repository-owned paths independent of the
+ * caller's temp-directory depth, so one source commit has one artifact digest.
+ */
+export function canonicalizeWorkerBundleSource(source: string, sourcePath: string): string {
+  const repositoryPrefix = `${REPOSITORY}${sep}`;
+  const absoluteSourcePath = resolve(sourcePath);
+  return source
+    .split("\n")
+    .map((line) => {
+      if (!line.startsWith("// ")) return line;
+      const label = line.slice(3);
+      let base = dirname(absoluteSourcePath);
+      while (true) {
+        const candidate = resolve(base, label);
+        if (candidate === REPOSITORY || candidate.startsWith(repositoryPrefix)) {
+          return `// ${relative(REPOSITORY, candidate).split(sep).join("/")}`;
+        }
+        const parent = dirname(base);
+        if (parent === base) break;
+        base = parent;
+      }
+      return line;
+    })
+    .join("\n");
 }
 
 function exactBundle(root: string): string {

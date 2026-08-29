@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { deploymentVariables, serviceBindings } from "../scripts/deploy/realized-config.ts";
+import { deploymentVariables } from "../scripts/deploy/realized-config.ts";
 import { loadTarget } from "../scripts/deploy/target.ts";
 import { PRODUCTION_STANDARD_SERVICE_SUPPLIES_KIND } from "../src/standard-service-production.ts";
 
@@ -184,10 +184,7 @@ describe("private data service deploy configuration", () => {
           objectBucketSupplies: SUPPLIES,
           edgeSupplies: EDGE_SUPPLIES,
           workerEndpointSuffix: "hosted.workers.dev",
-          hostedTopology: {
-            service: "takosumi-platform",
-            entrypoint: "TakosumiHostRuntimeMaterializerEntrypoint",
-          },
+          sponsorship: true,
         }),
       );
       const target = loadTarget(path, "production");
@@ -204,15 +201,7 @@ describe("private data service deploy configuration", () => {
       expect(realized.vars).not.toHaveProperty("TAKOSERVER_ZONES");
       expect(JSON.stringify(realized)).not.toContain("TOKEN");
       expect(JSON.stringify(realized)).not.toContain("sk_");
-      expect(serviceBindings(target)).toEqual({
-        services: [
-          {
-            binding: "HOST_RUNTIME_MATERIALIZER",
-            service: "takosumi-platform",
-            entrypoint: "TakosumiHostRuntimeMaterializerEntrypoint",
-          },
-        ],
-      });
+      expect(target.sponsorship).toBe(true);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -319,7 +308,7 @@ describe("private data service deploy configuration", () => {
     }
   });
 
-  test("keeps edge capacity independent from an optional runtime materializer service", () => {
+  test("keeps edge capacity independent from optional sponsorship", () => {
     const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
     try {
       const path = join(directory, "target.json");
@@ -333,14 +322,13 @@ describe("private data service deploy configuration", () => {
       );
       const target = loadTarget(path, "production");
       expect(JSON.stringify(target.edgeSupplies)).toBe(JSON.stringify(EDGE_SUPPLIES));
-      expect(target.hostedTopology).toBeUndefined();
-      expect(serviceBindings(target)).toEqual({});
+      expect(target.sponsorship).toBeUndefined();
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
   });
 
-  test("rejects an unbounded host runtime materializer service descriptor", () => {
+  test("rejects the retired host runtime service descriptor", () => {
     const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
     try {
       const path = join(directory, "target.json");
@@ -349,8 +337,8 @@ describe("private data service deploy configuration", () => {
         JSON.stringify({
           ...BASE,
           hostedTopology: {
-            service: "takosumi-platform",
-            entrypoint: "TakosumiHostRuntimeMaterializerEntrypoint",
+            service: "retired-runtime-service",
+            entrypoint: "RetiredRuntimeEntrypoint",
             token: "must-not-be-here",
           },
         }),

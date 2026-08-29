@@ -6,6 +6,7 @@ import { runFormAuthorityInvoke } from "./deploy/form-authority-invoke.ts";
 import { runHosted } from "./deploy/hosted.ts";
 import { runOperatorIdentity } from "./deploy/identity.ts";
 import type { DeployEnvironment } from "./deploy/qualification.ts";
+import { runRetirement } from "./deploy/retirement.ts";
 import { runD1Schema } from "./deploy/schema.ts";
 import { runSigning } from "./deploy/signing.ts";
 import { runStaticSite } from "./deploy/static.ts";
@@ -18,6 +19,9 @@ const USAGE = `takoserver deploy
   bun run deploy -- <surface> --status --environment=<integration|rehearsal|production> --commit=<sha>
   bun run deploy -- <surface> --apply  --environment=<integration|rehearsal|production> --commit=<sha>
   The authority cutover may add --legacy-predecessor-version=<uuid> for integration bootstrap.
+  Hosted-edge authority transition requires the named
+  --legacy-host-runtime-predecessor-version=<uuid> selector in integration or production.
+  Hosted-edge retirement uses --legacy-host-runtime-predecessor-version=<uuid> and --reverse.
 
 The target descriptor is selected only by the exact environment. There is no
 deploy-plan flag, ledger, target override or mixed mutation controller.
@@ -31,16 +35,20 @@ interface Invocation {
   readonly environment: DeployEnvironment;
   readonly commit: string;
   readonly legacyPredecessorVersionId?: string;
+  readonly legacyHostRuntimePredecessorVersionId?: string;
+  readonly reverse?: boolean;
 }
 
 function parseInvocation(args: readonly string[]): Invocation | null {
-  if (args.length < 4 || args.length > 5) return null;
+  if (args.length < 4 || args.length > 6) return null;
   const [surfaceValue, ...flags] = args;
   if (!isSurface(surfaceValue)) return null;
   let action: Invocation["action"] | null = null;
   let environment: DeployEnvironment | null = null;
   let commit: string | null = null;
   let legacyPredecessorVersionId: string | null = null;
+  let legacyHostRuntimePredecessorVersionId: string | null = null;
+  let reverse = false;
   for (const flag of flags) {
     if (flag === "--status" || flag === "--apply") {
       if (action !== null) return null;
@@ -64,10 +72,24 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       continue;
     }
     if (flag.startsWith("--legacy-predecessor-version=")) {
-      if (legacyPredecessorVersionId !== null) return null;
+      if (legacyPredecessorVersionId !== null || legacyHostRuntimePredecessorVersionId !== null)
+        return null;
       const value = flag.slice("--legacy-predecessor-version=".length);
       if (!isWorkerVersionId(value)) return null;
       legacyPredecessorVersionId = value;
+      continue;
+    }
+    if (flag.startsWith("--legacy-host-runtime-predecessor-version=")) {
+      if (legacyHostRuntimePredecessorVersionId !== null || legacyPredecessorVersionId !== null)
+        return null;
+      const value = flag.slice("--legacy-host-runtime-predecessor-version=".length);
+      if (!isWorkerVersionId(value)) return null;
+      legacyHostRuntimePredecessorVersionId = value;
+      continue;
+    }
+    if (flag === "--reverse") {
+      if (reverse) return null;
+      reverse = true;
       continue;
     }
     return null;
@@ -88,12 +110,41 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   ) {
     return null;
   }
+  if (
+    legacyHostRuntimePredecessorVersionId !== null &&
+    (surfaceValue !== "takoserver-worker-authority-cutover" ||
+      (environment !== "integration" && environment !== "production"))
+  ) {
+    return null;
+  }
+  if (
+    reverse &&
+    !(
+      surfaceValue === "takoserver-worker-authority-cutover" ||
+      surfaceValue === "takoserver-host-runtime-topology-retirement" ||
+      surfaceValue === "takoserver-hosted-token-retirement"
+    )
+  ) {
+    return null;
+  }
+  if (reverse && action !== "apply") return null;
+  if (
+    reverse &&
+    surfaceValue === "takoserver-worker-authority-cutover" &&
+    legacyHostRuntimePredecessorVersionId === null
+  ) {
+    return null;
+  }
   return {
     surface: surfaceValue,
     action,
     environment,
     commit,
     ...(legacyPredecessorVersionId === null ? {} : { legacyPredecessorVersionId }),
+    ...(legacyHostRuntimePredecessorVersionId === null
+      ? {}
+      : { legacyHostRuntimePredecessorVersionId }),
+    ...(reverse ? { reverse: true } : {}),
   };
 }
 
@@ -106,6 +157,22 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
   switch (invocation.surface) {
     case "takoserver-worker":
     case "takoserver-worker-authority-cutover":
+      if (
+        invocation.surface === "takoserver-worker-authority-cutover" &&
+        invocation.legacyHostRuntimePredecessorVersionId !== undefined
+      ) {
+        return await runRetirement(
+          {
+            surface: invocation.surface,
+            action: invocation.action,
+            environment: invocation.environment,
+            commit: invocation.commit,
+            ...(invocation.reverse ? { reverse: true } : {}),
+            legacyHostRuntimePredecessorVersionId: invocation.legacyHostRuntimePredecessorVersionId,
+          },
+          target,
+        );
+      }
       return await runWorker(
         {
           surface: invocation.surface,
@@ -137,13 +204,24 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
         target,
       );
     case "takoserver-hosted-token-cutover":
-    case "takoserver-hosted-topology-cutover":
       return await runHosted(
         {
           surface: invocation.surface,
           action: invocation.action,
           environment: invocation.environment,
           commit: invocation.commit,
+        },
+        target,
+      );
+    case "takoserver-host-runtime-topology-retirement":
+    case "takoserver-hosted-token-retirement":
+      return await runRetirement(
+        {
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
+          ...(invocation.reverse ? { reverse: true } : {}),
         },
         target,
       );

@@ -18,32 +18,22 @@ const target = {
   r2: { bucketName: "takoserver-objects" },
   publicOrigin: "https://api.takoserver.example",
   signing: { currentKeyId: "key-current", nextKeyId: "key-next" },
-  hostedTopology: {
-    service: "takosumi-hosted",
-    entrypoint: "TakosumiHostRuntimeMaterializerEntrypoint",
-  },
+  sponsorship: true,
 } satisfies DeployTarget;
 
 describe("realized Worker configuration", () => {
-  test("keeps the current signing id while Hosted topology is the desired routine state", () => {
+  test("realizes the independent public Worker with no service binding", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-config-v2-"));
     try {
       const path = writeWorkerConfig(target, {
         path: join(root, "wrangler.jsonc"),
         main: join(root, "worker.js"),
         commit: "a".repeat(40),
-        hostedTopology: "desired",
       });
       const config = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
       expect(effectiveSigningKeyId(target)).toBe("key-current");
       expect(config.vars).toMatchObject({ TAKOSERVER_SIGNING_KEY_ID: "key-current" });
-      expect(config.services).toEqual([
-        {
-          binding: "HOST_RUNTIME_MATERIALIZER",
-          service: "takosumi-hosted",
-          entrypoint: "TakosumiHostRuntimeMaterializerEntrypoint",
-        },
-      ]);
+      expect(config).not.toHaveProperty("services");
       expect(config.secrets).toEqual({
         required: ["TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN", "TAKOSERVER_SIGNING_KEY"],
       });
@@ -52,19 +42,20 @@ describe("realized Worker configuration", () => {
     }
   });
 
-  test("can seal the pre-topology token state without silently changing signing", () => {
+  test("does not infer sponsorship or a service route for a standalone target", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-config-token-"));
     try {
-      const path = writeWorkerConfig(target, {
+      const { sponsorship: _sponsorship, ...standalone } = target;
+      const path = writeWorkerConfig(standalone, {
         path: join(root, "wrangler.jsonc"),
         main: join(root, "worker.js"),
         commit: "a".repeat(40),
-        hostedTopology: "absent",
         signingKeyId: "key-current",
       });
       const config = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
       expect(config).not.toHaveProperty("services");
       expect(config.vars).toMatchObject({ TAKOSERVER_SIGNING_KEY_ID: "key-current" });
+      expect(config.secrets).toEqual({ required: ["TAKOSERVER_SIGNING_KEY"] });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -75,10 +66,10 @@ describe("realized Worker configuration", () => {
       "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN",
       "TAKOSERVER_SIGNING_KEY",
     ]);
-    const { hostedTopology: _hostedTopology, ...withoutHostedTopology } = target;
+    const { sponsorship: _sponsorship, ...withoutSponsorship } = target;
     expect(
       expectedWorkerSecrets({
-        ...withoutHostedTopology,
+        ...withoutSponsorship,
         stripeCheckout: true,
         r2ParentAccessKeyId: "parent-key",
       }),
@@ -99,14 +90,12 @@ describe("realized Worker configuration", () => {
         path: join(root, "desired.json"),
         main: join(root, "worker.js"),
         commit: "a".repeat(40),
-        hostedTopology: "desired",
       });
       const { operatorIdentity: _operatorIdentity, ...withoutOperatorIdentity } = identityTarget;
       const absentPath = writeWorkerConfig(withoutOperatorIdentity, {
         path: join(root, "absent.json"),
         main: join(root, "worker.js"),
         commit: "a".repeat(40),
-        hostedTopology: "desired",
       });
       const desired = JSON.parse(readFileSync(desiredPath, "utf8")) as {
         vars: Record<string, string>;

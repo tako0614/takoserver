@@ -1,6 +1,6 @@
 # Takoserver deploy surfaces
 
-This repository owns one deploy entrypoint and fifteen separate mutation surfaces.
+This repository owns one deploy entrypoint and sixteen separate mutation surfaces.
 The contract is read-only:
 
 ```sh
@@ -29,7 +29,19 @@ artifact identity. An independent reviewer is required. A missing or malformed
 annotation is reported as `legacy-unattributed-predecessor` with
 `authorityScope` set to the entire Worker artifact; no predecessor source diff
 is invented. Routine Worker, rehearsal, and production invocations never accept
-this selector.
+this selector; the named Hosted-edge authority transition is the sole reviewed
+exception and accepts it in integration or production only with an exact pinned
+predecessor, clean/reachable commit and independent review.
+
+Legacy Hosted-edge retirement is a separately reviewed L→C→T→R sequence. The
+authority surface accepts `--legacy-host-runtime-predecessor-version=<uuid>` to
+publish candidate code while preserving exactly the observed
+`HOST_RUNTIME_MATERIALIZER` service binding and
+`TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN`. Ordinary target realization never carries
+either retired field. Retirement applies perform one provider mutation followed
+by authoritative readback; an acknowledgement loss is settled by `--status`,
+never by a blind retry. `--reverse` is accepted only by the named retirement
+surfaces.
 
 The environment selects only `.deploy/targets/<environment>.json` (or the
 matching absolute `TAKOSERVER_DEPLOY_TARGET_<ENVIRONMENT>` path). There is no
@@ -51,14 +63,17 @@ The routine surfaces are:
 The separate authority and irreversible surfaces are:
 
 - `takoserver-worker-authority-cutover`: reviewed publication of
-  authority-sensitive Worker code only.
+  authority-sensitive Worker code only. Its named legacy-edge transition
+  profile is the only way to carry an observed Hosted service binding and
+  secret into the candidate predecessor state.
 - `takoserver-form-authority-worker`: one reviewed route-less service-binding
   RPC Worker upload. Exact D1/R2 and identity bindings are read back with no
   secret or public-domain, zone-route, workers.dev, or preview ownership. The
   served public Worker artifact is rebuilt from the same commit and must match
   byte-for-byte before upload. Its Form `apply` remains fail-closed until
-  released Core admission and signed trust adapters exist; deploying the shell
-  does not grant Form mutation authority.
+  released Form package verification exists. Released Core supplies verification
+  facts only; Takoserver Host retains admission policy and private handle
+  issuance. Deploying the shell does not grant Form mutation authority.
 - `takoserver-integration-form-authority-worker`: integration only. It packages
   the exact generated 12-Form unsigned fixture corpus, hard-refuses any other
   environment before binding reads, and remains permanently non-production.
@@ -80,7 +95,7 @@ The separate authority and irreversible surfaces are:
   tenant and Space are also sealed independently into both Workers; each
   rejects every signed plan/apply/readback activation outside that scope before
   its RPC or storage boundary. Both Workers recheck the live public Worker
-  Version, and apply checks again after trust/Core preparation and immediately
+  Version, and apply checks again after verification plus Host policy and immediately
   before every durable command. A clean first deployment is allowed only when
   both the gateway script and configured custom domain are absent. Foreign
   ownership and every script/domain partial topology are refused, and a
@@ -109,8 +124,16 @@ The separate authority and irreversible surfaces are:
   the Hosted bearer and proves the authenticated sponsorship route returns a
   credential signed by the current D1 key. Before topology cutover its reversal
   is explicit deletion of that newly added named secret.
-- `takoserver-hosted-topology-cutover`: after that token proof, uploads identical
-  Worker code with only the exact Hosted service and entrypoint binding added.
+- `takoserver-host-runtime-topology-retirement`: C→T transition. It uploads a
+  byte-identical candidate Worker exactly once, removes only the observed
+  `HOST_RUNTIME_MATERIALIZER` binding, retains the Hosted secret, and proves the
+  direct successor. `--reverse` redeploys that exact provider-history Version.
+- `takoserver-hosted-token-retirement`: T→R transition. It deletes only
+  `TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN` after topology retirement and verifies
+  an exact direct-successor Worker Version with unchanged code identity. `--reverse`
+  re-puts the owned 0600 token file through stdin, creating the corresponding
+  direct successor; topology reverse then restores the candidate through provider
+  history. Token bytes never enter argv or output.
 - `takoserver-integration-operator-identity`: integration only. It rebuilds the
   already served commit once, requires the exact served bundle digest, and
   uploads one immutable Worker Version that adds only the target's canonical
@@ -123,8 +146,11 @@ The separate authority and irreversible surfaces are:
 
 The intended forward order is schema, public-key registration, any required
 authority-sensitive Worker code, signing repair or explicit rotation, Hosted
-token, then Hosted topology. Status must show the required predecessor state
-before each apply. Registration, topology, and schema are forward-repair only.
+token cutover, authority candidate transition (L→C), topology retirement (C→T),
+then token retirement (T→R). Status must show the required direct predecessor
+state before each apply. Each retirement surface has an explicit provider-history
+or secret re-put reverse; no automatic fallback or raw Wrangler reversal is
+exposed.
 
 The operator-identity surface is deliberately outside that production order.
 Its invocation parser accepts only `--environment=integration`; rehearsal and

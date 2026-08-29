@@ -15,22 +15,22 @@ import {
   TAKOFORM_REVOCATION_V1_EMPTY_ENTRIES_DIGEST,
   TAKOFORM_REVOCATION_V1_GENESIS_DIGEST,
 } from "../src/takoform/admission.ts";
-import type { FormAuthorityTrustEvidence } from "../src/takoform/core-admission-adapter.ts";
+import type { FormAuthorityVerificationEvidence } from "../src/takoform/form-authority-verification.ts";
+import type { FormAuthorityPlanRequest } from "../src/takoform/host-admission-coordinator.ts";
+import { createProductionFormAuthorityComposition } from "../src/takoform/host-admission-endpoint.ts";
 import {
   YURUCOMMU_FORM_VERSIONS,
   YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
   yurucommuLifecycleCapabilityManifest,
 } from "../src/takoform/implementation-catalog.ts";
 import { createIntegrationFormAuthorityComposition } from "../src/takoform/integration-operator-endpoint.ts";
-import type { FormAuthorityPlanRequest } from "../src/takoform/operator-authority.ts";
-import { createProductionFormAuthorityComposition } from "../src/takoform/operator-endpoint.ts";
 
 const digest = (hex: string) => `sha256:${hex.repeat(64)}` as const;
 const PUBLIC_VERSION_ID = "00000000-0000-4000-8000-000000000001";
 const DRIFTED_PUBLIC_VERSION_ID = "00000000-0000-4000-8000-000000000002";
 const CAPABILITIES = yurucommuLifecycleCapabilityManifest(YURUCOMMU_IDENTITY_CAPABILITY_KINDS);
 
-function trustEvidence(): FormAuthorityTrustEvidence {
+function trustEvidence(): FormAuthorityVerificationEvidence {
   return {
     publisher: {
       publisherKey: "publisher-yurucommu-integration-fixture",
@@ -319,7 +319,9 @@ describe("integration Form authority bridge", () => {
     expect(
       applied.receipts.every(
         (receipt) =>
-          receipt.admissionMode === "integration-fixture" && receipt.productionEligible === false,
+          receipt.policyAuthority === "takoserver-host" &&
+          receipt.verificationMode === "integration-fixture" &&
+          receipt.productionEligible === false,
       ),
     ).toBe(true);
     expect(applied.nextPlan.commands).toEqual([]);

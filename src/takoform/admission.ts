@@ -94,7 +94,7 @@ export interface AdmissionReport {
   readonly checks: readonly { readonly code: string; readonly passed: boolean }[];
 }
 
-/** Claims copied from a successful Core evaluator, never from JSON at commit. */
+/** Claims from a successful Host policy decision, never from JSON at commit. */
 export interface AdmissionHandleClaims {
   readonly operation: "install" | "replace";
   readonly packageDigest: AdmissionDigest;
@@ -106,16 +106,16 @@ export interface AdmissionHandleClaims {
   readonly checkpointSequence: number;
   readonly checkpointDigest: AdmissionDigest;
   readonly checkpointEventDigest: AdmissionDigest;
-  /** The exact evaluator report is part of the opaque claims.  The Host
+  /** The exact Host policy report is part of the opaque claims. The Host
    * computes its digest from this cloned body when persisting the event; a
    * caller cannot supply a detached digest. */
   readonly report: AdmissionReport;
 }
 
 /**
- * Opaque in-process authority issued by the pinned Core adapter.  The private
- * WeakMap below is the runtime check; a report, object spread, or structured
- * clone has no entry and is rejected by the Host store.
+ * Opaque in-process authority issued by the Host coordinator. The private
+ * WeakMap below is the runtime check; verification evidence, a report, object
+ * spread, or structured clone has no entry and is rejected by the Host store.
  */
 export interface AdmissionHandle {
   readonly __admissionHandle?: never;

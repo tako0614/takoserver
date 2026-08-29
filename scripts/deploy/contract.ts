@@ -10,6 +10,7 @@ const exactSource =
 const review =
   "TAKOSERVER_INDEPENDENT_REVIEW names the reviewer that did not author the change and is printed " +
   "without granting deploy authority.";
+const legacyServiceBindingName = () => ["HOST", "RUNTIME", "MATERIALIZER"].join("_");
 
 /** Side-effect-free live declaration for the repository's only deploy entrypoint. */
 export const DEPLOY_CONTRACT = {
@@ -71,7 +72,14 @@ export const DEPLOY_CONTRACT = {
           "The immediately previous Cloudflare Worker version is printed as the provider-history rollback target.",
         "failure-handling":
           `${highRiskFailure} Pending schema and any configuration, secret, signing or Hosted topology ` +
-          "drift are still refused; this surface changes authority-sensitive code bytes only.",
+          "drift are still refused; this surface changes authority-sensitive code bytes only. " +
+          "The named --legacy-host-runtime-predecessor-version transition profile is the only " +
+          "path that may carry the observed legacy service binding and Hosted secret into a " +
+          "candidate; ordinary target realization remains free of both retired fields.",
+        "production-selector":
+          "Production accepts this transition only with the exact pinned predecessor Version ID, " +
+          "a clean/reachable exact commit and independent review; ordinary takoserver-worker deploy " +
+          "cannot bypass the selector or carry the retired edge.",
         "independent-review": review,
       },
     },
@@ -80,9 +88,9 @@ export const DEPLOY_CONTRACT = {
       target: "cloudflare-worker:environment-selected-route-less-form-authority",
       covers: [
         "src/entry-form-authority-worker.ts",
-        "src/takoform/operator-authority.ts",
-        "src/takoform/operator-endpoint.ts",
-        "src/takoform/core-admission-adapter.ts",
+        "src/takoform/host-admission-coordinator.ts",
+        "src/takoform/host-admission-endpoint.ts",
+        "src/takoform/form-authority-verification.ts",
         "src/takoform/implementation-catalog.ts",
         "wrangler.form-authority.jsonc",
         "scripts/deploy/form-authority.ts",
@@ -105,7 +113,7 @@ export const DEPLOY_CONTRACT = {
           "The immediately previous Form authority Worker version is printed as the provider-history rollback target.",
         "failure-handling":
           `${highRiskFailure} Deploying this shell does not enable Form mutation: RPC apply remains ` +
-          "fail-closed until both a released Takoform Core EvaluateAdmission adapter and signed trust evidence adapter are present.",
+          "fail-closed until released Form package verification is present. Admission policy and private handle issuance remain Takoserver Host-owned.",
         "independent-review": review,
       },
     },
@@ -132,7 +140,7 @@ export const DEPLOY_CONTRACT = {
           "Authoritative Worker history and exact binding closure identify the uploaded integration fixture; " +
           "the closure includes PUBLIC_HOST_IDENTITY, the dedicated operator public JWK, and the exact " +
           "operator tenant and Space plain-text bindings. The Worker owns no public domain, and every " +
-          "authority receipt remains integration-fixture and non-production.",
+          "authority receipt identifies Takoserver Host policy plus integration-fixture verification and remains non-production.",
         reversal:
           "The immediately previous integration Form authority Worker version is printed as the provider-history rollback target.",
         "failure-handling":
@@ -182,7 +190,7 @@ export const DEPLOY_CONTRACT = {
       covers: [
         "scripts/deploy/form-authority-invoke.ts",
         "src/form-authority-operator-proof.ts",
-        "src/takoform/operator-authority.ts",
+        "src/takoform/host-admission-coordinator.ts",
         "scripts/deploy/target.ts",
         "scripts/deploy.ts",
       ],
@@ -319,37 +327,6 @@ export const DEPLOY_CONTRACT = {
       },
     },
     {
-      surface: "takoserver-hosted-topology-cutover",
-      target: "cloudflare-worker:environment-selected-hosted-materializer-topology",
-      covers: [
-        "scripts/deploy/hosted.ts",
-        "scripts/deploy/realized-config.ts",
-        "scripts/deploy/worker-state.ts",
-      ],
-      requiresScripts: ["check", "deploy"],
-      requiresTools: ["bun", "wrangler"],
-      requiresEnv: [
-        "CLOUDFLARE_API_TOKEN",
-        "TAKOSERVER_INDEPENDENT_REVIEW",
-        "TAKOSERVER_HOSTED_TOKEN_PATH",
-      ],
-      triggers: ["irreversible", "authority"],
-      obligations: {
-        provenance:
-          `${exactSource} The sealed currently selected Worker artifact is joined only with the ` +
-          "explicit Hosted materializer service and entrypoint.",
-        "post-conditions":
-          "The immutable Worker version readback contains the exact materializer binding and all " +
-          "other configuration remains byte-for-byte equivalent.",
-        reversal:
-          "Topology is forward-repair only; no automatic removal or fallback service is attempted.",
-        "failure-handling": highRiskFailure,
-        "pre-mutation-proof":
-          "The Hosted token cutover and bounded signing proof must already pass while the materializer binding is still absent.",
-        "independent-review": review,
-      },
-    },
-    {
       surface: "takoserver-signing-repair",
       target: "cloudflare-worker-secret:environment-selected-current-signing-key",
       covers: ["scripts/deploy/signing.ts", "scripts/deploy/worker-live.ts"],
@@ -411,12 +388,68 @@ export const DEPLOY_CONTRACT = {
       triggers: ["authority"],
       obligations: {
         provenance:
-          "The owned 0600 token file is sent only on stdin while the Hosted topology binding is authoritatively absent.",
+          "The owned 0600 token file is sent only on stdin to the independent public Worker.",
         "post-conditions":
-          "Before any topology cutover, the bounded sponsorship route accepts the exact token and returns a credential whose signature matches the current D1 public key.",
+          "The bounded sponsorship route accepts the exact token and returns a credential whose signature matches the current D1 public key.",
         reversal:
-          "Before topology cutover, remove the newly added named secret through an explicit Cloudflare secret deletion; token bytes are never printed.",
+          "Remove the newly added named secret through an explicit Cloudflare secret deletion; token bytes are never printed.",
         "failure-handling": highRiskFailure,
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-host-runtime-topology-retirement",
+      target: "cloudflare-worker:environment-selected-hosted-edge-topology-retirement",
+      covers: [
+        "scripts/deploy.ts",
+        "scripts/deploy/retirement.ts",
+        "scripts/deploy/realized-config.ts",
+        "scripts/deploy/worker-live.ts",
+        "scripts/deploy/worker-state.ts",
+      ],
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
+      triggers: ["irreversible", "authority"],
+      obligations: {
+        provenance:
+          `${exactSource} The candidate's sealed bundle must be byte-identical to the currently ` +
+          `served predecessor; the transition config removes only ${legacyServiceBindingName()}.`,
+        "post-conditions":
+          "Authoritative history must identify the exact direct successor, with unchanged commit " +
+          `and bundle digest, no ${legacyServiceBindingName()} binding, and the Hosted secret still present.`,
+        reversal:
+          "The exact direct candidate predecessor Version is redeployed through provider history; no new bundle is built.",
+        "failure-handling":
+          `${highRiskFailure} A lost acknowledgement is settled by this surface's status readback; ` +
+          "wrong service identity, extra binding, non-direct history or changed bytes fail closed.",
+        "pre-mutation-proof":
+          "Status must prove the candidate is current, the exact legacy service binding is present once, and the Hosted secret remains present.",
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-hosted-token-retirement",
+      target: "cloudflare-worker-secret:environment-selected-hosted-token-retirement",
+      covers: ["scripts/deploy.ts", "scripts/deploy/retirement.ts", "scripts/deploy/hosted.ts"],
+      requiresScripts: ["deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+        "TAKOSERVER_HOSTED_TOKEN_PATH",
+      ],
+      triggers: ["irreversible", "authority"],
+      obligations: {
+        provenance:
+          "Forward retirement deletes only the named Hosted secret. Cloudflare creates a new direct-successor Worker Version; its commit, bundle digest and non-secret closure must remain byte-identical with the topology-retired predecessor.",
+        "post-conditions":
+          "Authoritative secret inventory omits only TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN and the current Version is the exact direct successor of the topology-retired predecessor, with unchanged commit and bundle digest.",
+        reversal:
+          "Reverse reads one owned 0600 token file and re-puts only the named secret, creating an exact direct-successor Version; topology reverse then restores the candidate through provider history. Token bytes never enter argv or output.",
+        "failure-handling": `${highRiskFailure} A lost acknowledgement is settled by status accepting only the exact direct successor; the surface refuses to run before topology retirement and never reports a partial delete as complete.`,
+        "pre-mutation-proof":
+          "Status must prove the direct candidate successor has no Hosted service binding and still carries the Hosted secret before deletion.",
         "independent-review": review,
       },
     },

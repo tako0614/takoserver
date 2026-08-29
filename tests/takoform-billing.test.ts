@@ -13,10 +13,38 @@ import {
   type Offering,
 } from "../src/index.ts";
 import { type Sql, SqlError } from "../src/ports.ts";
-import { createProviderDriver } from "../src/provider-driver.ts";
-import type { Provider, ProviderOffering } from "../src/provider-port.ts";
-import { FakeProvider } from "../src/providers/fake.ts";
+import { createProviderDriver, ProviderMutationRecoveryError } from "../src/provider-driver.ts";
+import { failed, type Provider, type ProviderOffering, succeeded } from "../src/provider-port.ts";
+import { createFakeProviderState, FakeProvider } from "../src/providers/fake.ts";
+import { createTakoformStore } from "../src/takoform/store.ts";
 import { createStaticStableTestTakoformHost } from "./helpers/historical-takoform-host.ts";
+
+const fakeReadback = {
+  createNativeReadbackDescriptor(input: {
+    readonly offering: ProviderOffering;
+    readonly nativeId: string;
+    readonly identity: {
+      readonly tenantRef: string;
+      readonly space: string;
+      readonly name: string;
+    };
+  }) {
+    return {
+      apiVersion: "providers.takoserver.com/readback/v1" as const,
+      provider: "fake",
+      kind: input.offering.kind,
+      nativeId: input.nativeId,
+      data: {
+        tenantRef: input.identity.tenantRef,
+        space: input.identity.space,
+        name: input.identity.name,
+      },
+    };
+  },
+  async verifyNativeAbsence() {
+    return { outcome: "absent" as const, evidence: {} };
+  },
+};
 
 /**
  * The join the old design was missing: declaring a resource through Takoform
@@ -210,6 +238,275 @@ async function applyBucket(
 }
 
 describe("Takoform apply on a real backend", () => {
+  test("keeps a priced hold while an async provider runs, then captures after restart", async () => {
+    const sql = createEphemeralSql();
+    const clock = () => new Date("2026-08-24T00:00:00.000Z");
+    const ledger = createLedger(sql, clock);
+    await ledger.fund({ organizationId: "org_priced", fundingRef: "paid", amountMinor: 2_000 });
+    const state = createFakeProviderState();
+    const provider = new FakeProvider({
+      offerings: [PROVIDER_OFFERING],
+      mode: "async",
+      pollsToSettle: 2,
+      state,
+    });
+    const input = {
+      operationId: "op_priced_running",
+      tenantId: "org_priced",
+      resourceUid: "uid_priced",
+      form: FORM,
+      name: "slow",
+      space: "default",
+      spec: { location: "apac" },
+      relations: [],
+    } as const;
+    const makeDriver = () =>
+      createProviderDriver({
+        providers: [provider],
+        catalog: createCatalog([SOLD]),
+        ledger,
+        deployments: createResourceDeploymentStore(sql, clock),
+        inlinePollBudget: 1,
+        sleep: async () => {},
+      });
+
+    let firstError: unknown;
+    try {
+      await makeDriver().apply(input);
+    } catch (error) {
+      firstError = error;
+    }
+    expect(firstError).toBeInstanceOf(ProviderMutationRecoveryError);
+    if (!(firstError instanceof ProviderMutationRecoveryError)) {
+      throw new Error("expected a provider recovery outcome");
+    }
+    expect(firstError.providerOutcome).toBe("running");
+    const providerHandle = firstError.providerHandle;
+    expect(providerHandle).toBe("handle_op_priced_running");
+    if (!providerHandle) throw new Error("expected a provider recovery handle");
+    expect(await ledger.wallet("org_priced")).toMatchObject({
+      settledMinor: 2_000,
+      heldMinor: 500,
+      availableMinor: 1_500,
+    });
+    expect(provider.sideEffectCount).toBe(1);
+
+    const restarted = makeDriver();
+    const settled = await restarted.apply({
+      ...input,
+      operationMode: "recovery",
+      providerHandle,
+    });
+    expect(settled.observed).toEqual({ location: "apac" });
+    expect(provider.sideEffectCount).toBe(1);
+    expect(await ledger.wallet("org_priced")).toMatchObject({
+      settledMinor: 1_500,
+      heldMinor: 0,
+      availableMinor: 1_500,
+    });
+  });
+
+  test("persists an initial running handle before any inline poll can fail", async () => {
+    const sql = createEphemeralSql();
+    const clock = () => new Date("2026-08-24T00:00:00.000Z");
+    const ledger = createLedger(sql, clock);
+    await ledger.fund({ organizationId: "org_poll_lost", fundingRef: "paid", amountMinor: 2_000 });
+    const state = createFakeProviderState();
+    const fake = new FakeProvider({
+      offerings: [PROVIDER_OFFERING],
+      mode: "async",
+      pollsToSettle: 2,
+      state,
+    });
+    let pollCalls = 0;
+    let failNextPoll = true;
+    const provider: Provider = {
+      id: fake.id,
+      offerings: fake.offerings,
+      ...fakeReadback,
+      apply: (input) => fake.apply(input),
+      observe: (input) => fake.observe(input),
+      delete: (input) => fake.delete(input),
+      poll: async (input) => {
+        pollCalls += 1;
+        if (failNextPoll) {
+          failNextPoll = false;
+          throw new Error("poll transport closed");
+        }
+        return await fake.poll(input);
+      },
+    };
+    const makeDriver = () =>
+      createProviderDriver({
+        providers: [provider],
+        catalog: createCatalog([SOLD]),
+        ledger,
+        deployments: createResourceDeploymentStore(sql, clock),
+        inlinePollBudget: 3,
+        sleep: async () => {},
+      });
+    const input = {
+      operationId: "op_poll_lost",
+      tenantId: "org_poll_lost",
+      resourceUid: "uid_poll_lost",
+      form: FORM,
+      name: "poll-lost",
+      space: "default",
+      spec: { location: "apac" },
+      relations: [],
+    } as const;
+
+    await expect(makeDriver().apply(input)).rejects.toMatchObject({
+      providerOutcome: "running",
+      providerHandle: "handle_op_poll_lost",
+    });
+    // The handle must be returned before the first fallible poll. A restarted
+    // executor can then carry it back through the recovery-only path.
+    expect(pollCalls).toBe(0);
+    failNextPoll = false;
+    const recovered = await makeDriver().apply({
+      ...input,
+      operationMode: "recovery",
+      providerHandle: "handle_op_poll_lost",
+    });
+    expect(recovered.observed).toEqual({ location: "apac" });
+    expect(pollCalls).toBe(2);
+    expect(fake.sideEffectCount).toBe(1);
+  });
+
+  test("keeps a priced hold when an indeterminate provider result has no handle", async () => {
+    const sql = createEphemeralSql();
+    const clock = () => new Date("2026-08-24T00:00:00.000Z");
+    const ledger = createLedger(sql, clock);
+    await ledger.fund({
+      organizationId: "org_indeterminate",
+      fundingRef: "paid",
+      amountMinor: 2_000,
+    });
+    let attempts = 0;
+    const provider: Provider = {
+      id: "fake",
+      offerings: [PROVIDER_OFFERING],
+      ...fakeReadback,
+      async apply(input) {
+        attempts += 1;
+        if (attempts === 1) return failed("timeout", "the acknowledgement was lost", true);
+        return succeeded({
+          nativeId: `fake:${input.identity.tenantRef}/${input.identity.space}/${input.identity.name}`,
+          observed: structuredClone(input.spec),
+          outputs: {},
+        });
+      },
+      async observe() {
+        return failed("not_found", "not found");
+      },
+      async delete() {
+        return failed("not_found", "not found");
+      },
+    };
+    const makeDriver = () =>
+      createProviderDriver({
+        providers: [provider],
+        catalog: createCatalog([SOLD]),
+        ledger,
+        deployments: createResourceDeploymentStore(sql, clock),
+      });
+    const input = {
+      operationId: "op_priced_indeterminate",
+      tenantId: "org_indeterminate",
+      resourceUid: "uid_indeterminate",
+      form: FORM,
+      name: "uncertain",
+      space: "default",
+      spec: {},
+      relations: [],
+    } as const;
+
+    await expect(makeDriver().apply(input)).rejects.toMatchObject({
+      providerOutcome: "indeterminate",
+    });
+    expect(await ledger.wallet("org_indeterminate")).toMatchObject({
+      settledMinor: 2_000,
+      heldMinor: 500,
+      availableMinor: 1_500,
+    });
+    await expect(makeDriver().apply({ ...input, operationMode: "recovery" })).rejects.toMatchObject(
+      {
+        providerOutcome: "indeterminate",
+      },
+    );
+    expect(attempts).toBe(1);
+    expect(await ledger.wallet("org_indeterminate")).toMatchObject({
+      settledMinor: 2_000,
+      heldMinor: 500,
+      availableMinor: 1_500,
+    });
+  });
+
+  test("recovers a handle-less apply only through the provider's read-only seam", async () => {
+    const sql = createEphemeralSql();
+    const clock = () => new Date("2026-08-24T00:00:00.000Z");
+    const ledger = createLedger(sql, clock);
+    await ledger.fund({
+      organizationId: "org_recover_apply",
+      fundingRef: "paid",
+      amountMinor: 2_000,
+    });
+    let applyCalls = 0;
+    let recoverCalls = 0;
+    const provider: Provider = {
+      id: "fake",
+      offerings: [PROVIDER_OFFERING],
+      ...fakeReadback,
+      async apply() {
+        applyCalls += 1;
+        return failed("timeout", "the acknowledgement was lost", true);
+      },
+      async recoverApply(input) {
+        recoverCalls += 1;
+        return succeeded({
+          nativeId: `recoverable:${input.identity.tenantRef}/${input.identity.space}/${input.identity.name}`,
+          observed: structuredClone(input.spec),
+          outputs: {},
+        });
+      },
+      async observe() {
+        return failed("not_found", "not found");
+      },
+      async delete() {
+        return failed("not_found", "not found");
+      },
+    };
+    const makeDriver = () =>
+      createProviderDriver({
+        providers: [provider],
+        catalog: createCatalog([SOLD]),
+        ledger,
+        deployments: createResourceDeploymentStore(sql, clock),
+      });
+    const input = {
+      operationId: "op_recover_apply",
+      tenantId: "org_recover_apply",
+      resourceUid: "uid_recover_apply",
+      form: FORM,
+      name: "recoverable",
+      space: "default",
+      spec: { location: "apac" },
+      relations: [],
+    } as const;
+    await expect(makeDriver().apply(input)).rejects.toMatchObject({
+      providerOutcome: "indeterminate",
+    });
+    const recovered = await makeDriver().apply({ ...input, operationMode: "recovery" });
+    expect(recovered.observed).toEqual(input.spec);
+    expect(applyCalls).toBe(1);
+    expect(recoverCalls).toBe(1);
+    expect(await ledger.wallet("org_recover_apply")).toMatchObject({
+      settledMinor: 1_500,
+      heldMinor: 0,
+    });
+  });
+
   test("inherits one exact provider installation for a revision Form", async () => {
     const sql = createEphemeralSql();
     const clock = () => new Date("2026-08-19T00:00:00.000Z");
@@ -338,6 +635,62 @@ describe("Takoform apply on a real backend", () => {
     const replayed = await created.replay();
     expect(replayed.status).toBe(201);
     expect(await ledger.wallet(organizationId)).toMatchObject({ settledMinor: 1_500 });
+  });
+
+  test("abandons a planned apply when its durable dispatch marker fails", async () => {
+    const durable = createEphemeralSql();
+    let failDispatch = true;
+    const sql: Sql = {
+      query: (statement, params) => durable.query(statement, params),
+      run: (statement, params) => {
+        if (
+          failDispatch &&
+          statement.includes("tf_resource_provider_effects") &&
+          params?.[5] === "dispatched"
+        ) {
+          failDispatch = false;
+          throw new SqlError("unavailable", "simulated dispatch marker failure");
+        }
+        return durable.run(statement, params);
+      },
+      batch: (statements) => durable.batch(statements),
+    };
+    const provider = new FakeProvider({ offerings: [PROVIDER_OFFERING] });
+    const app = buildApp({
+      sql,
+      objects: createMemoryObjectStore(),
+      identity,
+      settlement,
+      publicOrigin: "https://api.takoserver.com",
+      forms: [FORM],
+      hostForms: [FORM],
+      takoformHostFactory: createStaticStableTestTakoformHost,
+      providers: [provider],
+      offerings: [SOLD],
+    });
+    const { organizationId, provider: auth } = await tenant(app.fetch);
+
+    const failedApply = await applyBucket(
+      app.fetch,
+      auth,
+      "dispatch-marker-fails",
+      {},
+      "marker-001",
+    );
+    expect(failedApply.status).not.toBe(201);
+    expect(provider.sideEffectCount).toBe(0);
+    expect(
+      await sql.query(
+        `SELECT phase FROM tf_resource_provider_effects
+         WHERE tenant_id = ? AND effect_kind = 'apply'`,
+        [organizationId],
+      ),
+    ).toEqual([{ phase: "planned" }, { phase: "cancelled" }]);
+    expect(
+      await sql.query("SELECT operation_id FROM tf_provider_mutation_sagas WHERE tenant_id = ?", [
+        organizationId,
+      ]),
+    ).toEqual([]);
   });
 
   test("resumes an executed provider receipt after the final atomic batch is lost", async () => {
@@ -480,6 +833,1048 @@ describe("Takoform apply on a real backend", () => {
       { state: "deleted" },
     ]);
     expect(await sql.query("SELECT operation_id FROM tf_provider_mutation_sagas")).toEqual([]);
+  });
+
+  test("proves native absence through a read-only scoped residual receipt", async () => {
+    const { app } = newApp();
+    const { organizationId, provider: auth } = await tenant(app.fetch);
+    const created = await applyBucket(app.fetch, auth, "residual-proof", {}, "residual-create");
+    expect(created.status).toBe(201);
+    const uid = String((created.body.metadata as { uid: string }).uid);
+    const revision = String((created.body.metadata as { revision: string }).revision);
+    const generation = String((created.body.metadata as { generation: string }).generation);
+    const path = `${LANE}/resources/${FORM_REF.apiVersion}/${FORM_REF.kind}/residual-proof?${QUERY}`;
+    const deleted = await call(app.fetch, "DELETE", path, undefined, {
+      ...auth,
+      "idempotency-key": "residual-delete",
+      "if-match": `"${revision}"`,
+      "takoform-expected-generation": generation,
+    });
+    expect(deleted.status).toBe(204);
+    const query = new URLSearchParams({
+      space: "default",
+      name: "residual-proof",
+    });
+    const proof = await call(
+      app.fetch,
+      "GET",
+      `/v1/organizations/${organizationId}/resources/${uid}/native-residual?${query}`,
+      undefined,
+      auth,
+    );
+    expect(proof.status).toBe(200);
+    expect(proof.body).toEqual({
+      residual: {
+        status: "absent",
+        source: "provider",
+        effectCount: 6,
+        deploymentCount: 1,
+        checkedAt: expect.stringMatching(/^2026-08-29T/u),
+        evidenceRef: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+      },
+    });
+    expect(JSON.stringify(proof.body)).not.toContain("fake:org_");
+
+    const wrongSpace = await call(
+      app.fetch,
+      "GET",
+      `/v1/organizations/${organizationId}/resources/${uid}/native-residual?${new URLSearchParams({
+        space: "other-space",
+        name: "residual-proof",
+      })}`,
+      undefined,
+      auth,
+    );
+    expect(wrongSpace.status).toBe(200);
+    expect(wrongSpace.body).toEqual({
+      residual: {
+        status: "indeterminate",
+        source: "provider",
+        reason: "legacy_unattested",
+        effectCount: 6,
+        deploymentCount: 1,
+        checkedAt: expect.stringMatching(/^2026-08-29T/u),
+      },
+    });
+    const unauthorized = await call(
+      app.fetch,
+      "GET",
+      `/v1/organizations/${organizationId}/resources/${uid}/native-residual?${query}`,
+    );
+    expect(unauthorized.status).toBe(401);
+  });
+
+  test("fails closed when native residual readback still sees the object", async () => {
+    const sql = createEphemeralSql();
+    const clock = () => new Date("2026-08-24T00:00:00.000Z");
+    const ledger = createLedger(sql, clock);
+    await ledger.fund({
+      organizationId: "org_residual_present",
+      fundingRef: "paid",
+      amountMinor: 2_000,
+    });
+    const provider: Provider = {
+      id: "fake",
+      offerings: [PROVIDER_OFFERING],
+      ...fakeReadback,
+      async apply(input) {
+        return succeeded({ nativeId: "fake:native-present", observed: input.spec, outputs: {} });
+      },
+      async observe() {
+        return succeeded({ nativeId: "fake:native-present", observed: {}, outputs: {} });
+      },
+      async delete() {
+        // Simulate a provider that acknowledged DELETE while the native object
+        // remains reachable; the follow-up readback is the authority.
+        return succeeded({
+          nativeId: "fake:native-present",
+          observed: { deleted: true },
+          outputs: {},
+        });
+      },
+      async verifyNativeAbsence() {
+        return { outcome: "present" as const, evidence: { state: "present" } };
+      },
+      async recoverDelete() {
+        return failed("unavailable", "native object is still present", true);
+      },
+    };
+    const deployments = createResourceDeploymentStore(sql, clock);
+    const deletions = createTakoformStore(sql, clock);
+    const driver = createProviderDriver({
+      providers: [provider],
+      catalog: createCatalog([SOLD]),
+      ledger,
+      deployments,
+      deletions,
+    });
+    const input = {
+      operationId: "op_residual_present",
+      tenantId: "org_residual_present",
+      resourceUid: "uid_residual_present",
+      form: FORM,
+      name: "residual-present",
+      space: "default",
+      spec: {},
+      relations: [],
+    } as const;
+    await driver.apply(input);
+    await deletions.prepareResourceDeletion({
+      tenantId: input.tenantId,
+      resourceUid: input.resourceUid,
+      address: {
+        tenantId: input.tenantId,
+        space: input.space,
+        apiVersion: FORM_REF.apiVersion,
+        kind: FORM_REF.kind,
+        name: input.name,
+      },
+      formRef: FORM_REF,
+      operationId: "op_residual_delete",
+    });
+    await deletions.markResourceDeletionDispatch({
+      tenantId: input.tenantId,
+      resourceUid: input.resourceUid,
+      operationId: "op_residual_delete",
+    });
+    await driver.delete({
+      operationId: "op_residual_delete",
+      tenantId: input.tenantId,
+      resourceUid: input.resourceUid,
+      resource: {
+        apiVersion: FORM_REF.apiVersion,
+        kind: FORM_REF.kind,
+        form: FORM.identity,
+        metadata: {
+          name: input.name,
+          space: input.space,
+          uid: input.resourceUid,
+          generation: "1",
+          revision: "1",
+        },
+        spec: input.spec,
+        status: { observedGeneration: "1", conditions: [] },
+      },
+      relations: [],
+    });
+    await deletions.recordResourceEffect({
+      tenantId: input.tenantId,
+      resourceUid: input.resourceUid,
+      effectId: "op_residual_delete",
+      kind: "delete",
+      phase: "succeeded",
+      operationMode: "initial",
+      providerPackRef: "fake",
+      providerInstallationRef: SOLD.providerInstallationRef,
+      nativeId: "fake:native-present",
+    });
+    await sql.run(
+      `UPDATE tf_resource_deletion_attestations
+       SET state = 'closed', updated_at = ?
+       WHERE tenant_id = ? AND resource_uid = ?`,
+      [clock().getTime(), input.tenantId, input.resourceUid],
+    );
+    const evidence = await driver.verifyNativeAbsence?.({
+      tenantId: input.tenantId,
+      resourceUid: input.resourceUid,
+      space: input.space,
+      name: input.name,
+    });
+    expect(evidence).toMatchObject({
+      status: "present",
+      source: "provider",
+      deploymentCount: 1,
+    });
+  });
+
+  test("aggregates readback evidence across every deleted deployment and fences the incarnation", async () => {
+    const sql = createEphemeralSql();
+    const clock = () => new Date("2026-08-24T00:00:00.000Z");
+    const deployments = createResourceDeploymentStore(sql, clock);
+    const deletions = createTakoformStore(sql, clock);
+    const calls: string[] = [];
+    const provider: Provider = {
+      id: "fake",
+      offerings: [PROVIDER_OFFERING],
+      ...fakeReadback,
+      createNativeReadbackDescriptor(input) {
+        calls.push(input.nativeId);
+        return fakeReadback.createNativeReadbackDescriptor(input);
+      },
+      async apply() {
+        return failed("unavailable", "not used", true);
+      },
+      async observe() {
+        return failed("not_found", "not found");
+      },
+      async delete() {
+        return failed("unavailable", "not used", true);
+      },
+      async recoverDelete(input) {
+        calls.push(`${input.nativeId}:${input.operationId}`);
+        return succeeded({
+          nativeId: input.nativeId,
+          observed: { deleted: true },
+          outputs: {},
+          disposition: "deleted",
+        });
+      },
+    };
+    const driver = createProviderDriver({
+      providers: [provider],
+      catalog: createCatalog([SOLD]),
+      ledger: createLedger(sql, clock),
+      deployments,
+      deletions,
+    });
+    const marker = (deleteOperationId: string) => ({
+      __takoserver: {
+        resourceUid: "uid_residual_multi",
+        space: "default",
+        name: "residual-multi",
+        deleteOperationId,
+      },
+    });
+    await deployments.create({
+      tenantId: "org_residual_multi",
+      id: "deployment_old",
+      resourceUid: "uid_residual_multi",
+      offeringId: SOLD.id,
+      providerPackRef: "fake",
+      providerInstallationRef: SOLD.providerInstallationRef,
+      nativeId: "fake:native-old",
+      state: "deleted",
+      observed: { deleted: true },
+      outputs: marker("op-delete-old"),
+    });
+    await deployments.create({
+      tenantId: "org_residual_multi",
+      id: "deployment_new",
+      resourceUid: "uid_residual_multi",
+      offeringId: SOLD.id,
+      providerPackRef: "fake",
+      providerInstallationRef: SOLD.providerInstallationRef,
+      nativeId: "fake:native-new",
+      state: "deleted",
+      observed: { deleted: true },
+      outputs: marker("op-delete-new"),
+    });
+    for (const [effectId, installation, native] of [
+      ["op-delete-old", "fake.installation.0", "fake:native-old"],
+      ["op-delete-new", "fake.installation.1", "fake:native-new"],
+    ] as const) {
+      await deletions.prepareResourceDeletion({
+        tenantId: "org_residual_multi",
+        resourceUid: "uid_residual_multi",
+        address: {
+          tenantId: "org_residual_multi",
+          space: "default",
+          apiVersion: FORM_REF.apiVersion,
+          kind: FORM_REF.kind,
+          name: "residual-multi",
+        },
+        formRef: FORM_REF,
+        operationId: effectId,
+      });
+      await deletions.markResourceDeletionDispatch({
+        tenantId: "org_residual_multi",
+        resourceUid: "uid_residual_multi",
+        operationId: effectId,
+      });
+      await deletions.recordResourceEffect({
+        tenantId: "org_residual_multi",
+        resourceUid: "uid_residual_multi",
+        effectId,
+        kind: "delete",
+        phase: "succeeded",
+        operationMode: "initial",
+        providerPackRef: "fake",
+        providerInstallationRef: installation,
+        nativeId: native,
+      });
+    }
+    await sql.run(
+      `UPDATE tf_resource_deletion_attestations
+       SET state = 'closed', updated_at = ?
+       WHERE tenant_id = ? AND resource_uid = ?`,
+      [clock().getTime(), "org_residual_multi", "uid_residual_multi"],
+    );
+
+    const evidence = await driver.verifyNativeAbsence?.({
+      tenantId: "org_residual_multi",
+      resourceUid: "uid_residual_multi",
+      space: "default",
+      name: "residual-multi",
+    });
+    expect(evidence).toMatchObject({
+      status: "absent",
+      source: "provider",
+      effectCount: 6,
+      deploymentCount: 2,
+    });
+    expect(calls).toEqual(["fake:native-new", "fake:native-old"]);
+
+    // A caller cannot select another incarnation by changing only the logical
+    // address. The UID and every retained tombstone marker must agree.
+    await expect(
+      driver.verifyNativeAbsence?.({
+        tenantId: "org_residual_multi",
+        resourceUid: "uid_residual_multi",
+        space: "default",
+        name: "other-incarnation",
+      }),
+    ).resolves.toMatchObject({
+      status: "indeterminate",
+      reason: "legacy_unattested",
+      effectCount: 6,
+      deploymentCount: 2,
+    });
+    expect(calls).toHaveLength(2);
+  });
+
+  test("attests intrinsic WorkerBundle absence from a closed zero-identity tombstone", async () => {
+    const sql = createEphemeralSql();
+    const clock = () => new Date("2026-08-24T00:00:00.000Z");
+    const deletions = createTakoformStore(sql, clock);
+    const formRef = {
+      apiVersion: "edge.forms.takoform.com",
+      kind: "WorkerBundle",
+      definitionVersion: "0.1.0",
+      schemaDigest: `sha256:${"0".repeat(64)}`,
+    } as const;
+    const input = {
+      tenantId: "org_intrinsic_absence",
+      resourceUid: "uid_intrinsic_absence",
+      address: {
+        tenantId: "org_intrinsic_absence",
+        space: "default",
+        apiVersion: formRef.apiVersion,
+        kind: formRef.kind,
+        name: "worker",
+      },
+      formRef,
+      operationId: "op_intrinsic_delete",
+    } as const;
+    const prepared = await deletions.prepareResourceDeletion(input);
+    expect(prepared.state).toBe("pending");
+    await deletions.recordResourceEffect({
+      tenantId: input.tenantId,
+      resourceUid: input.resourceUid,
+      effectId: input.operationId,
+      kind: "delete",
+      phase: "dispatched",
+      operationMode: "initial",
+    });
+    await deletions.recordResourceEffect({
+      tenantId: input.tenantId,
+      resourceUid: input.resourceUid,
+      effectId: input.operationId,
+      kind: "delete",
+      phase: "succeeded",
+      operationMode: "initial",
+    });
+    await sql.run(
+      `UPDATE tf_resource_deletion_attestations
+       SET state = 'closed', updated_at = ?
+       WHERE tenant_id = ? AND resource_uid = ?`,
+      [clock().getTime(), input.tenantId, input.resourceUid],
+    );
+    expect(
+      await deletions.cacheResourceDeletionEvidence({
+        tenantId: input.tenantId,
+        resourceUid: input.resourceUid,
+        closureFence: prepared.closureFence,
+        evidence: { status: "absent", source: "intrinsic" },
+        evidenceRef: `sha256:${"1".repeat(64)}`,
+        effectSetDigest: `sha256:${"3".repeat(64)}`,
+        checkedAt: clock().getTime(),
+        status: "absent",
+      }),
+    ).toBe(false);
+    const closed = await deletions.readResourceDeletion(input.tenantId, input.resourceUid);
+    expect(closed?.closureFence).toBe(prepared.closureFence + 2);
+    expect(
+      await deletions.cacheResourceDeletionEvidence({
+        tenantId: input.tenantId,
+        resourceUid: input.resourceUid,
+        closureFence: closed?.closureFence ?? 0,
+        evidence: { status: "absent", source: "intrinsic" },
+        evidenceRef: `sha256:${"2".repeat(64)}`,
+        effectSetDigest: `sha256:${"4".repeat(64)}`,
+        checkedAt: clock().getTime(),
+        status: "absent",
+      }),
+    ).toBe(true);
+    const driver = createProviderDriver({
+      providers: [],
+      catalog: createCatalog([]),
+      ledger: createLedger(sql, clock),
+      deployments: createResourceDeploymentStore(sql, clock),
+      deletions,
+    });
+    const evidence = await driver.verifyNativeAbsence?.({
+      tenantId: input.tenantId,
+      resourceUid: input.resourceUid,
+      space: input.address.space,
+      name: input.address.name,
+    });
+    expect(evidence).toMatchObject({
+      status: "absent",
+      source: "intrinsic",
+      effectCount: 3,
+      deploymentCount: 0,
+      evidenceRef: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+    });
+  });
+
+  test("keeps provider effects append-only and refuses secret targets or UID reuse", async () => {
+    const sql = createEphemeralSql();
+    const clock = () => new Date("2026-08-24T00:00:00.000Z");
+    const deletions = createTakoformStore(sql, clock);
+    const address = {
+      tenantId: "org_effect_ledger",
+      space: "default",
+      apiVersion: FORM_REF.apiVersion,
+      kind: FORM_REF.kind,
+      name: "effect-ledger",
+    } as const;
+    const formRef = FORM_REF;
+    const resourceUid = "uid_effect_ledger";
+    expect(
+      await deletions.reserveResourceIncarnation({
+        tenantId: address.tenantId,
+        resourceUid,
+        address,
+        formRef,
+      }),
+    ).toBe(true);
+    expect(
+      await deletions.recordResourceEffect({
+        tenantId: address.tenantId,
+        resourceUid,
+        effectId: "op_effect_order",
+        kind: "apply",
+        phase: "dispatched",
+        operationMode: "initial",
+      }),
+    ).toBe(false);
+    await expect(
+      deletions.recordResourceEffect({
+        tenantId: address.tenantId,
+        resourceUid,
+        effectId: "op_effect_order",
+        kind: "apply",
+        phase: "planned",
+        operationMode: "initial",
+        target: { token: "must-not-persist" },
+      }),
+    ).rejects.toMatchObject({ code: "invalid_argument", status: 400 });
+    expect(
+      await deletions.recordResourceEffect({
+        tenantId: address.tenantId,
+        resourceUid,
+        effectId: "op_effect_order",
+        kind: "apply",
+        phase: "planned",
+        operationMode: "initial",
+      }),
+    ).toBe(true);
+    expect(
+      await deletions.recordResourceEffect({
+        tenantId: address.tenantId,
+        resourceUid,
+        effectId: "op_effect_order",
+        kind: "apply",
+        phase: "succeeded",
+        operationMode: "initial",
+      }),
+    ).toBe(false);
+    expect(
+      await deletions.recordResourceEffect({
+        tenantId: address.tenantId,
+        resourceUid,
+        effectId: "op_effect_order",
+        kind: "apply",
+        phase: "dispatched",
+        operationMode: "initial",
+      }),
+    ).toBe(true);
+    expect(
+      await deletions.recordResourceEffect({
+        tenantId: address.tenantId,
+        resourceUid,
+        effectId: "op_effect_order",
+        kind: "apply",
+        phase: "succeeded",
+        operationMode: "initial",
+      }),
+    ).toBe(true);
+    expect(
+      await deletions.recordResourceEffect({
+        tenantId: address.tenantId,
+        resourceUid,
+        effectId: "op_effect_order",
+        kind: "apply",
+        phase: "cancelled",
+        operationMode: "recovery",
+      }),
+    ).toBe(false);
+    expect(await deletions.readResourceEffectLedger(address.tenantId, resourceUid)).toHaveLength(3);
+
+    await sql.run(
+      `UPDATE tf_resource_deletion_attestations
+       SET state = 'closed', updated_at = ?
+       WHERE tenant_id = ? AND resource_uid = ?`,
+      [clock().getTime(), address.tenantId, resourceUid],
+    );
+    expect(
+      await deletions.reserveResourceIncarnation({
+        tenantId: address.tenantId,
+        resourceUid,
+        address,
+        formRef,
+      }),
+    ).toBe(false);
+    expect(
+      await deletions.reserveResourceIncarnation({
+        tenantId: address.tenantId,
+        resourceUid,
+        address: { ...address, name: "reincarnated" },
+        formRef,
+      }),
+    ).toBe(false);
+  });
+
+  test("proves a retained deployment absent only after provider readback", async () => {
+    const sql = createEphemeralSql();
+    const clock = () => new Date("2026-08-24T00:00:00.000Z");
+    const deletions = createTakoformStore(sql, clock);
+    const deployments = createResourceDeploymentStore(sql, clock);
+    const tenantId = "org_retained_absence";
+    const resourceUid = "uid_retained_absence";
+    const operationId = "op_retained_delete";
+    const nativeId = "fake:retained-native";
+    const formRef = FORM_REF;
+    await deletions.prepareResourceDeletion({
+      tenantId,
+      resourceUid,
+      address: {
+        tenantId,
+        space: "default",
+        apiVersion: formRef.apiVersion,
+        kind: formRef.kind,
+        name: "retained",
+      },
+      formRef,
+      operationId,
+    });
+    await deletions.recordResourceEffect({
+      tenantId,
+      resourceUid,
+      effectId: operationId,
+      kind: "delete",
+      phase: "dispatched",
+      operationMode: "initial",
+      providerPackRef: "fake",
+      providerInstallationRef: SOLD.providerInstallationRef,
+      nativeId,
+    });
+    await deletions.recordResourceEffect({
+      tenantId,
+      resourceUid,
+      effectId: operationId,
+      kind: "delete",
+      phase: "succeeded",
+      operationMode: "initial",
+      providerPackRef: "fake",
+      providerInstallationRef: SOLD.providerInstallationRef,
+      nativeId,
+    });
+    await sql.run(
+      `UPDATE tf_resource_deletion_attestations
+       SET state = 'closed', updated_at = ?
+       WHERE tenant_id = ? AND resource_uid = ?`,
+      [clock().getTime(), tenantId, resourceUid],
+    );
+    await deployments.create({
+      tenantId,
+      id: "dep_retained_absence",
+      resourceUid,
+      offeringId: SOLD.id,
+      providerPackRef: "fake",
+      providerInstallationRef: SOLD.providerInstallationRef,
+      nativeId,
+      state: "retained",
+      observed: { retained: true },
+      outputs: {
+        __takoserver: {
+          resourceUid,
+          space: "default",
+          name: "retained",
+          deleteOperationId: operationId,
+        },
+      },
+    });
+    let readbacks = 0;
+    const provider: Provider = {
+      id: "fake",
+      offerings: [PROVIDER_OFFERING],
+      ...fakeReadback,
+      async verifyNativeAbsence() {
+        readbacks += 1;
+        return await fakeReadback.verifyNativeAbsence();
+      },
+      async apply() {
+        return failed("unavailable", "not used", true);
+      },
+      async observe() {
+        return failed("not_found", "not found");
+      },
+      async delete() {
+        return failed("unavailable", "not used", true);
+      },
+      async recoverDelete(input) {
+        readbacks += 1;
+        return succeeded({
+          nativeId: input.nativeId,
+          observed: { deleted: true },
+          outputs: {},
+          disposition: "deleted",
+        });
+      },
+    };
+    const driver = createProviderDriver({
+      providers: [provider],
+      catalog: createCatalog([SOLD]),
+      ledger: createLedger(sql, clock),
+      deployments,
+      deletions,
+    });
+    const evidence = await driver.verifyNativeAbsence?.({
+      tenantId,
+      resourceUid,
+      space: "default",
+      name: "retained",
+    });
+    expect(evidence).toMatchObject({
+      status: "absent",
+      source: "provider",
+      effectCount: 3,
+      deploymentCount: 1,
+    });
+    expect(readbacks).toBe(1);
+  });
+
+  test("keeps a provider tombstone indeterminate when dispatch had no Deployment receipt", async () => {
+    const sql = createEphemeralSql();
+    const clock = () => new Date("2026-08-24T00:00:00.000Z");
+    const deletions = createTakoformStore(sql, clock);
+    const tenantId = "org_lost_deployment";
+    const resourceUid = "uid_lost_deployment";
+    const operationId = "op_lost_deployment";
+    await deletions.prepareResourceDeletion({
+      tenantId,
+      resourceUid,
+      address: {
+        tenantId,
+        space: "default",
+        apiVersion: FORM_REF.apiVersion,
+        kind: FORM_REF.kind,
+        name: "lost-deployment",
+      },
+      formRef: FORM_REF,
+      operationId,
+    });
+    await deletions.recordResourceEffect({
+      tenantId,
+      resourceUid,
+      effectId: operationId,
+      kind: "delete",
+      phase: "dispatched",
+      operationMode: "initial",
+      providerPackRef: "fake",
+      providerInstallationRef: SOLD.providerInstallationRef,
+      nativeId: "fake:lost-deployment",
+    });
+    await deletions.recordResourceEffect({
+      tenantId,
+      resourceUid,
+      effectId: operationId,
+      kind: "delete",
+      phase: "succeeded",
+      operationMode: "initial",
+      providerPackRef: "fake",
+      providerInstallationRef: SOLD.providerInstallationRef,
+      nativeId: "fake:lost-deployment",
+    });
+    await sql.run(
+      `UPDATE tf_resource_deletion_attestations
+       SET state = 'closed', updated_at = ?
+       WHERE tenant_id = ? AND resource_uid = ?`,
+      [clock().getTime(), tenantId, resourceUid],
+    );
+    let readbacks = 0;
+    const provider: Provider = {
+      id: "fake",
+      offerings: [PROVIDER_OFFERING],
+      ...fakeReadback,
+      async apply() {
+        return failed("unavailable", "not used", true);
+      },
+      async observe() {
+        return failed("not_found", "not found");
+      },
+      async delete() {
+        return failed("unavailable", "not used", true);
+      },
+      async recoverDelete() {
+        readbacks += 1;
+        return succeeded({
+          nativeId: "fake:lost-deployment",
+          observed: { deleted: true },
+          outputs: {},
+        });
+      },
+    };
+    const driver = createProviderDriver({
+      providers: [provider],
+      catalog: createCatalog([SOLD]),
+      ledger: createLedger(sql, clock),
+      deployments: createResourceDeploymentStore(sql, clock),
+      deletions,
+    });
+    const evidence = await driver.verifyNativeAbsence?.({
+      tenantId,
+      resourceUid,
+      space: "default",
+      name: "lost-deployment",
+    });
+    expect(evidence).toEqual({
+      status: "indeterminate",
+      source: "provider",
+      reason: "provider_identity_missing",
+      effectCount: 3,
+      deploymentCount: 0,
+      checkedAt: expect.any(String),
+    });
+    expect(readbacks).toBe(0);
+  });
+
+  test("fails closed when a deployment installation drifts from the provider authority", async () => {
+    const sql = createEphemeralSql();
+    const clock = () => new Date("2026-08-24T00:00:00.000Z");
+    const deletions = createTakoformStore(sql, clock);
+    const deployments = createResourceDeploymentStore(sql, clock);
+    const tenantId = "org_same_native";
+    const resourceUid = "uid_same_native";
+    const operationIds = ["op_install_a", "op_install_b"] as const;
+    const nativeId = "fake:shared-native";
+    await deletions.prepareResourceDeletion({
+      tenantId,
+      resourceUid,
+      address: {
+        tenantId,
+        space: "default",
+        apiVersion: FORM_REF.apiVersion,
+        kind: FORM_REF.kind,
+        name: "same-native",
+      },
+      formRef: FORM_REF,
+      operationId: operationIds[0],
+    });
+    await deletions.prepareResourceDeletion({
+      tenantId,
+      resourceUid,
+      address: {
+        tenantId,
+        space: "default",
+        apiVersion: FORM_REF.apiVersion,
+        kind: FORM_REF.kind,
+        name: "same-native",
+      },
+      formRef: FORM_REF,
+      operationId: operationIds[1],
+    });
+    for (const [index, operationId] of operationIds.entries()) {
+      await deletions.recordResourceEffect({
+        tenantId,
+        resourceUid,
+        effectId: operationId,
+        kind: "delete",
+        phase: "dispatched",
+        operationMode: "initial",
+        providerPackRef: "fake",
+        providerInstallationRef: `fake.installation.${index}`,
+        nativeId,
+      });
+      await deletions.recordResourceEffect({
+        tenantId,
+        resourceUid,
+        effectId: operationId,
+        kind: "delete",
+        phase: "succeeded",
+        operationMode: "initial",
+        providerPackRef: "fake",
+        providerInstallationRef: `fake.installation.${index}`,
+        nativeId,
+      });
+    }
+    await sql.run(
+      `UPDATE tf_resource_deletion_attestations
+       SET state = 'closed', updated_at = ?
+       WHERE tenant_id = ? AND resource_uid = ?`,
+      [clock().getTime(), tenantId, resourceUid],
+    );
+    const marker = (operationId: string) => ({
+      __takoserver: {
+        resourceUid,
+        space: "default",
+        name: "same-native",
+        deleteOperationId: operationId,
+      },
+    });
+    await deployments.create({
+      tenantId,
+      id: "dep_install_a",
+      resourceUid,
+      offeringId: SOLD.id,
+      providerPackRef: "fake",
+      providerInstallationRef: "fake.installation.0",
+      nativeId,
+      state: "retained",
+      observed: { retained: true },
+      outputs: marker(operationIds[0]),
+    });
+    await deployments.create({
+      tenantId,
+      id: "dep_install_b",
+      resourceUid,
+      offeringId: SOLD.id,
+      providerPackRef: "fake",
+      providerInstallationRef: "fake.installation.1",
+      nativeId,
+      state: "retained",
+      observed: { retained: true },
+      outputs: marker(operationIds[1]),
+    });
+    const readbacks: string[] = [];
+    const provider: Provider = {
+      id: "fake",
+      offerings: [PROVIDER_OFFERING],
+      ...fakeReadback,
+      createNativeReadbackDescriptor(input) {
+        readbacks.push(input.nativeId);
+        return fakeReadback.createNativeReadbackDescriptor(input);
+      },
+      async apply() {
+        return failed("unavailable", "not used", true);
+      },
+      async observe() {
+        return failed("not_found", "not found");
+      },
+      async delete() {
+        return failed("unavailable", "not used", true);
+      },
+      async recoverDelete(input) {
+        readbacks.push(`${input.operationId}:${input.nativeId}`);
+        return succeeded({
+          nativeId,
+          observed: { deleted: true },
+          outputs: {},
+          disposition: "deleted",
+        });
+      },
+    };
+    const driver = createProviderDriver({
+      providers: [provider],
+      catalog: createCatalog([SOLD]),
+      ledger: createLedger(sql, clock),
+      deployments,
+      deletions,
+    });
+    const evidence = await driver.verifyNativeAbsence?.({
+      tenantId,
+      resourceUid,
+      space: "default",
+      name: "same-native",
+    });
+    expect(evidence).toMatchObject({
+      status: "indeterminate",
+      source: "provider",
+      reason: "provider_unavailable",
+      effectCount: 6,
+      deploymentCount: 2,
+    });
+    expect(readbacks).toEqual([]);
+  });
+
+  test("fails closed before adapter readback when the provider offering Form drifts", async () => {
+    const sql = createEphemeralSql();
+    const clock = () => new Date("2026-08-24T00:00:00.000Z");
+    const deletions = createTakoformStore(sql, clock);
+    const deployments = createResourceDeploymentStore(sql, clock);
+    const tenantId = "org_offering_form_drift";
+    const resourceUid = "uid_offering_form_drift";
+    const operationId = "op_offering_form_drift_delete";
+    const nativeId = "fake:offering-form-drift";
+    await deletions.prepareResourceDeletion({
+      tenantId,
+      resourceUid,
+      address: {
+        tenantId,
+        space: "default",
+        apiVersion: FORM_REF.apiVersion,
+        kind: FORM_REF.kind,
+        name: "offering-form-drift",
+      },
+      formRef: FORM_REF,
+      operationId,
+    });
+    await deletions.recordResourceEffect({
+      tenantId,
+      resourceUid,
+      effectId: operationId,
+      kind: "delete",
+      phase: "dispatched",
+      operationMode: "initial",
+      providerPackRef: SOLD.providerPackRef,
+      providerInstallationRef: SOLD.providerInstallationRef,
+      nativeId,
+    });
+    await deletions.recordResourceEffect({
+      tenantId,
+      resourceUid,
+      effectId: operationId,
+      kind: "delete",
+      phase: "succeeded",
+      operationMode: "initial",
+      providerPackRef: SOLD.providerPackRef,
+      providerInstallationRef: SOLD.providerInstallationRef,
+      nativeId,
+    });
+    await sql.run(
+      `UPDATE tf_resource_deletion_attestations
+       SET state = 'closed', updated_at = ?
+       WHERE tenant_id = ? AND resource_uid = ?`,
+      [clock().getTime(), tenantId, resourceUid],
+    );
+    await deployments.create({
+      tenantId,
+      id: "dep_offering_form_drift",
+      resourceUid,
+      offeringId: SOLD.id,
+      providerPackRef: SOLD.providerPackRef,
+      providerInstallationRef: SOLD.providerInstallationRef,
+      nativeId,
+      state: "retained",
+      observed: { retained: true },
+      outputs: {
+        __takoserver: {
+          resourceUid,
+          space: "default",
+          name: "offering-form-drift",
+          deleteOperationId: operationId,
+        },
+      },
+    });
+    const driftedOffering: ProviderOffering = {
+      ...PROVIDER_OFFERING,
+      form: { ...FORM_REF, definitionVersion: "0.2.0" },
+    };
+    let descriptorCalls = 0;
+    let verifyCalls = 0;
+    const provider: Provider = {
+      id: SOLD.providerPackRef,
+      offerings: [driftedOffering],
+      createNativeReadbackDescriptor(input) {
+        descriptorCalls += 1;
+        return {
+          apiVersion: "providers.takoserver.com/readback/v1",
+          provider: SOLD.providerPackRef,
+          kind: input.offering.kind,
+          nativeId: input.nativeId,
+          data: {
+            tenantRef: input.identity.tenantRef,
+            space: input.identity.space,
+            name: input.identity.name,
+          },
+        };
+      },
+      async verifyNativeAbsence() {
+        verifyCalls += 1;
+        return { outcome: "absent" as const, evidence: {} };
+      },
+      async apply() {
+        return failed("unavailable", "not used", true);
+      },
+      async observe() {
+        return failed("not_found", "not found");
+      },
+      async delete() {
+        return failed("unavailable", "not used", true);
+      },
+    };
+    const driver = createProviderDriver({
+      providers: [provider],
+      catalog: createCatalog([SOLD]),
+      ledger: createLedger(sql, clock),
+      deployments,
+      deletions,
+    });
+    const evidence = await driver.verifyNativeAbsence?.({
+      tenantId,
+      resourceUid,
+      space: "default",
+      name: "offering-form-drift",
+    });
+    expect(evidence).toMatchObject({
+      status: "indeterminate",
+      source: "provider",
+      reason: "provider_unavailable",
+      deploymentCount: 1,
+    });
+    expect(descriptorCalls).toBe(0);
+    expect(verifyCalls).toBe(0);
   });
 
   test("provisions a usage-only resource without a fake monthly or setup debit", async () => {

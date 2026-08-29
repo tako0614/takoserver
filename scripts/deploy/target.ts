@@ -79,16 +79,8 @@ export interface DeployTarget {
   readonly edgeSupplies?: HostedEdgeSupplies;
   /** Exact workers.dev suffix assigned to the provisioning account. */
   readonly workerEndpointSuffix?: string;
-  /**
-   * Named Worker entrypoint that resolves opaque host-runtime requirements.
-   *
-   * This is routing metadata, never secret material. The materialized values
-   * cross only the Worker service-binding RPC boundary at provisioning time.
-   */
-  readonly hostedTopology?: {
-    readonly service: string;
-    readonly entrypoint: string;
-  };
+  /** Requires the private bearer that authorizes the sponsorship owner API. */
+  readonly sponsorship?: boolean;
   /** Route-less Form authority Workers sharing this target's existing D1/R2. */
   readonly formAuthority?: {
     readonly workerName: string;
@@ -147,7 +139,6 @@ const KEY_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/u;
 const GOOGLE_CLIENT_ID = /^[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com$/u;
 const HOSTNAME =
   /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/u;
-const ENTRYPOINT = /^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/u;
 const BASE64URL_32 = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/u;
 
 export function targetPath(environment: DeployEnvironment): string {
@@ -213,7 +204,7 @@ function validateTarget(
       "objectBucketSupplies",
       "edgeSupplies",
       "workerEndpointSuffix",
-      "hostedTopology",
+      "sponsorship",
       "formAuthority",
       "operatorIdentity",
     ],
@@ -286,11 +277,9 @@ function validateTarget(
             "workerEndpointSuffix",
           ),
         }),
-    ...(value.hostedTopology === undefined
+    ...(value.sponsorship === undefined
       ? {}
-      : {
-          hostedTopology: hostedTopology(value.hostedTopology),
-        }),
+      : { sponsorship: boolean(value.sponsorship, "sponsorship") }),
     ...(value.formAuthority === undefined
       ? {}
       : {
@@ -552,20 +541,6 @@ function publicEd25519Jwk(
 
 function exactKeySet(value: Record<string, unknown>, keys: readonly string[]): boolean {
   return JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...keys].sort());
-}
-
-function hostedTopology(value: unknown): {
-  service: string;
-  entrypoint: string;
-} {
-  if (!isRecord(value)) {
-    throw preflightError("deploy target `hostedTopology` must be an object");
-  }
-  assertExactKeys(value, ["service", "entrypoint"]);
-  return {
-    service: pattern(value.service, WORKER_NAME, "hostedTopology.service"),
-    entrypoint: pattern(value.entrypoint, ENTRYPOINT, "hostedTopology.entrypoint"),
-  };
 }
 
 function signing(value: unknown): { currentKeyId: string; nextKeyId?: string } {

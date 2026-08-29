@@ -367,4 +367,142 @@ describe("provider mutation saga execution leases", () => {
     ).toEqual({ kind: "acquired", mode: "recovery" });
     database.close();
   });
+
+  test("persists an opaque provider handle and indeterminate outcome across recovery", async () => {
+    const database = new Database(":memory:");
+    migrateSqlite(database);
+    let now = 1_000;
+    const store = createTakoformStore(createSqliteSql(database), () => new Date(now));
+    const recoverySaga: ProviderMutationSaga = {
+      ...saga,
+      operationId: "op_persisted_provider_handle",
+      replayKey: "replay-persisted-provider-handle",
+      resourceUid: "uid_persisted_provider_handle",
+      target: { ...saga.target, name: "persisted-provider-handle" },
+    };
+    await store.acceptProviderMutationSaga(recoverySaga);
+    expect(
+      await store.acquireProviderMutationExecution({
+        tenantId: recoverySaga.tenantId,
+        operationId: recoverySaga.operationId,
+        resourceUid: recoverySaga.resourceUid,
+        leaseToken: "lease_handle_initial",
+        leaseUntil: 2_000,
+      }),
+    ).toEqual({ kind: "acquired", mode: "initial" });
+    expect(
+      await store.markProviderMutationDispatch({
+        tenantId: recoverySaga.tenantId,
+        operationId: recoverySaga.operationId,
+        resourceUid: recoverySaga.resourceUid,
+        leaseToken: "lease_handle_initial",
+      }),
+    ).toBe(true);
+    expect(
+      await store.recordProviderMutationOutcome({
+        tenantId: recoverySaga.tenantId,
+        operationId: recoverySaga.operationId,
+        resourceUid: recoverySaga.resourceUid,
+        leaseToken: "lease_handle_initial",
+        outcome: "running",
+        providerHandle: "opaque-provider-handle",
+      }),
+    ).toBe(true);
+    expect(
+      await store.releaseProviderMutationExecution({
+        tenantId: recoverySaga.tenantId,
+        operationId: recoverySaga.operationId,
+        resourceUid: recoverySaga.resourceUid,
+        leaseToken: "lease_handle_initial",
+      }),
+    ).toBe(true);
+
+    now = 2_001;
+    expect(
+      await store.acquireProviderMutationExecution({
+        tenantId: recoverySaga.tenantId,
+        operationId: recoverySaga.operationId,
+        resourceUid: recoverySaga.resourceUid,
+        leaseToken: "lease_handle_recovery",
+        leaseUntil: 3_001,
+      }),
+    ).toEqual({
+      kind: "acquired",
+      mode: "recovery",
+      providerHandle: "opaque-provider-handle",
+      providerOutcome: "running",
+    });
+    expect(
+      await store.recordProviderMutationOutcome({
+        tenantId: recoverySaga.tenantId,
+        operationId: recoverySaga.operationId,
+        resourceUid: recoverySaga.resourceUid,
+        leaseToken: "lease_handle_recovery",
+        outcome: "indeterminate",
+      }),
+    ).toBe(true);
+    expect(
+      await store.releaseProviderMutationExecution({
+        tenantId: recoverySaga.tenantId,
+        operationId: recoverySaga.operationId,
+        resourceUid: recoverySaga.resourceUid,
+        leaseToken: "lease_handle_recovery",
+      }),
+    ).toBe(true);
+
+    now = 3_002;
+    expect(
+      await store.acquireProviderMutationExecution({
+        tenantId: recoverySaga.tenantId,
+        operationId: recoverySaga.operationId,
+        resourceUid: recoverySaga.resourceUid,
+        leaseToken: "lease_indeterminate_recovery",
+        leaseUntil: 4_002,
+      }),
+    ).toEqual({ kind: "acquired", mode: "recovery", providerOutcome: "indeterminate" });
+    database.close();
+  });
+
+  test("terminalizes a provider precondition failure without retaining a retryable plan", async () => {
+    const database = new Database(":memory:");
+    migrateSqlite(database);
+    const store = createTakoformStore(createSqliteSql(database), () => new Date(1_000));
+    const failedSaga: ProviderMutationSaga = {
+      ...saga,
+      operationId: "op_provider_precondition",
+      replayKey: "replay-provider-precondition",
+      resourceUid: "uid_provider_precondition",
+      target: { ...saga.target, name: "provider-precondition" },
+    };
+    await store.acceptProviderMutationSaga(failedSaga);
+    await store.acquireProviderMutationExecution({
+      tenantId: failedSaga.tenantId,
+      operationId: failedSaga.operationId,
+      resourceUid: failedSaga.resourceUid,
+      leaseToken: "lease_precondition",
+      leaseUntil: 2_000,
+    });
+    await store.markProviderMutationDispatch({
+      tenantId: failedSaga.tenantId,
+      operationId: failedSaga.operationId,
+      resourceUid: failedSaga.resourceUid,
+      leaseToken: "lease_precondition",
+    });
+    expect(
+      await store.settleProviderMutationPreconditionFailure({
+        tenantId: failedSaga.tenantId,
+        operationId: failedSaga.operationId,
+        resourceUid: failedSaga.resourceUid,
+        leaseToken: "lease_precondition",
+      }),
+    ).toBe(true);
+    expect(
+      await store.providerMutationPlanExists(
+        failedSaga.tenantId,
+        failedSaga.operationId,
+        failedSaga.resourceUid,
+      ),
+    ).toBe(false);
+    database.close();
+  });
 });

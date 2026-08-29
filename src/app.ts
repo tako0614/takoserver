@@ -185,6 +185,7 @@ export function buildApp(ports: AppPorts): App {
     },
     attachments,
     clock,
+    effects: inventory,
   });
   const reseller = createReseller({ sql: ports.sql, ledger, catalog, clock, randomId });
   const tokens = createTokenService({
@@ -201,6 +202,7 @@ export function buildApp(ports: AppPorts): App {
       catalog,
       ledger,
       deployments,
+      deletions: inventory,
     });
   const availability =
     ports.availability ??
@@ -281,9 +283,6 @@ export function buildApp(ports: AppPorts): App {
             scope: {
               space: claims.spaceRef,
               mode: "tenant-run" as const,
-              ...(claims.runtimeMaterialization
-                ? { runtimeMaterialization: claims.runtimeMaterialization }
-                : {}),
             },
           };
         } catch {
@@ -388,7 +387,7 @@ export function buildApp(ports: AppPorts): App {
             if (!listing) return null;
             return {
               tenantId,
-              principalId: "service:takosumi-hosted-sponsorship",
+              principalId: "service:hosted-sponsorship",
               scope: {
                 space: listing.space,
                 formRef: listing.resource.form.formRef,
@@ -416,6 +415,7 @@ export function buildApp(ports: AppPorts): App {
       })()
     : null;
 
+  const verifyNativeAbsence = driver.verifyNativeAbsence;
   const control = createControlRoutes({
     accounts,
     inventory,
@@ -433,6 +433,13 @@ export function buildApp(ports: AppPorts): App {
     settlement: ports.settlement,
     clock,
     ...(ports.consoleOrigin === undefined ? {} : { consoleOrigin: ports.consoleOrigin }),
+    ...(verifyNativeAbsence
+      ? {
+          nativeResidual: {
+            verify: async (input) => await verifyNativeAbsence(input),
+          },
+        }
+      : {}),
   });
 
   const metering = createMetering({
@@ -485,6 +492,16 @@ export function buildApp(ports: AppPorts): App {
       ...(ports.consoleOrigin === undefined ? {} : { consoleOrigin: ports.consoleOrigin }),
     }),
     async tick(): Promise<TickReport> {
+      await reseller.reconcileDue(64, async (intent) => {
+        if (!intent.authorityRef) return "ready";
+        const migration = await migrations.read(intent.organizationId, intent.authorityRef);
+        if (!migration) return "pending";
+        if (migration.state === "completed") return "ready";
+        if (migration.state === "failed" || migration.state === "rolled_back") {
+          return "cancelled";
+        }
+        return "pending";
+      });
       const expiredReservations = await reseller.expireDue(64);
       const store = inventory;
       const installed = ports.forms.map((form) => form.identity.formRef.schemaDigest);

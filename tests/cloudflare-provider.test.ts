@@ -533,6 +533,45 @@ describe("Cloudflare provider", () => {
       retryable: true,
     });
   });
+
+  test("does not repeat a mutating POST after an indeterminate response", async () => {
+    let posts = 0;
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [BUCKET],
+      artifacts,
+      authorize: () => "Bearer token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        if (request.method === "POST") {
+          posts += 1;
+          // The backend accepted the bucket before the transport closed. The
+          // provider cannot prove the result, so a recovery must stop rather
+          // than issue the same POST a second time.
+          throw new TypeError("connection closed after mutation");
+        }
+        throw new Error(`unexpected ${request.method}`);
+      },
+    });
+    const input = {
+      operationId: "op-indeterminate-bucket",
+      offering: BUCKET,
+      identity: IDENTITY,
+      spec: {},
+    } as const;
+
+    const first = await provider.apply({ ...input, operationMode: "initial" });
+    expect(first).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    const recovered = await provider.apply({ ...input, operationMode: "recovery" });
+    expect(recovered).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(posts).toBe(1);
+  });
 });
 
 describe("released edge Form placement", () => {
@@ -1013,37 +1052,17 @@ describe("released edge Form placement", () => {
     expect(requests).toBe(0);
   });
 
-  test("retries a refused runtime commit by recovering the Version and committing only", async () => {
+  test("recovers an already uploaded Version without uploading it again", async () => {
     const workerOffering = technical("ModuleWorker");
     const versionOffering = technical("WorkerVersion");
     const requests: Request[] = [];
-    const materialized: unknown[] = [];
-    const committed: unknown[] = [];
     let storedVersion: { id: string; marker: string } | undefined;
-    let refuseFirstCommit = true;
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
       artifacts,
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
-      workerEndpointSuffix: "workers.example",
-      runtimeMaterializer: {
-        async materializeRuntimeBindings(input) {
-          materialized.push(input);
-          return { values: { ENCRYPTION_KEY: "generated-encryption-key" } };
-        },
-        async commitRuntimeBindings(input) {
-          committed.push(input);
-          if (refuseFirstCommit) {
-            refuseFirstCommit = false;
-            throw new Error("commit acknowledgement lost");
-          }
-        },
-        async rollbackRuntimeBindings() {
-          throw new Error("an uploaded immutable Version must not be rolled back");
-        },
-      },
       async fetch(request) {
         requests.push(request.clone());
         const url = new URL(request.url);
@@ -1102,22 +1121,13 @@ describe("released edge Form placement", () => {
         throw new Error(`unexpected Cloudflare request: ${request.method} ${url.pathname}`);
       },
     });
-    const runtimeMaterialization = {
-      contract: "takosumi.host-runtime-materialization/v1",
-      installConfigId: "icfg_yurucommu",
-      workspaceId: "workspace_1",
-      capsuleId: "capsule_yurucommu",
-      installingPrincipalId: "tsub_owner",
-      requirements: [],
-    } as const;
     const apply = (operationMode: "initial" | "recovery") =>
       provider.apply({
         operationId: "op-version-commit-retry",
         operationMode,
         offering: versionOffering,
         identity: { ...IDENTITY, name: "version" },
-        spec: { handlers: ["fetch"], requiredSensitiveVars: ["ENCRYPTION_KEY"] },
-        runtimeMaterialization,
+        spec: { handlers: ["fetch"], requiredSensitiveVars: [] },
         relations: [
           related("/worker", stored("ModuleWorker", "worker-uid", {}), {
             nativeId: "worker:script-name",
@@ -1135,17 +1145,14 @@ describe("released edge Form placement", () => {
       });
 
     expect(await apply("initial")).toMatchObject({
-      phase: "failed",
-      failure: { code: "provider_error" },
+      phase: "succeeded",
+      result: { nativeId: "version:script-name:version-commit-retry" },
     });
     expect(await apply("recovery")).toMatchObject({
       phase: "succeeded",
       result: { nativeId: "version:script-name:version-commit-retry" },
     });
     expect(requests.filter((request) => request.method === "POST")).toHaveLength(1);
-    expect(materialized).toHaveLength(1);
-    expect(committed).toHaveLength(2);
-    expect(committed[1]).toEqual(materialized[0]);
   });
 
   test("recovers the one tagged Version after its upload response is lost", async () => {
@@ -1301,10 +1308,9 @@ describe("released edge Form placement", () => {
     expect(uploads).toBe(0);
   });
 
-  test("keeps an unacknowledged upload indeterminate instead of rolling materialization back", async () => {
+  test("keeps an unacknowledged upload indeterminate", async () => {
     const workerOffering = technical("ModuleWorker");
     const versionOffering = technical("WorkerVersion");
-    const rollbacks: unknown[] = [];
     let uploads = 0;
     const provider = new CloudflareProvider({
       accountId: "acct_1",
@@ -1312,21 +1318,6 @@ describe("released edge Form placement", () => {
       artifacts,
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
-      workerEndpointSuffix: "workers.example",
-      runtimeMaterializer: {
-        async materializeRuntimeBindings() {
-          return {
-            values: { ENCRYPTION_KEY: "generated-encryption-key" },
-            rollbackReceipt: "opaque-read-receipt",
-          };
-        },
-        async commitRuntimeBindings() {
-          throw new Error("an unacknowledged Version must not be committed");
-        },
-        async rollbackRuntimeBindings(input) {
-          rollbacks.push(input);
-        },
-      },
       async fetch(request) {
         if (request.method === "GET") {
           return Response.json({ success: true, errors: [], result: { items: [] } });
@@ -1335,22 +1326,12 @@ describe("released edge Form placement", () => {
         return Response.json({ success: true, errors: [], result: {} });
       },
     });
-    const runtimeMaterialization = {
-      contract: "takosumi.host-runtime-materialization/v1",
-      installConfigId: "icfg_yurucommu",
-      workspaceId: "workspace_1",
-      capsuleId: "capsule_yurucommu",
-      installingPrincipalId: "tsub_owner",
-      requirements: [],
-    } as const;
-
     const ticket = await provider.apply({
       operationId: "op-version-ambiguous-upload",
       operationMode: "initial",
       offering: versionOffering,
       identity: { ...IDENTITY, name: "version" },
-      spec: { handlers: ["fetch"], requiredSensitiveVars: ["ENCRYPTION_KEY"] },
-      runtimeMaterialization,
+      spec: { handlers: ["fetch"], requiredSensitiveVars: [] },
       relations: [
         related("/worker", stored("ModuleWorker", "worker-uid", {}), {
           nativeId: "worker:script-name",
@@ -1372,7 +1353,6 @@ describe("released edge Form placement", () => {
       failure: { code: "unavailable", retryable: true },
     });
     expect(uploads).toBe(1);
-    expect(rollbacks).toEqual([]);
   });
 
   for (const scenario of [
@@ -1635,7 +1615,7 @@ describe("released edge Form placement", () => {
     }
   });
 
-  test("provisions a stable Worker Version without a runtime materializer", async () => {
+  test("provisions a stable Worker Version with no sensitive bindings", async () => {
     const workerOffering = technical("ModuleWorker");
     const versionOffering = technical("WorkerVersion");
     const calls: Call[] = [];
@@ -1721,10 +1701,9 @@ describe("released edge Form placement", () => {
     expect(JSON.stringify(ticket)).not.toContain("com.amazonaws.s3");
   });
 
-  test("ignores unused runtime authority for a fetch-only Worker Version", async () => {
+  test("provisions a fetch-only Worker Version without secret bindings", async () => {
     const workerOffering = technical("ModuleWorker");
     const versionOffering = technical("WorkerVersion");
-    let materializerCalls = 0;
     let uploadBody = "";
     const provider = new CloudflareProvider({
       accountId: "acct_1",
@@ -1732,21 +1711,6 @@ describe("released edge Form placement", () => {
       artifacts,
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
-      workerEndpointSuffix: "workers.example",
-      runtimeMaterializer: {
-        async materializeRuntimeBindings() {
-          materializerCalls += 1;
-          throw new Error("unused authority must not be materialized");
-        },
-        async commitRuntimeBindings() {
-          materializerCalls += 1;
-          throw new Error("unused authority must not be committed");
-        },
-        async rollbackRuntimeBindings() {
-          materializerCalls += 1;
-          throw new Error("unused authority must not be rolled back");
-        },
-      },
       async fetch(request) {
         if (request.method !== "POST") {
           throw new Error("a first dispatch must not enter recovery");
@@ -1759,22 +1723,12 @@ describe("released edge Form placement", () => {
         });
       },
     });
-    const runtimeMaterialization = {
-      contract: "takosumi.host-runtime-materialization/v1",
-      installConfigId: "icfg_yurucommu",
-      workspaceId: "workspace_1",
-      capsuleId: "capsule_yurucommu",
-      installingPrincipalId: "tsub_owner",
-      requirements: [],
-    } as const;
-
     const ticket = await provider.apply({
       operationId: "op-version-fetch-only",
       operationMode: "initial",
       offering: versionOffering,
       identity: { ...IDENTITY, name: "version" },
       spec: { handlers: ["fetch"], requiredSensitiveVars: [] },
-      runtimeMaterialization,
       relations: [
         related("/worker", stored("ModuleWorker", "worker-uid", {}), {
           nativeId: "worker:script-name",
@@ -1795,323 +1749,10 @@ describe("released edge Form placement", () => {
       phase: "succeeded",
       result: { nativeId: "version:script-name:version-fetch-only" },
     });
-    expect(materializerCalls).toBe(0);
     expect(uploadBody).not.toContain('"type":"secret_text"');
   });
 
-  test("materializes exact sensitive bindings only inside the immutable Worker Version upload", async () => {
-    const workerOffering = technical("ModuleWorker");
-    const versionOffering = technical("WorkerVersion");
-    const calls: Call[] = [];
-    const materialized: unknown[] = [];
-    const committed: unknown[] = [];
-    const lifecycle: string[] = [];
-    let uploadMetadata: Record<string, unknown> | undefined;
-    const provider = new CloudflareProvider({
-      accountId: "acct_1",
-      offerings: [workerOffering, versionOffering],
-      artifacts,
-      authorize: () => "Bearer secret-account-token",
-      apiOrigin: "https://api.cloudflare.test/client/v4",
-      workerEndpointSuffix: "workers.example",
-      runtimeMaterializer: {
-        async materializeRuntimeBindings(input) {
-          lifecycle.push("materialize");
-          materialized.push(input);
-          return {
-            values: {
-              ENCRYPTION_KEY: "generated-encryption-key",
-              TAKOSUMI_ACCOUNTS_CLIENT_ID: "public-client-id",
-            },
-          };
-        },
-        async commitRuntimeBindings(input) {
-          lifecycle.push("commit");
-          committed.push(input);
-        },
-        async rollbackRuntimeBindings() {
-          throw new Error("a successful upload must not roll back");
-        },
-      },
-      async fetch(request) {
-        const url = new URL(request.url);
-        if (request.method === "GET" && url.pathname.endsWith("/versions")) {
-          return Response.json({
-            success: true,
-            errors: [],
-            result: { items: [] },
-            result_info: { page: 1, per_page: 100 },
-          });
-        }
-        lifecycle.push("upload");
-        const form = await request.clone().formData();
-        const metadataPart = form.get("metadata");
-        uploadMetadata = JSON.parse(
-          typeof metadataPart === "string" ? metadataPart : await (metadataPart as Blob).text(),
-        ) as Record<string, unknown>;
-        calls.push({
-          method: request.method,
-          url: request.url,
-          authorization: request.headers.get("authorization"),
-          body: await request.clone().text(),
-        });
-        return Response.json({
-          success: true,
-          errors: [],
-          result: { id: "version-sensitive" },
-        });
-      },
-    });
-    const runtimeMaterialization = {
-      contract: "takosumi.host-runtime-materialization/v1",
-      installConfigId: "icfg_yurucommu",
-      workspaceId: "workspace_1",
-      capsuleId: "capsule_yurucommu",
-      installingPrincipalId: "tsub_owner",
-      requirements: [],
-    } as const;
-    const ticket = await provider.apply({
-      operationId: "op-version-sensitive",
-      operationMode: "initial",
-      offering: versionOffering,
-      identity: { ...IDENTITY, name: "version" },
-      spec: {
-        handlers: ["fetch"],
-        requiredSensitiveVars: ["ENCRYPTION_KEY", "TAKOSUMI_ACCOUNTS_CLIENT_ID"],
-      },
-      runtimeMaterialization,
-      relations: [
-        related("/worker", stored("ModuleWorker", "worker-uid", {}), {
-          nativeId: "worker:script-name",
-          offeringId: workerOffering.id,
-          providerPackRef: "cloudflare",
-          outputs: { scriptName: "script-name" },
-        }),
-        related(
-          "/bundle",
-          stored("WorkerBundle", "bundle-uid", {
-            manifestDigest: `sha256:${"d".repeat(64)}`,
-          }),
-        ),
-      ],
-    });
-    expect(ticket).toMatchObject({
-      phase: "succeeded",
-      result: { nativeId: "version:script-name:version-sensitive" },
-    });
-    expect(materialized).toEqual([
-      {
-        request: runtimeMaterialization,
-        resourceName: "version",
-        scriptName: "script-name",
-        publicOrigin: "https://script-name.workers.example",
-        bindings: ["ENCRYPTION_KEY", "TAKOSUMI_ACCOUNTS_CLIENT_ID"],
-      },
-    ]);
-    expect(committed).toEqual(materialized);
-    expect(committed[0]).toBe(materialized[0]);
-    expect(lifecycle).toEqual(["materialize", "upload", "commit"]);
-    expect(calls[0]?.body).toContain(
-      '"type":"secret_text","name":"ENCRYPTION_KEY","text":"generated-encryption-key"',
-    );
-    expect(calls[0]?.body).toContain(
-      '"type":"secret_text","name":"TAKOSUMI_ACCOUNTS_CLIENT_ID","text":"public-client-id"',
-    );
-    expect(uploadMetadata).not.toHaveProperty("annotations");
-    expect(uploadMetadata?.bindings).toContainEqual({
-      type: "plain_text",
-      name: "TAKOSERVER_INTERNAL_OPERATION_MARKER",
-      text: "tsop-v1:8f0fa7feeca8c241ad945d9775309bb2e3f5331d6a0bedb4e30453cdea472801",
-    });
-    // A host-materialized WorkerVersion owns the exact sensitive binding set.
-    // Preserving older secret_text bindings would leave a removed declaration
-    // available to the next immutable Version.
-    expect(calls[0]?.body).not.toContain("keep_bindings");
-    expect(JSON.stringify(ticket)).not.toContain("generated-encryption-key");
-    expect(JSON.stringify(ticket)).not.toContain("public-client-id");
-  });
-
-  test("returns an opaque materialization receipt when Worker Version upload fails", async () => {
-    const workerOffering = technical("ModuleWorker");
-    const versionOffering = technical("WorkerVersion");
-    const rollbacks: unknown[] = [];
-    const commits: unknown[] = [];
-    const runtimeMaterialization = {
-      contract: "takosumi.host-runtime-materialization/v1",
-      installConfigId: "icfg_yurucommu",
-      workspaceId: "workspace_1",
-      capsuleId: "capsule_yurucommu",
-      installingPrincipalId: "tsub_owner",
-      requirements: [],
-    } as const;
-    const provider = new CloudflareProvider({
-      accountId: "acct_1",
-      offerings: [workerOffering, versionOffering],
-      artifacts,
-      authorize: () => "Bearer secret-account-token",
-      apiOrigin: "https://api.cloudflare.test/client/v4",
-      workerEndpointSuffix: "workers.example",
-      runtimeMaterializer: {
-        async materializeRuntimeBindings() {
-          return {
-            values: { ENCRYPTION_KEY: "generated-encryption-key" },
-            rollbackReceipt: "opaque-rollback-receipt",
-          };
-        },
-        async commitRuntimeBindings(input) {
-          commits.push(input);
-        },
-        async rollbackRuntimeBindings(input) {
-          rollbacks.push(input);
-        },
-      },
-      async fetch(request) {
-        const url = new URL(request.url);
-        if (request.method === "GET" && url.pathname.endsWith("/versions")) {
-          return Response.json({
-            success: true,
-            errors: [],
-            result: { items: [] },
-            result_info: { page: 1, per_page: 100 },
-          });
-        }
-        return Response.json(
-          { success: false, errors: [{ code: 10000 }], result: null },
-          { status: 503 },
-        );
-      },
-    });
-
-    const ticket = await provider.apply({
-      operationId: "op-version-upload-failed",
-      operationMode: "initial",
-      offering: versionOffering,
-      identity: { ...IDENTITY, name: "version" },
-      spec: { handlers: ["fetch"], requiredSensitiveVars: ["ENCRYPTION_KEY"] },
-      runtimeMaterialization,
-      relations: [
-        related("/worker", stored("ModuleWorker", "worker-uid", {}), {
-          nativeId: "worker:script-name",
-          offeringId: workerOffering.id,
-          providerPackRef: "cloudflare",
-          outputs: { scriptName: "script-name" },
-        }),
-        related(
-          "/bundle",
-          stored("WorkerBundle", "bundle-uid", {
-            manifestDigest: `sha256:${"d".repeat(64)}`,
-          }),
-        ),
-      ],
-    });
-
-    expect(ticket).toMatchObject({
-      phase: "failed",
-      failure: { code: "unavailable", retryable: true },
-    });
-    expect(rollbacks).toEqual([
-      {
-        request: runtimeMaterialization,
-        rollbackReceipt: "opaque-rollback-receipt",
-      },
-    ]);
-    expect(commits).toEqual([]);
-    expect(JSON.stringify(ticket)).not.toContain("generated-encryption-key");
-  });
-
-  test("does not report a Worker Version success when runtime activation is refused", async () => {
-    const workerOffering = technical("ModuleWorker");
-    const versionOffering = technical("WorkerVersion");
-    const commits: unknown[] = [];
-    const runtimeMaterialization = {
-      contract: "takosumi.host-runtime-materialization/v1",
-      installConfigId: "icfg_yurucommu",
-      workspaceId: "workspace_1",
-      capsuleId: "capsule_yurucommu",
-      installingPrincipalId: "tsub_owner",
-      requirements: [],
-    } as const;
-    const provider = new CloudflareProvider({
-      accountId: "acct_1",
-      offerings: [workerOffering, versionOffering],
-      artifacts,
-      authorize: () => "Bearer secret-account-token",
-      apiOrigin: "https://api.cloudflare.test/client/v4",
-      workerEndpointSuffix: "workers.example",
-      runtimeMaterializer: {
-        async materializeRuntimeBindings() {
-          return { values: { ENCRYPTION_KEY: "generated-encryption-key" } };
-        },
-        async commitRuntimeBindings(input) {
-          commits.push(input);
-          throw new Error("activation RPC included generated-encryption-key");
-        },
-        async rollbackRuntimeBindings() {
-          throw new Error("an uploaded Version cannot roll back activation");
-        },
-      },
-      async fetch(request) {
-        const url = new URL(request.url);
-        if (request.method === "GET" && url.pathname.endsWith("/versions")) {
-          return Response.json({
-            success: true,
-            errors: [],
-            result: { items: [] },
-            result_info: { page: 1, per_page: 100 },
-          });
-        }
-        return Response.json({
-          success: true,
-          errors: [],
-          result: { id: "version-commit-refused" },
-        });
-      },
-    });
-
-    const ticket = await provider.apply({
-      operationId: "op-version-commit-refused",
-      operationMode: "initial",
-      offering: versionOffering,
-      identity: { ...IDENTITY, name: "version" },
-      spec: { handlers: ["fetch"], requiredSensitiveVars: ["ENCRYPTION_KEY"] },
-      runtimeMaterialization,
-      relations: [
-        related("/worker", stored("ModuleWorker", "worker-uid", {}), {
-          nativeId: "worker:script-name",
-          offeringId: workerOffering.id,
-          providerPackRef: "cloudflare",
-          outputs: { scriptName: "script-name" },
-        }),
-        related(
-          "/bundle",
-          stored("WorkerBundle", "bundle-uid", {
-            manifestDigest: `sha256:${"d".repeat(64)}`,
-          }),
-        ),
-      ],
-    });
-
-    expect(ticket).toEqual({
-      phase: "failed",
-      failure: {
-        code: "provider_error",
-        message: "runtime binding activation was not confirmed by the host",
-        retryable: false,
-      },
-    });
-    expect(commits).toEqual([
-      {
-        request: runtimeMaterialization,
-        resourceName: "version",
-        scriptName: "script-name",
-        publicOrigin: "https://script-name.workers.example",
-        bindings: ["ENCRYPTION_KEY"],
-      },
-    ]);
-    expect(JSON.stringify(ticket)).not.toContain("generated-encryption-key");
-  });
-
-  test("refuses sensitive Worker Version declarations without exact runtime authority", async () => {
+  test("refuses unsupported sensitive Worker bindings before provider mutation", async () => {
     const workerOffering = technical("ModuleWorker");
     const versionOffering = technical("WorkerVersion");
     const provider = new CloudflareProvider({
@@ -2126,7 +1767,7 @@ describe("released edge Form placement", () => {
       },
     });
     const ticket = await provider.apply({
-      operationId: "op-version-unmaterialized",
+      operationId: "op-version-sensitive-unsupported",
       offering: versionOffering,
       identity: { ...IDENTITY, name: "version" },
       spec: { handlers: ["fetch"], requiredSensitiveVars: ["ENCRYPTION_KEY"] },
@@ -2150,7 +1791,7 @@ describe("released edge Form placement", () => {
       failure: {
         code: "denied",
         retryable: false,
-        message: "the sensitive Worker bindings have no runtime materialization authority",
+        message: "sensitive Worker bindings are unsupported by this Host",
       },
     });
   });
@@ -2330,6 +1971,92 @@ describe("released edge Form placement", () => {
       (call) => call.method === "PUT" && call.url.endsWith("/schedules"),
     );
     expect(scheduleUpdate?.body).toBe('[{"cron":"0 0 * * *"}]');
+  });
+
+  test("proves exact Worker identities absent/present without a mutation", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const calls: Call[] = [];
+    let response: Response = Response.json({
+      success: true,
+      errors: [],
+      result: { id: "script-exact" },
+    });
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        calls.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body: await request.clone().text(),
+        });
+        return response;
+      },
+    });
+    const descriptor = provider.createNativeReadbackDescriptor({
+      offering: workerOffering,
+      nativeId: "worker:script-exact",
+      identity: IDENTITY,
+    });
+    expect(calls).toHaveLength(0);
+
+    const present = await provider.verifyNativeAbsence({
+      offering: workerOffering,
+      descriptor,
+    });
+    expect(present).toMatchObject({ outcome: "present", evidence: { kind: "ModuleWorker" } });
+    expect(JSON.stringify(present)).not.toContain("script-exact");
+
+    response = new Response("not-json", { status: 200 });
+    const malformed = await provider.verifyNativeAbsence({
+      offering: workerOffering,
+      descriptor,
+    });
+    expect(malformed).toEqual({ outcome: "unknown", reason: "malformed", retryable: false });
+
+    response = new Response(null, { status: 404 });
+    const absent = await provider.verifyNativeAbsence({ offering: workerOffering, descriptor });
+    expect(absent).toMatchObject({ outcome: "absent" });
+    expect(calls.every((call) => call.method === "GET")).toBe(true);
+    expect(calls.every((call) => !call.method.match(/DELETE|PUT|POST/u))).toBe(true);
+  });
+
+  test("treats a retained Worker Version as present until its parent is deleted", async () => {
+    const versionOffering = technical("WorkerVersion");
+    const calls: string[] = [];
+    let parentDeleted = false;
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [versionOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        calls.push(`${request.method} ${new URL(request.url).pathname}`);
+        return parentDeleted
+          ? new Response(null, { status: 404 })
+          : Response.json({ success: true, errors: [], result: { id: "version-exact" } });
+      },
+    });
+    const descriptor = provider.createNativeReadbackDescriptor({
+      offering: versionOffering,
+      nativeId: "version:script-exact:version-exact",
+      identity: IDENTITY,
+    });
+    expect(await provider.verifyNativeAbsence({ offering: versionOffering, descriptor })).toEqual({
+      outcome: "present",
+      evidence: { provider: "cloudflare", kind: "WorkerVersion", state: "present" },
+    });
+    parentDeleted = true;
+    expect(await provider.verifyNativeAbsence({ offering: versionOffering, descriptor })).toEqual({
+      outcome: "absent",
+      evidence: { provider: "cloudflare", kind: "WorkerVersion", state: "absent" },
+    });
+    expect(calls.every((call) => call.startsWith("GET "))).toBe(true);
   });
 
   function stored(kind: string, uid: string, spec: JsonObject) {

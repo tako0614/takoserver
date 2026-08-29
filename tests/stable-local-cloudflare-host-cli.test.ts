@@ -14,8 +14,6 @@ import { startStableLocalCloudflareHost } from "../src/entry-stable-local-cloudf
 const REPOSITORY_ROOT = resolve(import.meta.dir, "..");
 const TAKOFORM_ROOT = resolve(import.meta.dir, "fixtures/takoform-v1");
 const TOKEN = "generic-stable-local-token";
-const RUNTIME_NAME = "GENERIC_LOCAL_VALUE";
-const RUNTIME_VALUE = "generic-local-secret-value";
 type LauncherChild = ChildProcessByStdio<null, Readable, Readable>;
 
 const children = new Set<LauncherChild>();
@@ -29,32 +27,23 @@ afterEach(async () => {
 });
 
 describe("the stable local Cloudflare Host launcher", () => {
-  test("requires a complete, nonempty generic runtime-value map", () => {
-    const base = {
-      TAKOFORM_STABLE_CATALOG_ROOT: TAKOFORM_ROOT,
-      TAKOSERVER_STABLE_LOCAL_TOKEN: TOKEN,
-    };
-
-    for (const runtimeValues of [undefined, "", "null", "[]", "{}", "{broken"] as const) {
-      expect(() =>
-        parseStableLocalCloudflareHostEnvironment({
-          ...base,
-          TAKOSERVER_STABLE_LOCAL_RUNTIME_VALUES: runtimeValues,
-        }),
-      ).toThrow("TAKOSERVER_STABLE_LOCAL_RUNTIME_VALUES");
+  test("requires the frozen catalog root and local bearer", () => {
+    for (const environment of [
+      { TAKOSERVER_STABLE_LOCAL_TOKEN: TOKEN },
+      { TAKOFORM_STABLE_CATALOG_ROOT: TAKOFORM_ROOT },
+    ]) {
+      expect(() => parseStableLocalCloudflareHostEnvironment(environment)).toThrow(
+        "TAKOFORM_STABLE_CATALOG_ROOT and TAKOSERVER_STABLE_LOCAL_TOKEN are required",
+      );
     }
-
     expect(
       parseStableLocalCloudflareHostEnvironment({
-        ...base,
-        TAKOSERVER_STABLE_LOCAL_RUNTIME_VALUES: JSON.stringify({
-          [RUNTIME_NAME]: RUNTIME_VALUE,
-        }),
+        TAKOFORM_STABLE_CATALOG_ROOT: TAKOFORM_ROOT,
+        TAKOSERVER_STABLE_LOCAL_TOKEN: TOKEN,
       }),
     ).toEqual({
       takoformRepositoryRoot: TAKOFORM_ROOT,
       token: TOKEN,
-      runtimeValues: { [RUNTIME_NAME]: RUNTIME_VALUE },
       space: "default",
       port: 0,
     });
@@ -91,7 +80,7 @@ describe("the stable local Cloudflare Host launcher", () => {
         currentEdgeObjectsReferences: 0,
       },
     });
-    for (const forbidden of [TOKEN, RUNTIME_NAME, RUNTIME_VALUE, "Takosumi", "materializer"]) {
+    for (const forbidden of [TOKEN, "Takosumi", "materializer"]) {
       expect(rendered.toLowerCase()).not.toContain(forbidden.toLowerCase());
     }
   });
@@ -103,9 +92,6 @@ describe("the stable local Cloudflare Host launcher", () => {
         ...process.env,
         TAKOFORM_STABLE_CATALOG_ROOT: TAKOFORM_ROOT,
         TAKOSERVER_STABLE_LOCAL_TOKEN: TOKEN,
-        TAKOSERVER_STABLE_LOCAL_RUNTIME_VALUES: JSON.stringify({
-          [RUNTIME_NAME]: RUNTIME_VALUE,
-        }),
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -120,7 +106,7 @@ describe("the stable local Cloudflare Host launcher", () => {
     expect(new URL(ready.endpoint).hostname).toBe("127.0.0.1");
     expect(ready.diagnosticRuntimeEndpoint).toBe(ready.endpoint);
     expect(ready.classification).toBe("test-only-local-cloudflare-adapter");
-    for (const forbidden of [TOKEN, RUNTIME_NAME, RUNTIME_VALUE, "Takosumi", "materializer"]) {
+    for (const forbidden of [TOKEN, "Takosumi", "materializer"]) {
       expect(line.toLowerCase()).not.toContain(forbidden.toLowerCase());
     }
 
@@ -199,7 +185,6 @@ describe("the stable local Cloudflare Host launcher", () => {
         startStableLocalCloudflareHost({
           takoformRepositoryRoot: root,
           token: TOKEN,
-          runtimeValues: { [RUNTIME_NAME]: RUNTIME_VALUE },
         }),
       ).rejects.toThrow("frozen_stable_input_mismatch");
     } finally {

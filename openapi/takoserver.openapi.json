@@ -203,6 +203,120 @@
         }
       }
     },
+    "/v1/organizations/{organizationId}/resources/{resourceUid}/native-residual": {
+      "get": {
+        "summary": "Prove provider-native absence after a Resource delete",
+        "parameters": [
+          {
+            "name": "space",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Closed tri-state native absence attestation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "residual"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "residual": {
+                      "type": "object",
+                      "required": [
+                        "status",
+                        "source",
+                        "effectCount",
+                        "deploymentCount",
+                        "checkedAt"
+                      ],
+                      "additionalProperties": false,
+                      "properties": {
+                        "status": {
+                          "type": "string",
+                          "enum": [
+                            "absent",
+                            "present",
+                            "indeterminate"
+                          ]
+                        },
+                        "source": {
+                          "type": "string",
+                          "enum": [
+                            "intrinsic",
+                            "provider"
+                          ]
+                        },
+                        "evidenceRef": {
+                          "type": "string",
+                          "pattern": "^sha256:[a-f0-9]{64}$"
+                        },
+                        "effectCount": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "deploymentCount": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "checkedAt": {
+                          "type": "string",
+                          "format": "date-time"
+                        },
+                        "reason": {
+                          "type": "string",
+                          "enum": [
+                            "closure_pending",
+                            "effect_unresolved",
+                            "deployment_active",
+                            "deployment_unmarked",
+                            "provider_unavailable",
+                            "provider_readback_failed",
+                            "provider_identity_missing",
+                            "legacy_unattested"
+                          ]
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid exact address query"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "404": {
+            "description": "Resource incarnation not found"
+          },
+          "503": {
+            "description": "Absence evidence is unavailable"
+          }
+        }
+      }
+    },
     "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations": {
       "get": {
         "summary": "List explicit provider migrations for one logical Resource",

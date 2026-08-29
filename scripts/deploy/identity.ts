@@ -155,7 +155,6 @@ export async function runOperatorIdentity(
       root,
       target,
       commit: source.commit,
-      hostedTopology: "desired",
       signingKeyId: target.signing.currentKeyId,
       run,
     });
@@ -259,7 +258,6 @@ async function inspectIdentityState(
   const version = await state.workerVersion(target.workerName, history.versionId);
   const identity = workerVersionIdentity(phase, version);
   const desired = expectedExactBindingClosure(target, {
-    hostedTopology: "desired",
     signingKeyId: target.signing.currentKeyId,
   });
   let configured = true;
@@ -272,7 +270,6 @@ async function inspectIdentityState(
       history.versionId,
       version,
       expectedExactBindingClosure(withoutOperatorIdentity(target), {
-        hostedTopology: "desired",
         signingKeyId: target.signing.currentKeyId,
       }),
     );

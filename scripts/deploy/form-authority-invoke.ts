@@ -7,7 +7,7 @@ import {
   TAKOFORM_REVOCATION_V1_EMPTY_ENTRIES_DIGEST,
   TAKOFORM_REVOCATION_V1_GENESIS_DIGEST,
 } from "../../src/takoform/admission.ts";
-import type { FormAuthorityTrustEvidence } from "../../src/takoform/core-admission-adapter.ts";
+import type { FormAuthorityVerificationEvidence } from "../../src/takoform/form-authority-verification.ts";
 import {
   canonicalFormAuthorityPlanDigest,
   type FormAuthorityApplyResult,
@@ -15,8 +15,8 @@ import {
   type FormAuthorityPlan,
   type FormAuthorityPlanRequest,
   type FormAuthorityReadback,
-} from "../../src/takoform/operator-authority.ts";
-import { deriveFormAuthorityIdentity } from "../../src/takoform/operator-endpoint.ts";
+} from "../../src/takoform/host-admission-coordinator.ts";
+import { deriveFormAuthorityIdentity } from "../../src/takoform/host-admission-endpoint.ts";
 import { type DeployPhase, mutationError, preflightError, verificationError } from "./errors.ts";
 import {
   type FormAuthorityDeployOptions,
@@ -165,7 +165,8 @@ export async function runFormAuthorityInvoke(
           eventDigest: receipt.eventDigest,
           state: receipt.state,
           changed: receipt.changed,
-          admissionMode: receipt.admissionMode,
+          policyAuthority: receipt.policyAuthority,
+          verificationMode: receipt.verificationMode,
           productionEligible: receipt.productionEligible,
         })),
         ...(applied.failure === undefined ? {} : { failure: applied.failure }),
@@ -200,7 +201,8 @@ export async function runFormAuthorityInvoke(
       status: applied.status,
       planDigest: applied.planDigest,
       receipts: structuredClone(applied.receipts),
-      admissionMode: applied.admissionMode,
+      policyAuthority: applied.policyAuthority,
+      verificationMode: applied.verificationMode,
       productionEligible: applied.productionEligible,
       replanRequired: applied.replanRequired,
       nextPlanDigest: applied.nextPlan.planDigest,
@@ -255,7 +257,9 @@ async function exactGatewayIdentity(
     value.operatorOrigin !== authority.integrationOperatorOrigin ||
     value.authorityWorkerName !== authority.integrationWorkerName ||
     value.routeMode !== "authenticated-integration-custom-domain" ||
-    value.admissionMode !== "integration-fixture" ||
+    value.policyAuthority !== "takoserver-host" ||
+    value.verificationMode !== "integration-fixture" ||
+    value.verificationAvailable !== true ||
     value.productionEligible !== false ||
     value.ready !== true ||
     !workerVersion(value.versionId) ||
@@ -379,10 +383,10 @@ async function integrationPlanRequest(input: {
   const policy = {
     apiVersion: "takoserver.integration-form-authority-policy@v1",
     mode: "integration-fixture",
-    productionEligible: false,
+    fixtureOnly: true,
     packageClosure,
   } as const;
-  const evidence: FormAuthorityTrustEvidence = {
+  const evidence: FormAuthorityVerificationEvidence = {
     publisher: {
       publisherKey: "takoserver-yurucommu-integration-fixture",
       policyDigest: await canonicalDigest(policy),
@@ -478,7 +482,8 @@ async function exactApplyResult(
     (value.status !== "converged" && value.status !== "partial") ||
     value.planDigest !== plan.planDigest ||
     !Array.isArray(value.receipts) ||
-    value.admissionMode !== "integration-fixture" ||
+    value.policyAuthority !== "takoserver-host" ||
+    value.verificationMode !== "integration-fixture" ||
     value.productionEligible !== false ||
     typeof value.replanRequired !== "boolean" ||
     !isRecord(value.readback) ||
@@ -500,14 +505,15 @@ async function exactApplyResult(
       return (
         !isRecord(receipt) ||
         !exactKeys(receipt, [
-          "admissionMode",
           "changed",
           "commandDigest",
           "eventDigest",
           "index",
           "kind",
+          "policyAuthority",
           "productionEligible",
           "state",
+          "verificationMode",
         ]) ||
         !command ||
         !Number.isSafeInteger(receipt.index) ||
@@ -519,7 +525,8 @@ async function exactApplyResult(
         typeof receipt.state !== "string" ||
         !ADMISSION_STATES.has(receipt.state) ||
         typeof receipt.changed !== "boolean" ||
-        receipt.admissionMode !== "integration-fixture" ||
+        receipt.policyAuthority !== "takoserver-host" ||
+        receipt.verificationMode !== "integration-fixture" ||
         receipt.productionEligible !== false
       );
     }) ||
@@ -657,7 +664,8 @@ function invocationResult(input: {
     operatorOrigin: input.gateway.origin,
     identity: structuredClone(input.gateway.identity),
     activation: { kind: "space", ...input.scope },
-    admissionMode: "integration-fixture",
+    policyAuthority: "takoserver-host",
+    verificationMode: "integration-fixture",
     productionEligible: false,
     ...(input.source === undefined ? {} : input.source),
     ...(input.reviewer === undefined ? {} : { reviewer: input.reviewer }),

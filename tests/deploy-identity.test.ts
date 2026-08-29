@@ -453,7 +453,6 @@ function version(identity: "desired" | "absent") {
 function versionForTarget(selected: DeployTarget, identity: "desired" | "absent") {
   const selectedTarget = identity === "desired" ? selected : withoutOperatorIdentity(selected);
   const expected = expectedExactBindingClosure(selectedTarget, {
-    hostedTopology: "desired",
     signingKeyId: selected.signing.currentKeyId,
   });
   return {

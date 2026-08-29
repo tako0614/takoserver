@@ -173,7 +173,7 @@ describe("Hosted sponsorship owner API", () => {
     });
   });
 
-  test("issues one short-lived multi-Resource credential for the exact opaque tenant", async () => {
+  test("issues one short-lived multi-Resource credential without runtime materialization authority", async () => {
     const sql = createEphemeralSql();
     const now = new Date("2026-08-20T00:00:00.000Z");
     await sql.run(
@@ -201,27 +201,10 @@ describe("Hosted sponsorship owner API", () => {
       clock: () => now,
     });
     await call(route, "POST", base, { organizationId: "org_legal" });
-    const runtimeMaterialization = {
-      contract: "takosumi.host-runtime-materialization/v1",
-      installConfigId: "icfg_yurucommu",
-      workspaceId: "workspace_1",
-      capsuleId: "capsule_yurucommu",
-      installingPrincipalId: "tsub_owner",
-      requirements: [
-        {
-          kind: "generated_secret",
-          binding: "ENCRYPTION_KEY",
-          secretRef: "secret:repository/encryption-key",
-          bytes: 32,
-          encoding: "hex",
-        },
-      ],
-    };
     const response = await call(route, "POST", `${base}/takoform-run-credentials`, {
-      runRef: "run_takosumi_1",
+      runRef: "run_host_1",
       spaceRef: "tsp_capsule_yurucommu",
       expiresInSeconds: 300,
-      runtimeMaterialization,
     });
     expect(response.status).toBe(201);
     expect(await json(response)).toEqual({
@@ -235,21 +218,28 @@ describe("Hosted sponsorship owner API", () => {
         organizationId: "org_legal",
         tenantRef: "tenant_opaque",
         spaceRef: "tsp_capsule_yurucommu",
-        runRef: "run_takosumi_1",
-        runtimeMaterialization,
+        runRef: "run_host_1",
         ttlSeconds: 300,
       },
     ]);
     expect(
       await call(route, "POST", `${base}/takoform-run-credentials`, {
-        runRef: "run_takosumi_2",
+        runRef: "run_legacy_materialization",
+        spaceRef: "tsp_capsule_yurucommu",
+        expiresInSeconds: 300,
+        runtimeMaterialization: { kind: "retired" },
+      }),
+    ).toMatchObject({ status: 400 });
+    expect(
+      await call(route, "POST", `${base}/takoform-run-credentials`, {
+        runRef: "run_host_2",
         spaceRef: "tsp_capsule_yurucommu",
         expiresInSeconds: 601,
       }),
     ).toMatchObject({ status: 400 });
     expect(
       await call(route, "POST", `${base}/takoform-run-credentials`, {
-        runRef: "run_takosumi_legacy",
+        runRef: "run_missing_space",
         expiresInSeconds: 300,
       }),
     ).toMatchObject({ status: 400 });

@@ -1,24 +1,14 @@
-import { createHash } from "node:crypto";
-import {
-  copyFileSync,
-  lstatSync,
-  mkdirSync,
-  mkdtempSync,
-  readdirSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { canonicalDigest, canonicalJson } from "../../src/json.ts";
+import { deriveFormAuthorityIdentity } from "../../src/takoform/host-admission-endpoint.ts";
 import {
   type TakoformLifecycleCapabilityManifest,
   YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
   type YurucommuIdentityCapabilityKind,
   yurucommuLifecycleCapabilityManifest,
 } from "../../src/takoform/implementation-catalog.ts";
-import { deriveFormAuthorityIdentity } from "../../src/takoform/operator-endpoint.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import {
   type DeployError,
@@ -35,7 +25,7 @@ import {
   runCommand,
   wranglerCommand,
 } from "./process.ts";
-import { type DeployEnvironment, qualifySource, sealDirectory } from "./qualification.ts";
+import { type DeployEnvironment, qualifySource } from "./qualification.ts";
 import type { DeployTarget } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import { inspectLiveWorkerVersion } from "./worker-live.ts";
@@ -96,7 +86,9 @@ export interface SelectedFormAuthorityTarget {
   readonly workerName: string;
   readonly hostId: string;
   readonly main: string;
-  readonly admissionMode: "released-core-unavailable" | "integration-fixture";
+  readonly policyAuthority: "takoserver-host";
+  readonly verificationMode: "released-core" | "integration-fixture";
+  readonly verificationAvailable: boolean;
   readonly productionEligible: false;
   readonly operatorOrigin?: string;
   readonly authorityWorkerName?: string;
@@ -221,7 +213,9 @@ export async function runFormAuthority(
             authorityCommitMatches: dependencyBefore?.commit === invocation.commit,
           }
         : {}),
-      admissionMode: selected.admissionMode,
+      policyAuthority: selected.policyAuthority,
+      verificationMode: selected.verificationMode,
+      verificationAvailable: selected.verificationAvailable,
       productionEligible: selected.productionEligible,
       ready:
         before?.commit === invocation.commit &&
@@ -258,29 +252,37 @@ export async function runFormAuthority(
       root: join(root, "public-worker-proof"),
       target,
       commit: source.commit,
-      hostedTopology: "desired",
       run,
     });
     const expectedPublicDigest = `sha256:${publicProof.bundleDigestHex}` as const;
     if (expectedPublicDigest !== publicBefore.workerArtifactDigest) {
       throw preflightError(
         "served public Worker artifact differs from the exact Form authority source build",
+        `served=${publicBefore.workerArtifactDigest} source=${expectedPublicDigest}`,
       );
     }
     const publicProofArtifact = publicProof.seal();
     publicProofArtifact.assertUnchanged();
-    const prepared = await prepareFormAuthorityArtifact({
+    const prepared = await prepareWorkerArtifact({
       root,
-      invocation,
       target,
-      selected,
       commit: source.commit,
-      workerArtifactDigest: publicBefore.workerArtifactDigest,
-      publicWorkerVersionId: publicBefore.history.versionId,
-      capabilityManifestJson,
       run,
+      main: resolve(REPOSITORY, selected.main),
+      writeConfig: ({ path, main }) =>
+        writeFormAuthorityConfig({
+          path,
+          main,
+          invocation: { ...invocation, commit: source.commit },
+          target,
+          selected,
+          workerArtifactDigest: publicBefore.workerArtifactDigest,
+          publicWorkerVersionId: publicBefore.history.versionId,
+          capabilityManifestJson,
+        }),
     });
-    const artifact = sealDirectory(prepared.releaseDirectory, ["worker.js", "wrangler.jsonc"]);
+    const authorityArtifactDigest = `sha256:${prepared.bundleDigestHex}` as const;
+    const artifact = prepared.seal();
     artifact.assertUnchanged();
 
     const publicLast = await inspectPublicWorker("preflight", target, state);
@@ -318,7 +320,7 @@ export async function runFormAuthority(
         prepared.configPath,
         "--strict",
         "--message",
-        message(invocation.surface, source.commit, prepared.authorityArtifactDigest),
+        message(invocation.surface, source.commit, authorityArtifactDigest),
       ]),
       { env: environment },
     );
@@ -367,7 +369,7 @@ export async function runFormAuthority(
       after.history.versionId === before?.history.versionId ||
       (before !== null && after.history.previousVersionId !== before.history.versionId) ||
       after.commit !== source.commit ||
-      after.authorityArtifactDigest !== prepared.authorityArtifactDigest
+      after.authorityArtifactDigest !== authorityArtifactDigest
     ) {
       throw verificationError(
         "Form authority authoritative history does not identify the exact uploaded successor",
@@ -383,7 +385,7 @@ export async function runFormAuthority(
       dirty: source.dirty,
       remoteRef: source.remoteRef,
       reviewer,
-      authorityArtifactDigest: prepared.authorityArtifactDigest,
+      authorityArtifactDigest,
       workerArtifactDigest: publicBefore.workerArtifactDigest,
       publicWorkerVersionId: publicBefore.history.versionId,
       capabilityDigest,
@@ -401,7 +403,9 @@ export async function runFormAuthority(
             authorityVersionId: dependencyBefore?.history.versionId ?? null,
           }
         : {}),
-      admissionMode: selected.admissionMode,
+      policyAuthority: selected.policyAuthority,
+      verificationMode: selected.verificationMode,
+      verificationAvailable: selected.verificationAvailable,
       productionEligible: selected.productionEligible,
       rollback: before
         ? `wrangler versions deploy ${before.history.versionId}@100% --yes --name ${selected.workerName}`
@@ -536,72 +540,6 @@ function operatorGatewayConfiguration(
       },
     ],
   };
-}
-
-async function prepareFormAuthorityArtifact(input: {
-  readonly root: string;
-  readonly invocation: FormAuthorityDeployInvocation;
-  readonly target: DeployTarget;
-  readonly selected: SelectedFormAuthorityTarget;
-  readonly commit: string;
-  readonly workerArtifactDigest: `sha256:${string}`;
-  readonly publicWorkerVersionId: string;
-  readonly capabilityManifestJson: string;
-  readonly run: FormAuthorityProcess;
-}): Promise<{
-  readonly releaseDirectory: string;
-  readonly bundlePath: string;
-  readonly configPath: string;
-  readonly authorityArtifactDigest: `sha256:${string}`;
-}> {
-  const build = join(input.root, "build");
-  const release = join(input.root, "release");
-  mkdirSync(build, { recursive: true, mode: 0o700 });
-  mkdirSync(release, { recursive: true, mode: 0o700 });
-  const buildConfig = writeFormAuthorityConfig({
-    path: join(input.root, "build-wrangler.jsonc"),
-    main: resolve(REPOSITORY, input.selected.main),
-    invocation: { ...input.invocation, commit: input.commit },
-    target: input.target,
-    selected: input.selected,
-    workerArtifactDigest: input.workerArtifactDigest,
-    publicWorkerVersionId: input.publicWorkerVersionId,
-    capabilityManifestJson: input.capabilityManifestJson,
-  });
-  const built = await input.run(
-    wranglerCommand([
-      "deploy",
-      "--dry-run",
-      "--strict",
-      "--config",
-      buildConfig,
-      "--outdir",
-      build,
-    ]),
-  );
-  if (built.exitCode !== 0) {
-    throw preflightError(
-      `exact Form authority Worker bundle build failed (exit ${built.exitCode})`,
-      `${built.stdout}${built.stderr}`.trim(),
-    );
-  }
-  const source = exactBundle(build);
-  const bundlePath = join(release, "worker.js");
-  copyFileSync(source, bundlePath);
-  const authorityArtifactDigest = `sha256:${createHash("sha256")
-    .update(readFileSync(bundlePath))
-    .digest("hex")}` as const;
-  const configPath = writeFormAuthorityConfig({
-    path: join(release, "wrangler.jsonc"),
-    main: "worker.js",
-    invocation: { ...input.invocation, commit: input.commit },
-    target: input.target,
-    selected: input.selected,
-    workerArtifactDigest: input.workerArtifactDigest,
-    publicWorkerVersionId: input.publicWorkerVersionId,
-    capabilityManifestJson: input.capabilityManifestJson,
-  });
-  return { releaseDirectory: release, bundlePath, configPath, authorityArtifactDigest };
 }
 
 async function inspectFormAuthority(
@@ -816,7 +754,9 @@ function selectTarget(
       authorityWorkerName: authority.integrationWorkerName,
       operatorPublicJwk: authority.operatorPublicJwk,
       operatorScope: authority.integrationOperatorScope,
-      admissionMode: "integration-fixture",
+      policyAuthority: "takoserver-host",
+      verificationMode: "integration-fixture",
+      verificationAvailable: true,
       productionEligible: false,
     };
   }
@@ -837,7 +777,9 @@ function selectTarget(
       main: "src/entry-integration-form-authority-worker.ts",
       operatorPublicJwk: authority.operatorPublicJwk,
       operatorScope: authority.integrationOperatorScope,
-      admissionMode: "integration-fixture",
+      policyAuthority: "takoserver-host",
+      verificationMode: "integration-fixture",
+      verificationAvailable: true,
       productionEligible: false,
     };
   }
@@ -846,13 +788,15 @@ function selectTarget(
     workerName: authority.workerName,
     hostId: authority.hostId,
     main: "src/entry-form-authority-worker.ts",
-    admissionMode: "released-core-unavailable",
+    policyAuthority: "takoserver-host",
+    verificationMode: "released-core",
+    verificationAvailable: false,
     productionEligible: false,
   };
 }
 
 function invocationSurfaceIsIntegrationAuthority(selected: SelectedFormAuthorityTarget): boolean {
-  return selected.kind === "authority" && selected.admissionMode === "integration-fixture";
+  return selected.kind === "authority" && selected.verificationMode === "integration-fixture";
 }
 
 function requiredOperatorPublicJwk(
@@ -905,9 +849,7 @@ async function inspectPublicWorker(
   target: DeployTarget,
   state: FormAuthorityDeployState,
 ): Promise<PublicWorkerInspection> {
-  const live = await inspectLiveWorkerVersion(phase, target, state, {
-    hostedTopology: "desired",
-  });
+  const live = await inspectLiveWorkerVersion(phase, target, state, {});
   return {
     history: live.history,
     commit: live.commit,
@@ -972,38 +914,6 @@ function assertSameVersion(
   ) {
     throw preflightError("Form authority Worker changed during qualification");
   }
-}
-
-function exactBundle(root: string): string {
-  const files = regularFiles(root);
-  const bundles = files.filter((path) => path.endsWith(".js"));
-  if (bundles.length !== 1) {
-    throw preflightError("Form authority dry-run must produce exactly one JavaScript bundle");
-  }
-  const bundle = bundles[0] as string;
-  const allowed = new Set([bundle, `${bundle}.map`, join(root, "README.md")]);
-  if (files.some((path) => !allowed.has(path))) {
-    throw preflightError("Form authority dry-run produced an unexpected ancillary file");
-  }
-  return bundle;
-}
-
-function regularFiles(root: string): string[] {
-  const files: string[] = [];
-  const visit = (directory: string): void => {
-    for (const name of readdirSync(directory).sort()) {
-      const path = join(directory, name);
-      const status = lstatSync(path);
-      if (status.isSymbolicLink() || (status.isFile() && status.nlink !== 1)) {
-        throw preflightError(`Form authority build output is not link-free: ${path}`);
-      }
-      if (status.isDirectory()) visit(path);
-      else if (status.isFile()) files.push(path);
-      else throw preflightError(`Form authority build output is not a regular file: ${path}`);
-    }
-  };
-  visit(root);
-  return files;
 }
 
 async function checked(

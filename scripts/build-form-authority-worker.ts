@@ -80,7 +80,11 @@ try {
     if (source.includes("/admin") || source.includes("CLOUDFLARE_API_TOKEN")) {
       throw new Error(`${name} bundle contains a public-admin or credential surface`);
     }
-    const containsFixture = source.includes("integration-fixture-exact-package-closure");
+    // The generated corpus export is the bundle-level witness that the
+    // integration Worker carries the exact fixture package closure. Keep the
+    // marker tied to the generated source symbol rather than a prose label
+    // that is not part of the compiled Worker.
+    const containsFixture = source.includes("INTEGRATION_FORM_PACKAGES");
     if (containsFixture !== fixture) {
       throw new Error(`${name} bundle integration-fixture closure is incorrect`);
     }

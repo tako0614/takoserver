@@ -238,7 +238,7 @@ function version(commit: string, artifactDigest: `sha256:${string}`) {
 }
 
 function publicVersion(message: string) {
-  const expected = expectedExactBindingClosure(target, { hostedTopology: "desired" });
+  const expected = expectedExactBindingClosure(target);
   return {
     annotations: { "workers/message": message },
     resources: {
@@ -442,7 +442,9 @@ describe("route-less Form authority deploy surfaces", () => {
           main: "src/entry-integration-form-authority-worker.ts",
           operatorPublicJwk: OPERATOR_PUBLIC_JWK,
           operatorScope: target.formAuthority.integrationOperatorScope,
-          admissionMode: "integration-fixture",
+          policyAuthority: "takoserver-host",
+          verificationMode: "integration-fixture",
+          verificationAvailable: true,
           productionEligible: false,
         },
         workerArtifactDigest: PUBLIC_WORKER_DIGEST,
@@ -514,7 +516,9 @@ describe("route-less Form authority deploy surfaces", () => {
           main: "src/entry-integration-form-authority-worker.ts",
           operatorPublicJwk: OPERATOR_PUBLIC_JWK,
           operatorScope: target.formAuthority.integrationOperatorScope,
-          admissionMode: "integration-fixture",
+          policyAuthority: "takoserver-host",
+          verificationMode: "integration-fixture",
+          verificationAvailable: true,
           productionEligible: false,
         },
         workerArtifactDigest: PUBLIC_WORKER_DIGEST,
@@ -596,7 +600,9 @@ describe("route-less Form authority deploy surfaces", () => {
       );
       expect(result).toMatchObject({
         kind: "takoserver.form-authority-worker-apply@v1",
-        admissionMode: "integration-fixture",
+        policyAuthority: "takoserver-host",
+        verificationMode: "integration-fixture",
+        verificationAvailable: true,
         productionEligible: false,
         authorityArtifactDigest: BUNDLE_DIGEST,
         workerArtifactDigest: PUBLIC_WORKER_DIGEST,
@@ -669,7 +675,9 @@ describe("route-less Form authority deploy surfaces", () => {
           authorityWorkerName: target.formAuthority.integrationWorkerName,
           operatorPublicJwk: OPERATOR_PUBLIC_JWK,
           operatorScope: target.formAuthority.integrationOperatorScope,
-          admissionMode: "integration-fixture",
+          policyAuthority: "takoserver-host",
+          verificationMode: "integration-fixture",
+          verificationAvailable: true,
           productionEligible: false,
         },
         workerArtifactDigest: PUBLIC_WORKER_DIGEST,

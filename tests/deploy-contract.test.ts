@@ -33,10 +33,11 @@ const SURFACES = [
   ["takoserver-console", []],
   ["takoserver-d1-schema", ["irreversible"]],
   ["takoserver-signing-key-register", ["irreversible", "authority", "published-identity"]],
-  ["takoserver-hosted-topology-cutover", ["irreversible", "authority"]],
   ["takoserver-signing-repair", ["authority"]],
   ["takoserver-signing-rotation", ["authority", "published-identity"]],
   ["takoserver-hosted-token-cutover", ["authority"]],
+  ["takoserver-host-runtime-topology-retirement", ["irreversible", "authority"]],
+  ["takoserver-hosted-token-retirement", ["irreversible", "authority"]],
   ["takoserver-integration-operator-identity", ["authority"]],
 ] as const;
 
@@ -182,6 +183,62 @@ describe("Takoserver split deploy entrypoint", () => {
         `--commit=${sha}`,
         `--legacy-predecessor-version=${version}`,
         `--legacy-predecessor-version=${version}`,
+      ],
+    ] as const) {
+      const refused = await deploy(args);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+    }
+  });
+
+  test("accepts the reviewed Hosted-edge retirement selector and reverse only on retirement surfaces", async () => {
+    const sha = "a".repeat(40);
+    const version = "00000000-0000-4000-8000-000000000001";
+    const accepted = await deploy([
+      "takoserver-worker-authority-cutover",
+      "--status",
+      "--environment=integration",
+      `--commit=${sha}`,
+      `--legacy-host-runtime-predecessor-version=${version}`,
+    ]);
+    expect(accepted.exitCode).toBe(2);
+    expect(accepted.stderr).toContain("deploy target descriptor not found");
+    expect(accepted.stderr).not.toContain("no target was touched");
+
+    const productionAccepted = await deploy([
+      "takoserver-worker-authority-cutover",
+      "--status",
+      "--environment=production",
+      `--commit=${sha}`,
+      `--legacy-host-runtime-predecessor-version=${version}`,
+    ]);
+    expect(productionAccepted.exitCode).toBe(2);
+    expect(productionAccepted.stderr).toContain("deploy target descriptor not found");
+    expect(productionAccepted.stderr).not.toContain("no target was touched");
+
+    for (const args of [
+      [
+        "takoserver-worker-authority-cutover",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--legacy-host-runtime-predecessor-version=${version}`,
+        "--reverse",
+      ],
+      [
+        "takoserver-host-runtime-topology-retirement",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        "--reverse",
+      ],
+      [
+        "takoserver-worker-authority-cutover",
+        "--apply",
+        "--environment=integration",
+        `--commit=${sha}`,
+        "--reverse",
       ],
     ] as const) {
       const refused = await deploy(args);

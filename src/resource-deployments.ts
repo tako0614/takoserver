@@ -70,6 +70,13 @@ export type ResourceDeploymentMutation =
       readonly tenantId: string;
       readonly deploymentId: string;
       readonly expectedNativeId: string;
+      /** Delete identity retained for post-delete native readback evidence. */
+      readonly operationId?: string;
+      readonly resourceUid?: string;
+      readonly space?: string;
+      readonly name?: string;
+      readonly providerPackRef?: string;
+      readonly providerInstallationRef?: string;
     }
   | {
       readonly kind: "retain";
@@ -78,6 +85,13 @@ export type ResourceDeploymentMutation =
       readonly expectedNativeId: string;
       readonly observed: JsonObject;
       readonly outputs: JsonObject;
+      /** Delete identity retained for post-delete native readback evidence. */
+      readonly operationId?: string;
+      readonly resourceUid?: string;
+      readonly space?: string;
+      readonly name?: string;
+      readonly providerPackRef?: string;
+      readonly providerInstallationRef?: string;
     };
 
 export interface ResourceDeploymentStore {
@@ -112,13 +126,29 @@ export interface ResourceDeploymentStore {
     readonly observed: JsonObject;
     readonly outputs: JsonObject;
   }): Promise<boolean>;
-  markDeleted(tenantId: string, deploymentId: string, expectedNativeId: string): Promise<boolean>;
+  markDeleted(
+    tenantId: string,
+    deploymentId: string,
+    expectedNativeId: string,
+    metadata?: {
+      readonly operationId: string;
+      readonly resourceUid: string;
+      readonly space: string;
+      readonly name: string;
+    },
+  ): Promise<boolean>;
   markRetained(
     tenantId: string,
     deploymentId: string,
     expectedNativeId: string,
     observed: JsonObject,
     outputs: JsonObject,
+    metadata?: {
+      readonly operationId: string;
+      readonly resourceUid: string;
+      readonly space: string;
+      readonly name: string;
+    },
   ): Promise<boolean>;
   cutover(
     tenantId: string,
@@ -263,29 +293,78 @@ export function createResourceDeploymentStore(sql: Sql, clock: Clock): ResourceD
       return changed.changes === 1;
     },
 
-    async markDeleted(tenantId, deploymentId, expectedNativeId) {
-      const changed = await sql.run(
-        `UPDATE tf_resource_deployments SET state = 'deleted', updated_at = ?
-         WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`,
-        [now(), tenantId, deploymentId, expectedNativeId],
-      );
+    async markDeleted(tenantId, deploymentId, expectedNativeId, metadata) {
+      const changed = metadata
+        ? await sql.run(
+            `UPDATE tf_resource_deployments
+             SET state = 'deleted',
+                 outputs_json = json_set(
+                   outputs_json,
+                   '$.__takoserver.deleteOperationId', ?,
+                   '$.__takoserver.space', ?,
+                   '$.__takoserver.name', ?,
+                   '$.__takoserver.resourceUid', ?
+                 ),
+                 updated_at = ?
+             WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`,
+            [
+              metadata.operationId,
+              metadata.space,
+              metadata.name,
+              metadata.resourceUid,
+              now(),
+              tenantId,
+              deploymentId,
+              expectedNativeId,
+            ],
+          )
+        : await sql.run(
+            `UPDATE tf_resource_deployments SET state = 'deleted', updated_at = ?
+             WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`,
+            [now(), tenantId, deploymentId, expectedNativeId],
+          );
       return changed.changes === 1;
     },
 
-    async markRetained(tenantId, deploymentId, expectedNativeId, observed, outputs) {
-      const changed = await sql.run(
-        `UPDATE tf_resource_deployments
-         SET state = 'retained', observed_json = ?, outputs_json = ?, updated_at = ?
-         WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`,
-        [
-          JSON.stringify(observed),
-          JSON.stringify(outputs),
-          now(),
-          tenantId,
-          deploymentId,
-          expectedNativeId,
-        ],
-      );
+    async markRetained(tenantId, deploymentId, expectedNativeId, observed, outputs, metadata) {
+      const changed = metadata
+        ? await sql.run(
+            `UPDATE tf_resource_deployments
+             SET state = 'retained', observed_json = ?,
+                 outputs_json = json_set(
+                   ?,
+             '$.__takoserver', json(?)
+                 ),
+                 updated_at = ?
+             WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`,
+            [
+              JSON.stringify(observed),
+              JSON.stringify(outputs),
+              JSON.stringify({
+                resourceUid: metadata.resourceUid,
+                space: metadata.space,
+                name: metadata.name,
+                deleteOperationId: metadata.operationId,
+              }),
+              now(),
+              tenantId,
+              deploymentId,
+              expectedNativeId,
+            ],
+          )
+        : await sql.run(
+            `UPDATE tf_resource_deployments
+             SET state = 'retained', observed_json = ?, outputs_json = ?, updated_at = ?
+             WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`,
+            [
+              JSON.stringify(observed),
+              JSON.stringify(outputs),
+              now(),
+              tenantId,
+              deploymentId,
+              expectedNativeId,
+            ],
+          );
       return changed.changes === 1;
     },
 

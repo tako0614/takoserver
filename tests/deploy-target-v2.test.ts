@@ -18,10 +18,7 @@ function descriptor(overrides: Record<string, unknown> = {}) {
     publicOrigin: "https://takoserver-api-rehearsal.example.workers.dev",
     consoleOrigin: "https://console-rehearsal.example.test",
     signing: { currentKeyId: "takoserver-rehearsal-2026-08" },
-    hostedTopology: {
-      service: "takosumi-hosted-rehearsal",
-      entrypoint: "TakosumiHostRuntimeMaterializerEntrypoint",
-    },
+    sponsorship: true,
     ...overrides,
   };
 }
@@ -38,17 +35,26 @@ function withTarget(value: unknown, run: (path: string) => void): void {
 }
 
 describe("environment-exact deploy target", () => {
-  test("loads the selected environment and explicit signing/topology state", () => {
+  test("loads the selected environment and product-owned sponsorship state", () => {
     withTarget(descriptor(), (path) => {
       expect(loadTarget(path, "rehearsal")).toMatchObject({
         environment: "rehearsal",
         signing: { currentKeyId: "takoserver-rehearsal-2026-08" },
-        hostedTopology: {
-          service: "takosumi-hosted-rehearsal",
-          entrypoint: "TakosumiHostRuntimeMaterializerEntrypoint",
-        },
+        sponsorship: true,
       });
     });
+  });
+
+  test("refuses the retired cross-product runtime topology", () => {
+    withTarget(
+      descriptor({
+        hostedTopology: {
+          service: "retired-runtime-service",
+          entrypoint: "RetiredRuntimeEntrypoint",
+        },
+      }),
+      (path) => expect(() => loadTarget(path, "rehearsal")).toThrow("unexpected keys"),
+    );
   });
 
   test("refuses a descriptor for another environment", () => {

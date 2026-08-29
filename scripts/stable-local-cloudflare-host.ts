@@ -6,7 +6,6 @@ import {
 interface StableLocalCloudflareHostConfiguration {
   readonly takoformRepositoryRoot: string;
   readonly token: string;
-  readonly runtimeValues: Readonly<Record<string, string>>;
   readonly space: string;
   readonly port: number;
 }
@@ -17,8 +16,7 @@ type ReadyHost = Pick<
 >;
 
 /**
- * Parses only disposable local-host inputs. Runtime values are injected into
- * the test authority directly; this is not a deploy or production materializer.
+ * Parses only disposable local-host inputs.
  */
 export function parseStableLocalCloudflareHostEnvironment(
   environment: Readonly<Record<string, string | undefined>>,
@@ -28,28 +26,6 @@ export function parseStableLocalCloudflareHostEnvironment(
   if (!takoformRepositoryRoot || !token) {
     throw new Error("TAKOFORM_STABLE_CATALOG_ROOT and TAKOSERVER_STABLE_LOCAL_TOKEN are required");
   }
-
-  const encodedRuntimeValues = environment.TAKOSERVER_STABLE_LOCAL_RUNTIME_VALUES?.trim() ?? "";
-  let candidate: unknown;
-  try {
-    candidate = encodedRuntimeValues ? JSON.parse(encodedRuntimeValues) : null;
-  } catch {
-    throw new Error("TAKOSERVER_STABLE_LOCAL_RUNTIME_VALUES must be a nonempty string map");
-  }
-  if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) {
-    throw new Error("TAKOSERVER_STABLE_LOCAL_RUNTIME_VALUES must be a nonempty string map");
-  }
-  const entries = Object.entries(candidate);
-  if (
-    entries.length === 0 ||
-    entries.some(
-      ([name, value]) =>
-        !/^[A-Z][A-Z0-9_]{0,127}$/u.test(name) || typeof value !== "string" || value.length === 0,
-    )
-  ) {
-    throw new Error("TAKOSERVER_STABLE_LOCAL_RUNTIME_VALUES must be a nonempty string map");
-  }
-  const runtimeValues = Object.fromEntries(entries) as Record<string, string>;
 
   const space = environment.TAKOSERVER_STABLE_LOCAL_SPACE?.trim() || "default";
   const encodedPort = environment.TAKOSERVER_STABLE_LOCAL_PORT?.trim() ?? "";
@@ -61,7 +37,7 @@ export function parseStableLocalCloudflareHostEnvironment(
     throw new Error("TAKOSERVER_STABLE_LOCAL_PORT must be an integer from 0 through 65535");
   }
 
-  return { takoformRepositoryRoot, token, runtimeValues, space, port };
+  return { takoformRepositoryRoot, token, space, port };
 }
 
 export function stableLocalCloudflareHostReadyRecord(host: ReadyHost) {

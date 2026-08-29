@@ -79,7 +79,6 @@ export interface StableLocalCloudflareHost {
 export async function startStableLocalCloudflareHost(input: {
   readonly takoformRepositoryRoot: string;
   readonly token: string;
-  readonly runtimeValues: Readonly<Record<string, string>>;
   readonly space?: string;
   readonly port?: number;
 }): Promise<StableLocalCloudflareHost> {
@@ -90,19 +89,6 @@ export async function startStableLocalCloudflareHost(input: {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(space)) {
     throw new Error("stable local Host Space is invalid");
   }
-  const runtimeNames = Object.keys(input.runtimeValues).sort();
-  if (
-    runtimeNames.length === 0 ||
-    runtimeNames.some(
-      (name) =>
-        !/^[A-Z][A-Z0-9_]{0,127}$/u.test(name) ||
-        input.runtimeValues[name] === undefined ||
-        input.runtimeValues[name]?.length === 0,
-    )
-  ) {
-    throw new Error("stable local runtime values are invalid");
-  }
-
   const catalog = await loadProviderEraTestCatalog(input.takoformRepositoryRoot);
   const forms = HOST_FORMS.map((kind) => exactForm(catalog.forms, kind));
   const database = new Database(":memory:");
@@ -131,20 +117,6 @@ export async function startStableLocalCloudflareHost(input: {
     apiOrigin: "https://api.cloudflare.test/client/v4",
     workerEndpointSuffix: WORKER_SUFFIX,
     workerCompatibilityDate: "2026-08-18",
-    runtimeMaterializer: {
-      async materializeRuntimeBindings(request) {
-        const requested = [...request.bindings].sort();
-        if (
-          JSON.stringify(requested) !== JSON.stringify(runtimeNames) ||
-          request.request.kind !== "takoserver.stable-local-runtime-materialization@v1"
-        ) {
-          throw new Error("stable local runtime authority mismatch");
-        }
-        return { values: structuredClone(input.runtimeValues) };
-      },
-      async commitRuntimeBindings() {},
-      async rollbackRuntimeBindings() {},
-    },
     fetch: (request) => cloudflare.fetch(request),
   });
   const driver = localProviderDriver(provider, offerings);
@@ -210,9 +182,6 @@ export async function startStableLocalCloudflareHost(input: {
             scope: {
               mode: "tenant-run" as const,
               space,
-              runtimeMaterialization: {
-                kind: "takoserver.stable-local-runtime-materialization@v1",
-              },
             },
           }
         : null,
@@ -309,9 +278,6 @@ function localProviderDriver(
           },
           spec: value.spec,
           relations: relations(value.relations),
-          ...(value.runtimeMaterialization
-            ? { runtimeMaterialization: value.runtimeMaterialization }
-            : {}),
           ...(value.standardServices
             ? { standardServices: structuredClone(value.standardServices) }
             : {}),

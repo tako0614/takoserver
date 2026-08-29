@@ -121,8 +121,6 @@ export interface TakoformHostPrincipal {
     | {
         readonly space: string;
         readonly mode: "tenant-run";
-        /** Opaque authority signed into this exact short-lived Run token. */
-        readonly runtimeMaterialization?: JsonObject;
       }
     | {
         readonly space: string;
@@ -170,6 +168,29 @@ export interface TakoformDriverReceipt {
   readonly conditions?: readonly TakoformCondition[];
   /** Host-internal provider realization; never rendered into a Resource. */
   readonly deploymentMutation?: ResourceDeploymentMutation;
+}
+
+/**
+ * Closed, tri-state native-absence attestation.  `source` tells operators
+ * whether the proof came from a Host-owned intrinsic resource or from a
+ * provider readback; neither path exposes a provider-native identifier.
+ */
+export interface TakoformNativeAbsenceEvidence {
+  readonly status: "absent" | "present" | "indeterminate";
+  readonly source: "intrinsic" | "provider";
+  readonly evidenceRef?: `sha256:${string}`;
+  readonly effectCount: number;
+  readonly deploymentCount: number;
+  readonly checkedAt: string;
+  readonly reason?:
+    | "closure_pending"
+    | "effect_unresolved"
+    | "deployment_active"
+    | "deployment_unmarked"
+    | "provider_unavailable"
+    | "provider_readback_failed"
+    | "provider_identity_missing"
+    | "legacy_unattested";
 }
 
 /**
@@ -226,6 +247,8 @@ export interface TakoformResourceDriver {
     readonly operationId: string;
     /** Durable saga evidence: only `initial` may dispatch a new provider mutation. */
     readonly operationMode?: "initial" | "recovery";
+    /** Opaque provider-owned handle retained by the saga for recovery polling. */
+    readonly providerHandle?: string;
     readonly tenantId: string;
     readonly resourceUid: string;
     readonly form: InstalledTakoformForm;
@@ -234,7 +257,6 @@ export interface TakoformResourceDriver {
     readonly spec: JsonObject;
     readonly relations: readonly TakoformDriverRelation[];
     readonly commercialAuthority?: TakoformCommercialAuthority;
-    readonly runtimeMaterialization?: JsonObject;
     readonly standardServices?: readonly TakoformStandardServiceProjection[];
     readonly previous?: TakoformStoredResource;
     /** Commit the Deployment realization with the portable Resource. */
@@ -248,6 +270,10 @@ export interface TakoformResourceDriver {
   }): Promise<TakoformDriverReceipt>;
   delete(input: {
     readonly operationId: string;
+    /** Durable saga mode; recovery must poll a retained provider handle. */
+    readonly operationMode?: "initial" | "recovery";
+    /** Opaque provider-owned handle retained by the saga for recovery polling. */
+    readonly providerHandle?: string;
     readonly tenantId: string;
     readonly resourceUid: string;
     readonly resource: TakoformStoredResource;
@@ -256,8 +282,22 @@ export interface TakoformResourceDriver {
     readonly atomicDeploymentCommit?: true;
     // biome-ignore lint/suspicious/noConfusingVoidType: intrinsic Resource deletion has no provider receipt
   }): Promise<TakoformDriverReceipt | void>;
+  /**
+   * Read-only, tombstone-backed native absence attestation.  Implementations
+   * must never redispatch a mutation while answering this method.
+   */
+  verifyNativeAbsence?(input: {
+    readonly tenantId: string;
+    readonly resourceUid: string;
+    readonly space: string;
+    readonly name: string;
+  }): Promise<TakoformNativeAbsenceEvidence>;
   import?(input: {
     readonly operationId: string;
+    /** Durable saga evidence: only `initial` may dispatch a new provider mutation. */
+    readonly operationMode?: "initial" | "recovery";
+    /** Opaque provider-owned handle retained by the saga for recovery polling. */
+    readonly providerHandle?: string;
     readonly tenantId: string;
     readonly resourceUid: string;
     readonly form: InstalledTakoformForm;

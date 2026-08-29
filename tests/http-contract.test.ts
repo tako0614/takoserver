@@ -79,6 +79,7 @@ const PUBLIC_PATHS = [
   "/v1/organizations/{organizationId}/operations",
   "/v1/organizations/{organizationId}/resources",
   "/v1/organizations/{organizationId}/resources/{resourceUid}",
+  "/v1/organizations/{organizationId}/resources/{resourceUid}/native-residual",
   "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations",
   "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}",
   "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/cancel",
@@ -116,6 +117,42 @@ describe("published API description", () => {
     expect(openApiDocument.openapi).toBe("3.1.0");
     expect(openApiDocument.servers).toEqual([{ url: "https://api.takoserver.com" }]);
     expect(openApiDocument.components.securitySchemes.bearerAuth.scheme).toBe("bearer");
+  });
+
+  test("describes the native residual response as a closed tri-state schema", () => {
+    const path = openApiDocument.paths[
+      "/v1/organizations/{organizationId}/resources/{resourceUid}/native-residual"
+    ] as {
+      get: {
+        responses: {
+          "200": {
+            content: {
+              "application/json": {
+                schema: {
+                  properties: {
+                    residual: {
+                      properties: {
+                        status: { enum: readonly string[] };
+                        source: { enum: readonly string[] };
+                      };
+                    };
+                  };
+                };
+              };
+            };
+          };
+        };
+      };
+    };
+    expect(
+      path.get.responses["200"].content["application/json"].schema.properties.residual.properties
+        .status.enum,
+    ).toEqual(["absent", "present", "indeterminate"]);
+    expect(
+      path.get.responses["200"].content["application/json"].schema.properties.residual.properties
+        .source.enum,
+    ).toEqual(["intrinsic", "provider"]);
+    expect(JSON.stringify(path)).not.toContain("nativeId");
   });
 
   test("mentions no other product and leaks no upstream identity vocabulary", () => {

@@ -1,5 +1,5 @@
 import { canonicalDigest, canonicalJson } from "../json.ts";
-import type { Clock, Row, Sql, SqlParam, SqlStatement } from "../ports.ts";
+import type { Clock, JsonObject, Row, Sql, SqlParam, SqlStatement } from "../ports.ts";
 import { SqlError } from "../ports.ts";
 import type { TakoformAuthorityFence } from "./host-authority.ts";
 import { OPERATION_TTL_MILLISECONDS, REPLAY_TTL_MILLISECONDS, SWEEP_ROW_LIMIT } from "./limits.ts";
@@ -48,6 +48,50 @@ export interface OperationRecord {
   readonly state: "succeeded" | "failed";
   readonly createdAt: string;
   readonly resource?: TakoformStoredResource;
+}
+
+export type ResourceDeletionEffectPhase = "planned" | "dispatched" | "succeeded" | "cancelled";
+export type ResourceEffectKind =
+  | "apply"
+  | "import"
+  | "provision"
+  | "transfer-export"
+  | "transfer-import"
+  | "verify"
+  | "cancel-delete"
+  | "delete";
+
+/** Host-owned, provider-opaque events retained by a deletion tombstone. */
+export interface ResourceDeletionEffect {
+  readonly eventId?: string;
+  readonly operationId: string;
+  readonly kind?: ResourceEffectKind;
+  readonly phase: ResourceDeletionEffectPhase;
+  readonly operationMode?: "initial" | "recovery";
+  readonly providerPackRef?: string;
+  readonly providerInstallationRef?: string;
+  readonly nativeId?: string;
+  /** Provider-owned, redacted target descriptor retained only for evidence. */
+  readonly target?: JsonObject;
+  readonly disposition?: "deleted" | "retained";
+}
+
+/** Durable identity and closure fence for one deleted Resource incarnation. */
+export interface ResourceDeletionTombstone {
+  readonly tenantId: string;
+  readonly resourceUid: string;
+  readonly address: ResourceAddress;
+  readonly formRef: TakoformV1Alpha3FormRef;
+  readonly state: "live" | "pending" | "closed" | "cancelled";
+  readonly closureFence: number;
+  readonly effects: readonly ResourceDeletionEffect[];
+  readonly evidenceJson?: JsonObject;
+  readonly evidenceRef?: `sha256:${string}`;
+  readonly evidenceEffectDigest?: `sha256:${string}`;
+  readonly evidenceCheckedAt?: string;
+  readonly evidenceStatus?: "absent" | "present" | "indeterminate";
+  readonly createdAt: string;
+  readonly updatedAt: string;
 }
 
 export type DeferredOperationPhase =
@@ -103,6 +147,16 @@ export interface ResourceMutationCommit {
   readonly replayKey: string;
   readonly replay: StoredReplay;
   readonly providerReceipt?: TakoformDriverReceipt;
+  /** Append the terminal event for the provider effect in the same commit. */
+  readonly providerEffect?: {
+    readonly effectId: string;
+    readonly kind: ResourceEffectKind;
+    readonly operationMode?: "initial" | "recovery";
+  };
+  /** Finalize the pre-created deletion tombstone in this same SQL batch. */
+  readonly deletionTombstone?: {
+    readonly operationId: string;
+  };
   readonly claimKeys?: readonly string[];
   /** An identity-preserving no-op must leave the live Resource's committed claims untouched. */
   readonly preserveClaims?: true;
@@ -128,7 +182,14 @@ export interface ProviderMutationSaga {
 }
 
 export type ProviderMutationExecution =
-  | { readonly kind: "acquired"; readonly mode: "initial" | "recovery" }
+  | {
+      readonly kind: "acquired";
+      readonly mode: "initial" | "recovery";
+      /** Opaque provider handle from the last accepted dispatch, if any. */
+      readonly providerHandle?: string;
+      /** Whether the accepted dispatch is still running or indeterminate. */
+      readonly providerOutcome?: "running" | "indeterminate";
+    }
   | { readonly kind: "busy" }
   | { readonly kind: "executed"; readonly receipt: TakoformDriverReceipt };
 
@@ -238,6 +299,59 @@ export interface TakoformStore {
   putOperation(tenantId: string, record: OperationRecord): Promise<void>;
   readOperation(tenantId: string, id: string): Promise<OperationRecord | null>;
 
+  /** Arm one exact Resource-incarnation tombstone before provider dispatch. */
+  prepareResourceDeletion(input: {
+    readonly tenantId: string;
+    readonly resourceUid: string;
+    readonly address: ResourceAddress;
+    readonly formRef: TakoformV1Alpha3FormRef;
+    readonly operationId: string;
+  }): Promise<ResourceDeletionTombstone>;
+  /** Record that the provider boundary was crossed for the armed tombstone. */
+  markResourceDeletionDispatch(input: {
+    readonly tenantId: string;
+    readonly resourceUid: string;
+    readonly operationId: string;
+  }): Promise<boolean>;
+  readResourceDeletion(
+    tenantId: string,
+    resourceUid: string,
+  ): Promise<ResourceDeletionTombstone | null>;
+  /** Reserve an incarnation before any external provider dispatch. */
+  reserveResourceIncarnation(input: {
+    readonly tenantId: string;
+    readonly resourceUid: string;
+    readonly address: ResourceAddress;
+    readonly formRef: TakoformV1Alpha3FormRef;
+  }): Promise<boolean>;
+  /** Append one provider/migration effect event; duplicate events are idempotent. */
+  recordResourceEffect(input: {
+    readonly tenantId: string;
+    readonly resourceUid: string;
+    readonly effectId: string;
+    readonly kind: ResourceEffectKind;
+    readonly phase: ResourceDeletionEffectPhase;
+    readonly operationMode: "initial" | "recovery";
+    readonly providerPackRef?: string;
+    readonly providerInstallationRef?: string;
+    readonly nativeId?: string;
+    readonly target?: JsonObject;
+  }): Promise<boolean>;
+  readResourceEffectLedger(
+    tenantId: string,
+    resourceUid: string,
+  ): Promise<readonly ResourceDeletionEffect[]>;
+  cacheResourceDeletionEvidence(input: {
+    readonly tenantId: string;
+    readonly resourceUid: string;
+    readonly closureFence: number;
+    readonly evidence: JsonObject;
+    readonly evidenceRef: `sha256:${string}`;
+    readonly effectSetDigest: `sha256:${string}`;
+    readonly checkedAt: number;
+    readonly status: "absent" | "present" | "indeterminate";
+  }): Promise<boolean>;
+
   acceptProviderMutationSaga(record: ProviderMutationSaga): Promise<ProviderMutationSaga>;
   acquireProviderMutationExecution(input: {
     readonly tenantId: string;
@@ -247,6 +361,22 @@ export interface TakoformStore {
     readonly leaseUntil: number;
   }): Promise<ProviderMutationExecution>;
   markProviderMutationDispatch(input: {
+    readonly tenantId: string;
+    readonly operationId: string;
+    readonly resourceUid: string;
+    readonly leaseToken: string;
+  }): Promise<boolean>;
+  /** Retains an accepted provider handle when completion was not observed. */
+  recordProviderMutationOutcome(input: {
+    readonly tenantId: string;
+    readonly operationId: string;
+    readonly resourceUid: string;
+    readonly leaseToken: string;
+    readonly outcome: "running" | "indeterminate";
+    readonly providerHandle?: string;
+  }): Promise<boolean>;
+  /** Terminalizes a failure proven to have happened before provider dispatch. */
+  settleProviderMutationPreconditionFailure(input: {
     readonly tenantId: string;
     readonly operationId: string;
     readonly resourceUid: string;
@@ -865,6 +995,259 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       };
     },
 
+    async reserveResourceIncarnation(input): Promise<boolean> {
+      const timestamp = now();
+      await sql.run(
+        `INSERT OR IGNORE INTO tf_resource_deletion_attestations
+           (tenant_id, resource_uid, space, api_version, kind, name, form_ref_json,
+            state, closure_fence, effects_json, evidence_json, evidence_ref,
+            evidence_effect_digest, evidence_checked_at, evidence_status,
+            created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'live', 1, '[]', NULL, NULL, NULL, NULL, NULL, ?, ?)`,
+        [
+          input.tenantId,
+          input.resourceUid,
+          input.address.space,
+          input.address.apiVersion,
+          input.address.kind,
+          input.address.name,
+          canonicalJson(input.formRef),
+          timestamp,
+          timestamp,
+        ],
+      );
+      const rows = await sql.query(
+        `SELECT * FROM tf_resource_deletion_attestations
+         WHERE tenant_id = ? AND resource_uid = ? LIMIT 2`,
+        [input.tenantId, input.resourceUid],
+      );
+      if (rows.length !== 1 || !rows[0]) return false;
+      const row = resourceDeletionTombstone(rows[0]);
+      return (
+        row.address.space === input.address.space &&
+        row.address.apiVersion === input.address.apiVersion &&
+        row.address.kind === input.address.kind &&
+        row.address.name === input.address.name &&
+        canonicalJson(row.formRef) === canonicalJson(input.formRef) &&
+        row.state === "live"
+      );
+    },
+
+    async recordResourceEffect(input): Promise<boolean> {
+      validResourceEffectInput(input);
+      const eventId = `${input.effectId}:${input.phase}`;
+      const existing = await sql.query(
+        `SELECT event_id FROM tf_resource_provider_effects
+         WHERE tenant_id = ? AND resource_uid = ? AND event_id = ? LIMIT 1`,
+        [input.tenantId, input.resourceUid, eventId],
+      );
+      if (existing.length > 0) return true;
+      const prior = await sql.query(
+        `SELECT phase FROM tf_resource_provider_effects
+         WHERE tenant_id = ? AND resource_uid = ? AND effect_id = ?
+         ORDER BY created_at, event_id`,
+        [input.tenantId, input.resourceUid, input.effectId],
+      );
+      const phases = new Set(prior.map((row) => row.phase));
+      if (
+        (input.phase === "dispatched" && !phases.has("planned")) ||
+        (input.phase === "succeeded" && !phases.has("dispatched")) ||
+        (input.phase === "cancelled" && !phases.has("planned") && !phases.has("dispatched")) ||
+        phases.has("succeeded") ||
+        phases.has("cancelled")
+      ) {
+        return false;
+      }
+      const timestamp = now();
+      const inserted = await sql.run(
+        `INSERT OR IGNORE INTO tf_resource_provider_effects
+           (tenant_id, resource_uid, event_id, effect_id, effect_kind, phase,
+            operation_mode, provider_pack_ref, provider_installation_ref,
+            native_id, target_json, created_at)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+         WHERE EXISTS (
+           SELECT 1 FROM tf_resource_deletion_attestations
+           WHERE tenant_id = ? AND resource_uid = ? AND state IN ('live', 'pending')
+         )`,
+        [
+          input.tenantId,
+          input.resourceUid,
+          eventId,
+          input.effectId,
+          input.kind,
+          input.phase,
+          input.operationMode,
+          input.providerPackRef ?? null,
+          input.providerInstallationRef ?? null,
+          input.nativeId ?? null,
+          input.target ? canonicalJson(input.target) : null,
+          timestamp,
+          input.tenantId,
+          input.resourceUid,
+        ],
+      );
+      if (inserted.changes !== 1) return false;
+      await sql.run(
+        `UPDATE tf_resource_deletion_attestations
+         SET closure_fence = closure_fence + 1,
+             effects_json = json_insert(effects_json, '$[#]', json(?)),
+             evidence_json = NULL, evidence_ref = NULL,
+             evidence_effect_digest = NULL, evidence_checked_at = NULL,
+             evidence_status = NULL, updated_at = ?
+         WHERE tenant_id = ? AND resource_uid = ? AND state IN ('live', 'pending')`,
+        [
+          canonicalJson({
+            eventId,
+            operationId: input.effectId,
+            kind: input.kind,
+            phase: input.phase,
+            operationMode: input.operationMode,
+            ...(input.providerPackRef ? { providerPackRef: input.providerPackRef } : {}),
+            ...(input.providerInstallationRef
+              ? { providerInstallationRef: input.providerInstallationRef }
+              : {}),
+            ...(input.nativeId ? { nativeId: input.nativeId } : {}),
+            ...(input.target ? { target: input.target } : {}),
+          }),
+          timestamp,
+          input.tenantId,
+          input.resourceUid,
+        ],
+      );
+      return true;
+    },
+
+    async readResourceEffectLedger(
+      tenantId,
+      resourceUid,
+    ): Promise<readonly ResourceDeletionEffect[]> {
+      const rows = await sql.query(
+        `SELECT event_id, effect_id, effect_kind, phase, operation_mode,
+                provider_pack_ref, provider_installation_ref, native_id, target_json
+         FROM tf_resource_provider_effects
+         WHERE tenant_id = ? AND resource_uid = ?
+         ORDER BY created_at, event_id`,
+        [tenantId, resourceUid],
+      );
+      return rows.map(resourceProviderEffect);
+    },
+
+    async prepareResourceDeletion(input): Promise<ResourceDeletionTombstone> {
+      const timestamp = now();
+      await sql.run(
+        `INSERT OR IGNORE INTO tf_resource_deletion_attestations
+           (tenant_id, resource_uid, space, api_version, kind, name, form_ref_json,
+            state, closure_fence, effects_json, evidence_json, evidence_ref,
+            evidence_effect_digest, evidence_checked_at, evidence_status,
+            created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 1, '[]', NULL, NULL, NULL, NULL, NULL, ?, ?)`,
+        [
+          input.tenantId,
+          input.resourceUid,
+          input.address.space,
+          input.address.apiVersion,
+          input.address.kind,
+          input.address.name,
+          canonicalJson(input.formRef),
+          timestamp,
+          timestamp,
+        ],
+      );
+      const rows = await sql.query(
+        `SELECT * FROM tf_resource_deletion_attestations
+         WHERE tenant_id = ? AND resource_uid = ? LIMIT 2`,
+        [input.tenantId, input.resourceUid],
+      );
+      const existing = rows[0] ? resourceDeletionTombstone(rows[0]) : null;
+      if (
+        !existing ||
+        rows.length !== 1 ||
+        existing.address.space !== input.address.space ||
+        existing.address.apiVersion !== input.address.apiVersion ||
+        existing.address.kind !== input.address.kind ||
+        existing.address.name !== input.address.name ||
+        canonicalJson(existing.formRef) !== canonicalJson(input.formRef)
+      ) {
+        throw new TakoformHostError("resource_busy", 409);
+      }
+      if (existing.state === "live" || existing.state === "pending") {
+        await sql.run(
+          `UPDATE tf_resource_deletion_attestations
+           SET state = 'pending', updated_at = ?
+           WHERE tenant_id = ? AND resource_uid = ? AND state = 'live'`,
+          [timestamp, input.tenantId, input.resourceUid],
+        );
+      }
+      const recorded = await this.recordResourceEffect({
+        tenantId: input.tenantId,
+        resourceUid: input.resourceUid,
+        effectId: input.operationId,
+        kind: "delete",
+        phase: "planned",
+        operationMode: "initial",
+      });
+      if (!recorded) throw new TakoformHostError("resource_busy", 409);
+      const refreshed = await sql.query(
+        `SELECT * FROM tf_resource_deletion_attestations
+         WHERE tenant_id = ? AND resource_uid = ? LIMIT 2`,
+        [input.tenantId, input.resourceUid],
+      );
+      const result = refreshed[0]
+        ? {
+            ...resourceDeletionTombstone(refreshed[0]),
+            effects: await this.readResourceEffectLedger(input.tenantId, input.resourceUid),
+          }
+        : null;
+      if (!result || refreshed.length !== 1) throw new TakoformHostError("resource_busy", 409);
+      return result;
+    },
+
+    async markResourceDeletionDispatch(input): Promise<boolean> {
+      return await this.recordResourceEffect({
+        tenantId: input.tenantId,
+        resourceUid: input.resourceUid,
+        effectId: input.operationId,
+        kind: "delete",
+        phase: "dispatched",
+        operationMode: "initial",
+      });
+    },
+
+    async readResourceDeletion(tenantId, resourceUid): Promise<ResourceDeletionTombstone | null> {
+      const rows = await sql.query(
+        `SELECT * FROM tf_resource_deletion_attestations
+         WHERE tenant_id = ? AND resource_uid = ? LIMIT 2`,
+        [tenantId, resourceUid],
+      );
+      if (rows.length > 1) throw new TakoformHostError("backend_unavailable", 503);
+      if (!rows[0]) return null;
+      const parsed = resourceDeletionTombstone(rows[0]);
+      const ledger = await this.readResourceEffectLedger(tenantId, resourceUid);
+      return ledger.length > 0 ? { ...parsed, effects: ledger } : parsed;
+    },
+
+    async cacheResourceDeletionEvidence(input): Promise<boolean> {
+      const changed = await sql.run(
+        `UPDATE tf_resource_deletion_attestations
+         SET evidence_json = ?, evidence_ref = ?, evidence_effect_digest = ?,
+             evidence_checked_at = ?, evidence_status = ?, updated_at = ?
+         WHERE tenant_id = ? AND resource_uid = ? AND state = 'closed'
+           AND closure_fence = ?`,
+        [
+          canonicalJson(input.evidence),
+          input.evidenceRef,
+          input.effectSetDigest,
+          input.checkedAt,
+          input.status,
+          now(),
+          input.tenantId,
+          input.resourceUid,
+          input.closureFence,
+        ],
+      );
+      return changed.changes === 1;
+    },
+
     async acceptProviderMutationSaga(record) {
       const timestamp = now();
       await sql.run(
@@ -993,7 +1376,20 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           timestamp,
         ],
       );
-      if (recovery.changes === 1) return { kind: "acquired", mode: "recovery" };
+      if (recovery.changes === 1) {
+        const stateRows = await sql.query(
+          `SELECT provider_handle, provider_outcome
+           FROM tf_provider_mutation_sagas
+           WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+             AND execution_lease_token = ? LIMIT 1`,
+          [input.tenantId, input.operationId, input.resourceUid, input.leaseToken],
+        );
+        return {
+          kind: "acquired",
+          mode: "recovery",
+          ...providerMutationExecutionState(stateRows[0]),
+        };
+      }
 
       const rows = await sql.query(
         `SELECT phase, receipt_json FROM tf_provider_mutation_sagas
@@ -1013,7 +1409,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       const timestamp = now();
       const marked = await sql.run(
         `UPDATE tf_provider_mutation_sagas
-         SET execution_started_at = ?, updated_at = ?
+         SET execution_started_at = ?, provider_outcome = 'running', updated_at = ?
          WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
            AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
            AND execution_lease_token = ? AND execution_lease_until > ?
@@ -1030,6 +1426,51 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         ],
       );
       return marked.changes === 1;
+    },
+
+    async recordProviderMutationOutcome(input) {
+      if (input.outcome !== "running" && input.outcome !== "indeterminate") {
+        throw new TypeError("invalid provider mutation outcome");
+      }
+      if (input.providerHandle !== undefined && input.providerHandle.length === 0) {
+        throw new TypeError("provider mutation handle must not be empty");
+      }
+      if (input.outcome === "running" && input.providerHandle === undefined) {
+        throw new TypeError("a running provider mutation must retain its handle");
+      }
+      const timestamp = now();
+      const recorded = await sql.run(
+        `UPDATE tf_provider_mutation_sagas
+         SET provider_handle = ?, provider_outcome = ?, updated_at = ?
+         WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+           AND phase = 'planned' AND receipt_json IS NULL
+           AND execution_started_at IS NOT NULL
+           AND execution_lease_token = ? AND execution_lease_until > ?`,
+        [
+          input.providerHandle ?? null,
+          input.outcome,
+          timestamp,
+          input.tenantId,
+          input.operationId,
+          input.resourceUid,
+          input.leaseToken,
+          timestamp,
+        ],
+      );
+      return recorded.changes === 1;
+    },
+
+    async settleProviderMutationPreconditionFailure(input) {
+      const settled = await sql.run(
+        `DELETE FROM tf_provider_mutation_sagas
+         WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+           AND phase = 'planned' AND receipt_json IS NULL
+           AND provider_handle IS NULL AND provider_outcome = 'running'
+           AND execution_started_at IS NOT NULL
+           AND execution_lease_token = ? AND execution_lease_until > ?`,
+        [input.tenantId, input.operationId, input.resourceUid, input.leaseToken, now()],
+      );
+      return settled.changes === 1;
     },
 
     async releaseProviderMutationExecution(input) {
@@ -1130,7 +1571,8 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           {
             sql: `UPDATE tf_provider_mutation_sagas
                   SET phase = 'executed', receipt_json = ?, updated_at = ?, expires_at = NULL,
-                      execution_lease_token = NULL, execution_lease_until = NULL
+                      execution_lease_token = NULL, execution_lease_until = NULL,
+                      provider_handle = NULL, provider_outcome = 'planned'
                   WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
                     AND authority_head_digest IS ?
                     AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
@@ -1485,6 +1927,8 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         ? canonicalJson(mutation.providerReceipt)
         : undefined;
       const deployment = deploymentMutationSql(mutation.providerReceipt, now());
+      const providerEffect = providerEffectSql(mutation, now());
+      const deletionFence = deletionTombstoneFence(mutation, operation.id);
       const authority = mutation.authorityFence
         ? await authorityFenceSql(mutation.authorityFence)
         : { sql: "1 = 1", params: [] as readonly SqlParam[] };
@@ -1502,6 +1946,8 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
                 SELECT ?, CASE WHEN ${operationFence} AND ${resourceFence}
                                      AND ${claimFence} AND ${providerSagaFence}
                                      AND ${deployment.fence}
+                                     AND ${deletionFence.sql}
+                                     AND ${providerEffect.fence}
                                      AND (${authority.sql}) THEN 1 ELSE 0 END`,
           params: [
             guard,
@@ -1531,10 +1977,14 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
                 ]
               : []),
             ...deployment.fenceParams,
+            ...deletionFence.params,
+            ...providerEffect.fenceParams,
             ...authority.params,
           ],
         },
         ...deployment.statements,
+        ...providerEffect.statements,
+        ...deletionTombstoneStatements(mutation, now()),
       ];
       if (mutation.kind === "write") {
         const resource = mutation.resource;
@@ -1981,6 +2431,24 @@ function providerMutationSaga(row: Row): ProviderMutationSaga {
   };
 }
 
+function providerMutationExecutionState(row: Row | undefined): {
+  readonly providerHandle?: string;
+  readonly providerOutcome?: "running" | "indeterminate";
+} {
+  if (!row) throw new Error("provider_mutation_saga_missing_after_lease");
+  const providerHandle = typeof row.provider_handle === "string" ? row.provider_handle : undefined;
+  const providerOutcome =
+    row.provider_outcome === "running" || row.provider_outcome === "indeterminate"
+      ? row.provider_outcome
+      : undefined;
+  return {
+    ...(providerHandle ? { providerHandle } : {}),
+    ...(providerOutcome === "indeterminate" || (providerOutcome === "running" && providerHandle)
+      ? { providerOutcome }
+      : {}),
+  };
+}
+
 function sameProviderMutationSaga(
   left: ProviderMutationSaga,
   right: ProviderMutationSaga,
@@ -2049,6 +2517,8 @@ function providerMutationCommitStatements(input: {
           WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
             AND claim_key IN (${claimKeys.map(() => "?").join(", ")})) = ?`;
   const deployment = deploymentMutationSql(mutation.providerReceipt, input.now);
+  const providerEffect = providerEffectSql(mutation, input.now);
+  const deletionFence = deletionTombstoneFence(mutation, input.operationId);
   const sagaFence = receiptJson
     ? `EXISTS (
     SELECT 1 FROM tf_provider_mutation_sagas AS saga
@@ -2082,6 +2552,8 @@ function providerMutationCommitStatements(input: {
       sql: `INSERT INTO tf_operation_commit_guards (token, valid)
             SELECT ?, CASE WHEN ${sagaFence} AND ${claimFence}
                                  AND ${deployment.fence}
+                                 AND ${deletionFence.sql}
+                                 AND ${providerEffect.fence}
                                  AND (${input.additionalFence ?? "1 = 1"}) THEN 1 ELSE 0 END`,
       params: [
         input.guard,
@@ -2110,10 +2582,14 @@ function providerMutationCommitStatements(input: {
               claimKeys.length,
             ]),
         ...deployment.fenceParams,
+        ...deletionFence.params,
+        ...providerEffect.fenceParams,
         ...(input.additionalFenceParams ?? []),
       ],
     },
     ...deployment.statements,
+    ...providerEffect.statements,
+    ...deletionTombstoneStatements(mutation, input.now),
   ];
   if (mutation.kind === "write") {
     const resource = mutation.resource;
@@ -2227,6 +2703,182 @@ function providerMutationCommitStatements(input: {
   return statements;
 }
 
+function deletionTombstoneFence(
+  mutation: ResourceMutationCommit,
+  operationId: string,
+): { readonly sql: string; readonly params: readonly SqlParam[] } {
+  if (!mutation.deletionTombstone) return { sql: "1 = 1", params: [] };
+  return {
+    sql: `EXISTS (
+      SELECT 1 FROM tf_resource_deletion_attestations AS attestation
+      WHERE attestation.tenant_id = ? AND attestation.resource_uid = ?
+        AND attestation.state = 'pending'
+        AND EXISTS (
+          SELECT 1 FROM tf_resource_provider_effects AS effect
+          WHERE effect.tenant_id = attestation.tenant_id
+            AND effect.resource_uid = attestation.resource_uid
+            AND effect.effect_id = ?
+            AND effect.phase = 'dispatched'
+        )
+    )`,
+    params: [mutation.address.tenantId, mutation.resourceUid, operationId],
+  };
+}
+
+function providerEffectSql(
+  mutation: ResourceMutationCommit,
+  timestamp: number,
+): {
+  readonly fence: string;
+  readonly fenceParams: readonly SqlParam[];
+  readonly statements: readonly SqlStatement[];
+} {
+  const declared =
+    mutation.providerEffect ??
+    (mutation.deletionTombstone
+      ? {
+          effectId: mutation.deletionTombstone.operationId,
+          kind: "delete" as const,
+          operationMode: "initial" as const,
+        }
+      : undefined);
+  if (!declared) return { fence: "1 = 1", fenceParams: [], statements: [] };
+  const providerMutation = mutation.providerReceipt?.deploymentMutation;
+  const providerPackRef =
+    providerMutation && "providerPackRef" in providerMutation
+      ? providerMutation.providerPackRef
+      : undefined;
+  const providerInstallationRef =
+    providerMutation && "providerInstallationRef" in providerMutation
+      ? providerMutation.providerInstallationRef
+      : undefined;
+  const nativeId =
+    providerMutation && "expectedNativeId" in providerMutation
+      ? providerMutation.expectedNativeId
+      : undefined;
+  const target = {
+    resourceUid: mutation.resourceUid,
+    address: {
+      space: mutation.address.space,
+      apiVersion: mutation.address.apiVersion,
+      kind: mutation.address.kind,
+      name: mutation.address.name,
+    },
+    ...(providerPackRef ? { providerPackRef } : {}),
+    ...(providerInstallationRef ? { providerInstallationRef } : {}),
+    ...(nativeId ? { nativeId } : {}),
+  } satisfies JsonObject;
+  const operationMode = declared.operationMode ?? "initial";
+  return {
+    fence: `EXISTS (
+      SELECT 1 FROM tf_resource_provider_effects
+      WHERE tenant_id = ? AND resource_uid = ? AND effect_id = ?
+        AND phase = 'dispatched'
+    )`,
+    fenceParams: [mutation.address.tenantId, mutation.resourceUid, declared.effectId],
+    statements: [
+      {
+        sql: `INSERT OR IGNORE INTO tf_resource_provider_effects
+               (tenant_id, resource_uid, event_id, effect_id, effect_kind, phase,
+                operation_mode, provider_pack_ref, provider_installation_ref,
+                native_id, target_json, created_at)
+             SELECT ?, ?, ?, ?, ?, 'succeeded', ?, ?, ?, ?, ?, ?
+             WHERE EXISTS (
+               SELECT 1 FROM tf_resource_provider_effects
+               WHERE tenant_id = ? AND resource_uid = ? AND effect_id = ?
+                 AND phase = 'dispatched'
+             )`,
+        params: [
+          mutation.address.tenantId,
+          mutation.resourceUid,
+          `${declared.effectId}:succeeded`,
+          declared.effectId,
+          declared.kind,
+          operationMode,
+          providerPackRef ?? null,
+          providerInstallationRef ?? null,
+          nativeId ?? null,
+          canonicalJson(target),
+          timestamp,
+          mutation.address.tenantId,
+          mutation.resourceUid,
+          declared.effectId,
+        ],
+      },
+      {
+        sql: `UPDATE tf_resource_deletion_attestations
+              SET closure_fence = closure_fence + 1,
+                  effects_json = json_insert(effects_json, '$[#]', json(?)),
+                  evidence_json = NULL, evidence_ref = NULL,
+                  evidence_effect_digest = NULL, evidence_checked_at = NULL,
+                  evidence_status = NULL, updated_at = ?
+              WHERE tenant_id = ? AND resource_uid = ?
+                AND state IN ('live', 'pending')`,
+        params: [
+          canonicalJson({
+            eventId: `${declared.effectId}:succeeded`,
+            operationId: declared.effectId,
+            kind: declared.kind,
+            phase: "succeeded",
+            operationMode,
+            ...(providerPackRef ? { providerPackRef } : {}),
+            ...(providerInstallationRef ? { providerInstallationRef } : {}),
+            ...(nativeId ? { nativeId } : {}),
+            target,
+          }),
+          timestamp,
+          mutation.address.tenantId,
+          mutation.resourceUid,
+        ],
+      },
+    ],
+  };
+}
+
+function deletionTombstoneStatements(
+  mutation: ResourceMutationCommit,
+  timestamp: number,
+): readonly SqlStatement[] {
+  const tombstone = mutation.deletionTombstone;
+  if (!tombstone) return [];
+  return [
+    {
+      sql: `UPDATE tf_resource_deletion_attestations
+            SET state = 'closed', closure_fence = closure_fence + 1,
+                evidence_json = NULL, evidence_ref = NULL,
+                evidence_effect_digest = NULL, evidence_checked_at = NULL,
+                evidence_status = NULL, updated_at = ?
+            WHERE tenant_id = ? AND resource_uid = ? AND state = 'pending'
+              AND EXISTS (
+                SELECT 1 FROM tf_resource_provider_effects
+                WHERE tenant_id = ? AND resource_uid = ? AND effect_id = ?
+                  AND phase = 'succeeded'
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM tf_resource_provider_effects AS open_effect
+                WHERE open_effect.tenant_id = tf_resource_deletion_attestations.tenant_id
+                  AND open_effect.resource_uid = tf_resource_deletion_attestations.resource_uid
+                  AND open_effect.phase IN ('planned', 'dispatched')
+                  AND NOT EXISTS (
+                    SELECT 1 FROM tf_resource_provider_effects AS terminal_effect
+                    WHERE terminal_effect.tenant_id = open_effect.tenant_id
+                      AND terminal_effect.resource_uid = open_effect.resource_uid
+                      AND terminal_effect.effect_id = open_effect.effect_id
+                      AND terminal_effect.phase IN ('succeeded', 'cancelled')
+                  )
+              )`,
+      params: [
+        timestamp,
+        mutation.address.tenantId,
+        mutation.resourceUid,
+        mutation.address.tenantId,
+        mutation.resourceUid,
+        tombstone.operationId,
+      ],
+    },
+  ];
+}
+
 function deploymentMutationSql(
   receipt: TakoformDriverReceipt | undefined,
   timestamp: number,
@@ -2326,14 +2978,33 @@ function deploymentMutationSql(
       fenceParams: commonParams,
       statements: [
         {
-          sql: `UPDATE tf_resource_deployments
+          sql: mutation.operationId
+            ? `UPDATE tf_resource_deployments
+                SET state = 'retained', observed_json = ?,
+                    outputs_json = json_set(
+                      ?,
+                      '$.__takoserver.deleteOperationId', ?,
+                      '$.__takoserver.resourceUid', ?,
+                      '$.__takoserver.space', ?,
+                      '$.__takoserver.name', ?
+                    ), updated_at = ?
+                WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`
+            : `UPDATE tf_resource_deployments
                 SET state = 'retained', observed_json = ?, outputs_json = ?, updated_at = ?
                 WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`,
           params: [
             JSON.stringify(mutation.observed),
-            JSON.stringify(mutation.outputs),
-            timestamp,
-            ...commonParams,
+            ...(mutation.operationId
+              ? [
+                  JSON.stringify(mutation.outputs),
+                  mutation.operationId,
+                  mutation.resourceUid ?? "",
+                  mutation.space ?? "",
+                  mutation.name ?? "",
+                  timestamp,
+                  ...commonParams,
+                ]
+              : [JSON.stringify(mutation.outputs), timestamp, ...commonParams]),
           ],
         },
       ],
@@ -2344,9 +3015,30 @@ function deploymentMutationSql(
     fenceParams: commonParams,
     statements: [
       {
-        sql: `UPDATE tf_resource_deployments SET state = 'deleted', updated_at = ?
+        sql: mutation.operationId
+          ? `UPDATE tf_resource_deployments
+              SET state = 'deleted',
+                    outputs_json = json_set(
+                    outputs_json,
+                    '$.__takoserver.deleteOperationId', ?,
+                    '$.__takoserver.resourceUid', ?,
+                    '$.__takoserver.space', ?,
+                    '$.__takoserver.name', ?
+                  ),
+                  updated_at = ?
+              WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`
+          : `UPDATE tf_resource_deployments SET state = 'deleted', updated_at = ?
               WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`,
-        params: [timestamp, ...commonParams],
+        params: mutation.operationId
+          ? [
+              mutation.operationId,
+              mutation.resourceUid ?? "",
+              mutation.space ?? "",
+              mutation.name ?? "",
+              timestamp,
+              ...commonParams,
+            ]
+          : [timestamp, ...commonParams],
       },
     ],
   };
@@ -2673,6 +3365,253 @@ function resourceListing(row: Row): ResourceListing {
     updatedAt: new Date(Number(row.updated_at)).toISOString(),
     resource: JSON.parse(text(row.resource_json)) as TakoformStoredResource,
   };
+}
+
+function resourceDeletionTombstone(row: Row): ResourceDeletionTombstone {
+  const formRef = JSON.parse(text(row.form_ref_json)) as unknown;
+  const effectsValue = JSON.parse(text(row.effects_json)) as unknown;
+  if (!recordValue(formRef) || !Array.isArray(effectsValue)) {
+    throw new TakoformHostError("backend_unavailable", 503);
+  }
+  const effects = effectsValue.map(resourceDeletionEffect);
+  const state = text(row.state);
+  if (state !== "live" && state !== "pending" && state !== "closed" && state !== "cancelled") {
+    throw new TakoformHostError("backend_unavailable", 503);
+  }
+  const closureFence = row.closure_fence;
+  if (typeof closureFence !== "number" || !Number.isSafeInteger(closureFence)) {
+    throw new TakoformHostError("backend_unavailable", 503);
+  }
+  const evidence =
+    typeof row.evidence_json === "string" ? (JSON.parse(row.evidence_json) as unknown) : undefined;
+  if (evidence !== undefined && !recordValue(evidence)) {
+    throw new TakoformHostError("backend_unavailable", 503);
+  }
+  const evidenceRef = row.evidence_ref;
+  if (evidenceRef !== null && !isDigest(evidenceRef)) {
+    throw new TakoformHostError("backend_unavailable", 503);
+  }
+  const evidenceEffectDigest = row.evidence_effect_digest;
+  if (evidenceEffectDigest !== null && !isDigest(evidenceEffectDigest)) {
+    throw new TakoformHostError("backend_unavailable", 503);
+  }
+  const evidenceCheckedAt = row.evidence_checked_at;
+  if (
+    evidenceCheckedAt !== null &&
+    (typeof evidenceCheckedAt !== "number" || !Number.isSafeInteger(evidenceCheckedAt))
+  ) {
+    throw new TakoformHostError("backend_unavailable", 503);
+  }
+  const evidenceStatus = row.evidence_status;
+  if (
+    evidenceStatus !== null &&
+    evidenceStatus !== "absent" &&
+    evidenceStatus !== "present" &&
+    evidenceStatus !== "indeterminate"
+  ) {
+    throw new TakoformHostError("backend_unavailable", 503);
+  }
+  return {
+    tenantId: text(row.tenant_id),
+    resourceUid: text(row.resource_uid),
+    address: {
+      tenantId: text(row.tenant_id),
+      space: text(row.space),
+      apiVersion: text(row.api_version),
+      kind: text(row.kind),
+      name: text(row.name),
+    },
+    formRef: formRef as unknown as TakoformV1Alpha3FormRef,
+    state,
+    closureFence,
+    effects,
+    ...(evidence ? { evidenceJson: evidence as JsonObject } : {}),
+    ...(typeof evidenceRef === "string" ? { evidenceRef } : {}),
+    ...(typeof evidenceEffectDigest === "string" ? { evidenceEffectDigest } : {}),
+    ...(typeof evidenceCheckedAt === "number"
+      ? { evidenceCheckedAt: new Date(evidenceCheckedAt).toISOString() }
+      : {}),
+    ...(evidenceStatus ? { evidenceStatus } : {}),
+    createdAt: new Date(integerColumn(row.created_at)).toISOString(),
+    updatedAt: new Date(integerColumn(row.updated_at)).toISOString(),
+  };
+}
+
+function resourceDeletionEffect(value: unknown): ResourceDeletionEffect {
+  if (!recordValue(value) || typeof value.operationId !== "string") {
+    throw new TakoformHostError("backend_unavailable", 503);
+  }
+  const phase = value.phase;
+  if (
+    phase !== "planned" &&
+    phase !== "dispatched" &&
+    phase !== "succeeded" &&
+    phase !== "cancelled"
+  ) {
+    throw new TakoformHostError("backend_unavailable", 503);
+  }
+  const kind = value.kind;
+  if (
+    kind !== undefined &&
+    kind !== "apply" &&
+    kind !== "import" &&
+    kind !== "provision" &&
+    kind !== "transfer-export" &&
+    kind !== "transfer-import" &&
+    kind !== "verify" &&
+    kind !== "cancel-delete" &&
+    kind !== "delete"
+  ) {
+    throw new TakoformHostError("backend_unavailable", 503);
+  }
+  const operationMode = value.operationMode;
+  if (operationMode !== undefined && operationMode !== "initial" && operationMode !== "recovery") {
+    throw new TakoformHostError("backend_unavailable", 503);
+  }
+  const providerPackRef = value.providerPackRef;
+  const providerInstallationRef = value.providerInstallationRef;
+  const nativeId = value.nativeId;
+  const target = value.target;
+  const disposition = value.disposition;
+  if (
+    (providerPackRef !== undefined && typeof providerPackRef !== "string") ||
+    (providerInstallationRef !== undefined && typeof providerInstallationRef !== "string") ||
+    (nativeId !== undefined && typeof nativeId !== "string") ||
+    (target !== undefined && !recordValue(target)) ||
+    (disposition !== undefined && disposition !== "deleted" && disposition !== "retained")
+  ) {
+    throw new TakoformHostError("backend_unavailable", 503);
+  }
+  return {
+    ...(typeof value.eventId === "string" ? { eventId: value.eventId } : {}),
+    operationId: value.operationId,
+    ...(kind ? { kind } : {}),
+    phase,
+    ...(operationMode ? { operationMode } : {}),
+    ...(typeof providerPackRef === "string" ? { providerPackRef } : {}),
+    ...(typeof providerInstallationRef === "string" ? { providerInstallationRef } : {}),
+    ...(typeof nativeId === "string" ? { nativeId } : {}),
+    ...(recordValue(target) ? { target: target as JsonObject } : {}),
+    ...(disposition === "deleted" || disposition === "retained" ? { disposition } : {}),
+  };
+}
+
+function validResourceEffectInput(input: {
+  readonly tenantId: string;
+  readonly resourceUid: string;
+  readonly effectId: string;
+  readonly kind: ResourceEffectKind;
+  readonly phase: ResourceDeletionEffectPhase;
+  readonly operationMode: "initial" | "recovery";
+  readonly providerPackRef?: string;
+  readonly providerInstallationRef?: string;
+  readonly nativeId?: string;
+  readonly target?: JsonObject;
+}): void {
+  if (
+    input.tenantId.length < 1 ||
+    input.tenantId.length > 255 ||
+    input.resourceUid.length < 3 ||
+    input.resourceUid.length > 128 ||
+    input.effectId.length < 3 ||
+    input.effectId.length > 255
+  ) {
+    throw new TakoformHostError("invalid_argument", 400);
+  }
+  if (input.providerPackRef !== undefined && input.providerPackRef.length > 255) {
+    throw new TakoformHostError("invalid_argument", 400);
+  }
+  if (input.providerInstallationRef !== undefined && input.providerInstallationRef.length > 255) {
+    throw new TakoformHostError("invalid_argument", 400);
+  }
+  if (input.nativeId !== undefined && (input.nativeId.length < 1 || input.nativeId.length > 4096)) {
+    throw new TakoformHostError("invalid_argument", 400);
+  }
+  if (input.target !== undefined) {
+    let encoded: string;
+    try {
+      encoded = canonicalJson(input.target);
+    } catch {
+      throw new TakoformHostError("invalid_argument", 400);
+    }
+    if (encoded.length < 2 || encoded.length > 1_048_576) {
+      throw new TakoformHostError("invalid_argument", 400);
+    }
+    const forbidden = /(?:secret|token|password|credential|private[_-]?key|authorization)/iu;
+    const containsSecretKey = (value: unknown): boolean => {
+      if (Array.isArray(value)) return value.some(containsSecretKey);
+      if (!recordValue(value)) return false;
+      return Object.entries(value).some(
+        ([key, child]) => forbidden.test(key) || containsSecretKey(child),
+      );
+    };
+    if (containsSecretKey(input.target)) throw new TakoformHostError("invalid_argument", 400);
+  }
+}
+
+function resourceProviderEffect(row: Row): ResourceDeletionEffect {
+  const phase = text(row.phase);
+  if (
+    phase !== "planned" &&
+    phase !== "dispatched" &&
+    phase !== "succeeded" &&
+    phase !== "cancelled"
+  ) {
+    throw new TakoformHostError("backend_unavailable", 503);
+  }
+  const operationMode = text(row.operation_mode);
+  if (operationMode !== "initial" && operationMode !== "recovery") {
+    throw new TakoformHostError("backend_unavailable", 503);
+  }
+  const kind = text(row.effect_kind);
+  if (
+    kind !== "apply" &&
+    kind !== "import" &&
+    kind !== "provision" &&
+    kind !== "transfer-export" &&
+    kind !== "transfer-import" &&
+    kind !== "verify" &&
+    kind !== "cancel-delete" &&
+    kind !== "delete"
+  ) {
+    throw new TakoformHostError("backend_unavailable", 503);
+  }
+  return {
+    eventId: text(row.event_id),
+    operationId: text(row.effect_id),
+    kind,
+    phase,
+    operationMode,
+    ...(typeof row.provider_pack_ref === "string"
+      ? { providerPackRef: row.provider_pack_ref }
+      : {}),
+    ...(typeof row.provider_installation_ref === "string"
+      ? { providerInstallationRef: row.provider_installation_ref }
+      : {}),
+    ...(typeof row.native_id === "string" ? { nativeId: row.native_id } : {}),
+    ...(typeof row.target_json === "string"
+      ? (() => {
+          try {
+            const parsed = JSON.parse(row.target_json) as unknown;
+            if (!recordValue(parsed)) throw new Error("invalid target descriptor");
+            return { target: parsed as JsonObject };
+          } catch {
+            throw new TakoformHostError("backend_unavailable", 503);
+          }
+        })()
+      : {}),
+  };
+}
+
+function recordValue(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function integerColumn(value: unknown): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new TakoformHostError("backend_unavailable", 503);
+  }
+  return value;
 }
 
 function text(value: unknown): string {

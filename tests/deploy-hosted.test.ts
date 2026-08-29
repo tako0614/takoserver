@@ -1,9 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DeployError } from "../scripts/deploy/errors.ts";
 import { type HostedDatabase, type HostedProcess, runHosted } from "../scripts/deploy/hosted.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import type { SigningPublicKeyRow } from "../scripts/deploy/signing.ts";
@@ -12,8 +10,6 @@ import type { WorkerState } from "../scripts/deploy/worker-live.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
 
 const COMMIT = "a".repeat(40);
-const BUNDLE = "export default {fetch(){return new Response('ok')}};\n";
-const DIGEST = createHash("sha256").update(BUNDLE).digest("hex");
 const TOKEN = "hosted-token-exact";
 
 const target = {
@@ -28,10 +24,7 @@ const target = {
   r2: { bucketName: "takoserver-objects-integration" },
   publicOrigin: "https://api.integration.example.test",
   signing: { currentKeyId: "key-current" },
-  hostedTopology: {
-    service: "takosumi-platform",
-    entrypoint: "TakosumiHostRuntimeMaterializerEntrypoint",
-  },
+  sponsorship: true,
 } satisfies DeployTarget;
 
 async function key() {
@@ -64,7 +57,6 @@ function database(publicJwk: string): HostedDatabase & { readonly reads: number 
 
 function processFixture() {
   const calls: { command: string[]; input?: string }[] = [];
-  let uploadMessage: string | null = null;
   const run: HostedProcess = async (command, options): Promise<CommandResult> => {
     calls.push({
       command: [...command],
@@ -74,29 +66,15 @@ function processFixture() {
     if (key === "git rev-parse HEAD") return ok(`${COMMIT}\n`);
     if (key === "git branch --show-current") return ok("feature/hosted\n");
     if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
-    if (key === "bun run check") return ok("green\n");
     if (command.includes("secret") && command.includes("put")) return ok("secret updated\n");
-    if (command.includes("--dry-run")) {
-      const out = command[command.indexOf("--outdir") + 1];
-      if (!out) throw new Error("missing outdir");
-      writeFileSync(join(out, "index.js"), BUNDLE);
-      return ok("built\n");
-    }
-    if (command.includes("deploy") && command.includes("--no-bundle")) {
-      uploadMessage = command[command.indexOf("--message") + 1] ?? null;
-      return ok("uploaded\n");
-    }
     throw new Error(`unexpected command: ${key}`);
   };
-  return { run, calls, message: () => uploadMessage };
+  return { run, calls };
 }
 
 function state(input: {
-  readonly beforeTopology: "desired" | "absent";
-  readonly afterTopology: "desired" | "absent";
   readonly beforeHostedSecret: boolean;
   readonly afterHostedSecret: boolean;
-  readonly afterMessage?: () => string | null;
 }): WorkerState {
   let historyReads = 0;
   let secretReads = 0;
@@ -116,7 +94,6 @@ function state(input: {
     async workerVersion(_worker, versionId) {
       const after = versionId === "version-after";
       return version(
-        after ? input.afterTopology : input.beforeTopology,
         after
           ? input.afterHostedSecret
             ? hostedSecrets()
@@ -124,9 +101,7 @@ function state(input: {
           : input.beforeHostedSecret
             ? hostedSecrets()
             : baseSecrets(),
-        after
-          ? (input.afterMessage?.() ?? `takoserver-worker:${COMMIT}:${DIGEST}`)
-          : `takoserver-worker:${COMMIT}:${DIGEST}`,
+        `takoserver-worker:${COMMIT}:${"b".repeat(64)}`,
       );
     },
     async workerSecrets() {
@@ -141,7 +116,7 @@ function state(input: {
   };
 }
 
-describe("ordered Hosted token and topology cutovers", () => {
+describe("Hosted sponsorship token cutover", () => {
   test("token cutover changes only the secret, then proves the exact bearer and current signature", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-hosted-token-"));
     try {
@@ -162,8 +137,6 @@ describe("ordered Hosted token and topology cutovers", () => {
         {
           database: signingDatabase,
           state: state({
-            beforeTopology: "absent",
-            afterTopology: "absent",
             beforeHostedSecret: false,
             afterHostedSecret: true,
           }),
@@ -177,7 +150,6 @@ describe("ordered Hosted token and topology cutovers", () => {
       );
       expect(result).toMatchObject({
         kind: "takoserver.hosted-token-cutover-apply@v2",
-        topology: "absent",
         proof: { keyId: "key-current", tenantRef: "tenant-proof" },
       });
       const mutations = process.calls.filter(
@@ -193,100 +165,6 @@ describe("ordered Hosted token and topology cutovers", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
-
-  test("topology refuses to run before the Hosted token exists", async () => {
-    const root = mkdtempSync(join(tmpdir(), "takoserver-hosted-order-"));
-    try {
-      const signing = await key();
-      const tokenPath = join(root, "hosted-token");
-      writeFileSync(tokenPath, TOKEN, { mode: 0o600 });
-      const process = processFixture();
-      const failure = await runHosted(
-        {
-          surface: "takoserver-hosted-topology-cutover",
-          action: "apply",
-          environment: "integration",
-          commit: COMMIT,
-        },
-        target,
-        {
-          database: database(signing.publicJwk),
-          state: state({
-            beforeTopology: "absent",
-            afterTopology: "desired",
-            beforeHostedSecret: false,
-            afterHostedSecret: false,
-          }),
-          run: process.run,
-          tokenPath,
-          review: "reviewer@example.test",
-          outputDirectory: join(root, "work"),
-          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
-          fetcher: sponsorshipFetcher(signing.pair.privateKey, []),
-        },
-      ).catch((error) => error);
-      expect(failure).toBeInstanceOf(DeployError);
-      expect(failure.message).toContain("HOSTED_SPONSORSHIP_TOKEN");
-      expect(process.calls.some(({ command }) => command.includes("--dry-run"))).toBe(false);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("topology proves the token first, then uploads identical code with only the service binding", async () => {
-    const root = mkdtempSync(join(tmpdir(), "takoserver-hosted-topology-"));
-    try {
-      const signing = await key();
-      const tokenPath = join(root, "hosted-token");
-      writeFileSync(tokenPath, TOKEN, { mode: 0o600 });
-      const process = processFixture();
-      const signingDatabase = database(signing.publicJwk);
-      const requests: Request[] = [];
-      const result = await runHosted(
-        {
-          surface: "takoserver-hosted-topology-cutover",
-          action: "apply",
-          environment: "integration",
-          commit: COMMIT,
-        },
-        target,
-        {
-          database: signingDatabase,
-          state: state({
-            beforeTopology: "absent",
-            afterTopology: "desired",
-            beforeHostedSecret: true,
-            afterHostedSecret: true,
-            afterMessage: process.message,
-          }),
-          run: process.run,
-          tokenPath,
-          review: "reviewer@example.test",
-          outputDirectory: join(root, "work"),
-          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
-          fetcher: sponsorshipFetcher(signing.pair.privateKey, requests),
-        },
-      );
-      expect(result).toMatchObject({
-        kind: "takoserver.hosted-topology-cutover-apply@v2",
-        topology: "desired",
-        service: target.hostedTopology.service,
-        entrypoint: target.hostedTopology.entrypoint,
-      });
-      expect(requests).toHaveLength(2);
-      expect(process.calls.filter(({ command }) => command.includes("--dry-run"))).toHaveLength(1);
-      expect(process.calls.filter(({ command }) => command.includes("--no-bundle"))).toHaveLength(
-        1,
-      );
-      expect(
-        process.calls.some(({ command }) => command.includes("secret") && command.includes("put")),
-      ).toBe(false);
-      expect(process.calls.some(({ command }) => command.join(" ").includes(TOKEN))).toBe(false);
-      expect(signingDatabase.reads).toBe(2);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
 });
 
 function baseSecrets(): string[] {
@@ -297,9 +175,8 @@ function hostedSecrets(): string[] {
   return ["TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN", "TAKOSERVER_SIGNING_KEY"];
 }
 
-function version(topology: "desired" | "absent", secrets: readonly string[], message: string) {
+function version(secrets: readonly string[], message: string) {
   const expected = expectedExactBindingClosure(target, {
-    hostedTopology: topology,
     signingKeyId: "key-current",
     expectedSecrets: secrets,
   });

@@ -47,13 +47,6 @@ describe("the stable local Cloudflare-backed Host", () => {
     const host = await startStableLocalCloudflareHost({
       takoformRepositoryRoot: TAKOFORM_ROOT,
       token: TOKEN,
-      runtimeValues: {
-        ENCRYPTION_KEY: "local-e2e-encryption-key-32-bytes",
-        TAKOSUMI_ACCOUNTS_ISSUER_URL: "https://accounts.local.invalid",
-        TAKOSUMI_ACCOUNTS_CLIENT_ID: "local-client",
-        TAKOSUMI_ACCOUNTS_OWNER_SUB: "local-owner",
-        TAKOSUMI_ACCOUNTS_REDIRECT_URI: "https://worker.local.invalid/auth/callback",
-      },
     });
     try {
       expect(host.report()).toMatchObject({
@@ -90,11 +83,6 @@ describe("the stable local Cloudflare-backed Host", () => {
     const host = await startStableLocalCloudflareHost({
       takoformRepositoryRoot: TAKOFORM_ROOT,
       token: TOKEN,
-      runtimeValues: {
-        JWT_SECRET: "local-road-jwt-secret",
-        OIDC_CLIENT_SECRET: "local-road-oidc-secret",
-        OPENAI_API_KEY: "local-road-openai-key",
-      },
     });
     try {
       const forms = await installedForms(host.endpoint);
@@ -176,7 +164,7 @@ export { index_default as default };`,
         bundle: reference("WorkerBundle", "road-local-bundle"),
         handlers: ["fetch"],
         vars: { ENVIRONMENT: "local" },
-        requiredSensitiveVars: ["JWT_SECRET", "OIDC_CLIENT_SECRET", "OPENAI_API_KEY"],
+        requiredSensitiveVars: [],
         sqliteBindings: [{ name: "DB", resource: reference("SQLiteDatabase", "road-local-db") }],
         assets: {
           bundle: reference("StaticAssetBundle", "road-local-assets"),
@@ -214,7 +202,6 @@ export { index_default as default };`,
     const host = await startStableLocalCloudflareHost({
       takoformRepositoryRoot: TAKOFORM_ROOT,
       token: TOKEN,
-      runtimeValues: { TEST_RUNTIME_VALUE: "fixture-value" },
     });
     try {
       const forms = await installedForms(host.endpoint);
@@ -345,7 +332,7 @@ export default {
           },
         ],
         handlers: ["fetch", "queue", "scheduled"],
-        requiredSensitiveVars: ["TEST_RUNTIME_VALUE"],
+        requiredSensitiveVars: [],
         kvBindings: [{ name: "KV", resource: reference("EdgeKVNamespace", kv) }],
         queueProducerBindings: [
           { name: "DELIVERY_DLQ", resource: reference("AtLeastOnceQueue", deadLetterQueue) },

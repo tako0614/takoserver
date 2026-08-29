@@ -7,17 +7,17 @@ import {
 import { createR2ObjectStore, type R2BucketLike } from "./objects-r2.ts";
 import type { PublicHostIdentityRpc } from "./public-host-identity.ts";
 import { createD1Sql, type D1DatabaseLike } from "./sql-d1.ts";
-import { createIntegrationFormAuthorityComposition } from "./takoform/integration-operator-endpoint.ts";
 import type {
   FormAuthorityApplyResult,
   FormAuthorityPlan,
   FormAuthorityPlanRequest,
   FormAuthorityReadback,
-} from "./takoform/operator-authority.ts";
+} from "./takoform/host-admission-coordinator.ts";
 import {
   type FormAuthorityComposition,
   parseFormAuthorityCapabilityManifest,
-} from "./takoform/operator-endpoint.ts";
+} from "./takoform/host-admission-endpoint.ts";
+import { createIntegrationFormAuthorityComposition } from "./takoform/integration-operator-endpoint.ts";
 
 export interface IntegrationFormAuthorityRawWorkerEnv {
   readonly TAKOSERVER_ENVIRONMENT: string;

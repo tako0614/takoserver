@@ -7,7 +7,7 @@ test("production installs the exact source-pinned stable Takoform catalog", () =
   expect(catalog.provenance).toEqual({
     classification: "public-unsigned-package-corpus",
     repository: "https://github.com/tako0614/takoform-forms.git",
-    commit: "026f862975b9adb0e2bfd9c6214a5e6691dfb596",
+    commit: "3a395e4d7f9f652a942da52905857fccc41b467e",
     gitTags: "unsigned",
     sigstoreBundle: null,
     familyIndexSha256: "sha256:c3c59a01fb90ab967c3765ff1dd15ca4af4062cba9b38c0a3b97a168822ffb32",

@@ -4,7 +4,6 @@ import { createDatabase } from "./database.ts";
 import { takoformResourceDeployments, takoformResources } from "./database-schema.ts";
 import type { Ledger } from "./ledger.ts";
 import type { Clock, Sql } from "./ports.ts";
-import { boundedRuntimeMaterialization } from "./runtime-materialization.ts";
 import type { TakoformHost } from "./takoform/types.ts";
 import type { TokenService } from "./token.ts";
 
@@ -72,21 +71,12 @@ export function createSponsorshipRoutes(
         rest.length === 2 &&
         rest[1] === "takoform-run-credentials"
       ) {
-        const body = await jsonObject(
-          request,
-          ["runRef", "spaceRef", "expiresInSeconds"],
-          ["runtimeMaterialization"],
-        );
+        const body = await jsonObject(request, ["runRef", "spaceRef", "expiresInSeconds"]);
         const issued = await options.tokens.issueTakoformTenantRunToken({
           organizationId,
           tenantRef,
           spaceRef: text(body.spaceRef, 256),
           runRef: text(body.runRef, 256),
-          ...(body.runtimeMaterialization === undefined
-            ? {}
-            : {
-                runtimeMaterialization: boundedRuntimeMaterialization(body.runtimeMaterialization),
-              }),
           ttlSeconds: boundedTtl(body.expiresInSeconds),
         });
         return Response.json({ takoformRunCredential: issued }, { status: 201 });

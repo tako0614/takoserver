@@ -21,6 +21,7 @@ import {
 } from "./process.ts";
 import { type DeployEnvironment, qualifySource } from "./qualification.ts";
 import { writeWorkerConfig } from "./realized-config.ts";
+import { runAuthorityTransition } from "./retirement.ts";
 import type { DeployTarget } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import type { WorkerDeploymentHistory } from "./worker-state.ts";
@@ -31,7 +32,7 @@ const AUTHORITY_PATHS = [
   /^wrangler\.jsonc$/u,
   /^scripts\/build-worker\.ts$/u,
   /^scripts\/deploy(?:\.ts|\/)/u,
-  /^src\/(?:app|auth|control|deployment-composition|google-identity|identity-setup|operator-credentials|operator-key|provider-driver|provider-port|reseller|resource-deployments|resource-migrations|runtime-grants|runtime-materialization|signing-key|sponsorship-api|takos-id-identity|token)\.ts$/u,
+  /^src\/(?:app|auth|control|deployment-composition|google-identity|identity-setup|operator-credentials|operator-key|provider-driver|provider-port|reseller|resource-deployments|resource-migrations|runtime-grants|signing-key|sponsorship-api|takos-id-identity|token)\.ts$/u,
   /^src\/(?:entry-cloudflare-worker|entry-worker|public-host-identity|router|worker-production-composition)\.ts$/u,
   /^src\/takoform\/(?:admission|admission-projection|host-authority|routes)(?:\.|\/)/u,
 ] as const;
@@ -64,6 +65,8 @@ export interface WorkerInvocation {
   readonly environment: DeployEnvironment;
   readonly commit: string;
   readonly legacyPredecessorVersionId?: string;
+  readonly legacyHostRuntimePredecessorVersionId?: string;
+  readonly reverse?: boolean;
 }
 
 export interface WorkerOptions {
@@ -124,6 +127,27 @@ export async function runWorker(
   const state =
     options.state ??
     new CloudflareState({ accountId: target.accountId, token: exactToken(environment) });
+  if (invocation.legacyHostRuntimePredecessorVersionId !== undefined) {
+    if (invocation.surface !== "takoserver-worker-authority-cutover") {
+      throw preflightError(
+        "legacy Host-runtime predecessor transition requires takoserver-worker-authority-cutover",
+      );
+    }
+    return await runAuthorityTransition(
+      {
+        surface: "takoserver-worker-authority-cutover",
+        action: invocation.action,
+        environment: invocation.environment,
+        commit: invocation.commit,
+        legacyHostRuntimePredecessorVersionId: invocation.legacyHostRuntimePredecessorVersionId,
+        ...(invocation.reverse ? { reverse: true } : {}),
+      },
+      target,
+      state,
+      run,
+      { ...options, cloudflareEnvironment: environment },
+    );
+  }
   const temporary = options.outputDirectory === undefined;
   const root = options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-worker-"));
   mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -132,7 +156,6 @@ export async function runWorker(
       path: join(root, "inspect-wrangler.jsonc"),
       main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
       commit: invocation.commit,
-      hostedTopology: "desired",
     });
     const migrations =
       options.migrations ?? remoteMigrationReader(inspectionConfig, environment, run);
@@ -239,7 +262,6 @@ export async function runWorker(
       root,
       target,
       commit: source.commit,
-      hostedTopology: "desired",
       run,
     });
     const { bundlePath, configPath, bundleDigestHex } = prepared;
@@ -251,7 +273,6 @@ export async function runWorker(
         throw preflightError("Worker legacy predecessor selector is unavailable");
       }
       const last = await inspectLiveWorkerVersionWithLegacyPredecessor("preflight", target, state, {
-        hostedTopology: "desired",
         legacyPredecessorVersionId: selector,
       });
       if (
@@ -358,16 +379,12 @@ async function inspectWorker(
 ): Promise<WorkerInspection> {
   const live =
     options.legacyPredecessorVersionId === undefined
-      ? await inspectLiveWorkerVersion(phase, target, state, {
-          hostedTopology: "desired",
-        })
+      ? await inspectLiveWorkerVersion(phase, target, state, {})
       : options.reconcileStatus === true
         ? await inspectLiveWorkerVersionForLegacyStatus(phase, target, state, {
-            hostedTopology: "desired",
             legacyPredecessorVersionId: options.legacyPredecessorVersionId,
           })
         : await inspectLiveWorkerVersionWithLegacyPredecessor(phase, target, state, {
-            hostedTopology: "desired",
             legacyPredecessorVersionId: options.legacyPredecessorVersionId,
           });
   const migrationState = await migrations.read();

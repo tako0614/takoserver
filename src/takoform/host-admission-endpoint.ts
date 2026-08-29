@@ -3,16 +3,26 @@ import type { ObjectStore, Sql } from "../ports.ts";
 import { TAKOSERVER_INTRINSIC_HANDLER_KINDS } from "../provider-driver.ts";
 import { CLOUDFLARE_TAKOFORM_HANDLER_KINDS, CloudflareProvider } from "../providers/cloudflare.ts";
 import { isPublicHostIdentity, type PublicHostIdentityRpc } from "../public-host-identity.ts";
+import { createAdmissionHandleIssuer } from "./admission.ts";
 import { createFormAdmissionStore } from "./admission-store.ts";
-import {
-  type CoreAdmissionAdapter,
-  createUnavailableCoreAdmissionAdapter,
-  createUnavailableSignedTrustEvidenceAdapter,
-  type FormAuthorityEnvironment,
-  type SignedTrustEvidenceAdapter,
-} from "./core-admission-adapter.ts";
 import { currentTakoformCandidates } from "./current-candidates.ts";
+import {
+  createUnavailableFormAuthorityEvidenceVerifier,
+  type FormAuthorityEnvironment,
+  type FormAuthorityEvidenceVerifier,
+} from "./form-authority-verification.ts";
 import { createFormPackageStore, type FormPackageInput } from "./form-packages.ts";
+import {
+  createHostAdmissionCoordinator,
+  type FormAuthorityApplyResult,
+  type FormAuthorityIdentity,
+  type FormAuthorityPackageSource,
+  type FormAuthorityPlan,
+  type FormAuthorityPlanRequest,
+  type FormAuthorityReadback,
+  type HostAdmissionCoordinator,
+  HostAdmissionCoordinatorError,
+} from "./host-admission-coordinator.ts";
 import {
   deriveImplementationCatalog,
   type TakoformHandlerManifest,
@@ -21,17 +31,6 @@ import {
   YURUCOMMU_FORM_VERSIONS,
   yurucommuFormCandidates,
 } from "./implementation-catalog.ts";
-import {
-  createFormAuthorityOperator,
-  type FormAuthorityApplyResult,
-  type FormAuthorityIdentity,
-  type FormAuthorityOperator,
-  FormAuthorityOperatorError,
-  type FormAuthorityPackageSource,
-  type FormAuthorityPlan,
-  type FormAuthorityPlanRequest,
-  type FormAuthorityReadback,
-} from "./operator-authority.ts";
 import type { TakoformOperation } from "./types.ts";
 
 const RESOURCE_OPERATION_ORDER = [
@@ -62,36 +61,36 @@ export interface FormAuthorityEndpointBindings {
 
 export interface FormAuthorityComposition {
   readonly identity: FormAuthorityIdentity;
-  readonly endpoint: FormAuthorityOperatorEndpoint;
+  readonly endpoint: HostAdmissionEndpoint;
 }
 
 /** RPC-only composition. It deliberately has no fetch handler or route. */
-export class FormAuthorityOperatorEndpoint {
+export class HostAdmissionEndpoint {
   constructor(
-    private readonly operator: FormAuthorityOperator,
+    private readonly coordinator: HostAdmissionCoordinator,
     private readonly assertCurrentPublicHost: () => Promise<void>,
   ) {}
 
   async plan(request: FormAuthorityPlanRequest): Promise<FormAuthorityPlan> {
     await this.assertCurrentPublicHost();
-    return await this.operator.plan(request);
+    return await this.coordinator.plan(request);
   }
 
   async apply(plan: FormAuthorityPlan): Promise<FormAuthorityApplyResult> {
     await this.assertCurrentPublicHost();
-    return await this.operator.apply(plan);
+    return await this.coordinator.apply(plan);
   }
 
   async readback(request: FormAuthorityPlanRequest): Promise<FormAuthorityReadback> {
     await this.assertCurrentPublicHost();
-    return await this.operator.readback(request);
+    return await this.coordinator.readback(request);
   }
 }
 
 /**
  * Production composition is intentionally useful for plan/readback but not
- * apply. Its adapters remain unavailable until released Core admission and
- * signed trust implementations can be injected here.
+ * apply. Verification remains unavailable until released Core verification
+ * can be injected here; Host policy continues to live in this composition.
  */
 export async function createProductionFormAuthorityComposition(input: {
   readonly configuration: FormAuthorityEndpointConfiguration;
@@ -99,13 +98,12 @@ export async function createProductionFormAuthorityComposition(input: {
 }): Promise<FormAuthorityComposition> {
   return createComposition({
     ...input,
-    core: createUnavailableCoreAdmissionAdapter(),
-    trust: createUnavailableSignedTrustEvidenceAdapter(),
+    verifier: createUnavailableFormAuthorityEvidenceVerifier(),
     packages: {
       async load(): Promise<never> {
-        throw new FormAuthorityOperatorError(
+        throw new HostAdmissionCoordinatorError(
           "package_unavailable",
-          "production package source is unavailable without released admission adapters",
+          "production package source is unavailable without released verification evidence",
         );
       },
     },
@@ -115,8 +113,7 @@ export async function createProductionFormAuthorityComposition(input: {
 export async function createFormAuthorityComposition(input: {
   readonly configuration: FormAuthorityEndpointConfiguration;
   readonly bindings: FormAuthorityEndpointBindings;
-  readonly core: CoreAdmissionAdapter;
-  readonly trust: SignedTrustEvidenceAdapter;
+  readonly verifier: FormAuthorityEvidenceVerifier;
   readonly packages: FormAuthorityPackageSource;
 }): Promise<FormAuthorityComposition> {
   return createComposition(input);
@@ -135,7 +132,7 @@ export function createExactFormPackageSource(
     async load({ formRef, packageDigest }): Promise<FormPackageInput> {
       const pkg = exact.get(`${canonicalJson(formRef)}\0${packageDigest}`);
       if (!pkg) {
-        throw new FormAuthorityOperatorError(
+        throw new HostAdmissionCoordinatorError(
           "package_unavailable",
           "exact Form authority package is unavailable",
         );
@@ -148,8 +145,7 @@ export function createExactFormPackageSource(
 async function createComposition(input: {
   readonly configuration: FormAuthorityEndpointConfiguration;
   readonly bindings: FormAuthorityEndpointBindings;
-  readonly core: CoreAdmissionAdapter;
-  readonly trust: SignedTrustEvidenceAdapter;
+  readonly verifier: FormAuthorityEvidenceVerifier;
   readonly packages: FormAuthorityPackageSource;
 }): Promise<FormAuthorityComposition> {
   const catalog = await deriveRuntimeImplementationCatalog(input.configuration);
@@ -161,29 +157,30 @@ async function createComposition(input: {
       live.hostId !== identity.hostId ||
       live.workerVersionId !== identity.publicWorkerVersionId
     ) {
-      throw new FormAuthorityOperatorError(
+      throw new HostAdmissionCoordinatorError(
         "identity_mismatch",
         "served public Host identity differs from this Form authority Worker",
       );
     }
   };
   const storedPackages = createFormPackageStore(input.bindings.objects);
+  const handles = createAdmissionHandleIssuer();
   const admission = createFormAdmissionStore({
     sql: input.bindings.sql,
     packages: storedPackages,
-    handles: input.core.handles,
+    handles,
   });
   return {
     identity,
-    endpoint: new FormAuthorityOperatorEndpoint(
-      createFormAuthorityOperator({
+    endpoint: new HostAdmissionEndpoint(
+      createHostAdmissionCoordinator({
         identity,
         catalog,
         packages: input.packages,
         storedPackages,
         admission,
-        core: input.core,
-        trust: input.trust,
+        handles,
+        verifier: input.verifier,
         assertMutationAuthority: assertCurrentPublicHost,
       }),
       assertCurrentPublicHost,
@@ -340,7 +337,7 @@ function clonePackage(pkg: FormPackageInput): FormPackageInput {
     ...(pkg.retentionUntil === undefined ? {} : { retentionUntil: pkg.retentionUntil }),
     files: pkg.files.map((file) => {
       if (!(file.bytes instanceof Uint8Array) && !(file.bytes instanceof ArrayBuffer)) {
-        throw new FormAuthorityOperatorError(
+        throw new HostAdmissionCoordinatorError(
           "package_unavailable",
           "embedded Form authority package source must be bounded in memory",
         );

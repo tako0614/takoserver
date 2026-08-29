@@ -1,4 +1,4 @@
-import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 /**
@@ -27,6 +27,8 @@ export interface WorkerdSite {
   readonly directory: string;
   readonly mainModule: string;
   readonly hostnames: readonly string[];
+  /** Durable identity of the desired publication, including its routes. */
+  readonly generation?: string;
   /**
    * How the asset layer answers a path that matches no file, when the script
    * declared assets. Absent means it declared none.
@@ -47,8 +49,8 @@ export interface WorkerdRuntime {
   remove(name: string): Promise<void>;
   /** Rewrites the configuration from every script currently published. */
   reload(): Promise<void>;
-  /** Whether a script is present, for `observe`. */
-  has(name: string): Promise<boolean>;
+  /** Whether the requested generation is actually activated, for `observe`. */
+  has(name: string, generation?: string): Promise<boolean>;
 }
 
 export interface WorkerdRuntimeOptions {
@@ -65,11 +67,14 @@ export interface WorkerdRuntimeOptions {
   readonly port?: number;
   /** Called after the config is rewritten, to make workerd read it. */
   readonly onReload?: (configPath: string) => Promise<void>;
+  /** Runtime liveness/readiness truth for serving observations. */
+  readonly isReady?: () => boolean;
 }
 
 interface Manifest {
   readonly mainModule: string;
   readonly hostnames: readonly string[];
+  readonly generation?: string;
   readonly assets?: { readonly notFoundHandling: string };
 }
 
@@ -81,6 +86,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): WorkerdRun
   const scriptsRoot = join(options.root, "workers");
   const configPath = options.configPath ?? join(scriptsRoot, "workerd.capnp");
   const port = options.port ?? 8788;
+  const activationPath = join(scriptsRoot, ".takoserver-active.json");
 
   const scriptDirectory = (name: string): string => {
     if (!/^[a-z0-9][a-z0-9_-]{0,127}$/u.test(name)) {
@@ -125,6 +131,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): WorkerdRun
         JSON.stringify({
           mainModule: site.mainModule,
           hostnames: site.hostnames,
+          ...(site.generation === undefined ? {} : { generation: site.generation }),
           ...(site.assets ? { assets: site.assets } : {}),
         }),
         "utf8",
@@ -135,11 +142,23 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): WorkerdRun
       await rm(scriptDirectory(name), { recursive: true, force: true });
     },
 
-    async has(name) {
-      const manifest = await readFile(join(scriptDirectory(name), MANIFEST), "utf8").catch(
-        () => null,
-      );
-      return manifest !== null;
+    async has(name, generation) {
+      const active = await readActivation(activationPath);
+      if (!(name in active)) return false;
+      if (generation !== undefined && active[name] !== generation) return false;
+      // A marker only records the generation the last successful reload
+      // attempted to activate. Without an explicit process-readiness probe
+      // there is no runtime truth to distinguish staged files from serving
+      // traffic, so fail closed and discard the marker.
+      if (options.isReady === undefined || !options.isReady()) {
+        // A dead child or failed boot invalidates the activation marker. Remove
+        // only the stale entry; other scripts may still have a live process.
+        const next = { ...active };
+        delete next[name];
+        await writeActivation(activationPath, next);
+        return false;
+      }
+      return true;
     },
 
     async reload() {
@@ -153,8 +172,41 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): WorkerdRun
       await mkdir(dirname(configPath), { recursive: true });
       await writeFile(configPath, renderConfig(published, port, scriptsRoot), "utf8");
       await options.onReload?.(configPath);
+      // A staged manifest is not runtime truth. Only after the reload hook
+      // returns successfully do we persist the generation actually activated;
+      // a failed reload therefore leaves the previous marker intact.
+      await writeActivation(
+        activationPath,
+        Object.fromEntries(
+          published.map((entry) => [entry.name, entry.manifest.generation ?? null]),
+        ),
+      );
     },
   };
+}
+
+async function readActivation(path: string): Promise<Record<string, string | null>> {
+  const raw = await readFile(path, "utf8").catch(() => null);
+  if (raw === null) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+    const record: Record<string, string | null> = {};
+    for (const [name, generation] of Object.entries(parsed)) {
+      if (generation !== null && typeof generation !== "string") return {};
+      record[name] = generation;
+    }
+    return record;
+  } catch {
+    return {};
+  }
+}
+
+async function writeActivation(path: string, active: Record<string, string | null>): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  const temporary = `${path}.tmp`;
+  await writeFile(temporary, JSON.stringify(active), "utf8");
+  await rename(temporary, path);
 }
 
 interface Published {
@@ -175,7 +227,12 @@ async function readPublished(scriptsRoot: string): Promise<readonly Published[]>
     } catch {
       continue;
     }
-    if (typeof manifest.mainModule !== "string") continue;
+    if (
+      typeof manifest.mainModule !== "string" ||
+      (manifest.generation !== undefined && typeof manifest.generation !== "string")
+    ) {
+      continue;
+    }
     published.push({ name: entry.name, manifest });
   }
   return published.sort((left, right) => left.name.localeCompare(right.name));

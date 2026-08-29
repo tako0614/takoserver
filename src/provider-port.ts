@@ -49,7 +49,12 @@ export interface ProviderResult {
 
 export type ProviderTicket =
   | { readonly phase: "succeeded"; readonly result: ProviderResult }
-  | { readonly phase: "failed"; readonly failure: ProviderFailure }
+  | {
+      readonly phase: "failed";
+      readonly failure: ProviderFailure;
+      /** Retained opaque handle when polling itself reports a retryable fault. */
+      readonly handle?: string;
+    }
   | {
       readonly phase: "running";
       readonly handle: string;
@@ -77,7 +82,8 @@ export interface ResourceIdentity {
   readonly name: string;
 }
 
-export interface ApplyInput {
+/** Durable identity and recovery evidence for every provider mutation. */
+export interface ProviderMutationInput {
   /** Stable across retries of the same logical operation. */
   readonly operationId: string;
   /**
@@ -86,6 +92,11 @@ export interface ApplyInput {
    * recovery so callers that do not own that lease fail closed.
    */
   readonly operationMode?: "initial" | "recovery";
+  /** Opaque provider-owned handle retained by the Host for recovery polling. */
+  readonly providerHandle?: string;
+}
+
+export interface ApplyInput extends ProviderMutationInput {
   readonly offering: ProviderOffering;
   readonly identity: ResourceIdentity;
   readonly spec: JsonObject;
@@ -94,8 +105,6 @@ export interface ApplyInput {
   readonly previous?: { readonly nativeId: string; readonly spec: JsonObject };
   /** Exact Host-pinned dependencies with any active provider realization. */
   readonly relations?: readonly ProviderRelation[];
-  /** Signed, short-lived and opaque to the Provider Pack until materialization. */
-  readonly runtimeMaterialization?: JsonObject;
   /** Host-resolved runtime material. Never portable state or provider output. */
   readonly standardServices?: readonly ProviderStandardServiceProjection[];
 }
@@ -166,11 +175,90 @@ export type ProviderValue<T> =
   | { readonly ok: true; readonly value: T }
   | { readonly ok: false; readonly failure: ProviderFailure };
 
+/**
+ * Versioned, provider-owned readback identity retained by the Host after a
+ * logical Resource is deleted.  `nativeId` and `data` are Host-internal: they
+ * are never copied to a customer-facing Resource or absence receipt.  The
+ * provider is responsible for constructing the descriptor from its own
+ * identity rules and for validating it again before a readback.
+ */
+export const PROVIDER_READBACK_API_VERSION = "providers.takoserver.com/readback/v1" as const;
+
+export interface ProviderNativeReadbackDescriptor {
+  readonly apiVersion: typeof PROVIDER_READBACK_API_VERSION;
+  readonly provider: string;
+  readonly kind: string;
+  readonly nativeId: string;
+  /** Exact provider address/parent relation, with no credentials or raw body. */
+  readonly data: JsonObject;
+}
+
+/** Safe construction failure; provider input and upstream diagnostics never escape. */
+export class ProviderReadbackDescriptorError extends Error {
+  readonly code = "invalid_descriptor" as const;
+
+  constructor() {
+    super("the provider readback descriptor is invalid");
+    this.name = "ProviderReadbackDescriptorError";
+  }
+}
+
+export type ProviderNativeAbsenceUnknownReason =
+  | "transport"
+  | "malformed"
+  | "unsupported"
+  | "authority_unavailable";
+
+/** Closed tri-state result for a provider-native absence readback. */
+export type ProviderNativeAbsence =
+  | {
+      readonly outcome: "absent" | "present";
+      /** Bounded safe descriptor of what was read; never includes nativeId. */
+      readonly evidence: JsonObject;
+    }
+  | {
+      readonly outcome: "unknown";
+      readonly reason: ProviderNativeAbsenceUnknownReason;
+      readonly retryable: boolean;
+    };
+
+export interface ProviderNativeReadbackInput {
+  readonly offering: ProviderOffering;
+  readonly nativeId: string;
+  readonly identity: ResourceIdentity;
+  readonly spec?: JsonObject;
+  readonly relations?: readonly ProviderRelation[];
+}
+
 export interface Provider {
   readonly id: string;
   /** Static configuration, not a per-request discovery call. */
   readonly offerings: readonly ProviderOffering[];
   apply(input: ApplyInput): Promise<ProviderTicket>;
+  /**
+   * Captures an opaque, versioned provider readback descriptor before the
+   * logical Resource row disappears. This method is pure and synchronous:
+   * descriptor creation never calls the provider or mutates local state.
+   */
+  createNativeReadbackDescriptor?(
+    input: ProviderNativeReadbackInput,
+  ): ProviderNativeReadbackDescriptor;
+  /**
+   * Strictly read-only native absence verification. Implementations may issue
+   * GET/HEAD/list/read calls only; they must never replay delete/apply or
+   * trigger retries, writes, reloads, or other mutation side effects.
+   */
+  verifyNativeAbsence?(input: {
+    readonly offering: ProviderOffering;
+    readonly descriptor: ProviderNativeReadbackDescriptor;
+  }): Promise<ProviderNativeAbsence>;
+  /**
+   * Deterministic, non-mutating recovery for an apply whose acknowledgement
+   * was lost. Implementations must read/adopt an existing native identity (or
+   * fail closed); this seam is intentionally separate from `apply` so a
+   * recovery retry can never accidentally issue a second write.
+   */
+  recoverApply?(input: ApplyInput): Promise<ProviderTicket>;
   poll?(input: { readonly operationId: string; readonly handle: string }): Promise<ProviderTicket>;
   observe(input: {
     readonly offering: ProviderOffering;
@@ -180,7 +268,27 @@ export interface Provider {
     readonly relations?: readonly ProviderRelation[];
   }): Promise<ProviderTicket>;
   delete(input: {
+    /** Stable identity and recovery evidence for this delete. */
     readonly operationId: string;
+    /** Only `initial` may issue a new delete; recovery must poll/observe. */
+    readonly operationMode?: "initial" | "recovery";
+    /** Opaque provider-owned handle retained by the Host for polling. */
+    readonly providerHandle?: string;
+    readonly offering: ProviderOffering;
+    readonly nativeId: string;
+    readonly identity: ResourceIdentity;
+    readonly spec?: JsonObject;
+    readonly relations?: readonly ProviderRelation[];
+  }): Promise<ProviderTicket>;
+  /**
+   * Deterministic, non-mutating delete recovery. Providers without a
+   * readback/adoption path must omit this capability and leave the Host in an
+   * explicit recovery-required state instead of replaying DELETE.
+   */
+  recoverDelete?(input: {
+    readonly operationId: string;
+    readonly operationMode?: "initial" | "recovery";
+    readonly providerHandle?: string;
     readonly offering: ProviderOffering;
     readonly nativeId: string;
     readonly identity: ResourceIdentity;
@@ -189,6 +297,23 @@ export interface Provider {
   }): Promise<ProviderTicket>;
   /** Adopts an existing native resource. Absent when adoption is impossible. */
   adopt?(input: {
+    /** Stable identity and recovery evidence for this adoption. */
+    readonly operationId: string;
+    /** Only `initial` may issue a new adoption; recovery must poll/observe. */
+    readonly operationMode?: "initial" | "recovery";
+    /** Opaque provider-owned handle retained by the Host for polling. */
+    readonly providerHandle?: string;
+    readonly offering: ProviderOffering;
+    readonly nativeId: string;
+    readonly identity: ResourceIdentity;
+    readonly spec: JsonObject;
+    readonly relations?: readonly ProviderRelation[];
+  }): Promise<ProviderTicket>;
+  /** Deterministic, non-mutating adoption recovery (observe/readback only). */
+  recoverAdopt?(input: {
+    readonly operationId: string;
+    readonly operationMode?: "initial" | "recovery";
+    readonly providerHandle?: string;
     readonly offering: ProviderOffering;
     readonly nativeId: string;
     readonly identity: ResourceIdentity;

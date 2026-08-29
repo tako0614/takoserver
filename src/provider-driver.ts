@@ -1,9 +1,13 @@
 import type { Catalog } from "./catalog.ts";
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import { isEdgeFormsApiVersion } from "./form-ref.ts";
+import { canonicalDigest } from "./json.ts";
 import type { Ledger } from "./ledger.ts";
+import type { JsonObject } from "./ports.ts";
 import type {
   Provider,
+  ProviderNativeAbsence,
+  ProviderNativeReadbackDescriptor,
   ProviderOffering,
   ProviderRelation,
   ProviderResult,
@@ -11,15 +15,34 @@ import type {
   ProviderValue,
 } from "./provider-port.ts";
 import type { ResourceDeployment, ResourceDeploymentStore } from "./resource-deployments.ts";
+import type { TakoformStore } from "./takoform/store.ts";
 import type {
   InstalledTakoformForm,
   TakoformDriverReceipt,
   TakoformDriverRelation,
   TakoformFormAvailabilityResolver,
+  TakoformNativeAbsenceEvidence,
   TakoformResourceDriver,
   TakoformStoredResource,
 } from "./takoform/types.ts";
 import { TakoformHostError } from "./takoform/types.ts";
+
+/**
+ * The provider accepted a mutation but the driver could not observe a
+ * terminal result. The handle is intentionally opaque and is persisted by the
+ * Host saga; retries must poll/adopt it rather than dispatching a second write.
+ */
+export class ProviderMutationRecoveryError extends TakoformHostError {
+  constructor(
+    readonly providerOutcome: "running" | "indeterminate",
+    readonly providerHandle?: string,
+    code = "backend_unavailable",
+    status = 503,
+  ) {
+    super(code, status);
+    this.name = "ProviderMutationRecoveryError";
+  }
+}
 
 /**
  * Connects a Takoform apply to a real backend, and to the wallet.
@@ -41,6 +64,11 @@ export interface CreateProviderDriverOptions {
   readonly catalog: Catalog;
   readonly ledger: Ledger;
   readonly deployments: ResourceDeploymentStore;
+  /** Host-owned deletion tombstones and effect-closure evidence. */
+  readonly deletions?: Pick<
+    TakoformStore,
+    "readResourceDeletion" | "cacheResourceDeletionEvidence" | "readResourceEffectLedger"
+  >;
   /**
    * How long an apply may wait for a backend that answers `running`. Cloudflare
    * settles within one call; anything slower currently surfaces as retryable
@@ -52,13 +80,23 @@ export interface CreateProviderDriverOptions {
 }
 
 export function createProviderDriver(options: CreateProviderDriverOptions): TakoformResourceDriver {
-  const { providers, catalog, ledger, deployments } = options;
+  const { providers, catalog, ledger, deployments, deletions } = options;
   const pollBudget = options.inlinePollBudget ?? 5;
   const sleep =
     options.sleep ??
     ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
 
   const byId = new Map(providers.map((provider) => [provider.id, provider]));
+  // A Provider instance is selected by pack id and has no installation
+  // selector. Build the closed catalog authority up front: if one pack is
+  // advertised for multiple installations, readback cannot safely choose one
+  // and every historical deployment under that pack must fail closed.
+  const installationsByPack = new Map<string, Set<string>>();
+  for (const offering of catalog.list()) {
+    const refs = installationsByPack.get(offering.providerPackRef) ?? new Set<string>();
+    refs.add(offering.providerInstallationRef);
+    installationsByPack.set(offering.providerPackRef, refs);
+  }
 
   const selectSold = (
     form: InstalledTakoformForm,
@@ -150,14 +188,63 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     provider: Provider,
     operationId: string,
     first: ProviderTicket,
+    handleDurable = false,
   ): Promise<ProviderTicket> => {
     let ticket = first;
+    let handle = ticket.phase === "running" ? ticket.handle : undefined;
+    // A running ticket is the provider's only recovery identity. The Host
+    // saga can persist it only after this call returns, so do not cross a
+    // fallible poll/sleep boundary while the handle still lives only in this
+    // stack frame. Recovery callers already have the persisted handle and may
+    // continue polling within the inline budget.
+    if (ticket.phase === "running" && !handleDurable) {
+      throw new ProviderMutationRecoveryError("running", ticket.handle);
+    }
     for (let attempt = 0; ticket.phase === "running" && attempt < pollBudget; attempt += 1) {
       if (!provider.poll) break;
-      await sleep(ticket.pollAfterMs);
-      ticket = await provider.poll({ operationId, handle: ticket.handle });
+      try {
+        await sleep(ticket.pollAfterMs);
+        ticket = await provider.poll({ operationId, handle: ticket.handle });
+      } catch {
+        // The opaque handle was durable before entering this loop. Preserve it
+        // when a transport or scheduler failure leaves the outcome unknown.
+        throw new ProviderMutationRecoveryError("indeterminate", handle);
+      }
+      if (ticket.phase === "running") {
+        handle = ticket.handle;
+      } else if (ticket.phase === "failed" && ticket.failure.retryable && handle) {
+        // Keep the handle beside a retryable poll fault. The next executor
+        // must retry the same operation, never dispatch a fresh mutation.
+        ticket = { ...ticket, handle };
+      }
     }
     return ticket;
+  };
+
+  const pollHandle = async (
+    provider: Provider,
+    operationId: string,
+    handle: string,
+  ): Promise<ProviderTicket> => {
+    if (!provider.poll) {
+      return {
+        phase: "failed",
+        failure: {
+          code: "unavailable",
+          message: "the provider recovery handle cannot be polled",
+          retryable: true,
+        },
+        handle,
+      };
+    }
+    try {
+      const ticket = await provider.poll({ operationId, handle });
+      return ticket.phase === "failed" && ticket.failure.retryable && !ticket.handle
+        ? { ...ticket, handle }
+        : ticket;
+    } catch {
+      throw new ProviderMutationRecoveryError("indeterminate", handle);
+    }
   };
 
   const resultOf = (ticket: ProviderTicket): ProviderResult => {
@@ -167,7 +254,14 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     if (ticket.phase === "running") {
       // Still working when the budget ran out. Saying so is honest; claiming
       // success would record a resource the backend has not made yet.
-      throw new TakoformHostError("backend_unavailable", 503);
+      throw new ProviderMutationRecoveryError("running", ticket.handle);
+    }
+    if (ticket.failure.retryable) {
+      // A retryable provider failure after a mutating call may be a lost
+      // response rather than a pre-dispatch rejection. Keep the saga in an
+      // explicit indeterminate state and require deterministic recovery.
+      const [code, status] = failureToWire(ticket.failure.code);
+      throw new ProviderMutationRecoveryError("indeterminate", ticket.handle, code, status);
     }
     throw new TakoformHostError(...failureToWire(ticket.failure.code));
   };
@@ -189,10 +283,27 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
       amountMinor: priceMinor,
     });
     if (!held) throw new TakoformHostError("insufficient_funds", 402);
-    let ticket: ProviderTicket;
+    // A provider recovery error means dispatch was accepted but the driver did
+    // not observe a terminal result. The durable hold is the only authority
+    // keeping this operation's price earmarked while a restarted executor
+    // polls/adopts the same operation. A thrown adapter error is likewise not
+    // definitive proof of a pre-dispatch failure, so the hold remains.
+    const ticket = await work();
+    if (ticket.phase === "succeeded") {
+      await ledger.capture({
+        organizationId,
+        reference: operationId,
+        amountMinor: priceMinor,
+      });
+      return ticket.result;
+    }
     try {
-      ticket = await work();
+      // `running` and retryable `failed` tickets are recovery outcomes. Call
+      // resultOf before releasing so both retain the hold for the next poll or
+      // same-operation retry.
+      return resultOf(ticket);
     } catch (error) {
+      if (error instanceof ProviderMutationRecoveryError) throw error;
       await ledger.release({
         organizationId,
         reference: operationId,
@@ -200,26 +311,53 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
       });
       throw error;
     }
-    if (ticket.phase === "succeeded") {
-      await ledger.capture({
-        organizationId,
-        reference: operationId,
-        amountMinor: priceMinor,
-      });
-    } else {
-      await ledger.release({
-        organizationId,
-        reference: operationId,
-        amountMinor: priceMinor,
-      });
-    }
-    return resultOf(ticket);
   };
 
   const receiptOf = (result: ProviderResult): TakoformDriverReceipt => ({
     observed: result.observed,
     outputs: result.outputs,
   });
+
+  /** Deployment rows are Host-internal; this marker is never projected onto a Resource. */
+  const deploymentOutputs = (
+    outputs: ProviderResult["outputs"],
+    input: { readonly resourceUid: string; readonly space: string; readonly name: string },
+  ): ProviderResult["outputs"] => ({
+    ...structuredClone(outputs),
+    __takoserver: {
+      resourceUid: input.resourceUid,
+      space: input.space,
+      name: input.name,
+    },
+  });
+
+  const deploymentMarker = (
+    outputs: JsonObject,
+  ): {
+    readonly resourceUid: string;
+    readonly space: string;
+    readonly name: string;
+    readonly deleteOperationId?: string;
+  } | null => {
+    const value = outputs.__takoserver;
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+    const marker = value as Record<string, unknown>;
+    if (
+      typeof marker.resourceUid !== "string" ||
+      typeof marker.space !== "string" ||
+      typeof marker.name !== "string"
+    ) {
+      return null;
+    }
+    return {
+      resourceUid: marker.resourceUid,
+      space: marker.space,
+      name: marker.name,
+      ...(typeof marker.deleteOperationId === "string"
+        ? { deleteOperationId: marker.deleteOperationId }
+        : {}),
+    };
+  };
 
   const installed = (
     deployment: ResourceDeployment,
@@ -348,29 +486,40 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
             spec: input.previous?.spec ?? input.spec,
           }
         : undefined;
+      const providerInput = {
+        operationId: input.operationId,
+        ...(input.operationMode ? { operationMode: input.operationMode } : {}),
+        offering,
+        identity: {
+          tenantRef: input.tenantId,
+          space: input.space,
+          name: input.name,
+        },
+        spec: input.spec,
+        relations: relationTargets,
+        ...(input.standardServices
+          ? { standardServices: structuredClone(input.standardServices) }
+          : {}),
+        ...(previous ? { previous } : {}),
+      } satisfies import("./provider-port.ts").ApplyInput;
       const work = async () =>
         await settle(
           provider,
           input.operationId,
-          await provider.apply({
-            operationId: input.operationId,
-            ...(input.operationMode ? { operationMode: input.operationMode } : {}),
-            offering,
-            identity: {
-              tenantRef: input.tenantId,
-              space: input.space,
-              name: input.name,
-            },
-            spec: input.spec,
-            relations: relationTargets,
-            ...(input.runtimeMaterialization
-              ? { runtimeMaterialization: input.runtimeMaterialization }
-              : {}),
-            ...(input.standardServices
-              ? { standardServices: structuredClone(input.standardServices) }
-              : {}),
-            ...(previous ? { previous } : {}),
-          }),
+          input.providerHandle
+            ? await pollHandle(provider, input.operationId, input.providerHandle)
+            : input.operationMode === "recovery"
+              ? provider.recoverApply
+                ? await provider.recoverApply(providerInput)
+                : (() => {
+                    // Recovery without an opaque handle is safe only when the
+                    // concrete provider advertises an explicit deterministic,
+                    // read-only recovery seam. Never route it back through
+                    // `apply`, whose contract permits a fresh mutation.
+                    throw new ProviderMutationRecoveryError("indeterminate");
+                  })()
+              : await provider.apply(providerInput),
+          Boolean(input.providerHandle),
         );
       // A reseller reservation already holds this exact Offering's price.
       // Charging the organization wallet again here would double-settle the
@@ -390,7 +539,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
                 deploymentId: current.id,
                 expectedNativeId: current.nativeId,
                 observed: result.observed,
-                outputs: result.outputs,
+                outputs: deploymentOutputs(result.outputs, input),
               }
             : {
                 kind: "create",
@@ -409,7 +558,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
                   nativeId: result.nativeId,
                   state: "active",
                   observed: result.observed,
-                  outputs: result.outputs,
+                  outputs: deploymentOutputs(result.outputs, input),
                 },
               },
         };
@@ -433,7 +582,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
             nativeId: result.nativeId,
             state: "active",
             observed: result.observed,
-            outputs: result.outputs,
+            outputs: deploymentOutputs(result.outputs, input),
           });
         } catch {
           throw new TakoformHostError("resource_busy", 409);
@@ -479,18 +628,42 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
       const ticket = await settle(
         provider,
         input.operationId,
-        await provider.delete({
-          operationId: input.operationId,
-          offering,
-          nativeId: deployment.nativeId,
-          identity: {
-            tenantRef: input.tenantId,
-            space: input.resource.metadata.space,
-            name: input.resource.metadata.name,
-          },
-          spec: input.resource.spec,
-          relations: await providerRelations(input.tenantId, input.relations),
-        }),
+        input.providerHandle
+          ? await pollHandle(provider, input.operationId, input.providerHandle)
+          : input.operationMode === "recovery"
+            ? provider.recoverDelete
+              ? await provider.recoverDelete({
+                  operationId: input.operationId,
+                  operationMode: "recovery",
+                  offering,
+                  nativeId: deployment.nativeId,
+                  identity: {
+                    tenantRef: input.tenantId,
+                    space: input.resource.metadata.space,
+                    name: input.resource.metadata.name,
+                  },
+                  spec: input.resource.spec,
+                  relations: await providerRelations(input.tenantId, input.relations),
+                })
+              : (() => {
+                  // A lost DELETE acknowledgement has no safe replay. Only a
+                  // provider-owned deterministic readback may settle it.
+                  throw new ProviderMutationRecoveryError("indeterminate");
+                })()
+            : await provider.delete({
+                operationId: input.operationId,
+                ...(input.operationMode ? { operationMode: input.operationMode } : {}),
+                offering,
+                nativeId: deployment.nativeId,
+                identity: {
+                  tenantRef: input.tenantId,
+                  space: input.resource.metadata.space,
+                  name: input.resource.metadata.name,
+                },
+                spec: input.resource.spec,
+                relations: await providerRelations(input.tenantId, input.relations),
+              }),
+        Boolean(input.providerHandle),
       );
       const result = resultOf(ticket);
       if (result.nativeId !== deployment.nativeId) {
@@ -507,12 +680,24 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
                   expectedNativeId: deployment.nativeId,
                   observed: result.observed,
                   outputs: result.outputs,
+                  operationId: input.operationId,
+                  resourceUid: input.resourceUid,
+                  space: input.resource.metadata.space,
+                  name: input.resource.metadata.name,
+                  providerPackRef: deployment.providerPackRef,
+                  providerInstallationRef: deployment.providerInstallationRef,
                 }
               : {
                   kind: "delete",
                   tenantId: input.tenantId,
                   deploymentId: deployment.id,
                   expectedNativeId: deployment.nativeId,
+                  operationId: input.operationId,
+                  resourceUid: input.resourceUid,
+                  space: input.resource.metadata.space,
+                  name: input.resource.metadata.name,
+                  providerPackRef: deployment.providerPackRef,
+                  providerInstallationRef: deployment.providerInstallationRef,
                 },
         };
       }
@@ -524,11 +709,280 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
               deployment.nativeId,
               result.observed,
               result.outputs,
+              {
+                operationId: input.operationId,
+                resourceUid: input.resourceUid,
+                space: input.resource.metadata.space,
+                name: input.resource.metadata.name,
+              },
             )
-          : await deployments.markDeleted(input.tenantId, deployment.id, deployment.nativeId);
+          : await deployments.markDeleted(input.tenantId, deployment.id, deployment.nativeId, {
+              operationId: input.operationId,
+              resourceUid: input.resourceUid,
+              space: input.resource.metadata.space,
+              name: input.resource.metadata.name,
+            });
       if (!recorded) {
         throw new TakoformHostError("resource_busy", 409);
       }
+    },
+
+    async verifyNativeAbsence(input): Promise<TakoformNativeAbsenceEvidence> {
+      const checkedAt = new Date().toISOString();
+      const indeterminate = (
+        source: "intrinsic" | "provider",
+        reason: TakoformNativeAbsenceEvidence["reason"],
+        effectCount: number,
+        deploymentCount: number,
+      ): TakoformNativeAbsenceEvidence => ({
+        status: "indeterminate",
+        source,
+        ...(reason ? { reason } : {}),
+        effectCount,
+        deploymentCount,
+        checkedAt,
+      });
+      if (!deletions) return indeterminate("provider", "legacy_unattested", 0, 0);
+
+      const tombstone = await deletions.readResourceDeletion(input.tenantId, input.resourceUid);
+      const rows = await deployments.forResource(input.tenantId, input.resourceUid);
+      if (!tombstone) {
+        if (rows.length > 0) {
+          return indeterminate("provider", "legacy_unattested", 0, rows.length);
+        }
+        throw new TakoformHostError("resource_not_found", 404);
+      }
+      if (tombstone.address.space !== input.space || tombstone.address.name !== input.name) {
+        return indeterminate(
+          "provider",
+          "legacy_unattested",
+          tombstone.effects.length,
+          rows.length,
+        );
+      }
+
+      const source = intrinsicFormRef(tombstone.formRef) ? "intrinsic" : "provider";
+      const effects = deletions.readResourceEffectLedger
+        ? await deletions.readResourceEffectLedger(input.tenantId, input.resourceUid)
+        : tombstone.effects;
+      const effectSetDigest = await canonicalDigest({
+        // The evidence cache is scoped to the exact incarnation address and
+        // Form identity as well as its effect history. A same-UID or same-name
+        // request for another Form must never hit a prior absence proof.
+        address: tombstone.address,
+        formRef: tombstone.formRef,
+        effects: effects.map((effect) => ({
+          eventId: effect.eventId,
+          operationId: effect.operationId,
+          kind: effect.kind,
+          phase: effect.phase,
+          operationMode: effect.operationMode,
+          providerPackRef: effect.providerPackRef,
+          providerInstallationRef: effect.providerInstallationRef,
+          nativeId: effect.nativeId,
+        })),
+      });
+      const effectCount = effects.length;
+      if (effectCount > 512 || rows.length > 128) {
+        return indeterminate(source, "effect_unresolved", effectCount, rows.length);
+      }
+      const latest = new Map<string, (typeof effects)[number]>();
+      for (const effect of effects) {
+        const prior = latest.get(effect.operationId);
+        if (!prior || phaseRank(effect.phase) >= phaseRank(prior.phase))
+          latest.set(effect.operationId, effect);
+      }
+      const unresolved = [...latest.values()].some(
+        (effect) => effect.phase !== "succeeded" && effect.phase !== "cancelled",
+      );
+
+      // A closed cache is usable only when the closure fence and complete
+      // effect set still match, and only for a short TTL. Readback is otherwise
+      // performed again so stale absence can never become a false zero.
+      const checkedAtMs = tombstone.evidenceCheckedAt
+        ? Date.parse(tombstone.evidenceCheckedAt)
+        : Number.NaN;
+      const cacheFresh =
+        tombstone.state === "closed" &&
+        tombstone.evidenceJson !== undefined &&
+        tombstone.evidenceRef !== undefined &&
+        tombstone.evidenceEffectDigest === effectSetDigest &&
+        Number.isFinite(checkedAtMs) &&
+        Date.now() - checkedAtMs >= 0 &&
+        Date.now() - checkedAtMs <= 30_000 &&
+        tombstone.evidenceStatus !== undefined;
+      if (cacheFresh) {
+        const cachedStatus = tombstone.evidenceStatus;
+        if (
+          cachedStatus === "absent" ||
+          cachedStatus === "present" ||
+          cachedStatus === "indeterminate"
+        ) {
+          return {
+            status: cachedStatus,
+            source,
+            evidenceRef: tombstone.evidenceRef,
+            effectCount,
+            deploymentCount: rows.length,
+            checkedAt: tombstone.evidenceCheckedAt ?? checkedAt,
+          };
+        }
+      }
+
+      const attest = async (
+        status: TakoformNativeAbsenceEvidence["status"],
+        reason?: TakoformNativeAbsenceEvidence["reason"],
+        cache = false,
+      ): Promise<TakoformNativeAbsenceEvidence> => {
+        const evidenceBase: TakoformNativeAbsenceEvidence = {
+          status,
+          source,
+          ...(reason ? { reason } : {}),
+          effectCount,
+          deploymentCount: rows.length,
+          checkedAt,
+        };
+        if (!cache || tombstone.state !== "closed") return evidenceBase;
+        const evidenceRef = await canonicalDigest({
+          tenantId: input.tenantId,
+          resourceUid: input.resourceUid,
+          space: input.space,
+          name: input.name,
+          closureFence: tombstone.closureFence,
+          effectSetDigest,
+          ...evidenceBase,
+        });
+        await deletions.cacheResourceDeletionEvidence({
+          tenantId: input.tenantId,
+          resourceUid: input.resourceUid,
+          closureFence: tombstone.closureFence,
+          evidence: evidenceBase as unknown as JsonObject,
+          evidenceRef,
+          effectSetDigest,
+          checkedAt: Date.parse(checkedAt),
+          status,
+        });
+        return { ...evidenceBase, evidenceRef };
+      };
+
+      if (tombstone.state !== "closed") return await attest("indeterminate", "closure_pending");
+      if (unresolved) return await attest("indeterminate", "effect_unresolved");
+
+      if (rows.length === 0) {
+        const physical = [...latest.values()].some(
+          (effect) =>
+            effect.phase === "succeeded" &&
+            (effect.nativeId !== undefined || effect.providerPackRef !== undefined),
+        );
+        if (!intrinsicFormRef(tombstone.formRef) || physical) {
+          return await attest("indeterminate", "provider_identity_missing");
+        }
+        return await attest("absent", undefined, true);
+      }
+
+      const marked = rows.map((deployment) => ({
+        deployment,
+        marker: deploymentMarker(deployment.outputs),
+      }));
+      if (
+        marked.some(
+          ({ marker }) =>
+            marker === null ||
+            marker.resourceUid !== input.resourceUid ||
+            marker.space !== input.space ||
+            marker.name !== input.name,
+        )
+      ) {
+        return await attest("indeterminate", "deployment_unmarked");
+      }
+      if (
+        marked.some(({ deployment }) =>
+          ["provisioning", "candidate", "active", "draining"].includes(deployment.state),
+        )
+      ) {
+        return await attest("present", "deployment_active");
+      }
+      if (
+        marked.some(
+          ({ deployment }) =>
+            deployment.state === "failed" ||
+            (deployment.state !== "deleted" && deployment.state !== "retained"),
+        )
+      ) {
+        return await attest("indeterminate", "effect_unresolved");
+      }
+
+      const unique = new Map<string, ResourceDeployment>();
+      for (const { deployment } of marked) {
+        const key = [
+          deployment.providerPackRef,
+          deployment.providerInstallationRef,
+          deployment.nativeId,
+        ].join("\u0000");
+        if (!unique.has(key)) unique.set(key, deployment);
+      }
+      for (const deployment of [...unique.values()].sort((a, b) =>
+        [a.providerPackRef, a.providerInstallationRef, a.nativeId]
+          .join("\u0000")
+          .localeCompare([b.providerPackRef, b.providerInstallationRef, b.nativeId].join("\u0000")),
+      )) {
+        // A retained Deployment is an historical provider identity, not a
+        // license to ask whichever installation currently happens to expose
+        // the same offering id.  Resolve the exact catalog tuple first; a
+        // missing/retired/drifted installation fails closed without a native
+        // provider readback call.
+        const catalogOffering = catalog.findOffering(deployment.offeringId);
+        if (
+          !catalogOffering ||
+          catalogOffering.providerPackRef !== deployment.providerPackRef ||
+          catalogOffering.providerInstallationRef !== deployment.providerInstallationRef ||
+          !sameForm(catalogOffering.form, tombstone.formRef)
+        ) {
+          return await attest("indeterminate", "provider_unavailable");
+        }
+        const installationRefs = installationsByPack.get(deployment.providerPackRef);
+        if (
+          installationRefs?.size !== 1 ||
+          !installationRefs?.has(deployment.providerInstallationRef)
+        ) {
+          return await attest("indeterminate", "provider_unavailable");
+        }
+        const provider = byId.get(deployment.providerPackRef);
+        const offering = provider?.offerings.find(
+          (candidate) => candidate.id === deployment.offeringId,
+        );
+        if (
+          !provider ||
+          !offering ||
+          !sameForm(offering.form, catalogOffering.form) ||
+          !sameForm(offering.form, tombstone.formRef) ||
+          !provider.createNativeReadbackDescriptor ||
+          !provider.verifyNativeAbsence
+        ) {
+          return await attest("indeterminate", "provider_unavailable");
+        }
+        let descriptor: ProviderNativeReadbackDescriptor;
+        try {
+          descriptor = provider.createNativeReadbackDescriptor({
+            offering,
+            nativeId: deployment.nativeId,
+            identity: { tenantRef: input.tenantId, space: input.space, name: input.name },
+            spec: deployment.observed,
+          });
+        } catch {
+          return await attest("indeterminate", "provider_readback_failed");
+        }
+        let proof: ProviderNativeAbsence;
+        try {
+          proof = await provider.verifyNativeAbsence({ offering, descriptor });
+        } catch {
+          return await attest("indeterminate", "provider_readback_failed");
+        }
+        if (proof.outcome === "present") return await attest("present");
+        if (proof.outcome !== "absent")
+          return await attest("indeterminate", "provider_readback_failed");
+      }
+      return await attest("absent", undefined, true);
     },
 
     async import(input): Promise<TakoformDriverReceipt> {
@@ -574,17 +1028,46 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
       // Adoption bills nothing: the resource already exists and was paid for
       // wherever it came from.
       const result = resultOf(
-        await provider.adopt({
-          offering,
-          nativeId: input.nativeId,
-          identity: {
-            tenantRef: input.tenantId,
-            space: input.space,
-            name: input.name,
-          },
-          spec: input.spec,
-          relations: await providerRelations(input.tenantId, input.relations),
-        }),
+        await settle(
+          provider,
+          input.operationId,
+          input.providerHandle
+            ? await pollHandle(provider, input.operationId, input.providerHandle)
+            : input.operationMode === "recovery"
+              ? provider.recoverAdopt
+                ? await provider.recoverAdopt({
+                    operationId: input.operationId,
+                    operationMode: "recovery",
+                    offering,
+                    nativeId: input.nativeId,
+                    identity: {
+                      tenantRef: input.tenantId,
+                      space: input.space,
+                      name: input.name,
+                    },
+                    spec: input.spec,
+                    relations: await providerRelations(input.tenantId, input.relations),
+                  })
+                : (() => {
+                    // Adoption recovery must observe/adopt an existing object;
+                    // calling `adopt` again could claim it twice.
+                    throw new ProviderMutationRecoveryError("indeterminate");
+                  })()
+              : await provider.adopt({
+                  operationId: input.operationId,
+                  ...(input.operationMode ? { operationMode: input.operationMode } : {}),
+                  offering,
+                  nativeId: input.nativeId,
+                  identity: {
+                    tenantRef: input.tenantId,
+                    space: input.space,
+                    name: input.name,
+                  },
+                  spec: input.spec,
+                  relations: await providerRelations(input.tenantId, input.relations),
+                }),
+          Boolean(input.providerHandle),
+        ),
       );
       if (result.nativeId !== input.nativeId) {
         throw new TakoformHostError("import_conflict", 409);
@@ -600,7 +1083,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
                   deploymentId: current.id,
                   expectedNativeId: current.nativeId,
                   observed: result.observed,
-                  outputs: result.outputs,
+                  outputs: deploymentOutputs(result.outputs, input),
                 }
               : {
                   kind: "claim",
@@ -609,7 +1092,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
                   expectedNativeId: current.nativeId,
                   nativeId: result.nativeId,
                   observed: result.observed,
-                  outputs: result.outputs,
+                  outputs: deploymentOutputs(result.outputs, input),
                 }
             : {
                 kind: "create",
@@ -624,7 +1107,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
                   nativeClaimed: true,
                   state: "active",
                   observed: result.observed,
-                  outputs: result.outputs,
+                  outputs: deploymentOutputs(result.outputs, input),
                 },
               },
         };
@@ -644,7 +1127,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
             expectedNativeId: current.nativeId,
             nativeId: result.nativeId,
             observed: result.observed,
-            outputs: result.outputs,
+            outputs: deploymentOutputs(result.outputs, input),
           }))
         ) {
           throw new TakoformHostError("resource_busy", 409);
@@ -662,7 +1145,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
             nativeClaimed: true,
             state: "active",
             observed: result.observed,
-            outputs: result.outputs,
+            outputs: deploymentOutputs(result.outputs, input),
           });
         } catch {
           throw new TakoformHostError("resource_busy", 409);
@@ -714,6 +1197,18 @@ function intrinsicForm(form: InstalledTakoformForm): boolean {
 
 function intrinsicFormRef(form: TakoformV1Alpha3FormRef): boolean {
   return isEdgeFormsApiVersion(form.apiVersion) && INTRINSIC_FORMS.has(form.kind);
+}
+
+function phaseRank(phase: "planned" | "dispatched" | "succeeded" | "cancelled"): number {
+  switch (phase) {
+    case "planned":
+      return 0;
+    case "dispatched":
+      return 1;
+    case "succeeded":
+    case "cancelled":
+      return 2;
+  }
 }
 
 function sameForm(left: TakoformV1Alpha3FormRef, right: TakoformV1Alpha3FormRef): boolean {

@@ -154,6 +154,392 @@ describe("reseller lane", () => {
     expect(await ledger.wallet("org_a")).toMatchObject({ settledMinor: 9_000, heldMinor: 0 });
   });
 
+  test("does not expose captured state when the ledger capture acknowledgement is lost", async () => {
+    await funded(10_000);
+    const { reservation } = await activeReservation();
+    const durableLedger = ledger;
+    let loseAcknowledgement = true;
+    ledger = {
+      ...durableLedger,
+      async capture(input) {
+        await durableLedger.capture(input);
+        if (loseAcknowledgement) {
+          loseAcknowledgement = false;
+          throw new Error("capture response lost");
+        }
+      },
+    };
+    reseller = createReseller({
+      sql,
+      ledger,
+      catalog: createCatalog([OFFERING]),
+      clock: () => new Date(now),
+    });
+
+    await expect(
+      reseller.capture({
+        organizationId: "org_a",
+        tenantRef: "tenant_x",
+        reservationId: reservation.id,
+        usage: { quantity: 2 },
+      }),
+    ).rejects.toThrow("capture response lost");
+    // A ledger write without its statement is not a public capture. The
+    // reservation remains active while the durable intent records recovery.
+    expect(
+      await reseller.reservation({
+        organizationId: "org_a",
+        tenantRef: "tenant_x",
+        reservationId: reservation.id,
+      }),
+    ).toMatchObject({ status: "active" });
+
+    await expect(
+      reseller.capture({
+        organizationId: "org_a",
+        tenantRef: "tenant_x",
+        reservationId: reservation.id,
+        usage: { quantity: 2 },
+      }),
+    ).resolves.toMatchObject({ reservationId: reservation.id, amountMinor: 1_000 });
+    expect(await ledger.wallet("org_a")).toMatchObject({ settledMinor: 9_000, heldMinor: 0 });
+  });
+
+  test("keeps a failed capture recoverable and repairs it after restart", async () => {
+    await funded(10_000);
+    const { reservation } = await activeReservation();
+    const durableLedger = ledger;
+    let failBeforeCapture = true;
+    ledger = {
+      ...durableLedger,
+      async capture(input) {
+        if (failBeforeCapture) {
+          failBeforeCapture = false;
+          throw new Error("capture refused before side effect");
+        }
+        await durableLedger.capture(input);
+      },
+    };
+    reseller = createReseller({
+      sql,
+      ledger,
+      catalog: createCatalog([OFFERING]),
+      clock: () => new Date(now),
+    });
+
+    await expect(
+      reseller.capture({
+        organizationId: "org_a",
+        tenantRef: "tenant_x",
+        reservationId: reservation.id,
+        usage: { quantity: 2 },
+      }),
+    ).rejects.toThrow("capture refused before side effect");
+    expect(
+      await reseller.settlement({
+        organizationId: "org_a",
+        idempotencyKey: `reservation:${reservation.id}`,
+      }),
+    ).toMatchObject({ state: "recovery_required", ledgerCaptured: false });
+    expect(
+      await reseller.reservation({
+        organizationId: "org_a",
+        tenantRef: "tenant_x",
+        reservationId: reservation.id,
+      }),
+    ).toMatchObject({ status: "active" });
+
+    // A fresh Reseller instance sees only the durable intent and retries the
+    // same ledger reference; it does not need an in-memory capture receipt.
+    const restarted = createReseller({
+      sql,
+      ledger,
+      catalog: createCatalog([OFFERING]),
+      clock: () => new Date(now),
+    });
+    expect(await restarted.reconcileDue(8)).toBe(1);
+    expect(
+      await restarted.settlement({
+        organizationId: "org_a",
+        idempotencyKey: `reservation:${reservation.id}`,
+      }),
+    ).toMatchObject({ state: "captured", ledgerCaptured: true });
+    expect(
+      await restarted.statement({
+        organizationId: "org_a",
+        tenantRef: "tenant_x",
+        reservationId: reservation.id,
+      }),
+    ).toMatchObject({ amountMinor: 1_000 });
+  });
+
+  test("reconciles a pending authority only after its authoritative resolver commits", async () => {
+    await funded(10_000);
+    const { reservation } = await activeReservation();
+    const intent = await reseller.beginSettlement({
+      organizationId: "org_a",
+      tenantRef: "tenant_x",
+      reservationId: reservation.id,
+      offeringId: OFFERING.id,
+      usage: { meter: "resource.create", quantity: 2 },
+      idempotencyKey: `migration:mig-1:${reservation.id}:${OFFERING.id}`,
+      authorityRef: "mig-1",
+    });
+    expect(intent).toMatchObject({ state: "pending", authorityRef: "mig-1" });
+    expect(await reseller.reconcileDue(8, async () => "pending")).toBe(0);
+    expect(
+      await reseller.settlement({
+        organizationId: "org_a",
+        idempotencyKey: intent.idempotencyKey,
+      }),
+    ).toMatchObject({ state: "pending" });
+
+    expect(
+      await reseller.reconcileDue(8, async (current) => {
+        expect(current.authorityRef).toBe("mig-1");
+        return "ready";
+      }),
+    ).toBe(1);
+    expect(
+      await reseller.settlement({
+        organizationId: "org_a",
+        idempotencyKey: intent.idempotencyKey,
+      }),
+    ).toMatchObject({ state: "captured", ledgerCaptured: true });
+  });
+
+  test("repairs a lost cancellation release acknowledgement without routing into capture", async () => {
+    await funded(10_000);
+    const { reservation } = await activeReservation();
+    const key = `migration:cancel-lost:${reservation.id}`;
+    await reseller.beginSettlement({
+      organizationId: "org_a",
+      tenantRef: "tenant_x",
+      reservationId: reservation.id,
+      offeringId: OFFERING.id,
+      usage: { meter: "resource.create", quantity: 2 },
+      idempotencyKey: key,
+      authorityRef: "migration:cancel-lost",
+    });
+
+    const durableLedger = ledger;
+    const releaseReferences: string[] = [];
+    let loseReleaseAcknowledgement = true;
+    let captureCalls = 0;
+    ledger = {
+      ...durableLedger,
+      async release(input) {
+        releaseReferences.push(input.reference);
+        await durableLedger.release(input);
+        if (loseReleaseAcknowledgement) {
+          loseReleaseAcknowledgement = false;
+          throw new Error("release response lost");
+        }
+      },
+      async capture(input) {
+        captureCalls += 1;
+        await durableLedger.capture(input);
+      },
+    };
+    reseller = createReseller({
+      sql,
+      ledger,
+      catalog: createCatalog([OFFERING]),
+      clock: () => new Date(now),
+    });
+
+    await expect(
+      reseller.cancelSettlement({
+        organizationId: "org_a",
+        tenantRef: "tenant_x",
+        reservationId: reservation.id,
+        idempotencyKey: key,
+      }),
+    ).rejects.toThrow("release response lost");
+    expect(
+      await reseller.settlement({ organizationId: "org_a", idempotencyKey: key }),
+    ).toMatchObject({
+      state: "recovery_required",
+    });
+
+    const restarted = createReseller({
+      sql,
+      ledger,
+      catalog: createCatalog([OFFERING]),
+      clock: () => new Date(now),
+    });
+    expect(await restarted.reconcileDue(8)).toBe(1);
+    expect(releaseReferences).toEqual([reservation.id, reservation.id]);
+    expect(captureCalls).toBe(0);
+    expect(
+      await restarted.settlement({ organizationId: "org_a", idempotencyKey: key }),
+    ).toMatchObject({ state: "cancelled" });
+    expect(
+      await restarted.reservation({
+        organizationId: "org_a",
+        tenantRef: "tenant_x",
+        reservationId: reservation.id,
+      }),
+    ).toMatchObject({ status: "released" });
+    expect(await ledger.wallet("org_a")).toMatchObject({ settledMinor: 10_000, heldMinor: 0 });
+  });
+
+  test("fences a pending cancellation against a concurrent ready transition", async () => {
+    await funded(10_000);
+    const { reservation } = await activeReservation();
+    const key = `migration:cancel-race:${reservation.id}`;
+    await reseller.beginSettlement({
+      organizationId: "org_a",
+      tenantRef: "tenant_x",
+      reservationId: reservation.id,
+      offeringId: OFFERING.id,
+      usage: { meter: "resource.create", quantity: 2 },
+      idempotencyKey: key,
+      authorityRef: "migration:cancel-race",
+    });
+
+    const durableLedger = ledger;
+    let enteredRelease = false;
+    let unblockRelease: () => void = () => undefined;
+    const releaseBlocked = new Promise<void>((resolve) => {
+      unblockRelease = resolve;
+    });
+    ledger = {
+      ...durableLedger,
+      async release(input) {
+        enteredRelease = true;
+        await releaseBlocked;
+        await durableLedger.release(input);
+      },
+    };
+    reseller = createReseller({
+      sql,
+      ledger,
+      catalog: createCatalog([OFFERING]),
+      clock: () => new Date(now),
+    });
+
+    const cancelling = reseller.cancelSettlement({
+      organizationId: "org_a",
+      tenantRef: "tenant_x",
+      reservationId: reservation.id,
+      idempotencyKey: key,
+    });
+    for (let attempt = 0; attempt < 20 && !enteredRelease; attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    expect(enteredRelease).toBe(true);
+    await expect(
+      reseller.commitSettlement({
+        organizationId: "org_a",
+        tenantRef: "tenant_x",
+        reservationId: reservation.id,
+        idempotencyKey: key,
+      }),
+    ).rejects.toMatchObject({ code: "conflict" });
+    unblockRelease();
+    await expect(cancelling).resolves.toMatchObject({ state: "cancelled" });
+    expect(await ledger.wallet("org_a")).toMatchObject({ settledMinor: 10_000, heldMinor: 0 });
+  });
+
+  test("waits for an active cancellation lease and reclaims it after expiry", async () => {
+    await funded(10_000);
+    const { reservation } = await activeReservation();
+    const key = `migration:cancel-lease:${reservation.id}`;
+    await reseller.beginSettlement({
+      organizationId: "org_a",
+      tenantRef: "tenant_x",
+      reservationId: reservation.id,
+      offeringId: OFFERING.id,
+      usage: { meter: "resource.create", quantity: 2 },
+      idempotencyKey: key,
+      authorityRef: "migration:cancel-lease",
+    });
+    await sql.run(
+      `UPDATE reseller_settlement_intents
+       SET lease_token = ?, lease_until = ?
+       WHERE org_id = ? AND idempotency_key = ?`,
+      ["live-cancel-worker", now + 10_000, "org_a", key],
+    );
+
+    await expect(
+      reseller.cancelSettlement({
+        organizationId: "org_a",
+        tenantRef: "tenant_x",
+        reservationId: reservation.id,
+        idempotencyKey: key,
+      }),
+    ).rejects.toMatchObject({ code: "unavailable", status: 503 });
+
+    now += 11_000;
+    const restarted = createReseller({
+      sql,
+      ledger,
+      catalog: createCatalog([OFFERING]),
+      clock: () => new Date(now),
+    });
+    await expect(
+      restarted.cancelSettlement({
+        organizationId: "org_a",
+        tenantRef: "tenant_x",
+        reservationId: reservation.id,
+        idempotencyKey: key,
+      }),
+    ).resolves.toMatchObject({ state: "cancelled" });
+    expect(await ledger.wallet("org_a")).toMatchObject({ settledMinor: 10_000, heldMinor: 0 });
+  });
+
+  test("fences two reconcilers so one settlement performs one capture", async () => {
+    await funded(10_000);
+    const { reservation } = await activeReservation();
+    const durableLedger = ledger;
+    let calls = 0;
+    let unblock: () => void = () => undefined;
+    const blocked = new Promise<void>((resolve) => {
+      unblock = resolve;
+    });
+    ledger = {
+      ...durableLedger,
+      async capture(input) {
+        calls += 1;
+        await blocked;
+        await durableLedger.capture(input);
+      },
+    };
+    reseller = createReseller({
+      sql,
+      ledger,
+      catalog: createCatalog([OFFERING]),
+      clock: () => new Date(now),
+    });
+    const key = `reservation:${reservation.id}`;
+    await reseller.beginSettlement({
+      organizationId: "org_a",
+      tenantRef: "tenant_x",
+      reservationId: reservation.id,
+      offeringId: OFFERING.id,
+      usage: { meter: "resource.create", quantity: 2 },
+      idempotencyKey: key,
+    });
+
+    const first = reseller.reconcileDue(8);
+    for (let attempt = 0; attempt < 20 && calls === 0; attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    const second = reseller.reconcileDue(8);
+    expect(await second).toBe(0);
+    unblock();
+    expect(await first).toBe(1);
+    expect(calls).toBe(1);
+    expect(
+      await reseller.statement({
+        organizationId: "org_a",
+        tenantRef: "tenant_x",
+        reservationId: reservation.id,
+      }),
+    ).toMatchObject({ amountMinor: 1_000 });
+  });
+
   test("releases a hold back to the balance, once", async () => {
     await funded(10_000);
     const { reservation } = await activeReservation();
@@ -171,6 +557,123 @@ describe("reseller lane", () => {
       tenantRef: "tenant_x",
       reservationId: reservation.id,
     });
+    expect(await ledger.wallet("org_a")).toMatchObject({ settledMinor: 10_000, heldMinor: 0 });
+  });
+
+  test("keeps a direct release recoverable when the ledger response is lost", async () => {
+    await funded(10_000);
+    const { reservation } = await activeReservation();
+    const durableLedger = ledger;
+    const releaseReferences: string[] = [];
+    let loseAcknowledgement = true;
+    ledger = {
+      ...durableLedger,
+      async release(input) {
+        releaseReferences.push(input.reference);
+        await durableLedger.release(input);
+        if (loseAcknowledgement) {
+          loseAcknowledgement = false;
+          throw new Error("release response lost");
+        }
+      },
+    };
+    reseller = createReseller({
+      sql,
+      ledger,
+      catalog: createCatalog([OFFERING]),
+      clock: () => new Date(now),
+    });
+
+    await expect(
+      reseller.release({
+        organizationId: "org_a",
+        tenantRef: "tenant_x",
+        reservationId: reservation.id,
+      }),
+    ).rejects.toThrow("release response lost");
+    expect(
+      await reseller.reservation({
+        organizationId: "org_a",
+        tenantRef: "tenant_x",
+        reservationId: reservation.id,
+      }),
+    ).toMatchObject({ status: "active" });
+    expect(
+      await reseller.settlement({
+        organizationId: "org_a",
+        idempotencyKey: `reservation:release:${reservation.id}`,
+      }),
+    ).toMatchObject({ state: "recovery_required", direction: "cancel" });
+
+    const restarted = createReseller({
+      sql,
+      ledger,
+      catalog: createCatalog([OFFERING]),
+      clock: () => new Date(now),
+    });
+    await expect(
+      restarted.release({
+        organizationId: "org_a",
+        tenantRef: "tenant_x",
+        reservationId: reservation.id,
+      }),
+    ).resolves.toMatchObject({ status: "released" });
+    expect(releaseReferences).toEqual([reservation.id, reservation.id]);
+    expect(await ledger.wallet("org_a")).toMatchObject({ settledMinor: 10_000, heldMinor: 0 });
+  });
+
+  test("does not expire a reservation before a release retry succeeds", async () => {
+    await funded(10_000);
+    const { reservation } = await activeReservation();
+    now += 61 * 60_000;
+    const durableLedger = ledger;
+    let failBeforeRelease = true;
+    ledger = {
+      ...durableLedger,
+      async release(input) {
+        if (failBeforeRelease) {
+          failBeforeRelease = false;
+          throw new Error("release temporarily unavailable");
+        }
+        await durableLedger.release(input);
+      },
+    };
+    reseller = createReseller({
+      sql,
+      ledger,
+      catalog: createCatalog([OFFERING]),
+      clock: () => new Date(now),
+    });
+
+    expect(await reseller.expireDue(16)).toBe(0);
+    expect(
+      await reseller.reservation({
+        organizationId: "org_a",
+        tenantRef: "tenant_x",
+        reservationId: reservation.id,
+      }),
+    ).toMatchObject({ status: "active" });
+    expect(
+      await reseller.settlement({
+        organizationId: "org_a",
+        idempotencyKey: `reservation:release:${reservation.id}`,
+      }),
+    ).toMatchObject({ state: "recovery_required", direction: "cancel" });
+
+    expect(await reseller.expireDue(16)).toBe(1);
+    expect(
+      await reseller.reservation({
+        organizationId: "org_a",
+        tenantRef: "tenant_x",
+        reservationId: reservation.id,
+      }),
+    ).toMatchObject({ status: "expired" });
+    expect(
+      await reseller.settlement({
+        organizationId: "org_a",
+        idempotencyKey: `reservation:release:${reservation.id}`,
+      }),
+    ).toMatchObject({ direction: "cancel", desiredTerminalStatus: "expired" });
     expect(await ledger.wallet("org_a")).toMatchObject({ settledMinor: 10_000, heldMinor: 0 });
   });
 

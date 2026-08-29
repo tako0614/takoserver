@@ -6,8 +6,14 @@ import type { JsonObject } from "../ports.ts";
 import {
   type ApplyInput,
   failed,
+  PROVIDER_READBACK_API_VERSION,
   type Provider,
+  type ProviderNativeAbsence,
+  type ProviderNativeAbsenceUnknownReason,
+  type ProviderNativeReadbackDescriptor,
+  type ProviderNativeReadbackInput,
   type ProviderOffering,
+  ProviderReadbackDescriptorError,
   type ProviderRelation,
   type ProviderSqliteMigration,
   type ProviderSqliteMigrationIdentity,
@@ -17,6 +23,12 @@ import {
   succeeded,
 } from "../provider-port.ts";
 import type { WorkerdRuntime } from "../workerd-runtime.ts";
+import {
+  createSelfhostScriptStateStore,
+  type SelfhostScriptState,
+  type SelfhostScriptStateSnapshot,
+  SelfhostScriptStateStoreError,
+} from "./selfhost-script-state.ts";
 
 /**
  * Provisioning the released Takoform Edge Family on the machine this runs on.
@@ -51,8 +63,8 @@ import type { WorkerdRuntime } from "../workerd-runtime.ts";
  *
  * Version environment (`vars`, non-sensitive bindings) is recorded but not yet
  * projected into the workerd configuration; the runtime serves modules and
- * static assets. Sensitive names are rejected explicitly because this provider
- * has no runtime materialization authority.
+ * static assets. Sensitive names are rejected explicitly because this Host does
+ * not support sensitive Worker bindings.
  */
 
 const SQLITE_MIGRATION_LEDGER = "_takoform_sqlite_migrations";
@@ -105,13 +117,6 @@ export interface SelfhostProviderOptions {
   readonly suffixes?: readonly string[];
 }
 
-/** Publication state one script accumulates across the aggregate's Forms. */
-interface ScriptState {
-  readonly activeVersion?: string;
-  readonly endpointHostname?: string;
-  readonly domains: readonly string[];
-}
-
 interface VersionMeta {
   readonly mainModule: string;
   readonly assets?: { readonly notFoundHandling: string };
@@ -132,6 +137,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   const versionsRoot = join(dataRoot, "selfhost", "versions");
   const scriptsRoot = join(dataRoot, "selfhost", "scripts");
   const databasesRoot = join(dataRoot, "databases");
+  const scriptStates = createSelfhostScriptStateStore({ root: scriptsRoot });
 
   const serves = (hostname: string): boolean => {
     const suffixes = options.suffixes ?? [];
@@ -158,40 +164,70 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
 
   const databasePath = (name: string): string => join(databasesRoot, `${name}.sqlite`);
 
-  const scriptStatePath = (script: string): string => join(scriptsRoot, `${script}.json`);
-
-  const readScriptState = async (script: string): Promise<ScriptState> => {
-    const raw = await readFile(scriptStatePath(script), "utf8").catch(() => null);
-    if (raw === null) return { domains: [] };
+  const scriptStateOperation = async <T>(operation: () => Promise<T>): Promise<T> => {
     try {
-      const parsed = JSON.parse(raw) as Partial<ScriptState>;
-      return {
-        ...(typeof parsed.activeVersion === "string"
-          ? { activeVersion: parsed.activeVersion }
-          : {}),
-        ...(typeof parsed.endpointHostname === "string"
-          ? { endpointHostname: parsed.endpointHostname }
-          : {}),
-        domains: Array.isArray(parsed.domains)
-          ? parsed.domains.filter((entry): entry is string => typeof entry === "string")
-          : [],
-      };
-    } catch {
-      return { domains: [] };
+      return await operation();
+    } catch (error) {
+      if (!(error instanceof SelfhostScriptStateStoreError)) throw error;
+      if (error.code === "conflict") {
+        throw new SelfhostFailure(
+          failed("conflict", "the Worker script state changed concurrently", true),
+        );
+      }
+      if (error.code === "corrupt") {
+        throw new SelfhostFailure(
+          failed("provider_error", "the durable Worker script state is malformed"),
+        );
+      }
+      throw new SelfhostFailure(
+        failed("unavailable", "the durable Worker script state is unavailable", true),
+      );
     }
   };
 
-  const writeScriptState = async (script: string, state: ScriptState): Promise<void> => {
-    await mkdir(scriptsRoot, { recursive: true });
-    await writeFile(scriptStatePath(script), JSON.stringify(state), "utf8");
+  // Runtime publication is an adapter boundary too. A write or reload that
+  // throws is not evidence that the durable desired state was rejected, so
+  // surface it as a retryable provider outcome and let the next reconcile
+  // replay the publication from script state.
+  const runtimeOperation = async <T>(operation: () => Promise<T>): Promise<T> => {
+    try {
+      return await operation();
+    } catch (error) {
+      if (error instanceof SelfhostFailure) throw error;
+      throw new SelfhostFailure(failed("unavailable", "the Worker runtime is unavailable", true));
+    }
   };
+
+  // Runtime activation is identified by the complete desired route set, not
+  // merely by the active version. An endpoint/domain write can stage a new
+  // manifest while reload still serves the previous route table; keeping the
+  // route set in the generation lets `has` reject that stale activation.
+  const runtimeGeneration = (state: SelfhostScriptState): string =>
+    JSON.stringify({
+      activeVersion: state.activeVersion ?? null,
+      endpointHostname: state.endpointHostname ?? null,
+      domains: state.domains,
+    });
+
+  const readScriptState = (script: string): Promise<SelfhostScriptStateSnapshot> =>
+    scriptStateOperation(() => scriptStates.read(script));
+
+  const writeScriptState = (
+    script: string,
+    current: SelfhostScriptStateSnapshot,
+    state: SelfhostScriptState,
+  ): Promise<SelfhostScriptStateSnapshot> =>
+    scriptStateOperation(() => scriptStates.write(script, current.revision, state));
+
+  const removeScriptState = (script: string): Promise<boolean> =>
+    scriptStateOperation(() => scriptStates.remove(script));
 
   /** Rewrites what workerd serves for one script from durable state alone. */
   const republish = async (script: string): Promise<void> => {
-    const state = await readScriptState(script);
+    const { state } = await readScriptState(script);
     if (!state.activeVersion) {
-      await runtime.remove(script);
-      await runtime.reload();
+      await runtimeOperation(() => runtime.remove(script));
+      await runtimeOperation(() => runtime.reload());
       return;
     }
     const versionDirectory = join(versionsRoot, script, state.activeVersion);
@@ -208,18 +244,21 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       ...(state.endpointHostname ? [state.endpointHostname] : []),
       ...state.domains,
     ];
-    await runtime.write(
-      script,
-      {
-        directory: script,
-        mainModule: meta.mainModule,
-        hostnames,
-        ...(meta.assets ? { assets: { notFoundHandling: meta.assets.notFoundHandling } } : {}),
-      },
-      modules,
-      assets,
+    await runtimeOperation(() =>
+      runtime.write(
+        script,
+        {
+          directory: script,
+          mainModule: meta.mainModule,
+          hostnames,
+          generation: runtimeGeneration(state),
+          ...(meta.assets ? { assets: { notFoundHandling: meta.assets.notFoundHandling } } : {}),
+        },
+        modules,
+        assets,
+      ),
     );
-    await runtime.reload();
+    await runtimeOperation(() => runtime.reload());
   };
 
   const endpointAddress = (script: string): { hostname: string; url: string } => {
@@ -263,16 +302,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       return failed("invalid_spec", "the sensitive Worker binding declaration is invalid");
     }
     if (requiredSensitive.length > 0) {
-      return failed(
-        "denied",
-        "the sensitive Worker bindings have no runtime materialization authority",
-      );
-    }
-    if (input.runtimeMaterialization) {
-      return failed(
-        "invalid_spec",
-        "runtime materialization authority requires sensitive Worker bindings",
-      );
+      return failed("denied", "sensitive Worker bindings are unsupported by this Host");
     }
     const worker = relationResource(input.relations, "/worker", "ModuleWorker");
     const bundle = relationResource(input.relations, "/bundle", "WorkerBundle");
@@ -385,8 +415,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     // serves; the requested split is recorded so what was asked for and what
     // this machine can do are both visible.
     const active = weighted.reduce((best, entry) => (entry.weight > best.weight ? entry : best));
-    const state = await readScriptState(script);
-    await writeScriptState(script, { ...state, activeVersion: active.versionId });
+    const current = await readScriptState(script);
+    await writeScriptState(script, current, { ...current.state, activeVersion: active.versionId });
     try {
       await republish(script);
     } catch (error) {
@@ -405,16 +435,23 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     if (!worker) return failed("invalid_spec", "the Worker Endpoint is incomplete");
     const script = await scriptOf(input.identity.tenantRef, worker.metadata);
     const address = endpointAddress(script);
-    const state = await readScriptState(script);
-    if (state.endpointHostname !== address.hostname) {
-      await writeScriptState(script, { ...state, endpointHostname: address.hostname });
-      if (state.activeVersion) {
-        try {
-          await republish(script);
-        } catch (error) {
-          if (error instanceof SelfhostFailure) return error.ticket;
-          throw error;
-        }
+    const current = await readScriptState(script);
+    if (current.state.endpointHostname !== address.hostname) {
+      await writeScriptState(script, current, {
+        ...current.state,
+        endpointHostname: address.hostname,
+      });
+    }
+    // Desired state may already contain this endpoint after a process died
+    // during the previous republish. Reconcile runtime truth on every retry;
+    // checking only the durable value would turn a failed reload into a false
+    // success response.
+    if (current.state.activeVersion) {
+      try {
+        await republish(script);
+      } catch (error) {
+        if (error instanceof SelfhostFailure) return error.ticket;
+        throw error;
       }
     }
     return succeeded({
@@ -438,16 +475,22 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       );
     }
     const script = await scriptOf(input.identity.tenantRef, worker.metadata);
-    const state = await readScriptState(script);
-    if (!state.domains.includes(hostname)) {
-      await writeScriptState(script, { ...state, domains: [...state.domains, hostname] });
-      if (state.activeVersion) {
-        try {
-          await republish(script);
-        } catch (error) {
-          if (error instanceof SelfhostFailure) return error.ticket;
-          throw error;
-        }
+    const current = await readScriptState(script);
+    if (!current.state.domains.includes(hostname)) {
+      await writeScriptState(script, current, {
+        ...current.state,
+        domains: [...current.state.domains, hostname],
+      });
+    }
+    // As with endpoint attachment, a committed domain is not proof that the
+    // runtime accepted the corresponding route. Always retry publication while
+    // a version is active, even when the desired domain list is unchanged.
+    if (current.state.activeVersion) {
+      try {
+        await republish(script);
+      } catch (error) {
+        if (error instanceof SelfhostFailure) return error.ticket;
+        throw error;
       }
     }
     return succeeded({
@@ -552,6 +595,108 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     id,
     offerings: structuredClone(options.offerings) as ProviderOffering[],
 
+    /** Capture a pure, redacted descriptor for post-delete readback. */
+    createNativeReadbackDescriptor(
+      input: ProviderNativeReadbackInput,
+    ): ProviderNativeReadbackDescriptor {
+      const kind = dispatchKind(input.offering);
+      const parsed = parseSelfhostNativeId(kind, input.nativeId, input.spec, input.relations);
+      if (!parsed) throw new ProviderReadbackDescriptorError();
+      const data =
+        kind === "WorkerEndpoint" && parsed.script
+          ? { ...parsed.data, hostname: endpointAddress(parsed.script).hostname }
+          : parsed.data;
+      return {
+        apiVersion: PROVIDER_READBACK_API_VERSION,
+        provider: id,
+        kind,
+        nativeId: input.nativeId,
+        data,
+      };
+    },
+
+    /**
+     * Read only local durable/runtime descriptors. This method deliberately
+     * avoids `scriptStates.read` and `runtime.has`: both may clean stale
+     * activation files, while an absence proof must have no write/reload path.
+     */
+    async verifyNativeAbsence(input: {
+      offering: ProviderOffering;
+      descriptor: ProviderNativeReadbackDescriptor;
+    }): Promise<ProviderNativeAbsence> {
+      const kind = dispatchKind(input.offering);
+      const parsed = validateSelfhostReadbackDescriptor(id, kind, input.descriptor);
+      if (!parsed) return selfhostUnknown("malformed", false);
+      try {
+        switch (kind) {
+          case "ModuleWorker":
+            if (!parsed.script) return selfhostUnknown("malformed", false);
+            return await verifySelfhostWorkerAbsence(
+              dataRoot,
+              scriptsRoot,
+              versionsRoot,
+              parsed.script,
+              input.descriptor,
+              kind,
+            );
+          case "WorkerVersion":
+            if (!parsed.script || !parsed.versionId) return selfhostUnknown("malformed", false);
+            return await verifySelfhostVersionAbsence(
+              versionsRoot,
+              parsed.script,
+              parsed.versionId,
+              input.descriptor,
+              kind,
+            );
+          case "WorkerDeployment":
+            if (!parsed.script) return selfhostUnknown("malformed", false);
+            return await verifySelfhostDeploymentAbsence(
+              dataRoot,
+              parsed.script,
+              input.descriptor,
+              kind,
+            );
+          case "WorkerEndpoint":
+          case "WorkerCustomDomain":
+            if (!parsed.script) return selfhostUnknown("malformed", false);
+            return await verifySelfhostRouteAbsence(
+              dataRoot,
+              parsed.script,
+              parsed.hostname,
+              input.descriptor,
+              kind,
+            );
+          case "SQLiteDatabase":
+          case "sql_database":
+            return selfhostFileAbsence(
+              "SQLiteDatabase",
+              databasePath(parsed.databaseName ?? ""),
+              input.descriptor,
+              id,
+            );
+          // These declarations have no separate provider-native object on a
+          // self-hosted machine. Their descriptor is still captured so the
+          // Host can prove that no provider readback is required.
+          case "ObjectBucket":
+          case "object_bucket":
+          case "EdgeKVNamespace":
+          case "AtLeastOnceQueue":
+          case "WorkerCronTrigger":
+          case "QueueConsumer":
+            return selfhostAbsence("absent", input.descriptor, kind, id, parsed.data);
+          default:
+            return selfhostUnknown("unsupported", false);
+        }
+      } catch (error) {
+        // Filesystem errors are bounded to the closed provider vocabulary; no
+        // path, credential, or raw diagnostic crosses the provider seam.
+        if (error instanceof SelfhostReadbackMalformed) {
+          return selfhostUnknown("malformed", false);
+        }
+        return selfhostUnknown("transport", true);
+      }
+    },
+
     async apply(input): Promise<ProviderTicket> {
       try {
         switch (dispatchKind(input.offering)) {
@@ -620,13 +765,23 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             const worker = relationResource(input.relations, "/worker", "ModuleWorker");
             if (!worker) return failed("not_found", "the Worker Deployment has no worker relation");
             const script = await scriptOf(input.identity.tenantRef, worker.metadata);
-            const state = await readScriptState(script);
+            const { state } = await readScriptState(script);
+            const serving = await runtimeOperation(() =>
+              runtime.has(script, runtimeGeneration(state)),
+            );
+            if (state.activeVersion && !serving) {
+              return failed(
+                "unavailable",
+                "the Worker runtime is not serving the deployment",
+                true,
+              );
+            }
             return succeeded({
               nativeId: input.nativeId,
               observed: {
                 scriptName: script,
                 ...(state.activeVersion ? { activeVersionId: state.activeVersion } : {}),
-                serving: await runtime.has(script),
+                serving,
               },
               outputs: {},
             });
@@ -636,21 +791,42 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             if (!worker) return failed("not_found", "the Worker Endpoint has no worker relation");
             const script = await scriptOf(input.identity.tenantRef, worker.metadata);
             const address = endpointAddress(script);
+            const { state } = await readScriptState(script);
+            if (state.endpointHostname !== address.hostname || !state.activeVersion) {
+              return failed("not_found", "the Worker endpoint is not durably attached");
+            }
+            if (!(await runtimeOperation(() => runtime.has(script, runtimeGeneration(state))))) {
+              return failed("unavailable", "the Worker runtime is not serving the endpoint", true);
+            }
             return succeeded({
               nativeId: input.nativeId,
-              observed: { enabled: true, scriptName: script },
+              observed: { enabled: true, scriptName: script, serving: true },
               outputs: { hostname: address.hostname, url: address.url },
             });
           }
           case "WorkerCustomDomain": {
+            const worker = relationResource(input.relations, "/worker", "ModuleWorker");
             const hostname =
               typeof input.spec.hostname === "string"
                 ? input.spec.hostname.toLowerCase().replace(/\.$/u, "")
                 : null;
             if (!hostname) return failed("not_found", "the custom domain records no hostname");
+            if (!worker) return failed("not_found", "the custom domain has no worker relation");
+            const script = await scriptOf(input.identity.tenantRef, worker.metadata);
+            const { state } = await readScriptState(script);
+            if (!state.domains.includes(hostname) || !state.activeVersion) {
+              return failed("not_found", "the custom domain is not durably attached");
+            }
+            if (!(await runtimeOperation(() => runtime.has(script, runtimeGeneration(state))))) {
+              return failed(
+                "unavailable",
+                "the Worker runtime is not serving the custom domain",
+                true,
+              );
+            }
             return succeeded({
               nativeId: input.nativeId,
-              observed: { hostname },
+              observed: { hostname, scriptName: script, serving: true },
               outputs: {},
             });
           }
@@ -685,6 +861,12 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     },
 
     async delete(input): Promise<ProviderTicket> {
+      if (input.operationMode === "recovery" && !input.providerHandle) {
+        return failed("unavailable", "provider mutation recovery requires an opaque handle", true);
+      }
+      if (input.providerHandle) {
+        return failed("unavailable", "self-host delete recovery cannot poll this handle", true);
+      }
       const done = (): ProviderTicket =>
         succeeded({ nativeId: input.nativeId, observed: { deleted: true }, outputs: {} });
       try {
@@ -694,10 +876,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
               space: input.identity.space,
               name: input.identity.name,
             });
-            await runtime.remove(script);
+            await runtimeOperation(() => runtime.remove(script));
             await rm(join(versionsRoot, script), { recursive: true, force: true });
-            await rm(scriptStatePath(script), { force: true });
-            await runtime.reload();
+            await removeScriptState(script);
+            await runtimeOperation(() => runtime.reload());
             return done();
           }
           case "WorkerVersion": {
@@ -708,14 +890,18 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
                 space: input.identity.space,
                 name: input.identity.name,
               });
-              const state = await readScriptState(script);
-              await rm(join(versionsRoot, script, versionId), { recursive: true, force: true });
-              if (state.activeVersion === versionId) {
-                await writeScriptState(script, {
-                  domains: state.domains,
-                  ...(state.endpointHostname ? { endpointHostname: state.endpointHostname } : {}),
+              const current = await readScriptState(script);
+              if (current.state.activeVersion === versionId) {
+                await writeScriptState(script, current, {
+                  domains: current.state.domains,
+                  ...(current.state.endpointHostname
+                    ? { endpointHostname: current.state.endpointHostname }
+                    : {}),
                 });
+                await rm(join(versionsRoot, script, versionId), { recursive: true, force: true });
                 await republish(script);
+              } else {
+                await rm(join(versionsRoot, script, versionId), { recursive: true, force: true });
               }
             }
             return done();
@@ -724,10 +910,12 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             const worker = relationResource(input.relations, "/worker", "ModuleWorker");
             if (worker) {
               const script = await scriptOf(input.identity.tenantRef, worker.metadata);
-              const state = await readScriptState(script);
-              await writeScriptState(script, {
-                domains: state.domains,
-                ...(state.endpointHostname ? { endpointHostname: state.endpointHostname } : {}),
+              const current = await readScriptState(script);
+              await writeScriptState(script, current, {
+                domains: current.state.domains,
+                ...(current.state.endpointHostname
+                  ? { endpointHostname: current.state.endpointHostname }
+                  : {}),
               });
               await republish(script);
             }
@@ -737,12 +925,14 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             const worker = relationResource(input.relations, "/worker", "ModuleWorker");
             if (worker) {
               const script = await scriptOf(input.identity.tenantRef, worker.metadata);
-              const state = await readScriptState(script);
-              await writeScriptState(script, {
-                domains: state.domains,
-                ...(state.activeVersion ? { activeVersion: state.activeVersion } : {}),
+              const current = await readScriptState(script);
+              await writeScriptState(script, current, {
+                domains: current.state.domains,
+                ...(current.state.activeVersion
+                  ? { activeVersion: current.state.activeVersion }
+                  : {}),
               });
-              if (state.activeVersion) await republish(script);
+              if (current.state.activeVersion) await republish(script);
             }
             return done();
           }
@@ -754,12 +944,12 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
                 : null;
             if (worker && hostname) {
               const script = await scriptOf(input.identity.tenantRef, worker.metadata);
-              const state = await readScriptState(script);
-              await writeScriptState(script, {
-                ...state,
-                domains: state.domains.filter((entry) => entry !== hostname),
+              const current = await readScriptState(script);
+              await writeScriptState(script, current, {
+                ...current.state,
+                domains: current.state.domains.filter((entry) => entry !== hostname),
               });
-              if (state.activeVersion) await republish(script);
+              if (current.state.activeVersion) await republish(script);
             }
             return done();
           }
@@ -776,7 +966,106 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       }
     },
 
+    /**
+     * Read-only cancellation recovery for the local provider.
+     *
+     * A process can die after `delete` removed the files but before the Host
+     * recorded its receipt. Replaying the local mutation would hide that
+     * acknowledgement gap and could also remove a newer incarnation. The
+     * recovery seam therefore checks only durable state plus runtime serving
+     * truth; it never calls `remove`, rewrites desired state, or reloads.
+     */
+    async recoverDelete(input): Promise<ProviderTicket> {
+      if (input.providerHandle) {
+        return failed("unavailable", "self-host delete recovery cannot poll this handle", true);
+      }
+      const done = (): ProviderTicket =>
+        succeeded({ nativeId: input.nativeId, observed: { deleted: true }, outputs: {} });
+      const uncertain = (): ProviderTicket =>
+        failed(
+          "unavailable",
+          "the local delete outcome is not proven; operator repair is required",
+          true,
+        );
+      try {
+        switch (dispatchKind(input.offering)) {
+          case "ModuleWorker": {
+            const script = await scriptOf(input.identity.tenantRef, {
+              space: input.identity.space,
+              name: input.identity.name,
+            });
+            const current = await readScriptState(script);
+            const serving = await runtimeOperation(() =>
+              runtime.has(script, runtimeGeneration(current.state)),
+            );
+            return current.revision === null && !serving ? done() : uncertain();
+          }
+          case "WorkerVersion": {
+            const worker = relationResource(input.relations, "/worker", "ModuleWorker");
+            if (!worker) return failed("not_found", "the Worker Version has no worker relation");
+            const script = await scriptOf(input.identity.tenantRef, worker.metadata);
+            const versionId = await versionIdOf(input.identity.tenantRef, {
+              space: input.identity.space,
+              name: input.identity.name,
+            });
+            const current = await readScriptState(script);
+            // The immutable local Version is gone only when its whole
+            // materialization directory is absent and it is no longer the
+            // durable active generation. A different active generation may
+            // still serve, which is fine for this non-active Version.
+            const materialized = existsSync(join(versionsRoot, script, versionId));
+            return !materialized && current.state.activeVersion !== versionId
+              ? done()
+              : uncertain();
+          }
+          case "WorkerDeployment": {
+            const worker = relationResource(input.relations, "/worker", "ModuleWorker");
+            if (!worker) return failed("not_found", "the Worker Deployment has no worker relation");
+            const script = await scriptOf(input.identity.tenantRef, worker.metadata);
+            const current = await readScriptState(script);
+            const serving = await runtimeOperation(() =>
+              runtime.has(script, runtimeGeneration(current.state)),
+            );
+            return current.state.activeVersion === undefined && !serving ? done() : uncertain();
+          }
+          case "WorkerEndpoint":
+          case "WorkerCustomDomain": {
+            const worker = relationResource(input.relations, "/worker", "ModuleWorker");
+            if (!worker) return failed("not_found", "the Worker route has no worker relation");
+            const script = await scriptOf(input.identity.tenantRef, worker.metadata);
+            const current = await readScriptState(script);
+            const serving = await runtimeOperation(() =>
+              runtime.has(script, runtimeGeneration(current.state)),
+            );
+            // Workerd's boolean seam reports script activation, not a
+            // per-host route. When another route still serves the script we
+            // cannot prove this route's absence, so fail closed.
+            return !serving &&
+              (dispatchKind(input.offering) === "WorkerEndpoint"
+                ? current.state.endpointHostname === undefined
+                : current.state.domains.length === 0)
+              ? done()
+              : uncertain();
+          }
+          default:
+            // Namespace resources have no mutable local object; their delete
+            // is a durable declaration transition and has no residual bytes
+            // for this provider to read back.
+            return done();
+        }
+      } catch (error) {
+        if (error instanceof SelfhostFailure) return error.ticket;
+        throw error;
+      }
+    },
+
     async adopt(input): Promise<ProviderTicket> {
+      if (input.operationMode === "recovery" && !input.providerHandle) {
+        return failed("unavailable", "provider mutation recovery requires an opaque handle", true);
+      }
+      if (input.providerHandle) {
+        return failed("unavailable", "self-host adopt recovery cannot poll this handle", true);
+      }
       // Adoption records a claim on a native identity the caller names. Local
       // resources are namespace agreements keyed by declared identity, so the
       // adopted state is recomputed the same way apply computes it, while the
@@ -959,6 +1248,455 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       },
     },
   };
+}
+
+interface SelfhostReadbackParsed {
+  readonly data: JsonObject;
+  readonly script?: string;
+  readonly versionId?: string;
+  readonly hostname?: string;
+  readonly databaseName?: string;
+}
+
+/**
+ * Native IDs are opaque outside this adapter, but a descriptor still needs a
+ * bounded, path-safe projection so a forged value can never escape dataRoot.
+ * Operation suffixes are intentionally ignored after the stable address.
+ */
+function parseSelfhostNativeId(
+  kind: string,
+  value: string,
+  spec?: JsonObject,
+  relations?: readonly ProviderRelation[],
+): SelfhostReadbackParsed | null {
+  if (typeof value !== "string" || value.length < 1 || value.length > 4_096) return null;
+  const parts = value.split(":");
+  const script = safeSegment(parts[1]) ? parts[1] : undefined;
+  const versionId = safeSegment(parts[2]) ? parts[2] : undefined;
+  const workerRelation = relations?.find((relation) => relation.pointer === "/worker");
+  const relationMeta = workerRelation?.resource.metadata;
+  const relationData: JsonObject =
+    relationMeta &&
+    safeSegment(relationMeta.name) &&
+    safeSegment(relationMeta.space) &&
+    safeSegment(relationMeta.uid)
+      ? {
+          workerName: relationMeta.name,
+          workerSpace: relationMeta.space,
+          workerUid: relationMeta.uid,
+        }
+      : safeRelationData(spec);
+  const relationScript =
+    selfhostWorkerScript(relations) ??
+    (safeSegment(spec?.scriptName) ? spec.scriptName : undefined) ??
+    (safeSegment(spec?.workerScript) ? spec.workerScript : null);
+  switch (kind) {
+    case "ModuleWorker":
+      return parts[0] === "selfhost-worker" && script
+        ? { script, data: { scriptName: script } }
+        : null;
+    case "WorkerVersion":
+      return parts[0] === "selfhost-version" && script && versionId
+        ? {
+            script,
+            versionId,
+            data: { scriptName: script, versionId, ...relationData },
+          }
+        : null;
+    case "WorkerDeployment":
+      return parts[0] === "selfhost-deployment" && script
+        ? { script, data: { scriptName: script, ...relationData } }
+        : null;
+    case "WorkerEndpoint":
+      return parts[0] === "selfhost-endpoint" && script
+        ? { script, data: { scriptName: script } }
+        : null;
+    case "WorkerCustomDomain": {
+      const hostname = normalizedHostname(spec?.hostname);
+      return parts[0] === "selfhost-domain" && hostname && relationScript && parts[1] === hostname
+        ? {
+            script: relationScript,
+            hostname,
+            data: { scriptName: relationScript, hostname, ...relationData },
+          }
+        : null;
+    }
+    case "WorkerCronTrigger": {
+      const cron = optionalSafeString(spec?.cron);
+      return parts[0] === "selfhost-cron" && script && cron
+        ? { script, data: { scriptName: script, cron } }
+        : null;
+    }
+    case "QueueConsumer": {
+      const queue = safeSegment(parts[1]) ? parts[1] : undefined;
+      const consumerScript = safeSegment(parts[2]) ? parts[2] : undefined;
+      return parts[0] === "selfhost-consumer" && queue && consumerScript
+        ? {
+            script: consumerScript,
+            data: { queueName: queue, scriptName: consumerScript, ...relationData },
+          }
+        : null;
+    }
+    case "ObjectBucket":
+    case "object_bucket": {
+      const name = parts[0] === "local-bucket" ? parts[1] : null;
+      return name && safeSegment(name) ? { data: { bucketName: name } } : null;
+    }
+    case "EdgeKVNamespace":
+      return parts[0] === "selfhost-kv" && safeSegment(parts[1])
+        ? { data: { namespaceId: parts[1] as string } }
+        : null;
+    case "AtLeastOnceQueue":
+      return parts[0] === "selfhost-queue" && safeSegment(parts[1])
+        ? { data: { queueName: parts[1] as string } }
+        : null;
+    case "SQLiteDatabase":
+    case "sql_database":
+      return parts[0] === "selfhost-sqlite" && safeSegment(parts[1])
+        ? { databaseName: parts[1] as string, data: { databaseName: parts[1] as string } }
+        : null;
+    default:
+      return null;
+  }
+}
+
+function selfhostWorkerScript(relations: readonly ProviderRelation[] | undefined): string | null {
+  const nativeId = relations?.find((relation) => relation.pointer === "/worker")?.deployment
+    ?.nativeId;
+  if (typeof nativeId !== "string") return null;
+  const parts = nativeId.split(":");
+  return parts[0] === "selfhost-worker" && safeSegment(parts[1]) ? parts[1] : null;
+}
+
+function safeRelationData(spec: JsonObject | undefined): JsonObject {
+  if (
+    safeSegment(spec?.workerName) &&
+    safeSegment(spec?.workerSpace) &&
+    safeSegment(spec?.workerUid)
+  ) {
+    return {
+      workerName: spec.workerName,
+      workerSpace: spec.workerSpace,
+      workerUid: spec.workerUid,
+    };
+  }
+  return {};
+}
+
+function validateSelfhostReadbackDescriptor(
+  provider: string,
+  kind: string,
+  descriptor: ProviderNativeReadbackDescriptor,
+): SelfhostReadbackParsed | null {
+  if (typeof descriptor !== "object" || descriptor === null || Array.isArray(descriptor)) {
+    return null;
+  }
+  if (
+    descriptor.apiVersion !== PROVIDER_READBACK_API_VERSION ||
+    descriptor.provider !== provider ||
+    descriptor.kind !== kind ||
+    typeof descriptor.nativeId !== "string" ||
+    descriptor.nativeId.length < 1 ||
+    descriptor.nativeId.length > 4_096 ||
+    !isJsonObject(descriptor.data)
+  ) {
+    return null;
+  }
+  const parsed = parseSelfhostNativeId(kind, descriptor.nativeId, descriptor.data);
+  if (!parsed) return null;
+  const matches =
+    kind === "WorkerEndpoint"
+      ? selfhostEndpointDataMatches(parsed, descriptor.data)
+      : selfhostDataMatches(parsed.data, descriptor.data);
+  if (!matches) return null;
+  // The descriptor creator may include safe worker relation metadata. Reject
+  // an incomplete relation tuple rather than allowing an ambiguous parent.
+  const relationKeys = ["workerName", "workerSpace", "workerUid"];
+  const relationPresent = relationKeys.some((key) => key in descriptor.data);
+  if (
+    relationPresent &&
+    (!relationKeys.every((key) => typeof descriptor.data[key] === "string") ||
+      relationKeys.some((key) => !safeSegment(String(descriptor.data[key]))))
+  ) {
+    return null;
+  }
+  return parsed;
+}
+
+function selfhostEndpointDataMatches(parsed: SelfhostReadbackParsed, actual: JsonObject): boolean {
+  if (!parsed.script || !normalizedHostname(actual.hostname)) return false;
+  const keys = Object.keys(actual).sort();
+  return (
+    keys.length === 2 &&
+    keys[0] === "hostname" &&
+    keys[1] === "scriptName" &&
+    actual.scriptName === parsed.script &&
+    typeof actual.hostname === "string" &&
+    actual.hostname.startsWith(`${parsed.script}.`)
+  );
+}
+
+function selfhostDataMatches(expected: JsonObject, actual: JsonObject): boolean {
+  const expectedKeys = Object.keys(expected).sort();
+  const actualKeys = Object.keys(actual).sort();
+  if (
+    expectedKeys.length !== actualKeys.length ||
+    !expectedKeys.every((key, i) => key === actualKeys[i])
+  ) {
+    return false;
+  }
+  return expectedKeys.every((key) => actual[key] === expected[key]);
+}
+
+class SelfhostReadbackMalformed extends Error {}
+
+interface ReadonlyScriptState {
+  readonly exists: boolean;
+  readonly activeVersion?: string;
+  readonly endpointHostname?: string;
+  readonly domains: readonly string[];
+}
+
+async function readSelfhostState(root: string, script: string): Promise<ReadonlyScriptState> {
+  const path = join(root, `${script}.json`);
+  const temporary = await readFile(`${path}.tmp`).catch(() => null);
+  const bytes = await readFile(path).catch((error) => {
+    if (errorCode(error) === "ENOENT") return null;
+    throw error;
+  });
+  if (temporary !== null) throw new SelfhostReadbackMalformed();
+  if (bytes === null) return { exists: false, domains: [] };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
+  } catch {
+    throw new SelfhostReadbackMalformed();
+  }
+  if (!isJsonObject(parsed) || !Array.isArray(parsed.domains)) {
+    throw new SelfhostReadbackMalformed();
+  }
+  const activeVersion = parsed.activeVersion;
+  const endpointHostname = parsed.endpointHostname;
+  const domains = parsed.domains;
+  if (
+    (activeVersion !== undefined && !safeSegment(activeVersion)) ||
+    (endpointHostname !== undefined && !normalizedHostname(endpointHostname)) ||
+    domains.some((value) => !normalizedHostname(value)) ||
+    Object.keys(parsed).some(
+      (key) => key !== "activeVersion" && key !== "endpointHostname" && key !== "domains",
+    )
+  ) {
+    throw new SelfhostReadbackMalformed();
+  }
+  return {
+    exists: true,
+    ...(typeof activeVersion === "string" ? { activeVersion } : {}),
+    ...(typeof endpointHostname === "string" ? { endpointHostname } : {}),
+    domains: domains.filter((value): value is string => typeof value === "string"),
+  };
+}
+
+interface ReadonlyActivation {
+  readonly present: boolean;
+}
+
+async function readSelfhostActivation(root: string, script: string): Promise<ReadonlyActivation> {
+  const path = join(root, "workers", ".takoserver-active.json");
+  const bytes = await readFile(path).catch((error) => {
+    if (errorCode(error) === "ENOENT") return null;
+    throw error;
+  });
+  if (bytes === null) return { present: false };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
+  } catch {
+    throw new SelfhostReadbackMalformed();
+  }
+  if (!isJsonObject(parsed)) throw new SelfhostReadbackMalformed();
+  for (const generation of Object.values(parsed)) {
+    if (generation !== null && typeof generation !== "string") {
+      throw new SelfhostReadbackMalformed();
+    }
+  }
+  return { present: Object.hasOwn(parsed, script) };
+}
+
+interface ReadonlyRuntimeManifest {
+  readonly hostnames: readonly string[];
+}
+
+async function readSelfhostRuntimeManifest(
+  root: string,
+  script: string,
+): Promise<ReadonlyRuntimeManifest | null> {
+  const directory = join(root, "workers", script);
+  const path = join(directory, "takoserver-site.json");
+  const bytes = await readFile(path).catch((error) => {
+    if (errorCode(error) === "ENOENT") return null;
+    throw error;
+  });
+  if (bytes === null) {
+    if (existsSync(directory)) throw new SelfhostReadbackMalformed();
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
+  } catch {
+    throw new SelfhostReadbackMalformed();
+  }
+  if (!isJsonObject(parsed) || !Array.isArray(parsed.hostnames)) {
+    throw new SelfhostReadbackMalformed();
+  }
+  if (parsed.hostnames.some((hostname) => !normalizedHostname(hostname))) {
+    throw new SelfhostReadbackMalformed();
+  }
+  return {
+    hostnames: parsed.hostnames.filter(
+      (hostname): hostname is string => typeof hostname === "string",
+    ),
+  };
+}
+
+async function verifySelfhostWorkerAbsence(
+  root: string,
+  scriptsRoot: string,
+  versionsRoot: string,
+  script: string,
+  descriptor: ProviderNativeReadbackDescriptor,
+  kind: string,
+): Promise<ProviderNativeAbsence> {
+  const state = await readSelfhostState(scriptsRoot, script);
+  const activation = await readSelfhostActivation(root, script);
+  const runtimeManifest = await readSelfhostRuntimeManifest(root, script);
+  const versions = existsSync(join(versionsRoot, script));
+  if (state.exists || activation.present || runtimeManifest !== null || versions) {
+    return selfhostAbsence("present", descriptor, kind);
+  }
+  return selfhostAbsence("absent", descriptor, kind);
+}
+
+async function verifySelfhostVersionAbsence(
+  versionsRoot: string,
+  script: string,
+  versionId: string | undefined,
+  descriptor: ProviderNativeReadbackDescriptor,
+  kind: string,
+): Promise<ProviderNativeAbsence> {
+  if (!versionId) return selfhostUnknown("malformed", false);
+  const directory = join(versionsRoot, script, versionId);
+  const metaPath = join(directory, "meta.json");
+  const bytes = await readFile(metaPath).catch((error) => {
+    if (errorCode(error) === "ENOENT") return null;
+    throw error;
+  });
+  if (bytes === null) {
+    return existsSync(directory)
+      ? selfhostUnknown("malformed", false)
+      : selfhostAbsence("absent", descriptor, kind);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
+  } catch {
+    return selfhostUnknown("malformed", false);
+  }
+  if (
+    !isJsonObject(parsed) ||
+    typeof parsed.mainModule !== "string" ||
+    parsed.mainModule.length === 0
+  ) {
+    return selfhostUnknown("malformed", false);
+  }
+  return selfhostAbsence("present", descriptor, kind);
+}
+
+async function verifySelfhostDeploymentAbsence(
+  root: string,
+  script: string,
+  descriptor: ProviderNativeReadbackDescriptor,
+  kind: string,
+): Promise<ProviderNativeAbsence> {
+  const state = await readSelfhostState(join(root, "selfhost", "scripts"), script);
+  const activation = await readSelfhostActivation(root, script);
+  const manifest = await readSelfhostRuntimeManifest(root, script);
+  return state.activeVersion || activation.present || manifest !== null
+    ? selfhostAbsence("present", descriptor, kind)
+    : selfhostAbsence("absent", descriptor, kind);
+}
+
+async function verifySelfhostRouteAbsence(
+  root: string,
+  script: string,
+  hostname: string | undefined,
+  descriptor: ProviderNativeReadbackDescriptor,
+  kind: string,
+): Promise<ProviderNativeAbsence> {
+  if (!hostname) return selfhostUnknown("malformed", false);
+  const state = await readSelfhostState(join(root, "selfhost", "scripts"), script);
+  const manifest = await readSelfhostRuntimeManifest(root, script);
+  const durable =
+    kind === "WorkerEndpoint"
+      ? state.endpointHostname === hostname
+      : state.domains.includes(hostname);
+  const serving = manifest?.hostnames.includes(hostname) === true;
+  return durable || serving
+    ? selfhostAbsence("present", descriptor, kind)
+    : selfhostAbsence("absent", descriptor, kind);
+}
+
+function selfhostFileAbsence(
+  kind: string,
+  path: string,
+  descriptor: ProviderNativeReadbackDescriptor,
+  provider: string,
+): ProviderNativeAbsence {
+  return selfhostAbsence(existsSync(path) ? "present" : "absent", descriptor, kind, provider);
+}
+
+function selfhostAbsence(
+  outcome: "absent" | "present",
+  descriptor: ProviderNativeReadbackDescriptor,
+  kind: string,
+  provider = descriptor.provider,
+  data: JsonObject = descriptor.data,
+): ProviderNativeAbsence {
+  // Descriptor data (script/version/bucket identifiers and parent relation)
+  // remains Host-private. Public evidence is intentionally identifier-free.
+  void data;
+  return { outcome, evidence: { provider, kind, state: outcome } };
+}
+
+function selfhostUnknown(
+  reason: ProviderNativeAbsenceUnknownReason,
+  retryable: boolean,
+): ProviderNativeAbsence {
+  return { outcome: "unknown", reason, retryable };
+}
+
+function isJsonObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function safeSegment(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/u.test(value);
+}
+
+function optionalSafeString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 && value.length <= 4_096 ? value : undefined;
+}
+
+function normalizedHostname(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length < 1 || value.length > 255) return undefined;
+  const hostname = value.toLowerCase().replace(/\.$/u, "");
+  return /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/u.test(hostname) ? hostname : undefined;
+}
+
+function errorCode(error: unknown): string | undefined {
+  return typeof error === "object" && error !== null && "code" in error
+    ? String(error.code)
+    : undefined;
 }
 
 /** Reads every file under a directory into module-name → bytes. */

@@ -33,7 +33,7 @@ export function currentTakoformCandidates(): CurrentTakoformCandidates {
   if (
     catalog.provenance.classification !== "public-unsigned-package-corpus" ||
     catalog.provenance.repository !== "https://github.com/tako0614/takoform-forms.git" ||
-    catalog.provenance.commit !== "026f862975b9adb0e2bfd9c6214a5e6691dfb596" ||
+    catalog.provenance.commit !== "3a395e4d7f9f652a942da52905857fccc41b467e" ||
     catalog.provenance.gitTags !== "unsigned" ||
     catalog.provenance.sigstoreBundle !== null ||
     catalog.provenance.familyIndexSha256 !==

@@ -92,7 +92,6 @@ export async function runSigning(
       path: join(root, "inspect-wrangler.jsonc"),
       main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
       commit: invocation.commit,
-      hostedTopology: "desired",
       signingKeyId: target.signing.currentKeyId,
     });
     const database = options.database ?? createRemoteSigningDatabase(configPath, environment, run);
@@ -211,7 +210,6 @@ async function repairSigningSecret(
   const keyId = target.signing.currentKeyId;
   const row = requiredActiveRow(await database.readKey(keyId, "preflight"), keyId);
   const before = await inspectLiveWorkerVersion("preflight", target, state, {
-    hostedTopology: "desired",
     signingKeyId: keyId,
   });
   if (invocation.action === "status") {
@@ -262,7 +260,6 @@ async function repairSigningSecret(
     );
   }
   const after = await inspectLiveWorkerVersion("verification", target, state, {
-    hostedTopology: "desired",
     signingKeyId: keyId,
   });
   assertSecretOnlyAdvance(before, after);
@@ -303,7 +300,6 @@ async function rotateSigningKey(
   );
   const next = requiredActiveRow(await database.readKey(nextKeyId, "preflight"), nextKeyId);
   const before = await inspectLiveWorkerVersion("preflight", target, state, {
-    hostedTopology: "desired",
     signingKeyId: currentKeyId,
   });
   if (invocation.action === "status") {
@@ -344,7 +340,6 @@ async function rotateSigningKey(
     root,
     target,
     commit: source.commit,
-    hostedTopology: "desired",
     signingKeyId: nextKeyId,
     run,
   });
@@ -383,7 +378,6 @@ async function rotateSigningKey(
     );
   }
   const after = await inspectLiveWorkerVersion("verification", target, state, {
-    hostedTopology: "desired",
     signingKeyId: nextKeyId,
   });
   if (

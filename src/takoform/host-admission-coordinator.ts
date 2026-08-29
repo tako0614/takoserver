@@ -3,17 +3,20 @@ import type { JsonObject } from "../ports.ts";
 import type {
   AdmissionCommand,
   AdmissionDigest,
+  AdmissionHandle,
+  AdmissionHandleIssuer,
   AdmissionReceipt,
+  AdmissionReport,
   FormAdmissionHost,
 } from "./admission.ts";
 import { ADMISSION_GENESIS_DIGEST } from "./admission.ts";
 import type {
-  CoreAdmissionAdapter,
   FormAuthorityEnvironment,
-  FormAuthorityTrustEvidence,
-  PreparedCoreAdmission,
-  SignedTrustEvidenceAdapter,
-} from "./core-admission-adapter.ts";
+  FormAuthorityEvidenceVerifier,
+  FormAuthorityVerificationEvidence,
+  FormAuthorityVerificationMode,
+  VerifiedFormAuthorityEvidence,
+} from "./form-authority-verification.ts";
 import type { FormPackageInput, FormPackageStore } from "./form-packages.ts";
 import { takoformActivationAudience } from "./host-authority.ts";
 import type {
@@ -37,7 +40,7 @@ export interface FormAuthorityPlanRequest extends FormAuthorityIdentity {
     readonly tenantId: string;
     readonly space: string;
   };
-  readonly evidence: FormAuthorityTrustEvidence;
+  readonly evidence: FormAuthorityVerificationEvidence;
   readonly actor: string;
   readonly reason: string;
 }
@@ -119,7 +122,8 @@ export interface FormAuthorityActionReceipt {
   readonly eventDigest: AdmissionDigest;
   readonly state: AdmissionReceipt["state"];
   readonly changed: boolean;
-  readonly admissionMode: "released-core" | "integration-fixture";
+  readonly policyAuthority: "takoserver-host";
+  readonly verificationMode: FormAuthorityVerificationMode;
   readonly productionEligible: boolean;
 }
 
@@ -128,7 +132,8 @@ export interface FormAuthorityApplyResult {
   readonly status: "converged" | "partial";
   readonly planDigest: AdmissionDigest;
   readonly receipts: readonly FormAuthorityActionReceipt[];
-  readonly admissionMode: "released-core" | "integration-fixture";
+  readonly policyAuthority: "takoserver-host";
+  readonly verificationMode: FormAuthorityVerificationMode;
   readonly productionEligible: boolean;
   readonly readback: FormAuthorityReadback;
   readonly nextPlan: FormAuthorityPlan;
@@ -147,13 +152,13 @@ export interface FormAuthorityPackageSource {
   }): Promise<FormPackageInput>;
 }
 
-export interface FormAuthorityOperator {
+export interface HostAdmissionCoordinator {
   plan(request: FormAuthorityPlanRequest): Promise<FormAuthorityPlan>;
   apply(plan: FormAuthorityPlan): Promise<FormAuthorityApplyResult>;
   readback(request: FormAuthorityPlanRequest): Promise<FormAuthorityReadback>;
 }
 
-export class FormAuthorityOperatorError extends Error {
+export class HostAdmissionCoordinatorError extends Error {
   constructor(
     readonly code:
       | "invalid_request"
@@ -167,7 +172,7 @@ export class FormAuthorityOperatorError extends Error {
     message: string = code,
   ) {
     super(message);
-    this.name = "FormAuthorityOperatorError";
+    this.name = "HostAdmissionCoordinatorError";
   }
 }
 
@@ -188,24 +193,35 @@ interface AuthorityState {
 
 type AuthorityRow = Readonly<Record<string, unknown>>;
 
-export function createFormAuthorityOperator(options: {
+interface PreparedHostAdmission {
+  readonly verificationMode: FormAuthorityVerificationMode;
+  readonly productionEligible: boolean;
+  issue(input: {
+    readonly policyEventDigest: AdmissionDigest;
+    readonly checkpointEventDigest: AdmissionDigest;
+  }): AdmissionHandle;
+}
+
+export function createHostAdmissionCoordinator(options: {
   readonly identity: FormAuthorityIdentity;
   readonly catalog: TakoformImplementationCatalog;
   readonly packages: FormAuthorityPackageSource;
   /** Exact R2 package closure shared with the admission store. */
   readonly storedPackages: Pick<FormPackageStore, "read">;
   readonly admission: FormAdmissionHost;
-  readonly core: CoreAdmissionAdapter;
-  readonly trust: SignedTrustEvidenceAdapter;
+  /** Host-private issuer shared only with this coordinator and admission store. */
+  readonly handles: AdmissionHandleIssuer;
+  /** Verification facts are an input to Host policy, never the policy decision. */
+  readonly verifier: FormAuthorityEvidenceVerifier;
   /** Rechecks the live public Host immediately before every durable command. */
   readonly assertMutationAuthority: () => Promise<void>;
-}): FormAuthorityOperator {
+}): HostAdmissionCoordinator {
   validateIdentity(options.identity);
   if (
     options.catalog.capabilityDigest !== options.identity.capabilityDigest ||
     options.catalog.implementationDigest !== options.identity.implementationDigest
   ) {
-    throw new FormAuthorityOperatorError(
+    throw new HostAdmissionCoordinatorError(
       "identity_mismatch",
       "implementation catalog digests do not match the Worker identity",
     );
@@ -402,28 +418,31 @@ export function createFormAuthorityOperator(options: {
     assertRequestIdentity(candidate.request, options.identity);
     const { planDigest: _supplied, ...unsigned } = candidate;
     if ((await canonicalFormAuthorityPlanDigest(unsigned)) !== candidate.planDigest) {
-      throw new FormAuthorityOperatorError("plan_digest_mismatch");
+      throw new HostAdmissionCoordinatorError("plan_digest_mismatch");
     }
-    assertApplyReadiness(options.identity.environment, options.core, options.trust);
+    assertApplyReadiness(options.identity.environment, options.verifier);
     const planned = await readState(candidate.request);
     if (
       planned.headDigest !== candidate.currentHeadDigest ||
       canonicalJson(planned.heads) !== canonicalJson(candidate.currentHeads)
     ) {
-      throw new FormAuthorityOperatorError("head_drift");
+      throw new HostAdmissionCoordinatorError("head_drift");
     }
     const expected = await buildPlan(candidate.request, planned);
     if (canonicalJson(expected) !== canonicalJson(candidate)) {
-      throw new FormAuthorityOperatorError(
+      throw new HostAdmissionCoordinatorError(
         "plan_digest_mismatch",
         "Form authority plan differs from code-derived current operations",
       );
     }
 
-    // All package closure and trust/Core adapter work happens before the first
-    // D1/R2 mutation. The opaque handle itself is issued later because it must
-    // bind the actual guarded publisher/checkpoint event digests.
-    const prepared = new Map<string, { package: FormPackageInput; core: PreparedCoreAdmission }>();
+    // All package closure, verification, and Host policy work happens before
+    // the first D1/R2 mutation. The private handle itself is issued later so it
+    // can bind the actual guarded publisher/checkpoint event digests.
+    const prepared = new Map<
+      string,
+      { package: FormPackageInput; admission: PreparedHostAdmission }
+    >();
     for (const command of candidate.commands) {
       if (command.kind === "AllowPublisher" || command.kind === "AppendCheckpoint") continue;
       const key = canonicalJson(command.formRef);
@@ -433,9 +452,9 @@ export function createFormAuthorityOperator(options: {
         packageDigest: command.packageDigest,
       });
       if (pkg.packageDigest !== command.packageDigest || canonicalJson(pkg.formRef) !== key) {
-        throw new FormAuthorityOperatorError("package_unavailable");
+        throw new HostAdmissionCoordinatorError("package_unavailable");
       }
-      const verified = await options.trust.verify({
+      const verified = await options.verifier.verify({
         environment: candidate.request.environment,
         hostId: candidate.request.hostId,
         package: pkg,
@@ -448,17 +467,19 @@ export function createFormAuthorityOperator(options: {
       );
       prepared.set(key, {
         package: pkg,
-        core: await options.core.prepare({
+        admission: prepareHostAdmission({
           environment: candidate.request.environment,
-          hostId: candidate.request.hostId,
           operation: packageCommand?.kind === "InstallPackage" ? "install" : "replace",
           package: pkg,
-          evidence: verified,
+          requestedEvidence: candidate.request.evidence,
+          verified,
+          handles: options.handles,
+          verifierReleased: options.verifier.readiness.released,
         }),
       });
     }
 
-    // Trust/Core work may be slow. Re-read every durable head after it has
+    // Verification may be slow. Re-read every durable head after it has
     // completed, then fence the live public Host immediately before each
     // command that can write R2 or D1. A stale public artifact therefore gets
     // no mutation window even if it changed after RPC admission.
@@ -467,21 +488,21 @@ export function createFormAuthorityOperator(options: {
       before.headDigest !== candidate.currentHeadDigest ||
       canonicalJson(before.heads) !== canonicalJson(candidate.currentHeads)
     ) {
-      throw new FormAuthorityOperatorError("head_drift");
+      throw new HostAdmissionCoordinatorError("head_drift");
     }
     const preparedExpected = await buildPlan(candidate.request, before);
     if (canonicalJson(preparedExpected) !== canonicalJson(candidate)) {
-      throw new FormAuthorityOperatorError(
+      throw new HostAdmissionCoordinatorError(
         "plan_digest_mismatch",
         "Form authority plan drifted during admission preparation",
       );
     }
 
-    const admissionMode = options.core.readiness.released
-      ? ("released-core" as const)
-      : ("integration-fixture" as const);
+    const verificationMode = preparedVerificationMode(prepared, options.verifier);
     const productionEligible =
-      options.core.readiness.productionEligible && options.trust.readiness.productionEligible;
+      options.identity.environment === "production" &&
+      options.verifier.readiness.released &&
+      verificationMode === "released-core";
     let publisherEventDigest = eventDigest(before.publisher);
     let checkpointEventDigest = eventDigest(before.checkpoint);
     const receipts: FormAuthorityActionReceipt[] = [];
@@ -507,7 +528,8 @@ export function createFormAuthorityOperator(options: {
           eventDigest: receipt.eventDigest,
           state: receipt.state,
           changed: receipt.changed,
-          admissionMode: executable.prepared?.admissionMode ?? admissionMode,
+          policyAuthority: "takoserver-host",
+          verificationMode: executable.prepared?.verificationMode ?? verificationMode,
           productionEligible: executable.prepared?.productionEligible ?? productionEligible,
         });
       } catch (error) {
@@ -527,7 +549,8 @@ export function createFormAuthorityOperator(options: {
       status: converged ? "converged" : "partial",
       planDigest: candidate.planDigest,
       receipts,
-      admissionMode,
+      policyAuthority: "takoserver-host",
+      verificationMode,
       productionEligible,
       readback: after,
       nextPlan,
@@ -560,10 +583,10 @@ function executableCommand(
   command: FormAuthorityCommand,
   request: FormAuthorityPlanRequest,
   implementationDigest: AdmissionDigest,
-  prepared: ReadonlyMap<string, { package: FormPackageInput; core: PreparedCoreAdmission }>,
+  prepared: ReadonlyMap<string, { package: FormPackageInput; admission: PreparedHostAdmission }>,
   publisherEventDigest: AdmissionDigest | null,
   checkpointEventDigest: AdmissionDigest | null,
-): { readonly command: AdmissionCommand; readonly prepared?: PreparedCoreAdmission } {
+): { readonly command: AdmissionCommand; readonly prepared?: PreparedHostAdmission } {
   const metadata = {
     actor: request.actor,
     reason: request.reason,
@@ -576,7 +599,7 @@ function executableCommand(
       };
     case "AppendCheckpoint":
       if (!publisherEventDigest) {
-        throw new FormAuthorityOperatorError("authority_state_conflict");
+        throw new HostAdmissionCoordinatorError("authority_state_conflict");
       }
       return {
         command: {
@@ -596,22 +619,22 @@ function executableCommand(
     case "InstallPackage":
     case "ReplacePackage": {
       if (!publisherEventDigest || !checkpointEventDigest) {
-        throw new FormAuthorityOperatorError("authority_state_conflict");
+        throw new HostAdmissionCoordinatorError("authority_state_conflict");
       }
       const value = prepared.get(canonicalJson(command.formRef));
-      if (!value) throw new FormAuthorityOperatorError("package_unavailable");
+      if (!value) throw new HostAdmissionCoordinatorError("package_unavailable");
       return {
         command: {
           kind: command.kind,
           package: value.package,
-          handle: value.core.issue({
+          handle: value.admission.issue({
             policyEventDigest: publisherEventDigest,
             checkpointEventDigest,
           }),
           implementationDigest,
           ...metadata,
         },
-        prepared: value.core,
+        prepared: value.admission,
       };
     }
     case "SetSupport":
@@ -648,6 +671,143 @@ function executableCommand(
   }
 }
 
+function prepareHostAdmission(input: {
+  readonly environment: FormAuthorityEnvironment;
+  readonly operation: "install" | "replace";
+  readonly package: FormPackageInput;
+  readonly requestedEvidence: FormAuthorityVerificationEvidence;
+  readonly verified: VerifiedFormAuthorityEvidence;
+  readonly handles: AdmissionHandleIssuer;
+  readonly verifierReleased: boolean;
+}): PreparedHostAdmission {
+  const { evidence, verificationMode } = input.verified;
+  if (canonicalJson(evidence) !== canonicalJson(input.requestedEvidence)) {
+    throw new HostAdmissionCoordinatorError(
+      "invalid_request",
+      "verified evidence must preserve the exact submitted evidence closure",
+    );
+  }
+  if (
+    (verificationMode === "integration-fixture" && input.environment !== "integration") ||
+    (verificationMode === "released-core" && !input.verifierReleased)
+  ) {
+    throw new HostAdmissionCoordinatorError(
+      "production_not_ready",
+      "verification mode is not eligible for this Host environment",
+    );
+  }
+  if (evidence.publisher.group !== input.package.formRef.apiVersion) {
+    throw new HostAdmissionCoordinatorError(
+      "invalid_request",
+      "Host policy requires the verified namespace to match the Form group",
+    );
+  }
+  if ((evidence.checkpoint.revokedPackageDigests ?? []).includes(input.package.packageDigest)) {
+    throw new HostAdmissionCoordinatorError(
+      "invalid_request",
+      "Host policy refuses a package revoked by the verified checkpoint",
+    );
+  }
+  const productionEligible =
+    input.environment === "production" &&
+    input.verifierReleased &&
+    verificationMode === "released-core";
+  const report: AdmissionReport = {
+    status: "admitted",
+    operation: input.operation,
+    package: {
+      packageDigest: input.package.packageDigest,
+      formRef: structuredClone(input.package.formRef),
+      fileCount: input.package.files.length,
+      payloadBytes: input.package.files.reduce(
+        (total, file) => total + packageFileSize(file.bytes),
+        0,
+      ),
+    },
+    publisher: {
+      policyDigest: evidence.publisher.policyDigest,
+      oidcIssuer: evidence.publisher.oidcIssuer,
+      sourceRepository: evidence.publisher.sourceRepository,
+      workflow: evidence.publisher.workflow,
+      ref: evidence.publisher.ref,
+      identity: evidence.publisher.identity,
+    },
+    source: {
+      sourceCommit: evidence.publisher.sourceCommit,
+      workflowCommit: evidence.publisher.workflowCommit,
+      buildConfigCommit: evidence.publisher.buildConfigCommit,
+      repositoryIdentifier: evidence.publisher.repositoryIdentifier,
+      ownerIdentifier: evidence.publisher.ownerIdentifier,
+    },
+    namespace: {
+      group: evidence.publisher.group,
+      namespaceGrantDigest: evidence.publisher.namespaceGrantDigest,
+    },
+    signature: {
+      subjectDigest: input.package.packageDigest,
+      bundleDigest: evidence.bundleDigest,
+      trustedRootDigest: evidence.publisher.trustedRootDigest,
+    },
+    revocation: {
+      checkpointApiVersion: evidence.checkpoint.apiVersion,
+      sequence: evidence.checkpoint.sequence,
+      checkpointDigest: evidence.checkpoint.digest,
+      entriesDigest: evidence.checkpoint.entriesDigest,
+      revoked: false,
+    },
+    checks: [
+      { code: "host-policy-verification-evidence-accepted", passed: true },
+      { code: "host-policy-namespace-match", passed: true },
+      { code: "host-policy-package-not-revoked", passed: true },
+    ],
+  };
+  return {
+    verificationMode,
+    productionEligible,
+    issue({ policyEventDigest, checkpointEventDigest }): AdmissionHandle {
+      return input.handles.issue({
+        operation: input.operation,
+        packageDigest: input.package.packageDigest,
+        formRef: input.package.formRef,
+        publisherKey: evidence.publisher.publisherKey,
+        publisher: evidence.publisher,
+        policyEventDigest,
+        checkpointApiVersion: evidence.checkpoint.apiVersion,
+        checkpointSequence: evidence.checkpoint.sequence,
+        checkpointDigest: evidence.checkpoint.digest,
+        checkpointEventDigest,
+        report,
+      });
+    },
+  };
+}
+
+function preparedVerificationMode(
+  prepared: ReadonlyMap<string, { readonly admission: PreparedHostAdmission }>,
+  verifier: FormAuthorityEvidenceVerifier,
+): FormAuthorityVerificationMode {
+  const modes = new Set([...prepared.values()].map(({ admission }) => admission.verificationMode));
+  if (modes.size > 1) {
+    throw new HostAdmissionCoordinatorError(
+      "invalid_request",
+      "one Host apply cannot mix verification modes",
+    );
+  }
+  return (
+    modes.values().next().value ??
+    (verifier.readiness.released ? "released-core" : "integration-fixture")
+  );
+}
+
+function packageFileSize(bytes: Uint8Array | ArrayBuffer | ReadableStream<Uint8Array>): number {
+  if (bytes instanceof Uint8Array) return bytes.byteLength;
+  if (bytes instanceof ArrayBuffer) return bytes.byteLength;
+  throw new HostAdmissionCoordinatorError(
+    "package_unavailable",
+    "Host admission package bytes must be bounded in memory",
+  );
+}
+
 async function history(
   admission: FormAdmissionHost,
   chain: "publisher" | "checkpoint" | "install" | "support" | "activation",
@@ -655,7 +815,7 @@ async function history(
   const view = await admission.inspect({ kind: "History", chain, limit: 1_000 });
   const events = view.events ?? [];
   if (events.length === 1_000) {
-    throw new FormAuthorityOperatorError(
+    throw new HostAdmissionCoordinatorError(
       "history_too_large",
       "bounded authority readback cannot prove the current head",
     );
@@ -674,7 +834,7 @@ function exactHead(rows: readonly AuthorityRow[], key: string): AuthorityRow | n
     (row) => typeof row.event_digest === "string" && !predecessors.has(row.event_digest),
   );
   if (heads.length !== 1) {
-    throw new FormAuthorityOperatorError(
+    throw new HostAdmissionCoordinatorError(
       "authority_state_conflict",
       `${key} authority chain has ${heads.length} heads`,
     );
@@ -688,7 +848,7 @@ function spaceAudience(activation: FormAuthorityPlanRequest["activation"]): {
 } {
   const audience = takoformActivationAudience("space", activation);
   if (audience.kind !== "space") {
-    throw new FormAuthorityOperatorError("invalid_request", "space activation is required");
+    throw new HostAdmissionCoordinatorError("invalid_request", "space activation is required");
   }
   return { kind: "space", value: audience.value };
 }
@@ -705,7 +865,7 @@ function eventDigest(row: AuthorityRow | null): AdmissionDigest | null {
   const value = row?.event_digest;
   if (value === undefined || value === null) return null;
   if (!isSha256Digest(value)) {
-    throw new FormAuthorityOperatorError(
+    throw new HostAdmissionCoordinatorError(
       "authority_state_conflict",
       "durable head digest is invalid",
     );
@@ -716,7 +876,7 @@ function eventDigest(row: AuthorityRow | null): AdmissionDigest | null {
 async function installMatches(
   row: AuthorityRow | null,
   entry: TakoformImplementationCatalogEntry,
-  evidence: FormAuthorityTrustEvidence,
+  evidence: FormAuthorityVerificationEvidence,
 ): Promise<boolean> {
   return (
     (row?.event_type === "install" || row?.event_type === "replace") &&
@@ -728,13 +888,14 @@ async function installMatches(
 
 /**
  * AdmissionReport JSON is never executable authority. These comparisons only
- * prove that the opaque-handle-derived install head retained the exact trust
- * pins bound by this plan; a mismatch requires a fresh Core evaluation.
+ * prove that the Host-private-handle-derived install head retained the exact
+ * verified pins bound by this plan; a mismatch requires fresh verification and
+ * a new Host policy decision.
  */
 async function installEvidenceMatches(
   row: AuthorityRow,
   entry: TakoformImplementationCatalogEntry,
-  evidence: FormAuthorityTrustEvidence,
+  evidence: FormAuthorityVerificationEvidence,
 ): Promise<boolean> {
   if (
     row.publisher_key !== evidence.publisher.publisherKey ||
@@ -757,7 +918,7 @@ async function installEvidenceMatches(
   try {
     report = JSON.parse(row.admission_report_json);
   } catch {
-    throw new FormAuthorityOperatorError(
+    throw new HostAdmissionCoordinatorError(
       "authority_state_conflict",
       "installed admission report is invalid",
     );
@@ -767,7 +928,7 @@ async function installEvidenceMatches(
     !isSha256Digest(row.admission_report_digest) ||
     (await canonicalDigest(report)) !== row.admission_report_digest
   ) {
-    throw new FormAuthorityOperatorError(
+    throw new HostAdmissionCoordinatorError(
       "authority_state_conflict",
       "installed admission report digest does not match its durable body",
     );
@@ -814,7 +975,7 @@ function supportMatches(
   try {
     return canonicalJson(JSON.parse(row.operations_json)) === canonicalJson(entry.operations);
   } catch {
-    throw new FormAuthorityOperatorError(
+    throw new HostAdmissionCoordinatorError(
       "authority_state_conflict",
       "support operations are invalid",
     );
@@ -833,20 +994,20 @@ function assertExistingAuthorityMatches(
   state: AuthorityState,
 ): void {
   if (state.publisher && !publisherMatches(state.publisher, request.evidence)) {
-    throw new FormAuthorityOperatorError(
+    throw new HostAdmissionCoordinatorError(
       "authority_state_conflict",
       "publisher head differs from the signed plan evidence",
     );
   }
   if (state.checkpoint && !checkpointMatches(state.checkpoint, request.evidence, state.publisher)) {
-    throw new FormAuthorityOperatorError(
+    throw new HostAdmissionCoordinatorError(
       "authority_state_conflict",
       "checkpoint head differs from the signed plan evidence",
     );
   }
 }
 
-function publisherMatches(row: AuthorityRow, evidence: FormAuthorityTrustEvidence): boolean {
+function publisherMatches(row: AuthorityRow, evidence: FormAuthorityVerificationEvidence): boolean {
   const publisher = evidence.publisher;
   return (
     (row.event_type === "allow" || row.event_type === "rotate") &&
@@ -871,7 +1032,7 @@ function publisherMatches(row: AuthorityRow, evidence: FormAuthorityTrustEvidenc
 
 function checkpointMatches(
   row: AuthorityRow,
-  evidence: FormAuthorityTrustEvidence,
+  evidence: FormAuthorityVerificationEvidence,
   publisher: AuthorityRow | null,
 ): boolean {
   return (
@@ -897,7 +1058,10 @@ function validateIdentity(identity: FormAuthorityIdentity): void {
     !isSha256Digest(identity.capabilityDigest) ||
     !isSha256Digest(identity.implementationDigest)
   ) {
-    throw new FormAuthorityOperatorError("invalid_request", "Form authority identity is invalid");
+    throw new HostAdmissionCoordinatorError(
+      "invalid_request",
+      "Form authority identity is invalid",
+    );
   }
 }
 
@@ -913,7 +1077,7 @@ function validatePlanRequest(request: FormAuthorityPlanRequest): void {
     !request.evidence.publisher ||
     !boundedIdentity(request.evidence.publisher.publisherKey)
   ) {
-    throw new FormAuthorityOperatorError("invalid_request");
+    throw new HostAdmissionCoordinatorError("invalid_request");
   }
   validateIdentity(request);
 }
@@ -932,7 +1096,7 @@ function assertRequestIdentity(
     "implementationDigest",
   ] as const) {
     if (request[key] !== identity[key]) {
-      throw new FormAuthorityOperatorError(
+      throw new HostAdmissionCoordinatorError(
         "identity_mismatch",
         `Form authority ${key} does not match this Worker`,
       );
@@ -948,27 +1112,21 @@ function assertPlanShape(plan: FormAuthorityPlan): void {
     !Array.isArray(plan.commands) ||
     plan.commands.some((command, index) => command.index !== index)
   ) {
-    throw new FormAuthorityOperatorError("plan_digest_mismatch");
+    throw new HostAdmissionCoordinatorError("plan_digest_mismatch");
   }
 }
 
 function assertApplyReadiness(
   environment: FormAuthorityEnvironment,
-  core: CoreAdmissionAdapter,
-  trust: SignedTrustEvidenceAdapter,
+  verifier: FormAuthorityEvidenceVerifier,
 ): void {
   if (
-    !core.readiness.available ||
-    !trust.readiness.available ||
-    (environment === "production" &&
-      (!core.readiness.released ||
-        !trust.readiness.released ||
-        !core.readiness.productionEligible ||
-        !trust.readiness.productionEligible))
+    !verifier.readiness.available ||
+    (environment === "production" && !verifier.readiness.released)
   ) {
-    throw new FormAuthorityOperatorError(
+    throw new HostAdmissionCoordinatorError(
       "production_not_ready",
-      "Form authority apply needs released Core admission and signed trust adapters",
+      "Form authority apply needs released Form package verification",
     );
   }
 }

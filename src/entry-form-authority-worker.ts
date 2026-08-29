@@ -2,13 +2,16 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 import { createR2ObjectStore } from "./objects-r2.ts";
 import type { PublicHostIdentityRpc } from "./public-host-identity.ts";
 import { createD1Sql } from "./sql-d1.ts";
-import type { FormAuthorityPlan, FormAuthorityPlanRequest } from "./takoform/operator-authority.ts";
+import type {
+  FormAuthorityPlan,
+  FormAuthorityPlanRequest,
+} from "./takoform/host-admission-coordinator.ts";
 import {
   createProductionFormAuthorityComposition,
   type FormAuthorityComposition,
   type FormAuthorityEndpointConfiguration,
   parseFormAuthorityCapabilityManifest,
-} from "./takoform/operator-endpoint.ts";
+} from "./takoform/host-admission-endpoint.ts";
 
 /**
  * Named service-binding entrypoint only. There is intentionally no fetch

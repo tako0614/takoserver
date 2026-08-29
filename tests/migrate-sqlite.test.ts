@@ -25,6 +25,8 @@ describe("bringing a local database up to date", () => {
       "tf_deferred_operations",
       "tf_operation_commit_guards",
       "tf_resource_claims",
+      "tf_resource_deletion_attestations",
+      "tf_resource_provider_effects",
       "reservations",
     ]) {
       expect(() => database.query(`SELECT 1 FROM ${table} LIMIT 1`).all()).not.toThrow();
@@ -43,6 +45,188 @@ describe("bringing a local database up to date", () => {
     const second = migrateSqlite(database);
     expect(second.applied).toEqual([]);
     expect(second.alreadyApplied).toBe(MIGRATIONS.length);
+  });
+
+  test("does not fabricate deletion attestations for pre-0029 deleted deployments", () => {
+    const database = new Database(":memory:");
+    database.exec(`
+      CREATE TABLE applied_migrations (
+        name TEXT PRIMARY KEY NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+    const deletionAttestation = MIGRATIONS.findIndex(
+      (migration) => migration.name === "0029_resource_deletion_attestations.sql",
+    );
+    expect(deletionAttestation).toBeGreaterThan(0);
+    for (const migration of MIGRATIONS.slice(0, deletionAttestation)) {
+      database.exec(migration.sql);
+      database
+        .query("INSERT INTO applied_migrations (name, applied_at) VALUES (?, 'now')")
+        .run(migration.name);
+    }
+    database
+      .query(
+        `INSERT INTO tf_resource_deployments
+           (tenant_id, id, resource_uid, offering_id, provider_pack_ref,
+            provider_installation_ref, native_id, native_claimed, state,
+            observed_json, outputs_json, created_at, updated_at)
+         VALUES ('tenant-legacy', 'dep_deleted', 'uid_deleted', 'offering.test',
+                 'provider.test', 'provider.test.primary', 'native:test', 0,
+                 'deleted', '{}', '{}', 100, 100)`,
+      )
+      .run();
+
+    const report = migrateSqlite(database);
+
+    expect(report.applied[0]).toBe("0029_resource_deletion_attestations.sql");
+    expect(
+      database.query("SELECT COUNT(*) AS count FROM tf_resource_deletion_attestations").get(),
+    ).toEqual({ count: 0 });
+  });
+
+  test("fails closed when live rows cannot be registered as unique incarnations", () => {
+    const database = new Database(":memory:");
+    database.exec(`
+      CREATE TABLE applied_migrations (
+        name TEXT PRIMARY KEY NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+    const deletionAttestation = MIGRATIONS.findIndex(
+      (migration) => migration.name === "0029_resource_deletion_attestations.sql",
+    );
+    for (const migration of MIGRATIONS.slice(0, deletionAttestation)) {
+      database.exec(migration.sql);
+      database
+        .query("INSERT INTO applied_migrations (name, applied_at) VALUES (?, 'now')")
+        .run(migration.name);
+    }
+    const resource = JSON.stringify({
+      form: {
+        formRef: {
+          apiVersion: "edge.forms.takoform.com",
+          kind: "Thing",
+          definitionVersion: "v1",
+          schemaDigest: `sha256:${"a".repeat(64)}`,
+        },
+      },
+    });
+    for (const name of ["first", "second"]) {
+      database
+        .query(
+          `INSERT INTO tf_resources
+             (tenant_id, space, api_version, kind, name, uid, generation, revision,
+              resource_json, relations_json, updated_at)
+           VALUES ('tenant-duplicate', 'main', 'example.forms.invalid', 'Thing', ?,
+                   'uid_duplicate', '1', '1', ?, '[]', 1)`,
+        )
+        .run(name, resource);
+    }
+
+    expect(() => migrateSqlite(database)).toThrow(/0029_resource_deletion_attestations/);
+    expect(
+      database
+        .query(
+          "SELECT name FROM applied_migrations WHERE name = '0029_resource_deletion_attestations.sql'",
+        )
+        .all(),
+    ).toEqual([]);
+    expect(() => database.query("SELECT 1 FROM tf_resource_deletion_attestations").all()).toThrow();
+  });
+
+  test("fails closed when a live row has no FormRef", () => {
+    const database = new Database(":memory:");
+    database.exec(`
+      CREATE TABLE applied_migrations (
+        name TEXT PRIMARY KEY NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+    const deletionAttestation = MIGRATIONS.findIndex(
+      (migration) => migration.name === "0029_resource_deletion_attestations.sql",
+    );
+    for (const migration of MIGRATIONS.slice(0, deletionAttestation)) {
+      database.exec(migration.sql);
+      database
+        .query("INSERT INTO applied_migrations (name, applied_at) VALUES (?, 'now')")
+        .run(migration.name);
+    }
+    database
+      .query(
+        `INSERT INTO tf_resources
+           (tenant_id, space, api_version, kind, name, uid, generation, revision,
+            resource_json, relations_json, updated_at)
+         VALUES ('tenant-malformed', 'main', 'example.forms.invalid', 'Thing', 'broken',
+                 'uid_broken', '1', '1', '{}', '[]', 1)`,
+      )
+      .run();
+
+    expect(() => migrateSqlite(database)).toThrow(/0029_resource_deletion_attestations/);
+    expect(
+      database
+        .query(
+          "SELECT name FROM applied_migrations WHERE name = '0029_resource_deletion_attestations.sql'",
+        )
+        .all(),
+    ).toEqual([]);
+  });
+
+  test("fails closed for every malformed FormRef grammar component", () => {
+    const malformed: readonly [string, Record<string, string>][] = [
+      ["empty apiVersion", { apiVersion: "" }],
+      ["invalid apiVersion version", { apiVersion: "edge.forms.takoform.com/v1gamma1" }],
+      ["empty kind", { kind: "" }],
+      ["invalid kind case", { kind: "thing" }],
+      ["non-semver definitionVersion", { definitionVersion: "latest" }],
+      ["bad schema digest", { schemaDigest: "sha256:short" }],
+    ];
+    const deletionAttestation = MIGRATIONS.findIndex(
+      (migration) => migration.name === "0029_resource_deletion_attestations.sql",
+    );
+    for (const [index, [label, replacement]] of malformed.entries()) {
+      const database = new Database(":memory:");
+      database.exec(`
+        CREATE TABLE applied_migrations (
+          name TEXT PRIMARY KEY NOT NULL,
+          applied_at TEXT NOT NULL
+        );
+      `);
+      for (const migration of MIGRATIONS.slice(0, deletionAttestation)) {
+        database.exec(migration.sql);
+        database
+          .query("INSERT INTO applied_migrations (name, applied_at) VALUES (?, 'now')")
+          .run(migration.name);
+      }
+      const formRef = {
+        apiVersion: "edge.forms.takoform.com",
+        kind: "Thing",
+        definitionVersion: "1.0.0",
+        schemaDigest: `sha256:${"a".repeat(64)}`,
+        ...replacement,
+      };
+      database
+        .query(
+          `INSERT INTO tf_resources
+             (tenant_id, space, api_version, kind, name, uid, generation, revision,
+              resource_json, relations_json, updated_at)
+           VALUES ('tenant-malformed-ref', 'main', 'edge.forms.takoform.com', 'Thing', ?, ?,
+                   '1', '1', ?, '[]', 1)`,
+        )
+        .run(`broken-${index}`, `uid_malformed_${index}`, JSON.stringify({ form: { formRef } }));
+
+      expect(() => migrateSqlite(database), label).toThrow(/0029_resource_deletion_attestations/);
+      expect(
+        database
+          .query(
+            "SELECT name FROM applied_migrations WHERE name = '0029_resource_deletion_attestations.sql'",
+          )
+          .all(),
+      ).toEqual([]);
+      expect(() =>
+        database.query("SELECT 1 FROM tf_resource_deletion_attestations").all(),
+      ).toThrow();
+    }
   });
 
   test("adds durable operations and claims without rewriting released Takoform rows", () => {
@@ -71,18 +255,44 @@ describe("bringing a local database up to date", () => {
          VALUES ('tenant-a', 'main', 'example.forms.invalid', 'Thing', 'existing',
                  'uid_existing', '3', '7', ?, '[]', 42)`,
       )
-      .run('{"existing":true}');
-    database.exec(`
+      .run(
+        JSON.stringify({
+          existing: true,
+          form: {
+            formRef: {
+              apiVersion: "edge.forms.takoform.com",
+              kind: "Thing",
+              definitionVersion: "1.0.0",
+              schemaDigest: `sha256:${"a".repeat(64)}`,
+            },
+          },
+        }),
+      );
+    database
+      .query(`
       INSERT INTO tf_operations
         (id, tenant_id, operation, state, resource_json, created_at, expires_at)
       VALUES
-        ('op_existing', 'tenant-a', 'apply', 'succeeded', '{"existing":true}',
+        ('op_existing', 'tenant-a', 'apply', 'succeeded', ?,
          '2026-08-23T00:00:00.000Z', 9999999999999)
-    `);
+    `)
+      .run(
+        JSON.stringify({
+          existing: true,
+          form: {
+            formRef: {
+              apiVersion: "edge.forms.takoform.com",
+              kind: "Thing",
+              definitionVersion: "1.0.0",
+              schemaDigest: `sha256:${"a".repeat(64)}`,
+            },
+          },
+        }),
+      );
 
     const report = migrateSqlite(database);
 
-    expect(report.applied).toEqual([
+    expect(report.applied.slice(0, 5)).toEqual([
       "0020_takoform_deferred_operations.sql",
       "0021_takoform_provider_mutation_sagas.sql",
       "0022_takoform_admission.sql",
@@ -100,7 +310,17 @@ describe("bringing a local database up to date", () => {
       uid: "uid_existing",
       generation: "3",
       revision: "7",
-      resource_json: '{"existing":true}',
+      resource_json: JSON.stringify({
+        existing: true,
+        form: {
+          formRef: {
+            apiVersion: "edge.forms.takoform.com",
+            kind: "Thing",
+            definitionVersion: "1.0.0",
+            schemaDigest: `sha256:${"a".repeat(64)}`,
+          },
+        },
+      }),
       relations_json: "[]",
       updated_at: 42,
     });
@@ -108,7 +328,21 @@ describe("bringing a local database up to date", () => {
       database
         .query("SELECT id, state, resource_json FROM tf_operations WHERE id = 'op_existing'")
         .get(),
-    ).toEqual({ id: "op_existing", state: "succeeded", resource_json: '{"existing":true}' });
+    ).toEqual({
+      id: "op_existing",
+      state: "succeeded",
+      resource_json: JSON.stringify({
+        existing: true,
+        form: {
+          formRef: {
+            apiVersion: "edge.forms.takoform.com",
+            kind: "Thing",
+            definitionVersion: "1.0.0",
+            schemaDigest: `sha256:${"a".repeat(64)}`,
+          },
+        },
+      }),
+    });
     for (const table of [
       "tf_deferred_operations",
       "tf_operation_commit_guards",
@@ -162,7 +396,7 @@ describe("bringing a local database up to date", () => {
 
     const report = migrateSqlite(database);
 
-    expect(report.applied).toEqual([
+    expect(report.applied.slice(0, 2)).toEqual([
       "0023_takoform_host_authority.sql",
       "0024_takoform_provider_execution_leases.sql",
     ]);
@@ -232,7 +466,10 @@ describe("bringing a local database up to date", () => {
 
     const report = migrateSqlite(database);
 
-    expect(report.applied).toEqual(["0024_takoform_provider_execution_leases.sql"]);
+    expect(report.applied.slice(0, 2)).toEqual([
+      "0024_takoform_provider_execution_leases.sql",
+      "0025_resource_migration_execution.sql",
+    ]);
     expect(
       database
         .query(
@@ -259,6 +496,87 @@ describe("bringing a local database up to date", () => {
         execution_started_at: null,
       },
     ]);
+  });
+
+  test("makes existing in-flight Resource Migrations recovery-only without changing state", () => {
+    const database = new Database(":memory:");
+    database.exec(`
+      CREATE TABLE applied_migrations (
+        name TEXT PRIMARY KEY NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+    const executionMigration = MIGRATIONS.findIndex(
+      (migration) => migration.name === "0025_resource_migration_execution.sql",
+    );
+    expect(executionMigration).toBeGreaterThan(0);
+    for (const migration of MIGRATIONS.slice(0, executionMigration)) {
+      database.exec(migration.sql);
+      database
+        .query("INSERT INTO applied_migrations (name, applied_at) VALUES (?, 'now')")
+        .run(migration.name);
+    }
+    database.exec(`
+      INSERT INTO tf_resource_migrations
+        (tenant_id, id, resource_uid, source_deployment_id, target_deployment_id,
+         target_offering_id, target_provider_pack_ref, target_provider_installation_ref,
+         commercial_authorization_ref, commercial_tenant_ref, mode, transfer_format, state,
+         verification_json, rollback_until, attachment_rebindings_json, created_at, updated_at)
+      VALUES
+        ('tenant-a', 'mig_planned', 'uid_planned', 'dep_source_planned', 'dep_target_planned',
+         'offering.target', 'target', 'target.primary', 'reservation_planned', 'commercial-a',
+         'offline', 'transfer.example/v1', 'planned', NULL, NULL, NULL, 100, 110),
+        ('tenant-a', 'mig_provisioning', 'uid_provisioning', 'dep_source_provisioning',
+         'dep_target_provisioning', 'offering.target', 'target', 'target.primary',
+         'reservation_provisioning', 'commercial-a', 'offline', 'transfer.example/v1',
+         'provisioning', NULL, NULL, NULL, 200, 210),
+        ('tenant-a', 'mig_transferring', 'uid_transferring', 'dep_source_transferring',
+         'dep_target_transferring', 'offering.target', 'target', 'target.primary',
+         'reservation_transferring', 'commercial-a', 'offline', 'transfer.example/v1',
+         'transferring', NULL, NULL, NULL, 300, 310);
+    `);
+
+    const report = migrateSqlite(database);
+
+    expect(report.applied[0]).toBe("0025_resource_migration_execution.sql");
+    expect(
+      database
+        .query(
+          `SELECT id, state, execution_lease_token, execution_lease_until,
+                  execution_started_at, execution_json
+           FROM tf_resource_migrations ORDER BY id`,
+        )
+        .all(),
+    ).toEqual([
+      {
+        id: "mig_planned",
+        state: "planned",
+        execution_lease_token: null,
+        execution_lease_until: null,
+        execution_started_at: null,
+        execution_json: "{}",
+      },
+      {
+        id: "mig_provisioning",
+        state: "provisioning",
+        execution_lease_token: null,
+        execution_lease_until: null,
+        execution_started_at: 210,
+        execution_json: "{}",
+      },
+      {
+        id: "mig_transferring",
+        state: "transferring",
+        execution_lease_token: null,
+        execution_lease_until: null,
+        execution_started_at: 310,
+        execution_json: "{}",
+      },
+    ]);
+    expect(migrateSqlite(database)).toEqual({
+      applied: [],
+      alreadyApplied: MIGRATIONS.length,
+    });
   });
 
   test("renames fractional usage money without changing its value", () => {
@@ -439,6 +757,14 @@ describe("bringing a local database up to date", () => {
         "1",
         "2",
         JSON.stringify({
+          form: {
+            formRef: {
+              apiVersion: "edge.forms.takoform.com/v1beta1",
+              kind: "ObjectBucket",
+              definitionVersion: "1.0.0",
+              schemaDigest: `sha256:${"b".repeat(64)}`,
+            },
+          },
           status: {
             observed: { region: "global" },
             outputs: { bucket: "opaque" },
