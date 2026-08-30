@@ -1,8 +1,10 @@
+import { isAbsolute } from "node:path";
 import { runConsole } from "./deploy/console.ts";
 import { DEPLOY_CONTRACT } from "./deploy/contract.ts";
 import { DeployError, PHASE_EXIT_CODE } from "./deploy/errors.ts";
 import { runFormAuthority } from "./deploy/form-authority.ts";
 import { runFormAuthorityInvoke } from "./deploy/form-authority-invoke.ts";
+import { loadFormAuthorityScopeTransition } from "./deploy/form-authority-scope-transition.ts";
 import { runHosted } from "./deploy/hosted.ts";
 import { runOperatorIdentity } from "./deploy/identity.ts";
 import { runIntegrationE2eCredentials } from "./deploy/integration-e2e-credentials.ts";
@@ -27,6 +29,9 @@ const USAGE = `takoserver deploy
   and --reverse; token retirement is forward-only.
   Post-token attribution repair uses both --legacy-host-runtime-predecessor-version=<uuid>
   and --unattributed-successor-version=<uuid>; it has no --reverse mode.
+  Integration Form-authority scope retirement uses the operator-private
+  --form-authority-scope-transition=/absolute/file.json selector only on deactivation,
+  the route-less authority Worker and its operator gateway.
 
 The target descriptor is selected only by the exact environment. There is no
 deploy-plan flag, ledger, target override or mixed mutation controller.
@@ -42,6 +47,7 @@ interface InvocationBase {
   readonly legacyPredecessorVersionId?: string;
   readonly legacyHostRuntimePredecessorVersionId?: string;
   readonly unattributedSuccessorVersionId?: string;
+  readonly formAuthorityScopeTransitionPath?: string;
   readonly reverse?: boolean;
 }
 
@@ -63,6 +69,7 @@ interface ParsedInvocation {
   readonly legacyPredecessorVersionId?: string;
   readonly legacyHostRuntimePredecessorVersionId?: string;
   readonly unattributedSuccessorVersionId?: string;
+  readonly formAuthorityScopeTransitionPath?: string;
   readonly reverse?: boolean;
 }
 
@@ -76,6 +83,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let legacyPredecessorVersionId: string | null = null;
   let legacyHostRuntimePredecessorVersionId: string | null = null;
   let unattributedSuccessorVersionId: string | null = null;
+  let formAuthorityScopeTransitionPath: string | null = null;
   let reverse = false;
   for (const flag of flags) {
     if (flag === "--status" || flag === "--apply" || flag === "--issue" || flag === "--revoke") {
@@ -120,6 +128,13 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       const value = flag.slice("--unattributed-successor-version=".length);
       if (!isWorkerVersionId(value)) return null;
       unattributedSuccessorVersionId = value;
+      continue;
+    }
+    if (flag.startsWith("--form-authority-scope-transition=")) {
+      if (formAuthorityScopeTransitionPath !== null) return null;
+      const value = flag.slice("--form-authority-scope-transition=".length);
+      if (!value || !isAbsolute(value)) return null;
+      formAuthorityScopeTransitionPath = value;
       continue;
     }
     if (flag === "--reverse") {
@@ -187,6 +202,18 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     return null;
   }
   if (
+    formAuthorityScopeTransitionPath !== null &&
+    (environment !== "integration" ||
+      !(
+        surfaceValue === "takoserver-integration-form-authority-worker" ||
+        surfaceValue === "takoserver-integration-form-authority-operator-worker" ||
+        surfaceValue === "takoserver-integration-form-authority-deactivation"
+      ) ||
+      reverse)
+  ) {
+    return null;
+  }
+  if (
     reverse &&
     !(
       surfaceValue === "takoserver-worker-authority-cutover" ||
@@ -213,6 +240,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       ? {}
       : { legacyHostRuntimePredecessorVersionId }),
     ...(unattributedSuccessorVersionId === null ? {} : { unattributedSuccessorVersionId }),
+    ...(formAuthorityScopeTransitionPath === null ? {} : { formAuthorityScopeTransitionPath }),
     ...(reverse ? { reverse: true } : {}),
   } as Invocation;
 }
@@ -223,6 +251,10 @@ function isSurface(value: string | undefined): value is Surface {
 
 async function dispatch(invocation: Invocation): Promise<Record<string, unknown>> {
   const target = loadTarget(targetPath(invocation.environment), invocation.environment);
+  const scopeTransition =
+    invocation.formAuthorityScopeTransitionPath === undefined
+      ? undefined
+      : loadFormAuthorityScopeTransition(invocation.formAuthorityScopeTransitionPath, target);
   switch (invocation.surface) {
     case "takoserver-worker":
     case "takoserver-worker-authority-cutover":
@@ -353,6 +385,7 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
           action: invocation.action,
           environment: invocation.environment,
           commit: invocation.commit,
+          ...(scopeTransition === undefined ? {} : { scopeTransition }),
         },
         target,
       );
@@ -364,6 +397,7 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
           action: invocation.action,
           environment: invocation.environment,
           commit: invocation.commit,
+          ...(scopeTransition === undefined ? {} : { scopeTransition }),
         },
         target,
       );

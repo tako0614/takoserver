@@ -227,6 +227,32 @@ describe("environment-exact deploy target", () => {
     });
   });
 
+  test("keeps a transition predecessor outside the steady deploy target", () => {
+    const formAuthority = {
+      workerName: "takoserver-form-authority-integration",
+      integrationWorkerName: "takoserver-form-fixture-integration",
+      integrationOperatorWorkerName: "takoserver-form-operator-integration",
+      integrationOperatorOrigin: "https://form-authority.integration.takoserver.com",
+      integrationOperatorScope: {
+        tenantId: "tenant-yurucommu-integration",
+        space: "space-yurucommu-integration",
+      },
+      predecessorScope: {
+        tenantId: "tenant-yurucommu-predecessor",
+        space: "space-yurucommu-predecessor",
+      },
+      operatorPublicJwk: {
+        kty: "OKP",
+        crv: "Ed25519",
+        x: "A".repeat(43),
+      },
+      hostId: "https://takoserver-api-rehearsal.example.workers.dev",
+    };
+    withTarget(descriptor({ environment: "integration", formAuthority }), (path) => {
+      expect(() => loadTarget(path, "integration")).toThrow("unexpected keys");
+    });
+  });
+
   test("accepts only the fixed-organization dedicated integration E2E authority key", () => {
     const publicJwk = {
       kty: "OKP" as const,

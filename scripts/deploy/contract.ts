@@ -174,7 +174,10 @@ export const DEPLOY_CONTRACT = {
         "src/takoform/integration-operator-endpoint.ts",
         "src/generated/takoform-integration-form-packages.ts",
         "wrangler.integration-form-authority.jsonc",
+        "scripts/deploy.ts",
         "scripts/deploy/form-authority.ts",
+        "scripts/deploy/form-authority-scope-transition.ts",
+        "scripts/deploy/target.ts",
       ],
       requiresScripts: ["check", "deploy"],
       requiresTools: ["bun", "wrangler"],
@@ -187,14 +190,19 @@ export const DEPLOY_CONTRACT = {
         "post-conditions":
           "Authoritative Worker history and exact binding closure identify the uploaded integration fixture; " +
           "the closure includes PUBLIC_HOST_IDENTITY, the dedicated operator public JWK, and the exact " +
-          "operator tenant and Space plain-text bindings. The Worker owns no public domain, and every " +
+          "operator tenant and Space plain-text bindings. Scope status is exact-target or, only with the " +
+          "reviewed descriptor, exact-transition-predecessor; output binds the descriptor digest without its path. " +
+          "The Worker owns no public domain, and every " +
           "authority receipt identifies Takoserver Host policy plus integration-fixture verification and remains non-production.",
         reversal:
           "The immediately previous integration Form authority Worker version is printed as the provider-history rollback target.",
         "failure-handling":
           `${highRiskFailure} The entry hard-refuses every environment except integration before ` +
           "reading D1 or R2 bindings. It independently rejects every signed plan/apply/readback body " +
-          "outside its sealed tenant/Space; partial Form mutation requires authoritative readback and replan." +
+          "outside its sealed tenant/Space; partial Form mutation requires authoritative readback and replan. " +
+          "A scope transition accepts only the exact current-public predecessor, uploads target scope once, " +
+          "refuses absent/bootstrap, stale-public, third-scope and already-target apply, and settles a lost " +
+          "acknowledgement through status without retry." +
           inputContract(applyReviewInput),
         "independent-review": review,
       },
@@ -207,7 +215,10 @@ export const DEPLOY_CONTRACT = {
         "src/integration-form-authority-gateway.ts",
         "src/public-host-identity.ts",
         "wrangler.integration-form-authority-operator.jsonc",
+        "scripts/deploy.ts",
         "scripts/deploy/form-authority.ts",
+        "scripts/deploy/form-authority-scope-transition.ts",
+        "scripts/deploy/target.ts",
       ],
       requiresScripts: ["check", "deploy"],
       requiresTools: ["bun", "wrangler"],
@@ -222,14 +233,18 @@ export const DEPLOY_CONTRACT = {
           "Authoritative Worker history and exhaustive domain/binding state must identify the exact " +
           "custom-domain gateway, current public Worker Version, route-less integration authority " +
           "dependency and exact operator tenant/Space. A clean first upload is allowed only when both " +
-          "the script and configured custom domain are absent; the same exact closure is read back after upload.",
+          "the script and configured custom domain are absent; the same exact closure is read back after upload. " +
+          "During a named scope transition, the route-less authority must already be exact-target before " +
+          "the gateway advances once from exact-transition-predecessor to exact-target.",
         reversal:
           "The immediately previous operator gateway Worker version is printed as the provider-history rollback target.",
         "failure-handling":
           `${highRiskFailure} The gateway hard-refuses non-integration environments before key or ` +
           "service reads, accepts only short-lived body/method/path-bound Ed25519 proofs, independently " +
           "rejects every body outside its sealed tenant/Space, and rechecks the live public Host identity " +
-          "before every RPC. Foreign domain ownership and every script/domain partial topology are refused." +
+          "before every RPC. Foreign domain ownership and every script/domain partial topology are refused. " +
+          "Transition status rejects stale-public, third-scope, absent/bootstrap and history-based roll-forward; " +
+          "already-target apply is a refused no-op and lost acknowledgement is status-only reconciliation." +
           inputContract(applyReviewInput),
         "independent-review": review,
       },
@@ -239,6 +254,7 @@ export const DEPLOY_CONTRACT = {
       target: "https:integration-signed-form-authority-plan-apply-readback",
       covers: [
         "scripts/deploy/form-authority-invoke.ts",
+        "scripts/deploy/form-authority-scope-transition.ts",
         "src/form-authority-operator-proof.ts",
         "src/takoform/host-admission-coordinator.ts",
         "scripts/deploy/target.ts",
@@ -266,7 +282,8 @@ export const DEPLOY_CONTRACT = {
           "No HTTP mutation is retried. An apply transport or acknowledgement failure is indeterminate; " +
           "run status for authoritative readback before an explicit fresh apply. An acknowledged partial " +
           "apply performs its separate readback and exits as a verification failure with only sanitized " +
-          "receipts and next-plan diagnostics. Assertion and private-key bytes are always redacted." +
+          "receipts and next-plan diagnostics. Assertion and private-key bytes are always redacted. Normal " +
+          "activation never accepts the scope-transition selector." +
           inputContract(applyReviewInput, formAuthorityPrivateJwkInput),
         "independent-review": review,
       },
@@ -276,6 +293,7 @@ export const DEPLOY_CONTRACT = {
       target: "https:integration-signed-form-authority-deactivation-plan-apply-readback",
       covers: [
         "scripts/deploy/form-authority-invoke.ts",
+        "scripts/deploy/form-authority-scope-transition.ts",
         "src/form-authority-operator-proof.ts",
         "src/takoform/host-admission-coordinator.ts",
         "scripts/deploy/target.ts",
@@ -292,11 +310,17 @@ export const DEPLOY_CONTRACT = {
       obligations: {
         provenance:
           `${exactSource} Integration only. Exhaustive gateway/authority/public-Worker readback ` +
-          "must identify that commit before the owned 0600 Ed25519 key signs a deactivation request.",
+          "must identify that commit before the owned 0600 Ed25519 key signs a deactivation request. " +
+          "A named scope transition additionally requires an owned exact-0600 link-free bounded descriptor " +
+          "under an owned exact-0700 symlink-free parent outside every Git worktree; its digest, Host, " +
+          "predecessor and exact target scope are verified without emitting its path.",
         "post-conditions":
           "Status performs one signed authoritative readback. Apply obtains one signed canonical " +
           "deactivation plan, passes that exact plan digest once to apply, and finishes with a " +
-          "separately signed readback proving every exact 12 Space-scoped fixture is absent or inactive.",
+          "separately signed readback proving every exact 12 Space-scoped fixture is absent or inactive. " +
+          "With a transition descriptor, both gateway and route-less authority must be current-public " +
+          "exact-transition-predecessor and only predecessor desiredActive:false is signed. Success projects " +
+          "only the transition digest, binding profile, and scope-redacted boolean/digest readback summary.",
         reversal:
           "Deactivation is append-only; rollback is an explicit normal Form-authority reactivation, " +
           "not a Worker-version rollback.",
@@ -304,7 +328,9 @@ export const DEPLOY_CONTRACT = {
           "No HTTP mutation is retried. An apply transport or acknowledgement failure is indeterminate; " +
           "run status for authoritative readback before making an explicit fresh deactivation decision. " +
           "An acknowledged partial apply preserves only sanitized receipts and next-plan diagnostics. " +
-          "Assertion and private-key bytes are always redacted." +
+          "Assertion and private-key bytes are always redacted. Mixed predecessor/target topology, stale " +
+          "public closure, reverse, activation, and any third scope are refused before signing; refusal " +
+          "output never includes raw binding JSON or an actual, predecessor, or foreign scope." +
           inputContract(applyReviewInput, formAuthorityPrivateJwkInput),
         "independent-review": review,
       },

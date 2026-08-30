@@ -73,6 +73,9 @@ describe("Takoserver split deploy entrypoint", () => {
     const invocation = contract.surfaces.find(
       ({ surface }) => surface === "takoserver-integration-form-authority",
     );
+    const deactivation = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-integration-form-authority-deactivation",
+    );
     const credentials = contract.surfaces.find(
       ({ surface }) => surface === "takoserver-integration-e2e-credentials",
     );
@@ -85,13 +88,30 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(integrationAuthority?.obligations["failure-handling"]).toContain(
       "outside its sealed tenant/Space",
     );
+    expect(integrationAuthority?.obligations["failure-handling"]).toContain("already-target apply");
+    expect(integrationAuthority?.obligations["post-conditions"]).toContain(
+      "exact-transition-predecessor",
+    );
     expect(gateway?.obligations["post-conditions"]).toContain(
       "only when both the script and configured custom domain are absent",
     );
     expect(gateway?.obligations["failure-handling"]).toContain("script/domain partial topology");
+    expect(gateway?.obligations["post-conditions"]).toContain(
+      "route-less authority must already be exact-target",
+    );
     expect(invocation?.obligations["failure-handling"]).toContain(
       "exits as a verification failure",
     );
+    expect(invocation?.obligations["failure-handling"]).toContain(
+      "never accepts the scope-transition selector",
+    );
+    expect(deactivation?.obligations["post-conditions"]).toContain(
+      "only predecessor desiredActive:false is signed",
+    );
+    expect(deactivation?.obligations.provenance).toContain("without emitting its path");
+    expect(deactivation?.obligations.provenance).toContain("outside every Git worktree");
+    expect(deactivation?.obligations["post-conditions"]).toContain("scope-redacted");
+    expect(deactivation?.obligations["failure-handling"]).toContain("raw binding JSON");
     expect(credentials?.obligations.provenance).toContain(
       "exact five-variable JIT authority closure",
     );
@@ -524,6 +544,81 @@ describe("Takoserver split deploy entrypoint", () => {
         `--environment=${environment}`,
         `--commit=${sha}`,
       ]);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
+    }
+  });
+
+  test("accepts the scope-transition selector only on the two Workers and deactivation", async () => {
+    const sha = "a".repeat(40);
+    const selector = "--form-authority-scope-transition=/operator/private/transition.json";
+    for (const surface of [
+      "takoserver-integration-form-authority-worker",
+      "takoserver-integration-form-authority-operator-worker",
+      "takoserver-integration-form-authority-deactivation",
+    ] as const) {
+      const accepted = await deploy([
+        surface,
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        selector,
+      ]);
+      expect(accepted.exitCode).toBe(2);
+      expect(accepted.stderr).toContain("deploy target descriptor not found");
+      expect(accepted.stderr).not.toContain("no target was touched");
+    }
+
+    for (const args of [
+      [
+        "takoserver-integration-form-authority",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        selector,
+      ],
+      [
+        "takoserver-form-authority-worker",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        selector,
+      ],
+      ["takoserver-worker", "--status", "--environment=integration", `--commit=${sha}`, selector],
+      [
+        "takoserver-integration-form-authority-worker",
+        "--status",
+        "--environment=production",
+        `--commit=${sha}`,
+        selector,
+      ],
+      [
+        "takoserver-integration-form-authority-worker",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        "--form-authority-scope-transition=relative.json",
+      ],
+      [
+        "takoserver-integration-form-authority-worker",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        selector,
+        selector,
+      ],
+      [
+        "takoserver-integration-form-authority-worker",
+        "--apply",
+        "--environment=integration",
+        `--commit=${sha}`,
+        selector,
+        "--reverse",
+      ],
+    ] as const) {
+      const refused = await deploy(args);
       expect(refused.exitCode).toBe(2);
       expect(refused.stdout).toBe("");
       expect(refused.stderr).toContain("no target was touched");

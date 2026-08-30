@@ -8,6 +8,7 @@ import {
   formAuthorityRequestTimeoutMs,
   runFormAuthorityInvoke,
 } from "../scripts/deploy/form-authority-invoke.ts";
+import { formAuthorityScopeTransitionDigest } from "../scripts/deploy/form-authority-scope-transition.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { createEphemeralSql } from "../src/compat.ts";
@@ -29,6 +30,10 @@ const ARTIFACT = `sha256:${"b".repeat(64)}` as const;
 const PUBLIC_VERSION = "11111111-1111-4111-8111-111111111111";
 const ORIGIN = "https://form-authority.integration.takoserver.com";
 const HOST_ID = "https://api.integration.example.test";
+const TRANSITION_TARGET_SCOPE = {
+  tenantId: "tenant-yurucommu-transition-target",
+  space: "space-yurucommu-transition-target",
+} as const;
 
 let privateJwk: JsonWebKey;
 let publicJwk: { readonly kty: "OKP"; readonly crv: "Ed25519"; readonly x: string };
@@ -230,6 +235,168 @@ describe("signed Form authority operator invocation", () => {
         }
       ).forms.every(({ activationHead }) => !activationHead.present || !activationHead.active),
     ).toBe(true);
+  });
+
+  test("transition deactivation signs only the exact predecessor after both Workers prove predecessor/current-public closure", async () => {
+    const fixture = await invocationFixture();
+    await runFormAuthorityInvoke(
+      {
+        surface: "takoserver-integration-form-authority",
+        action: "apply",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      fixture.target,
+      fixture.options,
+    );
+    fixture.calls.length = 0;
+    fixture.assertions.length = 0;
+
+    const { transitionedTarget, transition } = transitionFixture(fixture.target);
+    const deactivated = await runFormAuthorityInvoke(
+      {
+        surface: "takoserver-integration-form-authority-deactivation",
+        action: "apply",
+        environment: "integration",
+        commit: COMMIT,
+        scopeTransition: transition,
+      },
+      transitionedTarget,
+      {
+        ...fixture.options,
+        inspectGateway: async () =>
+          fixture.gatewayStatus({
+            scopeBindingProfile: "exact-transition-predecessor",
+            authorityScopeBindingProfile: "exact-transition-predecessor",
+            scopeTransitionDigest: transition.digest,
+            ready: false,
+          }),
+      },
+    );
+
+    expect(fixture.calls.map(({ action }) => action)).toEqual(["plan", "apply", "readback"]);
+    const request = fixture.calls.find(({ action }) => action === "plan")?.body as {
+      activation: {
+        kind: "space";
+        tenantId: string;
+        space: string;
+        desiredActive: boolean;
+      };
+    };
+    expect(request.activation).toEqual({
+      kind: "space",
+      ...transition.value.predecessorScope,
+      desiredActive: false,
+    });
+    expect(deactivated).toMatchObject({
+      activation: {
+        kind: "space",
+        desiredActive: false,
+        scopeRedacted: true,
+      },
+      readback: {
+        kind: "takoserver.form-authority-readback-summary@v1",
+        currentHeadDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+        desiredActive: false,
+        allInactive: true,
+        scopeRedacted: true,
+      },
+      scopeBindingProfile: "exact-transition-predecessor",
+      scopeTransitionDigest: transition.digest,
+      ready: true,
+    });
+    expect(Object.keys(deactivated.activation as Record<string, unknown>).sort()).toEqual([
+      "desiredActive",
+      "kind",
+      "scopeRedacted",
+    ]);
+    expect(Object.keys(deactivated.readback as Record<string, unknown>).sort()).toEqual([
+      "allInactive",
+      "currentHeadDigest",
+      "desiredActive",
+      "kind",
+      "scopeRedacted",
+    ]);
+    const stdout = `${JSON.stringify(deactivated, null, 2)}\n`;
+    for (const sensitive of [
+      transition.value.predecessorScope.tenantId,
+      transition.value.predecessorScope.space,
+      transition.value.targetScope.tenantId,
+      transition.value.targetScope.space,
+      privateJwk.d as string,
+    ]) {
+      expect(stdout).not.toContain(sensitive);
+    }
+  });
+
+  test("transition deactivation refuses mixed scope topology and stale public closure before signing", async () => {
+    const fixture = await invocationFixture();
+    const { transitionedTarget, transition } = transitionFixture(fixture.target);
+    for (const status of [
+      {
+        scopeBindingProfile: "exact-transition-predecessor",
+        authorityScopeBindingProfile: "exact-target",
+      },
+      {
+        scopeBindingProfile: "exact-target",
+        authorityScopeBindingProfile: "exact-transition-predecessor",
+      },
+      {
+        scopeBindingProfile: "exact-transition-predecessor",
+        authorityScopeBindingProfile: "exact-transition-predecessor",
+        publicWorkerBindingProfile: "exact-direct-public-predecessor",
+      },
+    ]) {
+      fixture.calls.length = 0;
+      await expect(
+        runFormAuthorityInvoke(
+          {
+            surface: "takoserver-integration-form-authority-deactivation",
+            action: "status",
+            environment: "integration",
+            commit: COMMIT,
+            scopeTransition: transition,
+          },
+          transitionedTarget,
+          {
+            ...fixture.options,
+            inspectGateway: async () =>
+              fixture.gatewayStatus({
+                ...status,
+                scopeTransitionDigest: transition.digest,
+                ready: false,
+              }),
+          },
+        ),
+      ).rejects.toThrow("gateway");
+      expect(fixture.calls).toEqual([]);
+    }
+  });
+
+  test("normal activation never accepts a scope-transition descriptor", async () => {
+    const fixture = await invocationFixture();
+    const { transitionedTarget, transition } = transitionFixture(fixture.target);
+    let inspected = false;
+    await expect(
+      runFormAuthorityInvoke(
+        {
+          surface: "takoserver-integration-form-authority",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          scopeTransition: transition,
+        },
+        transitionedTarget,
+        {
+          ...fixture.options,
+          inspectGateway: async () => {
+            inspected = true;
+            return fixture.gatewayStatus();
+          },
+        },
+      ),
+    ).rejects.toThrow("activation");
+    expect(inspected).toBe(false);
   });
 
   test("status accepts the valid nonconverged initial readback and reports not ready", async () => {
@@ -478,46 +645,53 @@ async function invocationFixture(
     if (last) last.result = returned;
     return Response.json(returned);
   };
+  const gatewayStatus = (overrides: Record<string, unknown> = {}) => ({
+    kind: "takoserver.form-authority-worker-status@v1",
+    surface: "takoserver-integration-form-authority-operator-worker",
+    environment: "integration",
+    workerName: target.formAuthority?.integrationOperatorWorkerName,
+    hostId: HOST_ID,
+    selectedCommit,
+    deployedCommit: selectedCommit,
+    commitMatches: true,
+    versionId: "22222222-2222-4222-8222-222222222222",
+    authorityArtifactDigest: `sha256:${"c".repeat(64)}`,
+    publicWorkerBindingProfile: "exact-current-public",
+    scopeBindingProfile: "exact-target",
+    publicWorkerCommit: selectedCommit,
+    publicWorkerCommitMatches: true,
+    authorityDeployedCommit: selectedCommit,
+    authorityCommitMatches: true,
+    authorityVersionId: "33333333-3333-4333-8333-333333333333",
+    authorityPublicWorkerBindingProfile: "exact-current-public",
+    authorityScopeBindingProfile: "exact-target",
+    operatorOrigin: ORIGIN,
+    authorityWorkerName: target.formAuthority?.integrationWorkerName,
+    workerArtifactDigest: ARTIFACT,
+    publicWorkerVersionId: PUBLIC_VERSION,
+    capabilityDigest: identity.capabilityDigest,
+    implementationDigest: identity.implementationDigest,
+    routeMode: "authenticated-integration-custom-domain",
+    policyAuthority: "takoserver-host",
+    verificationMode: "integration-fixture",
+    verificationAvailable: true,
+    productionEligible: false,
+    ready: true,
+    ...overrides,
+  });
   return {
     target,
     calls,
     assertions,
     options: {
-      inspectGateway: async () => ({
-        kind: "takoserver.form-authority-worker-status@v1",
-        surface: "takoserver-integration-form-authority-operator-worker",
-        environment: "integration",
-        workerName: target.formAuthority?.integrationOperatorWorkerName,
-        hostId: HOST_ID,
-        selectedCommit,
-        deployedCommit: selectedCommit,
-        commitMatches: true,
-        versionId: "22222222-2222-4222-8222-222222222222",
-        authorityArtifactDigest: `sha256:${"c".repeat(64)}`,
-        publicWorkerCommit: selectedCommit,
-        publicWorkerCommitMatches: true,
-        authorityDeployedCommit: selectedCommit,
-        authorityCommitMatches: true,
-        authorityVersionId: "33333333-3333-4333-8333-333333333333",
-        operatorOrigin: ORIGIN,
-        authorityWorkerName: target.formAuthority?.integrationWorkerName,
-        workerArtifactDigest: ARTIFACT,
-        publicWorkerVersionId: PUBLIC_VERSION,
-        capabilityDigest: identity.capabilityDigest,
-        implementationDigest: identity.implementationDigest,
-        routeMode: "authenticated-integration-custom-domain",
-        policyAuthority: "takoserver-host",
-        verificationMode: "integration-fixture",
-        verificationAvailable: true,
-        productionEligible: false,
-        ready: true,
-      }),
+      inspectGateway: async () => gatewayStatus(),
       privateJwkPath: privateJwkFile(),
       fetcher,
       now: () => NOW,
       run: (command) => qualificationRun(command, selectedCommit),
       review: "independent-reviewer",
     } satisfies FormAuthorityInvokeOptions,
+    gatewayStatus,
     selectCommit(commit: string) {
       selectedCommit = commit;
     },
@@ -563,6 +737,41 @@ function privateJwkFile(): string {
   writeFileSync(path, `${JSON.stringify(privateJwk)}\n`, { mode: 0o600 });
   chmodSync(path, 0o600);
   return path;
+}
+
+function transitionFixture(predecessorTarget: DeployTarget): {
+  readonly transitionedTarget: DeployTarget;
+  readonly transition: {
+    readonly value: {
+      readonly kind: "takoserver.integration-form-authority-scope-transition@v1";
+      readonly environment: "integration";
+      readonly hostId: string;
+      readonly predecessorScope: { readonly tenantId: string; readonly space: string };
+      readonly targetScope: { readonly tenantId: string; readonly space: string };
+    };
+    readonly digest: `sha256:${string}`;
+  };
+} {
+  const authority = predecessorTarget.formAuthority;
+  if (!authority?.integrationOperatorScope) throw new Error("fixture scope missing");
+  const transitionedTarget: DeployTarget = {
+    ...predecessorTarget,
+    formAuthority: {
+      ...authority,
+      integrationOperatorScope: TRANSITION_TARGET_SCOPE,
+    },
+  };
+  const value = {
+    kind: "takoserver.integration-form-authority-scope-transition@v1",
+    environment: "integration",
+    hostId: authority.hostId,
+    predecessorScope: authority.integrationOperatorScope,
+    targetScope: TRANSITION_TARGET_SCOPE,
+  } as const;
+  return {
+    transitionedTarget,
+    transition: { value, digest: formAuthorityScopeTransitionDigest(value) },
+  };
 }
 
 async function qualificationRun(
