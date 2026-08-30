@@ -45,6 +45,10 @@ const OPERATOR_PUBLIC_JWK = {
   crv: "Ed25519" as const,
   x: "A".repeat(43),
 };
+const PREDECESSOR_SCOPE = {
+  tenantId: "tenant-yurucommu-predecessor",
+  space: "space-yurucommu-predecessor",
+} as const;
 
 const target = {
   kind: "takoserver.deploy-target@v2",
@@ -75,8 +79,21 @@ const target = {
   },
   signing: { currentKeyId: "key-current" },
 } satisfies DeployTarget;
+const SCOPE_TRANSITION_VALUE = {
+  kind: "takoserver.integration-form-authority-scope-transition@v1",
+  environment: "integration",
+  hostId: target.formAuthority.hostId,
+  predecessorScope: PREDECESSOR_SCOPE,
+  targetScope: target.formAuthority.integrationOperatorScope,
+} as const;
+const SCOPE_TRANSITION = {
+  value: SCOPE_TRANSITION_VALUE,
+  digest: `sha256:${createHash("sha256")
+    .update(canonicalJson(SCOPE_TRANSITION_VALUE))
+    .digest("hex")}` as const,
+};
 
-function fakeProcess(input?: { readonly onUpload?: () => void }): {
+function fakeProcess(input?: { readonly onUpload?: () => void; readonly failUpload?: boolean }): {
   readonly run: FormAuthorityProcess;
   readonly calls: string[][];
 } {
@@ -102,6 +119,7 @@ function fakeProcess(input?: { readonly onUpload?: () => void }): {
     }
     if (command.includes("--no-bundle") && command.includes("--strict")) {
       input?.onUpload?.();
+      if (input?.failUpload) return { exitCode: 1, stdout: "", stderr: "lost acknowledgement" };
       return ok("uploaded\n");
     }
     throw new Error(`unexpected command: ${key}`);
@@ -214,6 +232,8 @@ function version(
   artifactDigest: `sha256:${string}`,
   publicWorkerVersionId = PUBLIC_WORKER_VERSION_ID,
   publicWorkerArtifactDigest: `sha256:${string}` = PUBLIC_WORKER_DIGEST,
+  scope: { readonly tenantId: string; readonly space: string } = target.formAuthority
+    .integrationOperatorScope,
 ) {
   return {
     annotations: {
@@ -252,12 +272,12 @@ function version(
         {
           type: "plain_text",
           name: "TAKOSERVER_FORM_AUTHORITY_OPERATOR_TENANT_ID",
-          text: target.formAuthority.integrationOperatorScope.tenantId,
+          text: scope.tenantId,
         },
         {
           type: "plain_text",
           name: "TAKOSERVER_FORM_AUTHORITY_OPERATOR_SPACE",
-          text: target.formAuthority.integrationOperatorScope.space,
+          text: scope.space,
         },
         {
           type: "service",
@@ -371,7 +391,10 @@ function publicVersion(message: string) {
   };
 }
 
-function gatewayVersion() {
+function gatewayVersion(
+  scope: { readonly tenantId: string; readonly space: string } = target.formAuthority
+    .integrationOperatorScope,
+) {
   return {
     annotations: {
       "workers/message": `form-authority:takoserver-integration-form-authority-operator-worker:${COMMIT}:${BUNDLE_DIGEST}`,
@@ -419,12 +442,12 @@ function gatewayVersion() {
         {
           type: "plain_text",
           name: "TAKOSERVER_FORM_AUTHORITY_OPERATOR_TENANT_ID",
-          text: target.formAuthority.integrationOperatorScope.tenantId,
+          text: scope.tenantId,
         },
         {
           type: "plain_text",
           name: "TAKOSERVER_FORM_AUTHORITY_OPERATOR_SPACE",
-          text: target.formAuthority.integrationOperatorScope.space,
+          text: scope.space,
         },
       ],
     },
@@ -535,6 +558,115 @@ function gatewayPartialTopologyState(input: {
             ]
           : []),
       ];
+    },
+  };
+}
+
+function routeLessTransitionState(input: {
+  readonly beforeScope: { readonly tenantId: string; readonly space: string };
+  readonly afterScope?: { readonly tenantId: string; readonly space: string };
+  readonly publicProfile?: "current" | "predecessor";
+  readonly absent?: boolean;
+  readonly isUploaded?: () => boolean;
+}): FormAuthorityDeployState {
+  const isUploaded = input.isUploaded ?? (() => false);
+  const current = stateSequence({ isUploaded });
+  return {
+    ...current,
+    async workerScripts() {
+      return input.absent ? [] : [target.formAuthority.integrationWorkerName];
+    },
+    async workerVersion(workerName, versionId) {
+      if (workerName !== target.formAuthority.integrationWorkerName) {
+        return await current.workerVersion(workerName, versionId);
+      }
+      const uploaded = isUploaded();
+      const scope = uploaded
+        ? (input.afterScope ?? target.formAuthority.integrationOperatorScope)
+        : input.beforeScope;
+      const publicVersionId =
+        input.publicProfile === "predecessor"
+          ? PREVIOUS_PUBLIC_WORKER_VERSION_ID
+          : PUBLIC_WORKER_VERSION_ID;
+      const publicDigest =
+        input.publicProfile === "predecessor"
+          ? PREVIOUS_PUBLIC_WORKER_DIGEST
+          : PUBLIC_WORKER_DIGEST;
+      return version(
+        COMMIT,
+        versionId === CURRENT_AUTHORITY_VERSION_ID ? BUNDLE_DIGEST : PREVIOUS_DIGEST,
+        publicVersionId,
+        publicDigest,
+        scope,
+      );
+    },
+  };
+}
+
+function gatewayTransitionState(input: {
+  readonly authorityScope: { readonly tenantId: string; readonly space: string };
+  readonly gatewayBeforeScope: { readonly tenantId: string; readonly space: string };
+  readonly gatewayAfterScope?: { readonly tenantId: string; readonly space: string };
+  readonly isUploaded?: () => boolean;
+}): FormAuthorityDeployState {
+  const isUploaded = input.isUploaded ?? (() => false);
+  const current = gatewayState();
+  return {
+    ...current,
+    async workerDeployments(workerName) {
+      if (workerName === target.workerName) {
+        return [deployment("public-deployment", PUBLIC_WORKER_VERSION_ID, "2026-08-28T00:00:00Z")];
+      }
+      if (workerName === target.formAuthority.integrationWorkerName) {
+        return [
+          deployment(
+            "authority-deployment",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "2026-08-28T01:00:00Z",
+          ),
+        ];
+      }
+      return isUploaded()
+        ? [
+            deployment(
+              "gateway-current",
+              "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+              "2026-08-28T03:00:00Z",
+            ),
+            deployment(
+              "gateway-predecessor",
+              "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+              "2026-08-28T02:00:00Z",
+            ),
+          ]
+        : [
+            deployment(
+              "gateway-predecessor",
+              "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+              "2026-08-28T02:00:00Z",
+            ),
+          ];
+    },
+    async workerVersion(workerName) {
+      if (workerName === target.workerName) {
+        return publicVersion(
+          `takoserver-worker:${PUBLIC_WORKER_COMMIT}:${PUBLIC_WORKER_DIGEST.slice("sha256:".length)}`,
+        );
+      }
+      if (workerName === target.formAuthority.integrationWorkerName) {
+        return version(
+          COMMIT,
+          BUNDLE_DIGEST,
+          PUBLIC_WORKER_VERSION_ID,
+          PUBLIC_WORKER_DIGEST,
+          input.authorityScope,
+        );
+      }
+      return gatewayVersion(
+        isUploaded()
+          ? (input.gatewayAfterScope ?? target.formAuthority.integrationOperatorScope)
+          : input.gatewayBeforeScope,
+      );
     },
   };
 }
@@ -702,6 +834,263 @@ describe("route-less Form authority deploy surfaces", () => {
       boundPublicWorkerArtifactDigest: PREVIOUS_PUBLIC_WORKER_DIGEST,
       ready: false,
     });
+  });
+
+  test("transition status classifies only exact target or exact descriptor predecessor on current public", async () => {
+    const predecessor = await runFormAuthority(
+      {
+        surface: "takoserver-integration-form-authority-worker",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+        scopeTransition: SCOPE_TRANSITION,
+      },
+      target,
+      { state: routeLessTransitionState({ beforeScope: PREDECESSOR_SCOPE }) },
+    );
+    expect(predecessor).toMatchObject({
+      publicWorkerBindingProfile: "exact-current-public",
+      scopeBindingProfile: "exact-transition-predecessor",
+      scopeTransitionDigest: SCOPE_TRANSITION.digest,
+      ready: false,
+    });
+
+    const exactTarget = await runFormAuthority(
+      {
+        surface: "takoserver-integration-form-authority-worker",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+        scopeTransition: SCOPE_TRANSITION,
+      },
+      target,
+      {
+        state: routeLessTransitionState({
+          beforeScope: target.formAuthority.integrationOperatorScope,
+        }),
+      },
+    );
+    expect(exactTarget).toMatchObject({
+      publicWorkerBindingProfile: "exact-current-public",
+      scopeBindingProfile: "exact-target",
+      scopeTransitionDigest: SCOPE_TRANSITION.digest,
+      ready: true,
+    });
+
+    for (const state of [
+      routeLessTransitionState({
+        beforeScope: { tenantId: "tenant-third", space: "space-third" },
+      }),
+      routeLessTransitionState({
+        beforeScope: PREDECESSOR_SCOPE,
+        publicProfile: "predecessor",
+      }),
+      routeLessTransitionState({ beforeScope: PREDECESSOR_SCOPE, absent: true }),
+    ]) {
+      await expect(
+        runFormAuthority(
+          {
+            surface: "takoserver-integration-form-authority-worker",
+            action: "status",
+            environment: "integration",
+            commit: COMMIT,
+            scopeTransition: SCOPE_TRANSITION,
+          },
+          target,
+          { state },
+        ),
+      ).rejects.toBeInstanceOf(Error);
+    }
+  });
+
+  test("route-less scope transition uploads predecessor to target exactly once and refuses target no-op", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-scope-transition-"));
+    let uploaded = false;
+    try {
+      const process = fakeProcess({
+        onUpload() {
+          uploaded = true;
+        },
+      });
+      const result = await runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          scopeTransition: SCOPE_TRANSITION,
+        },
+        target,
+        {
+          run: process.run,
+          state: routeLessTransitionState({
+            beforeScope: PREDECESSOR_SCOPE,
+            isUploaded: () => uploaded,
+          }),
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          review: "independent-reviewer",
+        },
+      );
+      expect(result).toMatchObject({
+        scopeBindingProfile: "exact-target",
+        scopeTransitionDigest: SCOPE_TRANSITION.digest,
+      });
+      expect(process.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+
+      await expect(
+        runFormAuthority(
+          {
+            surface: "takoserver-integration-form-authority-worker",
+            action: "apply",
+            environment: "integration",
+            commit: COMMIT,
+            scopeTransition: SCOPE_TRANSITION,
+          },
+          target,
+          {
+            run: process.run,
+            state: routeLessTransitionState({
+              beforeScope: target.formAuthority.integrationOperatorScope,
+            }),
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+            review: "independent-reviewer",
+          },
+        ),
+      ).rejects.toThrow("already exact-target");
+      expect(process.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("lost scope-transition acknowledgement settles through status without a duplicate upload", async () => {
+    let uploaded = false;
+    const process = fakeProcess({
+      onUpload() {
+        uploaded = true;
+      },
+      failUpload: true,
+    });
+    const state = routeLessTransitionState({
+      beforeScope: PREDECESSOR_SCOPE,
+      isUploaded: () => uploaded,
+    });
+    const failure = await runFormAuthority(
+      {
+        surface: "takoserver-integration-form-authority-worker",
+        action: "apply",
+        environment: "integration",
+        commit: COMMIT,
+        scopeTransition: SCOPE_TRANSITION,
+      },
+      target,
+      {
+        run: process.run,
+        state,
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        review: "independent-reviewer",
+      },
+    ).catch((error) => error);
+    expect(failure).toMatchObject({ phase: "mutation" });
+
+    const status = await runFormAuthority(
+      {
+        surface: "takoserver-integration-form-authority-worker",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+        scopeTransition: SCOPE_TRANSITION,
+      },
+      target,
+      { state },
+    );
+    expect(status).toMatchObject({ scopeBindingProfile: "exact-target", ready: true });
+
+    await expect(
+      runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          scopeTransition: SCOPE_TRANSITION,
+        },
+        target,
+        {
+          run: process.run,
+          state,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          review: "independent-reviewer",
+        },
+      ),
+    ).rejects.toThrow("already exact-target");
+    expect(process.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+  });
+
+  test("gateway transition waits for route-less exact-target and then uploads predecessor once", async () => {
+    const blockedProcess = fakeProcess();
+    await expect(
+      runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-operator-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          scopeTransition: SCOPE_TRANSITION,
+        },
+        target,
+        {
+          run: blockedProcess.run,
+          state: gatewayTransitionState({
+            authorityScope: PREDECESSOR_SCOPE,
+            gatewayBeforeScope: PREDECESSOR_SCOPE,
+          }),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          review: "independent-reviewer",
+        },
+      ),
+    ).rejects.toThrow("route-less");
+    expect(blockedProcess.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
+
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-gateway-transition-"));
+    let uploaded = false;
+    try {
+      const process = fakeProcess({
+        onUpload() {
+          uploaded = true;
+        },
+      });
+      const result = await runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-operator-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          scopeTransition: SCOPE_TRANSITION,
+        },
+        target,
+        {
+          run: process.run,
+          state: gatewayTransitionState({
+            authorityScope: target.formAuthority.integrationOperatorScope,
+            gatewayBeforeScope: PREDECESSOR_SCOPE,
+            isUploaded: () => uploaded,
+          }),
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          review: "independent-reviewer",
+        },
+      );
+      expect(result).toMatchObject({
+        scopeBindingProfile: "exact-target",
+        authorityScopeBindingProfile: "exact-target",
+        scopeTransitionDigest: SCOPE_TRANSITION.digest,
+      });
+      expect(process.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("replaces one validated predecessor with one exact-current direct successor upload", async () => {

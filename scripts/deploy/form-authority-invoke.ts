@@ -28,6 +28,10 @@ import {
   runFormAuthority,
   targetCapabilityManifest,
 } from "./form-authority.ts";
+import {
+  assertLoadedFormAuthorityScopeTransition,
+  type LoadedFormAuthorityScopeTransition,
+} from "./form-authority-scope-transition.ts";
 import { provePrivateMatchesPublic, readPrivateJwk } from "./identity.ts";
 import { type CommandResult, requireEnvironment, runCommand } from "./process.ts";
 import { type DeployEnvironment, qualifySource } from "./qualification.ts";
@@ -63,6 +67,7 @@ export interface FormAuthorityInvokeInvocation {
   readonly action: "status" | "apply";
   readonly environment: DeployEnvironment;
   readonly commit: string;
+  readonly scopeTransition?: LoadedFormAuthorityScopeTransition;
 }
 
 export interface FormAuthorityInvokeOptions {
@@ -99,18 +104,25 @@ export async function runFormAuthorityInvoke(
   options: FormAuthorityInvokeOptions = {},
 ): Promise<Record<string, unknown>> {
   assertIntegrationInvocation(invocation, target);
+  if (invocation.scopeTransition) {
+    if (invocation.surface !== "takoserver-integration-form-authority-deactivation") {
+      throw preflightError("normal Form authority activation never accepts a scope transition");
+    }
+    assertLoadedFormAuthorityScopeTransition(invocation.scopeTransition, target);
+  }
   const formAuthority = target.formAuthority;
   const publicJwk = formAuthority?.operatorPublicJwk;
-  const scope = formAuthority?.integrationOperatorScope;
+  const targetScope = formAuthority?.integrationOperatorScope;
   if (
     !formAuthority?.integrationOperatorWorkerName ||
     !formAuthority.integrationOperatorOrigin ||
     !formAuthority.integrationWorkerName ||
     !publicJwk ||
-    !scope
+    !targetScope
   ) {
     throw preflightError("integration Form authority invocation target is incomplete");
   }
+  const scope = invocation.scopeTransition?.value.predecessorScope ?? targetScope;
 
   const status = await inspectGateway(invocation, target, options);
   const gateway = await exactGatewayIdentity(status, invocation, target);
@@ -242,6 +254,9 @@ async function inspectGateway(
       action: "status",
       environment: "integration",
       commit: invocation.commit,
+      ...(invocation.scopeTransition === undefined
+        ? {}
+        : { scopeTransition: invocation.scopeTransition }),
     },
     target,
     options.gatewayDeployOptions,
@@ -259,6 +274,8 @@ async function exactGatewayIdentity(
   }
   const workerArtifactDigest = value.workerArtifactDigest;
   const publicWorkerVersionId = value.publicWorkerVersionId;
+  const transition = invocation.scopeTransition;
+  const expectedScopeProfile = transition ? "exact-transition-predecessor" : "exact-target";
   if (
     value.kind !== "takoserver.form-authority-worker-status@v1" ||
     value.surface !== "takoserver-integration-form-authority-operator-worker" ||
@@ -272,6 +289,13 @@ async function exactGatewayIdentity(
     value.publicWorkerCommitMatches !== true ||
     value.authorityDeployedCommit !== invocation.commit ||
     value.authorityCommitMatches !== true ||
+    value.publicWorkerBindingProfile !== "exact-current-public" ||
+    value.authorityPublicWorkerBindingProfile !== "exact-current-public" ||
+    value.scopeBindingProfile !== expectedScopeProfile ||
+    value.authorityScopeBindingProfile !== expectedScopeProfile ||
+    (transition
+      ? value.scopeTransitionDigest !== transition.digest || value.ready !== false
+      : value.scopeTransitionDigest !== undefined || value.ready !== true) ||
     value.operatorOrigin !== authority.integrationOperatorOrigin ||
     value.authorityWorkerName !== authority.integrationWorkerName ||
     value.routeMode !== "authenticated-integration-custom-domain" ||
@@ -279,7 +303,6 @@ async function exactGatewayIdentity(
     value.verificationMode !== "integration-fixture" ||
     value.verificationAvailable !== true ||
     value.productionEligible !== false ||
-    value.ready !== true ||
     !workerVersion(value.versionId) ||
     !workerVersion(value.authorityVersionId) ||
     !isSha256Digest(value.authorityArtifactDigest) ||
@@ -789,6 +812,12 @@ function invocationResult(input: {
     policyAuthority: "takoserver-host",
     verificationMode: "integration-fixture",
     productionEligible: false,
+    scopeBindingProfile: input.invocation.scopeTransition
+      ? "exact-transition-predecessor"
+      : "exact-target",
+    ...(input.invocation.scopeTransition === undefined
+      ? {}
+      : { scopeTransitionDigest: input.invocation.scopeTransition.digest }),
     ...(input.source === undefined ? {} : input.source),
     ...(input.reviewer === undefined ? {} : { reviewer: input.reviewer }),
     ...(input.plan === undefined ? {} : { plan: input.plan }),

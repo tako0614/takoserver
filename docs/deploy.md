@@ -95,7 +95,10 @@ The separate authority and irreversible surfaces are:
   `404` only to satisfy Cloudflare’s module registration requirement; its named
   RPC entrypoint remains pure RPC and has no public route or privileged
   publisher branch. Form execution and partial convergence are described in
-  [form-authority.md](form-authority.md).
+  [form-authority.md](form-authority.md). Its optional scope-transition selector
+  accepts only an exact current-public predecessor, uploads the target scope
+  once, and refuses stale-public, third-scope, absent/bootstrap, history-based
+  roll-forward, and already-target apply.
 - `takoserver-integration-form-authority-operator-worker`: integration only.
   It owns only the dedicated custom domain
   `https://form-authority.integration.takoserver.com`, with workers.dev and
@@ -116,7 +119,10 @@ The separate authority and irreversible surfaces are:
   before every durable command. A clean first deployment is allowed only when
   both the gateway script and configured custom domain are absent. Foreign
   ownership and every script/domain partial topology are refused, and a
-  successful upload must pass the normal exact post-upload readback.
+  successful upload must pass the normal exact post-upload readback. During a
+  scope transition the route-less authority must be `exact-target` before the
+  gateway may upload once from `exact-transition-predecessor` to
+  `exact-target`.
 - `takoserver-integration-form-authority`: integration only. This owner CLI
   verifies the exhaustive gateway, route-less authority, and public Worker
   identity closure before using the dedicated private key. Status sends one
@@ -134,7 +140,10 @@ The separate authority and irreversible surfaces are:
   mode, repair, or reverse flag. Status/apply/status proves all exact 12
   durable activation heads are absent or inactive. It uses the same v2 signed
   request/plan/apply/readback protocol and the same no-retry/credential
-  redaction rules.
+  redaction rules. With the named transition descriptor it requires both live
+  Workers to be current-public `exact-transition-predecessor`, refuses mixed
+  topology, and signs only the descriptor predecessor. Normal activation never
+  accepts that selector.
 - `takoserver-integration-e2e-credentials`: integration only. Its distinct
   `--issue`, `--status`, and `--revoke` actions exhaustively read the immutable
   current public Worker Version and exact JIT binding closure before the owner
@@ -210,14 +219,17 @@ requires a separately reviewed dedicated surface. There is no automatic
 fallback or raw Wrangler reversal.
 
 For the reviewed Form integration cutover, first capture the old exact
-tenant/Space scope with status and an operator snapshot. Apply the authority
-code cutover, deploy the route-less authority and gateway at the same commit,
-then run the distinct deactivation surface as status, apply, status. Only then
-may the target name a new Space. Deploy route-less authority and gateway again
-for that target, perform normal activation, cut over consumers, and finally
-clean retained packages. Inactive activation leaves retained delete/observe
-available through the Host projection; no raw D1 is used. Rollback is an
-explicit normal reactivation append, never a Worker-version rollback.
+tenant/Space scope and write the strict operator-private transition descriptor.
+The descriptor keeps that predecessor outside the steady target and binds the
+exact Host plus the target's new scope. After the target names that new scope,
+use the descriptor for deactivation status/apply/status while both Workers are
+still predecessor, then advance the route-less authority once, then the gateway
+once. Remove the selector for normal target-scope activation, cut over
+consumers, and finally clean retained packages. Inactive activation leaves
+retained delete/observe available through the Host projection; no raw D1 is
+used. Rollback is an explicit normal reactivation append, never a
+Worker-version rollback. The exact descriptor schema and command order are in
+[form-authority.md](form-authority.md).
 
 The operator-identity surface is deliberately outside that production order.
 Its invocation parser accepts only `--environment=integration`; rehearsal and
@@ -265,6 +277,7 @@ tracked repository. Depending on the surface, the operator supplies:
 - `TAKOSERVER_HOSTED_TOKEN_PATH`
 - `TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH`
 - `TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH`
+- `--form-authority-scope-transition=/absolute/operator-private/transition.json`
 - `TAKOSERVER_INTEGRATION_E2E_API_KEY_PRIVATE_JWK_PATH`
 - `TAKOSERVER_INTEGRATION_E2E_OUTPUT_DIRECTORY`
 
@@ -298,6 +311,14 @@ its public half against the target-owned key, and keeps both the private JWK and
 short-lived assertions out of output and diagnostics. The deploy target fixes
 the exact integration tenant/Space activation audience; neither an environment
 variable nor a request can widen that scope.
+
+The Form-authority scope-transition descriptor is not a steady target field.
+It is an owned, link-free `0600` strict JSON file no larger than 16 KiB, selected
+only by an absolute CLI path. Its exact v1 shape contains the integration Host,
+predecessor scope, and exact target scope, with no optional or secret fields.
+Success output contains only its canonical digest and binding profile; the path
+is never emitted. The selector is accepted only by integration deactivation and
+the two integration Form-authority Worker surfaces.
 
 `TAKOSERVER_INTEGRATION_E2E_API_KEY_PRIVATE_JWK_PATH` is a third, dedicated
 operator-private Ed25519 key. The target stores only its public half and the
@@ -355,4 +376,6 @@ For a Form deactivation acknowledgement failure, do not retry apply. Run the
 deactivation surface with `--status` and require its exact 12-head
 absent-or-inactive proof before any fresh decision. A Worker rollback cannot
 reverse the append-only activation event; use the normal activation surface
-for explicit reactivation.
+for explicit reactivation. When a transition descriptor selected the
+predecessor, repeat status with that same descriptor; it never converts a mixed
+or already-advanced Worker topology into permission to sign another mutation.

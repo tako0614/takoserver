@@ -53,8 +53,11 @@ The separate owner surface
 tenant/Space and proof boundary, but always constructs
 `activation.desiredActive: false`. The normal activation surface always
 constructs `desiredActive: true`; there is no free mode flag, repair mode, or
-reverse option. Both surfaces speak only the v2 request, plan, apply, and
-readback protocol, so v1 envelopes are refused.
+reverse option. During an explicitly selected scope transition, deactivation
+requires both live Workers to remain sealed to the descriptor predecessor and
+signs only that predecessor scope with `desiredActive: false`. Normal
+activation never accepts the transition selector. Both surfaces speak only the
+v2 request, plan, apply, and readback protocol, so v1 envelopes are refused.
 
 Each request requires exact `application/json`, at most 2 MiB, and a bearer
 assertion signed by the dedicated target-owned Ed25519 public key. The assertion
@@ -129,6 +132,18 @@ Roll-forward always updates the route-less authority first. Gateway apply is
 blocked until that dependency is exact-current, after which the gateway may
 advance once from its own exact direct-predecessor profile.
 
+The operator-private scope-transition selector uses a stricter state machine.
+Its status accepts only the current public Worker identity with
+`scopeBindingProfile: exact-target` or
+`scopeBindingProfile: exact-transition-predecessor`. It does not use public
+Worker history as a scope migration mechanism. A third scope, stale public
+identity, missing Worker, bootstrap topology, or history-based roll-forward is
+refused. Apply accepts only `exact-transition-predecessor`, uploads once, and
+must read back `exact-target`; applying again at `exact-target` is a refused
+no-op. The gateway cannot advance until the route-less authority is already
+`exact-target`. A lost upload acknowledgement is reconciled only by status;
+there is no retry.
+
 After the three integration Workers are current at the same exact commit, the
 owner invokes the bridge through the repository entrypoint:
 
@@ -167,13 +182,52 @@ identity.
 ## Integration cutover order
 
 The reviewed order is deliberately staged. First capture the old exact
-tenant/Space scope with status and its operator snapshot. Perform the authority
-code cutover, then deploy the route-less authority and gateway at the same
-commit. Run deactivation status, apply, and status. Only after that proof is
-complete may the target descriptor name the new Space. Deploy the route-less
-authority and gateway again for that target, then run normal activation status
-and apply. Finish the consumer cutover, and only then perform retained package
-cleanup.
+tenant/Space scope with status and its operator snapshot. Write an
+operator-private descriptor with exactly these members:
+
+```json
+{
+  "kind": "takoserver.integration-form-authority-scope-transition@v1",
+  "environment": "integration",
+  "hostId": "https://api.integration.example.test",
+  "predecessorScope": {
+    "tenantId": "tenant-before",
+    "space": "space-before"
+  },
+  "targetScope": {
+    "tenantId": "tenant-after",
+    "space": "space-after"
+  }
+}
+```
+
+The file must be an owned, link-free `0600` regular file no larger than 16 KiB
+and must be selected by an absolute path. Strict JSON duplicate members and
+all extra fields, including secret-shaped fields, are refused. `hostId` and
+`targetScope` must exactly match the selected integration deploy target, while
+the two scopes must differ. The steady deploy target never stores the
+predecessor.
+
+After the target descriptor names `targetScope`, use the same transition file
+for the following order:
+
+1. Run deactivation status, apply, and status while both the route-less Worker
+   and gateway report `exact-transition-predecessor` on the current public
+   Worker. Mixed predecessor/target topology is refused before signing.
+2. Run the route-less authority status, apply, and status. It alone advances to
+   `exact-target` with one upload.
+3. Run the gateway status, apply, and status. It advances once only after the
+   route-less authority is `exact-target`.
+4. Remove the selector and run normal activation status and apply for the
+   target scope. Finish the consumer cutover, and only then perform retained
+   package cleanup.
+
+The selector is exactly
+`--form-authority-scope-transition=/absolute/operator-private/transition.json`
+and is accepted only by the deactivation, route-less integration authority,
+and integration operator gateway surfaces. Status and apply emit its canonical
+digest plus the scope binding profile, never the path or private-key material.
+Reverse mode and duplicate or relative selectors are refused.
 
 An inactive activation does not erase retention authority: existing retained
 delete and observe operations continue through the Host projection and require
