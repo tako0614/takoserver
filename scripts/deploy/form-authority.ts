@@ -30,7 +30,11 @@ import {
 import { type DeployEnvironment, qualifySource } from "./qualification.ts";
 import type { DeployTarget } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
-import { inspectLiveWorkerVersion, workerVersionIdentity } from "./worker-live.ts";
+import {
+  inspectLiveWorkerVersion,
+  workerVersionAnnotationProfile,
+  workerVersionIdentity,
+} from "./worker-live.ts";
 import {
   assertExactSecretInventory,
   assertExactVersionBindingClosure,
@@ -767,6 +771,7 @@ async function classifyPublicWorkerBinding(
     authorityVersionId,
     authorityVersion,
     state,
+    transition === undefined,
   );
   if (pinned !== null) {
     const legacyTarget = expectedLegacyBindings(
@@ -829,12 +834,15 @@ interface LegacyPinnedPublicWorker {
   readonly workerArtifactDigest: `sha256:${string}`;
 }
 
+const HISTORICAL_SIGNING_KEY_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/u;
+
 async function inspectLegacyPinnedPublicWorker(
   phase: DeployPhase,
   target: DeployTarget,
   authorityVersionId: string,
   authorityVersion: unknown,
   state: FormAuthorityDeployState,
+  allowHistoricalProfile: boolean,
 ): Promise<LegacyPinnedPublicWorker | null> {
   const versionId = optionalExactPlainTextBinding(
     phase,
@@ -858,6 +866,9 @@ async function inspectLegacyPinnedPublicWorker(
     throw phaseError(phase, "legacy Form authority public identity pins are incomplete or invalid");
   }
   const publicVersion = await state.workerVersion(target.workerName, versionId);
+  if (workerVersionAnnotationProfile(publicVersion) !== "canonical") {
+    throw phaseError(phase, "legacy Form authority pin has no canonical annotation inventory");
+  }
   const identity = workerVersionIdentity(phase, publicVersion);
   const expected = expectedExactBindingClosure(target, {
     workerArtifactDigest: `sha256:${identity.bundleDigestHex}`,
@@ -877,9 +888,14 @@ async function inspectLegacyPinnedPublicWorker(
     ...expected,
     TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST: null,
   };
+  const historicalBeforeJitAndSponsorship = allowHistoricalProfile
+    ? expectedHistoricalPinnedPublicWorkerClosure(phase, target, versionId, publicVersion)
+    : null;
   if (
     !hasExactBindingClosure(phase, versionId, publicVersion, expected) &&
-    !hasExactBindingClosure(phase, versionId, publicVersion, legacyBeforeCapabilityIdentity)
+    !hasExactBindingClosure(phase, versionId, publicVersion, legacyBeforeCapabilityIdentity) &&
+    (historicalBeforeJitAndSponsorship === null ||
+      !hasExactBindingClosure(phase, versionId, publicVersion, historicalBeforeJitAndSponsorship))
   ) {
     throw phaseError(
       phase,
@@ -898,6 +914,41 @@ async function inspectLegacyPinnedPublicWorker(
     commit: identity.commit,
     workerArtifactDigest: observedArtifactDigest,
   };
+}
+
+/**
+ * One-time integration bridge for the deployed generation before JIT provenance
+ * and sponsorship. Remove it after both authority Workers are verified dynamic.
+ */
+function expectedHistoricalPinnedPublicWorkerClosure(
+  phase: DeployPhase,
+  target: DeployTarget,
+  versionId: string,
+  publicVersion: unknown,
+): Parameters<typeof assertExactVersionBindingClosure>[3] | null {
+  if (
+    target.environment !== "integration" ||
+    target.sponsorship !== true ||
+    target.integrationE2eCredentialAuthority === undefined
+  ) {
+    return null;
+  }
+  const signingKeyId = optionalExactPlainTextBinding(
+    phase,
+    versionId,
+    publicVersion,
+    "TAKOSERVER_SIGNING_KEY_ID",
+  );
+  if (signingKeyId === null || !HISTORICAL_SIGNING_KEY_ID.test(signingKeyId)) return null;
+  const {
+    sponsorship: _currentSponsorship,
+    integrationE2eCredentialAuthority: _currentCredentialAuthority,
+    ...historicalTarget
+  } = target;
+  return expectedExactBindingClosure({
+    ...historicalTarget,
+    signing: { currentKeyId: signingKeyId },
+  });
 }
 
 function expectedLegacyBindings(
