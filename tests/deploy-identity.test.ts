@@ -110,6 +110,7 @@ describe("integration operator identity deploy surface", () => {
       const selectedTarget = targetWithPublicX(selected.publicJwk.x);
       const privatePath = join(root, "operator-private.jwk");
       writeFileSync(privatePath, `${JSON.stringify(selected.privateJwk)}\n`, { mode: 0o644 });
+      chmodSync(privatePath, 0o644);
       const process = processFixture();
       const invocation = {
         surface: "takoserver-integration-operator-identity" as const,
