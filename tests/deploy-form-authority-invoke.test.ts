@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { targetCapabilityManifest } from "../scripts/deploy/form-authority.ts";
 import {
   type FormAuthorityInvokeOptions,
+  formAuthorityRequestTimeoutMs,
   runFormAuthorityInvoke,
 } from "../scripts/deploy/form-authority-invoke.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
@@ -46,6 +47,12 @@ afterEach(() => {
 });
 
 describe("signed Form authority operator invocation", () => {
+  test("bounds reads at 30 seconds and leaves apply inside its 60-second assertion", () => {
+    expect(formAuthorityRequestTimeoutMs("plan")).toBe(30_000);
+    expect(formAuthorityRequestTimeoutMs("readback")).toBe(30_000);
+    expect(formAuthorityRequestTimeoutMs("apply")).toBe(55_000);
+  });
+
   test("performs exact signed plan -> one apply -> signed readback without exposing credentials", async () => {
     const fixture = await invocationFixture();
     const result = await runFormAuthorityInvoke(

@@ -30,6 +30,8 @@ import type { DeployTarget } from "./target.ts";
 
 const MAX_RESPONSE_BYTES = 8 * 1_024 * 1_024;
 const ASSERTION_LIFETIME_SECONDS = 60;
+const READ_REQUEST_TIMEOUT_MS = 30_000;
+const APPLY_REQUEST_TIMEOUT_MS = 55_000;
 const FORM_OPERATION_ORDER = ["create", "read", "update", "delete", "import", "observe"] as const;
 const ADMISSION_STATES = new Set([
   "allow",
@@ -67,6 +69,10 @@ export interface FormAuthorityInvokeOptions {
   ) => Promise<CommandResult>;
   readonly review?: string;
   readonly gatewayDeployOptions?: FormAuthorityDeployOptions;
+}
+
+export function formAuthorityRequestTimeoutMs(action: "plan" | "apply" | "readback"): number {
+  return action === "apply" ? APPLY_REQUEST_TIMEOUT_MS : READ_REQUEST_TIMEOUT_MS;
 }
 
 interface GatewayIdentity {
@@ -342,7 +348,7 @@ function formAuthorityClient(input: {
           },
           body: canonicalJson(body),
           redirect: "error",
-          signal: AbortSignal.timeout(30_000),
+          signal: AbortSignal.timeout(formAuthorityRequestTimeoutMs(action)),
         });
       } catch {
         throw phaseError(
