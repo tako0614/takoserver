@@ -869,7 +869,7 @@ describe("Takoform apply on a real backend", () => {
         source: "provider",
         effectCount: 6,
         deploymentCount: 1,
-        checkedAt: expect.stringMatching(/^2026-08-29T/u),
+        checkedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u),
         evidenceRef: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
       },
     });
@@ -893,7 +893,7 @@ describe("Takoform apply on a real backend", () => {
         reason: "legacy_unattested",
         effectCount: 6,
         deploymentCount: 1,
-        checkedAt: expect.stringMatching(/^2026-08-29T/u),
+        checkedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u),
       },
     });
     const unauthorized = await call(
