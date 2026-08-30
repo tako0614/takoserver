@@ -1,6 +1,6 @@
 # Takoserver deploy surfaces
 
-This repository owns one deploy entrypoint and nineteen separate mutation surfaces.
+This repository owns one deploy entrypoint and twenty-two separate mutation surfaces.
 The contract is read-only:
 
 ```sh
@@ -48,6 +48,16 @@ topology retirement surfaces. Secret deletion can create an unannotated direct s
 is never reported as complete and is repaired only through the dedicated
 post-token attribution surface below.
 
+Legacy integration operator authority has its own selected-Version transition.
+Only `takoserver-integration-legacy-operator-authority-retirement` and
+`takoserver-integration-legacy-operator-authority-restore` may add
+`--legacy-operator-authority-predecessor-version=<uuid>`. Status accepts only
+that exact Version being current or its exact direct successor. Retirement
+starts from the v2 desired Worker closure plus only the legacy
+`OPERATOR_PUBLIC_JWK` secret; exact restore starts from the same closure without
+it. Both require the replacement `OPERATOR_IDENTITY_PUBLIC_JWK` and Stripe
+settlement/checkout authority to be complete before any mutation.
+
 The environment selects only `.deploy/targets/<environment>.json` (or the
 matching absolute `TAKOSERVER_DEPLOY_TARGET_<ENVIRONMENT>` path). There is no
 target flag, mixed preflight/apply controller, deploy-plan flag, evidence
@@ -83,6 +93,8 @@ no operator input.
 | `takoserver-hosted-token-retirement` | `--status`, `--apply` | integration, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-worker-retirement-attribution-repair` | `--status`, `--apply` | integration, production | `CLOUDFLARE_API_TOKEN` for both actions. |
 | `takoserver-integration-operator-identity` | `--status`, `--apply` | integration only | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH` for `--apply` only. |
+| `takoserver-integration-legacy-operator-authority-retirement` | `--status`, `--apply` | integration only | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
+| `takoserver-integration-legacy-operator-authority-restore` | `--status`, `--apply` | integration only | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_LEGACY_OPERATOR_PUBLIC_JWK_PATH` for `--apply` only. |
 
 ## Surfaces
 
@@ -355,6 +367,22 @@ The separate authority and irreversible surfaces are:
   wallet-funding authority retained by the legacy `OPERATOR_PUBLIC_JWK`.
   A live Worker carrying that legacy funding binding is refused as unrelated
   authority; replacing or removing it requires its own reviewed transition.
+- `takoserver-integration-legacy-operator-authority-retirement`: integration
+  only. It pins the exact current legacy-bearing Version, proves the complete
+  replacement identity plus Stripe settlement/checkout closure, re-reads that
+  predecessor immediately before one `OPERATOR_PUBLIC_JWK` secret delete, and
+  accepts only the provider-created direct successor. The successor must have
+  the exact secret-created annotation, identical `resources.script.etag`,
+  canonical source/artifact identity, every other variable/binding/secret,
+  domain closure, and public product probe. A successful status is the only
+  reconciliation after a lost delete acknowledgement.
+- `takoserver-integration-legacy-operator-authority-restore`: integration only
+  and the exact reversal owner. It accepts only the target public JWK's
+  byte-exact canonical JSON from an owned, link-free `0600` regular file, sends
+  those bytes solely through stdin to one secret put, and never emits the path,
+  JWK bytes, or public coordinate. The exact direct successor must restore only
+  `OPERATOR_PUBLIC_JWK` while preserving the same code, closure, domains and
+  public probe. A lost put acknowledgement is status-only and is never retried.
 
 The intended forward order is schema, public-key registration, any required
 authority-sensitive Worker code, signing repair or explicit rotation, Hosted
@@ -454,6 +482,7 @@ payload or implementation digests; `P` and `I` remain build-derived.
 - `TAKOSERVER_SIGNING_NEXT_PRIVATE_JWK_PATH`
 - `TAKOSERVER_HOSTED_TOKEN_PATH`
 - `TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH`
+- `TAKOSERVER_LEGACY_OPERATOR_PUBLIC_JWK_PATH`
 - `TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH`
 - `--form-authority-scope-transition=/absolute/operator-private/transition.json`
 - `TAKOSERVER_INTEGRATION_E2E_API_KEY_PRIVATE_JWK_PATH`
@@ -538,6 +567,14 @@ Run the same surface with `--status`: an exact configured digest means the
 single-variable Version is current, while absence means the selected
 predecessor remains current. Any unrelated configuration or Version advance is
 refused rather than attributed to the interrupted attempt.
+
+For a legacy operator authority retirement or restore acknowledgement failure,
+do not retry apply. Run the same surface with the same
+`--legacy-operator-authority-predecessor-version=<uuid>` selector. Status accepts
+only that Version still being current or one exact secret-created direct
+successor whose sole closure difference is `OPERATOR_PUBLIC_JWK`; an unrelated
+or non-direct history advance fails closed. Restore status never reads the JWK
+file, and apply diagnostics never expose its path or bytes.
 
 For an integration credential issue failure, never replay the secret-bearing
 issue. Run the credential surface with `--status`; it validates the sealed pair

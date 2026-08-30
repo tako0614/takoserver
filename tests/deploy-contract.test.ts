@@ -43,6 +43,8 @@ const SURFACES = [
   ["takoserver-hosted-token-retirement", ["irreversible", "authority"]],
   ["takoserver-worker-retirement-attribution-repair", []],
   ["takoserver-integration-operator-identity", ["authority"]],
+  ["takoserver-integration-legacy-operator-authority-retirement", ["authority"]],
+  ["takoserver-integration-legacy-operator-authority-restore", ["authority"]],
 ] as const;
 
 describe("Takoserver split deploy entrypoint", () => {
@@ -469,6 +471,71 @@ describe("Takoserver split deploy entrypoint", () => {
         `--environment=${environment}`,
         `--commit=${sha}`,
       ]);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
+    }
+  });
+
+  test("pins legacy operator retirement and restore to their own integration surfaces", async () => {
+    const sha = "a".repeat(40);
+    const version = "00000000-0000-4000-8000-000000000001";
+    const selector = `--legacy-operator-authority-predecessor-version=${version}`;
+    for (const surface of [
+      "takoserver-integration-legacy-operator-authority-retirement",
+      "takoserver-integration-legacy-operator-authority-restore",
+    ] as const) {
+      const accepted = await deploy([
+        surface,
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        selector,
+      ]);
+      expect(accepted.exitCode).toBe(2);
+      expect(accepted.stderr).toContain("deploy target descriptor not found");
+      expect(accepted.stderr).not.toContain("no target was touched");
+    }
+
+    for (const args of [
+      ["takoserver-worker", "--status", "--environment=integration", `--commit=${sha}`, selector],
+      [
+        "takoserver-worker-authority-cutover",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        selector,
+      ],
+      [
+        "takoserver-integration-legacy-operator-authority-retirement",
+        "--status",
+        "--environment=production",
+        `--commit=${sha}`,
+        selector,
+      ],
+      [
+        "takoserver-integration-legacy-operator-authority-restore",
+        "--status",
+        "--environment=rehearsal",
+        `--commit=${sha}`,
+        selector,
+      ],
+      [
+        "takoserver-integration-legacy-operator-authority-retirement",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+      ],
+      [
+        "takoserver-integration-legacy-operator-authority-restore",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        "--legacy-operator-authority-predecessor-version=not-a-version",
+      ],
+    ] as const) {
+      const refused = await deploy(args);
       expect(refused.exitCode).toBe(2);
       expect(refused.stdout).toBe("");
       expect(refused.stderr).toContain("no target was touched");

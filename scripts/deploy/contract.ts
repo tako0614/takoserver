@@ -41,6 +41,8 @@ const hostedTokenInput =
   "`TAKOSERVER_HOSTED_TOKEN_PATH` is required for `--apply` only; `--status` does not read it.";
 const operatorPrivateJwkInput =
   "`TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH` is required for `--apply` only; `--status` does not read it and this surface is integration-only.";
+const legacyOperatorPublicJwkInput =
+  "`TAKOSERVER_LEGACY_OPERATOR_PUBLIC_JWK_PATH` is required for restore `--apply` only; `--status` does not read it and this surface is integration-only.";
 
 function inputContractWithToken(
   tokenRequirement: string,
@@ -803,6 +805,80 @@ export const DEPLOY_CONTRACT = {
           "Identity removal is a separate reviewed configuration transition; this surface never deletes it.",
         "failure-handling":
           highRiskFailure + inputContract(applyReviewInput, operatorPrivateJwkInput),
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-integration-legacy-operator-authority-retirement",
+      target: "cloudflare-worker:integration-legacy-operator-public-jwk-retirement",
+      covers: [
+        "scripts/deploy.ts",
+        "scripts/deploy/legacy-operator-authority-retirement.ts",
+        "scripts/deploy/qualification.ts",
+        "scripts/deploy/realized-config.ts",
+        "scripts/deploy/worker-live.ts",
+        "scripts/deploy/worker-state.ts",
+      ],
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
+      triggers: ["authority"],
+      obligations: {
+        provenance:
+          `${exactSource} Integration only. The exact selected predecessor must carry the v2 ` +
+          "desired closure plus only OPERATOR_PUBLIC_JWK, while the target and immutable Version " +
+          "prove the replacement OPERATOR_IDENTITY_PUBLIC_JWK and Stripe settlement/checkout authority.",
+        "post-conditions":
+          "One stdin-free secret delete creates the selected predecessor's exact direct-successor " +
+          "Worker Version. OPERATOR_PUBLIC_JWK alone is absent; script etag/code, every other variable, " +
+          "binding and secret, domains, canonical source/artifact identity and the public product probe remain exact.",
+        reversal:
+          "Exact restoration is owned only by takoserver-integration-legacy-operator-authority-restore " +
+          "with the retired Version selected and the expected public JWK supplied through stdin.",
+        "failure-handling":
+          `${highRiskFailure} The apply path re-reads the exact predecessor immediately before its one ` +
+          "delete. A lost acknowledgement is status-only reconciliation; already-retired apply, foreign " +
+          "secret/config drift, non-direct history and ordinary Worker or authority-cutover bypass are refused." +
+          inputContract(applyReviewInput),
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-integration-legacy-operator-authority-restore",
+      target: "cloudflare-worker:integration-legacy-operator-public-jwk-exact-restore",
+      covers: [
+        "scripts/deploy.ts",
+        "scripts/deploy/legacy-operator-authority-retirement.ts",
+        "scripts/deploy/qualification.ts",
+        "scripts/deploy/realized-config.ts",
+        "scripts/deploy/worker-live.ts",
+        "scripts/deploy/worker-state.ts",
+      ],
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+        "TAKOSERVER_LEGACY_OPERATOR_PUBLIC_JWK_PATH",
+      ],
+      triggers: ["authority"],
+      obligations: {
+        provenance:
+          `${exactSource} Integration only. The exact selected retired predecessor, canonical ` +
+          "source/artifact identity and replacement identity/Stripe closure are proven before an owned, " +
+          "link-free 0600 file is accepted only when its exact bytes and digest equal the target public JWK.",
+        "post-conditions":
+          "One stdin-only secret put creates the selected predecessor's exact direct-successor Worker " +
+          "Version. OPERATOR_PUBLIC_JWK alone is restored; script etag/code, every other variable, binding " +
+          "and secret, domains, canonical source/artifact identity and the public product probe remain exact.",
+        reversal:
+          "A later removal returns to takoserver-integration-legacy-operator-authority-retirement with " +
+          "the restored Version selected; no ordinary Worker surface may carry or remove the legacy secret.",
+        "failure-handling":
+          `${highRiskFailure} Public-JWK bytes and their path never enter argv, output or diagnostics. ` +
+          "The apply path re-reads the exact predecessor immediately before its one put; a lost " +
+          "acknowledgement is status-only reconciliation and never a blind retry." +
+          inputContract(applyReviewInput, legacyOperatorPublicJwkInput),
         "independent-review": review,
       },
     },

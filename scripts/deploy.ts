@@ -9,6 +9,7 @@ import { loadFormAuthorityScopeTransition } from "./deploy/form-authority-scope-
 import { runHosted } from "./deploy/hosted.ts";
 import { runOperatorIdentity } from "./deploy/identity.ts";
 import { runIntegrationE2eCredentials } from "./deploy/integration-e2e-credentials.ts";
+import { runLegacyOperatorAuthorityTransition } from "./deploy/legacy-operator-authority-retirement.ts";
 import type { DeployEnvironment } from "./deploy/qualification.ts";
 import { runRetirement } from "./deploy/retirement.ts";
 import { runD1Schema } from "./deploy/schema.ts";
@@ -33,6 +34,8 @@ const USAGE = `takoserver deploy
   Integration Form-authority scope retirement uses the operator-private
   --form-authority-scope-transition=/absolute/file.json selector only on deactivation,
   the route-less authority Worker and its operator gateway.
+  Legacy operator authority retirement and exact restore require
+  --legacy-operator-authority-predecessor-version=<uuid> and are integration-only.
 
 The target descriptor is selected only by the exact environment. There is no
 deploy-plan flag, ledger, target override or mixed mutation controller.
@@ -47,6 +50,7 @@ interface InvocationBase {
   readonly commit: string;
   readonly legacyPredecessorVersionId?: string;
   readonly legacyHostRuntimePredecessorVersionId?: string;
+  readonly legacyOperatorAuthorityPredecessorVersionId?: string;
   readonly unattributedSuccessorVersionId?: string;
   readonly formAuthorityScopeTransitionPath?: string;
   readonly reverse?: boolean;
@@ -69,6 +73,7 @@ interface ParsedInvocation {
   readonly commit: string;
   readonly legacyPredecessorVersionId?: string;
   readonly legacyHostRuntimePredecessorVersionId?: string;
+  readonly legacyOperatorAuthorityPredecessorVersionId?: string;
   readonly unattributedSuccessorVersionId?: string;
   readonly formAuthorityScopeTransitionPath?: string;
   readonly reverse?: boolean;
@@ -83,6 +88,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let commit: string | null = null;
   let legacyPredecessorVersionId: string | null = null;
   let legacyHostRuntimePredecessorVersionId: string | null = null;
+  let legacyOperatorAuthorityPredecessorVersionId: string | null = null;
   let unattributedSuccessorVersionId: string | null = null;
   let formAuthorityScopeTransitionPath: string | null = null;
   let reverse = false;
@@ -109,7 +115,11 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       continue;
     }
     if (flag.startsWith("--legacy-predecessor-version=")) {
-      if (legacyPredecessorVersionId !== null || legacyHostRuntimePredecessorVersionId !== null)
+      if (
+        legacyPredecessorVersionId !== null ||
+        legacyHostRuntimePredecessorVersionId !== null ||
+        legacyOperatorAuthorityPredecessorVersionId !== null
+      )
         return null;
       const value = flag.slice("--legacy-predecessor-version=".length);
       if (!isWorkerVersionId(value)) return null;
@@ -117,11 +127,28 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       continue;
     }
     if (flag.startsWith("--legacy-host-runtime-predecessor-version=")) {
-      if (legacyHostRuntimePredecessorVersionId !== null || legacyPredecessorVersionId !== null)
+      if (
+        legacyHostRuntimePredecessorVersionId !== null ||
+        legacyPredecessorVersionId !== null ||
+        legacyOperatorAuthorityPredecessorVersionId !== null
+      )
         return null;
       const value = flag.slice("--legacy-host-runtime-predecessor-version=".length);
       if (!isWorkerVersionId(value)) return null;
       legacyHostRuntimePredecessorVersionId = value;
+      continue;
+    }
+    if (flag.startsWith("--legacy-operator-authority-predecessor-version=")) {
+      if (
+        legacyOperatorAuthorityPredecessorVersionId !== null ||
+        legacyPredecessorVersionId !== null ||
+        legacyHostRuntimePredecessorVersionId !== null
+      ) {
+        return null;
+      }
+      const value = flag.slice("--legacy-operator-authority-predecessor-version=".length);
+      if (!isWorkerVersionId(value)) return null;
+      legacyOperatorAuthorityPredecessorVersionId = value;
       continue;
     }
     if (flag.startsWith("--unattributed-successor-version=")) {
@@ -159,7 +186,9 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       surfaceValue === "takoserver-integration-form-authority-operator-worker" ||
       surfaceValue === "takoserver-integration-form-authority" ||
       surfaceValue === "takoserver-integration-form-authority-deactivation" ||
-      surfaceValue === "takoserver-integration-e2e-credentials") &&
+      surfaceValue === "takoserver-integration-e2e-credentials" ||
+      surfaceValue === "takoserver-integration-legacy-operator-authority-retirement" ||
+      surfaceValue === "takoserver-integration-legacy-operator-authority-restore") &&
     environment !== "integration"
   ) {
     return null;
@@ -167,6 +196,23 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   if (
     legacyPredecessorVersionId !== null &&
     (surfaceValue !== "takoserver-worker-authority-cutover" || environment !== "integration")
+  ) {
+    return null;
+  }
+  if (
+    legacyOperatorAuthorityPredecessorVersionId !== null &&
+    !(
+      (surfaceValue === "takoserver-integration-legacy-operator-authority-retirement" ||
+        surfaceValue === "takoserver-integration-legacy-operator-authority-restore") &&
+      environment === "integration"
+    )
+  ) {
+    return null;
+  }
+  if (
+    legacyOperatorAuthorityPredecessorVersionId === null &&
+    (surfaceValue === "takoserver-integration-legacy-operator-authority-retirement" ||
+      surfaceValue === "takoserver-integration-legacy-operator-authority-restore")
   ) {
     return null;
   }
@@ -240,6 +286,9 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     ...(legacyHostRuntimePredecessorVersionId === null
       ? {}
       : { legacyHostRuntimePredecessorVersionId }),
+    ...(legacyOperatorAuthorityPredecessorVersionId === null
+      ? {}
+      : { legacyOperatorAuthorityPredecessorVersionId }),
     ...(unattributedSuccessorVersionId === null ? {} : { unattributedSuccessorVersionId }),
     ...(formAuthorityScopeTransitionPath === null ? {} : { formAuthorityScopeTransitionPath }),
     ...(reverse ? { reverse: true } : {}),
@@ -374,6 +423,23 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
           action: invocation.action,
           environment: invocation.environment,
           commit: invocation.commit,
+        },
+        target,
+      );
+    case "takoserver-integration-legacy-operator-authority-retirement":
+    case "takoserver-integration-legacy-operator-authority-restore":
+      return await runLegacyOperatorAuthorityTransition(
+        {
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
+          ...(invocation.legacyOperatorAuthorityPredecessorVersionId === undefined
+            ? {}
+            : {
+                legacyOperatorAuthorityPredecessorVersionId:
+                  invocation.legacyOperatorAuthorityPredecessorVersionId,
+              }),
         },
         target,
       );
