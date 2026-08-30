@@ -1032,9 +1032,7 @@ async function installMatches(
     (row?.event_type === "install" || row?.event_type === "replace") &&
     row.package_digest === entry.packageDigest &&
     row.form_ref_json === canonicalJson(entry.formRef) &&
-    (row.implementation_digest === null ||
-      row.implementation_digest === undefined ||
-      row.implementation_digest === implementationDigest) &&
+    row.implementation_digest === implementationDigest &&
     (await installEvidenceMatches(row, entry, evidence))
   );
 }
