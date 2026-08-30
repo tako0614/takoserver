@@ -63,7 +63,7 @@ no operator input.
 
 | Surface | Supported action(s) | Environment | Required input condition |
 | --- | --- | --- | --- |
-| `takoserver-worker` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both actions. |
+| `takoserver-worker` | `--status`, `--apply` | integration, rehearsal, production | Production requires `CLOUDFLARE_API_TOKEN` and direct-REST topology readback. Integration/rehearsal may omit it and use the active Wrangler OAuth profile through the version/deployment/secret/D1 readers. |
 | `takoserver-worker-authority-cutover` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-form-authority-identity-probe` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-form-authority-worker` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
@@ -88,12 +88,23 @@ no operator input.
 
 The routine surfaces are:
 
-- `takoserver-worker`: one Worker code upload. It refuses pending D1
-  migrations, any config/secret/signing/topology drift, and any selected diff
-  that changes authentication, authorization, the deploy mechanism, or any
-  executable dependency in the build-derived public Form payload/identity
-  closure. The latter closure is derived from the real P/I build roots rather
-  than maintained as a provider/handler filename regex.
+- `takoserver-worker`: one Worker code publication. Production uses the
+  explicit API-token/direct-REST path. Integration and rehearsal may use the
+  stored Wrangler OAuth profile; OAuth is consumed by Wrangler in each child
+  process and is never exported by the deploy tool. Non-production routine
+  publication builds with the version API, uploads one immutable Version, and
+  explicitly deploys that Version to 100% traffic. Its realized config is
+  topology-neutral: routes, custom domains, workers.dev toggles, and triggers
+  are not sent to either publication command. A strict Wrangler JSON reader
+  proves deployments, Version bindings, secret names/types, and D1 migration
+  state before and after publication, and the exact discovery/OpenAPI public
+  smoke must pass. It refuses pending D1 migrations, any config/secret/signing
+  drift, and any selected diff that changes authentication, authorization, or
+  the deploy mechanism, or any executable dependency in the build-derived
+  public Form payload/identity closure. The latter closure is derived from the
+  real P/I build roots rather than maintained as a provider/handler filename
+  regex. Custom-domain topology remains a direct-REST obligation, so OAuth
+  mode is limited to an existing workers.dev origin with no aliases.
 - `takoserver-site`: one Pages upload and byte-exact immutable URL readback;
   production also requires byte-exact `https://takoserver.com/` readback.
 - `takoserver-console`: one Console Worker upload. Exhaustive domain state must

@@ -32,6 +32,7 @@ import type { DeployTarget } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import { authoritySensitiveWorkerPaths } from "./worker-authority-paths.ts";
 import { parseWorkerDeploymentHistory, type WorkerDeploymentHistory } from "./worker-state.ts";
+import { publishWranglerVersion, WranglerWorkerState } from "./wrangler-state.ts";
 
 export type WorkerProcess = (
   command: readonly string[],
@@ -114,14 +115,28 @@ export async function runWorker(
     }
   }
   const run = options.run ?? runCommand;
+  const suppliedToken =
+    options.cloudflareEnvironment === undefined
+      ? process.env.CLOUDFLARE_API_TOKEN
+      : options.cloudflareEnvironment.CLOUDFLARE_API_TOKEN;
+  const storedOAuthEligible =
+    invocation.surface === "takoserver-worker" && invocation.environment !== "production";
+  const useStoredWranglerOAuth = storedOAuthEligible && suppliedToken === undefined;
   const environment =
     options.cloudflareEnvironment ??
-    (options.state !== undefined && invocation.action === "status"
+    (useStoredWranglerOAuth || (options.state !== undefined && invocation.action === "status")
       ? {}
       : cloudflareChildEnvironment());
-  const state =
-    options.state ??
-    new CloudflareState({ accountId: target.accountId, token: exactToken(environment) });
+  if (
+    useStoredWranglerOAuth &&
+    options.state === undefined &&
+    !isWranglerOAuthTopologySafe(target)
+  ) {
+    throw preflightError(
+      "stored Wrangler OAuth routine publication requires an existing workers.dev public origin; " +
+        "custom-domain topology requires CLOUDFLARE_API_TOKEN",
+    );
+  }
   if (invocation.legacyHostRuntimePredecessorVersionId !== undefined) {
     if (invocation.surface !== "takoserver-worker-authority-cutover") {
       throw preflightError(
@@ -138,7 +153,8 @@ export async function runWorker(
         ...(invocation.reverse ? { reverse: true } : {}),
       },
       target,
-      state,
+      options.state ??
+        new CloudflareState({ accountId: target.accountId, token: exactToken(environment) }),
       run,
       { ...options, cloudflareEnvironment: environment },
     );
@@ -151,10 +167,22 @@ export async function runWorker(
       path: join(root, "inspect-wrangler.jsonc"),
       main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
       commit: invocation.commit,
+      ...(useStoredWranglerOAuth ? { topology: "version-only" as const } : {}),
       ...(target.integrationE2eCredentialAuthority === undefined
         ? {}
         : { authorityProfile: { kind: "historical-pre-jit" as const } }),
     });
+    const state =
+      options.state ??
+      (useStoredWranglerOAuth
+        ? new WranglerWorkerState({
+            configPath: inspectionConfig,
+            workerName: target.workerName,
+            publicOrigin: target.publicOrigin,
+            environment,
+            run,
+          })
+        : new CloudflareState({ accountId: target.accountId, token: exactToken(environment) }));
     const migrations =
       options.migrations ?? remoteMigrationReader(inspectionConfig, environment, run);
     const signingDatabase =
@@ -231,6 +259,8 @@ export async function runWorker(
       };
     }
 
+    const versionPublication =
+      invocation.surface === "takoserver-worker" && invocation.environment !== "production";
     const source = await qualifySource({
       environment: invocation.environment,
       commit: invocation.commit,
@@ -276,6 +306,7 @@ export async function runWorker(
       target,
       commit: source.commit,
       run,
+      ...(versionPublication ? { dryRunCommand: "versions-upload" as const } : {}),
       writeConfig: ({ path, main, bundleDigestHex, formImplementationIdentity }) =>
         writeWorkerConfig(target, {
           path,
@@ -285,6 +316,7 @@ export async function runWorker(
           ...(bundleDigestHex === undefined
             ? {}
             : { workerArtifactDigest: `sha256:${bundleDigestHex}` as const }),
+          ...(versionPublication ? { topology: "version-only" as const } : {}),
           ...(target.integrationE2eCredentialAuthority === undefined
             ? {}
             : bundleDigestHex === undefined
@@ -303,7 +335,7 @@ export async function runWorker(
     const { bundlePath, configPath, bundleDigestHex } = prepared;
     const artifact = prepared.seal();
     artifact.assertUnchanged();
-    if (target.integrationE2eCredentialAuthority !== undefined) {
+    if (versionPublication || target.integrationE2eCredentialAuthority !== undefined) {
       const last = await inspectWorker("preflight", target, state, migrations, {
         ...(beforeAuthorityProfile === undefined
           ? {}
@@ -316,10 +348,12 @@ export async function runWorker(
         last.commit !== before.commit ||
         last.bundleDigestHex !== before.bundleDigestHex ||
         last.integrationE2eCredentialAuthorityConfigured !==
-          before.integrationE2eCredentialAuthorityConfigured
+          before.integrationE2eCredentialAuthorityConfigured ||
+        JSON.stringify(last.migrations) !== JSON.stringify(before.migrations) ||
+        JSON.stringify(last.pending) !== JSON.stringify(before.pending)
       ) {
         throw preflightError(
-          "Worker or integration E2E credential authority changed before upload",
+          "Worker state or integration E2E credential authority changed before upload",
         );
       }
     }
@@ -357,25 +391,38 @@ export async function runWorker(
       }
     }
     const message = `takoserver-worker:${source.commit}:${bundleDigestHex}`;
-    const upload = await run(
-      wranglerCommand([
-        "deploy",
-        bundlePath,
-        "--no-bundle",
-        "--config",
-        configPath,
-        "--strict",
-        "--message",
-        message,
-      ]),
-      { env: environment },
-    );
-    if (upload.exitCode !== 0) {
-      throw mutationError(
-        "Worker upload acknowledgement is indeterminate; do not retry before --status",
-        `${upload.stdout}${upload.stderr}`.trim(),
-      );
-    }
+    const publication = versionPublication
+      ? await publishWranglerVersion({
+          root,
+          bundlePath,
+          configPath,
+          workerName: target.workerName,
+          message,
+          environment,
+          run,
+        })
+      : await (async () => {
+          const upload = await run(
+            wranglerCommand([
+              "deploy",
+              bundlePath,
+              "--no-bundle",
+              "--config",
+              configPath,
+              "--strict",
+              "--message",
+              message,
+            ]),
+            { env: environment },
+          );
+          if (upload.exitCode !== 0) {
+            throw mutationError(
+              "Worker upload acknowledgement is indeterminate; do not retry before --status",
+              `${upload.stdout}${upload.stderr}`.trim(),
+            );
+          }
+          return null;
+        })();
 
     const afterAuthorityProfile =
       target.integrationE2eCredentialAuthority === undefined
@@ -396,6 +443,15 @@ export async function runWorker(
     ) {
       throw verificationError(
         "authoritative Worker deployment history does not advance exactly from the previous version",
+      );
+    }
+    if (
+      publication !== null &&
+      (after.history.versionId !== publication.versionId ||
+        after.history.deploymentId !== publication.deploymentId)
+    ) {
+      throw verificationError(
+        "Wrangler publication identity does not match authoritative Worker readback",
       );
     }
     if (after.commit !== source.commit || after.bundleDigestHex !== bundleDigestHex) {
@@ -427,6 +483,13 @@ export async function runWorker(
       deploymentId: after.history.deploymentId,
       versionId: after.history.versionId,
       probe,
+      ...(publication === null
+        ? {}
+        : {
+            publication: "versions-upload-and-deploy",
+            uploadedVersionId: publication.versionId,
+            publicationDeploymentId: publication.deploymentId,
+          }),
       ...(!legacyBootstrap
         ? {}
         : {
@@ -698,6 +761,28 @@ function exactToken(environment: Readonly<Record<string, string>>): string {
   const token = environment.CLOUDFLARE_API_TOKEN;
   if (!token) throw preflightError("CLOUDFLARE_API_TOKEN is required");
   return token;
+}
+
+function isWorkersDevOrigin(origin: string): boolean {
+  try {
+    const url = new URL(origin);
+    return (
+      url.protocol === "https:" &&
+      !url.username &&
+      !url.password &&
+      !url.port &&
+      url.pathname === "/" &&
+      !url.search &&
+      !url.hash &&
+      url.hostname.endsWith(".workers.dev")
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isWranglerOAuthTopologySafe(target: DeployTarget): boolean {
+  return isWorkersDevOrigin(target.publicOrigin) && (target.aliases?.length ?? 0) === 0;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

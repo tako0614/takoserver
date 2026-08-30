@@ -83,6 +83,17 @@ describe("Takoserver split deploy entrypoint", () => {
     const hosted = contract.surfaces.find(
       ({ surface }) => surface === "takoserver-hosted-token-cutover",
     );
+    const routineWorker = contract.surfaces.find(({ surface }) => surface === "takoserver-worker");
+    expect(routineWorker?.obligations.provenance).toContain("stored OAuth profile");
+    expect(routineWorker?.obligations.provenance).toContain(
+      "production remains explicit-token direct REST",
+    );
+    expect(routineWorker?.obligations["post-conditions"]).toContain(
+      "one versions upload followed by one explicit 100 percent deployment",
+    );
+    expect(routineWorker?.obligations["failure-handling"]).toContain(
+      "OAuth credential is never exported or printed",
+    );
     expect(integrationAuthority?.obligations["post-conditions"]).toContain(
       "exact operator tenant and Space plain-text bindings",
     );

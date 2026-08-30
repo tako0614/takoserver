@@ -34,7 +34,15 @@ export interface WorkerConfigOptions {
    * normal target descriptor.
    */
   readonly transitionExpectedSecrets?: readonly string[];
+  /**
+   * `version-only` realizes only immutable Worker resources. It deliberately
+   * omits routes, custom domains, workers.dev toggles and triggers so the
+   * versions API cannot change topology during routine non-production work.
+   */
+  readonly topology?: WorkerConfigTopology;
 }
+
+export type WorkerConfigTopology = "normal" | "version-only";
 
 export interface PublicWorkerProvenance {
   readonly sourceCommit: string;
@@ -81,7 +89,15 @@ export function writeWorkerConfig(target: DeployTarget, options: WorkerConfigOpt
   if (target.integrationE2eCredentialAuthority !== undefined && authorityProfile === undefined) {
     throw preflightError("JIT-enabled Worker config requires an explicit authority profile");
   }
-  const { $schema: _schema, ...neutralConfig } = neutral;
+  const { $schema: _schema, ...neutralConfigWithTopology } = neutral;
+  const neutralConfig =
+    options.topology === "version-only"
+      ? Object.fromEntries(
+          Object.entries(neutralConfigWithTopology).filter(
+            ([key]) => !VERSION_ONLY_TOPOLOGY_KEYS.has(key),
+          ),
+        )
+      : neutralConfigWithTopology;
   const signingKeyId = options.signingKeyId ?? effectiveSigningKeyId(target);
   const realized = {
     ...neutralConfig,
@@ -96,7 +112,9 @@ export function writeWorkerConfig(target: DeployTarget, options: WorkerConfigOpt
       },
     ],
     r2_buckets: [{ binding: "OBJECTS", bucket_name: target.r2.bucketName }],
-    ...serviceAddress(target.publicOrigin, target.aliases ?? []),
+    ...(options.topology === "version-only"
+      ? {}
+      : serviceAddress(target.publicOrigin, target.aliases ?? [])),
     ...deploymentVariables(target, signingKeyId, authorityProfile, {
       ...(options.formImplementationIdentity === undefined
         ? {}
@@ -138,6 +156,16 @@ export function writeWorkerConfig(target: DeployTarget, options: WorkerConfigOpt
   writeFileSync(options.path, `${JSON.stringify(realized, null, 2)}\n`, { mode: 0o600 });
   return options.path;
 }
+
+const VERSION_ONLY_TOPOLOGY_KEYS = new Set([
+  "routes",
+  "route",
+  "triggers",
+  "workers_dev",
+  "workers_dev_subdomain",
+  "custom_domains",
+  "domains",
+]);
 
 function legacyServiceBindingName(): string {
   return ["HOST", "RUNTIME", "MATERIALIZER"].join("_");

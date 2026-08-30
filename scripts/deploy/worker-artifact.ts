@@ -27,6 +27,8 @@ export interface WorkerArtifactConfigInput {
 
 export type WorkerArtifactConfigWriter = (input: WorkerArtifactConfigInput) => string;
 
+export type WorkerDryRunCommand = "deploy" | "versions-upload";
+
 export interface PreparedWorkerArtifact {
   readonly releaseDirectory: string;
   readonly bundlePath: string;
@@ -51,6 +53,8 @@ export async function prepareWorkerArtifact(input: {
   readonly main?: string;
   /** Optional target-specific config writer; the default realizes a public Worker config. */
   readonly writeConfig?: WorkerArtifactConfigWriter;
+  /** Use the version API for a non-mutating build when the caller will publish explicitly. */
+  readonly dryRunCommand?: WorkerDryRunCommand;
   readonly run: WorkerArtifactProcess;
 }): Promise<PreparedWorkerArtifact> {
   const build = join(input.root, "build");
@@ -100,7 +104,7 @@ export async function prepareWorkerArtifact(input: {
   });
   const built = await input.run(
     wranglerCommand([
-      "deploy",
+      ...(input.dryRunCommand === "versions-upload" ? ["versions", "upload"] : ["deploy"]),
       "--dry-run",
       "--strict",
       "--config",
