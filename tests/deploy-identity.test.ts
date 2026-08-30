@@ -457,7 +457,10 @@ function versionForTarget(selected: DeployTarget, identity: "desired" | "absent"
     signingKeyId: selected.signing.currentKeyId,
   });
   return {
-    annotations: { "workers/message": `takoserver-worker:${COMMIT}:${BUNDLE_DIGEST}` },
+    annotations: {
+      "workers/message": `takoserver-worker:${COMMIT}:${BUNDLE_DIGEST}`,
+      "workers/triggered_by": "version_upload",
+    },
     resources: {
       bindings: Object.entries(expected).flatMap(([name, requirement]) =>
         requirement === null ? [] : [{ name, type: requirement.type, ...requirement.fields }],

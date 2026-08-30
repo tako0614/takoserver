@@ -11,6 +11,43 @@ const review =
   "TAKOSERVER_INDEPENDENT_REVIEW names the reviewer that did not author the change and is printed " +
   "without granting deploy authority.";
 const legacyServiceBindingName = () => ["HOST", "RUNTIME", "MATERIALIZER"].join("_");
+const cloudflareTokenInput =
+  "Input contract: `CLOUDFLARE_API_TOKEN` is required for both `--status` and `--apply` in every supported environment.";
+const integrationE2eCloudflareTokenInput =
+  "Input contract: `CLOUDFLARE_API_TOKEN` is required for each `--issue`, `--status`, and `--revoke` action; all three actions are integration-only.";
+const applyReviewInput =
+  "`TAKOSERVER_INDEPENDENT_REVIEW` is required for `--apply` only; `--status` does not read it.";
+const formAuthorityPrivateJwkInput =
+  "`TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH` is required for both `--status` and `--apply`; both actions are integration-only.";
+const integrationE2ePrivateJwkInput =
+  "`TAKOSERVER_INTEGRATION_E2E_API_KEY_PRIVATE_JWK_PATH` is required for each `--issue`, `--status`, and `--revoke` action; all three actions are integration-only.";
+const integrationE2eOutputDirectoryInput =
+  "`TAKOSERVER_INTEGRATION_E2E_OUTPUT_DIRECTORY` is required for each `--issue`, `--status`, and `--revoke` action; all three actions are integration-only.";
+const integrationE2eReviewInput =
+  "`TAKOSERVER_INDEPENDENT_REVIEW` is required for `--issue` and `--revoke`; `--status` does not read it.";
+const rehearsalReceiptInput =
+  "`TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` is required for `--apply` in `rehearsal` and `production`; integration `--apply` and every `--status` action do not read it.";
+const signingPublicJwkInput =
+  "`TAKOSERVER_SIGNING_PUBLIC_JWK_PATH` is required for `--apply` only; `--status` does not read it.";
+const signingPrivateJwkInput =
+  "`TAKOSERVER_SIGNING_PRIVATE_JWK_PATH` is required for `--apply` only; `--status` does not read it.";
+const signingNextPrivateJwkInput =
+  "`TAKOSERVER_SIGNING_NEXT_PRIVATE_JWK_PATH` is required for `--apply` only; `--status` does not read it.";
+const hostedTokenInput =
+  "`TAKOSERVER_HOSTED_TOKEN_PATH` is required for `--apply` only; `--status` does not read it.";
+const operatorPrivateJwkInput =
+  "`TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH` is required for `--apply` only; `--status` does not read it and this surface is integration-only.";
+
+function inputContractWithToken(
+  tokenRequirement: string,
+  ...requirements: readonly string[]
+): string {
+  return ` ${[tokenRequirement, ...requirements].join(" ")}`;
+}
+
+function inputContract(...requirements: readonly string[]): string {
+  return inputContractWithToken(cloudflareTokenInput, ...requirements);
+}
 
 /** Side-effect-free live declaration for the repository's only deploy entrypoint. */
 export const DEPLOY_CONTRACT = {
@@ -43,7 +80,8 @@ export const DEPLOY_CONTRACT = {
         "failure-handling":
           `${routineFailure} The surface refuses pending migrations and any configuration, secret, ` +
           "signing or Hosted topology drift before upload. A diff that changes authentication, " +
-          "authorization or the deploy mechanism is refused and routed to the authority cutover surface.",
+          "authorization or the deploy mechanism is refused and routed to the authority cutover surface." +
+          inputContract(),
       },
     },
     {
@@ -83,7 +121,8 @@ export const DEPLOY_CONTRACT = {
           "mismatch are refused. " +
           "The named --legacy-host-runtime-predecessor-version transition profile is the only " +
           "path that may carry the observed legacy service binding and Hosted secret into a " +
-          "candidate; ordinary target realization remains free of both retired fields.",
+          "candidate; ordinary target realization remains free of both retired fields." +
+          inputContract(applyReviewInput),
         "production-selector":
           "Production accepts this transition only with the exact pinned predecessor Version ID, " +
           "a clean/reachable exact commit and independent review; ordinary takoserver-worker deploy " +
@@ -121,7 +160,8 @@ export const DEPLOY_CONTRACT = {
           "The immediately previous Form authority Worker version is printed as the provider-history rollback target.",
         "failure-handling":
           `${highRiskFailure} Deploying this shell does not enable Form mutation: RPC apply remains ` +
-          "fail-closed until released Form package verification is present. Admission policy and private handle issuance remain Takoserver Host-owned.",
+          "fail-closed until released Form package verification is present. Admission policy and private handle issuance remain Takoserver Host-owned." +
+          inputContract(applyReviewInput),
         "independent-review": review,
       },
     },
@@ -154,7 +194,8 @@ export const DEPLOY_CONTRACT = {
         "failure-handling":
           `${highRiskFailure} The entry hard-refuses every environment except integration before ` +
           "reading D1 or R2 bindings. It independently rejects every signed plan/apply/readback body " +
-          "outside its sealed tenant/Space; partial Form mutation requires authoritative readback and replan.",
+          "outside its sealed tenant/Space; partial Form mutation requires authoritative readback and replan." +
+          inputContract(applyReviewInput),
         "independent-review": review,
       },
     },
@@ -188,7 +229,8 @@ export const DEPLOY_CONTRACT = {
           `${highRiskFailure} The gateway hard-refuses non-integration environments before key or ` +
           "service reads, accepts only short-lived body/method/path-bound Ed25519 proofs, independently " +
           "rejects every body outside its sealed tenant/Space, and rechecks the live public Host identity " +
-          "before every RPC. Foreign domain ownership and every script/domain partial topology are refused.",
+          "before every RPC. Foreign domain ownership and every script/domain partial topology are refused." +
+          inputContract(applyReviewInput),
         "independent-review": review,
       },
     },
@@ -224,7 +266,8 @@ export const DEPLOY_CONTRACT = {
           "No HTTP mutation is retried. An apply transport or acknowledgement failure is indeterminate; " +
           "run status for authoritative readback before an explicit fresh apply. An acknowledged partial " +
           "apply performs its separate readback and exits as a verification failure with only sanitized " +
-          "receipts and next-plan diagnostics. Assertion and private-key bytes are always redacted.",
+          "receipts and next-plan diagnostics. Assertion and private-key bytes are always redacted." +
+          inputContract(applyReviewInput, formAuthorityPrivateJwkInput),
         "independent-review": review,
       },
     },
@@ -261,7 +304,8 @@ export const DEPLOY_CONTRACT = {
           "No HTTP mutation is retried. An apply transport or acknowledgement failure is indeterminate; " +
           "run status for authoritative readback before making an explicit fresh deactivation decision. " +
           "An acknowledged partial apply preserves only sanitized receipts and next-plan diagnostics. " +
-          "Assertion and private-key bytes are always redacted.",
+          "Assertion and private-key bytes are always redacted." +
+          inputContract(applyReviewInput, formAuthorityPrivateJwkInput),
         "independent-review": review,
       },
     },
@@ -307,7 +351,13 @@ export const DEPLOY_CONTRACT = {
           "required before any exact idempotent revoke settlement; a revoking fence may be resumed without " +
           "minting another pair. A partial pair is visible and fenced revoke wins over delayed issue. " +
           "Private JWK and API-key bytes never enter argv, Worker config, stdout or diagnostics; evidence never " +
-          "enters a Provider or runner, and a wrong organization, partial profile or key reuse fails closed.",
+          "enters a Provider or runner, and a wrong organization, partial profile or key reuse fails closed." +
+          inputContractWithToken(
+            integrationE2eCloudflareTokenInput,
+            integrationE2eReviewInput,
+            integrationE2ePrivateJwkInput,
+            integrationE2eOutputDirectoryInput,
+          ),
         "independent-review": review,
       },
     },
@@ -334,7 +384,7 @@ export const DEPLOY_CONTRACT = {
           "Production additionally requires a byte-exact https://takoserver.com/ readback.",
         reversal:
           "The previous Pages deployment id from authoritative project history is printed as the rollback target.",
-        "failure-handling": routineFailure,
+        "failure-handling": routineFailure + inputContract(),
       },
     },
     {
@@ -360,7 +410,7 @@ export const DEPLOY_CONTRACT = {
           "and after upload, and the public console.js must be byte-exact.",
         reversal:
           "The previous Console Worker version is printed; the command never changes its domain owner.",
-        "failure-handling": routineFailure,
+        "failure-handling": routineFailure + inputContract(),
       },
     },
     {
@@ -383,7 +433,8 @@ export const DEPLOY_CONTRACT = {
           "D1 lineage and canonical schema shape are read authoritatively after the deliberate last mutation.",
         reversal:
           "There is no down migration. Failure is repaired forward from the authoritative D1 lineage and schema shape.",
-        "failure-handling": highRiskFailure,
+        "failure-handling":
+          highRiskFailure + inputContract(applyReviewInput, rehearsalReceiptInput),
         "pre-mutation-proof":
           "Rehearsal writes a 0600 receipt outside every repository. Production requires that exact " +
           "commit, migration digest, pre-shape and expected post-shape before applying the same bytes.",
@@ -409,7 +460,8 @@ export const DEPLOY_CONTRACT = {
           "D1 returns exactly one byte-identical public key row for the selected id; this surface performs no Worker secret or configuration mutation.",
         reversal:
           "Registration is append-only. A mistaken public identity is not overwritten or deleted; repair forward with a new key id.",
-        "failure-handling": highRiskFailure,
+        "failure-handling":
+          highRiskFailure + inputContract(applyReviewInput, signingPublicJwkInput),
         "pre-mutation-proof":
           "The exact public-JWK digest, canonical Ed25519 shape and key-id absence are proven, then absence is rechecked immediately before insert.",
         "independent-review": review,
@@ -440,7 +492,8 @@ export const DEPLOY_CONTRACT = {
           "The exact Worker secret-name inventory and a new immutable version are read back while code/config stay unchanged, and the D1 row remains byte-identical.",
         reversal:
           "Reapply the previous exact secret only through this same repair surface; the command prints no secret bytes.",
-        "failure-handling": highRiskFailure,
+        "failure-handling":
+          highRiskFailure + inputContract(applyReviewInput, signingPrivateJwkInput),
         "independent-review": review,
       },
     },
@@ -468,7 +521,8 @@ export const DEPLOY_CONTRACT = {
           "An integration H status remains ready=false and repair-required while naming rotationApplyReady separately; H-to-S performs exactly one canonical deploy with --secrets-file and no classic secret put/delete mutation.",
         reversal:
           "The explicit current key remains pre-registered, so an operator may run a separately reviewed inverse rotation; no silent switch or key deletion occurs.",
-        "failure-handling": highRiskFailure,
+        "failure-handling":
+          highRiskFailure + inputContract(applyReviewInput, signingNextPrivateJwkInput),
         "independent-review": review,
         "no-overwrite":
           "Rotation consumes a separately pre-registered next id, retains the current public row, and never overwrites either identity.",
@@ -525,7 +579,7 @@ export const DEPLOY_CONTRACT = {
           "This temporary bridge is removed after canonical integration cutover.",
         reversal:
           "Proof-only apply has no mutation to reverse. For a fresh integration cutover, remove the newly added named secret through an explicit Cloudflare secret deletion; token bytes are never printed.",
-        "failure-handling": highRiskFailure,
+        "failure-handling": highRiskFailure + inputContract(applyReviewInput, hostedTokenInput),
         "independent-review": review,
       },
     },
@@ -554,7 +608,8 @@ export const DEPLOY_CONTRACT = {
           "The exact direct candidate predecessor Version is redeployed through provider history; no new bundle is built.",
         "failure-handling":
           `${highRiskFailure} A lost acknowledgement is settled by this surface's status readback; ` +
-          "wrong service identity, extra binding, non-direct history or changed bytes fail closed.",
+          "wrong service identity, extra binding, non-direct history or changed bytes fail closed." +
+          inputContract(applyReviewInput),
         "pre-mutation-proof":
           "Status must prove the candidate is current, the exact legacy service binding is present once, and the Hosted secret remains present.",
         "independent-review": review,
@@ -579,7 +634,8 @@ export const DEPLOY_CONTRACT = {
           `${highRiskFailure} A lost acknowledgement is settled by status accepting only the exact ` +
           "direct successor; a secret-created Version without the exact canonical annotation inventory is " +
           "reported as token-retired-unattributed-successor with ready=false and repairRequired=true. " +
-          "The surface refuses to run before topology retirement and never reports a partial delete as complete.",
+          "The surface refuses to run before topology retirement and never reports a partial delete as complete." +
+          inputContract(applyReviewInput),
         "pre-mutation-proof":
           "Status must prove the direct candidate successor has no Hosted service binding and still carries the Hosted secret before deletion.",
         "independent-review": review,
@@ -612,7 +668,8 @@ export const DEPLOY_CONTRACT = {
           "repaired by a separately selected higher Worker Version.",
         "failure-handling":
           `${routineFailure} The surface never retries a lost upload acknowledgement, never deletes or ` +
-          "restores a secret, and refuses an unrelated provider-history advance or weak/missing script identity.",
+          "restores a secret, and refuses an unrelated provider-history advance or weak/missing script identity." +
+          inputContract(),
       },
     },
     {
@@ -645,7 +702,8 @@ export const DEPLOY_CONTRACT = {
         reversal:
           "Before removing this identity, revoke every session and API key issued through it. " +
           "Identity removal is a separate reviewed configuration transition; this surface never deletes it.",
-        "failure-handling": highRiskFailure,
+        "failure-handling":
+          highRiskFailure + inputContract(applyReviewInput, operatorPrivateJwkInput),
         "independent-review": review,
       },
     },

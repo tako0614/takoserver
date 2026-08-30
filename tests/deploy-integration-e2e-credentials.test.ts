@@ -139,6 +139,12 @@ describe("integration E2E credential owner surface", () => {
       if (!snapshotPath) throw new Error("missing target snapshot");
       expect(lstatSync(snapshotPath).mode & 0o777).toBe(0o600);
       expect(JSON.parse(readFileSync(snapshotPath, "utf8"))).toEqual(target);
+      const inspectionConfig = JSON.parse(
+        readFileSync(join(root, "inspect-wrangler.jsonc"), "utf8"),
+      ) as { vars: Record<string, string> };
+      expect(inspectionConfig.vars).not.toHaveProperty("TAKOSERVER_ENVIRONMENT");
+      expect(inspectionConfig.vars).not.toHaveProperty("TAKOSERVER_SOURCE_COMMIT");
+      expect(inspectionConfig.vars).not.toHaveProperty("TAKOSERVER_WORKER_ARTIFACT_DIGEST");
       expect(JSON.stringify(result)).not.toContain("must-not-cross");
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -381,13 +387,19 @@ function invocation(action: "issue" | "status" | "revoke") {
 
 function version() {
   const closure = expectedExactBindingClosure(target, {
-    provenance: {
-      sourceCommit: COMMIT,
-      artifactDigest: `sha256:${BUNDLE_DIGEST}`,
+    authorityProfile: {
+      kind: "provenance-bound-jit",
+      provenance: {
+        sourceCommit: COMMIT,
+        artifactDigest: `sha256:${BUNDLE_DIGEST}`,
+      },
     },
   });
   return {
-    annotations: { "workers/message": `takoserver-worker:${COMMIT}:${BUNDLE_DIGEST}` },
+    annotations: {
+      "workers/message": `takoserver-worker:${COMMIT}:${BUNDLE_DIGEST}`,
+      "workers/triggered_by": "version_upload",
+    },
     resources: {
       bindings: Object.entries(closure).flatMap(([name, requirement]) =>
         requirement === null ? [] : [{ name, type: requirement.type, ...requirement.fields }],

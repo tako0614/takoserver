@@ -52,9 +52,33 @@ const target = {
   sponsorship: true,
 } satisfies DeployTarget;
 
+const integrationE2eTarget = {
+  ...target,
+  integrationE2eCredentialAuthority: {
+    organizationId: "org_takosumi_hosted_staging",
+    publicJwk: { kty: "OKP", crv: "Ed25519", x: "A".repeat(43) },
+  },
+} satisfies DeployTarget;
+
 const BASE_SECRETS = ["TAKOSERVER_SIGNING_KEY"];
 const HOSTED_SPONSORSHIP_SECRET = "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN";
 const HOSTED_SECRETS = [...BASE_SECRETS, HOSTED_SPONSORSHIP_SECRET];
+type TestAuthorityProfile =
+  | { readonly kind: "historical-pre-jit" }
+  | {
+      readonly kind: "provenance-bound-jit";
+      readonly provenance: {
+        readonly sourceCommit: string;
+        readonly artifactDigest: `sha256:${string}`;
+      };
+    };
+
+function jitAuthorityProfile(commit = COMMIT, digest = DIGEST): TestAuthorityProfile {
+  return {
+    kind: "provenance-bound-jit",
+    provenance: { sourceCommit: commit, artifactDigest: `sha256:${digest}` },
+  };
+}
 
 describe("reviewed Hosted legacy-edge retirement", () => {
   test("requires the exact observed service and entrypoint closure", () => {
@@ -110,6 +134,44 @@ describe("reviewed Hosted legacy-edge retirement", () => {
       expect(mutations).toHaveLength(1);
       expect(mutations[0]?.command).toContain("--no-bundle");
       expect(mutations[0]?.command.join(" ")).not.toContain("secret delete");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("authority transition classifies historical L as pre-JIT and requires provenance-bound JIT C", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-jit-authority-"));
+    try {
+      const fixture = stateFixture("legacy", undefined, COMMIT, integrationE2eTarget, {
+        [VERSION_CANDIDATE]: jitAuthorityProfile(),
+      });
+      const result = await runRetirement(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+        },
+        integrationE2eTarget,
+        {
+          run: fixture.run,
+          state: fixture.state,
+          outputDirectory: root,
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+
+      expect(result).toMatchObject({
+        state: "candidate",
+        previousVersionId: VERSION_LEGACY,
+        versionId: VERSION_CANDIDATE,
+        bundleDigest: `sha256:${DIGEST}`,
+      });
+      expect(
+        fixture.mutations.filter(({ command }) => command.includes("--no-bundle")),
+      ).toHaveLength(1);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -232,6 +294,100 @@ describe("reviewed Hosted legacy-edge retirement", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test("JIT topology retirement keeps the legacy L profile historical and C/T bound", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-jit-topology-"));
+    try {
+      const fixture = stateFixture("candidate", undefined, COMMIT, integrationE2eTarget, {
+        [VERSION_CANDIDATE]: jitAuthorityProfile(),
+        [VERSION_TOPOLOGY]: jitAuthorityProfile(),
+      });
+      const result = await runRetirement(
+        {
+          surface: "takoserver-host-runtime-topology-retirement",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+        },
+        integrationE2eTarget,
+        {
+          run: fixture.run,
+          state: fixture.state,
+          outputDirectory: root,
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+      expect(result).toMatchObject({
+        state: "topology-retired",
+        previousVersionId: VERSION_CANDIDATE,
+        versionId: VERSION_TOPOLOGY,
+        bundleDigest: `sha256:${DIGEST}`,
+      });
+      const status = await runRetirement(
+        {
+          surface: "takoserver-host-runtime-topology-retirement",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+        },
+        integrationE2eTarget,
+        { run: fixture.run, state: fixture.state },
+      );
+      expect(status).toMatchObject({
+        state: "topology-retired",
+        versionId: VERSION_TOPOLOGY,
+        ready: true,
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("retirement does not infer a historical profile from a canonical C annotation", async () => {
+    const historicalProfile: TestAuthorityProfile = { kind: "historical-pre-jit" };
+    const fixture = stateFixture("candidate", undefined, COMMIT, integrationE2eTarget, {
+      [VERSION_CANDIDATE]: historicalProfile,
+    });
+    await expect(
+      runRetirement(
+        {
+          surface: "takoserver-host-runtime-topology-retirement",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+        },
+        integrationE2eTarget,
+        { run: fixture.run, state: fixture.state },
+      ),
+    ).rejects.toThrow("does not declare the TAKOSERVER_ENVIRONMENT binding");
+    expect(fixture.mutations).toHaveLength(0);
+  });
+
+  test("token retirement does not infer a historical profile from a canonical T annotation", async () => {
+    const historicalProfile: TestAuthorityProfile = { kind: "historical-pre-jit" };
+    const fixture = stateFixture("topology", undefined, COMMIT, integrationE2eTarget, {
+      [VERSION_CANDIDATE]: jitAuthorityProfile(),
+      [VERSION_TOPOLOGY]: historicalProfile,
+    });
+    await expect(
+      runRetirement(
+        {
+          surface: "takoserver-hosted-token-retirement",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+        },
+        integrationE2eTarget,
+        { run: fixture.run, state: fixture.state },
+      ),
+    ).rejects.toThrow("does not declare the TAKOSERVER_ENVIRONMENT binding");
+    expect(fixture.mutations).toHaveLength(0);
   });
 
   test("topology status accepts a direct candidate with changed canonical identity", async () => {
@@ -757,6 +913,102 @@ describe("reviewed Hosted legacy-edge retirement", () => {
     }
   });
 
+  test("JIT token retirement requires a provenance-bound provider successor", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-jit-token-successor-"));
+    try {
+      const jitProfile: TestAuthorityProfile = {
+        kind: "provenance-bound-jit",
+        provenance: { sourceCommit: COMMIT, artifactDigest: `sha256:${DIGEST}` },
+      };
+      const fixture = stateFixture("topology", undefined, COMMIT, integrationE2eTarget, {
+        [VERSION_CANDIDATE]: jitAuthorityProfile(),
+        [VERSION_TOPOLOGY]: jitAuthorityProfile(),
+        [VERSION_TOKEN]: jitProfile,
+      });
+      await expect(
+        runRetirement(
+          {
+            surface: "takoserver-hosted-token-retirement",
+            action: "apply",
+            environment: "integration",
+            commit: COMMIT,
+            legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+          },
+          integrationE2eTarget,
+          {
+            run: fixture.run,
+            state: fixture.state,
+            outputDirectory: root,
+            review: "reviewer@example.test",
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          },
+        ),
+      ).rejects.toThrow("changed the served code identity");
+      expect(
+        fixture.mutations.filter(
+          ({ command }) => command.includes("secret") && command.includes("delete"),
+        ),
+      ).toHaveLength(1);
+
+      const status = await runRetirement(
+        {
+          surface: "takoserver-hosted-token-retirement",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+        },
+        integrationE2eTarget,
+        { run: fixture.run, state: fixture.state },
+      );
+      expect(status).toMatchObject({
+        state: "token-retired-unattributed-successor",
+        ready: false,
+        repairRequired: true,
+        versionId: VERSION_TOKEN,
+        secretPresent: false,
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("JIT token retirement rejects a historical-shaped new successor", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-jit-token-historical-"));
+    try {
+      const fixture = stateFixture("topology", undefined, COMMIT, integrationE2eTarget, {
+        [VERSION_CANDIDATE]: jitAuthorityProfile(),
+        [VERSION_TOPOLOGY]: jitAuthorityProfile(),
+      });
+      await expect(
+        runRetirement(
+          {
+            surface: "takoserver-hosted-token-retirement",
+            action: "apply",
+            environment: "integration",
+            commit: COMMIT,
+            legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+          },
+          integrationE2eTarget,
+          {
+            run: fixture.run,
+            state: fixture.state,
+            outputDirectory: root,
+            review: "reviewer@example.test",
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          },
+        ),
+      ).rejects.toThrow("TAKOSERVER_ENVIRONMENT");
+      expect(
+        fixture.mutations.filter(
+          ({ command }) => command.includes("secret") && command.includes("delete"),
+        ),
+      ).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("token-retired completion requires the exact canonical annotation inventory", async () => {
     const message = `takoserver-worker:${COMMIT}:${DIGEST}`;
     const variants = [
@@ -866,6 +1118,91 @@ describe("reviewed Hosted legacy-edge retirement", () => {
       scriptContentIdentity: SCRIPT_ETAG,
       probe: { status: 200, openapi: { status: 200 } },
     });
+    expect(fixture.mutations).toHaveLength(0);
+  });
+
+  test("attribution repair keeps old L/C/T/R historical while the new A is JIT", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-jit-attribution-"));
+    try {
+      const historicalProfile: TestAuthorityProfile = { kind: "historical-pre-jit" };
+      const fixture = stateFixture("token", undefined, REPAIR_COMMIT, integrationE2eTarget, {
+        [VERSION_CANDIDATE]: historicalProfile,
+        [VERSION_TOPOLOGY]: historicalProfile,
+        [VERSION_TOKEN]: historicalProfile,
+        [VERSION_ATTRIBUTION_REPAIRED]: jitAuthorityProfile(REPAIR_COMMIT),
+      });
+      const status = await runRetirement(
+        {
+          surface: "takoserver-worker-retirement-attribution-repair",
+          action: "status",
+          environment: "integration",
+          commit: REPAIR_COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+          unattributedSuccessorVersionId: VERSION_TOKEN,
+        },
+        integrationE2eTarget,
+        { run: fixture.run, state: fixture.state, fetcher: probeFetcher },
+      );
+      expect(status).toMatchObject({
+        state: "token-retired-unattributed-successor",
+        ready: false,
+        repairRequired: true,
+        versionId: VERSION_TOKEN,
+      });
+
+      const result = await runRetirement(
+        {
+          surface: "takoserver-worker-retirement-attribution-repair",
+          action: "apply",
+          environment: "integration",
+          commit: REPAIR_COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+          unattributedSuccessorVersionId: VERSION_TOKEN,
+        },
+        integrationE2eTarget,
+        {
+          run: fixture.run,
+          state: fixture.state,
+          outputDirectory: root,
+          fetcher: probeFetcher,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+      expect(result).toMatchObject({
+        state: "token-retirement-attribution-repaired",
+        versionId: VERSION_ATTRIBUTION_REPAIRED,
+        commit: REPAIR_COMMIT,
+        bundleDigest: `sha256:${DIGEST}`,
+      });
+      expect(
+        fixture.mutations.filter(({ command }) => command.includes("--no-bundle")),
+      ).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("attribution repair rejects a mixed historical/current pinned lineage", async () => {
+    const historicalProfile: TestAuthorityProfile = { kind: "historical-pre-jit" };
+    const fixture = stateFixture("token", undefined, COMMIT, integrationE2eTarget, {
+      [VERSION_CANDIDATE]: jitAuthorityProfile(),
+      [VERSION_TOPOLOGY]: historicalProfile,
+      [VERSION_TOKEN]: historicalProfile,
+    });
+    await expect(
+      runRetirement(
+        {
+          surface: "takoserver-worker-retirement-attribution-repair",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+          unattributedSuccessorVersionId: VERSION_TOKEN,
+        },
+        integrationE2eTarget,
+        { run: fixture.run, state: fixture.state, fetcher: probeFetcher },
+      ),
+    ).rejects.toThrow("exact selected target closure");
     expect(fixture.mutations).toHaveLength(0);
   });
 
@@ -1405,6 +1742,8 @@ function stateFixture(
     | "repair-upload-ack-loss"
     | "topology-reverse-ack-loss",
   headCommit = COMMIT,
+  selectedTarget: DeployTarget = target,
+  authorityProfiles: Readonly<Record<string, TestAuthorityProfile>> = {},
 ) {
   let current = stage;
   let history = initialHistory(stage);
@@ -1477,7 +1816,7 @@ function stateFixture(
   };
   const state: RetirementState = {
     async workerDomains() {
-      return [{ hostname: "api.integration.example.test", service: target.workerName }];
+      return [{ hostname: "api.integration.example.test", service: selectedTarget.workerName }];
     },
     async workerDeployments() {
       return history.map(({ deploymentId, versionId }, index) =>
@@ -1498,10 +1837,15 @@ function stateFixture(
         versionId !== VERSION_ATTRIBUTION_REPAIRED &&
         versionId !== VERSION_WRONG;
       return versionShape({
+        selectedTarget,
+        ...(authorityProfiles[versionId] === undefined
+          ? {}
+          : { authorityProfile: authorityProfiles[versionId] }),
         ...(serviceBinding === undefined ? {} : { serviceBinding }),
         includeHostedSecret: includesHostedSecret,
         message:
-          versionId === VERSION_LEGACY ||
+          (versionId === VERSION_LEGACY &&
+            selectedTarget.integrationE2eCredentialAuthority === undefined) ||
           versionId === VERSION_TOKEN ||
           versionId === VERSION_TOKEN_RESTORED
             ? null
@@ -1562,7 +1906,18 @@ function versionShape(input: {
   readonly message?: string | null;
   readonly annotations?: Readonly<Record<string, string>> | null;
   readonly scriptEtag?: string;
+  readonly selectedTarget?: DeployTarget;
+  readonly authorityProfile?:
+    | { readonly kind: "historical-pre-jit" }
+    | {
+        readonly kind: "provenance-bound-jit";
+        readonly provenance: {
+          readonly sourceCommit: string;
+          readonly artifactDigest: `sha256:${string}`;
+        };
+      };
 }) {
+  const selectedTarget: DeployTarget = input.selectedTarget ?? target;
   const annotations =
     input.annotations === null
       ? null
@@ -1573,26 +1928,26 @@ function versionShape(input: {
               "workers/message": input.message ?? `takoserver-worker:${COMMIT}:${DIGEST}`,
               "workers/triggered_by": "version_upload",
             }));
-  const bindings = [
-    { type: "ai", name: "AI" },
-    ...(input.includeVersionMetadata === false
-      ? []
-      : [{ type: "version_metadata", name: "WORKER_VERSION" }]),
-    { type: "d1", name: "STATE_DB", id: target.d1.databaseId },
-    { type: "r2_bucket", name: "OBJECTS", bucket_name: target.r2.bucketName },
-    { type: "plain_text", name: "PUBLIC_ORIGIN", text: target.publicOrigin },
-    { type: "plain_text", name: "TAKOSERVER_SIGNING_KEY_ID", text: target.signing.currentKeyId },
-    ...(input.includeHostedSecret === false
-      ? []
-      : [{ type: "secret_text", name: "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN" }]),
-    { type: "secret_text", name: "TAKOSERVER_SIGNING_KEY" },
-    ...(input.serviceBinding === undefined
-      ? []
-      : [{ type: "service", name: "HOST_RUNTIME_MATERIALIZER", ...input.serviceBinding }]),
-  ];
+  const authorityProfile =
+    input.authorityProfile ??
+    (selectedTarget.integrationE2eCredentialAuthority === undefined
+      ? undefined
+      : { kind: "historical-pre-jit" as const });
+  const expected = expectedTransitionBindingClosure(selectedTarget, {
+    serviceBinding: input.serviceBinding ?? null,
+    metadataProfile: input.includeVersionMetadata === false ? "pre-version-metadata" : "current",
+    expectedSecrets: input.includeHostedSecret === false ? BASE_SECRETS : HOSTED_SECRETS,
+    ...(authorityProfile === undefined ? {} : { authorityProfile }),
+  });
+  const bindings = Object.entries(expected).flatMap(([name, requirement]) =>
+    requirement === null ? [] : [{ name, type: requirement.type, ...requirement.fields }],
+  );
   return {
     ...(annotations === null ? {} : { annotations }),
-    resources: { bindings, script: { etag: input.scriptEtag ?? SCRIPT_ETAG } },
+    resources: {
+      bindings,
+      script: { etag: input.scriptEtag ?? SCRIPT_ETAG },
+    },
   };
 }
 

@@ -115,6 +115,69 @@ describe("immutable Worker Version binding closure", () => {
     ).toThrow("exact selected target closure");
   });
 
+  test("JIT authority closures require an exact five-binding provenance profile", () => {
+    const target = {
+      kind: "takoserver.deploy-target@v2",
+      environment: "integration",
+      accountId: "a".repeat(32),
+      workerName: "takoserver-api-integration",
+      d1: { databaseName: "runtime-db", databaseId: "database-id" },
+      r2: { bucketName: "objects" },
+      publicOrigin: "https://api.integration.example.test",
+      signing: { currentKeyId: "key-current" },
+      integrationE2eCredentialAuthority: {
+        organizationId: "org_takosumi_hosted_staging",
+        publicJwk: { kty: "OKP", crv: "Ed25519", x: "A".repeat(43) },
+      },
+    } satisfies DeployTarget;
+    const profile = {
+      kind: "provenance-bound-jit" as const,
+      provenance: {
+        sourceCommit: "a".repeat(40),
+        artifactDigest: `sha256:${"b".repeat(64)}` as const,
+      },
+    };
+    const exact = expectedExactVersionFromClosure(
+      expectedExactBindingClosure(target, { authorityProfile: profile }),
+    );
+    expect(() =>
+      assertExactVersionBindingClosure(
+        "preflight",
+        "version-1",
+        exact,
+        expectedExactBindingClosure(target, { authorityProfile: profile }),
+      ),
+    ).not.toThrow();
+
+    const historical = expectedExactVersionFromClosure(
+      expectedExactBindingClosure(target, { authorityProfile: { kind: "historical-pre-jit" } }),
+    );
+    expect(() =>
+      assertExactVersionBindingClosure(
+        "preflight",
+        "version-1",
+        historical,
+        expectedExactBindingClosure(target, { authorityProfile: profile }),
+      ),
+    ).toThrow("does not declare the TAKOSERVER_ENVIRONMENT binding");
+
+    const wrongProvenance = {
+      kind: "provenance-bound-jit" as const,
+      provenance: {
+        sourceCommit: "c".repeat(40),
+        artifactDigest: `sha256:${"d".repeat(64)}` as const,
+      },
+    };
+    expect(() =>
+      assertExactVersionBindingClosure(
+        "preflight",
+        "version-1",
+        exact,
+        expectedExactBindingClosure(target, { authorityProfile: wrongProvenance }),
+      ),
+    ).toThrow("binds TAKOSERVER_SOURCE_COMMIT with unexpected text");
+  });
+
   test("legacy predecessor closure requires exactly the pre-version-metadata shape", () => {
     const target = {
       kind: "takoserver.deploy-target@v2",
@@ -236,6 +299,16 @@ function expectedExactVersion(target: DeployTarget) {
         },
         { type: "secret_text", name: "TAKOSERVER_SIGNING_KEY" },
       ],
+    },
+  };
+}
+
+function expectedExactVersionFromClosure(closure: ReturnType<typeof expectedExactBindingClosure>) {
+  return {
+    resources: {
+      bindings: Object.entries(closure).flatMap(([name, requirement]) =>
+        requirement === null ? [] : [{ name, type: requirement.type, ...requirement.fields }],
+      ),
     },
   };
 }

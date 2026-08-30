@@ -30,7 +30,7 @@ import {
 } from "./signing.ts";
 import type { DeployTarget } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
-import type { WorkerDeploymentHistory } from "./worker-state.ts";
+import { parseWorkerDeploymentHistory, type WorkerDeploymentHistory } from "./worker-state.ts";
 
 const AUTHORITY_PATHS = [
   /^bun\.lock$/u,
@@ -59,6 +59,7 @@ import {
   type LEGACY_PRE_VERSION_METADATA_PROFILE,
   LEGACY_UNATTRIBUTED_PREDECESSOR,
   type WorkerState,
+  type WorkerVersionAuthoritySelection,
 } from "./worker-live.ts";
 
 export interface WorkerMigrationReader {
@@ -165,7 +166,9 @@ export async function runWorker(
       path: join(root, "inspect-wrangler.jsonc"),
       main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
       commit: invocation.commit,
-      omitIntegrationE2eCredentialAuthority: true,
+      ...(target.integrationE2eCredentialAuthority === undefined
+        ? {}
+        : { authorityProfile: { kind: "historical-pre-jit" as const } }),
     });
     const migrations =
       options.migrations ?? remoteMigrationReader(inspectionConfig, environment, run);
@@ -178,6 +181,11 @@ export async function runWorker(
       signingDatabase === undefined
         ? undefined
         : await requireDistinctIntegrationE2eSigningIdentity(target, signingDatabase);
+    const beforeAuthorityProfile = await authoritySelectionForCurrent("preflight", target, state, {
+      ...(invocation.legacyPredecessorVersionId === undefined
+        ? {}
+        : { legacyPredecessorVersionId: invocation.legacyPredecessorVersionId }),
+    });
     const before = await inspectWorker("preflight", target, state, migrations, {
       ...(invocation.legacyPredecessorVersionId === undefined
         ? {}
@@ -185,11 +193,7 @@ export async function runWorker(
             legacyPredecessorVersionId: invocation.legacyPredecessorVersionId,
             reconcileStatus: invocation.action === "status",
           }),
-      ...(invocation.surface === "takoserver-worker-authority-cutover" &&
-      invocation.environment === "integration" &&
-      target.integrationE2eCredentialAuthority !== undefined
-        ? { allowMissingIntegrationE2eCredentialAuthority: true }
-        : {}),
+      ...(beforeAuthorityProfile === undefined ? {} : { authorityProfile: beforeAuthorityProfile }),
     });
 
     if (invocation.action === "status") {
@@ -287,16 +291,34 @@ export async function runWorker(
       target,
       commit: source.commit,
       run,
+      writeConfig: ({ path, main, bundleDigestHex }) =>
+        writeWorkerConfig(target, {
+          path,
+          main,
+          commit: source.commit,
+          ...(target.integrationE2eCredentialAuthority === undefined
+            ? {}
+            : bundleDigestHex === undefined
+              ? { authorityProfile: { kind: "historical-pre-jit" as const } }
+              : {
+                  authorityProfile: {
+                    kind: "provenance-bound-jit" as const,
+                    provenance: {
+                      sourceCommit: source.commit,
+                      artifactDigest: `sha256:${bundleDigestHex}` as const,
+                    },
+                  },
+                }),
+        }),
     });
     const { bundlePath, configPath, bundleDigestHex } = prepared;
     const artifact = prepared.seal();
     artifact.assertUnchanged();
     if (target.integrationE2eCredentialAuthority !== undefined) {
       const last = await inspectWorker("preflight", target, state, migrations, {
-        ...(invocation.surface === "takoserver-worker-authority-cutover" &&
-        invocation.environment === "integration"
-          ? { allowMissingIntegrationE2eCredentialAuthority: true }
-          : {}),
+        ...(beforeAuthorityProfile === undefined
+          ? {}
+          : { authorityProfile: beforeAuthorityProfile }),
       });
       if (
         last.history.deploymentId !== before.history.deploymentId ||
@@ -326,16 +348,12 @@ export async function runWorker(
       if (selector === undefined) {
         throw preflightError("Worker legacy predecessor selector is unavailable");
       }
-      const last = await inspectLiveWorkerVersionWithLegacyPredecessor(
-        "preflight",
-        before.integrationE2eCredentialAuthorityConfigured
-          ? target
-          : withoutIntegrationE2eCredentialAuthority(target),
-        state,
-        {
-          legacyPredecessorVersionId: selector,
-        },
-      );
+      const last = await inspectLiveWorkerVersionWithLegacyPredecessor("preflight", target, state, {
+        legacyPredecessorVersionId: selector,
+        ...(beforeAuthorityProfile === undefined
+          ? {}
+          : { authorityProfile: beforeAuthorityProfile }),
+      });
       if (
         last.history.versionId !== before.history.versionId ||
         last.legacyPredecessorProfile !== before.legacyPredecessorProfile ||
@@ -370,7 +388,19 @@ export async function runWorker(
       );
     }
 
-    const after = await inspectWorker("verification", target, state, migrations);
+    const afterAuthorityProfile =
+      target.integrationE2eCredentialAuthority === undefined
+        ? undefined
+        : {
+            kind: "provenance-bound-jit" as const,
+            provenance: {
+              sourceCommit: source.commit,
+              artifactDigest: `sha256:${bundleDigestHex}` as const,
+            },
+          };
+    const after = await inspectWorker("verification", target, state, migrations, {
+      ...(afterAuthorityProfile === undefined ? {} : { authorityProfile: afterAuthorityProfile }),
+    });
     if (
       after.history.versionId === before.history.versionId ||
       after.history.previousVersionId !== before.history.versionId
@@ -467,36 +497,33 @@ async function inspectWorker(
   options: {
     readonly legacyPredecessorVersionId?: string;
     readonly reconcileStatus?: boolean;
-    readonly allowMissingIntegrationE2eCredentialAuthority?: boolean;
+    readonly authorityProfile?: WorkerVersionAuthoritySelection;
   } = {},
 ): Promise<WorkerInspection> {
   const inspect = async (selectedTarget: DeployTarget) =>
     options.legacyPredecessorVersionId === undefined
-      ? await inspectLiveWorkerVersion(phase, selectedTarget, state, {})
+      ? await inspectLiveWorkerVersion(phase, selectedTarget, state, {
+          ...(options.authorityProfile === undefined
+            ? {}
+            : { authorityProfile: options.authorityProfile }),
+        })
       : options.reconcileStatus === true
         ? await inspectLiveWorkerVersionForLegacyStatus(phase, selectedTarget, state, {
             legacyPredecessorVersionId: options.legacyPredecessorVersionId,
+            ...(options.authorityProfile === undefined
+              ? {}
+              : { authorityProfile: options.authorityProfile }),
           })
         : await inspectLiveWorkerVersionWithLegacyPredecessor(phase, selectedTarget, state, {
             legacyPredecessorVersionId: options.legacyPredecessorVersionId,
+            ...(options.authorityProfile === undefined
+              ? {}
+              : { authorityProfile: options.authorityProfile }),
           });
-  let integrationE2eCredentialAuthorityConfigured =
-    target.integrationE2eCredentialAuthority === undefined;
-  let live: Awaited<ReturnType<typeof inspect>>;
-  try {
-    live = await inspect(target);
-    integrationE2eCredentialAuthorityConfigured =
-      target.integrationE2eCredentialAuthority !== undefined;
-  } catch (error) {
-    if (
-      options.allowMissingIntegrationE2eCredentialAuthority !== true ||
-      target.integrationE2eCredentialAuthority === undefined
-    ) {
-      throw error;
-    }
-    live = await inspect(withoutIntegrationE2eCredentialAuthority(target));
-    integrationE2eCredentialAuthorityConfigured = false;
-  }
+  const live = await inspect(target);
+  const integrationE2eCredentialAuthorityConfigured =
+    target.integrationE2eCredentialAuthority === undefined ||
+    options.authorityProfile?.kind === "provenance-bound-jit";
   const migrationState = await migrations.read();
   const pending = pendingMigrations(migrationState.local, migrationState.applied);
   return {
@@ -513,12 +540,32 @@ async function inspectWorker(
   };
 }
 
-function withoutIntegrationE2eCredentialAuthority(target: DeployTarget): DeployTarget {
-  const {
-    integrationE2eCredentialAuthority: _integrationE2eCredentialAuthority,
-    ...withoutAuthority
-  } = target;
-  return withoutAuthority;
+/**
+ * Chooses the caller's authority profile before the strict live inspector.
+ * A pinned current legacy predecessor is explicitly historical; every other
+ * current Version must prove its canonical source/artifact provenance. This
+ * reads only deployment lineage, never the Version's own annotation/bindings,
+ * so the inspector remains the sole authority check.
+ */
+async function authoritySelectionForCurrent(
+  phase: DeployPhase,
+  target: DeployTarget,
+  state: WorkerState,
+  options: { readonly legacyPredecessorVersionId?: string },
+): Promise<WorkerVersionAuthoritySelection | undefined> {
+  if (target.integrationE2eCredentialAuthority === undefined) return undefined;
+  const history = parseWorkerDeploymentHistory(
+    await state.workerDeployments(target.workerName),
+    phase,
+  );
+  if (history === null) throw preflightError("Worker has no authoritative current deployment");
+  if (
+    options.legacyPredecessorVersionId !== undefined &&
+    history.versionId === options.legacyPredecessorVersionId
+  ) {
+    return { kind: "historical-pre-jit" };
+  }
+  return { kind: "provenance-bound-jit" };
 }
 
 function remoteMigrationReader(

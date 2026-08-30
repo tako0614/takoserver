@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCommand } from "../scripts/deploy/process.ts";
@@ -42,6 +42,54 @@ async function build(root: string) {
 }
 
 describe("hermetic Worker bundle identity", () => {
+  test("uses an explicit historical build profile and preserves sealed upload provenance", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-worker-artifact-authority-"));
+    const jitTarget = {
+      ...target,
+      integrationE2eCredentialAuthority: {
+        organizationId: "org_takosumi_hosted_staging",
+        publicJwk: { kty: "OKP" as const, crv: "Ed25519" as const, x: "E".repeat(43) },
+      },
+    } satisfies DeployTarget;
+    try {
+      const prepared = await prepareWorkerArtifact({
+        root,
+        target: jitTarget,
+        commit: COMMIT,
+        run: async (command) => {
+          const outdir = command[command.indexOf("--outdir") + 1];
+          if (!outdir) throw new Error("dry-run outdir missing");
+          mkdirSync(outdir, { recursive: true });
+          writeFileSync(join(outdir, "worker.js"), "export default {};\n");
+          return { exitCode: 0, stdout: "built\n", stderr: "" };
+        },
+      });
+      const buildConfig = JSON.parse(readFileSync(join(root, "build-wrangler.jsonc"), "utf8")) as {
+        vars: Record<string, string>;
+      };
+      expect(buildConfig.vars).not.toHaveProperty("TAKOSERVER_ENVIRONMENT");
+      expect(buildConfig.vars).not.toHaveProperty("TAKOSERVER_SOURCE_COMMIT");
+      expect(buildConfig.vars).not.toHaveProperty("TAKOSERVER_WORKER_ARTIFACT_DIGEST");
+
+      const releaseConfig = JSON.parse(readFileSync(prepared.configPath, "utf8")) as {
+        vars: Record<string, string>;
+      };
+      expect(releaseConfig.vars).toMatchObject({
+        TAKOSERVER_ENVIRONMENT: "integration",
+        TAKOSERVER_INTEGRATION_E2E_ORGANIZATION_ID: "org_takosumi_hosted_staging",
+        TAKOSERVER_SOURCE_COMMIT: COMMIT,
+        TAKOSERVER_WORKER_ARTIFACT_DIGEST: `sha256:${prepared.bundleDigestHex}`,
+      });
+      expect(releaseConfig.vars.TAKOSERVER_INTEGRATION_E2E_API_KEY_PUBLIC_JWK).toBe(
+        JSON.stringify(jitTarget.integrationE2eCredentialAuthority.publicJwk),
+      );
+      const artifact = prepared.seal();
+      artifact.assertUnchanged();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("uses identical bytes and digest across shallow and nested real Wrangler builds", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-artifact-"));
     try {

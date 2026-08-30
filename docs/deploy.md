@@ -53,6 +53,36 @@ matching absolute `TAKOSERVER_DEPLOY_TARGET_<ENVIRONMENT>` path). There is no
 target flag, mixed preflight/apply controller, deploy-plan flag, evidence
 ledger, journal, capability token, or implied deploy authority.
 
+## Environment inputs and action matrix
+
+`requiresEnv` in `takos.deploy-contract@v2` is the conservative union of the
+environment variables needed by any action supported by that surface. It does
+not mean that every listed variable is read by every action. Each surface's
+obligation answer names the exact action condition; `--contract` itself reads
+no operator input.
+
+| Surface | Supported action(s) | Environment | Required input condition |
+| --- | --- | --- | --- |
+| `takoserver-worker` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both actions. |
+| `takoserver-worker-authority-cutover` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
+| `takoserver-form-authority-worker` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
+| `takoserver-integration-form-authority-worker` | `--status`, `--apply` | integration only | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
+| `takoserver-integration-form-authority-operator-worker` | `--status`, `--apply` | integration only | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
+| `takoserver-integration-form-authority` | `--status`, `--apply` | integration only | `CLOUDFLARE_API_TOKEN` and `TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
+| `takoserver-integration-form-authority-deactivation` | `--status`, `--apply` | integration only | `CLOUDFLARE_API_TOKEN` and `TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
+| `takoserver-integration-e2e-credentials` | `--issue`, `--status`, `--revoke` | integration only | `CLOUDFLARE_API_TOKEN`, `TAKOSERVER_INTEGRATION_E2E_API_KEY_PRIVATE_JWK_PATH`, and `TAKOSERVER_INTEGRATION_E2E_OUTPUT_DIRECTORY` for all three; `TAKOSERVER_INDEPENDENT_REVIEW` for `--issue` and `--revoke` only. |
+| `takoserver-site` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both actions. |
+| `takoserver-console` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both actions. |
+| `takoserver-d1-schema` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` for `--apply` in rehearsal or production only. |
+| `takoserver-signing-key-register` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PUBLIC_JWK_PATH` for `--apply` only. |
+| `takoserver-signing-repair` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PRIVATE_JWK_PATH` for `--apply` only. |
+| `takoserver-signing-rotation` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_NEXT_PRIVATE_JWK_PATH` for `--apply` only. |
+| `takoserver-hosted-token-cutover` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_HOSTED_TOKEN_PATH` for `--apply` only. |
+| `takoserver-host-runtime-topology-retirement` | `--status`, `--apply` | integration, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
+| `takoserver-hosted-token-retirement` | `--status`, `--apply` | integration, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
+| `takoserver-worker-retirement-attribution-repair` | `--status`, `--apply` | integration, production | `CLOUDFLARE_API_TOKEN` for both actions. |
+| `takoserver-integration-operator-identity` | `--status`, `--apply` | integration only | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH` for `--apply` only. |
+
 ## Surfaces
 
 The routine surfaces are:

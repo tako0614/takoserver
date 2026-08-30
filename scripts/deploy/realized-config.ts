@@ -12,10 +12,12 @@ export interface WorkerConfigOptions {
   readonly main: string;
   readonly commit: string;
   readonly signingKeyId?: string;
-  /** Exact public Worker identity. Required when the integration JIT route is target-enabled. */
-  readonly provenance?: PublicWorkerProvenance;
-  /** Build/inspection/provider-control configs are never uploaded as a new script Version. */
-  readonly omitIntegrationE2eCredentialAuthority?: true;
+  /**
+   * Explicit immutable Version authority profile. JIT-enabled targets must
+   * select either historical-pre-jit or provenance-bound-jit; no profile is
+   * inferred from annotations or a target clone.
+   */
+  readonly authorityProfile?: WorkerVersionAuthorityProfile;
   /**
    * Transition-only legacy service binding.  Ordinary target realization never
    * supplies this field; it exists solely for the reviewed L→C profile.
@@ -35,6 +37,25 @@ export interface PublicWorkerProvenance {
 }
 
 /**
+ * Exact immutable-Worker authority shape used by live inspectors. Historical
+ * Versions may explicitly prove the absence of the five JIT bindings; current
+ * Versions must carry their source/artifact provenance.
+ */
+export type WorkerVersionAuthorityProfile =
+  | { readonly kind: "historical-pre-jit" }
+  | { readonly kind: "provenance-bound-jit"; readonly provenance: PublicWorkerProvenance };
+
+/**
+ * Caller-selected authority shape for live inspection. A JIT selection may
+ * omit provenance while the inspector binds it to the Version's canonical
+ * annotation; upload/config realization always uses the concrete profile
+ * above and therefore requires provenance.
+ */
+export type WorkerVersionAuthoritySelection =
+  | { readonly kind: "historical-pre-jit" }
+  | { readonly kind: "provenance-bound-jit"; readonly provenance?: PublicWorkerProvenance };
+
+/**
  * Realizes one target into a caller-owned temporary path. The caller seals the
  * resulting config beside the exact bundle; this module never writes mutable
  * deploy state into the repository.
@@ -45,11 +66,15 @@ export function writeWorkerConfig(target: DeployTarget, options: WorkerConfigOpt
   }
   const neutral = readNeutralConfig();
   assertNeutral(neutral);
-  if (options.provenance !== undefined && options.provenance.sourceCommit !== options.commit) {
+  const authorityProfile = options.authorityProfile;
+  if (
+    authorityProfile?.kind === "provenance-bound-jit" &&
+    authorityProfile.provenance.sourceCommit !== options.commit
+  ) {
     throw preflightError("Worker config provenance must match its exact commit");
   }
-  if (options.provenance !== undefined && options.omitIntegrationE2eCredentialAuthority) {
-    throw preflightError("Worker config cannot both include and omit JIT authority provenance");
+  if (target.integrationE2eCredentialAuthority !== undefined && authorityProfile === undefined) {
+    throw preflightError("JIT-enabled Worker config requires an explicit authority profile");
   }
   const { $schema: _schema, ...neutralConfig } = neutral;
   const signingKeyId = options.signingKeyId ?? effectiveSigningKeyId(target);
@@ -67,13 +92,7 @@ export function writeWorkerConfig(target: DeployTarget, options: WorkerConfigOpt
     ],
     r2_buckets: [{ binding: "OBJECTS", bucket_name: target.r2.bucketName }],
     ...serviceAddress(target.publicOrigin, target.aliases ?? []),
-    ...deploymentVariables(
-      options.omitIntegrationE2eCredentialAuthority
-        ? withoutIntegrationE2eCredentialAuthority(target)
-        : target,
-      signingKeyId,
-      options.provenance,
-    ),
+    ...deploymentVariables(target, signingKeyId, authorityProfile),
     ...(options.transitionServiceBinding === undefined
       ? {}
       : {
@@ -107,7 +126,7 @@ export function effectiveSigningKeyId(target: DeployTarget): string {
 export function deploymentVariables(
   target: DeployTarget,
   signingKeyId = effectiveSigningKeyId(target),
-  provenance?: PublicWorkerProvenance,
+  authorityProfile?: WorkerVersionAuthorityProfile,
 ): Record<string, unknown> {
   const vars: Record<string, string> = {
     PUBLIC_ORIGIN: target.publicOrigin,
@@ -150,11 +169,16 @@ export function deploymentVariables(
   if (target.operatorIdentity !== undefined) {
     vars.OPERATOR_IDENTITY_PUBLIC_JWK = JSON.stringify(target.operatorIdentity.publicJwk);
   }
-  if (target.integrationE2eCredentialAuthority !== undefined) {
+  if (
+    target.integrationE2eCredentialAuthority !== undefined &&
+    authorityProfile?.kind !== "historical-pre-jit"
+  ) {
     if (target.environment !== "integration") {
       throw preflightError("integration E2E credential authority config is integration-only");
     }
-    const exact = exactPublicWorkerProvenance(provenance);
+    const exact = exactPublicWorkerProvenance(
+      authorityProfile?.kind === "provenance-bound-jit" ? authorityProfile.provenance : undefined,
+    );
     vars.TAKOSERVER_ENVIRONMENT = "integration";
     vars.TAKOSERVER_INTEGRATION_E2E_API_KEY_PUBLIC_JWK = JSON.stringify(
       target.integrationE2eCredentialAuthority.publicJwk,
@@ -180,14 +204,6 @@ function exactPublicWorkerProvenance(
     );
   }
   return value;
-}
-
-function withoutIntegrationE2eCredentialAuthority(target: DeployTarget): DeployTarget {
-  const {
-    integrationE2eCredentialAuthority: _integrationE2eCredentialAuthority,
-    ...withoutAuthority
-  } = target;
-  return withoutAuthority;
 }
 
 /** Names only; Cloudflare never returns or receives secret bytes here. */

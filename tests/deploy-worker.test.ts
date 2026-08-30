@@ -426,6 +426,7 @@ describe("split Takoserver Worker surfaces", () => {
           action: "status",
           environment: "integration",
           commit: COMMIT,
+          legacyPredecessorVersionId: VERSION_BEFORE,
         },
         authorityTarget,
         {
@@ -464,6 +465,7 @@ describe("split Takoserver Worker surfaces", () => {
           action: "apply",
           environment: "integration",
           commit: COMMIT,
+          legacyPredecessorVersionId: VERSION_BEFORE,
         },
         authorityTarget,
         {
@@ -497,6 +499,102 @@ describe("split Takoserver Worker surfaces", () => {
       });
       expect(JSON.stringify(config)).not.toContain("private-material");
       expect(process.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("JIT target rejects a historical-shaped current Version without an explicit historical selector", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-worker-jit-no-selector-"));
+    const authorityTarget = {
+      ...target,
+      integrationE2eCredentialAuthority: {
+        organizationId: INTEGRATION_E2E_ORGANIZATION_ID,
+        publicJwk: { kty: "OKP", crv: "Ed25519", x: "E".repeat(43) },
+      },
+    } satisfies DeployTarget;
+    try {
+      const process = fixture({ diff: "src/auth.ts\n" });
+      const failure = await runWorker(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        authorityTarget,
+        {
+          ...process,
+          outputDirectory: root,
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          signingDatabase: signingDatabase(`${"F".repeat(42)}A`),
+        },
+      ).catch((error) => error);
+
+      expect(failure).toBeInstanceOf(DeployError);
+      expect(failure.phase).toBe("preflight");
+      expect(failure.message).toContain("does not declare the TAKOSERVER_ENVIRONMENT binding");
+      expect(process.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("JIT target rejects wrong provenance exactly once without retrying through a stripped target", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-worker-jit-wrong-provenance-"));
+    const authorityTarget = {
+      ...target,
+      integrationE2eCredentialAuthority: {
+        organizationId: INTEGRATION_E2E_ORGANIZATION_ID,
+        publicJwk: { kty: "OKP", crv: "Ed25519", x: "E".repeat(43) },
+      },
+    } satisfies DeployTarget;
+    try {
+      const process = fixture({ diff: "src/catalog.ts\n" });
+      const base = process.state;
+      let workerVersionReads = 0;
+      const state: WorkerState = {
+        ...base,
+        async workerVersion(workerName, versionId) {
+          if (versionId !== VERSION_BEFORE) return await base.workerVersion(workerName, versionId);
+          workerVersionReads += 1;
+          const value = versionForTarget(
+            versionId,
+            `takoserver-worker:${LIVE_COMMIT}:${"c".repeat(64)}`,
+            authorityTarget,
+          );
+          const source = value.resources.bindings.find(
+            (binding) => binding.name === "TAKOSERVER_SOURCE_COMMIT",
+          ) as { readonly name: string; readonly type: string; text?: string } | undefined;
+          if (!source) throw new Error("missing JIT source binding");
+          source.text = OTHER_COMMIT;
+          return value;
+        },
+      };
+      const failure = await runWorker(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        authorityTarget,
+        {
+          ...process,
+          state,
+          outputDirectory: root,
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          signingDatabase: signingDatabase(`${"F".repeat(42)}A`),
+        },
+      ).catch((error) => error);
+
+      expect(failure).toBeInstanceOf(DeployError);
+      expect(failure.phase).toBe("preflight");
+      expect(failure.message).toContain("binds TAKOSERVER_SOURCE_COMMIT with unexpected text");
+      expect(workerVersionReads).toBe(1);
+      expect(process.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -905,7 +1003,7 @@ describe("split Takoserver Worker surfaces", () => {
       ).catch((error) => error);
       expect(failure).toBeInstanceOf(DeployError);
       expect(failure.phase).toBe("preflight");
-      expect(failure.message).toContain("exact commit and artifact annotation");
+      expect(failure.message).toContain("non-canonical annotation inventory");
       expect(current.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1291,7 +1389,7 @@ describe("split Takoserver Worker surfaces", () => {
       ).catch((error) => error);
       expect(failure).toBeInstanceOf(DeployError);
       expect(failure.phase).toBe("verification");
-      expect(failure.message).toContain("exact commit and artifact annotation");
+      expect(failure.message).toContain("non-canonical annotation inventory");
       expect(current.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1342,7 +1440,7 @@ describe("split Takoserver Worker surfaces", () => {
         },
       ).catch((error) => error);
       expect(second).toBeInstanceOf(DeployError);
-      expect(second.message).toContain("exact commit and artifact annotation");
+      expect(second.message).toContain("non-canonical annotation inventory");
       expect(current.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1390,7 +1488,14 @@ function version(
   const expected = expectedExactBindingClosure(target);
   return {
     id,
-    ...(message === null ? {} : { annotations: { "workers/message": message } }),
+    ...(message === null
+      ? {}
+      : {
+          annotations: {
+            "workers/message": message,
+            "workers/triggered_by": "version_upload",
+          },
+        }),
     resources: {
       bindings: Object.entries(expected).flatMap(([name, requirement]) => {
         if (requirement === null) return [];
@@ -1410,15 +1515,21 @@ function versionForTarget(id: string, message: string, selectedTarget: DeployTar
     ...(selectedTarget.integrationE2eCredentialAuthority === undefined
       ? {}
       : {
-          provenance: {
-            sourceCommit: match[1] as string,
-            artifactDigest: `sha256:${match[2]}` as const,
+          authorityProfile: {
+            kind: "provenance-bound-jit" as const,
+            provenance: {
+              sourceCommit: match[1] as string,
+              artifactDigest: `sha256:${match[2]}` as const,
+            },
           },
         }),
   });
   return {
     id,
-    annotations: { "workers/message": message },
+    annotations: {
+      "workers/message": message,
+      "workers/triggered_by": "version_upload",
+    },
     resources: {
       bindings: Object.entries(expected).flatMap(([name, requirement]) =>
         requirement === null ? [] : [{ name, type: requirement.type, ...requirement.fields }],

@@ -54,6 +54,7 @@ describe("Takoserver split deploy entrypoint", () => {
       surfaces: {
         surface: string;
         triggers: readonly string[];
+        requiresEnv: readonly string[];
         obligations: Record<string, string>;
       }[];
     };
@@ -130,6 +131,25 @@ describe("Takoserver split deploy entrypoint", () => {
       }
       expect(JSON.stringify(surface)).not.toContain("ledger");
       expect(JSON.stringify(surface)).not.toContain("--plan");
+    }
+  });
+
+  test("mentions every requiresEnv name in that surface's own obligations", async () => {
+    const probe = await deploy(["--contract"]);
+    expect(probe.exitCode).toBe(0);
+    expect(probe.stderr).toBe("");
+    const contract = JSON.parse(probe.stdout) as {
+      surfaces: {
+        surface: string;
+        requiresEnv: readonly string[];
+        obligations: Record<string, string>;
+      }[];
+    };
+
+    for (const surface of contract.surfaces) {
+      const answers = Object.values(surface.obligations).join("\n");
+      const uncovered = surface.requiresEnv.filter((name) => !answers.includes(name));
+      expect(uncovered, `${surface.surface} has undiscoverable environment inputs`).toEqual([]);
     }
   });
 

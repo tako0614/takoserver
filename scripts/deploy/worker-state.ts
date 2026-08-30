@@ -4,7 +4,7 @@ import { runChecked, runCommand, wranglerCommand } from "./process.ts";
 import {
   deploymentVariables,
   expectedWorkerSecrets,
-  type PublicWorkerProvenance,
+  type WorkerVersionAuthorityProfile,
 } from "./realized-config.ts";
 import type { DeployTarget } from "./target.ts";
 
@@ -135,10 +135,10 @@ export function expectedExactBindingClosure(
   input: {
     readonly signingKeyId?: string;
     readonly expectedSecrets?: readonly string[];
-    readonly provenance?: PublicWorkerProvenance;
+    readonly authorityProfile?: WorkerVersionAuthorityProfile;
   } = {},
 ): ExpectedBindingClosure {
-  const vars = deploymentVariables(target, input.signingKeyId, input.provenance);
+  const vars = deploymentVariables(target, input.signingKeyId, input.authorityProfile);
   const entries = (vars.vars ?? {}) as Readonly<Record<string, string>>;
   return {
     AI: { type: "ai", fields: {} },
@@ -169,7 +169,7 @@ export function expectedLegacyPreVersionMetadataBindingClosure(
   input: {
     readonly signingKeyId?: string;
     readonly expectedSecrets?: readonly string[];
-    readonly provenance?: PublicWorkerProvenance;
+    readonly authorityProfile?: WorkerVersionAuthorityProfile;
   } = {},
 ): ExpectedBindingClosure {
   return {
@@ -186,13 +186,13 @@ export function expectedTransitionBindingClosure(
     readonly signingKeyId?: string;
     readonly expectedSecrets?: readonly string[];
     readonly metadataProfile?: WorkerVersionMetadataBindingProfile;
-    readonly provenance?: PublicWorkerProvenance;
+    readonly authorityProfile?: WorkerVersionAuthorityProfile;
   },
 ): ExpectedBindingClosure {
   const exact = expectedExactBindingClosure(target, {
     ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
     ...(input.expectedSecrets === undefined ? {} : { expectedSecrets: input.expectedSecrets }),
-    ...(input.provenance === undefined ? {} : { provenance: input.provenance }),
+    ...(input.authorityProfile === undefined ? {} : { authorityProfile: input.authorityProfile }),
   });
   return {
     ...exact,

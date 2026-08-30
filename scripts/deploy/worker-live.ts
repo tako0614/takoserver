@@ -1,5 +1,15 @@
 import { type DeployPhase, mutationError, preflightError, verificationError } from "./errors.ts";
-import { expectedWorkerSecrets } from "./realized-config.ts";
+import {
+  expectedWorkerSecrets,
+  type WorkerVersionAuthorityProfile,
+  type WorkerVersionAuthoritySelection,
+} from "./realized-config.ts";
+
+export type {
+  WorkerVersionAuthorityProfile,
+  WorkerVersionAuthoritySelection,
+} from "./realized-config.ts";
+
 import type { DeployTarget } from "./target.ts";
 import {
   assertExactSecretInventory,
@@ -18,10 +28,18 @@ import {
 
 const WORKER_MESSAGE = /^takoserver-worker:([0-9a-f]{40}):([0-9a-f]{64})$/u;
 const WORKER_VERSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const INTEGRATION_E2E_AUTHORITY_BINDINGS = [
+  "TAKOSERVER_ENVIRONMENT",
+  "TAKOSERVER_INTEGRATION_E2E_API_KEY_PUBLIC_JWK",
+  "TAKOSERVER_INTEGRATION_E2E_ORGANIZATION_ID",
+  "TAKOSERVER_SOURCE_COMMIT",
+  "TAKOSERVER_WORKER_ARTIFACT_DIGEST",
+] as const;
 
 export const LEGACY_UNATTRIBUTED_PREDECESSOR = "legacy-unattributed-predecessor" as const;
 export const LEGACY_PRE_VERSION_METADATA_PROFILE = "pre-version-metadata" as const;
 
+/** Exact authority-bearing binding shape carried by an immutable Version. */
 export interface WorkerState {
   workerDomains(): Promise<readonly { readonly hostname: string; readonly service: string }[]>;
   workerDeployments(workerName: string): Promise<readonly unknown[]>;
@@ -89,6 +107,8 @@ export async function inspectLiveWorkerVersionForRetirement(
     readonly expectedInventorySecrets?: readonly string[];
     readonly expectedVersionId?: string;
     readonly signingKeyId?: string;
+    /** Historical legacy Versions must explicitly use the pre-JIT profile. */
+    readonly authorityProfile?: WorkerVersionAuthoritySelection;
   },
 ): Promise<RetirementLiveWorkerVersion> {
   const history = parseWorkerDeploymentHistory(
@@ -106,6 +126,12 @@ export async function inspectLiveWorkerVersionForRetirement(
   const version = await state.workerVersion(target.workerName, history.versionId);
   const metadataProfile = workerVersionMetadataBindingProfile(phase, history.versionId, version);
   const identity = canonicalWorkerVersionIdentityOrLegacy(phase, version);
+  const authorityProfile = resolveAuthorityProfile(
+    phase,
+    target,
+    input.authorityProfile,
+    identity.kind === "canonical" ? identity : null,
+  );
   assertExactVersionBindingClosure(
     phase,
     history.versionId,
@@ -115,14 +141,7 @@ export async function inspectLiveWorkerVersionForRetirement(
       expectedSecrets: input.expectedSecrets,
       metadataProfile,
       ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
-      ...(identity.kind === "canonical"
-        ? {
-            provenance: {
-              sourceCommit: identity.commit,
-              artifactDigest: `sha256:${identity.bundleDigestHex}` as const,
-            },
-          }
-        : {}),
+      ...(authorityProfile === undefined ? {} : { authorityProfile }),
     }),
   );
   const inventorySecrets = input.expectedInventorySecrets ?? input.expectedSecrets;
@@ -164,6 +183,8 @@ export async function inspectLiveWorkerVersion(
     readonly signingKeyId?: string;
     readonly expectedSecrets?: readonly string[];
     readonly secretInventory?: readonly unknown[];
+    /** JIT-enabled targets must select the immutable Version's exact profile. */
+    readonly authorityProfile?: WorkerVersionAuthoritySelection;
   },
 ): Promise<LiveWorkerVersion> {
   const inspected = await inspectLiveWorkerVersionCore(phase, target, state, input, "strict");
@@ -187,6 +208,12 @@ export async function inspectCanonicalWorkerVersionWithScriptIdentity(
     readonly expectedSecrets?: readonly string[];
     readonly selectedCommit?: string;
     readonly secretInventory?: readonly unknown[];
+    /**
+     * JIT-enabled targets must select the exact authority profile for this
+     * immutable Version. Historical C predecessors pass the explicit
+     * pre-JIT profile; newly uploaded canonical Versions pass provenance.
+     */
+    readonly authorityProfile?: WorkerVersionAuthoritySelection;
   },
 ): Promise<CanonicalWorkerVersionWithScriptIdentity> {
   const chain = strictTransitionChain(phase, await state.workerDeployments(target.workerName));
@@ -196,6 +223,8 @@ export async function inspectCanonicalWorkerVersionWithScriptIdentity(
   }
   const history = historyFromChain(phase, chain);
   const version = await state.workerVersion(target.workerName, current.versionId);
+  const identity = canonicalWorkerVersionIdentity(phase, current.versionId, version);
+  const authorityProfile = resolveAuthorityProfile(phase, target, input.authorityProfile, identity);
   assertExactVersionBindingClosure(
     phase,
     current.versionId,
@@ -203,9 +232,9 @@ export async function inspectCanonicalWorkerVersionWithScriptIdentity(
     expectedExactBindingClosure(target, {
       ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
       ...(input.expectedSecrets === undefined ? {} : { expectedSecrets: input.expectedSecrets }),
+      ...(authorityProfile === undefined ? {} : { authorityProfile }),
     }),
   );
-  const identity = canonicalWorkerVersionIdentity(phase, current.versionId, version);
   if (input.selectedCommit !== undefined && identity.commit !== input.selectedCommit) {
     throw phaseError(phase, "canonical Worker predecessor does not match the selected commit");
   }
@@ -247,6 +276,8 @@ export async function inspectSecretCreatedDirectSuccessor(
     readonly expectedPredecessorVersionId?: string;
     readonly expectedSuccessorVersionId?: string;
     readonly secretInventory?: readonly unknown[];
+    /** Required for a JIT-enabled target; pre-JIT is an explicit historical profile. */
+    readonly authorityProfile?: WorkerVersionAuthoritySelection;
   },
 ): Promise<SecretCreatedDirectSuccessor> {
   return await inspectSecretCreatedTransition(phase, target, state, {
@@ -273,6 +304,8 @@ export async function inspectSecretCreatedLineage(
     readonly signingKeyId?: string;
     readonly selectedCommit?: string;
     readonly secretInventory?: readonly unknown[];
+    /** Required for a JIT-enabled target; pre-JIT is an explicit historical profile. */
+    readonly authorityProfile?: WorkerVersionAuthoritySelection;
   },
 ): Promise<SecretCreatedDirectSuccessor> {
   return await inspectSecretCreatedTransition(phase, target, state, {
@@ -286,6 +319,7 @@ type SecretCreatedTransitionInput = {
   readonly signingKeyId?: string;
   readonly selectedCommit?: string;
   readonly secretInventory?: readonly unknown[];
+  readonly authorityProfile?: WorkerVersionAuthoritySelection;
 } & (
   | {
       readonly profile: "current-successor";
@@ -376,23 +410,38 @@ async function inspectSecretCreatedTransition(
   const predecessorSecrets = desiredSecrets.filter((name) => name !== input.addedSecret);
   const predecessorVersion = await state.workerVersion(target.workerName, predecessorVersionId);
   const successorVersion = await state.workerVersion(target.workerName, successorVersionId);
+  const predecessorIdentity = canonicalWorkerVersionIdentity(
+    phase,
+    predecessorVersionId,
+    predecessorVersion,
+  );
+  const authorityProfile = resolveAuthorityProfile(
+    phase,
+    target,
+    input.authorityProfile,
+    predecessorIdentity,
+  );
   const bindingInput = input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId };
+  const profileInput = authorityProfile === undefined ? {} : { authorityProfile };
   assertExactVersionBindingClosure(
     phase,
     predecessorVersionId,
     predecessorVersion,
-    expectedExactBindingClosure(target, { ...bindingInput, expectedSecrets: predecessorSecrets }),
+    expectedExactBindingClosure(target, {
+      ...bindingInput,
+      expectedSecrets: predecessorSecrets,
+      ...profileInput,
+    }),
   );
   assertExactVersionBindingClosure(
     phase,
     successorVersionId,
     successorVersion,
-    expectedExactBindingClosure(target, { ...bindingInput, expectedSecrets: desiredSecrets }),
-  );
-  const predecessorIdentity = canonicalWorkerVersionIdentity(
-    phase,
-    predecessorVersionId,
-    predecessorVersion,
+    expectedExactBindingClosure(target, {
+      ...bindingInput,
+      expectedSecrets: desiredSecrets,
+      ...profileInput,
+    }),
   );
   if (input.selectedCommit !== undefined && predecessorIdentity.commit !== input.selectedCommit) {
     throw phaseError(phase, "secret-created predecessor does not match the selected commit");
@@ -453,6 +502,8 @@ export async function inspectLiveWorkerVersionWithLegacyPredecessor(
     readonly expectedSecrets?: readonly string[];
     readonly legacyPredecessorVersionId: string;
     readonly secretInventory?: readonly unknown[];
+    /** Historical predecessor or newly uploaded JIT profile, selected by caller. */
+    readonly authorityProfile?: WorkerVersionAuthoritySelection;
   },
 ): Promise<LiveWorkerVersion | LegacyLiveWorkerVersion> {
   if (!isWorkerVersionId(input.legacyPredecessorVersionId)) {
@@ -475,6 +526,8 @@ export async function inspectLiveWorkerVersionForLegacyStatus(
     readonly expectedSecrets?: readonly string[];
     readonly legacyPredecessorVersionId: string;
     readonly secretInventory?: readonly unknown[];
+    /** Historical predecessor or newly uploaded JIT profile, selected by caller. */
+    readonly authorityProfile?: WorkerVersionAuthoritySelection;
   },
 ): Promise<LiveWorkerVersion | LegacyLiveWorkerVersion> {
   if (!isWorkerVersionId(input.legacyPredecessorVersionId)) {
@@ -492,6 +545,7 @@ async function inspectLiveWorkerVersionCore(
     readonly expectedSecrets?: readonly string[];
     readonly legacyPredecessorVersionId?: string;
     readonly secretInventory?: readonly unknown[];
+    readonly authorityProfile?: WorkerVersionAuthoritySelection;
   },
   mode: "strict" | "pinned-current" | "status-reconciliation",
 ): Promise<LiveWorkerVersion | LegacyLiveWorkerVersion> {
@@ -530,21 +584,29 @@ async function inspectLiveWorkerVersionCore(
     mode !== "strict" && selectorIsCurrent && metadataBindingProfile === "pre-version-metadata"
       ? LEGACY_PRE_VERSION_METADATA_PROFILE
       : null;
+  if (
+    legacyPredecessorProfile === null &&
+    workerVersionAnnotationProfile(version) !== "canonical"
+  ) {
+    throw phaseError(
+      phase,
+      `version ${history.versionId} has a non-canonical annotation inventory`,
+    );
+  }
   const identity =
     legacyPredecessorProfile === null
       ? { kind: "canonical" as const, ...workerVersionIdentity(phase, version) }
       : workerVersionIdentityOrLegacy(phase, version);
+  const authorityProfile = resolveAuthorityProfile(
+    phase,
+    target,
+    input.authorityProfile,
+    identity.kind === "canonical" ? identity : null,
+  );
   const bindingInput = {
     ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
     ...(input.expectedSecrets === undefined ? {} : { expectedSecrets: input.expectedSecrets }),
-    ...(identity.kind === "canonical"
-      ? {
-          provenance: {
-            sourceCommit: identity.commit,
-            artifactDigest: `sha256:${identity.bundleDigestHex}` as const,
-          },
-        }
-      : {}),
+    ...(authorityProfile === undefined ? {} : { authorityProfile }),
   } as const;
   assertExactVersionBindingClosure(
     phase,
@@ -631,6 +693,60 @@ export function workerVersionAnnotationProfile(value: unknown): WorkerVersionAnn
   return "other";
 }
 
+/**
+ * Classifies the exact public JIT authority binding shape on one immutable
+ * Version. A target with JIT enabled may inspect only the complete five-name
+ * profile; an absent profile is accepted solely for an explicitly historical
+ * pre-JIT inspection.
+ */
+export type WorkerVersionAuthorityBindingShape = "historical-pre-jit" | "provenance-bound-jit";
+
+/** Selects the explicit historical profile for a legacy Version on a JIT target. */
+export function historicalWorkerVersionAuthorityProfile(
+  target: DeployTarget,
+): WorkerVersionAuthorityProfile | undefined {
+  return target.integrationE2eCredentialAuthority === undefined
+    ? undefined
+    : { kind: "historical-pre-jit" };
+}
+
+export function workerVersionAuthorityBindingShape(
+  phase: DeployPhase,
+  versionId: string,
+  value: unknown,
+): WorkerVersionAuthorityBindingShape {
+  if (!isRecord(value) || !isRecord(value.resources) || !Array.isArray(value.resources.bindings)) {
+    throw phaseError(phase, `version ${versionId} has no canonical binding inventory`);
+  }
+  const actual = value.resources.bindings.map((entry) => {
+    if (!isRecord(entry)) return null;
+    return typeof entry.name === "string"
+      ? entry.name
+      : typeof entry.binding === "string"
+        ? entry.binding
+        : null;
+  });
+  if (actual.some((name) => name === null)) {
+    throw phaseError(phase, `version ${versionId} has an unnamed binding`);
+  }
+  const jit = actual.filter(
+    (name): name is string =>
+      typeof name === "string" &&
+      (INTEGRATION_E2E_AUTHORITY_BINDINGS as readonly string[]).includes(name),
+  );
+  if (jit.length === 0) return "historical-pre-jit";
+  if (
+    jit.length === INTEGRATION_E2E_AUTHORITY_BINDINGS.length &&
+    new Set(jit).size === INTEGRATION_E2E_AUTHORITY_BINDINGS.length
+  ) {
+    return "provenance-bound-jit";
+  }
+  throw phaseError(
+    phase,
+    `version ${versionId} has a partial integration E2E authority binding profile`,
+  );
+}
+
 function canonicalWorkerVersionIdentity(
   phase: DeployPhase,
   versionId: string,
@@ -640,6 +756,43 @@ function canonicalWorkerVersionIdentity(
     throw phaseError(phase, `version ${versionId} has a non-canonical annotation inventory`);
   }
   return workerVersionIdentity(phase, value);
+}
+
+function resolveAuthorityProfile(
+  phase: DeployPhase,
+  target: DeployTarget,
+  selection: WorkerVersionAuthoritySelection | undefined,
+  identity: { readonly commit: string; readonly bundleDigestHex: string } | null,
+): WorkerVersionAuthorityProfile | undefined {
+  if (target.integrationE2eCredentialAuthority === undefined) {
+    // A profile is meaningful only when the realized target carries the JIT
+    // authority surface. Keep ordinary non-JIT inspectors backward-compatible
+    // when a caller shares a profile-bearing proof path across environments.
+    return undefined;
+  }
+  if (selection === undefined) {
+    throw phaseError(
+      phase,
+      "JIT-enabled inspection requires an explicit authority binding profile selection",
+    );
+  }
+  if (selection.kind === "historical-pre-jit") return selection;
+  if (selection.provenance !== undefined) {
+    return { kind: "provenance-bound-jit", provenance: selection.provenance };
+  }
+  if (identity === null) {
+    throw phaseError(
+      phase,
+      "provenance-bound JIT inspection requires a canonical Version annotation",
+    );
+  }
+  return {
+    kind: "provenance-bound-jit",
+    provenance: {
+      sourceCommit: identity.commit,
+      artifactDigest: `sha256:${identity.bundleDigestHex}` as const,
+    },
+  };
 }
 
 function assertSecretCreatedAnnotation(

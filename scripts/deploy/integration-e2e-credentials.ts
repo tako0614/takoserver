@@ -103,7 +103,7 @@ export async function runIntegrationE2eCredentials(
       main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
       commit: invocation.commit,
       signingKeyId: target.signing.currentKeyId,
-      omitIntegrationE2eCredentialAuthority: true,
+      authorityProfile: { kind: "historical-pre-jit" },
     });
     const signingDatabase =
       options.signingDatabase ?? createRemoteSigningDatabase(inspectionConfig, environment, run);
@@ -112,7 +112,9 @@ export async function runIntegrationE2eCredentials(
       authority.publicJwk.x,
       signingDatabase,
     );
-    const live = await inspectLiveWorkerVersion("preflight", target, state, {});
+    const live = await inspectLiveWorkerVersion("preflight", target, state, {
+      authorityProfile: { kind: "provenance-bound-jit" },
+    });
     assertSelectedLiveCommit(invocation.commit, live);
 
     const reviewer =
@@ -132,7 +134,9 @@ export async function runIntegrationE2eCredentials(
     const exactLive =
       invocation.action === "status"
         ? live
-        : await inspectLiveWorkerVersion("preflight", target, state, {});
+        : await inspectLiveWorkerVersion("preflight", target, state, {
+            authorityProfile: { kind: "provenance-bound-jit" },
+          });
     assertSameLiveVersion(live, exactLive);
     if (invocation.action !== "status") {
       const lastSigningIdentity = await requireDistinctRuntimeSigningIdentity(

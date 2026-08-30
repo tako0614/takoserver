@@ -257,12 +257,19 @@ async function inspectIdentityState(
   }
   const version = await state.workerVersion(target.workerName, history.versionId);
   const identity = workerVersionIdentity(phase, version);
+  const authorityProfile =
+    target.integrationE2eCredentialAuthority === undefined
+      ? undefined
+      : {
+          kind: "provenance-bound-jit" as const,
+          provenance: {
+            sourceCommit: identity.commit,
+            artifactDigest: `sha256:${identity.bundleDigestHex}` as const,
+          },
+        };
   const desired = expectedExactBindingClosure(target, {
     signingKeyId: target.signing.currentKeyId,
-    provenance: {
-      sourceCommit: identity.commit,
-      artifactDigest: `sha256:${identity.bundleDigestHex}`,
-    },
+    ...(authorityProfile === undefined ? {} : { authorityProfile }),
   });
   let configured = true;
   try {
@@ -275,10 +282,7 @@ async function inspectIdentityState(
       version,
       expectedExactBindingClosure(withoutOperatorIdentity(target), {
         signingKeyId: target.signing.currentKeyId,
-        provenance: {
-          sourceCommit: identity.commit,
-          artifactDigest: `sha256:${identity.bundleDigestHex}`,
-        },
+        ...(authorityProfile === undefined ? {} : { authorityProfile }),
       }),
     );
   }

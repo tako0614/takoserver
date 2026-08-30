@@ -31,7 +31,10 @@ import {
   isWorkerVersionId,
   type RetirementLiveWorkerVersion,
   type WorkerState,
+  type WorkerVersionAuthorityBindingShape,
+  type WorkerVersionAuthorityProfile,
   workerVersionAnnotationProfile,
+  workerVersionAuthorityBindingShape,
   workerVersionScriptContentIdentity,
 } from "./worker-live.ts";
 import {
@@ -178,6 +181,8 @@ export async function runAuthorityTransition(
         service,
         hostedVersionSecrets(target),
         hostedVersionSecrets(target),
+        undefined,
+        historicalAuthorityProfile(target),
       );
       return {
         kind: "takoserver.worker-authority-transition-status@v1",
@@ -218,6 +223,8 @@ export async function runAuthorityTransition(
       service,
       hostedVersionSecrets(target),
       hostedVersionSecrets(target),
+      undefined,
+      historicalAuthorityProfile(target),
     );
     const source = await qualifySource({
       environment: invocation.environment === "integration" ? "integration" : "production",
@@ -276,6 +283,7 @@ export async function runAuthorityTransition(
       hostedVersionSecrets(target),
       hostedVersionSecrets(target),
       freshVersion,
+      historicalAuthorityProfile(target),
     );
     const upload = await run(
       wranglerCommand([
@@ -311,6 +319,13 @@ export async function runAuthorityTransition(
       service,
       hostedVersionSecrets(target),
       hostedVersionSecrets(target),
+      undefined,
+      provenanceBoundAuthorityProfile(
+        "verification",
+        target,
+        source.commit,
+        prepared.bundleDigestHex,
+      ),
     );
     if (after.commit !== source.commit || after.bundleDigestHex !== prepared.bundleDigestHex) {
       throw verificationError(
@@ -364,6 +379,7 @@ async function authorityCandidateStatus(
     previous,
     service,
     hostedVersionSecrets(target),
+    historicalAuthorityProfile(target),
   );
   const candidate = await inspectRetirementVersionAt(
     "preflight",
@@ -373,6 +389,8 @@ async function authorityCandidateStatus(
     service,
     hostedVersionSecrets(target),
     hostedVersionSecrets(target),
+    undefined,
+    await requireCurrentAuthorityProfileAt("preflight", target, state, history.versionId),
   );
   if (candidate.commit !== invocation.commit) {
     throw preflightError(
@@ -410,6 +428,7 @@ async function reverseAuthority(
   if (selector === undefined || current.previousVersionId !== selector) {
     throw preflightError("authority transition reverse requires the pinned direct predecessor");
   }
+  const historicalProfile = historicalAuthorityProfile(target);
   const candidate = await inspectRetirementVersionAt(
     "preflight",
     target,
@@ -418,6 +437,8 @@ async function reverseAuthority(
     service,
     hostedVersionSecrets(target),
     hostedVersionSecrets(target),
+    undefined,
+    await requireCurrentAuthorityProfileAt("preflight", target, state, current.versionId),
   );
   if (candidate.commit !== invocation.commit) {
     throw preflightError("authority transition reverse requires the selected candidate commit");
@@ -431,6 +452,7 @@ async function reverseAuthority(
     predecessor,
     service,
     hostedVersionSecrets(target),
+    historicalAuthorityProfile(target),
   );
   const configPath = writeWorkerConfig(target, {
     path: join(root, "retirement-reverse-wrangler.jsonc"),
@@ -439,7 +461,7 @@ async function reverseAuthority(
     signingKeyId: target.signing.currentKeyId,
     transitionServiceBinding: service,
     transitionExpectedSecrets: hostedVersionSecrets(target),
-    omitIntegrationE2eCredentialAuthority: true,
+    ...(historicalProfile === undefined ? {} : { authorityProfile: historicalProfile }),
   });
   const mutation = await run(
     wranglerCommand([
@@ -472,6 +494,8 @@ async function reverseAuthority(
     service,
     hostedVersionSecrets(target),
     hostedVersionSecrets(target),
+    undefined,
+    historicalAuthorityProfile(target),
   );
   return {
     kind: "takoserver.worker-authority-transition-reverse@v1",
@@ -505,6 +529,30 @@ async function runTopologyRetirement(
     if (!topologyPresent) {
       const beforeInventory = await state.workerSecrets(target.workerName);
       const beforeHasToken = inventoryHasSecret(beforeInventory, HOSTED_SPONSORSHIP_SECRET);
+      // A topology-shaped head is either the direct T successor of C or the
+      // bounded T' successor of an already token-retired R. Select the
+      // trusted canonical predecessor by that lineage position, never by the
+      // current Version's annotation inventory. In the ordinary C -> T
+      // suffix, C is the direct predecessor; in the T' -> R -> T extension,
+      // R is unannotated and T is the second ancestor.
+      const directPredecessor =
+        beforeHistory.previousVersionId === null
+          ? undefined
+          : await readVersionAt("preflight", target, state, beforeHistory.previousVersionId);
+      const trustedAncestorDistance: 1 | 2 =
+        beforeHasToken &&
+        directPredecessor !== undefined &&
+        !hasMaterializerBinding(directPredecessor)
+          ? 2
+          : 1;
+      const beforeAuthorityProfile = await requireProviderSuccessorAuthorityProfileAt(
+        "preflight",
+        target,
+        state,
+        beforeHistory,
+        trustedAncestorDistance,
+        "provenance-bound-jit",
+      );
       const before = await inspectRetirementVersionAt(
         "preflight",
         target,
@@ -513,6 +561,8 @@ async function runTopologyRetirement(
         null,
         beforeHasToken ? hostedVersionSecrets(target) : baseWorkerSecrets(target),
         beforeHasToken ? hostedVersionSecrets(target) : baseWorkerSecrets(target),
+        undefined,
+        beforeAuthorityProfile,
       );
       if (invocation.action === "status") {
         if (!beforeHasToken) {
@@ -527,6 +577,7 @@ async function runTopologyRetirement(
           beforeHistory,
           before,
           selector,
+          beforeAuthorityProfile,
         );
         const predecessorId = candidate.versionId;
         if (
@@ -565,6 +616,7 @@ async function runTopologyRetirement(
         beforeHistory,
         before,
         selector,
+        beforeAuthorityProfile,
       );
       return await reverseTopology(
         invocation,
@@ -579,12 +631,24 @@ async function runTopologyRetirement(
         options,
         candidate.versionId,
         selector,
+        beforeAuthorityProfile,
       );
     }
     const service = extractLegacyHostServiceBinding(
       "preflight",
       beforeHistory.versionId,
       beforeVersion,
+    );
+    // C is the fresh candidate successor of the pinned historical L. Select
+    // C's JIT provenance from L's canonical identity, while independently
+    // requiring L to carry the explicit historical binding shape.
+    const beforeAuthorityProfile = await requireProviderSuccessorAuthorityProfileAt(
+      "preflight",
+      target,
+      state,
+      beforeHistory,
+      1,
+      "historical-pre-jit",
     );
     const before = await inspectRetirementVersionAt(
       "preflight",
@@ -594,6 +658,8 @@ async function runTopologyRetirement(
       service,
       hostedVersionSecrets(target),
       hostedVersionSecrets(target),
+      undefined,
+      beforeAuthorityProfile,
     );
     const directPredecessorId = beforeHistory.previousVersionId;
     if (directPredecessorId !== null) {
@@ -611,6 +677,7 @@ async function runTopologyRetirement(
           beforeHistory,
           before,
           selector,
+          beforeAuthorityProfile,
         );
         if (invocation.action === "status") {
           return {
@@ -647,6 +714,7 @@ async function runTopologyRetirement(
       target,
       state,
       beforeHistory,
+      historicalAuthorityProfile(target),
     );
     if (predecessor.service !== service.service || predecessor.entrypoint !== service.entrypoint) {
       throw preflightError(
@@ -723,6 +791,7 @@ async function runTopologyRetirement(
       service,
       hostedVersionSecrets(target),
       hostedVersionSecrets(target),
+      await requireCurrentAuthorityProfileAt("preflight", target, state, beforeHistory.versionId),
     );
     await assertPinnedLineage(
       "preflight",
@@ -738,6 +807,7 @@ async function runTopologyRetirement(
       target,
       state,
       fresh.history,
+      historicalAuthorityProfile(target),
     );
     if (
       freshPredecessor.service !== service.service ||
@@ -779,6 +849,13 @@ async function runTopologyRetirement(
       null,
       hostedVersionSecrets(target),
       hostedVersionSecrets(target),
+      undefined,
+      provenanceBoundAuthorityProfile(
+        "verification",
+        target,
+        source.commit,
+        prepared.bundleDigestHex,
+      ),
     );
     if (after.commit !== before.commit || after.bundleDigestHex !== before.bundleDigestHex) {
       throw verificationError(
@@ -823,6 +900,7 @@ async function reverseTopology(
   options: RetirementOptions,
   candidateVersionId: string | undefined,
   selector: string,
+  authorityProfile: WorkerVersionAuthorityProfile | undefined,
 ): Promise<Record<string, unknown>> {
   const predecessorId = candidateVersionId ?? beforeHistory.previousVersionId;
   if (predecessorId === null) {
@@ -838,11 +916,13 @@ async function reverseTopology(
     hostedVersionSecrets(target),
     hostedVersionSecrets(target),
     predecessor,
+    authorityProfile,
   );
   const candidate = await previous;
   if (candidate.commit !== before.commit || candidate.bundleDigestHex !== before.bundleDigestHex) {
     throw preflightError("topology retirement reverse predecessor identity is not byte-identical");
   }
+  const historicalProfile = historicalAuthorityProfile(target);
   const configPath = writeWorkerConfig(target, {
     path: join(root, "topology-reverse-wrangler.jsonc"),
     main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
@@ -850,7 +930,7 @@ async function reverseTopology(
     signingKeyId: target.signing.currentKeyId,
     transitionServiceBinding: service,
     transitionExpectedSecrets: hostedVersionSecrets(target),
-    omitIntegrationE2eCredentialAuthority: true,
+    ...(historicalProfile === undefined ? {} : { authorityProfile: historicalProfile }),
   });
   const fresh = await assertCurrentRetirementState(
     "preflight",
@@ -861,6 +941,7 @@ async function reverseTopology(
     null,
     hostedVersionSecrets(target),
     hostedVersionSecrets(target),
+    authorityProfile,
   );
   const freshCandidate = await topologyReverseCandidate(
     "preflight",
@@ -869,6 +950,7 @@ async function reverseTopology(
     fresh.history,
     fresh,
     selector,
+    authorityProfile,
   );
   if (freshCandidate.versionId !== predecessorId) {
     throw preflightError("topology retirement reverse candidate changed before mutation");
@@ -910,6 +992,8 @@ async function reverseTopology(
     service,
     hostedVersionSecrets(target),
     hostedVersionSecrets(target),
+    undefined,
+    authorityProfile,
   );
   return {
     kind: "takoserver.host-runtime-topology-retirement-reverse@v1",
@@ -1085,6 +1169,12 @@ async function runAttributionRepair(
       unattributedSelector,
       false,
       source.commit,
+      provenanceBoundAuthorityProfile(
+        "verification",
+        target,
+        source.commit,
+        prepared.bundleDigestHex,
+      ),
     );
     if (
       !after.currentIsRepaired ||
@@ -1117,6 +1207,12 @@ async function runAttributionRepair(
       unattributedSelector,
       false,
       source.commit,
+      provenanceBoundAuthorityProfile(
+        "verification",
+        target,
+        source.commit,
+        prepared.bundleDigestHex,
+      ),
     );
     if (
       !final.currentIsRepaired ||
@@ -1188,6 +1284,7 @@ async function inspectAttributionRepairLineage(
   unattributedSelector: string,
   requireCurrentSelector: boolean,
   expectedRepairedCommit?: string,
+  repairedAuthorityProfile?: WorkerVersionAuthorityProfile,
 ): Promise<AttributionRepairLineage> {
   const chain = await deploymentChain(phase, target, state);
   if (
@@ -1269,6 +1366,7 @@ async function inspectAttributionRepairLineage(
     legacyVersion,
     service,
     hostedVersionSecrets(target),
+    historicalAuthorityProfile(target),
   );
   assertRetirementVersionShape(
     phase,
@@ -1278,6 +1376,7 @@ async function inspectAttributionRepairLineage(
     candidateVersion,
     service,
     hostedVersionSecrets(target),
+    historicalAuthorityProfile(target),
   );
   assertRetirementVersionShape(
     phase,
@@ -1287,6 +1386,7 @@ async function inspectAttributionRepairLineage(
     topologyVersion,
     null,
     hostedVersionSecrets(target),
+    historicalAuthorityProfile(target),
   );
   assertRetirementVersionShape(
     phase,
@@ -1296,6 +1396,7 @@ async function inspectAttributionRepairLineage(
     unattributedVersion,
     null,
     baseWorkerSecrets(target),
+    historicalAuthorityProfile(target),
   );
   if (hasWorkersMessage(unattributedVersion)) {
     throw phaseError(phase, "selected R Version must have no workers/message annotation");
@@ -1337,6 +1438,15 @@ async function inspectAttributionRepairLineage(
     baseWorkerSecrets(target),
     baseWorkerSecrets(target),
     currentVersion,
+    currentIsRepaired
+      ? (repairedAuthorityProfile ??
+          requireCurrentAuthorityProfile(
+            phase,
+            target,
+            currentHistoryValue.versionId,
+            currentVersion,
+          ))
+      : historicalAuthorityProfile(target),
   );
   assertExactSecretInventory(
     await state.workerSecrets(target.workerName),
@@ -1412,6 +1522,28 @@ async function runTokenRetirement(
     }
     const beforeInventory = await state.workerSecrets(target.workerName);
     const beforeHasToken = inventoryHasSecret(beforeInventory, HOSTED_SPONSORSHIP_SECRET);
+    // Token retirement starts from topology-shaped T (direct C predecessor)
+    // or a bounded T' restoration on top of R. The direct predecessor's
+    // topology shape selects whether the trusted canonical source is one or
+    // two lineage positions back; annotations never select the profile.
+    const directPredecessorForProfile =
+      beforeHistory.previousVersionId === null
+        ? undefined
+        : await readVersionAt("preflight", target, state, beforeHistory.previousVersionId);
+    const trustedAncestorDistance: 1 | 2 =
+      beforeHasToken &&
+      directPredecessorForProfile !== undefined &&
+      !hasMaterializerBinding(directPredecessorForProfile)
+        ? 2
+        : 1;
+    const beforeAuthorityProfile = await requireProviderSuccessorAuthorityProfileAt(
+      "preflight",
+      target,
+      state,
+      beforeHistory,
+      trustedAncestorDistance,
+      "provenance-bound-jit",
+    );
     const before = await inspectRetirementVersionAt(
       "preflight",
       target,
@@ -1420,6 +1552,8 @@ async function runTokenRetirement(
       null,
       beforeHasToken ? hostedVersionSecrets(target) : baseWorkerSecrets(target),
       beforeHasToken ? hostedVersionSecrets(target) : baseWorkerSecrets(target),
+      undefined,
+      beforeAuthorityProfile,
     );
     let predecessorService: LegacyHostServiceBinding;
     let directTokenRetirement = false;
@@ -1449,6 +1583,7 @@ async function runTokenRetirement(
           target,
           state,
           beforeHistory,
+          beforeAuthorityProfile,
         );
         directTokenRetirement = true;
       } else {
@@ -1463,6 +1598,7 @@ async function runTokenRetirement(
           beforeHistory,
           before,
           selector,
+          beforeAuthorityProfile,
         );
         predecessorService = candidate.service;
         if (invocation.action !== "status") {
@@ -1479,6 +1615,7 @@ async function runTokenRetirement(
         beforeHistory,
         before,
         selector,
+        beforeAuthorityProfile,
       );
     }
     await assertPinnedSelectorVersion("preflight", target, state, selector, predecessorService);
@@ -1515,13 +1652,14 @@ async function runTokenRetirement(
     const reviewer = exactReviewer(
       options.review ?? requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW"),
     );
+    const historicalProfile = historicalAuthorityProfile(target);
     const configPath = writeWorkerConfig(target, {
       path: join(root, "token-retirement-wrangler.jsonc"),
       main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
       commit: invocation.commit,
       signingKeyId: target.signing.currentKeyId,
       transitionExpectedSecrets: hostedVersionSecrets(target),
-      omitIntegrationE2eCredentialAuthority: true,
+      ...(historicalProfile === undefined ? {} : { authorityProfile: historicalProfile }),
     });
     if (!beforeHasToken) {
       throw preflightError("Hosted token retirement requires the legacy secret to be present");
@@ -1540,6 +1678,7 @@ async function runTokenRetirement(
       null,
       hostedVersionSecrets(target),
       hostedVersionSecrets(target),
+      beforeAuthorityProfile,
     );
     await assertPinnedLineage(
       "preflight",
@@ -1555,6 +1694,7 @@ async function runTokenRetirement(
       target,
       state,
       fresh.history,
+      beforeAuthorityProfile,
     );
     if (
       freshPredecessorService.service !== predecessorService.service ||
@@ -1594,6 +1734,14 @@ async function runTokenRetirement(
     ) {
       throw verificationError("Hosted token retirement did not create the exact direct successor");
     }
+    const afterVersion = await readVersionAt("verification", target, state, afterHistory.versionId);
+    const afterAuthorityProfile = successorAuthorityProfile(
+      "verification",
+      target,
+      before.commit === null || before.bundleDigestHex === null
+        ? null
+        : { commit: before.commit, bundleDigestHex: before.bundleDigestHex },
+    );
     const after = await inspectRetirementVersionAt(
       "verification",
       target,
@@ -1602,6 +1750,8 @@ async function runTokenRetirement(
       null,
       baseWorkerSecrets(target),
       baseWorkerSecrets(target),
+      afterVersion,
+      afterAuthorityProfile,
     );
     if (after.commit !== before.commit || after.bundleDigestHex !== before.bundleDigestHex) {
       throw verificationError("Hosted token retirement changed the served code identity");
@@ -1633,17 +1783,23 @@ function transitionConfigWriter(
   readonly bundleDigestHex?: string;
 }) => string {
   return (input) => {
+    const historicalProfile = historicalAuthorityProfile(target);
     const config: WorkerConfigOptions = {
       ...input,
       commit,
       signingKeyId: target.signing.currentKeyId,
       transitionExpectedSecrets: expectedSecrets,
       ...(input.bundleDigestHex === undefined
-        ? { omitIntegrationE2eCredentialAuthority: true as const }
+        ? historicalProfile === undefined
+          ? {}
+          : { authorityProfile: historicalProfile }
         : {
-            provenance: {
-              sourceCommit: commit,
-              artifactDigest: `sha256:${input.bundleDigestHex}` as const,
+            authorityProfile: {
+              kind: "provenance-bound-jit" as const,
+              provenance: {
+                sourceCommit: commit,
+                artifactDigest: `sha256:${input.bundleDigestHex}` as const,
+              },
             },
           }),
       ...(serviceBinding === undefined ? {} : { transitionServiceBinding: serviceBinding }),
@@ -1661,7 +1817,9 @@ async function inspectRetirementVersionAt(
   expectedVersionSecrets: readonly string[],
   expectedInventorySecrets: readonly string[],
   versionOverride?: unknown,
+  authorityProfile?: WorkerVersionAuthorityProfile,
 ): Promise<RetirementLiveWorkerVersion> {
+  const resolvedAuthorityProfile = requireExplicitAuthorityProfile(phase, target, authorityProfile);
   if (versionOverride !== undefined) {
     assertRetirementVersionShape(
       phase,
@@ -1671,6 +1829,7 @@ async function inspectRetirementVersionAt(
       versionOverride,
       expectedServiceBinding,
       expectedVersionSecrets,
+      resolvedAuthorityProfile,
     );
     const identity = versionIdentity(versionOverride);
     return {
@@ -1686,6 +1845,9 @@ async function inspectRetirementVersionAt(
     expectedSecrets: expectedVersionSecrets,
     expectedInventorySecrets,
     signingKeyId: target.signing.currentKeyId,
+    ...(resolvedAuthorityProfile === undefined
+      ? {}
+      : { authorityProfile: resolvedAuthorityProfile }),
   });
 }
 
@@ -1704,6 +1866,7 @@ async function assertCurrentRetirementState(
   expectedServiceBinding: LegacyHostServiceBinding | null,
   expectedVersionSecrets: readonly string[],
   expectedInventorySecrets: readonly string[],
+  authorityProfile?: WorkerVersionAuthorityProfile,
 ): Promise<RetirementLiveWorkerVersion> {
   const freshHistory = await currentHistory(phase, target, state);
   if (!sameDeploymentHistory(freshHistory, expectedHistory)) {
@@ -1717,6 +1880,8 @@ async function assertCurrentRetirementState(
     expectedServiceBinding,
     expectedVersionSecrets,
     expectedInventorySecrets,
+    undefined,
+    authorityProfile,
   );
   if (!sameDeploymentHistory(fresh.history, expectedHistory)) {
     throw phaseError(phase, "retirement Worker changed during pre-mutation inspection");
@@ -1749,8 +1914,10 @@ function assertRetirementVersionShape(
   version: unknown,
   expectedServiceBinding: LegacyHostServiceBinding | null,
   expectedSecrets: readonly string[],
+  authorityProfile?: WorkerVersionAuthorityProfile,
 ): void {
   const identity = versionIdentity(version);
+  const resolvedAuthorityProfile = requireExplicitAuthorityProfile(phase, target, authorityProfile);
   assertExactVersionBindingClosure(
     phase,
     versionId,
@@ -1760,13 +1927,20 @@ function assertRetirementVersionShape(
       expectedSecrets,
       metadataProfile: metadataProfileForVersion(phase, versionId, version),
       signingKeyId: target.signing.currentKeyId,
+      ...(resolvedAuthorityProfile === undefined
+        ? {}
+        : { authorityProfile: resolvedAuthorityProfile }),
       ...(identity === null
         ? {}
         : {
-            provenance: {
-              sourceCommit: identity.commit,
-              artifactDigest: `sha256:${identity.bundleDigestHex}` as const,
-            },
+            ...(resolvedAuthorityProfile === undefined
+              ? {
+                  provenance: {
+                    sourceCommit: identity.commit,
+                    artifactDigest: `sha256:${identity.bundleDigestHex}` as const,
+                  },
+                }
+              : {}),
           }),
     }),
   );
@@ -1802,6 +1976,168 @@ async function readVersionAt(
   versionId: string,
 ): Promise<unknown> {
   return await state.workerVersion(target.workerName, versionId);
+}
+
+function requireExplicitAuthorityProfile(
+  phase: DeployPhase,
+  target: DeployTarget,
+  authorityProfile: WorkerVersionAuthorityProfile | undefined,
+): WorkerVersionAuthorityProfile | undefined {
+  if (target.integrationE2eCredentialAuthority !== undefined && authorityProfile === undefined) {
+    throw phaseError(
+      phase,
+      "JIT-enabled retirement inspection requires an explicit authority profile",
+    );
+  }
+  return authorityProfile;
+}
+
+function requireCurrentAuthorityProfile(
+  phase: DeployPhase,
+  target: DeployTarget,
+  versionId: string,
+  version: unknown,
+): WorkerVersionAuthorityProfile | undefined {
+  if (target.integrationE2eCredentialAuthority === undefined) return undefined;
+  const shape = workerVersionAuthorityBindingShape(phase, versionId, version);
+  if (shape !== "provenance-bound-jit") {
+    throw phaseError(
+      phase,
+      `version ${versionId} must carry the complete provenance-bound JIT authority profile`,
+    );
+  }
+  const identity = versionIdentity(version);
+  if (identity === null) {
+    throw phaseError(
+      phase,
+      `version ${versionId} has JIT authority bindings without canonical provenance`,
+    );
+  }
+  return {
+    kind: "provenance-bound-jit",
+    provenance: {
+      sourceCommit: identity.commit,
+      artifactDigest: `sha256:${identity.bundleDigestHex}` as const,
+    },
+  };
+}
+
+function historicalAuthorityProfile(
+  target: DeployTarget,
+): WorkerVersionAuthorityProfile | undefined {
+  return target.integrationE2eCredentialAuthority === undefined
+    ? undefined
+    : { kind: "historical-pre-jit" };
+}
+
+function provenanceBoundAuthorityProfile(
+  phase: DeployPhase,
+  target: DeployTarget,
+  commit: string | null,
+  bundleDigestHex: string | null,
+): WorkerVersionAuthorityProfile | undefined {
+  if (target.integrationE2eCredentialAuthority === undefined) return undefined;
+  if (commit === null || bundleDigestHex === null) {
+    throw phaseError(
+      phase,
+      "JIT authority profile requires a trusted canonical predecessor identity",
+    );
+  }
+  return {
+    kind: "provenance-bound-jit",
+    provenance: {
+      sourceCommit: commit,
+      artifactDigest: `sha256:${bundleDigestHex}` as const,
+    },
+  };
+}
+
+async function requireCurrentAuthorityProfileAt(
+  phase: DeployPhase,
+  target: DeployTarget,
+  state: RetirementState,
+  versionId: string,
+): Promise<WorkerVersionAuthorityProfile | undefined> {
+  return requireCurrentAuthorityProfile(
+    phase,
+    target,
+    versionId,
+    await readVersionAt(phase, target, state, versionId),
+  );
+}
+
+/**
+ * Selects the JIT profile for a provider-created successor from its already
+ * proven canonical predecessor. The successor itself is never inspected to
+ * decide whether it may omit the profile; the exact closure check consumes
+ * this profile and rejects any historical or partial shape.
+ */
+async function requireProviderSuccessorAuthorityProfileAt(
+  phase: DeployPhase,
+  target: DeployTarget,
+  state: RetirementState,
+  history: WorkerDeploymentHistory,
+  trustedAncestorDistance: 1 | 2 = 1,
+  trustedAncestorProfile: WorkerVersionAuthorityBindingShape = "provenance-bound-jit",
+): Promise<WorkerVersionAuthorityProfile | undefined> {
+  if (target.integrationE2eCredentialAuthority === undefined) return undefined;
+  const chain = await deploymentChain(phase, target, state);
+  if (
+    chain[0]?.versionId !== history.versionId ||
+    chain[0]?.deploymentId !== history.deploymentId
+  ) {
+    throw phaseError(
+      phase,
+      "retirement deployment history changed while selecting authority profile",
+    );
+  }
+  const predecessorId = chain[trustedAncestorDistance]?.versionId;
+  if (predecessorId === undefined) {
+    throw phaseError(phase, "provider-created successor has no trusted canonical predecessor");
+  }
+  const predecessor = await readVersionAt(phase, target, state, predecessorId);
+  const actualProfile = workerVersionAuthorityBindingShape(phase, predecessorId, predecessor);
+  if (actualProfile !== trustedAncestorProfile) {
+    throw phaseError(
+      phase,
+      `retirement trusted ancestor ${predecessorId} has ${actualProfile} authority bindings; expected ${trustedAncestorProfile}`,
+    );
+  }
+  const identity = versionIdentity(predecessor);
+  if (identity === null) {
+    throw phaseError(
+      phase,
+      `retirement trusted ancestor ${predecessorId} has no canonical provenance`,
+    );
+  }
+  return {
+    kind: "provenance-bound-jit",
+    provenance: {
+      sourceCommit: identity.commit,
+      artifactDigest: `sha256:${identity.bundleDigestHex}` as const,
+    },
+  };
+}
+
+function successorAuthorityProfile(
+  phase: DeployPhase,
+  target: DeployTarget,
+  predecessor: { readonly commit: string; readonly bundleDigestHex: string } | null,
+): WorkerVersionAuthorityProfile | undefined {
+  if (target.integrationE2eCredentialAuthority === undefined) return undefined;
+  if (predecessor === null) {
+    throw phaseError(
+      phase,
+      "token retirement successor requires a trusted predecessor identity for JIT authority",
+    );
+  }
+  return {
+    kind: "provenance-bound-jit",
+    provenance: {
+      sourceCommit: predecessor.commit,
+      artifactDigest: `sha256:${predecessor.bundleDigestHex}` as const,
+    },
+  };
 }
 
 async function currentHistory(
@@ -1862,6 +2198,7 @@ async function requireDirectServicePredecessor(
   target: DeployTarget,
   state: RetirementState,
   history: WorkerDeploymentHistory,
+  authorityProfile?: WorkerVersionAuthorityProfile,
 ): Promise<LegacyHostServiceBinding> {
   const predecessorId = history.previousVersionId;
   if (predecessorId === null) {
@@ -1878,6 +2215,7 @@ async function requireDirectServicePredecessor(
     hostedVersionSecrets(target),
     hostedVersionSecrets(target),
     predecessor,
+    authorityProfile,
   );
   return service;
 }
@@ -1898,6 +2236,7 @@ async function assertPinnedSelectorVersion(
     predecessor,
     service,
     hostedVersionSecrets(target),
+    historicalAuthorityProfile(target),
   );
 }
 
@@ -1909,6 +2248,7 @@ async function requireDirectTopologyPredecessor(
   history: WorkerDeploymentHistory,
   current: RetirementLiveWorkerVersion,
   selector: string,
+  authorityProfile: WorkerVersionAuthorityProfile | undefined,
 ): Promise<LegacyHostServiceBinding> {
   await assertPinnedLineage(
     phase,
@@ -1947,6 +2287,7 @@ async function requireDirectTopologyPredecessor(
     hasSecretBinding(predecessor, HOSTED_SPONSORSHIP_SECRET)
       ? hostedVersionSecrets(target)
       : baseWorkerSecrets(target),
+    authorityProfile,
   );
   const candidate = await topologyReverseCandidate(
     phase,
@@ -1955,6 +2296,7 @@ async function requireDirectTopologyPredecessor(
     history,
     current,
     selector,
+    authorityProfile,
   );
   return candidate.service;
 }
@@ -1983,6 +2325,7 @@ async function topologyReverseCandidate(
   currentHistory: WorkerDeploymentHistory,
   current: RetirementLiveWorkerVersion,
   selector: string,
+  authorityProfile: WorkerVersionAuthorityProfile | undefined,
 ): Promise<TopologyReverseCandidate> {
   const chain = await deploymentChain(phase, target, state);
   if (
@@ -2016,6 +2359,7 @@ async function topologyReverseCandidate(
       1,
       false,
       "topology retirement reverse contains an unrelated token predecessor",
+      authorityProfile,
     );
     await assertReverseAncestor(
       phase,
@@ -2026,6 +2370,7 @@ async function topologyReverseCandidate(
       2,
       true,
       "topology retirement reverse contains an unrelated topology predecessor",
+      authorityProfile,
     );
     candidateIndex = 3;
   } else {
@@ -2039,6 +2384,7 @@ async function topologyReverseCandidate(
       1,
       true,
       "token-retired topology has an unrelated direct predecessor",
+      authorityProfile,
     );
     candidateIndex = 2;
   }
@@ -2071,6 +2417,7 @@ async function topologyReverseCandidate(
     version,
     service,
     hostedVersionSecrets(target),
+    authorityProfile,
   );
   const selectorVersion = await readVersionAt(phase, target, state, selector);
   assertRetirementVersionShape(
@@ -2081,6 +2428,7 @@ async function topologyReverseCandidate(
     selectorVersion,
     service,
     hostedVersionSecrets(target),
+    historicalAuthorityProfile(target),
   );
   return {
     versionId: candidateEntry.versionId,
@@ -2107,6 +2455,7 @@ async function topologyCandidateRestored(
   currentHistory: WorkerDeploymentHistory,
   current: RetirementLiveWorkerVersion,
   selector: string,
+  authorityProfile: WorkerVersionAuthorityProfile | undefined,
 ): Promise<TopologyReverseCandidate> {
   const chain = await deploymentChain(phase, target, state);
   if (
@@ -2149,8 +2498,17 @@ async function topologyCandidateRestored(
         1,
         true,
         "topology retirement restored candidate contains an unrelated topology predecessor",
+        authorityProfile,
       );
-      return await readRestoredCandidate(phase, target, state, current, selector, candidateEntry);
+      return await readRestoredCandidate(
+        phase,
+        target,
+        state,
+        current,
+        selector,
+        candidateEntry,
+        authorityProfile,
+      );
     }
   }
 
@@ -2179,6 +2537,7 @@ async function topologyCandidateRestored(
     1,
     true,
     "topology retirement restored candidate contains an unrelated token predecessor",
+    authorityProfile,
   );
   await assertReverseAncestor(
     phase,
@@ -2189,6 +2548,7 @@ async function topologyCandidateRestored(
     2,
     false,
     "topology retirement restored candidate contains an unrelated retired token Version",
+    authorityProfile,
   );
   await assertReverseAncestor(
     phase,
@@ -2199,8 +2559,17 @@ async function topologyCandidateRestored(
     3,
     true,
     "topology retirement restored candidate contains an unrelated topology Version",
+    authorityProfile,
   );
-  return await readRestoredCandidate(phase, target, state, current, selector, candidateEntry);
+  return await readRestoredCandidate(
+    phase,
+    target,
+    state,
+    current,
+    selector,
+    candidateEntry,
+    authorityProfile,
+  );
 }
 
 async function readRestoredCandidate(
@@ -2210,6 +2579,7 @@ async function readRestoredCandidate(
   current: RetirementLiveWorkerVersion,
   selector: string,
   candidateEntry: DeploymentChainEntry,
+  authorityProfile: WorkerVersionAuthorityProfile | undefined,
 ): Promise<TopologyReverseCandidate> {
   const version = await readVersionAt(phase, target, state, candidateEntry.versionId);
   const identity = versionIdentity(version);
@@ -2234,6 +2604,7 @@ async function readRestoredCandidate(
     version,
     service,
     hostedVersionSecrets(target),
+    authorityProfile,
   );
   const selectorVersion = await readVersionAt(phase, target, state, selector);
   assertRetirementVersionShape(
@@ -2244,6 +2615,7 @@ async function readRestoredCandidate(
     selectorVersion,
     service,
     hostedVersionSecrets(target),
+    historicalAuthorityProfile(target),
   );
   return {
     versionId: candidateEntry.versionId,
@@ -2263,6 +2635,7 @@ async function assertReverseAncestor(
   index: number,
   hostedToken: boolean,
   message: string,
+  authorityProfile: WorkerVersionAuthorityProfile | undefined,
 ): Promise<void> {
   const entry = chain[index];
   if (entry === undefined) throw phaseError(phase, message);
@@ -2289,6 +2662,7 @@ async function assertReverseAncestor(
     version,
     null,
     hostedToken ? hostedVersionSecrets(target) : baseWorkerSecrets(target),
+    authorityProfile,
   );
 }
 

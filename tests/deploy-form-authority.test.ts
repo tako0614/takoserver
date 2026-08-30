@@ -109,12 +109,15 @@ function fakeProcess(input?: { readonly onUpload?: () => void }): {
   return { run, calls };
 }
 
-function stateSequence(input?: {
-  readonly publicDrift?: boolean;
-  readonly subdomain?: boolean;
-  readonly route?: boolean;
-  readonly isUploaded?: () => boolean;
-}): FormAuthorityDeployState {
+function stateSequence(
+  input?: {
+    readonly publicDrift?: boolean;
+    readonly subdomain?: boolean;
+    readonly route?: boolean;
+    readonly isUploaded?: () => boolean;
+  },
+  inspectedTarget: DeployTarget = target,
+): FormAuthorityDeployState {
   let historyRead = 0;
   let publicHistoryRead = 0;
   return {
@@ -161,6 +164,7 @@ function stateSequence(input?: {
             : PUBLIC_WORKER_DIGEST.slice("sha256:".length);
         return publicVersion(
           `takoserver-worker:${previous ? PREVIOUS_COMMIT : PUBLIC_WORKER_COMMIT}:${digest}`,
+          inspectedTarget,
         );
       }
       const current = versionId === CURRENT_AUTHORITY_VERSION_ID;
@@ -359,10 +363,25 @@ function qualificationDriftState(
   };
 }
 
-function publicVersion(message: string) {
-  const expected = expectedExactBindingClosure(target);
+function publicVersion(message: string, inspectedTarget: DeployTarget = target) {
+  const identity = /^takoserver-worker:([0-9a-f]{40}):([0-9a-f]{64})$/u.exec(message);
+  if (!identity?.[1] || !identity[2]) throw new Error("invalid public Worker fixture identity");
+  const expected = expectedExactBindingClosure(
+    inspectedTarget,
+    inspectedTarget.integrationE2eCredentialAuthority === undefined
+      ? {}
+      : {
+          authorityProfile: {
+            kind: "provenance-bound-jit",
+            provenance: {
+              sourceCommit: identity[1],
+              artifactDigest: `sha256:${identity[2]}`,
+            },
+          },
+        },
+  );
   return {
-    annotations: { "workers/message": message },
+    annotations: { "workers/message": message, "workers/triggered_by": "version_upload" },
     resources: {
       bindings: Object.entries(expected).flatMap(([name, requirement]) =>
         requirement === null ? [] : [{ name, type: requirement.type, ...requirement.fields }],
@@ -701,6 +720,31 @@ describe("route-less Form authority deploy surfaces", () => {
       boundPublicWorkerVersionId: PREVIOUS_PUBLIC_WORKER_VERSION_ID,
       boundPublicWorkerArtifactDigest: PREVIOUS_PUBLIC_WORKER_DIGEST,
       ready: false,
+    });
+  });
+
+  test("passes an explicit provenance-bound JIT profile for current public Worker inspection", async () => {
+    const jitTarget = {
+      ...target,
+      integrationE2eCredentialAuthority: {
+        organizationId: "org_takosumi_hosted_staging",
+        publicJwk: { kty: "OKP" as const, crv: "Ed25519" as const, x: "E".repeat(43) },
+      },
+    } satisfies DeployTarget;
+    const status = await runFormAuthority(
+      {
+        surface: "takoserver-integration-form-authority-worker",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      jitTarget,
+      { state: stateSequence(undefined, jitTarget) },
+    );
+    expect(status).toMatchObject({
+      publicWorkerCommit: PUBLIC_WORKER_COMMIT,
+      publicWorkerVersionId: PUBLIC_WORKER_VERSION_ID,
+      publicWorkerCommitMatches: true,
     });
   });
 

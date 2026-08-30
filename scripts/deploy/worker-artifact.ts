@@ -58,11 +58,14 @@ export async function prepareWorkerArtifact(input: {
         commit: input.commit,
         ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
         ...(config.bundleDigestHex === undefined
-          ? { omitIntegrationE2eCredentialAuthority: true as const }
+          ? { authorityProfile: { kind: "historical-pre-jit" as const } }
           : {
-              provenance: {
-                sourceCommit: input.commit,
-                artifactDigest: `sha256:${config.bundleDigestHex}` as const,
+              authorityProfile: {
+                kind: "provenance-bound-jit" as const,
+                provenance: {
+                  sourceCommit: input.commit,
+                  artifactDigest: `sha256:${config.bundleDigestHex}` as const,
+                },
               },
             }),
       }));

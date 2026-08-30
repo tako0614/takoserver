@@ -720,15 +720,22 @@ async function inspectDirectPublicPredecessor(
   }
   const version = await state.workerVersion(target.workerName, versionId);
   const identity = workerVersionIdentity(phase, version);
+  const authorityProfile =
+    target.integrationE2eCredentialAuthority === undefined
+      ? undefined
+      : {
+          kind: "provenance-bound-jit" as const,
+          provenance: {
+            sourceCommit: identity.commit,
+            artifactDigest: `sha256:${identity.bundleDigestHex}` as const,
+          },
+        };
   assertExactVersionBindingClosure(
     phase,
     versionId,
     version,
     expectedExactBindingClosure(target, {
-      provenance: {
-        sourceCommit: identity.commit,
-        artifactDigest: `sha256:${identity.bundleDigestHex}`,
-      },
+      ...(authorityProfile === undefined ? {} : { authorityProfile }),
     }),
   );
   return {
@@ -984,7 +991,9 @@ async function inspectPublicWorker(
   target: DeployTarget,
   state: FormAuthorityDeployState,
 ): Promise<PublicWorkerInspection> {
-  const live = await inspectLiveWorkerVersion(phase, target, state, {});
+  const live = await inspectLiveWorkerVersion(phase, target, state, {
+    authorityProfile: { kind: "provenance-bound-jit" },
+  });
   return {
     history: live.history,
     commit: live.commit,

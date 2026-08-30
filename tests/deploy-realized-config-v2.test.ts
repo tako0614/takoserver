@@ -138,7 +138,7 @@ describe("realized Worker configuration", () => {
           main: join(root, "worker.js"),
           commit: sourceCommit,
         }),
-      ).toThrow("exact Worker source/artifact provenance");
+      ).toThrow("explicit authority profile");
       expect(() =>
         writeWorkerConfig(
           { ...authorityTarget, environment: "production" },
@@ -146,7 +146,10 @@ describe("realized Worker configuration", () => {
             path: join(root, "production.json"),
             main: join(root, "worker.js"),
             commit: sourceCommit,
-            provenance: { sourceCommit, artifactDigest },
+            authorityProfile: {
+              kind: "provenance-bound-jit",
+              provenance: { sourceCommit, artifactDigest },
+            },
           },
         ),
       ).toThrow("integration-only");
@@ -155,7 +158,10 @@ describe("realized Worker configuration", () => {
         path: join(root, "complete.json"),
         main: join(root, "worker.js"),
         commit: sourceCommit,
-        provenance: { sourceCommit, artifactDigest },
+        authorityProfile: {
+          kind: "provenance-bound-jit",
+          provenance: { sourceCommit, artifactDigest },
+        },
       });
       const config = JSON.parse(readFileSync(path, "utf8")) as {
         vars: Record<string, string>;

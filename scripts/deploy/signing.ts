@@ -19,11 +19,15 @@ import type { DeployTarget } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import {
   assertDomainClosure,
-  inspectLiveWorkerVersion,
+  historicalWorkerVersionAuthorityProfile,
+  inspectCanonicalWorkerVersionWithScriptIdentity,
+  type inspectLiveWorkerVersion,
   inspectSecretCreatedDirectSuccessor,
   inspectSecretCreatedLineage,
   type SecretCreatedDirectSuccessor,
   type WorkerState,
+  type WorkerVersionAuthorityProfile,
+  type WorkerVersionAuthoritySelection,
   workerVersionAnnotationProfile,
   workerVersionIdentity,
   workerVersionScriptContentIdentity,
@@ -32,7 +36,9 @@ import {
   assertExactSecretInventory,
   assertExactVersionBindingClosure,
   expectedExactBindingClosure,
+  parseWorkerDeploymentChain,
   parseWorkerDeploymentHistory,
+  type WorkerDeploymentHistory,
   workerSecretInventoryIncludes,
 } from "./worker-state.ts";
 
@@ -119,12 +125,13 @@ export async function runSigning(
   const root = options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-signing-"));
   mkdirSync(root, { recursive: true, mode: 0o700 });
   try {
+    const authorityProfile = historicalWorkerVersionAuthorityProfile(target);
     const configPath = writeWorkerConfig(target, {
       path: join(root, "inspect-wrangler.jsonc"),
       main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
       commit: invocation.commit,
       signingKeyId: target.signing.currentKeyId,
-      omitIntegrationE2eCredentialAuthority: true,
+      ...(authorityProfile === undefined ? {} : { authorityProfile }),
     });
     const database = options.database ?? createRemoteSigningDatabase(configPath, environment, run);
     if (invocation.surface === "takoserver-signing-key-register") {
@@ -241,8 +248,51 @@ async function repairSigningSecret(
 ): Promise<Record<string, unknown>> {
   const keyId = target.signing.currentKeyId;
   const row = requiredActiveRow(await database.readKey(keyId, "preflight"), keyId);
-  const before = await inspectLiveWorkerVersion("preflight", target, state, {
+  const authoritySelection =
+    target.integrationE2eCredentialAuthority === undefined
+      ? undefined
+      : { kind: "provenance-bound-jit" as const };
+  const currentHistory = parseWorkerDeploymentHistory(
+    await state.workerDeployments(target.workerName),
+    "preflight",
+  );
+  if (currentHistory === null) {
+    throw preflightError("Worker has no authoritative current deployment");
+  }
+  const currentVersion = await state.workerVersion(target.workerName, currentHistory.versionId);
+  const currentAnnotation = workerVersionAnnotationProfile(currentVersion);
+  if (currentAnnotation === "secret-created") {
+    const settled = await inspectSigningSecretRepairSuccessor(
+      "preflight",
+      target,
+      state,
+      keyId,
+      authoritySelection,
+    );
+    if (invocation.action === "status") {
+      return {
+        kind: "takoserver.signing-repair-status@v2",
+        surface: invocation.surface,
+        environment: invocation.environment,
+        selectedCommit: invocation.commit,
+        deployedCommit: settled.commit,
+        keyId,
+        publicJwkDigest: sha256(row.publicJwk),
+        versionId: settled.history.versionId,
+        previousVersionId: settled.history.previousVersionId,
+        ready: settled.commit === invocation.commit,
+      };
+    }
+    throw preflightError(
+      "signing repair already has a secret-created successor; run --status before another repair",
+    );
+  }
+  if (currentAnnotation !== "canonical") {
+    throw preflightError("signing Worker has no exact canonical annotation inventory");
+  }
+  const before = await inspectCanonicalWorkerVersionWithScriptIdentity("preflight", target, state, {
     signingKeyId: keyId,
+    ...(authoritySelection === undefined ? {} : { authorityProfile: authoritySelection }),
   });
   if (invocation.action === "status") {
     return {
@@ -265,6 +315,23 @@ async function repairSigningSecret(
   if (before.commit !== source.commit) {
     throw preflightError("signing repair commit must equal the currently served Worker commit");
   }
+  const repairAuthorityProfile =
+    target.integrationE2eCredentialAuthority === undefined
+      ? undefined
+      : {
+          kind: "provenance-bound-jit" as const,
+          provenance: {
+            sourceCommit: source.commit,
+            artifactDigest: `sha256:${before.bundleDigestHex}` as const,
+          },
+        };
+  writeWorkerConfig(target, {
+    path: configPath,
+    main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
+    commit: source.commit,
+    signingKeyId: keyId,
+    ...(repairAuthorityProfile === undefined ? {} : { authorityProfile: repairAuthorityProfile }),
+  });
   const reviewer = exactReviewer(
     options.review ?? requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW"),
   );
@@ -291,9 +358,14 @@ async function repairSigningSecret(
       `${mutation.stdout}${mutation.stderr}`.trim(),
     );
   }
-  const after = await inspectLiveWorkerVersion("verification", target, state, {
-    signingKeyId: keyId,
-  });
+  const after = await inspectSigningSecretRepairSuccessor(
+    "verification",
+    target,
+    state,
+    keyId,
+    repairAuthorityProfile,
+    before.history.versionId,
+  );
   assertSecretOnlyAdvance(before, after);
   requiredExactRow(await database.readKey(keyId, "verification"), row, "verification");
   return {
@@ -464,7 +536,21 @@ async function rotateSigningKey(
       `${upload.stdout}${upload.stderr}`.trim(),
     );
   }
-  const after = await inspectSigningRotationClosure("verification", target, state, nextKeyId);
+  const after = await inspectSigningRotationClosure(
+    "verification",
+    target,
+    state,
+    nextKeyId,
+    target.integrationE2eCredentialAuthority === undefined
+      ? undefined
+      : {
+          kind: "provenance-bound-jit",
+          provenance: {
+            sourceCommit: source.commit,
+            artifactDigest: `sha256:${prepared.bundleDigestHex}`,
+          },
+        },
+  );
   if (
     after.history.versionId === before.history.versionId ||
     after.history.previousVersionId !== before.history.versionId ||
@@ -475,6 +561,7 @@ async function rotateSigningKey(
     throw verificationError("signing rotation changed more than the explicit key id and secret");
   }
   if (before.hostedBridge !== null) {
+    const authorityProfile = historicalWorkerVersionAuthorityProfile(target);
     const lineage = await inspectSecretCreatedLineage("verification", target, state, {
       predecessorVersionId: before.hostedBridge.predecessorVersionId,
       successorVersionId: before.hostedBridge.successorVersionId,
@@ -482,6 +569,7 @@ async function rotateSigningKey(
       addedSecret: HOSTED_SECRET,
       signingKeyId: currentKeyId,
       selectedCommit: source.commit,
+      ...(authorityProfile === undefined ? {} : { authorityProfile }),
     });
     if (
       lineage.predecessorCommit !== before.hostedBridge.predecessorCommit ||
@@ -546,11 +634,16 @@ async function inspectSigningRotationStatus(
           "secret-created signing successor is an integration-only Hosted bridge",
         );
       }
+      if (history.previousVersionId === null) {
+        throw preflightError("secret-created signing successor has no direct predecessor");
+      }
+      const authorityProfile = historicalWorkerVersionAuthorityProfile(target);
       const hostedBridge = await inspectSecretCreatedDirectSuccessor("preflight", target, state, {
         addedSecret: HOSTED_SECRET,
         signingKeyId: currentKeyId,
         secretInventory: inventory,
         expectedSuccessorVersionId: history.versionId,
+        ...(authorityProfile === undefined ? {} : { authorityProfile }),
       });
       return {
         history: hostedBridge.history,
@@ -567,7 +660,17 @@ async function inspectSigningRotationStatus(
     case "other":
       throw preflightError("current signing Worker has no exact authority annotation profile");
   }
-  const live = await inspectSigningRotationClosure("preflight", target, state, servingKeyId);
+  const liveAuthorityProfile = canonicalSigningAuthorityProfile(
+    target,
+    workerVersionIdentity("preflight", version),
+  );
+  const live = await inspectSigningRotationClosure(
+    "preflight",
+    target,
+    state,
+    servingKeyId,
+    liveAuthorityProfile,
+  );
   let hostedBridge: SecretCreatedDirectSuccessor | null = null;
   if (servingKeyId === nextKeyId) {
     if (live.history.previousVersionId === null) {
@@ -578,16 +681,30 @@ async function inspectSigningRotationStatus(
       live.history.previousVersionId,
     );
     switch (workerVersionAnnotationProfile(predecessor)) {
-      case "secret-created":
+      case "secret-created": {
         if (environment !== "integration" || !hasHostedSecret) {
           throw preflightError("secret-created signing bridge is not allowed outside integration");
         }
+        const lineageChain = parseWorkerDeploymentChain(
+          await state.workerDeployments(target.workerName),
+          "preflight",
+          { requireUuidVersionIds: true },
+        );
+        const successorIndex = lineageChain.findIndex(
+          (entry) => entry.versionId === live.history.previousVersionId,
+        );
+        const predecessorEntry = lineageChain[successorIndex + 1];
+        if (predecessorEntry === undefined) {
+          throw preflightError("secret-created signing bridge has no direct C predecessor");
+        }
+        const authorityProfile = historicalWorkerVersionAuthorityProfile(target);
         hostedBridge = await inspectSecretCreatedLineage("preflight", target, state, {
           successorVersionId: live.history.previousVersionId,
           expectedCurrentVersionId: live.history.versionId,
           addedSecret: HOSTED_SECRET,
           signingKeyId: currentKeyId,
           secretInventory: inventory,
+          ...(authorityProfile === undefined ? {} : { authorityProfile }),
         });
         if (
           hostedBridge.successorScriptEtag !== live.scriptEtag ||
@@ -597,12 +714,20 @@ async function inspectSigningRotationStatus(
           throw preflightError("next signing successor does not retain the Hosted bridge identity");
         }
         break;
+      }
       case "canonical": {
+        const authorityProfile = canonicalSigningAuthorityProfile(
+          target,
+          workerVersionIdentity("preflight", predecessor),
+        );
         assertExactVersionBindingClosure(
           "preflight",
           live.history.previousVersionId,
           predecessor,
-          expectedExactBindingClosure(target, { signingKeyId: currentKeyId }),
+          expectedExactBindingClosure(target, {
+            signingKeyId: currentKeyId,
+            ...(authorityProfile === undefined ? {} : { authorityProfile }),
+          }),
         );
         const predecessorIdentity = workerVersionIdentity("preflight", predecessor);
         const predecessorScriptEtag = workerVersionScriptContentIdentity(
@@ -668,12 +793,17 @@ async function inspectRotationPredecessor(
           "secret-created signing successor is an integration-only Hosted bridge",
         );
       }
+      if (history.previousVersionId === null) {
+        throw phaseFailure(phase, "secret-created signing successor has no direct predecessor");
+      }
+      const authorityProfile = historicalWorkerVersionAuthorityProfile(target);
       const hostedBridge = await inspectSecretCreatedDirectSuccessor(phase, target, state, {
         addedSecret: HOSTED_SECRET,
         signingKeyId: currentKeyId,
         ...(selectedCommit === undefined ? {} : { selectedCommit }),
         secretInventory: inventory,
         expectedSuccessorVersionId: history.versionId,
+        ...(authorityProfile === undefined ? {} : { authorityProfile }),
       });
       return {
         history: hostedBridge.history,
@@ -688,7 +818,17 @@ async function inspectRotationPredecessor(
     case "other":
       throw phaseFailure(phase, "current signing Worker has no exact authority annotation profile");
   }
-  const live = await inspectSigningRotationClosure(phase, target, state, currentKeyId);
+  const authorityProfile = canonicalSigningAuthorityProfile(
+    target,
+    workerVersionIdentity(phase, currentVersion),
+  );
+  const live = await inspectSigningRotationClosure(
+    phase,
+    target,
+    state,
+    currentKeyId,
+    authorityProfile,
+  );
   if (selectedCommit !== undefined && live.commit !== selectedCommit) {
     throw phaseFailure(phase, "signing rotation predecessor does not match the selected commit");
   }
@@ -713,11 +853,158 @@ function sameHostedBridge(
   );
 }
 
+interface SigningRepairVersion {
+  readonly history: WorkerDeploymentHistory;
+  readonly commit: string;
+  readonly bundleDigestHex: string;
+  readonly scriptEtag: string;
+}
+
+/**
+ * Proves the Version Cloudflare creates after replacing the signing secret.
+ * Secret writes produce a `workers/triggered_by=secret` Version, not a new
+ * canonical upload annotation, so both the immutable canonical predecessor
+ * and the exact secret-created successor closure are checked here.
+ */
+async function inspectSigningSecretRepairSuccessor(
+  phase: DeployPhase,
+  target: DeployTarget,
+  state: WorkerState,
+  signingKeyId: string,
+  authoritySelection: WorkerVersionAuthoritySelection | undefined,
+  expectedPredecessorVersionId?: string,
+): Promise<SigningRepairVersion> {
+  const history = parseWorkerDeploymentHistory(
+    await state.workerDeployments(target.workerName),
+    phase,
+  );
+  if (history === null) throw phaseFailure(phase, "Worker has no authoritative current deployment");
+  if (history.previousVersionId === null) {
+    throw phaseFailure(phase, "signing secret repair successor has no direct predecessor");
+  }
+  if (
+    expectedPredecessorVersionId !== undefined &&
+    history.previousVersionId !== expectedPredecessorVersionId
+  ) {
+    throw phaseFailure(
+      phase,
+      "signing secret repair successor has an unexpected direct predecessor",
+    );
+  }
+  const predecessorVersion = await state.workerVersion(
+    target.workerName,
+    history.previousVersionId,
+  );
+  const successorVersion = await state.workerVersion(target.workerName, history.versionId);
+  if (workerVersionAnnotationProfile(predecessorVersion) !== "canonical") {
+    throw phaseFailure(
+      phase,
+      "signing repair predecessor has no exact canonical annotation profile",
+    );
+  }
+  if (workerVersionAnnotationProfile(successorVersion) !== "secret-created") {
+    throw phaseFailure(
+      phase,
+      "signing repair successor has no exact secret-created annotation profile",
+    );
+  }
+  const predecessorIdentity = workerVersionIdentity(phase, predecessorVersion);
+  const authorityProfile = signingRepairAuthorityProfile(
+    phase,
+    target,
+    authoritySelection,
+    predecessorIdentity,
+  );
+  const expected = expectedExactBindingClosure(target, {
+    signingKeyId,
+    expectedSecrets: expectedWorkerSecrets(target),
+    ...(authorityProfile === undefined ? {} : { authorityProfile }),
+  });
+  assertExactVersionBindingClosure(phase, history.previousVersionId, predecessorVersion, expected);
+  assertExactVersionBindingClosure(phase, history.versionId, successorVersion, expected);
+  const predecessorScriptEtag = workerVersionScriptContentIdentity(
+    phase,
+    history.previousVersionId,
+    predecessorVersion,
+  );
+  const successorScriptEtag = workerVersionScriptContentIdentity(
+    phase,
+    history.versionId,
+    successorVersion,
+  );
+  if (predecessorScriptEtag !== successorScriptEtag) {
+    throw phaseFailure(phase, "signing secret repair changed the script content identity");
+  }
+  assertExactSecretInventory(
+    await state.workerSecrets(target.workerName),
+    expectedWorkerSecrets(target),
+    phase,
+  );
+  assertDomainClosure(phase, target, await state.workerDomains());
+  const afterHistory = parseWorkerDeploymentHistory(
+    await state.workerDeployments(target.workerName),
+    phase,
+  );
+  if (
+    afterHistory === null ||
+    afterHistory.deploymentId !== history.deploymentId ||
+    afterHistory.versionId !== history.versionId ||
+    afterHistory.previousVersionId !== history.previousVersionId
+  ) {
+    throw phaseFailure(
+      phase,
+      "authoritative Worker history changed during signing repair inspection",
+    );
+  }
+  return {
+    history,
+    commit: predecessorIdentity.commit,
+    bundleDigestHex: predecessorIdentity.bundleDigestHex,
+    scriptEtag: successorScriptEtag,
+  };
+}
+
+function signingRepairAuthorityProfile(
+  phase: DeployPhase,
+  target: DeployTarget,
+  selection: WorkerVersionAuthoritySelection | undefined,
+  identity: { readonly commit: string; readonly bundleDigestHex: string },
+): WorkerVersionAuthorityProfile | undefined {
+  if (target.integrationE2eCredentialAuthority === undefined) return undefined;
+  if (selection === undefined) {
+    throw phaseFailure(phase, "JIT-enabled signing repair requires an explicit authority profile");
+  }
+  if (selection.kind === "historical-pre-jit") return selection;
+  return {
+    kind: "provenance-bound-jit",
+    provenance: selection.provenance ?? {
+      sourceCommit: identity.commit,
+      artifactDigest: `sha256:${identity.bundleDigestHex}` as const,
+    },
+  };
+}
+
+function canonicalSigningAuthorityProfile(
+  target: DeployTarget,
+  identity: { readonly commit: string; readonly bundleDigestHex: string },
+): WorkerVersionAuthorityProfile | undefined {
+  return target.integrationE2eCredentialAuthority === undefined
+    ? undefined
+    : {
+        kind: "provenance-bound-jit",
+        provenance: {
+          sourceCommit: identity.commit,
+          artifactDigest: `sha256:${identity.bundleDigestHex}` as const,
+        },
+      };
+}
+
 async function inspectSigningRotationClosure(
   phase: DeployPhase,
   target: DeployTarget,
   state: WorkerState,
   signingKeyId: string,
+  authorityProfile?: WorkerVersionAuthorityProfile,
 ) {
   const history = parseWorkerDeploymentHistory(
     await state.workerDeployments(target.workerName),
@@ -725,16 +1012,25 @@ async function inspectSigningRotationClosure(
   );
   if (history === null) throw phaseFailure(phase, "Worker has no authoritative current deployment");
   const version = await state.workerVersion(target.workerName, history.versionId);
-  assertExactVersionBindingClosure(
-    phase,
-    history.versionId,
-    version,
-    expectedExactBindingClosure(target, { signingKeyId }),
-  );
   if (workerVersionAnnotationProfile(version) !== "canonical") {
     throw phaseFailure(phase, "signing Worker has no exact canonical annotation inventory");
   }
   const identity = workerVersionIdentity(phase, version);
+  if (target.integrationE2eCredentialAuthority !== undefined && authorityProfile === undefined) {
+    throw phaseFailure(
+      phase,
+      "JIT-enabled signing inspection requires an explicit authority profile",
+    );
+  }
+  assertExactVersionBindingClosure(
+    phase,
+    history.versionId,
+    version,
+    expectedExactBindingClosure(target, {
+      signingKeyId,
+      ...(authorityProfile === undefined ? {} : { authorityProfile }),
+    }),
+  );
   const scriptEtag = workerVersionScriptContentIdentity(phase, history.versionId, version);
   assertExactSecretInventory(
     await state.workerSecrets(target.workerName),

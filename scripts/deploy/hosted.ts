@@ -23,11 +23,13 @@ import {
 import type { DeployTarget } from "./target.ts";
 import {
   type CanonicalWorkerVersionWithScriptIdentity,
+  historicalWorkerVersionAuthorityProfile,
   inspectCanonicalWorkerVersionWithScriptIdentity,
   inspectSecretCreatedDirectSuccessor,
   type SecretCreatedDirectSuccessor,
   type WorkerState,
   workerVersionAnnotationProfile,
+  workerVersionIdentity,
 } from "./worker-live.ts";
 import { parseWorkerDeploymentHistory, workerSecretInventoryIncludes } from "./worker-state.ts";
 
@@ -84,12 +86,13 @@ export async function runHosted(
   const root = options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-hosted-"));
   mkdirSync(root, { recursive: true, mode: 0o700 });
   try {
+    const authorityProfile = historicalWorkerVersionAuthorityProfile(target);
     const configPath = writeWorkerConfig(target, {
       path: join(root, "inspect-wrangler.jsonc"),
       main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
       commit: invocation.commit,
       signingKeyId: target.signing.currentKeyId,
-      omitIntegrationE2eCredentialAuthority: true,
+      ...(authorityProfile === undefined ? {} : { authorityProfile }),
     });
     const state =
       options.state ??
@@ -178,6 +181,13 @@ async function proveCanonicalHostedToken(
       signingKeyId: target.signing.currentKeyId,
       expectedSecrets: expectedWorkerSecrets(target),
       selectedCommit: source.commit,
+      authorityProfile: {
+        kind: "provenance-bound-jit",
+        provenance: {
+          sourceCommit: before.commit,
+          artifactDigest: `sha256:${before.bundleDigestHex}`,
+        },
+      },
     },
   );
   if (!sameCanonicalVersion(before, requalified)) {
@@ -336,10 +346,22 @@ async function inspectHostedState(
     const version = await state.workerVersion(target.workerName, history.versionId);
     const annotation = workerVersionAnnotationProfile(version);
     if (annotation === "canonical") {
+      const identity = workerVersionIdentity(phase, version);
+      const authorityProfile =
+        target.integrationE2eCredentialAuthority === undefined
+          ? undefined
+          : {
+              kind: "provenance-bound-jit" as const,
+              provenance: {
+                sourceCommit: identity.commit,
+                artifactDigest: `sha256:${identity.bundleDigestHex}` as const,
+              },
+            };
       const live = await inspectCanonicalWorkerVersionWithScriptIdentity(phase, target, state, {
         signingKeyId: target.signing.currentKeyId,
         expectedSecrets: desiredSecrets,
         secretInventory: inventory,
+        ...(authorityProfile === undefined ? {} : { authorityProfile }),
       });
       return { kind: "canonical-token-present", live };
     }
@@ -349,19 +371,28 @@ async function inspectHostedState(
     if (annotation !== "secret-created") {
       throw phaseError(phase, "Hosted token successor has no exact authority annotation profile");
     }
+    if (history.previousVersionId === null) {
+      throw phaseError(phase, "Hosted token successor has no direct canonical predecessor");
+    }
+    const authorityProfile = historicalWorkerVersionAuthorityProfile(target);
     const successor = await inspectSecretCreatedDirectSuccessor(phase, target, state, {
       addedSecret: HOSTED_SECRET,
       signingKeyId: target.signing.currentKeyId,
       selectedCommit: invocation.commit,
       secretInventory: inventory,
       expectedSuccessorVersionId: history.versionId,
+      ...(authorityProfile === undefined ? {} : { authorityProfile }),
     });
     return { kind: "hosted-token-added-unattributed-successor", successor };
   }
+  const preTokenAuthorityProfile = historicalWorkerVersionAuthorityProfile(target);
   const live = await inspectCanonicalWorkerVersionWithScriptIdentity(phase, target, state, {
     signingKeyId: target.signing.currentKeyId,
     expectedSecrets: preTokenSecrets,
     secretInventory: inventory,
+    ...(preTokenAuthorityProfile === undefined
+      ? {}
+      : { authorityProfile: preTokenAuthorityProfile }),
   });
   return { kind: "canonical-pre-token", live };
 }
@@ -402,6 +433,7 @@ async function cutoverHostedToken(
   );
   const tenantRef = await database.proofTenant("preflight");
   const preTokenSecrets = expectedWorkerSecrets(target).filter((name) => name !== HOSTED_SECRET);
+  const preTokenAuthorityProfile = historicalWorkerVersionAuthorityProfile(target);
   const requalified = await inspectCanonicalWorkerVersionWithScriptIdentity(
     "preflight",
     target,
@@ -410,6 +442,9 @@ async function cutoverHostedToken(
       signingKeyId: target.signing.currentKeyId,
       expectedSecrets: preTokenSecrets,
       selectedCommit: source.commit,
+      ...(preTokenAuthorityProfile === undefined
+        ? {}
+        : { authorityProfile: preTokenAuthorityProfile }),
     },
   );
   if (!sameCanonicalVersion(before, requalified)) {
@@ -441,11 +476,20 @@ async function cutoverHostedToken(
       `${mutation.stdout}${mutation.stderr}`.trim(),
     );
   }
+  const afterHistory = parseWorkerDeploymentHistory(
+    await state.workerDeployments(target.workerName),
+    "verification",
+  );
+  if (afterHistory === null || afterHistory.previousVersionId === null) {
+    throw verificationError("Hosted token cutover did not expose a direct secret successor");
+  }
+  const authorityProfile = historicalWorkerVersionAuthorityProfile(target);
   const after = await inspectSecretCreatedDirectSuccessor("verification", target, state, {
     addedSecret: HOSTED_SECRET,
     signingKeyId: target.signing.currentKeyId,
     selectedCommit: source.commit,
     expectedPredecessorVersionId: before.history.versionId,
+    ...(authorityProfile === undefined ? {} : { authorityProfile }),
   });
   const proof = await proveHostedCredential(
     target.publicOrigin,

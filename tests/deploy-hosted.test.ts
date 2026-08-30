@@ -9,6 +9,7 @@ import type { CommandResult } from "../scripts/deploy/process.ts";
 import type { SigningPublicKeyRow } from "../scripts/deploy/signing.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import {
+  inspectCanonicalWorkerVersionWithScriptIdentity,
   inspectSecretCreatedDirectSuccessor,
   type WorkerState,
 } from "../scripts/deploy/worker-live.ts";
@@ -34,6 +35,14 @@ const target = {
   publicOrigin: "https://api.integration.example.test",
   signing: { currentKeyId: "key-current" },
   sponsorship: true,
+} satisfies DeployTarget;
+
+const integrationE2eTarget = {
+  ...target,
+  integrationE2eCredentialAuthority: {
+    organizationId: "org_takosumi_hosted_staging",
+    publicJwk: { kty: "OKP", crv: "Ed25519", x: `${"A".repeat(42)}A` },
+  },
 } satisfies DeployTarget;
 
 async function key() {
@@ -248,6 +257,7 @@ function driftingCanonicalTokenState(
 
 function successorProofState(
   input: {
+    readonly selectedTarget?: DeployTarget;
     readonly successorScriptEtag?: string;
     readonly successorAnnotations?: Record<string, string>;
     readonly successorExtraBinding?: Record<string, string>;
@@ -271,9 +281,13 @@ function successorProofState(
     },
     async workerVersion(_worker, versionId) {
       if (versionId === VERSION_C) {
-        return version(baseSecrets(), `takoserver-worker:${COMMIT}:${"b".repeat(64)}`);
+        return version(
+          baseSecrets(),
+          `takoserver-worker:${COMMIT}:${"b".repeat(64)}`,
+          input.selectedTarget,
+        );
       }
-      const current = version(hostedSecrets(), undefined);
+      const current = version(hostedSecrets(), undefined, input.selectedTarget);
       return {
         ...current,
         ...(input.successorAnnotations === undefined
@@ -853,6 +867,80 @@ describe("Hosted sponsorship token cutover", () => {
     }
   });
 
+  test("canonical Hosted inspector passes the exact JIT provenance profile", async () => {
+    const result = await inspectCanonicalWorkerVersionWithScriptIdentity(
+      "preflight",
+      integrationE2eTarget,
+      canonicalTokenState(integrationE2eTarget),
+      {
+        signingKeyId: integrationE2eTarget.signing.currentKeyId,
+        expectedSecrets: hostedSecrets(),
+        selectedCommit: COMMIT,
+        authorityProfile: {
+          kind: "provenance-bound-jit",
+          provenance: {
+            sourceCommit: COMMIT,
+            artifactDigest: `sha256:${"b".repeat(64)}`,
+          },
+        },
+      },
+    );
+
+    expect(result).toMatchObject({
+      commit: COMMIT,
+      bundleDigestHex: "b".repeat(64),
+      scriptEtag: "script-etag",
+      history: { versionId: VERSION_H },
+    });
+  });
+
+  test("canonical Hosted inspector binds a caller-selected JIT shape to canonical annotation provenance", async () => {
+    const result = await inspectCanonicalWorkerVersionWithScriptIdentity(
+      "preflight",
+      integrationE2eTarget,
+      canonicalTokenState(integrationE2eTarget),
+      {
+        signingKeyId: integrationE2eTarget.signing.currentKeyId,
+        expectedSecrets: hostedSecrets(),
+        selectedCommit: COMMIT,
+        authorityProfile: { kind: "provenance-bound-jit" },
+      },
+    );
+
+    expect(result).toMatchObject({
+      commit: COMMIT,
+      bundleDigestHex: "b".repeat(64),
+      scriptEtag: "script-etag",
+    });
+  });
+
+  test("Hosted status accepts a canonical Version with the target JIT authority", async () => {
+    const result = await runHosted(
+      {
+        surface: "takoserver-hosted-token-cutover",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      integrationE2eTarget,
+      {
+        database: database(JSON.stringify({ kty: "OKP", crv: "Ed25519", x: "A".repeat(43) })),
+        state: canonicalTokenState(integrationE2eTarget),
+        run: processFixture().run,
+        outputDirectory: join(tmpdir(), "takoserver-canonical-jit-status"),
+      },
+    );
+
+    expect(result).toMatchObject({
+      state: "canonical-token-present",
+      deployedCommit: COMMIT,
+      hostedTokenPresent: true,
+      proofApplyReady: true,
+      repairRequired: false,
+      ready: false,
+    });
+  });
+
   test("canonical token status keeps readiness pending and derives proof apply readiness only from live state", async () => {
     const signing = await key();
     for (const environment of ["integration", "rehearsal", "production"] as const) {
@@ -893,6 +981,48 @@ describe("Hosted sponsorship token cutover", () => {
         expect(signingDatabase.reads, `${environment}/${proofApplyReady}`).toBe(0);
         expect(signingDatabase.tenantReads, `${environment}/${proofApplyReady}`).toBe(0);
       }
+    }
+  });
+
+  test("JIT-enabled Hosted recovery explicitly proves a historical pre-JIT C-to-H bridge", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-hosted-jit-recovery-"));
+    try {
+      const signing = await key();
+      const tokenPath = join(root, "hosted-token");
+      writeFileSync(tokenPath, TOKEN, { mode: 0o600 });
+      const process = processFixture();
+      const requests: Request[] = [];
+      const result = await runHosted(
+        {
+          surface: "takoserver-hosted-token-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        integrationE2eTarget,
+        {
+          database: database(signing.publicJwk),
+          state: recoveryState(),
+          run: process.run,
+          tokenPath,
+          review: "reviewer@example.test",
+          outputDirectory: join(root, "work"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          fetcher: sponsorshipFetcher(signing.pair.privateKey, requests),
+        },
+      );
+
+      expect(result).toMatchObject({
+        state: "hosted-token-added-unattributed-successor",
+        mutationApplied: false,
+        repairRequired: true,
+        previousVersionId: VERSION_C,
+        versionId: VERSION_H,
+      });
+      expect(process.calls.filter(({ command }) => command.includes("secret"))).toHaveLength(0);
+      expect(requests).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -1565,6 +1695,74 @@ describe("Hosted sponsorship token cutover", () => {
     }
   });
 
+  test("secret-created C-to-H proof passes the exact JIT provenance profile", async () => {
+    const result = await inspectSecretCreatedDirectSuccessor(
+      "preflight",
+      integrationE2eTarget,
+      successorProofState({ selectedTarget: integrationE2eTarget }),
+      {
+        addedSecret: HOSTED_SECRET,
+        signingKeyId: integrationE2eTarget.signing.currentKeyId,
+        selectedCommit: COMMIT,
+        expectedPredecessorVersionId: VERSION_C,
+        expectedSuccessorVersionId: VERSION_H,
+        authorityProfile: {
+          kind: "provenance-bound-jit",
+          provenance: {
+            sourceCommit: COMMIT,
+            artifactDigest: `sha256:${"b".repeat(64)}`,
+          },
+        },
+      },
+    );
+
+    expect(result).toMatchObject({
+      predecessorVersionId: VERSION_C,
+      successorVersionId: VERSION_H,
+      predecessorCommit: COMMIT,
+      predecessorBundleDigestHex: "b".repeat(64),
+    });
+  });
+
+  test("secret-created C-to-H proof accepts only an explicitly pre-JIT historical profile", async () => {
+    const result = await inspectSecretCreatedDirectSuccessor(
+      "preflight",
+      integrationE2eTarget,
+      successorProofState(),
+      {
+        addedSecret: HOSTED_SECRET,
+        signingKeyId: integrationE2eTarget.signing.currentKeyId,
+        selectedCommit: COMMIT,
+        expectedPredecessorVersionId: VERSION_C,
+        expectedSuccessorVersionId: VERSION_H,
+        authorityProfile: { kind: "historical-pre-jit" },
+      },
+    );
+
+    expect(result).toMatchObject({
+      predecessorVersionId: VERSION_C,
+      successorVersionId: VERSION_H,
+    });
+  });
+
+  test("JIT-enabled secret-created inspection refuses an omitted authority profile", async () => {
+    const failure = await inspectSecretCreatedDirectSuccessor(
+      "preflight",
+      integrationE2eTarget,
+      successorProofState({ selectedTarget: integrationE2eTarget }),
+      {
+        addedSecret: HOSTED_SECRET,
+        signingKeyId: integrationE2eTarget.signing.currentKeyId,
+        selectedCommit: COMMIT,
+        expectedPredecessorVersionId: VERSION_C,
+        expectedSuccessorVersionId: VERSION_H,
+      },
+    ).catch((error) => error);
+
+    expect(failure).toBeInstanceOf(DeployError);
+    expect(failure.message).toContain("requires an explicit authority binding profile");
+  });
+
   test("secret transition history accepts an older rollback repeat outside the C-to-H prefix", async () => {
     const history = [
       deployment("deployment-hosted", VERSION_H, "2026-08-28T04:00:00Z"),
@@ -1630,9 +1828,22 @@ function version(
   message: string | undefined,
   selectedTarget: DeployTarget = target,
 ) {
+  const provenance =
+    selectedTarget.integrationE2eCredentialAuthority === undefined
+      ? {}
+      : {
+          authorityProfile: {
+            kind: "provenance-bound-jit" as const,
+            provenance: {
+              sourceCommit: COMMIT,
+              artifactDigest: `sha256:${"b".repeat(64)}` as const,
+            },
+          },
+        };
   const expected = expectedExactBindingClosure(selectedTarget, {
     signingKeyId: "key-current",
     expectedSecrets: secrets,
+    ...provenance,
   });
   return {
     annotations:

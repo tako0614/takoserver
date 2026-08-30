@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DeployError } from "../scripts/deploy/errors.ts";
@@ -35,6 +35,14 @@ const baseTarget = {
   r2: { bucketName: "takoserver-objects-integration" },
   publicOrigin: "https://api.integration.example.test",
   signing: { currentKeyId: "key-current" },
+} satisfies DeployTarget;
+
+const integrationE2eTarget = {
+  ...baseTarget,
+  integrationE2eCredentialAuthority: {
+    organizationId: "org_takosumi_hosted_staging",
+    publicJwk: { kty: "OKP", crv: "Ed25519", x: "A".repeat(43) },
+  },
 } satisfies DeployTarget;
 
 class FakeDatabase implements SigningDatabase {
@@ -104,6 +112,7 @@ function workerState(input: {
   readonly afterHasPredecessor?: boolean;
   readonly beforeMessage?: string;
   readonly beforeAnnotations?: Readonly<Record<string, string>>;
+  readonly afterAnnotations?: Readonly<Record<string, string>>;
   readonly beforeScriptEtag?: string;
   readonly afterScriptEtag?: string;
   readonly afterWhen?: () => boolean;
@@ -141,9 +150,13 @@ function workerState(input: {
           ? (input.beforeScriptEtag ?? "script-etag")
           : (input.afterScriptEtag ?? "script-etag");
       const current = workerVersion(input.target, signing, message, scriptEtag);
-      return versionId === VERSION_C && input.beforeAnnotations !== undefined
-        ? { ...current, annotations: input.beforeAnnotations }
-        : current;
+      if (versionId === VERSION_C && input.beforeAnnotations !== undefined) {
+        return { ...current, annotations: input.beforeAnnotations };
+      }
+      if (versionId !== VERSION_C && input.afterAnnotations !== undefined) {
+        return { ...current, annotations: input.afterAnnotations };
+      }
+      return current;
     },
     async workerSecrets() {
       return [
@@ -161,6 +174,7 @@ function hostedRotationState(
   uploaded: () => boolean,
   uploadMessage: () => string | null,
   successorAnnotations?: Readonly<Record<string, string>>,
+  historicalAuthority = false,
 ): WorkerState {
   return {
     async workerDomains() {
@@ -190,9 +204,17 @@ function hostedRotationState(
           : { ...version, annotations: successorAnnotations };
       }
       if (versionId === VERSION_H) {
-        return hostedVersion(target, "key-current");
+        return hostedVersion(
+          target,
+          "key-current",
+          historicalAuthority ? { kind: "historical-pre-jit" } : undefined,
+        );
       }
-      return canonicalPreTokenVersion(target, "key-current");
+      return canonicalPreTokenVersion(
+        target,
+        "key-current",
+        historicalAuthority ? { kind: "historical-pre-jit" } : undefined,
+      );
     },
     async workerSecrets() {
       return [
@@ -386,7 +408,15 @@ describe("split signing authority surfaces", () => {
         baseTarget,
         {
           database: db,
-          state: workerState({ target: baseTarget, beforeSigning: "key-current" }),
+          state: workerState({
+            target: baseTarget,
+            beforeSigning: "key-current",
+            afterAnnotations: { "workers/triggered_by": "secret" },
+            afterWhen: () =>
+              process.calls.some(
+                ({ command }) => command.includes("secret") && command.includes("put"),
+              ),
+          }),
           run: process.run,
           privateJwkPath: privatePath,
           review: "reviewer@example.test",
@@ -406,6 +436,196 @@ describe("split signing authority surfaces", () => {
       expect(mutations[0]?.input).toBe(privateRaw);
       expect(mutations[0]?.command.join(" ")).not.toContain(privateRaw.trim());
       expect(process.calls.some(({ command }) => command.includes("--secrets-file"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("JIT signing repair proves a secret-created provenance-bound successor", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-jit-repair-"));
+    try {
+      const key = await keyPair("key-current");
+      const privatePath = join(root, "private.jwk");
+      const privateRaw = `${JSON.stringify(key.privateJwk)}\n`;
+      writeFileSync(privatePath, privateRaw, { mode: 0o600 });
+      chmodSync(privatePath, 0o600);
+      const db = new FakeDatabase();
+      db.rows.set("key-current", row("key-current", key.publicJwk));
+      const process = processFixture();
+      const result = await runSigning(
+        {
+          surface: "takoserver-signing-repair",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        integrationE2eTarget,
+        {
+          database: db,
+          state: workerState({
+            target: integrationE2eTarget,
+            beforeSigning: "key-current",
+            afterAnnotations: { "workers/triggered_by": "secret" },
+            afterWhen: () =>
+              process.calls.some(
+                ({ command }) => command.includes("secret") && command.includes("put"),
+              ),
+          }),
+          run: process.run,
+          privateJwkPath: privatePath,
+          review: "reviewer@example.test",
+          outputDirectory: join(root, "work"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+
+      expect(result).toMatchObject({
+        kind: "takoserver.signing-repair-apply@v2",
+        commit: COMMIT,
+        keyId: "key-current",
+      });
+      const config = JSON.parse(
+        readFileSync(join(root, "work/inspect-wrangler.jsonc"), "utf8"),
+      ) as { vars: Record<string, string> };
+      expect(config.vars).toMatchObject({
+        TAKOSERVER_ENVIRONMENT: "integration",
+        TAKOSERVER_INTEGRATION_E2E_API_KEY_PUBLIC_JWK: JSON.stringify(
+          integrationE2eTarget.integrationE2eCredentialAuthority.publicJwk,
+        ),
+        TAKOSERVER_INTEGRATION_E2E_ORGANIZATION_ID:
+          integrationE2eTarget.integrationE2eCredentialAuthority.organizationId,
+        TAKOSERVER_SOURCE_COMMIT: COMMIT,
+        TAKOSERVER_WORKER_ARTIFACT_DIGEST: `sha256:${BUNDLE_DIGEST}`,
+      });
+      expect(process.calls.filter(({ command }) => command.includes("secret"))).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("JIT signing repair status reconciles an acknowledged secret-created successor", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-jit-repair-status-"));
+    try {
+      const key = await keyPair("key-current");
+      const db = new FakeDatabase();
+      db.rows.set("key-current", row("key-current", key.publicJwk));
+      const process = processFixture();
+      const result = await runSigning(
+        {
+          surface: "takoserver-signing-repair",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        integrationE2eTarget,
+        {
+          database: db,
+          state: workerState({
+            target: integrationE2eTarget,
+            beforeSigning: "key-current",
+            deploymentMode: "after",
+            afterAnnotations: { "workers/triggered_by": "secret" },
+          }),
+          run: process.run,
+          outputDirectory: join(root, "work"),
+        },
+      );
+
+      expect(result).toMatchObject({
+        kind: "takoserver.signing-repair-status@v2",
+        deployedCommit: COMMIT,
+        versionId: VERSION_S,
+        previousVersionId: VERSION_C,
+        ready: true,
+      });
+      expect(process.calls).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("JIT canonical current-key rotation uses the provenance-bound profile for status and apply", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-jit-rotation-current-"));
+    try {
+      const current = await keyPair("key-current");
+      const next = await keyPair("key-next");
+      const target = {
+        ...integrationE2eTarget,
+        signing: { currentKeyId: "key-current", nextKeyId: "key-next" },
+      } satisfies DeployTarget;
+
+      const statusDatabase = new FakeDatabase();
+      statusDatabase.rows.set("key-current", row("key-current", current.publicJwk));
+      statusDatabase.rows.set("key-next", row("key-next", next.publicJwk));
+      const statusProcess = processFixture();
+      const status = await runSigning(
+        {
+          surface: "takoserver-signing-rotation",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target,
+        {
+          database: statusDatabase,
+          state: workerState({ target, beforeSigning: "key-current", deploymentMode: "before" }),
+          run: statusProcess.run,
+          outputDirectory: join(root, "status"),
+        },
+      );
+      expect(status).toMatchObject({
+        cutoverState: "current-key-serving",
+        servingKeyId: "key-current",
+        versionId: VERSION_C,
+        ready: true,
+      });
+      expect(statusProcess.calls).toHaveLength(0);
+
+      const privatePath = join(root, "next-private.jwk");
+      writeFileSync(privatePath, `${JSON.stringify(next.privateJwk)}\n`, { mode: 0o600 });
+      const applyDatabase = new FakeDatabase();
+      applyDatabase.rows.set("key-current", row("key-current", current.publicJwk));
+      applyDatabase.rows.set("key-next", row("key-next", next.publicJwk));
+      let uploadMessage: string | null = null;
+      const applyProcess = processFixture({ afterMessage: () => uploadMessage });
+      const wrapped: SigningProcess = async (command, options) => {
+        if (command.includes("deploy") && command.includes("--secrets-file")) {
+          uploadMessage = command[command.indexOf("--message") + 1] ?? null;
+        }
+        return await applyProcess.run(command, options);
+      };
+      const applied = await runSigning(
+        {
+          surface: "takoserver-signing-rotation",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target,
+        {
+          database: applyDatabase,
+          state: workerState({
+            target,
+            beforeSigning: "key-current",
+            afterSigning: "key-next",
+            afterMessage: () => uploadMessage,
+            afterWhen: () => uploadMessage !== null,
+          }),
+          run: wrapped,
+          nextPrivateJwkPath: privatePath,
+          review: "reviewer@example.test",
+          outputDirectory: join(root, "apply"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+      expect(applied).toMatchObject({
+        kind: "takoserver.signing-rotation-apply@v2",
+        previousVersionId: VERSION_C,
+        versionId: VERSION_S,
+      });
+      expect(
+        applyProcess.calls.filter(({ command }) => command.includes("--secrets-file")),
+      ).toHaveLength(1);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -823,6 +1043,73 @@ describe("split signing authority surfaces", () => {
       expect(db.inserts).toHaveLength(0);
       expect(JSON.stringify(result)).not.toContain(JSON.parse(current.publicJwk).x);
       expect(JSON.stringify(result)).not.toContain(JSON.parse(next.publicJwk).x);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("integration H-to-S completion keeps historical C/H pre-JIT and requires JIT on final S", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-hosted-jit-rotation-"));
+    try {
+      const current = await keyPair("key-current");
+      const next = await keyPair("key-next");
+      const privatePath = join(root, "next-private.jwk");
+      writeFileSync(privatePath, `${JSON.stringify(next.privateJwk)}\n`, { mode: 0o600 });
+      const target = {
+        ...integrationE2eTarget,
+        sponsorship: true,
+        signing: { currentKeyId: "key-current", nextKeyId: "key-next" },
+      } satisfies DeployTarget;
+      const db = new FakeDatabase();
+      db.rows.set("key-current", row("key-current", current.publicJwk));
+      db.rows.set("key-next", row("key-next", next.publicJwk));
+      const process = processFixture();
+      let uploaded = false;
+      let uploadMessage: string | null = null;
+      const wrapped: SigningProcess = async (command, options) => {
+        if (command.includes("deploy") && command.includes("--secrets-file")) {
+          uploadMessage = command[command.indexOf("--message") + 1] ?? null;
+          uploaded = true;
+        }
+        return await process.run(command, options);
+      };
+
+      const result = await runSigning(
+        {
+          surface: "takoserver-signing-rotation",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target,
+        {
+          database: db,
+          state: hostedRotationState(
+            target,
+            () => uploaded,
+            () => uploadMessage,
+            undefined,
+            true,
+          ),
+          run: wrapped,
+          nextPrivateJwkPath: privatePath,
+          review: "reviewer@example.test",
+          outputDirectory: join(root, "work"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+
+      expect(result).toMatchObject({
+        kind: "takoserver.signing-rotation-apply@v2",
+        hostedTransition: "C-to-H-to-S",
+        previousVersionId: VERSION_H,
+        versionId: VERSION_S,
+        inheritedCommit: COMMIT,
+        inheritedBundleDigest: `sha256:${BUNDLE_DIGEST}`,
+      });
+      expect(
+        process.calls.filter(({ command }) => command.includes("--secrets-file")),
+      ).toHaveLength(1);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -1532,8 +1819,21 @@ function workerVersion(
   message: string,
   scriptEtag: string,
 ) {
+  const match = /^takoserver-worker:([0-9a-f]{40}):([0-9a-f]{64})$/u.exec(message);
+  if (!match?.[1] || !match[2]) throw new Error("invalid test Worker annotation");
   const expected = expectedExactBindingClosure(target, {
     signingKeyId,
+    ...(target.integrationE2eCredentialAuthority === undefined
+      ? {}
+      : {
+          authorityProfile: {
+            kind: "provenance-bound-jit" as const,
+            provenance: {
+              sourceCommit: match[1],
+              artifactDigest: `sha256:${match[2]}` as const,
+            },
+          },
+        }),
   });
   return {
     annotations: { "workers/message": message, "workers/triggered_by": "version_upload" },
@@ -1546,23 +1846,74 @@ function workerVersion(
   };
 }
 
-function signingVersion(target: DeployTarget, signingKeyId: string, message: string) {
-  const expected = expectedExactBindingClosure(target, { signingKeyId });
+function signingVersion(
+  target: DeployTarget,
+  signingKeyId: string,
+  message: string,
+  authorityProfile?:
+    | { readonly kind: "historical-pre-jit" }
+    | {
+        readonly kind: "provenance-bound-jit";
+        readonly provenance: {
+          readonly sourceCommit: string;
+          readonly artifactDigest: `sha256:${string}`;
+        };
+      },
+) {
+  const match = /^takoserver-worker:([0-9a-f]{40}):([0-9a-f]{64})$/u.exec(message);
+  if (!match?.[1] || !match[2]) throw new Error("invalid test Worker annotation");
+  const closure = expectedExactBindingClosure(target, {
+    signingKeyId,
+    ...(target.integrationE2eCredentialAuthority === undefined
+      ? {}
+      : {
+          authorityProfile: authorityProfile ?? {
+            kind: "provenance-bound-jit" as const,
+            provenance: {
+              sourceCommit: match[1],
+              artifactDigest: `sha256:${match[2]}` as const,
+            },
+          },
+        }),
+  });
   return {
     annotations: { "workers/message": message, "workers/triggered_by": "version_upload" },
     resources: {
       script: { etag: "script-etag" },
-      bindings: Object.entries(expected).flatMap(([name, requirement]) =>
+      bindings: Object.entries(closure).flatMap(([name, requirement]) =>
         requirement === null ? [] : [{ name, type: requirement.type, ...requirement.fields }],
       ),
     },
   };
 }
 
-function canonicalPreTokenVersion(target: DeployTarget, signingKeyId: string) {
+function canonicalPreTokenVersion(
+  target: DeployTarget,
+  signingKeyId: string,
+  authorityProfile?:
+    | { readonly kind: "historical-pre-jit" }
+    | {
+        readonly kind: "provenance-bound-jit";
+        readonly provenance: {
+          readonly sourceCommit: string;
+          readonly artifactDigest: `sha256:${string}`;
+        };
+      },
+) {
   const expected = expectedExactBindingClosure(target, {
     signingKeyId,
     expectedSecrets: ["TAKOSERVER_SIGNING_KEY"],
+    ...(target.integrationE2eCredentialAuthority === undefined
+      ? {}
+      : {
+          authorityProfile: authorityProfile ?? {
+            kind: "provenance-bound-jit" as const,
+            provenance: {
+              sourceCommit: COMMIT,
+              artifactDigest: `sha256:${BUNDLE_DIGEST}` as const,
+            },
+          },
+        }),
   });
   return {
     annotations: {
@@ -1578,9 +1929,32 @@ function canonicalPreTokenVersion(target: DeployTarget, signingKeyId: string) {
   };
 }
 
-function hostedVersion(target: DeployTarget, signingKeyId: string) {
+function hostedVersion(
+  target: DeployTarget,
+  signingKeyId: string,
+  authorityProfile?:
+    | { readonly kind: "historical-pre-jit" }
+    | {
+        readonly kind: "provenance-bound-jit";
+        readonly provenance: {
+          readonly sourceCommit: string;
+          readonly artifactDigest: `sha256:${string}`;
+        };
+      },
+) {
   const expected = expectedExactBindingClosure(target, {
     signingKeyId,
+    ...(target.integrationE2eCredentialAuthority === undefined
+      ? {}
+      : {
+          authorityProfile: authorityProfile ?? {
+            kind: "provenance-bound-jit" as const,
+            provenance: {
+              sourceCommit: COMMIT,
+              artifactDigest: `sha256:${BUNDLE_DIGEST}` as const,
+            },
+          },
+        }),
   });
   return {
     annotations: { "workers/triggered_by": "secret" },
