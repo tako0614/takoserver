@@ -13,10 +13,7 @@ import {
   parseFormAuthorityCapabilityManifest,
 } from "./takoform/host-admission-endpoint.ts";
 
-/**
- * Named service-binding entrypoint only. There is intentionally no fetch
- * method or public route.
- */
+/** Named service-binding entrypoint only. It has no public fetch surface. */
 export class FormAuthorityEntrypoint extends WorkerEntrypoint<FormAuthorityWorkerEnv> {
   plan(request: FormAuthorityPlanRequest) {
     return this.composition().then(({ endpoint }) => endpoint.plan(request));
@@ -42,7 +39,15 @@ export class FormAuthorityEntrypoint extends WorkerEntrypoint<FormAuthorityWorke
   }
 }
 
-export default FormAuthorityEntrypoint;
+/**
+ * Registration-only default handler. Named RPC consumers bind
+ * `FormAuthorityEntrypoint` explicitly; unqualified requests fail closed.
+ */
+export default {
+  fetch(_request: Request): Response {
+    return new Response(null, { status: 404 });
+  },
+} satisfies ExportedHandler<FormAuthorityWorkerEnv>;
 
 function workerConfiguration(env: FormAuthorityWorkerEnv): FormAuthorityEndpointConfiguration {
   return {

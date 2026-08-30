@@ -20,8 +20,11 @@ Form mutation belongs to two separately named, route-less Cloudflare Workers:
   permanently reports `policyAuthority: takoserver-host`,
   `verificationMode: integration-fixture`, and `productionEligible: false`.
 
-Neither authority Worker has a public route, `fetch` method, `workers.dev`
-address, preview URL, customer handler, or secret binding. Both use the selected
+Neither authority Worker has a public route, `workers.dev` address, preview URL,
+customer handler, or secret binding. Each default export has a non-operational
+`fetch` handler that always returns `404`; it exists only because Cloudflare
+requires an event handler to register the module. The named RPC entrypoints
+remain pure RPC classes and are bound explicitly. Both use the selected
 Takoserver target’s existing `STATE_DB` and `OBJECTS` bindings. The production
 bundle does not contain the integration package corpus.
 

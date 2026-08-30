@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, mock, test } from "bun:test";
 import { dirname, extname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -22,6 +22,24 @@ import { createFormPackageStore, packageManifest } from "../src/takoform/form-pa
 import { createTakoformHost } from "../src/takoform/host.ts";
 import { createTakoformHostAuthority } from "../src/takoform/host-authority.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
+
+// The entry modules target the Workers runtime's built-in module. Mock only
+// that constructor so the default registration handlers can be exercised in
+// Bun without changing their production bundle or RPC class shape.
+mock.module("cloudflare:workers", () => ({ WorkerEntrypoint: class WorkerEntrypoint {} }));
+
+type RegistrationHandler = {
+  readonly fetch: (request: Request) => Response | Promise<Response>;
+};
+
+type AuthorityModule = {
+  readonly default: RegistrationHandler;
+  readonly [exportName: string]: unknown;
+};
+
+async function loadAuthorityModule(specifier: string): Promise<AuthorityModule> {
+  return (await import(specifier)) as unknown as AuthorityModule;
+}
 
 /**
  * W17 characterization: the current production Host is still assembled from
@@ -209,6 +227,23 @@ test("route-less Form authority Workers own the writer graph and no public route
   expect(production.has("src/generated/takoform-integration-form-packages.ts")).toBe(false);
   expect(integration.has("src/form-authority-operator-proof.ts")).toBe(true);
   expect(integration.has("src/generated/takoform-integration-form-packages.ts")).toBe(true);
+});
+
+test("route-less Form authority defaults return empty 404 while named RPC stays pure", async () => {
+  const [production, integration] = await Promise.all([
+    loadAuthorityModule("../src/entry-form-authority-worker.ts"),
+    loadAuthorityModule("../src/entry-integration-form-authority-worker.ts"),
+  ]);
+  for (const [authority, entrypointName] of [
+    [production, "FormAuthorityEntrypoint"],
+    [integration, "IntegrationFormAuthorityEntrypoint"],
+  ] as const) {
+    const response = await authority.default.fetch(new Request("https://authority.invalid/"));
+    expect(response.status).toBe(404);
+    expect(await response.text()).toBe("");
+    const prototype = (authority[entrypointName] as { readonly prototype: object }).prototype;
+    expect(Reflect.has(prototype, "fetch")).toBe(false);
+  }
 });
 
 test("authenticated operator gateway is isolated from both storage writers and customer routes", async () => {

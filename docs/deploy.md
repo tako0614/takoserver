@@ -71,6 +71,9 @@ The separate authority and irreversible surfaces are:
 - `takoserver-form-authority-worker`: one reviewed route-less service-binding
   RPC Worker upload. Exact D1/R2 and identity bindings are read back with no
   secret or public-domain, zone-route, workers.dev, or preview ownership. The
+  default export has a non-operational `fetch` handler that always returns
+  `404` only to satisfy Cloudflare’s module registration requirement; the named
+  RPC entrypoint remains pure RPC and has no public route. The
   served public Worker artifact is rebuilt from the same commit and must match
   byte-for-byte before upload. Its Form `apply` remains fail-closed until
   released Form package verification exists. Released Core supplies verification
@@ -79,8 +82,11 @@ The separate authority and irreversible surfaces are:
 - `takoserver-integration-form-authority-worker`: integration only. It packages
   the exact generated 12-Form unsigned fixture corpus, hard-refuses any other
   environment before binding reads, and remains permanently non-production.
-  It has no public route or privileged publisher branch. Form execution and
-  partial convergence are described in [form-authority.md](form-authority.md).
+  Its default export has a non-operational `fetch` handler that always returns
+  `404` only to satisfy Cloudflare’s module registration requirement; its named
+  RPC entrypoint remains pure RPC and has no public route or privileged
+  publisher branch. Form execution and partial convergence are described in
+  [form-authority.md](form-authority.md).
 - `takoserver-integration-form-authority-operator-worker`: integration only.
   It owns only the dedicated custom domain
   `https://form-authority.integration.takoserver.com`, with workers.dev and
