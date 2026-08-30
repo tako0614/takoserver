@@ -134,7 +134,12 @@ export async function runFormAuthorityInvoke(
   });
 
   if (invocation.action === "status") {
-    const readback = exactReadback(await client.call("readback", request, "preflight"), request);
+    const readback = parseExactReadback(
+      await client.call("readback", request, "preflight"),
+      request,
+      false,
+      "preflight",
+    );
     return invocationResult({
       invocation,
       gateway,
@@ -150,8 +155,8 @@ export async function runFormAuthorityInvoke(
   const readbackValue = await client.call("readback", request, "verification");
   const readback =
     applied.status === "partial"
-      ? parseExactReadback(readbackValue, request, false)
-      : exactReadback(readbackValue, request);
+      ? parseExactReadback(readbackValue, request, false, "verification")
+      : exactReadback(readbackValue, request, "verification");
   if (applied.status === "partial") {
     throw verificationError(
       "Form authority apply acknowledged partial convergence",
@@ -554,14 +559,19 @@ async function exactApplyResult(
   return structuredClone(result);
 }
 
-function exactReadback(value: unknown, request: FormAuthorityPlanRequest): FormAuthorityReadback {
-  return parseExactReadback(value, request, true);
+function exactReadback(
+  value: unknown,
+  request: FormAuthorityPlanRequest,
+  phase: DeployPhase,
+): FormAuthorityReadback {
+  return parseExactReadback(value, request, true, phase);
 }
 
 function parseExactReadback(
   value: unknown,
   request: FormAuthorityPlanRequest,
   requireConverged: boolean,
+  phase: DeployPhase,
 ): FormAuthorityReadback {
   if (
     !isRecord(value) ||
@@ -605,7 +615,7 @@ function parseExactReadback(
           (form.installed !== true || form.supported !== true || form.active !== true)),
     )
   ) {
-    throw verificationError("Form authority readback is invalid");
+    throw phaseError(phase, "Form authority readback is invalid");
   }
   return structuredClone(value as unknown as FormAuthorityReadback);
 }

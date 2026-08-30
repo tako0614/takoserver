@@ -123,6 +123,44 @@ describe("signed Form authority operator invocation", () => {
     expect(status).toMatchObject({ action: "status", ready: true, credentialsRedacted: true });
   });
 
+  test("status accepts the valid nonconverged initial readback and reports not ready", async () => {
+    const fixture = await invocationFixture();
+    const status = await runFormAuthorityInvoke(
+      {
+        surface: "takoserver-integration-form-authority",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      fixture.target,
+      fixture.options,
+    );
+
+    expect(fixture.calls.map(({ action }) => action)).toEqual(["readback"]);
+    expect(status).toMatchObject({ action: "status", ready: false, credentialsRedacted: true });
+    expect((status.readback as { forms: unknown[] }).forms).toHaveLength(12);
+  });
+
+  test("classifies a malformed status readback as a preflight error", async () => {
+    const fixture = await invocationFixture({ tamperReadback: "truthy" });
+    const failure = await runFormAuthorityInvoke(
+      {
+        surface: "takoserver-integration-form-authority",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      fixture.target,
+      fixture.options,
+    ).catch((error) => error);
+
+    expect(fixture.calls.map(({ action }) => action)).toEqual(["readback"]);
+    expect(failure).toMatchObject({
+      phase: "preflight",
+      message: expect.stringContaining("readback is invalid"),
+    });
+  });
+
   test("rejects a tampered canonical plan digest before sending apply", async () => {
     const fixture = await invocationFixture({ tamperPlanDigest: true });
     await expect(
