@@ -3,6 +3,7 @@ import { runConsole } from "./deploy/console.ts";
 import { DEPLOY_CONTRACT } from "./deploy/contract.ts";
 import { DeployError, PHASE_EXIT_CODE } from "./deploy/errors.ts";
 import { runFormAuthority } from "./deploy/form-authority.ts";
+import { runFormAuthorityIdentityProbe } from "./deploy/form-authority-identity-probe.ts";
 import { runFormAuthorityInvoke } from "./deploy/form-authority-invoke.ts";
 import { loadFormAuthorityScopeTransition } from "./deploy/form-authority-scope-transition.ts";
 import { runHosted } from "./deploy/hosted.ts";
@@ -386,6 +387,16 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
           environment: invocation.environment,
           commit: invocation.commit,
           ...(scopeTransition === undefined ? {} : { scopeTransition }),
+        },
+        target,
+      );
+    case "takoserver-form-authority-identity-probe":
+      return await runFormAuthorityIdentityProbe(
+        {
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
         },
         target,
       );

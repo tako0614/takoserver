@@ -1,5 +1,9 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import {
+  type IntegrationFormAuthorityRawWorkerEnv,
+  invokeAuthenticatedIntegrationFormAuthorityFromWorkerEnv,
+} from "../src/form-authority-worker-composition.ts";
+import {
   type FormAuthorityRpc,
   handleIntegrationFormAuthorityGateway,
   type IntegrationFormAuthorityGatewayEnv,
@@ -10,7 +14,11 @@ const OPERATOR_ORIGIN = "https://form-authority.integration.takoserver.com";
 const HOST_ID = "https://api.integration.takoserver.com";
 const PUBLIC_VERSION_ID = "11111111-1111-4111-8111-111111111111";
 const DRIFTED_VERSION_ID = "22222222-2222-4222-8222-222222222222";
-const WORKER_ARTIFACT_DIGEST = `sha256:${"a".repeat(64)}`;
+const WORKER_ARTIFACT_DIGEST: `sha256:${string}` = `sha256:${"a".repeat(64)}`;
+const DRIFTED_WORKER_ARTIFACT_DIGEST: `sha256:${string}` = `sha256:${"c".repeat(64)}`;
+const IMPLEMENTATION_DIGEST: `sha256:${string}` = `sha256:${"b".repeat(64)}`;
+const IMPLEMENTATION_PAYLOAD_DIGEST: `sha256:${string}` = `sha256:${"d".repeat(64)}`;
+const CAPABILITY_DIGEST: `sha256:${string}` = `sha256:${"e".repeat(64)}`;
 const OPERATOR_SCOPE = {
   tenantId: "tenant-yurucommu-integration",
   space: "space-yurucommu-integration",
@@ -140,7 +148,7 @@ describe("integration Form authority operator gateway", () => {
     expect(calls).toEqual([]);
   });
 
-  test("rejects public Worker drift before invoking the route-less authority", async () => {
+  test("rejects a proof for a stale public Worker Version before route-less RPC", async () => {
     const calls: { action: string; body: unknown; assertion: string }[] = [];
     const body = {
       kind: "takoserver.form-authority-plan-request@v2",
@@ -156,9 +164,86 @@ describe("integration Form authority operator gateway", () => {
       env,
       () => NOW,
     );
-    expect(result.status).toBe(409);
-    expect(await result.json()).toEqual({ error: { code: "public_host_drift" } });
+    expect(result.status).toBe(401);
+    expect(await result.json()).toEqual({ error: { code: "invalid_operator_assertion" } });
     expect(calls).toEqual([]);
+  });
+
+  test("verifies the proof against the live artifact identity", async () => {
+    const calls: { action: string; body: unknown; assertion: string }[] = [];
+    const body = {
+      kind: "takoserver.form-authority-plan-request@v2",
+      activation: { kind: "space", ...OPERATOR_SCOPE, desiredActive: true },
+    };
+    const assertion = await signGatewayAssertion("plan", "/v1/plan", body);
+    const env = gatewayEnv({
+      authority: authority(calls),
+      publicVersionId: PUBLIC_VERSION_ID,
+      workerArtifactDigest: DRIFTED_WORKER_ARTIFACT_DIGEST,
+    });
+
+    const result = await handleIntegrationFormAuthorityGateway(
+      request("/v1/plan", body, assertion),
+      env,
+      () => NOW,
+    );
+
+    expect(result.status).toBe(401);
+    expect(await result.json()).toEqual({ error: { code: "invalid_operator_assertion" } });
+    expect(calls).toEqual([]);
+  });
+
+  test("a gateway-to-route-less identity race fails closed", async () => {
+    const body = {
+      kind: "takoserver.form-authority-plan-request@v2",
+      activation: { kind: "space", ...OPERATOR_SCOPE, desiredActive: true },
+    };
+    const assertion = await signGatewayAssertion("plan", "/v1/plan", body);
+    let privilegedRead = false;
+    const routeLessEnv = {
+      TAKOSERVER_ENVIRONMENT: "integration",
+      TAKOSERVER_FORM_AUTHORITY_HOST_ID: HOST_ID,
+      TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK: canonicalJson(publicJwk),
+      TAKOSERVER_FORM_AUTHORITY_OPERATOR_TENANT_ID: OPERATOR_SCOPE.tenantId,
+      TAKOSERVER_FORM_AUTHORITY_OPERATOR_SPACE: OPERATOR_SCOPE.space,
+      PUBLIC_HOST_IDENTITY: {
+        async identity() {
+          return publicIdentity({ workerVersionId: DRIFTED_VERSION_ID });
+        },
+      },
+      get TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST() {
+        privilegedRead = true;
+        throw new Error("identity race must fail before capabilities");
+      },
+      get STATE_DB() {
+        privilegedRead = true;
+        throw new Error("identity race must fail before D1");
+      },
+      get OBJECTS() {
+        privilegedRead = true;
+        throw new Error("identity race must fail before R2");
+      },
+    } as unknown as IntegrationFormAuthorityRawWorkerEnv;
+    const routeLess: FormAuthorityRpc = {
+      plan: (invocation) =>
+        invokeAuthenticatedIntegrationFormAuthorityFromWorkerEnv(routeLessEnv, "plan", invocation),
+      async apply() {
+        throw new Error("unexpected apply");
+      },
+      async readback() {
+        throw new Error("unexpected readback");
+      },
+    };
+
+    const result = await handleIntegrationFormAuthorityGateway(
+      request("/v1/plan", body, assertion),
+      gatewayEnv({ authority: routeLess, publicVersionId: PUBLIC_VERSION_ID }),
+      () => NOW,
+    );
+
+    expect(result.status).toBe(401);
+    expect(await result.json()).toEqual({ error: { code: "invalid_operator_assertion" } });
+    expect(privilegedRead).toBe(false);
   });
 
   test("fails closed as unavailable when the sealed operator key is malformed", async () => {
@@ -174,6 +259,30 @@ describe("integration Form authority operator gateway", () => {
       env,
       () => NOW,
     );
+    expect(result.status).toBe(503);
+    expect(await result.json()).toEqual({ error: { code: "identity_unavailable" } });
+    expect(calls).toEqual([]);
+  });
+
+  test("maps a thrown public identity RPC to identity_unavailable before authority RPC", async () => {
+    const calls: { action: string; body: unknown; assertion: string }[] = [];
+    const body = { kind: "takoserver.form-authority-plan-request@v2" };
+    const assertion = await signGatewayAssertion("plan", "/v1/plan", body);
+    const env = {
+      ...gatewayEnv({ authority: authority(calls), publicVersionId: PUBLIC_VERSION_ID }),
+      PUBLIC_HOST_IDENTITY: {
+        async identity(): Promise<never> {
+          throw new Error("rpc unavailable");
+        },
+      },
+    };
+
+    const result = await handleIntegrationFormAuthorityGateway(
+      request("/v1/plan", body, assertion),
+      env,
+      () => NOW,
+    );
+
     expect(result.status).toBe(503);
     expect(await result.json()).toEqual({ error: { code: "identity_unavailable" } });
     expect(calls).toEqual([]);
@@ -206,24 +315,24 @@ describe("integration Form authority operator gateway", () => {
 function gatewayEnv(input: {
   readonly authority: FormAuthorityRpc;
   readonly publicVersionId: string;
+  readonly workerArtifactDigest?: `sha256:${string}`;
 }): IntegrationFormAuthorityGatewayEnv {
   return {
     TAKOSERVER_ENVIRONMENT: "integration",
     TAKOSERVER_FORM_AUTHORITY_HOST_ID: HOST_ID,
     TAKOSERVER_FORM_AUTHORITY_OPERATOR_ORIGIN: OPERATOR_ORIGIN,
-    TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST: WORKER_ARTIFACT_DIGEST,
-    TAKOSERVER_PUBLIC_WORKER_VERSION_ID: PUBLIC_VERSION_ID,
     TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK: canonicalJson(publicJwk),
     TAKOSERVER_FORM_AUTHORITY_OPERATOR_TENANT_ID: OPERATOR_SCOPE.tenantId,
     TAKOSERVER_FORM_AUTHORITY_OPERATOR_SPACE: OPERATOR_SCOPE.space,
     FORM_AUTHORITY: input.authority,
     PUBLIC_HOST_IDENTITY: {
       async identity() {
-        return {
-          kind: "takoserver.public-host-identity@v1",
-          hostId: HOST_ID,
+        return publicIdentity({
           workerVersionId: input.publicVersionId,
-        };
+          ...(input.workerArtifactDigest
+            ? { workerArtifactDigest: input.workerArtifactDigest }
+            : {}),
+        });
       },
     },
   } as IntegrationFormAuthorityGatewayEnv;
@@ -287,6 +396,7 @@ async function signGatewayAssertion(
     hostId: HOST_ID,
     workerArtifactDigest: WORKER_ARTIFACT_DIGEST,
     publicWorkerVersionId: PUBLIC_VERSION_ID,
+    implementationDigest: IMPLEMENTATION_DIGEST,
     iat: now - 1,
     exp: now + 60,
   };
@@ -297,4 +407,19 @@ async function signGatewayAssertion(
     new TextEncoder().encode(payload),
   );
   return `${payload}.${Buffer.from(signature).toString("base64url")}`;
+}
+
+function publicIdentity(input: {
+  readonly workerVersionId: string;
+  readonly workerArtifactDigest?: `sha256:${string}`;
+}) {
+  return {
+    kind: "takoserver.public-host-identity@v2" as const,
+    hostId: HOST_ID,
+    workerVersionId: input.workerVersionId,
+    workerArtifactDigest: input.workerArtifactDigest ?? WORKER_ARTIFACT_DIGEST,
+    implementationPayloadDigest: IMPLEMENTATION_PAYLOAD_DIGEST,
+    capabilityDigest: CAPABILITY_DIGEST,
+    implementationDigest: IMPLEMENTATION_DIGEST,
+  };
 }

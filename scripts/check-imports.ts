@@ -79,7 +79,7 @@ const LAYERS: readonly Layer[] = [
     // `payment-setup` builds the shape the routes layer asks for, which makes
     // it composition rather than domain: it is allowed to know both halves.
     match:
-      /^src\/(?:app|deployment-composition|form-authority-worker-composition|integration-form-authority-gateway|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|selfhost-composition|standalone-provider-composition|standard-service-production|worker-data-services|worker-(?:object-bucket|production|stable-local)-composition)\.ts$|^src\/takoform\/(?:host-admission-endpoint|integration-operator-endpoint)\.ts$/u,
+      /^src\/(?:app|deployment-composition|form-authority-(?:identity-probe|public-identity|worker-composition)|integration-form-authority-gateway|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|public-form-(?:implementation-build|runtime)|public-worker-implementation|selfhost-composition|standalone-provider-composition|standard-service-production|worker-data-services|worker-(?:object-bucket|production|stable-local)-composition)\.ts$|^src\/takoform\/(?:host-admission-endpoint|integration-operator-endpoint)\.ts$/u,
     may: ["core", "adapter", "domain", "routes", "app", "release-data"],
   },
   // An entry chooses concrete implementations — that is its whole job. What it
@@ -163,6 +163,7 @@ const PUBLIC_READER_ENTRIES = [
   "src/entry-worker.ts",
   "src/router.ts",
   "src/openapi.ts",
+  "src/entry-public-form-runtime-payload.ts",
 ];
 const FORM_AUTHORITY_ENTRIES = [
   "src/entry-form-authority-worker.ts",
@@ -170,6 +171,7 @@ const FORM_AUTHORITY_ENTRIES = [
 ];
 const FORM_AUTHORITY_OPERATOR_GATEWAY_ENTRIES = [
   "src/entry-integration-form-authority-operator-worker.ts",
+  "src/entry-form-authority-identity-probe.ts",
 ];
 const FORM_AUTHORITY_WRITERS = [
   "src/takoform/admission-store.ts",
@@ -178,6 +180,7 @@ const FORM_AUTHORITY_WRITERS = [
 ];
 const FORM_AUTHORITY_RPC_MODULES = [
   "src/form-authority-operator-proof.ts",
+  "src/form-authority-public-identity.ts",
   "src/form-authority-worker-composition.ts",
   "src/takoform/host-admission-coordinator.ts",
   "src/takoform/host-admission-endpoint.ts",

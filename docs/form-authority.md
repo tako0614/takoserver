@@ -28,6 +28,16 @@ remain pure RPC classes and are bound explicitly. Both use the selected
 Takoserver target’s existing `STATE_DB` and `OBJECTS` bindings. The production
 bundle does not contain the integration package corpus.
 
+Every advertised Form-authority environment also has one permanent minimal
+`takoserver-form-authority-identity-probe` Worker. Its target-owned
+`identityProbeWorkerName` and `identityProbeOrigin` name a workers.dev endpoint
+with only `GET /v1/public-host-identity`. The probe has one service binding to
+the public Worker's `PublicHostIdentityEntrypoint`, one expected Host-id
+variable, and no D1, R2, secret, mutation RPC, route, preview, or custom domain.
+Deploy status actively calls this endpoint and validates the RPC result against
+the authoritative served public Version and artifact. An absent, thrown,
+malformed, stale, or semantically inconsistent response makes readiness false.
+
 The only network ingress is a third, separately deployed integration Worker,
 `takoserver-integration-form-authority-operator-worker`. It owns the dedicated
 custom origin `https://form-authority.integration.takoserver.com` and binds the
@@ -62,19 +72,21 @@ v2 request, plan, apply, and readback protocol, so v1 envelopes are refused.
 Each request requires exact `application/json`, at most 2 MiB, and a bearer
 assertion signed by the dedicated target-owned Ed25519 public key. The assertion
 is valid for at most 60 seconds and binds its purpose, action, method, path,
-canonical body digest, environment, Host id, public Worker artifact digest, and
-public Worker Version. The private key never enters a Worker binding. The
-gateway forwards the exact original assertion and request envelope to the
-route-less authority, which independently verifies it against its own sealed
-public JWK before reading capability, D1, R2, or public identity bindings. Both
-Workers independently call the public Worker’s named
-`PublicHostIdentityEntrypoint` before every plan/apply/readback and require the
-same immutable Worker Version. Apply checks that identity again after
-verification and the Host policy decision plus current-head reread, then immediately before every
-durable command. A later ordinary public Worker deploy therefore closes the
-stale operator path immediately. Public Host readers also treat a support
-profile sealed to another Worker Version as unsupported until the authority is
-redeployed and the Forms are explicitly reconverged.
+canonical body digest, environment, Host id, public Worker artifact digest and
+Version, and implementation digest. The private key never enters a Worker
+binding. The gateway forwards the exact original assertion and request envelope
+to the route-less authority. Both Workers first call the public Worker’s named
+`PublicHostIdentityEntrypoint`; its exact v2 result—Host id, served Worker
+Version, outer artifact digest, implementation-payload digest, capability
+digest, and semantic implementation digest—is request-time authority.
+The route-less authority then independently verifies the assertion against its
+own sealed public JWK before reading capability, D1, or R2. It rereads the live
+identity while constructing the operation composition, and the endpoint checks
+it again before the operation; apply also checks it immediately before every
+durable command. Any change between proof creation, gateway verification,
+route-less verification, policy/current-head read, and durable mutation
+therefore fails closed. A later ordinary public Worker deploy closes an
+assertion for the old identity immediately.
 
 ## Plan and apply
 
@@ -94,60 +106,103 @@ inactive successor only for a present active head, carrying that head's exact
 durable implementation digest and predecessor. Missing or already-inactive
 heads are no-op. Malformed, multiple, or drifted heads fail closed.
 
+New support events use `takoserver.form-support@v2` and contain only the
+semantic `implementationDigest`. A Worker Version change alone does not make
+an installed Form unsupported. An unrelated route/UI change may rotate the
+outer Worker artifact without rotating semantic identity. A sealed
+handler/provider payload, capability manifest, exact Form package identity, or
+admitted operation change derives a new implementation digest and requires
+explicit reconvergence. Existing exact
+`takoserver.form-support@v1` events remain readable as immutable history, but
+their Version, artifact, and capability fields are shape-validated rather than
+used as the support key.
+
 Executable operations are the intersection of:
 
 1. lifecycle operations in the exact Form package;
-2. the selected Host capability manifest; and
-3. handlers present in the selected Worker artifact.
+2. the code-owned public Host capability manifest; and
+3. handlers present in the separately sealed public Form runtime payload.
 
-The operator-private deploy target may narrow this result per Form through
-`formAuthority.operatorOperations`; the target parser and capability builder
-reject every widening. The canonical narrowed manifest is an immutable Worker
-binding and changes the capability/implementation identity. Every D1
-transition retains its existing guarded predecessor/uniqueness fence. Package
-objects retain create-only, byte-exact existing-object convergence in R2. Apply
-does not consider a D1 install head converged unless the exact package index and
-every payload byte also verify from R2. It does not retry a failed action or
-keep a second ledger: it returns receipts for completed actions, performs
-authoritative readback, and returns the next plan.
+The capability manifest has no target or environment selector. The deploy
+target must realize the exact four provider supplies required by that manifest,
+and `formAuthority.operatorOperations` is rejected as an unknown target key;
+an operator therefore cannot select either payload `P` or semantic identity
+`I`. Every D1 transition retains its existing guarded predecessor/uniqueness
+fence. Package objects retain create-only, byte-exact existing-object
+convergence in R2. Apply does not consider a D1 install head converged unless
+the exact package index and every payload byte also verify from R2. It does not
+retry a failed action or keep a second ledger: it returns receipts for completed
+actions, performs authoritative readback, and returns the next plan.
 
 The authority deploy surfaces read the served public Worker Version, prove its
-commit, binding/secret/domain closure, and artifact digest, then rebuilds that
-public Worker from the same exact source commit and requires byte identity. The
-authority Worker binds that proven public artifact digest; its own bundle digest
-is recorded separately. `formAuthority.hostId` must equal the public Worker’s
-`publicOrigin`. Gateway status additionally proves exact custom-domain ownership,
-the named route-less authority service binding, the named public identity
-binding, the dedicated public JWK, the exact operator tenant/Space bindings,
-and the absence of D1/R2 and secret bindings. Gateway bootstrap is accepted
-only from the clean state in which both its script and configured custom domain
-are absent. A foreign domain owner, or either script/domain half existing
-without the other, is refused; a successful upload is followed by the same
-exact exhaustive readback used for later deployments.
+commit, binding/secret/domain closure, and artifact digest, then rebuild that
+public Worker from the same exact source commit and require byte identity. This
+is a deploy-time provenance/race fence; the route-less and gateway Workers do
+not store a public Worker Version or artifact pin. Their immutable service
+binding to `PublicHostIdentityEntrypoint` supplies the live runtime identity.
+The authority bundle digest is recorded separately. `formAuthority.hostId`
+must equal the public Worker’s `publicOrigin`. The public integration Worker
+embeds build-derived semantic identity rather than accepting a public capability
+variable. The route-less authority receives the same canonical capability
+manifest from the code-owned build helper and verifies it against all four
+identity digests returned by the live RPC.
 
-Status classifies an authority binding only as `exact-current-public` or the
-exact `previousVersionId` profile `exact-direct-public-predecessor`; every
-arbitrary, two-hop, malformed, or identity-mismatched predecessor is refused.
-Roll-forward always updates the route-less authority first. Gateway apply is
-blocked until that dependency is exact-current, after which the gateway may
-advance once from its own exact direct-predecessor profile.
+Public Worker construction is two-stage. Wrangler first builds and seals a
+target-neutral handler/provider payload `P` from the real runtime seam shared by
+production composition. Deploy then derives semantic identity `I` from `P`, the
+adapter/capability manifest, and the exact admitted Form package/operation set.
+`P`, the capability digest, and `I` are compile-time definitions embedded into
+the outer Worker; only after that does deploy hash the final outer artifact `A`
+and realize `A` as the public identity variable for integration, rehearsal, and
+production. `P` and `I` have no target override, runtime source scan, or central
+pin. Worker Version remains the request/mutation fence and is not an input to
+`I`.
 
-The operator-private scope-transition selector uses a stricter state machine.
-Its status accepts only the current public Worker identity with
-`scopeBindingProfile: exact-target` or
+Gateway status additionally proves exact custom-domain ownership, the named
+route-less authority service binding, the named public identity binding, the
+dedicated public JWK, the exact operator tenant/Space bindings, and the absence
+of D1/R2 and secret bindings. Gateway bootstrap is accepted only from the clean
+state in which both its script and configured custom domain are absent. A
+foreign domain owner, or either script/domain half existing without the other,
+is refused; a successful upload is followed by the same exact exhaustive
+readback used for later deployments.
+
+The steady-state `dynamic-public-rpc` binding profile contains no public Worker
+Version or artifact variables. Status reports both bound legacy fields as
+`null`, and readiness requires this dynamic profile. A one-time migration also
+recognizes `legacy-exact-pinned`, but only after fetching the immutable public
+Worker Version named by both legacy bindings and proving its canonical
+annotation, exact target closure, exact bundle digest, and same source commit
+as the authority Worker. The pinned Version may be outside current deployment
+history; it is neither required nor assumed to be a direct predecessor. The
+legacy pre-capability-manifest public closure and the exact current closure are
+the only accepted source shapes. Partial pins, malformed ids/digests, foreign
+closures, digest mismatch, or commit mismatch are refused.
+
+Normal apply migrates a verified legacy closure by uploading one exact dynamic
+direct successor: route-less authority first, then gateway after its dependency
+is dynamic. It removes both legacy identity variables and verifies the exact
+pin-free closure after upload. A lost acknowledgement is resolved with status;
+the upload is never retried automatically.
+
+The operator-private scope-transition selector uses a separate stricter state
+machine. Its status accepts either the dynamic profile or one fully verified
+legacy exact pin with `scopeBindingProfile: exact-target` or
 `scopeBindingProfile: exact-transition-predecessor`. It does not use public
 Worker history as a scope migration mechanism. A third scope, stale public
-identity, missing Worker, bootstrap topology, or history-based roll-forward is
-refused. Apply accepts only `exact-transition-predecessor`, uploads once, and
-must read back `exact-target`; applying again at `exact-target` is a refused
-no-op. The gateway cannot advance until the route-less authority is already
-`exact-target`. A lost upload acknowledgement is reconciled only by status;
-there is no retry.
+identity proof, missing Worker, bootstrap topology, or history-based
+roll-forward is refused. Apply accepts only `exact-transition-predecessor`,
+uploads one dynamic target closure, and must read back `exact-target`; applying
+again at `exact-target` is a refused no-op. The gateway cannot advance until
+the route-less authority is already dynamic and `exact-target`. A lost upload
+acknowledgement is reconciled only by status; there is no retry.
 
-After the three integration Workers are current at the same exact commit, the
+After the public Worker, identity probe, route-less authority, and gateway are
+current at the same exact commit, the
 owner invokes the bridge through the repository entrypoint:
 
 ```sh
+bun run deploy -- takoserver-form-authority-identity-probe --status --environment=integration --commit=<40-hex-sha>
 bun run deploy -- takoserver-integration-form-authority --status --environment=integration --commit=<40-hex-sha>
 bun run deploy -- takoserver-integration-form-authority --apply --environment=integration --commit=<40-hex-sha>
 bun run deploy -- takoserver-integration-form-authority-deactivation --status --environment=integration --commit=<40-hex-sha>
@@ -180,6 +235,17 @@ a present active head whose implementation digest equals the current code
 identity.
 
 ## Integration cutover order
+
+Before the first invocation after this identity change, deploy the public
+integration Worker through `bun run deploy` so it exposes the complete
+build-derived `PublicHostIdentity@v2`. Deploy and verify
+`takoserver-form-authority-identity-probe` next. Then run status/apply/status for
+the route-less integration authority and, after it is dynamic, for the operator
+gateway. This is the one-time migration from a verified legacy exact pin; no
+live request is signed until the probe and both authority status results are
+ready. Rehearsal and production use the same public Worker → identity probe →
+route-less authority order. These steps do not authorize deployment by
+themselves.
 
 The reviewed order is deliberately staged. First capture the old exact
 tenant/Space scope with status and its operator snapshot. Write an
@@ -215,8 +281,9 @@ After the target descriptor names `targetScope`, use the same transition file
 for the following order:
 
 1. Run deactivation status, apply, and status while both the route-less Worker
-   and gateway report `exact-transition-predecessor` on the current public
-   Worker. Mixed predecessor/target topology is refused before signing.
+   and gateway report `exact-transition-predecessor` with a verified dynamic or
+   legacy exact identity profile. Mixed predecessor/target topology is refused
+   before signing.
 2. Run the route-less authority status, apply, and status. It alone advances to
    `exact-target` with one upload.
 3. Run the gateway status, apply, and status. It advances once only after the
@@ -269,9 +336,9 @@ selected Takoserver deploy commit. A changed fixture corpus creates a new
 immutable publisher key; the previous publisher/checkpoint chain remains
 append-only history while packages move through explicit replacements. A later
 public Worker Version does not rotate publisher, checkpoint, or install
-provenance. It does require an explicit support-profile reseal for that Version;
-an existing activation survives only while the implementation digest is
-unchanged.
+provenance or require a support-profile reseal by itself. Explicit
+reconvergence is required only when the semantic implementation digest changes;
+an existing activation remains effective while that digest is unchanged.
 
 Regenerate after the verified fixture changes:
 

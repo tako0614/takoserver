@@ -159,8 +159,10 @@ export interface CreateTakoformHostAuthorityOptions {
   readonly objects?: Pick<ObjectStoreAccess, "get" | "list">;
   readonly packages?: FormPackageReader;
   readonly hostId: string;
-  /** Current public Worker Version; a stale authority profile is unsupported. */
+  /** Current Worker Version is retained only as operation/audit provenance. */
   readonly publicWorkerVersionId?: string;
+  /** Current semantic Form implementation identity. */
+  readonly implementationDigest?: AdmissionDigest;
   /** Build/operator inputs only; these bytes do not confer any runtime authority. */
   readonly candidates: readonly InstalledTakoformForm[];
   readonly bindings?: readonly InstalledTakoformBinding[];
@@ -203,6 +205,9 @@ export function createTakoformHostAuthority(
     )
   ) {
     throw new TypeError("public Worker Version identity is invalid");
+  }
+  if (options.implementationDigest !== undefined && !isSha256Digest(options.implementationDigest)) {
+    throw new TypeError("public Worker semantic identity is invalid");
   }
   if (
     !options.technicalAvailability ||
@@ -268,7 +273,7 @@ export function createTakoformHostAuthority(
     const currentImplementationProfile = supportProfileMatchesPublicWorker(
       supportRow,
       support.implementationDigest,
-      options.publicWorkerVersionId,
+      options.implementationDigest,
     );
     await validateEvidencePins({
       publisherRow,
@@ -693,18 +698,38 @@ export function createTakoformHostAuthority(
 function supportProfileMatchesPublicWorker(
   row: Row,
   implementationDigest: AdmissionDigest,
-  publicWorkerVersionId: string | undefined,
+  currentImplementationDigest: AdmissionDigest | undefined,
 ): boolean {
-  if (publicWorkerVersionId === undefined) return true;
+  if (currentImplementationDigest === undefined) return true;
   const profile = parseJson(row.profile_json);
+  if (!isJsonObject(profile)) return false;
+  const semanticMatch =
+    profile.implementationDigest === implementationDigest &&
+    implementationDigest === currentImplementationDigest;
+  if (!semanticMatch) return false;
+  if (profile.kind === "takoserver.form-support@v2") {
+    return exactKeys(profile, ["implementationDigest", "kind"]);
+  }
   return (
-    isJsonObject(profile) &&
     profile.kind === "takoserver.form-support@v1" &&
-    profile.publicWorkerVersionId === publicWorkerVersionId &&
+    exactKeys(profile, [
+      "capabilityDigest",
+      "implementationDigest",
+      "kind",
+      "publicWorkerVersionId",
+      "workerArtifactDigest",
+    ]) &&
     isSha256Digest(profile.workerArtifactDigest) &&
     isSha256Digest(profile.capabilityDigest) &&
-    profile.implementationDigest === implementationDigest
+    typeof profile.publicWorkerVersionId === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(
+      profile.publicWorkerVersionId,
+    )
   );
+}
+
+function exactKeys(value: Readonly<Record<string, unknown>>, keys: readonly string[]): boolean {
+  return JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...keys].sort());
 }
 
 /** Canonical durable audience values used by the private writer/operator tool. */

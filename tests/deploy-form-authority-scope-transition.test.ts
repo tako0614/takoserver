@@ -37,6 +37,9 @@ const target = {
   publicOrigin: HOST_ID,
   formAuthority: {
     workerName: "takoserver-form-authority-integration",
+    identityProbeWorkerName: "takoserver-form-identity-integration",
+    identityProbeOrigin:
+      "https://takoserver-form-identity-integration.integration.example.workers.dev",
     integrationWorkerName: "takoserver-form-fixture-integration",
     integrationOperatorWorkerName: "takoserver-form-operator-integration",
     integrationOperatorOrigin: "https://form-authority.integration.example.test",

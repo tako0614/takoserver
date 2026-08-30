@@ -7,7 +7,6 @@ import {
   signedFormAuthorityRpcInvocation,
   verifyFormAuthorityOperatorAssertion,
 } from "./form-authority-operator-proof.ts";
-import { isSha256Digest } from "./json.ts";
 import { isPublicHostIdentity, type PublicHostIdentityRpc } from "./public-host-identity.ts";
 import { parseStrictJson } from "./strict-json.ts";
 
@@ -24,8 +23,6 @@ export interface IntegrationFormAuthorityGatewayEnv {
   readonly TAKOSERVER_ENVIRONMENT: string;
   readonly TAKOSERVER_FORM_AUTHORITY_HOST_ID: string;
   readonly TAKOSERVER_FORM_AUTHORITY_OPERATOR_ORIGIN: string;
-  readonly TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST: string;
-  readonly TAKOSERVER_PUBLIC_WORKER_VERSION_ID: string;
   readonly TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK: string;
   readonly TAKOSERVER_FORM_AUTHORITY_OPERATOR_TENANT_ID: string;
   readonly TAKOSERVER_FORM_AUTHORITY_OPERATOR_SPACE: string;
@@ -57,17 +54,20 @@ export async function handleIntegrationFormAuthorityGateway(
     const assertion = bearer(request.headers.get("authorization"));
     const body = parseStrictJson(await boundedBody(request), MAX_BODY_BYTES);
     if (!isRecord(body)) return response(400, "invalid_request");
-    const hostId = env.TAKOSERVER_FORM_AUTHORITY_HOST_ID;
-    const workerArtifactDigest = env.TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST;
-    const publicWorkerVersionId = env.TAKOSERVER_PUBLIC_WORKER_VERSION_ID;
-    if (
-      hostId.length === 0 ||
-      hostId.length > 255 ||
-      !isSha256Digest(workerArtifactDigest) ||
-      !workerVersion(publicWorkerVersionId)
-    ) {
+    let live: unknown;
+    try {
+      live = await env.PUBLIC_HOST_IDENTITY.identity();
+    } catch {
       return response(503, "identity_unavailable");
     }
+    if (!isPublicHostIdentity(live)) {
+      return response(503, "identity_unavailable");
+    }
+    const hostId = env.TAKOSERVER_FORM_AUTHORITY_HOST_ID;
+    if (hostId.length === 0 || hostId.length > 255) {
+      return response(503, "identity_unavailable");
+    }
+    if (live.hostId !== hostId) return response(409, "public_host_drift");
     try {
       await verifyFormAuthorityOperatorAssertion({
         assertion,
@@ -77,8 +77,9 @@ export async function handleIntegrationFormAuthorityGateway(
         identity: {
           environment: "integration",
           hostId,
-          workerArtifactDigest,
-          publicWorkerVersionId,
+          workerArtifactDigest: live.workerArtifactDigest,
+          publicWorkerVersionId: live.workerVersionId,
+          implementationDigest: live.implementationDigest,
         },
         publicJwk: env.TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK,
         clock,
@@ -105,14 +106,6 @@ export async function handleIntegrationFormAuthorityGateway(
         return response(403, "operator_scope_mismatch");
       }
       return response(401, "invalid_operator_assertion");
-    }
-    const live = await env.PUBLIC_HOST_IDENTITY.identity();
-    if (
-      !isPublicHostIdentity(live) ||
-      live.hostId !== hostId ||
-      live.workerVersionId !== publicWorkerVersionId
-    ) {
-      return response(409, "public_host_drift");
     }
     let result: unknown;
     const rpcInvocation = signedFormAuthorityRpcInvocation({ action, assertion, body });
@@ -219,10 +212,6 @@ function exactOrigin(value: string): string {
     throw new TypeError("identity_unavailable");
   }
   return url.origin;
-}
-
-function workerVersion(value: string): boolean {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(value);
 }
 
 function operatorErrorCode(error: unknown): string {

@@ -46,6 +46,46 @@ describe("Form authority implementation catalog", () => {
     expect(catalog.entries[0]?.operations).toEqual(["create", "read", "delete"]);
   });
 
+  test("rotates semantic identity for exact Form package or admitted operation changes", async () => {
+    const form = yurucommuFormCandidates(currentTakoformCandidates().forms).find(
+      (candidate) => candidate.identity.formRef.kind === "WorkerDeployment",
+    );
+    if (!form) throw new Error("WorkerDeployment candidate missing");
+    const capabilities = {
+      apiVersion: "takoserver.form-lifecycle-capabilities@v1" as const,
+      implementation: "cloudflare-provider-v1",
+      forms: { WorkerDeployment: ["create", "read", "delete"] as const },
+    };
+    const handlers = {
+      apiVersion: "takoserver.form-handlers@v1" as const,
+      artifact: "sha256:payload-v1",
+      forms: { WorkerDeployment: ["create", "read", "delete"] as const },
+    };
+    const base = await deriveImplementationCatalog({ forms: [form], capabilities, handlers });
+    const changedPackage = await deriveImplementationCatalog({
+      forms: [
+        {
+          ...form,
+          identity: { ...form.identity, packageDigest: `sha256:${"f".repeat(64)}` as const },
+        },
+      ],
+      capabilities,
+      handlers,
+    });
+    const changedOperations = await deriveImplementationCatalog({
+      forms: [form],
+      capabilities,
+      handlers: {
+        ...handlers,
+        forms: { WorkerDeployment: ["read", "delete"] as const },
+      },
+    });
+
+    expect(changedPackage.implementationDigest).not.toBe(base.implementationDigest);
+    expect(changedOperations.entries[0]?.operations).toEqual(["read", "delete"]);
+    expect(changedOperations.implementationDigest).not.toBe(base.implementationDigest);
+  });
+
   test("lets an operator narrow but rejects every widening request", async () => {
     const form = yurucommuFormCandidates(currentTakoformCandidates().forms).find(
       (candidate) => candidate.identity.formRef.kind === "ModuleWorker",
@@ -77,7 +117,7 @@ describe("Form authority implementation catalog", () => {
     ).rejects.toThrow("widen");
   });
 
-  test("seals operator narrowing into the target capability manifest", () => {
+  test("can derive a separately narrowed policy manifest without widening support", () => {
     const narrowed = yurucommuLifecycleCapabilityManifest(YURUCOMMU_IDENTITY_CAPABILITY_KINDS, {
       ModuleWorker: ["read"],
     });

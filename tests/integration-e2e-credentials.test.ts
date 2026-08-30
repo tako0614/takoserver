@@ -481,6 +481,9 @@ describe("integration E2E credential helper", () => {
           ...fixture.options.target,
           formAuthority: {
             workerName: "takoserver-form-authority-integration",
+            identityProbeWorkerName: "takoserver-form-identity-integration",
+            identityProbeOrigin:
+              "https://takoserver-form-identity-integration.integration.example.workers.dev",
             hostId: "host.integration.example.test",
             operatorPublicJwk: fixture.options.authority.publicJwk,
           },

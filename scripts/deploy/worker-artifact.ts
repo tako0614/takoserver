@@ -1,7 +1,13 @@
 import { createHash } from "node:crypto";
 import { lstatSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
+import {
+  derivePublicFormImplementationIdentity,
+  type PublicFormImplementationIdentity,
+  publicFormCapabilityManifest,
+} from "../../src/public-worker-implementation.ts";
 import { DeployError, preflightError } from "./errors.ts";
+import { assertPublicFormCapabilityTarget } from "./form-authority-capability.ts";
 import { type CommandResult, REPOSITORY, wranglerCommand } from "./process.ts";
 import { type SealedArtifact, sealDirectory } from "./qualification.ts";
 import { writeWorkerConfig } from "./realized-config.ts";
@@ -16,6 +22,7 @@ export interface WorkerArtifactConfigInput {
   readonly path: string;
   readonly main: string;
   readonly bundleDigestHex?: string;
+  readonly formImplementationIdentity?: PublicFormImplementationIdentity;
 }
 
 export type WorkerArtifactConfigWriter = (input: WorkerArtifactConfigInput) => string;
@@ -25,13 +32,15 @@ export interface PreparedWorkerArtifact {
   readonly bundlePath: string;
   readonly configPath: string;
   readonly bundleDigestHex: string;
+  readonly formImplementationIdentity?: PublicFormImplementationIdentity;
   seal(additionalRequiredFiles?: readonly string[]): SealedArtifact;
 }
 
 /**
- * Builds exactly once, reduces Wrangler output to one link-free bundle, and
- * realizes the upload config beside it. Callers may add a 0600 secrets file,
- * then seal the whole directory immediately before their single upload.
+ * Builds one uploadable outer bundle and realizes its config beside it. A
+ * Form-authority target first performs one separate, non-uploaded payload
+ * build whose digest becomes semantic identity. Callers may add a 0600 secrets
+ * file, then seal the outer release directory before their single upload.
  */
 export async function prepareWorkerArtifact(input: {
   readonly root: string;
@@ -49,6 +58,15 @@ export async function prepareWorkerArtifact(input: {
   mkdirSync(build, { recursive: true, mode: 0o700 });
   mkdirSync(release, { recursive: true, mode: 0o700 });
   const main = input.main ?? resolve(REPOSITORY, "src/entry-cloudflare-worker.ts");
+  const formImplementationIdentity =
+    input.target.formAuthority !== undefined &&
+    resolve(main) === resolve(REPOSITORY, "src/entry-cloudflare-worker.ts")
+      ? await preparePublicFormImplementationPayload({
+          root: join(input.root, "form-implementation-payload"),
+          target: input.target,
+          run: input.run,
+        })
+      : undefined;
   const writeConfig =
     input.writeConfig ??
     ((config: WorkerArtifactConfigInput) =>
@@ -57,6 +75,12 @@ export async function prepareWorkerArtifact(input: {
         main: config.main,
         commit: input.commit,
         ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
+        ...(config.formImplementationIdentity === undefined
+          ? {}
+          : { formImplementationIdentity: config.formImplementationIdentity }),
+        ...(config.bundleDigestHex === undefined
+          ? {}
+          : { workerArtifactDigest: `sha256:${config.bundleDigestHex}` as const }),
         ...(config.bundleDigestHex === undefined
           ? { authorityProfile: { kind: "historical-pre-jit" as const } }
           : {
@@ -72,6 +96,7 @@ export async function prepareWorkerArtifact(input: {
   const buildConfig = writeConfig({
     path: join(input.root, "build-wrangler.jsonc"),
     main,
+    ...(formImplementationIdentity === undefined ? {} : { formImplementationIdentity }),
   });
   const built = await input.run(
     wranglerCommand([
@@ -99,6 +124,7 @@ export async function prepareWorkerArtifact(input: {
     path: join(release, "wrangler.jsonc"),
     main: "worker.js",
     bundleDigestHex,
+    ...(formImplementationIdentity === undefined ? {} : { formImplementationIdentity }),
   });
   let sealed = false;
   return {
@@ -106,12 +132,64 @@ export async function prepareWorkerArtifact(input: {
     bundlePath,
     configPath,
     bundleDigestHex,
+    ...(formImplementationIdentity === undefined ? {} : { formImplementationIdentity }),
     seal(additionalRequiredFiles = []) {
       if (sealed) throw preflightError("Worker artifact may be sealed only once");
       sealed = true;
       return sealDirectory(release, ["worker.js", "wrangler.jsonc", ...additionalRequiredFiles]);
     },
   };
+}
+
+async function preparePublicFormImplementationPayload(input: {
+  readonly root: string;
+  readonly target: DeployTarget;
+  readonly run: WorkerArtifactProcess;
+}): Promise<PublicFormImplementationIdentity> {
+  assertPublicFormCapabilityTarget(input.target);
+  const build = join(input.root, "build");
+  const release = join(input.root, "release");
+  mkdirSync(build, { recursive: true, mode: 0o700 });
+  mkdirSync(release, { recursive: true, mode: 0o700 });
+  const configPath = join(input.root, "wrangler.jsonc");
+  writeFileSync(
+    configPath,
+    `${JSON.stringify(
+      {
+        name: "takoserver-public-form-runtime-payload",
+        main: resolve(REPOSITORY, "src/entry-public-form-runtime-payload.ts"),
+        compatibility_date: "2026-08-17",
+        compatibility_flags: ["nodejs_compat"],
+        workers_dev: false,
+        preview_urls: false,
+      },
+      null,
+      2,
+    )}\n`,
+    { mode: 0o600 },
+  );
+  const built = await input.run(
+    wranglerCommand(["deploy", "--dry-run", "--strict", "--config", configPath, "--outdir", build]),
+  );
+  if (built.exitCode !== 0) {
+    throw new DeployError(
+      "preflight",
+      `public Form implementation payload build failed (exit ${built.exitCode})`,
+      `${built.stdout}${built.stderr}`.trim(),
+    );
+  }
+  const source = exactBundle(build);
+  const payloadPath = join(release, "form-implementation.js");
+  writeFileSync(payloadPath, canonicalizeWorkerBundleSource(readFileSync(source, "utf8"), source));
+  const implementationPayloadDigest = `sha256:${createHash("sha256")
+    .update(readFileSync(payloadPath))
+    .digest("hex")}` as const;
+  const artifact = sealDirectory(release, ["form-implementation.js"]);
+  artifact.assertUnchanged();
+  return await derivePublicFormImplementationIdentity({
+    implementationPayloadDigest,
+    capabilities: publicFormCapabilityManifest(),
+  });
 }
 
 /**

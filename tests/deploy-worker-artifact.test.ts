@@ -9,6 +9,7 @@ import {
   canonicalizeWorkerBundleSource,
   prepareWorkerArtifact,
 } from "../scripts/deploy/worker-artifact.ts";
+import { YURUCOMMU_IDENTITY_CAPABILITY_KINDS } from "../src/takoform/implementation-catalog.ts";
 
 const COMMIT = "a".repeat(40);
 const target = {
@@ -42,6 +43,89 @@ async function build(root: string) {
 }
 
 describe("hermetic Worker bundle identity", () => {
+  test("seals a separate Form runtime payload before embedding its semantic digest", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-worker-form-payload-"));
+    const formTarget = {
+      ...target,
+      edgeSupplies: {
+        offerings: YURUCOMMU_IDENTITY_CAPABILITY_KINDS.map((formKind) => ({ formKind })),
+      } as unknown as NonNullable<DeployTarget["edgeSupplies"]>,
+      workerEndpointSuffix: "integration.example.workers.dev",
+      formAuthority: {
+        workerName: "takoserver-form-authority-integration",
+        identityProbeWorkerName: "takoserver-form-identity-integration",
+        identityProbeOrigin:
+          "https://takoserver-form-identity-integration.integration.example.workers.dev",
+        hostId: target.publicOrigin,
+      },
+    } satisfies DeployTarget;
+    try {
+      const buildFormWorker = async (name: string, payload: string, outer: string) =>
+        await prepareWorkerArtifact({
+          root: join(root, name),
+          target: formTarget,
+          commit: COMMIT,
+          run: async (command) => {
+            const outdir = command[command.indexOf("--outdir") + 1];
+            if (!outdir) throw new Error("dry-run outdir missing");
+            mkdirSync(outdir, { recursive: true });
+            writeFileSync(
+              join(outdir, "worker.js"),
+              outdir.includes("form-implementation-payload") ? payload : outer,
+            );
+            return { exitCode: 0, stdout: "built\n", stderr: "" };
+          },
+        });
+      const prepared = await buildFormWorker(
+        "base",
+        "export const runtimeHandler = 'provider-v1';\n",
+        "export default { async fetch() { return new Response('outer'); } };\n",
+      );
+      const unrelatedOuterChange = await buildFormWorker(
+        "outer-change",
+        "export const runtimeHandler = 'provider-v1';\n",
+        "export default { async fetch() { return new Response('unrelated route'); } };\n",
+      );
+      const changedRuntimePayload = await buildFormWorker(
+        "payload-change",
+        "export const runtimeHandler = 'provider-v2';\n",
+        "export default { async fetch() { return new Response('outer'); } };\n",
+      );
+
+      const identity = prepared.formImplementationIdentity;
+      if (!identity) throw new Error("Form implementation identity was not built");
+      expect(unrelatedOuterChange.bundleDigestHex).not.toBe(prepared.bundleDigestHex);
+      expect(unrelatedOuterChange.formImplementationIdentity).toEqual(identity);
+      expect(
+        changedRuntimePayload.formImplementationIdentity?.implementationPayloadDigest,
+      ).not.toBe(identity.implementationPayloadDigest);
+      expect(changedRuntimePayload.formImplementationIdentity?.implementationDigest).not.toBe(
+        identity.implementationDigest,
+      );
+      expect(identity.implementationPayloadDigest).toMatch(/^sha256:[0-9a-f]{64}$/u);
+      expect(identity.capabilityDigest).toMatch(/^sha256:[0-9a-f]{64}$/u);
+      expect(identity.implementationDigest).toMatch(/^sha256:[0-9a-f]{64}$/u);
+      const releaseConfig = JSON.parse(readFileSync(prepared.configPath, "utf8")) as {
+        define: Record<string, string>;
+        vars: Record<string, string>;
+      };
+      expect(releaseConfig.define).toMatchObject({
+        TAKOSERVER_BUILD_FORM_IMPLEMENTATION_DIGEST: JSON.stringify(identity.implementationDigest),
+        TAKOSERVER_BUILD_FORM_IMPLEMENTATION_PAYLOAD_DIGEST: JSON.stringify(
+          identity.implementationPayloadDigest,
+        ),
+      });
+      expect(releaseConfig.vars).toMatchObject({
+        TAKOSERVER_WORKER_ARTIFACT_DIGEST: `sha256:${prepared.bundleDigestHex}`,
+      });
+      expect(releaseConfig.vars).not.toHaveProperty(
+        "TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST",
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("uses an explicit historical build profile and preserves sealed upload provenance", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-artifact-authority-"));
     const jitTarget = {

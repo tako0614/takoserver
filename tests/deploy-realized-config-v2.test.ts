@@ -9,6 +9,7 @@ import {
 } from "../scripts/deploy/realized-config.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { INTEGRATION_E2E_ORGANIZATION_ID } from "../src/integration-e2e-credential-authority.ts";
+import { YURUCOMMU_IDENTITY_CAPABILITY_KINDS } from "../src/takoform/implementation-catalog.ts";
 
 const target = {
   kind: "takoserver.deploy-target@v2",
@@ -57,6 +58,83 @@ describe("realized Worker configuration", () => {
       expect(config).not.toHaveProperty("services");
       expect(config.vars).toMatchObject({ TAKOSERVER_SIGNING_KEY_ID: "key-current" });
       expect(config.secrets).toEqual({ required: ["TAKOSERVER_SIGNING_KEY"] });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not half-configure public Form identity without artifact provenance", () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-config-form-identity-"));
+    try {
+      const path = writeWorkerConfig(
+        {
+          ...target,
+          formAuthority: {
+            workerName: "takoserver-form-authority-production",
+            identityProbeWorkerName: "takoserver-form-identity-production",
+            identityProbeOrigin:
+              "https://takoserver-form-identity-production.production.example.workers.dev",
+            hostId: target.publicOrigin,
+          },
+        },
+        {
+          path: join(root, "wrangler.jsonc"),
+          main: join(root, "worker.js"),
+          commit: "a".repeat(40),
+        },
+      );
+      const config = JSON.parse(readFileSync(path, "utf8")) as {
+        vars: Record<string, string>;
+      };
+      expect(config.vars.TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST).toBeUndefined();
+      expect(config.vars.TAKOSERVER_WORKER_ARTIFACT_DIGEST).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("realizes complete build-derived public identity in rehearsal and production", () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-config-form-identity-all-env-"));
+    const semantic = {
+      implementationPayloadDigest: `sha256:${"1".repeat(64)}` as const,
+      capabilityDigest: `sha256:${"2".repeat(64)}` as const,
+      implementationDigest: `sha256:${"3".repeat(64)}` as const,
+    };
+    const workerArtifactDigest = `sha256:${"4".repeat(64)}` as const;
+    try {
+      for (const environment of ["rehearsal", "production"] as const) {
+        const selected = {
+          ...target,
+          environment,
+          formAuthority: {
+            workerName: `takoserver-form-authority-${environment}`,
+            identityProbeWorkerName: `takoserver-form-identity-${environment}`,
+            identityProbeOrigin: `https://takoserver-form-identity-${environment}.${environment}.example.workers.dev`,
+            hostId: target.publicOrigin,
+          },
+        } satisfies DeployTarget;
+        const path = writeWorkerConfig(selected, {
+          path: join(root, `${environment}.json`),
+          main: "worker.js",
+          commit: "a".repeat(40),
+          formImplementationIdentity: semantic,
+          workerArtifactDigest,
+        });
+        const config = JSON.parse(readFileSync(path, "utf8")) as {
+          vars: Record<string, string>;
+          define: Record<string, string>;
+        };
+        expect(config.vars.TAKOSERVER_WORKER_ARTIFACT_DIGEST).toBe(workerArtifactDigest);
+        expect(config.define).toEqual({
+          TAKOSERVER_BUILD_FORM_IMPLEMENTATION_DIGEST: JSON.stringify(
+            semantic.implementationDigest,
+          ),
+          TAKOSERVER_BUILD_FORM_CAPABILITY_DIGEST: JSON.stringify(semantic.capabilityDigest),
+          TAKOSERVER_BUILD_FORM_IMPLEMENTATION_PAYLOAD_DIGEST: JSON.stringify(
+            semantic.implementationPayloadDigest,
+          ),
+        });
+      }
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -126,6 +204,18 @@ describe("realized Worker configuration", () => {
     const authorityTarget = {
       ...target,
       environment: "integration",
+      edgeSupplies: {
+        offerings: YURUCOMMU_IDENTITY_CAPABILITY_KINDS.map((formKind) => ({ formKind })),
+      } as unknown as NonNullable<DeployTarget["edgeSupplies"]>,
+      workerEndpointSuffix: "integration.example.workers.dev",
+      formAuthority: {
+        workerName: "takoserver-form-authority-integration",
+        identityProbeWorkerName: "takoserver-form-identity-integration",
+        identityProbeOrigin:
+          "https://takoserver-form-identity-integration.integration.example.workers.dev",
+        integrationWorkerName: "takoserver-form-fixture-integration",
+        hostId: target.publicOrigin,
+      },
       integrationE2eCredentialAuthority: {
         organizationId: INTEGRATION_E2E_ORGANIZATION_ID,
         publicJwk: { kty: "OKP" as const, crv: "Ed25519" as const, x: "E".repeat(43) },

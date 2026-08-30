@@ -65,6 +65,7 @@ no operator input.
 | --- | --- | --- | --- |
 | `takoserver-worker` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both actions. |
 | `takoserver-worker-authority-cutover` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
+| `takoserver-form-authority-identity-probe` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-form-authority-worker` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-integration-form-authority-worker` | `--status`, `--apply` | integration only | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-integration-form-authority-operator-worker` | `--status`, `--apply` | integration only | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
@@ -89,7 +90,10 @@ The routine surfaces are:
 
 - `takoserver-worker`: one Worker code upload. It refuses pending D1
   migrations, any config/secret/signing/topology drift, and any selected diff
-  that changes authentication, authorization, or the deploy mechanism.
+  that changes authentication, authorization, the deploy mechanism, or any
+  executable dependency in the build-derived public Form payload/identity
+  closure. The latter closure is derived from the real P/I build roots rather
+  than maintained as a provider/handler filename regex.
 - `takoserver-site`: one Pages upload and byte-exact immutable URL readback;
   production also requires byte-exact `https://takoserver.com/` readback.
 - `takoserver-console`: one Console Worker upload. Exhaustive domain state must
@@ -107,6 +111,13 @@ The separate authority and irreversible surfaces are:
   runtime-grant signing key. Its named legacy-edge transition
   profile is the only way to carry an observed Hosted service binding and
   secret into the candidate predecessor state.
+- `takoserver-form-authority-identity-probe`: one reviewed minimal read-only
+  Worker upload in every Form-authority environment. Its permanent target-owned
+  workers.dev endpoint exposes only `GET /v1/public-host-identity`, backed by a
+  named service binding to the public Worker's identity RPC. It has no storage,
+  secret, mutation RPC, custom domain, preview, or zone route. Status is ready
+  only after actively calling that RPC bridge and matching Host id, served
+  Version, outer artifact `A`, payload `P`, capability, and semantic `I`.
 - `takoserver-form-authority-worker`: one reviewed route-less service-binding
   RPC Worker upload. Exact D1/R2 and identity bindings are read back with no
   secret or public-domain, zone-route, workers.dev, or preview ownership. The
@@ -114,7 +125,10 @@ The separate authority and irreversible surfaces are:
   `404` only to satisfy Cloudflare’s module registration requirement; the named
   RPC entrypoint remains pure RPC and has no public route. The
   served public Worker artifact is rebuilt from the same commit and must match
-  byte-for-byte before upload. Its Form `apply` remains fail-closed until
+  byte-for-byte before upload. The immutable authority config carries no
+  public Worker Version or artifact pins; its public identity service binding
+  reads authoritative `PublicHostIdentity@v2` on every operation. Its Form
+  `apply` remains fail-closed until
   released Form package verification exists. Released Core supplies verification
   facts only; Takoserver Host retains admission policy and private handle
   issuance. Deploying the shell does not grant Form mutation authority.
@@ -125,10 +139,16 @@ The separate authority and irreversible surfaces are:
   `404` only to satisfy Cloudflare’s module registration requirement; its named
   RPC entrypoint remains pure RPC and has no public route or privileged
   publisher branch. Form execution and partial convergence are described in
-  [form-authority.md](form-authority.md). Its optional scope-transition selector
-  accepts only an exact current-public predecessor, uploads the target scope
-  once, and refuses stale-public, third-scope, absent/bootstrap, history-based
-  roll-forward, and already-target apply.
+  [form-authority.md](form-authority.md). The public integration Worker embeds
+  `P`/capability/`I` during its two-stage build; this route-less Worker receives
+  the same code-derived capability manifest and verifies it against the
+  live identity RPC.
+  A one-time deploy migration accepts only a fully verified legacy exact public
+  identity pin, regardless of its position in public deployment history, and
+  removes both pins in one upload. Its optional scope-transition selector
+  accepts only the exact configured scope predecessor, uploads the target scope
+  once, and refuses stale identity proof, third-scope, absent/bootstrap,
+  history-based roll-forward, and already-target apply.
 - `takoserver-integration-form-authority-operator-worker`: integration only.
   It owns only the dedicated custom domain
   `https://form-authority.integration.takoserver.com`, with workers.dev and
@@ -137,16 +157,18 @@ The separate authority and irreversible surfaces are:
   customer routes. Each POST to `/v1/plan`, `/v1/apply`, or `/v1/readback`
   requires exact `application/json`, a bounded body, and a short-lived Ed25519
   proof bound to method, path, canonical body digest, environment, Host id,
-  public Worker artifact digest, and public Worker Version. The public key is
+  public Worker artifact digest, public Worker Version, and implementation
+  digest. The public key is
   target-owned and dedicated to this purpose; its private half remains
   operator-private. The gateway forwards the original signed request envelope;
   the route-less authority independently verifies the same proof against its
   own sealed copy of that key before any D1/R2 read. The exact target-owned
   tenant and Space are also sealed independently into both Workers; each
   rejects every signed plan/apply/readback activation outside that scope before
-  its RPC or storage boundary. Both Workers recheck the live public Worker
-  Version, and apply checks again after verification plus Host policy and immediately
-  before every durable command. A clean first deployment is allowed only when
+  its RPC or storage boundary. Both Workers read the live v2 public Host
+  identity; the route-less endpoint checks it again before each operation, and
+  apply checks again after verification plus Host policy and immediately before
+  every durable command. A clean first deployment is allowed only when
   both the gateway script and configured custom domain are absent. Foreign
   ownership and every script/domain partial topology are refused, and a
   successful upload must pass the normal exact post-upload readback. During a
@@ -171,9 +193,9 @@ The separate authority and irreversible surfaces are:
   durable activation heads are absent or inactive. It uses the same v2 signed
   request/plan/apply/readback protocol and the same no-retry/credential
   redaction rules. With the named transition descriptor it requires both live
-  Workers to be current-public `exact-transition-predecessor`, refuses mixed
-  topology, and signs only the descriptor predecessor. Normal activation never
-  accepts that selector.
+  Workers to have a verified dynamic or legacy exact identity profile and
+  `exact-transition-predecessor` scope, refuses mixed topology, and signs only
+  the descriptor predecessor. Normal activation never accepts that selector.
 - `takoserver-integration-e2e-credentials`: integration only. Its distinct
   `--issue`, `--status`, and `--revoke` actions exhaustively read the immutable
   current public Worker Version and exact JIT binding closure before the owner
@@ -313,8 +335,15 @@ token retirement and attribution repair are forward-only and restoration
 requires a separately reviewed dedicated surface. There is no automatic
 fallback or raw Wrangler reversal.
 
-For the reviewed Form integration cutover, first capture the old exact
-tenant/Space scope and write the strict operator-private transition descriptor.
+For the reviewed Form integration cutover, first deploy the public integration
+Worker through the owning `bun run deploy` entrypoint so it exposes
+the complete build-derived `PublicHostIdentity@v2`. Deploy and verify
+`takoserver-form-authority-identity-probe` next. Migrate the
+route-less authority from a verified legacy exact pin to `dynamic-public-rpc`,
+then migrate the gateway after that dependency is dynamic; use status/apply/status
+for each and do not sign a live request until the probe and both authority
+surfaces are ready. Then capture the
+old exact tenant/Space scope and write the strict operator-private transition descriptor.
 The descriptor keeps that predecessor outside the steady target and binds the
 exact Host plus the target's new scope. After the target names that new scope,
 use the descriptor for deactivation status/apply/status while both Workers are
@@ -339,11 +368,21 @@ The selected commit must equal HEAD. Routine integration and rehearsal may use
 a dirty HEAD. A high-risk rehearsal that creates production proof, and every
 production operation, require clean `main` equal to freshly fetched
 `origin/main`, or clean HEAD proven reachable from an exact remote ref. Routine
-uploads run one scoped owner gate, build once into a fresh link-free directory,
+uploads run one scoped owner gate, build into a fresh link-free directory,
 seal the artifact and realized config, upload once, and perform authoritative
 provider readback plus the surface's bounded public readback. Worker version
 identity is internal deployment history, not a consumer-pinned published
 identity.
+
+For a target that advertises Form authority, public Worker construction first
+builds and seals a separate target-neutral handler/provider payload `P`. It
+derives `I` from `P`, the adapter/capability manifest, and the exact admitted
+Form package/operation set, embeds `P`/capability/`I` into the outer Worker, and
+only then hashes final artifact `A`. Unrelated outer bytes may rotate `A`
+without rotating `I`; handler/provider, capability, Form package, or admitted
+operation changes rotate `I`. `P` and `I` have no operator override or runtime
+source scan, and all three supported environments realize `A` plus the embedded
+semantic identity.
 
 Credential actions are pinned more tightly than routine status: the selected
 commit must equal the current immutable Worker annotation, whose artifact
@@ -362,6 +401,11 @@ inherited.
 
 All target descriptors, receipts, secrets, and realized state stay outside the
 tracked repository. Depending on the surface, the operator supplies:
+
+A target that declares `formAuthority` must declare distinct
+`identityProbeWorkerName` and its exact matching bare workers.dev
+`identityProbeOrigin`. They select the owned read-only RPC bridge topology, not
+payload or implementation digests; `P` and `I` remain build-derived.
 
 - `CLOUDFLARE_API_TOKEN`
 - `TAKOSERVER_INDEPENDENT_REVIEW`

@@ -146,9 +146,10 @@ describe("environment-exact deploy target", () => {
   test("validates distinct route-less Form authority targets", () => {
     const formAuthority = {
       workerName: "takoserver-form-authority-integration",
+      identityProbeWorkerName: "takoserver-form-identity-integration",
+      identityProbeOrigin: "https://takoserver-form-identity-integration.example.workers.dev",
       integrationWorkerName: "takoserver-form-fixture-integration",
       hostId: "https://takoserver-api-rehearsal.example.workers.dev",
-      operatorOperations: { ModuleWorker: ["create", "read"] as const },
     };
     withTarget(descriptor({ environment: "integration", formAuthority }), (path) =>
       expect(loadTarget(path, "integration").formAuthority).toEqual(formAuthority),
@@ -160,6 +161,8 @@ describe("environment-exact deploy target", () => {
       descriptor({
         formAuthority: {
           workerName: "takoserver-api-rehearsal",
+          identityProbeWorkerName: "takoserver-form-identity-rehearsal",
+          identityProbeOrigin: "https://takoserver-form-identity-rehearsal.example.workers.dev",
           hostId: "https://takoserver-api-rehearsal.example.workers.dev",
         },
       }),
@@ -169,6 +172,8 @@ describe("environment-exact deploy target", () => {
       descriptor({
         formAuthority: {
           workerName: "takoserver-form-authority-rehearsal",
+          identityProbeWorkerName: "takoserver-form-identity-rehearsal",
+          identityProbeOrigin: "https://takoserver-form-identity-rehearsal.example.workers.dev",
           hostId: "https://another-host.example.test",
         },
       }),
@@ -178,11 +183,13 @@ describe("environment-exact deploy target", () => {
       descriptor({
         formAuthority: {
           workerName: "takoserver-form-authority-rehearsal",
+          identityProbeWorkerName: "takoserver-form-identity-rehearsal",
+          identityProbeOrigin: "https://takoserver-form-identity-rehearsal.example.workers.dev",
           hostId: "https://takoserver-api-rehearsal.example.workers.dev",
-          operatorOperations: { ModuleWorker: ["read", "read"] },
+          operatorOperations: { ModuleWorker: ["read"] },
         },
       }),
-      (path) => expect(() => loadTarget(path, "rehearsal")).toThrow("operator operations"),
+      (path) => expect(() => loadTarget(path, "rehearsal")).toThrow("unexpected keys"),
     );
   });
 
@@ -194,6 +201,8 @@ describe("environment-exact deploy target", () => {
     };
     const formAuthority = {
       workerName: "takoserver-form-authority-integration",
+      identityProbeWorkerName: "takoserver-form-identity-integration",
+      identityProbeOrigin: "https://takoserver-form-identity-integration.example.workers.dev",
       integrationWorkerName: "takoserver-form-fixture-integration",
       integrationOperatorWorkerName: "takoserver-form-operator-integration",
       integrationOperatorOrigin: "https://form-authority.integration.takoserver.com",
@@ -305,6 +314,8 @@ describe("environment-exact deploy target", () => {
         environment: "integration",
         formAuthority: {
           workerName: "takoserver-form-authority-integration",
+          identityProbeWorkerName: "takoserver-form-identity-integration",
+          identityProbeOrigin: "https://takoserver-form-identity-integration.example.workers.dev",
           integrationWorkerName: "takoserver-form-fixture-integration",
           integrationOperatorWorkerName: "takoserver-form-operator-integration",
           integrationOperatorOrigin: "https://form-authority.integration.takoserver.com",

@@ -1,11 +1,13 @@
 import { canonicalJson, isSha256Digest } from "../json.ts";
 import type { ObjectStore, Sql } from "../ports.ts";
-import { TAKOSERVER_INTRINSIC_HANDLER_KINDS } from "../provider-driver.ts";
-import { CLOUDFLARE_TAKOFORM_HANDLER_KINDS, CloudflareProvider } from "../providers/cloudflare.ts";
 import { isPublicHostIdentity, type PublicHostIdentityRpc } from "../public-host-identity.ts";
+import {
+  deriveRuntimeImplementationCatalog,
+  parseFormAuthorityCapabilityManifest,
+  providerResourceOperationHandlers,
+} from "../public-worker-implementation.ts";
 import { createAdmissionHandleIssuer } from "./admission.ts";
 import { createFormAdmissionStore } from "./admission-store.ts";
-import { currentTakoformCandidates } from "./current-candidates.ts";
 import {
   createUnavailableFormAuthorityEvidenceVerifier,
   type FormAuthorityEnvironment,
@@ -23,24 +25,12 @@ import {
   type HostAdmissionCoordinator,
   HostAdmissionCoordinatorError,
 } from "./host-admission-coordinator.ts";
-import {
-  deriveImplementationCatalog,
-  type TakoformHandlerManifest,
-  type TakoformImplementationCatalog,
-  type TakoformLifecycleCapabilityManifest,
-  YURUCOMMU_FORM_VERSIONS,
-  yurucommuFormCandidates,
+import type {
+  TakoformImplementationCatalog,
+  TakoformLifecycleCapabilityManifest,
 } from "./implementation-catalog.ts";
-import type { TakoformOperation } from "./types.ts";
 
-const RESOURCE_OPERATION_ORDER = [
-  "create",
-  "read",
-  "update",
-  "delete",
-  "import",
-  "observe",
-] as const satisfies readonly TakoformOperation[];
+export { parseFormAuthorityCapabilityManifest, providerResourceOperationHandlers };
 
 export interface FormAuthorityEndpointConfiguration {
   readonly environment: FormAuthorityEnvironment;
@@ -49,7 +39,11 @@ export interface FormAuthorityEndpointConfiguration {
   readonly workerArtifactDigest: `sha256:${string}`;
   /** Exact served public Worker Version checked again before every RPC. */
   readonly publicWorkerVersionId: string;
-  /** Realized public-Worker capability manifest, supplied by deploy target composition. */
+  /** Digest of the separately sealed handler/provider payload. */
+  readonly implementationPayloadDigest: `sha256:${string}`;
+  /** Build-derived semantic identity returned by the public identity RPC. */
+  readonly implementationDigest: `sha256:${string}`;
+  /** Code-owned capability manifest embedded into the public Worker build. */
   readonly capabilities: TakoformLifecycleCapabilityManifest;
 }
 
@@ -148,14 +142,27 @@ async function createComposition(input: {
   readonly verifier: FormAuthorityEvidenceVerifier;
   readonly packages: FormAuthorityPackageSource;
 }): Promise<FormAuthorityComposition> {
-  const catalog = await deriveRuntimeImplementationCatalog(input.configuration);
+  const catalog = await deriveRuntimeImplementationCatalog({
+    implementationPayloadDigest: input.configuration.implementationPayloadDigest,
+    capabilities: input.configuration.capabilities,
+  });
+  if (catalog.implementationDigest !== input.configuration.implementationDigest) {
+    throw new HostAdmissionCoordinatorError(
+      "identity_mismatch",
+      "implementation catalog differs from the build-derived public identity",
+    );
+  }
   const identity = formAuthorityIdentity(input.configuration, catalog);
   const assertCurrentPublicHost = async (): Promise<void> => {
     const live = await input.bindings.publicHostIdentity.identity();
     if (
       !isPublicHostIdentity(live) ||
       live.hostId !== identity.hostId ||
-      live.workerVersionId !== identity.publicWorkerVersionId
+      live.workerVersionId !== identity.publicWorkerVersionId ||
+      live.workerArtifactDigest !== identity.workerArtifactDigest ||
+      live.implementationPayloadDigest !== input.configuration.implementationPayloadDigest ||
+      live.capabilityDigest !== catalog.capabilityDigest ||
+      live.implementationDigest !== identity.implementationDigest
     ) {
       throw new HostAdmissionCoordinatorError(
         "identity_mismatch",
@@ -192,46 +199,24 @@ async function createComposition(input: {
 export async function deriveFormAuthorityIdentity(
   configuration: FormAuthorityEndpointConfiguration,
 ): Promise<FormAuthorityIdentity> {
-  const catalog = await deriveRuntimeImplementationCatalog(configuration);
-  return formAuthorityIdentity(configuration, catalog);
-}
-
-async function deriveRuntimeImplementationCatalog(
-  configuration: FormAuthorityEndpointConfiguration,
-): Promise<TakoformImplementationCatalog> {
-  validateConfiguration(configuration);
-  const forms = yurucommuFormCandidates(currentTakoformCandidates().forms);
-  const providerOperations = providerResourceOperationHandlers(
-    CloudflareProvider.prototype as unknown as Readonly<Record<string, unknown>>,
-  );
-  const intrinsicKinds = new Set<string>(TAKOSERVER_INTRINSIC_HANDLER_KINDS);
-  const cloudflareKinds = new Set<string>(CLOUDFLARE_TAKOFORM_HANDLER_KINDS);
-  const handlerForms = Object.fromEntries(
-    forms.map(({ identity }) => [
-      identity.formRef.kind,
-      intrinsicKinds.has(identity.formRef.kind)
-        ? RESOURCE_OPERATION_ORDER
-        : cloudflareKinds.has(identity.formRef.kind)
-          ? providerOperations
-          : [],
-    ]),
-  );
-  const handlers: TakoformHandlerManifest = {
-    apiVersion: "takoserver.form-handlers@v1",
-    artifact: configuration.workerArtifactDigest,
-    forms: handlerForms,
-  };
-  return await deriveImplementationCatalog({
-    forms,
+  const catalog = await deriveRuntimeImplementationCatalog({
+    implementationPayloadDigest: configuration.implementationPayloadDigest,
     capabilities: configuration.capabilities,
-    handlers,
   });
+  if (catalog.implementationDigest !== configuration.implementationDigest) {
+    throw new HostAdmissionCoordinatorError(
+      "identity_mismatch",
+      "implementation catalog differs from the build-derived public identity",
+    );
+  }
+  return formAuthorityIdentity(configuration, catalog);
 }
 
 function formAuthorityIdentity(
   configuration: FormAuthorityEndpointConfiguration,
   catalog: TakoformImplementationCatalog,
 ): FormAuthorityIdentity {
+  validateConfiguration(configuration);
   return {
     environment: configuration.environment,
     hostId: configuration.hostId,
@@ -250,6 +235,8 @@ function validateConfiguration(configuration: FormAuthorityEndpointConfiguration
     configuration.hostId.length === 0 ||
     configuration.hostId.length > 255 ||
     !isSha256Digest(configuration.workerArtifactDigest) ||
+    !isSha256Digest(configuration.implementationPayloadDigest) ||
+    !isSha256Digest(configuration.implementationDigest) ||
     typeof configuration.publicWorkerVersionId !== "string" ||
     !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(
       configuration.publicWorkerVersionId,
@@ -257,75 +244,7 @@ function validateConfiguration(configuration: FormAuthorityEndpointConfiguration
   ) {
     throw new TypeError("Form authority Worker configuration is invalid");
   }
-  validateCapabilityManifest(configuration.capabilities);
-}
-
-export function parseFormAuthorityCapabilityManifest(
-  value: string,
-): TakoformLifecycleCapabilityManifest {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(value);
-  } catch {
-    throw new TypeError("Form authority capability manifest is invalid");
-  }
-  validateCapabilityManifest(parsed);
-  return structuredClone(parsed as TakoformLifecycleCapabilityManifest);
-}
-
-function validateCapabilityManifest(value: unknown): void {
-  if (!isRecord(value)) throw new TypeError("Form authority capability manifest is invalid");
-  const keys = Object.keys(value).sort();
-  if (
-    keys.length !== 3 ||
-    keys[0] !== "apiVersion" ||
-    keys[1] !== "forms" ||
-    keys[2] !== "implementation" ||
-    value.apiVersion !== "takoserver.form-lifecycle-capabilities@v1" ||
-    typeof value.implementation !== "string" ||
-    value.implementation.length < 1 ||
-    value.implementation.length > 255 ||
-    !isRecord(value.forms)
-  ) {
-    throw new TypeError("Form authority capability manifest is invalid");
-  }
-  for (const [kind, operations] of Object.entries(value.forms)) {
-    if (
-      !(kind in YURUCOMMU_FORM_VERSIONS) ||
-      !Array.isArray(operations) ||
-      operations.some((operation) => !RESOURCE_OPERATION_ORDER.includes(operation)) ||
-      new Set(operations).size !== operations.length
-    ) {
-      throw new TypeError("Form authority capability manifest is invalid");
-    }
-  }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/** Derives provider-backed operations from concrete runtime method presence. */
-export function providerResourceOperationHandlers(
-  surface: Readonly<Record<string, unknown>>,
-): readonly TakoformOperation[] {
-  const has = (method: string): boolean => typeof surface[method] === "function";
-  return RESOURCE_OPERATION_ORDER.filter((operation) => {
-    switch (operation) {
-      case "create":
-      case "update":
-        return has("apply");
-      case "read":
-        return true;
-      case "delete":
-        return has("delete");
-      case "import":
-        return has("adopt");
-      case "observe":
-        return has("observe");
-    }
-    return false;
-  });
+  parseFormAuthorityCapabilityManifest(JSON.stringify(configuration.capabilities));
 }
 
 function clonePackage(pkg: FormPackageInput): FormPackageInput {

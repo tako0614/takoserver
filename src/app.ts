@@ -18,10 +18,14 @@ import {
 import { createLedger, type FundingSettlementVerifier } from "./ledger.ts";
 import { createMetering, type MeteringRates } from "./metering.ts";
 import type { Clock, ObjectStoreAccess, Sql } from "./ports.ts";
-import { createProviderDriver, createProviderFormAvailability } from "./provider-driver.ts";
 import { createProviderMetering } from "./provider-metering.ts";
 import type { ProviderPack } from "./provider-pack.ts";
 import type { Provider } from "./provider-port.ts";
+import {
+  createProviderDriver,
+  createProviderFormAvailability,
+  createTakoformEngine,
+} from "./public-form-runtime.ts";
 import { createReseller } from "./reseller.ts";
 import { createResourceDeploymentStore } from "./resource-deployments.ts";
 import {
@@ -33,7 +37,7 @@ import type { S3CredentialIssuer } from "./s3-port.ts";
 import { createSponsorshipRoutes } from "./sponsorship-api.ts";
 import { createTakoformArtifacts, type TakoformArtifactTransport } from "./takoform/artifacts.ts";
 import { installedBindings } from "./takoform/bindings.ts";
-import { createTakoformEngine, type WorkerModuleInspector } from "./takoform/engine.ts";
+import type { WorkerModuleInspector } from "./takoform/engine.ts";
 import { installedForms, sameFormRef } from "./takoform/forms.ts";
 import { type CreateTakoformHostOptions, createTakoformHost } from "./takoform/host.ts";
 import {
@@ -79,8 +83,10 @@ export interface AppPorts {
   /** Short-lived standard S3 credentials for a provisioned ObjectBucket. */
   readonly s3?: S3CredentialIssuer;
   readonly publicOrigin: string;
-  /** Current Cloudflare Worker Version; fences Form support written for a stale public artifact. */
+  /** Current Cloudflare Worker Version, retained only as operation and audit provenance. */
   readonly publicWorkerVersionId?: string;
+  /** Current semantic Form implementation identity. */
+  readonly formImplementationDigest?: `sha256:${string}`;
   /** Complete integration-only JIT key authority configuration, or no route. */
   readonly integrationE2eCredentialAuthority?: IntegrationE2eCredentialAuthorityConfig;
   /** Where this deployment's console is served, if it has one. */
@@ -258,6 +264,9 @@ export function buildApp(ports: AppPorts): App {
           hostId: ports.publicOrigin,
           ...(ports.publicWorkerVersionId
             ? { publicWorkerVersionId: ports.publicWorkerVersionId }
+            : {}),
+          ...(ports.formImplementationDigest
+            ? { implementationDigest: ports.formImplementationDigest }
             : {}),
           candidates: ports.hostForms,
           bindings: ports.hostBindings ?? [],

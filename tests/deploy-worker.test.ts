@@ -13,6 +13,7 @@ import {
   type WorkerProcess,
   type WorkerState,
 } from "../scripts/deploy/worker.ts";
+import { publicFormIdentityAuthorityPaths } from "../scripts/deploy/worker-authority-paths.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
 import { INTEGRATION_E2E_ORGANIZATION_ID } from "../src/integration-e2e-credential-authority.ts";
 
@@ -223,6 +224,43 @@ describe("split Takoserver Worker surfaces", () => {
       "src/takoform/host-authority.ts",
       "wrangler.jsonc",
     ]);
+  });
+
+  test("classifies every executable public Form P/I owner as authority", () => {
+    const expected = [
+      "src/entry-public-form-runtime-payload.ts",
+      "src/form-ref.ts",
+      "src/generated/takoform-stable-v1-catalog.ts",
+      "src/json.ts",
+      "src/ports.ts",
+      "src/provider-driver.ts",
+      "src/provider-port.ts",
+      "src/providers/cloudflare-r2-standard-service.ts",
+      "src/providers/cloudflare.ts",
+      "src/public-form-implementation-build.ts",
+      "src/public-form-runtime.ts",
+      "src/public-worker-implementation.ts",
+      "src/standard-service-port.ts",
+      "src/strict-json.ts",
+      "src/takoform/bindings.ts",
+      "src/takoform/current-candidates.ts",
+      "src/takoform/edge-family.ts",
+      "src/takoform/edge-semantics.ts",
+      "src/takoform/engine.ts",
+      "src/takoform/forms.ts",
+      "src/takoform/implementation-catalog.ts",
+      "src/takoform/limits.ts",
+      "src/takoform/relations.ts",
+      "src/takoform/schema.ts",
+      "src/takoform/sqlite-migrations.ts",
+      "src/takoform/standard-services.ts",
+      "src/takoform/types.ts",
+      "src/takoform/wire.ts",
+      "src/takoform/worker-aggregate.ts",
+      "src/takoform/worker-runtime-contract.ts",
+    ];
+    expect(publicFormIdentityAuthorityPaths()).toEqual(expected);
+    expect(authoritySensitiveWorkerPaths([...expected, "src/catalog.ts"])).toEqual(expected);
   });
 
   test("routine cannot publish public Form-authority fences without the reviewed cutover", async () => {

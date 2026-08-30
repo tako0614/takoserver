@@ -10,6 +10,11 @@ import { createR2ObjectStore } from "./objects-r2.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
 import { resolvePayment } from "./payment-setup.ts";
 import type { CloudflareWorkersAiBinding } from "./providers/cloudflare-workers-ai.ts";
+import { embeddedPublicFormImplementationIdentity } from "./public-form-implementation-build.ts";
+import type {
+  PublicFormImplementationIdentity,
+  PublicWorkerImplementationIdentity,
+} from "./public-worker-implementation.ts";
 import { loadSigningKey } from "./signing-key.ts";
 import { createD1Sql } from "./sql-d1.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
@@ -195,6 +200,23 @@ export function requirePublicOrigin(env: { readonly PUBLIC_ORIGIN?: string | und
   return origin;
 }
 
+export function resolvePublicWorkerImplementationIdentity(
+  env: Pick<WorkerEnv, "TAKOSERVER_WORKER_ARTIFACT_DIGEST">,
+  embedded:
+    | PublicFormImplementationIdentity
+    | undefined = embeddedPublicFormImplementationIdentity(),
+): PublicWorkerImplementationIdentity | undefined {
+  const artifact = env.TAKOSERVER_WORKER_ARTIFACT_DIGEST;
+  if (artifact === undefined && embedded === undefined) return undefined;
+  if (artifact === undefined || embedded === undefined) {
+    throw new TypeError("public Worker Form implementation identity is incomplete");
+  }
+  if (!/^sha256:[0-9a-f]{64}$/u.test(artifact)) {
+    throw new TypeError("public Worker Form implementation identity is incomplete");
+  }
+  return { workerArtifactDigest: artifact as `sha256:${string}`, ...embedded };
+}
+
 /**
  * No dedicated fields means no route. Once either dedicated field appears,
  * every provenance and policy field is required before D1 is constructed.
@@ -330,6 +352,7 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
   }
   const edge = await buildEdgeForms();
   const currentCandidates = currentTakoformCandidates();
+  const implementationIdentity = resolvePublicWorkerImplementationIdentity(env);
   const { identity, identityProviders, settlement, checkout } = workerCredentials(env);
   const sql = createD1Sql(env.STATE_DB);
   const objects = createR2ObjectStore(env.OBJECTS);
@@ -358,6 +381,11 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     sql,
     objects,
     publicWorkerVersionId: env.WORKER_VERSION.id,
+    ...(implementationIdentity
+      ? {
+          formImplementationDigest: implementationIdentity.implementationDigest,
+        }
+      : {}),
     ...(integrationE2eCredentialAuthority ? { integrationE2eCredentialAuthority } : {}),
     artifacts,
     workerModuleInspector: createJavaScriptWorkerModuleInspector(),

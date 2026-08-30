@@ -10,6 +10,7 @@ import { canonicalDigest, canonicalJson } from "../src/json.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { signOperatorAssertion } from "../src/operator-key.ts";
 import type { ObjectStore, Sql } from "../src/ports.ts";
+import { derivePublicFormImplementationIdentity } from "../src/public-worker-implementation.ts";
 import {
   TAKOFORM_REVOCATION_V1,
   TAKOFORM_REVOCATION_V1_EMPTY_ENTRIES_DIGEST,
@@ -17,7 +18,11 @@ import {
 } from "../src/takoform/admission.ts";
 import type { FormAuthorityVerificationEvidence } from "../src/takoform/form-authority-verification.ts";
 import type { FormAuthorityPlanRequest } from "../src/takoform/host-admission-coordinator.ts";
-import { createProductionFormAuthorityComposition } from "../src/takoform/host-admission-endpoint.ts";
+import {
+  createProductionFormAuthorityComposition,
+  deriveFormAuthorityIdentity,
+  type FormAuthorityEndpointConfiguration,
+} from "../src/takoform/host-admission-endpoint.ts";
 import {
   YURUCOMMU_FORM_VERSIONS,
   YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
@@ -29,6 +34,25 @@ const digest = (hex: string) => `sha256:${hex.repeat(64)}` as const;
 const PUBLIC_VERSION_ID = "00000000-0000-4000-8000-000000000001";
 const DRIFTED_PUBLIC_VERSION_ID = "00000000-0000-4000-8000-000000000002";
 const CAPABILITIES = yurucommuLifecycleCapabilityManifest(YURUCOMMU_IDENTITY_CAPABILITY_KINDS);
+const TEST_IMPLEMENTATION_DIGEST = digest("9");
+const TEST_IMPLEMENTATION_PAYLOAD_DIGEST = digest("8");
+
+async function buildConfiguration(
+  input: Omit<
+    FormAuthorityEndpointConfiguration,
+    "implementationPayloadDigest" | "implementationDigest"
+  >,
+): Promise<FormAuthorityEndpointConfiguration> {
+  const semantic = await derivePublicFormImplementationIdentity({
+    implementationPayloadDigest: TEST_IMPLEMENTATION_PAYLOAD_DIGEST,
+    capabilities: input.capabilities,
+  });
+  return {
+    ...input,
+    implementationPayloadDigest: semantic.implementationPayloadDigest,
+    implementationDigest: semantic.implementationDigest,
+  };
+}
 
 function trustEvidence(): FormAuthorityVerificationEvidence {
   return {
@@ -66,24 +90,22 @@ async function integrationFixture(input?: { readonly sql?: Sql; readonly objects
   const sql = input?.sql ?? createEphemeralSql();
   const objects = input?.objects ?? createMemoryObjectStore();
   const hostId = "takoserver-yurucommu-integration";
+  const configuration = await buildConfiguration({
+    environment: "integration",
+    hostId,
+    workerArtifactDigest: digest("5"),
+    publicWorkerVersionId: PUBLIC_VERSION_ID,
+    capabilities: CAPABILITIES,
+  });
+  const live = await identityFor(configuration);
   const composition = await createIntegrationFormAuthorityComposition({
-    configuration: {
-      environment: "integration",
-      hostId,
-      workerArtifactDigest: digest("5"),
-      publicWorkerVersionId: PUBLIC_VERSION_ID,
-      capabilities: CAPABILITIES,
-    },
+    configuration,
     bindings: {
       sql,
       objects,
       publicHostIdentity: {
         async identity() {
-          return {
-            kind: "takoserver.public-host-identity@v1",
-            hostId,
-            workerVersionId: PUBLIC_VERSION_ID,
-          };
+          return live;
         },
       },
     },
@@ -102,6 +124,23 @@ async function integrationFixture(input?: { readonly sql?: Sql; readonly objects
     reason: "activate the exact Yurucommu integration fixture",
   };
   return { ...composition, request, sql, objects };
+}
+
+async function identityFor(configuration: FormAuthorityEndpointConfiguration) {
+  const identity = await deriveFormAuthorityIdentity(configuration);
+  const semantic = await derivePublicFormImplementationIdentity({
+    implementationPayloadDigest: configuration.implementationPayloadDigest,
+    capabilities: configuration.capabilities,
+  });
+  return {
+    kind: "takoserver.public-host-identity@v2" as const,
+    hostId: identity.hostId,
+    workerVersionId: identity.publicWorkerVersionId,
+    workerArtifactDigest: identity.workerArtifactDigest,
+    implementationPayloadDigest: semantic.implementationPayloadDigest,
+    capabilityDigest: semantic.capabilityDigest,
+    implementationDigest: identity.implementationDigest,
+  };
 }
 
 describe("integration Form authority bridge", () => {
@@ -132,6 +171,7 @@ describe("integration Form authority bridge", () => {
         hostId,
         workerArtifactDigest: artifact,
         publicWorkerVersionId: PUBLIC_VERSION_ID,
+        implementationDigest: TEST_IMPLEMENTATION_DIGEST,
       },
       nowSeconds: now,
       lifetimeSeconds: 60,
@@ -140,8 +180,6 @@ describe("integration Form authority bridge", () => {
     const env = {
       TAKOSERVER_ENVIRONMENT: "integration",
       TAKOSERVER_FORM_AUTHORITY_HOST_ID: hostId,
-      TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST: artifact,
-      TAKOSERVER_PUBLIC_WORKER_VERSION_ID: PUBLIC_VERSION_ID,
       TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK: canonicalJson({
         kty: authorityPublic.kty,
         crv: authorityPublic.crv,
@@ -161,7 +199,19 @@ describe("integration Form authority bridge", () => {
       },
       get PUBLIC_HOST_IDENTITY() {
         reads.push("public-host");
-        throw new Error("must not read the public service for an invalid proof");
+        return {
+          async identity() {
+            return {
+              kind: "takoserver.public-host-identity@v2" as const,
+              hostId,
+              workerVersionId: PUBLIC_VERSION_ID,
+              workerArtifactDigest: artifact,
+              implementationPayloadDigest: TEST_IMPLEMENTATION_PAYLOAD_DIGEST,
+              capabilityDigest: digest("7"),
+              implementationDigest: TEST_IMPLEMENTATION_DIGEST,
+            };
+          },
+        };
       },
     } as unknown as IntegrationFormAuthorityRawWorkerEnv;
 
@@ -172,7 +222,7 @@ describe("integration Form authority bridge", () => {
         signedFormAuthorityRpcInvocation({ action: "plan", assertion, body }),
       ),
     ).rejects.toMatchObject({ code: "invalid_operator_assertion" });
-    expect(reads).toEqual([]);
+    expect(reads).toEqual(["public-host"]);
   });
 
   test("independently rejects a valid proof outside its sealed tenant and Space before D1/R2", async () => {
@@ -206,6 +256,7 @@ describe("integration Form authority bridge", () => {
         hostId,
         workerArtifactDigest: artifact,
         publicWorkerVersionId: PUBLIC_VERSION_ID,
+        implementationDigest: TEST_IMPLEMENTATION_DIGEST,
       },
       nowSeconds: now,
       lifetimeSeconds: 60,
@@ -214,8 +265,6 @@ describe("integration Form authority bridge", () => {
     const env = {
       TAKOSERVER_ENVIRONMENT: "integration",
       TAKOSERVER_FORM_AUTHORITY_HOST_ID: hostId,
-      TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST: artifact,
-      TAKOSERVER_PUBLIC_WORKER_VERSION_ID: PUBLIC_VERSION_ID,
       TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK: canonicalJson({
         kty: publicJwk.kty,
         crv: publicJwk.crv,
@@ -237,7 +286,19 @@ describe("integration Form authority bridge", () => {
       },
       get PUBLIC_HOST_IDENTITY() {
         reads.push("public-host");
-        throw new Error("must not read the public service outside the sealed scope");
+        return {
+          async identity() {
+            return {
+              kind: "takoserver.public-host-identity@v2" as const,
+              hostId,
+              workerVersionId: PUBLIC_VERSION_ID,
+              workerArtifactDigest: artifact,
+              implementationPayloadDigest: TEST_IMPLEMENTATION_PAYLOAD_DIGEST,
+              capabilityDigest: digest("7"),
+              implementationDigest: TEST_IMPLEMENTATION_DIGEST,
+            };
+          },
+        };
       },
     } as unknown as IntegrationFormAuthorityRawWorkerEnv;
 
@@ -248,7 +309,94 @@ describe("integration Form authority bridge", () => {
         signedFormAuthorityRpcInvocation({ action: "plan", assertion, body }),
       ),
     ).rejects.toMatchObject({ code: "operator_scope_mismatch" });
-    expect(reads).toEqual([]);
+    expect(reads).toEqual(["public-host"]);
+  });
+
+  test("refuses an identity change between proof verification and composition before D1/R2", async () => {
+    const pair = (await crypto.subtle.generateKey("Ed25519", true, [
+      "sign",
+      "verify",
+    ])) as CryptoKeyPair;
+    const publicJwk = await crypto.subtle.exportKey("jwk", pair.publicKey);
+    const privateJwk = await crypto.subtle.exportKey("jwk", pair.privateKey);
+    const hostId = "takoserver-yurucommu-integration";
+    const artifact = digest("5");
+    const body = {
+      kind: "takoserver.form-authority-plan-request@v2",
+      activation: {
+        kind: "space",
+        tenantId: "tenant-yurucommu",
+        space: "space-yurucommu",
+        desiredActive: true,
+      },
+    };
+    const now = Math.floor(Date.now() / 1_000);
+    const assertion = await signOperatorAssertion({
+      privateJwk: JSON.stringify(privateJwk),
+      claims: {
+        purpose: "form-authority",
+        action: "plan",
+        method: "POST",
+        path: "/v1/plan",
+        bodyDigest: await canonicalDigest(body),
+        environment: "integration",
+        hostId,
+        workerArtifactDigest: artifact,
+        publicWorkerVersionId: PUBLIC_VERSION_ID,
+        implementationDigest: TEST_IMPLEMENTATION_DIGEST,
+      },
+      nowSeconds: now,
+      lifetimeSeconds: 60,
+    });
+    let identityReads = 0;
+    const privilegedReads: string[] = [];
+    const env = {
+      TAKOSERVER_ENVIRONMENT: "integration",
+      TAKOSERVER_FORM_AUTHORITY_HOST_ID: hostId,
+      TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK: canonicalJson({
+        kty: publicJwk.kty,
+        crv: publicJwk.crv,
+        x: publicJwk.x,
+      }),
+      TAKOSERVER_FORM_AUTHORITY_OPERATOR_TENANT_ID: "tenant-yurucommu",
+      TAKOSERVER_FORM_AUTHORITY_OPERATOR_SPACE: "space-yurucommu",
+      PUBLIC_HOST_IDENTITY: {
+        async identity() {
+          identityReads += 1;
+          return {
+            kind: "takoserver.public-host-identity@v2" as const,
+            hostId,
+            workerVersionId: identityReads === 1 ? PUBLIC_VERSION_ID : DRIFTED_PUBLIC_VERSION_ID,
+            workerArtifactDigest: artifact,
+            implementationPayloadDigest: TEST_IMPLEMENTATION_PAYLOAD_DIGEST,
+            capabilityDigest: digest("7"),
+            implementationDigest: TEST_IMPLEMENTATION_DIGEST,
+          };
+        },
+      },
+      get TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST() {
+        privilegedReads.push("capabilities");
+        throw new Error("identity race must fail before capabilities");
+      },
+      get STATE_DB() {
+        privilegedReads.push("d1");
+        throw new Error("identity race must fail before D1");
+      },
+      get OBJECTS() {
+        privilegedReads.push("r2");
+        throw new Error("identity race must fail before R2");
+      },
+    } as unknown as IntegrationFormAuthorityRawWorkerEnv;
+
+    await expect(
+      invokeAuthenticatedIntegrationFormAuthorityFromWorkerEnv(
+        env,
+        "plan",
+        signedFormAuthorityRpcInvocation({ action: "plan", assertion, body }),
+      ),
+    ).rejects.toMatchObject({ code: "identity_unavailable" });
+    expect(identityReads).toBe(2);
+    expect(privilegedReads).toEqual([]);
   });
 
   test("refuses a non-integration environment before reading D1 or R2 bindings", () => {
@@ -261,14 +409,6 @@ describe("integration Form authority bridge", () => {
       get TAKOSERVER_FORM_AUTHORITY_HOST_ID() {
         reads.push("host");
         return "must-not-read";
-      },
-      get TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST() {
-        reads.push("artifact");
-        return digest("6");
-      },
-      get TAKOSERVER_PUBLIC_WORKER_VERSION_ID() {
-        reads.push("version");
-        return PUBLIC_VERSION_ID;
       },
       get TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST() {
         reads.push("capabilities");
@@ -335,31 +475,29 @@ describe("integration Form authority bridge", () => {
     expect(applied.nextPlan.commands).toEqual([]);
   });
 
-  test("reseals support only when the public Worker Version advances", async () => {
+  test("keeps support converged when only the public Worker Version advances", async () => {
     const sql = createEphemeralSql();
     const objects = createMemoryObjectStore();
     const original = await integrationFixture({ sql, objects });
     expect(
       (await original.endpoint.apply(await original.endpoint.plan(original.request))).status,
     ).toBe("converged");
+    const configuration = await buildConfiguration({
+      environment: "integration",
+      hostId: original.identity.hostId,
+      workerArtifactDigest: original.identity.workerArtifactDigest,
+      publicWorkerVersionId: DRIFTED_PUBLIC_VERSION_ID,
+      capabilities: CAPABILITIES,
+    });
+    const live = await identityFor(configuration);
     const advanced = await createIntegrationFormAuthorityComposition({
-      configuration: {
-        environment: "integration",
-        hostId: original.identity.hostId,
-        workerArtifactDigest: original.identity.workerArtifactDigest,
-        publicWorkerVersionId: DRIFTED_PUBLIC_VERSION_ID,
-        capabilities: CAPABILITIES,
-      },
+      configuration,
       bindings: {
         sql,
         objects,
         publicHostIdentity: {
           async identity() {
-            return {
-              kind: "takoserver.public-host-identity@v1",
-              hostId: original.identity.hostId,
-              workerVersionId: DRIFTED_PUBLIC_VERSION_ID,
-            };
+            return live;
           },
         },
       },
@@ -374,14 +512,13 @@ describe("integration Form authority bridge", () => {
       before.forms.every(
         (form) =>
           form.installed &&
-          !form.supported &&
+          form.supported &&
           form.activationHead.present &&
           form.activationHead.active,
       ),
     ).toBe(true);
     const plan = await advanced.endpoint.plan(request);
-    expect(plan.commands).toHaveLength(12);
-    expect(plan.commands.every((command) => command.kind === "SetSupport")).toBe(true);
+    expect(plan.commands).toEqual([]);
     const applied = await advanced.endpoint.apply(plan);
     expect(applied.status).toBe("converged");
     expect(applied.nextPlan.commands).toEqual([]);
@@ -402,10 +539,67 @@ describe("integration Form authority bridge", () => {
     ).toBe(12);
     expect(
       (await sql.query("SELECT COUNT(*) AS count FROM tf_form_support_events"))[0]?.count,
-    ).toBe(24);
+    ).toBe(12);
   });
 
-  test("moves all Forms to a stable publisher generation while resealing the public Version", async () => {
+  test("keeps semantic support across outer artifact changes but reconverges capabilities", async () => {
+    const changedCapabilities = yurucommuLifecycleCapabilityManifest(
+      YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
+      { ModuleWorker: ["read"] },
+    );
+    for (const change of [
+      { workerArtifactDigest: digest("6"), capabilities: CAPABILITIES, semanticChange: false },
+      {
+        workerArtifactDigest: digest("5"),
+        capabilities: changedCapabilities,
+        semanticChange: true,
+      },
+    ] as const) {
+      const sql = createEphemeralSql();
+      const objects = createMemoryObjectStore();
+      const original = await integrationFixture({ sql, objects });
+      expect(
+        (await original.endpoint.apply(await original.endpoint.plan(original.request))).status,
+      ).toBe("converged");
+      const configuration = await buildConfiguration({
+        environment: "integration",
+        hostId: original.identity.hostId,
+        publicWorkerVersionId: DRIFTED_PUBLIC_VERSION_ID,
+        workerArtifactDigest: change.workerArtifactDigest,
+        capabilities: change.capabilities,
+      });
+      const live = await identityFor(configuration);
+      const changed = await createIntegrationFormAuthorityComposition({
+        configuration,
+        bindings: {
+          sql,
+          objects,
+          publicHostIdentity: {
+            async identity() {
+              return live;
+            },
+          },
+        },
+      });
+      const request = { ...original.request, ...changed.identity };
+
+      const before = await changed.endpoint.readback(request);
+      expect(before.forms.every((form) => form.installed && form.activationHead.active)).toBe(true);
+      const plan = await changed.endpoint.plan(request);
+      if (change.semanticChange) {
+        expect(before.forms.every((form) => !form.supported)).toBe(true);
+        expect(plan.commands).toHaveLength(24);
+        expect(plan.commands.filter(({ kind }) => kind === "SetSupport")).toHaveLength(12);
+        expect(plan.commands.filter(({ kind }) => kind === "SetActivation")).toHaveLength(12);
+      } else {
+        expect(changed.identity.implementationDigest).toBe(original.identity.implementationDigest);
+        expect(before.forms.every((form) => form.supported)).toBe(true);
+        expect(plan.commands).toEqual([]);
+      }
+    }
+  });
+
+  test("moves all Forms to a stable publisher generation without resealing a config-only public Version", async () => {
     const baseSql = createEphemeralSql();
     let failReplacementAt: number | undefined;
     let replacementWrites = 0;
@@ -433,24 +627,22 @@ describe("integration Form authority bridge", () => {
     expect(
       (await original.endpoint.apply(await original.endpoint.plan(original.request))).status,
     ).toBe("converged");
+    const configuration = await buildConfiguration({
+      environment: "integration",
+      hostId: original.identity.hostId,
+      workerArtifactDigest: original.identity.workerArtifactDigest,
+      publicWorkerVersionId: DRIFTED_PUBLIC_VERSION_ID,
+      capabilities: CAPABILITIES,
+    });
+    const live = await identityFor(configuration);
     const advanced = await createIntegrationFormAuthorityComposition({
-      configuration: {
-        environment: "integration",
-        hostId: original.identity.hostId,
-        workerArtifactDigest: original.identity.workerArtifactDigest,
-        publicWorkerVersionId: DRIFTED_PUBLIC_VERSION_ID,
-        capabilities: CAPABILITIES,
-      },
+      configuration,
       bindings: {
         sql,
         objects,
         publicHostIdentity: {
           async identity() {
-            return {
-              kind: "takoserver.public-host-identity@v1",
-              hostId: original.identity.hostId,
-              workerVersionId: DRIFTED_PUBLIC_VERSION_ID,
-            };
+            return live;
           },
         },
       },
@@ -475,13 +667,13 @@ describe("integration Form authority bridge", () => {
     };
 
     const plan = await advanced.endpoint.plan(request);
-    expect(plan.commands).toHaveLength(2 + 12 * 2);
+    expect(plan.commands).toHaveLength(2 + 12);
     expect(plan.commands.slice(0, 2).map((command) => command.kind)).toEqual([
       "AllowPublisher",
       "AppendCheckpoint",
     ]);
     expect(plan.commands.slice(2).map((command) => command.kind)).toEqual(
-      Array.from({ length: 12 }, () => ["ReplacePackage", "SetSupport"] as const).flat(),
+      Array.from({ length: 12 }, () => "ReplacePackage"),
     );
 
     failReplacementAt = 3;
@@ -491,13 +683,11 @@ describe("integration Form authority bridge", () => {
       "AllowPublisher",
       "AppendCheckpoint",
       "ReplacePackage",
-      "SetSupport",
       "ReplacePackage",
-      "SetSupport",
     ]);
-    expect(partial.nextPlan.commands).toHaveLength(10 * 2);
+    expect(partial.nextPlan.commands).toHaveLength(10);
     expect(partial.nextPlan.commands.map((command) => command.kind)).toEqual(
-      Array.from({ length: 10 }, () => ["ReplacePackage", "SetSupport"] as const).flat(),
+      Array.from({ length: 10 }, () => "ReplacePackage"),
     );
 
     const applied = await advanced.endpoint.apply(partial.nextPlan);
@@ -523,7 +713,7 @@ describe("integration Form authority bridge", () => {
     ).toBe(24);
     expect(
       (await sql.query("SELECT COUNT(*) AS count FROM tf_form_support_events"))[0]?.count,
-    ).toBe(24);
+    ).toBe(12);
     expect(
       (await sql.query("SELECT COUNT(*) AS count FROM tf_form_activation_events"))[0]?.count,
     ).toBe(12);
@@ -623,24 +813,22 @@ describe("integration Form authority bridge", () => {
     const sql = createEphemeralSql();
     const objects = createMemoryObjectStore();
     const original = await integrationFixture({ sql, objects });
+    const configuration = await buildConfiguration({
+      environment: "integration",
+      hostId: original.identity.hostId,
+      workerArtifactDigest: digest("6"),
+      publicWorkerVersionId: PUBLIC_VERSION_ID,
+      capabilities: CAPABILITIES,
+    });
+    const live = await identityFor(configuration);
     const drifted = await createIntegrationFormAuthorityComposition({
-      configuration: {
-        environment: "integration",
-        hostId: original.identity.hostId,
-        workerArtifactDigest: digest("6"),
-        publicWorkerVersionId: PUBLIC_VERSION_ID,
-        capabilities: CAPABILITIES,
-      },
+      configuration,
       bindings: {
         sql,
         objects,
         publicHostIdentity: {
           async identity() {
-            return {
-              kind: "takoserver.public-host-identity@v1",
-              hostId: original.identity.hostId,
-              workerVersionId: PUBLIC_VERSION_ID,
-            };
+            return live;
           },
         },
       },
@@ -654,28 +842,29 @@ describe("integration Form authority bridge", () => {
     expect((await objects.list({ prefix: "formpkg/", limit: 1_000 })).objects).toEqual([]);
   });
 
-  test("rejects a live public Worker Version drift before any authority read", async () => {
+  test("refuses an identity change between composition and endpoint before any authority read", async () => {
     const sql = createEphemeralSql();
     const objects = createMemoryObjectStore();
     const original = await integrationFixture({ sql, objects });
+    const configuration = await buildConfiguration({
+      environment: "integration",
+      hostId: original.identity.hostId,
+      workerArtifactDigest: original.identity.workerArtifactDigest,
+      publicWorkerVersionId: PUBLIC_VERSION_ID,
+      capabilities: CAPABILITIES,
+    });
+    const live = {
+      ...(await identityFor(configuration)),
+      workerVersionId: DRIFTED_PUBLIC_VERSION_ID,
+    };
     const staleAuthority = await createIntegrationFormAuthorityComposition({
-      configuration: {
-        environment: "integration",
-        hostId: original.identity.hostId,
-        workerArtifactDigest: original.identity.workerArtifactDigest,
-        publicWorkerVersionId: PUBLIC_VERSION_ID,
-        capabilities: CAPABILITIES,
-      },
+      configuration,
       bindings: {
         sql,
         objects,
         publicHostIdentity: {
           async identity() {
-            return {
-              kind: "takoserver.public-host-identity@v1",
-              hostId: original.identity.hostId,
-              workerVersionId: DRIFTED_PUBLIC_VERSION_ID,
-            };
+            return live;
           },
         },
       },
@@ -692,24 +881,22 @@ describe("integration Form authority bridge", () => {
 test("production composition plans exact Forms but apply remains adapter-fail-closed", async () => {
   const sql = createEphemeralSql();
   const objects = createMemoryObjectStore();
+  const configuration = await buildConfiguration({
+    environment: "production",
+    hostId: "takoserver-production",
+    workerArtifactDigest: digest("7"),
+    publicWorkerVersionId: PUBLIC_VERSION_ID,
+    capabilities: CAPABILITIES,
+  });
+  const live = await identityFor(configuration);
   const composition = await createProductionFormAuthorityComposition({
-    configuration: {
-      environment: "production",
-      hostId: "takoserver-production",
-      workerArtifactDigest: digest("7"),
-      publicWorkerVersionId: PUBLIC_VERSION_ID,
-      capabilities: CAPABILITIES,
-    },
+    configuration,
     bindings: {
       sql,
       objects,
       publicHostIdentity: {
         async identity() {
-          return {
-            kind: "takoserver.public-host-identity@v1",
-            hostId: "takoserver-production",
-            workerVersionId: PUBLIC_VERSION_ID,
-          };
+          return live;
         },
       },
     },

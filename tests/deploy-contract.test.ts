@@ -25,6 +25,7 @@ async function deploy(args: readonly string[]): Promise<{
 const SURFACES = [
   ["takoserver-worker", []],
   ["takoserver-worker-authority-cutover", ["authority"]],
+  ["takoserver-form-authority-identity-probe", ["authority"]],
   ["takoserver-form-authority-worker", ["authority"]],
   ["takoserver-integration-form-authority-worker", ["authority"]],
   ["takoserver-integration-form-authority-operator-worker", ["authority"]],

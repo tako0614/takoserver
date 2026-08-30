@@ -17,11 +17,11 @@ import {
 import type { MeterSource, ProviderPack } from "./provider-pack.ts";
 import type { Provider, ProviderOffering } from "./provider-port.ts";
 import type { ArtifactBytes, CloudflareZone } from "./providers/cloudflare.ts";
-import { CloudflareProvider } from "./providers/cloudflare.ts";
 import { createCloudflareEdgeMeterSources } from "./providers/cloudflare-edge-meter.ts";
 import { createCloudflareR2MeterSource } from "./providers/cloudflare-r2-meter.ts";
 import { createWasabiProvider } from "./providers/wasabi.ts";
 import { createWasabiBucketMeterSource } from "./providers/wasabi-meter.ts";
+import { CloudflareProvider } from "./public-form-runtime.ts";
 import { createS3AttachmentFactory } from "./s3-attachment-factory.ts";
 import type { S3CredentialIssuer } from "./s3-port.ts";
 import { createProductionStandardServiceResolver } from "./standard-service-production.ts";

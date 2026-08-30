@@ -2,13 +2,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { canonicalDigest, canonicalJson } from "../../src/json.ts";
+import { publicFormCapabilityManifest } from "../../src/public-worker-implementation.ts";
 import { deriveFormAuthorityIdentity } from "../../src/takoform/host-admission-endpoint.ts";
-import {
-  type TakoformLifecycleCapabilityManifest,
-  YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
-  type YurucommuIdentityCapabilityKind,
-  yurucommuLifecycleCapabilityManifest,
-} from "../../src/takoform/implementation-catalog.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import {
   DeployError,
@@ -17,6 +12,8 @@ import {
   preflightError,
   verificationError,
 } from "./errors.ts";
+import { assertPublicFormCapabilityTarget } from "./form-authority-capability.ts";
+import { readPublicHostIdentityProbe } from "./form-authority-identity-probe.ts";
 import {
   assertLoadedFormAuthorityScopeTransition,
   type FormAuthorityScope,
@@ -33,15 +30,12 @@ import {
 import { type DeployEnvironment, qualifySource } from "./qualification.ts";
 import type { DeployTarget } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
-import {
-  inspectLiveWorkerVersion,
-  isWorkerVersionId,
-  workerVersionIdentity,
-} from "./worker-live.ts";
+import { inspectLiveWorkerVersion, workerVersionIdentity } from "./worker-live.ts";
 import {
   assertExactSecretInventory,
   assertExactVersionBindingClosure,
   expectedExactBindingClosure,
+  optionalExactPlainTextBinding,
   parseWorkerDeploymentHistory,
   type WorkerDeploymentHistory,
 } from "./worker-state.ts";
@@ -50,6 +44,8 @@ export type FormAuthoritySurface =
   | "takoserver-form-authority-worker"
   | "takoserver-integration-form-authority-worker"
   | "takoserver-integration-form-authority-operator-worker";
+
+export { publicFormCapabilityManifest } from "../../src/public-worker-implementation.ts";
 
 export interface FormAuthorityDeployInvocation {
   readonly surface: FormAuthoritySurface;
@@ -90,6 +86,7 @@ export interface FormAuthorityDeployOptions {
   readonly outputDirectory?: string;
   readonly cloudflareEnvironment?: Readonly<Record<string, string>>;
   readonly review?: string;
+  readonly fetcher?: (input: string, init?: RequestInit) => Promise<Response>;
 }
 
 export interface SelectedFormAuthorityTarget {
@@ -118,20 +115,14 @@ interface FormAuthorityInspection {
   readonly history: WorkerDeploymentHistory;
   readonly commit: string;
   readonly authorityArtifactDigest: `sha256:${string}`;
-  readonly publicWorkerBindingProfile: "exact-current-public" | "exact-direct-public-predecessor";
+  readonly publicWorkerBindingProfile: "dynamic-public-rpc" | "legacy-exact-pinned";
   readonly scopeBindingProfile: "exact-target" | "exact-transition-predecessor";
-  readonly boundPublicWorkerVersionId: string;
-  readonly boundPublicWorkerArtifactDigest: `sha256:${string}`;
+  readonly boundPublicWorkerVersionId: string | null;
+  readonly boundPublicWorkerArtifactDigest: `sha256:${string}` | null;
 }
 
 interface PublicWorkerInspection {
   readonly history: WorkerDeploymentHistory;
-  readonly commit: string;
-  readonly workerArtifactDigest: `sha256:${string}`;
-}
-
-interface PublicWorkerVersionIdentity {
-  readonly versionId: string;
   readonly commit: string;
   readonly workerArtifactDigest: `sha256:${string}`;
 }
@@ -153,6 +144,7 @@ export async function runFormAuthority(
   if (target.environment !== invocation.environment) {
     throw preflightError("Form authority invocation and target environments differ");
   }
+  assertPublicFormCapabilityTarget(target);
   if (invocation.scopeTransition) {
     if (
       invocation.environment !== "integration" ||
@@ -163,7 +155,7 @@ export async function runFormAuthority(
     assertLoadedFormAuthorityScopeTransition(invocation.scopeTransition, target);
   }
   const selected = selectTarget(invocation, target);
-  const capabilityManifest = targetCapabilityManifest(target);
+  const capabilityManifest = publicFormCapabilityManifest();
   const capabilityManifestJson = canonicalJson(capabilityManifest);
   const capabilityDigest = await canonicalDigest(capabilityManifest);
   const run = options.run ?? runCommand;
@@ -176,13 +168,22 @@ export async function runFormAuthority(
     options.state ??
     new CloudflareState({ accountId: target.accountId, token: exactToken(environment) });
   const publicBefore = await inspectPublicWorker("preflight", target, state);
-  const operatorIdentity = await deriveFormAuthorityIdentity({
-    environment: invocation.environment,
-    hostId: selected.hostId,
-    workerArtifactDigest: publicBefore.workerArtifactDigest,
-    publicWorkerVersionId: publicBefore.history.versionId,
-    capabilities: capabilityManifest,
-  });
+  const publicIdentityReadback = await readPublicHostIdentityProbe(
+    target,
+    publicBefore,
+    options.fetcher ?? fetch,
+  );
+  const operatorIdentity = publicIdentityReadback.identity
+    ? await deriveFormAuthorityIdentity({
+        environment: invocation.environment,
+        hostId: selected.hostId,
+        workerArtifactDigest: publicIdentityReadback.identity.workerArtifactDigest,
+        publicWorkerVersionId: publicIdentityReadback.identity.workerVersionId,
+        implementationPayloadDigest: publicIdentityReadback.identity.implementationPayloadDigest,
+        implementationDigest: publicIdentityReadback.identity.implementationDigest,
+        capabilities: capabilityManifest,
+      })
+    : null;
   const dependencySelected =
     selected.kind === "operator-gateway"
       ? selectTarget(
@@ -240,7 +241,10 @@ export async function runFormAuthority(
       publicWorkerVersionId: publicBefore.history.versionId,
       publicWorkerCommitMatches: publicBefore.commit === invocation.commit,
       capabilityDigest,
-      implementationDigest: operatorIdentity.implementationDigest,
+      publicIdentityRpcReady: publicIdentityReadback.ready,
+      implementationPayloadDigest:
+        publicIdentityReadback.identity?.implementationPayloadDigest ?? null,
+      implementationDigest: operatorIdentity?.implementationDigest ?? null,
       ...(invocation.scopeTransition
         ? { scopeTransitionDigest: invocation.scopeTransition.digest }
         : {}),
@@ -263,14 +267,20 @@ export async function runFormAuthority(
       productionEligible: selected.productionEligible,
       ready:
         before?.commit === invocation.commit &&
-        before.publicWorkerBindingProfile === "exact-current-public" &&
+        publicIdentityReadback.ready &&
+        operatorIdentity !== null &&
+        before.publicWorkerBindingProfile === "dynamic-public-rpc" &&
         before.scopeBindingProfile === "exact-target" &&
         publicBefore.commit === invocation.commit &&
         (dependencySelected === null ||
           (dependencyBefore?.commit === invocation.commit &&
-            dependencyBefore.publicWorkerBindingProfile === "exact-current-public" &&
+            dependencyBefore.publicWorkerBindingProfile === "dynamic-public-rpc" &&
             dependencyBefore.scopeBindingProfile === "exact-target")),
     };
+  }
+
+  if (!publicIdentityReadback.ready || operatorIdentity === null) {
+    throw preflightError("public Host identity RPC is unavailable or inconsistent");
   }
 
   if (invocation.scopeTransition) {
@@ -308,7 +318,7 @@ export async function runFormAuthority(
   if (
     dependencySelected &&
     (dependencyBefore?.commit !== source.commit ||
-      dependencyBefore.publicWorkerBindingProfile !== "exact-current-public" ||
+      dependencyBefore.publicWorkerBindingProfile !== "dynamic-public-rpc" ||
       (invocation.scopeTransition !== undefined &&
         dependencyBefore.scopeBindingProfile !== "exact-target"))
   ) {
@@ -350,8 +360,6 @@ export async function runFormAuthority(
           invocation: { ...invocation, commit: source.commit },
           target,
           selected,
-          workerArtifactDigest: publicBefore.workerArtifactDigest,
-          publicWorkerVersionId: publicBefore.history.versionId,
           capabilityManifestJson,
         }),
     });
@@ -405,6 +413,23 @@ export async function runFormAuthority(
 
     const publicAfter = await inspectPublicWorker("verification", target, state);
     assertSamePublicWorker("verification", publicBefore, publicAfter);
+    const publicIdentityAfter = await readPublicHostIdentityProbe(
+      target,
+      publicAfter,
+      options.fetcher ?? fetch,
+    );
+    if (
+      !publicIdentityAfter.ready ||
+      publicIdentityAfter.identity === null ||
+      publicIdentityAfter.identity.implementationPayloadDigest !==
+        publicIdentityReadback.identity?.implementationPayloadDigest ||
+      publicIdentityAfter.identity.capabilityDigest !==
+        publicIdentityReadback.identity?.capabilityDigest ||
+      publicIdentityAfter.identity.implementationDigest !==
+        publicIdentityReadback.identity?.implementationDigest
+    ) {
+      throw verificationError("public Host identity RPC changed or became unavailable");
+    }
     if (dependencySelected) {
       const dependencyAfter = await inspectFormAuthority(
         "verification",
@@ -420,7 +445,7 @@ export async function runFormAuthority(
         !dependencyAfter ||
         dependencyAfter.history.versionId !== dependencyBefore?.history.versionId ||
         dependencyAfter.commit !== source.commit ||
-        dependencyAfter.publicWorkerBindingProfile !== "exact-current-public" ||
+        dependencyAfter.publicWorkerBindingProfile !== "dynamic-public-rpc" ||
         (invocation.scopeTransition !== undefined &&
           dependencyAfter.scopeBindingProfile !== "exact-target")
       ) {
@@ -442,7 +467,7 @@ export async function runFormAuthority(
       !after ||
       after.history.versionId === before?.history.versionId ||
       (before !== null && after.history.previousVersionId !== before.history.versionId) ||
-      after.publicWorkerBindingProfile !== "exact-current-public" ||
+      after.publicWorkerBindingProfile !== "dynamic-public-rpc" ||
       after.scopeBindingProfile !== "exact-target" ||
       after.commit !== source.commit ||
       after.authorityArtifactDigest !== authorityArtifactDigest
@@ -465,6 +490,8 @@ export async function runFormAuthority(
       workerArtifactDigest: publicBefore.workerArtifactDigest,
       publicWorkerVersionId: publicBefore.history.versionId,
       capabilityDigest,
+      publicIdentityRpcReady: true,
+      implementationPayloadDigest: publicIdentityAfter.identity.implementationPayloadDigest,
       implementationDigest: operatorIdentity.implementationDigest,
       scopeBindingProfile: after.scopeBindingProfile,
       ...(invocation.scopeTransition
@@ -503,24 +530,12 @@ export function writeFormAuthorityConfig(input: {
   readonly invocation: FormAuthorityDeployInvocation;
   readonly target: DeployTarget;
   readonly selected: SelectedFormAuthorityTarget;
-  readonly workerArtifactDigest: `sha256:${string}`;
-  readonly publicWorkerVersionId: string;
   readonly capabilityManifestJson: string;
 }): string {
   if (!/^[0-9a-f]{40}$/u.test(input.invocation.commit)) {
     throw preflightError("Form authority config requires one exact commit");
   }
-  if (!/^sha256:[0-9a-f]{64}$/u.test(input.workerArtifactDigest)) {
-    throw preflightError("Form authority config requires one exact public Worker artifact digest");
-  }
-  if (
-    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(
-      input.publicWorkerVersionId,
-    )
-  ) {
-    throw preflightError("Form authority config requires one exact public Worker Version id");
-  }
-  if (canonicalJson(targetCapabilityManifest(input.target)) !== input.capabilityManifestJson) {
+  if (canonicalJson(publicFormCapabilityManifest()) !== input.capabilityManifestJson) {
     throw preflightError("Form authority config requires one canonical capability manifest");
   }
   const shared = {
@@ -541,8 +556,6 @@ export function writeFormAuthorityConfig(input: {
           vars: {
             TAKOSERVER_ENVIRONMENT: input.invocation.environment,
             TAKOSERVER_FORM_AUTHORITY_HOST_ID: input.selected.hostId,
-            TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST: input.workerArtifactDigest,
-            TAKOSERVER_PUBLIC_WORKER_VERSION_ID: input.publicWorkerVersionId,
             TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST: input.capabilityManifestJson,
             ...(input.invocation.surface === "takoserver-integration-form-authority-worker"
               ? {
@@ -601,8 +614,6 @@ function operatorGatewayConfiguration(
       TAKOSERVER_ENVIRONMENT: "integration",
       TAKOSERVER_FORM_AUTHORITY_HOST_ID: input.selected.hostId,
       TAKOSERVER_FORM_AUTHORITY_OPERATOR_ORIGIN: origin,
-      TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST: input.workerArtifactDigest,
-      TAKOSERVER_PUBLIC_WORKER_VERSION_ID: input.publicWorkerVersionId,
       TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK: canonicalJson(operatorPublicJwk),
       TAKOSERVER_FORM_AUTHORITY_OPERATOR_TENANT_ID: operatorScope.tenantId,
       TAKOSERVER_FORM_AUTHORITY_OPERATOR_SPACE: operatorScope.space,
@@ -628,7 +639,7 @@ async function inspectFormAuthority(
   invocation: FormAuthorityDeployInvocation,
   target: DeployTarget,
   selected: SelectedFormAuthorityTarget,
-  publicWorker: PublicWorkerInspection,
+  _publicWorker: PublicWorkerInspection,
   capabilityManifestJson: string,
   state: FormAuthorityDeployState,
 ): Promise<FormAuthorityInspection | null> {
@@ -685,7 +696,6 @@ async function inspectFormAuthority(
     history.versionId,
     version,
     identity.commit,
-    publicWorker,
     capabilityManifestJson,
     state,
   );
@@ -705,7 +715,6 @@ async function classifyPublicWorkerBinding(
   authorityVersionId: string,
   authorityVersion: unknown,
   authorityCommit: string,
-  publicWorker: PublicWorkerInspection,
   capabilityManifestJson: string,
   state: FormAuthorityDeployState,
 ): Promise<
@@ -718,27 +727,19 @@ async function classifyPublicWorkerBinding(
   >
 > {
   const transition = invocation.scopeTransition;
-  const currentExpected = expectedBindings(
+  const targetExpected = expectedBindings(
     invocation.environment,
     target,
     selected,
-    publicWorker.workerArtifactDigest,
-    publicWorker.history.versionId,
     capabilityManifestJson,
     transition?.value.targetScope,
   );
-  if (hasExactBindingClosure(phase, authorityVersionId, authorityVersion, currentExpected)) {
-    if (authorityCommit !== publicWorker.commit) {
-      throw phaseError(
-        phase,
-        "Form authority current-public closure commit differs from the public Worker commit",
-      );
-    }
+  if (hasExactBindingClosure(phase, authorityVersionId, authorityVersion, targetExpected)) {
     return {
-      publicWorkerBindingProfile: "exact-current-public",
+      publicWorkerBindingProfile: "dynamic-public-rpc",
       scopeBindingProfile: "exact-target",
-      boundPublicWorkerVersionId: publicWorker.history.versionId,
-      boundPublicWorkerArtifactDigest: publicWorker.workerArtifactDigest,
+      boundPublicWorkerVersionId: null,
+      boundPublicWorkerArtifactDigest: null,
     };
   }
 
@@ -747,96 +748,176 @@ async function classifyPublicWorkerBinding(
       invocation.environment,
       target,
       selected,
-      publicWorker.workerArtifactDigest,
-      publicWorker.history.versionId,
       capabilityManifestJson,
       transition.value.predecessorScope,
     );
-    if (!hasExactBindingClosure(phase, authorityVersionId, authorityVersion, predecessorExpected)) {
-      throw phaseError(
-        phase,
-        "Form authority scope transition binding is neither exact-target nor exact-transition-predecessor",
-      );
+    if (hasExactBindingClosure(phase, authorityVersionId, authorityVersion, predecessorExpected)) {
+      return {
+        publicWorkerBindingProfile: "dynamic-public-rpc",
+        scopeBindingProfile: "exact-transition-predecessor",
+        boundPublicWorkerVersionId: null,
+        boundPublicWorkerArtifactDigest: null,
+      };
     }
-    if (authorityCommit !== publicWorker.commit) {
-      throw phaseError(
-        phase,
-        "Form authority transition predecessor commit differs from the current public Worker commit",
-      );
-    }
-    return {
-      publicWorkerBindingProfile: "exact-current-public",
-      scopeBindingProfile: "exact-transition-predecessor",
-      boundPublicWorkerVersionId: publicWorker.history.versionId,
-      boundPublicWorkerArtifactDigest: publicWorker.workerArtifactDigest,
-    };
   }
 
-  const predecessor = await inspectDirectPublicPredecessor(phase, target, state, publicWorker);
-  assertExactVersionBindingClosure(
+  const pinned = await inspectLegacyPinnedPublicWorker(
     phase,
+    target,
     authorityVersionId,
     authorityVersion,
-    expectedBindings(
+    state,
+  );
+  if (pinned !== null) {
+    const legacyTarget = expectedLegacyBindings(
       invocation.environment,
       target,
       selected,
-      predecessor.workerArtifactDigest,
-      predecessor.versionId,
       capabilityManifestJson,
-    ),
-  );
-  if (authorityCommit !== predecessor.commit) {
-    throw phaseError(
-      phase,
-      "Form authority direct-predecessor closure commit differs from the predecessor public Worker commit",
+      pinned,
+      transition?.value.targetScope,
     );
+    if (hasExactBindingClosure(phase, authorityVersionId, authorityVersion, legacyTarget)) {
+      if (authorityCommit === pinned.commit) {
+        return {
+          publicWorkerBindingProfile: "legacy-exact-pinned",
+          scopeBindingProfile: "exact-target",
+          boundPublicWorkerVersionId: pinned.versionId,
+          boundPublicWorkerArtifactDigest: pinned.workerArtifactDigest,
+        };
+      }
+      if (!transition) {
+        throw phaseError(
+          phase,
+          "legacy Form authority commit differs from its exact pinned public Worker commit",
+        );
+      }
+    }
+    if (transition) {
+      const legacyPredecessor = expectedLegacyBindings(
+        invocation.environment,
+        target,
+        selected,
+        capabilityManifestJson,
+        pinned,
+        transition.value.predecessorScope,
+      );
+      if (hasExactBindingClosure(phase, authorityVersionId, authorityVersion, legacyPredecessor)) {
+        if (authorityCommit === pinned.commit) {
+          return {
+            publicWorkerBindingProfile: "legacy-exact-pinned",
+            scopeBindingProfile: "exact-transition-predecessor",
+            boundPublicWorkerVersionId: pinned.versionId,
+            boundPublicWorkerArtifactDigest: pinned.workerArtifactDigest,
+          };
+        }
+      }
+    }
   }
-  return {
-    publicWorkerBindingProfile: "exact-direct-public-predecessor",
-    scopeBindingProfile: "exact-target",
-    boundPublicWorkerVersionId: predecessor.versionId,
-    boundPublicWorkerArtifactDigest: predecessor.workerArtifactDigest,
-  };
+
+  throw phaseError(
+    phase,
+    transition
+      ? "Form authority scope transition binding is neither exact-target nor exact-transition-predecessor"
+      : "Form authority binding is neither dynamic public RPC nor an exact legacy public pin",
+  );
 }
 
-async function inspectDirectPublicPredecessor(
+interface LegacyPinnedPublicWorker {
+  readonly versionId: string;
+  readonly commit: string;
+  readonly workerArtifactDigest: `sha256:${string}`;
+}
+
+async function inspectLegacyPinnedPublicWorker(
   phase: DeployPhase,
   target: DeployTarget,
+  authorityVersionId: string,
+  authorityVersion: unknown,
   state: FormAuthorityDeployState,
-  current: PublicWorkerInspection,
-): Promise<PublicWorkerVersionIdentity> {
-  const versionId = current.history.previousVersionId;
-  if (versionId === null || !isWorkerVersionId(versionId)) {
+): Promise<LegacyPinnedPublicWorker | null> {
+  const versionId = optionalExactPlainTextBinding(
+    phase,
+    authorityVersionId,
+    authorityVersion,
+    "TAKOSERVER_PUBLIC_WORKER_VERSION_ID",
+  );
+  const artifactDigest = optionalExactPlainTextBinding(
+    phase,
+    authorityVersionId,
+    authorityVersion,
+    "TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST",
+  );
+  if (versionId === null && artifactDigest === null) return null;
+  if (
+    versionId === null ||
+    artifactDigest === null ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(versionId) ||
+    !/^sha256:[0-9a-f]{64}$/u.test(artifactDigest)
+  ) {
+    throw phaseError(phase, "legacy Form authority public identity pins are incomplete or invalid");
+  }
+  const publicVersion = await state.workerVersion(target.workerName, versionId);
+  const identity = workerVersionIdentity(phase, publicVersion);
+  const expected = expectedExactBindingClosure(target, {
+    workerArtifactDigest: `sha256:${identity.bundleDigestHex}`,
+    ...(target.integrationE2eCredentialAuthority === undefined
+      ? {}
+      : {
+          authorityProfile: {
+            kind: "provenance-bound-jit" as const,
+            provenance: {
+              sourceCommit: identity.commit,
+              artifactDigest: `sha256:${identity.bundleDigestHex}` as const,
+            },
+          },
+        }),
+  });
+  const legacyBeforeCapabilityIdentity = {
+    ...expected,
+    TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST: null,
+  };
+  if (
+    !hasExactBindingClosure(phase, versionId, publicVersion, expected) &&
+    !hasExactBindingClosure(phase, versionId, publicVersion, legacyBeforeCapabilityIdentity)
+  ) {
     throw phaseError(
       phase,
-      "Form authority closure is not current and public history has no exact direct predecessor",
+      "legacy Form authority pin does not name an exact public Worker closure",
     );
   }
-  const version = await state.workerVersion(target.workerName, versionId);
-  const identity = workerVersionIdentity(phase, version);
-  const authorityProfile =
-    target.integrationE2eCredentialAuthority === undefined
-      ? undefined
-      : {
-          kind: "provenance-bound-jit" as const,
-          provenance: {
-            sourceCommit: identity.commit,
-            artifactDigest: `sha256:${identity.bundleDigestHex}` as const,
-          },
-        };
-  assertExactVersionBindingClosure(
-    phase,
-    versionId,
-    version,
-    expectedExactBindingClosure(target, {
-      ...(authorityProfile === undefined ? {} : { authorityProfile }),
-    }),
-  );
+  const observedArtifactDigest = `sha256:${identity.bundleDigestHex}` as const;
+  if (artifactDigest !== observedArtifactDigest) {
+    throw phaseError(
+      phase,
+      "legacy Form authority artifact pin mismatches its public Worker Version",
+    );
+  }
   return {
     versionId,
     commit: identity.commit,
-    workerArtifactDigest: `sha256:${identity.bundleDigestHex}`,
+    workerArtifactDigest: observedArtifactDigest,
+  };
+}
+
+function expectedLegacyBindings(
+  environment: DeployEnvironment,
+  target: DeployTarget,
+  selected: SelectedFormAuthorityTarget,
+  capabilityManifestJson: string,
+  pinned: LegacyPinnedPublicWorker,
+  scopeOverride?: FormAuthorityScope,
+) {
+  return {
+    ...expectedBindings(environment, target, selected, capabilityManifestJson, scopeOverride),
+    TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST: {
+      type: "plain_text",
+      fields: { text: pinned.workerArtifactDigest },
+    },
+    TAKOSERVER_PUBLIC_WORKER_VERSION_ID: {
+      type: "plain_text",
+      fields: { text: pinned.versionId },
+    },
   };
 }
 
@@ -859,8 +940,6 @@ function expectedBindings(
   environment: DeployEnvironment,
   target: DeployTarget,
   selected: SelectedFormAuthorityTarget,
-  workerArtifactDigest: `sha256:${string}`,
-  publicWorkerVersionId: string,
   capabilityManifestJson: string,
   scopeOverride?: FormAuthorityScope,
 ) {
@@ -898,14 +977,6 @@ function expectedBindings(
         type: "plain_text",
         fields: { text: selected.operatorOrigin },
       },
-      TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST: {
-        type: "plain_text",
-        fields: { text: workerArtifactDigest },
-      },
-      TAKOSERVER_PUBLIC_WORKER_VERSION_ID: {
-        type: "plain_text",
-        fields: { text: publicWorkerVersionId },
-      },
       TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK: {
         type: "plain_text",
         fields: { text: canonicalJson(selected.operatorPublicJwk) },
@@ -934,14 +1005,6 @@ function expectedBindings(
     TAKOSERVER_FORM_AUTHORITY_HOST_ID: {
       type: "plain_text",
       fields: { text: selected.hostId },
-    },
-    TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST: {
-      type: "plain_text",
-      fields: { text: workerArtifactDigest },
-    },
-    TAKOSERVER_PUBLIC_WORKER_VERSION_ID: {
-      type: "plain_text",
-      fields: { text: publicWorkerVersionId },
     },
     TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST: {
       type: "plain_text",
@@ -1064,23 +1127,6 @@ function routeMode(selected: SelectedFormAuthorityTarget): string {
   return selected.kind === "operator-gateway"
     ? "authenticated-integration-custom-domain"
     : "service-binding-rpc-only";
-}
-
-export function targetCapabilityManifest(
-  target: DeployTarget,
-): TakoformLifecycleCapabilityManifest {
-  const kinds = target.edgeSupplies?.offerings.map(({ formKind }) => formKind) ?? [];
-  const actual = [...kinds].sort();
-  const expected = [...YURUCOMMU_IDENTITY_CAPABILITY_KINDS].sort();
-  if (actual.length !== expected.length || actual.some((kind, index) => kind !== expected[index])) {
-    throw preflightError(
-      "Form authority requires the exact four realized Yurucommu identity capabilities",
-    );
-  }
-  return yurucommuLifecycleCapabilityManifest(
-    kinds as YurucommuIdentityCapabilityKind[],
-    target.formAuthority?.operatorOperations,
-  );
 }
 
 async function inspectPublicWorker(

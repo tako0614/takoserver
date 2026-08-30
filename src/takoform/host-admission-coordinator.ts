@@ -701,13 +701,7 @@ function executableCommand(
           formRef: command.formRef,
           packageDigest: command.packageDigest,
           supported: true,
-          profile: {
-            kind: "takoserver.form-support@v1",
-            workerArtifactDigest: request.workerArtifactDigest,
-            publicWorkerVersionId: request.publicWorkerVersionId,
-            capabilityDigest: request.capabilityDigest,
-            implementationDigest: request.implementationDigest,
-          },
+          profile: formAuthorityPackageProfile(request),
           operations: command.operations,
           implementationDigest,
           ...metadata,
@@ -1123,9 +1117,9 @@ function supportMatches(
     return false;
   }
   try {
+    const profile = JSON.parse(row.profile_json);
     return (
-      canonicalJson(JSON.parse(row.profile_json)) ===
-        canonicalJson(formAuthorityPackageProfile(identity)) &&
+      supportProfileMatchesSemanticIdentity(profile, identity) &&
       canonicalJson(JSON.parse(row.operations_json)) === canonicalJson(entry.operations)
     );
   } catch {
@@ -1315,12 +1309,34 @@ function errorCode(error: unknown): string {
 
 export function formAuthorityPackageProfile(identity: FormAuthorityIdentity): JsonObject {
   return {
-    kind: "takoserver.form-support@v1",
-    workerArtifactDigest: identity.workerArtifactDigest,
-    publicWorkerVersionId: identity.publicWorkerVersionId,
-    capabilityDigest: identity.capabilityDigest,
+    kind: "takoserver.form-support@v2",
     implementationDigest: identity.implementationDigest,
   };
+}
+
+function supportProfileMatchesSemanticIdentity(
+  value: unknown,
+  identity: FormAuthorityIdentity,
+): boolean {
+  if (!isRecord(value) || value.implementationDigest !== identity.implementationDigest) {
+    return false;
+  }
+  if (value.kind === "takoserver.form-support@v2") {
+    return exactKeys(value, ["implementationDigest", "kind"]);
+  }
+  return (
+    value.kind === "takoserver.form-support@v1" &&
+    exactKeys(value, [
+      "capabilityDigest",
+      "implementationDigest",
+      "kind",
+      "publicWorkerVersionId",
+      "workerArtifactDigest",
+    ]) &&
+    isSha256Digest(value.workerArtifactDigest) &&
+    isSha256Digest(value.capabilityDigest) &&
+    workerVersionId(value.publicWorkerVersionId)
+  );
 }
 
 function workerVersionId(value: unknown): value is string {

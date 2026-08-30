@@ -1,0 +1,170 @@
+import { isSha256Digest } from "./json.ts";
+import {
+  CLOUDFLARE_TAKOFORM_HANDLER_KINDS,
+  CloudflareProvider,
+  TAKOSERVER_INTRINSIC_HANDLER_KINDS,
+} from "./public-form-runtime.ts";
+import { currentTakoformCandidates } from "./takoform/current-candidates.ts";
+import {
+  deriveImplementationCatalog,
+  type TakoformHandlerManifest,
+  type TakoformImplementationCatalog,
+  type TakoformLifecycleCapabilityManifest,
+  YURUCOMMU_FORM_VERSIONS,
+  YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
+  yurucommuFormCandidates,
+  yurucommuLifecycleCapabilityManifest,
+} from "./takoform/implementation-catalog.ts";
+import type { TakoformOperation } from "./takoform/types.ts";
+
+const RESOURCE_OPERATION_ORDER = [
+  "create",
+  "read",
+  "update",
+  "delete",
+  "import",
+  "observe",
+] as const satisfies readonly TakoformOperation[];
+
+export interface PublicFormImplementationConfiguration {
+  readonly implementationPayloadDigest: `sha256:${string}`;
+  readonly capabilities: TakoformLifecycleCapabilityManifest;
+}
+
+export interface PublicFormImplementationIdentity {
+  readonly implementationPayloadDigest: `sha256:${string}`;
+  readonly capabilityDigest: `sha256:${string}`;
+  readonly implementationDigest: `sha256:${string}`;
+}
+
+export interface PublicWorkerImplementationIdentity extends PublicFormImplementationIdentity {
+  readonly workerArtifactDigest: `sha256:${string}`;
+}
+
+/**
+ * The compiled public Host capability surface. It is deliberately derived
+ * without a deploy target or environment so an operator cannot select P or I.
+ * Target validation separately requires the provider supplies needed to make
+ * this exact code-owned manifest truthful.
+ */
+export function publicFormCapabilityManifest(): TakoformLifecycleCapabilityManifest {
+  return yurucommuLifecycleCapabilityManifest(YURUCOMMU_IDENTITY_CAPABILITY_KINDS);
+}
+
+/** Derives semantic identity from the sealed runtime payload and exact support set. */
+export async function derivePublicFormImplementationIdentity(
+  configuration: PublicFormImplementationConfiguration,
+): Promise<PublicFormImplementationIdentity> {
+  if (!isSha256Digest(configuration.implementationPayloadDigest)) {
+    throw new TypeError("public Form implementation payload digest is invalid");
+  }
+  const catalog = await deriveRuntimeImplementationCatalog(configuration);
+  return {
+    implementationPayloadDigest: configuration.implementationPayloadDigest,
+    capabilityDigest: catalog.capabilityDigest,
+    implementationDigest: catalog.implementationDigest,
+  };
+}
+
+export async function deriveRuntimeImplementationCatalog(
+  configuration: PublicFormImplementationConfiguration,
+): Promise<TakoformImplementationCatalog> {
+  validateCapabilityManifest(configuration.capabilities);
+  const implementationPayloadDigest = configuration.implementationPayloadDigest;
+  if (!isSha256Digest(implementationPayloadDigest)) {
+    throw new TypeError("public Form implementation payload digest is invalid");
+  }
+  const forms = yurucommuFormCandidates(currentTakoformCandidates().forms);
+  const providerOperations = providerResourceOperationHandlers(
+    CloudflareProvider.prototype as unknown as Readonly<Record<string, unknown>>,
+  );
+  const intrinsicKinds = new Set<string>(TAKOSERVER_INTRINSIC_HANDLER_KINDS);
+  const cloudflareKinds = new Set<string>(CLOUDFLARE_TAKOFORM_HANDLER_KINDS);
+  const handlers: TakoformHandlerManifest = {
+    apiVersion: "takoserver.form-handlers@v1",
+    artifact: implementationPayloadDigest,
+    forms: Object.fromEntries(
+      forms.map(({ identity }) => [
+        identity.formRef.kind,
+        intrinsicKinds.has(identity.formRef.kind)
+          ? RESOURCE_OPERATION_ORDER
+          : cloudflareKinds.has(identity.formRef.kind)
+            ? providerOperations
+            : [],
+      ]),
+    ),
+  };
+  return await deriveImplementationCatalog({
+    forms,
+    capabilities: configuration.capabilities,
+    handlers,
+  });
+}
+
+export function parseFormAuthorityCapabilityManifest(
+  value: string,
+): TakoformLifecycleCapabilityManifest {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new TypeError("Form authority capability manifest is invalid");
+  }
+  validateCapabilityManifest(parsed);
+  return structuredClone(parsed as TakoformLifecycleCapabilityManifest);
+}
+
+function validateCapabilityManifest(value: unknown): void {
+  if (!isRecord(value)) throw new TypeError("Form authority capability manifest is invalid");
+  const keys = Object.keys(value).sort();
+  if (
+    keys.length !== 3 ||
+    keys[0] !== "apiVersion" ||
+    keys[1] !== "forms" ||
+    keys[2] !== "implementation" ||
+    value.apiVersion !== "takoserver.form-lifecycle-capabilities@v1" ||
+    typeof value.implementation !== "string" ||
+    value.implementation.length < 1 ||
+    value.implementation.length > 255 ||
+    !isRecord(value.forms)
+  ) {
+    throw new TypeError("Form authority capability manifest is invalid");
+  }
+  for (const [kind, operations] of Object.entries(value.forms)) {
+    if (
+      !(kind in YURUCOMMU_FORM_VERSIONS) ||
+      !Array.isArray(operations) ||
+      operations.some((operation) => !RESOURCE_OPERATION_ORDER.includes(operation)) ||
+      new Set(operations).size !== operations.length
+    ) {
+      throw new TypeError("Form authority capability manifest is invalid");
+    }
+  }
+}
+
+/** Derives provider-backed operations from concrete runtime method presence. */
+export function providerResourceOperationHandlers(
+  surface: Readonly<Record<string, unknown>>,
+): readonly TakoformOperation[] {
+  const has = (method: string): boolean => typeof surface[method] === "function";
+  return RESOURCE_OPERATION_ORDER.filter((operation) => {
+    switch (operation) {
+      case "create":
+      case "update":
+        return has("apply");
+      case "read":
+        return true;
+      case "delete":
+        return has("delete");
+      case "import":
+        return has("adopt");
+      case "observe":
+        return has("observe");
+    }
+    return false;
+  });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}

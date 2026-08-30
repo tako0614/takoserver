@@ -18,8 +18,6 @@ import { preflightError } from "./errors.ts";
 import { REPOSITORY } from "./process.ts";
 import type { DeployEnvironment } from "./qualification.ts";
 
-type FormAuthorityOperation = "create" | "read" | "update" | "delete" | "import" | "observe";
-
 /**
  * The realized deploy target. It names one Cloudflare account and the exact
  * resources this repository may publish onto. It is operator-private and is
@@ -85,6 +83,9 @@ export interface DeployTarget {
   /** Route-less Form authority Workers sharing this target's existing D1/R2. */
   readonly formAuthority?: {
     readonly workerName: string;
+    /** Permanent minimal workers.dev bridge used only for live identity RPC readback. */
+    readonly identityProbeWorkerName: string;
+    readonly identityProbeOrigin: string;
     readonly integrationWorkerName?: string;
     readonly integrationOperatorWorkerName?: string;
     readonly integrationOperatorOrigin?: string;
@@ -100,8 +101,6 @@ export interface DeployTarget {
       readonly x: string;
     };
     readonly hostId: string;
-    /** Target-owned narrowing policy; omission keeps the code-derived intersection. */
-    readonly operatorOperations?: Readonly<Record<string, readonly FormAuthorityOperation[]>>;
   };
   /**
    * Public half of the integration operator's identity-only proof key.
@@ -339,6 +338,7 @@ function validateTarget(
     const names = [
       target.workerName,
       target.formAuthority.workerName,
+      target.formAuthority.identityProbeWorkerName,
       ...(target.formAuthority.integrationWorkerName
         ? [target.formAuthority.integrationWorkerName]
         : []),
@@ -348,6 +348,15 @@ function validateTarget(
     ];
     if (new Set(names).size !== names.length) {
       throw preflightError("deploy target Form authority Worker names must be distinct");
+    }
+    const probe = new URL(target.formAuthority.identityProbeOrigin);
+    if (
+      !probe.hostname.endsWith(".workers.dev") ||
+      probe.hostname.split(".")[0] !== target.formAuthority.identityProbeWorkerName
+    ) {
+      throw preflightError(
+        "deploy target Form authority identity probe must use its named workers.dev origin",
+      );
     }
     if (
       target.formAuthority.integrationOperatorOrigin &&
@@ -389,14 +398,13 @@ function formAuthority(
   }
   assertExactKeys(
     value,
-    ["workerName", "hostId"],
+    ["workerName", "hostId", "identityProbeWorkerName", "identityProbeOrigin"],
     [
       "integrationWorkerName",
       "integrationOperatorWorkerName",
       "integrationOperatorOrigin",
       "integrationOperatorScope",
       "operatorPublicJwk",
-      "operatorOperations",
     ],
   );
   const integrationWorkerName =
@@ -461,6 +469,12 @@ function formAuthority(
   }
   return {
     workerName: pattern(value.workerName, WORKER_NAME, "formAuthority.workerName"),
+    identityProbeWorkerName: pattern(
+      value.identityProbeWorkerName,
+      WORKER_NAME,
+      "formAuthority.identityProbeWorkerName",
+    ),
+    identityProbeOrigin: httpsOrigin(value.identityProbeOrigin),
     ...(integrationWorkerName === undefined ? {} : { integrationWorkerName }),
     ...(integrationOperatorWorkerName === undefined
       ? {}
@@ -475,9 +489,6 @@ function formAuthority(
           >,
         }),
     hostId: value.hostId,
-    ...(value.operatorOperations === undefined
-      ? {}
-      : { operatorOperations: formAuthorityOperatorOperations(value.operatorOperations) }),
   };
 }
 
@@ -510,33 +521,6 @@ function boundedTargetIdentity(value: unknown, field: string): string {
     throw preflightError(`deploy target \`formAuthority.${field}\` is invalid`);
   }
   return value;
-}
-
-function formAuthorityOperatorOperations(
-  value: unknown,
-): Readonly<Record<string, readonly FormAuthorityOperation[]>> {
-  if (!isRecord(value)) {
-    throw preflightError("deploy target `formAuthority.operatorOperations` must be an object");
-  }
-  const order = ["create", "read", "update", "delete", "import", "observe"] as const;
-  const result: Record<string, readonly FormAuthorityOperation[]> = {};
-  for (const [kind, operations] of Object.entries(value)) {
-    if (kind.length === 0 || kind.length > 255 || !Array.isArray(operations)) {
-      throw preflightError("deploy target Form authority operator operations are invalid");
-    }
-    const typed = operations as unknown[];
-    if (
-      typed.some(
-        (operation) =>
-          typeof operation !== "string" || !order.includes(operation as FormAuthorityOperation),
-      ) ||
-      new Set(typed).size !== typed.length
-    ) {
-      throw preflightError("deploy target Form authority operator operations are invalid");
-    }
-    result[kind] = order.filter((operation) => typed.includes(operation));
-  }
-  return result;
 }
 
 function operatorIdentity(value: unknown): NonNullable<DeployTarget["operatorIdentity"]> {

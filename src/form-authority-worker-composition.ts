@@ -1,11 +1,18 @@
 import {
   assertFormAuthorityOperatorScope,
   type FormAuthorityGatewayAction,
+  FormAuthorityOperatorProofError,
   type SignedFormAuthorityRpcInvocation,
   verifySignedFormAuthorityRpcInvocation,
 } from "./form-authority-operator-proof.ts";
+import {
+  currentPublicHostIdentity,
+  type FormAuthorityPublicIdentityWorkerEnv,
+  formAuthorityConfigurationFromPublicIdentity,
+  samePublicHostIdentity,
+} from "./form-authority-public-identity.ts";
 import { createR2ObjectStore, type R2BucketLike } from "./objects-r2.ts";
-import type { PublicHostIdentityRpc } from "./public-host-identity.ts";
+import type { PublicHostIdentity } from "./public-host-identity.ts";
 import { createD1Sql, type D1DatabaseLike } from "./sql-d1.ts";
 import type {
   FormAuthorityApplyResult,
@@ -13,24 +20,21 @@ import type {
   FormAuthorityPlanRequest,
   FormAuthorityReadback,
 } from "./takoform/host-admission-coordinator.ts";
-import {
-  type FormAuthorityComposition,
-  parseFormAuthorityCapabilityManifest,
-} from "./takoform/host-admission-endpoint.ts";
+import type { FormAuthorityComposition } from "./takoform/host-admission-endpoint.ts";
 import { createIntegrationFormAuthorityComposition } from "./takoform/integration-operator-endpoint.ts";
 
-export interface IntegrationFormAuthorityRawWorkerEnv {
-  readonly TAKOSERVER_ENVIRONMENT: string;
-  readonly TAKOSERVER_FORM_AUTHORITY_HOST_ID: string;
-  readonly TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST: string;
-  readonly TAKOSERVER_PUBLIC_WORKER_VERSION_ID: string;
-  readonly TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST: string;
+export {
+  currentPublicHostIdentity,
+  type FormAuthorityPublicIdentityWorkerEnv,
+  formAuthorityConfigurationFromPublicIdentity,
+} from "./form-authority-public-identity.ts";
+
+export interface IntegrationFormAuthorityRawWorkerEnv extends FormAuthorityPublicIdentityWorkerEnv {
   readonly TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK: string;
   readonly TAKOSERVER_FORM_AUTHORITY_OPERATOR_TENANT_ID: string;
   readonly TAKOSERVER_FORM_AUTHORITY_OPERATOR_SPACE: string;
   readonly STATE_DB: D1DatabaseLike;
   readonly OBJECTS: R2BucketLike;
-  readonly PUBLIC_HOST_IDENTITY: PublicHostIdentityRpc;
 }
 
 /**
@@ -61,15 +65,16 @@ export async function invokeAuthenticatedIntegrationFormAuthorityFromWorkerEnv(
   if (environment !== "integration") {
     throw new TypeError("integration Form authority refuses every non-integration environment");
   }
-  const workerArtifactDigest = env.TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST;
+  const live = await currentPublicHostIdentity(env);
   const body = await verifySignedFormAuthorityRpcInvocation({
     invocation,
     expectedAction,
     identity: {
       environment,
-      hostId: env.TAKOSERVER_FORM_AUTHORITY_HOST_ID,
-      workerArtifactDigest: workerArtifactDigest as `sha256:${string}`,
-      publicWorkerVersionId: env.TAKOSERVER_PUBLIC_WORKER_VERSION_ID,
+      hostId: live.hostId,
+      workerArtifactDigest: live.workerArtifactDigest,
+      publicWorkerVersionId: live.workerVersionId,
+      implementationDigest: live.implementationDigest,
     },
     publicJwk: env.TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK,
   });
@@ -81,7 +86,7 @@ export async function invokeAuthenticatedIntegrationFormAuthorityFromWorkerEnv(
       space: env.TAKOSERVER_FORM_AUTHORITY_OPERATOR_SPACE,
     },
   });
-  const { endpoint } = await createIntegrationFormAuthorityCompositionFromWorkerEnv(env);
+  const { endpoint } = await createIntegrationFormAuthorityCompositionFromWorkerEnv(env, live);
   switch (expectedAction) {
     case "plan":
       return await endpoint.plan(body as FormAuthorityPlanRequest);
@@ -98,26 +103,24 @@ export async function invokeAuthenticatedIntegrationFormAuthorityFromWorkerEnv(
  */
 export function createIntegrationFormAuthorityCompositionFromWorkerEnv(
   env: IntegrationFormAuthorityRawWorkerEnv,
+  proofIdentity?: PublicHostIdentity,
 ): Promise<FormAuthorityComposition> {
   const environment = env.TAKOSERVER_ENVIRONMENT;
   if (environment !== "integration") {
     throw new TypeError("integration Form authority refuses every non-integration environment");
   }
-  const configuration = {
-    environment,
-    hostId: env.TAKOSERVER_FORM_AUTHORITY_HOST_ID,
-    workerArtifactDigest: env.TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST as `sha256:${string}`,
-    publicWorkerVersionId: env.TAKOSERVER_PUBLIC_WORKER_VERSION_ID,
-    capabilities: parseFormAuthorityCapabilityManifest(
-      env.TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST,
-    ),
-  } as const;
-  return createIntegrationFormAuthorityComposition({
-    configuration,
-    bindings: {
-      sql: createD1Sql(env.STATE_DB),
-      objects: createR2ObjectStore(env.OBJECTS),
-      publicHostIdentity: env.PUBLIC_HOST_IDENTITY,
-    },
+  return currentPublicHostIdentity(env).then((reread) => {
+    if (proofIdentity !== undefined && !samePublicHostIdentity(proofIdentity, reread)) {
+      throw new FormAuthorityOperatorProofError("identity_unavailable");
+    }
+    const fixed = proofIdentity ?? reread;
+    return createIntegrationFormAuthorityComposition({
+      configuration: formAuthorityConfigurationFromPublicIdentity(env, fixed),
+      bindings: {
+        sql: createD1Sql(env.STATE_DB),
+        objects: createR2ObjectStore(env.OBJECTS),
+        publicHostIdentity: env.PUBLIC_HOST_IDENTITY,
+      },
+    });
   });
 }

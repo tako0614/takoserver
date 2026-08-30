@@ -8,6 +8,7 @@ export interface FormAuthorityProofIdentity {
   readonly hostId: string;
   readonly workerArtifactDigest: `sha256:${string}`;
   readonly publicWorkerVersionId: string;
+  readonly implementationDigest: `sha256:${string}`;
 }
 
 export interface FormAuthorityOperatorScope {
@@ -159,6 +160,7 @@ export async function verifyFormAuthorityOperatorAssertion(input: {
       "exp",
       "hostId",
       "iat",
+      "implementationDigest",
       "method",
       "path",
       "publicWorkerVersionId",
@@ -172,7 +174,8 @@ export async function verifyFormAuthorityOperatorAssertion(input: {
     claims.environment !== input.identity.environment ||
     claims.hostId !== input.identity.hostId ||
     claims.workerArtifactDigest !== input.identity.workerArtifactDigest ||
-    claims.publicWorkerVersionId !== input.identity.publicWorkerVersionId
+    claims.publicWorkerVersionId !== input.identity.publicWorkerVersionId ||
+    claims.implementationDigest !== input.identity.implementationDigest
   ) {
     throw new FormAuthorityOperatorProofError("invalid_operator_assertion");
   }
@@ -208,6 +211,7 @@ function validateProofIdentity(identity: FormAuthorityProofIdentity): void {
     identity.hostId.length === 0 ||
     identity.hostId.length > 255 ||
     !isSha256Digest(identity.workerArtifactDigest) ||
+    !isSha256Digest(identity.implementationDigest) ||
     !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(
       identity.publicWorkerVersionId,
     )

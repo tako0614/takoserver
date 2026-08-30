@@ -62,6 +62,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/build-worker.ts",
         "scripts/deploy.ts",
         "scripts/deploy/worker.ts",
+        "scripts/deploy/worker-authority-paths.ts",
         "scripts/deploy/qualification.ts",
       ],
       requiresScripts: ["check", "deploy"],
@@ -93,6 +94,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/build-worker.ts",
         "scripts/deploy.ts",
         "scripts/deploy/worker.ts",
+        "scripts/deploy/worker-authority-paths.ts",
         "scripts/deploy/realized-config.ts",
         "scripts/deploy/target.ts",
         "scripts/deploy/worker-live.ts",
@@ -111,7 +113,8 @@ export const DEPLOY_CONTRACT = {
           "Authoritative deployment/version state, exact binding/configuration closure and the " +
           "public product probe identify the selected authority-sensitive commit and uploaded artifact. " +
           "Integration JIT enablement adds exactly its environment, dedicated public JWK, fixed organization, " +
-          "source commit and artifact digest plain-text bindings as one all-or-none profile.",
+          "source commit and artifact digest plain-text bindings as one all-or-none profile. Every Form-authority " +
+          "environment separately seals handler/provider payload P, derives semantic I from P plus the adapter/capability and exact Form package-operation set, embeds P/capability/I, then hashes outer artifact A.",
         reversal:
           "The immediately previous Cloudflare Worker version is printed as the provider-history rollback target.",
         "failure-handling":
@@ -131,6 +134,40 @@ export const DEPLOY_CONTRACT = {
       },
     },
     {
+      surface: "takoserver-form-authority-identity-probe",
+      target: "cloudflare-worker:environment-selected-read-only-public-identity-rpc-probe",
+      covers: [
+        "src/entry-form-authority-identity-probe.ts",
+        "src/form-authority-identity-probe.ts",
+        "src/public-host-identity.ts",
+        "src/public-worker-implementation.ts",
+        "wrangler.form-authority-identity-probe.jsonc",
+        "scripts/deploy/form-authority-capability.ts",
+        "scripts/deploy/form-authority-identity-probe.ts",
+        "scripts/deploy/target.ts",
+      ],
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
+      triggers: ["authority"],
+      obligations: {
+        provenance:
+          `${exactSource} The minimal probe bundle, one public identity service binding and one ` +
+          "target Host id are sealed before one upload.",
+        "post-conditions":
+          "Authoritative Worker history and exact binding closure identify the upload. Its permanent " +
+          "workers.dev endpoint must actively return the exact PublicHostIdentity@v2 value read through " +
+          "the named public Worker RPC; no storage, secret, mutation RPC, route or custom domain exists.",
+        reversal:
+          "The immediately previous identity probe Worker version is printed as the provider-history rollback target.",
+        "failure-handling":
+          `${highRiskFailure} A missing, thrown, malformed or identity-inconsistent public RPC response ` +
+          "is unavailable and prevents Form-authority readiness." +
+          inputContract(applyReviewInput),
+        "independent-review": review,
+      },
+    },
+    {
       surface: "takoserver-form-authority-worker",
       target: "cloudflare-worker:environment-selected-route-less-form-authority",
       covers: [
@@ -139,7 +176,11 @@ export const DEPLOY_CONTRACT = {
         "src/takoform/host-admission-endpoint.ts",
         "src/takoform/form-authority-verification.ts",
         "src/takoform/implementation-catalog.ts",
+        "src/public-worker-implementation.ts",
+        "src/form-authority-public-identity.ts",
+        "src/public-host-identity.ts",
         "wrangler.form-authority.jsonc",
+        "scripts/deploy/form-authority-capability.ts",
         "scripts/deploy/form-authority.ts",
       ],
       requiresScripts: ["check", "deploy"],
@@ -149,13 +190,15 @@ export const DEPLOY_CONTRACT = {
       obligations: {
         provenance:
           `${exactSource} The exact route-less Worker bundle, target D1/R2 bindings, Host identity ` +
-          "and code-derived capability/implementation identities are sealed before one upload.",
+          "and code-derived capability manifest are sealed before one upload. The public Worker's " +
+          "internal PublicHostIdentity@v2 RPC is the runtime authority for its served Version, artifact, and implementation identities.",
         "post-conditions":
           "Authoritative Worker history must name the exact commit/artifact. The immutable Version " +
-          "must contain exactly STATE_DB, OBJECTS, PUBLIC_HOST_IDENTITY and the five plain-text " +
-          "variables TAKOSERVER_ENVIRONMENT, TAKOSERVER_FORM_AUTHORITY_HOST_ID, " +
-          "TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST, TAKOSERVER_PUBLIC_WORKER_VERSION_ID and " +
-          "TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST, with no secret or public-domain ownership.",
+          "must contain exactly STATE_DB, OBJECTS, PUBLIC_HOST_IDENTITY and the three plain-text " +
+          "variables TAKOSERVER_ENVIRONMENT, TAKOSERVER_FORM_AUTHORITY_HOST_ID and " +
+          "TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST, with no public Worker identity pins, " +
+          "secret, route, or public-domain ownership. Status is ready only after the permanent minimal " +
+          "identity probe actively calls PublicHostIdentity@v2 and matches live Version/A/P/capability/I.",
         reversal:
           "The immediately previous Form authority Worker version is printed as the provider-history rollback target.",
         "failure-handling":
@@ -186,11 +229,12 @@ export const DEPLOY_CONTRACT = {
       obligations: {
         provenance:
           `${exactSource} Integration only. The generated exact 12-package unsigned fixture corpus, ` +
-          "route-less bundle, target D1/R2 bindings and Host identity are sealed before one upload.",
+          "route-less bundle, target D1/R2 bindings, public identity RPC, and canonical capability manifest are sealed before one upload.",
         "post-conditions":
           "Authoritative Worker history and exact binding closure identify the uploaded integration fixture; " +
           "the closure includes PUBLIC_HOST_IDENTITY, the dedicated operator public JWK, and the exact " +
-          "operator tenant and Space plain-text bindings. Scope status is exact-target or, only with the " +
+          "operator tenant and Space plain-text bindings, with no public Worker Version or artifact pin. " +
+          "Scope status is exact-target or, only with the " +
           "reviewed descriptor, exact-transition-predecessor; output binds the descriptor digest without its path. " +
           "The Worker owns no public domain, and every " +
           "authority receipt identifies Takoserver Host policy plus integration-fixture verification and remains non-production.",
@@ -200,7 +244,9 @@ export const DEPLOY_CONTRACT = {
           `${highRiskFailure} The entry hard-refuses every environment except integration before ` +
           "reading D1 or R2 bindings. It independently rejects every signed plan/apply/readback body " +
           "outside its sealed tenant/Space; partial Form mutation requires authoritative readback and replan. " +
-          "A scope transition accepts only the exact current-public predecessor, uploads target scope once, " +
+          "A one-time identity migration accepts only a fully verified legacy exact pin, without relying on " +
+          "that public Version's position in deployment history, and removes both identity pins in one upload. " +
+          "A scope transition accepts only the exact configured predecessor, uploads target scope once, " +
           "refuses absent/bootstrap, stale-public, third-scope and already-target apply, and settles a lost " +
           "acknowledgement through status without retry." +
           inputContract(applyReviewInput),
@@ -228,10 +274,11 @@ export const DEPLOY_CONTRACT = {
         provenance:
           `${exactSource} Integration only. The gateway bundle, dedicated operator public key, ` +
           "exact tenant/Space, exact custom domain, private authority service binding and current " +
-          "public Worker identity are sealed before one upload.",
+          "public identity RPC binding are sealed before one upload. The live PublicHostIdentity@v2 " +
+          "result remains request-time authority rather than immutable gateway configuration.",
         "post-conditions":
           "Authoritative Worker history and exhaustive domain/binding state must identify the exact " +
-          "custom-domain gateway, current public Worker Version, route-less integration authority " +
+          "custom-domain gateway, route-less integration authority " +
           "dependency and exact operator tenant/Space. A clean first upload is allowed only when both " +
           "the script and configured custom domain are absent; the same exact closure is read back after upload. " +
           "During a named scope transition, the route-less authority must already be exact-target before " +
@@ -241,8 +288,9 @@ export const DEPLOY_CONTRACT = {
         "failure-handling":
           `${highRiskFailure} The gateway hard-refuses non-integration environments before key or ` +
           "service reads, accepts only short-lived body/method/path-bound Ed25519 proofs, independently " +
-          "rejects every body outside its sealed tenant/Space, and rechecks the live public Host identity " +
-          "before every RPC. Foreign domain ownership and every script/domain partial topology are refused. " +
+          "rejects every body outside its sealed tenant/Space, and reads live public Host identity before " +
+          "every RPC; the route-less authority independently rereads and verifies that same proof identity. " +
+          "Foreign domain ownership and every script/domain partial topology are refused. " +
           "Transition status rejects stale-public, third-scope, absent/bootstrap and history-based roll-forward; " +
           "already-target apply is a refused no-op and lost acknowledgement is status-only reconciliation." +
           inputContract(applyReviewInput),
@@ -318,7 +366,7 @@ export const DEPLOY_CONTRACT = {
           "Status performs one signed authoritative readback. Apply obtains one signed canonical " +
           "deactivation plan, passes that exact plan digest once to apply, and finishes with a " +
           "separately signed readback proving every exact 12 Space-scoped fixture is absent or inactive. " +
-          "With a transition descriptor, both gateway and route-less authority must be current-public " +
+          "With a transition descriptor, both gateway and route-less authority must have a verified dynamic or legacy exact identity profile and " +
           "exact-transition-predecessor and only predecessor desiredActive:false is signed. Success projects " +
           "only the transition digest, binding profile, and scope-redacted boolean/digest readback summary.",
         reversal:

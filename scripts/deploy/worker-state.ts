@@ -101,6 +101,38 @@ export interface LegacyHostServiceBinding {
 }
 
 /**
+ * Reads one optional immutable plain-text binding without exposing its value in
+ * diagnostics. Transition classifiers use this before proving the complete
+ * exact closure selected by that value.
+ */
+export function optionalExactPlainTextBinding(
+  phase: DeployPhase,
+  versionId: string,
+  version: unknown,
+  name: string,
+): string | null {
+  const bindings = versionBindings(phase, versionId, version);
+  const matches = bindings.filter((binding) => binding.name === name || binding.binding === name);
+  if (matches.length === 0) return null;
+  if (matches.length !== 1) {
+    throw new DeployError(
+      phase,
+      `version ${versionId} declares the ${name} binding more than once`,
+      bindingInventoryDetail(matches),
+    );
+  }
+  const match = matches[0] as Record<string, unknown>;
+  if (match.type !== "plain_text" || typeof match.text !== "string") {
+    throw new DeployError(
+      phase,
+      `version ${versionId} has an invalid ${name} binding`,
+      bindingInventoryDetail(matches),
+    );
+  }
+  return match.text;
+}
+
+/**
  * The immutable Worker binding closure one realized target must serve.
  *
  * Keeping this derivation beside the Version parser makes ordinary status
@@ -136,9 +168,15 @@ export function expectedExactBindingClosure(
     readonly signingKeyId?: string;
     readonly expectedSecrets?: readonly string[];
     readonly authorityProfile?: WorkerVersionAuthorityProfile;
+    /** Canonical outer artifact annotation for current Form-authority Hosts. */
+    readonly workerArtifactDigest?: `sha256:${string}`;
   } = {},
 ): ExpectedBindingClosure {
-  const vars = deploymentVariables(target, input.signingKeyId, input.authorityProfile);
+  const vars = deploymentVariables(target, input.signingKeyId, input.authorityProfile, {
+    ...(input.workerArtifactDigest === undefined
+      ? {}
+      : { workerArtifactDigest: input.workerArtifactDigest }),
+  });
   const entries = (vars.vars ?? {}) as Readonly<Record<string, string>>;
   return {
     AI: { type: "ai", fields: {} },
@@ -170,6 +208,7 @@ export function expectedLegacyPreVersionMetadataBindingClosure(
     readonly signingKeyId?: string;
     readonly expectedSecrets?: readonly string[];
     readonly authorityProfile?: WorkerVersionAuthorityProfile;
+    readonly workerArtifactDigest?: `sha256:${string}`;
   } = {},
 ): ExpectedBindingClosure {
   return {
@@ -187,12 +226,16 @@ export function expectedTransitionBindingClosure(
     readonly expectedSecrets?: readonly string[];
     readonly metadataProfile?: WorkerVersionMetadataBindingProfile;
     readonly authorityProfile?: WorkerVersionAuthorityProfile;
+    readonly workerArtifactDigest?: `sha256:${string}`;
   },
 ): ExpectedBindingClosure {
   const exact = expectedExactBindingClosure(target, {
     ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
     ...(input.expectedSecrets === undefined ? {} : { expectedSecrets: input.expectedSecrets }),
     ...(input.authorityProfile === undefined ? {} : { authorityProfile: input.authorityProfile }),
+    ...(input.workerArtifactDigest === undefined
+      ? {}
+      : { workerArtifactDigest: input.workerArtifactDigest }),
   });
   return {
     ...exact,

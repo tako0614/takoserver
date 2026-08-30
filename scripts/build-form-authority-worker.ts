@@ -8,6 +8,13 @@ const output = mkdtempSync(join(tmpdir(), "takoserver-form-authority-build-"));
 try {
   for (const [name, config, fixture, requiredBindings, forbiddenBindings] of [
     [
+      "identity-probe",
+      "wrangler.form-authority-identity-probe.jsonc",
+      false,
+      ["PUBLIC_HOST_IDENTITY", "TAKOSERVER_FORM_AUTHORITY_HOST_ID"],
+      ["STATE_DB", "OBJECTS"],
+    ],
+    [
       "production",
       "wrangler.form-authority.jsonc",
       false,

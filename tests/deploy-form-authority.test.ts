@@ -6,17 +6,16 @@ import { join } from "node:path";
 import {
   type FormAuthorityDeployState,
   type FormAuthorityProcess,
-  runFormAuthority,
+  publicFormCapabilityManifest,
+  runFormAuthority as runFormAuthorityImpl,
   writeFormAuthorityConfig,
 } from "../scripts/deploy/form-authority.ts";
 import { expectedWorkerSecrets } from "../scripts/deploy/realized-config.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
 import { canonicalJson } from "../src/json.ts";
-import {
-  YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
-  yurucommuLifecycleCapabilityManifest,
-} from "../src/takoform/implementation-catalog.ts";
+import { derivePublicFormImplementationIdentity } from "../src/public-worker-implementation.ts";
+import { YURUCOMMU_IDENTITY_CAPABILITY_KINDS } from "../src/takoform/implementation-catalog.ts";
 
 const COMMIT = "a".repeat(40);
 const PREVIOUS_COMMIT = "b".repeat(40);
@@ -36,9 +35,7 @@ const PREVIOUS_PUBLIC_WORKER_DIGEST = `sha256:${"d".repeat(64)}` as const;
 const PUBLIC_WORKER_DIGEST = `sha256:${createHash("sha256")
   .update(PUBLIC_BUNDLE)
   .digest("hex")}` as const;
-const CAPABILITY_MANIFEST_JSON = canonicalJson(
-  yurucommuLifecycleCapabilityManifest(YURUCOMMU_IDENTITY_CAPABILITY_KINDS),
-);
+const CAPABILITY_MANIFEST_JSON = canonicalJson(publicFormCapabilityManifest());
 const OPERATOR_ORIGIN = "https://form-authority.integration.takoserver.com";
 const OPERATOR_PUBLIC_JWK = {
   kty: "OKP" as const,
@@ -67,6 +64,9 @@ const target = {
   workerEndpointSuffix: "integration.example.workers.dev",
   formAuthority: {
     workerName: "takoserver-form-authority-integration",
+    identityProbeWorkerName: "takoserver-form-identity-integration",
+    identityProbeOrigin:
+      "https://takoserver-form-identity-integration.integration.example.workers.dev",
     integrationWorkerName: "takoserver-form-fixture-integration",
     integrationOperatorWorkerName: "takoserver-form-operator-integration",
     integrationOperatorOrigin: OPERATOR_ORIGIN,
@@ -79,6 +79,28 @@ const target = {
   },
   signing: { currentKeyId: "key-current" },
 } satisfies DeployTarget;
+
+async function runFormAuthority(
+  ...[invocation, selectedTarget, options = {}]: Parameters<typeof runFormAuthorityImpl>
+): ReturnType<typeof runFormAuthorityImpl> {
+  return await runFormAuthorityImpl(invocation, selectedTarget, {
+    fetcher: async () => {
+      const implementationPayloadDigest = `sha256:${"9".repeat(64)}` as const;
+      const semantic = await derivePublicFormImplementationIdentity({
+        implementationPayloadDigest,
+        capabilities: publicFormCapabilityManifest(),
+      });
+      return Response.json({
+        kind: "takoserver.public-host-identity@v2",
+        hostId: selectedTarget.formAuthority?.hostId,
+        workerVersionId: PUBLIC_WORKER_VERSION_ID,
+        workerArtifactDigest: PUBLIC_WORKER_DIGEST,
+        ...semantic,
+      });
+    },
+    ...options,
+  });
+}
 const SCOPE_TRANSITION_VALUE = {
   kind: "takoserver.integration-form-authority-scope-transition@v1",
   environment: "integration",
@@ -133,6 +155,9 @@ function stateSequence(
     readonly subdomain?: boolean;
     readonly route?: boolean;
     readonly isUploaded?: () => boolean;
+    readonly legacyBoundVersionId?: string;
+    readonly legacyBoundArtifactDigest?: `sha256:${string}`;
+    readonly legacyCommit?: string;
   },
   inspectedTarget: DeployTarget = target,
 ): FormAuthorityDeployState {
@@ -186,15 +211,15 @@ function stateSequence(
         );
       }
       const current = versionId === CURRENT_AUTHORITY_VERSION_ID;
-      const commit = current ? COMMIT : PREVIOUS_COMMIT;
+      const commit = current ? COMMIT : (input?.legacyCommit ?? PREVIOUS_COMMIT);
       const artifactDigest = current ? BUNDLE_DIGEST : PREVIOUS_DIGEST;
       return current
-        ? version(commit, artifactDigest)
+        ? dynamicVersion(commit, artifactDigest)
         : version(
             commit,
             artifactDigest,
-            PREVIOUS_PUBLIC_WORKER_VERSION_ID,
-            PREVIOUS_PUBLIC_WORKER_DIGEST,
+            input?.legacyBoundVersionId ?? PREVIOUS_PUBLIC_WORKER_VERSION_ID,
+            input?.legacyBoundArtifactDigest ?? PREVIOUS_PUBLIC_WORKER_DIGEST,
           );
     },
     async workerSecrets(workerName) {
@@ -294,6 +319,27 @@ function version(
   };
 }
 
+function dynamicVersion(
+  commit: string,
+  artifactDigest: `sha256:${string}`,
+  scope: { readonly tenantId: string; readonly space: string } = target.formAuthority
+    .integrationOperatorScope,
+) {
+  const value = version(
+    commit,
+    artifactDigest,
+    PUBLIC_WORKER_VERSION_ID,
+    PUBLIC_WORKER_DIGEST,
+    scope,
+  );
+  value.resources.bindings = value.resources.bindings.filter(
+    ({ name }) =>
+      name !== "TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST" &&
+      name !== "TAKOSERVER_PUBLIC_WORKER_VERSION_ID",
+  );
+  return value;
+}
+
 function invalidPredecessorState(input: {
   readonly boundVersionId?: string;
   readonly boundArtifactDigest?: `sha256:${string}`;
@@ -389,8 +435,9 @@ function publicVersion(message: string, inspectedTarget: DeployTarget = target) 
   const expected = expectedExactBindingClosure(
     inspectedTarget,
     inspectedTarget.integrationE2eCredentialAuthority === undefined
-      ? {}
+      ? { workerArtifactDigest: `sha256:${identity[2]}` }
       : {
+          workerArtifactDigest: `sha256:${identity[2]}`,
           authorityProfile: {
             kind: "provenance-bound-jit",
             provenance: {
@@ -413,6 +460,7 @@ function publicVersion(message: string, inspectedTarget: DeployTarget = target) 
 function gatewayVersion(
   scope: { readonly tenantId: string; readonly space: string } = target.formAuthority
     .integrationOperatorScope,
+  legacyPins = false,
 ) {
   return {
     annotations: {
@@ -443,16 +491,20 @@ function gatewayVersion(
           name: "TAKOSERVER_FORM_AUTHORITY_OPERATOR_ORIGIN",
           text: OPERATOR_ORIGIN,
         },
-        {
-          type: "plain_text",
-          name: "TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST",
-          text: PUBLIC_WORKER_DIGEST,
-        },
-        {
-          type: "plain_text",
-          name: "TAKOSERVER_PUBLIC_WORKER_VERSION_ID",
-          text: PUBLIC_WORKER_VERSION_ID,
-        },
+        ...(legacyPins
+          ? [
+              {
+                type: "plain_text",
+                name: "TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST",
+                text: PUBLIC_WORKER_DIGEST,
+              },
+              {
+                type: "plain_text",
+                name: "TAKOSERVER_PUBLIC_WORKER_VERSION_ID",
+                text: PUBLIC_WORKER_VERSION_ID,
+              },
+            ]
+          : []),
         {
           type: "plain_text",
           name: "TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK",
@@ -497,7 +549,7 @@ function gatewayState(): FormAuthorityDeployState {
         );
       }
       if (workerName === target.formAuthority.integrationWorkerName) {
-        return version(COMMIT, BUNDLE_DIGEST);
+        return dynamicVersion(COMMIT, BUNDLE_DIGEST);
       }
       return gatewayVersion();
     },
@@ -611,13 +663,9 @@ function routeLessTransitionState(input: {
         input.publicProfile === "predecessor"
           ? PREVIOUS_PUBLIC_WORKER_DIGEST
           : PUBLIC_WORKER_DIGEST;
-      return version(
-        COMMIT,
-        versionId === CURRENT_AUTHORITY_VERSION_ID ? BUNDLE_DIGEST : PREVIOUS_DIGEST,
-        publicVersionId,
-        publicDigest,
-        scope,
-      );
+      return uploaded
+        ? dynamicVersion(COMMIT, BUNDLE_DIGEST, scope)
+        : version(COMMIT, PREVIOUS_DIGEST, publicVersionId, publicDigest, scope);
     },
   };
 }
@@ -673,18 +721,13 @@ function gatewayTransitionState(input: {
         );
       }
       if (workerName === target.formAuthority.integrationWorkerName) {
-        return version(
-          COMMIT,
-          BUNDLE_DIGEST,
-          PUBLIC_WORKER_VERSION_ID,
-          PUBLIC_WORKER_DIGEST,
-          input.authorityScope,
-        );
+        return dynamicVersion(COMMIT, BUNDLE_DIGEST, input.authorityScope);
       }
       return gatewayVersion(
         isUploaded()
           ? (input.gatewayAfterScope ?? target.formAuthority.integrationOperatorScope)
           : input.gatewayBeforeScope,
+        !isUploaded(),
       );
     },
   };
@@ -720,8 +763,6 @@ describe("route-less Form authority deploy surfaces", () => {
           verificationAvailable: true,
           productionEligible: false,
         },
-        workerArtifactDigest: PUBLIC_WORKER_DIGEST,
-        publicWorkerVersionId: PUBLIC_WORKER_VERSION_ID,
         capabilityManifestJson: CAPABILITY_MANIFEST_JSON,
       });
       const config = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
@@ -732,8 +773,6 @@ describe("route-less Form authority deploy surfaces", () => {
         vars: {
           TAKOSERVER_ENVIRONMENT: "integration",
           TAKOSERVER_FORM_AUTHORITY_HOST_ID: target.formAuthority.hostId,
-          TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST: PUBLIC_WORKER_DIGEST,
-          TAKOSERVER_PUBLIC_WORKER_VERSION_ID: PUBLIC_WORKER_VERSION_ID,
           TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST: CAPABILITY_MANIFEST_JSON,
           TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK: canonicalJson(OPERATOR_PUBLIC_JWK),
           TAKOSERVER_FORM_AUTHORITY_OPERATOR_TENANT_ID:
@@ -742,6 +781,9 @@ describe("route-less Form authority deploy surfaces", () => {
             target.formAuthority.integrationOperatorScope.space,
         },
       });
+      const vars = config.vars as Record<string, unknown>;
+      expect(vars.TAKOSERVER_PUBLIC_WORKER_VERSION_ID).toBeUndefined();
+      expect(vars.TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST).toBeUndefined();
       expect(config).not.toHaveProperty("route");
       expect(config).not.toHaveProperty("routes");
       expect(config).not.toHaveProperty("triggers");
@@ -752,58 +794,6 @@ describe("route-less Form authority deploy surfaces", () => {
           entrypoint: "PublicHostIdentityEntrypoint",
         },
       ]);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("seals target-owned operation narrowing into the authority capability binding", () => {
-    const narrowedTarget: DeployTarget = {
-      ...target,
-      formAuthority: {
-        ...target.formAuthority,
-        operatorOperations: { ModuleWorker: ["read"] },
-      },
-    };
-    const manifest = canonicalJson(
-      yurucommuLifecycleCapabilityManifest(YURUCOMMU_IDENTITY_CAPABILITY_KINDS, {
-        ModuleWorker: ["read"],
-      }),
-    );
-    const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-narrowing-"));
-    try {
-      const path = writeFormAuthorityConfig({
-        path: join(root, "wrangler.jsonc"),
-        main: "worker.js",
-        invocation: {
-          surface: "takoserver-integration-form-authority-worker",
-          action: "apply",
-          environment: "integration",
-          commit: COMMIT,
-        },
-        target: narrowedTarget,
-        selected: {
-          kind: "authority",
-          workerName: narrowedTarget.formAuthority?.integrationWorkerName ?? "missing",
-          hostId: narrowedTarget.publicOrigin,
-          main: "src/entry-integration-form-authority-worker.ts",
-          operatorPublicJwk: OPERATOR_PUBLIC_JWK,
-          operatorScope: target.formAuthority.integrationOperatorScope,
-          policyAuthority: "takoserver-host",
-          verificationMode: "integration-fixture",
-          verificationAvailable: true,
-          productionEligible: false,
-        },
-        workerArtifactDigest: PUBLIC_WORKER_DIGEST,
-        publicWorkerVersionId: PUBLIC_WORKER_VERSION_ID,
-        capabilityManifestJson: manifest,
-      });
-      const config = JSON.parse(readFileSync(path, "utf8")) as {
-        vars: { TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST: string };
-      };
-      expect(JSON.parse(config.vars.TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST)).toMatchObject({
-        forms: { ModuleWorker: ["read"] },
-      });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -833,7 +823,7 @@ describe("route-less Form authority deploy surfaces", () => {
     expect(stateRead).toBe(false);
   });
 
-  test("reports the exact direct public predecessor as an explicit stale profile", async () => {
+  test("reports an exact legacy public pin as a one-time migration profile", async () => {
     const status = await runFormAuthority(
       {
         surface: "takoserver-integration-form-authority-worker",
@@ -848,9 +838,105 @@ describe("route-less Form authority deploy surfaces", () => {
       deployedCommit: PREVIOUS_COMMIT,
       commitMatches: false,
       publicWorkerCommitMatches: true,
-      publicWorkerBindingProfile: "exact-direct-public-predecessor",
+      publicWorkerBindingProfile: "legacy-exact-pinned",
       boundPublicWorkerVersionId: PREVIOUS_PUBLIC_WORKER_VERSION_ID,
       boundPublicWorkerArtifactDigest: PREVIOUS_PUBLIC_WORKER_DIGEST,
+      ready: false,
+    });
+  });
+
+  test("accepts an exact legacy pin without assuming it is the direct public predecessor", async () => {
+    for (const [boundVersionId, state] of [
+      [
+        ARBITRARY_PUBLIC_WORKER_VERSION_ID,
+        invalidPredecessorState({
+          boundVersionId: ARBITRARY_PUBLIC_WORKER_VERSION_ID,
+          boundArtifactDigest: PUBLIC_WORKER_DIGEST,
+          authorityCommit: COMMIT,
+        }),
+      ],
+      [
+        TWO_HOP_PUBLIC_WORKER_VERSION_ID,
+        invalidPredecessorState({
+          boundVersionId: TWO_HOP_PUBLIC_WORKER_VERSION_ID,
+          boundArtifactDigest: PUBLIC_WORKER_DIGEST,
+          authorityCommit: COMMIT,
+          twoHop: true,
+        }),
+      ],
+    ] as const) {
+      const status = await runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-worker",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target,
+        { state },
+      );
+      expect(status).toMatchObject({
+        publicWorkerBindingProfile: "legacy-exact-pinned",
+        boundPublicWorkerVersionId: boundVersionId,
+        boundPublicWorkerArtifactDigest: PUBLIC_WORKER_DIGEST,
+        ready: false,
+      });
+    }
+  });
+
+  test("accepts the exact legacy public closure from before capability injection", async () => {
+    const migrationTarget = {
+      ...target,
+      integrationE2eCredentialAuthority: {
+        organizationId: "org_takosumi_hosted_staging",
+        publicJwk: { kty: "OKP" as const, crv: "Ed25519" as const, x: "E".repeat(43) },
+      },
+    } satisfies DeployTarget;
+    const base = invalidPredecessorState({
+      boundVersionId: ARBITRARY_PUBLIC_WORKER_VERSION_ID,
+      boundArtifactDigest: PUBLIC_WORKER_DIGEST,
+      authorityCommit: COMMIT,
+    });
+    const state: FormAuthorityDeployState = {
+      ...base,
+      async workerVersion(workerName, versionId) {
+        if (workerName === target.workerName) {
+          const commit =
+            versionId === ARBITRARY_PUBLIC_WORKER_VERSION_ID ? COMMIT : PUBLIC_WORKER_COMMIT;
+          const legacy = publicVersion(
+            `takoserver-worker:${commit}:${PUBLIC_WORKER_DIGEST.slice("sha256:".length)}`,
+            migrationTarget,
+          );
+          return versionId === ARBITRARY_PUBLIC_WORKER_VERSION_ID
+            ? {
+                ...legacy,
+                resources: {
+                  ...legacy.resources,
+                  bindings: legacy.resources.bindings.filter(
+                    ({ name }) => name !== "TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST",
+                  ),
+                },
+              }
+            : legacy;
+        }
+        return await base.workerVersion(workerName, versionId);
+      },
+    };
+
+    const status = await runFormAuthority(
+      {
+        surface: "takoserver-integration-form-authority-worker",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      migrationTarget,
+      { state },
+    );
+    expect(status).toMatchObject({
+      publicWorkerBindingProfile: "legacy-exact-pinned",
+      boundPublicWorkerVersionId: ARBITRARY_PUBLIC_WORKER_VERSION_ID,
+      boundPublicWorkerArtifactDigest: PUBLIC_WORKER_DIGEST,
       ready: false,
     });
   });
@@ -880,6 +966,33 @@ describe("route-less Form authority deploy surfaces", () => {
     });
   });
 
+  test("cannot report ready when the live public identity RPC is unavailable", async () => {
+    const status = await runFormAuthorityImpl(
+      {
+        surface: "takoserver-integration-form-authority-worker",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      target,
+      {
+        state: stateSequence({ isUploaded: () => true }),
+        async fetcher(): Promise<never> {
+          throw new Error("probe unavailable");
+        },
+      },
+    );
+
+    expect(status).toMatchObject({
+      deployedCommit: COMMIT,
+      publicWorkerCommitMatches: true,
+      publicIdentityRpcReady: false,
+      implementationPayloadDigest: null,
+      implementationDigest: null,
+      ready: false,
+    });
+  });
+
   test("transition status classifies only exact target or exact descriptor predecessor on current public", async () => {
     const predecessor = await runFormAuthority(
       {
@@ -893,7 +1006,7 @@ describe("route-less Form authority deploy surfaces", () => {
       { state: routeLessTransitionState({ beforeScope: PREDECESSOR_SCOPE }) },
     );
     expect(predecessor).toMatchObject({
-      publicWorkerBindingProfile: "exact-current-public",
+      publicWorkerBindingProfile: "legacy-exact-pinned",
       scopeBindingProfile: "exact-transition-predecessor",
       scopeTransitionDigest: SCOPE_TRANSITION.digest,
       ready: false,
@@ -915,10 +1028,10 @@ describe("route-less Form authority deploy surfaces", () => {
       },
     );
     expect(exactTarget).toMatchObject({
-      publicWorkerBindingProfile: "exact-current-public",
+      publicWorkerBindingProfile: "legacy-exact-pinned",
       scopeBindingProfile: "exact-target",
       scopeTransitionDigest: SCOPE_TRANSITION.digest,
-      ready: true,
+      ready: false,
     });
 
     for (const state of [
@@ -1179,7 +1292,7 @@ describe("route-less Form authority deploy surfaces", () => {
     }
   });
 
-  test("replaces one validated predecessor with one exact-current direct successor upload", async () => {
+  test("migrates one exact non-predecessor legacy pin to one dynamic direct successor upload", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-roll-forward-"));
     let uploaded = false;
     try {
@@ -1198,7 +1311,12 @@ describe("route-less Form authority deploy surfaces", () => {
         target,
         {
           run: process.run,
-          state: stateSequence({ isUploaded: () => uploaded }),
+          state: stateSequence({
+            isUploaded: () => uploaded,
+            legacyBoundVersionId: ARBITRARY_PUBLIC_WORKER_VERSION_ID,
+            legacyBoundArtifactDigest: PUBLIC_WORKER_DIGEST,
+            legacyCommit: COMMIT,
+          }),
           outputDirectory: root,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
           review: "independent-reviewer",
@@ -1217,15 +1335,11 @@ describe("route-less Form authority deploy surfaces", () => {
     }
   });
 
-  test("rejects arbitrary, two-hop, mismatched, and malformed predecessor claims before upload", async () => {
+  test("rejects mismatched and malformed legacy pin claims before upload", async () => {
     const cases: readonly FormAuthorityDeployState[] = [
-      invalidPredecessorState({ boundVersionId: ARBITRARY_PUBLIC_WORKER_VERSION_ID }),
-      invalidPredecessorState({
-        boundVersionId: TWO_HOP_PUBLIC_WORKER_VERSION_ID,
-        twoHop: true,
-      }),
       invalidPredecessorState({ boundArtifactDigest: `sha256:${"e".repeat(64)}` }),
       invalidPredecessorState({ authorityCommit: COMMIT }),
+      invalidPredecessorState({ boundVersionId: "not-a-worker-version" }),
       invalidPredecessorState({ malformedHistory: true }),
     ];
     for (const state of cases) {
@@ -1310,7 +1424,9 @@ describe("route-less Form authority deploy surfaces", () => {
         previousVersionId: PREVIOUS_AUTHORITY_VERSION_ID,
         versionId: CURRENT_AUTHORITY_VERSION_ID,
       });
-      expect(process.calls.filter((call) => call.includes("--dry-run"))).toHaveLength(2);
+      // Public source proof is the two-stage payload+outer build; the authority
+      // Worker remains a third, independently sealed bundle.
+      expect(process.calls.filter((call) => call.includes("--dry-run"))).toHaveLength(3);
       expect(process.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1381,8 +1497,6 @@ describe("route-less Form authority deploy surfaces", () => {
           verificationAvailable: true,
           productionEligible: false,
         },
-        workerArtifactDigest: PUBLIC_WORKER_DIGEST,
-        publicWorkerVersionId: PUBLIC_WORKER_VERSION_ID,
         capabilityManifestJson: CAPABILITY_MANIFEST_JSON,
       });
       const config = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
@@ -1393,7 +1507,6 @@ describe("route-less Form authority deploy surfaces", () => {
         vars: {
           TAKOSERVER_FORM_AUTHORITY_OPERATOR_ORIGIN: OPERATOR_ORIGIN,
           TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK: canonicalJson(OPERATOR_PUBLIC_JWK),
-          TAKOSERVER_PUBLIC_WORKER_VERSION_ID: PUBLIC_WORKER_VERSION_ID,
           TAKOSERVER_FORM_AUTHORITY_OPERATOR_TENANT_ID:
             target.formAuthority.integrationOperatorScope.tenantId,
           TAKOSERVER_FORM_AUTHORITY_OPERATOR_SPACE:
@@ -1412,6 +1525,9 @@ describe("route-less Form authority deploy surfaces", () => {
           },
         ],
       });
+      const vars = config.vars as Record<string, unknown>;
+      expect(vars.TAKOSERVER_PUBLIC_WORKER_VERSION_ID).toBeUndefined();
+      expect(vars.TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST).toBeUndefined();
       expect(config).not.toHaveProperty("d1_databases");
       expect(config).not.toHaveProperty("r2_buckets");
 

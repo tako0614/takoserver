@@ -716,20 +716,18 @@ async function inspectSigningRotationStatus(
         break;
       }
       case "canonical": {
-        const authorityProfile = canonicalSigningAuthorityProfile(
-          target,
-          workerVersionIdentity("preflight", predecessor),
-        );
+        const predecessorIdentity = workerVersionIdentity("preflight", predecessor);
+        const authorityProfile = canonicalSigningAuthorityProfile(target, predecessorIdentity);
         assertExactVersionBindingClosure(
           "preflight",
           live.history.previousVersionId,
           predecessor,
           expectedExactBindingClosure(target, {
             signingKeyId: currentKeyId,
+            workerArtifactDigest: `sha256:${predecessorIdentity.bundleDigestHex}`,
             ...(authorityProfile === undefined ? {} : { authorityProfile }),
           }),
         );
-        const predecessorIdentity = workerVersionIdentity("preflight", predecessor);
         const predecessorScriptEtag = workerVersionScriptContentIdentity(
           "preflight",
           live.history.previousVersionId,
@@ -918,6 +916,7 @@ async function inspectSigningSecretRepairSuccessor(
   const expected = expectedExactBindingClosure(target, {
     signingKeyId,
     expectedSecrets: expectedWorkerSecrets(target),
+    workerArtifactDigest: `sha256:${predecessorIdentity.bundleDigestHex}`,
     ...(authorityProfile === undefined ? {} : { authorityProfile }),
   });
   assertExactVersionBindingClosure(phase, history.previousVersionId, predecessorVersion, expected);
@@ -1028,6 +1027,7 @@ async function inspectSigningRotationClosure(
     version,
     expectedExactBindingClosure(target, {
       signingKeyId,
+      workerArtifactDigest: `sha256:${identity.bundleDigestHex}`,
       ...(authorityProfile === undefined ? {} : { authorityProfile }),
     }),
   );

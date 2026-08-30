@@ -1,4 +1,9 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
+import {
+  currentPublicHostIdentity,
+  type FormAuthorityPublicIdentityWorkerEnv,
+  formAuthorityConfigurationFromPublicIdentity,
+} from "./form-authority-public-identity.ts";
 import { createR2ObjectStore } from "./objects-r2.ts";
 import type { PublicHostIdentityRpc } from "./public-host-identity.ts";
 import { createD1Sql } from "./sql-d1.ts";
@@ -9,8 +14,6 @@ import type {
 import {
   createProductionFormAuthorityComposition,
   type FormAuthorityComposition,
-  type FormAuthorityEndpointConfiguration,
-  parseFormAuthorityCapabilityManifest,
 } from "./takoform/host-admission-endpoint.ts";
 
 /** Named service-binding entrypoint only. It has no public fetch surface. */
@@ -27,13 +30,22 @@ export class FormAuthorityEntrypoint extends WorkerEntrypoint<FormAuthorityWorke
     return this.composition().then(({ endpoint }) => endpoint.readback(request));
   }
 
-  private composition(): Promise<FormAuthorityComposition> {
-    return createProductionFormAuthorityComposition({
-      configuration: workerConfiguration(this.env),
+  private async composition(): Promise<FormAuthorityComposition> {
+    const publicHostIdentity = this.env.PUBLIC_HOST_IDENTITY as unknown as PublicHostIdentityRpc;
+    const identityEnv = {
+      TAKOSERVER_ENVIRONMENT: this.env.TAKOSERVER_ENVIRONMENT,
+      TAKOSERVER_FORM_AUTHORITY_HOST_ID: this.env.TAKOSERVER_FORM_AUTHORITY_HOST_ID,
+      TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST:
+        this.env.TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST,
+      PUBLIC_HOST_IDENTITY: publicHostIdentity,
+    } satisfies FormAuthorityPublicIdentityWorkerEnv;
+    const identity = await currentPublicHostIdentity(identityEnv);
+    return await createProductionFormAuthorityComposition({
+      configuration: formAuthorityConfigurationFromPublicIdentity(identityEnv, identity),
       bindings: {
         sql: createD1Sql(this.env.STATE_DB),
         objects: createR2ObjectStore(this.env.OBJECTS),
-        publicHostIdentity: this.env.PUBLIC_HOST_IDENTITY as unknown as PublicHostIdentityRpc,
+        publicHostIdentity,
       },
     });
   }
@@ -48,15 +60,3 @@ export default {
     return new Response(null, { status: 404 });
   },
 } satisfies ExportedHandler<FormAuthorityWorkerEnv>;
-
-function workerConfiguration(env: FormAuthorityWorkerEnv): FormAuthorityEndpointConfiguration {
-  return {
-    environment: env.TAKOSERVER_ENVIRONMENT,
-    hostId: env.TAKOSERVER_FORM_AUTHORITY_HOST_ID,
-    workerArtifactDigest: env.TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST as `sha256:${string}`,
-    publicWorkerVersionId: env.TAKOSERVER_PUBLIC_WORKER_VERSION_ID,
-    capabilities: parseFormAuthorityCapabilityManifest(
-      env.TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST,
-    ),
-  };
-}

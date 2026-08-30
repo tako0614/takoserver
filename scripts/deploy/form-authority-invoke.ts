@@ -25,8 +25,8 @@ import { deriveFormAuthorityIdentity } from "../../src/takoform/host-admission-e
 import { type DeployPhase, mutationError, preflightError, verificationError } from "./errors.ts";
 import {
   type FormAuthorityDeployOptions,
+  publicFormCapabilityManifest,
   runFormAuthority,
-  targetCapabilityManifest,
 } from "./form-authority.ts";
 import {
   assertLoadedFormAuthorityScopeTransition,
@@ -274,6 +274,7 @@ async function exactGatewayIdentity(
   }
   const workerArtifactDigest = value.workerArtifactDigest;
   const publicWorkerVersionId = value.publicWorkerVersionId;
+  const implementationPayloadDigest = value.implementationPayloadDigest;
   const transition = invocation.scopeTransition;
   const expectedScopeProfile = transition ? "exact-transition-predecessor" : "exact-target";
   if (
@@ -287,10 +288,11 @@ async function exactGatewayIdentity(
     value.commitMatches !== true ||
     value.publicWorkerCommit !== invocation.commit ||
     value.publicWorkerCommitMatches !== true ||
+    value.publicIdentityRpcReady !== true ||
     value.authorityDeployedCommit !== invocation.commit ||
     value.authorityCommitMatches !== true ||
-    value.publicWorkerBindingProfile !== "exact-current-public" ||
-    value.authorityPublicWorkerBindingProfile !== "exact-current-public" ||
+    value.publicWorkerBindingProfile !== "dynamic-public-rpc" ||
+    value.authorityPublicWorkerBindingProfile !== "dynamic-public-rpc" ||
     value.scopeBindingProfile !== expectedScopeProfile ||
     value.authorityScopeBindingProfile !== expectedScopeProfile ||
     (transition
@@ -308,6 +310,7 @@ async function exactGatewayIdentity(
     !isSha256Digest(value.authorityArtifactDigest) ||
     !isSha256Digest(workerArtifactDigest) ||
     !workerVersion(publicWorkerVersionId) ||
+    !isSha256Digest(implementationPayloadDigest) ||
     !isSha256Digest(value.capabilityDigest) ||
     !isSha256Digest(value.implementationDigest)
   ) {
@@ -318,7 +321,9 @@ async function exactGatewayIdentity(
     hostId: authority.hostId,
     workerArtifactDigest,
     publicWorkerVersionId,
-    capabilities: targetCapabilityManifest(target),
+    implementationPayloadDigest,
+    implementationDigest: value.implementationDigest,
+    capabilities: publicFormCapabilityManifest(),
   });
   if (
     identity.capabilityDigest !== value.capabilityDigest ||
@@ -359,6 +364,7 @@ function formAuthorityClient(input: {
             hostId: input.gateway.identity.hostId,
             workerArtifactDigest: input.gateway.identity.workerArtifactDigest,
             publicWorkerVersionId: input.gateway.identity.publicWorkerVersionId,
+            implementationDigest: input.gateway.identity.implementationDigest,
           },
           nowSeconds,
           lifetimeSeconds: ASSERTION_LIFETIME_SECONDS,

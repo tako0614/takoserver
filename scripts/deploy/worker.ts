@@ -30,18 +30,8 @@ import {
 } from "./signing.ts";
 import type { DeployTarget } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
+import { authoritySensitiveWorkerPaths } from "./worker-authority-paths.ts";
 import { parseWorkerDeploymentHistory, type WorkerDeploymentHistory } from "./worker-state.ts";
-
-const AUTHORITY_PATHS = [
-  /^bun\.lock$/u,
-  /^package\.json$/u,
-  /^wrangler\.jsonc$/u,
-  /^scripts\/build-worker\.ts$/u,
-  /^scripts\/deploy(?:\.ts|\/)/u,
-  /^src\/(?:app|auth|control|deployment-composition|google-identity|identity-setup|operator-credentials|operator-key|provider-driver|provider-port|reseller|resource-deployments|resource-migrations|runtime-grants|signing-key|sponsorship-api|takos-id-identity|token)\.ts$/u,
-  /^src\/(?:entry-cloudflare-worker|entry-worker|public-host-identity|router|worker-production-composition)\.ts$/u,
-  /^src\/takoform\/(?:admission|admission-projection|host-authority|routes)(?:\.|\/)/u,
-] as const;
 
 export type WorkerProcess = (
   command: readonly string[],
@@ -99,12 +89,7 @@ interface WorkerInspection {
   readonly integrationE2eCredentialAuthorityConfigured: boolean;
 }
 
-/** Paths whose code publication changes authentication, authorization or deploy authority. */
-export function authoritySensitiveWorkerPaths(paths: readonly string[]): readonly string[] {
-  return [
-    ...new Set(paths.filter((path) => AUTHORITY_PATHS.some((pattern) => pattern.test(path)))),
-  ].sort();
-}
+export { authoritySensitiveWorkerPaths } from "./worker-authority-paths.ts";
 
 /** Routine or explicitly reviewed authority-sensitive Worker code publication. */
 export async function runWorker(
@@ -291,11 +276,15 @@ export async function runWorker(
       target,
       commit: source.commit,
       run,
-      writeConfig: ({ path, main, bundleDigestHex }) =>
+      writeConfig: ({ path, main, bundleDigestHex, formImplementationIdentity }) =>
         writeWorkerConfig(target, {
           path,
           main,
           commit: source.commit,
+          ...(formImplementationIdentity === undefined ? {} : { formImplementationIdentity }),
+          ...(bundleDigestHex === undefined
+            ? {}
+            : { workerArtifactDigest: `sha256:${bundleDigestHex}` as const }),
           ...(target.integrationE2eCredentialAuthority === undefined
             ? {}
             : bundleDigestHex === undefined

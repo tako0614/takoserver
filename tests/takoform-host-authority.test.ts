@@ -40,6 +40,7 @@ const technicallyAvailable = {
 const digest = (hex: string): AdmissionDigest => `sha256:${hex.repeat(64)}` as AdmissionDigest;
 const PUBLIC_WORKER_VERSION_ID = "11111111-1111-4111-8111-111111111111";
 const STALE_PUBLIC_WORKER_VERSION_ID = "22222222-2222-4222-8222-222222222222";
+const PUBLIC_WORKER_ARTIFACT_DIGEST = digest("7");
 
 function first<T>(values: readonly T[], label: string): T {
   const value = values[0];
@@ -213,7 +214,7 @@ async function committedAuthority() {
     supported: true,
     profile: {
       kind: "takoserver.form-support@v1",
-      workerArtifactDigest: digest("7"),
+      workerArtifactDigest: PUBLIC_WORKER_ARTIFACT_DIGEST,
       publicWorkerVersionId: PUBLIC_WORKER_VERSION_ID,
       capabilityDigest: digest("8"),
       implementationDigest,
@@ -454,13 +455,14 @@ describe("durable read-only Takoform Host authority", () => {
     ).rejects.toMatchObject({ code: "form_unavailable", status: 503 });
   });
 
-  test("treats support sealed to another public Worker Version as unsupported", async () => {
+  test("keeps semantic support eligible across a config-only Worker Version change", async () => {
     const fixture = await committedAuthority();
     const current = createTakoformHostAuthority({
       sql: fixture.sql,
       objects: fixture.objects,
       hostId: "host-a",
       publicWorkerVersionId: PUBLIC_WORKER_VERSION_ID,
+      implementationDigest: fixture.implementationDigest,
       candidates: fixture.catalog.forms,
       bindings: fixture.catalog.bindings,
       technicalAvailability: technicallyAvailable,
@@ -470,6 +472,7 @@ describe("durable read-only Takoform Host authority", () => {
       objects: fixture.objects,
       hostId: "host-a",
       publicWorkerVersionId: STALE_PUBLIC_WORKER_VERSION_ID,
+      implementationDigest: fixture.implementationDigest,
       candidates: fixture.catalog.forms,
       bindings: fixture.catalog.bindings,
       technicalAvailability: technicallyAvailable,
@@ -477,6 +480,36 @@ describe("durable read-only Takoform Host authority", () => {
 
     expect((await current.catalog(CONTEXT)).forms[0]?.supported).toBe(true);
     expect((await stale.catalog(CONTEXT)).forms[0]).toMatchObject({
+      supported: true,
+      availability: {
+        executable: true,
+        activated: true,
+        availableToPrincipal: true,
+      },
+    });
+    await expect(
+      stale.authorizeMutation({
+        operation: "create",
+        context: CONTEXT,
+        formRef: fixture.form.identity.formRef,
+      }),
+    ).resolves.toMatchObject({ implementationDigest: fixture.implementationDigest });
+  });
+
+  test("refuses support when the semantic implementation changes", async () => {
+    const fixture = await committedAuthority();
+    const authority = createTakoformHostAuthority({
+      sql: fixture.sql,
+      objects: fixture.objects,
+      hostId: "host-a",
+      publicWorkerVersionId: STALE_PUBLIC_WORKER_VERSION_ID,
+      implementationDigest: digest("a"),
+      candidates: fixture.catalog.forms,
+      bindings: fixture.catalog.bindings,
+      technicalAvailability: technicallyAvailable,
+    });
+
+    expect((await authority.catalog(CONTEXT)).forms[0]).toMatchObject({
       supported: false,
       availability: {
         executable: false,
@@ -485,7 +518,7 @@ describe("durable read-only Takoform Host authority", () => {
       },
     });
     await expect(
-      stale.authorizeMutation({
+      authority.authorizeMutation({
         operation: "create",
         context: CONTEXT,
         formRef: fixture.form.identity.formRef,

@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import type { PublicFormImplementationIdentity } from "../../src/public-worker-implementation.ts";
 import { preflightError } from "./errors.ts";
 import { REPOSITORY } from "./process.ts";
 import type { DeployTarget } from "./target.ts";
@@ -18,6 +19,10 @@ export interface WorkerConfigOptions {
    * inferred from annotations or a target clone.
    */
   readonly authorityProfile?: WorkerVersionAuthorityProfile;
+  /** Build-derived semantic identity embedded into the outer Worker bytes. */
+  readonly formImplementationIdentity?: PublicFormImplementationIdentity;
+  /** Exact final outer Worker artifact, kept separate from semantic identity. */
+  readonly workerArtifactDigest?: `sha256:${string}`;
   /**
    * Transition-only legacy service binding.  Ordinary target realization never
    * supplies this field; it exists solely for the reviewed L→C profile.
@@ -92,7 +97,29 @@ export function writeWorkerConfig(target: DeployTarget, options: WorkerConfigOpt
     ],
     r2_buckets: [{ binding: "OBJECTS", bucket_name: target.r2.bucketName }],
     ...serviceAddress(target.publicOrigin, target.aliases ?? []),
-    ...deploymentVariables(target, signingKeyId, authorityProfile),
+    ...deploymentVariables(target, signingKeyId, authorityProfile, {
+      ...(options.formImplementationIdentity === undefined
+        ? {}
+        : { formImplementationIdentity: options.formImplementationIdentity }),
+      ...(options.workerArtifactDigest === undefined
+        ? {}
+        : { workerArtifactDigest: options.workerArtifactDigest }),
+    }),
+    ...(options.formImplementationIdentity === undefined
+      ? {}
+      : {
+          define: {
+            TAKOSERVER_BUILD_FORM_IMPLEMENTATION_DIGEST: JSON.stringify(
+              options.formImplementationIdentity.implementationDigest,
+            ),
+            TAKOSERVER_BUILD_FORM_CAPABILITY_DIGEST: JSON.stringify(
+              options.formImplementationIdentity.capabilityDigest,
+            ),
+            TAKOSERVER_BUILD_FORM_IMPLEMENTATION_PAYLOAD_DIGEST: JSON.stringify(
+              options.formImplementationIdentity.implementationPayloadDigest,
+            ),
+          },
+        }),
     ...(options.transitionServiceBinding === undefined
       ? {}
       : {
@@ -127,6 +154,10 @@ export function deploymentVariables(
   target: DeployTarget,
   signingKeyId = effectiveSigningKeyId(target),
   authorityProfile?: WorkerVersionAuthorityProfile,
+  implementation: {
+    readonly formImplementationIdentity?: PublicFormImplementationIdentity;
+    readonly workerArtifactDigest?: `sha256:${string}`;
+  } = {},
 ): Record<string, unknown> {
   const vars: Record<string, string> = {
     PUBLIC_ORIGIN: target.publicOrigin,
@@ -163,6 +194,9 @@ export function deploymentVariables(
   if (target.edgeSupplies !== undefined) {
     vars.TAKOSERVER_EDGE_SUPPLIES = JSON.stringify(target.edgeSupplies);
   }
+  if (target.formAuthority !== undefined && implementation.workerArtifactDigest !== undefined) {
+    vars.TAKOSERVER_WORKER_ARTIFACT_DIGEST = implementation.workerArtifactDigest;
+  }
   if (target.workerEndpointSuffix !== undefined) {
     vars.TAKOSERVER_WORKER_ENDPOINT_SUFFIX = target.workerEndpointSuffix;
   }
@@ -179,6 +213,12 @@ export function deploymentVariables(
     const exact = exactPublicWorkerProvenance(
       authorityProfile?.kind === "provenance-bound-jit" ? authorityProfile.provenance : undefined,
     );
+    if (
+      implementation.workerArtifactDigest !== undefined &&
+      implementation.workerArtifactDigest !== exact.artifactDigest
+    ) {
+      throw preflightError("public Worker artifact identity differs from JIT provenance");
+    }
     vars.TAKOSERVER_ENVIRONMENT = "integration";
     vars.TAKOSERVER_INTEGRATION_E2E_API_KEY_PUBLIC_JWK = JSON.stringify(
       target.integrationE2eCredentialAuthority.publicJwk,

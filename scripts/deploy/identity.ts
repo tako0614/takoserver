@@ -269,6 +269,7 @@ async function inspectIdentityState(
         };
   const desired = expectedExactBindingClosure(target, {
     signingKeyId: target.signing.currentKeyId,
+    workerArtifactDigest: `sha256:${identity.bundleDigestHex}`,
     ...(authorityProfile === undefined ? {} : { authorityProfile }),
   });
   let configured = true;
@@ -282,6 +283,7 @@ async function inspectIdentityState(
       version,
       expectedExactBindingClosure(withoutOperatorIdentity(target), {
         signingKeyId: target.signing.currentKeyId,
+        workerArtifactDigest: `sha256:${identity.bundleDigestHex}`,
         ...(authorityProfile === undefined ? {} : { authorityProfile }),
       }),
     );

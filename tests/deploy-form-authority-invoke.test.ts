@@ -2,7 +2,7 @@ import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { targetCapabilityManifest } from "../scripts/deploy/form-authority.ts";
+import { publicFormCapabilityManifest } from "../scripts/deploy/form-authority.ts";
 import {
   type FormAuthorityInvokeOptions,
   formAuthorityRequestTimeoutMs,
@@ -15,6 +15,7 @@ import { createEphemeralSql } from "../src/compat.ts";
 import { verifyFormAuthorityOperatorAssertion } from "../src/form-authority-operator-proof.ts";
 import { canonicalJson } from "../src/json.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
+import { derivePublicFormImplementationIdentity } from "../src/public-worker-implementation.ts";
 import {
   CURRENT_PUBLISHER_COMMIT,
   CURRENT_PUBLISHER_REPOSITORY,
@@ -344,7 +345,7 @@ describe("signed Form authority operator invocation", () => {
       {
         scopeBindingProfile: "exact-transition-predecessor",
         authorityScopeBindingProfile: "exact-transition-predecessor",
-        publicWorkerBindingProfile: "exact-direct-public-predecessor",
+        publicWorkerBindingProfile: "legacy-exact-pinned",
       },
     ]) {
       fixture.calls.length = 0;
@@ -550,31 +551,39 @@ async function invocationFixture(
 ) {
   let selectedCommit = COMMIT;
   const target = await integrationTarget();
-  const capabilities = targetCapabilityManifest(target);
-  const identity = await deriveFormAuthorityIdentity({
-    environment: "integration",
+  const capabilities = publicFormCapabilityManifest();
+  const implementationPayloadDigest = `sha256:${"8".repeat(64)}` as const;
+  const semantic = await derivePublicFormImplementationIdentity({
+    implementationPayloadDigest,
+    capabilities,
+  });
+  const configuration = {
+    environment: "integration" as const,
     hostId: HOST_ID,
     workerArtifactDigest: ARTIFACT,
     publicWorkerVersionId: PUBLIC_VERSION,
+    implementationPayloadDigest,
+    implementationDigest: semantic.implementationDigest,
     capabilities,
+  };
+  const identity = await deriveFormAuthorityIdentity({
+    ...configuration,
   });
   const composition = await createIntegrationFormAuthorityComposition({
-    configuration: {
-      environment: "integration",
-      hostId: HOST_ID,
-      workerArtifactDigest: ARTIFACT,
-      publicWorkerVersionId: PUBLIC_VERSION,
-      capabilities,
-    },
+    configuration,
     bindings: {
       sql: createEphemeralSql(),
       objects: createMemoryObjectStore(),
       publicHostIdentity: {
         async identity() {
           return {
-            kind: "takoserver.public-host-identity@v1",
+            kind: "takoserver.public-host-identity@v2",
             hostId: HOST_ID,
             workerVersionId: PUBLIC_VERSION,
+            workerArtifactDigest: ARTIFACT,
+            implementationPayloadDigest,
+            capabilityDigest: semantic.capabilityDigest,
+            implementationDigest: identity.implementationDigest,
           };
         },
       },
@@ -601,6 +610,7 @@ async function invocationFixture(
         hostId: HOST_ID,
         workerArtifactDigest: ARTIFACT,
         publicWorkerVersionId: PUBLIC_VERSION,
+        implementationDigest: identity.implementationDigest,
       },
       publicJwk,
       clock: () => NOW,
@@ -656,19 +666,21 @@ async function invocationFixture(
     commitMatches: true,
     versionId: "22222222-2222-4222-8222-222222222222",
     authorityArtifactDigest: `sha256:${"c".repeat(64)}`,
-    publicWorkerBindingProfile: "exact-current-public",
+    publicWorkerBindingProfile: "dynamic-public-rpc",
     scopeBindingProfile: "exact-target",
     publicWorkerCommit: selectedCommit,
     publicWorkerCommitMatches: true,
     authorityDeployedCommit: selectedCommit,
     authorityCommitMatches: true,
     authorityVersionId: "33333333-3333-4333-8333-333333333333",
-    authorityPublicWorkerBindingProfile: "exact-current-public",
+    authorityPublicWorkerBindingProfile: "dynamic-public-rpc",
     authorityScopeBindingProfile: "exact-target",
     operatorOrigin: ORIGIN,
     authorityWorkerName: target.formAuthority?.integrationWorkerName,
     workerArtifactDigest: ARTIFACT,
     publicWorkerVersionId: PUBLIC_VERSION,
+    publicIdentityRpcReady: true,
+    implementationPayloadDigest,
     capabilityDigest: identity.capabilityDigest,
     implementationDigest: identity.implementationDigest,
     routeMode: "authenticated-integration-custom-domain",
@@ -716,6 +728,9 @@ async function integrationTarget(): Promise<DeployTarget> {
     workerEndpointSuffix: "integration.example.workers.dev",
     formAuthority: {
       workerName: "takoserver-form-authority-integration",
+      identityProbeWorkerName: "takoserver-form-identity-integration",
+      identityProbeOrigin:
+        "https://takoserver-form-identity-integration.integration.example.workers.dev",
       integrationWorkerName: "takoserver-form-fixture-integration",
       integrationOperatorWorkerName: "takoserver-form-operator-integration",
       integrationOperatorOrigin: ORIGIN,

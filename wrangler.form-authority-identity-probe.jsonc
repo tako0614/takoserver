@@ -1,0 +1,19 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "takoserver-form-authority-identity-probe",
+  "main": "src/entry-form-authority-identity-probe.ts",
+  "compatibility_date": "2026-08-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "preview_urls": false,
+  "vars": {
+    "TAKOSERVER_FORM_AUTHORITY_HOST_ID": "unconfigured.invalid"
+  },
+  "services": [
+    {
+      "binding": "PUBLIC_HOST_IDENTITY",
+      "service": "takoserver-api",
+      "entrypoint": "PublicHostIdentityEntrypoint"
+    }
+  ]
+}

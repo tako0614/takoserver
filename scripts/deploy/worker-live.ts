@@ -142,6 +142,9 @@ export async function inspectLiveWorkerVersionForRetirement(
       metadataProfile,
       ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
       ...(authorityProfile === undefined ? {} : { authorityProfile }),
+      ...(identity.kind === "canonical"
+        ? { workerArtifactDigest: `sha256:${identity.bundleDigestHex}` as const }
+        : {}),
     }),
   );
   const inventorySecrets = input.expectedInventorySecrets ?? input.expectedSecrets;
@@ -233,6 +236,7 @@ export async function inspectCanonicalWorkerVersionWithScriptIdentity(
       ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
       ...(input.expectedSecrets === undefined ? {} : { expectedSecrets: input.expectedSecrets }),
       ...(authorityProfile === undefined ? {} : { authorityProfile }),
+      workerArtifactDigest: `sha256:${identity.bundleDigestHex}`,
     }),
   );
   if (input.selectedCommit !== undefined && identity.commit !== input.selectedCommit) {
@@ -431,6 +435,7 @@ async function inspectSecretCreatedTransition(
       ...bindingInput,
       expectedSecrets: predecessorSecrets,
       ...profileInput,
+      workerArtifactDigest: `sha256:${predecessorIdentity.bundleDigestHex}`,
     }),
   );
   assertExactVersionBindingClosure(
@@ -441,6 +446,7 @@ async function inspectSecretCreatedTransition(
       ...bindingInput,
       expectedSecrets: desiredSecrets,
       ...profileInput,
+      workerArtifactDigest: `sha256:${predecessorIdentity.bundleDigestHex}`,
     }),
   );
   if (input.selectedCommit !== undefined && predecessorIdentity.commit !== input.selectedCommit) {
@@ -607,6 +613,9 @@ async function inspectLiveWorkerVersionCore(
     ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
     ...(input.expectedSecrets === undefined ? {} : { expectedSecrets: input.expectedSecrets }),
     ...(authorityProfile === undefined ? {} : { authorityProfile }),
+    ...(identity.kind === "canonical"
+      ? { workerArtifactDigest: `sha256:${identity.bundleDigestHex}` as const }
+      : {}),
   } as const;
   assertExactVersionBindingClosure(
     phase,
