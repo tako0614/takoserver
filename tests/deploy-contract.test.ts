@@ -92,6 +92,14 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(routineWorker?.obligations["post-conditions"]).toContain(
       "re-read immediately after upload and before traffic deployment",
     );
+    expect(routineWorker?.obligations["post-conditions"]).toContain(
+      "no conditional deployment/CAS input",
+    );
+    expect(routineWorker?.obligations["post-conditions"]).toContain("actual immediate predecessor");
+    expect(routineWorker?.obligations["failure-handling"]).toContain("traffic is indeterminate");
+    expect(routineWorker?.obligations["failure-handling"]).not.toContain(
+      "uploaded Version is inactive",
+    );
     expect(routineWorker?.obligations["failure-handling"]).toContain("Wrangler OAuth is refused");
     expect(integrationAuthority?.obligations["post-conditions"]).toContain(
       "exact operator tenant and Space plain-text bindings",

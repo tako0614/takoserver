@@ -1,4 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { DeployError, mutationError, preflightError } from "./errors.ts";
 import { type CommandResult, runCommand, wranglerCommand } from "./process.ts";
@@ -6,6 +8,7 @@ import type { WorkerState } from "./worker-live.ts";
 import { parseWorkerDeploymentChain, parseWorkerSecretInventory } from "./worker-state.ts";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const ACCOUNT_ID = /^[0-9a-f]{32}$/u;
 const WORKER_NAME = /^[a-z0-9][a-z0-9-]{1,62}$/u;
 
 export type WranglerProcess = (
@@ -112,6 +115,17 @@ export class WranglerWorkerState implements WorkerState {
     );
   }
 
+  async workerSubdomain(workerName: string): Promise<{
+    readonly enabled: boolean;
+    readonly previewsEnabled: boolean;
+  }> {
+    this.#assertWorker(workerName);
+    throw preflightError(
+      "Wrangler OAuth cannot prove workers.dev enabled state; " +
+        "use CLOUDFLARE_API_TOKEN and direct REST state",
+    );
+  }
+
   async #json(command: readonly string[], label: string): Promise<unknown> {
     let result: CommandResult;
     try {
@@ -207,19 +221,100 @@ export interface WranglerVersionPublication {
   readonly deploymentId: string;
 }
 
+export interface WranglerVersionPublicationLease {
+  readonly accountId: string;
+  readonly workerName: string;
+  release(): void;
+}
+
+/**
+ * Serializes this owning publication path on one operator host. Cloudflare's
+ * supported deployment POST has no predecessor/CAS input, so this deliberately
+ * bounded lease prevents same-host entrypoint overlap without pretending to
+ * fence the dashboard, direct API calls, or another host. A crash leaves the
+ * directory in place and the next invocation fails closed as stale.
+ */
+export function acquireWranglerVersionPublicationLease(input: {
+  readonly accountId: string;
+  readonly workerName: string;
+  readonly root?: string;
+}): WranglerVersionPublicationLease {
+  if (!ACCOUNT_ID.test(input.accountId) || !WORKER_NAME.test(input.workerName)) {
+    throw preflightError("Worker Version publication lease requires one exact target");
+  }
+  const root = input.root ?? join(tmpdir(), "takoserver-worker-publication-locks");
+  if (!isAbsolute(root)) {
+    throw preflightError("Worker Version publication lease root must be absolute");
+  }
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const rootState = lstatSync(root);
+  const effectiveUserId = process.getuid?.();
+  if (
+    !rootState.isDirectory() ||
+    rootState.isSymbolicLink() ||
+    (rootState.mode & 0o077) !== 0 ||
+    (effectiveUserId !== undefined && rootState.uid !== effectiveUserId)
+  ) {
+    throw preflightError("Worker Version publication lease root is not private and owned");
+  }
+  const targetDigest = createHash("sha256")
+    .update(`${input.accountId}\0${input.workerName}`)
+    .digest("hex");
+  const path = join(root, targetDigest);
+  try {
+    mkdirSync(path, { mode: 0o700 });
+  } catch (error) {
+    if (errorCode(error) === "EEXIST") {
+      throw preflightError(
+        "another same-host Worker Version publication is active or its lease is stale",
+        path,
+      );
+    }
+    throw preflightError("Worker Version publication lease could not be created");
+  }
+  const ownerPath = join(path, "owner");
+  const owner = randomUUID();
+  try {
+    writeFileSync(ownerPath, owner, { encoding: "utf8", flag: "wx", mode: 0o600 });
+  } catch {
+    rmSync(path, { recursive: true, force: true });
+    throw preflightError("Worker Version publication lease owner could not be recorded");
+  }
+  let released = false;
+  return {
+    accountId: input.accountId,
+    workerName: input.workerName,
+    release() {
+      if (released) return;
+      released = true;
+      try {
+        if (readFileSync(ownerPath, "utf8") === owner) {
+          rmSync(path, { recursive: true, force: true });
+        }
+      } catch {
+        // A missing or replaced owner is never removed on assumption.
+      }
+    },
+  };
+}
+
 /**
  * Uploads a version and then explicitly deploys exactly that version to 100%
  * traffic. The config is expected to be topology-neutral; neither command
- * invokes trigger/domain mutation. The caller must authoritatively re-fence
- * the active predecessor after upload; traffic deployment never follows a
- * stale predecessor observation.
+ * invokes trigger/domain mutation. The caller authoritatively re-reads the
+ * active predecessor after upload. Cloudflare exposes no conditional traffic
+ * mutation, so that read is an observation rather than CAS; post-mutation
+ * history must establish the actual predecessor.
  */
 export async function publishWranglerVersion(input: {
   readonly root: string;
   readonly bundlePath: string;
   readonly configPath: string;
+  readonly accountId: string;
   readonly workerName: string;
   readonly message: string;
+  /** Caller-held target lease; the caller releases it only after authoritative verification. */
+  readonly lease: WranglerVersionPublicationLease;
   /** Re-read and compare the pinned active deployment after upload, immediately before traffic. */
   readonly assertPredecessorStillCurrent: () => Promise<void>;
   readonly environment?: Readonly<Record<string, string>>;
@@ -231,7 +326,27 @@ export async function publishWranglerVersion(input: {
   if (!WORKER_NAME.test(input.workerName)) {
     throw preflightError("Wrangler version publication requires one exact Worker name");
   }
+  if (input.lease.accountId !== input.accountId || input.lease.workerName !== input.workerName) {
+    throw preflightError("Wrangler version publication lease does not match the exact target");
+  }
   const run = input.run ?? runCommand;
+  return await publishWranglerVersionWhileLeased(input, run);
+}
+
+async function publishWranglerVersionWhileLeased(
+  input: {
+    readonly root: string;
+    readonly bundlePath: string;
+    readonly configPath: string;
+    readonly accountId: string;
+    readonly workerName: string;
+    readonly message: string;
+    readonly lease: WranglerVersionPublicationLease;
+    readonly assertPredecessorStillCurrent: () => Promise<void>;
+    readonly environment?: Readonly<Record<string, string>>;
+  },
+  run: WranglerProcess,
+): Promise<WranglerVersionPublication> {
   mkdirSync(input.root, { recursive: true, mode: 0o700 });
   const uploadOutputPath = join(input.root, "wrangler-version-upload.jsonl");
   const deployOutputPath = join(input.root, "wrangler-version-deploy.jsonl");
@@ -280,7 +395,8 @@ export async function publishWranglerVersion(input: {
     await input.assertPredecessorStillCurrent();
   } catch (error) {
     throw mutationError(
-      "Worker predecessor re-fence failed after Version upload; the uploaded Version is inactive and traffic was not changed",
+      "Worker predecessor re-fence failed after Version upload; traffic state is indeterminate, " +
+        "and this invocation did not start a traffic deployment; run --status before repair",
       safeErrorDetail(error),
     );
   }
@@ -479,6 +595,10 @@ function readOutput(path: string, stdout: string): string {
 function safeErrorDetail(error: unknown): string | undefined {
   if (error instanceof DeployError) return error.message;
   return "invalid Wrangler publication event";
+}
+
+function errorCode(error: unknown): string | undefined {
+  return isRecord(error) && typeof error.code === "string" ? error.code : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

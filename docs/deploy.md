@@ -92,18 +92,34 @@ The routine surfaces are:
   the explicit API-token/direct-REST path. Stored Wrangler OAuth is disabled:
   its supported readers cannot prove whether workers.dev is enabled or list an
   exhaustive custom-domain inventory, and target URL/alias declarations are
-  not live proof. The deploy tool never extracts an OAuth credential.
+  not live proof. Direct REST must prove the script-specific workers.dev state
+  is enabled when the selected public origin is under workers.dev, in addition
+  to proving the exhaustive custom-domain inventory. The deploy tool never
+  extracts an OAuth credential.
   Non-production routine publication builds with the version API, uploads one
-  immutable Version, re-reads the exact pinned active deployment/Version,
-  binding, secret, and migration closure, and only then explicitly deploys the
-  uploaded Version to 100% traffic. Concurrent active-deployment drift after
-  upload therefore fails before traffic mutation; the acknowledged uploaded
-  Version remains inactive for inspection and traffic is left on the
-  concurrent deployment. The realized config is topology-neutral: routes,
-  custom domains, workers.dev toggles, and triggers are not sent to either
-  publication command. Strict publication JSON and
-  authoritative post-deployment readback must identify the uploaded Version
-  and deployment, and the exact discovery/OpenAPI public smoke must pass. It
+  immutable Version, re-reads the exact active deployment/Version, binding,
+  secret, routing, and migration closure, and only then explicitly deploys the
+  uploaded Version to 100% traffic. The realized config is topology-neutral:
+  routes, custom domains, workers.dev toggles, and triggers are not sent to
+  either publication command. A target-scoped lease in the operator host's
+  temporary directory serializes this owning publication path on that host
+  from the final pre-mutation closure read through post-mutation authoritative
+  history and public smoke; a crash leaves the lease stale and the next apply
+  fails closed. It is not a provider lock. Cloudflare's supported deployment
+  POST and Wrangler command expose no predecessor/CAS condition, so a dashboard
+  action, direct API call, another owning deploy surface, or invocation on
+  another host can still race the final traffic mutation. A
+  failed post-upload re-read means traffic is indeterminate: this invocation
+  has not started its traffic deployment, but it does not claim the uploaded
+  Version is inactive or that another actor left traffic unchanged. After a
+  successful traffic mutation, authoritative history must identify the exact
+  uploaded Version and deployment; its actual immediate predecessor, not the
+  earlier observation, is printed as the rollback target. A concurrent
+  deployment observed by that readback fails verification instead of triggering
+  an automatic restore. An external advance after the point-in-time history
+  read is not fenced by the host lease and may remain undetected when its public
+  behavior also passes the smoke. Strict publication JSON, the exact
+  discovery/OpenAPI public smoke, and that readback must all pass. It
   refuses pending D1 migrations, any config/secret/signing drift, and any
   selected diff that changes authentication, authorization, the deploy
   mechanism, or any executable dependency in the build-derived public Form

@@ -26,7 +26,7 @@ import {
 import type { DeployTarget } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import {
-  assertDomainClosure,
+  assertLiveWorkerRoutingClosure,
   inspectLiveWorkerVersionForRetirement,
   isWorkerVersionId,
   type RetirementLiveWorkerVersion,
@@ -1453,7 +1453,7 @@ async function inspectAttributionRepairLineage(
     baseWorkerSecrets(target),
     phase,
   );
-  assertDomainClosure(phase, target, await state.workerDomains());
+  await assertLiveWorkerRoutingClosure(phase, target, state);
   const historyAfterCurrent = await currentHistory(phase, target, state);
   if (!sameDeploymentHistory(historyAfterCurrent, currentHistoryValue)) {
     throw phaseError(

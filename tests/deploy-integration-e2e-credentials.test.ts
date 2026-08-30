@@ -312,7 +312,7 @@ describe("integration E2E credential owner surface", () => {
       localOptions(racingState(), run, { review: "reviewer@example.test" }),
     ).catch((error) => error);
     expect(raceFailure).toMatchObject({ phase: "preflight" });
-    expect(raceFailure.message).toContain("changed before credential helper");
+    expect(raceFailure.message).toContain("deployment history changed during closure inspection");
     expect(helperCalls).toBe(0);
 
     const mutationFailure = await runIntegrationE2eCredentials(

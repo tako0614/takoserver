@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { DeployError } from "../scripts/deploy/errors.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
@@ -11,6 +11,7 @@ import {
   type WorkerState,
 } from "../scripts/deploy/worker.ts";
 import {
+  acquireWranglerVersionPublicationLease,
   parseWranglerDeploymentOutput,
   parseWranglerSecretOutput,
   parseWranglerVersionDeployOutput,
@@ -22,6 +23,10 @@ import {
 const WORKER = "takoserver-api-integration";
 const VERSION = "00000000-0000-4000-8000-000000000001";
 const DEPLOYMENT = "00000000-0000-4000-8000-000000000002";
+const BEFORE_VERSION = "00000000-0000-4000-8000-000000000005";
+const BEFORE_DEPLOYMENT = "00000000-0000-4000-8000-000000000004";
+const CONCURRENT_VERSION = "00000000-0000-4000-8000-000000000006";
+const CONCURRENT_DEPLOYMENT = "00000000-0000-4000-8000-000000000007";
 
 const VERSION_BODY = {
   id: VERSION,
@@ -104,6 +109,7 @@ describe("Wrangler OAuth Worker reader", () => {
       },
     });
     await expect(state.workerDomains()).rejects.toThrow("workers.dev enabled state");
+    await expect(state.workerSubdomain(WORKER)).rejects.toThrow("workers.dev enabled state");
   });
 
   test("does not turn an unobservable undeclared custom-domain alias into absence", async () => {
@@ -156,6 +162,33 @@ describe("Wrangler OAuth Worker reader", () => {
 });
 
 describe("Wrangler version publication output", () => {
+  test("serializes the owning publication path per target on one operator host", () => {
+    const root = `${process.env.TMPDIR ?? "/tmp"}/takoserver-version-lease-${crypto.randomUUID()}`;
+    try {
+      const first = acquireWranglerVersionPublicationLease({
+        accountId: target.accountId,
+        workerName: target.workerName,
+        root,
+      });
+      expect(() =>
+        acquireWranglerVersionPublicationLease({
+          accountId: target.accountId,
+          workerName: target.workerName,
+          root,
+        }),
+      ).toThrow("active or its lease is stale");
+      first.release();
+      const second = acquireWranglerVersionPublicationLease({
+        accountId: target.accountId,
+        workerName: target.workerName,
+        root,
+      });
+      second.release();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("parses one exact upload and deployment event", () => {
     expect(
       parseWranglerVersionUploadOutput(
@@ -299,10 +332,12 @@ describe("routine Worker authentication and version publication boundary", () =>
   });
 
   test("uses explicit-token version publication and re-reads the predecessor before deploy", async () => {
-    const fixture = await routineVersionPublication();
+    const fixture = await routineVersionPublication({ assertLeaseHeldDuringProbe: true });
     expect(fixture.outcome).toMatchObject({
       publication: "versions-upload-and-deploy",
       versionId: VERSION,
+      preMutationObservedVersionId: BEFORE_VERSION,
+      previousVersionId: BEFORE_VERSION,
     });
     expect(fixture.commands.some((command) => command.includes("auth"))).toBe(false);
     expect(
@@ -323,18 +358,46 @@ describe("routine Worker authentication and version publication boundary", () =>
     expect(upload).toBeGreaterThanOrEqual(0);
     expect(deploy).toBeGreaterThan(upload);
     expect(fixture.trace.slice(upload + 1, deploy)).toContain("state:deployments");
+    expect(fixture.probeLeaseCollisions).toBe(2);
+    expect(fixture.leaseReleasedAfterRun).toBe(true);
     for (const key of ["routes", "triggers", "workers_dev", "workers_dev_subdomain"]) {
       expect(fixture.config).not.toHaveProperty(key);
     }
   });
 
-  test("refuses a concurrent active deployment after upload before 100 percent traffic mutation", async () => {
+  test("requires direct REST proof that the selected workers.dev origin is enabled", async () => {
+    const fixture = await routineVersionPublication({ workersDevEnabled: false });
+    expect(fixture.outcome).toBeInstanceOf(DeployError);
+    expect((fixture.outcome as DeployError).phase).toBe("preflight");
+    expect((fixture.outcome as DeployError).message).toContain(
+      "workers.dev subdomain is not enabled",
+    );
+    expect(fixture.commands).toHaveLength(0);
+  });
+
+  test("rejects a deployment change after the first history read before upload", async () => {
+    const fixture = await routineVersionPublication({ concurrentAfterFirstHistoryRead: true });
+    expect(fixture.outcome).toBeInstanceOf(DeployError);
+    expect((fixture.outcome as DeployError).phase).toBe("preflight");
+    expect((fixture.outcome as DeployError).message).toContain(
+      "deployment history changed during closure inspection",
+    );
+    expect(fixture.commands).toHaveLength(0);
+  });
+
+  test("reports post-upload fence failure as indeterminate without claiming traffic state", async () => {
     const fixture = await routineVersionPublication({ concurrentAfterUpload: true });
     expect(fixture.outcome).toBeInstanceOf(DeployError);
     expect((fixture.outcome as DeployError).phase).toBe("mutation");
     expect((fixture.outcome as DeployError).message).toContain(
       "predecessor re-fence failed after Version upload",
     );
+    expect((fixture.outcome as DeployError).message).toContain("traffic state is indeterminate");
+    expect((fixture.outcome as DeployError).message).toContain(
+      "this invocation did not start a traffic deployment",
+    );
+    expect((fixture.outcome as DeployError).message).not.toContain("inactive");
+    expect((fixture.outcome as DeployError).message).not.toContain("traffic was not changed");
     expect((fixture.outcome as DeployError).detail).toContain(
       "changed after Version upload and before traffic deployment",
     );
@@ -349,25 +412,48 @@ describe("routine Worker authentication and version publication boundary", () =>
       ),
     ).toHaveLength(0);
   });
+
+  test("re-establishes the actual predecessor when an external deploy races the final mutation", async () => {
+    const fixture = await routineVersionPublication({ concurrentImmediatelyBeforeDeploy: true });
+    expect(fixture.outcome).toMatchObject({
+      publication: "versions-upload-and-deploy",
+      versionId: VERSION,
+      preMutationObservedVersionId: BEFORE_VERSION,
+      previousVersionId: CONCURRENT_VERSION,
+      rollback: expect.stringContaining(`${CONCURRENT_VERSION}@100%`),
+    });
+    expect(
+      fixture.commands.filter(
+        (command) => command.includes("versions") && command.includes("deploy"),
+      ),
+    ).toHaveLength(1);
+  });
 });
 
 async function routineVersionPublication(
-  options: { readonly concurrentAfterUpload?: boolean } = {},
+  options: {
+    readonly concurrentAfterFirstHistoryRead?: boolean;
+    readonly concurrentAfterUpload?: boolean;
+    readonly concurrentImmediatelyBeforeDeploy?: boolean;
+    readonly assertLeaseHeldDuringProbe?: boolean;
+    readonly workersDevEnabled?: boolean;
+  } = {},
 ): Promise<{
   readonly outcome: Record<string, unknown> | DeployError;
   readonly commands: readonly string[][];
   readonly trace: readonly string[];
   readonly config: Record<string, unknown>;
+  readonly probeLeaseCollisions: number;
+  readonly leaseReleasedAfterRun: boolean;
 }> {
   const root = `${process.env.TMPDIR ?? "/tmp"}/takoserver-version-${crypto.randomUUID()}`;
   const commands: string[][] = [];
   const trace: string[] = [];
   let uploaded = false;
   let deployed = false;
-  const beforeVersion = "00000000-0000-4000-8000-000000000005";
-  const beforeDeployment = "00000000-0000-4000-8000-000000000004";
-  const concurrentVersion = "00000000-0000-4000-8000-000000000006";
-  const concurrentDeployment = "00000000-0000-4000-8000-000000000007";
+  let deploymentReads = 0;
+  let concurrentCurrent = false;
+  let probeLeaseCollisions = 0;
   const run: WorkerProcess = async (command, commandOptions) => {
     commands.push([...command]);
     const joined = command.join(" ");
@@ -410,6 +496,7 @@ async function routineVersionPublication(
       return result("Uploaded\n");
     }
     if (command[1] === "versions" && command[2] === "deploy") {
+      if (options.concurrentImmediatelyBeforeDeploy === true) concurrentCurrent = true;
       deployed = true;
       const path = commandOptions?.env?.WRANGLER_OUTPUT_FILE_PATH;
       if (!path) throw new Error("missing Wrangler output path");
@@ -432,21 +519,35 @@ async function routineVersionPublication(
     async workerDomains() {
       return [];
     },
+    async workerSubdomain() {
+      trace.push("state:subdomain");
+      return {
+        enabled: options.workersDevEnabled ?? true,
+        previewsEnabled: false,
+      };
+    },
     async workerDeployments() {
       trace.push("state:deployments");
+      deploymentReads += 1;
       if (deployed) {
+        return options.concurrentImmediatelyBeforeDeploy === true
+          ? [
+              deployment(DEPLOYMENT, VERSION, "2026-08-30T00:02:00Z"),
+              deployment(CONCURRENT_DEPLOYMENT, CONCURRENT_VERSION, "2026-08-30T00:01:00Z"),
+              deployment(BEFORE_DEPLOYMENT, BEFORE_VERSION, "2026-08-29T00:00:00Z"),
+            ]
+          : [
+              deployment(DEPLOYMENT, VERSION, "2026-08-30T00:02:00Z"),
+              deployment(BEFORE_DEPLOYMENT, BEFORE_VERSION, "2026-08-29T00:00:00Z"),
+            ];
+      }
+      if (concurrentCurrent || (uploaded && options.concurrentAfterUpload === true)) {
         return [
-          deployment(DEPLOYMENT, VERSION, "2026-08-30T00:02:00Z"),
-          deployment(beforeDeployment, beforeVersion, "2026-08-29T00:00:00Z"),
+          deployment(CONCURRENT_DEPLOYMENT, CONCURRENT_VERSION, "2026-08-30T00:01:00Z"),
+          deployment(BEFORE_DEPLOYMENT, BEFORE_VERSION, "2026-08-29T00:00:00Z"),
         ];
       }
-      if (uploaded && options.concurrentAfterUpload === true) {
-        return [
-          deployment(concurrentDeployment, concurrentVersion, "2026-08-30T00:01:00Z"),
-          deployment(beforeDeployment, beforeVersion, "2026-08-29T00:00:00Z"),
-        ];
-      }
-      return [deployment(beforeDeployment, beforeVersion, "2026-08-29T00:00:00Z")];
+      return [deployment(BEFORE_DEPLOYMENT, BEFORE_VERSION, "2026-08-29T00:00:00Z")];
     },
     async workerVersion(_worker, versionId) {
       const digest =
@@ -455,11 +556,11 @@ async function routineVersionPublication(
               .update(readFileSync(`${root}/release/worker.js`))
               .digest("hex")
           : "b".repeat(64);
-      return {
+      const value = {
         id: versionId,
         annotations: {
           "workers/message": `takoserver-worker:${
-            versionId === concurrentVersion ? "c".repeat(40) : "a".repeat(40)
+            versionId === CONCURRENT_VERSION ? "c".repeat(40) : "a".repeat(40)
           }:${digest}`,
           "workers/triggered_by": "version_upload",
         },
@@ -479,6 +580,14 @@ async function routineVersionPublication(
           ],
         },
       };
+      if (
+        options.concurrentAfterFirstHistoryRead === true &&
+        deploymentReads === 1 &&
+        versionId === BEFORE_VERSION
+      ) {
+        concurrentCurrent = true;
+      }
+      return value;
     },
     async workerSecrets() {
       return [{ name: "TAKOSERVER_SIGNING_KEY", type: "secret_text" }];
@@ -504,8 +613,26 @@ async function routineVersionPublication(
         migrations,
         outputDirectory: root,
         cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
-        fetcher: async (input) =>
-          input.endsWith("/openapi.json")
+        fetcher: async (input) => {
+          if (options.assertLeaseHeldDuringProbe === true) {
+            try {
+              const competing = acquireWranglerVersionPublicationLease({
+                accountId: target.accountId,
+                workerName: target.workerName,
+              });
+              competing.release();
+              throw new Error("publication lease was not held during public smoke");
+            } catch (error) {
+              if (
+                !(error instanceof DeployError) ||
+                !error.message.includes("active or its lease is stale")
+              ) {
+                throw error;
+              }
+              probeLeaseCollisions += 1;
+            }
+          }
+          return input.endsWith("/openapi.json")
             ? Response.json({ servers: [{ url: target.publicOrigin }] })
             : Response.json({
                 product: "takoserver",
@@ -514,14 +641,24 @@ async function routineVersionPublication(
                   api: target.publicOrigin,
                   openapi: `${target.publicOrigin}/openapi.json`,
                 },
-              }),
+              });
+        },
       },
     ).catch((error) => error as DeployError);
-    const config = JSON.parse(await Bun.file(`${root}/release/wrangler.jsonc`).text()) as Record<
-      string,
-      unknown
-    >;
-    return { outcome, commands, trace, config };
+    let leaseReleasedAfterRun = false;
+    if (options.assertLeaseHeldDuringProbe === true) {
+      const after = acquireWranglerVersionPublicationLease({
+        accountId: target.accountId,
+        workerName: target.workerName,
+      });
+      after.release();
+      leaseReleasedAfterRun = true;
+    }
+    const configPath = `${root}/release/wrangler.jsonc`;
+    const config = existsSync(configPath)
+      ? (JSON.parse(await Bun.file(configPath).text()) as Record<string, unknown>)
+      : {};
+    return { outcome, commands, trace, config, probeLeaseCollisions, leaseReleasedAfterRun };
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

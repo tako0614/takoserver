@@ -84,7 +84,11 @@ export const DEPLOY_CONTRACT = {
           "public product probe identify the selected commit and uploaded artifact. Non-production " +
           "routine publication uses one versions upload followed by one explicit 100 percent deployment " +
           "with a topology-neutral config, so routes, domains and triggers are never mutated. The exact " +
-          "pinned predecessor closure is re-read immediately after upload and before traffic deployment.",
+          "predecessor closure and workers.dev enabled state are re-read immediately after upload and " +
+          "before traffic deployment. A target-scoped same-host lease serializes this owning publication " +
+          "path through authoritative readback and public smoke. Cloudflare exposes no conditional " +
+          "deployment/CAS input, so authoritative post-mutation " +
+          "history re-establishes the actual immediate predecessor as the rollback target.",
         reversal:
           "The immediately previous Cloudflare Worker version is printed as the provider-history rollback target.",
         "failure-handling":
@@ -92,8 +96,12 @@ export const DEPLOY_CONTRACT = {
           "signing or Hosted topology drift before upload. A diff that changes authentication, " +
           "authorization or the deploy mechanism is refused and routed to the authority cutover surface. " +
           "Wrangler JSON framing, the upload-to-deploy predecessor re-fence, publication identities and " +
-          "final public smoke are strict; any drift or readback mismatch fails closed. A post-upload " +
-          "re-fence failure leaves only the acknowledged inactive Version and does not change traffic. " +
+          "final public smoke are strict; any drift or readback mismatch fails closed. The host-local " +
+          "lease does not fence dashboard, direct-API, other owning deploy surfaces, or other-host actors; " +
+          "an external advance after the point-in-time history read can evade Version attribution when its " +
+          "public behavior still passes smoke. A post-upload re-fence failure " +
+          "means traffic is indeterminate; this invocation has not started its traffic deployment, but it " +
+          "does not infer the uploaded Version's activity or traffic's current owner. " +
           routineWorkerAuthInput,
       },
     },

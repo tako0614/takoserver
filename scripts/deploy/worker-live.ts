@@ -42,6 +42,15 @@ export const LEGACY_PRE_VERSION_METADATA_PROFILE = "pre-version-metadata" as con
 /** Exact authority-bearing binding shape carried by an immutable Version. */
 export interface WorkerState {
   workerDomains(): Promise<readonly { readonly hostname: string; readonly service: string }[]>;
+  /**
+   * Direct REST exposes this separately from the custom-domain inventory.
+   * Portable custom-domain fixtures may omit it, but a workers.dev target can
+   * never prove its public topology without this read.
+   */
+  workerSubdomain?(workerName: string): Promise<{
+    readonly enabled: boolean;
+    readonly previewsEnabled: boolean;
+  }>;
   workerDeployments(workerName: string): Promise<readonly unknown[]>;
   workerVersion(workerName: string, versionId: string): Promise<unknown>;
   workerSecrets(workerName: string): Promise<readonly unknown[]>;
@@ -149,7 +158,7 @@ export async function inspectLiveWorkerVersionForRetirement(
   );
   const inventorySecrets = input.expectedInventorySecrets ?? input.expectedSecrets;
   assertExactSecretInventory(await state.workerSecrets(target.workerName), inventorySecrets, phase);
-  assertDomainClosure(phase, target, await state.workerDomains());
+  await assertLiveWorkerRoutingClosure(phase, target, state);
   const historyAfter = parseWorkerDeploymentHistory(
     await state.workerDeployments(target.workerName),
     phase,
@@ -248,7 +257,7 @@ export async function inspectCanonicalWorkerVersionWithScriptIdentity(
     input.expectedSecrets ?? expectedWorkerSecrets(target),
     phase,
   );
-  assertDomainClosure(phase, target, await state.workerDomains());
+  await assertLiveWorkerRoutingClosure(phase, target, state);
   const after = strictTransitionChain(phase, await state.workerDeployments(target.workerName));
   if (!sameDeploymentChain(chain, after)) {
     throw phaseError(
@@ -471,7 +480,7 @@ async function inspectSecretCreatedTransition(
     desiredSecrets,
     phase,
   );
-  assertDomainClosure(phase, target, await state.workerDomains());
+  await assertLiveWorkerRoutingClosure(phase, target, state);
   const after = strictTransitionChain(phase, await state.workerDeployments(target.workerName));
   if (!sameDeploymentChain(chain, after)) {
     throw phaseError(
@@ -630,23 +639,21 @@ async function inspectLiveWorkerVersionCore(
     input.expectedSecrets ?? expectedWorkerSecrets(target),
     phase,
   );
-  assertDomainClosure(phase, target, await state.workerDomains());
-  if (mode === "pinned-current") {
-    const historyAfterClosure = parseWorkerDeploymentHistory(
-      await state.workerDeployments(target.workerName),
+  await assertLiveWorkerRoutingClosure(phase, target, state);
+  const historyAfterClosure = parseWorkerDeploymentHistory(
+    await state.workerDeployments(target.workerName),
+    phase,
+  );
+  if (
+    historyAfterClosure === null ||
+    historyAfterClosure.deploymentId !== history.deploymentId ||
+    historyAfterClosure.versionId !== history.versionId ||
+    historyAfterClosure.previousVersionId !== history.previousVersionId
+  ) {
+    throw phaseError(
       phase,
+      "authoritative Worker deployment history changed during closure inspection",
     );
-    if (
-      historyAfterClosure === null ||
-      historyAfterClosure.deploymentId !== history.deploymentId ||
-      historyAfterClosure.versionId !== history.versionId ||
-      historyAfterClosure.previousVersionId !== history.previousVersionId
-    ) {
-      throw phaseError(
-        phase,
-        "authoritative Worker deployment history changed during closure inspection",
-      );
-    }
   }
   return identity.kind === "canonical"
     ? {
@@ -886,8 +893,15 @@ export function assertDomainClosure(
   phase: DeployPhase,
   target: DeployTarget,
   entries: readonly { readonly hostname: string; readonly service: string }[],
+  subdomain?: { readonly enabled: boolean; readonly previewsEnabled: boolean },
 ): void {
   const canonical = new URL(target.publicOrigin).hostname;
+  if (canonical.endsWith(".workers.dev") && subdomain?.enabled !== true) {
+    throw phaseError(
+      phase,
+      "Worker workers.dev subdomain is not enabled for the selected public origin",
+    );
+  }
   const expected = canonical.endsWith(".workers.dev")
     ? []
     : [canonical, ...(target.aliases ?? [])].sort();
@@ -918,6 +932,33 @@ export function assertDomainClosure(
       `expected=${JSON.stringify(expected)} actual=${JSON.stringify(actual.sort())}`,
     );
   }
+}
+
+/**
+ * Proves the two independent Cloudflare routing inventories. Custom domains
+ * come from the exhaustive account list, while a workers.dev public origin
+ * additionally requires the script-specific enabled state. A target whose
+ * reader cannot expose that state fails closed.
+ */
+export async function assertLiveWorkerRoutingClosure(
+  phase: DeployPhase,
+  target: DeployTarget,
+  state: Pick<WorkerState, "workerDomains" | "workerSubdomain">,
+): Promise<void> {
+  const domains = await state.workerDomains();
+  const canonical = new URL(target.publicOrigin).hostname;
+  if (state.workerSubdomain === undefined) {
+    if (canonical.endsWith(".workers.dev")) {
+      throw phaseError(
+        phase,
+        "Worker state cannot prove workers.dev enabled state for the selected public origin",
+      );
+    }
+    assertDomainClosure(phase, target, domains);
+    return;
+  }
+  const subdomain = await state.workerSubdomain(target.workerName);
+  assertDomainClosure(phase, target, domains, subdomain);
 }
 
 function phaseError(phase: DeployPhase, message: string, detail?: string) {

@@ -32,7 +32,12 @@ import type { DeployTarget } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import { authoritySensitiveWorkerPaths } from "./worker-authority-paths.ts";
 import { parseWorkerDeploymentHistory, type WorkerDeploymentHistory } from "./worker-state.ts";
-import { publishWranglerVersion } from "./wrangler-state.ts";
+import {
+  acquireWranglerVersionPublicationLease,
+  publishWranglerVersion,
+  type WranglerVersionPublication,
+  type WranglerVersionPublicationLease,
+} from "./wrangler-state.ts";
 
 export type WorkerProcess = (
   command: readonly string[],
@@ -154,6 +159,7 @@ export async function runWorker(
   const temporary = options.outputDirectory === undefined;
   const root = options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-worker-"));
   mkdirSync(root, { recursive: true, mode: 0o700 });
+  let publicationLease: WranglerVersionPublicationLease | null = null;
   try {
     const inspectionConfig = writeWorkerConfig(target, {
       path: join(root, "inspect-wrangler.jsonc"),
@@ -318,7 +324,13 @@ export async function runWorker(
     const { bundlePath, configPath, bundleDigestHex } = prepared;
     const artifact = prepared.seal();
     artifact.assertUnchanged();
-    if (versionPublication || target.integrationE2eCredentialAuthority !== undefined) {
+    if (versionPublication) {
+      publicationLease = acquireWranglerVersionPublicationLease({
+        accountId: target.accountId,
+        workerName: target.workerName,
+      });
+    }
+    if (!legacyBootstrap) {
       const last = await inspectWorker("preflight", target, state, migrations, {
         ...(beforeAuthorityProfile === undefined
           ? {}
@@ -364,50 +376,58 @@ export async function runWorker(
       }
     }
     const message = `takoserver-worker:${source.commit}:${bundleDigestHex}`;
-    const publication = versionPublication
-      ? await publishWranglerVersion({
-          root,
-          bundlePath,
-          configPath,
-          workerName: target.workerName,
-          message,
-          environment,
-          run,
-          assertPredecessorStillCurrent: async () => {
-            const current = await inspectWorker("preflight", target, state, migrations, {
-              ...(beforeAuthorityProfile === undefined
-                ? {}
-                : { authorityProfile: beforeAuthorityProfile }),
-            });
-            assertWorkerInspectionUnchanged(
-              before,
-              current,
-              "Worker state changed after Version upload and before traffic deployment",
-            );
-          },
-        })
-      : await (async () => {
-          const upload = await run(
-            wranglerCommand([
-              "deploy",
-              bundlePath,
-              "--no-bundle",
-              "--config",
-              configPath,
-              "--strict",
-              "--message",
-              message,
-            ]),
-            { env: environment },
+    let publication: WranglerVersionPublication | null;
+    if (versionPublication) {
+      if (publicationLease === null) {
+        throw preflightError("Worker Version publication lease is unavailable");
+      }
+      publication = await publishWranglerVersion({
+        root,
+        bundlePath,
+        configPath,
+        accountId: target.accountId,
+        workerName: target.workerName,
+        message,
+        lease: publicationLease,
+        environment,
+        run,
+        assertPredecessorStillCurrent: async () => {
+          const current = await inspectWorker("preflight", target, state, migrations, {
+            ...(beforeAuthorityProfile === undefined
+              ? {}
+              : { authorityProfile: beforeAuthorityProfile }),
+          });
+          assertWorkerInspectionUnchanged(
+            before,
+            current,
+            "Worker state changed after Version upload and before traffic deployment",
           );
-          if (upload.exitCode !== 0) {
-            throw mutationError(
-              "Worker upload acknowledgement is indeterminate; do not retry before --status",
-              `${upload.stdout}${upload.stderr}`.trim(),
-            );
-          }
-          return null;
-        })();
+        },
+      });
+    } else {
+      publication = await (async () => {
+        const upload = await run(
+          wranglerCommand([
+            "deploy",
+            bundlePath,
+            "--no-bundle",
+            "--config",
+            configPath,
+            "--strict",
+            "--message",
+            message,
+          ]),
+          { env: environment },
+        );
+        if (upload.exitCode !== 0) {
+          throw mutationError(
+            "Worker upload acknowledgement is indeterminate; do not retry before --status",
+            `${upload.stdout}${upload.stderr}`.trim(),
+          );
+        }
+        return null;
+      })();
+    }
 
     const afterAuthorityProfile =
       target.integrationE2eCredentialAuthority === undefined
@@ -422,12 +442,10 @@ export async function runWorker(
     const after = await inspectWorker("verification", target, state, migrations, {
       ...(afterAuthorityProfile === undefined ? {} : { authorityProfile: afterAuthorityProfile }),
     });
-    if (
-      after.history.versionId === before.history.versionId ||
-      after.history.previousVersionId !== before.history.versionId
-    ) {
+    const rollbackVersionId = after.history.previousVersionId;
+    if (after.history.versionId === before.history.versionId || rollbackVersionId === null) {
       throw verificationError(
-        "authoritative Worker deployment history does not advance exactly from the previous version",
+        "authoritative Worker deployment history does not identify a new current Version and its actual immediate predecessor",
       );
     }
     if (
@@ -464,7 +482,8 @@ export async function runWorker(
       artifactBytes: artifact.bytes,
       artifactFiles: artifact.files,
       bundleDigest: `sha256:${bundleDigestHex}`,
-      previousVersionId: before.history.versionId,
+      preMutationObservedVersionId: before.history.versionId,
+      previousVersionId: rollbackVersionId,
       deploymentId: after.history.deploymentId,
       versionId: after.history.versionId,
       probe,
@@ -487,10 +506,10 @@ export async function runWorker(
             authorityScope: "entire-worker-artifact",
           }),
       rollback:
-        `wrangler versions deploy ${before.history.versionId}@100% --yes ` +
-        `--name ${target.workerName}`,
+        `wrangler versions deploy ${rollbackVersionId}@100% --yes ` + `--name ${target.workerName}`,
     };
   } finally {
+    publicationLease?.release();
     if (temporary) rmSync(root, { recursive: true, force: true });
   }
 }
