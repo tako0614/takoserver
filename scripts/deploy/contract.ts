@@ -14,9 +14,9 @@ const legacyServiceBindingName = () => ["HOST", "RUNTIME", "MATERIALIZER"].join(
 const cloudflareTokenInput =
   "Input contract: `CLOUDFLARE_API_TOKEN` is required for both `--status` and `--apply` in every supported environment.";
 const routineWorkerAuthInput =
-  "Input contract: production requires explicit `CLOUDFLARE_API_TOKEN` and exhaustive direct-REST topology readback. " +
-  "Integration and rehearsal may omit that variable and use Wrangler's stored OAuth profile through " +
-  "the version/deployment/secret/D1 readers; the OAuth credential is never exported or printed.";
+  "Input contract: explicit `CLOUDFLARE_API_TOKEN` is required for both `--status` and `--apply` in every environment. " +
+  "Wrangler OAuth is refused because its supported readers cannot prove workers.dev enabled state or exhaustive " +
+  "custom-domain inventory; the deploy tool never extracts an OAuth credential.";
 const integrationE2eCloudflareTokenInput =
   "Input contract: `CLOUDFLARE_API_TOKEN` is required for each `--issue`, `--status`, and `--revoke` action; all three actions are integration-only.";
 const applyReviewInput =
@@ -77,22 +77,23 @@ export const DEPLOY_CONTRACT = {
       obligations: {
         provenance:
           `${exactSource} The owner gate runs once, then the exact link-free bundle and realized ` +
-          "configuration are sealed and requalified immediately before one upload. Integration and " +
-          "rehearsal may use Wrangler's stored OAuth profile through the read-only version/deployment/secret/D1 " +
-          "reader; production remains explicit-token direct REST.",
+          "configuration are sealed and requalified immediately before one upload. Every environment " +
+          "uses explicit `CLOUDFLARE_API_TOKEN` and direct-REST live state; stored OAuth is not a topology authority.",
         "post-conditions":
           "Authoritative deployment/version state, exact binding/configuration closure and the " +
           "public product probe identify the selected commit and uploaded artifact. Non-production " +
           "routine publication uses one versions upload followed by one explicit 100 percent deployment " +
-          "with a topology-neutral config, so routes, domains and triggers are never mutated.",
+          "with a topology-neutral config, so routes, domains and triggers are never mutated. The exact " +
+          "pinned predecessor closure is re-read immediately after upload and before traffic deployment.",
         reversal:
           "The immediately previous Cloudflare Worker version is printed as the provider-history rollback target.",
         "failure-handling":
           `${routineFailure} The surface refuses pending migrations and any configuration, secret, ` +
           "signing or Hosted topology drift before upload. A diff that changes authentication, " +
           "authorization or the deploy mechanism is refused and routed to the authority cutover surface. " +
-          "Wrangler JSON framing, upload/deployment identities and final public smoke are strict; any " +
-          "drift or readback mismatch fails closed." +
+          "Wrangler JSON framing, the upload-to-deploy predecessor re-fence, publication identities and " +
+          "final public smoke are strict; any drift or readback mismatch fails closed. A post-upload " +
+          "re-fence failure leaves only the acknowledged inactive Version and does not change traffic. " +
           routineWorkerAuthInput,
       },
     },

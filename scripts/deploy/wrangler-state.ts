@@ -16,26 +16,26 @@ export type WranglerProcess = (
 export interface WranglerWorkerStateOptions {
   readonly configPath: string;
   readonly workerName: string;
-  /** Used to prove that this OAuth reader never needs custom-domain topology. */
+  /** Validated target declaration; deliberately never treated as live topology proof. */
   readonly publicOrigin?: string;
   readonly environment?: Readonly<Record<string, string>>;
   readonly run?: WranglerProcess;
 }
 
 /**
- * Read-only Worker state through Wrangler's own authenticated commands.
+ * Partial read-only Worker state through Wrangler's own authenticated commands.
  *
  * Wrangler resolves its stored OAuth profile inside each child process. The
  * adapter deliberately has no token resolver and never invokes a credential
- * extraction command. A workers.dev target has no route/domain inventory to
- * inspect; custom-domain topology remains a direct-REST obligation.
+ * extraction command. Wrangler exposes no supported exhaustive topology
+ * reader, so `workerDomains` always fails closed and this adapter is not wired
+ * into publication authority.
  */
 export class WranglerWorkerState implements WorkerState {
   readonly #configPath: string;
   readonly #workerName: string;
   readonly #environment: Readonly<Record<string, string>>;
   readonly #run: WranglerProcess;
-  readonly #workersDev: boolean;
 
   constructor(input: WranglerWorkerStateOptions) {
     if (!isAbsolute(input.configPath) || input.configPath.length === 0) {
@@ -49,9 +49,7 @@ export class WranglerWorkerState implements WorkerState {
         "Wrangler OAuth state must not receive CLOUDFLARE_API_TOKEN; use direct REST state",
       );
     }
-    let workersDev = true;
     if (input.publicOrigin !== undefined) {
-      let hostname: string;
       try {
         const origin = new URL(input.publicOrigin);
         if (
@@ -65,17 +63,14 @@ export class WranglerWorkerState implements WorkerState {
         ) {
           throw new Error("origin");
         }
-        hostname = origin.hostname;
       } catch {
         throw preflightError("Wrangler Worker state requires one exact HTTPS public origin");
       }
-      workersDev = hostname.endsWith(".workers.dev");
     }
     this.#configPath = input.configPath;
     this.#workerName = input.workerName;
     this.#environment = Object.freeze({ ...(input.environment ?? {}) });
     this.#run = input.run ?? runCommand;
-    this.#workersDev = workersDev;
   }
 
   async workerDeployments(workerName: string): Promise<readonly unknown[]> {
@@ -111,12 +106,10 @@ export class WranglerWorkerState implements WorkerState {
   async workerDomains(): Promise<
     readonly { readonly hostname: string; readonly service: string }[]
   > {
-    if (!this.#workersDev) {
-      throw preflightError(
-        "Wrangler OAuth state cannot inspect custom-domain topology; use CLOUDFLARE_API_TOKEN",
-      );
-    }
-    return [];
+    throw preflightError(
+      "Wrangler OAuth cannot prove workers.dev enabled state or exhaustive custom-domain inventory; " +
+        "use CLOUDFLARE_API_TOKEN and direct REST state",
+    );
   }
 
   async #json(command: readonly string[], label: string): Promise<unknown> {
@@ -217,7 +210,9 @@ export interface WranglerVersionPublication {
 /**
  * Uploads a version and then explicitly deploys exactly that version to 100%
  * traffic. The config is expected to be topology-neutral; neither command
- * invokes trigger/domain mutation.
+ * invokes trigger/domain mutation. The caller must authoritatively re-fence
+ * the active predecessor after upload; traffic deployment never follows a
+ * stale predecessor observation.
  */
 export async function publishWranglerVersion(input: {
   readonly root: string;
@@ -225,6 +220,8 @@ export async function publishWranglerVersion(input: {
   readonly configPath: string;
   readonly workerName: string;
   readonly message: string;
+  /** Re-read and compare the pinned active deployment after upload, immediately before traffic. */
+  readonly assertPredecessorStillCurrent: () => Promise<void>;
   readonly environment?: Readonly<Record<string, string>>;
   readonly run?: WranglerProcess;
 }): Promise<WranglerVersionPublication> {
@@ -275,6 +272,15 @@ export async function publishWranglerVersion(input: {
   } catch (error) {
     throw mutationError(
       "Worker Version upload returned no exact publication identity; do not retry before --status",
+      safeErrorDetail(error),
+    );
+  }
+
+  try {
+    await input.assertPredecessorStillCurrent();
+  } catch (error) {
+    throw mutationError(
+      "Worker predecessor re-fence failed after Version upload; the uploaded Version is inactive and traffic was not changed",
       safeErrorDetail(error),
     );
   }

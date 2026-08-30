@@ -84,16 +84,15 @@ describe("Takoserver split deploy entrypoint", () => {
       ({ surface }) => surface === "takoserver-hosted-token-cutover",
     );
     const routineWorker = contract.surfaces.find(({ surface }) => surface === "takoserver-worker");
-    expect(routineWorker?.obligations.provenance).toContain("stored OAuth profile");
-    expect(routineWorker?.obligations.provenance).toContain(
-      "production remains explicit-token direct REST",
-    );
+    expect(routineWorker?.obligations.provenance).toContain("explicit `CLOUDFLARE_API_TOKEN`");
+    expect(routineWorker?.obligations.provenance).not.toContain("stored OAuth profile");
     expect(routineWorker?.obligations["post-conditions"]).toContain(
       "one versions upload followed by one explicit 100 percent deployment",
     );
-    expect(routineWorker?.obligations["failure-handling"]).toContain(
-      "OAuth credential is never exported or printed",
+    expect(routineWorker?.obligations["post-conditions"]).toContain(
+      "re-read immediately after upload and before traffic deployment",
     );
+    expect(routineWorker?.obligations["failure-handling"]).toContain("Wrangler OAuth is refused");
     expect(integrationAuthority?.obligations["post-conditions"]).toContain(
       "exact operator tenant and Space plain-text bindings",
     );

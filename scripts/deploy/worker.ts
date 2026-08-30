@@ -32,7 +32,7 @@ import type { DeployTarget } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import { authoritySensitiveWorkerPaths } from "./worker-authority-paths.ts";
 import { parseWorkerDeploymentHistory, type WorkerDeploymentHistory } from "./worker-state.ts";
-import { publishWranglerVersion, WranglerWorkerState } from "./wrangler-state.ts";
+import { publishWranglerVersion } from "./wrangler-state.ts";
 
 export type WorkerProcess = (
   command: readonly string[],
@@ -119,24 +119,16 @@ export async function runWorker(
     options.cloudflareEnvironment === undefined
       ? process.env.CLOUDFLARE_API_TOKEN
       : options.cloudflareEnvironment.CLOUDFLARE_API_TOKEN;
-  const storedOAuthEligible =
-    invocation.surface === "takoserver-worker" && invocation.environment !== "production";
-  const useStoredWranglerOAuth = storedOAuthEligible && suppliedToken === undefined;
-  const environment =
-    options.cloudflareEnvironment ??
-    (useStoredWranglerOAuth || (options.state !== undefined && invocation.action === "status")
-      ? {}
-      : cloudflareChildEnvironment());
-  if (
-    useStoredWranglerOAuth &&
-    options.state === undefined &&
-    !isWranglerOAuthTopologySafe(target)
-  ) {
+  if (options.state === undefined && suppliedToken === undefined) {
     throw preflightError(
-      "stored Wrangler OAuth routine publication requires an existing workers.dev public origin; " +
-        "custom-domain topology requires CLOUDFLARE_API_TOKEN",
+      "CLOUDFLARE_API_TOKEN is required because Wrangler OAuth cannot prove authoritative live topology",
     );
   }
+  const environment =
+    options.cloudflareEnvironment ??
+    (options.state !== undefined && invocation.action === "status"
+      ? {}
+      : cloudflareChildEnvironment());
   if (invocation.legacyHostRuntimePredecessorVersionId !== undefined) {
     if (invocation.surface !== "takoserver-worker-authority-cutover") {
       throw preflightError(
@@ -167,22 +159,13 @@ export async function runWorker(
       path: join(root, "inspect-wrangler.jsonc"),
       main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
       commit: invocation.commit,
-      ...(useStoredWranglerOAuth ? { topology: "version-only" as const } : {}),
       ...(target.integrationE2eCredentialAuthority === undefined
         ? {}
         : { authorityProfile: { kind: "historical-pre-jit" as const } }),
     });
     const state =
       options.state ??
-      (useStoredWranglerOAuth
-        ? new WranglerWorkerState({
-            configPath: inspectionConfig,
-            workerName: target.workerName,
-            publicOrigin: target.publicOrigin,
-            environment,
-            run,
-          })
-        : new CloudflareState({ accountId: target.accountId, token: exactToken(environment) }));
+      new CloudflareState({ accountId: target.accountId, token: exactToken(environment) });
     const migrations =
       options.migrations ?? remoteMigrationReader(inspectionConfig, environment, run);
     const signingDatabase =
@@ -341,21 +324,11 @@ export async function runWorker(
           ? {}
           : { authorityProfile: beforeAuthorityProfile }),
       });
-      if (
-        last.history.deploymentId !== before.history.deploymentId ||
-        last.history.versionId !== before.history.versionId ||
-        last.history.previousVersionId !== before.history.previousVersionId ||
-        last.commit !== before.commit ||
-        last.bundleDigestHex !== before.bundleDigestHex ||
-        last.integrationE2eCredentialAuthorityConfigured !==
-          before.integrationE2eCredentialAuthorityConfigured ||
-        JSON.stringify(last.migrations) !== JSON.stringify(before.migrations) ||
-        JSON.stringify(last.pending) !== JSON.stringify(before.pending)
-      ) {
-        throw preflightError(
-          "Worker state or integration E2E credential authority changed before upload",
-        );
-      }
+      assertWorkerInspectionUnchanged(
+        before,
+        last,
+        "Worker state or integration E2E credential authority changed before upload",
+      );
     }
     if (signingDatabase !== undefined && signingIdentity !== undefined) {
       const lastSigningIdentity = await requireDistinctIntegrationE2eSigningIdentity(
@@ -400,6 +373,18 @@ export async function runWorker(
           message,
           environment,
           run,
+          assertPredecessorStillCurrent: async () => {
+            const current = await inspectWorker("preflight", target, state, migrations, {
+              ...(beforeAuthorityProfile === undefined
+                ? {}
+                : { authorityProfile: beforeAuthorityProfile }),
+            });
+            assertWorkerInspectionUnchanged(
+              before,
+              current,
+              "Worker state changed after Version upload and before traffic deployment",
+            );
+          },
         })
       : await (async () => {
           const upload = await run(
@@ -507,6 +492,26 @@ export async function runWorker(
     };
   } finally {
     if (temporary) rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function assertWorkerInspectionUnchanged(
+  expected: WorkerInspection,
+  actual: WorkerInspection,
+  message: string,
+): void {
+  if (
+    actual.history.deploymentId !== expected.history.deploymentId ||
+    actual.history.versionId !== expected.history.versionId ||
+    actual.history.previousVersionId !== expected.history.previousVersionId ||
+    actual.commit !== expected.commit ||
+    actual.bundleDigestHex !== expected.bundleDigestHex ||
+    actual.integrationE2eCredentialAuthorityConfigured !==
+      expected.integrationE2eCredentialAuthorityConfigured ||
+    JSON.stringify(actual.migrations) !== JSON.stringify(expected.migrations) ||
+    JSON.stringify(actual.pending) !== JSON.stringify(expected.pending)
+  ) {
+    throw preflightError(message);
   }
 }
 
@@ -761,28 +766,6 @@ function exactToken(environment: Readonly<Record<string, string>>): string {
   const token = environment.CLOUDFLARE_API_TOKEN;
   if (!token) throw preflightError("CLOUDFLARE_API_TOKEN is required");
   return token;
-}
-
-function isWorkersDevOrigin(origin: string): boolean {
-  try {
-    const url = new URL(origin);
-    return (
-      url.protocol === "https:" &&
-      !url.username &&
-      !url.password &&
-      !url.port &&
-      url.pathname === "/" &&
-      !url.search &&
-      !url.hash &&
-      url.hostname.endsWith(".workers.dev")
-    );
-  } catch {
-    return false;
-  }
-}
-
-function isWranglerOAuthTopologySafe(target: DeployTarget): boolean {
-  return isWorkersDevOrigin(target.publicOrigin) && (target.aliases?.length ?? 0) === 0;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
