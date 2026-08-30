@@ -32,6 +32,7 @@ const PUBLIC_BUNDLE = "export default { async fetch() { return new Response('pub
 const BUNDLE_DIGEST = `sha256:${createHash("sha256").update(BUNDLE).digest("hex")}` as const;
 const PREVIOUS_DIGEST = `sha256:${"c".repeat(64)}` as const;
 const PREVIOUS_PUBLIC_WORKER_DIGEST = `sha256:${"d".repeat(64)}` as const;
+const HISTORICAL_SIGNING_KEY_ID = "key-historical";
 const PUBLIC_WORKER_DIGEST = `sha256:${createHash("sha256")
   .update(PUBLIC_BUNDLE)
   .digest("hex")}` as const;
@@ -454,6 +455,231 @@ function publicVersion(message: string, inspectedTarget: DeployTarget = target) 
         requirement === null ? [] : [{ name, type: requirement.type, ...requirement.fields }],
       ),
     },
+  };
+}
+
+function evolvedIntegrationTarget(): DeployTarget {
+  return {
+    ...target,
+    zones: [{ zoneId: "zone-integration", suffix: "apps.integration.example.test" }],
+    aiModels: [{ id: "model-integration", provider: "openai" }],
+    standardServiceSupplies: {
+      kind: "takoserver.standard-service-supplies@v1",
+      supplies: [],
+    } as unknown as NonNullable<DeployTarget["standardServiceSupplies"]>,
+    sponsorship: true,
+    operatorIdentity: { publicJwk: OPERATOR_PUBLIC_JWK },
+    integrationE2eCredentialAuthority: {
+      organizationId: "org_takosumi_hosted_staging",
+      publicJwk: { kty: "OKP", crv: "Ed25519", x: "E".repeat(43) },
+    },
+    signing: { currentKeyId: "key-current" },
+  };
+}
+
+interface HistoricalPublicVersion {
+  readonly annotations: Record<string, string>;
+  readonly resources: { bindings: Record<string, unknown>[] };
+}
+
+function historicalPinnedPublicState(
+  currentTarget: DeployTarget,
+  options: {
+    readonly authorityCommit?: string;
+    readonly boundArtifactDigest?: `sha256:${string}`;
+    readonly isUploaded?: () => boolean;
+    readonly mutateHistoricalVersion?: (version: HistoricalPublicVersion) => void;
+  } = {},
+): FormAuthorityDeployState {
+  const current = stateSequence({ isUploaded: options.isUploaded ?? (() => false) }, currentTarget);
+  const {
+    sponsorship: _currentSponsorship,
+    integrationE2eCredentialAuthority: _currentCredentialAuthority,
+    ...historicalBase
+  } = currentTarget;
+  const historicalTarget = {
+    ...historicalBase,
+    signing: { currentKeyId: HISTORICAL_SIGNING_KEY_ID },
+  } satisfies DeployTarget;
+  return {
+    ...current,
+    async workerVersion(workerName, versionId) {
+      if (workerName === currentTarget.workerName) {
+        if (versionId === ARBITRARY_PUBLIC_WORKER_VERSION_ID) {
+          const historical = historicalPublicVersion(
+            `takoserver-worker:${PREVIOUS_COMMIT}:${PREVIOUS_PUBLIC_WORKER_DIGEST.slice("sha256:".length)}`,
+            historicalTarget,
+          );
+          options.mutateHistoricalVersion?.(historical);
+          return historical;
+        }
+        return publicVersion(
+          `takoserver-worker:${PUBLIC_WORKER_COMMIT}:${PUBLIC_WORKER_DIGEST.slice("sha256:".length)}`,
+          currentTarget,
+        );
+      }
+      if (versionId === CURRENT_AUTHORITY_VERSION_ID) {
+        return await current.workerVersion(workerName, versionId);
+      }
+      return version(
+        options.authorityCommit ?? PREVIOUS_COMMIT,
+        PREVIOUS_DIGEST,
+        ARBITRARY_PUBLIC_WORKER_VERSION_ID,
+        options.boundArtifactDigest ?? PREVIOUS_PUBLIC_WORKER_DIGEST,
+      );
+    },
+    async workerSecrets(workerName) {
+      return workerName === currentTarget.workerName
+        ? expectedWorkerSecrets(currentTarget).map((name) => ({ name, type: "secret_text" }))
+        : [];
+    },
+  };
+}
+
+function historicalPublicVersion(
+  message: string,
+  historicalTarget: DeployTarget,
+): HistoricalPublicVersion {
+  const expected = expectedExactBindingClosure(historicalTarget);
+  return {
+    annotations: { "workers/message": message, "workers/triggered_by": "version_upload" },
+    resources: {
+      bindings: Object.entries(expected).flatMap(([name, requirement]) =>
+        requirement === null ? [] : [{ name, type: requirement.type, ...requirement.fields }],
+      ),
+    },
+  };
+}
+
+function historicalAuthorityMigrationState(
+  currentTarget: DeployTarget,
+  state: { readonly routeLessUploaded: () => boolean; readonly gatewayUploaded: () => boolean },
+): FormAuthorityDeployState {
+  const formAuthority = currentTarget.formAuthority;
+  if (!formAuthority?.integrationWorkerName || !formAuthority.integrationOperatorWorkerName) {
+    throw new Error("historical authority migration fixture requires both integration Workers");
+  }
+  const authorityWorkerName = formAuthority.integrationWorkerName;
+  const gatewayWorkerName = formAuthority.integrationOperatorWorkerName;
+  const {
+    sponsorship: _currentSponsorship,
+    integrationE2eCredentialAuthority: _currentCredentialAuthority,
+    ...historicalBase
+  } = currentTarget;
+  const historicalTarget = {
+    ...historicalBase,
+    signing: { currentKeyId: HISTORICAL_SIGNING_KEY_ID },
+  } satisfies DeployTarget;
+  const historicalGatewayVersion = gatewayVersion(undefined, true);
+  historicalGatewayVersion.annotations["workers/message"] =
+    `form-authority:takoserver-integration-form-authority-operator-worker:${PREVIOUS_COMMIT}:${PREVIOUS_DIGEST}`;
+  for (const binding of historicalGatewayVersion.resources.bindings) {
+    if (binding.name === "TAKOSERVER_PUBLIC_WORKER_VERSION_ID") {
+      binding.text = ARBITRARY_PUBLIC_WORKER_VERSION_ID;
+    }
+    if (binding.name === "TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST") {
+      binding.text = PREVIOUS_PUBLIC_WORKER_DIGEST;
+    }
+  }
+  const historicalGatewayVersionId = "88888888-8888-4888-8888-888888888888";
+  const dynamicGatewayVersionId = "99999999-9999-4999-8999-999999999999";
+  return {
+    async workerScripts() {
+      return [authorityWorkerName, gatewayWorkerName];
+    },
+    async workerDeployments(workerName) {
+      if (workerName === currentTarget.workerName) {
+        return [deployment("public-current", PUBLIC_WORKER_VERSION_ID, "2026-08-28T00:00:00Z")];
+      }
+      if (workerName === authorityWorkerName) {
+        return state.routeLessUploaded()
+          ? [
+              deployment("authority-current", CURRENT_AUTHORITY_VERSION_ID, "2026-08-28T02:00:00Z"),
+              deployment(
+                "authority-historical",
+                PREVIOUS_AUTHORITY_VERSION_ID,
+                "2026-08-28T01:00:00Z",
+              ),
+            ]
+          : [
+              deployment(
+                "authority-historical",
+                PREVIOUS_AUTHORITY_VERSION_ID,
+                "2026-08-28T01:00:00Z",
+              ),
+            ];
+      }
+      return state.gatewayUploaded()
+        ? [
+            deployment("gateway-current", dynamicGatewayVersionId, "2026-08-28T04:00:00Z"),
+            deployment("gateway-historical", historicalGatewayVersionId, "2026-08-28T03:00:00Z"),
+          ]
+        : [deployment("gateway-historical", historicalGatewayVersionId, "2026-08-28T03:00:00Z")];
+    },
+    async workerVersion(workerName, versionId) {
+      if (workerName === currentTarget.workerName) {
+        return versionId === ARBITRARY_PUBLIC_WORKER_VERSION_ID
+          ? historicalPublicVersion(
+              `takoserver-worker:${PREVIOUS_COMMIT}:${PREVIOUS_PUBLIC_WORKER_DIGEST.slice("sha256:".length)}`,
+              historicalTarget,
+            )
+          : publicVersion(
+              `takoserver-worker:${PUBLIC_WORKER_COMMIT}:${PUBLIC_WORKER_DIGEST.slice("sha256:".length)}`,
+              currentTarget,
+            );
+      }
+      if (workerName === authorityWorkerName) {
+        return versionId === CURRENT_AUTHORITY_VERSION_ID
+          ? dynamicVersion(COMMIT, BUNDLE_DIGEST)
+          : version(
+              PREVIOUS_COMMIT,
+              PREVIOUS_DIGEST,
+              ARBITRARY_PUBLIC_WORKER_VERSION_ID,
+              PREVIOUS_PUBLIC_WORKER_DIGEST,
+            );
+      }
+      return versionId === dynamicGatewayVersionId ? gatewayVersion() : historicalGatewayVersion;
+    },
+    async workerSecrets(workerName) {
+      return workerName === currentTarget.workerName
+        ? expectedWorkerSecrets(currentTarget).map((name) => ({ name, type: "secret_text" }))
+        : [];
+    },
+    async workerDomains() {
+      return [
+        { hostname: "api.integration.example.test", service: currentTarget.workerName },
+        {
+          hostname: "form-authority.integration.takoserver.com",
+          service: gatewayWorkerName,
+        },
+      ];
+    },
+    async workerSubdomain() {
+      return { enabled: false, previewsEnabled: false };
+    },
+    async workerRoutes() {
+      return [];
+    },
+  };
+}
+
+function mutateHistoricalBinding(
+  bindingName: string,
+  field: string,
+  value: unknown,
+): (version: HistoricalPublicVersion) => void {
+  return (version) => {
+    const binding = version.resources.bindings.find((entry) => entry.name === bindingName);
+    if (!binding) throw new Error(`missing historical fixture binding: ${bindingName}`);
+    (binding as Record<string, unknown>)[field] = value;
+  };
+}
+
+function removeHistoricalBinding(bindingName: string): (version: HistoricalPublicVersion) => void {
+  return (version) => {
+    version.resources.bindings = version.resources.bindings.filter(
+      ({ name }) => name !== bindingName,
+    );
   };
 }
 
@@ -940,6 +1166,333 @@ describe("route-less Form authority deploy surfaces", () => {
       ready: false,
     });
   });
+
+  test("accepts the pinned pre-JIT and pre-sponsorship public closure after target evolution", async () => {
+    const currentTarget = evolvedIntegrationTarget();
+    const status = await runFormAuthority(
+      {
+        surface: "takoserver-integration-form-authority-worker",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      currentTarget,
+      { state: historicalPinnedPublicState(currentTarget) },
+    );
+
+    expect(status).toMatchObject({
+      deployedCommit: PREVIOUS_COMMIT,
+      publicWorkerCommitMatches: true,
+      publicWorkerBindingProfile: "legacy-exact-pinned",
+      boundPublicWorkerVersionId: ARBITRARY_PUBLIC_WORKER_VERSION_ID,
+      boundPublicWorkerArtifactDigest: PREVIOUS_PUBLIC_WORKER_DIGEST,
+      ready: false,
+    });
+  });
+
+  test("migrates the exact historical public pin to one dynamic successor", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-historical-"));
+    const currentTarget = evolvedIntegrationTarget();
+    let uploaded = false;
+    try {
+      const process = fakeProcess({
+        onUpload() {
+          uploaded = true;
+        },
+      });
+      const result = await runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        currentTarget,
+        {
+          run: process.run,
+          state: historicalPinnedPublicState(currentTarget, { isUploaded: () => uploaded }),
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          review: "independent-reviewer",
+        },
+      );
+
+      expect(result).toMatchObject({
+        previousVersionId: PREVIOUS_AUTHORITY_VERSION_ID,
+        versionId: CURRENT_AUTHORITY_VERSION_ID,
+        publicWorkerVersionId: PUBLIC_WORKER_VERSION_ID,
+      });
+      expect(process.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  for (const [label, binding, field, value] of [
+    ["D1 id", "STATE_DB", "id", "99999999-9999-4999-8999-999999999999"],
+    ["R2 bucket", "OBJECTS", "bucket_name", "foreign-bucket"],
+    ["public origin", "PUBLIC_ORIGIN", "text", "https://foreign.example.test"],
+    ["account id", "CLOUDFLARE_ACCOUNT_ID", "text", "f".repeat(32)],
+    ["zones", "TAKOSERVER_ZONES", "text", "[]"],
+    ["AI models", "TAKOSERVER_AI_MODELS", "text", "[]"],
+    ["standard supplies", "TAKOSERVER_STANDARD_SERVICE_SUPPLIES", "text", "{}"],
+    ["edge supplies", "TAKOSERVER_EDGE_SUPPLIES", "text", "{}"],
+    ["Worker endpoint suffix", "TAKOSERVER_WORKER_ENDPOINT_SUFFIX", "text", "foreign.test"],
+    ["operator public key", "OPERATOR_IDENTITY_PUBLIC_JWK", "text", "{}"],
+  ] as const) {
+    test(`rejects a historical public closure with mutated ${label}`, async () => {
+      const currentTarget = evolvedIntegrationTarget();
+      await expect(
+        runFormAuthority(
+          {
+            surface: "takoserver-integration-form-authority-worker",
+            action: "status",
+            environment: "integration",
+            commit: COMMIT,
+          },
+          currentTarget,
+          {
+            state: historicalPinnedPublicState(currentTarget, {
+              mutateHistoricalVersion: mutateHistoricalBinding(binding, field, value),
+            }),
+          },
+        ),
+      ).rejects.toThrow(/legacy Form authority pin does not name an exact public Worker closure/u);
+    });
+  }
+
+  for (const [label, mutateHistoricalVersion] of [
+    [
+      "unexpected JIT binding",
+      (version: HistoricalPublicVersion) =>
+        version.resources.bindings.push({
+          name: "TAKOSERVER_SOURCE_COMMIT",
+          type: "plain_text",
+          text: PREVIOUS_COMMIT,
+        }),
+    ],
+    [
+      "unexpected outer artifact binding",
+      (version: HistoricalPublicVersion) =>
+        version.resources.bindings.push({
+          name: "TAKOSERVER_WORKER_ARTIFACT_DIGEST",
+          type: "plain_text",
+          text: PREVIOUS_PUBLIC_WORKER_DIGEST,
+        }),
+    ],
+    [
+      "unexpected sponsorship secret",
+      (version: HistoricalPublicVersion) =>
+        version.resources.bindings.push({
+          name: "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN",
+          type: "secret_text",
+        }),
+    ],
+    ["missing provider secret", removeHistoricalBinding("CLOUDFLARE_API_TOKEN")],
+    ["missing signing secret", removeHistoricalBinding("TAKOSERVER_SIGNING_KEY")],
+    ["missing Worker Version metadata", removeHistoricalBinding("WORKER_VERSION")],
+    ["missing historical signing key id", removeHistoricalBinding("TAKOSERVER_SIGNING_KEY_ID")],
+    [
+      "malformed historical signing key id",
+      mutateHistoricalBinding("TAKOSERVER_SIGNING_KEY_ID", "text", "bad key id"),
+    ],
+    [
+      "non-canonical annotation",
+      (version: HistoricalPublicVersion) => {
+        version.annotations["workers/message"] = "foreign";
+      },
+    ],
+    [
+      "wrong triggered-by annotation",
+      (version: HistoricalPublicVersion) => {
+        version.annotations["workers/triggered_by"] = "secret";
+      },
+    ],
+    [
+      "extra annotation",
+      (version: HistoricalPublicVersion) => {
+        version.annotations["workers/extra"] = "foreign";
+      },
+    ],
+  ] as const) {
+    test(`rejects a historical public closure with ${label}`, async () => {
+      const currentTarget = evolvedIntegrationTarget();
+      await expect(
+        runFormAuthority(
+          {
+            surface: "takoserver-integration-form-authority-worker",
+            action: "status",
+            environment: "integration",
+            commit: COMMIT,
+          },
+          currentTarget,
+          {
+            state: historicalPinnedPublicState(currentTarget, { mutateHistoricalVersion }),
+          },
+        ),
+      ).rejects.toBeInstanceOf(Error);
+    });
+  }
+
+  test("rejects the historical pre-JIT profile combined with a scope transition for status and apply", async () => {
+    const currentTarget = evolvedIntegrationTarget();
+    for (const action of ["status", "apply"] as const) {
+      const process = fakeProcess();
+      await expect(
+        runFormAuthority(
+          {
+            surface: "takoserver-integration-form-authority-worker",
+            action,
+            environment: "integration",
+            commit: COMMIT,
+            scopeTransition: SCOPE_TRANSITION,
+          },
+          currentTarget,
+          {
+            run: process.run,
+            state: historicalPinnedPublicState(currentTarget),
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+            review: "independent-reviewer",
+          },
+        ),
+      ).rejects.toThrow(/does not name an exact public Worker closure/u);
+      expect(process.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
+    }
+  });
+
+  test("completes historical migration only after route-less authority then gateway are both dynamic", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-historical-sequence-"));
+    const currentTarget = evolvedIntegrationTarget();
+    let routeLessUploaded = false;
+    let gatewayUploaded = false;
+    const state = historicalAuthorityMigrationState(currentTarget, {
+      routeLessUploaded: () => routeLessUploaded,
+      gatewayUploaded: () => gatewayUploaded,
+    });
+    try {
+      const blockedGatewayProcess = fakeProcess();
+      await expect(
+        runFormAuthority(
+          {
+            surface: "takoserver-integration-form-authority-operator-worker",
+            action: "apply",
+            environment: "integration",
+            commit: COMMIT,
+          },
+          currentTarget,
+          {
+            run: blockedGatewayProcess.run,
+            state,
+            outputDirectory: join(root, "blocked-gateway"),
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+            review: "independent-reviewer",
+          },
+        ),
+      ).rejects.toThrow(/integration Form authority Worker/u);
+      expect(
+        blockedGatewayProcess.calls.filter((call) => call.includes("--no-bundle")),
+      ).toHaveLength(0);
+
+      const routeLessProcess = fakeProcess({
+        onUpload() {
+          routeLessUploaded = true;
+        },
+      });
+      await runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        currentTarget,
+        {
+          run: routeLessProcess.run,
+          state,
+          outputDirectory: join(root, "route-less"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          review: "independent-reviewer",
+        },
+      );
+      expect(routeLessProcess.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+
+      const gatewayProcess = fakeProcess({
+        onUpload() {
+          gatewayUploaded = true;
+        },
+      });
+      await runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-operator-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        currentTarget,
+        {
+          run: gatewayProcess.run,
+          state,
+          outputDirectory: join(root, "gateway"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          review: "independent-reviewer",
+        },
+      );
+      expect(gatewayProcess.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+
+      const routeLessStatus = await runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-worker",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        currentTarget,
+        { state },
+      );
+      const gatewayStatus = await runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-operator-worker",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        currentTarget,
+        { state },
+      );
+      expect(routeLessStatus).toMatchObject({
+        publicWorkerBindingProfile: "dynamic-public-rpc",
+        ready: true,
+      });
+      expect(gatewayStatus).toMatchObject({
+        publicWorkerBindingProfile: "dynamic-public-rpc",
+        authorityPublicWorkerBindingProfile: "dynamic-public-rpc",
+        ready: true,
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  for (const [label, options] of [
+    ["artifact pin mismatch", { boundArtifactDigest: `sha256:${"e".repeat(64)}` as const }],
+    ["authority commit mismatch", { authorityCommit: COMMIT }],
+  ] as const) {
+    test(`rejects a historical public closure with ${label}`, async () => {
+      const currentTarget = evolvedIntegrationTarget();
+      await expect(
+        runFormAuthority(
+          {
+            surface: "takoserver-integration-form-authority-worker",
+            action: "status",
+            environment: "integration",
+            commit: COMMIT,
+          },
+          currentTarget,
+          { state: historicalPinnedPublicState(currentTarget, options) },
+        ),
+      ).rejects.toBeInstanceOf(Error);
+    });
+  }
 
   test("passes an explicit provenance-bound JIT profile for current public Worker inspection", async () => {
     const jitTarget = {

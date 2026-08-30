@@ -176,14 +176,37 @@ annotation, exact target closure, exact bundle digest, and same source commit
 as the authority Worker. The pinned Version may be outside current deployment
 history; it is neither required nor assumed to be a direct predecessor. The
 legacy pre-capability-manifest public closure and the exact current closure are
-the only accepted source shapes. Partial pins, malformed ids/digests, foreign
-closures, digest mismatch, or commit mismatch are refused.
+the normal accepted source shapes. One integration-only migration profile also
+recognizes the exact historical generation before JIT provenance and hosted
+sponsorship were configured. It is available only when the current target has
+both features, requires every unchanged account, origin, D1, R2, supply,
+operator-identity, and secret binding to remain exact, and takes only the
+historical signing-key id from the already pinned immutable Version. The
+historical Version must omit the later provenance, artifact-variable, and
+sponsorship bindings; a mixed generation is refused. Its canonical annotation,
+authority-held Version and artifact pins, bundle digest, and source commit must
+still agree exactly. Canonical means the annotation inventory contains exactly
+`workers/message` with the expected public Worker commit/digest identity and
+`workers/triggered_by: version_upload`; a wrong trigger or any extra annotation
+is refused. This profile is evaluated only when no scope-transition selector is
+present. Combining the historical profile with that selector is refused by both
+status and apply rather than being classified as either transition scope.
+Partial pins, malformed ids/digests, foreign closures, digest mismatch, or
+commit mismatch are refused.
 
 Normal apply migrates a verified legacy closure by uploading one exact dynamic
 direct successor: route-less authority first, then gateway after its dependency
 is dynamic. It removes both legacy identity variables and verifies the exact
 pin-free closure after upload. A lost acknowledgement is resolved with status;
-the upload is never retried automatically.
+the upload is never retried automatically. Completion requires this exact
+order: route-less authority apply and status first, then operator gateway apply
+and status. Delete the historical pre-JIT and pre-sponsorship migration profile
+only after route-less status reports `publicWorkerBindingProfile:
+dynamic-public-rpc` and `ready: true`, and gateway status reports both
+`publicWorkerBindingProfile: dynamic-public-rpc`,
+`authorityPublicWorkerBindingProfile: dynamic-public-rpc`, and `ready: true` at
+the same selected commit. Until that joint readback, the bridge remains needed;
+after it, the bridge is deleted rather than retained as compatibility.
 
 The operator-private scope-transition selector uses a separate stricter state
 machine. Its status accepts either the dynamic profile or one fully verified
