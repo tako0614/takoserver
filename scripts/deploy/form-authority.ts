@@ -743,20 +743,21 @@ async function classifyPublicWorkerBinding(
   }
 
   if (transition) {
-    assertExactVersionBindingClosure(
-      phase,
-      authorityVersionId,
-      authorityVersion,
-      expectedBindings(
-        invocation.environment,
-        target,
-        selected,
-        publicWorker.workerArtifactDigest,
-        publicWorker.history.versionId,
-        capabilityManifestJson,
-        transition.value.predecessorScope,
-      ),
+    const predecessorExpected = expectedBindings(
+      invocation.environment,
+      target,
+      selected,
+      publicWorker.workerArtifactDigest,
+      publicWorker.history.versionId,
+      capabilityManifestJson,
+      transition.value.predecessorScope,
     );
+    if (!hasExactBindingClosure(phase, authorityVersionId, authorityVersion, predecessorExpected)) {
+      throw phaseError(
+        phase,
+        "Form authority scope transition binding is neither exact-target nor exact-transition-predecessor",
+      );
+    }
     if (authorityCommit !== publicWorker.commit) {
       throw phaseError(
         phase,

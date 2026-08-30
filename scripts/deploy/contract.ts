@@ -268,14 +268,16 @@ export const DEPLOY_CONTRACT = {
         provenance:
           `${exactSource} Integration only. Exhaustive gateway/authority/public-Worker readback ` +
           "must identify that commit before the owned 0600 Ed25519 key signs a deactivation request. " +
-          "A named scope transition additionally requires an owned 0600 link-free bounded descriptor " +
-          "whose digest, Host, predecessor and exact target scope are verified without emitting its path.",
+          "A named scope transition additionally requires an owned exact-0600 link-free bounded descriptor " +
+          "under an owned exact-0700 symlink-free parent outside every Git worktree; its digest, Host, " +
+          "predecessor and exact target scope are verified without emitting its path.",
         "post-conditions":
           "Status performs one signed authoritative readback. Apply obtains one signed canonical " +
           "deactivation plan, passes that exact plan digest once to apply, and finishes with a " +
           "separately signed readback proving every exact 12 Space-scoped fixture is absent or inactive. " +
           "With a transition descriptor, both gateway and route-less authority must be current-public " +
-          "exact-transition-predecessor and only predecessor desiredActive:false is signed.",
+          "exact-transition-predecessor and only predecessor desiredActive:false is signed. Success projects " +
+          "only the transition digest, binding profile, and scope-redacted boolean/digest readback summary.",
         reversal:
           "Deactivation is append-only; rollback is an explicit normal Form-authority reactivation, " +
           "not a Worker-version rollback.",
@@ -284,7 +286,8 @@ export const DEPLOY_CONTRACT = {
           "run status for authoritative readback before making an explicit fresh deactivation decision. " +
           "An acknowledged partial apply preserves only sanitized receipts and next-plan diagnostics. " +
           "Assertion and private-key bytes are always redacted. Mixed predecessor/target topology, stale " +
-          "public closure, reverse, activation, and any third scope are refused before signing.",
+          "public closure, reverse, activation, and any third scope are refused before signing; refusal " +
+          "output never includes raw binding JSON or an actual, predecessor, or foreign scope.",
         "independent-review": review,
       },
     },

@@ -313,10 +313,14 @@ the exact integration tenant/Space activation audience; neither an environment
 variable nor a request can widen that scope.
 
 The Form-authority scope-transition descriptor is not a steady target field.
-It is an owned, link-free `0600` strict JSON file no larger than 16 KiB, selected
-only by an absolute CLI path. Its exact v1 shape contains the integration Host,
-predecessor scope, and exact target scope, with no optional or secret fields.
-Success output contains only its canonical digest and binding profile; the path
+It is an owned, link-free exact-`0600` strict JSON file no larger than 16 KiB,
+selected only by an absolute CLI path whose every ancestor is symlink-free. Its
+immediate parent must be an owned exact-`0700` directory outside every Git
+worktree; special mode bits are refused. Its exact v1 shape contains the
+integration Host, predecessor scope, and exact target scope, with no optional
+or secret fields. Success output contains only its canonical digest, binding
+profile, and scope-redacted boolean/digest summaries; refusal details never
+echo the predecessor, a foreign observed scope, or raw binding JSON. The path
 is never emitted. The selector is accepted only by integration deactivation and
 the two integration Form-authority Worker surfaces.
 

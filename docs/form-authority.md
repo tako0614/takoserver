@@ -201,12 +201,15 @@ operator-private descriptor with exactly these members:
 }
 ```
 
-The file must be an owned, link-free `0600` regular file no larger than 16 KiB
-and must be selected by an absolute path. Strict JSON duplicate members and
-all extra fields, including secret-shaped fields, are refused. `hostId` and
-`targetScope` must exactly match the selected integration deploy target, while
-the two scopes must differ. The steady deploy target never stores the
-predecessor.
+The file must be an owned, link-free exact-`0600` regular file no larger than
+16 KiB and must be selected by an absolute path. The complete path is
+symlink-free, its immediate parent is an owned exact-`0700` directory, and that
+parent stays outside every Git worktree. Setuid, setgid, sticky, group, and
+other permission bits are refused rather than masked away. Strict JSON
+duplicate members and all extra fields, including secret-shaped fields, are
+refused. `hostId` and `targetScope` must exactly match the selected integration
+deploy target, while the two scopes must differ. The steady deploy target never
+stores the predecessor.
 
 After the target descriptor names `targetScope`, use the same transition file
 for the following order:
@@ -227,7 +230,10 @@ The selector is exactly
 and is accepted only by the deactivation, route-less integration authority,
 and integration operator gateway surfaces. Status and apply emit its canonical
 digest plus the scope binding profile, never the path or private-key material.
-Reverse mode and duplicate or relative selectors are refused.
+Transition deactivation projects activation/readback as a scope-redacted
+digest-and-boolean summary; neither success nor refusal output includes the
+predecessor or a foreign observed scope. Reverse mode and duplicate or relative
+selectors are refused.
 
 An inactive activation does not erase retention authority: existing retained
 delete and observe operations continue through the Host projection and require

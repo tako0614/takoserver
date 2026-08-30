@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, linkSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadFormAuthorityScopeTransition } from "../scripts/deploy/form-authority-scope-transition.ts";
@@ -115,6 +123,63 @@ describe("operator-private Form authority scope transition descriptor", () => {
       })();
       expect(failure).toBeInstanceOf(Error);
       expect(String(failure)).not.toContain(path);
+    }
+  });
+
+  test("rejects a descriptor reached through a symlinked ancestor", () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-scope-ancestor-"));
+    roots.push(root);
+    const actual = join(root, "actual-private");
+    mkdirSync(actual, { mode: 0o700 });
+    const path = join(actual, "transition.json");
+    writeFileSync(path, JSON.stringify(descriptor()), { mode: 0o600 });
+    const linked = join(root, "linked-private");
+    symlinkSync(actual, linked, "dir");
+
+    expect(() => loadFormAuthorityScopeTransition(join(linked, "transition.json"), target)).toThrow(
+      "symlink",
+    );
+  });
+
+  test("requires an owned exact-0700 parent outside every Git worktree", () => {
+    const unsafeRoot = mkdtempSync(join(tmpdir(), "takoserver-form-authority-scope-parent-"));
+    roots.push(unsafeRoot);
+    const unsafeParent = join(unsafeRoot, "operator-private");
+    mkdirSync(unsafeParent, { mode: 0o755 });
+    chmodSync(unsafeParent, 0o755);
+    const unsafePath = join(unsafeParent, "transition.json");
+    writeFileSync(unsafePath, JSON.stringify(descriptor()), { mode: 0o600 });
+
+    const worktreeRoot = mkdtempSync(join(tmpdir(), "takoserver-form-authority-scope-worktree-"));
+    roots.push(worktreeRoot);
+    writeFileSync(join(worktreeRoot, ".git"), "gitdir: /operator/private/gitdir\n", {
+      mode: 0o600,
+    });
+    const worktreeParent = join(worktreeRoot, "operator-private");
+    mkdirSync(worktreeParent, { mode: 0o700 });
+    const worktreePath = join(worktreeParent, "transition.json");
+    writeFileSync(worktreePath, JSON.stringify(descriptor()), { mode: 0o600 });
+
+    for (const path of [unsafePath, worktreePath]) {
+      const failure = (() => {
+        try {
+          loadFormAuthorityScopeTransition(path, target);
+          return null;
+        } catch (error) {
+          return error;
+        }
+      })();
+      expect(failure).toBeInstanceOf(Error);
+      expect(String(failure)).not.toContain(path);
+    }
+  });
+
+  test("rejects every special mode bit instead of treating it as exact 0600", () => {
+    for (const mode of [0o4600, 0o2600, 0o1600]) {
+      const path = privateFile(JSON.stringify(descriptor()));
+      const changed = Bun.spawnSync({ cmd: ["chmod", mode.toString(8), path] });
+      expect(changed.exitCode).toBe(0);
+      expect(() => loadFormAuthorityScopeTransition(path, target)).toThrow("0600");
     }
   });
 

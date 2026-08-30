@@ -796,6 +796,7 @@ function invocationResult(input: {
   readonly plan?: Record<string, unknown>;
   readonly applied?: Record<string, unknown>;
 }): Record<string, unknown> {
+  const transition = input.invocation.scopeTransition !== undefined;
   return {
     kind: "takoserver.integration-form-authority-invocation@v2",
     surface: input.invocation.surface,
@@ -804,11 +805,17 @@ function invocationResult(input: {
     commit: input.invocation.commit,
     operatorOrigin: input.gateway.origin,
     identity: structuredClone(input.gateway.identity),
-    activation: {
-      kind: "space",
-      ...input.scope,
-      desiredActive: input.invocation.surface === "takoserver-integration-form-authority",
-    },
+    activation: transition
+      ? {
+          kind: "space",
+          desiredActive: false,
+          scopeRedacted: true,
+        }
+      : {
+          kind: "space",
+          ...input.scope,
+          desiredActive: input.invocation.surface === "takoserver-integration-form-authority",
+        },
     policyAuthority: "takoserver-host",
     verificationMode: "integration-fixture",
     productionEligible: false,
@@ -822,7 +829,17 @@ function invocationResult(input: {
     ...(input.reviewer === undefined ? {} : { reviewer: input.reviewer }),
     ...(input.plan === undefined ? {} : { plan: input.plan }),
     ...(input.applied === undefined ? {} : { apply: input.applied }),
-    readback: structuredClone(input.readback),
+    readback: transition
+      ? {
+          kind: "takoserver.form-authority-readback-summary@v1",
+          currentHeadDigest: input.readback.currentHeadDigest,
+          desiredActive: false,
+          allInactive: input.readback.forms.every(
+            ({ activationHead }) => !activationHead.present || !activationHead.active,
+          ),
+          scopeRedacted: true,
+        }
+      : structuredClone(input.readback),
     ready: input.ready,
     credentialsRedacted: true,
   };

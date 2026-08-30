@@ -290,14 +290,43 @@ describe("signed Form authority operator invocation", () => {
     });
     expect(deactivated).toMatchObject({
       activation: {
-        ...transition.value.predecessorScope,
+        kind: "space",
         desiredActive: false,
+        scopeRedacted: true,
+      },
+      readback: {
+        kind: "takoserver.form-authority-readback-summary@v1",
+        currentHeadDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+        desiredActive: false,
+        allInactive: true,
+        scopeRedacted: true,
       },
       scopeBindingProfile: "exact-transition-predecessor",
       scopeTransitionDigest: transition.digest,
       ready: true,
     });
-    expect(JSON.stringify(deactivated)).not.toContain(privateJwk.d as string);
+    expect(Object.keys(deactivated.activation as Record<string, unknown>).sort()).toEqual([
+      "desiredActive",
+      "kind",
+      "scopeRedacted",
+    ]);
+    expect(Object.keys(deactivated.readback as Record<string, unknown>).sort()).toEqual([
+      "allInactive",
+      "currentHeadDigest",
+      "desiredActive",
+      "kind",
+      "scopeRedacted",
+    ]);
+    const stdout = `${JSON.stringify(deactivated, null, 2)}\n`;
+    for (const sensitive of [
+      transition.value.predecessorScope.tenantId,
+      transition.value.predecessorScope.space,
+      transition.value.targetScope.tenantId,
+      transition.value.targetScope.space,
+      privateJwk.d as string,
+    ]) {
+      expect(stdout).not.toContain(sensitive);
+    }
   });
 
   test("transition deactivation refuses mixed scope topology and stale public closure before signing", async () => {

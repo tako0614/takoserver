@@ -903,6 +903,48 @@ describe("route-less Form authority deploy surfaces", () => {
     }
   });
 
+  test("transition refusal output never reveals predecessor or foreign scope bindings", async () => {
+    const thirdScope = { tenantId: "tenant-third-private", space: "space-third-private" } as const;
+    for (const state of [
+      routeLessTransitionState({ beforeScope: thirdScope }),
+      routeLessTransitionState({
+        beforeScope: PREDECESSOR_SCOPE,
+        publicProfile: "predecessor",
+      }),
+    ]) {
+      const failure = (await runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-worker",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          scopeTransition: SCOPE_TRANSITION,
+        },
+        target,
+        { state },
+      ).catch((error) => error)) as { readonly message: string; readonly detail?: string };
+      const stdout = "";
+      const stderr = `deploy failed during preflight: ${failure.message}\n${failure.detail ?? ""}\n`;
+      expect(stdout).toBe("");
+      expect(failure.message).toBe(
+        "Form authority scope transition binding is neither exact-target nor exact-transition-predecessor",
+      );
+      expect(failure.detail).toBeUndefined();
+      expect(stderr).not.toContain('{"');
+      for (const sensitive of [
+        PREDECESSOR_SCOPE.tenantId,
+        PREDECESSOR_SCOPE.space,
+        target.formAuthority.integrationOperatorScope.tenantId,
+        target.formAuthority.integrationOperatorScope.space,
+        thirdScope.tenantId,
+        thirdScope.space,
+      ]) {
+        expect(stdout).not.toContain(sensitive);
+        expect(stderr).not.toContain(sensitive);
+      }
+    }
+  });
+
   test("route-less scope transition uploads predecessor to target exactly once and refuses target no-op", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-scope-transition-"));
     let uploaded = false;

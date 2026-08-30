@@ -105,6 +105,9 @@ describe("Takoserver split deploy entrypoint", () => {
       "only predecessor desiredActive:false is signed",
     );
     expect(deactivation?.obligations.provenance).toContain("without emitting its path");
+    expect(deactivation?.obligations.provenance).toContain("outside every Git worktree");
+    expect(deactivation?.obligations["post-conditions"]).toContain("scope-redacted");
+    expect(deactivation?.obligations["failure-handling"]).toContain("raw binding JSON");
     expect(credentials?.obligations.provenance).toContain(
       "exact five-variable JIT authority closure",
     );

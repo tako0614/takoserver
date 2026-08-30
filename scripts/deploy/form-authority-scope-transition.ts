@@ -1,6 +1,14 @@
 import { createHash } from "node:crypto";
-import { closeSync, constants, fstatSync, openSync, readFileSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+} from "node:fs";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { canonicalJson } from "../../src/json.ts";
 import { parseStrictJson } from "../../src/strict-json.ts";
 import { preflightError } from "./errors.ts";
@@ -29,8 +37,8 @@ export interface LoadedFormAuthorityScopeTransition {
 }
 
 /**
- * Opens one operator-owned transition descriptor without following a final
- * symlink. The returned value deliberately carries no source path.
+ * Opens one operator-owned transition descriptor only after proving its full
+ * path link-free. The returned value deliberately carries no source path.
  */
 export function loadFormAuthorityScopeTransition(
   path: string,
@@ -39,17 +47,18 @@ export function loadFormAuthorityScopeTransition(
   if (!isAbsolute(path)) {
     throw preflightError("Form authority scope transition selector must be an absolute path");
   }
+  const normalized = linkFreePath(path);
 
   let descriptor: number | null = null;
   let raw: Uint8Array;
   try {
-    descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    descriptor = openSync(normalized, constants.O_RDONLY | constants.O_NOFOLLOW);
     const status = fstatSync(descriptor);
     if (
       !status.isFile() ||
       status.nlink !== 1 ||
       (typeof process.getuid === "function" && status.uid !== process.getuid()) ||
-      (status.mode & 0o777) !== 0o600 ||
+      (status.mode & 0o7777) !== 0o600 ||
       status.size < 1 ||
       status.size > MAX_DESCRIPTOR_BYTES
     ) {
@@ -77,6 +86,51 @@ export function loadFormAuthorityScopeTransition(
   } as const;
   assertLoadedFormAuthorityScopeTransition(loaded, target);
   return loaded;
+}
+
+function linkFreePath(path: string): string {
+  const normalized = resolve(path);
+  const parts = normalized.split(sep).filter(Boolean);
+  let current: string = sep;
+  for (const part of parts) {
+    current = join(current, part);
+    let status: ReturnType<typeof lstatSync>;
+    try {
+      status = lstatSync(current);
+    } catch {
+      throw preflightError("Form authority scope transition path is unavailable");
+    }
+    if (status.isSymbolicLink()) {
+      throw preflightError("Form authority scope transition path contains a symlink");
+    }
+    if (current !== normalized && !status.isDirectory()) {
+      throw preflightError("Form authority scope transition path has a non-directory ancestor");
+    }
+  }
+  const parent = dirname(normalized);
+  let parentStatus: ReturnType<typeof lstatSync>;
+  try {
+    parentStatus = lstatSync(parent);
+  } catch {
+    throw preflightError("Form authority scope transition parent is unavailable");
+  }
+  if (
+    !parentStatus.isDirectory() ||
+    (parentStatus.mode & 0o7777) !== 0o700 ||
+    (typeof process.getuid === "function" && parentStatus.uid !== process.getuid())
+  ) {
+    throw preflightError(
+      "Form authority scope transition parent must be an owned exact-0700 directory",
+    );
+  }
+  for (let cursor = parent; ; cursor = dirname(cursor)) {
+    if (existsSync(join(cursor, ".git"))) {
+      throw preflightError("Form authority scope transition must stay outside every Git worktree");
+    }
+    const next = dirname(cursor);
+    if (next === cursor) break;
+  }
+  return normalized;
 }
 
 export function assertLoadedFormAuthorityScopeTransition(
