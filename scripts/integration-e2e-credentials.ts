@@ -18,15 +18,19 @@ import {
   credentialAuthorityClaims,
   credentialAuthorityPath,
   credentialAuthorityRequestBody,
-  deterministicIntegrationE2eApiKeyId,
+  deterministicIntegrationE2eApiKeyIds,
   INTEGRATION_E2E_API_KEY_DEFAULT_TTL_SECONDS,
-  INTEGRATION_E2E_API_KEY_MAX_TTL_SECONDS,
-  INTEGRATION_E2E_API_KEY_NAME,
   INTEGRATION_E2E_API_KEY_PROOF_MAX_TTL_SECONDS,
-  INTEGRATION_E2E_API_KEY_SCOPES,
+  INTEGRATION_E2E_CREDENTIAL_ROLE_POLICY,
+  INTEGRATION_E2E_EVIDENCE_KEY_NAME,
+  INTEGRATION_E2E_EVIDENCE_SCOPES,
+  INTEGRATION_E2E_WRITER_KEY_NAME,
+  INTEGRATION_E2E_WRITER_SCOPES,
   type IntegrationE2eCredentialAuthorityAction,
   type IntegrationE2eCredentialAuthorityConfig,
   type IntegrationE2eCredentialAuthorityIdentity,
+  type IntegrationE2eCredentialPairStatus,
+  type IntegrationE2eCredentialRole,
   resolveIntegrationE2eCredentialAuthorityConfig,
 } from "../src/integration-e2e-credential-authority.ts";
 import { signOperatorAssertion } from "../src/operator-key.ts";
@@ -38,12 +42,14 @@ import { loadTarget } from "./deploy/target.ts";
  * Offline client for the integration-only, exact-organization API-key route.
  *
  * It never signs in, creates an organization, or calls the ordinary owner API.
- * One operation issues one resources:write key; writer implies reader in the
- * product authorization model. Every network operation carries a fresh proof
- * bound to the exact deployed source, artifact, and active Worker Version.
+ * One operation issues a resources:write writer and a separate resources:read
+ * evidence key. The evidence secret remains in external-evaluator custody and
+ * is never passed to a Provider or runner. Every network operation carries a
+ * fresh proof bound to the currently active authority Worker Version.
  */
 
-export const WRITER_KEY_NAME = INTEGRATION_E2E_API_KEY_NAME;
+export const WRITER_KEY_NAME = INTEGRATION_E2E_WRITER_KEY_NAME;
+export const EVIDENCE_KEY_NAME = INTEGRATION_E2E_EVIDENCE_KEY_NAME;
 export const KEY_TTL_SECONDS = INTEGRATION_E2E_API_KEY_DEFAULT_TTL_SECONDS;
 export const PROOF_TTL_SECONDS = INTEGRATION_E2E_API_KEY_PROOF_MAX_TTL_SECONDS;
 
@@ -64,52 +70,47 @@ export interface CredentialAuthorityRouting extends IntegrationE2eCredentialAuth
 }
 
 export interface CredentialPaths {
-  readonly secret: string;
+  readonly writerSecret: string;
+  readonly evidenceSecret: string;
   readonly metadata: string;
 }
 
 export interface CredentialKeyMetadata {
-  readonly name: typeof WRITER_KEY_NAME;
+  readonly role: IntegrationE2eCredentialRole;
+  readonly name: typeof WRITER_KEY_NAME | typeof EVIDENCE_KEY_NAME;
   readonly keyId: string;
-  readonly operationId: string;
-  readonly scopes: typeof INTEGRATION_E2E_API_KEY_SCOPES;
-  readonly ttlSeconds: number;
-  readonly createdAt: string;
-  readonly expiresAt: string;
+  readonly scopes: readonly string[];
   readonly secretPath: string;
 }
 
 export interface CredentialMetadataDocument {
-  readonly version: 2;
-  readonly kind: "takoserver.integration-e2e-credential@v2";
+  readonly version: 3;
+  readonly kind: "takoserver.integration-e2e-credential-pair@v3";
   readonly origin: string;
   readonly environment: "integration";
   readonly organizationId: string;
-  readonly sourceCommit: string;
-  readonly artifactDigest: `sha256:${string}`;
-  readonly publicWorkerVersionId: string;
-  readonly key: CredentialKeyMetadata;
-}
-
-export interface CredentialRemoteStatus {
-  readonly keyId: string;
   readonly operationId: string;
-  readonly present: boolean;
-  readonly usable: boolean;
-  readonly organizationId?: string;
-  readonly scopes?: readonly string[];
-  readonly createdAt?: string;
-  readonly expiresAt?: string;
+  readonly ttlSeconds: typeof KEY_TTL_SECONDS;
+  readonly requestedAuthority: {
+    readonly sourceCommit: string;
+    readonly artifactDigest: `sha256:${string}`;
+    readonly publicWorkerVersionId: string;
+  };
+  readonly roles: {
+    readonly writer: CredentialKeyMetadata;
+    readonly evidence: CredentialKeyMetadata;
+  };
 }
 
 export interface CredentialStatus {
-  readonly kind: "takoserver.integration-e2e-credential-status@v2";
+  readonly kind: "takoserver.integration-e2e-credential-pair-local-status@v3";
   readonly origin: string;
   readonly organizationId: string;
-  readonly keyId: string;
-  readonly remote: CredentialRemoteStatus | null;
+  readonly operationId: string;
+  readonly remote: IntegrationE2eCredentialPairStatus | null;
   readonly files: {
-    readonly secret: LocalFileStatus;
+    readonly writerSecret: LocalFileStatus;
+    readonly evidenceSecret: LocalFileStatus;
     readonly metadata: LocalFileStatus;
   };
 }
@@ -161,12 +162,9 @@ interface PreparedOptions {
   readonly removeFile: (path: string) => Promise<void>;
 }
 
-interface IssuedCredential extends CredentialRemoteStatus {
-  readonly organizationId: string;
-  readonly scopes: typeof INTEGRATION_E2E_API_KEY_SCOPES;
-  readonly createdAt: string;
-  readonly expiresAt: string;
-  readonly secret: string;
+interface IssuedCredentialPair {
+  readonly pair: IntegrationE2eCredentialPairStatus;
+  readonly secrets: { readonly writer: string; readonly evidence: string };
 }
 
 export class IntegrationCredentialError extends Error {
@@ -188,31 +186,75 @@ export async function issueIntegrationCredentials(
     prepared.authority.publicJwk,
   );
   const operationId = prepared.operationId();
-  const expectedKeyId = await deterministicIntegrationE2eApiKeyId(operationId).catch(() => {
+  const expectedKeyIds = await deterministicIntegrationE2eApiKeyIds(operationId).catch(() => {
     throw new IntegrationCredentialError("generated credential operation id is invalid");
   });
   const body = credentialAuthorityRequestBody({
     operationId,
     organizationId: prepared.authority.organizationId,
-    scopes: INTEGRATION_E2E_API_KEY_SCOPES,
     ttlSeconds: prepared.keyLifetimeSeconds,
   });
+  const metadata: CredentialMetadataDocument = {
+    version: 3,
+    kind: "takoserver.integration-e2e-credential-pair@v3",
+    origin: prepared.origin,
+    environment: "integration",
+    organizationId: prepared.authority.organizationId,
+    operationId,
+    ttlSeconds: KEY_TTL_SECONDS,
+    requestedAuthority: {
+      sourceCommit: prepared.authority.sourceCommit,
+      artifactDigest: prepared.authority.artifactDigest,
+      publicWorkerVersionId: prepared.authority.publicWorkerVersionId,
+    },
+    roles: {
+      writer: {
+        role: "writer",
+        name: WRITER_KEY_NAME,
+        keyId: expectedKeyIds.writer,
+        scopes: INTEGRATION_E2E_WRITER_SCOPES,
+        secretPath: paths.writerSecret,
+      },
+      evidence: {
+        role: "evidence",
+        name: EVIDENCE_KEY_NAME,
+        keyId: expectedKeyIds.evidence,
+        scopes: INTEGRATION_E2E_EVIDENCE_SCOPES,
+        secretPath: paths.evidenceSecret,
+      },
+    },
+  };
 
-  let issued: IssuedCredential;
+  // Local recovery coordinates are durable before the first remote mutation.
+  // A hard death can therefore be settled by current-authority status/revoke
+  // without guessing an operation id or issuing a second pair.
+  await atomicWriteMetadata(paths.metadata, metadata);
+  assertPublishedMetadata(paths.metadata, metadata);
+
+  let issued: IssuedCredentialPair;
   try {
     const response = await authorityRequest(prepared, privateJwk, "issue", body);
-    issued = parseIssued(response, {
-      operationId,
-      keyId: expectedKeyId,
-      organizationId: prepared.authority.organizationId,
-      ttlSeconds: prepared.keyLifetimeSeconds,
-    });
+    issued = parseIssued(response, metadata);
   } catch (error) {
-    const reconciled = await reconcileLostIssue(prepared, privateJwk, body, expectedKeyId);
-    if (reconciled === "absent") throw safeError(error);
+    const reconciled = await reconcileLostIssue(prepared, privateJwk, body, metadata);
+    if (reconciled === "no-operation") {
+      if (!(await removeCredentialFiles(paths, prepared.removeFile))) {
+        throw new IntegrationCredentialError(
+          "signed status proved no remote operation but local file cleanup failed",
+          { cause: safeError(error) },
+        );
+      }
+      throw safeError(error);
+    }
     if (reconciled === "revoked") {
+      if (!(await removeCredentialFiles(paths, prepared.removeFile))) {
+        throw new IntegrationCredentialError(
+          "credential compensation proved remote absence but local file cleanup failed",
+          { cause: safeError(error) },
+        );
+      }
       throw new IntegrationCredentialError(
-        "credential secret acknowledgement was lost; the exact key was revoked and a new operation is required",
+        "credential-pair secret acknowledgement was lost; both exact roles were revoked and a new operation is required",
         { cause: safeError(error) },
       );
     }
@@ -222,42 +264,24 @@ export async function issueIntegrationCredentials(
     );
   }
 
-  const metadata: CredentialMetadataDocument = {
-    version: 2,
-    kind: "takoserver.integration-e2e-credential@v2",
-    origin: prepared.origin,
-    environment: "integration",
-    organizationId: prepared.authority.organizationId,
-    sourceCommit: prepared.authority.sourceCommit,
-    artifactDigest: prepared.authority.artifactDigest,
-    publicWorkerVersionId: prepared.authority.publicWorkerVersionId,
-    key: {
-      name: WRITER_KEY_NAME,
-      keyId: issued.keyId,
-      operationId,
-      scopes: INTEGRATION_E2E_API_KEY_SCOPES,
-      ttlSeconds: prepared.keyLifetimeSeconds,
-      createdAt: issued.createdAt,
-      expiresAt: issued.expiresAt,
-      secretPath: paths.secret,
-    },
-  };
-
   try {
-    // Publish the nonsecret recovery coordinates first. If the process stops
-    // before the secret appears, a later signed status/revoke can still name
-    // the exact operation; the inverse order could strand an unaddressable key.
-    await atomicWriteMetadata(paths.metadata, metadata);
-    assertPublishedMetadata(paths.metadata, metadata);
-    await prepared.writeSecret(paths.secret, issued.secret);
-    assertPublishedSecret(paths.secret, issued.secret);
+    await prepared.writeSecret(paths.writerSecret, issued.secrets.writer);
+    assertPublishedSecret(paths.writerSecret, issued.secrets.writer);
+    await prepared.writeSecret(paths.evidenceSecret, issued.secrets.evidence);
+    assertPublishedSecret(paths.evidenceSecret, issued.secrets.evidence);
     return metadata;
   } catch (error) {
-    const absent = await revokeAndProveAbsence(prepared, privateJwk, body, expectedKeyId);
-    const filesRemoved = await removeCredentialFiles(paths, prepared.removeFile);
-    if (!absent || !filesRemoved) {
+    const absent = await revokeAndProveAbsence(prepared, privateJwk, body, metadata);
+    if (!absent) {
       throw new IntegrationCredentialError(
         "credential compensation is indeterminate; inspect the exact key and local files before continuing",
+        { cause: safeError(error) },
+      );
+    }
+    const filesRemoved = await removeCredentialFiles(paths, prepared.removeFile);
+    if (!filesRemoved) {
+      throw new IntegrationCredentialError(
+        "credential compensation proved remote absence but local file cleanup failed",
         { cause: safeError(error) },
       );
     }
@@ -274,10 +298,10 @@ export async function statusIntegrationCredentials(
   const metadata = readMetadataIfPresent(paths.metadata);
   if (!metadata) {
     return {
-      kind: "takoserver.integration-e2e-credential-status@v2",
+      kind: "takoserver.integration-e2e-credential-pair-local-status@v3",
       origin: prepared.origin,
       organizationId: prepared.authority.organizationId,
-      keyId: "",
+      operationId: "",
       remote: null,
       files: fileStatuses(paths),
     };
@@ -289,21 +313,24 @@ export async function statusIntegrationCredentials(
   );
   const body = requestBodyFromMetadata(metadata);
   const response = await authorityRequest(prepared, privateJwk, "status", body);
-  const remote = parseStatus(response, body, metadata.key.keyId);
+  const remote = parseStatus(response, metadata);
   return {
-    kind: "takoserver.integration-e2e-credential-status@v2",
+    kind: "takoserver.integration-e2e-credential-pair-local-status@v3",
     origin: prepared.origin,
     organizationId: prepared.authority.organizationId,
-    keyId: metadata.key.keyId,
+    operationId: metadata.operationId,
     remote,
     files: fileStatuses(paths),
   };
 }
 
-/** Revoke once, then require a separate signed status response before deleting local files. */
-export async function revokeIntegrationCredentials(
-  options: CredentialClientOptions,
-): Promise<{ readonly organizationId: string; readonly keyId: string; readonly absent: true }> {
+/** Revoke, resume only a signed revoking fence, then prove absence before local cleanup. */
+export async function revokeIntegrationCredentials(options: CredentialClientOptions): Promise<{
+  readonly organizationId: string;
+  readonly operationId: string;
+  readonly keyIds: { readonly writer: string; readonly evidence: string };
+  readonly absent: true;
+}> {
   const prepared = prepareOptions(options);
   const paths = credentialPaths(prepared.outputDirectory);
   const metadata = readMetadata(paths.metadata);
@@ -314,14 +341,17 @@ export async function revokeIntegrationCredentials(
   );
   const body = requestBodyFromMetadata(metadata);
 
-  // Revoke is server-idempotent, but this invocation still sends it once. A
-  // lost acknowledgement is settled by the following signed status request.
-  await authorityRequest(prepared, privateJwk, "revoke", body).catch(() => null);
-  const statusResponse = await authorityRequest(prepared, privateJwk, "status", body);
-  const status = parseStatus(statusResponse, body, metadata.key.keyId);
-  if (status.present) {
+  const status = await revokeThenSignedStatus(prepared, privateJwk, body, metadata);
+  if (
+    !status.terminal ||
+    status.state !== "revoked" ||
+    status.completeness !== "absent" ||
+    status.roles.writer.present ||
+    status.roles.evidence.present ||
+    status.legacyKeyPresent
+  ) {
     throw new IntegrationCredentialError(
-      "credential revoke is incomplete because signed status still reports the exact key present",
+      "credential-pair revoke is incomplete because signed status is not a terminal two-role tombstone",
     );
   }
   if (!(await removeCredentialFiles(paths, prepared.removeFile))) {
@@ -331,15 +361,20 @@ export async function revokeIntegrationCredentials(
   }
   return {
     organizationId: metadata.organizationId,
-    keyId: metadata.key.keyId,
+    operationId: metadata.operationId,
+    keyIds: {
+      writer: metadata.roles.writer.keyId,
+      evidence: metadata.roles.evidence.keyId,
+    },
     absent: true,
   };
 }
 
 export function credentialPaths(outputDirectory: string): CredentialPaths {
   return {
-    secret: join(outputDirectory, "task-0037-integration-writer.secret"),
-    metadata: join(outputDirectory, "task-0037-integration-writer.json"),
+    writerSecret: join(outputDirectory, "task-0037-integration-writer.secret"),
+    evidenceSecret: join(outputDirectory, "task-0037-integration-evidence.secret"),
+    metadata: join(outputDirectory, "task-0037-integration-credential-pair.json"),
   };
 }
 
@@ -368,12 +403,8 @@ function prepareOptions(options: CredentialClientOptions): PreparedOptions {
     }
   }
   const keyLifetimeSeconds = options.keyLifetimeSeconds ?? KEY_TTL_SECONDS;
-  if (
-    !Number.isSafeInteger(keyLifetimeSeconds) ||
-    keyLifetimeSeconds <= 0 ||
-    keyLifetimeSeconds > INTEGRATION_E2E_API_KEY_MAX_TTL_SECONDS
-  ) {
-    throw new IntegrationCredentialError("API-key lifetime is outside its bounded range");
+  if (keyLifetimeSeconds !== KEY_TTL_SECONDS) {
+    throw new IntegrationCredentialError("credential-pair lifetime must be exactly 3600 seconds");
   }
   const proofLifetimeSeconds = options.proofLifetimeSeconds ?? PROOF_TTL_SECONDS;
   if (
@@ -407,20 +438,22 @@ async function reconcileLostIssue(
   prepared: PreparedOptions,
   privateJwk: Readonly<Record<string, unknown>>,
   body: ReturnType<typeof credentialAuthorityRequestBody>,
-  expectedKeyId: string,
-): Promise<"absent" | "revoked" | "indeterminate"> {
-  let status: CredentialRemoteStatus;
+  metadata: CredentialMetadataDocument,
+): Promise<"no-operation" | "revoked" | "indeterminate"> {
+  let status: IntegrationE2eCredentialPairStatus;
   try {
-    status = parseStatus(
-      await authorityRequest(prepared, privateJwk, "status", body),
-      body,
-      expectedKeyId,
-    );
+    status = parseStatus(await authorityRequest(prepared, privateJwk, "status", body), metadata);
   } catch {
     return "indeterminate";
   }
-  if (!status.present) return "absent";
-  return (await revokeAndProveAbsence(prepared, privateJwk, body, expectedKeyId))
+  if (
+    status.state === "unregistered" &&
+    status.completeness === "absent" &&
+    !status.legacyKeyPresent
+  ) {
+    return "no-operation";
+  }
+  return (await revokeAndProveAbsence(prepared, privateJwk, body, metadata))
     ? "revoked"
     : "indeterminate";
 }
@@ -429,19 +462,39 @@ async function revokeAndProveAbsence(
   prepared: PreparedOptions,
   privateJwk: Readonly<Record<string, unknown>>,
   body: ReturnType<typeof credentialAuthorityRequestBody>,
-  expectedKeyId: string,
+  metadata: CredentialMetadataDocument,
 ): Promise<boolean> {
-  await authorityRequest(prepared, privateJwk, "revoke", body).catch(() => null);
   try {
-    const status = parseStatus(
-      await authorityRequest(prepared, privateJwk, "status", body),
-      body,
-      expectedKeyId,
+    const status = await revokeThenSignedStatus(prepared, privateJwk, body, metadata);
+    return (
+      status.state === "revoked" &&
+      status.terminal &&
+      status.completeness === "absent" &&
+      !status.roles.writer.present &&
+      !status.roles.evidence.present &&
+      !status.legacyKeyPresent
     );
-    return !status.present;
   } catch {
     return false;
   }
+}
+
+async function revokeThenSignedStatus(
+  prepared: PreparedOptions,
+  privateJwk: Readonly<Record<string, unknown>>,
+  body: ReturnType<typeof credentialAuthorityRequestBody>,
+  metadata: CredentialMetadataDocument,
+): Promise<IntegrationE2eCredentialPairStatus> {
+  await authorityRequest(prepared, privateJwk, "revoke", body).catch(() => null);
+  let status = parseStatus(await authorityRequest(prepared, privateJwk, "status", body), metadata);
+  if (status.state === "revoking") {
+    // Signed status proves the exact operation already owns the monotonic
+    // revoke fence. Resuming that idempotent settlement is safe; issuing a
+    // second secret-bearing operation is never inferred from this recovery.
+    await authorityRequest(prepared, privateJwk, "revoke", body).catch(() => null);
+    status = parseStatus(await authorityRequest(prepared, privateJwk, "status", body), metadata);
+  }
+  return status;
 }
 
 async function authorityRequest(
@@ -486,126 +539,213 @@ async function authorityRequest(
 
 function parseIssued(
   response: { readonly status: number; readonly body: unknown },
-  expected: {
-    readonly operationId: string;
-    readonly keyId: string;
-    readonly organizationId: string;
-    readonly ttlSeconds: number;
-  },
-): IssuedCredential {
+  metadata: CredentialMetadataDocument,
+): IssuedCredentialPair {
   if (response.status !== 201) {
     throw new IntegrationCredentialError(
-      `credential issue returned status ${response.status}${safeResponseCode(response.body)}`,
+      `credential-pair issue returned status ${response.status}${safeResponseCode(response.body)}`,
     );
   }
   const value = responseRecord(response.body);
-  const status = parseStatusValue(value, expected.operationId, expected.keyId, true);
-  const secret = value.secret;
-  if (
-    !status.present ||
-    !status.usable ||
-    status.organizationId !== expected.organizationId ||
-    JSON.stringify(status.scopes) !== JSON.stringify(INTEGRATION_E2E_API_KEY_SCOPES) ||
-    typeof status.createdAt !== "string" ||
-    typeof status.expiresAt !== "string" ||
-    Date.parse(status.expiresAt) - Date.parse(status.createdAt) !== expected.ttlSeconds * 1_000 ||
-    typeof secret !== "string" ||
-    secret.length < 16 ||
-    secret.length > 512
-  ) {
-    throw new IntegrationCredentialError(
-      "credential issue response does not match the exact request",
-    );
+  if (!exactKeys(value, ["kind", "pair", "secrets"])) {
+    throw new IntegrationCredentialError("credential-pair issue response is malformed");
   }
-  return {
-    ...status,
-    organizationId: status.organizationId,
-    scopes: INTEGRATION_E2E_API_KEY_SCOPES,
-    createdAt: status.createdAt,
-    expiresAt: status.expiresAt,
-    secret,
-  };
+  const pair = parseStatusValue(value.pair, metadata);
+  const secrets = responseRecord(value.secrets);
+  if (
+    value.kind !== "takoserver.integration-e2e-credential-pair-issued@v1" ||
+    !exactKeys(secrets, ["evidence", "writer"]) ||
+    pair.state !== "active" ||
+    pair.completeness !== "complete" ||
+    pair.terminal ||
+    pair.legacyKeyPresent ||
+    pair.provenance === null ||
+    !pair.roles.writer.present ||
+    !pair.roles.writer.usable ||
+    !pair.roles.evidence.present ||
+    !pair.roles.evidence.usable ||
+    typeof secrets.writer !== "string" ||
+    typeof secrets.evidence !== "string" ||
+    !validIssuedSecret(secrets.writer) ||
+    !validIssuedSecret(secrets.evidence) ||
+    secrets.writer === secrets.evidence
+  ) {
+    throw new IntegrationCredentialError("credential-pair issue response does not match request");
+  }
+  return { pair, secrets: { writer: secrets.writer, evidence: secrets.evidence } };
 }
 
 function parseStatus(
   response: { readonly status: number; readonly body: unknown },
-  request: ReturnType<typeof credentialAuthorityRequestBody>,
-  keyId: string,
-): CredentialRemoteStatus {
+  metadata: CredentialMetadataDocument,
+): IntegrationE2eCredentialPairStatus {
   if (response.status !== 200) {
     throw new IntegrationCredentialError(
-      `credential status returned status ${response.status}${safeResponseCode(response.body)}`,
+      `credential-pair status returned status ${response.status}${safeResponseCode(response.body)}`,
     );
   }
-  const status = parseStatusValue(responseRecord(response.body), request.operationId, keyId);
-  if (
-    (status.organizationId !== undefined && status.organizationId !== request.organizationId) ||
-    (status.scopes !== undefined &&
-      JSON.stringify(status.scopes) !== JSON.stringify(INTEGRATION_E2E_API_KEY_SCOPES)) ||
-    (status.createdAt !== undefined &&
-      status.expiresAt !== undefined &&
-      Date.parse(status.expiresAt) - Date.parse(status.createdAt) !== request.ttlSeconds * 1_000)
-  ) {
-    throw new IntegrationCredentialError("credential status does not match the exact request");
-  }
-  return status;
+  return parseStatusValue(response.body, metadata);
 }
 
 function parseStatusValue(
-  value: Readonly<Record<string, unknown>>,
-  operationId: string,
-  keyId: string,
-  allowSecret = false,
-): CredentialRemoteStatus {
-  const baseKeys = ["keyId", "kind", "operationId", "present", "usable"] as const;
-  const detailKeys = ["createdAt", "expiresAt", "organizationId", "scopes"] as const;
-  const hasAnyDetails = detailKeys.some((key) => key in value);
-  const hasAllDetails = detailKeys.every((key) => key in value);
+  input: unknown,
+  metadata: CredentialMetadataDocument,
+): IntegrationE2eCredentialPairStatus {
+  const value = responseRecord(input);
+  if (
+    !exactKeys(value, [
+      "completeness",
+      "fence",
+      "kind",
+      "legacyKeyPresent",
+      "operationId",
+      "organizationId",
+      "provenance",
+      "roles",
+      "state",
+      "terminal",
+    ]) ||
+    value.kind !== "takoserver.integration-e2e-credential-pair-status@v1" ||
+    value.operationId !== metadata.operationId ||
+    value.organizationId !== metadata.organizationId ||
+    ![
+      "unregistered",
+      "indeterminate",
+      "prepared",
+      "issuing",
+      "active",
+      "partial",
+      "revoking",
+      "revoked",
+    ].includes(String(value.state)) ||
+    (value.fence !== null && (!Number.isSafeInteger(value.fence) || Number(value.fence) < 1)) ||
+    !["absent", "partial", "complete"].includes(String(value.completeness)) ||
+    typeof value.terminal !== "boolean" ||
+    typeof value.legacyKeyPresent !== "boolean"
+  ) {
+    throw new IntegrationCredentialError("credential-pair status response is malformed");
+  }
+  const roles = responseRecord(value.roles);
+  if (!exactKeys(roles, ["evidence", "writer"])) {
+    throw new IntegrationCredentialError("credential-pair role status is malformed");
+  }
+  const writer = parseRoleStatus(roles.writer, metadata.roles.writer, metadata.ttlSeconds);
+  const evidence = parseRoleStatus(roles.evidence, metadata.roles.evidence, metadata.ttlSeconds);
+  let provenance: IntegrationE2eCredentialPairStatus["provenance"] = null;
+  if (value.provenance !== null) {
+    const candidate = responseRecord(value.provenance);
+    if (
+      !exactKeys(candidate, ["artifactDigest", "publicWorkerVersionId", "sourceCommit"]) ||
+      candidate.sourceCommit !== metadata.requestedAuthority.sourceCommit ||
+      candidate.artifactDigest !== metadata.requestedAuthority.artifactDigest ||
+      candidate.publicWorkerVersionId !== metadata.requestedAuthority.publicWorkerVersionId
+    ) {
+      throw new IntegrationCredentialError("credential-pair provenance does not match metadata");
+    }
+    provenance = {
+      sourceCommit: candidate.sourceCommit as string,
+      artifactDigest: candidate.artifactDigest as `sha256:${string}`,
+      publicWorkerVersionId: candidate.publicWorkerVersionId as string,
+    };
+  }
+  const state = value.state as IntegrationE2eCredentialPairStatus["state"];
+  const completeness = value.completeness as IntegrationE2eCredentialPairStatus["completeness"];
+  const durable = ["prepared", "issuing", "active", "partial", "revoking", "revoked"].includes(
+    state,
+  );
+  const terminal =
+    state === "revoked" &&
+    completeness === "absent" &&
+    !value.legacyKeyPresent &&
+    !writer.present &&
+    !evidence.present;
+  if (
+    completeness !== pairCompleteness(writer.present, evidence.present) ||
+    value.terminal !== terminal ||
+    (durable && (value.fence === null || provenance === null)) ||
+    (!durable && (value.fence !== null || provenance !== null)) ||
+    (state === "unregistered" && (writer.recorded || evidence.recorded || value.legacyKeyPresent))
+  ) {
+    throw new IntegrationCredentialError("credential-pair status invariants are malformed");
+  }
+  return {
+    kind: "takoserver.integration-e2e-credential-pair-status@v1",
+    operationId: metadata.operationId,
+    organizationId: metadata.organizationId,
+    state,
+    fence: value.fence as number | null,
+    completeness,
+    terminal: value.terminal,
+    legacyKeyPresent: value.legacyKeyPresent,
+    provenance,
+    roles: { writer, evidence },
+  };
+}
+
+function parseRoleStatus(
+  input: unknown,
+  expected: CredentialKeyMetadata,
+  ttlSeconds: number,
+): IntegrationE2eCredentialPairStatus["roles"]["writer"] {
+  const value = responseRecord(input);
+  const hasTimes = "createdAt" in value || "expiresAt" in value;
   const expectedKeys = [
-    ...baseKeys,
-    ...(hasAllDetails ? detailKeys : []),
-    ...(allowSecret ? ["secret"] : []),
+    "keyId",
+    "name",
+    "present",
+    "recorded",
+    "role",
+    "scopes",
+    "ttlSeconds",
+    "usable",
+    ...(hasTimes ? ["createdAt", "expiresAt"] : []),
   ];
   if (
-    hasAnyDetails !== hasAllDetails ||
     !exactKeys(value, expectedKeys) ||
-    value.kind !== "takoserver.integration-e2e-api-key-status@v1" ||
-    value.operationId !== operationId ||
-    value.keyId !== keyId ||
+    value.role !== expected.role ||
+    value.name !== expected.name ||
+    value.keyId !== expected.keyId ||
+    JSON.stringify(value.scopes) !== JSON.stringify(expected.scopes) ||
+    value.ttlSeconds !== ttlSeconds ||
+    typeof value.recorded !== "boolean" ||
     typeof value.present !== "boolean" ||
     typeof value.usable !== "boolean" ||
+    (value.present && !value.recorded) ||
     (value.usable && !value.present) ||
-    (value.present && !hasAllDetails)
+    value.recorded !== hasTimes
   ) {
-    throw new IntegrationCredentialError("credential status response is malformed");
+    throw new IntegrationCredentialError("credential-pair role status is malformed");
   }
   if (
-    hasAllDetails &&
-    (typeof value.organizationId !== "string" ||
-      !Array.isArray(value.scopes) ||
-      !value.scopes.every((scope) => typeof scope === "string") ||
-      typeof value.createdAt !== "string" ||
+    hasTimes &&
+    (typeof value.createdAt !== "string" ||
       !isCanonicalInstant(value.createdAt) ||
       typeof value.expiresAt !== "string" ||
-      !isCanonicalInstant(value.expiresAt))
+      !isCanonicalInstant(value.expiresAt) ||
+      Date.parse(value.expiresAt) - Date.parse(value.createdAt) !== ttlSeconds * 1_000)
   ) {
-    throw new IntegrationCredentialError("credential status response is malformed");
+    throw new IntegrationCredentialError("credential-pair role expiry is malformed");
   }
-  const optional = {
-    ...(typeof value.organizationId === "string" ? { organizationId: value.organizationId } : {}),
-    ...(Array.isArray(value.scopes) && value.scopes.every((scope) => typeof scope === "string")
-      ? { scopes: value.scopes as readonly string[] }
-      : {}),
+  return {
+    role: expected.role,
+    name: expected.name,
+    keyId: expected.keyId,
+    scopes: expected.scopes as readonly ("resources:write" | "resources:read")[],
+    ttlSeconds,
+    recorded: value.recorded,
+    present: value.present,
+    usable: value.usable,
     ...(typeof value.createdAt === "string" ? { createdAt: value.createdAt } : {}),
     ...(typeof value.expiresAt === "string" ? { expiresAt: value.expiresAt } : {}),
   };
-  return {
-    keyId,
-    operationId,
-    present: value.present,
-    usable: value.usable,
-    ...optional,
-  };
+}
+
+function pairCompleteness(writer: boolean, evidence: boolean): "absent" | "partial" | "complete" {
+  return writer && evidence ? "complete" : writer || evidence ? "partial" : "absent";
+}
+
+function validIssuedSecret(value: string): boolean {
+  return value.length >= 16 && value.length <= 512;
 }
 
 function safeResponseCode(value: unknown): string {
@@ -693,7 +833,7 @@ async function readAndValidatePrivateJwk(
 }
 
 function assertDestinationsVacant(paths: CredentialPaths): void {
-  for (const path of [paths.secret, paths.metadata]) {
+  for (const path of [paths.writerSecret, paths.evidenceSecret, paths.metadata]) {
     try {
       lstatSync(path);
       throw new IntegrationCredentialError("credential destination already exists");
@@ -790,13 +930,37 @@ async function removeCredentialFiles(
   paths: CredentialPaths,
   remove: (path: string) => Promise<void>,
 ): Promise<boolean> {
+  const entries = [paths.writerSecret, paths.evidenceSecret, paths.metadata] as const;
+  try {
+    const expected = credentialPaths(validateOutputDirectory(dirname(paths.metadata)));
+    if (
+      expected.writerSecret !== paths.writerSecret ||
+      expected.evidenceSecret !== paths.evidenceSecret ||
+      expected.metadata !== paths.metadata
+    ) {
+      return false;
+    }
+  } catch {
+    return false;
+  }
   let complete = true;
-  for (const path of [paths.secret, paths.metadata]) {
-    if (!existsSync(path)) continue;
+  for (const path of entries) {
     try {
-      assertOwnedRegular(path, "credential file");
+      validateOutputDirectory(dirname(path));
+      if (!pathEntryExists(path)) continue;
+      // Remote terminal absence has already been proved. Unlink the exact leaf
+      // entry without following it so a dangling symlink cannot survive merely
+      // because existsSync would have treated its missing target as absent.
       await remove(path);
-      if (existsSync(path)) complete = false;
+      if (pathEntryExists(path)) complete = false;
+    } catch {
+      complete = false;
+    }
+  }
+  for (const path of entries) {
+    try {
+      validateOutputDirectory(dirname(path));
+      if (pathEntryExists(path)) complete = false;
     } catch {
       complete = false;
     }
@@ -814,7 +978,7 @@ function readMetadata(path: string): CredentialMetadataDocument {
 }
 
 function readMetadataIfPresent(path: string): CredentialMetadataDocument | null {
-  return existsSync(path) ? readMetadata(path) : null;
+  return pathEntryExists(path) ? readMetadata(path) : null;
 }
 
 function parseMetadata(raw: string): CredentialMetadataDocument {
@@ -827,71 +991,85 @@ function parseMetadata(raw: string): CredentialMetadataDocument {
   const root = responseRecord(value);
   if (
     !exactKeys(root, [
-      "artifactDigest",
       "environment",
-      "key",
       "kind",
+      "operationId",
       "organizationId",
       "origin",
-      "publicWorkerVersionId",
-      "sourceCommit",
+      "requestedAuthority",
+      "roles",
+      "ttlSeconds",
       "version",
     ]) ||
-    root.version !== 2 ||
-    root.kind !== "takoserver.integration-e2e-credential@v2" ||
+    root.version !== 3 ||
+    root.kind !== "takoserver.integration-e2e-credential-pair@v3" ||
     root.environment !== "integration" ||
     typeof root.origin !== "string" ||
     typeof root.organizationId !== "string" ||
-    typeof root.sourceCommit !== "string" ||
-    typeof root.artifactDigest !== "string" ||
-    typeof root.publicWorkerVersionId !== "string"
+    typeof root.operationId !== "string" ||
+    root.ttlSeconds !== KEY_TTL_SECONDS
   ) {
     throw new IntegrationCredentialError("credential metadata is malformed");
   }
-  const key = responseRecord(root.key);
+  const requestedAuthority = responseRecord(root.requestedAuthority);
   if (
-    !exactKeys(key, [
-      "createdAt",
-      "expiresAt",
-      "keyId",
-      "name",
-      "operationId",
-      "scopes",
-      "secretPath",
-      "ttlSeconds",
-    ]) ||
-    key.name !== WRITER_KEY_NAME ||
-    typeof key.keyId !== "string" ||
-    typeof key.operationId !== "string" ||
-    JSON.stringify(key.scopes) !== JSON.stringify(INTEGRATION_E2E_API_KEY_SCOPES) ||
-    !Number.isSafeInteger(key.ttlSeconds) ||
-    typeof key.createdAt !== "string" ||
-    !isCanonicalInstant(key.createdAt) ||
-    typeof key.expiresAt !== "string" ||
-    !isCanonicalInstant(key.expiresAt) ||
-    typeof key.secretPath !== "string"
+    !exactKeys(requestedAuthority, ["artifactDigest", "publicWorkerVersionId", "sourceCommit"]) ||
+    typeof requestedAuthority.sourceCommit !== "string" ||
+    !/^[0-9a-f]{40}$/u.test(requestedAuthority.sourceCommit) ||
+    typeof requestedAuthority.artifactDigest !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/u.test(requestedAuthority.artifactDigest) ||
+    typeof requestedAuthority.publicWorkerVersionId !== "string" ||
+    !/^[0-9a-f-]{36}$/u.test(requestedAuthority.publicWorkerVersionId)
   ) {
-    throw new IntegrationCredentialError("credential metadata key is malformed");
+    throw new IntegrationCredentialError("credential metadata authority is malformed");
   }
+  const roles = responseRecord(root.roles);
+  if (!exactKeys(roles, ["evidence", "writer"])) {
+    throw new IntegrationCredentialError("credential metadata roles are malformed");
+  }
+  const writer = parseMetadataRole(roles.writer, "writer");
+  const evidence = parseMetadataRole(roles.evidence, "evidence");
   return {
-    version: 2,
-    kind: "takoserver.integration-e2e-credential@v2",
+    version: 3,
+    kind: "takoserver.integration-e2e-credential-pair@v3",
     origin: root.origin,
     environment: "integration",
     organizationId: root.organizationId,
-    sourceCommit: root.sourceCommit,
-    artifactDigest: root.artifactDigest as `sha256:${string}`,
-    publicWorkerVersionId: root.publicWorkerVersionId,
-    key: {
-      name: WRITER_KEY_NAME,
-      keyId: key.keyId,
-      operationId: key.operationId,
-      scopes: INTEGRATION_E2E_API_KEY_SCOPES,
-      ttlSeconds: key.ttlSeconds as number,
-      createdAt: key.createdAt,
-      expiresAt: key.expiresAt,
-      secretPath: key.secretPath,
+    operationId: root.operationId,
+    ttlSeconds: KEY_TTL_SECONDS,
+    requestedAuthority: {
+      sourceCommit: requestedAuthority.sourceCommit,
+      artifactDigest: requestedAuthority.artifactDigest as `sha256:${string}`,
+      publicWorkerVersionId: requestedAuthority.publicWorkerVersionId,
     },
+    roles: { writer, evidence },
+  };
+}
+
+function parseMetadataRole(
+  input: unknown,
+  role: IntegrationE2eCredentialRole,
+): CredentialKeyMetadata {
+  const value = responseRecord(input);
+  const expectedName = role === "writer" ? WRITER_KEY_NAME : EVIDENCE_KEY_NAME;
+  const expectedScopes =
+    role === "writer" ? INTEGRATION_E2E_WRITER_SCOPES : INTEGRATION_E2E_EVIDENCE_SCOPES;
+  if (
+    !exactKeys(value, ["keyId", "name", "role", "scopes", "secretPath"]) ||
+    value.role !== role ||
+    value.name !== expectedName ||
+    typeof value.keyId !== "string" ||
+    JSON.stringify(value.scopes) !== JSON.stringify(expectedScopes) ||
+    typeof value.secretPath !== "string"
+  ) {
+    throw new IntegrationCredentialError("credential metadata role is malformed");
+  }
+  return {
+    role,
+    name: expectedName,
+    keyId: value.keyId,
+    scopes: expectedScopes,
+    secretPath: value.secretPath,
   };
 }
 
@@ -900,23 +1078,20 @@ async function assertMetadataMatches(
   prepared: PreparedOptions,
   paths: CredentialPaths,
 ): Promise<void> {
-  const expectedKeyId = await deterministicIntegrationE2eApiKeyId(metadata.key.operationId).catch(
+  const expectedKeyIds = await deterministicIntegrationE2eApiKeyIds(metadata.operationId).catch(
     () => null,
   );
   if (
     metadata.origin !== prepared.origin ||
     metadata.environment !== "integration" ||
     metadata.organizationId !== prepared.authority.organizationId ||
-    metadata.sourceCommit !== prepared.authority.sourceCommit ||
-    metadata.artifactDigest !== prepared.authority.artifactDigest ||
-    metadata.publicWorkerVersionId !== prepared.authority.publicWorkerVersionId ||
-    expectedKeyId === null ||
-    metadata.key.keyId !== expectedKeyId ||
-    metadata.key.secretPath !== paths.secret ||
-    metadata.key.ttlSeconds <= 0 ||
-    metadata.key.ttlSeconds > INTEGRATION_E2E_API_KEY_MAX_TTL_SECONDS ||
-    Date.parse(metadata.key.expiresAt) - Date.parse(metadata.key.createdAt) !==
-      metadata.key.ttlSeconds * 1_000
+    metadata.ttlSeconds !== KEY_TTL_SECONDS ||
+    expectedKeyIds === null ||
+    metadata.roles.writer.keyId !== expectedKeyIds.writer ||
+    metadata.roles.evidence.keyId !== expectedKeyIds.evidence ||
+    metadata.roles.writer.keyId === metadata.roles.evidence.keyId ||
+    metadata.roles.writer.secretPath !== paths.writerSecret ||
+    metadata.roles.evidence.secretPath !== paths.evidenceSecret
   ) {
     throw new IntegrationCredentialError("credential metadata does not match exact live routing");
   }
@@ -924,23 +1099,54 @@ async function assertMetadataMatches(
 
 function requestBodyFromMetadata(metadata: CredentialMetadataDocument) {
   return credentialAuthorityRequestBody({
-    operationId: metadata.key.operationId,
+    operationId: metadata.operationId,
     organizationId: metadata.organizationId,
-    scopes: INTEGRATION_E2E_API_KEY_SCOPES,
-    ttlSeconds: metadata.key.ttlSeconds,
+    roles: INTEGRATION_E2E_CREDENTIAL_ROLE_POLICY,
+    ttlSeconds: metadata.ttlSeconds,
   });
 }
 
 function fileStatuses(paths: CredentialPaths): CredentialStatus["files"] {
-  return { secret: localFileStatus(paths.secret), metadata: localFileStatus(paths.metadata) };
+  return {
+    writerSecret: localFileStatus(paths.writerSecret),
+    evidenceSecret: localFileStatus(paths.evidenceSecret),
+    metadata: localFileStatus(paths.metadata),
+  };
 }
 
 function localFileStatus(path: string): LocalFileStatus {
   try {
     const stat = lstatSync(path);
+    if (stat.isSymbolicLink()) {
+      throw new IntegrationCredentialError("credential path entry must not be a symlink");
+    }
+    if (
+      !stat.isFile() ||
+      stat.nlink !== 1 ||
+      (stat.mode & 0o777) !== PRIVATE_FILE_MODE ||
+      (typeof process.getuid === "function" && stat.uid !== process.getuid())
+    ) {
+      throw new IntegrationCredentialError(
+        "credential path entry must be an owned regular file with mode 0600",
+      );
+    }
     return { path, exists: true, mode: stat.mode & 0o777, symlink: stat.isSymbolicLink() };
-  } catch {
-    return { path, exists: false, mode: null, symlink: false };
+  } catch (error) {
+    if (error instanceof IntegrationCredentialError) throw error;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { path, exists: false, mode: null, symlink: false };
+    }
+    throw new IntegrationCredentialError("credential path entry cannot be inspected");
+  }
+}
+
+function pathEntryExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw new IntegrationCredentialError("credential path entry cannot be inspected");
   }
 }
 
@@ -1162,8 +1368,8 @@ async function cli(): Promise<void> {
       : action === "status"
         ? await statusIntegrationCredentials(options)
         : await revokeIntegrationCredentials(options);
-  // Every result type is nonsecret. Assertions and the one-time API-key secret
-  // exist only in request memory and the owner-only secret file.
+  // Every result type is nonsecret. Assertions and the two one-time API-key
+  // secrets exist only in request memory and the owner-only secret files.
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }
 

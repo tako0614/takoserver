@@ -183,7 +183,7 @@ export function buildApp(ports: AppPorts): App {
   const integrationE2eCredentialRoute = integrationE2eCredentialAuthority
     ? createIntegrationE2eCredentialAuthority({
         configuration: integrationE2eCredentialAuthority,
-        apiKeys: apiKeyAdministration,
+        sql: ports.sql,
         clock,
       })
     : null;

@@ -19,6 +19,7 @@ describe("bringing a local database up to date", () => {
       "principals",
       "orgs",
       "ledger",
+      "integration_e2e_credential_pair_operations",
       "tf_resources",
       "tf_resource_attachments",
       "tf_resource_deployments",
@@ -45,6 +46,104 @@ describe("bringing a local database up to date", () => {
     const second = migrateSqlite(database);
     expect(second.applied).toEqual([]);
     expect(second.alreadyApplied).toBe(MIGRATIONS.length);
+  });
+
+  test("appends the pair lifecycle without reinterpreting historical single-key rows", () => {
+    const database = new Database(":memory:");
+    database.exec(`
+      CREATE TABLE applied_migrations (
+        name TEXT PRIMARY KEY NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+    const pairLifecycle = MIGRATIONS.findIndex(
+      (migration) => migration.name === "0030_integration_e2e_credential_pairs.sql",
+    );
+    expect(pairLifecycle).toBe(MIGRATIONS.length - 1);
+    expect(MIGRATIONS[pairLifecycle - 1]?.name).toBe("0029_resource_deletion_attestations.sql");
+    for (const migration of MIGRATIONS.slice(0, pairLifecycle)) {
+      expect(migration.sql).not.toContain("integration_e2e_credential_pair_operations");
+      database.exec(migration.sql);
+      database
+        .query("INSERT INTO applied_migrations (name, applied_at) VALUES (?, 'now')")
+        .run(migration.name);
+    }
+    database.exec(`
+      INSERT INTO principals
+        (id, provider, provider_subject, email, display_name, created_at)
+      VALUES
+        ('principal_legacy', 'takos-id', 'legacy', 'legacy@example.test', 'Legacy',
+         '2026-08-30T00:00:00.000Z');
+      INSERT INTO orgs (id, name, owner_principal_id, created_at)
+      VALUES
+        ('org_takosumi_hosted_staging', 'Takosumi Hosted staging', 'principal_legacy',
+         '2026-08-30T00:00:00.000Z');
+      INSERT INTO auth_tokens
+        (secret_digest, id, kind, principal_id, org_id, name, scopes_json,
+         created_at, expires_at, revoked_at)
+      VALUES
+        ('sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+         'key_ie2e_historical_single', 'api_key', 'principal_legacy',
+         'org_takosumi_hosted_staging', 'integration-e2e-api-key',
+         '["resources:write"]', '2026-08-30T00:00:00.000Z',
+         '2026-08-30T00:15:00.000Z', NULL);
+    `);
+    const historical = database
+      .query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'")
+      .get();
+
+    expect(migrateSqlite(database).applied).toEqual(["0030_integration_e2e_credential_pairs.sql"]);
+    expect(
+      database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
+    ).toEqual(historical);
+    expect(
+      database
+        .query("SELECT COUNT(*) AS count FROM integration_e2e_credential_pair_operations")
+        .get(),
+    ).toEqual({ count: 0 });
+  });
+
+  test("enforces the fixed organization, roles, scopes, TTL, and distinct role ids in 0030", () => {
+    const database = new Database(":memory:");
+    migrateSqlite(database);
+    const insert = database.query(`
+      INSERT INTO integration_e2e_credential_pair_operations
+        (operation_id, authority_slot, org_id, writer_key_id, evidence_key_id,
+         writer_name, evidence_name, writer_scopes_json, evidence_scopes_json,
+         ttl_seconds, state, fence, source_commit, artifact_digest,
+         authority_worker_version_id, created_at, updated_at, revoked_at)
+      VALUES (?, 'integration-e2e-credential-pair', ?, ?, ?, ?, ?, ?, ?, ?,
+              'prepared', 1, ?, ?, ?, 1, 1, NULL)
+    `);
+    const valid = [
+      "operation-migration-constraints",
+      "org_takosumi_hosted_staging",
+      "key_writer",
+      "key_evidence",
+      "integration-e2e-writer",
+      "integration-e2e-evidence",
+      '["resources:write"]',
+      '["resources:read"]',
+      3_600,
+      "a".repeat(40),
+      `sha256:${"b".repeat(64)}`,
+      "00000000-0000-4000-8000-000000000001",
+    ] as const;
+    for (const [index, replacement] of [
+      [1, "org_wrong"],
+      [3, "key_writer"],
+      [4, "wrong-writer-name"],
+      [5, "wrong-evidence-name"],
+      [6, '["resources:read"]'],
+      [7, '["resources:write"]'],
+      [8, 900],
+    ] as const) {
+      const values: (string | number)[] = [...valid];
+      values[0] = `${valid[0]}-${index}`;
+      values[index] = replacement;
+      expect(() => insert.run(...values)).toThrow();
+    }
+    expect(() => insert.run(...valid)).not.toThrow();
   });
 
   test("does not fabricate deletion attestations for pre-0029 deleted deployments", () => {

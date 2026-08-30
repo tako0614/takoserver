@@ -8,6 +8,7 @@ import {
   readFileSync,
   rmSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,6 +17,7 @@ import { join } from "node:path";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import {
   credentialPaths,
+  EVIDENCE_KEY_NAME,
   IntegrationCredentialError,
   issueIntegrationCredentials,
   KEY_TTL_SECONDS,
@@ -34,13 +36,21 @@ const ORIGIN = "https://api.integration.example.test";
 const NOW = Date.UTC(2026, 7, 30, 12, 0, 0);
 
 describe("integration E2E credential helper", () => {
-  test("issues one exact-org writer into separate owner-only 0600 secret and metadata files", async () => {
+  test("issues one exact-org writer/evidence pair into three owner-only 0600 files", async () => {
     const fixture = await testFixture();
     const requests: { readonly method: string; readonly path: string; readonly url: string }[] = [];
+    let sawDurableCoordinatesBeforeIssue = false;
     try {
       const metadata = await issueIntegrationCredentials({
         ...fixture.options,
         fetcher: async (input, init) => {
+          expect(existsSync(fixture.paths.metadata)).toBe(true);
+          expect(existsSync(fixture.paths.writerSecret)).toBe(false);
+          expect(existsSync(fixture.paths.evidenceSecret)).toBe(false);
+          const metadataStat = lstatSync(fixture.paths.metadata);
+          expect(metadataStat.mode & 0o777).toBe(0o600);
+          expect(metadataStat.nlink).toBe(1);
+          sawDurableCoordinatesBeforeIssue = true;
           requests.push({
             method: init?.method ?? "GET",
             path: new URL(input).pathname,
@@ -51,26 +61,36 @@ describe("integration E2E credential helper", () => {
       });
 
       expect(metadata.organizationId).toBe(fixture.organizationId);
-      expect(metadata.key).toMatchObject({
-        name: WRITER_KEY_NAME,
-        scopes: ["resources:write"],
-        ttlSeconds: KEY_TTL_SECONDS,
+      expect(metadata.ttlSeconds).toBe(KEY_TTL_SECONDS);
+      expect(metadata.roles).toMatchObject({
+        writer: { name: WRITER_KEY_NAME, scopes: ["resources:write"] },
+        evidence: { name: EVIDENCE_KEY_NAME, scopes: ["resources:read"] },
       });
       expect(metadata).not.toHaveProperty("secret");
       expect(metadata).not.toHaveProperty("assertion");
-      expect(readFileSync(fixture.paths.secret, "utf8").trim().length).toBeGreaterThan(16);
+      const writerSecret = readFileSync(fixture.paths.writerSecret, "utf8").trim();
+      const evidenceSecret = readFileSync(fixture.paths.evidenceSecret, "utf8").trim();
+      expect(writerSecret.length).toBeGreaterThan(16);
+      expect(evidenceSecret.length).toBeGreaterThan(16);
+      expect(writerSecret).not.toBe(evidenceSecret);
       const metadataBytes = readFileSync(fixture.paths.metadata, "utf8");
-      expect(metadataBytes).not.toContain(readFileSync(fixture.paths.secret, "utf8").trim());
-      for (const path of [fixture.paths.secret, fixture.paths.metadata]) {
+      expect(metadataBytes).not.toContain(writerSecret);
+      expect(metadataBytes).not.toContain(evidenceSecret);
+      for (const path of [
+        fixture.paths.writerSecret,
+        fixture.paths.evidenceSecret,
+        fixture.paths.metadata,
+      ]) {
         const stat = lstatSync(path);
         expect(stat.isSymbolicLink()).toBe(false);
         expect(stat.nlink).toBe(1);
         expect(stat.mode & 0o777).toBe(0o600);
       }
       expect(requests.map((request) => request.path)).toEqual([credentialAuthorityPath("issue")]);
+      expect(sawDurableCoordinatesBeforeIssue).toBe(true);
       expect(requests.every((request) => !request.url.includes("assertion"))).toBe(true);
       expect(requests.every((request) => !request.url.includes("secret"))).toBe(true);
-      expect(await fixture.liveKeyCount()).toBe(1);
+      expect(await fixture.liveKeyCount()).toBe(2);
     } finally {
       fixture.cleanup();
     }
@@ -101,14 +121,15 @@ describe("integration E2E credential helper", () => {
       expect(actions).toEqual(["issue", "status", "revoke", "status"]);
       expect(actions.filter((action) => action === "issue")).toHaveLength(1);
       expect(await fixture.liveKeyCount()).toBe(0);
-      expect(existsSync(fixture.paths.secret)).toBe(false);
+      expect(existsSync(fixture.paths.writerSecret)).toBe(false);
+      expect(existsSync(fixture.paths.evidenceSecret)).toBe(false);
       expect(existsSync(fixture.paths.metadata)).toBe(false);
     } finally {
       fixture.cleanup();
     }
   });
 
-  test("compensates a secret publication failure and proves the exact id absent", async () => {
+  test("compensates an evidence-secret publication failure and proves both ids absent", async () => {
     const fixture = await testFixture();
     const actions: IntegrationE2eCredentialAuthorityAction[] = [];
     try {
@@ -122,15 +143,91 @@ describe("integration E2E credential helper", () => {
           },
           writeSecret: async (path, secret) => {
             writeFileSync(path, `${secret}\n`, { mode: 0o600 });
-            throw new Error("disk acknowledgement lost for secret=api-key-secret-value");
+            if (path === fixture.paths.evidenceSecret) {
+              throw new Error("disk acknowledgement lost for secret=api-key-secret-value");
+            }
           },
         }),
       ).rejects.toBeInstanceOf(IntegrationCredentialError);
 
       expect(actions).toEqual(["issue", "revoke", "status"]);
       expect(await fixture.liveKeyCount()).toBe(0);
-      expect(existsSync(fixture.paths.secret)).toBe(false);
+      expect(existsSync(fixture.paths.writerSecret)).toBe(false);
+      expect(existsSync(fixture.paths.evidenceSecret)).toBe(false);
       expect(existsSync(fixture.paths.metadata)).toBe(false);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("preserves every recovery path when secret publication compensation lacks signed absence", async () => {
+    const fixture = await testFixture();
+    const actions: IntegrationE2eCredentialAuthorityAction[] = [];
+    const diagnosticSecret = "api-key-secret-value-must-not-escape";
+    try {
+      const failure = await issueIntegrationCredentials({
+        ...fixture.options,
+        fetcher: async (input, init) => {
+          const action = actionFromPath(new URL(input).pathname);
+          if (action) actions.push(action);
+          if (action === "status") throw new Error(`status lost secret=${diagnosticSecret}`);
+          return await fixture.fetcher(input, init);
+        },
+        writeSecret: async (path, secret) => {
+          writeFileSync(path, `${secret}\n`, { mode: 0o600 });
+          if (path === fixture.paths.evidenceSecret) {
+            throw new Error(`disk acknowledgement lost secret=${diagnosticSecret}`);
+          }
+        },
+      }).catch((error) => error);
+
+      expect(failure).toBeInstanceOf(IntegrationCredentialError);
+      expect(failure.message).toContain("compensation is indeterminate");
+      expect(failure.message).not.toContain(diagnosticSecret);
+      expect(actions).toEqual(["issue", "revoke", "status"]);
+      for (const path of [
+        fixture.paths.writerSecret,
+        fixture.paths.evidenceSecret,
+        fixture.paths.metadata,
+      ]) {
+        expect(pathEntryExists(path)).toBe(true);
+      }
+      expect(readFileSync(fixture.paths.metadata, "utf8")).not.toContain(diagnosticSecret);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("resumes an exact revoking operation after signed status without replaying issue", async () => {
+    const fixture = await testFixture();
+    const actions: IntegrationE2eCredentialAuthorityAction[] = [];
+    let loseFirstRevoke = true;
+    try {
+      const metadata = await issueIntegrationCredentials(fixture.options);
+      const revoked = await revokeIntegrationCredentials({
+        ...fixture.options,
+        fetcher: async (input, init) => {
+          const action = actionFromPath(new URL(input).pathname);
+          if (action) actions.push(action);
+          if (action === "revoke" && loseFirstRevoke) {
+            loseFirstRevoke = false;
+            const claimed = await fixture.sql.run(
+              `UPDATE integration_e2e_credential_pair_operations
+               SET state = 'revoking', fence = fence + 1, updated_at = ?
+               WHERE operation_id = ? AND state = 'active'`,
+              [NOW, metadata.operationId],
+            );
+            expect(claimed.changes).toBe(1);
+            throw new Error("revoke acknowledgement lost secret=must-not-escape");
+          }
+          return await fixture.fetcher(input, init);
+        },
+      });
+
+      expect(revoked).toMatchObject({ operationId: metadata.operationId, absent: true });
+      expect(actions).toEqual(["revoke", "status", "revoke", "status"]);
+      expect(await fixture.liveKeyCount()).toBe(0);
+      expect(pathEntryExists(fixture.paths.metadata)).toBe(false);
     } finally {
       fixture.cleanup();
     }
@@ -150,11 +247,18 @@ describe("integration E2E credential helper", () => {
         },
       });
       expect(status.remote).toMatchObject({
-        keyId: metadata.key.keyId,
-        present: true,
-        usable: true,
+        state: "active",
+        completeness: "complete",
+        roles: {
+          writer: { keyId: metadata.roles.writer.keyId, present: true, usable: true },
+          evidence: { keyId: metadata.roles.evidence.keyId, present: true, usable: true },
+        },
       });
-      expect(status.files).toMatchObject({ secret: { exists: true }, metadata: { exists: true } });
+      expect(status.files).toMatchObject({
+        writerSecret: { exists: true },
+        evidenceSecret: { exists: true },
+        metadata: { exists: true },
+      });
 
       const revoked = await revokeIntegrationCredentials({
         ...fixture.options,
@@ -164,10 +268,77 @@ describe("integration E2E credential helper", () => {
           return await fixture.fetcher(input, init);
         },
       });
-      expect(revoked).toMatchObject({ keyId: metadata.key.keyId, absent: true });
+      expect(revoked).toMatchObject({
+        operationId: metadata.operationId,
+        keyIds: {
+          writer: metadata.roles.writer.keyId,
+          evidence: metadata.roles.evidence.keyId,
+        },
+        absent: true,
+      });
       expect(actions).toEqual(["status", "revoke", "status"]);
       expect(await fixture.liveKeyCount()).toBe(0);
-      expect(existsSync(fixture.paths.secret)).toBe(false);
+      expect(existsSync(fixture.paths.writerSecret)).toBe(false);
+      expect(existsSync(fixture.paths.evidenceSecret)).toBe(false);
+      expect(existsSync(fixture.paths.metadata)).toBe(false);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("recovers and revokes an older live pair through the current dedicated authority", async () => {
+    const fixture = await testFixture();
+    try {
+      const metadata = await issueIntegrationCredentials(fixture.options);
+      const nextPair = (await crypto.subtle.generateKey({ name: "Ed25519" }, true, [
+        "sign",
+        "verify",
+      ])) as CryptoKeyPair;
+      const nextPrivate = (await crypto.subtle.exportKey("jwk", nextPair.privateKey)) as JsonWebKey;
+      const nextPublic = (await crypto.subtle.exportKey("jwk", nextPair.publicKey)) as JsonWebKey;
+      const nextPrivatePath = join(fixture.root, "integration-e2e-api-key-next.jwk");
+      writeFileSync(nextPrivatePath, `${JSON.stringify(nextPrivate)}\n`, { mode: 0o600 });
+      chmodSync(nextPrivatePath, 0o600);
+      const nextAuthority = {
+        environment: "integration",
+        organizationId: fixture.organizationId,
+        publicJwk: { kty: "OKP", crv: "Ed25519", x: string(nextPublic.x) },
+        sourceCommit: "c".repeat(40),
+        artifactDigest: `sha256:${"d".repeat(64)}` as const,
+        publicWorkerVersionId: "00000000-0000-4000-8000-000000000002",
+      } as const;
+      const currentApp = buildApp({
+        sql: fixture.sql,
+        objects: createMemoryObjectStore(),
+        identity: { verify: () => Promise.reject(new Error("not configured")) },
+        settlement: { verify: () => Promise.reject(new Error("not configured")) },
+        publicOrigin: ORIGIN,
+        forms: [],
+        hostForms: [],
+        offerings: [],
+        clock: () => new Date(NOW),
+        publicWorkerVersionId: nextAuthority.publicWorkerVersionId,
+        integrationE2eCredentialAuthority: nextAuthority,
+      });
+      const currentOptions = {
+        ...fixture.options,
+        authority: nextAuthority,
+        privateJwkPath: nextPrivatePath,
+        fetcher: async (input: string, init?: RequestInit) =>
+          await currentApp.fetch(new Request(input, init)),
+      };
+
+      expect(await statusIntegrationCredentials(currentOptions)).toMatchObject({
+        remote: {
+          state: "active",
+          provenance: metadata.requestedAuthority,
+        },
+      });
+      expect(await revokeIntegrationCredentials(currentOptions)).toMatchObject({
+        operationId: metadata.operationId,
+        absent: true,
+      });
+      expect(await fixture.liveKeyCount()).toBe(0);
       expect(existsSync(fixture.paths.metadata)).toBe(false);
     } finally {
       fixture.cleanup();
@@ -191,7 +362,64 @@ describe("integration E2E credential helper", () => {
           },
         }),
       ).rejects.toThrow("compensation is indeterminate");
-      expect(await fixture.liveKeyCount()).toBe(1);
+      expect(await fixture.liveKeyCount()).toBe(2);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("fails closed when a dangling metadata path entry would otherwise look absent", async () => {
+    const fixture = await testFixture();
+    try {
+      symlinkSync(join(fixture.root, "missing-metadata-target"), fixture.paths.metadata);
+      await expect(statusIntegrationCredentials(fixture.options)).rejects.toThrow("symlink");
+      expect(pathEntryExists(fixture.paths.metadata)).toBe(true);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("unlinks a dangling secret path only after signed terminal absence", async () => {
+    const fixture = await testFixture();
+    try {
+      const metadata = await issueIntegrationCredentials(fixture.options);
+      unlinkSync(fixture.paths.evidenceSecret);
+      symlinkSync(join(fixture.root, "missing-evidence-target"), fixture.paths.evidenceSecret);
+
+      expect(await revokeIntegrationCredentials(fixture.options)).toMatchObject({
+        operationId: metadata.operationId,
+        absent: true,
+      });
+      for (const path of [
+        fixture.paths.writerSecret,
+        fixture.paths.evidenceSecret,
+        fixture.paths.metadata,
+      ]) {
+        expect(pathEntryExists(path)).toBe(false);
+      }
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("rechecks all three path entries after terminal cleanup before claiming absence", async () => {
+    const fixture = await testFixture();
+    try {
+      await issueIntegrationCredentials(fixture.options);
+      const failure = await revokeIntegrationCredentials({
+        ...fixture.options,
+        removeFile: async (path) => {
+          unlinkSync(path);
+          if (path === fixture.paths.metadata) {
+            writeFileSync(fixture.paths.writerSecret, "recreated-path-entry\n", { mode: 0o600 });
+          }
+        },
+      }).catch((error) => error);
+
+      expect(failure).toBeInstanceOf(IntegrationCredentialError);
+      expect(failure.message).toContain("local file cleanup failed");
+      expect(pathEntryExists(fixture.paths.writerSecret)).toBe(true);
+      expect(await fixture.liveKeyCount()).toBe(0);
     } finally {
       fixture.cleanup();
     }
@@ -243,7 +471,7 @@ describe("integration E2E credential helper", () => {
       ).rejects.toThrow("integration target");
       await expect(
         issueIntegrationCredentials({ ...fixture.options, keyLifetimeSeconds: 3_601, fetcher }),
-      ).rejects.toThrow("outside its bounded range");
+      ).rejects.toThrow("exactly 3600 seconds");
       for (const target of [
         {
           ...fixture.options.target,
@@ -289,7 +517,7 @@ describe("integration E2E credential helper", () => {
         }),
       ).rejects.toThrow();
       expect(calls).toEqual([]);
-      expect(await fixture.liveKeyCount()).toBe(1);
+      expect(await fixture.liveKeyCount()).toBe(2);
     } finally {
       fixture.cleanup();
     }
@@ -304,8 +532,9 @@ describe("integration E2E credential helper", () => {
         string,
         unknown
       >;
-      const key = record(metadata.key);
-      key.keyId = "key_ie2e_0000000000000000000000000000000000000000";
+      const roles = record(metadata.roles);
+      const writer = record(roles.writer);
+      writer.keyId = "key_ie2e_w_0000000000000000000000000000000000000000";
       writeFileSync(fixture.paths.metadata, `${JSON.stringify(metadata)}\n`, { mode: 0o600 });
       await expect(
         statusIntegrationCredentials({
@@ -317,7 +546,7 @@ describe("integration E2E credential helper", () => {
         }),
       ).rejects.toThrow("exact live routing");
       expect(calls).toEqual([]);
-      expect(await fixture.liveKeyCount()).toBe(1);
+      expect(await fixture.liveKeyCount()).toBe(2);
     } finally {
       fixture.cleanup();
     }
@@ -413,6 +642,7 @@ async function testFixture() {
     await app.fetch(new Request(input, init));
   const paths = credentialPaths(outputDirectory);
   return {
+    sql,
     root,
     outputDirectory,
     privatePath,
@@ -455,4 +685,14 @@ function record(value: unknown): Record<string, unknown> {
 function string(value: unknown): string {
   if (typeof value !== "string") throw new TypeError("string");
   return value;
+}
+
+function pathEntryExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
 }

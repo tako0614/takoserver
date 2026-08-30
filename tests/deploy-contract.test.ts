@@ -91,7 +91,14 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(credentials?.obligations.provenance).toContain(
       "exact five-variable JIT authority closure",
     );
-    expect(credentials?.obligations["failure-handling"]).toContain("never retries issue or revoke");
+    expect(credentials?.obligations["failure-handling"]).toContain("never replays issue");
+    expect(credentials?.obligations["failure-handling"]).toContain(
+      "exact idempotent revoke settlement",
+    );
+    expect(credentials?.obligations["post-conditions"]).toContain(
+      "distinct 3600-second writer and external-evidence secrets",
+    );
+    expect(credentials?.obligations.reversal).toContain("current dedicated authority");
 
     for (const surface of contract.surfaces) {
       expect(surface.obligations).toMatchObject({

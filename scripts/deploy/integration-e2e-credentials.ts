@@ -3,12 +3,16 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   INTEGRATION_E2E_API_KEY_DEFAULT_TTL_SECONDS,
-  INTEGRATION_E2E_API_KEY_NAME,
-  INTEGRATION_E2E_API_KEY_SCOPES,
+  INTEGRATION_E2E_EVIDENCE_KEY_NAME,
+  INTEGRATION_E2E_EVIDENCE_SCOPES,
   INTEGRATION_E2E_ORGANIZATION_ID,
+  INTEGRATION_E2E_WRITER_KEY_NAME,
+  INTEGRATION_E2E_WRITER_SCOPES,
 } from "../../src/integration-e2e-credential-authority.ts";
+import { parseStrictJson } from "../../src/strict-json.ts";
 import {
   AUTHORITY_CONFIG_ENVIRONMENT_VARIABLE,
+  credentialPaths,
   OUTPUT_DIRECTORY_ENVIRONMENT_VARIABLE,
   PRIVATE_JWK_ENVIRONMENT_VARIABLE,
   TARGET_ENVIRONMENT_VARIABLE,
@@ -67,7 +71,7 @@ export interface IntegrationE2eCredentialOptions {
  * Invokes the offline helper only after the immutable live Worker proves its
  * exact target, source, artifact, Version, and dedicated public key closure.
  * The private JWK remains a path in a sanitized child environment; neither its
- * bytes nor the issued API-key secret cross argv/stdout.
+ * bytes nor either issued API-key secret cross argv/stdout.
  */
 export async function runIntegrationE2eCredentials(
   invocation: IntegrationE2eCredentialInvocation,
@@ -171,7 +175,13 @@ export async function runIntegrationE2eCredentials(
         detail,
       );
     }
-    const result = exactHelperResult(invocation.action, child.stdout, authorityConfig);
+    const result = exactHelperResult(
+      invocation.action,
+      child.stdout,
+      authorityConfig,
+      target.publicOrigin,
+      credentialPaths(credentialOutputDirectory),
+    );
     return {
       kind: "takoserver.integration-e2e-credential-invocation@v1",
       surface: invocation.surface,
@@ -279,13 +289,15 @@ function exactHelperResult(
     readonly artifactDigest: string;
     readonly publicWorkerVersionId: string;
   },
+  origin: string,
+  paths: ReturnType<typeof credentialPaths>,
 ): Record<string, unknown> {
   if (new TextEncoder().encode(stdout).byteLength > 256 * 1_024) {
     throw mutationError("integration E2E credential helper output exceeded its bound");
   }
   let value: unknown;
   try {
-    value = JSON.parse(stdout);
+    value = parseStrictJson(new TextEncoder().encode(stdout), 256 * 1_024);
   } catch {
     throw mutationError("integration E2E credential helper returned invalid JSON");
   }
@@ -293,119 +305,291 @@ function exactHelperResult(
     throw mutationError("integration E2E credential helper returned an invalid result");
   }
   if (action === "issue") {
-    const key = value.key;
+    const requestedAuthority = value.requestedAuthority;
+    const roles = value.roles;
     if (
-      value.kind !== "takoserver.integration-e2e-credential@v2" ||
+      !exactKeys(value, [
+        "environment",
+        "kind",
+        "operationId",
+        "organizationId",
+        "origin",
+        "requestedAuthority",
+        "roles",
+        "ttlSeconds",
+        "version",
+      ]) ||
+      !isRecord(requestedAuthority) ||
+      !exactKeys(requestedAuthority, ["artifactDigest", "publicWorkerVersionId", "sourceCommit"]) ||
+      !isRecord(roles) ||
+      !exactKeys(roles, ["evidence", "writer"])
+    ) {
+      throw mutationError("integration E2E credential helper returned an invalid result");
+    }
+    if (
+      value.kind !== "takoserver.integration-e2e-credential-pair@v3" ||
+      value.version !== 3 ||
+      value.origin !== origin ||
       value.environment !== "integration" ||
       value.organizationId !== authority.organizationId ||
-      value.sourceCommit !== authority.sourceCommit ||
-      value.artifactDigest !== authority.artifactDigest ||
-      value.publicWorkerVersionId !== authority.publicWorkerVersionId ||
-      !isRecord(key) ||
-      key.name !== INTEGRATION_E2E_API_KEY_NAME ||
-      typeof key.keyId !== "string" ||
-      typeof key.operationId !== "string" ||
-      !Array.isArray(key.scopes) ||
-      JSON.stringify(key.scopes) !== JSON.stringify(INTEGRATION_E2E_API_KEY_SCOPES) ||
-      key.ttlSeconds !== INTEGRATION_E2E_API_KEY_DEFAULT_TTL_SECONDS ||
-      typeof key.createdAt !== "string" ||
-      typeof key.expiresAt !== "string" ||
-      typeof key.secretPath !== "string"
+      typeof value.operationId !== "string" ||
+      value.ttlSeconds !== INTEGRATION_E2E_API_KEY_DEFAULT_TTL_SECONDS ||
+      requestedAuthority.sourceCommit !== authority.sourceCommit ||
+      requestedAuthority.artifactDigest !== authority.artifactDigest ||
+      requestedAuthority.publicWorkerVersionId !== authority.publicWorkerVersionId
     ) {
       throw mutationError("integration E2E credential issue returned mismatched provenance");
     }
+    const writer = safeIssueRole(roles.writer, "writer");
+    const evidence = safeIssueRole(roles.evidence, "evidence");
+    if (
+      writer.keyId === evidence.keyId ||
+      writer.secretPath !== paths.writerSecret ||
+      evidence.secretPath !== paths.evidenceSecret
+    ) {
+      throw mutationError("integration E2E credential issue returned non-distinct role custody");
+    }
     return {
       kind: value.kind,
+      version: value.version,
       environment: value.environment,
       organizationId: value.organizationId,
-      sourceCommit: value.sourceCommit,
-      artifactDigest: value.artifactDigest,
-      publicWorkerVersionId: value.publicWorkerVersionId,
-      key: {
-        name: key.name,
-        keyId: key.keyId,
-        operationId: key.operationId,
-        scopes: [...key.scopes],
-        ttlSeconds: key.ttlSeconds,
-        createdAt: key.createdAt,
-        expiresAt: key.expiresAt,
-        secretPath: key.secretPath,
+      operationId: value.operationId,
+      ttlSeconds: value.ttlSeconds,
+      requestedAuthority: {
+        sourceCommit: requestedAuthority.sourceCommit,
+        artifactDigest: requestedAuthority.artifactDigest,
+        publicWorkerVersionId: requestedAuthority.publicWorkerVersionId,
       },
+      roles: { writer, evidence },
     };
   } else if (action === "status") {
     const files = value.files;
     if (
-      value.kind !== "takoserver.integration-e2e-credential-status@v2" ||
+      !exactKeys(value, ["files", "kind", "operationId", "organizationId", "origin", "remote"]) ||
+      value.kind !== "takoserver.integration-e2e-credential-pair-local-status@v3" ||
+      value.origin !== origin ||
       value.organizationId !== authority.organizationId ||
-      typeof value.keyId !== "string" ||
-      !isRecord(files)
+      typeof value.operationId !== "string" ||
+      !isRecord(files) ||
+      !exactKeys(files, ["evidenceSecret", "metadata", "writerSecret"])
     ) {
       throw preflightError("integration E2E credential status returned a mismatched result");
     }
     const remote = safeRemoteStatus(value.remote, authority.organizationId);
+    const writerSecret = safeLocalFileStatus(files.writerSecret, paths.writerSecret);
+    const evidenceSecret = safeLocalFileStatus(files.evidenceSecret, paths.evidenceSecret);
+    const metadata = safeLocalFileStatus(files.metadata, paths.metadata);
+    if (
+      (remote === null && value.operationId !== "") ||
+      (remote !== null && remote.operationId !== value.operationId)
+    ) {
+      throw preflightError(
+        "integration E2E credential status returned mismatched recovery custody",
+      );
+    }
     return {
       kind: value.kind,
       organizationId: value.organizationId,
-      keyId: value.keyId,
+      operationId: value.operationId,
       remote,
-      files: {
-        secret: safeLocalFileStatus(files.secret),
-        metadata: safeLocalFileStatus(files.metadata),
-      },
+      files: { writerSecret, evidenceSecret, metadata },
     };
   }
   if (
+    !exactKeys(value, ["absent", "keyIds", "operationId", "organizationId"]) ||
     value.organizationId !== authority.organizationId ||
     value.absent !== true ||
-    typeof value.keyId !== "string"
+    typeof value.operationId !== "string" ||
+    !isRecord(value.keyIds) ||
+    !exactKeys(value.keyIds, ["evidence", "writer"]) ||
+    typeof value.keyIds.writer !== "string" ||
+    typeof value.keyIds.evidence !== "string" ||
+    value.keyIds.writer === value.keyIds.evidence
   ) {
     throw mutationError("integration E2E credential revoke returned a mismatched result");
   }
   return {
     organizationId: value.organizationId,
-    keyId: value.keyId,
+    operationId: value.operationId,
+    keyIds: { writer: value.keyIds.writer, evidence: value.keyIds.evidence },
     absent: true,
   };
+}
+
+function safeIssueRole(value: unknown, role: "writer" | "evidence"): Record<string, unknown> {
+  const name =
+    role === "writer" ? INTEGRATION_E2E_WRITER_KEY_NAME : INTEGRATION_E2E_EVIDENCE_KEY_NAME;
+  const scopes =
+    role === "writer" ? INTEGRATION_E2E_WRITER_SCOPES : INTEGRATION_E2E_EVIDENCE_SCOPES;
+  if (
+    !isRecord(value) ||
+    !exactKeys(value, ["keyId", "name", "role", "scopes", "secretPath"]) ||
+    value.role !== role ||
+    value.name !== name ||
+    typeof value.keyId !== "string" ||
+    JSON.stringify(value.scopes) !== JSON.stringify(scopes) ||
+    typeof value.secretPath !== "string"
+  ) {
+    throw mutationError("integration E2E credential issue returned invalid role metadata");
+  }
+  return { role, name, keyId: value.keyId, scopes: [...scopes], secretPath: value.secretPath };
 }
 
 function safeRemoteStatus(value: unknown, organizationId: string): Record<string, unknown> | null {
   if (value === null) return null;
   if (
     !isRecord(value) ||
-    typeof value.keyId !== "string" ||
+    !exactKeys(value, [
+      "completeness",
+      "fence",
+      "kind",
+      "legacyKeyPresent",
+      "operationId",
+      "organizationId",
+      "provenance",
+      "roles",
+      "state",
+      "terminal",
+    ]) ||
+    value.kind !== "takoserver.integration-e2e-credential-pair-status@v1" ||
     typeof value.operationId !== "string" ||
-    typeof value.present !== "boolean" ||
-    typeof value.usable !== "boolean" ||
-    (value.organizationId !== undefined && value.organizationId !== organizationId) ||
-    (value.scopes !== undefined &&
-      (!Array.isArray(value.scopes) ||
-        JSON.stringify(value.scopes) !== JSON.stringify(INTEGRATION_E2E_API_KEY_SCOPES))) ||
-    (value.createdAt !== undefined && typeof value.createdAt !== "string") ||
-    (value.expiresAt !== undefined && typeof value.expiresAt !== "string")
+    value.organizationId !== organizationId ||
+    ![
+      "unregistered",
+      "indeterminate",
+      "prepared",
+      "issuing",
+      "active",
+      "partial",
+      "revoking",
+      "revoked",
+    ].includes(String(value.state)) ||
+    (value.fence !== null && (!Number.isSafeInteger(value.fence) || Number(value.fence) < 1)) ||
+    !["absent", "partial", "complete"].includes(String(value.completeness)) ||
+    typeof value.terminal !== "boolean" ||
+    typeof value.legacyKeyPresent !== "boolean" ||
+    !isRecord(value.roles) ||
+    !exactKeys(value.roles, ["evidence", "writer"])
   ) {
     throw preflightError("integration E2E credential status returned a mismatched result");
   }
+  const writer = safeRemoteRole(value.roles.writer, "writer");
+  const evidence = safeRemoteRole(value.roles.evidence, "evidence");
+  let provenance: Record<string, unknown> | null = null;
+  if (value.provenance !== null) {
+    if (
+      !isRecord(value.provenance) ||
+      !exactKeys(value.provenance, ["artifactDigest", "publicWorkerVersionId", "sourceCommit"]) ||
+      typeof value.provenance.sourceCommit !== "string" ||
+      typeof value.provenance.artifactDigest !== "string" ||
+      typeof value.provenance.publicWorkerVersionId !== "string"
+    ) {
+      throw preflightError("integration E2E credential status returned invalid provenance");
+    }
+    provenance = {
+      sourceCommit: value.provenance.sourceCommit,
+      artifactDigest: value.provenance.artifactDigest,
+      publicWorkerVersionId: value.provenance.publicWorkerVersionId,
+    };
+  }
+  const complete =
+    writer.present && evidence.present
+      ? "complete"
+      : writer.present || evidence.present
+        ? "partial"
+        : "absent";
+  const durable = ["prepared", "issuing", "active", "partial", "revoking", "revoked"].includes(
+    String(value.state),
+  );
+  const terminal =
+    value.state === "revoked" && complete === "absent" && value.legacyKeyPresent === false;
+  if (
+    value.completeness !== complete ||
+    value.terminal !== terminal ||
+    (durable && (value.fence === null || provenance === null)) ||
+    (!durable && (value.fence !== null || provenance !== null))
+  ) {
+    throw preflightError("integration E2E credential status returned invalid lifecycle invariants");
+  }
   return {
-    keyId: value.keyId,
     operationId: value.operationId,
+    organizationId,
+    state: value.state,
+    fence: value.fence,
+    completeness: value.completeness,
+    terminal: value.terminal,
+    legacyKeyPresent: value.legacyKeyPresent,
+    provenance,
+    roles: { writer, evidence },
+  };
+}
+
+function safeRemoteRole(value: unknown, role: "writer" | "evidence"): Record<string, unknown> {
+  const name =
+    role === "writer" ? INTEGRATION_E2E_WRITER_KEY_NAME : INTEGRATION_E2E_EVIDENCE_KEY_NAME;
+  const scopes =
+    role === "writer" ? INTEGRATION_E2E_WRITER_SCOPES : INTEGRATION_E2E_EVIDENCE_SCOPES;
+  const hasTimes = isRecord(value) && ("createdAt" in value || "expiresAt" in value);
+  if (
+    !isRecord(value) ||
+    !exactKeys(value, [
+      "keyId",
+      "name",
+      "present",
+      "recorded",
+      "role",
+      "scopes",
+      "ttlSeconds",
+      "usable",
+      ...(hasTimes ? ["createdAt", "expiresAt"] : []),
+    ]) ||
+    value.role !== role ||
+    value.name !== name ||
+    typeof value.keyId !== "string" ||
+    JSON.stringify(value.scopes) !== JSON.stringify(scopes) ||
+    value.ttlSeconds !== INTEGRATION_E2E_API_KEY_DEFAULT_TTL_SECONDS ||
+    typeof value.recorded !== "boolean" ||
+    typeof value.present !== "boolean" ||
+    typeof value.usable !== "boolean" ||
+    (value.present && !value.recorded) ||
+    (value.usable && !value.present) ||
+    (value.createdAt !== undefined && typeof value.createdAt !== "string") ||
+    (value.expiresAt !== undefined && typeof value.expiresAt !== "string") ||
+    value.recorded !== hasTimes
+  ) {
+    throw preflightError("integration E2E credential status returned invalid role metadata");
+  }
+  return {
+    role,
+    name,
+    keyId: value.keyId,
+    scopes: [...scopes],
+    ttlSeconds: value.ttlSeconds,
+    recorded: value.recorded,
     present: value.present,
     usable: value.usable,
-    ...(value.organizationId === undefined ? {} : { organizationId: value.organizationId }),
-    ...(value.scopes === undefined ? {} : { scopes: [...value.scopes] }),
     ...(value.createdAt === undefined ? {} : { createdAt: value.createdAt }),
     ...(value.expiresAt === undefined ? {} : { expiresAt: value.expiresAt }),
   };
 }
 
-function safeLocalFileStatus(value: unknown): Record<string, unknown> {
+function safeLocalFileStatus(value: unknown, expectedPath: string): Record<string, unknown> {
   if (
     !isRecord(value) ||
-    typeof value.path !== "string" ||
+    !exactKeys(value, ["exists", "mode", "path", "symlink"]) ||
+    value.path !== expectedPath ||
     typeof value.exists !== "boolean" ||
     (value.mode !== null && !Number.isSafeInteger(value.mode)) ||
     typeof value.symlink !== "boolean"
   ) {
     throw preflightError("integration E2E credential status returned invalid local custody");
+  }
+  if (
+    (value.exists && (value.mode !== 0o600 || value.symlink)) ||
+    (!value.exists && (value.mode !== null || value.symlink))
+  ) {
+    throw preflightError("integration E2E credential status returned unsafe local custody");
   }
   return { path: value.path, exists: value.exists, mode: value.mode, symlink: value.symlink };
 }
@@ -433,4 +617,8 @@ function exactCloudflareToken(environment: Readonly<Record<string, string>>): st
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function exactKeys(value: Readonly<Record<string, unknown>>, keys: readonly string[]): boolean {
+  return JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...keys].sort());
 }

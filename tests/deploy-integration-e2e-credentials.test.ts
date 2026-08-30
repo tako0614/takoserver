@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { lstatSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { lstatSync, mkdtempSync, readFileSync, rmSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -11,6 +11,7 @@ import type { WorkerState } from "../scripts/deploy/worker-live.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
 import {
   AUTHORITY_CONFIG_ENVIRONMENT_VARIABLE,
+  credentialPaths,
   OUTPUT_DIRECTORY_ENVIRONMENT_VARIABLE,
   PRIVATE_JWK_ENVIRONMENT_VARIABLE,
   TARGET_ENVIRONMENT_VARIABLE,
@@ -55,24 +56,33 @@ describe("integration E2E credential owner surface", () => {
         calls.push({ command: [...command], env: { ...(options?.env ?? {}) } });
         return ok(
           JSON.stringify({
-            version: 2,
-            kind: "takoserver.integration-e2e-credential@v2",
+            version: 3,
+            kind: "takoserver.integration-e2e-credential-pair@v3",
             origin: target.publicOrigin,
             environment: "integration",
             organizationId: INTEGRATION_E2E_ORGANIZATION_ID,
-            sourceCommit: COMMIT,
-            artifactDigest: `sha256:${BUNDLE_DIGEST}`,
-            publicWorkerVersionId: VERSION_ID,
-            key: {
-              name: "integration-e2e-api-key",
-              keyId: "key_ie2e_exact",
-              operationId: "issue-owner-derived",
-              scopes: ["resources:write"],
-              ttlSeconds: 900,
-              createdAt: "2026-08-30T12:00:00.000Z",
-              expiresAt: "2026-08-30T12:15:00.000Z",
-              secretPath: join(outputDirectory, "task-0037-integration-writer.secret"),
-              secret: "must-not-cross",
+            operationId: "issue-owner-derived",
+            ttlSeconds: 3_600,
+            requestedAuthority: {
+              sourceCommit: COMMIT,
+              artifactDigest: `sha256:${BUNDLE_DIGEST}`,
+              publicWorkerVersionId: VERSION_ID,
+            },
+            roles: {
+              writer: {
+                role: "writer",
+                name: "integration-e2e-writer",
+                keyId: "key_ie2e_w_exact",
+                scopes: ["resources:write"],
+                secretPath: join(outputDirectory, "task-0037-integration-writer.secret"),
+              },
+              evidence: {
+                role: "evidence",
+                name: "integration-e2e-evidence",
+                keyId: "key_ie2e_e_exact",
+                scopes: ["resources:read"],
+                secretPath: join(outputDirectory, "task-0037-integration-evidence.secret"),
+              },
             },
           }),
         );
@@ -130,6 +140,125 @@ describe("integration E2E credential owner surface", () => {
       expect(lstatSync(snapshotPath).mode & 0o777).toBe(0o600);
       expect(JSON.parse(readFileSync(snapshotPath, "utf8"))).toEqual(target);
       expect(JSON.stringify(result)).not.toContain("must-not-cross");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses type-correct helper paths outside the exact credential output custody", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-deploy-jit-custody-"));
+    const outputDirectory = join(root, "credentials");
+    const paths = credentialPaths(outputDirectory);
+    const baseOptions = {
+      state: staticState(version()),
+      privateJwkPath: join(root, "private.jwk"),
+      credentialOutputDirectory: outputDirectory,
+      temporaryDirectory: root,
+      cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+      signingDatabase: signingDatabase(DISTINCT_SIGNING_X),
+    } as const;
+    try {
+      const issueFailure = await runIntegrationE2eCredentials(invocation("issue"), target, {
+        ...baseOptions,
+        review: "reviewer@example.test",
+        run: async () =>
+          ok(
+            JSON.stringify({
+              version: 3,
+              kind: "takoserver.integration-e2e-credential-pair@v3",
+              origin: target.publicOrigin,
+              environment: "integration",
+              organizationId: INTEGRATION_E2E_ORGANIZATION_ID,
+              operationId: "issue-owner-wrong-custody",
+              ttlSeconds: 3_600,
+              requestedAuthority: {
+                sourceCommit: COMMIT,
+                artifactDigest: `sha256:${BUNDLE_DIGEST}`,
+                publicWorkerVersionId: VERSION_ID,
+              },
+              roles: {
+                writer: {
+                  role: "writer",
+                  name: "integration-e2e-writer",
+                  keyId: "key_ie2e_w_exact",
+                  scopes: ["resources:write"],
+                  secretPath: join(root, "attacker-selected-writer.secret"),
+                },
+                evidence: {
+                  role: "evidence",
+                  name: "integration-e2e-evidence",
+                  keyId: "key_ie2e_e_exact",
+                  scopes: ["resources:read"],
+                  secretPath: paths.evidenceSecret,
+                },
+              },
+            }),
+          ),
+      }).catch((error) => error);
+      expect(issueFailure).toMatchObject({ phase: "mutation" });
+      expect(issueFailure.message).toContain("custody");
+      unlinkSync(join(root, "deploy-target.json"));
+
+      const statusFailure = await runIntegrationE2eCredentials(invocation("status"), target, {
+        ...baseOptions,
+        run: async () =>
+          ok(
+            JSON.stringify({
+              kind: "takoserver.integration-e2e-credential-pair-local-status@v3",
+              origin: target.publicOrigin,
+              organizationId: INTEGRATION_E2E_ORGANIZATION_ID,
+              operationId: "",
+              remote: null,
+              files: {
+                writerSecret: {
+                  path: paths.writerSecret,
+                  exists: false,
+                  mode: null,
+                  symlink: false,
+                },
+                evidenceSecret: {
+                  path: paths.evidenceSecret,
+                  exists: false,
+                  mode: null,
+                  symlink: false,
+                },
+                metadata: {
+                  path: join(root, "attacker-selected-metadata.json"),
+                  exists: false,
+                  mode: null,
+                  symlink: false,
+                },
+              },
+            }),
+          ),
+      }).catch((error) => error);
+      expect(statusFailure).toMatchObject({ phase: "preflight" });
+      expect(statusFailure.message).toContain("custody");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects undeclared child fields instead of accepting value-bearing helper output", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-deploy-jit-exact-output-"));
+    const outputDirectory = join(root, "credentials");
+    const leaked = "api-key-secret-value-must-not-cross";
+    try {
+      const failure = await runIntegrationE2eCredentials(invocation("issue"), target, {
+        state: staticState(version()),
+        run: async () =>
+          ok(JSON.stringify({ ...helperIssueResult(outputDirectory), secret: leaked })),
+        privateJwkPath: join(root, "private.jwk"),
+        credentialOutputDirectory: outputDirectory,
+        temporaryDirectory: root,
+        review: "reviewer@example.test",
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        signingDatabase: signingDatabase(DISTINCT_SIGNING_X),
+      }).catch((error) => error);
+
+      expect(failure).toMatchObject({ phase: "mutation" });
+      expect(failure.message).toContain("invalid result");
+      expect(JSON.stringify(failure)).not.toContain(leaked);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -337,4 +466,38 @@ function signingDatabase(publicX: string) {
 
 function ok(stdout: string) {
   return { exitCode: 0, stdout, stderr: "" };
+}
+
+function helperIssueResult(outputDirectory: string) {
+  const paths = credentialPaths(outputDirectory);
+  return {
+    version: 3,
+    kind: "takoserver.integration-e2e-credential-pair@v3",
+    origin: target.publicOrigin,
+    environment: "integration",
+    organizationId: INTEGRATION_E2E_ORGANIZATION_ID,
+    operationId: "issue-owner-exact-output",
+    ttlSeconds: 3_600,
+    requestedAuthority: {
+      sourceCommit: COMMIT,
+      artifactDigest: `sha256:${BUNDLE_DIGEST}`,
+      publicWorkerVersionId: VERSION_ID,
+    },
+    roles: {
+      writer: {
+        role: "writer",
+        name: "integration-e2e-writer",
+        keyId: "key_ie2e_w_exact",
+        scopes: ["resources:write"],
+        secretPath: paths.writerSecret,
+      },
+      evidence: {
+        role: "evidence",
+        name: "integration-e2e-evidence",
+        keyId: "key_ie2e_e_exact",
+        scopes: ["resources:read"],
+        secretPath: paths.evidenceSecret,
+      },
+    },
+  };
 }

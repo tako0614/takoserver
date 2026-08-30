@@ -41,9 +41,9 @@ export interface WorkerEnv {
   readonly PUBLIC_ORIGIN?: string;
   /** Exact deploy lane. The JIT credential route refuses every value but integration. */
   readonly TAKOSERVER_ENVIRONMENT?: string;
-  /** Public half of the dedicated integration-e2e-api-key proof key. */
+  /** Public half of the dedicated operator proof key for the JIT pair lifecycle. */
   readonly TAKOSERVER_INTEGRATION_E2E_API_KEY_PUBLIC_JWK?: string;
-  /** Existing organization to which the one JIT writer key is pinned. */
+  /** Existing organization to which the JIT writer/evidence pair is pinned. */
   readonly TAKOSERVER_INTEGRATION_E2E_ORGANIZATION_ID?: string;
   /** Exact source and built artifact identities injected by the owning deploy surface. */
   readonly TAKOSERVER_SOURCE_COMMIT?: string;

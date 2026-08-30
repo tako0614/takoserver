@@ -139,11 +139,15 @@ The separate authority and irreversible surfaces are:
   `--issue`, `--status`, and `--revoke` actions exhaustively read the immutable
   current public Worker Version and exact JIT binding closure before the owner
   writes a temporary `0600` target snapshot and invokes its internal helper
-  once. Issue creates one 900-second `resources:write` key for the fixed
-  organization; status performs signed exact-operation readback; revoke sends
-  one exact revocation and requires a separately signed absence readback before
-  deleting the two owned local files. Neither private JWK nor API-key bytes
-  enter Worker configuration, argv, owner output, or diagnostics.
+  once. The downstream E2E orchestrator issues and revokes a fresh 3600-second
+  pair around each product run for the fixed
+  organization: a `resources:write` writer and a distinct `resources:read`
+  external-evidence key. Status performs signed exact-operation readback;
+  revoke settles both deterministic ids and requires a separately signed
+  terminal-absence readback before deleting the two secret files and their
+  metadata. The evidence secret never enters a Provider or runner. Neither
+  private JWK nor API-key bytes enter Worker configuration, argv, owner output,
+  or diagnostics.
 - `takoserver-d1-schema`: ordered, forward-only D1 migration apply and exact
   post-lineage/schema-shape readback.
 - `takoserver-signing-key-register`: append-only public Ed25519 JWK registration
@@ -302,8 +306,9 @@ signing key: the owner proves that against the active canonical public JWK in
 D1 before upload or credential mutation, and the Worker independently checks
 the configured private signing key at startup. The credential surface proves
 the JIT private half against its target, keeps it outside Cloudflare, and writes
-the issued secret plus nonsecret recovery metadata only to the existing link-free `0700`
-`TAKOSERVER_INTEGRATION_E2E_OUTPUT_DIRECTORY` as separate `0600` files. See
+the two issued secrets plus nonsecret pair-recovery metadata only to the existing
+link-free `0700` `TAKOSERVER_INTEGRATION_E2E_OUTPUT_DIRECTORY` as three separate
+`0600` files. See
 [integration-e2e-credentials.md](integration-e2e-credentials.md).
 
 ## Failure handling
@@ -328,12 +333,15 @@ single-variable Version is current, while absence means the selected
 predecessor remains current. Any unrelated configuration or Version advance is
 refused rather than attributed to the interrupted attempt.
 
-For an integration credential issue or revoke failure, do not retry the
-mutation. Run the credential surface with `--status`; it validates the sealed
-metadata and sends one signed readback for the exact deterministic operation.
-Wrong organization, partial bindings, key reuse, selected/live source or
-artifact mismatch, active D1 runtime-signing identity drift, and a live Version
-advance all fail before the helper is invoked.
+For an integration credential issue failure, never replay the secret-bearing
+issue. Run the credential surface with `--status`; it validates the sealed pair
+metadata and sends one signed readback for the exact deterministic operation and
+both role ids. A signed `revoking` state may be settled by an exact idempotent
+revoke followed by another signed status; this does not issue a new pair. Status
+and revoke use the current dedicated authority even when issuance provenance
+names an older Worker Version. Wrong organization, partial bindings, key reuse,
+selected/live source or artifact mismatch, and active D1 runtime-signing
+identity drift fail before the helper is invoked.
 
 For a post-token attribution repair acknowledgement failure, do not retry apply.
 Run the same repair surface with both pinned selectors and `--status`: only the

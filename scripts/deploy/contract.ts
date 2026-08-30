@@ -277,6 +277,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/worker-state.ts",
         "src/integration-e2e-credential-authority.ts",
         "src/entry-worker.ts",
+        "migrations/0030_integration_e2e_credential_pairs.sql",
       ],
       requiresScripts: ["deploy"],
       requiresTools: ["bun"],
@@ -293,16 +294,20 @@ export const DEPLOY_CONTRACT = {
           "commit, annotated artifact digest, exact five-variable JIT authority closure and live Version " +
           "before the owner writes a 0600 target snapshot and invokes the helper once.",
         "post-conditions":
-          "Issue writes one fixed-scope short-lived secret plus nonsecret metadata under owner-only custody. " +
-          "Status is a signed readback of that exact operation. Revoke sends one revoke and requires a " +
-          "separate signed absence readback before deleting the owned local files.",
+          "Each issue durably publishes operation coordinates, then writes distinct 3600-second writer and " +
+          "external-evidence secrets plus pair metadata under owner-only custody. Status is a value-free signed " +
+          "readback of both exact roles. Revoke settles both ids and requires a terminal signed absence readback " +
+          "before deleting all three owned local files.",
         reversal:
-          "The issued key is reversed only by this surface's exact revoke action. The dedicated public " +
-          "authority key is configuration and remains separate from every issued short-lived API key.",
+          "The issued pair is reversed only by this surface's exact revoke action. Status and revoke use the " +
+          "current dedicated authority while preserving issuance provenance, so a Worker Version change cannot " +
+          "strand the old pair. The authority key remains separate from both issued API keys.",
         "failure-handling":
-          "The owner never retries issue or revoke. A nonzero mutation result is indeterminate and requires " +
-          "status before any new action. Private JWK and API-key bytes never enter argv, Worker config, " +
-          "stdout or diagnostics; a wrong organization, partial profile, key reuse or live provenance drift fails closed.",
+          "The owner never replays issue after an indeterminate secret-bearing mutation. Signed status is " +
+          "required before any exact idempotent revoke settlement; a revoking fence may be resumed without " +
+          "minting another pair. A partial pair is visible and fenced revoke wins over delayed issue. " +
+          "Private JWK and API-key bytes never enter argv, Worker config, stdout or diagnostics; evidence never " +
+          "enters a Provider or runner, and a wrong organization, partial profile or key reuse fails closed.",
         "independent-review": review,
       },
     },
