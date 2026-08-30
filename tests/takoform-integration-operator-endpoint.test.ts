@@ -327,6 +327,182 @@ describe("integration Form authority bridge", () => {
     expect(applied.nextPlan.commands).toEqual([]);
   });
 
+  test("reseals support only when the public Worker Version advances", async () => {
+    const sql = createEphemeralSql();
+    const objects = createMemoryObjectStore();
+    const original = await integrationFixture({ sql, objects });
+    expect(
+      (await original.endpoint.apply(await original.endpoint.plan(original.request))).status,
+    ).toBe("converged");
+    const advanced = await createIntegrationFormAuthorityComposition({
+      configuration: {
+        environment: "integration",
+        hostId: original.identity.hostId,
+        workerArtifactDigest: original.identity.workerArtifactDigest,
+        publicWorkerVersionId: DRIFTED_PUBLIC_VERSION_ID,
+        capabilities: CAPABILITIES,
+      },
+      bindings: {
+        sql,
+        objects,
+        publicHostIdentity: {
+          async identity() {
+            return {
+              kind: "takoserver.public-host-identity@v1",
+              hostId: original.identity.hostId,
+              workerVersionId: DRIFTED_PUBLIC_VERSION_ID,
+            };
+          },
+        },
+      },
+    });
+    const request: FormAuthorityPlanRequest = {
+      ...original.request,
+      ...advanced.identity,
+    };
+
+    const before = await advanced.endpoint.readback(request);
+    expect(before.forms.every((form) => form.installed && !form.supported && form.active)).toBe(
+      true,
+    );
+    const plan = await advanced.endpoint.plan(request);
+    expect(plan.commands).toHaveLength(12);
+    expect(plan.commands.every((command) => command.kind === "SetSupport")).toBe(true);
+    const applied = await advanced.endpoint.apply(plan);
+    expect(applied.status).toBe("converged");
+    expect(applied.nextPlan.commands).toEqual([]);
+    expect(
+      applied.readback.forms.every((form) => form.installed && form.supported && form.active),
+    ).toBe(true);
+    expect(
+      (await sql.query("SELECT COUNT(*) AS count FROM tf_form_install_events"))[0]?.count,
+    ).toBe(12);
+    expect(
+      (await sql.query("SELECT COUNT(*) AS count FROM tf_form_activation_events"))[0]?.count,
+    ).toBe(12);
+    expect(
+      (await sql.query("SELECT COUNT(*) AS count FROM tf_form_support_events"))[0]?.count,
+    ).toBe(24);
+  });
+
+  test("moves all Forms to a stable publisher generation while resealing the public Version", async () => {
+    const baseSql = createEphemeralSql();
+    let failReplacementAt: number | undefined;
+    let replacementWrites = 0;
+    const sql: Sql = {
+      query: (statement, params) => baseSql.query(statement, params),
+      async run(statement, params) {
+        if (
+          failReplacementAt !== undefined &&
+          statement.includes("INSERT INTO tf_form_install_events")
+        ) {
+          replacementWrites += 1;
+          if (replacementWrites === failReplacementAt) {
+            failReplacementAt = undefined;
+            const error = new Error("synthetic replacement outage") as Error & { code: string };
+            error.code = "guarded_write_unavailable";
+            throw error;
+          }
+        }
+        return await baseSql.run(statement, params);
+      },
+      batch: (statements) => baseSql.batch(statements),
+    };
+    const objects = createMemoryObjectStore();
+    const original = await integrationFixture({ sql, objects });
+    expect(
+      (await original.endpoint.apply(await original.endpoint.plan(original.request))).status,
+    ).toBe("converged");
+    const advanced = await createIntegrationFormAuthorityComposition({
+      configuration: {
+        environment: "integration",
+        hostId: original.identity.hostId,
+        workerArtifactDigest: original.identity.workerArtifactDigest,
+        publicWorkerVersionId: DRIFTED_PUBLIC_VERSION_ID,
+        capabilities: CAPABILITIES,
+      },
+      bindings: {
+        sql,
+        objects,
+        publicHostIdentity: {
+          async identity() {
+            return {
+              kind: "takoserver.public-host-identity@v1",
+              hostId: original.identity.hostId,
+              workerVersionId: DRIFTED_PUBLIC_VERSION_ID,
+            };
+          },
+        },
+      },
+    });
+    const evidence = trustEvidence();
+    const request: FormAuthorityPlanRequest = {
+      ...original.request,
+      ...advanced.identity,
+      evidence: {
+        ...evidence,
+        publisher: {
+          ...evidence.publisher,
+          publisherKey: "publisher-stable-corpus-generation",
+          sourceRepository: "https://github.com/tako0614/takoform-forms.git",
+          ref: `git:${"d".repeat(40)}`,
+          sourceCommit: "d".repeat(40),
+          workflowCommit: "d".repeat(40),
+          buildConfigCommit: "d".repeat(40),
+          repositoryIdentifier: "repo:tako0614/takoform-forms",
+        },
+      },
+    };
+
+    const plan = await advanced.endpoint.plan(request);
+    expect(plan.commands).toHaveLength(2 + 12 * 2);
+    expect(plan.commands.slice(0, 2).map((command) => command.kind)).toEqual([
+      "AllowPublisher",
+      "AppendCheckpoint",
+    ]);
+    expect(plan.commands.slice(2).map((command) => command.kind)).toEqual(
+      Array.from({ length: 12 }, () => ["ReplacePackage", "SetSupport"] as const).flat(),
+    );
+
+    failReplacementAt = 3;
+    const partial = await advanced.endpoint.apply(plan);
+    expect(partial.status).toBe("partial");
+    expect(partial.receipts.map((receipt) => receipt.kind)).toEqual([
+      "AllowPublisher",
+      "AppendCheckpoint",
+      "ReplacePackage",
+      "SetSupport",
+      "ReplacePackage",
+      "SetSupport",
+    ]);
+    expect(partial.nextPlan.commands).toHaveLength(10 * 2);
+    expect(partial.nextPlan.commands.map((command) => command.kind)).toEqual(
+      Array.from({ length: 10 }, () => ["ReplacePackage", "SetSupport"] as const).flat(),
+    );
+
+    const applied = await advanced.endpoint.apply(partial.nextPlan);
+    expect(applied.status).toBe("converged");
+    expect(applied.nextPlan.commands).toEqual([]);
+    expect(
+      applied.readback.forms.every((form) => form.installed && form.supported && form.active),
+    ).toBe(true);
+    expect(
+      (await sql.query("SELECT COUNT(*) AS count FROM tf_form_publisher_events"))[0]?.count,
+    ).toBe(2);
+    expect(
+      (await sql.query("SELECT COUNT(*) AS count FROM tf_form_revocation_checkpoints"))[0]?.count,
+    ).toBe(2);
+    expect(
+      (await sql.query("SELECT COUNT(*) AS count FROM tf_form_install_events"))[0]?.count,
+    ).toBe(24);
+    expect(
+      (await sql.query("SELECT COUNT(*) AS count FROM tf_form_support_events"))[0]?.count,
+    ).toBe(24);
+    expect(
+      (await sql.query("SELECT COUNT(*) AS count FROM tf_form_activation_events"))[0]?.count,
+    ).toBe(12);
+  });
+
   test("converges exact-existing R2 package bytes only after readback and replan", async () => {
     const baseSql = createEphemeralSql();
     let failFirstInstall = true;

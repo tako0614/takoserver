@@ -14,11 +14,16 @@ import { createEphemeralSql } from "../src/compat.ts";
 import { verifyFormAuthorityOperatorAssertion } from "../src/form-authority-operator-proof.ts";
 import { canonicalJson } from "../src/json.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
+import {
+  CURRENT_PUBLISHER_COMMIT,
+  CURRENT_PUBLISHER_REPOSITORY,
+} from "../src/takoform/current-publisher-catalog.ts";
 import { deriveFormAuthorityIdentity } from "../src/takoform/host-admission-endpoint.ts";
 import { YURUCOMMU_IDENTITY_CAPABILITY_KINDS } from "../src/takoform/implementation-catalog.ts";
 import { createIntegrationFormAuthorityComposition } from "../src/takoform/integration-operator-endpoint.ts";
 
 const COMMIT = "a".repeat(40);
+const NEXT_COMMIT = "d".repeat(40);
 const NOW = new Date("2026-08-29T02:00:00Z");
 const ARTIFACT = `sha256:${"b".repeat(64)}` as const;
 const PUBLIC_VERSION = "11111111-1111-4111-8111-111111111111";
@@ -99,6 +104,53 @@ describe("signed Form authority operator invocation", () => {
     const serialized = JSON.stringify(result);
     expect(serialized).not.toContain(privateJwk.d as string);
     expect(serialized).not.toContain(fixture.assertions[0] ?? "missing-assertion");
+  });
+
+  test("keeps the Form publisher generation stable across Host deploy commits", async () => {
+    const fixture = await invocationFixture();
+    await runFormAuthorityInvoke(
+      {
+        surface: "takoserver-integration-form-authority",
+        action: "apply",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      fixture.target,
+      fixture.options,
+    );
+    const firstRequest = fixture.calls.find(({ action }) => action === "plan")?.body as {
+      evidence?: { publisher?: Record<string, unknown> };
+    };
+    fixture.calls.length = 0;
+    fixture.assertions.length = 0;
+    fixture.selectCommit(NEXT_COMMIT);
+
+    const second = await runFormAuthorityInvoke(
+      {
+        surface: "takoserver-integration-form-authority",
+        action: "apply",
+        environment: "integration",
+        commit: NEXT_COMMIT,
+      },
+      fixture.target,
+      fixture.options,
+    );
+    const secondRequest = fixture.calls.find(({ action }) => action === "plan")?.body as {
+      evidence?: { publisher?: Record<string, unknown> };
+    };
+
+    expect(second).toMatchObject({ ready: true, plan: { commandCount: 0 } });
+    expect((second.apply as { receipts: unknown[] }).receipts).toEqual([]);
+    expect(secondRequest.evidence?.publisher).toEqual(firstRequest.evidence?.publisher);
+    expect(secondRequest.evidence?.publisher).toMatchObject({
+      publisherKey: expect.stringMatching(/^takoform-integration-fixture:sha256:[0-9a-f]{64}$/),
+      sourceRepository: CURRENT_PUBLISHER_REPOSITORY,
+      sourceCommit: CURRENT_PUBLISHER_COMMIT,
+      workflowCommit: CURRENT_PUBLISHER_COMMIT,
+      buildConfigCommit: CURRENT_PUBLISHER_COMMIT,
+      repositoryIdentifier: "repo:tako0614/takoform-forms",
+    });
+    expect(secondRequest.evidence?.publisher?.sourceCommit).not.toBe(NEXT_COMMIT);
   });
 
   test("status is one signed readback and reports the exact 12-form convergence", async () => {
@@ -279,6 +331,7 @@ async function invocationFixture(
     readonly tamperReadback?: "truthy" | "extra" | "missing";
   } = {},
 ) {
+  let selectedCommit = COMMIT;
   const target = await integrationTarget();
   const capabilities = targetCapabilityManifest(target);
   const identity = await deriveFormAuthorityIdentity({
@@ -386,14 +439,14 @@ async function invocationFixture(
         environment: "integration",
         workerName: target.formAuthority?.integrationOperatorWorkerName,
         hostId: HOST_ID,
-        selectedCommit: COMMIT,
-        deployedCommit: COMMIT,
+        selectedCommit,
+        deployedCommit: selectedCommit,
         commitMatches: true,
         versionId: "22222222-2222-4222-8222-222222222222",
         authorityArtifactDigest: `sha256:${"c".repeat(64)}`,
-        publicWorkerCommit: COMMIT,
+        publicWorkerCommit: selectedCommit,
         publicWorkerCommitMatches: true,
-        authorityDeployedCommit: COMMIT,
+        authorityDeployedCommit: selectedCommit,
         authorityCommitMatches: true,
         authorityVersionId: "33333333-3333-4333-8333-333333333333",
         operatorOrigin: ORIGIN,
@@ -412,9 +465,12 @@ async function invocationFixture(
       privateJwkPath: privateJwkFile(),
       fetcher,
       now: () => NOW,
-      run: qualificationRun,
+      run: (command) => qualificationRun(command, selectedCommit),
       review: "independent-reviewer",
     } satisfies FormAuthorityInvokeOptions,
+    selectCommit(commit: string) {
+      selectedCommit = commit;
+    },
   };
 }
 
@@ -459,9 +515,12 @@ function privateJwkFile(): string {
   return path;
 }
 
-async function qualificationRun(command: readonly string[]): Promise<CommandResult> {
+async function qualificationRun(
+  command: readonly string[],
+  commit = COMMIT,
+): Promise<CommandResult> {
   const key = command.join(" ");
-  if (key === "git rev-parse HEAD") return ok(`${COMMIT}\n`);
+  if (key === "git rev-parse HEAD") return ok(`${commit}\n`);
   if (key === "git branch --show-current") return ok("feature/form-authority\n");
   if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
   throw new Error(`unexpected command: ${key}`);

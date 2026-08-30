@@ -342,8 +342,7 @@ export function createHostAdmissionCoordinator(options: {
           packageDigest: entry.packageDigest,
           operations: [...entry.operations],
           installed,
-          supported:
-            installed && supportMatches(support, entry, options.identity.implementationDigest),
+          supported: installed && supportMatches(support, entry, options.identity),
           active: installed && activationMatches(activation, options.identity.implementationDigest),
         };
       }),
@@ -372,7 +371,7 @@ export function createHostAdmissionCoordinator(options: {
           predecessorDigest: eventDigest(install) ?? ADMISSION_GENESIS_DIGEST,
         });
       }
-      if (!supportMatches(support, entry, options.identity.implementationDigest)) {
+      if (!supportMatches(support, entry, options.identity)) {
         descriptors.push({
           kind: "SetSupport",
           formRef: structuredClone(entry.formRef),
@@ -962,22 +961,27 @@ function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
 function supportMatches(
   row: AuthorityRow | null,
   entry: TakoformImplementationCatalogEntry,
-  implementationDigest: AdmissionDigest,
+  identity: FormAuthorityIdentity,
 ): boolean {
   if (
     row?.supported !== 1 ||
     row.package_digest !== entry.packageDigest ||
-    row.implementation_digest !== implementationDigest ||
+    row.implementation_digest !== identity.implementationDigest ||
+    typeof row.profile_json !== "string" ||
     typeof row.operations_json !== "string"
   ) {
     return false;
   }
   try {
-    return canonicalJson(JSON.parse(row.operations_json)) === canonicalJson(entry.operations);
+    return (
+      canonicalJson(JSON.parse(row.profile_json)) ===
+        canonicalJson(formAuthorityPackageProfile(identity)) &&
+      canonicalJson(JSON.parse(row.operations_json)) === canonicalJson(entry.operations)
+    );
   } catch {
     throw new HostAdmissionCoordinatorError(
       "authority_state_conflict",
-      "support operations are invalid",
+      "support profile or operations are invalid",
     );
   }
 }

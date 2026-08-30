@@ -50,7 +50,7 @@ that audience.
 
 Each request requires exact `application/json`, at most 2 MiB, and a bearer
 assertion signed by the dedicated target-owned Ed25519 public key. The assertion
-is valid for at most 120 seconds and binds its purpose, action, method, path,
+is valid for at most 60 seconds and binds its purpose, action, method, path,
 canonical body digest, environment, Host id, public Worker artifact digest, and
 public Worker Version. The private key never enters a Worker binding. The
 gateway forwards the exact original assertion and request envelope to the
@@ -105,6 +105,13 @@ are absent. A foreign domain owner, or either script/domain half existing
 without the other, is refused; a successful upload is followed by the same
 exact exhaustive readback used for later deployments.
 
+Status classifies an authority binding only as `exact-current-public` or the
+exact `previousVersionId` profile `exact-direct-public-predecessor`; every
+arbitrary, two-hop, malformed, or identity-mismatched predecessor is refused.
+Roll-forward always updates the route-less authority first. Gateway apply is
+blocked until that dependency is exact-current, after which the gateway may
+advance once from its own exact direct-predecessor profile.
+
 After the three integration Workers are current at the same exact commit, the
 owner invokes the bridge through the repository entrypoint:
 
@@ -123,7 +130,10 @@ per-command receipts, authoritative readback, and the next-plan digest, then
 the deploy command exits nonzero as a verification failure. A lost apply
 acknowledgement is indeterminate and is never retried or hidden behind an
 automatic readback; the operator runs status before making an explicit fresh
-apply decision.
+apply decision. Plan and readback requests are bounded at 30 seconds. Apply is
+bounded at 55 seconds, inside the assertion lifetime, so the exact 12-Form
+fixture can finish without turning an ordinary full convergence into a false
+lost acknowledgement.
 
 ## Integration fixture corpus
 
@@ -145,6 +155,17 @@ The Host then makes its own policy decision and issues the private handle shared
 only with its admission store.
 Activation is always scoped to one exact tenant/Space audience. There is no
 official, first-party, or privileged publisher branch.
+
+The integration publisher generation is derived from the pinned
+`takoform-forms` repository and commit together with the exact policy, bundle,
+trusted-root, namespace-grant, and group identities. It never depends on the
+selected Takoserver deploy commit. A changed fixture corpus creates a new
+immutable publisher key; the previous publisher/checkpoint chain remains
+append-only history while packages move through explicit replacements. A later
+public Worker Version does not rotate publisher, checkpoint, or install
+provenance. It does require an explicit support-profile reseal for that Version;
+an existing activation survives only while the implementation digest is
+unchanged.
 
 Regenerate after the verified fixture changes:
 

@@ -437,6 +437,34 @@ describe("route-less Takoserver Host admission coordinator", () => {
     expect((await f.operator.apply(replacement)).status).toBe("converged");
   });
 
+  test("moves an installed package to a new publisher generation without rotating old history", async () => {
+    const f = await fixture({ publisherIdentity: "retired-host-coupled-fixture" });
+    expect((await f.operator.apply(await f.operator.plan(f.request))).status).toBe("converged");
+    const nextRequest: FormAuthorityPlanRequest = {
+      ...f.request,
+      evidence: evidence("stable-corpus-generation"),
+    };
+
+    const migration = await f.operator.plan(nextRequest);
+    expect(migration.commands.map((command) => command.kind)).toEqual([
+      "AllowPublisher",
+      "AppendCheckpoint",
+      "ReplacePackage",
+    ]);
+    const applied = await f.operator.apply(migration);
+    expect(applied.status).toBe("converged");
+    expect(applied.nextPlan.commands).toEqual([]);
+    expect(applied.readback.forms).toEqual([
+      expect.objectContaining({ installed: true, supported: true, active: true }),
+    ]);
+    expect(
+      await f.sql.query("SELECT event_type FROM tf_form_publisher_events ORDER BY event_at, id"),
+    ).toEqual([{ event_type: "allow" }, { event_type: "allow" }]);
+    expect(
+      await f.sql.query("SELECT event_type FROM tf_form_install_events ORDER BY event_at, id"),
+    ).toEqual([{ event_type: "install" }, { event_type: "replace" }]);
+  });
+
   test("rejects tampered durable policy, revocation, and report evidence bodies", async () => {
     for (const statement of [
       "UPDATE tf_form_publisher_events SET policy_json = '{\"tampered\":true}'",

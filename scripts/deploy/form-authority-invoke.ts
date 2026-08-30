@@ -7,6 +7,10 @@ import {
   TAKOFORM_REVOCATION_V1_EMPTY_ENTRIES_DIGEST,
   TAKOFORM_REVOCATION_V1_GENESIS_DIGEST,
 } from "../../src/takoform/admission.ts";
+import {
+  CURRENT_PUBLISHER_COMMIT,
+  CURRENT_PUBLISHER_REPOSITORY,
+} from "../../src/takoform/current-publisher-catalog.ts";
 import type { FormAuthorityVerificationEvidence } from "../../src/takoform/form-authority-verification.ts";
 import {
   canonicalFormAuthorityPlanDigest,
@@ -130,7 +134,6 @@ export async function runFormAuthorityInvoke(
   const request = await integrationPlanRequest({
     identity: gateway.identity,
     scope,
-    commit: invocation.commit,
   });
   const client = formAuthorityClient({
     gateway,
@@ -385,7 +388,6 @@ function formAuthorityClient(input: {
 async function integrationPlanRequest(input: {
   readonly identity: FormAuthorityIdentity & { readonly environment: "integration" };
   readonly scope: { readonly tenantId: string; readonly space: string };
-  readonly commit: string;
 }): Promise<FormAuthorityPlanRequest> {
   const packageClosure = INTEGRATION_FORM_PACKAGES.map(({ formRef, packageDigest }) => ({
     formRef,
@@ -397,31 +399,47 @@ async function integrationPlanRequest(input: {
     fixtureOnly: true,
     packageClosure,
   } as const;
+  const policyDigest = await canonicalDigest(policy);
+  const trustedRootDigest = await canonicalDigest({
+    kind: "takoserver.integration-fixture-root@v1",
+    packageClosure,
+  });
+  const bundleDigest = await canonicalDigest({
+    kind: "takoserver.integration-fixture-bundle@v1",
+    packageClosure,
+  });
+  const namespaceGrantDigest = await canonicalDigest({
+    kind: "takoserver.integration-fixture-namespace@v1",
+    group: "edge.forms.takoform.com",
+    packageClosure,
+  });
+  const publisherPins = {
+    oidcIssuer: "https://integration-fixture.invalid",
+    sourceRepository: CURRENT_PUBLISHER_REPOSITORY,
+    workflow: "takoform-forms:checked-in-corpus",
+    ref: `git:${CURRENT_PUBLISHER_COMMIT}`,
+    identity: "external-integration-fixture",
+    trustedRootDigest,
+    sourceCommit: CURRENT_PUBLISHER_COMMIT,
+    workflowCommit: CURRENT_PUBLISHER_COMMIT,
+    buildConfigCommit: CURRENT_PUBLISHER_COMMIT,
+    repositoryIdentifier: "repo:tako0614/takoform-forms",
+    ownerIdentifier: "owner:tako0614",
+    group: "edge.forms.takoform.com",
+    namespaceGrantDigest,
+  } as const;
+  const publisherGenerationDigest = await canonicalDigest({
+    kind: "takoserver.integration-fixture-publisher-generation@v1",
+    policyDigest,
+    bundleDigest,
+    ...publisherPins,
+  });
   const evidence: FormAuthorityVerificationEvidence = {
     publisher: {
-      publisherKey: "takoserver-yurucommu-integration-fixture",
-      policyDigest: await canonicalDigest(policy),
+      publisherKey: `takoform-integration-fixture:${publisherGenerationDigest}`,
+      policyDigest,
       policy,
-      oidcIssuer: "https://integration-fixture.invalid",
-      sourceRepository: "https://github.com/tako0614/takoserver",
-      workflow: "scripts/deploy/form-authority-invoke.ts",
-      ref: `git:${input.commit}`,
-      identity: "external-integration-fixture",
-      trustedRootDigest: await canonicalDigest({
-        kind: "takoserver.integration-fixture-root@v1",
-        packageClosure,
-      }),
-      sourceCommit: input.commit,
-      workflowCommit: input.commit,
-      buildConfigCommit: input.commit,
-      repositoryIdentifier: "repo:tako0614/takoserver",
-      ownerIdentifier: "owner:tako0614",
-      group: "edge.forms.takoform.com",
-      namespaceGrantDigest: await canonicalDigest({
-        kind: "takoserver.integration-fixture-namespace@v1",
-        group: "edge.forms.takoform.com",
-        packageClosure,
-      }),
+      ...publisherPins,
     },
     checkpoint: {
       apiVersion: TAKOFORM_REVOCATION_V1,
@@ -431,10 +449,7 @@ async function integrationPlanRequest(input: {
       previousDigest: null,
       revokedPackageDigests: [],
     },
-    bundleDigest: await canonicalDigest({
-      kind: "takoserver.integration-fixture-bundle@v1",
-      packageClosure,
-    }),
+    bundleDigest,
   };
   return {
     kind: "takoserver.form-authority-plan-request@v1",
