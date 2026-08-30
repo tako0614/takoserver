@@ -1,7 +1,7 @@
 import { isAbsolute } from "node:path";
 import { runConsole } from "./deploy/console.ts";
 import { DEPLOY_CONTRACT } from "./deploy/contract.ts";
-import { DeployError, PHASE_EXIT_CODE } from "./deploy/errors.ts";
+import { DeployError, deployFailureAftermath, PHASE_EXIT_CODE } from "./deploy/errors.ts";
 import { runFormAuthority } from "./deploy/form-authority.ts";
 import { runFormAuthorityIdentityProbe } from "./deploy/form-authority-identity-probe.ts";
 import { runFormAuthorityInvoke } from "./deploy/form-authority-invoke.ts";
@@ -444,12 +444,6 @@ try {
   if (!(error instanceof DeployError)) throw error;
   process.stderr.write(`deploy failed during ${error.phase}: ${error.message}\n`);
   if (error.detail) process.stderr.write(`\n${error.detail}\n`);
-  const aftermath =
-    error.phase === "preflight"
-      ? "No target was touched. Fix the cause and re-run the exact surface."
-      : error.phase === "mutation"
-        ? "The target may have changed. Do not retry; run this surface with --status for authoritative readback."
-        : "The mutation was acknowledged but its post-conditions failed. Inspect --status and repair or roll back explicitly.";
-  process.stderr.write(`\n${aftermath}\n`);
+  process.stderr.write(`\n${deployFailureAftermath(error.phase)}\n`);
   process.exit(PHASE_EXIT_CODE[error.phase]);
 }

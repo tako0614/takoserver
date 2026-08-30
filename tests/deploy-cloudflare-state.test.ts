@@ -318,6 +318,22 @@ describe("strict paginated Cloudflare state", () => {
     });
   });
 
+  test("reads the authoritative account workers.dev subdomain exactly", async () => {
+    const requests: Request[] = [];
+    const state = new CloudflareState({
+      accountId: ACCOUNT,
+      token: "token",
+      fetcher: async (request) => {
+        requests.push(request);
+        return Response.json({ success: true, result: { subdomain: "account-owner" } });
+      },
+    });
+    expect(await state.workerAccountSubdomain()).toBe("account-owner");
+    expect(new URL(requests[0]?.url ?? "").pathname).toBe(
+      `/client/v4/accounts/${ACCOUNT}/workers/subdomain`,
+    );
+  });
+
   test("uses the Zones API limit and reads default plus internal zone routes exhaustively", async () => {
     const requests: Request[] = [];
     const defaultZones = Array.from({ length: 51 }, (_, index) => ({ id: `zone-${index}` }));

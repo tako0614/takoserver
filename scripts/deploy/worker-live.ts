@@ -51,6 +51,8 @@ export interface WorkerState {
     readonly enabled: boolean;
     readonly previewsEnabled: boolean;
   }>;
+  /** Account-owned workers.dev suffix used to bind the exact public hostname. */
+  workerAccountSubdomain?(): Promise<string>;
   workerDeployments(workerName: string): Promise<readonly unknown[]>;
   workerVersion(workerName: string, versionId: string): Promise<unknown>;
   workerSecrets(workerName: string): Promise<readonly unknown[]>;
@@ -935,29 +937,45 @@ export function assertDomainClosure(
 }
 
 /**
- * Proves the two independent Cloudflare routing inventories. Custom domains
- * come from the exhaustive account list, while a workers.dev public origin
- * additionally requires the script-specific enabled state. A target whose
- * reader cannot expose that state fails closed.
+ * Proves Cloudflare's independent routing authorities. Custom domains come
+ * from the exhaustive account list, while a workers.dev public origin also
+ * requires the account-owned suffix and the script-specific enabled state. A
+ * reader that cannot expose either workers.dev authority fails closed.
  */
 export async function assertLiveWorkerRoutingClosure(
   phase: DeployPhase,
   target: DeployTarget,
-  state: Pick<WorkerState, "workerDomains" | "workerSubdomain">,
+  state: Pick<WorkerState, "workerDomains" | "workerSubdomain" | "workerAccountSubdomain">,
 ): Promise<void> {
   const domains = await state.workerDomains();
   const canonical = new URL(target.publicOrigin).hostname;
-  if (state.workerSubdomain === undefined) {
-    if (canonical.endsWith(".workers.dev")) {
-      throw phaseError(
-        phase,
-        "Worker state cannot prove workers.dev enabled state for the selected public origin",
-      );
-    }
+  if (!canonical.endsWith(".workers.dev")) {
     assertDomainClosure(phase, target, domains);
     return;
   }
-  const subdomain = await state.workerSubdomain(target.workerName);
+  if (state.workerSubdomain === undefined || state.workerAccountSubdomain === undefined) {
+    throw phaseError(
+      phase,
+      "Worker state cannot prove the workers.dev account hostname and enabled state for the selected public origin",
+    );
+  }
+  const [subdomain, accountSubdomain] = await Promise.all([
+    state.workerSubdomain(target.workerName),
+    state.workerAccountSubdomain(),
+  ]);
+  if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(accountSubdomain)) {
+    throw phaseError(
+      phase,
+      "Cloudflare account workers.dev subdomain has an invalid hostname label",
+    );
+  }
+  const authoritativeHostname = `${target.workerName}.${accountSubdomain}.workers.dev`;
+  if (canonical !== authoritativeHostname) {
+    throw phaseError(
+      phase,
+      "selected workers.dev origin does not match the authoritative account Worker hostname",
+    );
+  }
   assertDomainClosure(phase, target, domains, subdomain);
 }
 

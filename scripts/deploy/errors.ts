@@ -39,3 +39,11 @@ export function verificationError(message: string, detail?: string): DeployError
     ? new DeployError("verification", message)
     : new DeployError("verification", message, detail);
 }
+
+export function deployFailureAftermath(phase: DeployPhase): string {
+  return phase === "preflight"
+    ? "No target was touched. Fix the cause and re-run the exact surface."
+    : phase === "mutation"
+      ? "The target may have changed. Do not retry; run this surface with --status for authoritative readback."
+      : "The mutation was acknowledged but its post-conditions failed. Inspect --status and repair or roll back explicitly.";
+}

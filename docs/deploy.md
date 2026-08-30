@@ -92,20 +92,28 @@ The routine surfaces are:
   the explicit API-token/direct-REST path. Stored Wrangler OAuth is disabled:
   its supported readers cannot prove whether workers.dev is enabled or list an
   exhaustive custom-domain inventory, and target URL/alias declarations are
-  not live proof. Direct REST must prove the script-specific workers.dev state
-  is enabled when the selected public origin is under workers.dev, in addition
-  to proving the exhaustive custom-domain inventory. The deploy tool never
-  extracts an OAuth credential.
+  not live proof. When the selected public origin is under workers.dev, direct
+  REST must prove both the script-specific enabled state and the account-owned
+  workers.dev subdomain, then require the origin hostname to equal exactly
+  `<worker-name>.<account-subdomain>.workers.dev`. An arbitrary workers.dev
+  suffix is refused. The exhaustive custom-domain inventory is proved
+  independently. The deploy tool never extracts an OAuth credential.
   Non-production routine publication builds with the version API, uploads one
   immutable Version, re-reads the exact active deployment/Version, binding,
   secret, routing, and migration closure, and only then explicitly deploys the
   uploaded Version to 100% traffic. The realized config is topology-neutral:
   routes, custom domains, workers.dev toggles, and triggers are not sent to
-  either publication command. A target-scoped lease in the operator host's
-  temporary directory serializes this owning publication path on that host
-  from the final pre-mutation closure read through post-mutation authoritative
-  history and public smoke; a crash leaves the lease stale and the next apply
-  fails closed. It is not a provider lock. Cloudflare's supported deployment
+  either publication command. A target-scoped Linux kernel `flock` in the
+  operator host's private temporary directory serializes this owning
+  publication path on that host from the final pre-mutation closure read through
+  post-mutation authoritative history and public smoke. Its atomic owner
+  sidecar binds the host boot id, lock-holder PID start ticks, and lock-file
+  device/inode. Status reports `active`, `stale-reclaimable`, `available`, or
+  `unsafe` in the ordinary routine `--status` output. A crashed holder releases
+  the kernel lock; the next apply replaces its complete stale sidecar only
+  while holding that lock. An active lock is
+  refused, while malformed or identity-inconsistent owner state stays `unsafe`
+  and is never deleted on assumption. It is not a provider lock. Cloudflare's supported deployment
   POST and Wrangler command expose no predecessor/CAS condition, so a dashboard
   action, direct API call, another owning deploy surface, or invocation on
   another host can still race the final traffic mutation. A
@@ -508,7 +516,10 @@ link-free `0700` `TAKOSERVER_INTEGRATION_E2E_OUTPUT_DIRECTORY` as three separate
 
 ## Failure handling
 
-Preflight failure means no target was touched. A mutation acknowledgement
+Preflight failure means no target was touched. Once traffic deployment is
+acknowledged, every authoritative Cloudflare/closure inspection failure is
+reported in the verification phase; it must never print the preflight-only
+`No target was touched` aftermath. A mutation acknowledgement
 failure is indeterminate: the command does not retry and the operator must run
 the same surface with `--status`. A failed post-condition means the mutation
 was acknowledged but must be repaired or rolled back explicitly. Routine

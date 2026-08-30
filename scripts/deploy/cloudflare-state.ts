@@ -197,6 +197,14 @@ export class CloudflareState {
     return { enabled: result.enabled, previewsEnabled: result.previews_enabled };
   }
 
+  async workerAccountSubdomain(): Promise<string> {
+    const result = await this.read("/workers/subdomain", "Cloudflare account subdomain state");
+    if (!isRecord(result) || typeof result.subdomain !== "string") {
+      throw preflightError("Cloudflare account subdomain state returned a malformed result");
+    }
+    return result.subdomain;
+  }
+
   /** Exhaustive account-zone inventory followed by each zone's complete route list. */
   async workerRoutes(): Promise<
     readonly {

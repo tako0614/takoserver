@@ -34,6 +34,7 @@ import { authoritySensitiveWorkerPaths } from "./worker-authority-paths.ts";
 import { parseWorkerDeploymentHistory, type WorkerDeploymentHistory } from "./worker-state.ts";
 import {
   acquireWranglerVersionPublicationLease,
+  inspectWranglerVersionPublicationLease,
   publishWranglerVersion,
   type WranglerVersionPublication,
   type WranglerVersionPublicationLease,
@@ -80,6 +81,8 @@ export interface WorkerOptions {
   readonly cloudflareEnvironment?: Readonly<Record<string, string>>;
   readonly review?: string;
   readonly fetcher?: (input: string, init?: RequestInit) => Promise<Response>;
+  /** Owner-private lease root override for portable tests. */
+  readonly publicationLeaseRoot?: string;
   /** Authoritative active runtime-signing identity; injectable only for portable tests. */
   readonly signingDatabase?: Pick<SigningDatabase, "readKey">;
 }
@@ -197,6 +200,8 @@ export async function runWorker(
           }),
       ...(beforeAuthorityProfile === undefined ? {} : { authorityProfile: beforeAuthorityProfile }),
     });
+    const versionPublication =
+      invocation.surface === "takoserver-worker" && invocation.environment !== "production";
 
     if (invocation.action === "status") {
       const advancedFromSelector =
@@ -218,6 +223,17 @@ export async function runWorker(
         pendingMigrations: before.pending,
         integrationE2eCredentialAuthorityConfigured:
           before.integrationE2eCredentialAuthorityConfigured,
+        ...(versionPublication
+          ? {
+              publicationLease: inspectWranglerVersionPublicationLease({
+                accountId: target.accountId,
+                workerName: target.workerName,
+                ...(options.publicationLeaseRoot === undefined
+                  ? {}
+                  : { root: options.publicationLeaseRoot }),
+              }),
+            }
+          : {}),
         ready:
           before.pending.length === 0 &&
           !legacyProfileCurrent &&
@@ -248,8 +264,6 @@ export async function runWorker(
       };
     }
 
-    const versionPublication =
-      invocation.surface === "takoserver-worker" && invocation.environment !== "production";
     const source = await qualifySource({
       environment: invocation.environment,
       commit: invocation.commit,
@@ -325,9 +339,12 @@ export async function runWorker(
     const artifact = prepared.seal();
     artifact.assertUnchanged();
     if (versionPublication) {
-      publicationLease = acquireWranglerVersionPublicationLease({
+      publicationLease = await acquireWranglerVersionPublicationLease({
         accountId: target.accountId,
         workerName: target.workerName,
+        ...(options.publicationLeaseRoot === undefined
+          ? {}
+          : { root: options.publicationLeaseRoot }),
       });
     }
     if (!legacyBootstrap) {
@@ -509,7 +526,7 @@ export async function runWorker(
         `wrangler versions deploy ${rollbackVersionId}@100% --yes ` + `--name ${target.workerName}`,
     };
   } finally {
-    publicationLease?.release();
+    await publicationLease?.release();
     if (temporary) rmSync(root, { recursive: true, force: true });
   }
 }
@@ -575,6 +592,32 @@ async function inspectWorker(
     readonly reconcileStatus?: boolean;
     readonly authorityProfile?: WorkerVersionAuthoritySelection;
   } = {},
+): Promise<WorkerInspection> {
+  try {
+    return await inspectWorkerState(phase, target, state, migrations, options);
+  } catch (error) {
+    if (phase !== "verification" || (error instanceof DeployError && error.phase === phase)) {
+      throw error;
+    }
+    if (error instanceof DeployError) {
+      throw verificationError(
+        `Worker post-mutation authoritative inspection failed: ${error.message}`,
+      );
+    }
+    throw verificationError("Worker post-mutation authoritative inspection failed");
+  }
+}
+
+async function inspectWorkerState(
+  phase: DeployPhase,
+  target: DeployTarget,
+  state: WorkerState,
+  migrations: WorkerMigrationReader,
+  options: {
+    readonly legacyPredecessorVersionId?: string;
+    readonly reconcileStatus?: boolean;
+    readonly authorityProfile?: WorkerVersionAuthoritySelection;
+  },
 ): Promise<WorkerInspection> {
   const inspect = async (selectedTarget: DeployTarget) =>
     options.legacyPredecessorVersionId === undefined

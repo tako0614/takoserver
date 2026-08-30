@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, rmSync } from "node:fs";
-import { DeployError } from "../scripts/deploy/errors.ts";
+import { existsSync, lstatSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { DeployError, deployFailureAftermath, preflightError } from "../scripts/deploy/errors.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import {
@@ -12,6 +12,7 @@ import {
 } from "../scripts/deploy/worker.ts";
 import {
   acquireWranglerVersionPublicationLease,
+  inspectWranglerVersionPublicationLease,
   parseWranglerDeploymentOutput,
   parseWranglerSecretOutput,
   parseWranglerVersionDeployOutput,
@@ -48,7 +49,7 @@ const target = {
     databaseId: "00000000-0000-4000-8000-000000000003",
   },
   r2: { bucketName: "objects" },
-  publicOrigin: "https://worker.example.workers.dev",
+  publicOrigin: `https://${WORKER}.example.workers.dev`,
   signing: { currentKeyId: "key-current" },
 } satisfies DeployTarget;
 
@@ -110,6 +111,7 @@ describe("Wrangler OAuth Worker reader", () => {
     });
     await expect(state.workerDomains()).rejects.toThrow("workers.dev enabled state");
     await expect(state.workerSubdomain(WORKER)).rejects.toThrow("workers.dev enabled state");
+    await expect(state.workerAccountSubdomain()).rejects.toThrow("account workers.dev subdomain");
   });
 
   test("does not turn an unobservable undeclared custom-domain alias into absence", async () => {
@@ -162,28 +164,125 @@ describe("Wrangler OAuth Worker reader", () => {
 });
 
 describe("Wrangler version publication output", () => {
-  test("serializes the owning publication path per target on one operator host", () => {
+  test("rejects an active same-host kernel lease", async () => {
     const root = `${process.env.TMPDIR ?? "/tmp"}/takoserver-version-lease-${crypto.randomUUID()}`;
     try {
-      const first = acquireWranglerVersionPublicationLease({
+      const first = await acquireWranglerVersionPublicationLease({
         accountId: target.accountId,
         workerName: target.workerName,
         root,
       });
-      expect(() =>
+      expect(
+        inspectWranglerVersionPublicationLease({
+          accountId: target.accountId,
+          workerName: target.workerName,
+          root,
+        }),
+      ).toEqual({ state: "active", reason: "kernel-lock-held" });
+      await expect(
         acquireWranglerVersionPublicationLease({
           accountId: target.accountId,
           workerName: target.workerName,
           root,
         }),
-      ).toThrow("active or its lease is stale");
-      first.release();
-      const second = acquireWranglerVersionPublicationLease({
+      ).rejects.toThrow("holds the active kernel lease");
+      await first.release();
+      const second = await acquireWranglerVersionPublicationLease({
         accountId: target.accountId,
         workerName: target.workerName,
         root,
       });
-      second.release();
+      await second.release();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("reports and safely reclaims a crashed same-host owner", async () => {
+    const root = `${process.env.TMPDIR ?? "/tmp"}/takoserver-version-stale-${crypto.randomUUID()}`;
+    try {
+      const moduleUrl = new URL("../scripts/deploy/wrangler-state.ts", import.meta.url).href;
+      const child = Bun.spawn(
+        [
+          process.execPath,
+          "-e",
+          `import { acquireWranglerVersionPublicationLease as acquire } from ${JSON.stringify(moduleUrl)}; await acquire({ accountId: ${JSON.stringify(target.accountId)}, workerName: ${JSON.stringify(target.workerName)}, root: ${JSON.stringify(root)} }); process.stdout.write("ready\\n"); process.exit(0);`,
+        ],
+        { stdout: "pipe", stderr: "pipe" },
+      );
+      expect(await new Response(child.stdout).text()).toBe("ready\n");
+      expect(await child.exited).toBe(0);
+
+      const ownerName = readdirSync(root).find((name) => name.endsWith(".owner.json"));
+      expect(ownerName).toBeDefined();
+      if (ownerName === undefined) throw new Error("missing crashed lease owner record");
+      const ownerPath = `${root}/${ownerName}`;
+      const lockPath = `${root}/${ownerName.slice(0, -".owner.json".length)}`;
+      const owner = JSON.parse(readFileSync(ownerPath, "utf8")) as Record<string, unknown>;
+      const lockIdentity = lstatSync(lockPath, { bigint: true });
+      expect(owner).toMatchObject({
+        kind: "takoserver.worker-publication-lease-owner@v1",
+        accountId: target.accountId,
+        workerName: target.workerName,
+        bootId: expect.stringMatching(/^[0-9a-f-]{36}$/u),
+        holderPid: expect.any(Number),
+        holderStartTicks: expect.stringMatching(/^[1-9][0-9]*$/u),
+        lockDevice: String(lockIdentity.dev),
+        lockInode: String(lockIdentity.ino),
+      });
+
+      let status = inspectWranglerVersionPublicationLease({
+        accountId: target.accountId,
+        workerName: target.workerName,
+        root,
+      });
+      for (let attempt = 0; status.state === "active" && attempt < 20; attempt += 1) {
+        await Bun.sleep(10);
+        status = inspectWranglerVersionPublicationLease({
+          accountId: target.accountId,
+          workerName: target.workerName,
+          root,
+        });
+      }
+      expect(status).toEqual({ state: "stale-reclaimable", reason: "stale-owner-record" });
+
+      const reclaimed = await acquireWranglerVersionPublicationLease({
+        accountId: target.accountId,
+        workerName: target.workerName,
+        root,
+      });
+      expect(
+        inspectWranglerVersionPublicationLease({
+          accountId: target.accountId,
+          workerName: target.workerName,
+          root,
+        }).state,
+      ).toBe("active");
+      await reclaimed.release();
+      expect(
+        inspectWranglerVersionPublicationLease({
+          accountId: target.accountId,
+          workerName: target.workerName,
+          root,
+        }).state,
+      ).toBe("available");
+
+      writeFileSync(ownerPath, "{}\n", { encoding: "utf8", mode: 0o600 });
+      expect(
+        inspectWranglerVersionPublicationLease({
+          accountId: target.accountId,
+          workerName: target.workerName,
+          root,
+        }),
+      ).toEqual({ state: "unsafe", reason: "owner-record-inconsistent" });
+      await expect(
+        acquireWranglerVersionPublicationLease({
+          accountId: target.accountId,
+          workerName: target.workerName,
+          root,
+        }),
+      ).rejects.toThrow("unsafe and cannot be reclaimed automatically");
+      expect(readFileSync(ownerPath, "utf8")).toBe("{}\n");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -375,6 +474,16 @@ describe("routine Worker authentication and version publication boundary", () =>
     expect(fixture.commands).toHaveLength(0);
   });
 
+  test("rejects an arbitrary workers.dev suffix despite script enablement", async () => {
+    const fixture = await routineVersionPublication({ accountSubdomain: "different-account" });
+    expect(fixture.outcome).toBeInstanceOf(DeployError);
+    expect((fixture.outcome as DeployError).phase).toBe("preflight");
+    expect((fixture.outcome as DeployError).message).toContain(
+      "does not match the authoritative account Worker hostname",
+    );
+    expect(fixture.commands).toHaveLength(0);
+  });
+
   test("rejects a deployment change after the first history read before upload", async () => {
     const fixture = await routineVersionPublication({ concurrentAfterFirstHistoryRead: true });
     expect(fixture.outcome).toBeInstanceOf(DeployError);
@@ -428,6 +537,17 @@ describe("routine Worker authentication and version publication boundary", () =>
       ),
     ).toHaveLength(1);
   });
+
+  test("classifies authoritative inspection failure after acknowledged traffic as verification", async () => {
+    const fixture = await routineVersionPublication({ postDeploymentInspectionFailure: true });
+    expect(fixture.outcome).toBeInstanceOf(DeployError);
+    const failure = fixture.outcome as DeployError;
+    expect(failure.phase).toBe("verification");
+    expect(failure.message).toContain("post-mutation authoritative inspection failed");
+    expect(failure.detail).toBeUndefined();
+    expect(deployFailureAftermath(failure.phase)).not.toContain("No target was touched");
+    expect(JSON.stringify(failure)).not.toContain("sensitive-provider-response");
+  });
 });
 
 async function routineVersionPublication(
@@ -435,7 +555,9 @@ async function routineVersionPublication(
     readonly concurrentAfterFirstHistoryRead?: boolean;
     readonly concurrentAfterUpload?: boolean;
     readonly concurrentImmediatelyBeforeDeploy?: boolean;
+    readonly postDeploymentInspectionFailure?: boolean;
     readonly assertLeaseHeldDuringProbe?: boolean;
+    readonly accountSubdomain?: string;
     readonly workersDevEnabled?: boolean;
   } = {},
 ): Promise<{
@@ -447,6 +569,7 @@ async function routineVersionPublication(
   readonly leaseReleasedAfterRun: boolean;
 }> {
   const root = `${process.env.TMPDIR ?? "/tmp"}/takoserver-version-${crypto.randomUUID()}`;
+  const publicationLeaseRoot = `${root}/publication-leases`;
   const commands: string[][] = [];
   const trace: string[] = [];
   let uploaded = false;
@@ -526,9 +649,19 @@ async function routineVersionPublication(
         previewsEnabled: false,
       };
     },
+    async workerAccountSubdomain() {
+      trace.push("state:account-subdomain");
+      return options.accountSubdomain ?? "example";
+    },
     async workerDeployments() {
       trace.push("state:deployments");
       deploymentReads += 1;
+      if (deployed && options.postDeploymentInspectionFailure === true) {
+        throw preflightError(
+          "Cloudflare authoritative deployment history became unavailable",
+          "sensitive-provider-response",
+        );
+      }
       if (deployed) {
         return options.concurrentImmediatelyBeforeDeploy === true
           ? [
@@ -616,16 +749,17 @@ async function routineVersionPublication(
         fetcher: async (input) => {
           if (options.assertLeaseHeldDuringProbe === true) {
             try {
-              const competing = acquireWranglerVersionPublicationLease({
+              const competing = await acquireWranglerVersionPublicationLease({
                 accountId: target.accountId,
                 workerName: target.workerName,
+                root: publicationLeaseRoot,
               });
-              competing.release();
+              await competing.release();
               throw new Error("publication lease was not held during public smoke");
             } catch (error) {
               if (
                 !(error instanceof DeployError) ||
-                !error.message.includes("active or its lease is stale")
+                !error.message.includes("holds the active kernel lease")
               ) {
                 throw error;
               }
@@ -643,15 +777,17 @@ async function routineVersionPublication(
                 },
               });
         },
+        publicationLeaseRoot,
       },
     ).catch((error) => error as DeployError);
     let leaseReleasedAfterRun = false;
     if (options.assertLeaseHeldDuringProbe === true) {
-      const after = acquireWranglerVersionPublicationLease({
+      const after = await acquireWranglerVersionPublicationLease({
         accountId: target.accountId,
         workerName: target.workerName,
+        root: publicationLeaseRoot,
       });
-      after.release();
+      await after.release();
       leaseReleasedAfterRun = true;
     }
     const configPath = `${root}/release/wrangler.jsonc`;

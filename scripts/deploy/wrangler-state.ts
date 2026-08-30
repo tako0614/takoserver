@@ -1,5 +1,18 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { DeployError, mutationError, preflightError } from "./errors.ts";
@@ -10,6 +23,10 @@ import { parseWorkerDeploymentChain, parseWorkerSecretInventory } from "./worker
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const ACCOUNT_ID = /^[0-9a-f]{32}$/u;
 const WORKER_NAME = /^[a-z0-9][a-z0-9-]{1,62}$/u;
+const BOOT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const PROCESS_START_TICKS = /^[1-9][0-9]*$/u;
+const LEASE_OWNER_KIND = "takoserver.worker-publication-lease-owner@v1" as const;
+const MAX_LEASE_OWNER_BYTES = 4096;
 
 export type WranglerProcess = (
   command: readonly string[],
@@ -126,6 +143,13 @@ export class WranglerWorkerState implements WorkerState {
     );
   }
 
+  async workerAccountSubdomain(): Promise<string> {
+    throw preflightError(
+      "Wrangler OAuth cannot prove the authoritative account workers.dev subdomain; " +
+        "use CLOUDFLARE_API_TOKEN and direct REST state",
+    );
+  }
+
   async #json(command: readonly string[], label: string): Promise<unknown> {
     let result: CommandResult;
     try {
@@ -224,29 +248,228 @@ export interface WranglerVersionPublication {
 export interface WranglerVersionPublicationLease {
   readonly accountId: string;
   readonly workerName: string;
-  release(): void;
+  release(): Promise<void>;
+}
+
+export interface WranglerVersionPublicationLeaseStatus {
+  readonly state: "available" | "active" | "stale-reclaimable" | "unsafe";
+  readonly reason:
+    | "no-lock-file"
+    | "kernel-lock-available"
+    | "kernel-lock-held"
+    | "stale-owner-record"
+    | "owner-record-inconsistent";
+}
+
+interface WranglerVersionPublicationLeaseOwner {
+  readonly kind: typeof LEASE_OWNER_KIND;
+  readonly ownerId: string;
+  readonly accountId: string;
+  readonly workerName: string;
+  readonly bootId: string;
+  readonly holderPid: number;
+  readonly holderStartTicks: string;
+  readonly lockDevice: string;
+  readonly lockInode: string;
+  readonly createdAt: string;
 }
 
 /**
  * Serializes this owning publication path on one operator host. Cloudflare's
  * supported deployment POST has no predecessor/CAS input, so this deliberately
  * bounded lease prevents same-host entrypoint overlap without pretending to
- * fence the dashboard, direct API calls, or another host. A crash leaves the
- * directory in place and the next invocation fails closed as stale.
+ * fence the dashboard, direct API calls, or another host. Kernel flock is the
+ * exclusion authority. The sidecar only supplies exact boot/PID-start/inode
+ * evidence so status and the next apply can distinguish a crashed stale owner
+ * from an active holder or an unsafe malformed record.
  */
-export function acquireWranglerVersionPublicationLease(input: {
+export async function acquireWranglerVersionPublicationLease(input: {
   readonly accountId: string;
   readonly workerName: string;
   readonly root?: string;
-}): WranglerVersionPublicationLease {
+}): Promise<WranglerVersionPublicationLease> {
   if (!ACCOUNT_ID.test(input.accountId) || !WORKER_NAME.test(input.workerName)) {
     throw preflightError("Worker Version publication lease requires one exact target");
   }
+  const paths = publicationLeasePaths(input);
+  ensurePrivateLeaseRoot(paths.root);
+  ensurePrivateLeaseFile(paths.lockPath);
+  const holder = Bun.spawn(
+    [
+      "flock",
+      "--exclusive",
+      "--nonblock",
+      "--no-fork",
+      paths.lockPath,
+      "/bin/sh",
+      "-c",
+      'printf "takoserver-lease-held\\n"; exec cat',
+    ],
+    { stdin: "pipe", stdout: "pipe", stderr: "pipe" },
+  );
+  const reader = holder.stdout.getReader();
+  const handshake = await reader.read();
+  reader.releaseLock();
+  const handshakeText = handshake.done
+    ? ""
+    : new TextDecoder().decode(handshake.value, { stream: false });
+  if (handshakeText !== "takoserver-lease-held\n") {
+    const exitCode = await holder.exited;
+    if (exitCode === 1) {
+      throw preflightError(
+        "another same-host Worker Version publication holds the active kernel lease",
+        paths.lockPath,
+      );
+    }
+    throw preflightError("Worker Version publication kernel lease could not be acquired");
+  }
+
+  let owner: WranglerVersionPublicationLeaseOwner;
+  try {
+    const lockIdentity = privateLeaseFileIdentity(paths.lockPath);
+    const previousOwner = readLeaseOwner(paths.ownerPath, lockIdentity, input);
+    if (previousOwner.kind === "unsafe") {
+      throw preflightError(
+        "Worker Version publication owner record is unsafe and cannot be reclaimed automatically",
+        paths.ownerPath,
+      );
+    }
+    if (
+      previousOwner.kind === "owner" &&
+      leaseOwnerProcessState(previousOwner.value) === "active"
+    ) {
+      throw preflightError(
+        "Worker Version publication owner record conflicts with the available kernel lease",
+        paths.ownerPath,
+      );
+    }
+    const holderStartTicks = procProcessStartTicks(holder.pid);
+    if (holderStartTicks === null) {
+      throw preflightError(
+        "Worker Version publication kernel lease holder identity is unavailable",
+      );
+    }
+    owner = {
+      kind: LEASE_OWNER_KIND,
+      ownerId: randomUUID(),
+      accountId: input.accountId,
+      workerName: input.workerName,
+      bootId: hostBootId(),
+      holderPid: holder.pid,
+      holderStartTicks,
+      lockDevice: lockIdentity.device,
+      lockInode: lockIdentity.inode,
+      createdAt: new Date().toISOString(),
+    };
+    writeLeaseOwner(paths, owner);
+  } catch (error) {
+    await stopLeaseHolder(holder);
+    if (error instanceof DeployError) throw error;
+    throw preflightError("Worker Version publication lease owner could not be recorded");
+  }
+  let released = false;
+  return {
+    accountId: input.accountId,
+    workerName: input.workerName,
+    async release() {
+      if (released) return;
+      released = true;
+      try {
+        const currentIdentity = privateLeaseFileIdentity(paths.lockPath);
+        const current = readLeaseOwner(paths.ownerPath, currentIdentity, input);
+        if (current.kind === "owner" && current.value.ownerId === owner.ownerId) {
+          unlinkSync(paths.ownerPath);
+          fsyncDirectory(paths.root);
+        }
+      } catch {
+        // A missing or replaced owner is never removed on assumption. The
+        // kernel lease is still released, and a complete retained record is
+        // classified on the next status/apply.
+      }
+      await stopLeaseHolder(holder);
+    },
+  };
+}
+
+export function inspectWranglerVersionPublicationLease(input: {
+  readonly accountId: string;
+  readonly workerName: string;
+  readonly root?: string;
+}): WranglerVersionPublicationLeaseStatus {
+  if (!ACCOUNT_ID.test(input.accountId) || !WORKER_NAME.test(input.workerName)) {
+    throw preflightError("Worker Version publication lease status requires one exact target");
+  }
+  const paths = publicationLeasePaths(input);
+  if (!pathEntryExists(paths.lockPath)) {
+    return pathEntryExists(paths.ownerPath)
+      ? { state: "unsafe", reason: "owner-record-inconsistent" }
+      : { state: "available", reason: "no-lock-file" };
+  }
+  let identity: { readonly device: string; readonly inode: string };
+  try {
+    ensurePrivateLeaseRoot(paths.root, false);
+    identity = privateLeaseFileIdentity(paths.lockPath);
+  } catch {
+    return { state: "unsafe", reason: "owner-record-inconsistent" };
+  }
+  const probe = Bun.spawnSync(["flock", "--exclusive", "--nonblock", paths.lockPath, "/bin/true"], {
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  if (probe.exitCode === 1) {
+    return { state: "active", reason: "kernel-lock-held" };
+  }
+  if (probe.exitCode !== 0) {
+    return { state: "unsafe", reason: "owner-record-inconsistent" };
+  }
+  const owner = readLeaseOwner(paths.ownerPath, identity, input);
+  if (owner.kind === "none") {
+    return { state: "available", reason: "kernel-lock-available" };
+  }
+  if (owner.kind === "unsafe") {
+    return { state: "unsafe", reason: "owner-record-inconsistent" };
+  }
+  try {
+    if (leaseOwnerProcessState(owner.value) === "active") {
+      return { state: "unsafe", reason: "owner-record-inconsistent" };
+    }
+  } catch {
+    return { state: "unsafe", reason: "owner-record-inconsistent" };
+  }
+  return { state: "stale-reclaimable", reason: "stale-owner-record" };
+}
+
+function pathEntryExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function publicationLeasePaths(input: {
+  readonly accountId: string;
+  readonly workerName: string;
+  readonly root?: string;
+}): { readonly root: string; readonly lockPath: string; readonly ownerPath: string } {
   const root = input.root ?? join(tmpdir(), "takoserver-worker-publication-locks");
   if (!isAbsolute(root)) {
     throw preflightError("Worker Version publication lease root must be absolute");
   }
-  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const targetDigest = createHash("sha256")
+    .update(`${input.accountId}\0${input.workerName}`)
+    .digest("hex");
+  return {
+    root,
+    lockPath: join(root, targetDigest),
+    ownerPath: join(root, `${targetDigest}.owner.json`),
+  };
+}
+
+function ensurePrivateLeaseRoot(root: string, create = true): void {
+  if (create) mkdirSync(root, { recursive: true, mode: 0o700 });
   const rootState = lstatSync(root);
   const effectiveUserId = process.getuid?.();
   if (
@@ -257,45 +480,187 @@ export function acquireWranglerVersionPublicationLease(input: {
   ) {
     throw preflightError("Worker Version publication lease root is not private and owned");
   }
-  const targetDigest = createHash("sha256")
-    .update(`${input.accountId}\0${input.workerName}`)
-    .digest("hex");
-  const path = join(root, targetDigest);
+}
+
+function ensurePrivateLeaseFile(path: string): void {
+  let descriptor: number;
   try {
-    mkdirSync(path, { mode: 0o700 });
-  } catch (error) {
-    if (errorCode(error) === "EEXIST") {
-      throw preflightError(
-        "another same-host Worker Version publication is active or its lease is stale",
-        path,
-      );
-    }
-    throw preflightError("Worker Version publication lease could not be created");
-  }
-  const ownerPath = join(path, "owner");
-  const owner = randomUUID();
-  try {
-    writeFileSync(ownerPath, owner, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    descriptor = openSync(
+      path,
+      constants.O_CREAT | constants.O_APPEND | constants.O_WRONLY | constants.O_NOFOLLOW,
+      0o600,
+    );
   } catch {
-    rmSync(path, { recursive: true, force: true });
-    throw preflightError("Worker Version publication lease owner could not be recorded");
+    throw preflightError("Worker Version publication kernel lease file could not be opened safely");
   }
-  let released = false;
-  return {
-    accountId: input.accountId,
-    workerName: input.workerName,
-    release() {
-      if (released) return;
-      released = true;
-      try {
-        if (readFileSync(ownerPath, "utf8") === owner) {
-          rmSync(path, { recursive: true, force: true });
-        }
-      } catch {
-        // A missing or replaced owner is never removed on assumption.
-      }
-    },
-  };
+  closeSync(descriptor);
+  privateLeaseFileIdentity(path);
+}
+
+function privateLeaseFileIdentity(path: string): {
+  readonly device: string;
+  readonly inode: string;
+} {
+  const state = lstatSync(path, { bigint: true });
+  const effectiveUserId = process.getuid?.();
+  if (
+    !state.isFile() ||
+    state.isSymbolicLink() ||
+    state.nlink !== 1n ||
+    (state.mode & 0o077n) !== 0n ||
+    (effectiveUserId !== undefined && state.uid !== BigInt(effectiveUserId))
+  ) {
+    throw preflightError("Worker Version publication kernel lease file is not private and owned");
+  }
+  return { device: String(state.dev), inode: String(state.ino) };
+}
+
+function readLeaseOwner(
+  ownerPath: string,
+  lockIdentity: { readonly device: string; readonly inode: string },
+  target: { readonly accountId: string; readonly workerName: string },
+):
+  | { readonly kind: "none" }
+  | { readonly kind: "unsafe" }
+  | { readonly kind: "owner"; readonly value: WranglerVersionPublicationLeaseOwner } {
+  if (!existsSync(ownerPath)) return { kind: "none" };
+  try {
+    const state = lstatSync(ownerPath, { bigint: true });
+    const effectiveUserId = process.getuid?.();
+    if (
+      !state.isFile() ||
+      state.isSymbolicLink() ||
+      state.nlink !== 1n ||
+      state.size < 1n ||
+      state.size > BigInt(MAX_LEASE_OWNER_BYTES) ||
+      (state.mode & 0o077n) !== 0n ||
+      (effectiveUserId !== undefined && state.uid !== BigInt(effectiveUserId))
+    ) {
+      return { kind: "unsafe" };
+    }
+    const parsed = JSON.parse(readFileSync(ownerPath, "utf8")) as unknown;
+    if (!isRecord(parsed)) return { kind: "unsafe" };
+    const keys = Object.keys(parsed).sort();
+    const expectedKeys = [
+      "accountId",
+      "bootId",
+      "createdAt",
+      "holderPid",
+      "holderStartTicks",
+      "kind",
+      "lockDevice",
+      "lockInode",
+      "ownerId",
+      "workerName",
+    ];
+    if (JSON.stringify(keys) !== JSON.stringify(expectedKeys)) return { kind: "unsafe" };
+    if (
+      parsed.kind !== LEASE_OWNER_KIND ||
+      typeof parsed.ownerId !== "string" ||
+      !UUID.test(parsed.ownerId) ||
+      parsed.accountId !== target.accountId ||
+      parsed.workerName !== target.workerName ||
+      typeof parsed.bootId !== "string" ||
+      !BOOT_ID.test(parsed.bootId) ||
+      typeof parsed.holderPid !== "number" ||
+      !Number.isSafeInteger(parsed.holderPid) ||
+      parsed.holderPid < 1 ||
+      typeof parsed.holderStartTicks !== "string" ||
+      !PROCESS_START_TICKS.test(parsed.holderStartTicks) ||
+      parsed.lockDevice !== lockIdentity.device ||
+      parsed.lockInode !== lockIdentity.inode ||
+      typeof parsed.createdAt !== "string" ||
+      new Date(parsed.createdAt).toISOString() !== parsed.createdAt
+    ) {
+      return { kind: "unsafe" };
+    }
+    return { kind: "owner", value: parsed as unknown as WranglerVersionPublicationLeaseOwner };
+  } catch {
+    return { kind: "unsafe" };
+  }
+}
+
+function writeLeaseOwner(
+  paths: { readonly root: string; readonly ownerPath: string },
+  owner: WranglerVersionPublicationLeaseOwner,
+): void {
+  const temporaryPath = `${paths.ownerPath}.${owner.ownerId}.tmp`;
+  let descriptor: number | null = null;
+  try {
+    descriptor = openSync(
+      temporaryPath,
+      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
+      0o600,
+    );
+    writeFileSync(descriptor, `${JSON.stringify(owner)}\n`, "utf8");
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = null;
+    renameSync(temporaryPath, paths.ownerPath);
+    fsyncDirectory(paths.root);
+  } catch (error) {
+    if (descriptor !== null) closeSync(descriptor);
+    rmSync(temporaryPath, { force: true });
+    throw error;
+  }
+}
+
+function fsyncDirectory(path: string): void {
+  const descriptor = openSync(path, constants.O_RDONLY);
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function hostBootId(): string {
+  const value = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+  if (!BOOT_ID.test(value)) {
+    throw preflightError("Worker Version publication host boot identity is unavailable");
+  }
+  return value;
+}
+
+function procProcessStartTicks(pid: number): string | null {
+  let value: string;
+  try {
+    value = readFileSync(`/proc/${pid}/stat`, "utf8");
+  } catch (error) {
+    if (errorCode(error) === "ENOENT" || errorCode(error) === "ESRCH") return null;
+    throw preflightError("Worker Version publication process identity could not be read");
+  }
+  const commandEnd = value.lastIndexOf(")");
+  const fields =
+    commandEnd < 0
+      ? []
+      : value
+          .slice(commandEnd + 2)
+          .trim()
+          .split(/\s+/u);
+  const startTicks = fields[19];
+  if (startTicks === undefined || !PROCESS_START_TICKS.test(startTicks)) {
+    throw preflightError("Worker Version publication process identity is malformed");
+  }
+  return startTicks;
+}
+
+function leaseOwnerProcessState(owner: WranglerVersionPublicationLeaseOwner): "active" | "stale" {
+  if (owner.bootId !== hostBootId()) return "stale";
+  const currentStartTicks = procProcessStartTicks(owner.holderPid);
+  return currentStartTicks === owner.holderStartTicks ? "active" : "stale";
+}
+
+async function stopLeaseHolder(holder: {
+  readonly stdin: { end(): void };
+  readonly exited: Promise<number>;
+}): Promise<void> {
+  try {
+    holder.stdin.end();
+  } catch {
+    // Poll the child below even if its input already closed.
+  }
+  await holder.exited.catch(() => undefined);
 }
 
 /**

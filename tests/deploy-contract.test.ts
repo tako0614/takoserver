@@ -56,6 +56,7 @@ describe("Takoserver split deploy entrypoint", () => {
         surface: string;
         triggers: readonly string[];
         requiresEnv: readonly string[];
+        requiresTools: readonly string[];
         obligations: Record<string, string>;
       }[];
     };
@@ -84,6 +85,7 @@ describe("Takoserver split deploy entrypoint", () => {
       ({ surface }) => surface === "takoserver-hosted-token-cutover",
     );
     const routineWorker = contract.surfaces.find(({ surface }) => surface === "takoserver-worker");
+    expect(routineWorker?.requiresTools).toContain("flock");
     expect(routineWorker?.obligations.provenance).toContain("explicit `CLOUDFLARE_API_TOKEN`");
     expect(routineWorker?.obligations.provenance).not.toContain("stored OAuth profile");
     expect(routineWorker?.obligations["post-conditions"]).toContain(
@@ -96,7 +98,15 @@ describe("Takoserver split deploy entrypoint", () => {
       "no conditional deployment/CAS input",
     );
     expect(routineWorker?.obligations["post-conditions"]).toContain("actual immediate predecessor");
+    expect(routineWorker?.obligations["post-conditions"]).toContain(
+      "exact account-owned workers.dev hostname",
+    );
+    expect(routineWorker?.obligations["post-conditions"]).toContain("PID-start");
+    expect(routineWorker?.obligations["post-conditions"]).toContain("stale");
     expect(routineWorker?.obligations["failure-handling"]).toContain("traffic is indeterminate");
+    expect(routineWorker?.obligations["failure-handling"]).toContain(
+      "never claims that no target was touched",
+    );
     expect(routineWorker?.obligations["failure-handling"]).not.toContain(
       "uploaded Version is inactive",
     );
