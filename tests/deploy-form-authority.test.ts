@@ -22,11 +22,17 @@ const COMMIT = "a".repeat(40);
 const PREVIOUS_COMMIT = "b".repeat(40);
 const PUBLIC_WORKER_COMMIT = COMMIT;
 const PUBLIC_WORKER_VERSION_ID = "11111111-1111-4111-8111-111111111111";
+const PREVIOUS_PUBLIC_WORKER_VERSION_ID = "33333333-3333-4333-8333-333333333333";
 const DRIFTED_PUBLIC_WORKER_VERSION_ID = "22222222-2222-4222-8222-222222222222";
+const PREVIOUS_AUTHORITY_VERSION_ID = "44444444-4444-4444-8444-444444444444";
+const CURRENT_AUTHORITY_VERSION_ID = "55555555-5555-4555-8555-555555555555";
+const ARBITRARY_PUBLIC_WORKER_VERSION_ID = "66666666-6666-4666-8666-666666666666";
+const TWO_HOP_PUBLIC_WORKER_VERSION_ID = "77777777-7777-4777-8777-777777777777";
 const BUNDLE = "export default class FormAuthorityEntrypoint {}\n";
 const PUBLIC_BUNDLE = "export default { async fetch() { return new Response('public'); } };\n";
 const BUNDLE_DIGEST = `sha256:${createHash("sha256").update(BUNDLE).digest("hex")}` as const;
 const PREVIOUS_DIGEST = `sha256:${"c".repeat(64)}` as const;
+const PREVIOUS_PUBLIC_WORKER_DIGEST = `sha256:${"d".repeat(64)}` as const;
 const PUBLIC_WORKER_DIGEST = `sha256:${createHash("sha256")
   .update(PUBLIC_BUNDLE)
   .digest("hex")}` as const;
@@ -107,6 +113,7 @@ function stateSequence(input?: {
   readonly publicDrift?: boolean;
   readonly subdomain?: boolean;
   readonly route?: boolean;
+  readonly isUploaded?: () => boolean;
 }): FormAuthorityDeployState {
   let historyRead = 0;
   let publicHistoryRead = 0;
@@ -124,28 +131,49 @@ function stateSequence(input?: {
             drifted ? DRIFTED_PUBLIC_WORKER_VERSION_ID : PUBLIC_WORKER_VERSION_ID,
             drifted ? "2026-08-28T03:00:00Z" : "2026-08-28T00:00:00Z",
           ),
+          deployment(
+            "public-deployment-previous",
+            PREVIOUS_PUBLIC_WORKER_VERSION_ID,
+            "2026-08-27T23:00:00Z",
+          ),
         ];
       }
       historyRead += 1;
-      return historyRead < 3
-        ? [deployment("deployment-previous", "version-previous", "2026-08-28T01:00:00Z")]
+      const uploaded = input?.isUploaded?.() ?? historyRead >= 3;
+      return !uploaded
+        ? [deployment("deployment-previous", PREVIOUS_AUTHORITY_VERSION_ID, "2026-08-28T01:00:00Z")]
         : [
-            deployment("deployment-current", "version-current", "2026-08-28T02:00:00Z"),
-            deployment("deployment-previous", "version-previous", "2026-08-28T01:00:00Z"),
+            deployment("deployment-current", CURRENT_AUTHORITY_VERSION_ID, "2026-08-28T02:00:00Z"),
+            deployment(
+              "deployment-previous",
+              PREVIOUS_AUTHORITY_VERSION_ID,
+              "2026-08-28T01:00:00Z",
+            ),
           ];
     },
     async workerVersion(workerName, versionId) {
       if (workerName === target.workerName) {
-        const digest =
-          versionId === DRIFTED_PUBLIC_WORKER_VERSION_ID
+        const previous = versionId === PREVIOUS_PUBLIC_WORKER_VERSION_ID;
+        const digest = previous
+          ? PREVIOUS_PUBLIC_WORKER_DIGEST.slice("sha256:".length)
+          : versionId === DRIFTED_PUBLIC_WORKER_VERSION_ID
             ? "f".repeat(64)
             : PUBLIC_WORKER_DIGEST.slice("sha256:".length);
-        return publicVersion(`takoserver-worker:${PUBLIC_WORKER_COMMIT}:${digest}`);
+        return publicVersion(
+          `takoserver-worker:${previous ? PREVIOUS_COMMIT : PUBLIC_WORKER_COMMIT}:${digest}`,
+        );
       }
-      const current = versionId === "version-current";
+      const current = versionId === CURRENT_AUTHORITY_VERSION_ID;
       const commit = current ? COMMIT : PREVIOUS_COMMIT;
       const artifactDigest = current ? BUNDLE_DIGEST : PREVIOUS_DIGEST;
-      return version(commit, artifactDigest);
+      return current
+        ? version(commit, artifactDigest)
+        : version(
+            commit,
+            artifactDigest,
+            PREVIOUS_PUBLIC_WORKER_VERSION_ID,
+            PREVIOUS_PUBLIC_WORKER_DIGEST,
+          );
     },
     async workerSecrets(workerName) {
       return workerName === target.workerName
@@ -181,7 +209,12 @@ function deployment(id: string, versionId: string, createdOn: string) {
   };
 }
 
-function version(commit: string, artifactDigest: `sha256:${string}`) {
+function version(
+  commit: string,
+  artifactDigest: `sha256:${string}`,
+  publicWorkerVersionId = PUBLIC_WORKER_VERSION_ID,
+  publicWorkerArtifactDigest: `sha256:${string}` = PUBLIC_WORKER_DIGEST,
+) {
   return {
     annotations: {
       "workers/message": `form-authority:takoserver-integration-form-authority-worker:${commit}:${artifactDigest}`,
@@ -199,12 +232,12 @@ function version(commit: string, artifactDigest: `sha256:${string}`) {
         {
           type: "plain_text",
           name: "TAKOSERVER_PUBLIC_WORKER_ARTIFACT_DIGEST",
-          text: PUBLIC_WORKER_DIGEST,
+          text: publicWorkerArtifactDigest,
         },
         {
           type: "plain_text",
           name: "TAKOSERVER_PUBLIC_WORKER_VERSION_ID",
-          text: PUBLIC_WORKER_VERSION_ID,
+          text: publicWorkerVersionId,
         },
         {
           type: "plain_text",
@@ -233,6 +266,95 @@ function version(commit: string, artifactDigest: `sha256:${string}`) {
           entrypoint: "PublicHostIdentityEntrypoint",
         },
       ],
+    },
+  };
+}
+
+function invalidPredecessorState(input: {
+  readonly boundVersionId?: string;
+  readonly boundArtifactDigest?: `sha256:${string}`;
+  readonly authorityCommit?: string;
+  readonly twoHop?: boolean;
+  readonly malformedHistory?: boolean;
+}): FormAuthorityDeployState {
+  const current = stateSequence({ isUploaded: () => false });
+  return {
+    ...current,
+    async workerDeployments(workerName) {
+      if (workerName !== target.workerName) return await current.workerDeployments(workerName);
+      if (input.malformedHistory) {
+        return [{ id: "public-deployment", created_on: "not-a-timestamp", versions: [] }];
+      }
+      return [
+        deployment("public-deployment", PUBLIC_WORKER_VERSION_ID, "2026-08-28T03:00:00Z"),
+        deployment(
+          "public-deployment-previous",
+          PREVIOUS_PUBLIC_WORKER_VERSION_ID,
+          "2026-08-28T02:00:00Z",
+        ),
+        ...(input.twoHop
+          ? [
+              deployment(
+                "public-deployment-two-hop",
+                TWO_HOP_PUBLIC_WORKER_VERSION_ID,
+                "2026-08-28T01:00:00Z",
+              ),
+            ]
+          : []),
+      ];
+    },
+    async workerVersion(workerName, versionId) {
+      if (workerName === target.formAuthority.integrationWorkerName) {
+        return version(
+          input.authorityCommit ?? PREVIOUS_COMMIT,
+          PREVIOUS_DIGEST,
+          input.boundVersionId ?? PREVIOUS_PUBLIC_WORKER_VERSION_ID,
+          input.boundArtifactDigest ?? PREVIOUS_PUBLIC_WORKER_DIGEST,
+        );
+      }
+      return await current.workerVersion(workerName, versionId);
+    },
+  };
+}
+
+function qualificationDriftState(
+  kind: "public-predecessor" | "authority-history",
+  isUploaded: () => boolean,
+): FormAuthorityDeployState {
+  const current = stateSequence({ isUploaded });
+  let publicReads = 0;
+  let authorityReads = 0;
+  return {
+    ...current,
+    async workerDeployments(workerName) {
+      const history = await current.workerDeployments(workerName);
+      if (workerName === target.workerName) {
+        publicReads += 1;
+        if (kind === "public-predecessor" && publicReads > 1) {
+          return [
+            history[0],
+            deployment(
+              "public-deployment-drifted-predecessor",
+              ARBITRARY_PUBLIC_WORKER_VERSION_ID,
+              "2026-08-28T01:00:00Z",
+            ),
+          ];
+        }
+      }
+      if (workerName === target.formAuthority.integrationWorkerName && !isUploaded()) {
+        authorityReads += 1;
+        if (kind === "authority-history" && authorityReads > 1) {
+          return [
+            history[0],
+            deployment(
+              "authority-unrelated-predecessor",
+              "88888888-8888-4888-8888-888888888888",
+              "2026-08-28T01:00:00Z",
+            ),
+          ];
+        }
+      }
+      return history;
     },
   };
 }
@@ -560,7 +682,7 @@ describe("route-less Form authority deploy surfaces", () => {
     expect(stateRead).toBe(false);
   });
 
-  test("does not report ready when only the public Worker commit is current", async () => {
+  test("reports the exact direct public predecessor as an explicit stale profile", async () => {
     const status = await runFormAuthority(
       {
         surface: "takoserver-integration-form-authority-worker",
@@ -569,13 +691,117 @@ describe("route-less Form authority deploy surfaces", () => {
         commit: COMMIT,
       },
       target,
-      { state: stateSequence() },
+      { state: stateSequence({ isUploaded: () => false }) },
     );
     expect(status).toMatchObject({
+      deployedCommit: PREVIOUS_COMMIT,
       commitMatches: false,
       publicWorkerCommitMatches: true,
+      publicWorkerBindingProfile: "exact-direct-public-predecessor",
+      boundPublicWorkerVersionId: PREVIOUS_PUBLIC_WORKER_VERSION_ID,
+      boundPublicWorkerArtifactDigest: PREVIOUS_PUBLIC_WORKER_DIGEST,
       ready: false,
     });
+  });
+
+  test("replaces one validated predecessor with one exact-current direct successor upload", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-roll-forward-"));
+    let uploaded = false;
+    try {
+      const process = fakeProcess({
+        onUpload() {
+          uploaded = true;
+        },
+      });
+      const result = await runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target,
+        {
+          run: process.run,
+          state: stateSequence({ isUploaded: () => uploaded }),
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          review: "independent-reviewer",
+        },
+      );
+      expect(result).toMatchObject({
+        previousVersionId: PREVIOUS_AUTHORITY_VERSION_ID,
+        versionId: CURRENT_AUTHORITY_VERSION_ID,
+        authorityArtifactDigest: BUNDLE_DIGEST,
+        workerArtifactDigest: PUBLIC_WORKER_DIGEST,
+        publicWorkerVersionId: PUBLIC_WORKER_VERSION_ID,
+      });
+      expect(process.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects arbitrary, two-hop, mismatched, and malformed predecessor claims before upload", async () => {
+    const cases: readonly FormAuthorityDeployState[] = [
+      invalidPredecessorState({ boundVersionId: ARBITRARY_PUBLIC_WORKER_VERSION_ID }),
+      invalidPredecessorState({
+        boundVersionId: TWO_HOP_PUBLIC_WORKER_VERSION_ID,
+        twoHop: true,
+      }),
+      invalidPredecessorState({ boundArtifactDigest: `sha256:${"e".repeat(64)}` }),
+      invalidPredecessorState({ authorityCommit: COMMIT }),
+      invalidPredecessorState({ malformedHistory: true }),
+    ];
+    for (const state of cases) {
+      const process = fakeProcess();
+      await expect(
+        runFormAuthority(
+          {
+            surface: "takoserver-integration-form-authority-worker",
+            action: "apply",
+            environment: "integration",
+            commit: COMMIT,
+          },
+          target,
+          {
+            run: process.run,
+            state,
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+            review: "independent-reviewer",
+          },
+        ),
+      ).rejects.toBeInstanceOf(Error);
+      expect(process.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
+    }
+  });
+
+  test("rejects public predecessor or authority history drift during qualification", async () => {
+    for (const kind of ["public-predecessor", "authority-history"] as const) {
+      let uploaded = false;
+      const process = fakeProcess({
+        onUpload() {
+          uploaded = true;
+        },
+      });
+      const failure = await runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target,
+        {
+          run: process.run,
+          state: qualificationDriftState(kind, () => uploaded),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          review: "independent-reviewer",
+        },
+      ).catch((error) => error);
+      expect(failure).toBeInstanceOf(Error);
+      expect(process.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
+    }
   });
 
   test("seals one bundle, reads exact route-less closure, and uploads once", async () => {
@@ -606,8 +832,8 @@ describe("route-less Form authority deploy surfaces", () => {
         productionEligible: false,
         authorityArtifactDigest: BUNDLE_DIGEST,
         workerArtifactDigest: PUBLIC_WORKER_DIGEST,
-        previousVersionId: "version-previous",
-        versionId: "version-current",
+        previousVersionId: PREVIOUS_AUTHORITY_VERSION_ID,
+        versionId: CURRENT_AUTHORITY_VERSION_ID,
       });
       expect(process.calls.filter((call) => call.includes("--dry-run"))).toHaveLength(2);
       expect(process.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
