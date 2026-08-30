@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DeployError } from "../scripts/deploy/errors.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import {
   type RetirementProcess,
@@ -756,6 +757,88 @@ describe("reviewed Hosted legacy-edge retirement", () => {
     }
   });
 
+  test("token-retired completion requires the exact canonical annotation inventory", async () => {
+    const message = `takoserver-worker:${COMMIT}:${DIGEST}`;
+    const variants = [
+      {
+        name: "exact-canonical",
+        annotations: { "workers/message": message, "workers/triggered_by": "version_upload" },
+        expectedState: "token-retired",
+        ready: true,
+        repairRequired: false,
+      },
+      {
+        name: "message-only",
+        annotations: { "workers/message": message },
+        expectedState: "token-retired-unattributed-successor",
+        ready: false,
+        repairRequired: true,
+      },
+      {
+        name: "pre-metadata-message-only",
+        annotations: { "workers/message": message },
+        expectedState: "token-retired-unattributed-successor",
+        ready: false,
+        repairRequired: true,
+      },
+      {
+        name: "secret-trigger",
+        annotations: { "workers/message": message, "workers/triggered_by": "secret" },
+        expectedState: "token-retired-unattributed-successor",
+        ready: false,
+        repairRequired: true,
+      },
+      {
+        name: "extra-annotation",
+        annotations: {
+          "workers/message": message,
+          "workers/triggered_by": "version_upload",
+          "workers/extra": "unexpected",
+        },
+        expectedState: "token-retired-unattributed-successor",
+        ready: false,
+        repairRequired: true,
+      },
+    ] as const;
+
+    for (const variant of variants) {
+      const fixture = stateFixture("token");
+      const state: RetirementState = {
+        ...fixture.state,
+        async workerVersion(workerName, versionId) {
+          if (versionId === VERSION_TOKEN) {
+            return versionShape({
+              includeHostedSecret: false,
+              includeVersionMetadata: variant.name !== "pre-metadata-message-only",
+              message,
+              annotations: variant.annotations,
+            });
+          }
+          return await fixture.state.workerVersion(workerName, versionId);
+        },
+      };
+      const status = await runRetirement(
+        {
+          surface: "takoserver-hosted-token-retirement",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+        },
+        target,
+        { run: fixture.run, state },
+      );
+      expect(status, variant.name).toMatchObject({
+        state: variant.expectedState,
+        ready: variant.ready,
+        repairRequired: variant.repairRequired,
+        versionId: VERSION_TOKEN,
+        secretPresent: false,
+      });
+      expect(fixture.mutations, variant.name).toHaveLength(0);
+    }
+  });
+
   test("attribution repair status proves the selected R against the trusted T script identity", async () => {
     const fixture = stateFixture("token");
     const status = await runRetirement(
@@ -870,6 +953,80 @@ describe("reviewed Hosted legacy-edge retirement", () => {
       expect(JSON.stringify(realized)).not.toContain(HOSTED_SPONSORSHIP_SECRET);
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("attribution-repaired completion requires the exact canonical annotation inventory", async () => {
+    const message = `takoserver-worker:${COMMIT}:${DIGEST}`;
+    const variants = [
+      {
+        name: "exact-canonical",
+        annotations: { "workers/message": message, "workers/triggered_by": "version_upload" },
+        canonical: true,
+      },
+      {
+        name: "message-only",
+        annotations: { "workers/message": message },
+        canonical: false,
+      },
+      {
+        name: "secret-trigger",
+        annotations: { "workers/message": message, "workers/triggered_by": "secret" },
+        canonical: false,
+      },
+      {
+        name: "extra-annotation",
+        annotations: {
+          "workers/message": message,
+          "workers/triggered_by": "version_upload",
+          "workers/extra": "unexpected",
+        },
+        canonical: false,
+      },
+    ] as const;
+
+    for (const variant of variants) {
+      const fixture = stateFixture("repaired");
+      const state: RetirementState = {
+        ...fixture.state,
+        async workerVersion(workerName, versionId) {
+          if (versionId === VERSION_ATTRIBUTION_REPAIRED) {
+            return versionShape({
+              includeHostedSecret: false,
+              message,
+              annotations: variant.annotations,
+            });
+          }
+          return await fixture.state.workerVersion(workerName, versionId);
+        },
+      };
+      const result = await runRetirement(
+        {
+          surface: "takoserver-worker-retirement-attribution-repair",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+          unattributedSuccessorVersionId: VERSION_TOKEN,
+        },
+        target,
+        { run: fixture.run, state, fetcher: probeFetcher },
+      ).catch((error) => error);
+
+      if (variant.canonical) {
+        expect(result, variant.name).toMatchObject({
+          state: "token-retirement-attribution-repaired",
+          ready: true,
+          repairRequired: false,
+          versionId: VERSION_ATTRIBUTION_REPAIRED,
+          previousVersionId: VERSION_TOKEN,
+        });
+      } else {
+        expect(result, variant.name).toBeInstanceOf(DeployError);
+        expect(result.phase, variant.name).toBe("preflight");
+        expect(result.message, variant.name).toContain("canonical identity");
+      }
+      expect(fixture.mutations, variant.name).toHaveLength(0);
     }
   });
 
@@ -1401,12 +1558,26 @@ function initialHistory(
 function versionShape(input: {
   readonly serviceBinding?: { readonly service: string; readonly entrypoint: string };
   readonly includeHostedSecret?: boolean;
+  readonly includeVersionMetadata?: boolean;
   readonly message?: string | null;
+  readonly annotations?: Readonly<Record<string, string>> | null;
   readonly scriptEtag?: string;
 }) {
+  const annotations =
+    input.annotations === null
+      ? null
+      : (input.annotations ??
+        (input.message === null
+          ? null
+          : {
+              "workers/message": input.message ?? `takoserver-worker:${COMMIT}:${DIGEST}`,
+              "workers/triggered_by": "version_upload",
+            }));
   const bindings = [
     { type: "ai", name: "AI" },
-    { type: "version_metadata", name: "WORKER_VERSION" },
+    ...(input.includeVersionMetadata === false
+      ? []
+      : [{ type: "version_metadata", name: "WORKER_VERSION" }]),
     { type: "d1", name: "STATE_DB", id: target.d1.databaseId },
     { type: "r2_bucket", name: "OBJECTS", bucket_name: target.r2.bucketName },
     { type: "plain_text", name: "PUBLIC_ORIGIN", text: target.publicOrigin },
@@ -1420,13 +1591,7 @@ function versionShape(input: {
       : [{ type: "service", name: "HOST_RUNTIME_MATERIALIZER", ...input.serviceBinding }]),
   ];
   return {
-    ...(input.message === null
-      ? {}
-      : {
-          annotations: {
-            "workers/message": input.message ?? `takoserver-worker:${COMMIT}:${DIGEST}`,
-          },
-        }),
+    ...(annotations === null ? {} : { annotations }),
     resources: { bindings, script: { etag: input.scriptEtag ?? SCRIPT_ETAG } },
   };
 }

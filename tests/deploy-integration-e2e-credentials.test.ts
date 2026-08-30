@@ -22,7 +22,7 @@ const COMMIT = "a".repeat(40);
 const BUNDLE_DIGEST = "b".repeat(64);
 const VERSION_ID = "00000000-0000-4000-8000-000000000001";
 const PUBLIC_JWK = { kty: "OKP" as const, crv: "Ed25519" as const, x: "E".repeat(43) };
-const DISTINCT_SIGNING_X = "F".repeat(43);
+const DISTINCT_SIGNING_X = `${"F".repeat(42)}A`;
 
 const target = {
   kind: "takoserver.deploy-target@v2",

@@ -388,7 +388,7 @@ describe("split Takoserver Worker surfaces", () => {
     } satisfies DeployTarget;
     try {
       const process = fixture({ diff: "src/auth.ts\n" });
-      const activeSigningDatabase = signingDatabase("F".repeat(43));
+      const activeSigningDatabase = signingDatabase(`${"F".repeat(42)}A`);
       const state: WorkerState = {
         async workerDomains() {
           return [{ hostname: "api.integration.example.test", service: target.workerName }];

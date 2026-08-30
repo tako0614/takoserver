@@ -75,6 +75,9 @@ describe("Takoserver split deploy entrypoint", () => {
     const credentials = contract.surfaces.find(
       ({ surface }) => surface === "takoserver-integration-e2e-credentials",
     );
+    const hosted = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-hosted-token-cutover",
+    );
     expect(integrationAuthority?.obligations["post-conditions"]).toContain(
       "exact operator tenant and Space plain-text bindings",
     );
@@ -99,6 +102,15 @@ describe("Takoserver split deploy entrypoint", () => {
       "distinct 3600-second writer and external-evidence secrets",
     );
     expect(credentials?.obligations.reversal).toContain("current dedicated authority");
+    expect(hosted?.obligations.provenance).toContain(
+      "canonical token-present proof-only apply is available in every environment",
+    );
+    expect(hosted?.obligations["post-conditions"]).toContain(
+      "zero secret, build, dry-run, upload, or configuration mutation",
+    );
+    expect(hosted?.obligations["post-conditions"]).toContain(
+      "functionalProofPending=false, repairRequired=false, and ready=true",
+    );
 
     for (const surface of contract.surfaces) {
       expect(surface.obligations).toMatchObject({

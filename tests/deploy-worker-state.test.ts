@@ -8,6 +8,7 @@ import {
   expectedBindingClosureForTarget,
   expectedExactBindingClosure,
   expectedLegacyPreVersionMetadataBindingClosure,
+  parseWorkerDeploymentChain,
   parseWorkerDeploymentHistory,
   workerVersionMetadataBindingProfile,
 } from "../scripts/deploy/worker-state.ts";
@@ -240,6 +241,64 @@ function expectedExactVersion(target: DeployTarget) {
 }
 
 describe("authoritative Worker history and secret closure", () => {
+  test("strict transition history rejects invalid Version IDs, duplicate deployments, and partial shapes", () => {
+    const validA = "11111111-1111-4111-8111-111111111111";
+    const validB = "22222222-2222-4222-8222-222222222222";
+    const strict = { requireUuidVersionIds: true } as const;
+    const cases = [
+      [
+        "invalid Version ID",
+        [deploymentHistory("deployment-a", "version-a", "2026-08-28T02:00:00Z")],
+      ],
+      [
+        "duplicate deployment IDs",
+        [
+          deploymentHistory("deployment-a", validA, "2026-08-28T02:00:00Z"),
+          deploymentHistory("deployment-a", validB, "2026-08-28T01:00:00Z"),
+        ],
+      ],
+      [
+        "one 100 percent Version",
+        [
+          {
+            id: "deployment-a",
+            created_on: "2026-08-28T02:00:00Z",
+            versions: [
+              { version_id: validA, percentage: 50 },
+              { version_id: validB, percentage: 50 },
+            ],
+          },
+        ],
+      ],
+    ] as const;
+
+    for (const [message, history] of cases) {
+      expect(() => parseWorkerDeploymentChain(history, "preflight", strict), message).toThrow(
+        message,
+      );
+    }
+  });
+
+  test("strict history preserves valid older rollback reuse of an immutable Version", () => {
+    const validA = "11111111-1111-4111-8111-111111111111";
+    const validB = "22222222-2222-4222-8222-222222222222";
+    expect(
+      parseWorkerDeploymentChain(
+        [
+          deploymentHistory("deployment-current", validA, "2026-08-28T03:00:00Z"),
+          deploymentHistory("deployment-previous", validB, "2026-08-28T02:00:00Z"),
+          deploymentHistory("deployment-rollback", validA, "2026-08-28T01:00:00Z"),
+        ],
+        "preflight",
+        { requireUuidVersionIds: true },
+      ).map(({ deploymentId, versionId }) => ({ deploymentId, versionId })),
+    ).toEqual([
+      { deploymentId: "deployment-current", versionId: validA },
+      { deploymentId: "deployment-previous", versionId: validB },
+      { deploymentId: "deployment-rollback", versionId: validA },
+    ]);
+  });
+
   test("requires one 100 percent version and preserves the previous rollback id", () => {
     expect(
       parseWorkerDeploymentHistory([
@@ -297,3 +356,7 @@ describe("authoritative Worker history and secret closure", () => {
     ).toThrow("secret inventory drift");
   });
 });
+
+function deploymentHistory(id: string, versionId: string, createdOn: string) {
+  return { id, created_on: createdOn, versions: [{ version_id: versionId, percentage: 100 }] };
+}

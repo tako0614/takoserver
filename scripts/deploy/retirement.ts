@@ -31,6 +31,7 @@ import {
   isWorkerVersionId,
   type RetirementLiveWorkerVersion,
   type WorkerState,
+  workerVersionAnnotationProfile,
   workerVersionScriptContentIdentity,
 } from "./worker-live.ts";
 import {
@@ -2386,7 +2387,13 @@ function assertUniqueLineage(
 function versionIdentity(
   value: unknown,
 ): { readonly commit: string; readonly bundleDigestHex: string } | null {
-  if (!isRecord(value) || !isRecord(value.annotations)) return null;
+  if (
+    workerVersionAnnotationProfile(value) !== "canonical" ||
+    !isRecord(value) ||
+    !isRecord(value.annotations)
+  ) {
+    return null;
+  }
   const message = value.annotations["workers/message"];
   if (typeof message !== "string") return null;
   const match = /^takoserver-worker:([0-9a-f]{40}):([0-9a-f]{64})$/u.exec(message);
