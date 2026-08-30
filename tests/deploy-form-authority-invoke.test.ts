@@ -76,7 +76,7 @@ describe("signed Form authority operator invocation", () => {
     expect((result.readback as { forms: unknown[] }).forms).toHaveLength(12);
     expect((result.apply as { receipts: unknown[] }).receipts).toHaveLength(38);
     expect(result).toMatchObject({
-      kind: "takoserver.integration-form-authority-invocation@v1",
+      kind: "takoserver.integration-form-authority-invocation@v2",
       action: "apply",
       environment: "integration",
       activation: {
@@ -180,6 +180,56 @@ describe("signed Form authority operator invocation", () => {
     );
     expect(fixture.calls.map(({ action }) => action)).toEqual(["readback"]);
     expect(status).toMatchObject({ action: "status", ready: true, credentialsRedacted: true });
+  });
+
+  test("deactivation uses a distinct surface and reports all 12 durable heads inactive", async () => {
+    const fixture = await invocationFixture();
+    await runFormAuthorityInvoke(
+      {
+        surface: "takoserver-integration-form-authority",
+        action: "apply",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      fixture.target,
+      fixture.options,
+    );
+    fixture.calls.length = 0;
+    fixture.assertions.length = 0;
+
+    const deactivated = await runFormAuthorityInvoke(
+      {
+        surface: "takoserver-integration-form-authority-deactivation",
+        action: "apply",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      fixture.target,
+      fixture.options,
+    );
+    expect(fixture.calls.map(({ action }) => action)).toEqual(["plan", "apply", "readback"]);
+    const planRequest = fixture.calls.find(({ action }) => action === "plan")?.body as {
+      activation?: { desiredActive?: boolean };
+    };
+    expect(planRequest.activation?.desiredActive).toBe(false);
+    expect(deactivated).toMatchObject({
+      kind: "takoserver.integration-form-authority-invocation@v2",
+      surface: "takoserver-integration-form-authority-deactivation",
+      activation: { desiredActive: false },
+      ready: true,
+      plan: { commandCount: 12 },
+      apply: { status: "converged", nextCommandCount: 0 },
+    });
+    expect(
+      (deactivated.readback as { forms: readonly { activationHead: { active: boolean } }[] }).forms,
+    ).toHaveLength(12);
+    expect(
+      (
+        deactivated.readback as {
+          forms: readonly { activationHead: { present: boolean; active: boolean } }[];
+        }
+      ).forms.every(({ activationHead }) => !activationHead.present || !activationHead.active),
+    ).toBe(true);
   });
 
   test("status accepts the valid nonconverged initial readback and reports not ready", async () => {
@@ -418,7 +468,7 @@ async function invocationFixture(
           ? { ...first, installed: "true" }
           : input.tamperReadback === "extra"
             ? { ...first, unexpected: true }
-            : (({ active: _active, ...missing }) => missing)(first);
+            : (({ activationHead: _activationHead, ...missing }) => missing)(first);
       returned = {
         ...(result as unknown as Record<string, unknown>),
         forms: [malformed, ...readback.forms.slice(1)],

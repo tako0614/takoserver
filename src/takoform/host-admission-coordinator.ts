@@ -34,11 +34,12 @@ export interface FormAuthorityIdentity {
 }
 
 export interface FormAuthorityPlanRequest extends FormAuthorityIdentity {
-  readonly kind: "takoserver.form-authority-plan-request@v1";
+  readonly kind: "takoserver.form-authority-plan-request@v2";
   readonly activation: {
     readonly kind: "space";
     readonly tenantId: string;
     readonly space: string;
+    readonly desiredActive: boolean;
   };
   readonly evidence: FormAuthorityVerificationEvidence;
   readonly actor: string;
@@ -48,6 +49,14 @@ export interface FormAuthorityPlanRequest extends FormAuthorityIdentity {
 export interface FormAuthorityHead {
   readonly kind: "publisher" | "checkpoint" | "package" | "install" | "support" | "activation";
   readonly key: string;
+  readonly eventDigest: AdmissionDigest | null;
+}
+
+/** The durable current activation event, kept separate from effective state. */
+export interface FormAuthorityActivationHead {
+  readonly present: boolean;
+  readonly active: boolean;
+  readonly implementationDigest: AdmissionDigest | null;
   readonly eventDigest: AdmissionDigest | null;
 }
 
@@ -77,6 +86,8 @@ export type FormAuthorityCommand = FormAuthorityCommandBase &
         readonly formRef: TakoformImplementationCatalogEntry["formRef"];
         readonly packageDigest: AdmissionDigest;
         readonly audience: { readonly kind: "space"; readonly value: string };
+        readonly active: boolean;
+        readonly implementationDigest: AdmissionDigest;
       }
   );
 
@@ -85,7 +96,7 @@ type FormAuthorityCommandDescriptor<T = FormAuthorityCommand> = T extends FormAu
   : never;
 
 export interface FormAuthorityPlan {
-  readonly kind: "takoserver.form-authority-plan@v1";
+  readonly kind: "takoserver.form-authority-plan@v2";
   readonly request: FormAuthorityPlanRequest;
   readonly packages: readonly {
     readonly formRef: TakoformImplementationCatalogEntry["formRef"];
@@ -100,7 +111,7 @@ export interface FormAuthorityPlan {
 }
 
 export interface FormAuthorityReadback {
-  readonly kind: "takoserver.form-authority-readback@v1";
+  readonly kind: "takoserver.form-authority-readback@v2";
   readonly identity: FormAuthorityIdentity;
   readonly activation: FormAuthorityPlanRequest["activation"];
   readonly currentHeads: readonly FormAuthorityHead[];
@@ -111,7 +122,7 @@ export interface FormAuthorityReadback {
     readonly operations: TakoformImplementationCatalogEntry["operations"];
     readonly installed: boolean;
     readonly supported: boolean;
-    readonly active: boolean;
+    readonly activationHead: FormAuthorityActivationHead;
   }[];
 }
 
@@ -128,7 +139,7 @@ export interface FormAuthorityActionReceipt {
 }
 
 export interface FormAuthorityApplyResult {
-  readonly kind: "takoserver.form-authority-apply@v1";
+  readonly kind: "takoserver.form-authority-apply@v2";
   readonly status: "converged" | "partial";
   readonly planDigest: AdmissionDigest;
   readonly receipts: readonly FormAuthorityActionReceipt[];
@@ -186,6 +197,7 @@ interface AuthorityState {
     readonly install: AuthorityRow | null;
     readonly support: AuthorityRow | null;
     readonly activation: AuthorityRow | null;
+    readonly activationHead: FormAuthorityActivationHead;
     readonly packagePresent: boolean;
     readonly installCurrent: boolean;
   }[];
@@ -232,6 +244,7 @@ export function createHostAdmissionCoordinator(options: {
 
   const readState = async (request: FormAuthorityPlanRequest): Promise<AuthorityState> => {
     assertRequestIdentity(request, options.identity);
+    const desiredActive = request.activation.desiredActive;
     const [publishers, checkpoints, installs, supports, activations] = await Promise.all([
       history(options.admission, "publisher"),
       history(options.admission, "checkpoint"),
@@ -268,25 +281,35 @@ export function createHostAdmissionCoordinator(options: {
           installs.filter((row) => row.form_ref_key === formRefKey),
           "form_ref_key",
         );
-        const packagePresent =
-          (await options.storedPackages.read({
-            packageDigest: entry.packageDigest,
-            formRef: entry.formRef,
-          })) !== null;
+        const support = exactHead(
+          supports.filter((row) => row.support_key === supportKey),
+          "support_key",
+        );
+        const activation = exactHead(
+          activations.filter((row) => row.activation_key === activationKey),
+          "activation_key",
+        );
+        const activationHead = await activationFacts(activation, entry, audience);
+        // Deactivation is deliberately independent of package/R2 availability:
+        // the durable activation head is the only state it may change. The
+        // install-chain identity is enough to report the retained boolean
+        // without turning a deactivation into a package read.
+        const packagePresent = desiredActive
+          ? (await options.storedPackages.read({
+              packageDigest: entry.packageDigest,
+              formRef: entry.formRef,
+            })) !== null
+          : installIdentityMatches(install, entry);
         return {
           entry,
           install,
-          support: exactHead(
-            supports.filter((row) => row.support_key === supportKey),
-            "support_key",
-          ),
-          activation: exactHead(
-            activations.filter((row) => row.activation_key === activationKey),
-            "activation_key",
-          ),
+          support,
+          activation,
+          activationHead,
           packagePresent,
-          installCurrent:
-            packagePresent && (await installMatches(install, entry, request.evidence)),
+          installCurrent: desiredActive
+            ? packagePresent && (await installMatches(install, entry, request.evidence))
+            : installIdentityMatches(install, entry),
         };
       }),
     );
@@ -330,12 +353,12 @@ export function createHostAdmissionCoordinator(options: {
   const readback = async (request: FormAuthorityPlanRequest): Promise<FormAuthorityReadback> => {
     const state = await readState(request);
     return {
-      kind: "takoserver.form-authority-readback@v1",
+      kind: "takoserver.form-authority-readback@v2",
       identity: structuredClone(options.identity),
       activation: structuredClone(request.activation),
       currentHeads: structuredClone(state.heads),
       currentHeadDigest: state.headDigest,
-      forms: state.forms.map(({ entry, support, activation, installCurrent }) => {
+      forms: state.forms.map(({ entry, support, activationHead, installCurrent }) => {
         const installed = installCurrent;
         return {
           formRef: structuredClone(entry.formRef),
@@ -343,7 +366,7 @@ export function createHostAdmissionCoordinator(options: {
           operations: [...entry.operations],
           installed,
           supported: installed && supportMatches(support, entry, options.identity),
-          active: installed && activationMatches(activation, options.identity.implementationDigest),
+          activationHead: structuredClone(activationHead),
         };
       }),
     };
@@ -353,16 +376,44 @@ export function createHostAdmissionCoordinator(options: {
     request: FormAuthorityPlanRequest,
     state: AuthorityState,
   ): Promise<FormAuthorityPlan> => {
-    assertExistingAuthorityMatches(request, state);
+    const desiredActive = request.activation.desiredActive;
+    if (desiredActive) assertExistingAuthorityMatches(request, state);
     const descriptors: FormAuthorityCommandDescriptor[] = [];
-    if (!state.publisher) {
+    const audience = spaceAudience(request.activation);
+    if (desiredActive && !state.publisher) {
       descriptors.push({ kind: "AllowPublisher", predecessorDigest: ADMISSION_GENESIS_DIGEST });
     }
-    if (!state.checkpoint) {
+    if (desiredActive && !state.checkpoint) {
       descriptors.push({ kind: "AppendCheckpoint", predecessorDigest: ADMISSION_GENESIS_DIGEST });
     }
-    const audience = spaceAudience(request.activation);
-    for (const { entry, install, support, activation, installCurrent } of state.forms) {
+    for (const {
+      entry,
+      install,
+      support,
+      activation,
+      activationHead,
+      installCurrent,
+    } of state.forms) {
+      if (!desiredActive) {
+        if (activationHead.present && activationHead.active) {
+          if (!activationHead.implementationDigest || !activationHead.eventDigest) {
+            throw new HostAdmissionCoordinatorError(
+              "authority_state_conflict",
+              "active activation head is missing its implementation or event digest",
+            );
+          }
+          descriptors.push({
+            kind: "SetActivation",
+            formRef: structuredClone(entry.formRef),
+            packageDigest: entry.packageDigest,
+            audience,
+            active: false,
+            implementationDigest: activationHead.implementationDigest,
+            predecessorDigest: activationHead.eventDigest,
+          });
+        }
+        continue;
+      }
       if (!installCurrent) {
         descriptors.push({
           kind: install ? "ReplacePackage" : "InstallPackage",
@@ -386,13 +437,15 @@ export function createHostAdmissionCoordinator(options: {
           formRef: structuredClone(entry.formRef),
           packageDigest: entry.packageDigest,
           audience,
+          active: true,
+          implementationDigest: options.identity.implementationDigest,
           predecessorDigest: eventDigest(activation) ?? ADMISSION_GENESIS_DIGEST,
         });
       }
     }
     const commands = await Promise.all(descriptors.map(indexedCommand));
     const unsigned = {
-      kind: "takoserver.form-authority-plan@v1" as const,
+      kind: "takoserver.form-authority-plan@v2" as const,
       request: structuredClone(request),
       packages: entries.map((entry) => ({
         formRef: structuredClone(entry.formRef),
@@ -404,7 +457,8 @@ export function createHostAdmissionCoordinator(options: {
       currentHeadDigest: state.headDigest,
       commands,
     };
-    return { ...unsigned, planDigest: await canonicalFormAuthorityPlanDigest(unsigned) };
+    const planDigest = await canonicalFormAuthorityPlanDigest(unsigned);
+    return { ...unsigned, planDigest };
   };
 
   const plan = async (request: FormAuthorityPlanRequest): Promise<FormAuthorityPlan> => {
@@ -419,7 +473,9 @@ export function createHostAdmissionCoordinator(options: {
     if ((await canonicalFormAuthorityPlanDigest(unsigned)) !== candidate.planDigest) {
       throw new HostAdmissionCoordinatorError("plan_digest_mismatch");
     }
-    assertApplyReadiness(options.identity.environment, options.verifier);
+    if (candidate.request.activation.desiredActive) {
+      assertApplyReadiness(options.identity.environment, options.verifier);
+    }
     const planned = await readState(candidate.request);
     if (
       planned.headDigest !== candidate.currentHeadDigest ||
@@ -442,40 +498,42 @@ export function createHostAdmissionCoordinator(options: {
       string,
       { package: FormPackageInput; admission: PreparedHostAdmission }
     >();
-    for (const command of candidate.commands) {
-      if (command.kind === "AllowPublisher" || command.kind === "AppendCheckpoint") continue;
-      const key = canonicalJson(command.formRef);
-      if (prepared.has(key)) continue;
-      const pkg = await options.packages.load({
-        formRef: command.formRef,
-        packageDigest: command.packageDigest,
-      });
-      if (pkg.packageDigest !== command.packageDigest || canonicalJson(pkg.formRef) !== key) {
-        throw new HostAdmissionCoordinatorError("package_unavailable");
-      }
-      const verified = await options.verifier.verify({
-        environment: candidate.request.environment,
-        hostId: candidate.request.hostId,
-        package: pkg,
-        evidence: candidate.request.evidence,
-      });
-      const packageCommand = candidate.commands.find(
-        (value) =>
-          (value.kind === "InstallPackage" || value.kind === "ReplacePackage") &&
-          canonicalJson(value.formRef) === key,
-      );
-      prepared.set(key, {
-        package: pkg,
-        admission: prepareHostAdmission({
+    if (candidate.request.activation.desiredActive) {
+      for (const command of candidate.commands) {
+        if (command.kind === "AllowPublisher" || command.kind === "AppendCheckpoint") continue;
+        const key = canonicalJson(command.formRef);
+        if (prepared.has(key)) continue;
+        const pkg = await options.packages.load({
+          formRef: command.formRef,
+          packageDigest: command.packageDigest,
+        });
+        if (pkg.packageDigest !== command.packageDigest || canonicalJson(pkg.formRef) !== key) {
+          throw new HostAdmissionCoordinatorError("package_unavailable");
+        }
+        const verified = await options.verifier.verify({
           environment: candidate.request.environment,
-          operation: packageCommand?.kind === "InstallPackage" ? "install" : "replace",
+          hostId: candidate.request.hostId,
           package: pkg,
-          requestedEvidence: candidate.request.evidence,
-          verified,
-          handles: options.handles,
-          verifierReleased: options.verifier.readiness.released,
-        }),
-      });
+          evidence: candidate.request.evidence,
+        });
+        const packageCommand = candidate.commands.find(
+          (value) =>
+            (value.kind === "InstallPackage" || value.kind === "ReplacePackage") &&
+            canonicalJson(value.formRef) === key,
+        );
+        prepared.set(key, {
+          package: pkg,
+          admission: prepareHostAdmission({
+            environment: candidate.request.environment,
+            operation: packageCommand?.kind === "InstallPackage" ? "install" : "replace",
+            package: pkg,
+            requestedEvidence: candidate.request.evidence,
+            verified,
+            handles: options.handles,
+            verifierReleased: options.verifier.readiness.released,
+          }),
+        });
+      }
     }
 
     // Verification may be slow. Re-read every durable head after it has
@@ -544,7 +602,7 @@ export function createHostAdmissionCoordinator(options: {
     const nextPlan = await plan(candidate.request);
     const converged = failure === undefined && nextPlan.commands.length === 0;
     return {
-      kind: "takoserver.form-authority-apply@v1",
+      kind: "takoserver.form-authority-apply@v2",
       status: converged ? "converged" : "partial",
       planDigest: candidate.planDigest,
       receipts,
@@ -661,9 +719,9 @@ function executableCommand(
           kind: command.kind,
           formRef: command.formRef,
           packageDigest: command.packageDigest,
-          active: true,
+          active: command.active,
           audience: command.audience,
-          implementationDigest,
+          implementationDigest: command.implementationDigest,
           ...metadata,
         },
       };
@@ -824,6 +882,14 @@ async function history(
 
 function exactHead(rows: readonly AuthorityRow[], key: string): AuthorityRow | null {
   if (rows.length === 0) return null;
+  for (const row of rows) {
+    if (!isSha256Digest(row.event_digest) || !isSha256Digest(row.predecessor_digest)) {
+      throw new HostAdmissionCoordinatorError(
+        "authority_state_conflict",
+        `${key} authority chain contains an invalid event or predecessor digest`,
+      );
+    }
+  }
   const predecessors = new Set(
     rows
       .map((row) => row.predecessor_digest)
@@ -839,6 +905,90 @@ function exactHead(rows: readonly AuthorityRow[], key: string): AuthorityRow | n
     );
   }
   return heads[0] ?? null;
+}
+
+async function activationFacts(
+  row: AuthorityRow | null,
+  entry: TakoformImplementationCatalogEntry,
+  audience: { readonly kind: "space"; readonly value: string },
+): Promise<FormAuthorityActivationHead> {
+  if (row === null) {
+    return {
+      present: false,
+      active: false,
+      implementationDigest: null,
+      eventDigest: null,
+    };
+  }
+  if (
+    typeof row.id !== "string" ||
+    row.id.length < 3 ||
+    row.id.length > 255 ||
+    !/^[A-Za-z0-9._:-]+$/u.test(row.id) ||
+    !isSha256Digest(row.activation_key) ||
+    row.form_ref_json !== canonicalJson(entry.formRef) ||
+    row.package_digest !== entry.packageDigest ||
+    row.audience_kind !== audience.kind ||
+    row.audience_value !== audience.value ||
+    (row.active !== 0 && row.active !== 1) ||
+    !isSha256Digest(row.implementation_digest) ||
+    typeof row.actor !== "string" ||
+    row.actor.length === 0 ||
+    row.actor.length > 255 ||
+    typeof row.reason !== "string" ||
+    row.reason.length === 0 ||
+    row.reason.length > 4_096 ||
+    typeof row.event_at !== "number" ||
+    !Number.isSafeInteger(row.event_at) ||
+    row.event_at < 0 ||
+    !isSha256Digest(row.event_digest) ||
+    !isSha256Digest(row.predecessor_digest)
+  ) {
+    throw new HostAdmissionCoordinatorError(
+      "authority_state_conflict",
+      "durable activation head is malformed or does not match the requested Form and audience",
+    );
+  }
+  const expectedEventDigest = await canonicalDigest({
+    chain: "activation",
+    id: row.id,
+    activationKey: row.activation_key,
+    formRef: entry.formRef,
+    packageDigest: row.package_digest,
+    audience: {
+      kind: row.audience_kind,
+      value: row.audience_value,
+    },
+    active: row.active === 1,
+    implementationDigest: row.implementation_digest,
+    actor: row.actor,
+    reason: row.reason,
+    eventAt: row.event_at,
+    predecessorDigest: row.predecessor_digest,
+  });
+  if (expectedEventDigest !== row.event_digest) {
+    throw new HostAdmissionCoordinatorError(
+      "authority_state_conflict",
+      "durable activation event digest does not match its canonical body",
+    );
+  }
+  return {
+    present: true,
+    active: row.active === 1,
+    implementationDigest: row.implementation_digest,
+    eventDigest: row.event_digest,
+  };
+}
+
+function installIdentityMatches(
+  row: AuthorityRow | null,
+  entry: TakoformImplementationCatalogEntry,
+): boolean {
+  return (
+    (row?.event_type === "install" || row?.event_type === "replace") &&
+    row.package_digest === entry.packageDigest &&
+    row.form_ref_json === canonicalJson(entry.formRef)
+  );
 }
 
 function spaceAudience(activation: FormAuthorityPlanRequest["activation"]): {
@@ -1071,10 +1221,13 @@ function validateIdentity(identity: FormAuthorityIdentity): void {
 
 function validatePlanRequest(request: FormAuthorityPlanRequest): void {
   if (
-    request.kind !== "takoserver.form-authority-plan-request@v1" ||
-    request.activation?.kind !== "space" ||
+    request.kind !== "takoserver.form-authority-plan-request@v2" ||
+    !isRecord(request.activation) ||
+    !exactKeys(request.activation, ["desiredActive", "kind", "space", "tenantId"]) ||
+    request.activation.kind !== "space" ||
     !boundedIdentity(request.activation.tenantId) ||
     !boundedIdentity(request.activation.space) ||
+    typeof request.activation.desiredActive !== "boolean" ||
     !boundedText(request.actor, 4_096) ||
     !boundedText(request.reason, 4_096) ||
     !request.evidence ||
@@ -1110,7 +1263,7 @@ function assertRequestIdentity(
 
 function assertPlanShape(plan: FormAuthorityPlan): void {
   if (
-    plan?.kind !== "takoserver.form-authority-plan@v1" ||
+    plan?.kind !== "takoserver.form-authority-plan@v2" ||
     !isSha256Digest(plan.planDigest) ||
     !isSha256Digest(plan.currentHeadDigest) ||
     !Array.isArray(plan.commands) ||
@@ -1141,6 +1294,10 @@ function boundedIdentity(value: unknown): value is string {
 
 function boundedText(value: unknown, max: number): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= max;
+}
+
+function exactKeys(value: Readonly<Record<string, unknown>>, keys: readonly string[]): boolean {
+  return JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...keys].sort());
 }
 
 function errorCode(error: unknown): string {

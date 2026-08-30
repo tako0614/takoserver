@@ -69,8 +69,8 @@ describe("integration Form authority operator gateway", () => {
   test("accepts only a short-lived exact method/path/body/public-identity proof", async () => {
     const calls: { action: string; body: unknown; assertion: string }[] = [];
     const body = {
-      kind: "takoserver.form-authority-plan-request@v1",
-      activation: { kind: "space", ...OPERATOR_SCOPE },
+      kind: "takoserver.form-authority-plan-request@v2",
+      activation: { kind: "space", ...OPERATOR_SCOPE, desiredActive: true },
       actor: "operator",
     };
     const env = gatewayEnv({
@@ -115,12 +115,17 @@ describe("integration Form authority operator gateway", () => {
     });
     for (const action of ["plan", "apply", "readback"] as const) {
       const requestBody = {
-        kind: "takoserver.form-authority-plan-request@v1",
-        activation: { kind: "space", tenantId: OPERATOR_SCOPE.tenantId, space: "other-space" },
+        kind: "takoserver.form-authority-plan-request@v2",
+        activation: {
+          kind: "space",
+          tenantId: OPERATOR_SCOPE.tenantId,
+          space: "other-space",
+          desiredActive: true,
+        },
       };
       const body =
         action === "apply"
-          ? { kind: "takoserver.form-authority-plan@v1", request: requestBody }
+          ? { kind: "takoserver.form-authority-plan@v2", request: requestBody }
           : requestBody;
       const path = `/v1/${action}` as const;
       const assertion = await signGatewayAssertion(action, path, body);
@@ -138,8 +143,8 @@ describe("integration Form authority operator gateway", () => {
   test("rejects public Worker drift before invoking the route-less authority", async () => {
     const calls: { action: string; body: unknown; assertion: string }[] = [];
     const body = {
-      kind: "takoserver.form-authority-plan-request@v1",
-      activation: { kind: "space", ...OPERATOR_SCOPE },
+      kind: "takoserver.form-authority-plan-request@v2",
+      activation: { kind: "space", ...OPERATOR_SCOPE, desiredActive: true },
     };
     const assertion = await signGatewayAssertion("readback", "/v1/readback", body);
     const env = gatewayEnv({
@@ -158,7 +163,7 @@ describe("integration Form authority operator gateway", () => {
 
   test("fails closed as unavailable when the sealed operator key is malformed", async () => {
     const calls: { action: string; body: unknown; assertion: string }[] = [];
-    const body = { kind: "takoserver.form-authority-plan-request@v1" };
+    const body = { kind: "takoserver.form-authority-plan-request@v2" };
     const assertion = await signGatewayAssertion("plan", "/v1/plan", body);
     const env = {
       ...gatewayEnv({ authority: authority(calls), publicVersionId: PUBLIC_VERSION_ID }),
@@ -232,7 +237,7 @@ function authority(
     invocation: Parameters<FormAuthorityRpc["plan"]>[0],
   ): { action: string; accepted: true } => {
     expect(invocation).toMatchObject({
-      kind: "takoserver.signed-form-authority-rpc@v1",
+      kind: "takoserver.signed-form-authority-rpc@v2",
       action,
       method: "POST",
       path: `/v1/${action}`,

@@ -1,6 +1,6 @@
 # Takoserver deploy surfaces
 
-This repository owns one deploy entrypoint and seventeen separate mutation surfaces.
+This repository owns one deploy entrypoint and eighteen separate mutation surfaces.
 The contract is read-only:
 
 ```sh
@@ -118,6 +118,14 @@ The separate authority and irreversible surfaces are:
   acknowledged partial apply still performs the separate readback, preserves
   only sanitized action receipts and next-plan diagnostics, and exits nonzero
   as a verification failure.
+- `takoserver-integration-form-authority-deactivation`: integration only and
+  separately owned from normal activation. It always signs
+  `activation.desiredActive: false`, emits only inactive activation successors,
+  never loads Form packages or invokes package verification, and has no free
+  mode, repair, or reverse flag. Status/apply/status proves all exact 12
+  durable activation heads are absent or inactive. It uses the same v2 signed
+  request/plan/apply/readback protocol and the same no-retry/credential
+  redaction rules.
 - `takoserver-d1-schema`: ordered, forward-only D1 migration apply and exact
   post-lineage/schema-shape readback.
 - `takoserver-signing-key-register`: append-only public Ed25519 JWK registration
@@ -178,6 +186,16 @@ authority and topology retirement surfaces expose their documented reversals;
 token retirement and attribution repair are forward-only and restoration
 requires a separately reviewed dedicated surface. There is no automatic
 fallback or raw Wrangler reversal.
+
+For the reviewed Form integration cutover, first capture the old exact
+tenant/Space scope with status and an operator snapshot. Apply the authority
+code cutover, deploy the route-less authority and gateway at the same commit,
+then run the distinct deactivation surface as status, apply, status. Only then
+may the target name a new Space. Deploy route-less authority and gateway again
+for that target, perform normal activation, cut over consumers, and finally
+clean retained packages. Inactive activation leaves retained delete/observe
+available through the Host projection; no raw D1 is used. Rollback is an
+explicit normal reactivation append, never a Worker-version rollback.
 
 The operator-identity surface is deliberately outside that production order.
 Its invocation parser accepts only `--environment=integration`; rehearsal and
@@ -280,3 +298,9 @@ exact A direct successor of the selected R, with canonical commit/digest, exact
 attempt. An R that remains current is still
 `token-retired-unattributed-successor`; any unrelated history advance or
 weak/missing script identity fails closed.
+
+For a Form deactivation acknowledgement failure, do not retry apply. Run the
+deactivation surface with `--status` and require its exact 12-head
+absent-or-inactive proof before any fresh decision. A Worker rollback cannot
+reverse the append-only activation event; use the normal activation surface
+for explicit reactivation.

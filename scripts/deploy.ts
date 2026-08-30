@@ -111,7 +111,8 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     (surfaceValue === "takoserver-integration-operator-identity" ||
       surfaceValue === "takoserver-integration-form-authority-worker" ||
       surfaceValue === "takoserver-integration-form-authority-operator-worker" ||
-      surfaceValue === "takoserver-integration-form-authority") &&
+      surfaceValue === "takoserver-integration-form-authority" ||
+      surfaceValue === "takoserver-integration-form-authority-deactivation") &&
     environment !== "integration"
   ) {
     return null;
@@ -325,6 +326,7 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
         target,
       );
     case "takoserver-integration-form-authority":
+    case "takoserver-integration-form-authority-deactivation":
       return await runFormAuthorityInvoke(
         {
           surface: invocation.surface,

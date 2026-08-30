@@ -137,6 +137,7 @@ async function fixture(
         packages: [{ formRef: pkg.formRef, packageDigest: pkg.packageDigest }],
       });
   const adapterCalls = { verify: 0 };
+  const packageLoads = { count: 0 };
   const verifier = {
     ...baseVerifier,
     async verify(request: Parameters<typeof baseVerifier.verify>[0]) {
@@ -159,6 +160,7 @@ async function fixture(
     catalog,
     packages: {
       async load(expected) {
+        packageLoads.count += 1;
         if (
           expected.packageDigest !== pkg.packageDigest ||
           JSON.stringify(expected.formRef) !== JSON.stringify(pkg.formRef)
@@ -175,14 +177,19 @@ async function fixture(
     assertMutationAuthority: input.assertMutationAuthority ?? (async () => {}),
   });
   const request: FormAuthorityPlanRequest = {
-    kind: "takoserver.form-authority-plan-request@v1",
+    kind: "takoserver.form-authority-plan-request@v2",
     ...identity,
-    activation: { kind: "space", tenantId: "tenant-yuru", space: "capsule-yuru" },
+    activation: {
+      kind: "space",
+      tenantId: "tenant-yuru",
+      space: "capsule-yuru",
+      desiredActive: true,
+    },
     evidence: evidence(input.publisherIdentity),
     actor: "integration-operator",
     reason: "install the exact Yurucommu Form package set",
   };
-  return { operator, request, sql, objects, durable, pkg, identity, adapterCalls };
+  return { operator, request, sql, objects, durable, pkg, identity, adapterCalls, packageLoads };
 }
 
 describe("route-less Takoserver Host admission coordinator", () => {
@@ -207,7 +214,16 @@ describe("route-less Takoserver Host admission coordinator", () => {
     expect(applied.replanRequired).toBe(false);
     expect(applied.nextPlan.commands).toEqual([]);
     expect(applied.readback.forms).toEqual([
-      expect.objectContaining({ installed: true, supported: true, active: true }),
+      expect.objectContaining({
+        installed: true,
+        supported: true,
+        activationHead: expect.objectContaining({
+          present: true,
+          active: true,
+          implementationDigest: f.identity.implementationDigest,
+          eventDigest: expect.stringMatching(/^sha256:/),
+        }),
+      }),
     ]);
     expect(applied.receipts).toHaveLength(5);
     expect(applied).toMatchObject({
@@ -455,7 +471,11 @@ describe("route-less Takoserver Host admission coordinator", () => {
     expect(applied.status).toBe("converged");
     expect(applied.nextPlan.commands).toEqual([]);
     expect(applied.readback.forms).toEqual([
-      expect.objectContaining({ installed: true, supported: true, active: true }),
+      expect.objectContaining({
+        installed: true,
+        supported: true,
+        activationHead: expect.objectContaining({ present: true, active: true }),
+      }),
     ]);
     expect(
       await f.sql.query("SELECT event_type FROM tf_form_publisher_events ORDER BY event_at, id"),
@@ -506,5 +526,171 @@ describe("route-less Takoserver Host admission coordinator", () => {
         (command) => command.kind,
       ),
     );
+  });
+
+  test("deactivates an active head with its durable implementation and no package verification", async () => {
+    const f = await fixture();
+    expect((await f.operator.apply(await f.operator.plan(f.request))).status).toBe("converged");
+    const loadsAfterActivation = f.packageLoads.count;
+    const verifiesAfterActivation = f.adapterCalls.verify;
+    const deactivationRequest: FormAuthorityPlanRequest = {
+      ...f.request,
+      activation: { ...f.request.activation, desiredActive: false },
+    };
+    const plan = await f.operator.plan(deactivationRequest);
+    expect(plan.commands).toHaveLength(1);
+    expect(plan.commands[0]).toMatchObject({
+      kind: "SetActivation",
+      active: false,
+      implementationDigest: f.identity.implementationDigest,
+    });
+    expect(plan.commands[0]?.predecessorDigest).toMatch(/^sha256:/);
+    expect(plan.commands.map((command) => command.kind)).toEqual(["SetActivation"]);
+    expect(f.packageLoads.count).toBe(loadsAfterActivation);
+    expect(f.adapterCalls.verify).toBe(verifiesAfterActivation);
+
+    const applied = await f.operator.apply(plan);
+    expect(applied.status).toBe("converged");
+    expect(applied.receipts).toHaveLength(1);
+    expect(applied.receipts[0]).toMatchObject({ kind: "SetActivation", state: "inactive" });
+    expect(applied.readback.forms[0]).toMatchObject({
+      activationHead: {
+        present: true,
+        active: false,
+        implementationDigest: f.identity.implementationDigest,
+        eventDigest: expect.stringMatching(/^sha256:/),
+      },
+    });
+    expect(f.packageLoads.count).toBe(loadsAfterActivation);
+    expect(f.adapterCalls.verify).toBe(verifiesAfterActivation);
+  });
+
+  test("treats an already inactive activation as a converged no-op", async () => {
+    const f = await fixture();
+    const active = await f.operator.apply(await f.operator.plan(f.request));
+    expect(active.status).toBe("converged");
+    const deactivationRequest: FormAuthorityPlanRequest = {
+      ...f.request,
+      activation: { ...f.request.activation, desiredActive: false },
+    };
+    expect((await f.operator.apply(await f.operator.plan(deactivationRequest))).status).toBe(
+      "converged",
+    );
+    const noOp = await f.operator.plan(deactivationRequest);
+    expect(noOp.commands).toEqual([]);
+    const applied = await f.operator.apply(noOp);
+    expect(applied.status).toBe("converged");
+    expect(applied.receipts).toEqual([]);
+    expect(applied.readback.forms[0]?.activationHead).toMatchObject({
+      present: true,
+      active: false,
+    });
+  });
+
+  test("rejects a durable activation head whose implementation body was tampered", async () => {
+    const f = await fixture();
+    expect((await f.operator.apply(await f.operator.plan(f.request))).status).toBe("converged");
+    const tamperedDigest = digest("9");
+    await f.sql.run("UPDATE tf_form_activation_events SET implementation_digest = ?", [
+      tamperedDigest,
+    ]);
+    const deactivationRequest: FormAuthorityPlanRequest = {
+      ...f.request,
+      activation: { ...f.request.activation, desiredActive: false },
+    };
+    await expect(f.operator.plan(deactivationRequest)).rejects.toMatchObject({
+      code: "authority_state_conflict",
+    });
+  });
+
+  test("deactivates a valid activation head left by a predecessor worker", async () => {
+    const f = await fixture();
+    expect((await f.operator.apply(await f.operator.plan(f.request))).status).toBe("converged");
+    const rows = await f.sql.query("SELECT * FROM tf_form_activation_events LIMIT 1");
+    const row = rows[0];
+    if (!row) throw new Error("activation head missing");
+    const predecessorImplementationDigest = digest("9");
+    const predecessorEventDigest = await canonicalDigest({
+      chain: "activation",
+      id: row.id,
+      activationKey: row.activation_key,
+      formRef: JSON.parse(String(row.form_ref_json)),
+      packageDigest: row.package_digest,
+      audience: {
+        kind: row.audience_kind,
+        value: row.audience_value,
+      },
+      active: row.active === 1,
+      implementationDigest: predecessorImplementationDigest,
+      actor: row.actor,
+      reason: row.reason,
+      eventAt: Number(row.event_at),
+      predecessorDigest: row.predecessor_digest,
+    });
+    await f.sql.run(
+      "UPDATE tf_form_activation_events SET implementation_digest = ?, event_digest = ?",
+      [predecessorImplementationDigest, predecessorEventDigest],
+    );
+    const deactivationRequest: FormAuthorityPlanRequest = {
+      ...f.request,
+      activation: { ...f.request.activation, desiredActive: false },
+    };
+    const plan = await f.operator.plan(deactivationRequest);
+    expect(plan.commands[0]).toMatchObject({
+      kind: "SetActivation",
+      active: false,
+      implementationDigest: predecessorImplementationDigest,
+      predecessorDigest: predecessorEventDigest,
+    });
+    const applied = await f.operator.apply(plan);
+    expect(applied.status).toBe("converged");
+    expect(applied.readback.forms[0]?.activationHead).toMatchObject({
+      present: true,
+      active: false,
+      implementationDigest: predecessorImplementationDigest,
+    });
+  });
+
+  test("rejects desired-state and SetActivation command tampering", async () => {
+    const f = await fixture();
+    const plan = await f.operator.plan(f.request);
+    const activationCommand = plan.commands.find((command) => command.kind === "SetActivation");
+    if (activationCommand?.kind !== "SetActivation") {
+      throw new Error("activation command missing");
+    }
+    const tamperedCommand = {
+      ...activationCommand,
+      active: false,
+    };
+    const tampered = {
+      ...plan,
+      commands: plan.commands.map((command) =>
+        command.kind === "SetActivation" ? tamperedCommand : command,
+      ),
+    };
+    const { planDigest: _planDigest, ...withoutDigest } = tampered;
+    await expect(
+      f.operator.apply({
+        ...withoutDigest,
+        planDigest: await canonicalFormAuthorityPlanDigest(withoutDigest),
+      }),
+    ).rejects.toMatchObject({ code: "plan_digest_mismatch" });
+
+    const deactivation = {
+      ...f.request,
+      activation: { ...f.request.activation, desiredActive: false },
+    };
+    const falsePlan = await f.operator.plan(deactivation);
+    const { planDigest: _falseDigest, ...falseUnsigned } = falsePlan;
+    await expect(
+      f.operator.apply({
+        ...falseUnsigned,
+        request: f.request,
+        planDigest: await canonicalFormAuthorityPlanDigest({
+          ...falseUnsigned,
+          request: f.request,
+        }),
+      }),
+    ).rejects.toMatchObject({ code: "plan_digest_mismatch" });
   });
 });

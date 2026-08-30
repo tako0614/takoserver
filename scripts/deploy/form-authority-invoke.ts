@@ -14,6 +14,7 @@ import {
 import type { FormAuthorityVerificationEvidence } from "../../src/takoform/form-authority-verification.ts";
 import {
   canonicalFormAuthorityPlanDigest,
+  type FormAuthorityActivationHead,
   type FormAuthorityApplyResult,
   type FormAuthorityIdentity,
   type FormAuthorityPlan,
@@ -56,7 +57,9 @@ const ADMISSION_STATES = new Set([
 ]);
 
 export interface FormAuthorityInvokeInvocation {
-  readonly surface: "takoserver-integration-form-authority";
+  readonly surface:
+    | "takoserver-integration-form-authority"
+    | "takoserver-integration-form-authority-deactivation";
   readonly action: "status" | "apply";
   readonly environment: DeployEnvironment;
   readonly commit: string;
@@ -134,6 +137,7 @@ export async function runFormAuthorityInvoke(
   const request = await integrationPlanRequest({
     identity: gateway.identity,
     scope,
+    desiredActive: invocation.surface === "takoserver-integration-form-authority",
   });
   const client = formAuthorityClient({
     gateway,
@@ -170,7 +174,7 @@ export async function runFormAuthorityInvoke(
     throw verificationError(
       "Form authority apply acknowledged partial convergence",
       canonicalJson({
-        kind: "takoserver.form-authority-partial-diagnostics@v1",
+        kind: "takoserver.form-authority-partial-diagnostics@v2",
         planDigest: applied.planDigest,
         receipts: applied.receipts.map((receipt) => ({
           index: receipt.index,
@@ -388,6 +392,7 @@ function formAuthorityClient(input: {
 async function integrationPlanRequest(input: {
   readonly identity: FormAuthorityIdentity & { readonly environment: "integration" };
   readonly scope: { readonly tenantId: string; readonly space: string };
+  readonly desiredActive: boolean;
 }): Promise<FormAuthorityPlanRequest> {
   const packageClosure = INTEGRATION_FORM_PACKAGES.map(({ formRef, packageDigest }) => ({
     formRef,
@@ -452,12 +457,21 @@ async function integrationPlanRequest(input: {
     bundleDigest,
   };
   return {
-    kind: "takoserver.form-authority-plan-request@v1",
+    kind: "takoserver.form-authority-plan-request@v2",
     ...input.identity,
-    activation: { kind: "space", tenantId: input.scope.tenantId, space: input.scope.space },
+    activation: {
+      kind: "space",
+      tenantId: input.scope.tenantId,
+      space: input.scope.space,
+      desiredActive: input.desiredActive,
+    },
     evidence,
-    actor: "takoserver-integration-form-authority-operator",
-    reason: "install, support and Space-activate the exact Yurucommu integration fixture",
+    actor: input.desiredActive
+      ? "takoserver-integration-form-authority-operator"
+      : "takoserver-integration-form-authority-deactivation-operator",
+    reason: input.desiredActive
+      ? "install, support and Space-activate the exact Yurucommu integration fixture"
+      : "deactivate the exact Yurucommu integration fixture at its current durable head",
   };
 }
 
@@ -476,7 +490,7 @@ async function exactPlan(
       "planDigest",
       "request",
     ]) ||
-    value.kind !== "takoserver.form-authority-plan@v1" ||
+    value.kind !== "takoserver.form-authority-plan@v2" ||
     !isSha256Digest(value.planDigest) ||
     !isSha256Digest(value.currentHeadDigest) ||
     canonicalJson(value.request) !== canonicalJson(request) ||
@@ -491,11 +505,34 @@ async function exactPlan(
   if (
     (await canonicalFormAuthorityPlanDigest(unsigned)) !== planDigest ||
     !exactPackageClosure(plan.packages) ||
-    plan.commands.some((command, index) => !isRecord(command) || command.index !== index)
+    !(await exactPlanCommands(plan.commands, request))
   ) {
     throw preflightError("Form authority plan digest or package closure is invalid");
   }
   return structuredClone(plan);
+}
+
+async function exactPlanCommands(
+  commands: readonly unknown[],
+  request: FormAuthorityPlanRequest,
+): Promise<boolean> {
+  for (const [index, value] of commands.entries()) {
+    if (!isRecord(value) || value.index !== index || !isSha256Digest(value.commandDigest)) {
+      return false;
+    }
+    const { commandDigest, ...unsigned } = value;
+    if ((await canonicalDigest(unsigned)) !== commandDigest) return false;
+    if (value.kind === "SetActivation") {
+      if (
+        typeof value.active !== "boolean" ||
+        !isSha256Digest(value.implementationDigest) ||
+        value.active !== request.activation.desiredActive
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 async function exactApplyResult(
@@ -504,7 +541,7 @@ async function exactApplyResult(
 ): Promise<FormAuthorityApplyResult> {
   if (
     !isRecord(value) ||
-    value.kind !== "takoserver.form-authority-apply@v1" ||
+    value.kind !== "takoserver.form-authority-apply@v2" ||
     (value.status !== "converged" && value.status !== "partial") ||
     value.planDigest !== plan.planDigest ||
     !Array.isArray(value.receipts) ||
@@ -526,6 +563,7 @@ async function exactApplyResult(
     (await canonicalFormAuthorityPlanDigest(nextUnsigned)) !== nextPlanDigest ||
     canonicalJson(result.nextPlan.request) !== canonicalJson(plan.request) ||
     !exactPackageClosure(result.nextPlan.packages) ||
+    !(await exactPlanCommands(result.nextPlan.commands, plan.request)) ||
     result.receipts.some((receipt, index) => {
       const command = plan.commands[index];
       return (
@@ -604,7 +642,7 @@ function parseExactReadback(
       "identity",
       "kind",
     ]) ||
-    value.kind !== "takoserver.form-authority-readback@v1" ||
+    value.kind !== "takoserver.form-authority-readback@v2" ||
     canonicalJson(value.identity) !== canonicalJson(formAuthorityRequestIdentity(request)) ||
     canonicalJson(value.activation) !== canonicalJson(request.activation) ||
     !isSha256Digest(value.currentHeadDigest) ||
@@ -615,7 +653,7 @@ function parseExactReadback(
       (form) =>
         !isRecord(form) ||
         !exactKeys(form, [
-          "active",
+          "activationHead",
           "formRef",
           "installed",
           "operations",
@@ -631,9 +669,8 @@ function parseExactReadback(
         new Set(form.operations).size !== form.operations.length ||
         typeof form.installed !== "boolean" ||
         typeof form.supported !== "boolean" ||
-        typeof form.active !== "boolean" ||
-        (requireConverged &&
-          (form.installed !== true || form.supported !== true || form.active !== true)),
+        !validActivationHead(form.activationHead) ||
+        (requireConverged && !formReady(form, request)),
     )
   ) {
     throw phaseError(phase, "Form authority readback is invalid");
@@ -658,9 +695,59 @@ function exactPackageClosure(values: readonly unknown[]): boolean {
 }
 
 function readbackConverged(readback: FormAuthorityReadback): boolean {
+  if (readback.forms.length !== INTEGRATION_FORM_PACKAGES.length) return false;
+  if (!readback.activation.desiredActive) {
+    return readback.forms.every(
+      ({ activationHead }) => !activationHead.present || !activationHead.active,
+    );
+  }
+  return readback.forms.every(
+    ({ installed, supported, activationHead }) =>
+      installed &&
+      supported &&
+      activationHead.present &&
+      activationHead.active &&
+      activationHead.implementationDigest === readback.identity.implementationDigest,
+  );
+}
+
+function validActivationHead(value: unknown): value is FormAuthorityActivationHead {
+  if (
+    !isRecord(value) ||
+    !exactKeys(value, ["active", "eventDigest", "implementationDigest", "present"]) ||
+    typeof value.present !== "boolean" ||
+    typeof value.active !== "boolean"
+  ) {
+    return false;
+  }
+  if (!value.present) {
+    return (
+      value.active === false && value.eventDigest === null && value.implementationDigest === null
+    );
+  }
   return (
-    readback.forms.length === INTEGRATION_FORM_PACKAGES.length &&
-    readback.forms.every(({ installed, supported, active }) => installed && supported && active)
+    value.eventDigest !== null &&
+    isSha256Digest(value.eventDigest) &&
+    value.implementationDigest !== null &&
+    isSha256Digest(value.implementationDigest)
+  );
+}
+
+function formReady(
+  form: Readonly<Record<string, unknown>>,
+  request: FormAuthorityPlanRequest,
+): boolean {
+  const activationHead = form.activationHead;
+  if (!validActivationHead(activationHead)) return false;
+  if (!request.activation.desiredActive) {
+    return !activationHead.present || !activationHead.active;
+  }
+  return (
+    form.installed === true &&
+    form.supported === true &&
+    activationHead.present &&
+    activationHead.active &&
+    activationHead.implementationDigest === request.implementationDigest
   );
 }
 
@@ -687,14 +774,18 @@ function invocationResult(input: {
   readonly applied?: Record<string, unknown>;
 }): Record<string, unknown> {
   return {
-    kind: "takoserver.integration-form-authority-invocation@v1",
+    kind: "takoserver.integration-form-authority-invocation@v2",
     surface: input.invocation.surface,
     action: input.invocation.action,
     environment: "integration",
     commit: input.invocation.commit,
     operatorOrigin: input.gateway.origin,
     identity: structuredClone(input.gateway.identity),
-    activation: { kind: "space", ...input.scope },
+    activation: {
+      kind: "space",
+      ...input.scope,
+      desiredActive: input.invocation.surface === "takoserver-integration-form-authority",
+    },
     policyAuthority: "takoserver-host",
     verificationMode: "integration-fixture",
     productionEligible: false,

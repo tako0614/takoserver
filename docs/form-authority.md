@@ -48,6 +48,14 @@ readback body whose activation is not that exact `kind: space`, tenant, and
 Space before reaching the RPC or storage boundary; caller input cannot widen
 that audience.
 
+The separate owner surface
+`takoserver-integration-form-authority-deactivation` has the same sealed
+tenant/Space and proof boundary, but always constructs
+`activation.desiredActive: false`. The normal activation surface always
+constructs `desiredActive: true`; there is no free mode flag, repair mode, or
+reverse option. Both surfaces speak only the v2 request, plan, apply, and
+readback protocol, so v1 envelopes are refused.
+
 Each request requires exact `application/json`, at most 2 MiB, and a bearer
 assertion signed by the dedicated target-owned Ed25519 public key. The assertion
 is valid for at most 60 seconds and binds its purpose, action, method, path,
@@ -67,12 +75,21 @@ redeployed and the Forms are explicitly reconverged.
 
 ## Plan and apply
 
-A canonical plan binds the environment, public Host identity, public Worker artifact,
+A canonical v2 plan binds the environment, public Host identity, public Worker artifact,
 capability and implementation digests, exact FormRef/schema/package digests,
 publisher policy/root/checkpoint/bundle evidence, current durable heads,
-Space-scoped activation, and ordered commands. Apply re-derives the plan from
+Space-scoped activation (including `desiredActive`), and ordered commands. Apply re-derives the plan from
 the same code and current heads; a caller cannot widen operations by editing a
 plan and recomputing its digest.
+
+For `desiredActive: true`, the planner converges publisher, checkpoint,
+package, install, support, and activation chains. Every `SetActivation`
+command carries `active: true` and the code-derived implementation digest. For
+`desiredActive: false`, the planner changes activation chains only. It does not
+load package bytes from R2 or invoke a new verifier dependency, and it emits an
+inactive successor only for a present active head, carrying that head's exact
+durable implementation digest and predecessor. Missing or already-inactive
+heads are no-op. Malformed, multiple, or drifted heads fail closed.
 
 Executable operations are the intersection of:
 
@@ -118,6 +135,8 @@ owner invokes the bridge through the repository entrypoint:
 ```sh
 bun run deploy -- takoserver-integration-form-authority --status --environment=integration --commit=<40-hex-sha>
 bun run deploy -- takoserver-integration-form-authority --apply --environment=integration --commit=<40-hex-sha>
+bun run deploy -- takoserver-integration-form-authority-deactivation --status --environment=integration --commit=<40-hex-sha>
+bun run deploy -- takoserver-integration-form-authority-deactivation --apply --environment=integration --commit=<40-hex-sha>
 ```
 
 The operator supplies an independent review and
@@ -134,6 +153,33 @@ apply decision. Plan and readback requests are bounded at 30 seconds. Apply is
 bounded at 55 seconds, inside the assertion lifetime, so the exact 12-Form
 fixture can finish without turning an ordinary full convergence into a false
 lost acknowledgement.
+
+Deactivation is an explicit status/apply/status sequence: inspect status,
+apply once, then run status again. Its ready proof requires the exact generated
+12 Forms to each have a durable activation head that is either absent or
+inactive, plus a zero-command next plan. The v2 readback exposes each head as
+`activationHead` with `present`, `active`, `implementationDigest`, and
+`eventDigest`; it never hides a stale active head behind installed or effective
+booleans. Normal activation readiness still requires installed, supported, and
+a present active head whose implementation digest equals the current code
+identity.
+
+## Integration cutover order
+
+The reviewed order is deliberately staged. First capture the old exact
+tenant/Space scope with status and its operator snapshot. Perform the authority
+code cutover, then deploy the route-less authority and gateway at the same
+commit. Run deactivation status, apply, and status. Only after that proof is
+complete may the target descriptor name the new Space. Deploy the route-less
+authority and gateway again for that target, then run normal activation status
+and apply. Finish the consumer cutover, and only then perform retained package
+cleanup.
+
+An inactive activation does not erase retention authority: existing retained
+delete and observe operations continue through the Host projection and require
+no raw D1 access. Rollback of a deactivation is an explicit normal activation
+that appends a new active event with the current implementation identity. A
+Worker-version rollback alone never reverses an append-only activation event.
 
 ## Integration fixture corpus
 

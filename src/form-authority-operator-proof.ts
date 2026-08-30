@@ -23,7 +23,7 @@ export interface FormAuthorityOperatorScope {
  * path, body and live public-Worker identity independently.
  */
 export interface SignedFormAuthorityRpcInvocation {
-  readonly kind: "takoserver.signed-form-authority-rpc@v1";
+  readonly kind: "takoserver.signed-form-authority-rpc@v2";
   readonly action: FormAuthorityGatewayAction;
   readonly method: "POST";
   readonly path: `/v1/${FormAuthorityGatewayAction}`;
@@ -64,8 +64,9 @@ export function assertFormAuthorityOperatorScope(input: {
   const activation = isRecord(request) ? request.activation : undefined;
   if (
     !isRecord(activation) ||
-    !exactKeys(activation, ["kind", "space", "tenantId"]) ||
+    !exactKeys(activation, ["desiredActive", "kind", "space", "tenantId"]) ||
     activation.kind !== "space" ||
+    typeof activation.desiredActive !== "boolean" ||
     activation.tenantId !== input.expected.tenantId ||
     activation.space !== input.expected.space
   ) {
@@ -85,7 +86,7 @@ export function signedFormAuthorityRpcInvocation(input: {
   readonly body: unknown;
 }): SignedFormAuthorityRpcInvocation {
   return {
-    kind: "takoserver.signed-form-authority-rpc@v1",
+    kind: "takoserver.signed-form-authority-rpc@v2",
     action: input.action,
     method: "POST",
     path: formAuthorityActionPath(input.action),
@@ -105,7 +106,7 @@ export async function verifySignedFormAuthorityRpcInvocation(input: {
   if (
     !isRecord(invocation) ||
     !exactKeys(invocation, ["action", "assertion", "body", "kind", "method", "path"]) ||
-    invocation.kind !== "takoserver.signed-form-authority-rpc@v1" ||
+    invocation.kind !== "takoserver.signed-form-authority-rpc@v2" ||
     invocation.action !== input.expectedAction ||
     invocation.method !== "POST" ||
     invocation.path !== formAuthorityActionPath(input.expectedAction) ||

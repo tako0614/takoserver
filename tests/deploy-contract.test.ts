@@ -29,6 +29,7 @@ const SURFACES = [
   ["takoserver-integration-form-authority-worker", ["authority"]],
   ["takoserver-integration-form-authority-operator-worker", ["authority"]],
   ["takoserver-integration-form-authority", ["authority"]],
+  ["takoserver-integration-form-authority-deactivation", ["authority"]],
   ["takoserver-site", []],
   ["takoserver-console", []],
   ["takoserver-d1-schema", ["irreversible"]],
@@ -446,6 +447,32 @@ describe("Takoserver split deploy entrypoint", () => {
     for (const environment of ["rehearsal", "production"] as const) {
       const refused = await deploy([
         "takoserver-integration-form-authority",
+        "--status",
+        `--environment=${environment}`,
+        `--commit=${sha}`,
+      ]);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
+    }
+  });
+
+  test("parses the distinct Form authority deactivation surface only for integration", async () => {
+    const sha = "a".repeat(40);
+    const accepted = await deploy([
+      "takoserver-integration-form-authority-deactivation",
+      "--status",
+      "--environment=integration",
+      `--commit=${sha}`,
+    ]);
+    expect(accepted.exitCode).toBe(2);
+    expect(accepted.stderr).toContain("deploy target descriptor not found");
+    expect(accepted.stderr).not.toContain("no target was touched");
+
+    for (const environment of ["rehearsal", "production"] as const) {
+      const refused = await deploy([
+        "takoserver-integration-form-authority-deactivation",
         "--status",
         `--environment=${environment}`,
         `--commit=${sha}`,

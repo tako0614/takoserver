@@ -89,12 +89,13 @@ async function integrationFixture(input?: { readonly sql?: Sql; readonly objects
     },
   });
   const request: FormAuthorityPlanRequest = {
-    kind: "takoserver.form-authority-plan-request@v1",
+    kind: "takoserver.form-authority-plan-request@v2",
     ...composition.identity,
     activation: {
       kind: "space",
       tenantId: "tenant-yurucommu",
       space: "space-yurucommu",
+      desiredActive: true,
     },
     evidence: trustEvidence(),
     actor: "integration-operator",
@@ -117,7 +118,7 @@ describe("integration Form authority bridge", () => {
     const otherPrivate = await crypto.subtle.exportKey("jwk", otherPair.privateKey);
     const hostId = "takoserver-yurucommu-integration";
     const artifact = digest("5");
-    const body = { kind: "takoserver.form-authority-plan-request@v1" };
+    const body = { kind: "takoserver.form-authority-plan-request@v2" };
     const now = Math.floor(Date.now() / 1_000);
     const assertion = await signOperatorAssertion({
       privateJwk: JSON.stringify(otherPrivate),
@@ -184,11 +185,12 @@ describe("integration Form authority bridge", () => {
     const hostId = "takoserver-yurucommu-integration";
     const artifact = digest("5");
     const body = {
-      kind: "takoserver.form-authority-plan-request@v1",
+      kind: "takoserver.form-authority-plan-request@v2",
       activation: {
         kind: "space",
         tenantId: "tenant-yurucommu",
         space: "space-outside-sealed-scope",
+        desiredActive: true,
       },
     };
     const now = Math.floor(Date.now() / 1_000);
@@ -314,7 +316,13 @@ describe("integration Form authority bridge", () => {
     expect(applied.status).toBe("converged");
     expect(applied.readback.forms).toHaveLength(12);
     expect(
-      applied.readback.forms.every((form) => form.installed && form.supported && form.active),
+      applied.readback.forms.every(
+        (form) =>
+          form.installed &&
+          form.supported &&
+          form.activationHead.present &&
+          form.activationHead.active,
+      ),
     ).toBe(true);
     expect(
       applied.receipts.every(
@@ -362,9 +370,15 @@ describe("integration Form authority bridge", () => {
     };
 
     const before = await advanced.endpoint.readback(request);
-    expect(before.forms.every((form) => form.installed && !form.supported && form.active)).toBe(
-      true,
-    );
+    expect(
+      before.forms.every(
+        (form) =>
+          form.installed &&
+          !form.supported &&
+          form.activationHead.present &&
+          form.activationHead.active,
+      ),
+    ).toBe(true);
     const plan = await advanced.endpoint.plan(request);
     expect(plan.commands).toHaveLength(12);
     expect(plan.commands.every((command) => command.kind === "SetSupport")).toBe(true);
@@ -372,7 +386,13 @@ describe("integration Form authority bridge", () => {
     expect(applied.status).toBe("converged");
     expect(applied.nextPlan.commands).toEqual([]);
     expect(
-      applied.readback.forms.every((form) => form.installed && form.supported && form.active),
+      applied.readback.forms.every(
+        (form) =>
+          form.installed &&
+          form.supported &&
+          form.activationHead.present &&
+          form.activationHead.active,
+      ),
     ).toBe(true);
     expect(
       (await sql.query("SELECT COUNT(*) AS count FROM tf_form_install_events"))[0]?.count,
@@ -484,7 +504,13 @@ describe("integration Form authority bridge", () => {
     expect(applied.status).toBe("converged");
     expect(applied.nextPlan.commands).toEqual([]);
     expect(
-      applied.readback.forms.every((form) => form.installed && form.supported && form.active),
+      applied.readback.forms.every(
+        (form) =>
+          form.installed &&
+          form.supported &&
+          form.activationHead.present &&
+          form.activationHead.active,
+      ),
     ).toBe(true);
     expect(
       (await sql.query("SELECT COUNT(*) AS count FROM tf_form_publisher_events"))[0]?.count,
@@ -535,7 +561,13 @@ describe("integration Form authority bridge", () => {
     expect(second.status).toBe("converged");
     expect(second.nextPlan.commands).toEqual([]);
     expect(
-      second.readback.forms.every((form) => form.installed && form.supported && form.active),
+      second.readback.forms.every(
+        (form) =>
+          form.installed &&
+          form.supported &&
+          form.activationHead.present &&
+          form.activationHead.active,
+      ),
     ).toBe(true);
   });
 
@@ -551,9 +583,15 @@ describe("integration Form authority bridge", () => {
     await objects.delete(index.key);
 
     const missing = await fixture.endpoint.readback(fixture.request);
-    expect(missing.forms.some((form) => !form.installed && !form.supported && !form.active)).toBe(
-      true,
-    );
+    expect(
+      missing.forms.some(
+        (form) =>
+          !form.installed &&
+          !form.supported &&
+          form.activationHead.present &&
+          form.activationHead.active,
+      ),
+    ).toBe(true);
     const repair = await fixture.endpoint.plan(fixture.request);
     expect(repair.commands[0]?.kind).toBe("ReplacePackage");
     expect((await fixture.endpoint.apply(repair)).status).toBe("converged");
@@ -677,9 +715,14 @@ test("production composition plans exact Forms but apply remains adapter-fail-cl
     },
   });
   const request: FormAuthorityPlanRequest = {
-    kind: "takoserver.form-authority-plan-request@v1",
+    kind: "takoserver.form-authority-plan-request@v2",
     ...composition.identity,
-    activation: { kind: "space", tenantId: "tenant-yurucommu", space: "space-yurucommu" },
+    activation: {
+      kind: "space",
+      tenantId: "tenant-yurucommu",
+      space: "space-yurucommu",
+      desiredActive: true,
+    },
     evidence: trustEvidence(),
     actor: "production-operator",
     reason: "prove the released-adapter refusal",

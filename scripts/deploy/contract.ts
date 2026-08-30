@@ -221,6 +221,43 @@ export const DEPLOY_CONTRACT = {
       },
     },
     {
+      surface: "takoserver-integration-form-authority-deactivation",
+      target: "https:integration-signed-form-authority-deactivation-plan-apply-readback",
+      covers: [
+        "scripts/deploy/form-authority-invoke.ts",
+        "src/form-authority-operator-proof.ts",
+        "src/takoform/host-admission-coordinator.ts",
+        "scripts/deploy/target.ts",
+        "scripts/deploy.ts",
+      ],
+      requiresScripts: ["deploy"],
+      requiresTools: ["bun"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+      ],
+      triggers: ["authority"],
+      obligations: {
+        provenance:
+          `${exactSource} Integration only. Exhaustive gateway/authority/public-Worker readback ` +
+          "must identify that commit before the owned 0600 Ed25519 key signs a deactivation request.",
+        "post-conditions":
+          "Status performs one signed authoritative readback. Apply obtains one signed canonical " +
+          "deactivation plan, passes that exact plan digest once to apply, and finishes with a " +
+          "separately signed readback proving every exact 12 Space-scoped fixture is absent or inactive.",
+        reversal:
+          "Deactivation is append-only; rollback is an explicit normal Form-authority reactivation, " +
+          "not a Worker-version rollback.",
+        "failure-handling":
+          "No HTTP mutation is retried. An apply transport or acknowledgement failure is indeterminate; " +
+          "run status for authoritative readback before making an explicit fresh deactivation decision. " +
+          "An acknowledged partial apply preserves only sanitized receipts and next-plan diagnostics. " +
+          "Assertion and private-key bytes are always redacted.",
+        "independent-review": review,
+      },
+    },
+    {
       surface: "takoserver-site",
       target: "cloudflare-pages:environment-selected-takoserver-site",
       covers: [
