@@ -21,7 +21,10 @@ const USAGE = `takoserver deploy
   The authority cutover may add --legacy-predecessor-version=<uuid> for integration bootstrap.
   Hosted-edge authority transition requires the named
   --legacy-host-runtime-predecessor-version=<uuid> selector in integration or production.
-  Hosted-edge retirement uses --legacy-host-runtime-predecessor-version=<uuid> and --reverse.
+  Hosted-edge authority/topology retirement uses --legacy-host-runtime-predecessor-version=<uuid>
+  and --reverse; token retirement is forward-only.
+  Post-token attribution repair uses both --legacy-host-runtime-predecessor-version=<uuid>
+  and --unattributed-successor-version=<uuid>; it has no --reverse mode.
 
 The target descriptor is selected only by the exact environment. There is no
 deploy-plan flag, ledger, target override or mixed mutation controller.
@@ -36,6 +39,7 @@ interface Invocation {
   readonly commit: string;
   readonly legacyPredecessorVersionId?: string;
   readonly legacyHostRuntimePredecessorVersionId?: string;
+  readonly unattributedSuccessorVersionId?: string;
   readonly reverse?: boolean;
 }
 
@@ -48,6 +52,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let commit: string | null = null;
   let legacyPredecessorVersionId: string | null = null;
   let legacyHostRuntimePredecessorVersionId: string | null = null;
+  let unattributedSuccessorVersionId: string | null = null;
   let reverse = false;
   for (const flag of flags) {
     if (flag === "--status" || flag === "--apply") {
@@ -87,6 +92,13 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       legacyHostRuntimePredecessorVersionId = value;
       continue;
     }
+    if (flag.startsWith("--unattributed-successor-version=")) {
+      if (unattributedSuccessorVersionId !== null) return null;
+      const value = flag.slice("--unattributed-successor-version=".length);
+      if (!isWorkerVersionId(value)) return null;
+      unattributedSuccessorVersionId = value;
+      continue;
+    }
     if (flag === "--reverse") {
       if (reverse) return null;
       reverse = true;
@@ -115,7 +127,8 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     (!(
       surfaceValue === "takoserver-worker-authority-cutover" ||
       surfaceValue === "takoserver-host-runtime-topology-retirement" ||
-      surfaceValue === "takoserver-hosted-token-retirement"
+      surfaceValue === "takoserver-hosted-token-retirement" ||
+      surfaceValue === "takoserver-worker-retirement-attribution-repair"
     ) ||
       (environment !== "integration" && environment !== "production"))
   ) {
@@ -124,7 +137,20 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   if (
     legacyHostRuntimePredecessorVersionId === null &&
     (surfaceValue === "takoserver-host-runtime-topology-retirement" ||
-      surfaceValue === "takoserver-hosted-token-retirement")
+      surfaceValue === "takoserver-hosted-token-retirement" ||
+      surfaceValue === "takoserver-worker-retirement-attribution-repair")
+  ) {
+    return null;
+  }
+  if (
+    unattributedSuccessorVersionId !== null &&
+    surfaceValue !== "takoserver-worker-retirement-attribution-repair"
+  ) {
+    return null;
+  }
+  if (
+    surfaceValue === "takoserver-worker-retirement-attribution-repair" &&
+    unattributedSuccessorVersionId === null
   ) {
     return null;
   }
@@ -132,8 +158,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     reverse &&
     !(
       surfaceValue === "takoserver-worker-authority-cutover" ||
-      surfaceValue === "takoserver-host-runtime-topology-retirement" ||
-      surfaceValue === "takoserver-hosted-token-retirement"
+      surfaceValue === "takoserver-host-runtime-topology-retirement"
     )
   ) {
     return null;
@@ -155,6 +180,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     ...(legacyHostRuntimePredecessorVersionId === null
       ? {}
       : { legacyHostRuntimePredecessorVersionId }),
+    ...(unattributedSuccessorVersionId === null ? {} : { unattributedSuccessorVersionId }),
     ...(reverse ? { reverse: true } : {}),
   };
 }
@@ -225,7 +251,6 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
         target,
       );
     case "takoserver-host-runtime-topology-retirement":
-    case "takoserver-hosted-token-retirement":
       return await runRetirement(
         {
           surface: invocation.surface,
@@ -239,6 +264,41 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
                   invocation.legacyHostRuntimePredecessorVersionId,
               }),
           ...(invocation.reverse ? { reverse: true } : {}),
+        },
+        target,
+      );
+    case "takoserver-hosted-token-retirement":
+      return await runRetirement(
+        {
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
+          ...(invocation.legacyHostRuntimePredecessorVersionId === undefined
+            ? {}
+            : {
+                legacyHostRuntimePredecessorVersionId:
+                  invocation.legacyHostRuntimePredecessorVersionId,
+              }),
+        },
+        target,
+      );
+    case "takoserver-worker-retirement-attribution-repair":
+      return await runRetirement(
+        {
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
+          ...(invocation.legacyHostRuntimePredecessorVersionId === undefined
+            ? {}
+            : {
+                legacyHostRuntimePredecessorVersionId:
+                  invocation.legacyHostRuntimePredecessorVersionId,
+              }),
+          ...(invocation.unattributedSuccessorVersionId === undefined
+            ? {}
+            : { unattributedSuccessorVersionId: invocation.unattributedSuccessorVersionId }),
         },
         target,
       );

@@ -38,6 +38,7 @@ const SURFACES = [
   ["takoserver-hosted-token-cutover", ["authority"]],
   ["takoserver-host-runtime-topology-retirement", ["irreversible", "authority"]],
   ["takoserver-hosted-token-retirement", ["irreversible", "authority"]],
+  ["takoserver-worker-retirement-attribution-repair", []],
   ["takoserver-integration-operator-identity", ["authority"]],
 ] as const;
 
@@ -276,6 +277,73 @@ describe("Takoserver split deploy entrypoint", () => {
         "--environment=rehearsal",
         `--commit=${sha}`,
         `--legacy-host-runtime-predecessor-version=${version}`,
+      ],
+      [
+        "takoserver-hosted-token-retirement",
+        "--apply",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--legacy-host-runtime-predecessor-version=${version}`,
+        "--reverse",
+      ],
+    ] as const) {
+      const refused = await deploy(args);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+    }
+  });
+
+  test("parses attribution repair only with both pinned Versions and no reverse", async () => {
+    const sha = "a".repeat(40);
+    const legacy = "00000000-0000-4000-8000-000000000001";
+    const unattributed = "00000000-0000-4000-8000-000000000004";
+    for (const environment of ["integration", "production"] as const) {
+      const accepted = await deploy([
+        "takoserver-worker-retirement-attribution-repair",
+        "--status",
+        `--environment=${environment}`,
+        `--commit=${sha}`,
+        `--legacy-host-runtime-predecessor-version=${legacy}`,
+        `--unattributed-successor-version=${unattributed}`,
+      ]);
+      expect(accepted.exitCode).toBe(2);
+      expect(accepted.stderr).toContain("deploy target descriptor not found");
+      expect(accepted.stderr).not.toContain("no target was touched");
+    }
+
+    for (const args of [
+      [
+        "takoserver-worker-retirement-attribution-repair",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--legacy-host-runtime-predecessor-version=${legacy}`,
+      ],
+      [
+        "takoserver-worker-retirement-attribution-repair",
+        "--apply",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--legacy-host-runtime-predecessor-version=${legacy}`,
+        `--unattributed-successor-version=${unattributed}`,
+        "--reverse",
+      ],
+      [
+        "takoserver-worker-retirement-attribution-repair",
+        "--status",
+        "--environment=rehearsal",
+        `--commit=${sha}`,
+        `--legacy-host-runtime-predecessor-version=${legacy}`,
+        `--unattributed-successor-version=${unattributed}`,
+      ],
+      [
+        "takoserver-hosted-token-retirement",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--legacy-host-runtime-predecessor-version=${legacy}`,
+        `--unattributed-successor-version=${unattributed}`,
       ],
     ] as const) {
       const refused = await deploy(args);

@@ -1,6 +1,6 @@
 # Takoserver deploy surfaces
 
-This repository owns one deploy entrypoint and sixteen separate mutation surfaces.
+This repository owns one deploy entrypoint and seventeen separate mutation surfaces.
 The contract is read-only:
 
 ```sh
@@ -40,8 +40,10 @@ publish candidate code while preserving exactly the observed
 `TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN`. Ordinary target realization never carries
 either retired field. Retirement applies perform one provider mutation followed
 by authoritative readback; an acknowledgement loss is settled by `--status`,
-never by a blind retry. `--reverse` is accepted only by the named retirement
-surfaces.
+never by a blind retry. `--reverse` is accepted only by the authority and
+topology retirement surfaces. Secret deletion can create an unannotated direct successor; that state
+is never reported as complete and is repaired only through the dedicated
+post-token attribution surface below.
 
 The environment selects only `.deploy/targets/<environment>.json` (or the
 matching absolute `TAKOSERVER_DEPLOY_TARGET_<ENVIRONMENT>` path). There is no
@@ -130,10 +132,26 @@ The separate authority and irreversible surfaces are:
   direct successor. `--reverse` redeploys that exact provider-history Version.
 - `takoserver-hosted-token-retirement`: T→R transition. It deletes only
   `TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN` after topology retirement and verifies
-  an exact direct-successor Worker Version with unchanged code identity. `--reverse`
-  re-puts the owned 0600 token file through stdin, creating the corresponding
-  direct successor; topology reverse then restores the candidate through provider
-  history. Token bytes never enter argv or output.
+  an exact direct-successor Worker Version with unchanged code identity. If the
+  provider-created R has no canonical `workers/message` annotation, status
+  reports `token-retired-unattributed-successor` with `ready: false` and
+  `repairRequired: true` rather than claiming completion. This surface is
+  forward-only; restoration requires a separately reviewed dedicated surface.
+  It never re-puts the retired secret, and token bytes never enter argv or output.
+- `takoserver-worker-retirement-attribution-repair`: post-token R→A code
+  attribution repair. It requires both exact
+  `--legacy-host-runtime-predecessor-version=<uuid>` and
+  `--unattributed-successor-version=<uuid>` selectors, proves the bounded
+  L→C→T→R history and exact closure, and reads the Version detail
+  `resources.script.etag` identity for T and R. It builds and seals the exact
+  selected source once, requires the local bundle digest to equal T's canonical
+  annotation (the provider etag is an opaque identity and is compared exactly,
+  never treated as a local SHA-256), then performs one code upload with no
+  retired service/token fields. The resulting A must be R's direct successor
+  with the selected source commit and canonical digest, exactly the T script
+  identity, and the existing public probe. This is a forward repair surface;
+  it has no `--reverse` or secret mutation and an upload acknowledgement loss is
+  settled only by status recognizing that exact A successor.
 - `takoserver-integration-operator-identity`: integration only. It rebuilds the
   already served commit once, requires the exact served bundle digest, and
   uploads one immutable Worker Version that adds only the target's canonical
@@ -147,10 +165,13 @@ The separate authority and irreversible surfaces are:
 The intended forward order is schema, public-key registration, any required
 authority-sensitive Worker code, signing repair or explicit rotation, Hosted
 token cutover, authority candidate transition (L→C), topology retirement (C→T),
-then token retirement (T→R). Status must show the required direct predecessor
-state before each apply. Each retirement surface has an explicit provider-history
-or secret re-put reverse; no automatic fallback or raw Wrangler reversal is
-exposed.
+then token retirement (T→R). If token retirement leaves an unannotated R,
+status must show that exact state before the dedicated attribution repair (R→A).
+Status must show the required direct predecessor state before each apply. The
+authority and topology retirement surfaces expose their documented reversals;
+token retirement and attribution repair are forward-only and restoration
+requires a separately reviewed dedicated surface. There is no automatic
+fallback or raw Wrangler reversal.
 
 The operator-identity surface is deliberately outside that production order.
 Its invocation parser accepts only `--environment=integration`; rehearsal and
@@ -245,3 +266,11 @@ Run the same surface with `--status`: an exact configured digest means the
 single-variable Version is current, while absence means the selected
 predecessor remains current. Any unrelated configuration or Version advance is
 refused rather than attributed to the interrupted attempt.
+
+For a post-token attribution repair acknowledgement failure, do not retry apply.
+Run the same repair surface with both pinned selectors and `--status`: only the
+exact A direct successor of the selected R, with canonical commit/digest, exact
+`resources.script.etag` equality to T, closure, and public probe, settles the
+attempt. An R that remains current is still
+`token-retired-unattributed-successor`; any unrelated history advance or
+weak/missing script identity fails closed.

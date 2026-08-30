@@ -292,6 +292,35 @@ export function workerVersionIdentity(
   return { commit: match[1], bundleDigestHex: match[2] };
 }
 
+/**
+ * Reads Cloudflare's content hash for one immutable Worker Version.
+ *
+ * The Version detail endpoint exposes this under `resources.script.etag` and
+ * documents it as hashed script content.  The top-level resource ETag and
+ * binding/annotation identities are different facts, so callers that need a
+ * byte proof must use this field. Cloudflare exposes the value as an opaque
+ * string rather than promising a particular digest encoding; keep it bounded
+ * and non-empty, then compare it exactly across Version detail responses.
+ */
+export function workerVersionScriptContentIdentity(
+  phase: DeployPhase,
+  versionId: string,
+  value: unknown,
+): string {
+  if (!isRecord(value) || !isRecord(value.resources) || !isRecord(value.resources.script)) {
+    throw phaseError(phase, `version ${versionId} has no script content identity`);
+  }
+  const etag = value.resources.script.etag;
+  if (typeof etag !== "string" || etag.length === 0 || etag.length > 1024 || etag.trim() !== etag) {
+    throw phaseError(
+      phase,
+      `version ${versionId} has no strong script content identity`,
+      typeof etag === "string" ? `etag=${etag}` : undefined,
+    );
+  }
+  return etag;
+}
+
 function workerVersionIdentityOrLegacy(
   _phase: DeployPhase,
   value: unknown,

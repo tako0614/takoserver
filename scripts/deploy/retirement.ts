@@ -9,7 +9,6 @@ import {
   preflightError,
   verificationError,
 } from "./errors.ts";
-import { readHostedToken } from "./hosted.ts";
 import {
   type CommandResult,
   cloudflareChildEnvironment,
@@ -27,12 +26,15 @@ import {
 import type { DeployTarget } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import {
+  assertDomainClosure,
   inspectLiveWorkerVersionForRetirement,
   isWorkerVersionId,
   type RetirementLiveWorkerVersion,
   type WorkerState,
+  workerVersionScriptContentIdentity,
 } from "./worker-live.ts";
 import {
+  assertExactSecretInventory,
   assertExactVersionBindingClosure,
   expectedTransitionBindingClosure,
   extractLegacyHostServiceBinding,
@@ -58,7 +60,8 @@ function legacyServiceBindingName(): string {
 export type RetirementSurface =
   | "takoserver-worker-authority-cutover"
   | "takoserver-host-runtime-topology-retirement"
-  | "takoserver-hosted-token-retirement";
+  | "takoserver-hosted-token-retirement"
+  | "takoserver-worker-retirement-attribution-repair";
 
 export interface RetirementInvocation {
   readonly surface: RetirementSurface;
@@ -67,6 +70,7 @@ export interface RetirementInvocation {
   readonly environment: DeployEnvironment;
   readonly commit: string;
   readonly legacyHostRuntimePredecessorVersionId?: string;
+  readonly unattributedSuccessorVersionId?: string;
 }
 
 export type RetirementProcess = (
@@ -80,9 +84,9 @@ export interface RetirementOptions {
   readonly run?: RetirementProcess;
   readonly state?: RetirementState;
   readonly review?: string;
-  readonly tokenPath?: string;
   readonly outputDirectory?: string;
   readonly cloudflareEnvironment?: Readonly<Record<string, string>>;
+  readonly fetcher?: (input: string, init?: RequestInit) => Promise<Response>;
 }
 
 /**
@@ -117,6 +121,9 @@ export async function runRetirement(
   }
   if (invocation.surface === "takoserver-host-runtime-topology-retirement") {
     return await runTopologyRetirement(invocation, target, state, run, runtimeOptions);
+  }
+  if (invocation.surface === "takoserver-worker-retirement-attribution-repair") {
+    return await runAttributionRepair(invocation, target, state, run, runtimeOptions);
   }
   return await runTokenRetirement(invocation, target, state, run, runtimeOptions);
 }
@@ -914,6 +921,472 @@ async function reverseTopology(
   };
 }
 
+interface AttributionRepairLineage {
+  readonly current: RetirementLiveWorkerVersion;
+  readonly currentIsRepaired: boolean;
+  readonly legacyVersionId: string;
+  readonly candidateVersionId: string;
+  readonly topologyVersionId: string;
+  readonly unattributedVersionId: string;
+  readonly service: LegacyHostServiceBinding;
+  readonly candidateIdentity: { readonly commit: string; readonly bundleDigestHex: string };
+  readonly topologyIdentity: { readonly commit: string; readonly bundleDigestHex: string };
+  readonly topologyScriptEtag: string;
+  readonly unattributedScriptEtag: string;
+  readonly currentScriptEtag: string;
+}
+
+/**
+ * Repairs the one provider-created Version that secret retirement cannot
+ * attribute. Secret deletion is deliberately kept on the token-retirement
+ * surface; this surface publishes code only after that authority mutation has
+ * already completed and the exact L -> C -> T -> R history is proven.
+ */
+async function runAttributionRepair(
+  invocation: RetirementInvocation,
+  target: DeployTarget,
+  state: RetirementState,
+  run: RetirementProcess,
+  options: RetirementOptions,
+): Promise<Record<string, unknown>> {
+  const selector = requiredPredecessorSelector(invocation);
+  const unattributedSelector = requiredUnattributedSuccessorSelector(invocation);
+  const root =
+    options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-attribution-repair-"));
+  const temporary = options.outputDirectory === undefined;
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  try {
+    const beforeHistory = await currentHistory("preflight", target, state);
+    const before = await inspectAttributionRepairLineage(
+      "preflight",
+      target,
+      state,
+      beforeHistory,
+      selector,
+      unattributedSelector,
+      invocation.action === "apply",
+      invocation.commit,
+    );
+    if (invocation.action === "status") {
+      const probe = await probeRetirementProduct(
+        target.publicOrigin,
+        options.fetcher ?? ((input, init) => fetch(input, init)),
+      );
+      const finalHistory = await currentHistory("verification", target, state);
+      const final = await inspectAttributionRepairLineage(
+        "verification",
+        target,
+        state,
+        finalHistory,
+        selector,
+        unattributedSelector,
+        false,
+        invocation.commit,
+      );
+      return attributionRepairStatus(invocation, final, probe);
+    }
+    if (before.currentIsRepaired) {
+      throw preflightError(
+        "attribution repair has already created the exact successor; run --status instead of retrying",
+      );
+    }
+    if (before.current.history.versionId !== unattributedSelector) {
+      throw preflightError(
+        "attribution repair requires the selected unattributed successor to be current",
+      );
+    }
+    if (before.current.commit !== null || before.current.bundleDigestHex !== null) {
+      throw preflightError("attribution repair selector is not an unattributed Worker Version");
+    }
+
+    const source = await qualifySource({
+      environment: invocation.environment === "integration" ? "integration" : "production",
+      commit: invocation.commit,
+      run,
+    });
+    const gate = await run(["bun", "run", "check"]);
+    if (gate.exitCode !== 0) {
+      throw preflightError(
+        `scoped owner gate \`bun run check\` failed (exit ${gate.exitCode})`,
+        `${gate.stdout}${gate.stderr}`.trim(),
+      );
+    }
+    const prepared = await prepareWorkerArtifact({
+      root,
+      target,
+      commit: source.commit,
+      signingKeyId: target.signing.currentKeyId,
+      run,
+      writeConfig: transitionConfigWriter(
+        target,
+        source.commit,
+        undefined,
+        baseWorkerSecrets(target),
+      ),
+    });
+    if (prepared.bundleDigestHex !== before.topologyIdentity.bundleDigestHex) {
+      throw preflightError(
+        "attribution repair refuses to publish bytes different from the trusted topology-retired Version",
+      );
+    }
+    const artifact = prepared.seal();
+    artifact.assertUnchanged();
+    const freshHistory = await currentHistory("preflight", target, state);
+    const fresh = await inspectAttributionRepairLineage(
+      "preflight",
+      target,
+      state,
+      freshHistory,
+      selector,
+      unattributedSelector,
+      false,
+      invocation.commit,
+    );
+    if (fresh.currentIsRepaired || fresh.current.history.versionId !== unattributedSelector) {
+      throw preflightError("attribution repair Worker changed before mutation");
+    }
+    if (
+      fresh.topologyIdentity.commit !== before.topologyIdentity.commit ||
+      fresh.topologyIdentity.bundleDigestHex !== before.topologyIdentity.bundleDigestHex ||
+      fresh.topologyScriptEtag !== before.topologyScriptEtag ||
+      fresh.unattributedScriptEtag !== before.unattributedScriptEtag
+    ) {
+      throw preflightError("attribution repair trusted Version changed before mutation");
+    }
+    const upload = await run(
+      wranglerCommand([
+        "deploy",
+        prepared.bundlePath,
+        "--no-bundle",
+        "--config",
+        prepared.configPath,
+        "--strict",
+        "--message",
+        `takoserver-worker:${source.commit}:${prepared.bundleDigestHex}`,
+      ]),
+      providerOptions(options.cloudflareEnvironment),
+    );
+    if (upload.exitCode !== 0) {
+      throw mutationError(
+        "attribution repair upload acknowledgement is indeterminate; run --status before repair",
+        `${upload.stdout}${upload.stderr}`.trim(),
+      );
+    }
+    const afterHistory = await currentHistory("verification", target, state);
+    const after = await inspectAttributionRepairLineage(
+      "verification",
+      target,
+      state,
+      afterHistory,
+      selector,
+      unattributedSelector,
+      false,
+      source.commit,
+    );
+    if (
+      !after.currentIsRepaired ||
+      after.current.history.previousVersionId !== unattributedSelector
+    ) {
+      throw verificationError(
+        "attribution repair did not create the exact direct successor of the selected R Version",
+      );
+    }
+    if (
+      after.current.commit !== source.commit ||
+      after.current.bundleDigestHex !== prepared.bundleDigestHex ||
+      after.currentScriptEtag !== before.topologyScriptEtag
+    ) {
+      throw verificationError(
+        "attribution repair successor is not canonically attributed to the trusted bytes",
+      );
+    }
+    const probe = await probeRetirementProduct(
+      target.publicOrigin,
+      options.fetcher ?? ((input, init) => fetch(input, init)),
+    );
+    const finalHistory = await currentHistory("verification", target, state);
+    const final = await inspectAttributionRepairLineage(
+      "verification",
+      target,
+      state,
+      finalHistory,
+      selector,
+      unattributedSelector,
+      false,
+      source.commit,
+    );
+    if (
+      !final.currentIsRepaired ||
+      final.current.history.previousVersionId !== unattributedSelector ||
+      final.current.commit !== source.commit ||
+      final.current.bundleDigestHex !== prepared.bundleDigestHex ||
+      final.currentScriptEtag !== before.topologyScriptEtag
+    ) {
+      throw verificationError(
+        "attribution repair final inspection no longer proves the exact A successor",
+      );
+    }
+    return {
+      kind: "takoserver.worker-retirement-attribution-repair-apply@v1",
+      surface: invocation.surface,
+      environment: invocation.environment,
+      state: "token-retirement-attribution-repaired",
+      commit: source.commit,
+      previousVersionId: unattributedSelector,
+      versionId: final.current.history.versionId,
+      artifactDigest: artifact.digest,
+      artifactBytes: artifact.bytes,
+      artifactFiles: artifact.files,
+      bundleDigest: `sha256:${prepared.bundleDigestHex}`,
+      scriptContentIdentity: final.currentScriptEtag,
+      probe,
+    };
+  } finally {
+    if (temporary) rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function attributionRepairStatus(
+  invocation: RetirementInvocation,
+  lineage: AttributionRepairLineage,
+  probe: Awaited<ReturnType<typeof probeRetirementProduct>>,
+): Record<string, unknown> {
+  return {
+    kind: "takoserver.worker-retirement-attribution-repair-status@v1",
+    surface: invocation.surface,
+    environment: invocation.environment,
+    selectedCommit: invocation.commit,
+    state: lineage.currentIsRepaired
+      ? "token-retirement-attribution-repaired"
+      : "token-retired-unattributed-successor",
+    ready: lineage.currentIsRepaired,
+    repairRequired: !lineage.currentIsRepaired,
+    versionId: lineage.current.history.versionId,
+    previousVersionId: lineage.current.history.previousVersionId,
+    unattributedVersionId: lineage.unattributedVersionId,
+    trustedTopologyVersionId: lineage.topologyVersionId,
+    trustedCommit: lineage.topologyIdentity.commit,
+    trustedArtifactDigest: `sha256:${lineage.topologyIdentity.bundleDigestHex}`,
+    deployedCommit: lineage.current.commit,
+    artifactDigest: digestValue(lineage.current.bundleDigestHex),
+    scriptContentIdentity: lineage.currentScriptEtag,
+    serviceRetired: true,
+    secretRetired: true,
+    probe,
+  };
+}
+
+async function inspectAttributionRepairLineage(
+  phase: DeployPhase,
+  target: DeployTarget,
+  state: RetirementState,
+  currentHistoryValue: WorkerDeploymentHistory,
+  legacySelector: string,
+  unattributedSelector: string,
+  requireCurrentSelector: boolean,
+  expectedRepairedCommit?: string,
+): Promise<AttributionRepairLineage> {
+  const chain = await deploymentChain(phase, target, state);
+  if (
+    chain[0]?.versionId !== currentHistoryValue.versionId ||
+    chain[0]?.deploymentId !== currentHistoryValue.deploymentId
+  ) {
+    throw phaseError(phase, "retirement deployment history changed during attribution inspection");
+  }
+  const currentIsUnattributed = chain[0]?.versionId === unattributedSelector;
+  const currentIsRepaired = chain[1]?.versionId === unattributedSelector;
+  if (!currentIsUnattributed && !currentIsRepaired) {
+    throw phaseError(
+      phase,
+      "attribution repair requires the selected unattributed successor or its exact direct successor",
+    );
+  }
+  if (requireCurrentSelector && !currentIsUnattributed) {
+    throw phaseError(
+      phase,
+      "attribution repair requires the selected unattributed successor to be current",
+    );
+  }
+  const unattributedIndex = currentIsUnattributed ? 0 : 1;
+  const topologyIndex = unattributedIndex + 1;
+  const candidateIndex = topologyIndex + 1;
+  const legacyIndex = candidateIndex + 1;
+  const unattributedEntry = chain[unattributedIndex];
+  const topologyEntry = chain[topologyIndex];
+  const candidateEntry = chain[candidateIndex];
+  const legacyEntry = chain[legacyIndex];
+  if (
+    unattributedEntry === undefined ||
+    topologyEntry === undefined ||
+    candidateEntry === undefined ||
+    legacyEntry === undefined ||
+    legacyEntry.versionId !== legacySelector
+  ) {
+    throw phaseError(phase, "attribution repair requires the pinned L-to-C-to-T-to-R lineage");
+  }
+  assertUniqueLineage(phase, chain, legacyIndex);
+  if (
+    currentHistoryValue.previousVersionId !==
+    (currentIsUnattributed ? topologyEntry.versionId : unattributedSelector)
+  ) {
+    throw phaseError(
+      phase,
+      "attribution repair current Version has an unexpected direct predecessor",
+    );
+  }
+  const legacyVersion = await readVersionAt(phase, target, state, legacyEntry.versionId);
+  const candidateVersion = await readVersionAt(phase, target, state, candidateEntry.versionId);
+  const topologyVersion = await readVersionAt(phase, target, state, topologyEntry.versionId);
+  const unattributedVersion = await readVersionAt(
+    phase,
+    target,
+    state,
+    unattributedEntry.versionId,
+  );
+  const service = extractLegacyHostServiceBinding(phase, legacyEntry.versionId, legacyVersion);
+  const candidateService = extractLegacyHostServiceBinding(
+    phase,
+    candidateEntry.versionId,
+    candidateVersion,
+  );
+  if (
+    candidateService.service !== service.service ||
+    candidateService.entrypoint !== service.entrypoint
+  ) {
+    throw phaseError(
+      phase,
+      "attribution repair service identity changed across the pinned lineage",
+    );
+  }
+  assertRetirementVersionShape(
+    phase,
+    target,
+    state,
+    legacyEntry.versionId,
+    legacyVersion,
+    service,
+    hostedVersionSecrets(target),
+  );
+  assertRetirementVersionShape(
+    phase,
+    target,
+    state,
+    candidateEntry.versionId,
+    candidateVersion,
+    service,
+    hostedVersionSecrets(target),
+  );
+  assertRetirementVersionShape(
+    phase,
+    target,
+    state,
+    topologyEntry.versionId,
+    topologyVersion,
+    null,
+    hostedVersionSecrets(target),
+  );
+  assertRetirementVersionShape(
+    phase,
+    target,
+    state,
+    unattributedEntry.versionId,
+    unattributedVersion,
+    null,
+    baseWorkerSecrets(target),
+  );
+  if (hasWorkersMessage(unattributedVersion)) {
+    throw phaseError(phase, "selected R Version must have no workers/message annotation");
+  }
+  const candidateIdentity = versionIdentity(candidateVersion);
+  const topologyIdentity = versionIdentity(topologyVersion);
+  if (candidateIdentity === null || topologyIdentity === null) {
+    throw phaseError(phase, "attribution repair requires canonical C and T annotations");
+  }
+  if (
+    candidateIdentity.commit !== topologyIdentity.commit ||
+    candidateIdentity.bundleDigestHex !== topologyIdentity.bundleDigestHex
+  ) {
+    throw phaseError(phase, "attribution repair C and T code identities differ");
+  }
+  const topologyScriptEtag = workerVersionScriptContentIdentity(
+    phase,
+    topologyEntry.versionId,
+    topologyVersion,
+  );
+  const unattributedScriptEtag = workerVersionScriptContentIdentity(
+    phase,
+    unattributedEntry.versionId,
+    unattributedVersion,
+  );
+  if (topologyScriptEtag !== unattributedScriptEtag) {
+    throw phaseError(phase, "attribution repair R script content differs from trusted T");
+  }
+  const currentVersion =
+    currentHistoryValue.versionId === unattributedEntry.versionId
+      ? unattributedVersion
+      : await readVersionAt(phase, target, state, currentHistoryValue.versionId);
+  const current = await inspectRetirementVersionAt(
+    phase,
+    target,
+    state,
+    currentHistoryValue,
+    null,
+    baseWorkerSecrets(target),
+    baseWorkerSecrets(target),
+    currentVersion,
+  );
+  assertExactSecretInventory(
+    await state.workerSecrets(target.workerName),
+    baseWorkerSecrets(target),
+    phase,
+  );
+  assertDomainClosure(phase, target, await state.workerDomains());
+  const historyAfterCurrent = await currentHistory(phase, target, state);
+  if (!sameDeploymentHistory(historyAfterCurrent, currentHistoryValue)) {
+    throw phaseError(
+      phase,
+      "attribution repair deployment history changed during closure inspection",
+    );
+  }
+  const currentScriptEtag = workerVersionScriptContentIdentity(
+    phase,
+    currentHistoryValue.versionId,
+    currentVersion,
+  );
+  if (currentScriptEtag !== topologyScriptEtag) {
+    throw phaseError(phase, "attribution repair current script content differs from trusted T");
+  }
+  if (
+    currentIsUnattributed &&
+    (current.commit !== null ||
+      current.bundleDigestHex !== null ||
+      hasWorkersMessage(currentVersion))
+  ) {
+    throw phaseError(phase, "selected R Version is not the missing-annotation direct successor");
+  }
+  if (
+    currentIsRepaired &&
+    (current.bundleDigestHex !== topologyIdentity.bundleDigestHex ||
+      (expectedRepairedCommit !== undefined && current.commit !== expectedRepairedCommit))
+  ) {
+    throw phaseError(phase, "attribution repair successor has an unexpected canonical identity");
+  }
+  return {
+    current,
+    currentIsRepaired,
+    legacyVersionId: legacyEntry.versionId,
+    candidateVersionId: candidateEntry.versionId,
+    topologyVersionId: topologyEntry.versionId,
+    unattributedVersionId: unattributedEntry.versionId,
+    service,
+    candidateIdentity,
+    topologyIdentity,
+    topologyScriptEtag,
+    unattributedScriptEtag,
+    currentScriptEtag,
+  };
+}
+
 async function runTokenRetirement(
   invocation: RetirementInvocation,
   target: DeployTarget,
@@ -976,9 +1449,10 @@ async function runTokenRetirement(
         );
         directTokenRetirement = true;
       } else {
-        // A token reverse creates T' on top of the already retired R. Status
-        // may reconcile that bounded extension, but another forward/delete
-        // must first restore the topology and establish a fresh direct chain.
+        // An external secret restoration can create T' on top of the already
+        // retired R. Status may reconcile that bounded extension, but another
+        // forward/delete must first restore the topology and establish a fresh
+        // direct chain.
         const candidate = await topologyReverseCandidate(
           "preflight",
           target,
@@ -1006,13 +1480,21 @@ async function runTokenRetirement(
     }
     await assertPinnedSelectorVersion("preflight", target, state, selector, predecessorService);
     if (invocation.action === "status") {
+      const unattributed = before.commit === null || before.bundleDigestHex === null;
       return {
         kind: "takoserver.hosted-token-retirement-status@v1",
         surface: invocation.surface,
         environment: invocation.environment,
         selectedCommit: invocation.commit,
-        state: beforeHasToken ? "topology-retired" : "token-retired",
-        ready: !beforeHasToken && before.commit === invocation.commit,
+        state: beforeHasToken
+          ? unattributed
+            ? "topology-retired-unattributed-successor"
+            : "topology-retired"
+          : unattributed
+            ? "token-retired-unattributed-successor"
+            : "token-retired",
+        ready: !beforeHasToken && !unattributed && before.commit === invocation.commit,
+        repairRequired: unattributed,
         versionId: before.history.versionId,
         deployedCommit: before.commit,
         artifactDigest: digestValue(before.bundleDigestHex),
@@ -1037,20 +1519,6 @@ async function runTokenRetirement(
       signingKeyId: target.signing.currentKeyId,
       transitionExpectedSecrets: hostedVersionSecrets(target),
     });
-    if (invocation.reverse) {
-      return await reverseToken(
-        invocation,
-        target,
-        state,
-        run,
-        options,
-        beforeHistory,
-        before,
-        reviewer,
-        configPath,
-        selector,
-      );
-    }
     if (!beforeHasToken) {
       throw preflightError("Hosted token retirement requires the legacy secret to be present");
     }
@@ -1144,101 +1612,10 @@ async function runTokenRetirement(
       previousVersionId: beforeHistory.versionId,
       commit: after.commit,
       secretRemoved: HOSTED_SPONSORSHIP_SECRET,
-      reverse: { surface: "takoserver-hosted-token-retirement", mode: "secret-reput" },
     };
   } finally {
     if (temporary) rmSync(root, { recursive: true, force: true });
   }
-}
-
-async function reverseToken(
-  invocation: RetirementInvocation,
-  target: DeployTarget,
-  state: RetirementState,
-  run: RetirementProcess,
-  options: RetirementOptions,
-  beforeHistory: WorkerDeploymentHistory,
-  before: RetirementLiveWorkerVersion,
-  reviewer: string,
-  configPath: string,
-  selector: string,
-): Promise<Record<string, unknown>> {
-  if (inventoryHasSecret(await state.workerSecrets(target.workerName), HOSTED_SPONSORSHIP_SECRET)) {
-    throw preflightError("Hosted token retirement reverse requires the legacy secret to be absent");
-  }
-  const token = readHostedToken(
-    options.tokenPath ?? requireEnvironment("TAKOSERVER_HOSTED_TOKEN_PATH"),
-  );
-  const fresh = await assertCurrentRetirementState(
-    "preflight",
-    target,
-    state,
-    beforeHistory,
-    before,
-    null,
-    baseWorkerSecrets(target),
-    baseWorkerSecrets(target),
-  );
-  await assertPinnedLineage(
-    "preflight",
-    target,
-    state,
-    fresh.history,
-    selector,
-    3,
-    "token retirement reverse requires the pinned legacy predecessor behind the retired topology",
-  );
-  await topologyReverseCandidate("preflight", target, state, fresh.history, fresh, selector);
-  const mutation = await run(
-    wranglerCommand([
-      "secret",
-      "put",
-      HOSTED_SPONSORSHIP_SECRET,
-      "--name",
-      target.workerName,
-      "--config",
-      configPath,
-    ]),
-    { ...providerOptions(options.cloudflareEnvironment), input: token },
-  );
-  if (mutation.exitCode !== 0) {
-    throw mutationError(
-      "Hosted token retirement reverse acknowledgement is indeterminate; run --status before repair",
-      `${mutation.stdout}${mutation.stderr}`.trim(),
-    );
-  }
-  const afterHistory = await currentHistory("verification", target, state);
-  if (
-    afterHistory.versionId === beforeHistory.versionId ||
-    afterHistory.previousVersionId !== beforeHistory.versionId
-  ) {
-    throw verificationError(
-      "Hosted token retirement reverse did not create the exact direct successor",
-    );
-  }
-  const after = await inspectRetirementVersionAt(
-    "verification",
-    target,
-    state,
-    afterHistory,
-    null,
-    hostedVersionSecrets(target),
-    hostedVersionSecrets(target),
-  );
-  if (after.commit !== before.commit || after.bundleDigestHex !== before.bundleDigestHex) {
-    throw verificationError("Hosted token retirement reverse changed the served code identity");
-  }
-  return {
-    kind: "takoserver.hosted-token-retirement-reverse@v1",
-    surface: invocation.surface,
-    environment: invocation.environment,
-    state: "token-restored",
-    reviewer,
-    versionId: after.history.versionId,
-    previousVersionId: beforeHistory.versionId,
-    secretRestored: HOSTED_SPONSORSHIP_SECRET,
-    reverse: { mode: "secret-reput" },
-  };
 }
 
 function transitionConfigWriter(
@@ -1499,7 +1876,7 @@ async function assertPinnedSelectorVersion(
   );
 }
 
-/** Verifies the topology-retired Version immediately before token reverse. */
+/** Verifies the topology-retired Version immediately before token retirement. */
 async function requireDirectTopologyPredecessor(
   phase: DeployPhase,
   target: DeployTarget,
@@ -1566,9 +1943,9 @@ interface TopologyReverseCandidate {
 }
 
 /**
- * Finds the candidate code Version for topology reverse. A token reverse
- * creates T' as a new Version, so the candidate is no longer the immediate
- * deployment predecessor. The only accepted ancestry is the bounded
+ * Finds the candidate code Version for topology reverse. An external secret
+ * restoration can create T' as a new Version, so the candidate is no longer
+ * the immediate deployment predecessor. The only accepted ancestry is the bounded
  * L -> C -> T -> R chain (or its token-reverse T' -> R extension); every
  * intervening Version must carry the exact semantic binding/secret shape.
  * The walk is capped at the known four-edge suffix and never scans older
@@ -1602,8 +1979,9 @@ async function topologyReverseCandidate(
     }
     candidateIndex = 1;
   } else if (current.hostedTokenPresent) {
-    // R' -> R -> T -> C -> L after token reverse. The current Version is
-    // topology-shaped again, while its direct predecessor is token-shaped.
+    // R' -> R -> T -> C -> L after external secret restoration. The current
+    // Version is topology-shaped again, while its direct predecessor is
+    // token-shaped.
     await assertReverseAncestor(
       phase,
       target,
@@ -2008,6 +2386,17 @@ function requiredPredecessorSelector(invocation: RetirementInvocation): string {
   return selector;
 }
 
+function requiredUnattributedSuccessorSelector(invocation: RetirementInvocation): string {
+  const selector = invocation.unattributedSuccessorVersionId;
+  if (selector === undefined) {
+    throw preflightError(`${invocation.surface} requires --unattributed-successor-version=<uuid>`);
+  }
+  if (!isWorkerVersionId(selector)) {
+    throw preflightError("unattributed successor Version ID must be one exact UUID");
+  }
+  return selector;
+}
+
 function validateInvocation(invocation: RetirementInvocation, target: DeployTarget): void {
   if (target.environment !== invocation.environment) {
     throw preflightError("retirement invocation and target environments differ");
@@ -2022,11 +2411,39 @@ function validateInvocation(invocation: RetirementInvocation, target: DeployTarg
     invocation.surface !== "takoserver-worker-authority-cutover" &&
     invocation.surface !== "takoserver-host-runtime-topology-retirement" &&
     invocation.surface !== "takoserver-hosted-token-retirement" &&
+    invocation.surface !== "takoserver-worker-retirement-attribution-repair" &&
     invocation.legacyHostRuntimePredecessorVersionId !== undefined
   ) {
     throw preflightError("legacy Host-runtime predecessor selector is retirement-only");
   }
+  if (
+    invocation.surface !== "takoserver-worker-retirement-attribution-repair" &&
+    invocation.unattributedSuccessorVersionId !== undefined
+  ) {
+    throw preflightError("unattributed successor selector is attribution-repair-only");
+  }
+  if (
+    invocation.surface === "takoserver-worker-retirement-attribution-repair" &&
+    invocation.reverse === true
+  ) {
+    throw preflightError("attribution repair does not support --reverse");
+  }
+  if (invocation.surface === "takoserver-hosted-token-retirement" && invocation.reverse === true) {
+    throw preflightError(
+      "Hosted token retirement is forward-only; restoration requires a separately reviewed dedicated surface",
+    );
+  }
+  if (
+    invocation.surface === "takoserver-worker-retirement-attribution-repair" &&
+    invocation.environment !== "integration" &&
+    invocation.environment !== "production"
+  ) {
+    throw preflightError("attribution repair is supported only in integration or production");
+  }
   requiredPredecessorSelector(invocation);
+  if (invocation.surface === "takoserver-worker-retirement-attribution-repair") {
+    requiredUnattributedSuccessorSelector(invocation);
+  }
 }
 
 function exactReviewer(value: string): string {
@@ -2048,6 +2465,78 @@ function providerOptions(environment: Readonly<Record<string, string>> | undefin
   return environment === undefined ? {} : { env: environment };
 }
 
+async function probeRetirementProduct(
+  origin: string,
+  fetcher: (input: string, init?: RequestInit) => Promise<Response>,
+): Promise<{
+  readonly url: string;
+  readonly status: number;
+  readonly openapi: { readonly url: string; readonly status: number };
+}> {
+  const url = `${origin}/.well-known/takoserver`;
+  let response: Response;
+  try {
+    response = await fetcher(url, {
+      method: "GET",
+      headers: { "cache-control": "no-cache" },
+      redirect: "error",
+    });
+  } catch (error) {
+    throw verificationError(
+      "Worker public product probe failed",
+      error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+    );
+  }
+  const body = (await response.json().catch(() => null)) as unknown;
+  if (
+    response.status !== 200 ||
+    !isRecord(body) ||
+    body.product !== "takoserver" ||
+    body.apiVersion !== "v1" ||
+    !isRecord(body.endpoints) ||
+    body.endpoints.api !== origin ||
+    body.endpoints.openapi !== `${origin}/openapi.json`
+  ) {
+    throw verificationError(
+      "Worker public product probe returned the wrong product or origin",
+      `status=${response.status}`,
+    );
+  }
+  const openapiUrl = `${origin}/openapi.json`;
+  let openapiResponse: Response;
+  try {
+    openapiResponse = await fetcher(openapiUrl, {
+      method: "GET",
+      headers: { "cache-control": "no-cache" },
+      redirect: "error",
+    });
+  } catch (error) {
+    throw verificationError(
+      "Worker OpenAPI probe failed",
+      error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+    );
+  }
+  const openapiBody = (await openapiResponse.json().catch(() => null)) as unknown;
+  const servers = isRecord(openapiBody) ? openapiBody.servers : null;
+  if (
+    openapiResponse.status !== 200 ||
+    !Array.isArray(servers) ||
+    servers.length !== 1 ||
+    !isRecord(servers[0]) ||
+    servers[0].url !== origin
+  ) {
+    throw verificationError(
+      "Worker OpenAPI server does not match the published origin",
+      `status=${openapiResponse.status}`,
+    );
+  }
+  return {
+    url,
+    status: response.status,
+    openapi: { url: openapiUrl, status: openapiResponse.status },
+  };
+}
+
 function phaseError(phase: DeployPhase, message: string): DeployError {
   return phase === "preflight"
     ? preflightError(message)
@@ -2058,4 +2547,12 @@ function phaseError(phase: DeployPhase, message: string): DeployError {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasWorkersMessage(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    isRecord(value.annotations) &&
+    Object.hasOwn(value.annotations, "workers/message")
+  );
 }

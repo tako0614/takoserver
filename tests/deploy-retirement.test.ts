@@ -17,16 +17,19 @@ import {
 } from "../scripts/deploy/worker-state.ts";
 
 const COMMIT = "a".repeat(40);
+const REPAIR_COMMIT = "d".repeat(40);
 const LEGACY_COMMIT = "b".repeat(40);
 const DIGEST = createHash("sha256")
   .update("export default {fetch(){return new Response('ok')}};\n")
   .digest("hex");
+const SCRIPT_ETAG = "provider-script-etag-v1";
 const LEGACY_DIGEST = "c".repeat(64);
 const VERSION_LEGACY = "00000000-0000-4000-8000-000000000001";
 const VERSION_CANDIDATE = "00000000-0000-4000-8000-000000000002";
 const VERSION_TOPOLOGY = "00000000-0000-4000-8000-000000000003";
 const VERSION_TOKEN = "00000000-0000-4000-8000-000000000004";
 const VERSION_TOKEN_RESTORED = "00000000-0000-4000-8000-000000000005";
+const VERSION_ATTRIBUTION_REPAIRED = "00000000-0000-4000-8000-000000000006";
 const VERSION_WRONG = "00000000-0000-4000-8000-000000000009";
 const VERSION_INTERLEAVED = "00000000-0000-4000-8000-00000000000a";
 const VERSION_REBOUND = "00000000-0000-4000-8000-00000000000b";
@@ -49,7 +52,8 @@ const target = {
 } satisfies DeployTarget;
 
 const BASE_SECRETS = ["TAKOSERVER_SIGNING_KEY"];
-const HOSTED_SECRETS = [...BASE_SECRETS, "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN"];
+const HOSTED_SPONSORSHIP_SECRET = "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN";
+const HOSTED_SECRETS = [...BASE_SECRETS, HOSTED_SPONSORSHIP_SECRET];
 
 describe("reviewed Hosted legacy-edge retirement", () => {
   test("requires the exact observed service and entrypoint closure", () => {
@@ -506,44 +510,41 @@ describe("reviewed Hosted legacy-edge retirement", () => {
     }
   });
 
-  test("topology reverse walks the bounded token-reverse ancestry", async () => {
+  test("topology reverse refuses an unattributed externally restored Version", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-topology-reverse-token-"));
     try {
       const fixture = stateFixture("tokenRestored");
-      const result = await runRetirement(
-        {
-          surface: "takoserver-host-runtime-topology-retirement",
-          action: "apply",
-          reverse: true,
-          environment: "integration",
-          commit: COMMIT,
-          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
-        },
-        target,
-        {
-          run: fixture.run,
-          state: fixture.state,
-          outputDirectory: root,
-          review: "reviewer@example.test",
-          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
-        },
-      );
-      expect(result).toMatchObject({
-        state: "candidate-restored",
-        versionId: VERSION_CANDIDATE,
-        reverse: { exactVersionId: VERSION_CANDIDATE },
-      });
+      await expect(
+        runRetirement(
+          {
+            surface: "takoserver-host-runtime-topology-retirement",
+            action: "apply",
+            reverse: true,
+            environment: "integration",
+            commit: COMMIT,
+            legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+          },
+          target,
+          {
+            run: fixture.run,
+            state: fixture.state,
+            outputDirectory: root,
+            review: "reviewer@example.test",
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          },
+        ),
+      ).rejects.toThrow("byte-identical");
       expect(
         fixture.mutations.filter(
           ({ command }) => command.includes("versions") && command.includes("deploy"),
         ),
-      ).toHaveLength(1);
+      ).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("topology reverse acknowledgement loss is reconciled on the full retained history", async () => {
+  test("topology reverse refuses an unattributed externally restored acknowledgement state", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-topology-reverse-ack-loss-"));
     try {
       const fixture = stateFixture("tokenRestored", "topology-reverse-ack-loss");
@@ -566,10 +567,49 @@ describe("reviewed Hosted legacy-edge retirement", () => {
             cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
           },
         ),
-      ).rejects.toThrow("indeterminate");
+      ).rejects.toThrow("byte-identical");
+      expect(
+        fixture.mutations.filter(
+          ({ command }) => command.includes("versions") && command.includes("deploy"),
+        ),
+      ).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("token retirement cannot attribute secret-created Versions and refuses reverse preflight", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-token-"));
+    try {
+      const fixture = stateFixture("topology");
+      await expect(
+        runRetirement(
+          {
+            surface: "takoserver-hosted-token-retirement",
+            action: "apply",
+            environment: "integration",
+            commit: COMMIT,
+            legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+          },
+          target,
+          {
+            run: fixture.run,
+            state: fixture.state,
+            outputDirectory: root,
+            review: "reviewer@example.test",
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          },
+        ),
+      ).rejects.toThrow("changed the served code identity");
+      const mutations = fixture.mutations.filter(
+        ({ command }) => command.includes("secret") && command.includes("delete"),
+      );
+      expect(mutations).toHaveLength(1);
+      expect(mutations[0]?.command.join(" ")).toContain("secret delete");
+
       const status = await runRetirement(
         {
-          surface: "takoserver-host-runtime-topology-retirement",
+          surface: "takoserver-hosted-token-retirement",
           action: "status",
           environment: "integration",
           commit: COMMIT,
@@ -579,109 +619,42 @@ describe("reviewed Hosted legacy-edge retirement", () => {
         { run: fixture.run, state: fixture.state },
       );
       expect(status).toMatchObject({
-        state: "candidate-restored",
-        versionId: VERSION_CANDIDATE,
-        previousVersionId: VERSION_CANDIDATE,
-      });
-      expect(
-        fixture.mutations.filter(
-          ({ command }) => command.includes("versions") && command.includes("deploy"),
-        ),
-      ).toHaveLength(1);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("token retirement deletes last and reverse re-puts the owned token", async () => {
-    const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-token-"));
-    try {
-      const tokenPath = join(root, "token");
-      writeFileSync(tokenPath, "hosted-token-exact", { mode: 0o600 });
-      const fixture = stateFixture("topology");
-      const result = await runRetirement(
-        {
-          surface: "takoserver-hosted-token-retirement",
-          action: "apply",
-          environment: "integration",
-          commit: COMMIT,
-          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
-        },
-        target,
-        {
-          run: fixture.run,
-          state: fixture.state,
-          tokenPath,
-          outputDirectory: root,
-          review: "reviewer@example.test",
-          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
-        },
-      );
-      expect(result).toMatchObject({
-        state: "token-retired",
+        state: "token-retired-unattributed-successor",
+        ready: false,
+        repairRequired: true,
         versionId: VERSION_TOKEN,
-        previousVersionId: VERSION_TOPOLOGY,
+        secretPresent: false,
       });
-      const mutations = fixture.mutations.filter(
-        ({ command }) => command.includes("secret") && command.includes("delete"),
-      );
-      expect(mutations).toHaveLength(1);
-      expect(mutations[0]?.command.join(" ")).toContain("secret delete");
 
-      const reversed = await runRetirement(
-        {
-          surface: "takoserver-hosted-token-retirement",
-          action: "apply",
-          reverse: true,
-          environment: "integration",
-          commit: COMMIT,
-          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
-        },
-        target,
-        {
-          run: fixture.run,
-          state: fixture.state,
-          tokenPath,
-          outputDirectory: join(root, "reverse"),
-          review: "reviewer@example.test",
-          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
-        },
-      );
-      expect(reversed).toMatchObject({
-        state: "token-restored",
-        versionId: VERSION_TOKEN_RESTORED,
-        previousVersionId: VERSION_TOKEN,
-      });
+      await expect(
+        runRetirement(
+          {
+            surface: "takoserver-hosted-token-retirement",
+            action: "apply",
+            reverse: true,
+            environment: "integration",
+            commit: COMMIT,
+            legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+          },
+          target,
+          {
+            run: fixture.run,
+            state: fixture.state,
+            outputDirectory: join(root, "reverse"),
+            review: "reviewer@example.test",
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          },
+        ),
+      ).rejects.toThrow("forward-only");
       const reverseMutations = fixture.mutations.filter(
         ({ command }) => command.includes("secret") && command.includes("put"),
       );
-      expect(reverseMutations).toHaveLength(1);
-      expect(reverseMutations[0]?.command.join(" ")).toContain("secret put");
-      expect(reverseMutations[0]?.input).toBe("hosted-token-exact");
-
-      const topologyReversed = await runRetirement(
-        {
-          surface: "takoserver-host-runtime-topology-retirement",
-          action: "apply",
-          reverse: true,
-          environment: "integration",
-          commit: COMMIT,
-          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
-        },
-        target,
-        {
-          run: fixture.run,
-          state: fixture.state,
-          outputDirectory: join(root, "topology-reverse"),
-          review: "reviewer@example.test",
-          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
-        },
-      );
-      expect(topologyReversed).toMatchObject({
-        state: "candidate-restored",
-        versionId: VERSION_CANDIDATE,
-        reverse: { exactVersionId: VERSION_CANDIDATE },
-      });
+      expect(reverseMutations).toHaveLength(0);
+      expect(
+        fixture.mutations.some(
+          ({ command }) => command.includes("secret") && command.includes("put"),
+        ),
+      ).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -727,12 +700,278 @@ describe("reviewed Hosted legacy-edge retirement", () => {
         { run: fixture.run, state: fixture.state },
       );
       expect(status).toMatchObject({
-        state: "token-retired",
+        state: "token-retired-unattributed-successor",
+        ready: false,
         versionId: VERSION_TOKEN,
         secretPresent: false,
       });
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("token deletion's direct successor can be unattributed without being complete", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-token-unattributed-"));
+    try {
+      const fixture = stateFixture("topology");
+      await expect(
+        runRetirement(
+          {
+            surface: "takoserver-hosted-token-retirement",
+            action: "apply",
+            environment: "integration",
+            commit: COMMIT,
+            legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+          },
+          target,
+          {
+            run: fixture.run,
+            state: fixture.state,
+            outputDirectory: root,
+            review: "reviewer@example.test",
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          },
+        ),
+      ).rejects.toThrow("changed the served code identity");
+
+      const status = await runRetirement(
+        {
+          surface: "takoserver-hosted-token-retirement",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+        },
+        target,
+        { run: fixture.run, state: fixture.state },
+      );
+      expect(status).toMatchObject({
+        state: "token-retired-unattributed-successor",
+        ready: false,
+        versionId: VERSION_TOKEN,
+        secretPresent: false,
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("attribution repair status proves the selected R against the trusted T script identity", async () => {
+    const fixture = stateFixture("token");
+    const status = await runRetirement(
+      {
+        surface: "takoserver-worker-retirement-attribution-repair",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+        legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+        unattributedSuccessorVersionId: VERSION_TOKEN,
+      },
+      target,
+      { run: fixture.run, state: fixture.state, fetcher: probeFetcher },
+    );
+    expect(status).toMatchObject({
+      state: "token-retired-unattributed-successor",
+      ready: false,
+      repairRequired: true,
+      versionId: VERSION_TOKEN,
+      previousVersionId: VERSION_TOPOLOGY,
+      unattributedVersionId: VERSION_TOKEN,
+      trustedTopologyVersionId: VERSION_TOPOLOGY,
+      trustedCommit: COMMIT,
+      trustedArtifactDigest: `sha256:${DIGEST}`,
+      scriptContentIdentity: SCRIPT_ETAG,
+      probe: { status: 200, openapi: { status: 200 } },
+    });
+    expect(fixture.mutations).toHaveLength(0);
+  });
+
+  test("attribution repair refuses a mismatched or missing provider script identity", async () => {
+    for (const mode of ["mismatch", "missing"] as const) {
+      const fixture = stateFixture("token");
+      const state: RetirementState = {
+        ...fixture.state,
+        async workerVersion(workerName, versionId) {
+          if (versionId !== VERSION_TOKEN) {
+            return await fixture.state.workerVersion(workerName, versionId);
+          }
+          const version = versionShape({ includeHostedSecret: false, message: null });
+          if (mode === "mismatch") {
+            return versionShape({
+              includeHostedSecret: false,
+              message: null,
+              scriptEtag: "provider-script-etag-r-mismatch",
+            });
+          }
+          const resources = version.resources as Record<string, unknown>;
+          return { ...version, resources: { bindings: resources.bindings } };
+        },
+      };
+      await expect(
+        runRetirement(
+          {
+            surface: "takoserver-worker-retirement-attribution-repair",
+            action: "status",
+            environment: "integration",
+            commit: COMMIT,
+            legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+            unattributedSuccessorVersionId: VERSION_TOKEN,
+          },
+          target,
+          { run: fixture.run, state, fetcher: probeFetcher },
+        ),
+      ).rejects.toThrow(
+        mode === "mismatch" ? "R script content differs" : "script content identity",
+      );
+      expect(fixture.mutations).toHaveLength(0);
+    }
+  });
+
+  test("attribution repair uploads one sealed canonical successor without retired fields", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-attribution-repair-"));
+    try {
+      const fixture = stateFixture("token", undefined, REPAIR_COMMIT);
+      const result = await runRetirement(
+        {
+          surface: "takoserver-worker-retirement-attribution-repair",
+          action: "apply",
+          environment: "integration",
+          commit: REPAIR_COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+          unattributedSuccessorVersionId: VERSION_TOKEN,
+        },
+        target,
+        {
+          run: fixture.run,
+          state: fixture.state,
+          outputDirectory: root,
+          fetcher: probeFetcher,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+      expect(result).toMatchObject({
+        state: "token-retirement-attribution-repaired",
+        previousVersionId: VERSION_TOKEN,
+        versionId: VERSION_ATTRIBUTION_REPAIRED,
+        commit: REPAIR_COMMIT,
+        bundleDigest: `sha256:${DIGEST}`,
+        scriptContentIdentity: SCRIPT_ETAG,
+        probe: { status: 200, openapi: { status: 200 } },
+      });
+      const uploads = fixture.mutations.filter(({ command }) => command.includes("--no-bundle"));
+      expect(uploads).toHaveLength(1);
+      expect(uploads[0]?.command.join(" ")).toContain(
+        `--message takoserver-worker:${REPAIR_COMMIT}:${DIGEST}`,
+      );
+      const realized = JSON.parse(
+        await Bun.file(join(root, "release/wrangler.jsonc")).text(),
+      ) as Record<string, unknown>;
+      expect(JSON.stringify(realized)).not.toContain("HOST_RUNTIME_MATERIALIZER");
+      expect(JSON.stringify(realized)).not.toContain(HOSTED_SPONSORSHIP_SECRET);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("attribution repair acknowledgement loss is settled by the exact A successor status", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-attribution-repair-ack-loss-"));
+    try {
+      const fixture = stateFixture("token", "repair-upload-ack-loss");
+      await expect(
+        runRetirement(
+          {
+            surface: "takoserver-worker-retirement-attribution-repair",
+            action: "apply",
+            environment: "integration",
+            commit: COMMIT,
+            legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+            unattributedSuccessorVersionId: VERSION_TOKEN,
+          },
+          target,
+          {
+            run: fixture.run,
+            state: fixture.state,
+            outputDirectory: root,
+            fetcher: probeFetcher,
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          },
+        ),
+      ).rejects.toThrow("indeterminate");
+      expect(
+        fixture.mutations.filter(({ command }) => command.includes("--no-bundle")),
+      ).toHaveLength(1);
+      const status = await runRetirement(
+        {
+          surface: "takoserver-worker-retirement-attribution-repair",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+          unattributedSuccessorVersionId: VERSION_TOKEN,
+        },
+        target,
+        { run: fixture.run, state: fixture.state, fetcher: probeFetcher },
+      );
+      expect(status).toMatchObject({
+        state: "token-retirement-attribution-repaired",
+        ready: true,
+        repairRequired: false,
+        versionId: VERSION_ATTRIBUTION_REPAIRED,
+        previousVersionId: VERSION_TOKEN,
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("attribution repair refuses status and apply when either public probe advances history", async () => {
+    for (const action of ["status", "apply"] as const) {
+      for (const probePhase of ["root", "openapi"] as const) {
+        const root = mkdtempSync(join(tmpdir(), "takoserver-attribution-repair-probe-race-"));
+        try {
+          const fixture = stateFixture(action === "status" ? "repaired" : "token");
+          const fetcher = async (input: string): Promise<Response> => {
+            const isRootProbe = input.endsWith("/.well-known/takoserver");
+            const isOpenApiProbe = input.endsWith("/openapi.json");
+            if (
+              (probePhase === "root" && isRootProbe) ||
+              (probePhase === "openapi" && isOpenApiProbe)
+            ) {
+              fixture.advanceToWrong();
+            }
+            return await probeFetcher(input);
+          };
+          await expect(
+            runRetirement(
+              {
+                surface: "takoserver-worker-retirement-attribution-repair",
+                action,
+                environment: "integration",
+                commit: COMMIT,
+                legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+                unattributedSuccessorVersionId: VERSION_TOKEN,
+              },
+              target,
+              {
+                run: fixture.run,
+                state: fixture.state,
+                fetcher,
+                ...(action === "apply"
+                  ? {
+                      outputDirectory: root,
+                      cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+                    }
+                  : {}),
+              },
+            ),
+          ).rejects.toThrow("attribution repair");
+          expect(
+            fixture.mutations.filter(({ command }) => command.includes("--no-bundle")),
+          ).toHaveLength(action === "apply" ? 1 : 0);
+        } finally {
+          rmSync(root, { recursive: true, force: true });
+        }
+      }
     }
   });
 
@@ -775,113 +1014,6 @@ describe("reviewed Hosted legacy-edge retirement", () => {
         ),
       ).rejects.toThrow("changed before mutation");
       expect(fixture.mutations.filter(({ command }) => command.includes("secret"))).toHaveLength(0);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("token reverse acknowledgement loss is reconciled by status on T-prime history", async () => {
-    const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-token-reverse-ack-loss-"));
-    try {
-      const tokenPath = join(root, "token");
-      writeFileSync(tokenPath, "hosted-token-exact", { mode: 0o600 });
-      const fixture = stateFixture("token", "secret-put-ack-loss");
-      await expect(
-        runRetirement(
-          {
-            surface: "takoserver-hosted-token-retirement",
-            action: "apply",
-            reverse: true,
-            environment: "integration",
-            commit: COMMIT,
-            legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
-          },
-          target,
-          {
-            run: fixture.run,
-            state: fixture.state,
-            tokenPath,
-            outputDirectory: root,
-            review: "reviewer@example.test",
-            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
-          },
-        ),
-      ).rejects.toThrow("indeterminate");
-
-      const status = await runRetirement(
-        {
-          surface: "takoserver-hosted-token-retirement",
-          action: "status",
-          environment: "integration",
-          commit: COMMIT,
-          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
-        },
-        target,
-        { run: fixture.run, state: fixture.state },
-      );
-      expect(status).toMatchObject({
-        state: "topology-retired",
-        versionId: VERSION_TOKEN_RESTORED,
-        secretPresent: true,
-      });
-      expect(
-        fixture.mutations.filter(
-          ({ command }) => command.includes("secret") && command.includes("put"),
-        ),
-      ).toHaveLength(1);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("token reverse rechecks authoritative state immediately before re-putting", async () => {
-    const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-token-reverse-race-"));
-    try {
-      const tokenPath = join(root, "token");
-      writeFileSync(tokenPath, "hosted-token-exact", { mode: 0o600 });
-      const fixture = stateFixture("token");
-      let deploymentReads = 0;
-      const state: RetirementState = {
-        ...fixture.state,
-        async workerDeployments(workerName) {
-          deploymentReads += 1;
-          const history = await fixture.state.workerDeployments(workerName);
-          if (deploymentReads < 6) return history;
-          return [
-            deployment("deployment-topology-race", VERSION_TOPOLOGY, "2026-08-29T06:00:00Z"),
-            deployment("deployment-token", VERSION_TOKEN, "2026-08-29T05:00:00Z"),
-            deployment("deployment-topology", VERSION_TOPOLOGY, "2026-08-29T04:00:00Z"),
-            deployment("deployment-candidate", VERSION_CANDIDATE, "2026-08-29T03:00:00Z"),
-            deployment("deployment-legacy", VERSION_LEGACY, "2026-08-29T02:00:00Z"),
-          ];
-        },
-      };
-      await expect(
-        runRetirement(
-          {
-            surface: "takoserver-hosted-token-retirement",
-            action: "apply",
-            reverse: true,
-            environment: "integration",
-            commit: COMMIT,
-            legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
-          },
-          target,
-          {
-            run: fixture.run,
-            state,
-            tokenPath,
-            outputDirectory: root,
-            review: "reviewer@example.test",
-            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
-          },
-        ),
-      ).rejects.toThrow("changed before mutation");
-      expect(
-        fixture.mutations.filter(
-          ({ command }) => command.includes("secret") && command.includes("put"),
-        ),
-      ).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -1109,21 +1241,28 @@ describe("reviewed Hosted legacy-edge retirement", () => {
 });
 
 function stateFixture(
-  stage: "legacy" | "candidate" | "topology" | "token" | "tokenRestored",
+  stage: "legacy" | "candidate" | "topology" | "token" | "tokenRestored" | "repaired",
   failure?:
     | "upload-ack-loss"
     | "secret-delete-ack-loss"
-    | "secret-put-ack-loss"
+    | "repair-upload-ack-loss"
     | "topology-reverse-ack-loss",
+  headCommit = COMMIT,
 ) {
   let current = stage;
   let history = initialHistory(stage);
   let deploymentSequence = history.length;
+  let advancedToWrong = false;
   const mutations: { command: string[]; input?: string }[] = [];
   let buildConfig: string | undefined;
   const appendDeployment = (versionId: string): void => {
     deploymentSequence += 1;
     history = [{ deploymentId: `deployment-${deploymentSequence}`, versionId }, ...history];
+  };
+  const advanceToWrong = (): void => {
+    if (advancedToWrong) return;
+    advancedToWrong = true;
+    appendDeployment(VERSION_WRONG);
   };
   const run: RetirementProcess = async (command, options): Promise<CommandResult> => {
     mutations.push({
@@ -1131,7 +1270,7 @@ function stateFixture(
       ...(options?.input === undefined ? {} : { input: options.input }),
     });
     const key = command.join(" ");
-    if (key === "git rev-parse HEAD") return ok(`${COMMIT}\n`);
+    if (key === "git rev-parse HEAD") return ok(`${headCommit}\n`);
     if (key === "git branch --show-current") return ok("feature/retirement\n");
     if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
     if (key === "bun run check") return ok("green\n");
@@ -1146,9 +1285,18 @@ function stateFixture(
       return ok("built\n");
     }
     if (command.includes("deploy") && command.includes("--no-bundle")) {
-      current = stage === "legacy" ? "candidate" : "topology";
-      appendDeployment(current === "candidate" ? VERSION_CANDIDATE : VERSION_TOPOLOGY);
-      if (failure === "upload-ack-loss") return { exitCode: 1, stdout: "", stderr: "closed" };
+      if (stage === "token") {
+        current = "repaired";
+        appendDeployment(VERSION_ATTRIBUTION_REPAIRED);
+      } else {
+        current = stage === "legacy" ? "candidate" : "topology";
+        appendDeployment(current === "candidate" ? VERSION_CANDIDATE : VERSION_TOPOLOGY);
+      }
+      if (
+        failure === "upload-ack-loss" ||
+        (stage === "token" && failure === "repair-upload-ack-loss")
+      )
+        return { exitCode: 1, stdout: "", stderr: "closed" };
       return ok("uploaded\n");
     }
     if (command.includes("secret") && command.includes("delete")) {
@@ -1167,14 +1315,6 @@ function stateFixture(
         return { exitCode: 1, stdout: "", stderr: "closed" };
       }
       return ok("restored\n");
-    }
-    if (command.includes("secret") && command.includes("put")) {
-      current = "tokenRestored";
-      appendDeployment(VERSION_TOKEN_RESTORED);
-      if (failure === "secret-put-ack-loss") {
-        return { exitCode: 1, stdout: "", stderr: "closed" };
-      }
-      return ok("put\n");
     }
     throw new Error(`unexpected command: ${key}`);
   };
@@ -1196,25 +1336,37 @@ function stateFixture(
         versionId === VERSION_LEGACY || versionId === VERSION_CANDIDATE
           ? { service: SERVICE, entrypoint: ENTRYPOINT }
           : undefined;
-      const includesHostedSecret = versionId !== VERSION_TOKEN;
+      const includesHostedSecret =
+        versionId !== VERSION_TOKEN &&
+        versionId !== VERSION_ATTRIBUTION_REPAIRED &&
+        versionId !== VERSION_WRONG;
       return versionShape({
         ...(serviceBinding === undefined ? {} : { serviceBinding }),
         includeHostedSecret: includesHostedSecret,
-        message: versionId === VERSION_LEGACY ? null : `takoserver-worker:${COMMIT}:${DIGEST}`,
+        message:
+          versionId === VERSION_LEGACY ||
+          versionId === VERSION_TOKEN ||
+          versionId === VERSION_TOKEN_RESTORED
+            ? null
+            : versionId === VERSION_WRONG
+              ? `takoserver-worker:${COMMIT}:${LEGACY_DIGEST}`
+              : `takoserver-worker:${versionId === VERSION_ATTRIBUTION_REPAIRED ? headCommit : COMMIT}:${DIGEST}`,
       });
     },
     async workerSecrets() {
-      return (current === "token" ? BASE_SECRETS : HOSTED_SECRETS).map((name) => ({
-        name,
-        type: "secret_text",
-      }));
+      return (current === "token" || current === "repaired" ? BASE_SECRETS : HOSTED_SECRETS).map(
+        (name) => ({
+          name,
+          type: "secret_text",
+        }),
+      );
     },
   };
-  return { run, state, mutations, buildConfig };
+  return { run, state, mutations, buildConfig, advanceToWrong };
 }
 
 function initialHistory(
-  stage: "legacy" | "candidate" | "topology" | "token" | "tokenRestored",
+  stage: "legacy" | "candidate" | "topology" | "token" | "tokenRestored" | "repaired",
 ): { deploymentId: string; versionId: string }[] {
   const chain =
     stage === "legacy"
@@ -1232,7 +1384,15 @@ function initialHistory(
                 VERSION_CANDIDATE,
                 VERSION_LEGACY,
               ];
-  return chain.map((versionId, index) => ({
+  const repaired = [
+    VERSION_ATTRIBUTION_REPAIRED,
+    VERSION_TOKEN,
+    VERSION_TOPOLOGY,
+    VERSION_CANDIDATE,
+    VERSION_LEGACY,
+  ];
+  const selected = stage === "repaired" ? repaired : chain;
+  return selected.map((versionId, index) => ({
     deploymentId: `deployment-${index + 1}`,
     versionId,
   }));
@@ -1242,6 +1402,7 @@ function versionShape(input: {
   readonly serviceBinding?: { readonly service: string; readonly entrypoint: string };
   readonly includeHostedSecret?: boolean;
   readonly message?: string | null;
+  readonly scriptEtag?: string;
 }) {
   const bindings = [
     { type: "ai", name: "AI" },
@@ -1266,7 +1427,7 @@ function versionShape(input: {
             "workers/message": input.message ?? `takoserver-worker:${COMMIT}:${DIGEST}`,
           },
         }),
-    resources: { bindings },
+    resources: { bindings, script: { etag: input.scriptEtag ?? SCRIPT_ETAG } },
   };
 }
 
@@ -1276,4 +1437,18 @@ function deployment(id: string, versionId: string, created: string) {
 
 function ok(stdout: string): CommandResult {
   return { exitCode: 0, stdout, stderr: "" };
+}
+
+async function probeFetcher(input: string): Promise<Response> {
+  if (input.endsWith("/openapi.json")) {
+    return Response.json({ servers: [{ url: target.publicOrigin }] });
+  }
+  return Response.json({
+    product: "takoserver",
+    apiVersion: "v1",
+    endpoints: {
+      api: target.publicOrigin,
+      openapi: `${target.publicOrigin}/openapi.json`,
+    },
+  });
 }

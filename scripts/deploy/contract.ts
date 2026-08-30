@@ -431,14 +431,10 @@ export const DEPLOY_CONTRACT = {
     {
       surface: "takoserver-hosted-token-retirement",
       target: "cloudflare-worker-secret:environment-selected-hosted-token-retirement",
-      covers: ["scripts/deploy.ts", "scripts/deploy/retirement.ts", "scripts/deploy/hosted.ts"],
+      covers: ["scripts/deploy.ts", "scripts/deploy/retirement.ts"],
       requiresScripts: ["deploy"],
       requiresTools: ["bun", "wrangler"],
-      requiresEnv: [
-        "CLOUDFLARE_API_TOKEN",
-        "TAKOSERVER_INDEPENDENT_REVIEW",
-        "TAKOSERVER_HOSTED_TOKEN_PATH",
-      ],
+      requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
       triggers: ["irreversible", "authority"],
       obligations: {
         provenance:
@@ -446,11 +442,45 @@ export const DEPLOY_CONTRACT = {
         "post-conditions":
           "Authoritative secret inventory omits only TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN and the current Version is the exact direct successor of the topology-retired predecessor, with unchanged commit and bundle digest.",
         reversal:
-          "Reverse reads one owned 0600 token file and re-puts only the named secret, creating an exact direct-successor Version; topology reverse then restores the candidate through provider history. Token bytes never enter argv or output.",
-        "failure-handling": `${highRiskFailure} A lost acknowledgement is settled by status accepting only the exact direct successor; the surface refuses to run before topology retirement and never reports a partial delete as complete.`,
+          "Forward-only; restoration requires a separately reviewed dedicated surface. This surface never re-puts the retired secret.",
+        "failure-handling":
+          `${highRiskFailure} A lost acknowledgement is settled by status accepting only the exact ` +
+          "direct successor; a secret-created Version without canonical workers/message is " +
+          "reported as token-retired-unattributed-successor with ready=false and repairRequired=true. " +
+          "The surface refuses to run before topology retirement and never reports a partial delete as complete.",
         "pre-mutation-proof":
           "Status must prove the direct candidate successor has no Hosted service binding and still carries the Hosted secret before deletion.",
         "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-worker-retirement-attribution-repair",
+      target: "cloudflare-worker:environment-selected-hosted-token-retirement-attribution-repair",
+      covers: [
+        "scripts/deploy.ts",
+        "scripts/deploy/retirement.ts",
+        "scripts/deploy/worker-artifact.ts",
+        "scripts/deploy/worker-live.ts",
+        "scripts/deploy/worker-state.ts",
+      ],
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: ["CLOUDFLARE_API_TOKEN"],
+      triggers: [],
+      obligations: {
+        provenance:
+          `${exactSource} The explicit L→C→T→R selectors, trusted T annotation/script identity ` +
+          "and one sealed bundle from the selected commit are rechecked before one upload.",
+        "post-conditions":
+          "Authoritative history must identify one direct successor of the selected unattributed R; " +
+          "its canonical commit, bundle digest, provider script identity, exact non-secret closure, " +
+          "retired service/secret absence and public product probe must all match trusted T.",
+        reversal:
+          "This is a forward attribution repair with no reverse mutation; a mistaken publication is " +
+          "repaired by a separately selected higher Worker Version.",
+        "failure-handling":
+          `${routineFailure} The surface never retries a lost upload acknowledgement, never deletes or ` +
+          "restores a secret, and refuses an unrelated provider-history advance or weak/missing script identity.",
       },
     },
     {
