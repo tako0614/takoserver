@@ -32,7 +32,7 @@ import { expectedWorkerSecrets } from "./realized-config.ts";
 import type { DeployTarget } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import {
-  assertDomainClosure,
+  assertLiveWorkerRoutingClosure,
   type LiveWorkerVersion,
   type WorkerState,
   workerVersionIdentity,
@@ -293,7 +293,7 @@ async function inspectIdentityState(
     expectedWorkerSecrets(target),
     phase,
   );
-  assertDomainClosure(phase, target, await state.workerDomains());
+  await assertLiveWorkerRoutingClosure(phase, target, state);
   return { history, ...identity, configured, version };
 }
 

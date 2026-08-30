@@ -112,15 +112,15 @@ function parseResults(
   description: string,
   raw: string,
 ): readonly Record<string, unknown>[] {
-  const start = raw.indexOf("[");
-  if (start < 0) {
-    throw new DeployError(phase, `${description} returned no JSON payload`, raw);
+  const text = raw.trim();
+  if (text.length === 0) {
+    throw new DeployError(phase, `${description} returned no JSON payload`);
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw.slice(start));
+    parsed = JSON.parse(text);
   } catch {
-    throw new DeployError(phase, `${description} returned unparsable JSON`, raw);
+    throw new DeployError(phase, `${description} returned unparsable JSON`);
   }
   if (!Array.isArray(parsed) || parsed.length !== 1) {
     throw new DeployError(phase, `${description} returned an unexpected shape`, raw);

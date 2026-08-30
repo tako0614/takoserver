@@ -2019,7 +2019,7 @@ describe("route-less Form authority deploy surfaces", () => {
           review: "independent-reviewer",
         },
       ),
-    ).rejects.toThrow("public Takoserver Worker changed");
+    ).rejects.toThrow("deployment history changed during closure inspection");
     expect(process.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
   });
 

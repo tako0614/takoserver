@@ -18,7 +18,7 @@ import { expectedWorkerSecrets, writeWorkerConfig } from "./realized-config.ts";
 import type { DeployTarget } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import {
-  assertDomainClosure,
+  assertLiveWorkerRoutingClosure,
   historicalWorkerVersionAuthorityProfile,
   inspectCanonicalWorkerVersionWithScriptIdentity,
   type inspectLiveWorkerVersion,
@@ -939,7 +939,7 @@ async function inspectSigningSecretRepairSuccessor(
     expectedWorkerSecrets(target),
     phase,
   );
-  assertDomainClosure(phase, target, await state.workerDomains());
+  await assertLiveWorkerRoutingClosure(phase, target, state);
   const afterHistory = parseWorkerDeploymentHistory(
     await state.workerDeployments(target.workerName),
     phase,
@@ -1037,7 +1037,7 @@ async function inspectSigningRotationClosure(
     expectedWorkerSecrets(target),
     phase,
   );
-  assertDomainClosure(phase, target, await state.workerDomains());
+  await assertLiveWorkerRoutingClosure(phase, target, state);
   const historyAfter = parseWorkerDeploymentHistory(
     await state.workerDeployments(target.workerName),
     phase,

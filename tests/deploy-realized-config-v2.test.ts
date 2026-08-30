@@ -140,6 +140,68 @@ describe("realized Worker configuration", () => {
     }
   });
 
+  test("realizes a version-only config without topology controls", () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-config-version-only-"));
+    const semantic = {
+      implementationPayloadDigest: `sha256:${"1".repeat(64)}` as const,
+      capabilityDigest: `sha256:${"2".repeat(64)}` as const,
+      implementationDigest: `sha256:${"3".repeat(64)}` as const,
+    };
+    const workerArtifactDigest = `sha256:${"4".repeat(64)}` as const;
+    try {
+      const formTarget = {
+        ...target,
+        formAuthority: {
+          workerName: "takoserver-form-authority-production",
+          identityProbeWorkerName: "takoserver-form-identity-production",
+          identityProbeOrigin:
+            "https://takoserver-form-identity-production.production.example.workers.dev",
+          hostId: target.publicOrigin,
+        },
+      } satisfies DeployTarget;
+      const path = writeWorkerConfig(formTarget, {
+        path: join(root, "wrangler.jsonc"),
+        main: join(root, "worker.js"),
+        commit: "a".repeat(40),
+        topology: "version-only",
+        formImplementationIdentity: semantic,
+        workerArtifactDigest,
+      });
+      const config = JSON.parse(readFileSync(path, "utf8")) as {
+        name: string;
+        d1_databases?: unknown;
+        r2_buckets?: unknown;
+        vars: Record<string, string>;
+        define: Record<string, string>;
+        [key: string]: unknown;
+      };
+      for (const key of [
+        "routes",
+        "route",
+        "custom_domains",
+        "domains",
+        "workers_dev",
+        "workers_dev_subdomain",
+        "triggers",
+      ]) {
+        expect(config).not.toHaveProperty(key);
+      }
+      expect(config.name).toBe(formTarget.workerName);
+      expect(config.d1_databases).toBeDefined();
+      expect(config.r2_buckets).toBeDefined();
+      expect(config.vars.TAKOSERVER_WORKER_ARTIFACT_DIGEST).toBe(workerArtifactDigest);
+      expect(config.define).toEqual({
+        TAKOSERVER_BUILD_FORM_IMPLEMENTATION_DIGEST: JSON.stringify(semantic.implementationDigest),
+        TAKOSERVER_BUILD_FORM_CAPABILITY_DIGEST: JSON.stringify(semantic.capabilityDigest),
+        TAKOSERVER_BUILD_FORM_IMPLEMENTATION_PAYLOAD_DIGEST: JSON.stringify(
+          semantic.implementationPayloadDigest,
+        ),
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("derives an exact secret inventory from enabled product capabilities", () => {
     expect(expectedWorkerSecrets(target)).toEqual([
       "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN",

@@ -63,7 +63,7 @@ no operator input.
 
 | Surface | Supported action(s) | Environment | Required input condition |
 | --- | --- | --- | --- |
-| `takoserver-worker` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both actions. |
+| `takoserver-worker` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both actions. Stored Wrangler OAuth is refused because it cannot prove workers.dev enabled state or exhaustive custom-domain inventory. |
 | `takoserver-worker-authority-cutover` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-form-authority-identity-probe` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-form-authority-worker` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
@@ -88,12 +88,51 @@ no operator input.
 
 The routine surfaces are:
 
-- `takoserver-worker`: one Worker code upload. It refuses pending D1
-  migrations, any config/secret/signing/topology drift, and any selected diff
-  that changes authentication, authorization, the deploy mechanism, or any
-  executable dependency in the build-derived public Form payload/identity
-  closure. The latter closure is derived from the real P/I build roots rather
-  than maintained as a provider/handler filename regex.
+- `takoserver-worker`: one Worker code publication. Every environment requires
+  the explicit API-token/direct-REST path. Stored Wrangler OAuth is disabled:
+  its supported readers cannot prove whether workers.dev is enabled or list an
+  exhaustive custom-domain inventory, and target URL/alias declarations are
+  not live proof. When the selected public origin is under workers.dev, direct
+  REST must prove both the script-specific enabled state and the account-owned
+  workers.dev subdomain, then require the origin hostname to equal exactly
+  `<worker-name>.<account-subdomain>.workers.dev`. An arbitrary workers.dev
+  suffix is refused. The exhaustive custom-domain inventory is proved
+  independently. The deploy tool never extracts an OAuth credential.
+  Non-production routine publication builds with the version API, uploads one
+  immutable Version, re-reads the exact active deployment/Version, binding,
+  secret, routing, and migration closure, and only then explicitly deploys the
+  uploaded Version to 100% traffic. The realized config is topology-neutral:
+  routes, custom domains, workers.dev toggles, and triggers are not sent to
+  either publication command. A target-scoped Linux kernel `flock` in the
+  operator host's private temporary directory serializes this owning
+  publication path on that host from the final pre-mutation closure read through
+  post-mutation authoritative history and public smoke. Its atomic owner
+  sidecar binds the host boot id, lock-holder PID start ticks, and lock-file
+  device/inode. Status reports `active`, `stale-reclaimable`, `available`, or
+  `unsafe` in the ordinary routine `--status` output. A crashed holder releases
+  the kernel lock; the next apply replaces its complete stale sidecar only
+  while holding that lock. An active lock is
+  refused, while malformed or identity-inconsistent owner state stays `unsafe`
+  and is never deleted on assumption. It is not a provider lock. Cloudflare's supported deployment
+  POST and Wrangler command expose no predecessor/CAS condition, so a dashboard
+  action, direct API call, another owning deploy surface, or invocation on
+  another host can still race the final traffic mutation. A
+  failed post-upload re-read means traffic is indeterminate: this invocation
+  has not started its traffic deployment, but it does not claim the uploaded
+  Version is inactive or that another actor left traffic unchanged. After a
+  successful traffic mutation, authoritative history must identify the exact
+  uploaded Version and deployment; its actual immediate predecessor, not the
+  earlier observation, is printed as the rollback target. A concurrent
+  deployment observed by that readback fails verification instead of triggering
+  an automatic restore. An external advance after the point-in-time history
+  read is not fenced by the host lease and may remain undetected when its public
+  behavior also passes the smoke. Strict publication JSON, the exact
+  discovery/OpenAPI public smoke, and that readback must all pass. It
+  refuses pending D1 migrations, any config/secret/signing drift, and any
+  selected diff that changes authentication, authorization, the deploy
+  mechanism, or any executable dependency in the build-derived public Form
+  payload/identity closure. The latter closure is derived from the real P/I
+  build roots rather than maintained as a provider/handler filename regex.
 - `takoserver-site`: one Pages upload and byte-exact immutable URL readback;
   production also requires byte-exact `https://takoserver.com/` readback.
 - `takoserver-console`: one Console Worker upload. Exhaustive domain state must
@@ -477,7 +516,10 @@ link-free `0700` `TAKOSERVER_INTEGRATION_E2E_OUTPUT_DIRECTORY` as three separate
 
 ## Failure handling
 
-Preflight failure means no target was touched. A mutation acknowledgement
+Preflight failure means no target was touched. Once traffic deployment is
+acknowledged, every authoritative Cloudflare/closure inspection failure is
+reported in the verification phase; it must never print the preflight-only
+`No target was touched` aftermath. A mutation acknowledgement
 failure is indeterminate: the command does not retry and the operator must run
 the same surface with `--status`. A failed post-condition means the mutation
 was acknowledged but must be repaired or rolled back explicitly. Routine

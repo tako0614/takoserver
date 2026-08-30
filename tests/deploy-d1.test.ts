@@ -37,4 +37,23 @@ describe("strict Wrangler D1 readback", () => {
       );
     }
   });
+
+  test("refuses log framing around the JSON result", async () => {
+    const database = new RemoteD1("/tmp/wrangler.jsonc", {
+      environment: {},
+      run: processReturning([{ success: true, results: [{ name: "one" }] }]),
+    });
+    const framed = new RemoteD1("/tmp/wrangler.jsonc", {
+      environment: {},
+      run: async (): Promise<CommandResult> => ({
+        exitCode: 0,
+        stdout: `warning\n${JSON.stringify([{ success: true, results: [{ name: "one" }] }])}\n`,
+        stderr: "",
+      }),
+    });
+    await expect(database.query("preflight", "strict read", "SELECT 1")).resolves.toHaveLength(1);
+    await expect(framed.query("preflight", "strict read", "SELECT 1")).rejects.toThrow(
+      "unparsable JSON",
+    );
+  });
 });
