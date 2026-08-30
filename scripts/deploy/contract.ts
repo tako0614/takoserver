@@ -329,7 +329,11 @@ export const DEPLOY_CONTRACT = {
     {
       surface: "takoserver-signing-repair",
       target: "cloudflare-worker-secret:environment-selected-current-signing-key",
-      covers: ["scripts/deploy/signing.ts", "scripts/deploy/worker-live.ts"],
+      covers: [
+        "scripts/deploy/signing.ts",
+        "scripts/deploy/worker-live.ts",
+        "scripts/deploy/worker-state.ts",
+      ],
       requiresScripts: ["deploy"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: [
@@ -363,9 +367,14 @@ export const DEPLOY_CONTRACT = {
       triggers: ["authority", "published-identity"],
       obligations: {
         provenance:
-          "The target explicitly names different current and next ids; both public keys must be pre-registered and the owned 0600 next private JWK must prove the next public half.",
+          "The target explicitly names different current and next ids; both public keys must be pre-registered and the owned 0600 next private JWK must prove the next public half. " +
+          "The ordinary path requires a canonical current-key Version even when the Hosted secret is present. " +
+          "Only integration may instead select the exact workers/triggered_by=secret H profile and its strict canonical C predecessor. " +
+          "Status and apply branch exhaustively on that exact annotation profile: mixed or unknown inventories fail before build/upload. " +
+          "Every history entry has a valid shape and UUID Version, deployment ids are globally unique, and only the inferred C-to-H or C-to-H-to-S prefix requires unique Version ids; older rollback reuse remains valid outside it.",
         "post-conditions":
-          "The immutable Worker version explicitly names the next id with the exact secret inventory and unchanged code, while both public rows remain byte-identical.",
+          "The immutable Worker version explicitly names the next id with the exact secret inventory and unchanged code, while both public rows remain byte-identical. " +
+          "An integration H status remains ready=false and repair-required while naming rotationApplyReady separately; H-to-S performs exactly one canonical deploy with --secrets-file and no classic secret put/delete mutation.",
         reversal:
           "The explicit current key remains pre-registered, so an operator may run a separately reviewed inverse rotation; no silent switch or key deletion occurs.",
         "failure-handling": highRiskFailure,
@@ -377,7 +386,12 @@ export const DEPLOY_CONTRACT = {
     {
       surface: "takoserver-hosted-token-cutover",
       target: "cloudflare-worker-secret:environment-selected-hosted-token",
-      covers: ["scripts/deploy/hosted.ts", "scripts/deploy/signing.ts"],
+      covers: [
+        "scripts/deploy/hosted.ts",
+        "scripts/deploy/signing.ts",
+        "scripts/deploy/worker-live.ts",
+        "scripts/deploy/worker-state.ts",
+      ],
       requiresScripts: ["deploy"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: [
@@ -388,11 +402,38 @@ export const DEPLOY_CONTRACT = {
       triggers: ["authority"],
       obligations: {
         provenance:
-          "The owned 0600 token file is sent only on stdin to the independent public Worker.",
+          "The owned 0600 token file is sent only on stdin to the independent public Worker. " +
+          "During the temporary integration transition, a provider-created H Version is " +
+          "trusted only as the exact C-to-H direct successor: C has the canonical " +
+          "workers/message commit/digest plus workers/triggered_by=version_upload and closure without the named secret, H has only " +
+          "workers/triggered_by=secret, both have equal resources.script.etag, and the " +
+          "secret/domain inventory and deployment history are exact and stable. The trigger " +
+          "annotation alone is not provenance. Rehearsal and production reject H even with a " +
+          "canonical D1 row; canonical token-present proof-only apply is available in every environment " +
+          "after exact local and remote source qualification, with production-strength qualification " +
+          "outside integration. Its strict status remains proof-pending and ready=false, and reports " +
+          "proofApplyReady only from the selected commit and source-independent live closure. Secret " +
+          "presence alone never selects the bridge. Fresh C-to-H apply is also " +
+          "integration-only: rehearsal/production C status reports cutoverApplyReady=false and " +
+          "ready=false, while apply refuses after minimal Worker-state classification and before " +
+          "source, reviewer, token-file, D1-row, proof-tenant, mutation, or HTTP-proof work. " +
+          "Immediately before the " +
+          "first secret put, the exact C history, commit, digest, script etag, D1 signing row, " +
+          "and proof tenant are requalified.",
         "post-conditions":
-          "The bounded sponsorship route accepts the exact token and returns a credential whose signature matches the current D1 public key.",
+          "The bounded sponsorship route accepts the exact token and returns a credential whose signature matches the current D1 public key. " +
+          "Status reports an exact H state as unattributed and repair-required; recovery performs " +
+          "proof only after exact source and independent-review qualification (zero additional " +
+          "secret mutations), and integration signing rotation may repair attribution with one " +
+          "canonical H-to-S upload. After proof, H closure/history/inventory/domains and the D1 row " +
+          "are read back again. Canonical proof-only apply performs zero secret, build, dry-run, upload, or configuration mutation; " +
+          "it validates the owned 0600 token, active current D1 row, stable tenant, exact JWT kid, claims, " +
+          "lifetime and signature, and re-reads canonical Version/history/commit/digest/script identity, " +
+          "binding/secret/domain closure and the byte-identical D1 row around the one HTTP proof. Its " +
+          "sanitized receipt reports mutationApplied=false, functionalProofPending=false, repairRequired=false, and ready=true. " +
+          "This temporary bridge is removed after canonical integration cutover.",
         reversal:
-          "Remove the newly added named secret through an explicit Cloudflare secret deletion; token bytes are never printed.",
+          "Proof-only apply has no mutation to reverse. For a fresh integration cutover, remove the newly added named secret through an explicit Cloudflare secret deletion; token bytes are never printed.",
         "failure-handling": highRiskFailure,
         "independent-review": review,
       },
@@ -445,7 +486,7 @@ export const DEPLOY_CONTRACT = {
           "Forward-only; restoration requires a separately reviewed dedicated surface. This surface never re-puts the retired secret.",
         "failure-handling":
           `${highRiskFailure} A lost acknowledgement is settled by status accepting only the exact ` +
-          "direct successor; a secret-created Version without canonical workers/message is " +
+          "direct successor; a secret-created Version without the exact canonical annotation inventory is " +
           "reported as token-retired-unattributed-successor with ready=false and repairRequired=true. " +
           "The surface refuses to run before topology retirement and never reports a partial delete as complete.",
         "pre-mutation-proof":

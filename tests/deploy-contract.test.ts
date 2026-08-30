@@ -70,6 +70,9 @@ describe("Takoserver split deploy entrypoint", () => {
     const invocation = contract.surfaces.find(
       ({ surface }) => surface === "takoserver-integration-form-authority",
     );
+    const hosted = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-hosted-token-cutover",
+    );
     expect(integrationAuthority?.obligations["post-conditions"]).toContain(
       "exact operator tenant and Space plain-text bindings",
     );
@@ -82,6 +85,15 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(gateway?.obligations["failure-handling"]).toContain("script/domain partial topology");
     expect(invocation?.obligations["failure-handling"]).toContain(
       "exits as a verification failure",
+    );
+    expect(hosted?.obligations.provenance).toContain(
+      "canonical token-present proof-only apply is available in every environment",
+    );
+    expect(hosted?.obligations["post-conditions"]).toContain(
+      "zero secret, build, dry-run, upload, or configuration mutation",
+    );
+    expect(hosted?.obligations["post-conditions"]).toContain(
+      "functionalProofPending=false, repairRequired=false, and ready=true",
     );
 
     for (const surface of contract.surfaces) {

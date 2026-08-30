@@ -127,11 +127,68 @@ The separate authority and irreversible surfaces are:
   secret repair.
 - `takoserver-signing-rotation`: explicit different current and next ids; both
   must already be registered, neither row is overwritten, and the identical
-  Worker code is uploaded with the next id and private secret together.
+  Worker code is uploaded with the next id and private secret together. A
+  canonical sponsored current-key Version follows this ordinary strict path;
+  secret presence does not select a bridge. Only integration may select the
+  exact `workers/triggered_by=secret` H profile. Annotation classification is
+  exhaustive: an exact canonical inventory uses the ordinary path, the exact H
+  inventory uses the integration bridge, and every mixed or unknown inventory
+  fails status/apply before build or upload. H status remains `ready: false` and
+  `repairRequired: true`, while `rotationApplyReady` states whether the selected
+  commit is qualified for the one H→S apply. All deployment-history entries must
+  have valid shapes, UUID Version IDs, unique deployment IDs, and one 100 percent
+  Version. Older rollback reuse of a Version is valid outside the inferred
+  transition, while the C→H or C→H→S prefix itself must contain unique Versions.
 - `takoserver-hosted-token-cutover`: while Hosted topology is absent, puts only
   the Hosted bearer and proves the authenticated sponsorship route returns a
-  credential signed by the current D1 key. Before topology cutover its reversal
-  is explicit deletion of that newly added named secret.
+  credential signed by the current D1 key. Fresh C→H apply is temporary and
+  integration-only. Rehearsal and production may inspect canonical pre-token C,
+  but status reports `cutoverApplyReady: false` and `ready: false`; apply refuses
+  immediately after the minimal Worker-state classification, before source,
+  reviewer, token-file, D1-row, proof-tenant, secret mutation, or HTTP-proof work.
+  Cloudflare may create an unannotated successor when the secret is added. The
+  temporary integration transition accepts that H Version only when it is the
+  exact direct successor of canonical C: C's exact annotation inventory
+  (`workers/message` plus `workers/triggered_by=version_upload`) supplies the
+  selected commit/digest, C's closure is exact without the named secret, H's
+  annotation inventory is exactly `workers/triggered_by=secret`, C/H
+  `resources.script.etag` values match, and the secret/domain inventory plus
+  deployment history are exact and stable. The trigger marker alone is not
+  provenance. Rehearsal and production reject H for both status and apply,
+  including when the D1 row is canonical, without secret mutation or functional
+  proof. A canonically annotated token-present Version remains on the ordinary
+  strict status path; secret presence alone never selects the bridge. That
+  standalone status remains conservative (`functionalProofPending: true`,
+  `ready: false`) and reports `proofApplyReady` only when the selected commit
+  equals the exact source-independent live commit.
+  When that exact canonical token-present Version is current, `--apply` is a
+  proof-only path in integration, rehearsal, and production. It performs no
+  secret put/delete, build, dry-run, Worker upload, or provider configuration
+  mutation, and it writes no D1 proof ledger. The path qualifies the exact
+  local commit plus remote reachability; rehearsal and production use the
+  production-strength clean/source qualification. It then requires the
+  independent reviewer, reads the owned `0600` Hosted token, and validates the
+  exact active current D1 signing row and one stable proof tenant.
+  Immediately before the first secret put, apply re-reads exact C
+  deployment/version/predecessor, commit, digest, script etag,
+  binding/secret/domain closure, the byte-identical D1 row, and the stable proof
+  tenant. Status reports H as unattributed and repair-required. Recovery first
+  qualifies the exact local/remote source commit and independent reviewer, then
+  proves sponsorship without another secret put. Both first apply and recovery
+  finish by re-reading exact H closure/history/secret/domain inventory and the
+  D1 row after proof.
+  Immediately before canonical proof-only HTTP, apply re-reads the exact
+  canonical Version/history, commit, digest, script etag,
+  binding/secret/domain closure, the byte-identical D1 row, and the stable
+  tenant. The one bounded sponsorship response must carry the exact current
+  `kid`, claims and lifetime and verify under that row. Apply then re-reads the
+  final canonical closure/history and exact D1 row and fails on any drift. Its
+  sanitized receipt includes the version, commit, artifact digest, reviewer,
+  key id, public-JWK digest, tenant reference, and lifetime, with
+  `mutationApplied: false`, `functionalProofPending: false`,
+  `repairRequired: false`, and `ready: true`.
+  Before topology cutover its reversal is explicit deletion of that newly added
+  named secret. Canonical proof-only apply has no mutation to reverse.
 - `takoserver-host-runtime-topology-retirement`: C→T transition. It uploads a
   byte-identical candidate Worker exactly once, removes only the observed
   `HOST_RUNTIME_MATERIALIZER` binding, retains the Hosted secret, and proves the
@@ -139,8 +196,9 @@ The separate authority and irreversible surfaces are:
 - `takoserver-hosted-token-retirement`: T→R transition. It deletes only
   `TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN` after topology retirement and verifies
   an exact direct-successor Worker Version with unchanged code identity. If the
-  provider-created R has no canonical `workers/message` annotation, status
-  reports `token-retired-unattributed-successor` with `ready: false` and
+  provider-created R has no exact canonical annotation inventory
+  (`workers/message` plus `workers/triggered_by=version_upload`), status reports
+  `token-retired-unattributed-successor` with `ready: false` and
   `repairRequired: true` rather than claiming completion. This surface is
   forward-only; restoration requires a separately reviewed dedicated surface.
   It never re-puts the retired secret, and token bytes never enter argv or output.
@@ -173,6 +231,13 @@ authority-sensitive Worker code, signing repair or explicit rotation, Hosted
 token cutover, authority candidate transition (L→C), topology retirement (C→T),
 then token retirement (T→R). If token retirement leaves an unannotated R,
 status must show that exact state before the dedicated attribution repair (R→A).
+For the temporary integration Hosted transition, signing rotation is the sole
+attribution repair: it accepts the exact C→H bridge and performs one canonical
+H→S `deploy --secrets-file` upload, with no classic secret put/delete or second
+mutation, and proves C→H→S with the same script identity and byte-identical D1
+rows. Rehearsal, production, and ordinary signing paths remain canonical-strict.
+This is a temporary integration-only bridge, not a generalized compatibility
+layer; remove it after the integration Worker has completed canonical cutover.
 Status must show the required direct predecessor state before each apply. The
 authority and topology retirement surfaces expose their documented reversals;
 token retirement and attribution repair are forward-only and restoration

@@ -5,6 +5,7 @@ import { deploymentVariables, expectedWorkerSecrets } from "./realized-config.ts
 import type { DeployTarget } from "./target.ts";
 
 const VERSION_ID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/u;
+const EXACT_VERSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const MISSING_WORKER = /script_not_found|could not find|does not exist|no deployments/iu;
 
 /**
@@ -314,6 +315,75 @@ export interface WorkerDeploymentHistory {
   readonly previousVersionId: string | null;
 }
 
+export interface WorkerDeploymentChainEntry {
+  readonly deploymentId: string;
+  readonly versionId: string;
+  readonly createdOn: string;
+}
+
+export interface WorkerDeploymentChainOptions {
+  /** Secret-created lineage inference requires provider UUID identities. */
+  readonly requireUuidVersionIds?: boolean;
+}
+
+/**
+ * Canonical Cloudflare deployment-history parser.
+ *
+ * All callers share entry/percentage/deployment-identity validation. Named
+ * transition callers may additionally require UUID identities. Repeated
+ * immutable Versions remain valid rollback history; transition consumers own
+ * uniqueness checks for only the C→H or C→H→S prefix they infer.
+ */
+export function parseWorkerDeploymentChain(
+  value: readonly unknown[],
+  phase: DeployPhase = "preflight",
+  options: WorkerDeploymentChainOptions = {},
+): readonly WorkerDeploymentChainEntry[] {
+  const entries = value.map((entry) => {
+    if (
+      !isRecord(entry) ||
+      typeof entry.id !== "string" ||
+      entry.id.length === 0 ||
+      typeof entry.created_on !== "string" ||
+      !Number.isFinite(Date.parse(entry.created_on)) ||
+      !Array.isArray(entry.versions)
+    ) {
+      throw new DeployError(phase, "Worker deployment history contains a malformed entry");
+    }
+    if (entry.versions.length !== 1) {
+      throw new DeployError(
+        phase,
+        `deployment ${entry.id} must contain exactly one 100 percent Version`,
+      );
+    }
+    const version = entry.versions[0];
+    if (
+      !isRecord(version) ||
+      typeof version.version_id !== "string" ||
+      version.version_id.length === 0 ||
+      version.percentage !== 100
+    ) {
+      throw new DeployError(
+        phase,
+        `deployment ${entry.id} must contain exactly one 100 percent Version`,
+      );
+    }
+    if (options.requireUuidVersionIds === true && !EXACT_VERSION_ID.test(version.version_id)) {
+      throw new DeployError(phase, "Worker deployment history contains an invalid Version ID");
+    }
+    return {
+      deploymentId: entry.id,
+      versionId: version.version_id,
+      createdOn: entry.created_on,
+    };
+  });
+  const deploymentIds = entries.map(({ deploymentId }) => deploymentId);
+  if (new Set(deploymentIds).size !== deploymentIds.length) {
+    throw new DeployError(phase, "Worker deployment history contains duplicate deployment IDs");
+  }
+  return [...entries].sort((left, right) => right.createdOn.localeCompare(left.createdOn));
+}
+
 /**
  * Reduces Cloudflare's endpoint-provided deployment history to the active and
  * rollback identities. The endpoint exposes a bounded, non-paginated history;
@@ -322,29 +392,15 @@ export interface WorkerDeploymentHistory {
  */
 export function parseWorkerDeploymentHistory(
   value: readonly unknown[],
+  phase: DeployPhase = "preflight",
 ): WorkerDeploymentHistory | null {
-  if (value.length === 0) return null;
-  const deployments = value.map((entry) => {
-    if (
-      !isRecord(entry) ||
-      typeof entry.id !== "string" ||
-      typeof entry.created_on !== "string" ||
-      !Array.isArray(entry.versions) ||
-      !Number.isFinite(Date.parse(entry.created_on))
-    ) {
-      throw new DeployError("preflight", "Worker deployment history contains a malformed entry");
-    }
-    return { id: entry.id, createdOn: entry.created_on, versions: entry.versions };
-  });
-  deployments.sort((left, right) => right.createdOn.localeCompare(left.createdOn));
+  const deployments = parseWorkerDeploymentChain(value, phase);
   const currentDeployment = deployments[0];
   if (!currentDeployment) return null;
-  const current = singleVersion(currentDeployment);
-  const previous = deployments[1] === undefined ? null : singleVersion(deployments[1]);
   return {
-    deploymentId: currentDeployment.id,
-    versionId: current,
-    previousVersionId: previous,
+    deploymentId: currentDeployment.deploymentId,
+    versionId: currentDeployment.versionId,
+    previousVersionId: deployments[1]?.versionId ?? null,
   };
 }
 
@@ -354,18 +410,10 @@ export function assertExactSecretInventory(
   expected: readonly string[],
   phase: DeployPhase = "preflight",
 ): void {
-  const actual = inventory.map((entry) => {
-    if (!isRecord(entry) || typeof entry.name !== "string" || entry.type !== "secret_text") {
-      throw new DeployError(phase, "Worker secret inventory contains a malformed entry");
-    }
-    return entry.name;
-  });
-  const sortedActual = [...new Set(actual)].sort();
+  const actual = parseWorkerSecretInventory(inventory, phase);
+  const sortedActual = [...actual].sort();
   const sortedExpected = [...new Set(expected)].sort();
-  if (
-    actual.length !== sortedActual.length ||
-    JSON.stringify(sortedActual) !== JSON.stringify(sortedExpected)
-  ) {
+  if (JSON.stringify(sortedActual) !== JSON.stringify(sortedExpected)) {
     throw new DeployError(
       phase,
       "Worker secret inventory drift",
@@ -374,24 +422,30 @@ export function assertExactSecretInventory(
   }
 }
 
-function singleVersion(deployment: {
-  readonly id: string;
-  readonly versions: readonly unknown[];
-}): string {
-  if (deployment.versions.length !== 1) {
-    throw new DeployError(
-      "preflight",
-      `deployment ${deployment.id} must contain exactly one 100 percent version`,
-    );
+/** Parses the provider's exhaustive secret name/type inventory once. */
+export function parseWorkerSecretInventory(
+  inventory: readonly unknown[],
+  phase: DeployPhase = "preflight",
+): readonly string[] {
+  const names = inventory.map((entry) => {
+    if (!isRecord(entry) || typeof entry.name !== "string" || entry.type !== "secret_text") {
+      throw new DeployError(phase, "Worker secret inventory contains a malformed entry");
+    }
+    return entry.name;
+  });
+  if (new Set(names).size !== names.length) {
+    throw new DeployError(phase, "Worker secret inventory contains a duplicate name");
   }
-  const version = deployment.versions[0];
-  if (!isRecord(version) || typeof version.version_id !== "string" || version.percentage !== 100) {
-    throw new DeployError(
-      "preflight",
-      `deployment ${deployment.id} must contain exactly one 100 percent version`,
-    );
-  }
-  return version.version_id;
+  return names;
+}
+
+/** Shared membership check used by Hosted and signing transition classifiers. */
+export function workerSecretInventoryIncludes(
+  inventory: readonly unknown[],
+  name: string,
+  phase: DeployPhase = "preflight",
+): boolean {
+  return parseWorkerSecretInventory(inventory, phase).includes(name);
 }
 
 export async function assertTargetBindingClosure(

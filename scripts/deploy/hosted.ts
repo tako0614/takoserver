@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -15,18 +16,23 @@ import {
 import { type DeployEnvironment, qualifySource } from "./qualification.ts";
 import { expectedWorkerSecrets, writeWorkerConfig } from "./realized-config.ts";
 import {
-  activePublicJwk,
+  activeHostedTokenCutoverPublicJwk,
   createRemoteSigningDatabase,
   type SigningPublicKeyRow,
 } from "./signing.ts";
 import type { DeployTarget } from "./target.ts";
 import {
-  inspectLiveWorkerVersion,
-  type LiveWorkerVersion,
+  type CanonicalWorkerVersionWithScriptIdentity,
+  inspectCanonicalWorkerVersionWithScriptIdentity,
+  inspectSecretCreatedDirectSuccessor,
+  type SecretCreatedDirectSuccessor,
   type WorkerState,
+  workerVersionAnnotationProfile,
 } from "./worker-live.ts";
+import { parseWorkerDeploymentHistory, workerSecretInventoryIncludes } from "./worker-state.ts";
 
 const HOSTED_SECRET = "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN";
+const TOKEN_REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{2,255}$/u;
 
 export interface HostedDatabase {
   readSigningKey(keyId: string, phase: DeployPhase): Promise<SigningPublicKeyRow | null>;
@@ -90,9 +96,35 @@ export async function runHosted(
         accountId: target.accountId,
         token: exactCloudflareToken(environment),
       });
-    const database = options.database ?? remoteHostedDatabase(configPath, environment, run);
     if (invocation.action === "status") {
       return await hostedStatus(invocation, target, state);
+    }
+    const inspection = await inspectHostedState("preflight", invocation, target, state);
+    if (inspection.kind === "canonical-pre-token" && invocation.environment !== "integration") {
+      throw preflightError("fresh Hosted token cutover is integration-only");
+    }
+    const database = options.database ?? remoteHostedDatabase(configPath, environment, run);
+    if (inspection.kind === "hosted-token-added-unattributed-successor") {
+      return await recoverHostedToken(
+        invocation,
+        target,
+        state,
+        database,
+        inspection.successor,
+        run,
+        options,
+      );
+    }
+    if (inspection.kind === "canonical-token-present") {
+      return await proveCanonicalHostedToken(
+        invocation,
+        target,
+        state,
+        database,
+        inspection.live,
+        run,
+        options,
+      );
     }
     return await cutoverHostedToken(
       invocation,
@@ -103,10 +135,98 @@ export async function runHosted(
       environment,
       run,
       options,
+      inspection.live,
     );
   } finally {
     if (temporary) rmSync(root, { recursive: true, force: true });
   }
+}
+
+async function proveCanonicalHostedToken(
+  invocation: HostedInvocation,
+  target: DeployTarget,
+  state: WorkerState,
+  database: HostedDatabase,
+  before: CanonicalWorkerVersionWithScriptIdentity,
+  run: HostedProcess,
+  options: HostedOptions,
+): Promise<Record<string, unknown>> {
+  const source = await qualifyHostedProofSource(invocation, run);
+  if (before.commit !== source.commit) {
+    throw preflightError("canonical Hosted token Worker does not match the selected source");
+  }
+  const reviewer = exactReviewer(
+    options.review ?? requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW"),
+  );
+  const token = readHostedToken(
+    options.tokenPath ?? requireEnvironment("TAKOSERVER_HOSTED_TOKEN_PATH"),
+  );
+  const row = await database.readSigningKey(target.signing.currentKeyId, "preflight");
+  if (row === null) throw preflightError("current signing identity disappeared before proof");
+  const publicJwk = activeHostedTokenCutoverPublicJwk(
+    row,
+    target.signing.currentKeyId,
+    invocation.environment,
+  );
+  const tenantRef = exactProofTenant(await database.proofTenant("preflight"), "preflight");
+  const requalified = await inspectCanonicalWorkerVersionWithScriptIdentity(
+    "preflight",
+    target,
+    state,
+    {
+      signingKeyId: target.signing.currentKeyId,
+      expectedSecrets: expectedWorkerSecrets(target),
+      selectedCommit: source.commit,
+    },
+  );
+  if (!sameCanonicalVersion(before, requalified)) {
+    throw preflightError("canonical Hosted token Worker changed while proof was prepared");
+  }
+  assertSigningRow(
+    "preflight",
+    await database.readSigningKey(target.signing.currentKeyId, "preflight"),
+    row,
+  );
+  if (exactProofTenant(await database.proofTenant("preflight"), "preflight") !== tenantRef) {
+    throw preflightError("Hosted credential proof tenant changed before HTTP proof");
+  }
+  const proof = {
+    ...(await proveHostedCredential(
+      target.publicOrigin,
+      tenantRef,
+      token,
+      target.signing.currentKeyId,
+      publicJwk,
+      options.fetcher ?? ((input, init) => fetch(input, init)),
+    )),
+    publicJwkDigest: sha256(row.publicJwk),
+  };
+  const final = await inspectHostedState("verification", invocation, target, state);
+  if (final.kind !== "canonical-token-present" || !sameCanonicalVersion(before, final.live)) {
+    throw verificationError("canonical Hosted token Worker changed during functional proof");
+  }
+  assertSigningRow(
+    "verification",
+    await database.readSigningKey(target.signing.currentKeyId, "verification"),
+    row,
+  );
+  return {
+    kind: "takoserver.hosted-token-cutover-apply@v2",
+    surface: invocation.surface,
+    environment: invocation.environment,
+    commit: source.commit,
+    reviewer,
+    state: "canonical-token-present",
+    mutationApplied: false,
+    functionalProofPending: false,
+    repairRequired: false,
+    ready: true,
+    versionId: before.history.versionId,
+    previousVersionId: before.history.previousVersionId,
+    artifactDigest: `sha256:${before.bundleDigestHex}`,
+    scriptContentIdentity: before.scriptEtag,
+    proof,
+  };
 }
 
 async function hostedStatus(
@@ -114,32 +234,135 @@ async function hostedStatus(
   target: DeployTarget,
   state: WorkerState,
 ): Promise<Record<string, unknown>> {
-  const desiredSecrets = expectedWorkerSecrets(target);
-  const preTokenSecrets = desiredSecrets.filter((name) => name !== HOSTED_SECRET);
-  let tokenPresent = true;
-  let live: LiveWorkerVersion;
-  try {
-    live = await inspectLiveWorkerVersion("preflight", target, state, {
-      signingKeyId: target.signing.currentKeyId,
-      expectedSecrets: desiredSecrets,
-    });
-  } catch {
-    tokenPresent = false;
-    live = await inspectLiveWorkerVersion("preflight", target, state, {
-      signingKeyId: target.signing.currentKeyId,
-      expectedSecrets: preTokenSecrets,
-    });
+  const inspection = await inspectHostedState("preflight", invocation, target, state);
+  if (inspection.kind === "canonical-pre-token") {
+    const { live } = inspection;
+    const cutoverApplyReady =
+      invocation.environment === "integration" && live.commit === invocation.commit;
+    return {
+      kind: "takoserver.hosted-token-cutover-status@v2",
+      surface: invocation.surface,
+      environment: invocation.environment,
+      selectedCommit: invocation.commit,
+      state: "canonical-pre-token",
+      mutationApplied: false,
+      functionalProofPending: false,
+      repairRequired: false,
+      deployedCommit: live.commit,
+      artifactDigest: `sha256:${live.bundleDigestHex}`,
+      versionId: live.history.versionId,
+      previousVersionId: live.history.previousVersionId,
+      hostedTokenPresent: false,
+      cutoverApplyReady,
+      ready: cutoverApplyReady,
+    };
   }
+  if (inspection.kind === "canonical-token-present") {
+    const { live } = inspection;
+    return {
+      kind: "takoserver.hosted-token-cutover-status@v2",
+      surface: invocation.surface,
+      environment: invocation.environment,
+      selectedCommit: invocation.commit,
+      state: "canonical-token-present",
+      mutationApplied: true,
+      functionalProofPending: true,
+      repairRequired: false,
+      deployedCommit: live.commit,
+      artifactDigest: `sha256:${live.bundleDigestHex}`,
+      versionId: live.history.versionId,
+      previousVersionId: live.history.previousVersionId,
+      hostedTokenPresent: true,
+      proofApplyReady: live.commit === invocation.commit,
+      ready: false,
+    };
+  }
+  const successor = inspection.successor;
   return {
     kind: "takoserver.hosted-token-cutover-status@v2",
     surface: invocation.surface,
     environment: invocation.environment,
     selectedCommit: invocation.commit,
-    deployedCommit: live.commit,
-    versionId: live.history.versionId,
-    hostedTokenPresent: tokenPresent,
-    ready: live.commit === invocation.commit && !tokenPresent,
+    state: "hosted-token-added-unattributed-successor",
+    mutationApplied: true,
+    functionalProofPending: true,
+    repairRequired: true,
+    deployedCommit: successor.predecessorCommit,
+    artifactDigest: `sha256:${successor.predecessorBundleDigestHex}`,
+    inheritedCommit: successor.predecessorCommit,
+    inheritedBundleDigest: `sha256:${successor.predecessorBundleDigestHex}`,
+    versionId: successor.successorVersionId,
+    previousVersionId: successor.predecessorVersionId,
+    hostedTokenPresent: true,
+    scriptContentIdentity: successor.successorScriptEtag,
+    provenance: successor.provenance,
+    ready: false,
   };
+}
+
+type HostedInspection =
+  | {
+      readonly kind: "canonical-pre-token";
+      readonly live: CanonicalWorkerVersionWithScriptIdentity;
+    }
+  | {
+      readonly kind: "canonical-token-present";
+      readonly live: CanonicalWorkerVersionWithScriptIdentity;
+    }
+  | {
+      readonly kind: "hosted-token-added-unattributed-successor";
+      readonly successor: SecretCreatedDirectSuccessor;
+    };
+
+async function inspectHostedState(
+  phase: DeployPhase,
+  invocation: HostedInvocation,
+  target: DeployTarget,
+  state: WorkerState,
+): Promise<HostedInspection> {
+  const desiredSecrets = expectedWorkerSecrets(target);
+  const preTokenSecrets = desiredSecrets.filter((name) => name !== HOSTED_SECRET);
+  const inventory = await state.workerSecrets(target.workerName);
+  const tokenPresent = workerSecretInventoryIncludes(inventory, HOSTED_SECRET, phase);
+  if (tokenPresent) {
+    const history = parseWorkerDeploymentHistory(
+      await state.workerDeployments(target.workerName),
+      phase,
+    );
+    if (history === null) {
+      throw phaseError(phase, "Worker has no authoritative current deployment");
+    }
+    const version = await state.workerVersion(target.workerName, history.versionId);
+    const annotation = workerVersionAnnotationProfile(version);
+    if (annotation === "canonical") {
+      const live = await inspectCanonicalWorkerVersionWithScriptIdentity(phase, target, state, {
+        signingKeyId: target.signing.currentKeyId,
+        expectedSecrets: desiredSecrets,
+        secretInventory: inventory,
+      });
+      return { kind: "canonical-token-present", live };
+    }
+    if (invocation.environment !== "integration") {
+      throw phaseError(phase, "unannotated Hosted token successor recovery is integration-only");
+    }
+    if (annotation !== "secret-created") {
+      throw phaseError(phase, "Hosted token successor has no exact authority annotation profile");
+    }
+    const successor = await inspectSecretCreatedDirectSuccessor(phase, target, state, {
+      addedSecret: HOSTED_SECRET,
+      signingKeyId: target.signing.currentKeyId,
+      selectedCommit: invocation.commit,
+      secretInventory: inventory,
+      expectedSuccessorVersionId: history.versionId,
+    });
+    return { kind: "hosted-token-added-unattributed-successor", successor };
+  }
+  const live = await inspectCanonicalWorkerVersionWithScriptIdentity(phase, target, state, {
+    signingKeyId: target.signing.currentKeyId,
+    expectedSecrets: preTokenSecrets,
+    secretInventory: inventory,
+  });
+  return { kind: "canonical-pre-token", live };
 }
 
 async function cutoverHostedToken(
@@ -151,13 +374,8 @@ async function cutoverHostedToken(
   environment: Readonly<Record<string, string>>,
   run: HostedProcess,
   options: HostedOptions,
+  before: CanonicalWorkerVersionWithScriptIdentity,
 ): Promise<Record<string, unknown>> {
-  const desiredSecrets = expectedWorkerSecrets(target);
-  const preTokenSecrets = desiredSecrets.filter((name) => name !== HOSTED_SECRET);
-  const before = await inspectLiveWorkerVersion("preflight", target, state, {
-    signingKeyId: target.signing.currentKeyId,
-    expectedSecrets: preTokenSecrets,
-  });
   const source = await qualifySource({
     environment: invocation.environment === "integration" ? "integration" : "production",
     commit: invocation.commit,
@@ -176,8 +394,34 @@ async function cutoverHostedToken(
   );
   const row = await database.readSigningKey(target.signing.currentKeyId, "preflight");
   if (row === null) throw preflightError("current signing identity disappeared before cutover");
-  const publicJwk = activePublicJwk(row, target.signing.currentKeyId);
+  const publicJwk = activeHostedTokenCutoverPublicJwk(
+    row,
+    target.signing.currentKeyId,
+    invocation.environment,
+  );
   const tenantRef = await database.proofTenant("preflight");
+  const preTokenSecrets = expectedWorkerSecrets(target).filter((name) => name !== HOSTED_SECRET);
+  const requalified = await inspectCanonicalWorkerVersionWithScriptIdentity(
+    "preflight",
+    target,
+    state,
+    {
+      signingKeyId: target.signing.currentKeyId,
+      expectedSecrets: preTokenSecrets,
+      selectedCommit: source.commit,
+    },
+  );
+  if (!sameCanonicalVersion(before, requalified)) {
+    throw preflightError("canonical Worker predecessor changed while Hosted cutover was prepared");
+  }
+  assertSigningRow(
+    "preflight",
+    await database.readSigningKey(target.signing.currentKeyId, "preflight"),
+    row,
+  );
+  if ((await database.proofTenant("preflight")) !== tenantRef) {
+    throw preflightError("Hosted credential proof tenant changed before token mutation");
+  }
   const mutation = await run(
     wranglerCommand([
       "secret",
@@ -196,11 +440,12 @@ async function cutoverHostedToken(
       `${mutation.stdout}${mutation.stderr}`.trim(),
     );
   }
-  const after = await inspectLiveWorkerVersion("verification", target, state, {
+  const after = await inspectSecretCreatedDirectSuccessor("verification", target, state, {
+    addedSecret: HOSTED_SECRET,
     signingKeyId: target.signing.currentKeyId,
-    expectedSecrets: desiredSecrets,
+    selectedCommit: source.commit,
+    expectedPredecessorVersionId: before.history.versionId,
   });
-  assertOnlyConfiguredStateAdvance(before, after, "Hosted token cutover");
   const proof = await proveHostedCredential(
     target.publicOrigin,
     tenantRef,
@@ -209,20 +454,140 @@ async function cutoverHostedToken(
     publicJwk,
     options.fetcher ?? ((input, init) => fetch(input, init)),
   );
-  assertSigningRow(await database.readSigningKey(target.signing.currentKeyId, "verification"), row);
+  const final = await inspectHostedState("verification", invocation, target, state);
+  if (
+    final.kind !== "hosted-token-added-unattributed-successor" ||
+    !sameSecretCreatedSuccessor(after, final.successor)
+  ) {
+    throw verificationError("Hosted token cutover observed a changed final Worker successor");
+  }
+  assertSigningRow(
+    "verification",
+    await database.readSigningKey(target.signing.currentKeyId, "verification"),
+    row,
+  );
   return {
     kind: "takoserver.hosted-token-cutover-apply@v2",
     surface: invocation.surface,
     environment: invocation.environment,
     commit: source.commit,
     reviewer,
-    previousVersionId: before.history.versionId,
-    versionId: after.history.versionId,
+    state: "hosted-token-added-unattributed-successor",
+    mutationApplied: true,
+    functionalProofPending: false,
+    repairRequired: true,
+    ready: false,
+    previousVersionId: after.predecessorVersionId,
+    versionId: after.successorVersionId,
+    artifactDigest: `sha256:${after.predecessorBundleDigestHex}`,
+    scriptContentIdentity: after.successorScriptEtag,
+    provenance: after.provenance,
     proof,
     rollback:
       `remove the newly added secret with ` +
       `wrangler secret delete ${HOSTED_SECRET} --name ${target.workerName}`,
   };
+}
+
+async function recoverHostedToken(
+  invocation: HostedInvocation,
+  target: DeployTarget,
+  state: WorkerState,
+  database: HostedDatabase,
+  successor: SecretCreatedDirectSuccessor,
+  run: HostedProcess,
+  options: HostedOptions,
+): Promise<Record<string, unknown>> {
+  const source = await qualifyHostedProofSource(invocation, run);
+  if (source.commit !== successor.predecessorCommit) {
+    throw preflightError("Hosted token recovery source does not match the canonical predecessor");
+  }
+  const reviewer = exactReviewer(
+    options.review ?? requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW"),
+  );
+  const token = readHostedToken(
+    options.tokenPath ?? requireEnvironment("TAKOSERVER_HOSTED_TOKEN_PATH"),
+  );
+  const row = await database.readSigningKey(target.signing.currentKeyId, "preflight");
+  if (row === null)
+    throw preflightError("current signing identity disappeared before proof recovery");
+  const publicJwk = activeHostedTokenCutoverPublicJwk(
+    row,
+    target.signing.currentKeyId,
+    invocation.environment,
+  );
+  const tenantRef = await database.proofTenant("preflight");
+  const proof = await proveHostedCredential(
+    target.publicOrigin,
+    tenantRef,
+    token,
+    target.signing.currentKeyId,
+    publicJwk,
+    options.fetcher ?? ((input, init) => fetch(input, init)),
+  );
+  const final = await inspectHostedState("verification", invocation, target, state);
+  if (
+    final.kind !== "hosted-token-added-unattributed-successor" ||
+    !sameSecretCreatedSuccessor(final.successor, successor)
+  ) {
+    throw verificationError("Hosted token proof recovery observed a changed Worker successor");
+  }
+  assertSigningRow(
+    "verification",
+    await database.readSigningKey(target.signing.currentKeyId, "verification"),
+    row,
+  );
+  return {
+    kind: "takoserver.hosted-token-cutover-apply@v2",
+    surface: invocation.surface,
+    environment: invocation.environment,
+    commit: source.commit,
+    reviewer,
+    state: "hosted-token-added-unattributed-successor",
+    mutationApplied: false,
+    functionalProofPending: false,
+    repairRequired: true,
+    ready: false,
+    previousVersionId: successor.predecessorVersionId,
+    versionId: successor.successorVersionId,
+    artifactDigest: `sha256:${successor.predecessorBundleDigestHex}`,
+    scriptContentIdentity: successor.successorScriptEtag,
+    provenance: successor.provenance,
+    proof,
+  };
+}
+
+async function qualifyHostedProofSource(invocation: HostedInvocation, run: HostedProcess) {
+  const source = await qualifySource({
+    environment: invocation.environment === "integration" ? "integration" : "production",
+    commit: invocation.commit,
+    run,
+  });
+  const fetched = await run(["git", "fetch", "--quiet", "--all", "--prune"]);
+  if (fetched.exitCode !== 0) {
+    throw preflightError(
+      `Hosted proof source remote qualification failed (exit ${fetched.exitCode})`,
+      `${fetched.stdout}${fetched.stderr}`.trim(),
+    );
+  }
+  const contains = await run(["git", "branch", "-r", "--contains", source.commit]);
+  if (contains.exitCode !== 0) {
+    throw preflightError(
+      `Hosted proof source remote reachability failed (exit ${contains.exitCode})`,
+      `${contains.stdout}${contains.stderr}`.trim(),
+    );
+  }
+  const remoteRefs = contains.stdout
+    .split("\n")
+    .map((line) => line.trim().replace(/^\*\s*/u, ""))
+    .filter((line) => line.length > 0 && !line.includes(" -> "));
+  if (
+    remoteRefs.length === 0 ||
+    remoteRefs.some((line) => !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$/u.test(line))
+  ) {
+    throw preflightError("Hosted proof source commit is not reachable from an exact remote ref");
+  }
+  return source;
 }
 
 function remoteHostedDatabase(
@@ -323,14 +688,16 @@ async function proveHostedCredential(
     claims.runRef !== "deploy-hosted-proof" ||
     claims.spaceRef !== "deploy-hosted-proof" ||
     typeof claims.organizationId !== "string" ||
+    !TOKEN_REFERENCE.test(claims.organizationId) ||
     typeof claims.jti !== "string" ||
+    !TOKEN_REFERENCE.test(claims.jti) ||
     !Number.isSafeInteger(claims.iat) ||
     claims.nbf !== claims.iat ||
     !Number.isSafeInteger(claims.exp) ||
     Number(claims.iat) > Math.floor(Date.now() / 1_000) ||
     Number(claims.exp) <= Math.floor(Date.now() / 1_000) ||
     Number(claims.exp) <= Number(claims.iat) ||
-    Number(claims.exp) - Number(claims.iat) > 60
+    Number(claims.exp) - Number(claims.iat) !== 60
   ) {
     throw verificationError("bounded Hosted credential proof carries invalid claims");
   }
@@ -356,15 +723,54 @@ async function proveHostedCredential(
   };
 }
 
-function assertSigningRow(actual: SigningPublicKeyRow | null, expected: SigningPublicKeyRow): void {
+function assertSigningRow(
+  phase: "preflight" | "verification",
+  actual: SigningPublicKeyRow | null,
+  expected: SigningPublicKeyRow,
+): void {
   if (
     actual?.keyId !== expected.keyId ||
     actual.publicJwk !== expected.publicJwk ||
     actual.createdAtEpochSeconds !== expected.createdAtEpochSeconds ||
     actual.revokedAtEpochSeconds !== null
   ) {
-    throw verificationError(`D1 signing identity ${expected.keyId} changed during Hosted cutover`);
+    throw phaseError(phase, `D1 signing identity ${expected.keyId} changed during Hosted cutover`);
   }
+}
+
+function sameCanonicalVersion(
+  left: CanonicalWorkerVersionWithScriptIdentity,
+  right: CanonicalWorkerVersionWithScriptIdentity,
+): boolean {
+  return (
+    left.history.deploymentId === right.history.deploymentId &&
+    left.history.versionId === right.history.versionId &&
+    left.history.previousVersionId === right.history.previousVersionId &&
+    left.commit === right.commit &&
+    left.bundleDigestHex === right.bundleDigestHex &&
+    left.scriptEtag === right.scriptEtag
+  );
+}
+
+function sha256(value: string): string {
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function sameSecretCreatedSuccessor(
+  left: SecretCreatedDirectSuccessor,
+  right: SecretCreatedDirectSuccessor,
+): boolean {
+  return (
+    left.history.deploymentId === right.history.deploymentId &&
+    left.history.versionId === right.history.versionId &&
+    left.history.previousVersionId === right.history.previousVersionId &&
+    left.predecessorVersionId === right.predecessorVersionId &&
+    left.successorVersionId === right.successorVersionId &&
+    left.predecessorCommit === right.predecessorCommit &&
+    left.predecessorBundleDigestHex === right.predecessorBundleDigestHex &&
+    left.predecessorScriptEtag === right.predecessorScriptEtag &&
+    left.successorScriptEtag === right.successorScriptEtag
+  );
 }
 
 export function readHostedToken(path: string): string {
@@ -395,21 +801,6 @@ export function readHostedToken(path: string): string {
   return raw;
 }
 
-function assertOnlyConfiguredStateAdvance(
-  before: LiveWorkerVersion,
-  after: LiveWorkerVersion,
-  label: string,
-): void {
-  if (
-    after.history.versionId === before.history.versionId ||
-    after.history.previousVersionId !== before.history.versionId ||
-    after.commit !== before.commit ||
-    after.bundleDigestHex !== before.bundleDigestHex
-  ) {
-    throw verificationError(`${label} changed the served code identity`);
-  }
-}
-
 function jwtRecord(part: string): Record<string, unknown> {
   try {
     const parsed = JSON.parse(Buffer.from(part, "base64url").toString("utf8"));
@@ -423,6 +814,13 @@ function jwtRecord(part: string): Record<string, unknown> {
 function exactReviewer(value: string): string {
   if (value.trim() !== value || value.length < 1 || value.length > 256 || value.includes("\n")) {
     throw preflightError("TAKOSERVER_INDEPENDENT_REVIEW must name one reviewer");
+  }
+  return value;
+}
+
+function exactProofTenant(value: string, phase: "preflight" | "verification"): string {
+  if (!TOKEN_REFERENCE.test(value)) {
+    throw phaseError(phase, "Hosted credential proof tenant has an invalid exact reference");
   }
   return value;
 }
