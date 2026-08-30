@@ -1,6 +1,6 @@
 # Takoserver deploy surfaces
 
-This repository owns one deploy entrypoint and eighteen separate mutation surfaces.
+This repository owns one deploy entrypoint and nineteen separate mutation surfaces.
 The contract is read-only:
 
 ```sh
@@ -13,6 +13,9 @@ Every routine status or apply invocation has exactly this shape:
 bun run deploy -- <surface> --status --environment=<integration|rehearsal|production> --commit=<40-hex-sha>
 bun run deploy -- <surface> --apply --environment=<integration|rehearsal|production> --commit=<40-hex-sha>
 ```
+
+The integration JIT credential authority instead accepts exactly one of
+`--issue`, `--status`, or `--revoke` through that same entrypoint.
 
 One bootstrap exception exists for the already deployed integration Worker whose
 Version predates the `WORKER_VERSION`
@@ -65,7 +68,13 @@ The routine surfaces are:
 The separate authority and irreversible surfaces are:
 
 - `takoserver-worker-authority-cutover`: reviewed publication of
-  authority-sensitive Worker code only. Its named legacy-edge transition
+  authority-sensitive Worker code and exact owned configuration. Integration
+  may add only the complete JIT credential-authority profile: environment,
+  dedicated public JWK, fixed `org_takosumi_hosted_staging` organization,
+  selected source commit, and built artifact digest. The profile is all or
+  none, and the public key must differ from every login, funding, Form, and
+  other target authority key as well as the authoritative active D1
+  runtime-grant signing key. Its named legacy-edge transition
   profile is the only way to carry an observed Hosted service binding and
   secret into the candidate predecessor state.
 - `takoserver-form-authority-worker`: one reviewed route-less service-binding
@@ -126,6 +135,15 @@ The separate authority and irreversible surfaces are:
   durable activation heads are absent or inactive. It uses the same v2 signed
   request/plan/apply/readback protocol and the same no-retry/credential
   redaction rules.
+- `takoserver-integration-e2e-credentials`: integration only. Its distinct
+  `--issue`, `--status`, and `--revoke` actions exhaustively read the immutable
+  current public Worker Version and exact JIT binding closure before the owner
+  writes a temporary `0600` target snapshot and invokes its internal helper
+  once. Issue creates one 900-second `resources:write` key for the fixed
+  organization; status performs signed exact-operation readback; revoke sends
+  one exact revocation and requires a separately signed absence readback before
+  deleting the two owned local files. Neither private JWK nor API-key bytes
+  enter Worker configuration, argv, owner output, or diagnostics.
 - `takoserver-d1-schema`: ordered, forward-only D1 migration apply and exact
   post-lineage/schema-shape readback.
 - `takoserver-signing-key-register`: append-only public Ed25519 JWK registration
@@ -216,6 +234,12 @@ provider readback plus the surface's bounded public readback. Worker version
 identity is internal deployment history, not a consumer-pinned published
 identity.
 
+Credential actions are pinned more tightly than routine status: the selected
+commit must equal the current immutable Worker annotation, whose artifact
+digest must equal the exact live source/artifact bindings. The live Version id
+is owner-derived and sealed into each proof. A target snapshot, environment
+value, or client payload cannot self-assert those provenance coordinates.
+
 Paginated Cloudflare list state is consumed exhaustively and its pagination
 coordinates are mandatory. Endpoint-specific closed shapes are used for the
 non-paginated Worker deployment-history envelope and secret inventory. Child
@@ -237,6 +261,8 @@ tracked repository. Depending on the surface, the operator supplies:
 - `TAKOSERVER_HOSTED_TOKEN_PATH`
 - `TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH`
 - `TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH`
+- `TAKOSERVER_INTEGRATION_E2E_API_KEY_PRIVATE_JWK_PATH`
+- `TAKOSERVER_INTEGRATION_E2E_OUTPUT_DIRECTORY`
 
 The Form authority surfaces must read the exhaustive account Worker script,
 domain, subdomain, secret, Version, zone, and Worker-route inventories before
@@ -269,6 +295,17 @@ short-lived assertions out of output and diagnostics. The deploy target fixes
 the exact integration tenant/Space activation audience; neither an environment
 variable nor a request can widen that scope.
 
+`TAKOSERVER_INTEGRATION_E2E_API_KEY_PRIVATE_JWK_PATH` is a third, dedicated
+operator-private Ed25519 key. The target stores only its public half and the
+fixed integration organization. It must not be the current runtime-grant
+signing key: the owner proves that against the active canonical public JWK in
+D1 before upload or credential mutation, and the Worker independently checks
+the configured private signing key at startup. The credential surface proves
+the JIT private half against its target, keeps it outside Cloudflare, and writes
+the issued secret plus nonsecret recovery metadata only to the existing link-free `0700`
+`TAKOSERVER_INTEGRATION_E2E_OUTPUT_DIRECTORY` as separate `0600` files. See
+[integration-e2e-credentials.md](integration-e2e-credentials.md).
+
 ## Failure handling
 
 Preflight failure means no target was touched. A mutation acknowledgement
@@ -290,6 +327,13 @@ Run the same surface with `--status`: an exact configured digest means the
 single-variable Version is current, while absence means the selected
 predecessor remains current. Any unrelated configuration or Version advance is
 refused rather than attributed to the interrupted attempt.
+
+For an integration credential issue or revoke failure, do not retry the
+mutation. Run the credential surface with `--status`; it validates the sealed
+metadata and sends one signed readback for the exact deterministic operation.
+Wrong organization, partial bindings, key reuse, selected/live source or
+artifact mismatch, active D1 runtime-signing identity drift, and a live Version
+advance all fail before the helper is invoked.
 
 For a post-token attribution repair acknowledgement failure, do not retry apply.
 Run the same repair surface with both pinned selectors and `--status`: only the

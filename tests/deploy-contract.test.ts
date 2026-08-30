@@ -30,6 +30,7 @@ const SURFACES = [
   ["takoserver-integration-form-authority-operator-worker", ["authority"]],
   ["takoserver-integration-form-authority", ["authority"]],
   ["takoserver-integration-form-authority-deactivation", ["authority"]],
+  ["takoserver-integration-e2e-credentials", ["authority"]],
   ["takoserver-site", []],
   ["takoserver-console", []],
   ["takoserver-d1-schema", ["irreversible"]],
@@ -71,6 +72,9 @@ describe("Takoserver split deploy entrypoint", () => {
     const invocation = contract.surfaces.find(
       ({ surface }) => surface === "takoserver-integration-form-authority",
     );
+    const credentials = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-integration-e2e-credentials",
+    );
     expect(integrationAuthority?.obligations["post-conditions"]).toContain(
       "exact operator tenant and Space plain-text bindings",
     );
@@ -84,6 +88,10 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(invocation?.obligations["failure-handling"]).toContain(
       "exits as a verification failure",
     );
+    expect(credentials?.obligations.provenance).toContain(
+      "exact five-variable JIT authority closure",
+    );
+    expect(credentials?.obligations["failure-handling"]).toContain("never retries issue or revoke");
 
     for (const surface of contract.surfaces) {
       expect(surface.obligations).toMatchObject({
@@ -477,6 +485,50 @@ describe("Takoserver split deploy entrypoint", () => {
         `--environment=${environment}`,
         `--commit=${sha}`,
       ]);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
+    }
+  });
+
+  test("parses the distinct integration credential actions only for integration", async () => {
+    const sha = "a".repeat(40);
+    for (const action of ["--issue", "--status", "--revoke"] as const) {
+      const accepted = await deploy([
+        "takoserver-integration-e2e-credentials",
+        action,
+        "--environment=integration",
+        `--commit=${sha}`,
+      ]);
+      expect(accepted.exitCode).toBe(2);
+      expect(accepted.stderr).toContain("deploy target descriptor not found");
+      expect(accepted.stderr).not.toContain("no target was touched");
+    }
+
+    for (const args of [
+      [
+        "takoserver-integration-e2e-credentials",
+        "--apply",
+        "--environment=integration",
+        `--commit=${sha}`,
+      ],
+      ["takoserver-worker", "--issue", "--environment=integration", `--commit=${sha}`],
+      ["takoserver-worker", "--revoke", "--environment=integration", `--commit=${sha}`],
+      [
+        "takoserver-integration-e2e-credentials",
+        "--status",
+        "--environment=rehearsal",
+        `--commit=${sha}`,
+      ],
+      [
+        "takoserver-integration-e2e-credentials",
+        "--issue",
+        "--environment=production",
+        `--commit=${sha}`,
+      ],
+    ] as const) {
+      const refused = await deploy(args);
       expect(refused.exitCode).toBe(2);
       expect(refused.stdout).toBe("");
       expect(refused.stderr).toContain("no target was touched");

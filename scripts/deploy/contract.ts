@@ -48,13 +48,17 @@ export const DEPLOY_CONTRACT = {
     },
     {
       surface: "takoserver-worker-authority-cutover",
-      target: "cloudflare-worker:environment-selected-takoserver-worker-authority-code",
+      target: "cloudflare-worker:environment-selected-takoserver-worker-authority-code-and-config",
       covers: [
         "src",
         "wrangler.jsonc",
         "scripts/build-worker.ts",
         "scripts/deploy.ts",
         "scripts/deploy/worker.ts",
+        "scripts/deploy/realized-config.ts",
+        "scripts/deploy/target.ts",
+        "scripts/deploy/worker-live.ts",
+        "scripts/deploy/worker-state.ts",
         "scripts/deploy/qualification.ts",
       ],
       requiresScripts: ["check", "deploy"],
@@ -67,12 +71,16 @@ export const DEPLOY_CONTRACT = {
           "realized configuration are sealed and requalified immediately before one upload.",
         "post-conditions":
           "Authoritative deployment/version state, exact binding/configuration closure and the " +
-          "public product probe identify the selected authority-sensitive commit and uploaded artifact.",
+          "public product probe identify the selected authority-sensitive commit and uploaded artifact. " +
+          "Integration JIT enablement adds exactly its environment, dedicated public JWK, fixed organization, " +
+          "source commit and artifact digest plain-text bindings as one all-or-none profile.",
         reversal:
           "The immediately previous Cloudflare Worker version is printed as the provider-history rollback target.",
         "failure-handling":
           `${highRiskFailure} Pending schema and any configuration, secret, signing or Hosted topology ` +
-          "drift are still refused; this surface changes authority-sensitive code bytes only. " +
+          "drift are still refused. Integration alone may bridge exact absence to the complete JIT " +
+          "credential-authority profile; partial fields, wrong organization, reused keys and provenance " +
+          "mismatch are refused. " +
           "The named --legacy-host-runtime-predecessor-version transition profile is the only " +
           "path that may carry the observed legacy service binding and Hosted secret into a " +
           "candidate; ordinary target realization remains free of both retired fields.",
@@ -254,6 +262,47 @@ export const DEPLOY_CONTRACT = {
           "run status for authoritative readback before making an explicit fresh deactivation decision. " +
           "An acknowledged partial apply preserves only sanitized receipts and next-plan diagnostics. " +
           "Assertion and private-key bytes are always redacted.",
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-integration-e2e-credentials",
+      target: "https:integration-exact-live-worker-jit-api-key-authority",
+      covers: [
+        "scripts/deploy.ts",
+        "scripts/deploy/integration-e2e-credentials.ts",
+        "scripts/integration-e2e-credentials.ts",
+        "scripts/deploy/target.ts",
+        "scripts/deploy/worker-live.ts",
+        "scripts/deploy/worker-state.ts",
+        "src/integration-e2e-credential-authority.ts",
+        "src/entry-worker.ts",
+      ],
+      requiresScripts: ["deploy"],
+      requiresTools: ["bun"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INTEGRATION_E2E_API_KEY_PRIVATE_JWK_PATH",
+        "TAKOSERVER_INTEGRATION_E2E_OUTPUT_DIRECTORY",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+      ],
+      triggers: ["authority"],
+      obligations: {
+        provenance:
+          "Integration only. Cloudflare's immutable current Worker Version must prove the selected " +
+          "commit, annotated artifact digest, exact five-variable JIT authority closure and live Version " +
+          "before the owner writes a 0600 target snapshot and invokes the helper once.",
+        "post-conditions":
+          "Issue writes one fixed-scope short-lived secret plus nonsecret metadata under owner-only custody. " +
+          "Status is a signed readback of that exact operation. Revoke sends one revoke and requires a " +
+          "separate signed absence readback before deleting the owned local files.",
+        reversal:
+          "The issued key is reversed only by this surface's exact revoke action. The dedicated public " +
+          "authority key is configuration and remains separate from every issued short-lived API key.",
+        "failure-handling":
+          "The owner never retries issue or revoke. A nonzero mutation result is indeterminate and requires " +
+          "status before any new action. Private JWK and API-key bytes never enter argv, Worker config, " +
+          "stdout or diagnostics; a wrong organization, partial profile, key reuse or live provenance drift fails closed.",
         "independent-review": review,
       },
     },

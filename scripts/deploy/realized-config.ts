@@ -12,6 +12,10 @@ export interface WorkerConfigOptions {
   readonly main: string;
   readonly commit: string;
   readonly signingKeyId?: string;
+  /** Exact public Worker identity. Required when the integration JIT route is target-enabled. */
+  readonly provenance?: PublicWorkerProvenance;
+  /** Build/inspection/provider-control configs are never uploaded as a new script Version. */
+  readonly omitIntegrationE2eCredentialAuthority?: true;
   /**
    * Transition-only legacy service binding.  Ordinary target realization never
    * supplies this field; it exists solely for the reviewed L→C profile.
@@ -25,6 +29,11 @@ export interface WorkerConfigOptions {
   readonly transitionExpectedSecrets?: readonly string[];
 }
 
+export interface PublicWorkerProvenance {
+  readonly sourceCommit: string;
+  readonly artifactDigest: `sha256:${string}`;
+}
+
 /**
  * Realizes one target into a caller-owned temporary path. The caller seals the
  * resulting config beside the exact bundle; this module never writes mutable
@@ -36,6 +45,12 @@ export function writeWorkerConfig(target: DeployTarget, options: WorkerConfigOpt
   }
   const neutral = readNeutralConfig();
   assertNeutral(neutral);
+  if (options.provenance !== undefined && options.provenance.sourceCommit !== options.commit) {
+    throw preflightError("Worker config provenance must match its exact commit");
+  }
+  if (options.provenance !== undefined && options.omitIntegrationE2eCredentialAuthority) {
+    throw preflightError("Worker config cannot both include and omit JIT authority provenance");
+  }
   const { $schema: _schema, ...neutralConfig } = neutral;
   const signingKeyId = options.signingKeyId ?? effectiveSigningKeyId(target);
   const realized = {
@@ -52,7 +67,13 @@ export function writeWorkerConfig(target: DeployTarget, options: WorkerConfigOpt
     ],
     r2_buckets: [{ binding: "OBJECTS", bucket_name: target.r2.bucketName }],
     ...serviceAddress(target.publicOrigin, target.aliases ?? []),
-    ...deploymentVariables(target, signingKeyId),
+    ...deploymentVariables(
+      options.omitIntegrationE2eCredentialAuthority
+        ? withoutIntegrationE2eCredentialAuthority(target)
+        : target,
+      signingKeyId,
+      options.provenance,
+    ),
     ...(options.transitionServiceBinding === undefined
       ? {}
       : {
@@ -86,6 +107,7 @@ export function effectiveSigningKeyId(target: DeployTarget): string {
 export function deploymentVariables(
   target: DeployTarget,
   signingKeyId = effectiveSigningKeyId(target),
+  provenance?: PublicWorkerProvenance,
 ): Record<string, unknown> {
   const vars: Record<string, string> = {
     PUBLIC_ORIGIN: target.publicOrigin,
@@ -128,7 +150,44 @@ export function deploymentVariables(
   if (target.operatorIdentity !== undefined) {
     vars.OPERATOR_IDENTITY_PUBLIC_JWK = JSON.stringify(target.operatorIdentity.publicJwk);
   }
+  if (target.integrationE2eCredentialAuthority !== undefined) {
+    if (target.environment !== "integration") {
+      throw preflightError("integration E2E credential authority config is integration-only");
+    }
+    const exact = exactPublicWorkerProvenance(provenance);
+    vars.TAKOSERVER_ENVIRONMENT = "integration";
+    vars.TAKOSERVER_INTEGRATION_E2E_API_KEY_PUBLIC_JWK = JSON.stringify(
+      target.integrationE2eCredentialAuthority.publicJwk,
+    );
+    vars.TAKOSERVER_INTEGRATION_E2E_ORGANIZATION_ID =
+      target.integrationE2eCredentialAuthority.organizationId;
+    vars.TAKOSERVER_SOURCE_COMMIT = exact.sourceCommit;
+    vars.TAKOSERVER_WORKER_ARTIFACT_DIGEST = exact.artifactDigest;
+  }
   return { vars };
+}
+
+function exactPublicWorkerProvenance(
+  value: PublicWorkerProvenance | undefined,
+): PublicWorkerProvenance {
+  if (
+    value === undefined ||
+    !/^[0-9a-f]{40}$/u.test(value.sourceCommit) ||
+    !/^sha256:[0-9a-f]{64}$/u.test(value.artifactDigest)
+  ) {
+    throw preflightError(
+      "integration E2E credential authority requires exact Worker source/artifact provenance",
+    );
+  }
+  return value;
+}
+
+function withoutIntegrationE2eCredentialAuthority(target: DeployTarget): DeployTarget {
+  const {
+    integrationE2eCredentialAuthority: _integrationE2eCredentialAuthority,
+    ...withoutAuthority
+  } = target;
+  return withoutAuthority;
 }
 
 /** Names only; Cloudflare never returns or receives secret bytes here. */

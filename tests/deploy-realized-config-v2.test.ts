@@ -8,6 +8,7 @@ import {
   writeWorkerConfig,
 } from "../scripts/deploy/realized-config.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
+import { INTEGRATION_E2E_ORGANIZATION_ID } from "../src/integration-e2e-credential-authority.ts";
 
 const target = {
   kind: "takoserver.deploy-target@v2",
@@ -113,6 +114,74 @@ describe("realized Worker configuration", () => {
         ...desiredWithoutIdentity
       } = desired.vars;
       expect(desiredWithoutIdentity).toEqual(absent.vars);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("seals the complete integration JIT authority profile from target and artifact provenance", () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-config-jit-authority-"));
+    const sourceCommit = "b".repeat(40);
+    const artifactDigest = `sha256:${"c".repeat(64)}` as const;
+    const authorityTarget = {
+      ...target,
+      environment: "integration",
+      integrationE2eCredentialAuthority: {
+        organizationId: INTEGRATION_E2E_ORGANIZATION_ID,
+        publicJwk: { kty: "OKP" as const, crv: "Ed25519" as const, x: "E".repeat(43) },
+      },
+    } satisfies DeployTarget;
+    try {
+      expect(() =>
+        writeWorkerConfig(authorityTarget, {
+          path: join(root, "missing.json"),
+          main: join(root, "worker.js"),
+          commit: sourceCommit,
+        }),
+      ).toThrow("exact Worker source/artifact provenance");
+      expect(() =>
+        writeWorkerConfig(
+          { ...authorityTarget, environment: "production" },
+          {
+            path: join(root, "production.json"),
+            main: join(root, "worker.js"),
+            commit: sourceCommit,
+            provenance: { sourceCommit, artifactDigest },
+          },
+        ),
+      ).toThrow("integration-only");
+
+      const path = writeWorkerConfig(authorityTarget, {
+        path: join(root, "complete.json"),
+        main: join(root, "worker.js"),
+        commit: sourceCommit,
+        provenance: { sourceCommit, artifactDigest },
+      });
+      const config = JSON.parse(readFileSync(path, "utf8")) as {
+        vars: Record<string, string>;
+      };
+      expect(
+        Object.fromEntries(
+          Object.entries(config.vars).filter(([name]) =>
+            [
+              "TAKOSERVER_ENVIRONMENT",
+              "TAKOSERVER_INTEGRATION_E2E_API_KEY_PUBLIC_JWK",
+              "TAKOSERVER_INTEGRATION_E2E_ORGANIZATION_ID",
+              "TAKOSERVER_SOURCE_COMMIT",
+              "TAKOSERVER_WORKER_ARTIFACT_DIGEST",
+            ].includes(name),
+          ),
+        ),
+      ).toEqual({
+        TAKOSERVER_ENVIRONMENT: "integration",
+        TAKOSERVER_INTEGRATION_E2E_API_KEY_PUBLIC_JWK: JSON.stringify(
+          authorityTarget.integrationE2eCredentialAuthority.publicJwk,
+        ),
+        TAKOSERVER_INTEGRATION_E2E_ORGANIZATION_ID: INTEGRATION_E2E_ORGANIZATION_ID,
+        TAKOSERVER_SOURCE_COMMIT: sourceCommit,
+        TAKOSERVER_WORKER_ARTIFACT_DIGEST: artifactDigest,
+      });
+      expect(JSON.stringify(config)).not.toContain('"d"');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

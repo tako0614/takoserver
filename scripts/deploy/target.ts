@@ -8,6 +8,7 @@ import {
   type HostedObjectBucketSupplies,
   parseHostedObjectBucketSupplies,
 } from "../../src/hosted-object-bucket-supplies.ts";
+import { INTEGRATION_E2E_ORGANIZATION_ID } from "../../src/integration-e2e-credential-authority.ts";
 import { parseOpenAiModelConfig } from "../../src/providers/openai.ts";
 import {
   type ProductionStandardServiceSupplies,
@@ -118,6 +119,15 @@ export interface DeployTarget {
       readonly x: string;
     };
   };
+  /** Integration-only JIT API-key authority. The private half is never target data. */
+  readonly integrationE2eCredentialAuthority?: {
+    readonly organizationId: typeof INTEGRATION_E2E_ORGANIZATION_ID;
+    readonly publicJwk: {
+      readonly kty: "OKP";
+      readonly crv: "Ed25519";
+      readonly x: string;
+    };
+  };
   /**
    * `nextKeyId` is present only while an explicit rotation is pending. The
    * routine Worker target is then the next id, but only the rotation surface
@@ -207,6 +217,7 @@ function validateTarget(
       "sponsorship",
       "formAuthority",
       "operatorIdentity",
+      "integrationE2eCredentialAuthority",
     ],
   );
 
@@ -288,6 +299,13 @@ function validateTarget(
     ...(value.operatorIdentity === undefined
       ? {}
       : { operatorIdentity: operatorIdentity(value.operatorIdentity) }),
+    ...(value.integrationE2eCredentialAuthority === undefined
+      ? {}
+      : {
+          integrationE2eCredentialAuthority: integrationE2eCredentialAuthority(
+            value.integrationE2eCredentialAuthority,
+          ),
+        }),
     signing: signing(value.signing),
   };
   const cloudflareObjectSupply = target.objectBucketSupplies?.supplies.some(
@@ -308,6 +326,9 @@ function validateTarget(
   }
   if (target.operatorIdentity && environment !== "integration") {
     throw preflightError("deploy target `operatorIdentity` is integration-only");
+  }
+  if (target.integrationE2eCredentialAuthority && environment !== "integration") {
+    throw preflightError("deploy target `integrationE2eCredentialAuthority` is integration-only");
   }
   if (target.formAuthority) {
     if (target.formAuthority.hostId !== target.publicOrigin) {
@@ -341,6 +362,18 @@ function validateTarget(
     ) {
       throw preflightError(
         "deploy target Form authority operator gateway requires its dedicated operatorPublicJwk",
+      );
+    }
+  }
+  if (target.integrationE2eCredentialAuthority) {
+    const authorityKey = target.integrationE2eCredentialAuthority.publicJwk.x;
+    const reused = [
+      target.operatorIdentity?.publicJwk.x,
+      target.formAuthority?.operatorPublicJwk?.x,
+    ].filter((value): value is string => value !== undefined && value === authorityKey);
+    if (reused.length > 0) {
+      throw preflightError(
+        "deploy target integration E2E API-key authority must use a dedicated Ed25519 key",
       );
     }
   }
@@ -514,6 +547,25 @@ function operatorIdentity(value: unknown): NonNullable<DeployTarget["operatorIde
     throw preflightError("deploy target `operatorIdentity` must contain only `publicJwk`");
   }
   return { publicJwk: publicEd25519Jwk(value.publicJwk, "operatorIdentity.publicJwk") };
+}
+
+function integrationE2eCredentialAuthority(
+  value: unknown,
+): NonNullable<DeployTarget["integrationE2eCredentialAuthority"]> {
+  if (!isRecord(value) || !exactKeySet(value, ["organizationId", "publicJwk"])) {
+    throw preflightError(
+      "deploy target `integrationE2eCredentialAuthority` must contain exact organizationId/publicJwk members",
+    );
+  }
+  if (value.organizationId !== INTEGRATION_E2E_ORGANIZATION_ID) {
+    throw preflightError(
+      `deploy target integration E2E organization must be ${INTEGRATION_E2E_ORGANIZATION_ID}`,
+    );
+  }
+  return {
+    organizationId: INTEGRATION_E2E_ORGANIZATION_ID,
+    publicJwk: publicEd25519Jwk(value.publicJwk, "integrationE2eCredentialAuthority.publicJwk"),
+  };
 }
 
 function publicEd25519Jwk(

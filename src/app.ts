@@ -2,6 +2,7 @@ import type { AiGateway } from "./ai-port.ts";
 import { createAttachmentService, createAttachmentStore } from "./attachments.ts";
 import {
   createAccounts,
+  createApiKeyAdministration,
   type ExternalIdentityVerifier,
   grants,
   type IdentityProviderDescriptor,
@@ -9,6 +10,11 @@ import {
 import { createCatalog, type Offering } from "./catalog.ts";
 import { type Checkout, createControlRoutes } from "./control.ts";
 import { createDataAiRoutes } from "./data-ai.ts";
+import {
+  createIntegrationE2eCredentialAuthority,
+  type IntegrationE2eCredentialAuthorityConfig,
+  resolveIntegrationE2eCredentialAuthorityConfig,
+} from "./integration-e2e-credential-authority.ts";
 import { createLedger, type FundingSettlementVerifier } from "./ledger.ts";
 import { createMetering, type MeteringRates } from "./metering.ts";
 import type { Clock, ObjectStoreAccess, Sql } from "./ports.ts";
@@ -75,6 +81,8 @@ export interface AppPorts {
   readonly publicOrigin: string;
   /** Current Cloudflare Worker Version; fences Form support written for a stale public artifact. */
   readonly publicWorkerVersionId?: string;
+  /** Complete integration-only JIT key authority configuration, or no route. */
+  readonly integrationE2eCredentialAuthority?: IntegrationE2eCredentialAuthorityConfig;
   /** Where this deployment's console is served, if it has one. */
   readonly consoleOrigin?: string;
   /** Private Hosted-to-Takoserver sponsorship bearer; absent disables the seam. */
@@ -144,10 +152,41 @@ export interface TickReport {
 }
 
 export function buildApp(ports: AppPorts): App {
+  // Configuration is validated before any storage capability is constructed or
+  // used. Undefined means the route is intentionally absent; partial is fatal.
+  const integrationE2eCredentialAuthority = resolveIntegrationE2eCredentialAuthorityConfig(
+    ports.integrationE2eCredentialAuthority,
+  );
+  if (
+    integrationE2eCredentialAuthority &&
+    ports.publicWorkerVersionId !== integrationE2eCredentialAuthority.publicWorkerVersionId
+  ) {
+    throw new TypeError(
+      "integration E2E credential authority does not match the active Worker Version",
+    );
+  }
   const clock = ports.clock ?? (() => new Date());
   const randomId = ports.randomId ?? (() => crypto.randomUUID().replaceAll("-", ""));
 
-  const accounts = createAccounts({ sql: ports.sql, identity: ports.identity, clock, randomId });
+  const apiKeyAdministration = createApiKeyAdministration({
+    sql: ports.sql,
+    clock,
+    randomId,
+  });
+  const accounts = createAccounts({
+    sql: ports.sql,
+    identity: ports.identity,
+    clock,
+    randomId,
+    apiKeyAdministration,
+  });
+  const integrationE2eCredentialRoute = integrationE2eCredentialAuthority
+    ? createIntegrationE2eCredentialAuthority({
+        configuration: integrationE2eCredentialAuthority,
+        apiKeys: apiKeyAdministration,
+        clock,
+      })
+    : null;
   const ledger = createLedger(ports.sql, clock);
   const catalog = createCatalog(ports.offerings);
   const deployments = createResourceDeploymentStore(ports.sql, clock);
@@ -481,16 +520,19 @@ export function buildApp(ports: AppPorts): App {
         })
       : undefined;
 
+  const router = createRouter({
+    control,
+    ...(sponsorship ? { sponsorship } : {}),
+    dataAi,
+    aiAvailable: ports.ai !== undefined,
+    takoformHost,
+    publicOrigin: ports.publicOrigin,
+    ...(ports.consoleOrigin === undefined ? {} : { consoleOrigin: ports.consoleOrigin }),
+  });
   return {
-    fetch: createRouter({
-      control,
-      ...(sponsorship ? { sponsorship } : {}),
-      dataAi,
-      aiAvailable: ports.ai !== undefined,
-      takoformHost,
-      publicOrigin: ports.publicOrigin,
-      ...(ports.consoleOrigin === undefined ? {} : { consoleOrigin: ports.consoleOrigin }),
-    }),
+    fetch: integrationE2eCredentialRoute
+      ? async (request) => (await integrationE2eCredentialRoute(request)) ?? (await router(request))
+      : router,
     async tick(): Promise<TickReport> {
       await reseller.reconcileDue(64, async (intent) => {
         if (!intent.authorityRef) return "ready";

@@ -83,6 +83,7 @@ export async function runHosted(
       main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
       commit: invocation.commit,
       signingKeyId: target.signing.currentKeyId,
+      omitIntegrationE2eCredentialAuthority: true,
     });
     const state =
       options.state ??

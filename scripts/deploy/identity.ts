@@ -259,6 +259,10 @@ async function inspectIdentityState(
   const identity = workerVersionIdentity(phase, version);
   const desired = expectedExactBindingClosure(target, {
     signingKeyId: target.signing.currentKeyId,
+    provenance: {
+      sourceCommit: identity.commit,
+      artifactDigest: `sha256:${identity.bundleDigestHex}`,
+    },
   });
   let configured = true;
   try {
@@ -271,6 +275,10 @@ async function inspectIdentityState(
       version,
       expectedExactBindingClosure(withoutOperatorIdentity(target), {
         signingKeyId: target.signing.currentKeyId,
+        provenance: {
+          sourceCommit: identity.commit,
+          artifactDigest: `sha256:${identity.bundleDigestHex}`,
+        },
       }),
     );
   }

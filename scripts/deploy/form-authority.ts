@@ -720,7 +720,17 @@ async function inspectDirectPublicPredecessor(
   }
   const version = await state.workerVersion(target.workerName, versionId);
   const identity = workerVersionIdentity(phase, version);
-  assertExactVersionBindingClosure(phase, versionId, version, expectedExactBindingClosure(target));
+  assertExactVersionBindingClosure(
+    phase,
+    versionId,
+    version,
+    expectedExactBindingClosure(target, {
+      provenance: {
+        sourceCommit: identity.commit,
+        artifactDigest: `sha256:${identity.bundleDigestHex}`,
+      },
+    }),
+  );
   return {
     versionId,
     commit: identity.commit,

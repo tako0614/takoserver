@@ -438,6 +438,7 @@ async function reverseAuthority(
     signingKeyId: target.signing.currentKeyId,
     transitionServiceBinding: service,
     transitionExpectedSecrets: hostedVersionSecrets(target),
+    omitIntegrationE2eCredentialAuthority: true,
   });
   const mutation = await run(
     wranglerCommand([
@@ -848,6 +849,7 @@ async function reverseTopology(
     signingKeyId: target.signing.currentKeyId,
     transitionServiceBinding: service,
     transitionExpectedSecrets: hostedVersionSecrets(target),
+    omitIntegrationE2eCredentialAuthority: true,
   });
   const fresh = await assertCurrentRetirementState(
     "preflight",
@@ -1518,6 +1520,7 @@ async function runTokenRetirement(
       commit: invocation.commit,
       signingKeyId: target.signing.currentKeyId,
       transitionExpectedSecrets: hostedVersionSecrets(target),
+      omitIntegrationE2eCredentialAuthority: true,
     });
     if (!beforeHasToken) {
       throw preflightError("Hosted token retirement requires the legacy secret to be present");
@@ -1623,13 +1626,25 @@ function transitionConfigWriter(
   commit: string,
   serviceBinding: LegacyHostServiceBinding | undefined,
   expectedSecrets: readonly string[],
-): (input: { readonly path: string; readonly main: string }) => string {
+): (input: {
+  readonly path: string;
+  readonly main: string;
+  readonly bundleDigestHex?: string;
+}) => string {
   return (input) => {
     const config: WorkerConfigOptions = {
       ...input,
       commit,
       signingKeyId: target.signing.currentKeyId,
       transitionExpectedSecrets: expectedSecrets,
+      ...(input.bundleDigestHex === undefined
+        ? { omitIntegrationE2eCredentialAuthority: true as const }
+        : {
+            provenance: {
+              sourceCommit: commit,
+              artifactDigest: `sha256:${input.bundleDigestHex}` as const,
+            },
+          }),
       ...(serviceBinding === undefined ? {} : { transitionServiceBinding: serviceBinding }),
     };
     return writeWorkerConfig(target, config);
@@ -1734,6 +1749,7 @@ function assertRetirementVersionShape(
   expectedServiceBinding: LegacyHostServiceBinding | null,
   expectedSecrets: readonly string[],
 ): void {
+  const identity = versionIdentity(version);
   assertExactVersionBindingClosure(
     phase,
     versionId,
@@ -1743,6 +1759,14 @@ function assertRetirementVersionShape(
       expectedSecrets,
       metadataProfile: metadataProfileForVersion(phase, versionId, version),
       signingKeyId: target.signing.currentKeyId,
+      ...(identity === null
+        ? {}
+        : {
+            provenance: {
+              sourceCommit: identity.commit,
+              artifactDigest: `sha256:${identity.bundleDigestHex}` as const,
+            },
+          }),
     }),
   );
   void state;

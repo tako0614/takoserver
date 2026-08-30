@@ -1,7 +1,11 @@
 import type { DeployPhase } from "./errors.ts";
 import { DeployError } from "./errors.ts";
 import { runChecked, runCommand, wranglerCommand } from "./process.ts";
-import { deploymentVariables, expectedWorkerSecrets } from "./realized-config.ts";
+import {
+  deploymentVariables,
+  expectedWorkerSecrets,
+  type PublicWorkerProvenance,
+} from "./realized-config.ts";
 import type { DeployTarget } from "./target.ts";
 
 const VERSION_ID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/u;
@@ -130,9 +134,10 @@ export function expectedExactBindingClosure(
   input: {
     readonly signingKeyId?: string;
     readonly expectedSecrets?: readonly string[];
+    readonly provenance?: PublicWorkerProvenance;
   } = {},
 ): ExpectedBindingClosure {
-  const vars = deploymentVariables(target, input.signingKeyId);
+  const vars = deploymentVariables(target, input.signingKeyId, input.provenance);
   const entries = (vars.vars ?? {}) as Readonly<Record<string, string>>;
   return {
     AI: { type: "ai", fields: {} },
@@ -163,6 +168,7 @@ export function expectedLegacyPreVersionMetadataBindingClosure(
   input: {
     readonly signingKeyId?: string;
     readonly expectedSecrets?: readonly string[];
+    readonly provenance?: PublicWorkerProvenance;
   } = {},
 ): ExpectedBindingClosure {
   return {
@@ -179,11 +185,13 @@ export function expectedTransitionBindingClosure(
     readonly signingKeyId?: string;
     readonly expectedSecrets?: readonly string[];
     readonly metadataProfile?: WorkerVersionMetadataBindingProfile;
+    readonly provenance?: PublicWorkerProvenance;
   },
 ): ExpectedBindingClosure {
   const exact = expectedExactBindingClosure(target, {
     ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
     ...(input.expectedSecrets === undefined ? {} : { expectedSecrets: input.expectedSecrets }),
+    ...(input.provenance === undefined ? {} : { provenance: input.provenance }),
   });
   return {
     ...exact,

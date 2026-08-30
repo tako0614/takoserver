@@ -1,6 +1,11 @@
 import { type App, buildApp } from "./app.ts";
 import { buildEdgeForms } from "./edge-forms.ts";
 import { resolveIdentity } from "./identity-setup.ts";
+import {
+  INTEGRATION_E2E_ORGANIZATION_ID,
+  type IntegrationE2eCredentialAuthorityConfig,
+  resolveIntegrationE2eCredentialAuthorityConfig,
+} from "./integration-e2e-credential-authority.ts";
 import { createR2ObjectStore } from "./objects-r2.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
 import { resolvePayment } from "./payment-setup.ts";
@@ -34,6 +39,15 @@ export interface WorkerEnv {
   readonly OBJECTS: Parameters<typeof createR2ObjectStore>[0];
   readonly WORKER_VERSION: { readonly id: string };
   readonly PUBLIC_ORIGIN?: string;
+  /** Exact deploy lane. The JIT credential route refuses every value but integration. */
+  readonly TAKOSERVER_ENVIRONMENT?: string;
+  /** Public half of the dedicated integration-e2e-api-key proof key. */
+  readonly TAKOSERVER_INTEGRATION_E2E_API_KEY_PUBLIC_JWK?: string;
+  /** Existing organization to which the one JIT writer key is pinned. */
+  readonly TAKOSERVER_INTEGRATION_E2E_ORGANIZATION_ID?: string;
+  /** Exact source and built artifact identities injected by the owning deploy surface. */
+  readonly TAKOSERVER_SOURCE_COMMIT?: string;
+  readonly TAKOSERVER_WORKER_ARTIFACT_DIGEST?: string;
   /** Where this deployment's console is served, if it has one. */
   readonly TAKOSERVER_CONSOLE_ORIGIN?: string;
   /** Public half of the operator key, as an Ed25519 JWK. */
@@ -181,8 +195,139 @@ export function requirePublicOrigin(env: { readonly PUBLIC_ORIGIN?: string | und
   return origin;
 }
 
+/**
+ * No dedicated fields means no route. Once either dedicated field appears,
+ * every provenance and policy field is required before D1 is constructed.
+ */
+export function workerIntegrationE2eCredentialAuthority(
+  env: Pick<
+    WorkerEnv,
+    | "WORKER_VERSION"
+    | "OPERATOR_PUBLIC_JWK"
+    | "OPERATOR_IDENTITY_PUBLIC_JWK"
+    | "TAKOSERVER_ENVIRONMENT"
+    | "TAKOSERVER_INTEGRATION_E2E_API_KEY_PUBLIC_JWK"
+    | "TAKOSERVER_INTEGRATION_E2E_ORGANIZATION_ID"
+    | "TAKOSERVER_SOURCE_COMMIT"
+    | "TAKOSERVER_WORKER_ARTIFACT_DIGEST"
+    | "TAKOSERVER_SIGNING_KEY_ID"
+    | "TAKOSERVER_SIGNING_KEY"
+  >,
+): IntegrationE2eCredentialAuthorityConfig | undefined {
+  const enabled =
+    env.TAKOSERVER_INTEGRATION_E2E_API_KEY_PUBLIC_JWK !== undefined ||
+    env.TAKOSERVER_INTEGRATION_E2E_ORGANIZATION_ID !== undefined;
+  if (!enabled) return undefined;
+  const values = [
+    env.TAKOSERVER_ENVIRONMENT,
+    env.TAKOSERVER_INTEGRATION_E2E_API_KEY_PUBLIC_JWK,
+    env.TAKOSERVER_INTEGRATION_E2E_ORGANIZATION_ID,
+    env.TAKOSERVER_SOURCE_COMMIT,
+    env.TAKOSERVER_WORKER_ARTIFACT_DIGEST,
+    env.WORKER_VERSION?.id,
+  ];
+  if (values.some((value) => typeof value !== "string" || value.length === 0)) {
+    throw new TypeError("integration E2E credential authority configuration is incomplete");
+  }
+  if (env.TAKOSERVER_INTEGRATION_E2E_ORGANIZATION_ID !== INTEGRATION_E2E_ORGANIZATION_ID) {
+    throw new TypeError(
+      `integration E2E credential authority organization must be ${INTEGRATION_E2E_ORGANIZATION_ID}`,
+    );
+  }
+  const resolved = resolveIntegrationE2eCredentialAuthorityConfig({
+    environment: env.TAKOSERVER_ENVIRONMENT as "integration",
+    publicJwk: env.TAKOSERVER_INTEGRATION_E2E_API_KEY_PUBLIC_JWK as string,
+    organizationId: env.TAKOSERVER_INTEGRATION_E2E_ORGANIZATION_ID as string,
+    sourceCommit: env.TAKOSERVER_SOURCE_COMMIT as string,
+    artifactDigest: env.TAKOSERVER_WORKER_ARTIFACT_DIGEST as `sha256:${string}`,
+    publicWorkerVersionId: env.WORKER_VERSION.id,
+  });
+  if (!resolved) throw new TypeError("integration E2E credential authority is unavailable");
+  const operatorKeys = operatorCredentialKeys(env);
+  if (
+    operatorKeys.identity?.x === resolved.publicJwk.x ||
+    operatorKeys.settlement?.x === resolved.publicJwk.x
+  ) {
+    throw new TypeError(
+      "integration E2E API-key authority must not reuse a sign-in or funding key",
+    );
+  }
+  const signingPublicJwk = configuredSigningPublicJwk(
+    env.TAKOSERVER_SIGNING_KEY_ID,
+    env.TAKOSERVER_SIGNING_KEY,
+  );
+  if (signingPublicJwk.x === resolved.publicJwk.x) {
+    throw new TypeError("integration E2E API-key authority must not reuse the runtime signing key");
+  }
+  return resolved;
+}
+
+function configuredSigningPublicJwk(
+  keyId: string | undefined,
+  privateJwk: string | undefined,
+): JsonWebKey & { readonly x: string } {
+  if (!keyId || !privateJwk) {
+    throw new TypeError(
+      "integration E2E API-key authority requires the configured runtime signing key",
+    );
+  }
+  return readSigningPublicJwk(privateJwk);
+}
+
+function readSigningPublicJwk(privateJwk: string): JsonWebKey & { readonly x: string } {
+  let value: unknown;
+  try {
+    value = JSON.parse(privateJwk);
+  } catch {
+    throw new TypeError("runtime signing key public half is unavailable");
+  }
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    (value as Record<string, unknown>).kty !== "OKP" ||
+    (value as Record<string, unknown>).crv !== "Ed25519" ||
+    !/^[A-Za-z0-9_-]{43}$/u.test(String((value as Record<string, unknown>).x))
+  ) {
+    throw new TypeError("runtime signing key public half is unavailable");
+  }
+  const publicJwk = {
+    kty: "OKP",
+    crv: "Ed25519",
+    x: (value as Record<string, unknown>).x as string,
+  } satisfies JsonWebKey & { readonly x: string };
+  return publicJwk;
+}
+
+async function proveSigningPublicJwk(privateJwk: string, privateKey: CryptoKey): Promise<void> {
+  const publicJwk = readSigningPublicJwk(privateJwk);
+  try {
+    const publicKey = await crypto.subtle.importKey("jwk", publicJwk, { name: "Ed25519" }, false, [
+      "verify",
+    ]);
+    const message = new TextEncoder().encode("takoserver.integration-e2e.signing-separation@v1");
+    const signature = await crypto.subtle.sign("Ed25519", privateKey, message);
+    if (!(await crypto.subtle.verify("Ed25519", publicKey, signature, message))) throw new Error();
+  } catch {
+    throw new TypeError("runtime signing key cannot prove its configured public half");
+  }
+}
+
 async function appFor(env: WorkerEnv, origin: string): Promise<App> {
   if (cached?.env === env) return cached.app;
+  const signingKey = await loadSigningKey(
+    env.TAKOSERVER_SIGNING_KEY_ID,
+    env.TAKOSERVER_SIGNING_KEY,
+  );
+  const integrationE2eCredentialAuthority = workerIntegrationE2eCredentialAuthority(env);
+  if (integrationE2eCredentialAuthority) {
+    if (!signingKey || !env.TAKOSERVER_SIGNING_KEY) {
+      throw new TypeError(
+        "integration E2E API-key authority requires the configured runtime signing key",
+      );
+    }
+    await proveSigningPublicJwk(env.TAKOSERVER_SIGNING_KEY, signingKey.privateKey);
+  }
   const edge = await buildEdgeForms();
   const currentCandidates = currentTakoformCandidates();
   const { identity, identityProviders, settlement, checkout } = workerCredentials(env);
@@ -194,10 +339,6 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     clock: () => new Date(),
     randomId: () => crypto.randomUUID(),
   });
-  const signingKey = await loadSigningKey(
-    env.TAKOSERVER_SIGNING_KEY_ID,
-    env.TAKOSERVER_SIGNING_KEY,
-  );
   const dataServices = createWorkerDataServices(env);
   const deployment = createWorkerProductionComposition({
     env,
@@ -217,6 +358,7 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     sql,
     objects,
     publicWorkerVersionId: env.WORKER_VERSION.id,
+    ...(integrationE2eCredentialAuthority ? { integrationE2eCredentialAuthority } : {}),
     artifacts,
     workerModuleInspector: createJavaScriptWorkerModuleInspector(),
     ...(signingKey ? { signingKey } : {}),

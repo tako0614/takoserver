@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadTarget, targetPath } from "../scripts/deploy/target.ts";
+import { INTEGRATION_E2E_ORGANIZATION_ID } from "../src/integration-e2e-credential-authority.ts";
 
 function descriptor(overrides: Record<string, unknown> = {}) {
   return {
@@ -224,5 +225,70 @@ describe("environment-exact deploy target", () => {
     withTarget(descriptor({ formAuthority }), (path) => {
       expect(() => loadTarget(path, "rehearsal")).toThrow("integration-only");
     });
+  });
+
+  test("accepts only the fixed-organization dedicated integration E2E authority key", () => {
+    const publicJwk = {
+      kty: "OKP" as const,
+      crv: "Ed25519" as const,
+      x: "E".repeat(43),
+    };
+    const authority = {
+      organizationId: INTEGRATION_E2E_ORGANIZATION_ID,
+      publicJwk,
+    } as const;
+    withTarget(
+      descriptor({ environment: "integration", integrationE2eCredentialAuthority: authority }),
+      (path) => {
+        expect(loadTarget(path, "integration").integrationE2eCredentialAuthority).toEqual(
+          authority,
+        );
+      },
+    );
+    withTarget(descriptor({ integrationE2eCredentialAuthority: authority }), (path) => {
+      expect(() => loadTarget(path, "rehearsal")).toThrow("integration-only");
+    });
+    withTarget(
+      descriptor({
+        environment: "integration",
+        integrationE2eCredentialAuthority: { ...authority, organizationId: "org_wrong" },
+      }),
+      (path) =>
+        expect(() => loadTarget(path, "integration")).toThrow(INTEGRATION_E2E_ORGANIZATION_ID),
+    );
+    withTarget(
+      descriptor({
+        environment: "integration",
+        integrationE2eCredentialAuthority: {
+          ...authority,
+          publicJwk: { ...publicJwk, d: "private-material" },
+        },
+      }),
+      (path) => expect(() => loadTarget(path, "integration")).toThrow("public-only"),
+    );
+    withTarget(
+      descriptor({
+        environment: "integration",
+        operatorIdentity: { publicJwk },
+        integrationE2eCredentialAuthority: authority,
+      }),
+      (path) => expect(() => loadTarget(path, "integration")).toThrow("dedicated"),
+    );
+    withTarget(
+      descriptor({
+        environment: "integration",
+        formAuthority: {
+          workerName: "takoserver-form-authority-integration",
+          integrationWorkerName: "takoserver-form-fixture-integration",
+          integrationOperatorWorkerName: "takoserver-form-operator-integration",
+          integrationOperatorOrigin: "https://form-authority.integration.takoserver.com",
+          integrationOperatorScope: { tenantId: "tenant", space: "space" },
+          operatorPublicJwk: publicJwk,
+          hostId: "https://takoserver-api-rehearsal.example.workers.dev",
+        },
+        integrationE2eCredentialAuthority: authority,
+      }),
+      (path) => expect(() => loadTarget(path, "integration")).toThrow("dedicated"),
+    );
   });
 });

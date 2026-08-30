@@ -85,6 +85,60 @@ export interface ApiKey {
   readonly expiresAt: string;
 }
 
+/** Exact durable state of one API-key id. Expiry never means absence. */
+export interface ApiKeyAdministrationStatus {
+  readonly apiKey: ApiKey;
+  /** The row has not been revoked. This remains true after expiry. */
+  readonly present: boolean;
+  /** The bearer can currently authenticate. */
+  readonly usable: boolean;
+  readonly revokedAt: string | null;
+}
+
+export type ApiKeyAdministrationIssue =
+  | {
+      readonly kind: "issued";
+      readonly apiKey: ApiKey;
+      readonly secret: string;
+    }
+  | {
+      /** The caller-supplied id was already consumed; its secret is unrecoverable. */
+      readonly kind: "existing";
+      readonly status: ApiKeyAdministrationStatus;
+    }
+  | {
+      /** Another unrevoked key owns the requested exclusive name. */
+      readonly kind: "exclusive_conflict";
+    };
+
+/**
+ * Internal API-key administration shared by the owner routes and narrow
+ * operator authorities. It never authenticates a session or invents a member.
+ */
+export interface ApiKeyAdministration {
+  organizationOwnerPrincipalId(organizationId: string): Promise<string | null>;
+  list(organizationId: string): Promise<readonly ApiKey[]>;
+  status(input: {
+    readonly organizationId: string;
+    readonly apiKeyId: string;
+  }): Promise<ApiKeyAdministrationStatus | null>;
+  issue(input: {
+    readonly organizationId: string;
+    readonly name: string;
+    readonly scopes: readonly ApiKeyScope[];
+    readonly expiresInSeconds: number;
+    /** Optional stable id for an operation whose response may be lost. */
+    readonly apiKeyId?: string;
+    /** Atomically refuses while any unrevoked key has this exact name. */
+    readonly exclusiveUnrevokedName?: string;
+  }): Promise<ApiKeyAdministrationIssue>;
+  /** Idempotent internally: null means the exact id was never present. */
+  revoke(input: {
+    readonly organizationId: string;
+    readonly apiKeyId: string;
+  }): Promise<ApiKeyAdministrationStatus | null>;
+}
+
 /** The resolved caller. `organizationId` is absent for a bare user session. */
 export interface Actor {
   /** Principal used by the data/Host plane. Each API key is its own service principal. */
@@ -181,6 +235,159 @@ export interface CreateAccountsOptions {
   readonly clock?: Clock;
   readonly randomSecret?: () => string;
   readonly randomId?: () => string;
+  /** Composition-owned capability; ordinary callers may omit it. */
+  readonly apiKeyAdministration?: ApiKeyAdministration;
+}
+
+export interface CreateApiKeyAdministrationOptions {
+  readonly sql: Sql;
+  readonly clock?: Clock;
+  readonly randomSecret?: () => string;
+  readonly randomId?: () => string;
+}
+
+export function createApiKeyAdministration(
+  options: CreateApiKeyAdministrationOptions,
+): ApiKeyAdministration {
+  const { sql } = options;
+  const clock = options.clock ?? (() => new Date());
+  const randomSecret = options.randomSecret ?? defaultSecret;
+  const randomId = options.randomId ?? (() => crypto.randomUUID().replaceAll("-", ""));
+
+  const organizationOwnerPrincipalId = async (organizationId: string): Promise<string | null> => {
+    const rows = await sql.query("SELECT owner_principal_id FROM orgs WHERE id = ?", [
+      organizationId,
+    ]);
+    const value = rows[0]?.owner_principal_id;
+    return typeof value === "string" ? value : null;
+  };
+
+  const status = async (input: {
+    readonly organizationId: string;
+    readonly apiKeyId: string;
+  }): Promise<ApiKeyAdministrationStatus | null> => {
+    const rows = await sql.query(
+      `SELECT id, org_id, name, scopes_json, created_at, expires_at, revoked_at
+       FROM auth_tokens WHERE id = ? AND org_id = ? AND kind = 'api_key'`,
+      [input.apiKeyId, input.organizationId],
+    );
+    const row = rows[0];
+    if (!row) return null;
+    const apiKey = apiKeyFromRow(row);
+    const revokedAt = typeof row.revoked_at === "string" ? row.revoked_at : null;
+    const present = revokedAt === null;
+    return {
+      apiKey,
+      present,
+      usable: present && Date.parse(apiKey.expiresAt) > clock().getTime(),
+      revokedAt,
+    };
+  };
+
+  return {
+    organizationOwnerPrincipalId,
+
+    async list(organizationId) {
+      const rows = await sql.query(
+        `SELECT id, org_id, name, scopes_json, created_at, expires_at FROM auth_tokens
+         WHERE org_id = ? AND kind = 'api_key' AND revoked_at IS NULL
+         ORDER BY created_at DESC, id DESC LIMIT 200`,
+        [organizationId],
+      );
+      return rows.map(apiKeyFromRow);
+    },
+
+    status,
+
+    async issue(input) {
+      const ownerPrincipalId = await organizationOwnerPrincipalId(input.organizationId);
+      if (!ownerPrincipalId) throw new AuthError("not_found");
+      const scopes = validScopes(input.scopes);
+      if (input.name.length === 0 || input.name.length > 128) throw new AuthError("invalid");
+      if (!Number.isSafeInteger(input.expiresInSeconds) || input.expiresInSeconds <= 0) {
+        throw new AuthError("invalid");
+      }
+      const id = input.apiKeyId ?? `key_${randomId()}`;
+      if (!/^key_[A-Za-z0-9][A-Za-z0-9._:-]{0,123}$/u.test(id)) {
+        throw new AuthError("invalid");
+      }
+      if (
+        input.exclusiveUnrevokedName !== undefined &&
+        input.exclusiveUnrevokedName !== input.name
+      ) {
+        throw new AuthError("invalid");
+      }
+      const now = clock();
+      const createdAt = now.toISOString();
+      const expiresAt = new Date(now.getTime() + input.expiresInSeconds * 1_000).toISOString();
+      const secret = randomSecret();
+      const secretDigest = await bytesDigest(new TextEncoder().encode(secret));
+      const params = [
+        secretDigest,
+        id,
+        ownerPrincipalId,
+        input.organizationId,
+        input.name,
+        JSON.stringify([...scopes]),
+        createdAt,
+        expiresAt,
+      ] as const;
+      const write =
+        input.exclusiveUnrevokedName === undefined
+          ? await sql.run(
+              `INSERT INTO auth_tokens
+                 (secret_digest, id, kind, principal_id, org_id, name, scopes_json, created_at, expires_at)
+               VALUES (?, ?, 'api_key', ?, ?, ?, ?, ?, ?)`,
+              params,
+            )
+          : await sql.run(
+              `INSERT INTO auth_tokens
+                 (secret_digest, id, kind, principal_id, org_id, name, scopes_json, created_at, expires_at)
+               SELECT ?, ?, 'api_key', ?, ?, ?, ?, ?, ?
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM auth_tokens
+                 WHERE org_id = ? AND kind = 'api_key' AND name = ? AND revoked_at IS NULL
+               )
+               ON CONFLICT(id) DO NOTHING`,
+              [...params, input.organizationId, input.exclusiveUnrevokedName],
+            );
+      if (write.changes === 1) {
+        return {
+          kind: "issued",
+          apiKey: {
+            id,
+            organizationId: input.organizationId,
+            name: input.name,
+            scopes,
+            createdAt,
+            expiresAt,
+          },
+          secret,
+        };
+      }
+      if (input.apiKeyId !== undefined) {
+        const existing = await status({
+          organizationId: input.organizationId,
+          apiKeyId: input.apiKeyId,
+        });
+        if (existing) return { kind: "existing", status: existing };
+      }
+      return { kind: "exclusive_conflict" };
+    },
+
+    async revoke(input) {
+      const existing = await status(input);
+      if (!existing) return null;
+      if (existing.present) {
+        await sql.run(
+          `UPDATE auth_tokens SET revoked_at = ?
+           WHERE id = ? AND org_id = ? AND kind = 'api_key' AND revoked_at IS NULL`,
+          [clock().toISOString(), input.apiKeyId, input.organizationId],
+        );
+      }
+      return await status(input);
+    },
+  };
 }
 
 export function createAccounts(options: CreateAccountsOptions): Accounts {
@@ -188,17 +395,16 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
   const clock = options.clock ?? (() => new Date());
   const randomSecret = options.randomSecret ?? defaultSecret;
   const randomId = options.randomId ?? (() => crypto.randomUUID().replaceAll("-", ""));
+  const apiKeyAdministration =
+    options.apiKeyAdministration ??
+    createApiKeyAdministration({ sql, clock, randomSecret, randomId });
   const stamp = (): string => clock().toISOString();
   const after = (seconds: number): string =>
     new Date(clock().getTime() + seconds * 1_000).toISOString();
 
-  const issueToken = async (input: {
-    kind: "session" | "api_key";
-    principalId: string;
-    organizationId?: string;
-    name: string;
-    scopes: readonly ApiKeyScope[];
-    expiresInSeconds: number;
+  const issueSessionToken = async (input: {
+    readonly principalId: string;
+    readonly expiresInSeconds: number;
   }): Promise<{
     id: string;
     secret: string;
@@ -206,7 +412,7 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
     expiresAt: string;
   }> => {
     const secret = randomSecret();
-    const id = `${input.kind === "session" ? "ses" : "key"}_${randomId()}`;
+    const id = `ses_${randomId()}`;
     const createdAt = stamp();
     const expiresAt = after(input.expiresInSeconds);
     await sql.run(
@@ -216,11 +422,11 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
       [
         await bytesDigest(new TextEncoder().encode(secret)),
         id,
-        input.kind,
+        "session",
         input.principalId,
-        input.organizationId ?? null,
-        input.name,
-        JSON.stringify([...input.scopes]),
+        null,
+        "session",
+        "[]",
         createdAt,
         expiresAt,
       ],
@@ -279,11 +485,8 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
           ]),
         ]);
       }
-      const { secret } = await issueToken({
-        kind: "session",
+      const { secret } = await issueSessionToken({
         principalId: id,
-        name: "session",
-        scopes: [],
         expiresInSeconds: sessionTtlSeconds ?? 12 * 60 * 60,
       });
       return {
@@ -365,71 +568,26 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
 
     async apiKeys({ actor, organizationId }) {
       await accounts.requireOwner(actor, organizationId);
-      const rows = await sql.query(
-        `SELECT id, org_id, name, scopes_json, created_at, expires_at FROM auth_tokens
-         WHERE org_id = ? AND kind = 'api_key' AND revoked_at IS NULL
-         ORDER BY created_at DESC, id DESC LIMIT 200`,
-        [organizationId],
-      );
-      return rows.map((row) => ({
-        id: String(row.id),
-        organizationId: String(row.org_id),
-        name: String(row.name),
-        scopes: JSON.parse(String(row.scopes_json)) as readonly ApiKeyScope[],
-        createdAt: String(row.created_at),
-        expiresAt: String(row.expires_at),
-      }));
+      return await apiKeyAdministration.list(organizationId);
     },
 
     async createApiKey({ actor, organizationId, name, scopes, expiresInSeconds }) {
       await accounts.requireOwner(actor, organizationId);
-      const validated = validScopes(scopes);
-      if (name.length === 0 || name.length > 128) throw new AuthError("invalid");
-      if (!Number.isSafeInteger(expiresInSeconds) || expiresInSeconds <= 0) {
-        throw new AuthError("invalid");
-      }
-      const issued = await issueToken({
-        kind: "api_key",
-        principalId: actor.principalId,
+      const issued = await apiKeyAdministration.issue({
         organizationId,
         name,
-        scopes: validated,
+        scopes,
         expiresInSeconds,
       });
-      return {
-        apiKey: {
-          id: issued.id,
-          organizationId,
-          name,
-          scopes: validated,
-          createdAt: issued.createdAt,
-          expiresAt: issued.expiresAt,
-        },
-        secret: issued.secret,
-      };
+      if (issued.kind !== "issued") throw new AuthError("invalid");
+      return { apiKey: issued.apiKey, secret: issued.secret };
     },
 
     async revokeApiKey({ actor, organizationId, apiKeyId }) {
       await accounts.requireOwner(actor, organizationId);
-      const rows = await sql.query(
-        `SELECT id, org_id, name, scopes_json, created_at, expires_at
-         FROM auth_tokens WHERE id = ? AND org_id = ? AND kind = 'api_key'`,
-        [apiKeyId, organizationId],
-      );
-      const row = rows[0];
-      if (!row) throw new AuthError("not_found");
-      await sql.run("UPDATE auth_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", [
-        stamp(),
-        apiKeyId,
-      ]);
-      return {
-        id: String(row.id),
-        organizationId,
-        name: String(row.name),
-        scopes: JSON.parse(String(row.scopes_json)) as ApiKeyScope[],
-        createdAt: String(row.created_at),
-        expiresAt: String(row.expires_at),
-      };
+      const revoked = await apiKeyAdministration.revoke({ organizationId, apiKeyId });
+      if (!revoked) throw new AuthError("not_found");
+      return revoked.apiKey;
     },
 
     async revokeSession(authorization) {
@@ -489,6 +647,17 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
   };
 
   return accounts;
+}
+
+function apiKeyFromRow(row: Readonly<Record<string, unknown>>): ApiKey {
+  return {
+    id: String(row.id),
+    organizationId: String(row.org_id),
+    name: String(row.name),
+    scopes: JSON.parse(String(row.scopes_json)) as readonly ApiKeyScope[],
+    createdAt: String(row.created_at),
+    expiresAt: String(row.expires_at),
+  };
 }
 
 function validScopes(scopes: readonly ApiKeyScope[]): readonly ApiKeyScope[] {

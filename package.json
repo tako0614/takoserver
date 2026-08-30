@@ -24,7 +24,6 @@
     "check:migrations": "bun scripts/check-d1-migrations.ts",
     "check:openapi": "bun scripts/check-openapi.ts",
     "check:worker-startup": "bun scripts/check-worker-startup.ts",
-    "integration:e2e:credentials": "bun scripts/integration-e2e-credentials.ts",
     "conformance:takoform-v1": "bun scripts/conformance-takoform-v1.ts",
     "check:worker-types": "wrangler types worker-configuration.d.ts --check --include-runtime=false --config wrangler.jsonc",
     "check:form-authority-worker-types": "wrangler types form-authority-worker-configuration.d.ts --check --env-interface FormAuthorityWorkerEnv --include-runtime=false --config wrangler.form-authority.jsonc && wrangler types integration-form-authority-worker-configuration.d.ts --check --env-interface IntegrationFormAuthorityWorkerEnv --include-runtime=false --config wrangler.integration-form-authority.jsonc && wrangler types integration-form-authority-operator-worker-configuration.d.ts --check --env-interface IntegrationFormAuthorityOperatorWorkerEnv --include-runtime=false --config wrangler.integration-form-authority-operator.jsonc",

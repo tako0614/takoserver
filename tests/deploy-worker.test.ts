@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DeployError } from "../scripts/deploy/errors.ts";
@@ -14,6 +14,7 @@ import {
   type WorkerState,
 } from "../scripts/deploy/worker.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
+import { INTEGRATION_E2E_ORGANIZATION_ID } from "../src/integration-e2e-credential-authority.ts";
 
 const COMMIT = "a".repeat(40);
 const LIVE_COMMIT = "b".repeat(40);
@@ -371,6 +372,171 @@ describe("split Takoserver Worker surfaces", () => {
       expect(uploads[0]?.find((value) => value.startsWith("takoserver-worker:"))).toMatch(
         /^takoserver-worker:[0-9a-f]{40}:[0-9a-f]{64}$/u,
       );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("only the integration authority cutover adds one complete provenance-bound JIT profile", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-worker-jit-authority-"));
+    const authorityTarget = {
+      ...target,
+      integrationE2eCredentialAuthority: {
+        organizationId: INTEGRATION_E2E_ORGANIZATION_ID,
+        publicJwk: { kty: "OKP", crv: "Ed25519", x: "E".repeat(43) },
+      },
+    } satisfies DeployTarget;
+    try {
+      const process = fixture({ diff: "src/auth.ts\n" });
+      const activeSigningDatabase = signingDatabase("F".repeat(43));
+      const state: WorkerState = {
+        async workerDomains() {
+          return [{ hostname: "api.integration.example.test", service: target.workerName }];
+        },
+        async workerDeployments() {
+          const uploaded = process.calls.some((call) => call.includes("--no-bundle"));
+          return uploaded
+            ? [
+                deployment("deployment-after", VERSION_AFTER, "2026-08-28T02:00:00Z"),
+                deployment("deployment-before", VERSION_BEFORE, "2026-08-28T01:00:00Z"),
+              ]
+            : [deployment("deployment-before", VERSION_BEFORE, "2026-08-28T01:00:00Z")];
+        },
+        async workerVersion(_worker, versionId) {
+          if (versionId === VERSION_BEFORE) {
+            return versionForTarget(
+              versionId,
+              `takoserver-worker:${LIVE_COMMIT}:${"c".repeat(64)}`,
+              target,
+            );
+          }
+          const upload = process.calls.find((call) => call.includes("--no-bundle"));
+          const message = upload?.[upload.indexOf("--message") + 1];
+          if (!message) throw new Error("missing upload annotation");
+          return versionForTarget(versionId, message, authorityTarget);
+        },
+        async workerSecrets() {
+          return [{ name: "TAKOSERVER_SIGNING_KEY", type: "secret_text" }];
+        },
+      };
+
+      const status = await runWorker(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        authorityTarget,
+        {
+          ...process,
+          state,
+          outputDirectory: root,
+          signingDatabase: activeSigningDatabase,
+        },
+      );
+      expect(status).toMatchObject({
+        ready: false,
+        integrationE2eCredentialAuthorityConfigured: false,
+        versionId: VERSION_BEFORE,
+      });
+
+      const routine = await runWorker(
+        {
+          surface: "takoserver-worker",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        authorityTarget,
+        {
+          ...process,
+          state,
+          outputDirectory: root,
+          signingDatabase: activeSigningDatabase,
+        },
+      ).catch((error) => error);
+      expect(routine).toBeInstanceOf(DeployError);
+
+      const result = await runWorker(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        authorityTarget,
+        {
+          ...process,
+          state,
+          review: "reviewer@example.test",
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          fetcher: publishedProductFetcher(),
+          signingDatabase: activeSigningDatabase,
+        },
+      );
+      expect(result).toMatchObject({
+        kind: "takoserver.worker-apply@v2",
+        surface: "takoserver-worker-authority-cutover",
+        commit: COMMIT,
+        previousVersionId: VERSION_BEFORE,
+        versionId: VERSION_AFTER,
+      });
+      const config = JSON.parse(readFileSync(join(root, "release/wrangler.jsonc"), "utf8")) as {
+        vars: Record<string, string>;
+      };
+      expect(config.vars).toMatchObject({
+        TAKOSERVER_ENVIRONMENT: "integration",
+        TAKOSERVER_INTEGRATION_E2E_API_KEY_PUBLIC_JWK: JSON.stringify(
+          authorityTarget.integrationE2eCredentialAuthority.publicJwk,
+        ),
+        TAKOSERVER_INTEGRATION_E2E_ORGANIZATION_ID: INTEGRATION_E2E_ORGANIZATION_ID,
+        TAKOSERVER_SOURCE_COMMIT: COMMIT,
+        TAKOSERVER_WORKER_ARTIFACT_DIGEST: result.bundleDigest,
+      });
+      expect(JSON.stringify(config)).not.toContain("private-material");
+      expect(process.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses JIT authority reuse of the active D1 signing key before any upload or put", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-worker-jit-signing-reuse-"));
+    const authorityTarget = {
+      ...target,
+      integrationE2eCredentialAuthority: {
+        organizationId: INTEGRATION_E2E_ORGANIZATION_ID,
+        publicJwk: { kty: "OKP", crv: "Ed25519", x: "E".repeat(43) },
+      },
+    } satisfies DeployTarget;
+    try {
+      const process = fixture({ diff: "src/auth.ts\n" });
+      const failure = await runWorker(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        authorityTarget,
+        {
+          ...process,
+          outputDirectory: root,
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          signingDatabase: signingDatabase(
+            authorityTarget.integrationE2eCredentialAuthority.publicJwk.x,
+          ),
+        },
+      ).catch((error) => error);
+
+      expect(failure).toMatchObject({ phase: "preflight" });
+      expect(failure.message).toContain("must not reuse the active runtime signing key");
+      expect(process.calls).toHaveLength(0);
+      expect(process.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
+      expect(process.calls.filter((call) => call.includes("put"))).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -1233,6 +1399,43 @@ function version(
         }
         return [{ name, type: requirement.type, ...requirement.fields }];
       }),
+    },
+  };
+}
+
+function versionForTarget(id: string, message: string, selectedTarget: DeployTarget) {
+  const match = /^takoserver-worker:([0-9a-f]{40}):([0-9a-f]{64})$/u.exec(message);
+  if (!match) throw new Error("invalid test Worker annotation");
+  const expected = expectedExactBindingClosure(selectedTarget, {
+    ...(selectedTarget.integrationE2eCredentialAuthority === undefined
+      ? {}
+      : {
+          provenance: {
+            sourceCommit: match[1] as string,
+            artifactDigest: `sha256:${match[2]}` as const,
+          },
+        }),
+  });
+  return {
+    id,
+    annotations: { "workers/message": message },
+    resources: {
+      bindings: Object.entries(expected).flatMap(([name, requirement]) =>
+        requirement === null ? [] : [{ name, type: requirement.type, ...requirement.fields }],
+      ),
+    },
+  };
+}
+
+function signingDatabase(publicX: string) {
+  return {
+    async readKey(keyId: string) {
+      return {
+        keyId,
+        publicJwk: JSON.stringify({ kty: "OKP", crv: "Ed25519", x: publicX }),
+        createdAtEpochSeconds: 1_700_000_000,
+        revokedAtEpochSeconds: null,
+      };
     },
   };
 }

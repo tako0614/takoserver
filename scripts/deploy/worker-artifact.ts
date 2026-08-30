@@ -15,6 +15,7 @@ export type WorkerArtifactProcess = (
 export interface WorkerArtifactConfigInput {
   readonly path: string;
   readonly main: string;
+  readonly bundleDigestHex?: string;
 }
 
 export type WorkerArtifactConfigWriter = (input: WorkerArtifactConfigInput) => string;
@@ -52,9 +53,18 @@ export async function prepareWorkerArtifact(input: {
     input.writeConfig ??
     ((config: WorkerArtifactConfigInput) =>
       writeWorkerConfig(input.target, {
-        ...config,
+        path: config.path,
+        main: config.main,
         commit: input.commit,
         ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
+        ...(config.bundleDigestHex === undefined
+          ? { omitIntegrationE2eCredentialAuthority: true as const }
+          : {
+              provenance: {
+                sourceCommit: input.commit,
+                artifactDigest: `sha256:${config.bundleDigestHex}` as const,
+              },
+            }),
       }));
   const buildConfig = writeConfig({
     path: join(input.root, "build-wrangler.jsonc"),
@@ -85,6 +95,7 @@ export async function prepareWorkerArtifact(input: {
   const configPath = writeConfig({
     path: join(release, "wrangler.jsonc"),
     main: "worker.js",
+    bundleDigestHex,
   });
   let sealed = false;
   return {

@@ -93,6 +93,7 @@ export async function runSigning(
       main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
       commit: invocation.commit,
       signingKeyId: target.signing.currentKeyId,
+      omitIntegrationE2eCredentialAuthority: true,
     });
     const database = options.database ?? createRemoteSigningDatabase(configPath, environment, run);
     if (invocation.surface === "takoserver-signing-key-register") {

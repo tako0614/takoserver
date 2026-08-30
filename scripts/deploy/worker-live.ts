@@ -78,6 +78,7 @@ export async function inspectLiveWorkerVersionForRetirement(
   }
   const version = await state.workerVersion(target.workerName, history.versionId);
   const metadataProfile = workerVersionMetadataBindingProfile(phase, history.versionId, version);
+  const identity = workerVersionIdentityOrLegacy(phase, version);
   assertExactVersionBindingClosure(
     phase,
     history.versionId,
@@ -87,6 +88,14 @@ export async function inspectLiveWorkerVersionForRetirement(
       expectedSecrets: input.expectedSecrets,
       metadataProfile,
       ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
+      ...(identity.kind === "canonical"
+        ? {
+            provenance: {
+              sourceCommit: identity.commit,
+              artifactDigest: `sha256:${identity.bundleDigestHex}` as const,
+            },
+          }
+        : {}),
     }),
   );
   const inventorySecrets = input.expectedInventorySecrets ?? input.expectedSecrets;
@@ -106,7 +115,6 @@ export async function inspectLiveWorkerVersionForRetirement(
       "authoritative Worker deployment history changed during retirement inspection",
     );
   }
-  const identity = workerVersionIdentityOrLegacy(phase, version);
   return {
     history,
     commit: identity.kind === "canonical" ? identity.commit : null,
@@ -230,6 +238,14 @@ async function inspectLiveWorkerVersionCore(
   const bindingInput = {
     ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
     ...(input.expectedSecrets === undefined ? {} : { expectedSecrets: input.expectedSecrets }),
+    ...(identity.kind === "canonical"
+      ? {
+          provenance: {
+            sourceCommit: identity.commit,
+            artifactDigest: `sha256:${identity.bundleDigestHex}` as const,
+          },
+        }
+      : {}),
   } as const;
   assertExactVersionBindingClosure(
     phase,

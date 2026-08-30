@@ -5,6 +5,7 @@ import { runFormAuthority } from "./deploy/form-authority.ts";
 import { runFormAuthorityInvoke } from "./deploy/form-authority-invoke.ts";
 import { runHosted } from "./deploy/hosted.ts";
 import { runOperatorIdentity } from "./deploy/identity.ts";
+import { runIntegrationE2eCredentials } from "./deploy/integration-e2e-credentials.ts";
 import type { DeployEnvironment } from "./deploy/qualification.ts";
 import { runRetirement } from "./deploy/retirement.ts";
 import { runD1Schema } from "./deploy/schema.ts";
@@ -18,6 +19,7 @@ const USAGE = `takoserver deploy
   bun run deploy -- --contract
   bun run deploy -- <surface> --status --environment=<integration|rehearsal|production> --commit=<sha>
   bun run deploy -- <surface> --apply  --environment=<integration|rehearsal|production> --commit=<sha>
+  bun run deploy -- takoserver-integration-e2e-credentials --<issue|status|revoke> --environment=integration --commit=<sha>
   The authority cutover may add --legacy-predecessor-version=<uuid> for integration bootstrap.
   Hosted-edge authority transition requires the named
   --legacy-host-runtime-predecessor-version=<uuid> selector in integration or production.
@@ -31,10 +33,31 @@ deploy-plan flag, ledger, target override or mixed mutation controller.
 `;
 
 type Surface = (typeof DEPLOY_CONTRACT.surfaces)[number]["surface"];
+type CredentialSurface = "takoserver-integration-e2e-credentials";
+type StandardSurface = Exclude<Surface, CredentialSurface>;
 
-interface Invocation {
+interface InvocationBase {
+  readonly environment: DeployEnvironment;
+  readonly commit: string;
+  readonly legacyPredecessorVersionId?: string;
+  readonly legacyHostRuntimePredecessorVersionId?: string;
+  readonly unattributedSuccessorVersionId?: string;
+  readonly reverse?: boolean;
+}
+
+type Invocation =
+  | (InvocationBase & {
+      readonly surface: StandardSurface;
+      readonly action: "status" | "apply";
+    })
+  | (InvocationBase & {
+      readonly surface: CredentialSurface;
+      readonly action: "issue" | "status" | "revoke";
+    });
+
+interface ParsedInvocation {
   readonly surface: Surface;
-  readonly action: "status" | "apply";
+  readonly action: "status" | "apply" | "issue" | "revoke";
   readonly environment: DeployEnvironment;
   readonly commit: string;
   readonly legacyPredecessorVersionId?: string;
@@ -47,7 +70,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   if (args.length < 4 || args.length > 6) return null;
   const [surfaceValue, ...flags] = args;
   if (!isSurface(surfaceValue)) return null;
-  let action: Invocation["action"] | null = null;
+  let action: ParsedInvocation["action"] | null = null;
   let environment: DeployEnvironment | null = null;
   let commit: string | null = null;
   let legacyPredecessorVersionId: string | null = null;
@@ -55,9 +78,9 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let unattributedSuccessorVersionId: string | null = null;
   let reverse = false;
   for (const flag of flags) {
-    if (flag === "--status" || flag === "--apply") {
+    if (flag === "--status" || flag === "--apply" || flag === "--issue" || flag === "--revoke") {
       if (action !== null) return null;
-      action = flag.slice(2) as Invocation["action"];
+      action = flag.slice(2) as ParsedInvocation["action"];
       continue;
     }
     if (flag.startsWith("--environment=")) {
@@ -108,11 +131,19 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   }
   if (!action || !environment || !commit) return null;
   if (
+    (surfaceValue === "takoserver-integration-e2e-credentials" && action === "apply") ||
+    (surfaceValue !== "takoserver-integration-e2e-credentials" &&
+      (action === "issue" || action === "revoke"))
+  ) {
+    return null;
+  }
+  if (
     (surfaceValue === "takoserver-integration-operator-identity" ||
       surfaceValue === "takoserver-integration-form-authority-worker" ||
       surfaceValue === "takoserver-integration-form-authority-operator-worker" ||
       surfaceValue === "takoserver-integration-form-authority" ||
-      surfaceValue === "takoserver-integration-form-authority-deactivation") &&
+      surfaceValue === "takoserver-integration-form-authority-deactivation" ||
+      surfaceValue === "takoserver-integration-e2e-credentials") &&
     environment !== "integration"
   ) {
     return null;
@@ -183,7 +214,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       : { legacyHostRuntimePredecessorVersionId }),
     ...(unattributedSuccessorVersionId === null ? {} : { unattributedSuccessorVersionId }),
     ...(reverse ? { reverse: true } : {}),
-  };
+  } as Invocation;
 }
 
 function isSurface(value: string | undefined): value is Surface {
@@ -328,6 +359,16 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
     case "takoserver-integration-form-authority":
     case "takoserver-integration-form-authority-deactivation":
       return await runFormAuthorityInvoke(
+        {
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
+        },
+        target,
+      );
+    case "takoserver-integration-e2e-credentials":
+      return await runIntegrationE2eCredentials(
         {
           surface: invocation.surface,
           action: invocation.action,
