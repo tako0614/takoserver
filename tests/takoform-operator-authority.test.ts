@@ -23,7 +23,12 @@ import {
   createHostAdmissionCoordinator,
   type FormAuthorityIdentity,
   type FormAuthorityPlanRequest,
+  formAuthorityPackageProfile,
 } from "../src/takoform/host-admission-coordinator.ts";
+import {
+  createTakoformHostAuthority,
+  takoformActivationAudience,
+} from "../src/takoform/host-authority.ts";
 import {
   deriveImplementationCatalog,
   yurucommuFormCandidates,
@@ -189,7 +194,100 @@ async function fixture(
     actor: "integration-operator",
     reason: "install the exact Yurucommu Form package set",
   };
-  return { operator, request, sql, objects, durable, pkg, identity, adapterCalls, packageLoads };
+  return {
+    operator,
+    request,
+    sql,
+    objects,
+    durable,
+    pkg,
+    form,
+    handles,
+    identity,
+    adapterCalls,
+    packageLoads,
+  };
+}
+
+type CoordinatorFixture = Awaited<ReturnType<typeof fixture>>;
+
+async function expectInstallIdentityRepair(
+  f: CoordinatorFixture,
+  operator: CoordinatorFixture["operator"] = f.operator,
+  request: FormAuthorityPlanRequest = f.request,
+  identity: FormAuthorityIdentity = f.identity,
+): Promise<void> {
+  expect((await operator.readback(request)).forms).toEqual([
+    expect.objectContaining({
+      installed: false,
+      supported: false,
+      activationHead: expect.objectContaining({
+        present: true,
+        active: true,
+        implementationDigest: identity.implementationDigest,
+      }),
+    }),
+  ]);
+
+  const repair = await operator.plan(request);
+  expect(repair.commands.map((command) => command.kind)).toEqual(["ReplacePackage"]);
+
+  const applied = await operator.apply(repair);
+  expect(applied.status).toBe("converged");
+  expect(applied.nextPlan.commands).toEqual([]);
+  expect(applied.readback.forms).toEqual([
+    expect.objectContaining({
+      installed: true,
+      supported: true,
+      activationHead: expect.objectContaining({
+        present: true,
+        active: true,
+        implementationDigest: identity.implementationDigest,
+      }),
+    }),
+  ]);
+
+  const heads = await f.durable.inspect({
+    kind: "Package",
+    formRef: f.pkg.formRef,
+    packageDigest: f.pkg.packageDigest,
+  });
+  expect(heads.install?.implementation_digest).toBe(identity.implementationDigest);
+  expect(heads.support?.implementation_digest).toBe(identity.implementationDigest);
+  expect(heads.activations?.at(-1)?.implementation_digest).toBe(identity.implementationDigest);
+
+  const authority = createTakoformHostAuthority({
+    sql: f.sql,
+    objects: f.objects,
+    hostId: identity.hostId,
+    publicWorkerVersionId: identity.publicWorkerVersionId,
+    implementationDigest: identity.implementationDigest,
+    candidates: [f.form],
+    bindings: [],
+    technicalAvailability: {
+      async resolve() {
+        return { executable: true, activated: true, availableToPrincipal: true };
+      },
+    },
+  });
+  expect(
+    (
+      await authority.catalog({
+        tenantId: request.activation.tenantId,
+        space: request.activation.space,
+        principalId: "principal-yuru",
+      })
+    ).forms,
+  ).toEqual([
+    expect.objectContaining({
+      supported: true,
+      availability: {
+        executable: true,
+        activated: true,
+        availableToPrincipal: true,
+      },
+    }),
+  ]);
 }
 
 describe("route-less Takoserver Host admission coordinator", () => {
@@ -451,6 +549,154 @@ describe("route-less Takoserver Host admission coordinator", () => {
     const replacement = await f.operator.plan(changed);
     expect(replacement.commands.map((command) => command.kind)).toEqual(["ReplacePackage"]);
     expect((await f.operator.apply(replacement)).status).toBe("converged");
+  });
+
+  test("repairs a same-package install head left on a predecessor implementation before reporting readiness", async () => {
+    const f = await fixture();
+    expect((await f.operator.apply(await f.operator.plan(f.request))).status).toBe("converged");
+
+    const catalog = await deriveImplementationCatalog({
+      forms: [f.form],
+      capabilities: {
+        apiVersion: "takoserver.form-lifecycle-capabilities@v1",
+        implementation: "cloudflare-provider-v1",
+        forms: { ModuleWorker: f.form.operations },
+      },
+      handlers: {
+        apiVersion: "takoserver.form-handlers@v1",
+        artifact: "worker-artifact-v2",
+        forms: { ModuleWorker: f.form.operations },
+      },
+    });
+    const identity: FormAuthorityIdentity = {
+      ...f.identity,
+      workerArtifactDigest: digest("6"),
+      publicWorkerVersionId: "00000000-0000-4000-8000-000000000002",
+      capabilityDigest: catalog.capabilityDigest,
+      implementationDigest: catalog.implementationDigest,
+    };
+    expect(identity.implementationDigest).not.toBe(f.identity.implementationDigest);
+
+    // This is the exact live split-brain shape: a prior projection advanced
+    // support and Space activation to the current semantic identity while the
+    // same-package install head remained on its predecessor identity.
+    await f.durable.execute({
+      kind: "SetSupport",
+      formRef: f.pkg.formRef,
+      packageDigest: f.pkg.packageDigest,
+      supported: true,
+      profile: formAuthorityPackageProfile(identity),
+      operations: f.form.operations,
+      implementationDigest: identity.implementationDigest,
+      actor: "integration-operator",
+      reason: "reproduce predecessor install identity drift",
+    });
+    await f.durable.execute({
+      kind: "SetActivation",
+      formRef: f.pkg.formRef,
+      packageDigest: f.pkg.packageDigest,
+      active: true,
+      audience: takoformActivationAudience("space", {
+        tenantId: f.request.activation.tenantId,
+        space: f.request.activation.space,
+      }),
+      implementationDigest: identity.implementationDigest,
+      actor: "integration-operator",
+      reason: "reproduce predecessor install identity drift",
+    });
+
+    const storedPackages = createFormPackageStore(f.objects);
+    const operator = createHostAdmissionCoordinator({
+      identity,
+      catalog,
+      packages: {
+        async load(expected) {
+          if (
+            expected.packageDigest !== f.pkg.packageDigest ||
+            JSON.stringify(expected.formRef) !== JSON.stringify(f.pkg.formRef)
+          ) {
+            throw new Error("unexpected package request");
+          }
+          return structuredClone(f.pkg);
+        },
+      },
+      storedPackages,
+      admission: f.durable,
+      handles: f.handles,
+      verifier: createIntegrationFixtureEvidenceVerifier({
+        packages: [{ formRef: f.pkg.formRef, packageDigest: f.pkg.packageDigest }],
+      }),
+      assertMutationAuthority: async () => {},
+    });
+    const request: FormAuthorityPlanRequest = { ...f.request, ...identity };
+    await expectInstallIdentityRepair(f, operator, request, identity);
+  });
+
+  test("repairs a persisted null implementation identity before reporting readiness", async () => {
+    let wroteLegacyInstall = false;
+    const f = await fixture({
+      admissionWrapper: (host) => ({
+        inspect: (query) => host.inspect(query),
+        async execute(command) {
+          if (!wroteLegacyInstall && command.kind === "InstallPackage") {
+            wroteLegacyInstall = true;
+            const { implementationDigest: _implementationDigest, ...legacyCommand } = command;
+            return await host.execute(legacyCommand);
+          }
+          return await host.execute(command);
+        },
+      }),
+    });
+    await f.operator.apply(await f.operator.plan(f.request));
+    expect(wroteLegacyInstall).toBe(true);
+    expect(
+      (
+        await f.durable.inspect({
+          kind: "Package",
+          formRef: f.pkg.formRef,
+          packageDigest: f.pkg.packageDigest,
+        })
+      ).install,
+    ).toHaveProperty("implementation_digest", null);
+
+    await expectInstallIdentityRepair(f);
+  });
+
+  test("repairs a historical install row whose implementation identity property is missing", async () => {
+    let exposedHistoricalShape = false;
+    const f = await fixture({
+      admissionWrapper: (host) => ({
+        async inspect(query) {
+          const view = await host.inspect(query);
+          if (query.kind !== "History" || query.chain !== "install" || !view.events) {
+            return view;
+          }
+          return {
+            ...view,
+            events: view.events.map((row) => {
+              if (row.event_type !== "install") return row;
+              const { implementation_digest: _implementationDigest, ...historicalRow } = row;
+              exposedHistoricalShape = true;
+              return historicalRow;
+            }),
+          };
+        },
+        execute: (command) => host.execute(command),
+      }),
+    });
+    await f.operator.apply(await f.operator.plan(f.request));
+    expect(exposedHistoricalShape).toBe(true);
+    expect(
+      (
+        await f.durable.inspect({
+          kind: "Package",
+          formRef: f.pkg.formRef,
+          packageDigest: f.pkg.packageDigest,
+        })
+      ).install?.implementation_digest,
+    ).toBe(f.identity.implementationDigest);
+
+    await expectInstallIdentityRepair(f);
   });
 
   test("moves an installed package to a new publisher generation without rotating old history", async () => {

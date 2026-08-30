@@ -584,16 +584,37 @@ describe("integration Form authority bridge", () => {
       const request = { ...original.request, ...changed.identity };
 
       const before = await changed.endpoint.readback(request);
-      expect(before.forms.every((form) => form.installed && form.activationHead.active)).toBe(true);
       const plan = await changed.endpoint.plan(request);
       if (change.semanticChange) {
-        expect(before.forms.every((form) => !form.supported)).toBe(true);
-        expect(plan.commands).toHaveLength(24);
+        expect(
+          before.forms.every(
+            (form) => !form.installed && !form.supported && form.activationHead.active,
+          ),
+        ).toBe(true);
+        expect(plan.commands).toHaveLength(36);
+        expect(plan.commands.filter(({ kind }) => kind === "ReplacePackage")).toHaveLength(12);
         expect(plan.commands.filter(({ kind }) => kind === "SetSupport")).toHaveLength(12);
         expect(plan.commands.filter(({ kind }) => kind === "SetActivation")).toHaveLength(12);
+        const applied = await changed.endpoint.apply(plan);
+        expect(applied.status).toBe("converged");
+        expect(applied.nextPlan.commands).toEqual([]);
+        expect(
+          applied.readback.forms.every(
+            (form) =>
+              form.installed &&
+              form.supported &&
+              form.activationHead.present &&
+              form.activationHead.active &&
+              form.activationHead.implementationDigest === changed.identity.implementationDigest,
+          ),
+        ).toBe(true);
       } else {
         expect(changed.identity.implementationDigest).toBe(original.identity.implementationDigest);
-        expect(before.forms.every((form) => form.supported)).toBe(true);
+        expect(
+          before.forms.every(
+            (form) => form.installed && form.supported && form.activationHead.active,
+          ),
+        ).toBe(true);
         expect(plan.commands).toEqual([]);
       }
     }
