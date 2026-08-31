@@ -11,7 +11,7 @@ try {
       "identity-probe",
       "wrangler.form-authority-identity-probe.jsonc",
       false,
-      ["PUBLIC_HOST_IDENTITY", "TAKOSERVER_FORM_AUTHORITY_HOST_ID"],
+      ["PUBLIC_HOST_IDENTITY", "FORM_AUTHORITY", "TAKOSERVER_FORM_AUTHORITY_HOST_ID"],
       ["STATE_DB", "OBJECTS"],
     ],
     [
@@ -23,6 +23,7 @@ try {
         "OBJECTS",
         "PUBLIC_HOST_IDENTITY",
         "CORE_VERIFIER",
+        "WORKER_VERSION",
         "TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST",
       ],
       [],

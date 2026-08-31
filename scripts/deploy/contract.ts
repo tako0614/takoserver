@@ -179,8 +179,8 @@ export const DEPLOY_CONTRACT = {
       triggers: ["authority"],
       obligations: {
         provenance:
-          `${exactSource} The minimal probe bundle, one public identity service binding and one ` +
-          "target Host id are sealed before one upload.",
+          `${exactSource} The minimal probe bundle, one public identity service binding, one ` +
+          "route-less Form-authority service binding and one target Host id are sealed before one upload.",
         "post-conditions":
           "Authoritative Worker history and exact binding closure identify the upload. Its permanent " +
           "workers.dev endpoint must actively return the exact PublicHostIdentity@v2 value read through " +
