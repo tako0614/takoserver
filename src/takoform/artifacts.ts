@@ -1,5 +1,5 @@
 import { bytesDigest, canonicalDigest } from "../json.ts";
-import type { Clock, ObjectStoreAccess, Sql } from "../ports.ts";
+import type { Clock, ObjectStoreAccess, Sql, SqlStatement } from "../ports.ts";
 import { parseStrictJson, StrictJsonError } from "../strict-json.ts";
 import {
   MAXIMUM_REQUEST_BODY_BYTES,
@@ -127,9 +127,15 @@ export function createTakoformArtifacts(
   const ownedUpload = async (
     principal: TakoformArtifactPrincipal,
     id: string,
-  ): Promise<{ manifest: TakoformArtifactManifest; manifestDigest: string } | null> => {
+  ): Promise<{
+    manifest: TakoformArtifactManifest;
+    manifestDigest: string;
+    lifecycleState: "open" | "committed" | "abandoned";
+  } | null> => {
     const rows = await sql.query(
-      "SELECT manifest_json, manifest_digest FROM tf_artifact_uploads WHERE id = ? AND tenant_id = ? AND principal_id = ?",
+      `SELECT manifest_json, manifest_digest, lifecycle_state
+       FROM tf_artifact_uploads
+       WHERE id = ? AND tenant_id = ? AND principal_id = ?`,
       [id, principal.tenantId, principal.principalId],
     );
     const row = rows[0];
@@ -137,6 +143,7 @@ export function createTakoformArtifacts(
     return {
       manifest: JSON.parse(String(row.manifest_json)) as TakoformArtifactManifest,
       manifestDigest: String(row.manifest_digest),
+      lifecycleState: String(row.lifecycle_state) as "open" | "committed" | "abandoned",
     };
   };
 
@@ -156,23 +163,36 @@ export function createTakoformArtifacts(
     };
   };
 
-  const writeReplay = async (
+  const replayStatement = (
     key: string,
     value: { status: number; body?: Record<string, string> },
-  ): Promise<void> => {
-    await sql.run(
-      `INSERT INTO tf_artifact_replays (replay_key, status, body_json, expires_at)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT (replay_key) DO UPDATE SET
-         status = excluded.status, body_json = excluded.body_json, expires_at = excluded.expires_at`,
-      [
-        key,
-        value.status,
-        value.body ? JSON.stringify(value.body) : null,
-        now() + REPLAY_TTL_MILLISECONDS,
-      ],
-    );
-  };
+    expiresAt = now() + REPLAY_TTL_MILLISECONDS,
+  ): SqlStatement => ({
+    sql: `INSERT INTO tf_artifact_replays (replay_key, status, body_json, expires_at)
+          VALUES (?, ?, ?, ?)
+          ON CONFLICT (replay_key) DO UPDATE SET
+            status = excluded.status, body_json = excluded.body_json, expires_at = excluded.expires_at`,
+    params: [key, value.status, value.body ? JSON.stringify(value.body) : null, expiresAt],
+  });
+
+  const replayRootStatement = (
+    principal: TakoformArtifactPrincipal,
+    replayKey: string,
+    manifestDigest: string,
+    createdAt: number,
+    expiresAt: number,
+  ): SqlStatement => ({
+    sql: `INSERT OR IGNORE INTO tf_artifact_roots
+            (tenant_id, root_kind, root_id, target_kind, digest, state, fence,
+             expires_at, release_reason, created_at, released_at)
+          VALUES (?, 'replay', ?, 'manifest', ?, 'active', 1, ?, NULL, ?, NULL)`,
+    params: [principal.tenantId, replayKey, manifestDigest, expiresAt, createdAt],
+  });
+
+  const guardToken = (): string =>
+    `ag_${randomId()
+      .replace(/[^A-Za-z0-9._-]/gu, "")
+      .slice(0, 120)}`;
 
   return {
     async resolveManifest(tenantId, digest) {
@@ -213,25 +233,91 @@ export function createTakoformArtifacts(
           const uploadId = replay.body.uploadId ?? "";
           const existing = await ownedUpload(principal, uploadId);
           if (existing) {
-            return Response.json({
-              uploadId,
-              missingBlobs: await missingBlobs(existing.manifest, principal.tenantId, holds),
-            });
+            return Response.json(
+              {
+                uploadId,
+                missingBlobs: await missingBlobs(existing.manifest, principal.tenantId, holds),
+              },
+              { status: replay.status },
+            );
           }
         }
         const id = `up_${randomId().replace(/[^A-Za-z0-9._-]/gu, "")}`;
-        await sql.run(
-          "INSERT INTO tf_artifact_uploads (id, tenant_id, principal_id, manifest_json, manifest_digest, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-          [
-            id,
-            principal.tenantId,
-            principal.principalId,
-            JSON.stringify(manifest),
-            manifestDigest,
-            now(),
-          ],
-        );
-        await writeReplay(replayKey, { status: 201, body: { uploadId: id, manifestDigest } });
+        const timestamp = now();
+        const replayExpiresAt = timestamp + REPLAY_TTL_MILLISECONDS;
+        const manifestJson = JSON.stringify(manifest);
+        const memberDigests = declarations(manifest).map((declaration) => declaration.digest);
+        const token = guardToken();
+        try {
+          await sql.batch([
+            {
+              sql: `INSERT INTO tf_artifact_gc_guards (token, valid)
+                    SELECT ?, CASE WHEN
+                      EXISTS (
+                        SELECT 1
+                        FROM tf_artifact_gc_candidates AS candidate
+                        JOIN json_each(?) AS requested ON requested.value = candidate.digest
+                        WHERE candidate.state = 'deleting'
+                      ) OR EXISTS (
+                        SELECT 1 FROM tf_artifact_replays WHERE replay_key = ?
+                      )
+                    THEN 0 ELSE 1 END`,
+              params: [token, JSON.stringify([manifestDigest, ...memberDigests]), replayKey],
+            },
+            {
+              sql: `INSERT INTO tf_artifact_uploads
+                      (id, tenant_id, principal_id, manifest_json, manifest_digest,
+                       created_at, lifecycle_state, lifecycle_fence, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'open', 1, ?)`,
+              params: [
+                id,
+                principal.tenantId,
+                principal.principalId,
+                manifestJson,
+                manifestDigest,
+                timestamp,
+                timestamp,
+              ],
+            },
+            {
+              sql: `INSERT OR IGNORE INTO tf_artifact_manifest_members
+                      (manifest_digest, blob_digest)
+                    SELECT ?, CAST(value AS TEXT) FROM json_each(?)`,
+              params: [manifestDigest, JSON.stringify(memberDigests)],
+            },
+            {
+              sql: `INSERT INTO tf_artifact_roots
+                      (tenant_id, root_kind, root_id, target_kind, digest, state, fence,
+                       expires_at, release_reason, created_at, released_at)
+                    VALUES (?, 'upload', ?, 'manifest', ?, 'active', 1,
+                            NULL, NULL, ?, NULL)`,
+              params: [principal.tenantId, id, manifestDigest, timestamp],
+            },
+            replayStatement(
+              replayKey,
+              { status: 201, body: { uploadId: id, manifestDigest } },
+              replayExpiresAt,
+            ),
+            replayRootStatement(principal, replayKey, manifestDigest, timestamp, replayExpiresAt),
+            { sql: "DELETE FROM tf_artifact_gc_guards WHERE token = ?", params: [token] },
+          ]);
+        } catch (error) {
+          const settled = await readReplay(replayKey).catch(() => null);
+          if (settled?.body?.manifestDigest === manifestDigest) {
+            const uploadId = settled.body.uploadId ?? "";
+            const existing = await ownedUpload(principal, uploadId);
+            if (existing) {
+              return Response.json(
+                {
+                  uploadId,
+                  missingBlobs: await missingBlobs(existing.manifest, principal.tenantId, holds),
+                },
+                { status: settled.status },
+              );
+            }
+          }
+          throw error;
+        }
         return Response.json(
           { uploadId: id, missingBlobs: await missingBlobs(manifest, principal.tenantId, holds) },
           { status: 201 },
@@ -245,6 +331,7 @@ export function createTakoformArtifacts(
       if (request.method === "PUT" && match) {
         const upload = await ownedUpload(principal, requiredSegment(match[1]));
         if (!upload) return failure("artifact_missing", 404);
+        if (upload.lifecycleState !== "open") return failure("artifact_invalid", 409);
         const digest = requiredDigest(match[2]);
         const declaration = declarations(upload.manifest).find((entry) => entry.digest === digest);
         if (!declaration) return failure("artifact_invalid", 400);
@@ -265,6 +352,7 @@ export function createTakoformArtifacts(
         if (replay) return replayArtifactResponse(replay);
         const upload = await ownedUpload(principal, requiredSegment(match[1]));
         if (!upload) return failure("artifact_missing", 404);
+        if (upload.lifecycleState !== "open") return failure("artifact_invalid", 409);
         // The manifest is not parsed again here. The row exists only because a
         // strict parse already succeeded, and preserving its portable `path`
         // field is what keeps the content address equal to the caller's
@@ -308,19 +396,73 @@ export function createTakoformArtifacts(
               upload.manifestDigest,
             ])
           ).length === 1;
-        await sql.run(
-          "INSERT OR IGNORE INTO tf_artifact_manifests (digest, manifest_json, created_at) VALUES (?, ?, ?)",
-          [upload.manifestDigest, JSON.stringify(upload.manifest), now()],
-        );
-        await grant(principal.tenantId, upload.manifestDigest, "manifest");
-        await inWaves(declarations(upload.manifest), 16, (declaration) =>
-          grant(principal.tenantId, declaration.digest, "blob"),
-        );
         const result = {
           status: existed ? 200 : 201,
           body: { manifestDigest: upload.manifestDigest },
         };
-        await writeReplay(replayKey, result);
+        const timestamp = now();
+        const replayExpiresAt = timestamp + REPLAY_TTL_MILLISECONDS;
+        const uploadId = requiredSegment(match[1]);
+        const token = guardToken();
+        try {
+          await sql.batch([
+            {
+              sql: `INSERT INTO tf_artifact_gc_guards (token, valid)
+                    SELECT ?, CASE WHEN
+                      EXISTS (
+                        SELECT 1 FROM tf_artifact_uploads
+                        WHERE id = ? AND tenant_id = ? AND principal_id = ?
+                          AND lifecycle_state = 'open'
+                      ) AND NOT EXISTS (
+                        SELECT 1 FROM tf_artifact_replays WHERE replay_key = ?
+                      )
+                    THEN 1 ELSE 0 END`,
+              params: [token, uploadId, principal.tenantId, principal.principalId, replayKey],
+            },
+            {
+              sql: "INSERT OR IGNORE INTO tf_artifact_manifests (digest, manifest_json, created_at) VALUES (?, ?, ?)",
+              params: [upload.manifestDigest, JSON.stringify(upload.manifest), timestamp],
+            },
+            {
+              sql: "INSERT OR IGNORE INTO tf_artifact_holds (tenant_id, digest, kind) VALUES (?, ?, 'manifest')",
+              params: [principal.tenantId, upload.manifestDigest],
+            },
+            {
+              sql: `INSERT OR IGNORE INTO tf_artifact_holds (tenant_id, digest, kind)
+                    SELECT ?, blob_digest, 'blob'
+                    FROM tf_artifact_manifest_members WHERE manifest_digest = ?`,
+              params: [principal.tenantId, upload.manifestDigest],
+            },
+            {
+              sql: `UPDATE tf_artifact_uploads
+                    SET lifecycle_state = 'committed', lifecycle_fence = lifecycle_fence + 1,
+                        updated_at = ?
+                    WHERE id = ? AND tenant_id = ? AND principal_id = ?
+                      AND lifecycle_state = 'open'`,
+              params: [timestamp, uploadId, principal.tenantId, principal.principalId],
+            },
+            {
+              sql: `UPDATE tf_artifact_roots
+                    SET fence = fence + 1
+                    WHERE tenant_id = ? AND root_kind = 'upload' AND root_id = ?
+                      AND target_kind = 'manifest' AND digest = ? AND state = 'active'`,
+              params: [principal.tenantId, uploadId, upload.manifestDigest],
+            },
+            replayStatement(replayKey, result, replayExpiresAt),
+            replayRootStatement(
+              principal,
+              replayKey,
+              upload.manifestDigest,
+              timestamp,
+              replayExpiresAt,
+            ),
+            { sql: "DELETE FROM tf_artifact_gc_guards WHERE token = ?", params: [token] },
+          ]);
+        } catch (error) {
+          const settled = await readReplay(replayKey).catch(() => null);
+          if (settled) return replayArtifactResponse(settled);
+          throw error;
+        }
         return replayArtifactResponse(result);
       }
 
@@ -331,9 +473,54 @@ export function createTakoformArtifacts(
         const replay = await readReplay(replayKey);
         if (replay) return replayArtifactResponse(replay);
         const id = requiredSegment(match[1]);
-        if (!(await ownedUpload(principal, id))) return failure("artifact_missing", 404);
-        await sql.run("DELETE FROM tf_artifact_uploads WHERE id = ?", [id]);
-        await writeReplay(replayKey, { status: 204 });
+        const upload = await ownedUpload(principal, id);
+        if (!upload) return failure("artifact_missing", 404);
+        if (upload.lifecycleState === "committed") return failure("artifact_committed", 409);
+        if (upload.lifecycleState === "open") {
+          const timestamp = now();
+          const token = guardToken();
+          try {
+            await sql.batch([
+              {
+                sql: `INSERT INTO tf_artifact_gc_guards (token, valid)
+                      SELECT ?, CASE WHEN
+                        EXISTS (
+                          SELECT 1 FROM tf_artifact_uploads
+                          WHERE id = ? AND tenant_id = ? AND principal_id = ?
+                            AND lifecycle_state = 'open'
+                        ) AND NOT EXISTS (
+                          SELECT 1 FROM tf_artifact_replays WHERE replay_key = ?
+                        )
+                      THEN 1 ELSE 0 END`,
+                params: [token, id, principal.tenantId, principal.principalId, replayKey],
+              },
+              {
+                sql: `UPDATE tf_artifact_uploads
+                      SET lifecycle_state = 'abandoned', lifecycle_fence = lifecycle_fence + 1,
+                          updated_at = ?, abandoned_at = ?
+                      WHERE id = ? AND tenant_id = ? AND principal_id = ?
+                        AND lifecycle_state = 'open'`,
+                params: [timestamp, timestamp, id, principal.tenantId, principal.principalId],
+              },
+              {
+                sql: `UPDATE tf_artifact_roots
+                      SET state = 'released', fence = fence + 1,
+                          release_reason = 'upload_abandoned', released_at = ?
+                      WHERE tenant_id = ? AND root_kind = 'upload' AND root_id = ?
+                        AND target_kind = 'manifest' AND digest = ? AND state = 'active'`,
+                params: [timestamp, principal.tenantId, id, upload.manifestDigest],
+              },
+              replayStatement(replayKey, { status: 204 }),
+              { sql: "DELETE FROM tf_artifact_gc_guards WHERE token = ?", params: [token] },
+            ]);
+          } catch (error) {
+            const settled = await readReplay(replayKey).catch(() => null);
+            if (settled) return replayArtifactResponse(settled);
+            throw error;
+          }
+        } else {
+          await sql.batch([replayStatement(replayKey, { status: 204 })]);
+        }
         return new Response(null, { status: 204 });
       }
 

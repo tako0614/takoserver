@@ -35,6 +35,11 @@ import {
 import { createRouter, type Router } from "./router.ts";
 import type { S3CredentialIssuer } from "./s3-port.ts";
 import { createSponsorshipRoutes } from "./sponsorship-api.ts";
+import {
+  type ArtifactReconcileReport,
+  type ArtifactReconciler,
+  createTakoformArtifactReconciler,
+} from "./takoform/artifact-reconciler.ts";
 import { createTakoformArtifacts, type TakoformArtifactTransport } from "./takoform/artifacts.ts";
 import { installedBindings } from "./takoform/bindings.ts";
 import type { WorkerModuleInspector } from "./takoform/engine.ts";
@@ -137,6 +142,10 @@ export interface AppPorts {
 
 export interface App {
   readonly fetch: Router;
+  /** Typed operator seam; no maintenance route is mounted on public HTTP. */
+  readonly maintenance: {
+    readonly artifacts: ArtifactReconciler;
+  };
   /** One pass of background settlement. Safe to call concurrently. */
   tick(): Promise<TickReport>;
 }
@@ -155,6 +164,8 @@ export interface TickReport {
   readonly providerMeterWindows: number;
   /** Deployment ids whose upstream usage could not be settled this pass. */
   readonly providerMeterFailures: readonly string[];
+  /** Bounded SQL-only repair; external artifact deletion is always operator-explicit. */
+  readonly artifactMaintenance: ArtifactReconcileReport;
 }
 
 export function buildApp(ports: AppPorts): App {
@@ -173,6 +184,12 @@ export function buildApp(ports: AppPorts): App {
   }
   const clock = ports.clock ?? (() => new Date());
   const randomId = ports.randomId ?? (() => crypto.randomUUID().replaceAll("-", ""));
+  const artifactReconciler = createTakoformArtifactReconciler({
+    sql: ports.sql,
+    objects: ports.objects,
+    clock,
+    randomId,
+  });
 
   const apiKeyAdministration = createApiKeyAdministration({
     sql: ports.sql,
@@ -542,6 +559,7 @@ export function buildApp(ports: AppPorts): App {
     fetch: integrationE2eCredentialRoute
       ? async (request) => (await integrationE2eCredentialRoute(request)) ?? (await router(request))
       : router,
+    maintenance: { artifacts: artifactReconciler },
     async tick(): Promise<TickReport> {
       await reseller.reconcileDue(64, async (intent) => {
         if (!intent.authorityRef) return "ready";
@@ -559,6 +577,10 @@ export function buildApp(ports: AppPorts): App {
       const orphans = await store.orphanedResources(installed, 32);
       const providerUsage = await providerMetering.reconcile(32);
       const meteredRows = await metering.rollUp(500);
+      const artifactMaintenance = await artifactReconciler.reconcile({
+        limit: 32,
+        deleteObjects: false,
+      });
       const orphanedResources = orphans.map(
         (orphan) => `${orphan.space}/${orphan.kind}/${orphan.name}`,
       );
@@ -578,6 +600,7 @@ export function buildApp(ports: AppPorts): App {
         meteredRows,
         providerMeterWindows: providerUsage.windows,
         providerMeterFailures: providerUsage.failures,
+        artifactMaintenance,
       };
     },
   };

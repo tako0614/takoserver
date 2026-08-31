@@ -20,6 +20,9 @@ describe("bringing a local database up to date", () => {
       "orgs",
       "ledger",
       "integration_e2e_credential_pair_operations",
+      "tf_artifact_gc_candidates",
+      "tf_artifact_manifest_members",
+      "tf_artifact_roots",
       "tf_resources",
       "tf_resource_attachments",
       "tf_resource_deployments",
@@ -59,8 +62,9 @@ describe("bringing a local database up to date", () => {
     const pairLifecycle = MIGRATIONS.findIndex(
       (migration) => migration.name === "0030_integration_e2e_credential_pairs.sql",
     );
-    expect(pairLifecycle).toBe(MIGRATIONS.length - 1);
+    expect(pairLifecycle).toBe(MIGRATIONS.length - 2);
     expect(MIGRATIONS[pairLifecycle - 1]?.name).toBe("0029_resource_deletion_attestations.sql");
+    expect(MIGRATIONS[pairLifecycle + 1]?.name).toBe("0031_takoform_artifact_lifecycle.sql");
     for (const migration of MIGRATIONS.slice(0, pairLifecycle)) {
       expect(migration.sql).not.toContain("integration_e2e_credential_pair_operations");
       database.exec(migration.sql);
@@ -92,7 +96,10 @@ describe("bringing a local database up to date", () => {
       .query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'")
       .get();
 
-    expect(migrateSqlite(database).applied).toEqual(["0030_integration_e2e_credential_pairs.sql"]);
+    expect(migrateSqlite(database).applied).toEqual([
+      "0030_integration_e2e_credential_pairs.sql",
+      "0031_takoform_artifact_lifecycle.sql",
+    ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
     ).toEqual(historical);
@@ -101,6 +108,123 @@ describe("bringing a local database up to date", () => {
         .query("SELECT COUNT(*) AS count FROM integration_e2e_credential_pair_operations")
         .get(),
     ).toEqual({ count: 0 });
+  });
+
+  test("backfills historical artifact owners conservatively into normalized roots", () => {
+    const database = new Database(":memory:");
+    database.exec(`
+      CREATE TABLE applied_migrations (
+        name TEXT PRIMARY KEY NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+    const lifecycle = MIGRATIONS.findIndex(
+      (migration) => migration.name === "0031_takoform_artifact_lifecycle.sql",
+    );
+    expect(lifecycle).toBe(MIGRATIONS.length - 1);
+    for (const migration of MIGRATIONS.slice(0, lifecycle)) {
+      database.exec(migration.sql);
+      database
+        .query("INSERT INTO applied_migrations (name, applied_at) VALUES (?, 'now')")
+        .run(migration.name);
+    }
+
+    const manifestDigest = `sha256:${"a".repeat(64)}`;
+    const blobDigest = `sha256:${"b".repeat(64)}`;
+    const unknownDigest = `sha256:${"c".repeat(64)}`;
+    const manifest = JSON.stringify({
+      apiVersion: "artifacts.takoform.com/v1alpha1",
+      kind: "WorkerBundle",
+      mainModule: "worker.mjs",
+      modules: [
+        {
+          name: "worker.mjs",
+          mediaType: "application/javascript+module",
+          size: 1,
+          digest: blobDigest,
+        },
+      ],
+    });
+    database
+      .query(
+        `INSERT INTO tf_artifact_uploads
+           (id, tenant_id, principal_id, manifest_json, manifest_digest, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run("up_legacy_artifact", "tenant_legacy", "run:legacy", manifest, manifestDigest, 10);
+    database
+      .query(
+        `INSERT INTO tf_artifact_manifests (digest, manifest_json, created_at)
+         VALUES (?, ?, ?)`,
+      )
+      .run(manifestDigest, manifest, 10);
+    database
+      .query("INSERT INTO tf_artifact_holds (tenant_id, digest, kind) VALUES (?, ?, ?)")
+      .run("tenant_legacy", manifestDigest, "manifest");
+    database
+      .query("INSERT INTO tf_artifact_holds (tenant_id, digest, kind) VALUES (?, ?, ?)")
+      .run("tenant_legacy", blobDigest, "blob");
+    database
+      .query("INSERT INTO tf_artifact_holds (tenant_id, digest, kind) VALUES (?, ?, ?)")
+      .run("tenant_unknown", unknownDigest, "blob");
+    database
+      .query(
+        `INSERT INTO tf_artifact_replays (replay_key, status, body_json, expires_at)
+         VALUES (?, 201, ?, ?)`,
+      )
+      .run(
+        ["tenant_legacy", "run:legacy", "start", "legacy-key"].join("\u0000"),
+        JSON.stringify({ uploadId: "up_legacy_artifact", manifestDigest }),
+        100,
+      );
+
+    expect(migrateSqlite(database).applied).toEqual(["0031_takoform_artifact_lifecycle.sql"]);
+    expect(
+      database
+        .query(
+          `SELECT lifecycle_state, lifecycle_fence, updated_at
+           FROM tf_artifact_uploads WHERE id = 'up_legacy_artifact'`,
+        )
+        .get(),
+    ).toEqual({ lifecycle_state: "committed", lifecycle_fence: 1, updated_at: 10 });
+    expect(
+      database
+        .query(
+          `SELECT manifest_digest, blob_digest FROM tf_artifact_manifest_members
+           ORDER BY manifest_digest, blob_digest`,
+        )
+        .all(),
+    ).toEqual([{ manifest_digest: manifestDigest, blob_digest: blobDigest }]);
+    expect(
+      database
+        .query(
+          `SELECT tenant_id, root_kind, target_kind, digest, state
+           FROM tf_artifact_roots ORDER BY tenant_id, root_kind, target_kind, digest`,
+        )
+        .all(),
+    ).toEqual([
+      {
+        tenant_id: "tenant_legacy",
+        root_kind: "replay",
+        target_kind: "manifest",
+        digest: manifestDigest,
+        state: "active",
+      },
+      {
+        tenant_id: "tenant_legacy",
+        root_kind: "upload",
+        target_kind: "manifest",
+        digest: manifestDigest,
+        state: "active",
+      },
+      {
+        tenant_id: "tenant_unknown",
+        root_kind: "legacy-hold",
+        target_kind: "blob",
+        digest: unknownDigest,
+        state: "active",
+      },
+    ]);
   });
 
   test("enforces the fixed organization, roles, scopes, TTL, and distinct role ids in 0030", () => {
