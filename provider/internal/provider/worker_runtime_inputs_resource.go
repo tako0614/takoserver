@@ -33,12 +33,14 @@ type workerRuntimeInputsResource struct {
 type workerRuntimeInputsModel struct {
 	Space                 types.String `tfsdk:"space"`
 	WorkerName            types.String `tfsdk:"worker_name"`
+	WorkerResourceUID     types.String `tfsdk:"worker_resource_uid"`
 	BundleName            types.String `tfsdk:"bundle_name"`
 	OriginResourceUID     types.String `tfsdk:"origin_resource_uid"`
 	CanonicalPublicOrigin types.String `tfsdk:"canonical_public_origin"`
 	BindingNames          types.Set    `tfsdk:"binding_names"`
 	MaterialSetID         types.String `tfsdk:"material_set_id"`
 	OperationID           types.String `tfsdk:"operation_id"`
+	RuntimeInputReference types.String `tfsdk:"runtime_input_reference"`
 	Status                types.String `tfsdk:"status"`
 	ExpiresAt             types.String `tfsdk:"expires_at"`
 }
@@ -63,6 +65,11 @@ func (r *workerRuntimeInputsResource) Schema(_ context.Context, _ frameworkresou
 			"worker_name": resourceschema.StringAttribute{
 				Required:      true,
 				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
+			},
+			"worker_resource_uid": resourceschema.StringAttribute{
+				Required:      true,
+				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
+				Description:   "Exact identity of the Worker resource realization targeted by this run-scoped material set.",
 			},
 			"bundle_name": resourceschema.StringAttribute{
 				Required:      true,
@@ -91,9 +98,10 @@ func (r *workerRuntimeInputsResource) Schema(_ context.Context, _ frameworkresou
 				},
 				Description: "Non-secret identity of the exact material set expected in the run-scoped credential file.",
 			},
-			"operation_id": resourceschema.StringAttribute{Computed: true},
-			"status":       resourceschema.StringAttribute{Computed: true},
-			"expires_at":   resourceschema.StringAttribute{Computed: true},
+			"operation_id":            resourceschema.StringAttribute{Computed: true},
+			"runtime_input_reference": resourceschema.StringAttribute{Computed: true, Description: "Opaque runtime-input reference returned by Takoserver for the downstream Host operation idempotency key."},
+			"status":                  resourceschema.StringAttribute{Computed: true},
+			"expires_at":              resourceschema.StringAttribute{Computed: true},
 		},
 	}
 }
@@ -134,6 +142,7 @@ func (r *workerRuntimeInputsResource) Create(ctx context.Context, request framew
 	envelope, err := credentialfile.LoadForTarget(r.data.credentialFilePath, credentialfile.Target{
 		Space:             plan.Space.ValueString(),
 		WorkerName:        plan.WorkerName.ValueString(),
+		WorkerResourceUID: plan.WorkerResourceUID.ValueString(),
 		BundleName:        plan.BundleName.ValueString(),
 		OriginResourceUID: plan.OriginResourceUID.ValueString(),
 	}, plan.CanonicalPublicOrigin.ValueString(), bindingNames)
@@ -154,6 +163,7 @@ func (r *workerRuntimeInputsResource) Create(ctx context.Context, request framew
 		MaterialSetID:         envelope.MaterialSetID,
 		Space:                 plan.Space.ValueString(),
 		WorkerName:            plan.WorkerName.ValueString(),
+		WorkerResourceUID:     plan.WorkerResourceUID.ValueString(),
 		BundleName:            plan.BundleName.ValueString(),
 		OriginResourceUID:     plan.OriginResourceUID.ValueString(),
 		CanonicalPublicOrigin: plan.CanonicalPublicOrigin.ValueString(),
@@ -165,6 +175,7 @@ func (r *workerRuntimeInputsResource) Create(ctx context.Context, request framew
 	}
 
 	plan.OperationID = types.StringValue(prepared.OperationID)
+	plan.RuntimeInputReference = types.StringValue(prepared.RuntimeInputReference)
 	plan.Status = types.StringValue(prepared.Status)
 	plan.ExpiresAt = types.StringValue(prepared.ExpiresAt.UTC().Format(time.RFC3339))
 	response.Diagnostics.Append(response.State.Set(ctx, &plan)...)
@@ -207,7 +218,7 @@ func (r *workerRuntimeInputsResource) Read(ctx context.Context, request framewor
 		return
 	}
 	sort.Strings(stateNames)
-	if observed.Space != state.Space.ValueString() || observed.WorkerName != state.WorkerName.ValueString() || observed.BundleName != state.BundleName.ValueString() || observed.OriginResourceUID != state.OriginResourceUID.ValueString() || observed.CanonicalPublicOrigin != state.CanonicalPublicOrigin.ValueString() || !equalStringSlices(observed.BindingNames, stateNames) {
+	if observed.Space != state.Space.ValueString() || observed.WorkerName != state.WorkerName.ValueString() || observed.WorkerResourceUID != state.WorkerResourceUID.ValueString() || observed.BundleName != state.BundleName.ValueString() || observed.OriginResourceUID != state.OriginResourceUID.ValueString() || observed.CanonicalPublicOrigin != state.CanonicalPublicOrigin.ValueString() || observed.RuntimeInputReference != state.RuntimeInputReference.ValueString() || !equalStringSlices(observed.BindingNames, stateNames) {
 		response.Diagnostics.AddError("Takoserver runtime input state drift", "The durable value-free preparation projection no longer matches the OpenTofu state identity.")
 		return
 	}
@@ -250,6 +261,7 @@ type operationIdentityDocument struct {
 type operationIdentityTarget struct {
 	Space             string `json:"space"`
 	WorkerName        string `json:"workerName"`
+	WorkerResourceUID string `json:"workerResourceUid"`
 	BundleName        string `json:"bundleName"`
 	OriginResourceUID string `json:"originResourceUid"`
 }
@@ -261,6 +273,7 @@ func deriveOperationID(plan workerRuntimeInputsModel, materialSetID string, bind
 		Target: operationIdentityTarget{
 			Space:             plan.Space.ValueString(),
 			WorkerName:        plan.WorkerName.ValueString(),
+			WorkerResourceUID: plan.WorkerResourceUID.ValueString(),
 			BundleName:        plan.BundleName.ValueString(),
 			OriginResourceUID: plan.OriginResourceUID.ValueString(),
 		},
@@ -283,6 +296,7 @@ func requireKnownPlan(plan *workerRuntimeInputsModel, response *frameworkresourc
 	}{
 		{name: "space", value: plan.Space},
 		{name: "worker_name", value: plan.WorkerName},
+		{name: "worker_resource_uid", value: plan.WorkerResourceUID},
 		{name: "bundle_name", value: plan.BundleName},
 		{name: "origin_resource_uid", value: plan.OriginResourceUID},
 		{name: "canonical_public_origin", value: plan.CanonicalPublicOrigin},

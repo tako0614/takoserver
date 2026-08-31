@@ -42,6 +42,7 @@ var (
 type Target struct {
 	Space             string `json:"space"`
 	WorkerName        string `json:"workerName"`
+	WorkerResourceUID string `json:"workerResourceUid"`
 	BundleName        string `json:"bundleName"`
 	OriginResourceUID string `json:"originResourceUid"`
 }
@@ -54,8 +55,8 @@ type commitmentBinding struct {
 // materialSetCommitmentDocument is the versioned, fixed-order preimage for a
 // materialSetId. Its UTF-8 canonical JSON is emitted without insignificant
 // whitespace in this exact key order:
-// format, materialSetNonce, target (space, workerName, bundleName,
-// originResourceUid), canonicalPublicOrigin, bindings (sorted name/value
+// format, materialSetNonce, target (space, workerName, workerResourceUid,
+// bundleName, originResourceUid), canonicalPublicOrigin, bindings (sorted name/value
 // pairs). The nonce is stored only in the 0600 credential file; it is
 // deliberately never returned in state or sent to Takoserver. Bindings are a
 // sorted slice rather than a map so encoding/json cannot introduce an order
@@ -300,6 +301,7 @@ func validateTarget(target Target) error {
 	for name, value := range map[string]string{
 		"space":             target.Space,
 		"workerName":        target.WorkerName,
+		"workerResourceUid": target.WorkerResourceUID,
 		"bundleName":        target.BundleName,
 		"originResourceUid": target.OriginResourceUID,
 	} {

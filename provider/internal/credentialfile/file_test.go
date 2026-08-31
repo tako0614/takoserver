@@ -26,11 +26,12 @@ func TestLoadAcceptsOneExactSecureMaterialSet(t *testing.T) {
 	}
 	contents := []byte(`{
   "format": "takosumi.provider-credential-file@v1",
-  "materialSetId": "material-set:v1:caa5711aad0ba57684e8d97b2ba0bb6082382a6ac32422b88450fb8498c4fba5",
+  "materialSetId": "material-set:v1:0045a05706edb055fff93f8bf200efb94827a00de4ac249a026c347fe68ef4d9",
   "materialSetNonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
   "target": {
     "space": "default",
     "workerName": "yurucommu",
+    "workerResourceUid": "uid-worker-01",
     "bundleName": "bundle-01",
     "originResourceUid": "uid-origin-01"
   },
@@ -54,7 +55,7 @@ func TestLoadAcceptsOneExactSecureMaterialSet(t *testing.T) {
 	if got.Format != "takosumi.provider-credential-file@v1" {
 		t.Fatalf("Format = %q", got.Format)
 	}
-	if got.MaterialSetID != "material-set:v1:caa5711aad0ba57684e8d97b2ba0bb6082382a6ac32422b88450fb8498c4fba5" {
+	if got.MaterialSetID != "material-set:v1:0045a05706edb055fff93f8bf200efb94827a00de4ac249a026c347fe68ef4d9" {
 		t.Fatalf("MaterialSetID = %q", got.MaterialSetID)
 	}
 	if got.CanonicalPublicOrigin != "https://community.example.test" {
@@ -73,7 +74,7 @@ func TestLoadRejectsBindingNamesOutsideThePortableEnvironmentNamespace(t *testin
       "format":"takosumi.provider-credential-file@v1",
       "materialSetId":"material-set:v1:0000000000000000000000000000000000000000000000000000000000000000",
       "materialSetNonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-      "target":{"space":"default","workerName":"yurucommu","bundleName":"bundle-01","originResourceUid":"uid-origin-01"},
+      "target":{"space":"default","workerName":"yurucommu","workerResourceUid":"uid-worker-01","bundleName":"bundle-01","originResourceUid":"uid-origin-01"},
       "canonicalPublicOrigin":"https://community.example.test",
       "values":{"../TOKEN":"placeholder-value"}
     }`), 0o600); err != nil {
@@ -90,7 +91,7 @@ func TestLoadAcceptsCanonicalJSONWithReorderedValues(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "runtime-inputs.json")
 	contents := validEnvelopeJSON(
-		"material-set:v1:5866abee0fff6a8765e02977561092a6f78cd3e97a5e2380a548aafbd030f4a3",
+		"material-set:v1:99d9cd8119da6244a528128b04077c06ade70382d7c064a0f600ba6405b81bc5",
 		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
 		"https://community.example.test",
 		`"TAKOSUMI_ACCOUNTS_CLIENT_ID":"placeholder-client-id","ENCRYPTION_KEY":"placeholder-encryption-value"`,
@@ -102,21 +103,69 @@ func TestLoadAcceptsCanonicalJSONWithReorderedValues(t *testing.T) {
 	got, err := credentialfile.LoadForTarget(path, credentialfile.Target{
 		Space:             "default",
 		WorkerName:        "yurucommu",
+		WorkerResourceUID: "uid-worker-01",
 		BundleName:        "bundle-01",
 		OriginResourceUID: "uid-origin-01",
 	}, "https://community.example.test", []string{"ENCRYPTION_KEY", "TAKOSUMI_ACCOUNTS_CLIENT_ID"})
 	if err != nil {
 		t.Fatalf("LoadForTarget() error = %v", err)
 	}
-	if got.MaterialSetID != "material-set:v1:5866abee0fff6a8765e02977561092a6f78cd3e97a5e2380a548aafbd030f4a3" || len(got.Values) != 2 {
+	if got.MaterialSetID != "material-set:v1:99d9cd8119da6244a528128b04077c06ade70382d7c064a0f600ba6405b81bc5" || len(got.Values) != 2 {
 		t.Fatalf("loaded envelope = %#v", got)
+	}
+}
+
+func TestLoadForTargetRejectsWorkerResourceUIDDrift(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "runtime-inputs.json")
+	contents := validEnvelopeJSON(
+		"material-set:v1:99d9cd8119da6244a528128b04077c06ade70382d7c064a0f600ba6405b81bc5",
+		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+		"https://community.example.test",
+		`"ENCRYPTION_KEY":"placeholder-encryption-value","TAKOSUMI_ACCOUNTS_CLIENT_ID":"placeholder-client-id"`,
+	)
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write credential fixture: %v", err)
+	}
+
+	_, err := credentialfile.LoadForTarget(path, credentialfile.Target{
+		Space:             "default",
+		WorkerName:        "yurucommu",
+		WorkerResourceUID: "uid-worker-02",
+		BundleName:        "bundle-01",
+		OriginResourceUID: "uid-origin-01",
+	}, "https://community.example.test", []string{"ENCRYPTION_KEY", "TAKOSUMI_ACCOUNTS_CLIENT_ID"})
+	if err == nil || !strings.Contains(err.Error(), "target does not match") {
+		t.Fatalf("LoadForTarget() error = %v, want worker resource identity drift rejection", err)
+	}
+}
+
+func TestLoadRejectsMissingWorkerResourceUID(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "runtime-inputs.json")
+	contents := `{
+      "format":"takosumi.provider-credential-file@v1",
+      "materialSetId":"material-set:v1:99d9cd8119da6244a528128b04077c06ade70382d7c064a0f600ba6405b81bc5",
+      "materialSetNonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "target":{"space":"default","workerName":"yurucommu","bundleName":"bundle-01","originResourceUid":"uid-origin-01"},
+      "canonicalPublicOrigin":"https://community.example.test",
+      "values":{"ENCRYPTION_KEY":"placeholder-encryption-value","TAKOSUMI_ACCOUNTS_CLIENT_ID":"placeholder-client-id"}
+    }`
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write credential fixture: %v", err)
+	}
+
+	if _, err := credentialfile.Load(path, "https://community.example.test", []string{"ENCRYPTION_KEY", "TAKOSUMI_ACCOUNTS_CLIENT_ID"}); err == nil || !strings.Contains(err.Error(), "workerResourceUid") {
+		t.Fatalf("Load() error = %v, want missing worker resource identity rejection", err)
 	}
 }
 
 func TestLoadRejectsHighValueCredentialFileHazards(t *testing.T) {
 	t.Parallel()
 
-	const materialSetID = "material-set:v1:5866abee0fff6a8765e02977561092a6f78cd3e97a5e2380a548aafbd030f4a3"
+	const materialSetID = "material-set:v1:99d9cd8119da6244a528128b04077c06ade70382d7c064a0f600ba6405b81bc5"
 	const nonce = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 	tests := []struct {
 		name  string
@@ -240,7 +289,7 @@ func validEnvelopeJSON(materialSetID, nonce, origin, values string) string {
   "format":"takosumi.provider-credential-file@v1",
   "materialSetId":%q,
   "materialSetNonce":%q,
-  "target":{"space":"default","workerName":"yurucommu","bundleName":"bundle-01","originResourceUid":"uid-origin-01"},
+  "target":{"space":"default","workerName":"yurucommu","workerResourceUid":"uid-worker-01","bundleName":"bundle-01","originResourceUid":"uid-origin-01"},
   "canonicalPublicOrigin":%q,
   "values":{%s}
 }

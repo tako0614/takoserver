@@ -41,9 +41,10 @@ func TestPutRuntimeInputPreparationUsesTheTakoserverControlBoundary(t *testing.T
           "format":"takoserver.worker-runtime-input-preparation@v1",
           "operationId":"op-01",
           "preparationId":"prep-01",
+          "runtimeInputReference":"rip1.prep-01.0000000000000000000000000000000000000000000000000000000000000000",
           "status":"prepared",
           "expiresAt":"2026-08-31T18:30:00Z",
-          "target":{"space":"default","workerName":"yurucommu","bundleName":"bundle-01","originResourceUid":"uid-origin-01"},
+          "target":{"space":"default","workerName":"yurucommu","workerResourceUid":"uid-worker-01","bundleName":"bundle-01","originResourceUid":"uid-origin-01"},
           "canonicalPublicOrigin":"https://community.example.test",
           "bindingNames":["ENCRYPTION_KEY","TAKOSUMI_ACCOUNTS_CLIENT_ID"]
         }`))
@@ -58,6 +59,7 @@ func TestPutRuntimeInputPreparationUsesTheTakoserverControlBoundary(t *testing.T
 		MaterialSetID:         "material-set:v1:5866abee0fff6a8765e02977561092a6f78cd3e97a5e2380a548aafbd030f4a3",
 		Space:                 "default",
 		WorkerName:            "yurucommu",
+		WorkerResourceUID:     "uid-worker-01",
 		BundleName:            "bundle-01",
 		OriginResourceUID:     "uid-origin-01",
 		CanonicalPublicOrigin: "https://community.example.test",
@@ -76,11 +78,15 @@ func TestPutRuntimeInputPreparationUsesTheTakoserverControlBoundary(t *testing.T
 	if gotBody["materialSetId"] != "material-set:v1:5866abee0fff6a8765e02977561092a6f78cd3e97a5e2380a548aafbd030f4a3" {
 		t.Fatalf("materialSetId = %#v", gotBody["materialSetId"])
 	}
+	target, ok := gotBody["target"].(map[string]any)
+	if !ok || target["workerResourceUid"] != "uid-worker-01" {
+		t.Fatalf("target workerResourceUid = %#v", gotBody["target"])
+	}
 	bindings, ok := gotBody["bindings"].(map[string]any)
 	if !ok || bindings["ENCRYPTION_KEY"] != "placeholder-encryption-value" || bindings["TAKOSUMI_ACCOUNTS_CLIENT_ID"] != "placeholder-client-id" {
 		t.Fatalf("bindings = %#v", gotBody["bindings"])
 	}
-	if result.OperationID != "op-01" || result.PreparationID != "prep-01" || result.Status != "prepared" {
+	if result.OperationID != "op-01" || result.PreparationID != "prep-01" || result.RuntimeInputReference != "rip1.prep-01.0000000000000000000000000000000000000000000000000000000000000000" || result.WorkerResourceUID != "uid-worker-01" || result.Status != "prepared" {
 		t.Fatalf("result identity/status = %#v", result)
 	}
 	if !result.ExpiresAt.Equal(time.Date(2026, 8, 31, 18, 30, 0, 0, time.UTC)) {
@@ -109,9 +115,10 @@ func TestGetRuntimeInputPreparationReturnsOnlyTheValueFreeProjection(t *testing.
           "format":"takoserver.worker-runtime-input-preparation@v1",
           "operationId":"op-01",
           "preparationId":"prep-01",
+          "runtimeInputReference":"rip1.prep-01.0000000000000000000000000000000000000000000000000000000000000000",
           "status":"consumed",
           "expiresAt":"2026-08-31T18:30:00Z",
-          "target":{"space":"default","workerName":"yurucommu","bundleName":"bundle-01","originResourceUid":"uid-origin-01"},
+          "target":{"space":"default","workerName":"yurucommu","workerResourceUid":"uid-worker-01","bundleName":"bundle-01","originResourceUid":"uid-origin-01"},
           "canonicalPublicOrigin":"https://community.example.test",
           "bindingNames":["ENCRYPTION_KEY","TAKOSUMI_ACCOUNTS_CLIENT_ID"]
         }`))
@@ -126,8 +133,64 @@ func TestGetRuntimeInputPreparationReturnsOnlyTheValueFreeProjection(t *testing.
 	if err != nil {
 		t.Fatalf("GetRuntimeInputPreparation() error = %v", err)
 	}
-	if result.OperationID != "op-01" || result.PreparationID != "prep-01" || result.Status != "consumed" {
+	if result.OperationID != "op-01" || result.PreparationID != "prep-01" || result.RuntimeInputReference != "rip1.prep-01.0000000000000000000000000000000000000000000000000000000000000000" || result.WorkerResourceUID != "uid-worker-01" || result.Status != "consumed" {
 		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestGetRuntimeInputPreparationRejectsMissingWorkerResourceUID(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+          "format":"takoserver.worker-runtime-input-preparation@v1",
+          "operationId":"op-01",
+          "preparationId":"prep-01",
+          "runtimeInputReference":"rip1.prep-01.0000000000000000000000000000000000000000000000000000000000000000",
+          "status":"prepared",
+          "expiresAt":"2026-08-31T18:30:00Z",
+          "target":{"space":"default","workerName":"yurucommu","bundleName":"bundle-01","originResourceUid":"uid-origin-01"},
+          "canonicalPublicOrigin":"https://community.example.test",
+          "bindingNames":["ENCRYPTION_KEY"]
+        }`))
+	}))
+	defer server.Close()
+
+	api, err := client.New(server.URL, "provider-token", "org-01", server.Client())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if _, err := api.GetRuntimeInputPreparation(context.Background(), "op-01"); err == nil || !strings.Contains(err.Error(), "incomplete projection") {
+		t.Fatalf("GetRuntimeInputPreparation() error = %v, want missing worker resource identity rejection", err)
+	}
+}
+
+func TestGetRuntimeInputPreparationRejectsMismatchedRuntimeInputReference(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+          "format":"takoserver.worker-runtime-input-preparation@v1",
+          "operationId":"op-01",
+          "preparationId":"prep-01",
+          "runtimeInputReference":"rip1.other-preparation.0000000000000000000000000000000000000000000000000000000000000000",
+          "status":"prepared",
+          "expiresAt":"2026-08-31T18:30:00Z",
+          "target":{"space":"default","workerName":"yurucommu","workerResourceUid":"uid-worker-01","bundleName":"bundle-01","originResourceUid":"uid-origin-01"},
+          "canonicalPublicOrigin":"https://community.example.test",
+          "bindingNames":["ENCRYPTION_KEY"]
+        }`))
+	}))
+	defer server.Close()
+
+	api, err := client.New(server.URL, "provider-token", "org-01", server.Client())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if _, err := api.GetRuntimeInputPreparation(context.Background(), "op-01"); err == nil || !strings.Contains(err.Error(), "mismatched identity") {
+		t.Fatalf("GetRuntimeInputPreparation() error = %v, want mismatched runtime input reference rejection", err)
 	}
 }
 
@@ -196,6 +259,7 @@ func TestRuntimeInputClientDoesNotFollowRedirectsOrLeakResponseBody(t *testing.T
 		MaterialSetID:         "material-set:v1:5866abee0fff6a8765e02977561092a6f78cd3e97a5e2380a548aafbd030f4a3",
 		Space:                 "default",
 		WorkerName:            "yurucommu",
+		WorkerResourceUID:     "uid-worker-01",
 		BundleName:            "bundle-01",
 		OriginResourceUID:     "uid-origin-01",
 		CanonicalPublicOrigin: "https://community.example.test",

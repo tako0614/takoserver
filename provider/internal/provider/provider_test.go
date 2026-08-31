@@ -50,12 +50,14 @@ func TestProviderExposesOneValueFreeRuntimeInputResource(t *testing.T) {
 	for _, name := range []string{
 		"space",
 		"worker_name",
+		"worker_resource_uid",
 		"bundle_name",
 		"origin_resource_uid",
 		"canonical_public_origin",
 		"binding_names",
 		"material_set_id",
 		"operation_id",
+		"runtime_input_reference",
 		"status",
 		"expires_at",
 	} {
@@ -68,10 +70,16 @@ func TestProviderExposesOneValueFreeRuntimeInputResource(t *testing.T) {
 			t.Errorf("resource state exposes forbidden attribute %q", forbidden)
 		}
 	}
-	for _, name := range []string{"space", "worker_name", "bundle_name", "origin_resource_uid", "canonical_public_origin", "material_set_id"} {
+	for _, name := range []string{"space", "worker_name", "worker_resource_uid", "bundle_name", "origin_resource_uid", "canonical_public_origin", "material_set_id"} {
 		attribute, ok := resourceSchema.Schema.Attributes[name].(resourceschema.StringAttribute)
 		if !ok || !attribute.Required || len(attribute.PlanModifiers) == 0 {
 			t.Errorf("%s must replace instead of mutating a preparation in place", name)
+		}
+	}
+	for _, name := range []string{"operation_id", "runtime_input_reference", "status", "expires_at"} {
+		attribute, ok := resourceSchema.Schema.Attributes[name].(resourceschema.StringAttribute)
+		if !ok || !attribute.Computed {
+			t.Errorf("%s must be computed from the Takoserver projection", name)
 		}
 	}
 	bindingNames, ok := resourceSchema.Schema.Attributes["binding_names"].(resourceschema.SetAttribute)

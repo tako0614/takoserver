@@ -28,6 +28,8 @@ var opaqueIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
 var materialSetIDPattern = regexp.MustCompile(`^material-set:v1:[0-9a-f]{64}$`)
 
+var runtimeInputReferencePattern = regexp.MustCompile(`^rip1\.([A-Za-z0-9_-]{3,42})\.([0-9a-f]{64})$`)
+
 // ErrNotFound means no durable preparation exists for the exact operation.
 var ErrNotFound = errors.New("runtime input preparation not found")
 
@@ -45,6 +47,7 @@ type RuntimeInputPreparationInput struct {
 	MaterialSetID         string
 	Space                 string
 	WorkerName            string
+	WorkerResourceUID     string
 	BundleName            string
 	OriginResourceUID     string
 	CanonicalPublicOrigin string
@@ -56,10 +59,12 @@ type RuntimeInputPreparationInput struct {
 type RuntimeInputPreparation struct {
 	OperationID           string
 	PreparationID         string
+	RuntimeInputReference string
 	Status                string
 	ExpiresAt             time.Time
 	Space                 string
 	WorkerName            string
+	WorkerResourceUID     string
 	BundleName            string
 	OriginResourceUID     string
 	CanonicalPublicOrigin string
@@ -78,6 +83,7 @@ type runtimeInputPreparationResponse struct {
 	Format                string            `json:"format"`
 	OperationID           string            `json:"operationId"`
 	PreparationID         string            `json:"preparationId"`
+	RuntimeInputReference string            `json:"runtimeInputReference"`
 	Status                string            `json:"status"`
 	ExpiresAt             time.Time         `json:"expiresAt"`
 	Target                preparationTarget `json:"target"`
@@ -88,6 +94,7 @@ type runtimeInputPreparationResponse struct {
 type preparationTarget struct {
 	Space             string `json:"space"`
 	WorkerName        string `json:"workerName"`
+	WorkerResourceUID string `json:"workerResourceUid"`
 	BundleName        string `json:"bundleName"`
 	OriginResourceUID string `json:"originResourceUid"`
 }
@@ -131,6 +138,9 @@ func (c *Client) PutRuntimeInputPreparation(ctx context.Context, operationID str
 	if !materialSetIDPattern.MatchString(input.MaterialSetID) {
 		return RuntimeInputPreparation{}, errors.New("runtime input material set identity is invalid")
 	}
+	if input.WorkerResourceUID == "" {
+		return RuntimeInputPreparation{}, errors.New("runtime input worker resource identity is required")
+	}
 	if err := validateCanonicalOrigin(input.CanonicalPublicOrigin); err != nil {
 		return RuntimeInputPreparation{}, err
 	}
@@ -140,6 +150,7 @@ func (c *Client) PutRuntimeInputPreparation(ctx context.Context, operationID str
 		Target: preparationTarget{
 			Space:             input.Space,
 			WorkerName:        input.WorkerName,
+			WorkerResourceUID: input.WorkerResourceUID,
 			BundleName:        input.BundleName,
 			OriginResourceUID: input.OriginResourceUID,
 		},
@@ -175,10 +186,10 @@ func (c *Client) PutRuntimeInputPreparation(ctx context.Context, operationID str
 	if err != nil {
 		return RuntimeInputPreparation{}, err
 	}
-	if wire.Format != runtimeInputPreparationFormat || wire.OperationID != operationID || wire.PreparationID == "" || wire.Status != "prepared" || wire.ExpiresAt.IsZero() {
+	if wire.Format != runtimeInputPreparationFormat || wire.OperationID != operationID || wire.PreparationID == "" || !validRuntimeInputReference(wire.RuntimeInputReference, wire.PreparationID) || wire.Status != "prepared" || wire.ExpiresAt.IsZero() {
 		return RuntimeInputPreparation{}, errors.New("Takoserver runtime input preparation returned mismatched identity or state")
 	}
-	if wire.Target.Space != input.Space || wire.Target.WorkerName != input.WorkerName || wire.Target.BundleName != input.BundleName || wire.Target.OriginResourceUID != input.OriginResourceUID || wire.CanonicalPublicOrigin != input.CanonicalPublicOrigin {
+	if wire.Target.Space != input.Space || wire.Target.WorkerName != input.WorkerName || wire.Target.WorkerResourceUID != input.WorkerResourceUID || wire.Target.BundleName != input.BundleName || wire.Target.OriginResourceUID != input.OriginResourceUID || wire.CanonicalPublicOrigin != input.CanonicalPublicOrigin {
 		return RuntimeInputPreparation{}, errors.New("Takoserver runtime input preparation returned a mismatched target")
 	}
 	wantNames := sortedBindingNames(input.Bindings)
@@ -189,10 +200,12 @@ func (c *Client) PutRuntimeInputPreparation(ctx context.Context, operationID str
 	return RuntimeInputPreparation{
 		OperationID:           wire.OperationID,
 		PreparationID:         wire.PreparationID,
+		RuntimeInputReference: wire.RuntimeInputReference,
 		Status:                wire.Status,
 		ExpiresAt:             wire.ExpiresAt,
 		Space:                 wire.Target.Space,
 		WorkerName:            wire.Target.WorkerName,
+		WorkerResourceUID:     wire.Target.WorkerResourceUID,
 		BundleName:            wire.Target.BundleName,
 		OriginResourceUID:     wire.Target.OriginResourceUID,
 		CanonicalPublicOrigin: wire.CanonicalPublicOrigin,
@@ -233,10 +246,10 @@ func (c *Client) GetRuntimeInputPreparation(ctx context.Context, operationID str
 	if err != nil {
 		return RuntimeInputPreparation{}, err
 	}
-	if wire.OperationID != operationID || wire.PreparationID == "" || wire.ExpiresAt.IsZero() || !validPreparationStatus(wire.Status) {
+	if wire.OperationID != operationID || wire.PreparationID == "" || !validRuntimeInputReference(wire.RuntimeInputReference, wire.PreparationID) || wire.ExpiresAt.IsZero() || !validPreparationStatus(wire.Status) {
 		return RuntimeInputPreparation{}, errors.New("Takoserver runtime input preparation read returned mismatched identity or state")
 	}
-	if wire.Target.Space == "" || wire.Target.WorkerName == "" || wire.Target.BundleName == "" || wire.Target.OriginResourceUID == "" || wire.CanonicalPublicOrigin == "" || len(wire.BindingNames) == 0 {
+	if wire.Target.Space == "" || wire.Target.WorkerName == "" || wire.Target.WorkerResourceUID == "" || wire.Target.BundleName == "" || wire.Target.OriginResourceUID == "" || wire.CanonicalPublicOrigin == "" || len(wire.BindingNames) == 0 {
 		return RuntimeInputPreparation{}, errors.New("Takoserver runtime input preparation read returned an incomplete projection")
 	}
 	if err := validateCanonicalOrigin(wire.CanonicalPublicOrigin); err != nil {
@@ -310,10 +323,12 @@ func runtimeInputPreparationFromWire(wire runtimeInputPreparationResponse) Runti
 	return RuntimeInputPreparation{
 		OperationID:           wire.OperationID,
 		PreparationID:         wire.PreparationID,
+		RuntimeInputReference: wire.RuntimeInputReference,
 		Status:                wire.Status,
 		ExpiresAt:             wire.ExpiresAt,
 		Space:                 wire.Target.Space,
 		WorkerName:            wire.Target.WorkerName,
+		WorkerResourceUID:     wire.Target.WorkerResourceUID,
 		BundleName:            wire.Target.BundleName,
 		OriginResourceUID:     wire.Target.OriginResourceUID,
 		CanonicalPublicOrigin: wire.CanonicalPublicOrigin,
@@ -328,6 +343,11 @@ func validPreparationStatus(status string) bool {
 	default:
 		return false
 	}
+}
+
+func validRuntimeInputReference(value, preparationID string) bool {
+	match := runtimeInputReferencePattern.FindStringSubmatch(value)
+	return match != nil && match[1] == preparationID
 }
 
 func hasDuplicateStrings(values []string) bool {
