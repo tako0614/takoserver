@@ -79,10 +79,36 @@ export function migrateSqlite(database: MigratableDatabase): MigrationReport {
  * files statement-by-statement after removing line comments.
  */
 function executeStatements(database: MigratableDatabase, sql: string): void {
-  const statements = sql
-    .replace(/^\s*--.*$/gmu, "")
-    .split(";")
-    .map((statement) => statement.trim())
-    .filter((statement) => statement.length > 0);
+  const statements = splitStatements(sql.replace(/^\s*--.*$/gmu, ""));
   for (const statement of statements) database.exec(statement);
+}
+
+/**
+ * Migration files are intentionally simple, with one exception: SQLite
+ * triggers contain semicolon-delimited statements inside `BEGIN ... END`.
+ * Preserve each complete trigger as one statement while retaining the
+ * intermediate-error visibility that a raw multi-statement `exec` lacks.
+ */
+function splitStatements(sql: string): readonly string[] {
+  const statements: string[] = [];
+  let rest = sql.trim();
+  while (rest.length > 0) {
+    if (/^CREATE\s+TRIGGER\b/iu.test(rest)) {
+      const end = /^END\s*;/imu.exec(rest);
+      if (!end) throw new Error("incomplete CREATE TRIGGER in migration");
+      const boundary = (end.index ?? 0) + end[0].length;
+      statements.push(rest.slice(0, boundary).trim());
+      rest = rest.slice(boundary).trim();
+      continue;
+    }
+    const boundary = rest.indexOf(";");
+    if (boundary < 0) {
+      statements.push(rest);
+      break;
+    }
+    const statement = rest.slice(0, boundary).trim();
+    if (statement.length > 0) statements.push(statement);
+    rest = rest.slice(boundary + 1).trim();
+  }
+  return statements;
 }
