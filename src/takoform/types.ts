@@ -244,8 +244,11 @@ export interface TakoformStandardServiceResolver {
 }
 
 export interface TakoformResourceDriver {
+  readonly runtimeInputPolicy?: TakoformRuntimeInputPolicy;
   apply(input: {
     readonly operationId: string;
+    /** Caller-chosen Host idempotency identity, retained across operation recovery. */
+    readonly operationKey: string;
     /** Durable saga evidence: only `initial` may dispatch a new provider mutation. */
     readonly operationMode?: "initial" | "recovery";
     /** Opaque provider-owned handle retained by the saga for recovery polling. */
@@ -330,6 +333,20 @@ export interface TakoformResourceDriver {
       readonly migrations: readonly TakoformSqliteMigration[];
     }): Promise<void>;
   };
+}
+
+/** Provider selection and runtime-input admission share one authority. */
+export interface TakoformRuntimeInputPolicy {
+  /** Target-independent guarantee suitable for public Form support metadata. */
+  guaranteedMaximum(form: InstalledTakoformForm): number;
+  /** Exact provider-selected admission before any durable plan or provider mutation. */
+  admit(input: {
+    readonly tenantId: string;
+    readonly form: InstalledTakoformForm;
+    readonly spec: JsonObject;
+    readonly relations: readonly TakoformDriverRelation[];
+    readonly commercialAuthority?: TakoformCommercialAuthority;
+  }): Promise<void>;
 }
 
 export interface TakoformSqliteMigrationIdentity {

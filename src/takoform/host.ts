@@ -122,6 +122,9 @@ export function createTakoformHost(options: CreateTakoformHostOptions): Takoform
       ? { standardServiceResolver: options.standardServiceResolver }
       : {}),
     ...(options.availability ? { availability: options.availability } : {}),
+    ...(options.driver.runtimeInputPolicy
+      ? { runtimeInputPolicy: options.driver.runtimeInputPolicy }
+      : {}),
     authority: options.authority,
     ...(options.provision ? { provision: options.provision } : {}),
   });

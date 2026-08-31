@@ -252,6 +252,7 @@ describe("Takoform apply on a real backend", () => {
     });
     const input = {
       operationId: "op_priced_running",
+      operationKey: "key_priced_running",
       tenantId: "org_priced",
       resourceUid: "uid_priced",
       form: FORM,
@@ -347,6 +348,7 @@ describe("Takoform apply on a real backend", () => {
       });
     const input = {
       operationId: "op_poll_lost",
+      operationKey: "key_poll_lost",
       tenantId: "org_poll_lost",
       resourceUid: "uid_poll_lost",
       form: FORM,
@@ -413,6 +415,7 @@ describe("Takoform apply on a real backend", () => {
       });
     const input = {
       operationId: "op_priced_indeterminate",
+      operationKey: "key_priced_indeterminate",
       tenantId: "org_indeterminate",
       resourceUid: "uid_indeterminate",
       form: FORM,
@@ -486,6 +489,7 @@ describe("Takoform apply on a real backend", () => {
       });
     const input = {
       operationId: "op_recover_apply",
+      operationKey: "key_recover_apply",
       tenantId: "org_recover_apply",
       resourceUid: "uid_recover_apply",
       form: FORM,
@@ -543,6 +547,7 @@ describe("Takoform apply on a real backend", () => {
     });
     const result = await driver.apply({
       operationId: "op_version",
+      operationKey: "key_version",
       tenantId: "org_inherited",
       resourceUid: "uid_version",
       form: version,
@@ -583,6 +588,116 @@ describe("Takoform apply on a real backend", () => {
     });
   });
 
+  test("admits runtime inputs only for the exact inherited provider capability", async () => {
+    const sql = createEphemeralSql();
+    const clock = () => new Date("2026-08-24T00:00:00.000Z");
+    const deployments = createResourceDeploymentStore(sql, clock);
+    const bundle = await buildEdgeForms();
+    const worker = bundle.forms.find(
+      (candidate) => candidate.identity.formRef.kind === "ModuleWorker",
+    );
+    const version = bundle.forms.find(
+      (candidate) => candidate.identity.formRef.kind === "WorkerVersion",
+    );
+    if (!worker || !version) throw new Error("released edge Forms missing");
+    const versionOffering = edgeProviderOffering(version, {
+      id: "cloudflare.worker-version",
+    });
+    const capable = Object.assign(
+      new FakeProvider({ id: "capable", offerings: [versionOffering] }),
+      { runtimeInputCapabilities: { maximumBindings: 64 } },
+    );
+    const incapable = new FakeProvider({ id: "incapable", offerings: [versionOffering] });
+    const driver = createProviderDriver({
+      providers: [capable, incapable],
+      catalog: createCatalog([]),
+      ledger: createLedger(sql, clock),
+      deployments,
+    });
+    const tenantId = "org_runtime_inputs";
+    const workerResource = (uid: string, name: string) => ({
+      apiVersion: worker.identity.formRef.apiVersion,
+      kind: worker.identity.formRef.kind,
+      form: worker.identity,
+      metadata: {
+        name,
+        space: "default",
+        uid,
+        generation: "1",
+        revision: "1",
+      },
+      spec: {},
+      status: { observedGeneration: "1", conditions: [] },
+    });
+    const relation = (uid: string, name: string) => ({
+      pointer: "/worker",
+      relation: "/worker",
+      targetUid: uid,
+      resource: workerResource(uid, name),
+    });
+    await deployments.create({
+      tenantId,
+      id: "dep_worker_capable",
+      resourceUid: "uid_worker_capable",
+      offeringId: "cloudflare.module-worker",
+      providerPackRef: "capable",
+      providerInstallationRef: "capable.primary",
+      nativeId: "capable:worker",
+      state: "active",
+      observed: { allocated: true },
+      outputs: { scriptName: "capable-worker" },
+    });
+    await deployments.create({
+      tenantId,
+      id: "dep_worker_incapable",
+      resourceUid: "uid_worker_incapable",
+      offeringId: "cloudflare.module-worker",
+      providerPackRef: "incapable",
+      providerInstallationRef: "incapable.primary",
+      nativeId: "incapable:worker",
+      state: "active",
+      observed: { allocated: true },
+      outputs: { scriptName: "incapable-worker" },
+    });
+
+    const capableResult = await driver.apply({
+      operationId: "op_runtime_capable",
+      operationKey: "key_runtime_capable",
+      tenantId,
+      resourceUid: "uid_version_capable",
+      form: version,
+      name: "version-capable",
+      space: "default",
+      spec: { handlers: ["fetch"], requiredSensitiveVars: ["ENCRYPTION_KEY"] },
+      relations: [relation("uid_worker_capable", "capable-worker")],
+    });
+    expect(capableResult.observed).toEqual({
+      handlers: ["fetch"],
+      requiredSensitiveVars: ["ENCRYPTION_KEY"],
+    });
+    expect(capable.sideEffectCount).toBe(1);
+    expect(await deployments.active(tenantId, "uid_version_capable")).toMatchObject({
+      providerPackRef: "capable",
+      providerInstallationRef: "capable.primary",
+    });
+
+    await expect(
+      driver.apply({
+        operationId: "op_runtime_incapable",
+        operationKey: "key_runtime_incapable",
+        tenantId,
+        resourceUid: "uid_version_incapable",
+        form: version,
+        name: "version-incapable",
+        space: "default",
+        spec: { handlers: ["fetch"], requiredSensitiveVars: ["ENCRYPTION_KEY"] },
+        relations: [relation("uid_worker_incapable", "incapable-worker")],
+      }),
+    ).rejects.toMatchObject({ code: "unsupported_capability", status: 422 });
+    expect(incapable.sideEffectCount).toBe(0);
+    expect(await deployments.active(tenantId, "uid_version_incapable")).toBeNull();
+  });
+
   test("does not charge a reseller reservation a second time inside the provider driver", async () => {
     const sql = createEphemeralSql();
     const clock = () => new Date("2026-08-18T18:00:00.000Z");
@@ -599,6 +714,7 @@ describe("Takoform apply on a real backend", () => {
 
     await driver.apply({
       operationId: "op_reseller_create",
+      operationKey: "key_reseller_create",
       tenantId: "org_reseller",
       resourceUid: "uid_reseller_bucket",
       form: FORM,
@@ -950,6 +1066,7 @@ describe("Takoform apply on a real backend", () => {
     });
     const input = {
       operationId: "op_residual_present",
+      operationKey: "key_residual_present",
       tenantId: "org_residual_present",
       resourceUid: "uid_residual_present",
       form: FORM,

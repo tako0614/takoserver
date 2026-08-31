@@ -644,6 +644,28 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
     return resolved;
   };
 
+  const admitRuntimeInputs = async (input: {
+    readonly context: EngineContext;
+    readonly form: InstalledTakoformForm;
+    readonly space: string;
+    readonly spec: JsonObject;
+    readonly relations: readonly TakoformStoredRelation[];
+  }): Promise<void> => {
+    const required = input.spec.requiredSensitiveVars;
+    if (!Array.isArray(required) || required.length === 0) return;
+    const policy = driver.runtimeInputPolicy;
+    if (!policy) throw new TakoformHostError("unsupported_capability", 422);
+    await policy.admit({
+      tenantId: input.context.tenantId,
+      form: input.form,
+      spec: input.spec,
+      relations: await driverRelations(input.context.tenantId, input.space, input.relations),
+      ...(input.context.commercialAuthority
+        ? { commercialAuthority: input.context.commercialAuthority }
+        : {}),
+    });
+  };
+
   return {
     async validateOrPrepare(context, mode): Promise<EngineResult> {
       const parsed = resourceRequest(await jsonBody(context.request));
@@ -1111,6 +1133,13 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         relations,
         store,
       });
+      await admitRuntimeInputs({
+        context,
+        form,
+        space: body.metadata.space,
+        spec: body.spec,
+        relations,
+      });
       await validateWorkerVersionRuntime({
         tenantId: context.tenantId,
         space: body.metadata.space,
@@ -1296,6 +1325,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           execute: async (operationMode, execution) => {
             return await driver.apply({
               operationId: opId,
+              operationKey: idempotencyKey(context.request),
               operationMode,
               ...(execution.providerHandle ? { providerHandle: execution.providerHandle } : {}),
               tenantId: context.tenantId,
@@ -1608,6 +1638,13 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         spec: body.spec,
         relations,
         store,
+      });
+      await admitRuntimeInputs({
+        context,
+        form,
+        space: body.metadata.space,
+        spec: body.spec,
+        relations,
       });
       await validateWorkerVersionRuntime({
         tenantId: context.tenantId,

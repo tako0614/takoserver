@@ -277,6 +277,9 @@ function exactPublicWorkerProvenance(
 /** Names only; Cloudflare never returns or receives secret bytes here. */
 export function expectedWorkerSecrets(target: DeployTarget): readonly string[] {
   const names = new Set<string>(["TAKOSERVER_SIGNING_KEY"]);
+  if (target.edgeSupplies !== undefined) {
+    names.add("TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING");
+  }
   if (target.sponsorship === true) names.add("TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN");
   if (target.stripeCheckout === true) names.add("STRIPE_SECRET_KEY");
   if (

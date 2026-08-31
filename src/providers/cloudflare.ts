@@ -18,6 +18,12 @@ import {
   type ProviderValue,
   succeeded,
 } from "../provider-port.ts";
+import type {
+  ProviderRuntimeInputDispatchedLease,
+  ProviderRuntimeInputLease,
+  ProviderRuntimeInputLeasePort,
+} from "../provider-runtime-input-port.ts";
+import { MAX_PROVIDER_RUNTIME_INPUT_BINDINGS } from "../provider-runtime-input-port.ts";
 import {
   AMAZON_S3_STANDARD_SERVICE,
   CLOUDFLARE_R2_CREDENTIAL_KIND,
@@ -74,6 +80,8 @@ const WORKER_VERSION_RECOVERY_PAGE_LIMIT = 10;
 const WORKER_VERSION_OPERATION_ID_BYTE_LIMIT = 512;
 const WORKER_VERSION_OPERATION_MARKER_BINDING = "TAKOSERVER_INTERNAL_OPERATION_MARKER";
 const WORKER_VERSION_OPERATION_MARKER_PREFIX = "tsop-v1:";
+const WORKER_VERSION_RUNTIME_INPUT_COMMITMENT_BINDING =
+  "TAKOSERVER_INTERNAL_RUNTIME_INPUT_COMMITMENT";
 
 const SQLITE_MIGRATION_LEDGER = "_takoform_sqlite_migrations";
 const SQLITE_MIGRATION_LEDGER_DDL = `CREATE TABLE IF NOT EXISTS ${SQLITE_MIGRATION_LEDGER} (
@@ -160,12 +168,15 @@ export interface CloudflareProviderOptions {
   /** Exact suffix assigned to this account, for example `team.workers.dev`. */
   readonly workerEndpointSuffix?: string;
   readonly workerCompatibilityDate?: string;
+  /** Host-owned one-shot runtime input authority; absent disables sensitive bindings. */
+  readonly runtimeInputs?: ProviderRuntimeInputLeasePort;
   readonly fetch?: (request: Request) => Promise<Response>;
 }
 
 export class CloudflareProvider implements Provider {
   readonly id: string;
   readonly offerings: readonly ProviderOffering[];
+  readonly runtimeInputCapabilities?: { readonly maximumBindings: number };
   readonly #accountId: string;
   readonly #origin: string;
   readonly #artifacts: ArtifactBytes;
@@ -174,6 +185,7 @@ export class CloudflareProvider implements Provider {
   readonly #fetch: (request: Request) => Promise<Response>;
   readonly #workerEndpointSuffix: string | undefined;
   readonly #workerCompatibilityDate: string;
+  readonly #runtimeInputs: ProviderRuntimeInputLeasePort | undefined;
 
   constructor(options: CloudflareProviderOptions) {
     this.id = options.id ?? "cloudflare";
@@ -186,6 +198,12 @@ export class CloudflareProvider implements Provider {
     this.#fetch = options.fetch ?? ((request) => fetch(request));
     this.#workerEndpointSuffix = options.workerEndpointSuffix;
     this.#workerCompatibilityDate = options.workerCompatibilityDate ?? "2026-08-19";
+    this.#runtimeInputs = options.runtimeInputs;
+    if (options.runtimeInputs) {
+      this.runtimeInputCapabilities = {
+        maximumBindings: MAX_PROVIDER_RUNTIME_INPUT_BINDINGS,
+      };
+    }
   }
 
   readonly sqliteMigrations = {
@@ -822,11 +840,14 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       return failed("invalid_spec", "the Worker Version operation identity is invalid");
     }
     const worker = relationDeployment(input.relations, "/worker", "worker");
+    const workerResource = relationResource(input.relations, "/worker", "ModuleWorker");
     const bundle = relationResource(input.relations, "/bundle", "WorkerBundle");
     const manifestDigest = optionalString(bundle?.spec.manifestDigest);
-    if (!worker || !manifestDigest)
+    if (!worker || !workerResource || !bundle || !manifestDigest)
       return failed("invalid_spec", "the Worker Version is incomplete");
     const scriptName = worker.name;
+    const workerResourceName = workerResource.metadata.name;
+    const bundleResourceName = bundle.metadata.name;
     const manifest = await this.#artifacts.manifest(input.identity.tenantRef, manifestDigest);
     if (!manifest) {
       return failed("invalid_spec", "the Worker Bundle is not available");
@@ -850,30 +871,91 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     if (!requiredSensitive) {
       return failed("invalid_spec", "the sensitive Worker binding declaration is invalid");
     }
-    if (requiredSensitive.length > 0) {
-      return failed("denied", "sensitive Worker bindings are unsupported by this Host");
+    if (
+      requiredSensitive.length > 0 &&
+      (!this.#runtimeInputs || !input.identity.uid || !input.operationKey)
+    ) {
+      return failed("denied", "required sensitive Worker runtime inputs are unavailable");
     }
     if (
       [...bindings, ...standardServiceBindings].some(
-        (binding) => binding.name === WORKER_VERSION_OPERATION_MARKER_BINDING,
+        (binding) =>
+          binding.name === WORKER_VERSION_OPERATION_MARKER_BINDING ||
+          binding.name === WORKER_VERSION_RUNTIME_INPUT_COMMITMENT_BINDING,
       )
     ) {
-      return failed("invalid_spec", "the Worker Version operation marker binding is reserved");
+      return failed("invalid_spec", "an internal Worker Version binding is reserved");
+    }
+    const occupiedNames = new Set(
+      [...bindings, ...standardServiceBindings]
+        .map((binding) => optionalString(binding.name))
+        .filter(isString),
+    );
+    if (requiredSensitive.some((name) => occupiedNames.has(name))) {
+      return failed("invalid_spec", "a sensitive Worker binding collides with another binding");
     }
     const assetsSpec = record(input.spec.assets);
+    let assetsDigest: string | undefined;
     if (assetsSpec) {
       const assetsResource = relationResource(
         input.relations,
         "/assets/bundle",
         "StaticAssetBundle",
       );
-      const assetsDigest = optionalString(assetsResource?.spec.manifestDigest);
+      assetsDigest = optionalString(assetsResource?.spec.manifestDigest);
       if (!assetsDigest) return failed("invalid_spec", "the Static Asset Bundle is unavailable");
     }
 
     if (input.operationMode !== "initial") {
-      const recovered = await this.#recoverWorkerVersion(scriptName, operationMarker);
+      let runtimeInputRecovery:
+        | Awaited<ReturnType<ProviderRuntimeInputLeasePort["recover"]>>
+        | undefined;
+      if (requiredSensitive.length > 0) {
+        try {
+          runtimeInputRecovery = await (
+            this.#runtimeInputs as ProviderRuntimeInputLeasePort
+          ).recover({
+            organizationId: input.identity.tenantRef,
+            operationId: input.operationId,
+            resourceUid: input.identity.uid as string,
+            reference: input.operationKey as string,
+            target: {
+              space: input.identity.space,
+              workerName: workerResourceName,
+              workerResourceUid: workerResource.metadata.uid,
+              bundleName: bundleResourceName,
+            },
+            bindingNames: requiredSensitive,
+          });
+        } catch (error) {
+          return runtimeInputFailure(error, "recover");
+        }
+        if (!sameStrings(runtimeInputRecovery.bindingNames, requiredSensitive)) {
+          return failed("denied", "required sensitive Worker runtime inputs are unavailable");
+        }
+      }
+      const recovered = await this.#recoverWorkerVersion(
+        scriptName,
+        operationMarker,
+        requiredSensitive,
+        runtimeInputRecovery?.preparation.commitment,
+      );
       if (!recovered.ok) return { phase: "failed", failure: recovered.failure };
+      if (runtimeInputRecovery) {
+        const receiptDigest = await workerVersionReceiptDigest(
+          this.#accountId,
+          operationMarker,
+          scriptName,
+          recovered.value,
+          requiredSensitive,
+          runtimeInputRecovery.preparation.commitment,
+        );
+        try {
+          await runtimeInputRecovery.settle(receiptDigest);
+        } catch (error) {
+          return runtimeInputFailure(error, "settle");
+        }
+      }
       return succeeded({
         nativeId: `version:${scriptName}:${recovered.value}`,
         observed: { scriptName, versionId: recovered.value },
@@ -881,21 +963,6 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       });
     }
 
-    let assetToken: string | null = null;
-    if (assetsSpec) {
-      const assetsResource = relationResource(
-        input.relations,
-        "/assets/bundle",
-        "StaticAssetBundle",
-      );
-      const assetsDigest = optionalString(assetsResource?.spec.manifestDigest);
-      if (!assetsDigest) return failed("invalid_spec", "the Static Asset Bundle is unavailable");
-      const uploaded = await this.#uploadAssets(scriptName, input.identity.tenantRef, {
-        bundle: assetsDigest,
-      });
-      if (typeof uploaded !== "string") return uploaded;
-      assetToken = uploaded;
-    }
     const modulePayloads: Array<{
       readonly module: (typeof modules)[number];
       readonly bytes: Uint8Array;
@@ -905,56 +972,134 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       if (!bytes) return failed("invalid_spec", `a declared module is missing: ${module.name}`);
       modulePayloads.push({ module, bytes });
     }
-    const form = new FormData();
-    form.set(
-      "metadata",
-      new Blob(
-        [
-          JSON.stringify({
-            main_module: manifest.mainModule,
-            compatibility_date: this.#workerCompatibilityDate,
-            bindings: [
-              ...bindings,
-              ...standardServiceBindings,
-              {
-                type: "plain_text",
-                name: WORKER_VERSION_OPERATION_MARKER_BINDING,
-                text: operationMarker,
-              },
-              ...(assetToken ? [{ type: "assets", name: ASSETS_BINDING }] : []),
-            ],
-            ...(assetToken
-              ? {
-                  assets: {
-                    jwt: assetToken,
-                    config: {
-                      html_handling: "auto-trailing-slash",
-                      not_found_handling:
-                        assetsSpec?.notFoundHandling === "single_page_application"
-                          ? "single-page-application"
-                          : "none",
-                      run_worker_first: assetsSpec?.runWorkerFirst === true,
-                    },
-                  },
-                }
-              : {}),
-          }),
-        ],
-        { type: "application/json" },
-      ),
-      "metadata.json",
-    );
-    for (const { module, bytes } of modulePayloads) {
+    let runtimeInputLease: ProviderRuntimeInputLease | undefined;
+    const abortRuntimeInputLease = async (): Promise<ProviderTicket | null> => {
+      if (!runtimeInputLease) return null;
+      try {
+        await runtimeInputLease.abort();
+        return null;
+      } catch (error) {
+        return runtimeInputFailure(error, "abort");
+      }
+    };
+    if (requiredSensitive.length > 0) {
+      try {
+        runtimeInputLease = await (this.#runtimeInputs as ProviderRuntimeInputLeasePort).acquire({
+          organizationId: input.identity.tenantRef,
+          operationId: input.operationId,
+          resourceUid: input.identity.uid as string,
+          reference: input.operationKey as string,
+          target: {
+            space: input.identity.space,
+            workerName: workerResourceName,
+            workerResourceUid: workerResource.metadata.uid,
+            bundleName: bundleResourceName,
+          },
+          bindingNames: requiredSensitive,
+        });
+      } catch (error) {
+        return runtimeInputFailure(error, "acquire");
+      }
+      if (!exactRuntimeInputBindings(runtimeInputLease.bindings, requiredSensitive)) {
+        const abortFailure = await abortRuntimeInputLease();
+        if (abortFailure) return abortFailure;
+        return failed("denied", "required sensitive Worker runtime inputs are unavailable");
+      }
+    }
+    let assetToken: string | null = null;
+    if (assetsDigest) {
+      const uploaded = await this.#uploadAssets(scriptName, input.identity.tenantRef, {
+        bundle: assetsDigest,
+      });
+      if (typeof uploaded !== "string") {
+        const abortFailure = await abortRuntimeInputLease();
+        return abortFailure ?? uploaded;
+      }
+      assetToken = uploaded;
+    }
+    let form: FormData;
+    try {
+      const sensitiveBindings = runtimeInputLease
+        ? requiredSensitive.map((name) => ({
+            type: "secret_text",
+            name,
+            text: runtimeInputLease?.bindings[name] as string,
+          }))
+        : [];
+      form = new FormData();
       form.set(
-        module.name,
-        new Blob([bytes.buffer as ArrayBuffer], { type: module.mediaType }),
-        module.name,
+        "metadata",
+        new Blob(
+          [
+            JSON.stringify({
+              main_module: manifest.mainModule,
+              compatibility_date: this.#workerCompatibilityDate,
+              bindings: [
+                ...bindings,
+                ...standardServiceBindings,
+                ...sensitiveBindings,
+                ...(runtimeInputLease
+                  ? [
+                      {
+                        type: "plain_text",
+                        name: WORKER_VERSION_RUNTIME_INPUT_COMMITMENT_BINDING,
+                        text: runtimeInputLease.preparation.commitment,
+                      },
+                    ]
+                  : []),
+                {
+                  type: "plain_text",
+                  name: WORKER_VERSION_OPERATION_MARKER_BINDING,
+                  text: operationMarker,
+                },
+                ...(assetToken ? [{ type: "assets", name: ASSETS_BINDING }] : []),
+              ],
+              ...(assetToken
+                ? {
+                    assets: {
+                      jwt: assetToken,
+                      config: {
+                        html_handling: "auto-trailing-slash",
+                        not_found_handling:
+                          assetsSpec?.notFoundHandling === "single_page_application"
+                            ? "single-page-application"
+                            : "none",
+                        run_worker_first: assetsSpec?.runWorkerFirst === true,
+                      },
+                    },
+                  }
+                : {}),
+            }),
+          ],
+          { type: "application/json" },
+        ),
+        "metadata.json",
       );
+      for (const { module, bytes } of modulePayloads) {
+        form.set(
+          module.name,
+          new Blob([bytes.buffer as ArrayBuffer], { type: module.mediaType }),
+          module.name,
+        );
+      }
+    } catch {
+      const abortFailure = await abortRuntimeInputLease();
+      if (abortFailure) return abortFailure;
+      return failed("provider_error", "the Worker Version upload could not be constructed");
+    }
+    let dispatchedLease: ProviderRuntimeInputDispatchedLease | undefined;
+    if (runtimeInputLease) {
+      try {
+        dispatchedLease = await runtimeInputLease.dispatch();
+      } catch (error) {
+        return runtimeInputFailure(error, "dispatch");
+      }
     }
     const uploaded = await this.#callForm(
       "POST",
       `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(scriptName)}/versions`,
       form,
+      { sensitive: requiredSensitive.length > 0 },
     );
     if (!uploaded.ok) {
       if (uploaded.indeterminate === true) {
@@ -966,6 +1111,21 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     if (!versionId) {
       return failed("unavailable", "the Worker Version upload outcome is indeterminate", true);
     }
+    if (dispatchedLease) {
+      const receiptDigest = await workerVersionReceiptDigest(
+        this.#accountId,
+        operationMarker,
+        scriptName,
+        versionId,
+        requiredSensitive,
+        runtimeInputLease?.preparation.commitment,
+      );
+      try {
+        await dispatchedLease.settle(receiptDigest);
+      } catch (error) {
+        return runtimeInputFailure(error, "settle");
+      }
+    }
     return succeeded({
       nativeId: `version:${scriptName}:${versionId}`,
       observed: { scriptName, versionId },
@@ -976,6 +1136,8 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
   async #recoverWorkerVersion(
     scriptName: string,
     operationMarker: string,
+    expectedSecretTextNames: readonly string[],
+    expectedRuntimeInputCommitment?: `sha256:${string}`,
   ): Promise<ProviderValue<string>> {
     const versionPath = `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(scriptName)}/versions`;
     const seen = new Set<string>();
@@ -1071,6 +1233,32 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
           );
         }
         if (marker !== operationMarker) continue;
+        const runtimeCommitmentBindings = (bindingsValue ?? []).filter(
+          (binding) => record(binding)?.name === WORKER_VERSION_RUNTIME_INPUT_COMMITMENT_BINDING,
+        );
+        if (
+          expectedRuntimeInputCommitment === undefined
+            ? runtimeCommitmentBindings.length !== 0
+            : runtimeCommitmentBindings.length !== 1 ||
+              record(runtimeCommitmentBindings[0])?.type !== "plain_text" ||
+              record(runtimeCommitmentBindings[0])?.text !== expectedRuntimeInputCommitment
+        ) {
+          return providerValueFailure(
+            "provider_error",
+            "the Worker Version recovery runtime-input commitment is mismatched",
+          );
+        }
+        const recoveredSecretNames = (bindingsValue ?? [])
+          .filter((binding) => record(binding)?.type === "secret_text")
+          .map((binding) => optionalString(record(binding)?.name))
+          .filter(isString)
+          .sort();
+        if (!sameStrings(recoveredSecretNames, expectedSecretTextNames)) {
+          return providerValueFailure(
+            "provider_error",
+            "the Worker Version recovery sensitive binding closure is mismatched",
+          );
+        }
         if (recovered) {
           return providerValueFailure(
             "provider_error",
@@ -1673,8 +1861,13 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     );
   }
 
-  async #callForm(method: "POST" | "PUT", path: string, form: FormData): Promise<CallResult> {
-    return await this.#send(method, path, { body: form });
+  async #callForm(
+    method: "POST" | "PUT",
+    path: string,
+    form: FormData,
+    options: { readonly sensitive?: boolean } = {},
+  ): Promise<CallResult> {
+    return await this.#send(method, path, { body: form }, options);
   }
 
   async #d1Query(
@@ -1699,6 +1892,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     method: string,
     path: string,
     payload?: { body: BodyInit; type?: string },
+    options: { readonly sensitive?: boolean } = {},
   ): Promise<CallResult> {
     let authorization: string;
     try {
@@ -1725,7 +1919,9 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
         }),
       );
     } catch (error) {
-      const transportError = sanitizedTransportError(error, authorization);
+      const transportError = options.sensitive
+        ? { errorName: error instanceof Error ? error.name : "UnknownError" }
+        : sanitizedTransportError(error, authorization);
       console.error(
         JSON.stringify({
           event: "takoserver.provider.fetch_failed",
@@ -1763,7 +1959,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
         method,
         path,
         status: response.status,
-        errors: Array.isArray(envelope?.errors) ? envelope.errors : undefined,
+        errors: options.sensitive || !Array.isArray(envelope?.errors) ? undefined : envelope.errors,
       }).slice(0, 4_096),
     );
     return {
@@ -2494,6 +2690,42 @@ function sensitiveBindingNames(value: JsonValue | undefined): readonly string[] 
   return names;
 }
 
+function exactRuntimeInputBindings(
+  bindings: Readonly<Record<string, string>>,
+  expectedNames: readonly string[],
+): boolean {
+  const names = Object.keys(bindings).sort();
+  const expected = [...expectedNames].sort();
+  return (
+    JSON.stringify(names) === JSON.stringify(expected) &&
+    names.every(
+      (name) => typeof bindings[name] === "string" && (bindings[name] as string).length > 0,
+    )
+  );
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return JSON.stringify([...left].sort()) === JSON.stringify([...right].sort());
+}
+
+function runtimeInputFailure(
+  error: unknown,
+  phase: "acquire" | "abort" | "dispatch" | "recover" | "settle",
+): ProviderTicket {
+  const code = optionalString(record(error)?.code);
+  if (phase !== "acquire" || code === "unavailable") {
+    return failed(
+      "unavailable",
+      "the sensitive Worker runtime input outcome is indeterminate",
+      true,
+    );
+  }
+  if (code === "conflict") {
+    return failed("conflict", "the sensitive Worker runtime input lease conflicts");
+  }
+  return failed("denied", "required sensitive Worker runtime inputs are unavailable");
+}
+
 function record(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -2529,6 +2761,32 @@ async function workerVersionOperationMarker(value: unknown): Promise<string | nu
   return `${WORKER_VERSION_OPERATION_MARKER_PREFIX}${[...digest]
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("")}`;
+}
+
+async function workerVersionReceiptDigest(
+  accountId: string,
+  operationMarker: string,
+  scriptName: string,
+  versionId: string,
+  secretTextNames: readonly string[],
+  runtimeInputCommitment?: `sha256:${string}`,
+): Promise<`sha256:${string}`> {
+  const canonical = JSON.stringify({
+    format: "takoserver.cloudflare-worker-version-receipt@v2",
+    accountId,
+    operationMarker,
+    scriptName,
+    versionId,
+    secretTextNames: [...secretTextNames].sort(),
+    runtimeInputCommitment: runtimeInputCommitment ?? null,
+  });
+  const digest = new Uint8Array(
+    await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(canonical) as unknown as BufferSource,
+    ),
+  );
+  return `sha256:${[...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 }
 
 function workerVersionOperationMarkerValue(value: string): boolean {

@@ -254,7 +254,9 @@ export function formSupportProfile(
     | "support.takoform.com/v1alpha1"
     | "support.takoform.com/v1alpha2"
     | "support.takoform.com/v1" = "support.takoform.com/v1alpha1",
+  maximumRuntimeInputBindings = 0,
 ): JsonObject {
+  validateMaximumRuntimeInputBindings(maximumRuntimeInputBindings);
   const supportedEnums = topLevelSupportedEnums(form.desiredSchema);
   const stableProfile = apiVersion === "support.takoform.com/v1";
   const renderedSupportedEnums = stableProfile
@@ -289,7 +291,8 @@ export function formSupportProfile(
       configuredArtifactFileLimit;
   }
   if (workerVersion) {
-    limits[stableProfile ? "/requiredSensitiveVars" : "requiredSensitiveVars"] = 0;
+    limits[stableProfile ? "/requiredSensitiveVars" : "requiredSensitiveVars"] =
+      maximumRuntimeInputBindings;
   }
   return {
     apiVersion,
@@ -308,6 +311,13 @@ export function formSupportProfile(
       : {}),
     ...(Object.keys(limits).length > 0 ? { limits } : {}),
   };
+}
+
+/** Validates the deployment capability projected into Host support and admission. */
+export function validateMaximumRuntimeInputBindings(value: number): void {
+  if (!Number.isSafeInteger(value) || value < 0 || value > 64) {
+    throw new TypeError("maximumRuntimeInputBindings must be an integer from 0 to 64");
+  }
 }
 
 function jsonPointer(member: string): string {

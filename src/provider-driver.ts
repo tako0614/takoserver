@@ -15,6 +15,7 @@ import type {
   ProviderValue,
 } from "./provider-port.ts";
 import type { ResourceDeployment, ResourceDeploymentStore } from "./resource-deployments.ts";
+import { validateMaximumRuntimeInputBindings } from "./takoform/forms.ts";
 import type { TakoformStore } from "./takoform/store.ts";
 import type {
   InstalledTakoformForm,
@@ -23,6 +24,7 @@ import type {
   TakoformFormAvailabilityResolver,
   TakoformNativeAbsenceEvidence,
   TakoformResourceDriver,
+  TakoformRuntimeInputPolicy,
   TakoformStoredResource,
 } from "./takoform/types.ts";
 import { TakoformHostError } from "./takoform/types.ts";
@@ -87,6 +89,9 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
 
   const byId = new Map(providers.map((provider) => [provider.id, provider]));
+  for (const provider of providers) {
+    validateMaximumRuntimeInputBindings(provider.runtimeInputCapabilities?.maximumBindings ?? 0);
+  }
   // A Provider instance is selected by pack id and has no installation
   // selector. Build the closed catalog authority up front: if one pack is
   // advertised for multiple installations, readback cannot safely choose one
@@ -181,6 +186,54 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
       providerInstallationRef,
       relations: resolved,
     };
+  };
+
+  const selectForMutation = async (input: {
+    readonly tenantId: string;
+    readonly form: InstalledTakoformForm;
+    readonly relations: readonly TakoformDriverRelation[];
+    readonly offeringId?: string;
+  }) => {
+    const soldSelection =
+      input.form.role === "identity" || catalog.offeringsFor(input.form.identity.formRef).length > 0
+        ? selectSold(input.form, input.offeringId)
+        : undefined;
+    const inheritedSelection = soldSelection
+      ? undefined
+      : await inherited(input.tenantId, input.form, input.relations);
+    const provider = soldSelection?.provider ?? inheritedSelection?.provider;
+    const offering = soldSelection?.offering ?? inheritedSelection?.offering;
+    if (!provider || !offering) throw new TakoformHostError("unsupported_capability", 422);
+    return { provider, offering, soldSelection, inheritedSelection };
+  };
+
+  const assertProviderRuntimeInputs = (provider: Provider, spec: JsonObject): void => {
+    const required = spec.requiredSensitiveVars;
+    const count = Array.isArray(required) ? required.length : 0;
+    const maximum = provider.runtimeInputCapabilities?.maximumBindings ?? 0;
+    validateMaximumRuntimeInputBindings(maximum);
+    if (count > maximum) throw new TakoformHostError("unsupported_capability", 422);
+  };
+
+  const runtimeInputPolicy: TakoformRuntimeInputPolicy = {
+    guaranteedMaximum(form) {
+      const candidates = providers.filter((provider) =>
+        provider.offerings.some((offering) => sameForm(offering.form, form.identity.formRef)),
+      );
+      if (candidates.length === 0) return 0;
+      return Math.min(
+        ...candidates.map((provider) => provider.runtimeInputCapabilities?.maximumBindings ?? 0),
+      );
+    },
+    async admit(input) {
+      const { provider } = await selectForMutation({
+        tenantId: input.tenantId,
+        form: input.form,
+        relations: input.relations,
+        ...(input.commercialAuthority ? { offeringId: input.commercialAuthority.offeringId } : {}),
+      });
+      assertProviderRuntimeInputs(provider, input.spec);
+    },
   };
 
   /** Drives a ticket to a terminal state within the inline budget. */
@@ -425,6 +478,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
   };
 
   return {
+    runtimeInputPolicy,
     sqliteMigrations: {
       async readLedger(input) {
         const { deployment, port } = await sqliteProvider(input.tenantId, input.database);
@@ -447,17 +501,13 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
         if (current) throw new TakoformHostError("backend_unavailable", 503);
         return { observed: structuredClone(input.spec) };
       }
-      const soldSelection =
-        input.form.role === "identity" ||
-        catalog.offeringsFor(input.form.identity.formRef).length > 0
-          ? selectSold(input.form, input.commercialAuthority?.offeringId)
-          : undefined;
-      const inheritedSelection = soldSelection
-        ? undefined
-        : await inherited(input.tenantId, input.form, input.relations);
-      const provider = soldSelection?.provider ?? inheritedSelection?.provider;
-      const offering = soldSelection?.offering ?? inheritedSelection?.offering;
-      if (!provider || !offering) throw new TakoformHostError("unsupported_capability", 422);
+      const { provider, offering, soldSelection, inheritedSelection } = await selectForMutation({
+        tenantId: input.tenantId,
+        form: input.form,
+        relations: input.relations,
+        ...(input.commercialAuthority ? { offeringId: input.commercialAuthority.offeringId } : {}),
+      });
+      assertProviderRuntimeInputs(provider, input.spec);
       const sold = soldSelection?.sold;
       const priceMinor = soldSelection?.priceMinor ?? 0;
       const relationTargets =
@@ -488,12 +538,14 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
         : undefined;
       const providerInput = {
         operationId: input.operationId,
+        operationKey: input.operationKey,
         ...(input.operationMode ? { operationMode: input.operationMode } : {}),
         offering,
         identity: {
           tenantRef: input.tenantId,
           space: input.space,
           name: input.name,
+          uid: input.resourceUid,
         },
         spec: input.spec,
         relations: relationTargets,

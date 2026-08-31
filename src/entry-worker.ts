@@ -15,10 +15,14 @@ import type {
   PublicFormImplementationIdentity,
   PublicWorkerImplementationIdentity,
 } from "./public-worker-implementation.ts";
+import { createTakoformRuntimeInputOriginAuthority } from "./runtime-input-origin-authority.ts";
+import { createRuntimeInputAuthority } from "./runtime-input-preparations.ts";
+import { parseRuntimeInputSealKeyRing } from "./runtime-input-seal-keyring.ts";
 import { loadSigningKey } from "./signing-key.ts";
 import { createD1Sql } from "./sql-d1.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import { currentTakoformCandidates } from "./takoform/current-candidates.ts";
+import { createTakoformStore } from "./takoform/store.ts";
 import { createJavaScriptWorkerModuleInspector } from "./takoform/worker-module-inspector.ts";
 import { createWorkerDataServices } from "./worker-data-services.ts";
 import { createWorkerProductionComposition } from "./worker-production-composition.ts";
@@ -97,6 +101,8 @@ export interface WorkerEnv {
   readonly TAKOSERVER_OBJECT_BUCKET_SUPPLIES?: string;
   /** Reviewed Cloudflare sales for released identity Forms other than storage. */
   readonly TAKOSERVER_EDGE_SUPPLIES?: string;
+  /** Operator-private AES key ring for one-shot Worker runtime inputs. */
+  readonly TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING?: string;
   /** Exact workers.dev suffix assigned to the configured provider account. */
   readonly TAKOSERVER_WORKER_ENDPOINT_SUFFIX?: string;
   /** Wasabi sub-user credentials. Both are Worker secrets. */
@@ -356,11 +362,22 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
   const { identity, identityProviders, settlement, checkout } = workerCredentials(env);
   const sql = createD1Sql(env.STATE_DB);
   const objects = createR2ObjectStore(env.OBJECTS);
+  const clock = () => new Date();
+  const randomId = () => crypto.randomUUID();
+  const runtimeInputs = env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING
+    ? createRuntimeInputAuthority({
+        sql,
+        sealKeys: await parseRuntimeInputSealKeyRing(env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING),
+        origins: createTakoformRuntimeInputOriginAuthority(createTakoformStore(sql, clock)),
+        clock,
+        randomId,
+      })
+    : undefined;
   const artifacts = createTakoformArtifacts({
     sql,
     objects,
-    clock: () => new Date(),
-    randomId: () => crypto.randomUUID(),
+    clock,
+    randomId,
   });
   const dataServices = createWorkerDataServices(env);
   const deployment = createWorkerProductionComposition({
@@ -375,6 +392,7 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
       },
     },
     ...(dataServices.s3 ? { s3CredentialIssuer: dataServices.s3 } : {}),
+    ...(runtimeInputs ? { runtimeInputs: runtimeInputs.leases } : {}),
     now: new Date(),
   });
   const app = buildApp({
@@ -387,6 +405,7 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
         }
       : {}),
     ...(integrationE2eCredentialAuthority ? { integrationE2eCredentialAuthority } : {}),
+    ...(runtimeInputs ? { runtimeInputs } : {}),
     artifacts,
     workerModuleInspector: createJavaScriptWorkerModuleInspector(),
     ...(signingKey ? { signingKey } : {}),

@@ -33,6 +33,7 @@ import {
   type TakoformHostPrincipal,
   type TakoformHostResourceScope,
   type TakoformInterfaceRef,
+  type TakoformRuntimeInputPolicy,
   type TakoformStandardServiceResolver,
 } from "./types.ts";
 import {
@@ -148,6 +149,7 @@ export interface CreateTakoformRoutesOptions {
   readonly deferredOperations?: DeferredOperations;
   readonly standardServiceResolver?: TakoformStandardServiceResolver;
   readonly availability?: TakoformFormAvailabilityResolver;
+  readonly runtimeInputPolicy?: Pick<TakoformRuntimeInputPolicy, "guaranteedMaximum">;
   /** Durable public discovery/support/activation authority. */
   readonly authority?: TakoformHostAuthority;
 }
@@ -164,6 +166,7 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
     deferredOperations,
     standardServiceResolver,
     availability,
+    runtimeInputPolicy,
     authority,
   } = options;
   const configuration = options.routes ?? DEFAULT_TAKOFORM_ROUTES;
@@ -362,7 +365,11 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
       const registry = await supportRegistry(context);
       return Response.json({
         profiles: [...registry.forms.values()].map((form) =>
-          formSupportProfile(form, configuration.supportProfileApiVersion),
+          formSupportProfile(
+            form,
+            configuration.supportProfileApiVersion,
+            runtimeInputPolicy?.guaranteedMaximum(form) ?? 0,
+          ),
         ),
       });
     }
@@ -390,7 +397,13 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
       );
       const candidate = candidates.length === 1 ? candidates[0] : undefined;
       if (!candidate) return failure("form_unknown", 404);
-      return Response.json(formSupportProfile(candidate, configuration.supportProfileApiVersion));
+      return Response.json(
+        formSupportProfile(
+          candidate,
+          configuration.supportProfileApiVersion,
+          runtimeInputPolicy?.guaranteedMaximum(candidate) ?? 0,
+        ),
+      );
     }
 
     const supportContract = supportContractPattern.exec(url.pathname);

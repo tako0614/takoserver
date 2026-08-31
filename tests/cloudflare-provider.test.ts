@@ -2,6 +2,11 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { buildEdgeForms, edgeProviderOffering } from "../src/edge-forms.ts";
 import type { JsonObject } from "../src/ports.ts";
 import type { ProviderOffering, ProviderRelation } from "../src/provider-port.ts";
+import type {
+  ProviderRuntimeInputLeasePort,
+  ProviderRuntimeInputPreparationIdentity,
+  ProviderRuntimeInputRecoveryInput,
+} from "../src/provider-runtime-input-port.ts";
 import {
   type ArtifactBytes,
   CloudflareProvider,
@@ -44,6 +49,16 @@ const IDENTITY = { tenantRef: "org_acme", space: "default", name: "assets" };
 const MODULE_BYTES = new TextEncoder().encode("export default { fetch() {} }");
 
 const ASSET_BUNDLE = `sha256:${"c".repeat(64)}`;
+
+const SENSITIVE_PREPARATION: ProviderRuntimeInputPreparationIdentity = {
+  preparationId: "prep_sensitive",
+  materialSetId: "material_sensitive",
+  originResourceUid: "origin-worker-uid",
+  workerResourceUid: "worker-uid",
+  canonicalPublicOrigin: "https://version.example.test",
+  commitment: `sha256:${"b".repeat(64)}`,
+};
+const SENSITIVE_OPERATION_KEY = `rip1.prep_sensitive.${SENSITIVE_PREPARATION.commitment.slice("sha256:".length)}`;
 
 const artifacts: ArtifactBytes = {
   async manifest(_tenantRef, digest) {
@@ -520,6 +535,7 @@ describe("Cloudflare provider", () => {
         throw new TypeError("connection reset");
       },
     });
+    expect(provider.runtimeInputCapabilities).toBeUndefined();
     const ticket = await provider.apply({
       operationId: "op_6",
       offering: BUCKET,
@@ -1752,7 +1768,7 @@ describe("released edge Form placement", () => {
     expect(uploadBody).not.toContain('"type":"secret_text"');
   });
 
-  test("refuses unsupported sensitive Worker bindings before provider mutation", async () => {
+  test("refuses sensitive Worker bindings without a runtime-input authority before mutation", async () => {
     const workerOffering = technical("ModuleWorker");
     const versionOffering = technical("WorkerVersion");
     const provider = new CloudflareProvider({
@@ -1768,6 +1784,7 @@ describe("released edge Form placement", () => {
     });
     const ticket = await provider.apply({
       operationId: "op-version-sensitive-unsupported",
+      operationKey: SENSITIVE_OPERATION_KEY,
       offering: versionOffering,
       identity: { ...IDENTITY, name: "version" },
       spec: { handlers: ["fetch"], requiredSensitiveVars: ["ENCRYPTION_KEY"] },
@@ -1791,8 +1808,881 @@ describe("released edge Form placement", () => {
       failure: {
         code: "denied",
         retryable: false,
-        message: "sensitive Worker bindings are unsupported by this Host",
+        message: "required sensitive Worker runtime inputs are unavailable",
       },
+    });
+  });
+
+  test("leases, erases, uploads, and settles exact sensitive Worker bindings", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const versionOffering = technical("WorkerVersion");
+    const events: string[] = [];
+    let settledReceipt: string | undefined;
+    let uploadedMetadata: { bindings?: Array<Record<string, unknown>> } | undefined;
+    const runtimeInputs: ProviderRuntimeInputLeasePort = {
+      async acquire(input) {
+        events.push("acquire");
+        expect(input).toEqual({
+          organizationId: "org_acme",
+          operationId: "op-version-sensitive",
+          resourceUid: "worker-version-uid",
+          reference: SENSITIVE_OPERATION_KEY,
+          target: {
+            space: "default",
+            workerName: "moduleworker",
+            workerResourceUid: "worker-uid",
+            bundleName: "workerbundle",
+          },
+          bindingNames: ["ENCRYPTION_KEY", "OIDC_CLIENT_SECRET"],
+        });
+        return {
+          bindings: {
+            ENCRYPTION_KEY: "secret-encryption-value",
+            OIDC_CLIENT_SECRET: "secret-oidc-value",
+          },
+          preparation: SENSITIVE_PREPARATION,
+          async abort() {
+            events.push("abort");
+          },
+          async dispatch() {
+            events.push("dispatch");
+            return {
+              async settle(receiptDigest) {
+                events.push("settle");
+                settledReceipt = receiptDigest;
+              },
+            };
+          },
+        };
+      },
+      async recover() {
+        throw new Error("recovery must not run on a confirmed initial upload");
+      },
+    };
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering, versionOffering],
+      artifacts,
+      runtimeInputs,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        events.push("upload");
+        expect(events).toEqual(["acquire", "dispatch", "upload"]);
+        const form = await request.formData();
+        const metadata = form.get("metadata");
+        uploadedMetadata = JSON.parse(
+          typeof metadata === "string" ? metadata : await (metadata as Blob).text(),
+        ) as { bindings?: Array<Record<string, unknown>> };
+        return Response.json({ success: true, errors: [], result: { id: "version-sensitive" } });
+      },
+    });
+    expect(provider.runtimeInputCapabilities).toEqual({ maximumBindings: 64 });
+    const ticket = await provider.apply({
+      operationId: "op-version-sensitive",
+      operationKey: SENSITIVE_OPERATION_KEY,
+      operationMode: "initial",
+      offering: versionOffering,
+      identity: { ...IDENTITY, uid: "worker-version-uid", name: "version" },
+      spec: {
+        handlers: ["fetch"],
+        requiredSensitiveVars: ["ENCRYPTION_KEY", "OIDC_CLIENT_SECRET"],
+      },
+      relations: [
+        related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+          nativeId: "worker:script-name",
+          offeringId: workerOffering.id,
+          providerPackRef: "cloudflare",
+          outputs: { scriptName: "script-name" },
+        }),
+        related(
+          "/bundle",
+          stored("WorkerBundle", "bundle-uid", {
+            manifestDigest: `sha256:${"d".repeat(64)}`,
+          }),
+        ),
+      ],
+    });
+
+    expect(events).toEqual(["acquire", "dispatch", "upload", "settle"]);
+    const bindings = uploadedMetadata?.bindings ?? [];
+    expect(
+      bindings
+        .filter((binding) => binding.type === "secret_text")
+        .map((binding) => binding.name)
+        .sort(),
+    ).toEqual(["ENCRYPTION_KEY", "OIDC_CLIENT_SECRET"]);
+    expect(uploadedMetadata?.bindings).toEqual(
+      expect.arrayContaining([
+        { type: "secret_text", name: "ENCRYPTION_KEY", text: "secret-encryption-value" },
+        { type: "secret_text", name: "OIDC_CLIENT_SECRET", text: "secret-oidc-value" },
+        {
+          type: "plain_text",
+          name: "TAKOSERVER_INTERNAL_RUNTIME_INPUT_COMMITMENT",
+          text: SENSITIVE_PREPARATION.commitment,
+        },
+        {
+          type: "plain_text",
+          name: "TAKOSERVER_INTERNAL_OPERATION_MARKER",
+          text: expect.stringMatching(/^tsop-v1:[0-9a-f]{64}$/u),
+        },
+      ]),
+    );
+    expect(settledReceipt).toMatch(/^sha256:[0-9a-f]{64}$/u);
+    expect(ticket).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: "version:script-name:version-sensitive" },
+    });
+    expect(JSON.stringify(ticket)).not.toContain("secret-encryption-value");
+    expect(JSON.stringify(ticket)).not.toContain("secret-oidc-value");
+  });
+
+  test("settles a dispatched sensitive lease by readback without uploading twice", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const versionOffering = technical("WorkerVersion");
+    let marker = "";
+    let commitment = "";
+    let uploads = 0;
+    let acquires = 0;
+    let recoveries = 0;
+    let recoveredInput: ProviderRuntimeInputRecoveryInput | undefined;
+    let recoveredReceipt: string | undefined;
+    const runtimeInputs: ProviderRuntimeInputLeasePort = {
+      async acquire(input) {
+        acquires += 1;
+        expect(input).toEqual({
+          organizationId: "org_acme",
+          operationId: "op-version-sensitive-recovery",
+          resourceUid: "worker-version-recovery-uid",
+          reference: SENSITIVE_OPERATION_KEY,
+          target: {
+            space: "default",
+            workerName: "moduleworker",
+            workerResourceUid: "worker-uid",
+            bundleName: "workerbundle",
+          },
+          bindingNames: ["ENCRYPTION_KEY"],
+        });
+        return {
+          bindings: { ENCRYPTION_KEY: "secret-lost-ack-value" },
+          preparation: SENSITIVE_PREPARATION,
+          async abort() {
+            throw new Error("the dispatched lease must not be aborted after upload");
+          },
+          async dispatch() {
+            return {
+              async settle() {
+                throw new Error("a lost upload acknowledgement cannot settle initial dispatch");
+              },
+            };
+          },
+        };
+      },
+      async recover(input) {
+        recoveries += 1;
+        recoveredInput = input;
+        return {
+          preparation: SENSITIVE_PREPARATION,
+          bindingNames: ["ENCRYPTION_KEY"],
+          async settle(receiptDigest) {
+            recoveredReceipt = receiptDigest;
+          },
+        };
+      },
+    };
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering, versionOffering],
+      artifacts,
+      runtimeInputs,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "POST") {
+          uploads += 1;
+          const form = await request.formData();
+          const metadataPart = form.get("metadata");
+          const metadata = JSON.parse(
+            typeof metadataPart === "string" ? metadataPart : await (metadataPart as Blob).text(),
+          ) as { bindings?: Array<{ name?: string; text?: string; type?: string }> };
+          marker =
+            metadata.bindings?.find(
+              (binding) => binding.name === "TAKOSERVER_INTERNAL_OPERATION_MARKER",
+            )?.text ?? "";
+          commitment =
+            metadata.bindings?.find(
+              (binding) => binding.name === "TAKOSERVER_INTERNAL_RUNTIME_INPUT_COMMITMENT",
+            )?.text ?? "";
+          throw new TypeError("connection closed after provider commit");
+        }
+        if (request.method === "GET" && url.pathname.endsWith("/versions")) {
+          const page = Number(url.searchParams.get("page"));
+          return Response.json({
+            success: true,
+            errors: [],
+            result: { items: page === 1 ? [{ id: "version-sensitive-recovered" }] : [] },
+            result_info: { page, per_page: 100 },
+          });
+        }
+        if (request.method === "GET" && url.pathname.endsWith("/version-sensitive-recovered")) {
+          return Response.json({
+            success: true,
+            errors: [],
+            result: {
+              id: "version-sensitive-recovered",
+              resources: {
+                bindings: [
+                  {
+                    type: "plain_text",
+                    name: "TAKOSERVER_INTERNAL_OPERATION_MARKER",
+                    text: marker,
+                  },
+                  {
+                    type: "plain_text",
+                    name: "TAKOSERVER_INTERNAL_RUNTIME_INPUT_COMMITMENT",
+                    text: commitment,
+                  },
+                  { type: "secret_text", name: "ENCRYPTION_KEY" },
+                ],
+              },
+            },
+          });
+        }
+        throw new Error(`unexpected request: ${request.method} ${url.pathname}`);
+      },
+    });
+    const input = {
+      operationId: "op-version-sensitive-recovery",
+      operationKey: SENSITIVE_OPERATION_KEY,
+      offering: versionOffering,
+      identity: { ...IDENTITY, uid: "worker-version-recovery-uid", name: "version" },
+      spec: { handlers: ["fetch"], requiredSensitiveVars: ["ENCRYPTION_KEY"] },
+      relations: [
+        related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+          nativeId: "worker:script-name",
+          offeringId: workerOffering.id,
+          providerPackRef: "cloudflare",
+          outputs: { scriptName: "script-name" },
+        }),
+        related(
+          "/bundle",
+          stored("WorkerBundle", "bundle-uid", {
+            manifestDigest: `sha256:${"d".repeat(64)}`,
+          }),
+        ),
+      ],
+    } as const;
+
+    expect(await provider.apply({ ...input, operationMode: "initial" })).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(await provider.apply({ ...input, operationMode: "recovery" })).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: "version:script-name:version-sensitive-recovered" },
+    });
+    expect(uploads).toBe(1);
+    expect(acquires).toBe(1);
+    expect(recoveries).toBe(1);
+    expect(recoveredInput).toEqual({
+      organizationId: "org_acme",
+      operationId: "op-version-sensitive-recovery",
+      resourceUid: "worker-version-recovery-uid",
+      reference: SENSITIVE_OPERATION_KEY,
+      target: {
+        space: "default",
+        workerName: "moduleworker",
+        workerResourceUid: "worker-uid",
+        bundleName: "workerbundle",
+      },
+      bindingNames: ["ENCRYPTION_KEY"],
+    });
+    expect(recoveredReceipt).toMatch(/^sha256:[0-9a-f]{64}$/u);
+  });
+
+  test("rejects sensitive recovery for every exact secret_text closure mismatch", async () => {
+    const operationId = "op-version-sensitive-closure-mismatch";
+    const operationDigest = new Uint8Array(
+      await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(operationId) as unknown as BufferSource,
+      ),
+    );
+    const operationMarker = `tsop-v1:${[...operationDigest]
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("")}`;
+    const scenarios = [
+      { name: "missing expected", bindings: [] },
+      {
+        name: "extra unexpected",
+        bindings: [
+          { type: "secret_text", name: "ENCRYPTION_KEY" },
+          { type: "secret_text", name: "UNEXPECTED" },
+        ],
+      },
+      {
+        name: "duplicate expected",
+        bindings: [
+          { type: "secret_text", name: "ENCRYPTION_KEY" },
+          { type: "secret_text", name: "ENCRYPTION_KEY" },
+        ],
+      },
+      {
+        name: "expected name with wrong type",
+        bindings: [{ type: "plain_text", name: "ENCRYPTION_KEY", text: "not-a-secret" }],
+      },
+    ] as const;
+
+    for (const scenario of scenarios) {
+      const workerOffering = technical("ModuleWorker");
+      const versionOffering = technical("WorkerVersion");
+      let posts = 0;
+      let settlements = 0;
+      let recoveries = 0;
+      const runtimeInputs: ProviderRuntimeInputLeasePort = {
+        async acquire() {
+          throw new Error("sensitive recovery must use recover, not acquire");
+        },
+        async recover(input) {
+          recoveries += 1;
+          expect(input).toEqual({
+            organizationId: "org_acme",
+            operationId,
+            resourceUid: "worker-version-closure-uid",
+            reference: SENSITIVE_OPERATION_KEY,
+            target: {
+              space: "default",
+              workerName: "moduleworker",
+              workerResourceUid: "worker-uid",
+              bundleName: "workerbundle",
+            },
+            bindingNames: ["ENCRYPTION_KEY"],
+          });
+          return {
+            preparation: SENSITIVE_PREPARATION,
+            bindingNames: ["ENCRYPTION_KEY"],
+            async settle() {
+              settlements += 1;
+            },
+          };
+        },
+      };
+      const provider = new CloudflareProvider({
+        accountId: "acct_1",
+        offerings: [workerOffering, versionOffering],
+        artifacts,
+        runtimeInputs,
+        authorize: () => "Bearer secret-account-token",
+        apiOrigin: "https://api.cloudflare.test/client/v4",
+        async fetch(request) {
+          const url = new URL(request.url);
+          if (request.method === "POST") {
+            posts += 1;
+            throw new Error("sensitive recovery must not upload a second Worker Version");
+          }
+          if (request.method === "GET" && url.pathname.endsWith("/versions")) {
+            const page = Number(url.searchParams.get("page"));
+            return Response.json({
+              success: true,
+              errors: [],
+              result: {
+                items: page === 1 ? [{ id: "version-sensitive-closure" }] : [],
+              },
+              result_info: { page, per_page: 100 },
+            });
+          }
+          if (request.method === "GET" && url.pathname.endsWith("/version-sensitive-closure")) {
+            return Response.json({
+              success: true,
+              errors: [],
+              result: {
+                id: "version-sensitive-closure",
+                resources: {
+                  bindings: [
+                    {
+                      type: "plain_text",
+                      name: "TAKOSERVER_INTERNAL_OPERATION_MARKER",
+                      text: operationMarker,
+                    },
+                    {
+                      type: "plain_text",
+                      name: "TAKOSERVER_INTERNAL_RUNTIME_INPUT_COMMITMENT",
+                      text: SENSITIVE_PREPARATION.commitment,
+                    },
+                    ...scenario.bindings,
+                  ],
+                },
+              },
+            });
+          }
+          throw new Error(`unexpected request: ${request.method} ${url.pathname}`);
+        },
+      });
+
+      const ticket = await provider.apply({
+        operationId,
+        operationKey: SENSITIVE_OPERATION_KEY,
+        operationMode: "recovery",
+        offering: versionOffering,
+        identity: { ...IDENTITY, uid: "worker-version-closure-uid", name: "version" },
+        spec: { handlers: ["fetch"], requiredSensitiveVars: ["ENCRYPTION_KEY"] },
+        relations: [
+          related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+            nativeId: "worker:script-name",
+            offeringId: workerOffering.id,
+            providerPackRef: "cloudflare",
+            outputs: { scriptName: "script-name" },
+          }),
+          related(
+            "/bundle",
+            stored("WorkerBundle", "bundle-uid", {
+              manifestDigest: `sha256:${"d".repeat(64)}`,
+            }),
+          ),
+        ],
+      });
+
+      expect(ticket).toMatchObject({
+        phase: "failed",
+        failure: { code: "provider_error", retryable: false },
+      });
+      expect({ recoveries, posts, settlements }).toEqual({
+        recoveries: 1,
+        posts: 0,
+        settlements: 0,
+      });
+    }
+  });
+
+  test("does not log sensitive values when a Worker Version POST loses its response", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const versionOffering = technical("WorkerVersion");
+    const log = spyOn(console, "error").mockImplementation(() => undefined);
+    let posts = 0;
+    let dispatches = 0;
+    const runtimeInputs: ProviderRuntimeInputLeasePort = {
+      async acquire(input) {
+        expect(input.reference).toBe(SENSITIVE_OPERATION_KEY);
+        return {
+          bindings: { ENCRYPTION_KEY: "transport-secret-value" },
+          preparation: SENSITIVE_PREPARATION,
+          async abort() {},
+          async dispatch() {
+            dispatches += 1;
+            return { async settle() {} };
+          },
+        };
+      },
+      async recover() {
+        throw new Error("recovery is not part of this transport failure");
+      },
+    };
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering, versionOffering],
+      artifacts,
+      runtimeInputs,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        posts += 1;
+        expect(request.method).toBe("POST");
+        throw new TypeError(
+          "connection lost after sending transport-secret-value with Bearer secret-account-token",
+        );
+      },
+    });
+
+    try {
+      const ticket = await provider.apply({
+        operationId: "op-version-sensitive-transport-error",
+        operationKey: SENSITIVE_OPERATION_KEY,
+        operationMode: "initial",
+        offering: versionOffering,
+        identity: { ...IDENTITY, uid: "worker-version-transport-uid", name: "version" },
+        spec: { handlers: ["fetch"], requiredSensitiveVars: ["ENCRYPTION_KEY"] },
+        relations: [
+          related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+            nativeId: "worker:script-name",
+            offeringId: workerOffering.id,
+            providerPackRef: "cloudflare",
+            outputs: { scriptName: "script-name" },
+          }),
+          related(
+            "/bundle",
+            stored("WorkerBundle", "bundle-uid", {
+              manifestDigest: `sha256:${"d".repeat(64)}`,
+            }),
+          ),
+        ],
+      });
+      expect(ticket).toMatchObject({
+        phase: "failed",
+        failure: { code: "unavailable", retryable: true },
+      });
+      expect({ posts, dispatches }).toEqual({ posts: 1, dispatches: 1 });
+      expect(log).toHaveBeenCalledTimes(1);
+      const event = String(log.mock.calls[0]?.[0]);
+      expect(event).toContain('"event":"takoserver.provider.fetch_failed"');
+      expect(event).toContain('"errorName":"TypeError"');
+      expect(event).not.toContain("transport-secret-value");
+      expect(event).not.toContain("secret-account-token");
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test("does not log sensitive values from a Worker Version backend refusal", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const versionOffering = technical("WorkerVersion");
+    const log = spyOn(console, "error").mockImplementation(() => undefined);
+    let posts = 0;
+    const runtimeInputs: ProviderRuntimeInputLeasePort = {
+      async acquire() {
+        return {
+          bindings: { ENCRYPTION_KEY: "backend-secret-value" },
+          preparation: SENSITIVE_PREPARATION,
+          async abort() {},
+          async dispatch() {
+            return { async settle() {} };
+          },
+        };
+      },
+      async recover() {
+        throw new Error("recovery is not part of this backend refusal");
+      },
+    };
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering, versionOffering],
+      artifacts,
+      runtimeInputs,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        posts += 1;
+        expect(request.method).toBe("POST");
+        return Response.json(
+          {
+            success: false,
+            errors: [{ message: "backend saw backend-secret-value" }],
+          },
+          { status: 500 },
+        );
+      },
+    });
+
+    try {
+      const ticket = await provider.apply({
+        operationId: "op-version-sensitive-backend-error",
+        operationKey: SENSITIVE_OPERATION_KEY,
+        operationMode: "initial",
+        offering: versionOffering,
+        identity: { ...IDENTITY, uid: "worker-version-backend-uid", name: "version" },
+        spec: { handlers: ["fetch"], requiredSensitiveVars: ["ENCRYPTION_KEY"] },
+        relations: [
+          related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+            nativeId: "worker:script-name",
+            offeringId: workerOffering.id,
+            providerPackRef: "cloudflare",
+            outputs: { scriptName: "script-name" },
+          }),
+          related(
+            "/bundle",
+            stored("WorkerBundle", "bundle-uid", {
+              manifestDigest: `sha256:${"d".repeat(64)}`,
+            }),
+          ),
+        ],
+      });
+      expect(ticket).toMatchObject({
+        phase: "failed",
+        failure: { code: "unavailable", retryable: true },
+      });
+      expect(posts).toBe(1);
+      expect(log).toHaveBeenCalledTimes(1);
+      const event = String(log.mock.calls[0]?.[0]);
+      expect(event).toContain('"event":"takoserver.provider.refused"');
+      expect(event).not.toContain("backend-secret-value");
+      expect(event).not.toContain("secret-account-token");
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test("aborts an invalid sensitive lease before dispatch without a Worker Version POST", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const versionOffering = technical("WorkerVersion");
+    let aborts = 0;
+    let dispatches = 0;
+    let posts = 0;
+    const runtimeInputs: ProviderRuntimeInputLeasePort = {
+      async acquire() {
+        return {
+          bindings: { UNEXPECTED: "must-not-be-uploaded" },
+          preparation: SENSITIVE_PREPARATION,
+          async abort() {
+            aborts += 1;
+          },
+          async dispatch() {
+            dispatches += 1;
+            return { async settle() {} };
+          },
+        };
+      },
+      async recover() {
+        throw new Error("recovery is not part of this pre-dispatch failure");
+      },
+    };
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering, versionOffering],
+      artifacts,
+      runtimeInputs,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch() {
+        posts += 1;
+        throw new Error("the invalid lease must fail before the backend is reached");
+      },
+    });
+
+    const ticket = await provider.apply({
+      operationId: "op-version-sensitive-invalid-lease",
+      operationKey: SENSITIVE_OPERATION_KEY,
+      operationMode: "initial",
+      offering: versionOffering,
+      identity: { ...IDENTITY, uid: "worker-version-invalid-lease-uid", name: "version" },
+      spec: { handlers: ["fetch"], requiredSensitiveVars: ["ENCRYPTION_KEY"] },
+      relations: [
+        related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+          nativeId: "worker:script-name",
+          offeringId: workerOffering.id,
+          providerPackRef: "cloudflare",
+          outputs: { scriptName: "script-name" },
+        }),
+        related(
+          "/bundle",
+          stored("WorkerBundle", "bundle-uid", {
+            manifestDigest: `sha256:${"d".repeat(64)}`,
+          }),
+        ),
+      ],
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "denied", retryable: false },
+    });
+    expect({ aborts, dispatches, posts }).toEqual({ aborts: 1, dispatches: 0, posts: 0 });
+  });
+
+  test("rejects sensitive acquisition before uploading Worker Version assets", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const versionOffering = technical("WorkerVersion");
+    const providerCalls: string[] = [];
+    const runtimeInputs: ProviderRuntimeInputLeasePort = {
+      async acquire(input) {
+        expect(input).toEqual({
+          organizationId: "org_acme",
+          operationId: "op-version-sensitive-assets-acquire-rejected",
+          resourceUid: "worker-version-sensitive-assets-acquire-rejected-uid",
+          reference: SENSITIVE_OPERATION_KEY,
+          target: {
+            space: "default",
+            workerName: "moduleworker",
+            workerResourceUid: "worker-uid",
+            bundleName: "workerbundle",
+          },
+          bindingNames: ["ENCRYPTION_KEY"],
+        });
+        throw new Error("runtime input authority rejected the lease");
+      },
+      async recover() {
+        throw new Error("recovery is not part of this initial acquisition rejection");
+      },
+    };
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering, versionOffering],
+      artifacts,
+      runtimeInputs,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        providerCalls.push(`${request.method} ${new URL(request.url).pathname}`);
+        throw new Error("the provider must not be reached after acquisition rejection");
+      },
+    });
+
+    const ticket = await provider.apply({
+      operationId: "op-version-sensitive-assets-acquire-rejected",
+      operationKey: SENSITIVE_OPERATION_KEY,
+      operationMode: "initial",
+      offering: versionOffering,
+      identity: {
+        ...IDENTITY,
+        uid: "worker-version-sensitive-assets-acquire-rejected-uid",
+        name: "version",
+      },
+      spec: {
+        handlers: ["fetch"],
+        requiredSensitiveVars: ["ENCRYPTION_KEY"],
+        assets: { bundle: ASSET_BUNDLE },
+      },
+      relations: [
+        related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+          nativeId: "worker:script-name",
+          offeringId: workerOffering.id,
+          providerPackRef: "cloudflare",
+          outputs: { scriptName: "script-name" },
+        }),
+        related(
+          "/bundle",
+          stored("WorkerBundle", "bundle-uid", {
+            manifestDigest: `sha256:${"d".repeat(64)}`,
+          }),
+        ),
+        related(
+          "/assets/bundle",
+          stored("StaticAssetBundle", "assets-bundle-uid", {
+            manifestDigest: ASSET_BUNDLE,
+          }),
+        ),
+      ],
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "denied", retryable: false },
+    });
+    expect(providerCalls).toEqual([]);
+    expect(providerCalls.filter((call) => call.endsWith("/assets-upload-session"))).toEqual([]);
+  });
+
+  test("aborts a sensitive lease when Worker Version asset upload fails before dispatch", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const versionOffering = technical("WorkerVersion");
+    let sessionPosts = 0;
+    let assetPosts = 0;
+    let versionPosts = 0;
+    let aborts = 0;
+    let dispatches = 0;
+    const runtimeInputs: ProviderRuntimeInputLeasePort = {
+      async acquire(input) {
+        expect(input).toEqual({
+          organizationId: "org_acme",
+          operationId: "op-version-sensitive-assets-upload-failure",
+          resourceUid: "worker-version-sensitive-assets-upload-failure-uid",
+          reference: SENSITIVE_OPERATION_KEY,
+          target: {
+            space: "default",
+            workerName: "moduleworker",
+            workerResourceUid: "worker-uid",
+            bundleName: "workerbundle",
+          },
+          bindingNames: ["ENCRYPTION_KEY"],
+        });
+        return {
+          bindings: { ENCRYPTION_KEY: "asset-upload-secret" },
+          preparation: SENSITIVE_PREPARATION,
+          async abort() {
+            aborts += 1;
+          },
+          async dispatch() {
+            dispatches += 1;
+            return { async settle() {} };
+          },
+        };
+      },
+      async recover() {
+        throw new Error("recovery is not part of this initial asset upload failure");
+      },
+    };
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering, versionOffering],
+      artifacts,
+      runtimeInputs,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "POST" && url.pathname.endsWith("/assets-upload-session")) {
+          sessionPosts += 1;
+          return Response.json({
+            success: true,
+            errors: [],
+            result: { jwt: "asset-token", buckets: [["e".repeat(32)]] },
+          });
+        }
+        if (request.method === "POST" && url.pathname.endsWith("/workers/assets/upload")) {
+          assetPosts += 1;
+          return Response.json(
+            { success: false, errors: [{ message: "asset upload failed" }] },
+            { status: 500 },
+          );
+        }
+        if (request.method === "POST" && url.pathname.endsWith("/versions")) {
+          versionPosts += 1;
+          return Response.json({
+            success: true,
+            errors: [],
+            result: { id: "must-not-upload" },
+          });
+        }
+        throw new Error(`unexpected provider request: ${request.method} ${url.pathname}`);
+      },
+    });
+
+    const ticket = await provider.apply({
+      operationId: "op-version-sensitive-assets-upload-failure",
+      operationKey: SENSITIVE_OPERATION_KEY,
+      operationMode: "initial",
+      offering: versionOffering,
+      identity: {
+        ...IDENTITY,
+        uid: "worker-version-sensitive-assets-upload-failure-uid",
+        name: "version",
+      },
+      spec: {
+        handlers: ["fetch"],
+        requiredSensitiveVars: ["ENCRYPTION_KEY"],
+        assets: { bundle: ASSET_BUNDLE },
+      },
+      relations: [
+        related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+          nativeId: "worker:script-name",
+          offeringId: workerOffering.id,
+          providerPackRef: "cloudflare",
+          outputs: { scriptName: "script-name" },
+        }),
+        related(
+          "/bundle",
+          stored("WorkerBundle", "bundle-uid", {
+            manifestDigest: `sha256:${"d".repeat(64)}`,
+          }),
+        ),
+        related(
+          "/assets/bundle",
+          stored("StaticAssetBundle", "assets-bundle-uid", {
+            manifestDigest: ASSET_BUNDLE,
+          }),
+        ),
+      ],
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect({ sessionPosts, assetPosts, versionPosts, aborts, dispatches }).toEqual({
+      sessionPosts: 1,
+      assetPosts: 1,
+      versionPosts: 0,
+      aborts: 1,
+      dispatches: 0,
     });
   });
 

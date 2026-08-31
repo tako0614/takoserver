@@ -361,6 +361,7 @@ function applyInput(
 ): Parameters<StableLocalWorkerComposition["driver"]["apply"]>[0] {
   return {
     operationId: `op-${value.metadata.name}`,
+    operationKey: extras.operationKey ?? `stable-local-${value.metadata.name}`,
     tenantId: "org_stable_local",
     resourceUid: value.metadata.uid,
     form: formOf(value),

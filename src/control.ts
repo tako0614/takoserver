@@ -17,6 +17,11 @@ import { type Reseller, ResellerError } from "./reseller.ts";
 import type { ResourceDeploymentStore } from "./resource-deployments.ts";
 import { ResourceMigrationError, type ResourceMigrationService } from "./resource-migrations.ts";
 import {
+  RUNTIME_INPUT_PREPARATION_FORMAT,
+  type RuntimeInputAuthority,
+  RuntimeInputPreparationError,
+} from "./runtime-input-preparations.ts";
+import {
   type S3Access,
   S3CredentialError,
   type S3CredentialIssuer,
@@ -26,7 +31,11 @@ import { parseStrictJson, StrictJsonError } from "./strict-json.ts";
 import { formSupportProfile, sameFormRef } from "./takoform/forms.ts";
 import { TAKOFORM_EDGE_OBJECTS_INTERFACE } from "./takoform/official-forms.ts";
 import type { OperationListing, ResourceListing } from "./takoform/store.ts";
-import type { InstalledTakoformForm, TakoformNativeAbsenceEvidence } from "./takoform/types.ts";
+import type {
+  InstalledTakoformForm,
+  TakoformNativeAbsenceEvidence,
+  TakoformRuntimeInputPolicy,
+} from "./takoform/types.ts";
 import { TakoformHostError } from "./takoform/types.ts";
 import { TakosIdIdentityError } from "./takos-id-identity.ts";
 import { TokenError, type TokenService } from "./token.ts";
@@ -113,6 +122,9 @@ export interface CreateControlRoutesOptions {
   readonly consoleOrigin?: string;
   /** Optional provider-backed residual proof; absent means unavailable. */
   readonly nativeResidual?: NativeResidualReader;
+  /** Closed, encrypted handoff from the Takoserver companion provider to the Host. */
+  readonly runtimeInputs?: RuntimeInputAuthority["preparations"];
+  readonly runtimeInputPolicy?: Pick<TakoformRuntimeInputPolicy, "guaranteedMaximum">;
 }
 
 export type ControlRoutes = (request: Request, url: URL) => Promise<Response | null>;
@@ -135,6 +147,8 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     clock,
     consoleOrigin,
     nativeResidual,
+    runtimeInputs,
+    runtimeInputPolicy,
   } = options;
 
   const authorization = (request: Request): string | null => {
@@ -202,7 +216,15 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     // catalogue in a console holds a session, and would otherwise be told they
     // are not authenticated for asking a public question.
     if (request.method === "GET" && url.pathname === "/v1/forms") {
-      return Response.json({ profiles: forms.map((form) => formSupportProfile(form)) });
+      return Response.json({
+        profiles: forms.map((form) =>
+          formSupportProfile(
+            form,
+            "support.takoform.com/v1alpha1",
+            runtimeInputPolicy?.guaranteedMaximum(form) ?? 0,
+          ),
+        ),
+      });
     }
 
     if (request.method === "GET" && url.pathname === "/v1/identity/providers") {
@@ -552,6 +574,60 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
         resources: page.resources.map(presentResource),
         ...(page.cursor === null ? {} : { cursor: page.cursor }),
       });
+    }
+
+    const runtimeInputPreparation =
+      /^\/v1\/organizations\/([^/]+)\/worker-runtime-input-preparations\/([^/]+)$/u.exec(
+        url.pathname,
+      );
+    if (runtimeInputPreparation) {
+      if (!runtimeInputs) controlError("not_found", 404);
+      const organizationId = segment(runtimeInputPreparation[1]);
+      const operationId = segment(runtimeInputPreparation[2]);
+      await scoped(request, organizationId, "resources:write");
+      const headers = {
+        "cache-control": "private, no-store",
+        "x-content-type-options": "nosniff",
+      };
+      if (request.method === "PUT") {
+        const body = await jsonObject(request);
+        exactKeys(body, ["format", "materialSetId", "target", "canonicalPublicOrigin", "bindings"]);
+        if (body.format !== RUNTIME_INPUT_PREPARATION_FORMAT) {
+          controlError("invalid_argument", 400);
+        }
+        const target = record(body.target);
+        exactKeys(target, [
+          "space",
+          "workerName",
+          "workerResourceUid",
+          "bundleName",
+          "originResourceUid",
+        ]);
+        const prepared = await runtimeInputs.prepare({
+          organizationId,
+          operationId,
+          materialSetId: text(body.materialSetId),
+          target: {
+            space: text(target.space),
+            workerName: text(target.workerName),
+            workerResourceUid: text(target.workerResourceUid),
+            bundleName: text(target.bundleName),
+            originResourceUid: text(target.originResourceUid),
+          },
+          canonicalPublicOrigin: text(body.canonicalPublicOrigin),
+          bindings: stringRecord(body.bindings),
+        });
+        return Response.json(prepared, { status: 201, headers });
+      }
+      if (request.method === "GET") {
+        const prepared = await runtimeInputs.read(organizationId, operationId);
+        if (!prepared) controlError("not_found", 404);
+        return Response.json(prepared, { headers });
+      }
+      if (request.method === "DELETE") {
+        await runtimeInputs.revoke(organizationId, operationId);
+        return new Response(null, { status: 204, headers });
+      }
     }
 
     const organizationResource = /^\/v1\/organizations\/([^/]+)\/resources\/([^/]+)$/u.exec(
@@ -1001,6 +1077,9 @@ export function controlErrorResponse(error: unknown): Response {
 
 function classify(error: unknown): { code: string; status: number } {
   if (error instanceof ControlError) return { code: error.code, status: error.status };
+  if (error instanceof RuntimeInputPreparationError) {
+    return { code: error.code, status: error.status };
+  }
   if (error instanceof TakoformHostError) return { code: error.code, status: error.status };
   if (error instanceof ResellerError) return { code: error.code, status: error.status };
   if (error instanceof AuthError) {
@@ -1215,6 +1294,14 @@ function stringList(value: unknown): readonly string[] {
     controlError("invalid_argument", 400);
   }
   return values as readonly string[];
+}
+
+function stringRecord(value: unknown): Readonly<Record<string, string>> {
+  const parsed = record(value);
+  if (Object.values(parsed).some((item) => typeof item !== "string")) {
+    controlError("invalid_argument", 400);
+  }
+  return parsed as Readonly<Record<string, string>>;
 }
 
 function segment(value: string | undefined): string {

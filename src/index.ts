@@ -103,6 +103,18 @@ export {
   type TransferEndpoint,
 } from "./provider-pack.ts";
 export {
+  MAX_PROVIDER_RUNTIME_INPUT_BINDINGS,
+  type ProviderRuntimeInputAcquireInput,
+  type ProviderRuntimeInputCapabilities,
+  type ProviderRuntimeInputDispatchedLease,
+  type ProviderRuntimeInputLease,
+  type ProviderRuntimeInputLeasePort,
+  type ProviderRuntimeInputPreparationIdentity,
+  type ProviderRuntimeInputRecoveryInput,
+  type ProviderRuntimeInputRecoveryLease,
+  type ProviderRuntimeInputTarget,
+} from "./provider-runtime-input-port.ts";
+export {
   CLOUDFLARE_EDGE_METER_SETS,
   CLOUDFLARE_EDGE_METERS,
   createCloudflareEdgeMeterSources,
@@ -154,6 +166,17 @@ export {
   type ResourceMigrationStore,
 } from "./resource-migrations.ts";
 export { createRouter, type Router } from "./router.ts";
+export { createTakoformRuntimeInputOriginAuthority } from "./runtime-input-origin-authority.ts";
+export {
+  createRuntimeInputAuthority,
+  RUNTIME_INPUT_PREPARATION_FORMAT,
+  type RuntimeInputAuthority,
+  type RuntimeInputOriginAuthority,
+  RuntimeInputPreparationError,
+  type RuntimeInputPreparationInput,
+  type RuntimeInputPreparationProjection,
+  type RuntimeInputPreparationTarget,
+} from "./runtime-input-preparations.ts";
 export { createS3AttachmentFactory } from "./s3-attachment-factory.ts";
 export {
   createS3CredentialIssuerRouter,

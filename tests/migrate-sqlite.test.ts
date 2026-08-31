@@ -31,6 +31,7 @@ describe("bringing a local database up to date", () => {
       "tf_resource_claims",
       "tf_resource_deletion_attestations",
       "tf_resource_provider_effects",
+      "worker_runtime_input_preparations",
       "reservations",
     ]) {
       expect(() => database.query(`SELECT 1 FROM ${table} LIMIT 1`).all()).not.toThrow();
@@ -62,7 +63,7 @@ describe("bringing a local database up to date", () => {
     const pairLifecycle = MIGRATIONS.findIndex(
       (migration) => migration.name === "0030_integration_e2e_credential_pairs.sql",
     );
-    expect(pairLifecycle).toBe(MIGRATIONS.length - 2);
+    expect(pairLifecycle).toBe(MIGRATIONS.length - 3);
     expect(MIGRATIONS[pairLifecycle - 1]?.name).toBe("0029_resource_deletion_attestations.sql");
     expect(MIGRATIONS[pairLifecycle + 1]?.name).toBe("0031_takoform_artifact_lifecycle.sql");
     for (const migration of MIGRATIONS.slice(0, pairLifecycle)) {
@@ -99,6 +100,7 @@ describe("bringing a local database up to date", () => {
     expect(migrateSqlite(database).applied).toEqual([
       "0030_integration_e2e_credential_pairs.sql",
       "0031_takoform_artifact_lifecycle.sql",
+      "0032_worker_runtime_input_preparations.sql",
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -121,7 +123,7 @@ describe("bringing a local database up to date", () => {
     const lifecycle = MIGRATIONS.findIndex(
       (migration) => migration.name === "0031_takoform_artifact_lifecycle.sql",
     );
-    expect(lifecycle).toBe(MIGRATIONS.length - 1);
+    expect(lifecycle).toBe(MIGRATIONS.length - 2);
     for (const migration of MIGRATIONS.slice(0, lifecycle)) {
       database.exec(migration.sql);
       database
@@ -178,7 +180,10 @@ describe("bringing a local database up to date", () => {
         100,
       );
 
-    expect(migrateSqlite(database).applied).toEqual(["0031_takoform_artifact_lifecycle.sql"]);
+    expect(migrateSqlite(database).applied).toEqual([
+      "0031_takoform_artifact_lifecycle.sql",
+      "0032_worker_runtime_input_preparations.sql",
+    ]);
     expect(
       database
         .query(

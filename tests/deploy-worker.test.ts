@@ -235,6 +235,7 @@ describe("split Takoserver Worker surfaces", () => {
       "src/ports.ts",
       "src/provider-driver.ts",
       "src/provider-port.ts",
+      "src/provider-runtime-input-port.ts",
       "src/providers/cloudflare-r2-standard-service.ts",
       "src/providers/cloudflare.ts",
       "src/public-form-implementation-build.ts",

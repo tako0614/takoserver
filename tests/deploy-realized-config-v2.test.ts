@@ -284,6 +284,9 @@ describe("realized Worker configuration", () => {
       },
     } satisfies DeployTarget;
     try {
+      expect(expectedWorkerSecrets(authorityTarget)).toContain(
+        "TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING",
+      );
       expect(() =>
         writeWorkerConfig(authorityTarget, {
           path: join(root, "missing.json"),

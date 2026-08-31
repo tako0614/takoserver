@@ -219,6 +219,11 @@ export interface ResourceListing {
   readonly resource: TakoformStoredResource;
 }
 
+export interface ResourceWithRelations {
+  readonly listing: ResourceListing;
+  readonly relations: readonly TakoformStoredRelation[];
+}
+
 export interface OperationListing {
   readonly id: string;
   readonly operation: string;
@@ -522,6 +527,9 @@ export interface TakoformStore {
 
   /** Exact resource lookup for a credential broker; a uid is not a list cursor. */
   resourceByUid(tenantId: string, uid: string): Promise<ResourceListing | null>;
+
+  /** One UID-scoped snapshot used by authorities that must bind Resource and relations together. */
+  resourceWithRelationsByUid(tenantId: string, uid: string): Promise<ResourceWithRelations | null>;
 
   /** The most recent settled operations for a tenant, newest first. */
   listOperations(tenantId: string, limit: number): Promise<readonly OperationListing[]>;
@@ -1174,9 +1182,31 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         await sql.run(
           `UPDATE tf_resource_deletion_attestations
            SET state = 'pending', updated_at = ?
-           WHERE tenant_id = ? AND resource_uid = ? AND state = 'live'`,
-          [timestamp, input.tenantId, input.resourceUid],
+           WHERE tenant_id = ? AND resource_uid = ? AND state = 'live'
+             AND NOT EXISTS (
+               SELECT 1 FROM worker_runtime_input_preparations AS runtime_input
+               WHERE runtime_input.organization_id = ?
+                 AND runtime_input.origin_resource_uid = ?
+                 AND runtime_input.state = 'claimed'
+                 AND runtime_input.claim_expires_at > ?
+             )`,
+          [
+            timestamp,
+            input.tenantId,
+            input.resourceUid,
+            input.tenantId,
+            input.resourceUid,
+            timestamp,
+          ],
         );
+      }
+      const armedRows = await sql.query(
+        `SELECT state FROM tf_resource_deletion_attestations
+         WHERE tenant_id = ? AND resource_uid = ? LIMIT 2`,
+        [input.tenantId, input.resourceUid],
+      );
+      if (armedRows.length !== 1 || text(armedRows[0]?.state) !== "pending") {
+        throw new TakoformHostError("dependency_in_use", 409);
       }
       const recorded = await this.recordResourceEffect({
         tenantId: input.tenantId,
@@ -2327,6 +2357,23 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       if (rows.length === 0) return null;
       if (rows.length !== 1) throw new Error("duplicate_resource_uid");
       return resourceListing(rows[0] as Row);
+    },
+
+    async resourceWithRelationsByUid(tenantId, uid) {
+      const rows = await sql.query(
+        `SELECT space, api_version, kind, name, uid, generation, revision,
+                updated_at, resource_json, relations_json
+         FROM tf_resources
+         WHERE tenant_id = ? AND uid = ?
+         LIMIT 2`,
+        [tenantId, uid],
+      );
+      if (rows.length === 0) return null;
+      if (rows.length !== 1 || !rows[0]) throw new Error("duplicate_resource_uid");
+      return {
+        listing: resourceListing(rows[0]),
+        relations: storedRelations(text(rows[0].relations_json)),
+      };
     },
 
     async listOperations(tenantId, limit) {

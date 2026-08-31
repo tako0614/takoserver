@@ -33,6 +33,7 @@ import {
   createResourceMigrationStore,
 } from "./resource-migrations.ts";
 import { createRouter, type Router } from "./router.ts";
+import type { RuntimeInputAuthority } from "./runtime-input-preparations.ts";
 import type { S3CredentialIssuer } from "./s3-port.ts";
 import { createSponsorshipRoutes } from "./sponsorship-api.ts";
 import {
@@ -94,6 +95,8 @@ export interface AppPorts {
   readonly formImplementationDigest?: `sha256:${string}`;
   /** Complete integration-only JIT key authority configuration, or no route. */
   readonly integrationE2eCredentialAuthority?: IntegrationE2eCredentialAuthorityConfig;
+  /** One Host-owned service shared by control, provider, and scheduled lifecycle cleanup. */
+  readonly runtimeInputs?: RuntimeInputAuthority;
   /** Where this deployment's console is served, if it has one. */
   readonly consoleOrigin?: string;
   /** Private Hosted-to-Takoserver sponsorship bearer; absent disables the seam. */
@@ -152,6 +155,7 @@ export interface App {
 
 export interface TickReport {
   readonly expiredReservations: number;
+  readonly expiredRuntimeInputPreparations: number;
   /**
    * Declarations pointing at a Form this deployment no longer installs. Any
    * number above zero means somebody's resource is unmanageable, so it is
@@ -505,6 +509,8 @@ export function buildApp(ports: AppPorts): App {
           },
         }
       : {}),
+    ...(ports.runtimeInputs ? { runtimeInputs: ports.runtimeInputs.preparations } : {}),
+    ...(driver.runtimeInputPolicy ? { runtimeInputPolicy: driver.runtimeInputPolicy } : {}),
   });
 
   const metering = createMetering({
@@ -572,6 +578,7 @@ export function buildApp(ports: AppPorts): App {
         return "pending";
       });
       const expiredReservations = await reseller.expireDue(64);
+      const expiredRuntimeInputPreparations = await ports.runtimeInputs?.maintenance.expireDue(64);
       const store = inventory;
       const installed = ports.forms.map((form) => form.identity.formRef.schemaDigest);
       const orphans = await store.orphanedResources(installed, 32);
@@ -596,6 +603,7 @@ export function buildApp(ports: AppPorts): App {
       }
       return {
         expiredReservations,
+        expiredRuntimeInputPreparations: expiredRuntimeInputPreparations ?? 0,
         orphanedResources,
         meteredRows,
         providerMeterWindows: providerUsage.windows,
@@ -671,6 +679,9 @@ export function createStaticTestTakoformHost(
       ? { standardServiceResolver: options.standardServiceResolver }
       : {}),
     ...(options.availability ? { availability: options.availability } : {}),
+    ...(options.driver.runtimeInputPolicy
+      ? { runtimeInputPolicy: options.driver.runtimeInputPolicy }
+      : {}),
     ...(options.provision ? { provision: options.provision } : {}),
   });
 }

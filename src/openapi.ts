@@ -144,6 +144,11 @@ const PUBLIC_PATHS: Record<string, Record<string, unknown>> = {
     post: "Create a scoped API key",
     get: "List the organization's live API keys",
   }),
+  "/v1/organizations/{organizationId}/worker-runtime-input-preparations/{operationId}": operations({
+    put: "Prepare one encrypted Worker runtime-input handoff",
+    get: "Read its value-free lifecycle projection",
+    delete: "Revoke one unclaimed Worker runtime-input handoff",
+  }),
   "/v1/organizations/{organizationId}/resources": operation(
     "get",
     "List the organization's Takoform resources",

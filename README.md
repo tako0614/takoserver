@@ -228,11 +228,24 @@ stale operator target or an incompletely wired live Version cannot masquerade
 as healthy state.
 Takoserver's public protocol and standalone path do not depend on Takosumi.
 Stable Worker Forms with an omitted or empty `requiredSensitiveVars`
-declaration provision normally. A non-empty declaration is advertised as
-unsupported and rejected by Host admission before any provider mutation or
-Offering claim. Takoserver does not resolve or inject those values. Realization
-places the other non-secret values in Worker vars. AI
-uses the native Workers AI binding, so it does not copy an account API token
+declaration provision normally. A configured Cloudflare provider can also
+accept a non-empty declaration through Takoserver's RuntimeInputAuthority, up
+to 64 names when `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING` is configured. An
+authenticated control-plane `PUT` seals the exact material and returns a
+one-shot `rip1` reference; the caller reuses that value as the Host
+`Idempotency-Key`. Before sealing, Takoserver derives the canonical HTTPS
+origin from an exact live `WorkerEndpoint` or `WorkerCustomDomain` Resource and
+checks its UID-pinned ModuleWorker relation. The provider lease claims the
+exact operation, Resource, worker incarnation, and target before any asset or
+Worker Version mutation, erases ciphertext before dispatch, and settles only
+after provider readback. Origin deletion and claim are reciprocally fenced in
+D1, and dispatch atomically fences the exact Resource revision from its final
+origin read. Recovery after that authorization point is value-free and does
+not depend on the origin still existing. Self-host remains fail-closed without
+this authority and capability.
+The declaration's names remain in the Worker Version spec; values do not enter
+portable state. Realization places the other non-secret values in Worker vars.
+AI uses the native Workers AI binding, so it does not copy an account API token
 into inference requests. `CLOUDFLARE_API_TOKEN` remains the provisioning
 secret. `r2ParentAccessKeyId` and `TAKOSERVER_R2_PARENT_TOKEN` belong only to
 the retained historical ObjectBucket credential path and must be paired with
@@ -244,6 +257,8 @@ than using a demo backend.
 
 See [docs/adr/0001-provision-from-the-worker.md](docs/adr/0001-provision-from-the-worker.md)
 for why the deployed Worker holds the account credential, and what that costs.
+The RuntimeInputAuthority boundary is recorded in
+[docs/adr/0004-runtime-input-authority.md](docs/adr/0004-runtime-input-authority.md).
 
 ## Resource and supply model
 

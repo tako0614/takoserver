@@ -16,6 +16,7 @@ import {
 } from "./hosted-object-bucket-supplies.ts";
 import type { MeterSource, ProviderPack } from "./provider-pack.ts";
 import type { Provider, ProviderOffering } from "./provider-port.ts";
+import type { ProviderRuntimeInputLeasePort } from "./provider-runtime-input-port.ts";
 import type { ArtifactBytes, CloudflareZone } from "./providers/cloudflare.ts";
 import { createCloudflareEdgeMeterSources } from "./providers/cloudflare-edge-meter.ts";
 import { createCloudflareR2MeterSource } from "./providers/cloudflare-r2-meter.ts";
@@ -80,6 +81,8 @@ export function createWorkerProductionComposition(input: {
   readonly artifacts: ArtifactBytes;
   readonly s3CredentialIssuer?: S3CredentialIssuer;
   readonly fetch?: (request: Request) => Promise<Response>;
+  /** Host-owned one-shot input authority shared with capable provider adapters. */
+  readonly runtimeInputs?: ProviderRuntimeInputLeasePort;
   readonly now: Date;
 }): WorkerProductionComposition {
   const { env } = input;
@@ -283,6 +286,7 @@ export function createWorkerProductionComposition(input: {
         ? { workerEndpointSuffix: env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX }
         : {}),
       artifacts: input.artifacts,
+      ...(input.runtimeInputs ? { runtimeInputs: input.runtimeInputs } : {}),
     });
     const meterSources: MeterSource[] = [];
     if (cloudflareObjects.length > 0) {

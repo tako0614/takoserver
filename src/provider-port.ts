@@ -1,6 +1,7 @@
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import type { TakoformBindingRef, TakoformInterfaceRef } from "./interface-ref.ts";
 import type { JsonObject } from "./ports.ts";
+import type { ProviderRuntimeInputCapabilities } from "./provider-runtime-input-port.ts";
 
 /**
  * The one seam between Takoserver and the clouds it provisions on.
@@ -80,12 +81,16 @@ export interface ResourceIdentity {
   readonly tenantRef: string;
   readonly space: string;
   readonly name: string;
+  /** Stable Host Resource UID. Required by adapters that consume one-shot inputs. */
+  readonly uid?: string;
 }
 
 /** Durable identity and recovery evidence for every provider mutation. */
 export interface ProviderMutationInput {
   /** Stable across retries of the same logical operation. */
   readonly operationId: string;
+  /** Host idempotency identity. Sensitive-input adapters require the Takoserver-issued form. */
+  readonly operationKey?: string;
   /**
    * `initial` is granted only by the durable Host execution lease and may
    * cross the provider mutation boundary once. An absent value is treated as
@@ -234,6 +239,8 @@ export interface Provider {
   readonly id: string;
   /** Static configuration, not a per-request discovery call. */
   readonly offerings: readonly ProviderOffering[];
+  /** Present only when this configured adapter can durably receive one-shot runtime inputs. */
+  readonly runtimeInputCapabilities?: ProviderRuntimeInputCapabilities;
   apply(input: ApplyInput): Promise<ProviderTicket>;
   /**
    * Captures an opaque, versioned provider readback descriptor before the
