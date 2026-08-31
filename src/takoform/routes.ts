@@ -15,7 +15,11 @@ import {
   isFormGroup,
   isKind,
 } from "./forms.ts";
-import type { TakoformAuthorityCatalog, TakoformHostAuthority } from "./host-authority.ts";
+import type {
+  TakoformAuthorityCatalog,
+  TakoformAuthoritySupportLookup,
+  TakoformHostAuthority,
+} from "./host-authority.ts";
 import type { DeferredOperations } from "./operations.ts";
 import { isStableStandardServiceProtocol } from "./standard-services.ts";
 import type { OperationRecord, TakoformStore } from "./store.ts";
@@ -231,6 +235,28 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
           availability: new Map<string, TakoformFormAvailability>(),
         };
 
+  const targetedSupportRegistry = async (
+    context: EngineContext,
+    query: TakoformAuthoritySupportLookup,
+  ) => {
+    if (!authority?.lookupSupport) return await supportRegistry(context);
+    const projected = await authority.lookupSupport(
+      {
+        tenantId: context.tenantId,
+        principalId: context.principalId,
+      },
+      query,
+    );
+    // A durable query may expose two supported schema digests for one Form
+    // definition. The regular registry intentionally rejects that shape, but
+    // a targeted support route must turn it into the route's ordinary absent
+    // result (404), not an internal error or an arbitrary winner.
+    if (hasAmbiguousSupportedForms(projected.forms)) {
+      return catalogRegistry({ forms: [], bindings: [] }, true);
+    }
+    return catalogRegistry(projected, true);
+  };
+
   const requestCatalog = async (context: EngineContext, space: string | null) => {
     if (!authority) {
       return {
@@ -342,7 +368,6 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
 
     const supportForm = supportFormPattern.exec(url.pathname);
     if (request.method === "GET" && supportForm) {
-      const registry = await supportRegistry(context);
       const apiVersion = joinedGroup(
         supportForm[1],
         strictStableLane ? undefined : supportForm[2],
@@ -350,6 +375,12 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
       );
       const kind = safeSegment(strictStableLane ? supportForm[2] : supportForm[3]);
       const definitionVersion = safeSegment(strictStableLane ? supportForm[3] : supportForm[4]);
+      const registry = await targetedSupportRegistry(context, {
+        target: "form",
+        apiVersion,
+        kind,
+        definitionVersion,
+      });
       const candidates = [...registry.forms.values()].filter(
         (form) =>
           form.identity.formRef.apiVersion === apiVersion &&
@@ -363,10 +394,14 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
 
     const supportContract = supportContractPattern.exec(url.pathname);
     if (request.method === "GET" && supportContract) {
-      const registry = await supportRegistry(context);
       const route = supportContract[1];
       const name = safeSegment(supportContract[2]);
       const version = safeSegment(supportContract[3]);
+      const registry = await targetedSupportRegistry(context, {
+        target: route === "interfaces" ? "interface" : "binding",
+        name,
+        version,
+      });
       const references: readonly (TakoformInterfaceRef | TakoformBindingRef)[] =
         route === "interfaces"
           ? [
@@ -1133,6 +1168,25 @@ function validateFormsFilters(url: URL): void {
   ) {
     throw new TakoformHostError();
   }
+}
+
+function hasAmbiguousSupportedForms(
+  entries: readonly TakoformAuthorityCatalog["forms"][number][],
+): boolean {
+  const definitions = new Map<string, string>();
+  const identities = new Set<string>();
+  for (const entry of entries) {
+    if (!entry.supported) continue;
+    const ref = entry.form.identity.formRef;
+    const definitionKey = `${ref.apiVersion}\u0000${ref.kind}\u0000${ref.definitionVersion}`;
+    const previousDigest = definitions.get(definitionKey);
+    if (previousDigest !== undefined && previousDigest !== ref.schemaDigest) return true;
+    definitions.set(definitionKey, ref.schemaDigest);
+    const identity = formKey(ref);
+    if (identities.has(identity)) return true;
+    identities.add(identity);
+  }
+  return false;
 }
 
 function boundedTenantReference(value: string): string {

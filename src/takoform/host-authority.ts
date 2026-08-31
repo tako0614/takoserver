@@ -30,6 +30,9 @@ import {
   formGroupFromApiVersion,
   formKey,
   installedForms,
+  isDefinitionVersion,
+  isFormApiVersion,
+  isKind,
   sameFormRef,
 } from "./forms.ts";
 import {
@@ -59,6 +62,7 @@ const ALL_OPERATIONS = new Set<TakoformOperation>([
   "observe",
 ]);
 const MAX_CURRENT_FORMS = 128;
+const CATALOG_FORM_CONCURRENCY = 4;
 
 export interface TakoformAuthorityRequestContext {
   readonly tenantId: string;
@@ -135,11 +139,37 @@ export interface TakoformAuthorityCatalog {
   readonly bindings: readonly InstalledTakoformBinding[];
 }
 
+/** One exact public support lookup; no route needs to materialize the catalog. */
+export type TakoformAuthoritySupportLookup =
+  | {
+      readonly target: "form";
+      readonly apiVersion: string;
+      readonly kind: string;
+      readonly definitionVersion: string;
+    }
+  | { readonly target: "interface"; readonly name: string; readonly version: string }
+  | { readonly target: "binding"; readonly name: string; readonly version: string };
+
+/** The authoritative projection returned by a targeted support lookup. */
+export interface TakoformAuthoritySupportProjection {
+  readonly forms: readonly TakoformAuthorityCatalogEntry[];
+  readonly bindings: readonly InstalledTakoformBinding[];
+}
+
 export interface TakoformHostAuthority {
   /** Fresh installed/support/activation truth for public discovery. */
   catalog(context: TakoformAuthorityRequestContext): Promise<TakoformAuthorityCatalog>;
   /** Fresh installed/support truth for the support-profile surface. */
   supportCatalog(context: TakoformAuthoritySupportContext): Promise<TakoformAuthorityCatalog>;
+  /**
+   * Fresh exact support truth for one Form/Interface/Binding query. This is
+   * optional for compatibility with historical in-process authorities; the
+   * durable implementation always supplies it and routes use it when present.
+   */
+  lookupSupport?(
+    context: TakoformAuthoritySupportContext,
+    query: TakoformAuthoritySupportLookup,
+  ): Promise<TakoformAuthoritySupportProjection>;
   /** Current authority for a new create/import/update. */
   authorizeMutation(input: {
     readonly operation: "create" | "import" | "update";
@@ -238,9 +268,12 @@ export function createTakoformHostAuthority(
   const currentBase = async (
     formRef: TakoformV1Alpha3FormRef,
     absence: "null" | "error",
+    knownInstallRow?: Row,
+    readMode: "definition" | "package" = "definition",
   ): Promise<CurrentBase | null> => {
     const formRefKey = asDigest(await canonicalDigest(formRef));
-    const installRow = await exactHead(options.sql, INSTALL_TABLE, "form_ref_key", formRefKey);
+    const installRow =
+      knownInstallRow ?? (await exactHead(options.sql, INSTALL_TABLE, "form_ref_key", formRefKey));
     if (!installRow || text(installRow, "event_type") === "uninstall") {
       if (absence === "error") throw unavailable();
       return null;
@@ -248,21 +281,14 @@ export function createTakoformHostAuthority(
     const install = readInstall(installRow, formRefKey, formRef);
     if (install.eventType !== "install" && install.eventType !== "replace") throw unavailable();
 
-    const publisherRow = await exactHead(
-      options.sql,
-      PUBLISHER_TABLE,
-      "publisher_key",
-      install.publisherKey,
-    );
-    const checkpointRow = await exactCheckpointHead(
-      options.sql,
-      install.publisherKey,
-      install.checkpointApiVersion,
-    );
     const supportKey = asDigest(
       await canonicalDigest({ formRefKey, packageDigest: install.packageDigest }),
     );
-    const supportRow = await exactHead(options.sql, SUPPORT_TABLE, "support_key", supportKey);
+    const [publisherRow, checkpointRow, supportRow] = await Promise.all([
+      exactHead(options.sql, PUBLISHER_TABLE, "publisher_key", install.publisherKey),
+      exactCheckpointHead(options.sql, install.publisherKey, install.checkpointApiVersion),
+      exactHead(options.sql, SUPPORT_TABLE, "support_key", supportKey),
+    ]);
     if (!publisherRow || !checkpointRow || !supportRow) {
       if (absence === "error") throw unavailable();
       return null;
@@ -283,15 +309,8 @@ export function createTakoformHostAuthority(
       checkpoint,
       install,
     });
-
-    const stored = await packages.read({
-      packageDigest: install.packageDigest,
-      formRef,
-    });
-    const durableForm = stored
-      ? await exactDefinition(stored.manifest, stored.files, formRef, install.packageDigest)
-      : null;
-    if (!stored || !durableForm) {
+    const durableForm = await readDurableForm(readMode, formRef, install.packageDigest);
+    if (!durableForm) {
       throw unavailable();
     }
     const compiledCandidate = exactInstalledForm(formRef, candidates);
@@ -364,23 +383,49 @@ export function createTakoformHostAuthority(
     };
   };
 
+  const readDurableForm = async (
+    mode: "definition" | "package",
+    formRef: TakoformV1Alpha3FormRef,
+    packageDigest: AdmissionDigest,
+  ): Promise<InstalledTakoformForm | null> => {
+    if (mode === "definition" && packages.readDefinition) {
+      const stored = await packages.readDefinition({ packageDigest, formRef });
+      return stored
+        ? await exactDefinition(stored.manifest, [stored.definition], formRef, packageDigest)
+        : null;
+    }
+    const stored = await packages.read({ packageDigest, formRef });
+    return stored
+      ? await exactDefinition(stored.manifest, stored.files, formRef, packageDigest)
+      : null;
+  };
+
   const activationRead = async (
     base: CurrentBase,
     context: TakoformAuthorityRequestContext,
   ): Promise<ActivationRead> => {
     validateContext(context);
     const durableAudiences = activationAudiences(options.hostId, context);
+    const reads = await Promise.all(
+      durableAudiences.map(async (audience) => {
+        const activationKey = asDigest(
+          await canonicalDigest({
+            formRefKey: base.formRefKey,
+            packageDigest: base.install.packageDigest,
+            audience: { kind: audience.kind, value: audience.value },
+          }),
+        );
+        const row = await exactHead(options.sql, ACTIVATION_TABLE, "activation_key", activationKey);
+        return {
+          row,
+          audience,
+          activationKey,
+        };
+      }),
+    );
     const facts: AdmissionProjectionActivation[] = [];
     const heads: TakoformAuthorityHeadExpectation[] = [];
-    for (const audience of durableAudiences) {
-      const activationKey = asDigest(
-        await canonicalDigest({
-          formRefKey: base.formRefKey,
-          packageDigest: base.install.packageDigest,
-          audience: { kind: audience.kind, value: audience.value },
-        }),
-      );
-      const row = await exactHead(options.sql, ACTIVATION_TABLE, "activation_key", activationKey);
+    for (const { row, audience, activationKey } of reads) {
       heads.push(
         expectation("activation", activationKey, row ? digest(row, "event_digest") : null),
       );
@@ -440,62 +485,16 @@ export function createTakoformHostAuthority(
     const installHeads = await allHeads(options.sql, INSTALL_TABLE, "form_ref_key");
     if (installHeads.length > MAX_CURRENT_FORMS) throw unavailable();
     const seen = new Set<string>();
-    const entries: TakoformAuthorityCatalogEntry[] = [];
     for (const row of installHeads) {
       const key = text(row, "form_ref_key");
       if (seen.has(key)) throw unavailable();
       seen.add(key);
-      if (text(row, "event_type") === "uninstall") continue;
-      const parsedRef = parseFormRef(row.form_ref_json);
-      const base = await currentBase(parsedRef, "null");
-      if (!base) continue;
-      const technical = base.baseSupported
-        ? await options.technicalAvailability.resolve({
-            tenantId: context.tenantId,
-            principalId: context.principalId,
-            form: base.form,
-          })
-        : { executable: false, activated: false, availableToPrincipal: false };
-      let activationAllowed = false;
-      let activationHeads: readonly TakoformAuthorityHeadExpectation[] = [];
-      if (resolveActivation) {
-        const operation = base.form.operations.find((value) => MUTATION_OPERATIONS.has(value));
-        if (operation === "create" || operation === "import" || operation === "update") {
-          const decision = await projection(
-            base,
-            operation,
-            context as TakoformAuthorityRequestContext,
-          );
-          activationAllowed = decision.allowed;
-          activationHeads = decision.activationHeads;
-        }
-      }
-      const heads = [...base.heads, ...activationHeads];
-      const headDigest = asDigest(
-        await canonicalDigest({
-          version: "takoserver.takoform-authority-catalog@v1",
-          formRef: base.form.identity.formRef,
-          packageDigest: base.install.packageDigest,
-          implementationDigest: base.support.implementationDigest,
-          heads,
-        }),
-      );
-      entries.push({
-        form: structuredClone(base.form),
-        supported: base.baseSupported && technical.executable,
-        availability: {
-          executable: base.baseSupported && technical.executable,
-          activated:
-            resolveActivation && activationAllowed && technical.activated && base.baseSupported,
-          availableToPrincipal:
-            resolveActivation &&
-            activationAllowed &&
-            technical.availableToPrincipal &&
-            base.baseSupported,
-        },
-        headDigest,
-      });
     }
+    const entries = (
+      await mapBounded(installHeads, CATALOG_FORM_CONCURRENCY, async (row) =>
+        catalogEntry(context, resolveActivation, row, "definition"),
+      )
+    ).filter((entry): entry is TakoformAuthorityCatalogEntry => entry !== null);
     entries.sort((left, right) =>
       formKey(left.form.identity.formRef).localeCompare(formKey(right.form.identity.formRef)),
     );
@@ -508,6 +507,137 @@ export function createTakoformHostAuthority(
     };
   };
 
+  /**
+   * Projects only the package(s) that can answer one exact support query. Form
+   * selectors resolve through the compiled candidate's canonical key, while
+   * interface/binding selectors use a bounded current-head scan and then open
+   * package bytes only for candidates that can provide the requested contract.
+   */
+  const projectSupportLookup = async (
+    context: TakoformAuthoritySupportContext,
+    query: TakoformAuthoritySupportLookup,
+  ): Promise<TakoformAuthoritySupportProjection> => {
+    validateSupportContext(context);
+    let installHeads: readonly Row[];
+    let candidateKeys: ReadonlySet<string> | null = null;
+    if (query.target === "form") {
+      if (
+        !isFormApiVersion(query.apiVersion) ||
+        !isKind(query.kind) ||
+        !isDefinitionVersion(query.definitionVersion)
+      ) {
+        return { forms: [], bindings: [] };
+      }
+      // The compiled candidate registry already refuses two schema digests
+      // for one Form definition. Use that sole exact identity to reach the
+      // indexed install-head lookup; a durable row for another schema digest
+      // is necessarily not executable by this Host and must not make this
+      // support probe scan the entire append-only ledger.
+      const candidate = [...candidates.values()].find(
+        (form) =>
+          form.identity.formRef.apiVersion === query.apiVersion &&
+          form.identity.formRef.kind === query.kind &&
+          form.identity.formRef.definitionVersion === query.definitionVersion,
+      );
+      if (!candidate) return { forms: [], bindings: [] };
+      const candidateFormRefKey = asDigest(await canonicalDigest(candidate.identity.formRef));
+      const installHead = await exactHead(
+        options.sql,
+        INSTALL_TABLE,
+        "form_ref_key",
+        candidateFormRefKey,
+      );
+      installHeads = installHead ? [installHead] : [];
+    } else {
+      installHeads = await allHeads(options.sql, INSTALL_TABLE, "form_ref_key");
+      if (installHeads.length > MAX_CURRENT_FORMS) throw unavailable();
+      candidateKeys = new Set(
+        [...candidates.values()]
+          .filter((form) => formMatchesSupportLookup(form, query, bindings))
+          .map((form) => formKey(form.identity.formRef)),
+      );
+      if (candidateKeys.size === 0) return { forms: [], bindings: [] };
+      assertUniqueInstallHeadKeys(installHeads);
+    }
+
+    const entries = (
+      await mapBounded(installHeads, CATALOG_FORM_CONCURRENCY, async (row) => {
+        if (candidateKeys !== null) {
+          const key = formKey(parseFormRef(row.form_ref_json));
+          if (!candidateKeys.has(key)) return null;
+        }
+        return catalogEntry(context, false, row, "definition");
+      })
+    ).filter((entry): entry is TakoformAuthorityCatalogEntry => entry !== null);
+
+    const supported = entries.filter((entry) => {
+      if (!entry.supported) return false;
+      return query.target === "form" || formMatchesSupportLookup(entry.form, query, bindings);
+    });
+    return {
+      forms: entries,
+      bindings: bindingsFor(
+        supported.map((entry) => entry.form),
+        bindings,
+      ),
+    };
+  };
+
+  const catalogEntry = async (
+    context: TakoformAuthorityRequestContext | TakoformAuthoritySupportContext,
+    resolveActivation: boolean,
+    row: Row,
+    readMode: "definition" | "package",
+  ): Promise<TakoformAuthorityCatalogEntry | null> => {
+    if (text(row, "event_type") === "uninstall") return null;
+    const parsedRef = parseFormRef(row.form_ref_json);
+    const base = await currentBase(parsedRef, "null", row, readMode);
+    if (!base) return null;
+    const technical = base.baseSupported
+      ? await options.technicalAvailability.resolve({
+          tenantId: context.tenantId,
+          principalId: context.principalId,
+          form: base.form,
+        })
+      : { executable: false, activated: false, availableToPrincipal: false };
+    let activationAllowed = false;
+    let activationHeads: readonly TakoformAuthorityHeadExpectation[] = [];
+    if (resolveActivation) {
+      const operation = base.form.operations.find((value) => MUTATION_OPERATIONS.has(value));
+      if (operation === "create" || operation === "import" || operation === "update") {
+        if (!("space" in context)) throw unavailable();
+        const decision = await projection(base, operation, context);
+        activationAllowed = decision.allowed;
+        activationHeads = decision.activationHeads;
+      }
+    }
+    const heads = [...base.heads, ...activationHeads];
+    const headDigest = asDigest(
+      await canonicalDigest({
+        version: "takoserver.takoform-authority-catalog@v1",
+        formRef: base.form.identity.formRef,
+        packageDigest: base.install.packageDigest,
+        implementationDigest: base.support.implementationDigest,
+        heads,
+      }),
+    );
+    return {
+      form: structuredClone(base.form),
+      supported: base.baseSupported && technical.executable,
+      availability: {
+        executable: base.baseSupported && technical.executable,
+        activated:
+          resolveActivation && activationAllowed && technical.activated && base.baseSupported,
+        availableToPrincipal:
+          resolveActivation &&
+          activationAllowed &&
+          technical.availableToPrincipal &&
+          base.baseSupported,
+      },
+      headDigest,
+    };
+  };
+
   return {
     catalog(context) {
       return execute(() => catalog(context, true));
@@ -517,10 +647,14 @@ export function createTakoformHostAuthority(
       return execute(() => catalog(context, false));
     },
 
+    lookupSupport(context, query) {
+      return execute(() => projectSupportLookup(context, query));
+    },
+
     authorizeMutation(input) {
       return execute(async () => {
         validateContext(input.context);
-        const base = await currentBase(input.formRef, "error");
+        const base = await currentBase(input.formRef, "error", undefined, "package");
         if (!base) throw unavailable();
         if (!base.baseSupported) throw unavailable();
         const decision = await projection(base, input.operation, input.context);
@@ -1095,6 +1229,81 @@ async function allHeads(sql: Sql, table: string, keyColumn: string): Promise<rea
     [MAX_CURRENT_FORMS + 1],
   );
   return rows;
+}
+
+function assertUniqueInstallHeadKeys(rows: readonly Row[]): void {
+  const keys = new Set<string>();
+  for (const row of rows) {
+    const key = text(row, "form_ref_key");
+    if (keys.has(key)) throw unavailable();
+    keys.add(key);
+  }
+}
+
+function formMatchesSupportLookup(
+  form: InstalledTakoformForm,
+  query: Exclude<TakoformAuthoritySupportLookup, { readonly target: "form" }>,
+  bindings: BindingRegistry,
+): boolean {
+  if (query.target === "binding") {
+    return (form.acceptedBindings ?? []).some(
+      (reference) => reference.name === query.name && reference.version === query.version,
+    );
+  }
+  if (
+    (form.providedInterfaces ?? []).some(
+      (reference) => reference.name === query.name && reference.version === query.version,
+    )
+  ) {
+    return true;
+  }
+  return (form.acceptedBindings ?? []).some((accepted) =>
+    [...bindings.values()].some(
+      (binding) =>
+        binding.bindingRef.name === accepted.name &&
+        binding.bindingRef.version === accepted.version &&
+        binding.targetInterface.name === query.name &&
+        binding.targetInterface.version === query.version,
+    ),
+  );
+}
+
+async function mapBounded<T, R>(
+  input: readonly T[],
+  concurrency: number,
+  map: (value: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  if (input.length === 0) return [];
+  if (!Number.isSafeInteger(concurrency) || concurrency < 1) {
+    throw new TypeError("concurrency must be a positive integer");
+  }
+  const output = Array<R>(input.length);
+  let next = 0;
+  let stopped = false;
+  let failed = false;
+  let firstError: unknown;
+  const worker = async (): Promise<void> => {
+    while (true) {
+      if (stopped) return;
+      const index = next;
+      next += 1;
+      if (index >= input.length) return;
+      const value = input[index];
+      if (value === undefined) return;
+      try {
+        output[index] = await map(value, index);
+      } catch (error) {
+        if (!failed) {
+          failed = true;
+          firstError = error;
+        }
+        stopped = true;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, input.length) }, () => worker()));
+  if (failed) throw firstError;
+  return output;
 }
 
 async function exactPackageHead(

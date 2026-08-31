@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { createEphemeralSql } from "../src/compat.ts";
+import { canonicalDigest } from "../src/json.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
-import type { JsonObject } from "../src/ports.ts";
+import type { JsonObject, Row, Sql } from "../src/ports.ts";
 import {
   type AdmissionDigest,
   type AdmissionHandleClaims,
@@ -18,6 +19,7 @@ import { createFormPackageStore, formPackageKey } from "../src/takoform/form-pac
 import { createTakoformHost } from "../src/takoform/host.ts";
 import {
   createTakoformHostAuthority,
+  type TakoformAuthorityCatalogEntry,
   type TakoformAuthorityRequestContext,
   takoformActivationAudience,
 } from "../src/takoform/host-authority.ts";
@@ -369,6 +371,227 @@ describe("durable read-only Takoform Host authority", () => {
         formRef: form.identity.formRef,
       }),
     ).rejects.toMatchObject({ code: "form_unavailable", status: 503 });
+  });
+
+  test("targeted Form support reads the indexed exact head and only the Definition object", async () => {
+    const fixture = await committedAuthority();
+    const getKeys: string[] = [];
+    let listCalls = 0;
+    const countedObjects = {
+      async get(key: string) {
+        getKeys.push(key);
+        return await fixture.objects.get(key);
+      },
+      async list(input: Parameters<typeof fixture.objects.list>[0]) {
+        listCalls += 1;
+        return await fixture.objects.list(input);
+      },
+    };
+    const sqlQueries: { readonly sql: string; readonly params: readonly unknown[] | undefined }[] =
+      [];
+    const countedSql: Sql = {
+      async query(sql, params) {
+        sqlQueries.push({ sql, params });
+        return await fixture.sql.query(sql, params);
+      },
+      run: fixture.sql.run.bind(fixture.sql),
+      batch: fixture.sql.batch.bind(fixture.sql),
+    };
+    const authority = createTakoformHostAuthority({
+      sql: countedSql,
+      objects: countedObjects,
+      hostId: "host-a",
+      candidates: fixture.catalog.forms,
+      bindings: fixture.catalog.bindings,
+      technicalAvailability: technicallyAvailable,
+    });
+    if (!authority.lookupSupport) throw new Error("targeted support lookup missing");
+
+    const result = await authority.lookupSupport(CONTEXT, {
+      target: "form",
+      apiVersion: fixture.form.identity.formRef.apiVersion,
+      kind: fixture.form.identity.formRef.kind,
+      definitionVersion: fixture.form.identity.formRef.definitionVersion,
+    });
+    expect(result.forms).toHaveLength(1);
+    expect(listCalls).toBe(0);
+    expect(getKeys).toHaveLength(2);
+    expect(getKeys[0]).toContain("/package-index.json");
+    expect(getKeys[1]).toContain("/definition.json");
+    const installQueries = sqlQueries.filter((entry) =>
+      entry.sql.includes("FROM tf_form_install_events AS current"),
+    );
+    expect(installQueries).toHaveLength(1);
+    expect(installQueries[0]?.sql).toContain("current.form_ref_key = ?");
+    expect(installQueries[0]?.sql).not.toContain("current.form_api_version = ?");
+    expect(installQueries[0]?.params).toEqual([
+      await canonicalDigest(fixture.form.identity.formRef),
+    ]);
+  });
+
+  test("targeted interface support preserves an interface exposed only through a Binding target", async () => {
+    const fixture = await committedAuthority();
+    const moduleWorker = fixture.catalog.forms.find(
+      (form) => form.identity.formRef.kind === "ModuleWorker",
+    );
+    if (!moduleWorker) throw new Error("ModuleWorker candidate missing");
+    const workerVersion = fixture.catalog.forms.find(
+      (form) => form.identity.formRef.kind === "WorkerVersion",
+    );
+    if (!workerVersion) throw new Error("WorkerVersion candidate missing");
+    const acceptedBindings = workerVersion.acceptedBindings;
+    if (!acceptedBindings) throw new Error("WorkerVersion binding candidates missing");
+    const binding = fixture.catalog.bindings.find(
+      (candidate) => candidate.bindingRef.name === "module-worker.edge-kv",
+    );
+    if (!binding) throw new Error("edge KV binding candidate missing");
+    // The committed fixture is the ModuleWorker package, while the binding is
+    // accepted by WorkerVersion. Keep the exact durable identity but compose a
+    // candidate whose only exposure for this query is that Binding target.
+    const bindingOnly = {
+      ...structuredClone(moduleWorker),
+      acceptedBindings,
+      providedInterfaces: [],
+    };
+    const candidates = fixture.catalog.forms.map((form) =>
+      form.identity.formRef.kind === "ModuleWorker" ? bindingOnly : form,
+    );
+    const authority = createTakoformHostAuthority({
+      sql: fixture.sql,
+      objects: fixture.objects,
+      hostId: "host-a",
+      candidates,
+      bindings: fixture.catalog.bindings,
+      technicalAvailability: technicallyAvailable,
+    });
+    if (!authority.lookupSupport) throw new Error("targeted support lookup missing");
+
+    const result = await authority.lookupSupport(CONTEXT, {
+      target: "interface",
+      name: binding.targetInterface.name,
+      version: binding.targetInterface.version,
+    });
+    expect(result.forms).toHaveLength(1);
+    expect(result.forms[0]?.form.providedInterfaces).toEqual([]);
+    expect(result.bindings).toContainEqual(
+      expect.objectContaining({ targetInterface: binding.targetInterface }),
+    );
+  });
+
+  test("targeted catalog failures stop assigning rows after the launched wave", async () => {
+    const fixture = unseeded();
+    const nonMatching = fixture.catalog.forms.find(
+      (form) => form.identity.formRef.kind === "WorkerBundle",
+    );
+    if (!nonMatching) throw new Error("non-matching candidate missing");
+    let formRefReads = 0;
+    const rows = Array.from({ length: 12 }, (_, index) => {
+      const row: Record<string, unknown> = {
+        form_ref_key: `key-${index}`,
+        event_type: "install",
+      };
+      Object.defineProperty(row, "form_ref_json", {
+        enumerable: true,
+        get() {
+          formRefReads += 1;
+          return index === 0 ? "{" : JSON.stringify(nonMatching.identity.formRef);
+        },
+      });
+      return row as Row;
+    });
+    const sql: Sql = {
+      async query(query, params) {
+        if (query.includes("FROM tf_form_install_events AS current")) return rows;
+        return await fixture.sql.query(query, params);
+      },
+      run: fixture.sql.run.bind(fixture.sql),
+      batch: fixture.sql.batch.bind(fixture.sql),
+    };
+    const authority = createTakoformHostAuthority({
+      sql,
+      objects: fixture.objects,
+      hostId: "host-a",
+      candidates: fixture.catalog.forms,
+      bindings: fixture.catalog.bindings,
+      technicalAvailability: technicallyAvailable,
+    });
+    if (!authority.lookupSupport) throw new Error("targeted support lookup missing");
+    await expect(
+      authority.lookupSupport(CONTEXT, {
+        target: "interface",
+        name: "worker.runtime",
+        version: "1.1.0",
+      }),
+    ).rejects.toMatchObject({ code: "form_unavailable", status: 503 });
+    // One mapper throws; the other three workers may already be parsing their
+    // row, but no worker is allowed to claim row five or later afterward.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(formRefReads).toBeGreaterThanOrEqual(1);
+    expect(formRefReads).toBeLessThanOrEqual(4);
+  });
+
+  test("support routes filter unsupported/uninstalled entries and fail closed on supported schema ambiguity", async () => {
+    const fixture = await committedAuthority();
+    const alternateForm = {
+      ...structuredClone(fixture.form),
+      identity: {
+        ...structuredClone(fixture.form.identity),
+        formRef: {
+          ...structuredClone(fixture.form.identity.formRef),
+          schemaDigest: digest("9"),
+        },
+      },
+    };
+    const entry = (
+      form: typeof fixture.form,
+      supported: boolean,
+    ): TakoformAuthorityCatalogEntry => ({
+      form: structuredClone(form),
+      supported,
+      availability: {
+        executable: supported,
+        activated: supported,
+        availableToPrincipal: supported,
+      },
+      headDigest: digest(supported ? "a" : "b"),
+    });
+    const path = `/apis/forms.takoform.com/v1/support/forms/${fixture.form.identity.formRef.apiVersion}/${fixture.form.identity.formRef.kind}/${fixture.form.identity.formRef.definitionVersion}`;
+    const hostFor = (entries: readonly TakoformAuthorityCatalogEntry[]) =>
+      createTakoformHost({
+        sql: fixture.sql,
+        objects: fixture.objects,
+        forms: fixture.catalog.forms,
+        bindings: fixture.catalog.bindings,
+        authority: {
+          ...fixture.authority,
+          lookupSupport: async () => ({ forms: entries, bindings: fixture.catalog.bindings }),
+        },
+        driver: new InMemoryTakoformResourceDriver(),
+        authenticate: async () => ({
+          tenantId: CONTEXT.tenantId,
+          principalId: CONTEXT.principalId,
+        }),
+      });
+
+    const supportedAndUnsupported = await hostFor([
+      entry(fixture.form, true),
+      entry(alternateForm, false),
+    ]).handle(new Request(`https://host.invalid${path}`));
+    expect(supportedAndUnsupported?.status).toBe(200);
+
+    const supportedAndUninstalled = await hostFor([entry(fixture.form, true)]).handle(
+      new Request(`https://host.invalid${path}`),
+    );
+    expect(supportedAndUninstalled?.status).toBe(200);
+
+    const twoSupportedSchemas = await hostFor([
+      entry(fixture.form, true),
+      entry(alternateForm, true),
+    ]).handle(new Request(`https://host.invalid${path}`));
+    expect(twoSupportedSchemas?.status).toBe(404);
+    expect(await twoSupportedSchemas?.json()).toMatchObject({
+      error: { code: "form_unknown" },
+    });
   });
 
   test("reads committed heads and observes deactivation without an isolate restart", async () => {

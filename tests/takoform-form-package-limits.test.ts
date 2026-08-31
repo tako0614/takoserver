@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { bytesDigest, canonicalDigest, canonicalJson } from "../src/json.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
-import type { StoredObjectBody } from "../src/ports.ts";
+import type { JsonObject, StoredObjectBody } from "../src/ports.ts";
 import {
   drainBoundedFormPackageStream,
   FORM_PACKAGE_LIMITS,
@@ -55,6 +55,59 @@ describe("portable Form Package limits", () => {
 
     await expect(reader.read({ packageDigest })).resolves.toBeNull();
     expect(cancelled).toBe(true);
+  });
+
+  test.each([
+    ["unsupported package API", { apiVersion: "packages.forms.takoform.com/v9" }],
+    ["malformed package version", { packageVersion: 42 }],
+    ["unsafe definition path", { definitionPath: "../definition.json" }],
+    ["index definition path", { definitionPath: "package-index.json" }],
+  ] as const)("definition-only and full reads reject %s in the index", async (_label, override) => {
+    const definitionBytes = new TextEncoder().encode("definition");
+    const definitionDigest = await bytesDigest(definitionBytes);
+    const manifest = {
+      apiVersion: "packages.forms.takoform.com/v1alpha1",
+      kind: "FormPackage",
+      formRef: FORM_REF,
+      definitionPath: "definition.json",
+      files: [
+        {
+          path: "definition.json",
+          digest: definitionDigest,
+          size: definitionBytes.byteLength,
+          mediaType: "application/json",
+        },
+      ],
+      ...override,
+    } as unknown as JsonObject;
+    const packageDigest = (await canonicalDigest(manifest)) as `sha256:${string}`;
+    const indexKey = `${readOnlyFormPackagePrefix(packageDigest)}/package-index.json`;
+    const definitionKey = readOnlyFormPackageKey(packageDigest, "definition.json");
+    const indexBytes = new TextEncoder().encode(canonicalJson(manifest));
+    let payloadReads = 0;
+    const reader = createFormPackageReader({
+      async get(key): Promise<StoredObjectBody | null> {
+        if (key === indexKey) {
+          return { key, size: indexBytes.byteLength, etag: "index", body: streamOf(indexBytes) };
+        }
+        payloadReads += 1;
+        if (key !== definitionKey) return null;
+        return {
+          key,
+          size: definitionBytes.byteLength,
+          etag: "definition",
+          body: streamOf(definitionBytes),
+        };
+      },
+      async list() {
+        throw new Error("index rejection must happen before listing");
+      },
+    });
+
+    if (!reader.readDefinition) throw new Error("definition reader missing");
+    await expect(reader.readDefinition({ packageDigest, formRef: FORM_REF })).resolves.toBeNull();
+    await expect(reader.read({ packageDigest, formRef: FORM_REF })).resolves.toBeNull();
+    expect(payloadReads).toBe(0);
   });
 
   test("rejects more than 1024 declared files without reading a payload", async () => {
@@ -162,6 +215,76 @@ describe("portable Form Package limits", () => {
     );
 
     await expect(get().read({ packageDigest })).resolves.toBeNull();
+  });
+
+  test("stops assigning package payloads after the first failed bounded wave", async () => {
+    const declarations = Array.from({ length: 92 }, (_, index) => ({
+      path: `payload-${String(index).padStart(3, "0")}.txt`,
+      digest: ZERO_DIGEST,
+      size: 0,
+      mediaType: "text/plain" as const,
+    }));
+    const { packageDigest, get, payloadReads } = await indexedReader(declarations);
+
+    await expect(get().read({ packageDigest })).resolves.toBeNull();
+    expect(payloadReads()).toBeGreaterThan(0);
+    expect(payloadReads()).toBeLessThanOrEqual(16);
+  });
+
+  test("definition-only reads fetch only the index and declared Definition", async () => {
+    const definitionBytes = new Uint8Array([1, 2, 3]);
+    const definitionDigest = await bytesDigest(definitionBytes);
+    const files = [
+      {
+        path: "definition.json",
+        digest: definitionDigest,
+        size: definitionBytes.byteLength,
+        mediaType: "application/json",
+      },
+      ...Array.from({ length: 91 }, (_, index) => ({
+        path: `payload-${String(index).padStart(3, "0")}.txt`,
+        digest: ZERO_DIGEST,
+        size: 0,
+        mediaType: "text/plain",
+      })),
+    ];
+    const manifest = {
+      apiVersion: "packages.forms.takoform.com/v1alpha1",
+      kind: "FormPackage",
+      formRef: FORM_REF,
+      definitionPath: "definition.json",
+      files,
+    } as unknown as JsonObject;
+    const packageDigest = (await canonicalDigest(manifest)) as `sha256:${string}`;
+    const indexKey = `${readOnlyFormPackagePrefix(packageDigest)}/package-index.json`;
+    const definitionKey = readOnlyFormPackageKey(packageDigest, "definition.json");
+    const indexBytes = new TextEncoder().encode(canonicalJson(manifest));
+    const reads: string[] = [];
+    const reader = createFormPackageReader({
+      async get(key): Promise<StoredObjectBody | null> {
+        reads.push(key);
+        if (key === indexKey) {
+          return { key, size: indexBytes.byteLength, etag: "index", body: streamOf(indexBytes) };
+        }
+        if (key === definitionKey) {
+          return {
+            key,
+            size: definitionBytes.byteLength,
+            etag: "definition",
+            body: streamOf(definitionBytes),
+          };
+        }
+        return null;
+      },
+      async list() {
+        throw new Error("definition-only reads must not enumerate the package");
+      },
+    });
+
+    if (!reader.readDefinition) throw new Error("definition reader missing");
+    const result = await reader.readDefinition({ packageDigest, formRef: FORM_REF });
+    expect(result?.definition.path).toBe("definition.json");
+    expect(reads).toEqual([indexKey, definitionKey]);
   });
 
   test("checks an input manifest declaration before reading its payload stream", async () => {
