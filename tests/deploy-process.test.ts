@@ -1,12 +1,20 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { runCommand } from "../scripts/deploy/process.ts";
+import { cloudflareChildEnvironment, runCommand } from "../scripts/deploy/process.ts";
 
 const AMBIENT = "TAKOSERVER_TEST_AMBIENT_SECRET";
-const previous = process.env[AMBIENT];
+const BUILDER_INPUT = "TAKOSERVER_BUILDX_BUILDER";
+const previous = Object.fromEntries(
+  [AMBIENT, BUILDER_INPUT, "BUILDX_BUILDER", "CLOUDFLARE_API_TOKEN"].map((name) => [
+    name,
+    process.env[name],
+  ]),
+);
 
 afterEach(() => {
-  if (previous === undefined) delete process.env[AMBIENT];
-  else process.env[AMBIENT] = previous;
+  for (const [name, value] of Object.entries(previous)) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
 });
 
 describe("sanitized deploy child environment", () => {
@@ -34,5 +42,34 @@ describe("sanitized deploy child environment", () => {
       env: { [AMBIENT]: "child-only" },
     });
     expect(process.env[AMBIENT]).toBeUndefined();
+  });
+
+  test("maps only the validated Takoserver buildx selector", async () => {
+    process.env.CLOUDFLARE_API_TOKEN = "explicit-token";
+    process.env.BUILDX_BUILDER = "ambient-must-not-cross";
+    delete process.env[BUILDER_INPUT];
+
+    const absent = await runCommand(
+      ["bun", "-e", "console.log(process.env.BUILDX_BUILDER ?? 'absent')"],
+      { env: cloudflareChildEnvironment() },
+    );
+    expect(absent.exitCode).toBe(0);
+    expect(absent.stdout.trim()).toBe("absent");
+
+    process.env[BUILDER_INPUT] = "remote_builder-1.example";
+    const selected = await runCommand(
+      ["bun", "-e", "console.log(process.env.BUILDX_BUILDER ?? 'absent')"],
+      { env: cloudflareChildEnvironment() },
+    );
+    expect(selected.exitCode).toBe(0);
+    expect(selected.stdout.trim()).toBe("remote_builder-1.example");
+  });
+
+  test("rejects executable paths and malformed buildx selectors before a child runs", () => {
+    process.env.CLOUDFLARE_API_TOKEN = "explicit-token";
+    for (const value of ["/tmp/docker-wrapper", "tcp://builder", " leading", "", "x".repeat(129)]) {
+      process.env[BUILDER_INPUT] = value;
+      expect(() => cloudflareChildEnvironment()).toThrow(BUILDER_INPUT);
+    }
   });
 });

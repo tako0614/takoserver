@@ -28,6 +28,9 @@ const CHILD_SUBSTRATE = [
   "NODE_EXTRA_CA_CERTS",
 ] as const;
 
+const BUILDX_BUILDER_INPUT = "TAKOSERVER_BUILDX_BUILDER";
+const BUILDX_BUILDER_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+
 /**
  * Builds the complete environment for a deploy child.
  *
@@ -63,7 +66,23 @@ export function requireEnvironment(name: string): string {
 
 /** The only ambient credential forwarded to Cloudflare commands. */
 export function cloudflareChildEnvironment(): Readonly<Record<string, string>> {
-  return { CLOUDFLARE_API_TOKEN: requireEnvironment("CLOUDFLARE_API_TOKEN") };
+  const environment: Record<string, string> = {
+    CLOUDFLARE_API_TOKEN: requireEnvironment("CLOUDFLARE_API_TOKEN"),
+  };
+  const builder = process.env[BUILDX_BUILDER_INPUT];
+  if (builder !== undefined) {
+    if (!BUILDX_BUILDER_NAME.test(builder)) {
+      throw new DeployError(
+        "preflight",
+        `${BUILDX_BUILDER_INPUT} must be a 1..128 character Docker builder name`,
+      );
+    }
+    // Wrangler invokes `docker build`; Docker's own buildx selector chooses an
+    // already configured builder without granting the child an executable
+    // path, Docker host, context, or arbitrary ambient Docker variables.
+    environment.BUILDX_BUILDER = builder;
+  }
+  return environment;
 }
 
 /** Runs a command to completion, capturing both streams and never inheriting stdin. */
