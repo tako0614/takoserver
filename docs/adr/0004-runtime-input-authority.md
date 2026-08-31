@@ -186,7 +186,10 @@ classified bootstrap state, not a weaker routine closure.
 Migration 0032's `seal_key_id` is also a rotation fence. Bootstrap requires no
 prepared or claimed row with a non-null key ID. Later rotations must retain
 every key ID used by such rows, and a prior key can be removed only at zero
-use. Missing or unreadable migration state is not interpreted as an empty
+use. The observed active current key must additionally become a previous key
+on every rotation even at zero row use; it may be removed only by a later
+rotation after it is no longer active and still has zero use. Missing or
+unreadable migration state is not interpreted as an empty
 table. Reversal is a separately reviewed forward repair with a retained prior
 keyring and matching descriptor: rolling back a Worker Version does not restore
 the script-wide secret.

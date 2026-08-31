@@ -44,6 +44,11 @@ const OLD_DESCRIPTOR = {
   previousKeyIds: [],
   commitment: `sha256:${"2".repeat(64)}`,
 } as const satisfies RuntimeInputSealKeyRingDescriptor;
+const UNRETAINED_ACTIVE_DESCRIPTOR = {
+  currentKeyId: "runtime-2026-06",
+  previousKeyIds: [],
+  commitment: `sha256:${"3".repeat(64)}`,
+} as const satisfies RuntimeInputSealKeyRingDescriptor;
 const BUNDLE = "export default {async fetch(){return new Response('ok')}};\n";
 const BUNDLE_DIGEST = createHash("sha256").update(BUNDLE).digest("hex");
 const VERSION_BEFORE = "11111111-1111-4111-8111-111111111111";
@@ -300,6 +305,61 @@ describe("runtime-input seal-key deployment authority", () => {
     }
   });
 
+  test("rotation retains the observed active key even when its sealed-row count is zero", async () => {
+    const process = processFixture();
+    const status = await runRuntimeInputSealKey(
+      {
+        surface: "takoserver-runtime-input-seal-key",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      target,
+      {
+        database: new FakeDatabase(),
+        state: stateFixture({
+          initialDescriptor: UNRETAINED_ACTIVE_DESCRIPTOR,
+          uploaded: () => false,
+          message: process.message,
+        }),
+        run: process.run,
+        fetcher: productFetcher,
+      },
+    );
+    expect(status).toMatchObject({
+      state: "rotation-required",
+      sealedRows: { total: 0, byKeyId: [] },
+      activeKeyRetained: false,
+      applyReady: false,
+      ready: false,
+    });
+
+    const failure = await runRuntimeInputSealKey(
+      {
+        surface: "takoserver-runtime-input-seal-key",
+        action: "apply",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      target,
+      {
+        database: new FakeDatabase(),
+        state: stateFixture({
+          initialDescriptor: UNRETAINED_ACTIVE_DESCRIPTOR,
+          uploaded: () => false,
+          message: process.message,
+        }),
+        run: process.run,
+        fetcher: productFetcher,
+      },
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(DeployError);
+    expect((failure as DeployError).phase).toBe("preflight");
+    expect((failure as Error).message).toContain("retain the observed active key");
+    expect(process.calls.some(({ command }) => command.includes("--secrets-file"))).toBe(false);
+    expect(process.calls.some(({ command }) => command.join(" ") === "bun run check")).toBe(false);
+  });
+
   test("missing 0032 is not ready and never queries it as an empty table", async () => {
     const database = new FakeDatabase();
     database.schema = MIGRATIONS.filter((name) => name < "0032_");
@@ -461,6 +521,91 @@ describe("runtime-input seal-key deployment authority", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
+      expect(process.calls.some(({ command }) => command.includes("--secrets-file"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a pre-upload active-key race is re-read and refuses rotation before mutation", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-runtime-seal-active-race-"));
+    const process = processFixture();
+    let descriptorReads = 0;
+    try {
+      const failure = await runRuntimeInputSealKey(
+        {
+          surface: "takoserver-runtime-input-seal-key",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target,
+        {
+          database: new FakeDatabase(),
+          state: stateFixture({
+            initialDescriptor: OLD_DESCRIPTOR,
+            uploaded: () => false,
+            message: process.message,
+            raceDescriptor: () => {
+              descriptorReads += 1;
+              return descriptorReads <= 3 ? OLD_DESCRIPTOR : UNRETAINED_ACTIVE_DESCRIPTOR;
+            },
+          }),
+          run: process.run,
+          fetcher: productFetcher,
+          keyringPath: writeKeyring(root),
+          review: "independent-reviewer",
+          outputDirectory: join(root, "output"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
+        },
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect((failure as DeployError).phase).toBe("preflight");
+      expect(descriptorReads).toBeGreaterThan(3);
+      expect(process.calls.some(({ command }) => command.includes("--secrets-file"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("source dirty-state drift after build is requalified immediately before upload", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-runtime-seal-source-race-"));
+    const process = processFixture();
+    let statusReads = 0;
+    const run: RuntimeInputSealKeyProcess = async (command, options) => {
+      if (command.join(" ") === "git status --porcelain=v1 -z --untracked-files=all") {
+        statusReads += 1;
+        if (statusReads > 1) return ok(" M src/entry-worker.ts\0");
+      }
+      return await process.run(command, options);
+    };
+    try {
+      const failure = await runRuntimeInputSealKey(
+        {
+          surface: "takoserver-runtime-input-seal-key",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target,
+        {
+          database: new FakeDatabase(),
+          state: stateFixture({
+            initialDescriptor: null,
+            uploaded: () => false,
+            message: process.message,
+          }),
+          run,
+          fetcher: productFetcher,
+          keyringPath: writeKeyring(root),
+          review: "independent-reviewer",
+          outputDirectory: join(root, "output"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
+        },
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect((failure as DeployError).phase).toBe("preflight");
+      expect(statusReads).toBe(2);
       expect(process.calls.some(({ command }) => command.includes("--secrets-file"))).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });

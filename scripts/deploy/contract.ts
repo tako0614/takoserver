@@ -201,11 +201,13 @@ export const DEPLOY_CONTRACT = {
           `${highRiskFailure} Apply never retries acknowledgement loss and status alone settles the exact ` +
           "successor. Missing schema 0032 is unavailable, not empty. Bootstrap requires zero live sealed rows; " +
           "rotation refuses any desired key-id set that omits a live row key, so a previous key can be removed " +
-          "only at zero use. Other Worker surfaces continue refusing secret or configuration drift." +
+          "only at zero use. Every rotation also retains the observed active key as a desired previous key, " +
+          "including at zero use. Other Worker surfaces continue refusing secret or configuration drift." +
           inputContract(runtimeInputSealKeyringInput, applyReviewInput),
         "pre-mutation-proof":
           "Immediately before upload, the exact predecessor Version/config/secret closure and D1 live-key " +
-          "inventory are re-read, the selected source is requalified, and the sealed artifact is byte-requalified.",
+          "inventory are re-read, exact HEAD plus dirty-state qualification is repeated and compared, and the " +
+          "sealed artifact is byte-requalified.",
         "independent-review": review,
       },
     },

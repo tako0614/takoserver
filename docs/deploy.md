@@ -180,8 +180,11 @@ The separate authority and irreversible surfaces are:
   this secret-name entry. Bootstrap requires schema migration 0032 and zero
   prepared/claimed rows with non-null `seal_key_id`. Rotation requires every
   grouped live row key ID to remain in the desired current/previous set; a
-  previous key may be removed only when its grouped count is zero. Missing or
-  unreadable schema 0032 is unavailable, never an empty inventory. Status and
+  previous key may be removed only when its grouped count is zero. Every
+  rotation also carries the observed active current key as a desired previous
+  key even when its row count is zero; only a later rotation may remove it once
+  it is no longer active and remains unused. Missing or unreadable schema 0032
+  is unavailable, never an empty inventory. Status and
   post-readback prove stable deployment history, exact commit/artifact/config,
   exhaustive secret names, descriptor binding, D1 counts, and the public
   discovery/OpenAPI runtime probe.

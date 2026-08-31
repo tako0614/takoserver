@@ -41,7 +41,11 @@ import {
   runCommand,
   wranglerCommand,
 } from "./process.ts";
-import { type DeployEnvironment, qualifySource } from "./qualification.ts";
+import {
+  type DeployEnvironment,
+  qualifySource,
+  type SourceQualification,
+} from "./qualification.ts";
 import { expectedWorkerSecrets, writeWorkerConfig } from "./realized-config.ts";
 import type { DeployTarget } from "./target.ts";
 import { probeProduct } from "./worker.ts";
@@ -169,6 +173,7 @@ export async function runRuntimeInputSealKey(
       options.database ?? remoteRuntimeInputSealDatabase(inspectionConfig, environment, run);
     const before = await inspectWorker("preflight", target, desired, state);
     const beforeDatabase = await inspectDatabase("preflight", database, before.state, desired);
+    const activeKeyRetained = retainsObservedActiveKey(before, desired);
 
     if (invocation.action === "status") {
       const probe = await probeProduct(
@@ -183,7 +188,15 @@ export async function runRuntimeInputSealKey(
         "Worker state changed during status readback",
       );
       const commitMatches = before.canonical.commit === invocation.commit;
-      return statusResult(invocation, desired, before, beforeDatabase, probe, commitMatches);
+      return statusResult(
+        invocation,
+        desired,
+        before,
+        beforeDatabase,
+        probe,
+        commitMatches,
+        activeKeyRetained,
+      );
     }
 
     if (!beforeDatabase.schema.ready) {
@@ -196,6 +209,11 @@ export async function runRuntimeInputSealKey(
         before.state === "bootstrap-required"
           ? "runtime-input seal-key bootstrap requires zero prepared or claimed sealed rows"
           : "desired runtime-input key ids do not cover every live sealed-row key id",
+      );
+    }
+    if (!activeKeyRetained) {
+      throw preflightError(
+        "runtime-input seal-key rotation must retain the observed active key as a previous key",
       );
     }
     if (before.state === "desired-current") {
@@ -267,10 +285,17 @@ export async function runRuntimeInputSealKey(
     if (
       !lastDatabase.schema.ready ||
       !lastDatabase.safe ||
+      !retainsObservedActiveKey(last, desired) ||
       !sameSchemaInspection(beforeDatabase.schema, lastDatabase.schema)
     ) {
       throw preflightError("D1 sealed-row key usage changed before runtime-input key upload");
     }
+    const requalifiedSource = await qualifySource({
+      environment: invocation.environment,
+      commit: invocation.commit,
+      run,
+    });
+    assertSourceQualificationUnchanged(source, requalifiedSource);
     artifact.assertUnchanged();
 
     const message = `takoserver-worker:${source.commit}:${prepared.bundleDigestHex}`;
@@ -661,8 +686,13 @@ function statusResult(
   database: DatabaseInspection,
   probe: Awaited<ReturnType<typeof probeProduct>>,
   commitMatches: boolean,
+  activeKeyRetained: boolean,
 ): Record<string, unknown> {
-  const applyReady = worker.state !== "desired-current" && database.schema.ready && database.safe;
+  const applyReady =
+    worker.state !== "desired-current" &&
+    database.schema.ready &&
+    database.safe &&
+    activeKeyRetained;
   return {
     kind: "takoserver.runtime-input-seal-key-status@v1",
     surface: invocation.surface,
@@ -685,6 +715,7 @@ function statusResult(
     appliedMigrations: database.schema.applied,
     pendingMigrations: database.schema.pending,
     sealedRows: database.rows,
+    activeKeyRetained,
     applyReady,
     ready:
       worker.state === "desired-current" && commitMatches && database.schema.ready && database.safe,
@@ -692,6 +723,33 @@ function statusResult(
     reversal:
       "Forward repair requires a separately reviewed retained prior canonical keyring and matching target descriptor; Worker Version rollback does not restore the script-wide secret.",
   };
+}
+
+function retainsObservedActiveKey(
+  worker: WorkerInspection,
+  desired: RuntimeInputSealKeyRingDescriptor,
+): boolean {
+  if (worker.state !== "rotation-required") return true;
+  return (
+    worker.descriptor !== null &&
+    worker.descriptor.currentKeyId !== desired.currentKeyId &&
+    desired.previousKeyIds.includes(worker.descriptor.currentKeyId)
+  );
+}
+
+function assertSourceQualificationUnchanged(
+  before: SourceQualification,
+  after: SourceQualification,
+): void {
+  if (
+    before.commit !== after.commit ||
+    before.branch !== after.branch ||
+    before.dirty !== after.dirty ||
+    before.remoteRef !== after.remoteRef ||
+    JSON.stringify(before.changedPaths) !== JSON.stringify(after.changedPaths)
+  ) {
+    throw preflightError("selected source changed while the seal-key upload was prepared");
+  }
 }
 
 function assertDirectSuccessor(
