@@ -3,7 +3,38 @@ import type { Clock, ObjectStoreAccess, Row, Sql, SqlStatement } from "../ports.
 const MAXIMUM_SWEEP_LIMIT = 64;
 const CANDIDATE_QUARANTINE_MILLISECONDS = 60 * 60_000;
 
-export interface ArtifactMaintenancePlan {
+export interface ArtifactCandidateEvidence {
+  readonly kind: "manifest" | "blob";
+  readonly digest: string;
+  readonly state: "pending" | "deleting" | "retry";
+  readonly notBefore: number;
+  readonly createdAt: number;
+}
+
+export type ArtifactObjectInventory =
+  | {
+      readonly availability: "complete";
+      readonly scannedObjects: number;
+      readonly untrackedObjects: number;
+    }
+  | {
+      readonly availability: "unavailable";
+      readonly scannedObjects: number;
+      readonly untrackedObjects: null;
+    };
+
+export interface ArtifactMaintenanceEvidence {
+  readonly legacyHoldRoots: number;
+  readonly legacyManifestRoots: number;
+  readonly danglingCommittedUploads: number;
+  readonly unresolvedConsumers: number;
+  readonly missingHolds: number;
+  readonly staleHolds: number;
+  readonly oldestCandidate: ArtifactCandidateEvidence | null;
+  readonly objectInventory: ArtifactObjectInventory;
+}
+
+export interface ArtifactMaintenancePlan extends ArtifactMaintenanceEvidence {
   /** Existing bytes declared by an active root but missing the tenant access row. */
   readonly repairableHolds: number;
   /** Replay rows eligible for release in this bounded pass. */
@@ -21,7 +52,7 @@ export interface ArtifactReconcileReport {
   readonly retryableObjects: number;
 }
 
-export interface ArtifactMaintenanceStatus {
+export interface ArtifactMaintenanceStatus extends ArtifactMaintenanceEvidence {
   readonly uploads: {
     readonly open: number;
     readonly committed: number;
@@ -40,21 +71,26 @@ export interface ExactFailedRunRepairRequest {
   readonly uploadId: string;
   readonly manifestDigest: string;
   readonly mode: "dry-run" | "execute";
-  /**
-   * Explicit operator policy assertions. The reconciler never substitutes a
-   * "no Resource row" or JSON search for either assertion.
-   */
-  readonly authority?: {
-    readonly policy: "retire-run-owned-committed-upload";
-    readonly ownerClosed: true;
-    readonly writesQuiesced: true;
+  /** Durable owner closure bound to the exact persisted upload/root fences. */
+  readonly closureReceipt?: {
+    readonly receiptId: string;
+    readonly receiptFence: number;
   };
 }
 
 export interface ExactFailedRunRepairResult {
-  readonly outcome: "not_found" | "blocked_policy" | "ready" | "released" | "already_released";
+  readonly outcome:
+    | "not_found"
+    | "blocked_policy"
+    | "blocked_receipt"
+    | "blocked_consumer"
+    | "ready"
+    | "released"
+    | "already_released";
   readonly lifecycle: "open" | "committed" | "abandoned" | "unknown";
   readonly activeReplayRoots: number;
+  readonly liveConsumerRoots: number;
+  readonly unresolvedConsumers: number;
   readonly externalDeleteIssued: false;
 }
 
@@ -71,7 +107,7 @@ export interface ArtifactReconciler {
 
 export interface CreateArtifactReconcilerOptions {
   readonly sql: Sql;
-  readonly objects: Pick<ObjectStoreAccess, "head" | "delete">;
+  readonly objects: Pick<ObjectStoreAccess, "head" | "delete" | "list">;
   readonly clock: Clock;
   readonly randomId: () => string;
 }
@@ -110,30 +146,63 @@ export function createTakoformArtifactReconciler(
   const now = (): number => clock().getTime();
 
   const missingHolds = async (limit: number): Promise<readonly MissingHold[]> => {
-    const rows = await sql.query(
-      `SELECT DISTINCT root.tenant_id, member.blob_digest
-       FROM tf_artifact_roots AS root
-       JOIN tf_artifact_manifest_members AS member
-         ON member.manifest_digest = root.digest
-       LEFT JOIN tf_artifact_holds AS hold
-         ON hold.tenant_id = root.tenant_id
-        AND hold.digest = member.blob_digest
-        AND hold.kind = 'blob'
-       WHERE root.state = 'active'
-         AND root.target_kind = 'manifest'
-         AND root.root_kind IN ('upload', 'replay')
-         AND hold.digest IS NULL
-       ORDER BY root.tenant_id, member.blob_digest
-       LIMIT ?`,
-      [limit],
-    );
     const existing: MissingHold[] = [];
-    for (const row of rows) {
-      const tenantId = stringColumn(row, "tenant_id");
-      const digest = digestColumn(row, "blob_digest");
-      if (await objects.head(blobKey(digest))) existing.push({ tenantId, digest });
+    let afterTenant = "";
+    let afterDigest = "";
+    while (existing.length < limit) {
+      const rows = await sql.query(
+        `WITH missing AS (
+           SELECT DISTINCT root.tenant_id, member.blob_digest
+           FROM tf_artifact_roots AS root
+           JOIN tf_artifact_manifest_members AS member
+             ON member.manifest_digest = root.digest
+           LEFT JOIN tf_artifact_holds AS hold
+             ON hold.tenant_id = root.tenant_id
+            AND hold.digest = member.blob_digest
+            AND hold.kind = 'blob'
+           WHERE root.state = 'active'
+             AND root.target_kind = 'manifest'
+             AND root.root_kind IN ('upload', 'replay', 'resource', 'deployment')
+             AND hold.digest IS NULL
+         )
+         SELECT tenant_id, blob_digest FROM missing
+         WHERE tenant_id > ? OR (tenant_id = ? AND blob_digest > ?)
+         ORDER BY tenant_id, blob_digest
+         LIMIT ?`,
+        [afterTenant, afterTenant, afterDigest, MAXIMUM_SWEEP_LIMIT],
+      );
+      if (rows.length === 0) break;
+      for (const row of rows) {
+        const tenantId = stringColumn(row, "tenant_id");
+        const digest = digestColumn(row, "blob_digest");
+        afterTenant = tenantId;
+        afterDigest = digest;
+        if (await objects.head(blobKey(digest))) existing.push({ tenantId, digest });
+        if (existing.length === limit) break;
+      }
+      if (rows.length < MAXIMUM_SWEEP_LIMIT) break;
     }
     return existing;
+  };
+
+  const missingHoldCount = async (): Promise<number> => {
+    const rows = await sql.query(
+      `SELECT COUNT(*) AS total FROM (
+         SELECT DISTINCT root.tenant_id, member.blob_digest
+         FROM tf_artifact_roots AS root
+         JOIN tf_artifact_manifest_members AS member
+           ON member.manifest_digest = root.digest
+         LEFT JOIN tf_artifact_holds AS hold
+           ON hold.tenant_id = root.tenant_id
+          AND hold.digest = member.blob_digest
+          AND hold.kind = 'blob'
+         WHERE root.state = 'active'
+           AND root.target_kind = 'manifest'
+           AND root.root_kind IN ('upload', 'replay', 'resource', 'deployment')
+           AND hold.digest IS NULL
+       )`,
+    );
+    return numberColumn(rows[0], "total");
   };
 
   const expiredReplayRows = async (limit: number): Promise<readonly Row[]> =>
@@ -176,6 +245,174 @@ export function createTakoformArtifactReconciler(
       digest: digestColumn(row, "digest"),
       kind: artifactKind(row, "kind"),
     }));
+  };
+
+  const staleHoldCount = async (): Promise<number> => {
+    const rows = await sql.query(
+      `SELECT COUNT(*) AS total
+       FROM tf_artifact_holds AS hold
+       WHERE NOT EXISTS (
+         SELECT 1
+         FROM tf_artifact_roots AS root
+         WHERE root.tenant_id = hold.tenant_id AND root.state = 'active'
+           AND (
+             (hold.kind = 'manifest' AND root.target_kind = 'manifest'
+               AND root.digest = hold.digest) OR
+             (hold.kind = 'blob' AND (
+               (root.target_kind = 'blob' AND root.digest = hold.digest) OR
+               (root.target_kind = 'manifest' AND EXISTS (
+                 SELECT 1 FROM tf_artifact_manifest_members AS member
+                 WHERE member.manifest_digest = root.digest
+                   AND member.blob_digest = hold.digest
+               ))
+             ))
+           )
+       )`,
+    );
+    return numberColumn(rows[0], "total");
+  };
+
+  const legacyRootCounts = async (): Promise<{
+    readonly legacyHoldRoots: number;
+    readonly legacyManifestRoots: number;
+  }> => {
+    const rows = await sql.query(
+      `SELECT root_kind, COUNT(*) AS total
+       FROM tf_artifact_roots
+       WHERE state = 'active' AND root_kind IN ('legacy-hold', 'legacy-manifest')
+       GROUP BY root_kind`,
+    );
+    const result = countsBy(rows, "root_kind");
+    return {
+      legacyHoldRoots: result["legacy-hold"] ?? 0,
+      legacyManifestRoots: result["legacy-manifest"] ?? 0,
+    };
+  };
+
+  const danglingCommittedUploadCount = async (): Promise<number> => {
+    const rows = await sql.query(
+      `SELECT COUNT(*) AS total
+       FROM tf_artifact_uploads AS upload
+       WHERE upload.lifecycle_state = 'committed'
+         AND NOT EXISTS (
+           SELECT 1 FROM tf_artifact_roots AS root
+           WHERE root.tenant_id = upload.tenant_id AND root.root_kind = 'upload'
+             AND root.root_id = upload.id AND root.target_kind = 'manifest'
+             AND root.digest = upload.manifest_digest
+         )`,
+    );
+    return numberColumn(rows[0], "total");
+  };
+
+  const unresolvedConsumerCount = async (): Promise<number> => {
+    const rows = await sql.query(
+      `SELECT COUNT(*) AS total
+       FROM tf_artifact_consumer_uncertainties
+       WHERE state = 'active'`,
+    );
+    return numberColumn(rows[0], "total");
+  };
+
+  const oldestCandidate = async (): Promise<ArtifactCandidateEvidence | null> => {
+    const rows = await sql.query(
+      `SELECT kind, digest, state, not_before, created_at
+       FROM tf_artifact_gc_candidates
+       WHERE state IN ('pending', 'deleting', 'retry')
+       ORDER BY created_at, kind, digest
+       LIMIT 1`,
+    );
+    const row = rows[0];
+    if (!row) return null;
+    const state = stringColumn(row, "state");
+    if (state !== "pending" && state !== "deleting" && state !== "retry") {
+      throw new Error("invalid artifact candidate state");
+    }
+    return {
+      kind: artifactKind(row, "kind"),
+      digest: digestColumn(row, "digest"),
+      state,
+      notBefore: numberColumn(row, "not_before"),
+      createdAt: numberColumn(row, "created_at"),
+    };
+  };
+
+  const trackedBlobDigests = async (digests: readonly string[]): Promise<ReadonlySet<string>> => {
+    if (digests.length === 0) return new Set();
+    const rows = await sql.query(
+      `SELECT CAST(requested.value AS TEXT) AS digest
+       FROM json_each(?) AS requested
+       WHERE EXISTS (
+         SELECT 1 FROM tf_artifact_manifest_members AS member
+         WHERE member.blob_digest = CAST(requested.value AS TEXT)
+       ) OR EXISTS (
+         SELECT 1 FROM tf_artifact_holds AS hold
+         WHERE hold.kind = 'blob' AND hold.digest = CAST(requested.value AS TEXT)
+       ) OR EXISTS (
+         SELECT 1 FROM tf_artifact_roots AS root
+         WHERE root.target_kind = 'blob' AND root.digest = CAST(requested.value AS TEXT)
+       ) OR EXISTS (
+         SELECT 1 FROM tf_artifact_gc_candidates AS candidate
+         WHERE candidate.kind = 'blob' AND candidate.digest = CAST(requested.value AS TEXT)
+           AND candidate.state IN ('pending', 'deleting', 'retry')
+       )`,
+      [JSON.stringify(digests)],
+    );
+    return new Set(rows.map((row) => digestColumn(row, "digest")));
+  };
+
+  const objectInventory = async (): Promise<ArtifactObjectInventory> => {
+    let cursor: string | undefined;
+    let scannedObjects = 0;
+    let untrackedObjects = 0;
+    const cursors = new Set<string>();
+    try {
+      while (true) {
+        const page = await objects.list({
+          prefix: "art/",
+          limit: MAXIMUM_SWEEP_LIMIT,
+          ...(cursor === undefined ? {} : { cursor }),
+        });
+        scannedObjects += page.objects.length;
+        const valid = page.objects
+          .map((object) => /^art\/([0-9a-f]{64})$/u.exec(object.key)?.[1] ?? null)
+          .filter((digest): digest is string => digest !== null)
+          .map((digest) => `sha256:${digest}`);
+        const tracked = await trackedBlobDigests(valid);
+        untrackedObjects += page.objects.length - valid.length;
+        untrackedObjects += valid.filter((digest) => !tracked.has(digest)).length;
+        if (!page.truncated) {
+          return { availability: "complete", scannedObjects, untrackedObjects };
+        }
+        if (!page.cursor || cursors.has(page.cursor) || page.objects.length === 0) {
+          return { availability: "unavailable", scannedObjects, untrackedObjects: null };
+        }
+        cursors.add(page.cursor);
+        cursor = page.cursor;
+      }
+    } catch {
+      return { availability: "unavailable", scannedObjects, untrackedObjects: null };
+    }
+  };
+
+  const maintenanceEvidence = async (): Promise<ArtifactMaintenanceEvidence> => {
+    const [legacy, dangling, unresolved, missing, stale, oldest, inventory] = await Promise.all([
+      legacyRootCounts(),
+      danglingCommittedUploadCount(),
+      unresolvedConsumerCount(),
+      missingHoldCount(),
+      staleHoldCount(),
+      oldestCandidate(),
+      objectInventory(),
+    ]);
+    return {
+      ...legacy,
+      danglingCommittedUploads: dangling,
+      unresolvedConsumers: unresolved,
+      missingHolds: missing,
+      staleHolds: stale,
+      oldestCandidate: oldest,
+      objectInventory: inventory,
+    };
   };
 
   const candidateDigests = async (limit: number): Promise<readonly CandidateDigest[]> => {
@@ -460,12 +697,14 @@ export function createTakoformArtifactReconciler(
   return {
     async dryRun(input) {
       const limit = boundedLimit(input.limit);
-      const [holds, replays, candidates] = await Promise.all([
+      const [holds, replays, candidates, evidence] = await Promise.all([
         missingHolds(limit),
         expiredReplayRows(limit),
         candidateDigests(limit),
+        maintenanceEvidence(),
       ]);
       return {
+        ...evidence,
         repairableHolds: holds.length,
         expiredReplays: replays.length,
         candidateDigests: candidates.length,
@@ -473,7 +712,7 @@ export function createTakoformArtifactReconciler(
     },
 
     async status() {
-      const [uploads, roots, candidates] = await Promise.all([
+      const [uploads, roots, candidates, evidence] = await Promise.all([
         sql.query(
           `SELECT lifecycle_state, COUNT(*) AS total
            FROM tf_artifact_uploads GROUP BY lifecycle_state`,
@@ -483,10 +722,12 @@ export function createTakoformArtifactReconciler(
           `SELECT state, COUNT(*) AS total
            FROM tf_artifact_gc_candidates GROUP BY state`,
         ),
+        maintenanceEvidence(),
       ]);
       const uploadCount = counts(uploads);
       const candidateCount = counts(candidates);
       return {
+        ...evidence,
         uploads: {
           open: uploadCount.open ?? 0,
           committed: uploadCount.committed ?? 0,
@@ -514,6 +755,8 @@ export function createTakoformArtifactReconciler(
           outcome: "not_found",
           lifecycle: "unknown",
           activeReplayRoots: 0,
+          liveConsumerRoots: 0,
+          unresolvedConsumers: 0,
           externalDeleteIssued: false,
         };
       }
@@ -531,25 +774,52 @@ export function createTakoformArtifactReconciler(
         [input.tenantId, input.uploadId, input.manifestDigest],
       );
       const rootState = roots[0]?.state;
-      if (rootState === "released" || lifecycle === "abandoned") {
+      const liveConsumerRoots = await activeConsumerRootCount(
+        sql,
+        input.tenantId,
+        input.manifestDigest,
+      );
+      const unresolvedConsumers = await activeConsumerUncertaintyCount(sql, input.tenantId);
+      if (rootState === "released") {
         return {
           outcome: "already_released",
           lifecycle,
           activeReplayRoots,
+          liveConsumerRoots,
+          unresolvedConsumers,
           externalDeleteIssued: false,
         };
       }
-      const authorized =
-        lifecycle === "committed" &&
-        input.principalId.startsWith("run:") &&
-        input.authority?.policy === "retire-run-owned-committed-upload" &&
-        input.authority.ownerClosed === true &&
-        input.authority.writesQuiesced === true;
-      if (!authorized) {
+      if (lifecycle !== "committed" || !input.principalId.startsWith("run:")) {
         return {
           outcome: "blocked_policy",
           lifecycle,
           activeReplayRoots,
+          liveConsumerRoots,
+          unresolvedConsumers,
+          externalDeleteIssued: false,
+        };
+      }
+      const receipt = input.closureReceipt;
+      const receiptValid =
+        receipt !== undefined && (await hasExactClosureReceipt(sql, input, receipt, now()));
+      if (!receiptValid) {
+        return {
+          outcome: "blocked_receipt",
+          lifecycle,
+          activeReplayRoots,
+          liveConsumerRoots,
+          unresolvedConsumers,
+          externalDeleteIssued: false,
+        };
+      }
+      if (liveConsumerRoots > 0 || unresolvedConsumers > 0) {
+        return {
+          outcome: "blocked_consumer",
+          lifecycle,
+          activeReplayRoots,
+          liveConsumerRoots,
+          unresolvedConsumers,
           externalDeleteIssued: false,
         };
       }
@@ -558,6 +828,8 @@ export function createTakoformArtifactReconciler(
           outcome: "ready",
           lifecycle,
           activeReplayRoots,
+          liveConsumerRoots,
+          unresolvedConsumers,
           externalDeleteIssued: false,
         };
       }
@@ -580,10 +852,54 @@ export function createTakoformArtifactReconciler(
                      AND root.root_id = upload.id
                      AND root.target_kind = 'manifest'
                      AND root.digest = upload.manifest_digest
+                    JOIN tf_artifact_owner_closure_receipts AS receipt
+                      ON receipt.tenant_id = upload.tenant_id
+                     AND receipt.principal_id = upload.principal_id
+                     AND receipt.upload_id = upload.id
+                     AND receipt.manifest_digest = upload.manifest_digest
+                     AND receipt.upload_fence = upload.lifecycle_fence
+                     AND receipt.root_fence = root.fence
                     WHERE upload.id = ? AND upload.tenant_id = ?
                       AND upload.principal_id = ? AND upload.manifest_digest = ?
                       AND upload.lifecycle_state = 'committed'
                       AND root.state = 'active'
+                      AND receipt.receipt_id = ? AND receipt.receipt_fence = ?
+                      AND receipt.state = 'closed'
+                      AND receipt.closed_at <= ? AND receipt.expires_at > ?
+                      AND NOT EXISTS (
+                        SELECT 1 FROM tf_artifact_roots AS consumer
+                        WHERE consumer.tenant_id = upload.tenant_id
+                          AND consumer.target_kind = 'manifest'
+                          AND consumer.digest = upload.manifest_digest
+                          AND consumer.state = 'active'
+                          AND consumer.root_kind IN ('resource', 'deployment')
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM tf_resources AS resource
+                        WHERE resource.tenant_id = upload.tenant_id
+                          AND json_extract(resource.resource_json, '$.spec.manifestDigest') =
+                              upload.manifest_digest
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM tf_artifact_consumer_uncertainties AS uncertainty
+                        WHERE uncertainty.tenant_id = upload.tenant_id
+                          AND uncertainty.state = 'active'
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM tf_resource_deployments AS deployment
+                        LEFT JOIN tf_resources AS resource
+                          ON resource.tenant_id = deployment.tenant_id
+                         AND resource.uid = deployment.resource_uid
+                        WHERE deployment.tenant_id = upload.tenant_id
+                          AND deployment.state <> 'deleted'
+                          AND (
+                            resource.uid IS NULL OR
+                            json_type(resource.resource_json, '$.spec.manifestDigest') IS NOT 'text' OR
+                            json_extract(resource.resource_json, '$.spec.manifestDigest') =
+                              upload.manifest_digest
+                          )
+                      )
                   ) THEN 1 ELSE 0 END`,
             params: [
               token,
@@ -591,6 +907,10 @@ export function createTakoformArtifactReconciler(
               input.tenantId,
               input.principalId,
               input.manifestDigest,
+              receipt.receiptId,
+              receipt.receiptFence,
+              timestamp,
+              timestamp,
             ],
           },
           {
@@ -631,6 +951,8 @@ export function createTakoformArtifactReconciler(
         outcome: "released",
         lifecycle: "committed",
         activeReplayRoots,
+        liveConsumerRoots: 0,
+        unresolvedConsumers: 0,
         externalDeleteIssued: false,
       };
     },
@@ -814,21 +1136,27 @@ function artifactKind(row: Row | undefined, name: string): "manifest" | "blob" {
 }
 
 function counts(rows: readonly Row[]): Record<string, number> {
+  return countsBy(rows, rows.some((row) => "state" in row) ? "state" : "lifecycle_state");
+}
+
+function countsBy(rows: readonly Row[], key: string): Record<string, number> {
   const result: Record<string, number> = {};
-  for (const row of rows) {
-    const state = stringColumn(row, "state" in row ? "state" : "lifecycle_state");
-    result[state] = numberColumn(row, "total");
-  }
+  for (const row of rows) result[stringColumn(row, key)] = numberColumn(row, "total");
   return result;
 }
 
 function requireExactRepairInput(input: ExactFailedRunRepairRequest): void {
+  const receipt = input.closureReceipt;
   if (
     !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$/u.test(input.tenantId) ||
     !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$/u.test(input.principalId) ||
     !/^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/u.test(input.uploadId) ||
     !/^sha256:[0-9a-f]{64}$/u.test(input.manifestDigest) ||
-    (input.mode !== "dry-run" && input.mode !== "execute")
+    (input.mode !== "dry-run" && input.mode !== "execute") ||
+    (receipt !== undefined &&
+      (!/^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$/u.test(receipt.receiptId) ||
+        !Number.isSafeInteger(receipt.receiptFence) ||
+        receipt.receiptFence < 1))
   ) {
     throw new TypeError("invalid exact artifact repair identity");
   }
@@ -855,4 +1183,72 @@ async function activeReplayRootCount(
     [tenantId, manifestDigest],
   );
   return numberColumn(rows[0], "total");
+}
+
+async function activeConsumerRootCount(
+  sql: Sql,
+  tenantId: string,
+  manifestDigest: string,
+): Promise<number> {
+  const rows = await sql.query(
+    `SELECT COUNT(*) AS total
+     FROM tf_artifact_roots
+     WHERE tenant_id = ? AND target_kind = 'manifest' AND digest = ?
+       AND state = 'active' AND root_kind IN ('resource', 'deployment')`,
+    [tenantId, manifestDigest],
+  );
+  return numberColumn(rows[0], "total");
+}
+
+async function activeConsumerUncertaintyCount(sql: Sql, tenantId: string): Promise<number> {
+  const rows = await sql.query(
+    `SELECT COUNT(*) AS total
+     FROM tf_artifact_consumer_uncertainties
+     WHERE tenant_id = ? AND state = 'active'`,
+    [tenantId],
+  );
+  return numberColumn(rows[0], "total");
+}
+
+async function hasExactClosureReceipt(
+  sql: Sql,
+  input: ExactFailedRunRepairRequest,
+  receipt: NonNullable<ExactFailedRunRepairRequest["closureReceipt"]>,
+  timestamp: number,
+): Promise<boolean> {
+  const rows = await sql.query(
+    `SELECT 1 AS valid
+     FROM tf_artifact_owner_closure_receipts AS receipt
+     JOIN tf_artifact_uploads AS upload
+       ON upload.tenant_id = receipt.tenant_id
+      AND upload.principal_id = receipt.principal_id
+      AND upload.id = receipt.upload_id
+      AND upload.manifest_digest = receipt.manifest_digest
+      AND upload.lifecycle_fence = receipt.upload_fence
+     JOIN tf_artifact_roots AS root
+       ON root.tenant_id = receipt.tenant_id
+      AND root.root_kind = 'upload'
+      AND root.root_id = receipt.upload_id
+      AND root.target_kind = 'manifest'
+      AND root.digest = receipt.manifest_digest
+      AND root.fence = receipt.root_fence
+     WHERE receipt.receipt_id = ? AND receipt.receipt_fence = ?
+       AND receipt.tenant_id = ? AND receipt.principal_id = ?
+       AND receipt.upload_id = ? AND receipt.manifest_digest = ?
+       AND receipt.state = 'closed'
+       AND receipt.closed_at <= ? AND receipt.expires_at > ?
+       AND upload.lifecycle_state = 'committed' AND root.state = 'active'
+     LIMIT 1`,
+    [
+      receipt.receiptId,
+      receipt.receiptFence,
+      input.tenantId,
+      input.principalId,
+      input.uploadId,
+      input.manifestDigest,
+      timestamp,
+      timestamp,
+    ],
+  );
+  return rows.length === 1;
 }

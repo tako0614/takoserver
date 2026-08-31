@@ -20,8 +20,10 @@ describe("bringing a local database up to date", () => {
       "orgs",
       "ledger",
       "integration_e2e_credential_pair_operations",
+      "tf_artifact_consumer_uncertainties",
       "tf_artifact_gc_candidates",
       "tf_artifact_manifest_members",
+      "tf_artifact_owner_closure_receipts",
       "tf_artifact_roots",
       "tf_resources",
       "tf_resource_attachments",
@@ -180,6 +182,33 @@ describe("bringing a local database up to date", () => {
         JSON.stringify({ uploadId: "up_legacy_artifact", manifestDigest }),
         100,
       );
+    database
+      .query(
+        `INSERT INTO tf_resources
+           (tenant_id, space, api_version, kind, name, uid, generation, revision,
+            resource_json, relations_json, package_digest, implementation_digest, updated_at)
+         VALUES ('tenant_legacy', 'default', 'edge.forms.takoform.com/v1beta1',
+                 'WorkerBundle', 'legacy-consumer', 'uid_legacy_consumer', '1',
+                 'revision-legacy-consumer', ?, '[]', NULL, NULL, 10)`,
+      )
+      .run(
+        JSON.stringify({
+          apiVersion: "edge.forms.takoform.com/v1beta1",
+          kind: "WorkerBundle",
+          metadata: { space: "default", name: "legacy-consumer", uid: "uid_legacy_consumer" },
+          spec: { manifestDigest },
+        }),
+      );
+    database.exec(`
+      INSERT INTO tf_resource_deployments
+        (tenant_id, id, resource_uid, offering_id, provider_pack_ref,
+         provider_installation_ref, native_id, native_claimed, state,
+         observed_json, outputs_json, created_at, updated_at)
+      VALUES
+        ('tenant_legacy', 'dep_legacy_consumer', 'uid_legacy_consumer',
+         'offering.legacy', 'provider.legacy', 'installation.legacy',
+         'native-legacy-consumer', 0, 'retained', '{}', '{}', 10, 10);
+    `);
 
     expect(migrateSqlite(database).applied).toEqual([
       "0031_takoform_artifact_lifecycle.sql",
@@ -211,7 +240,21 @@ describe("bringing a local database up to date", () => {
     ).toEqual([
       {
         tenant_id: "tenant_legacy",
+        root_kind: "deployment",
+        target_kind: "manifest",
+        digest: manifestDigest,
+        state: "active",
+      },
+      {
+        tenant_id: "tenant_legacy",
         root_kind: "replay",
+        target_kind: "manifest",
+        digest: manifestDigest,
+        state: "active",
+      },
+      {
+        tenant_id: "tenant_legacy",
+        root_kind: "resource",
         target_kind: "manifest",
         digest: manifestDigest,
         state: "active",
@@ -231,6 +274,327 @@ describe("bringing a local database up to date", () => {
         state: "active",
       },
     ]);
+    expect(
+      database
+        .query(
+          `SELECT consumer_kind, consumer_id, state, reason
+           FROM tf_artifact_consumer_uncertainties
+           WHERE tenant_id = 'tenant_legacy'`,
+        )
+        .all(),
+    ).toEqual([
+      {
+        consumer_kind: "deployment",
+        consumer_id: "dep_legacy_consumer",
+        state: "active",
+        reason: "historical_deployment_digest_unknown",
+      },
+    ]);
+  });
+
+  test("normalizes a previous artifact writer that starts and commits after lifecycle migration", () => {
+    const database = new Database(":memory:");
+    migrateSqlite(database);
+
+    const manifestDigest = `sha256:${"d".repeat(64)}`;
+    const blobDigest = `sha256:${"e".repeat(64)}`;
+    const manifest = JSON.stringify({
+      apiVersion: "artifacts.takoform.com/v1alpha1",
+      kind: "WorkerBundle",
+      mainModule: "worker.mjs",
+      modules: [
+        {
+          name: "worker.mjs",
+          mediaType: "application/javascript+module",
+          size: 1,
+          digest: blobDigest,
+        },
+      ],
+    });
+    const startReplayKey = ["tenant_previous", "run:previous", "start", "previous-start"].join(
+      "\u0000",
+    );
+    const commitReplayKey = [
+      "tenant_previous",
+      "run:previous",
+      "POST",
+      "/apis/forms.takoform.com/v1/artifacts/uploads/up_previous/commit",
+      "previous-commit",
+    ].join("\u0000");
+
+    // Exact start shape used by the previous Worker after 0031 has already run.
+    database
+      .query(
+        `INSERT INTO tf_artifact_uploads
+           (id, tenant_id, principal_id, manifest_json, manifest_digest, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run("up_previous", "tenant_previous", "run:previous", manifest, manifestDigest, 100);
+    database
+      .query(
+        `INSERT INTO tf_artifact_replays (replay_key, status, body_json, expires_at)
+         VALUES (?, 201, ?, ?)`,
+      )
+      .run(startReplayKey, JSON.stringify({ uploadId: "up_previous", manifestDigest }), 1_000);
+
+    expect(
+      database
+        .query(
+          `SELECT lifecycle_state, lifecycle_fence, updated_at
+           FROM tf_artifact_uploads WHERE id = 'up_previous'`,
+        )
+        .get(),
+    ).toEqual({ lifecycle_state: "open", lifecycle_fence: 1, updated_at: 100 });
+    expect(
+      database
+        .query(
+          `SELECT manifest_digest, blob_digest FROM tf_artifact_manifest_members
+           WHERE manifest_digest = ?`,
+        )
+        .all(manifestDigest),
+    ).toEqual([{ manifest_digest: manifestDigest, blob_digest: blobDigest }]);
+    expect(
+      database
+        .query(
+          `SELECT root_kind, root_id, state FROM tf_artifact_roots
+           WHERE tenant_id = 'tenant_previous' ORDER BY root_kind, root_id`,
+        )
+        .all(),
+    ).toEqual([
+      { root_kind: "replay", root_id: startReplayKey, state: "active" },
+      { root_kind: "upload", root_id: "up_previous", state: "active" },
+    ]);
+
+    // Exact commit/hold/replay shape used by the previous Worker.
+    database
+      .query(
+        `INSERT OR IGNORE INTO tf_artifact_manifests (digest, manifest_json, created_at)
+         VALUES (?, ?, ?)`,
+      )
+      .run(manifestDigest, manifest, 200);
+    database
+      .query(
+        `INSERT OR IGNORE INTO tf_artifact_holds (tenant_id, digest, kind)
+         VALUES (?, ?, 'manifest')`,
+      )
+      .run("tenant_previous", manifestDigest);
+    database
+      .query(
+        `INSERT OR IGNORE INTO tf_artifact_holds (tenant_id, digest, kind)
+         VALUES (?, ?, 'blob')`,
+      )
+      .run("tenant_previous", blobDigest);
+    database
+      .query(
+        `INSERT INTO tf_artifact_replays (replay_key, status, body_json, expires_at)
+         VALUES (?, 201, ?, ?)`,
+      )
+      .run(commitReplayKey, JSON.stringify({ manifestDigest }), 1_000);
+
+    expect(
+      database
+        .query(
+          `SELECT lifecycle_state, lifecycle_fence
+           FROM tf_artifact_uploads WHERE id = 'up_previous'`,
+        )
+        .get(),
+    ).toEqual({ lifecycle_state: "committed", lifecycle_fence: 2 });
+    expect(
+      database
+        .query(
+          `SELECT root_kind, root_id, state, fence FROM tf_artifact_roots
+           WHERE tenant_id = 'tenant_previous' ORDER BY root_kind, root_id`,
+        )
+        .all(),
+    ).toEqual([
+      { root_kind: "replay", root_id: commitReplayKey, state: "active", fence: 1 },
+      { root_kind: "replay", root_id: startReplayKey, state: "active", fence: 1 },
+      { root_kind: "upload", root_id: "up_previous", state: "active", fence: 2 },
+    ]);
+
+    database
+      .query(
+        `INSERT INTO tf_artifact_uploads
+           (id, tenant_id, principal_id, manifest_json, manifest_digest, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run("up_previous_delete", "tenant_previous", "run:previous", manifest, manifestDigest, 300);
+    database.query("DELETE FROM tf_artifact_uploads WHERE id = ?").run("up_previous_delete");
+    expect(
+      database
+        .query(
+          `SELECT state, fence FROM tf_artifact_roots
+           WHERE tenant_id = 'tenant_previous' AND root_kind = 'upload'
+             AND root_id = 'up_previous_delete'`,
+        )
+        .get(),
+    ).toEqual({ state: "active", fence: 1 });
+    database
+      .query(
+        `INSERT INTO tf_artifact_replays (replay_key, status, body_json, expires_at)
+         VALUES (?, 204, NULL, ?)`,
+      )
+      .run(
+        [
+          "tenant_previous",
+          "run:previous",
+          "DELETE",
+          "/apis/forms.takoform.com/v1/artifacts/uploads/up_previous_delete",
+          "previous-delete",
+        ].join("\u0000"),
+        1_000,
+      );
+    expect(
+      database
+        .query(
+          `SELECT lifecycle_state, lifecycle_fence, abandoned_at
+           FROM tf_artifact_uploads WHERE id = 'up_previous_delete'`,
+        )
+        .get(),
+    ).toEqual({ lifecycle_state: "abandoned", lifecycle_fence: 2, abandoned_at: 300 });
+    expect(
+      database
+        .query(
+          `SELECT state, fence, release_reason
+           FROM tf_artifact_roots
+           WHERE tenant_id = 'tenant_previous' AND root_kind = 'upload'
+             AND root_id = 'up_previous_delete'`,
+        )
+        .get(),
+    ).toEqual({ state: "released", fence: 2, release_reason: "upload_abandoned" });
+
+    const abandonedCommitReplayKey = [
+      "tenant_previous",
+      "run:previous",
+      "POST",
+      "/apis/forms.takoform.com/v1/artifacts/uploads/up_previous_delete/commit",
+      "previous-commit-after-delete",
+    ].join("\u0000");
+    expect(() =>
+      database
+        .query(
+          `INSERT INTO tf_artifact_replays (replay_key, status, body_json, expires_at)
+           VALUES (?, 201, ?, ?)`,
+        )
+        .run(abandonedCommitReplayKey, JSON.stringify({ manifestDigest }), 1_000),
+    ).toThrow("artifact_upload_abandoned");
+    expect(
+      database
+        .query("SELECT lifecycle_state FROM tf_artifact_uploads WHERE id = 'up_previous_delete'")
+        .get(),
+    ).toEqual({ lifecycle_state: "abandoned" });
+  });
+
+  test("normalizes a previous writer commit that replaces an expired replay row", () => {
+    const database = new Database(":memory:");
+    migrateSqlite(database);
+    const manifestDigest = `sha256:${"8".repeat(64)}`;
+    const blobDigest = `sha256:${"9".repeat(64)}`;
+    const manifest = JSON.stringify({
+      apiVersion: "artifacts.takoform.com/v1alpha1",
+      kind: "WorkerBundle",
+      mainModule: "worker.mjs",
+      modules: [
+        {
+          name: "worker.mjs",
+          mediaType: "application/javascript+module",
+          size: 1,
+          digest: blobDigest,
+        },
+      ],
+    });
+    const replayKey = [
+      "tenant_replaced",
+      "run:replaced",
+      "POST",
+      "/apis/forms.takoform.com/v1/artifacts/uploads/up_replaced/commit",
+      "replaced-commit",
+    ].join("\u0000");
+    database
+      .query(
+        `INSERT INTO tf_artifact_replays (replay_key, status, body_json, expires_at)
+         VALUES (?, 500, ?, 1)`,
+      )
+      .run(replayKey, JSON.stringify({ manifestDigest }));
+    database
+      .query(
+        `INSERT INTO tf_artifact_uploads
+           (id, tenant_id, principal_id, manifest_json, manifest_digest, created_at)
+         VALUES ('up_replaced', 'tenant_replaced', 'run:replaced', ?, ?, 100)`,
+      )
+      .run(manifest, manifestDigest);
+
+    database
+      .query(
+        `INSERT INTO tf_artifact_replays (replay_key, status, body_json, expires_at)
+         VALUES (?, 201, ?, ?)
+         ON CONFLICT (replay_key) DO UPDATE SET
+           status = excluded.status, body_json = excluded.body_json,
+           expires_at = excluded.expires_at`,
+      )
+      .run(replayKey, JSON.stringify({ manifestDigest }), 86_400_200);
+
+    expect(
+      database
+        .query(
+          `SELECT lifecycle_state, lifecycle_fence, updated_at
+           FROM tf_artifact_uploads WHERE id = 'up_replaced'`,
+        )
+        .get(),
+    ).toEqual({ lifecycle_state: "committed", lifecycle_fence: 2, updated_at: 200 });
+    expect(
+      database
+        .query(
+          `SELECT state, fence, expires_at FROM tf_artifact_roots
+           WHERE tenant_id = 'tenant_replaced' AND root_kind = 'replay'
+             AND root_id = ? AND digest = ?`,
+        )
+        .get(replayKey, manifestDigest),
+    ).toEqual({ state: "active", fence: 2, expires_at: 86_400_200 });
+  });
+
+  test("refuses a previous writer start while any declared blob is externally delete-fenced", () => {
+    const database = new Database(":memory:");
+    migrateSqlite(database);
+    const manifestDigest = `sha256:${"d".repeat(64)}`;
+    const blobDigest = `sha256:${"e".repeat(64)}`;
+    const manifest = JSON.stringify({
+      apiVersion: "artifacts.takoform.com/v1alpha1",
+      kind: "WorkerBundle",
+      mainModule: "worker.mjs",
+      modules: [
+        {
+          name: "worker.mjs",
+          mediaType: "application/javascript+module",
+          size: 1,
+          digest: blobDigest,
+        },
+      ],
+    });
+    database
+      .query(
+        `INSERT INTO tf_artifact_gc_candidates
+           (kind, digest, state, fence, not_before, expected_etag, attempts,
+            last_outcome, created_at, updated_at, deleted_at)
+         VALUES ('blob', ?, 'deleting', 2, 1, 'etag-delete-fenced', 1,
+                 'claimed', 1, 1, NULL)`,
+      )
+      .run(blobDigest);
+
+    expect(() =>
+      database
+        .query(
+          `INSERT INTO tf_artifact_uploads
+             (id, tenant_id, principal_id, manifest_json, manifest_digest, created_at)
+           VALUES ('up_previous_delete_fenced', 'tenant_previous', 'run:previous', ?, ?, 2)`,
+        )
+        .run(manifest, manifestDigest),
+    ).toThrow("artifact_gc_delete_fenced");
+    expect(
+      database
+        .query("SELECT COUNT(*) AS total FROM tf_artifact_uploads WHERE id = ?")
+        .get("up_previous_delete_fenced"),
+    ).toEqual({ total: 0 });
   });
 
   test("enforces the fixed organization, roles, scopes, TTL, and distinct role ids in 0030", () => {
