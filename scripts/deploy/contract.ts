@@ -204,12 +204,13 @@ export const DEPLOY_CONTRACT = {
         "src/public-worker-implementation.ts",
         "src/form-authority-public-identity.ts",
         "src/public-host-identity.ts",
+        "services/takoform-core-verifier",
         "wrangler.form-authority.jsonc",
         "scripts/deploy/form-authority-capability.ts",
         "scripts/deploy/form-authority.ts",
       ],
       requiresScripts: ["check", "deploy"],
-      requiresTools: ["bun", "wrangler"],
+      requiresTools: ["bun", "docker", "wrangler"],
       requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
       triggers: ["authority"],
       obligations: {
@@ -219,16 +220,15 @@ export const DEPLOY_CONTRACT = {
           "internal PublicHostIdentity@v2 RPC is the runtime authority for its served Version, artifact, and implementation identities.",
         "post-conditions":
           "Authoritative Worker history must name the exact commit/artifact. The immutable Version " +
-          "must contain exactly STATE_DB, OBJECTS, PUBLIC_HOST_IDENTITY and the three plain-text " +
+          "must contain exactly STATE_DB, OBJECTS, PUBLIC_HOST_IDENTITY, CORE_VERIFIER and the four plain-text " +
           "variables TAKOSERVER_ENVIRONMENT, TAKOSERVER_FORM_AUTHORITY_HOST_ID and " +
-          "TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST, with no public Worker identity pins, " +
+          "TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST plus the native verifier artifact digest, with no public Worker identity pins, " +
           "secret, route, or public-domain ownership. Status is ready only after the permanent minimal " +
           "identity probe actively calls PublicHostIdentity@v2 and matches live Version/A/P/capability/I.",
         reversal:
           "The immediately previous Form authority Worker version is printed as the provider-history rollback target.",
         "failure-handling":
-          `${highRiskFailure} Deploying this shell does not enable Form mutation: RPC apply remains ` +
-          "fail-closed until released Form package verification is present. Admission policy and private handle issuance remain Takoserver Host-owned." +
+          `${highRiskFailure} RPC apply remains fail-closed unless the released Core container returns the exact raw set, checkpoint continuity and artifact identity proof. Admission policy and private handle issuance remain Takoserver Host-owned.` +
           inputContract(applyReviewInput),
         "independent-review": review,
       },

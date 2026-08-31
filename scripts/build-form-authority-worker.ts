@@ -18,7 +18,13 @@ try {
       "production",
       "wrangler.form-authority.jsonc",
       false,
-      ["STATE_DB", "OBJECTS", "PUBLIC_HOST_IDENTITY"],
+      [
+        "STATE_DB",
+        "OBJECTS",
+        "PUBLIC_HOST_IDENTITY",
+        "CORE_VERIFIER",
+        "TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST",
+      ],
       [],
     ],
     [

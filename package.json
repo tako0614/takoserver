@@ -46,6 +46,7 @@
     "wrangler": "^4.123.0"
   },
   "dependencies": {
+    "@cloudflare/containers": "0.3.7",
     "acorn": "^8.15.0",
     "drizzle-orm": "^0.45.2"
   }

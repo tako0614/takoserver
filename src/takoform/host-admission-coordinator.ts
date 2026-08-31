@@ -192,6 +192,13 @@ interface AuthorityState {
   readonly headDigest: AdmissionDigest;
   readonly publisher: AuthorityRow | null;
   readonly checkpoint: AuthorityRow | null;
+  /** Durable predecessor of the exact checkpoint submitted for verification. */
+  readonly verificationPreviousCheckpoint: {
+    readonly checkpointApiVersion: string;
+    readonly sequence: number;
+    readonly digest: AdmissionDigest;
+    readonly entriesDigest: AdmissionDigest;
+  } | null;
   readonly forms: readonly {
     readonly entry: TakoformImplementationCatalogEntry;
     readonly install: AuthorityRow | null;
@@ -263,6 +270,11 @@ export function createHostAdmissionCoordinator(options: {
           row.checkpoint_api_version === request.evidence.checkpoint.apiVersion,
       ),
       "publisher_key",
+    );
+    const verificationPreviousCheckpoint = previousCheckpointPin(
+      checkpoint,
+      checkpoints,
+      request.evidence,
     );
     const audience = spaceAudience(request.activation);
     const forms = await Promise.all(
@@ -352,6 +364,7 @@ export function createHostAdmissionCoordinator(options: {
       headDigest: await canonicalDigest(heads),
       publisher,
       checkpoint,
+      verificationPreviousCheckpoint,
       forms,
     };
   };
@@ -389,8 +402,14 @@ export function createHostAdmissionCoordinator(options: {
     if (desiredActive && !state.publisher) {
       descriptors.push({ kind: "AllowPublisher", predecessorDigest: ADMISSION_GENESIS_DIGEST });
     }
-    if (desiredActive && !state.checkpoint) {
-      descriptors.push({ kind: "AppendCheckpoint", predecessorDigest: ADMISSION_GENESIS_DIGEST });
+    if (
+      desiredActive &&
+      (!state.checkpoint || !checkpointMatches(state.checkpoint, request.evidence, state.publisher))
+    ) {
+      descriptors.push({
+        kind: "AppendCheckpoint",
+        predecessorDigest: eventDigest(state.checkpoint) ?? ADMISSION_GENESIS_DIGEST,
+      });
     }
     for (const {
       entry,
@@ -505,10 +524,11 @@ export function createHostAdmissionCoordinator(options: {
       { package: FormPackageInput; admission: PreparedHostAdmission }
     >();
     if (candidate.request.activation.desiredActive) {
+      const loaded = new Map<string, FormPackageInput>();
       for (const command of candidate.commands) {
         if (command.kind === "AllowPublisher" || command.kind === "AppendCheckpoint") continue;
         const key = canonicalJson(command.formRef);
-        if (prepared.has(key)) continue;
+        if (loaded.has(key)) continue;
         const pkg = await options.packages.load({
           formRef: command.formRef,
           packageDigest: command.packageDigest,
@@ -516,29 +536,35 @@ export function createHostAdmissionCoordinator(options: {
         if (pkg.packageDigest !== command.packageDigest || canonicalJson(pkg.formRef) !== key) {
           throw new HostAdmissionCoordinatorError("package_unavailable");
         }
-        const verified = await options.verifier.verify({
+        loaded.set(key, pkg);
+      }
+      if (loaded.size > 0) {
+        const verified = await options.verifier.verifySet({
           environment: candidate.request.environment,
           hostId: candidate.request.hostId,
-          package: pkg,
+          packages: [...loaded.values()],
           evidence: candidate.request.evidence,
+          previousCheckpoint: planned.verificationPreviousCheckpoint,
         });
-        const packageCommand = candidate.commands.find(
-          (value) =>
-            (value.kind === "InstallPackage" || value.kind === "ReplacePackage") &&
-            canonicalJson(value.formRef) === key,
-        );
-        prepared.set(key, {
-          package: pkg,
-          admission: prepareHostAdmission({
-            environment: candidate.request.environment,
-            operation: packageCommand?.kind === "InstallPackage" ? "install" : "replace",
+        for (const [key, pkg] of loaded) {
+          const packageCommand = candidate.commands.find(
+            (value) =>
+              (value.kind === "InstallPackage" || value.kind === "ReplacePackage") &&
+              canonicalJson(value.formRef) === key,
+          );
+          prepared.set(key, {
             package: pkg,
-            requestedEvidence: candidate.request.evidence,
-            verified,
-            handles: options.handles,
-            verifierReleased: options.verifier.readiness.released,
-          }),
-        });
+            admission: prepareHostAdmission({
+              environment: candidate.request.environment,
+              operation: packageCommand?.kind === "InstallPackage" ? "install" : "replace",
+              package: pkg,
+              requestedEvidence: candidate.request.evidence,
+              verified,
+              handles: options.handles,
+              verifierReleased: options.verifier.readiness.released,
+            }),
+          });
+        }
       }
     }
 
@@ -802,7 +828,7 @@ function prepareHostAdmission(input: {
     },
     signature: {
       subjectDigest: input.package.packageDigest,
-      bundleDigest: evidence.bundleDigest,
+      bundleDigest: packageBundleDigest(evidence, input.package.packageDigest),
       trustedRootDigest: evidence.publisher.trustedRootDigest,
     },
     revocation: {
@@ -1095,7 +1121,7 @@ async function installEvidenceMatches(
     canonicalJson(packageReport.formRef) === canonicalJson(entry.formRef) &&
     isRecord(signature) &&
     signature.subjectDigest === entry.packageDigest &&
-    signature.bundleDigest === evidence.bundleDigest &&
+    signature.bundleDigest === packageBundleDigest(evidence, entry.packageDigest) &&
     signature.trustedRootDigest === evidence.publisher.trustedRootDigest &&
     isRecord(revocation) &&
     revocation.checkpointApiVersion === evidence.checkpoint.apiVersion &&
@@ -1104,6 +1130,23 @@ async function installEvidenceMatches(
     revocation.entriesDigest === evidence.checkpoint.entriesDigest &&
     revocation.revoked !== true
   );
+}
+
+function packageBundleDigest(
+  evidence: FormAuthorityVerificationEvidence,
+  packageDigest: AdmissionDigest,
+): AdmissionDigest {
+  if (evidence.packageBundleDigests === undefined) return evidence.bundleDigest;
+  const matches = evidence.packageBundleDigests.filter(
+    (entry) => entry.packageDigest === packageDigest,
+  );
+  if (matches.length !== 1 || !isSha256Digest(matches[0]?.bundleDigest)) {
+    throw new HostAdmissionCoordinatorError(
+      "invalid_request",
+      "verified package bundle identity is absent or ambiguous",
+    );
+  }
+  return matches[0].bundleDigest;
 }
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
@@ -1156,10 +1199,12 @@ function assertExistingAuthorityMatches(
     );
   }
   if (state.checkpoint && !checkpointMatches(state.checkpoint, request.evidence, state.publisher)) {
-    throw new HostAdmissionCoordinatorError(
-      "authority_state_conflict",
-      "checkpoint head differs from the signed plan evidence",
-    );
+    if (!checkpointImmediatelyPrecedes(state.checkpoint, request.evidence, state.publisher)) {
+      throw new HostAdmissionCoordinatorError(
+        "authority_state_conflict",
+        "checkpoint head is neither the signed plan checkpoint nor its exact predecessor",
+      );
+    }
   }
 }
 
@@ -1202,6 +1247,78 @@ function checkpointMatches(
     row.policy_event_digest === publisher?.event_digest &&
     row.revoked_package_digests_json ===
       canonicalJson(evidence.checkpoint.revokedPackageDigests ?? [])
+  );
+}
+
+function previousCheckpointPin(
+  current: AuthorityRow | null,
+  historyRows: readonly AuthorityRow[],
+  evidence: FormAuthorityVerificationEvidence,
+): AuthorityState["verificationPreviousCheckpoint"] {
+  if (current === null) return null;
+  if (current.checkpoint_digest === evidence.checkpoint.previousDigest) {
+    return checkpointRowPin(current);
+  }
+  if (current.checkpoint_digest !== evidence.checkpoint.digest) {
+    throw new HostAdmissionCoordinatorError(
+      "authority_state_conflict",
+      "durable checkpoint head is not the submitted checkpoint",
+    );
+  }
+  if (evidence.checkpoint.previousDigest === null) return null;
+  const predecessors = historyRows.filter(
+    (row) =>
+      row.publisher_key === evidence.publisher.publisherKey &&
+      row.checkpoint_api_version === evidence.checkpoint.apiVersion &&
+      row.checkpoint_digest === evidence.checkpoint.previousDigest,
+  );
+  if (predecessors.length !== 1) {
+    throw new HostAdmissionCoordinatorError(
+      "authority_state_conflict",
+      "durable checkpoint predecessor pin is absent or ambiguous",
+    );
+  }
+  return checkpointRowPin(predecessors[0] as AuthorityRow);
+}
+
+function checkpointRowPin(
+  checkpoint: AuthorityRow,
+): NonNullable<AuthorityState["verificationPreviousCheckpoint"]> {
+  if (
+    typeof checkpoint.checkpoint_api_version !== "string" ||
+    typeof checkpoint.sequence !== "number" ||
+    !Number.isSafeInteger(checkpoint.sequence) ||
+    checkpoint.sequence < 0 ||
+    !isSha256Digest(checkpoint.checkpoint_digest) ||
+    !isSha256Digest(checkpoint.entries_digest)
+  ) {
+    throw new HostAdmissionCoordinatorError(
+      "authority_state_conflict",
+      "durable checkpoint predecessor pin is malformed",
+    );
+  }
+  return {
+    checkpointApiVersion: checkpoint.checkpoint_api_version,
+    sequence: checkpoint.sequence,
+    digest: checkpoint.checkpoint_digest,
+    entriesDigest: checkpoint.entries_digest,
+  };
+}
+
+function checkpointImmediatelyPrecedes(
+  row: AuthorityRow,
+  evidence: FormAuthorityVerificationEvidence,
+  publisher: AuthorityRow | null,
+): boolean {
+  return (
+    evidence.checkpoint.previousDigest !== null &&
+    evidence.checkpoint.sequence > 0 &&
+    row.publisher_key === evidence.publisher.publisherKey &&
+    row.checkpoint_api_version === evidence.checkpoint.apiVersion &&
+    row.sequence === evidence.checkpoint.sequence - 1 &&
+    row.checkpoint_digest === evidence.checkpoint.previousDigest &&
+    row.policy_digest === evidence.publisher.policyDigest &&
+    row.policy_event_digest === publisher?.event_digest
   );
 }
 

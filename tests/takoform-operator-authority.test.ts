@@ -145,9 +145,9 @@ async function fixture(
   const packageLoads = { count: 0 };
   const verifier = {
     ...baseVerifier,
-    async verify(request: Parameters<typeof baseVerifier.verify>[0]) {
+    async verifySet(request: Parameters<typeof baseVerifier.verifySet>[0]) {
       adapterCalls.verify += 1;
-      return await baseVerifier.verify(request);
+      return await baseVerifier.verifySet(request);
     },
   };
   const sql = createEphemeralSql();

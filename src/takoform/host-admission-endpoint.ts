@@ -9,9 +9,11 @@ import {
 import { createAdmissionHandleIssuer } from "./admission.ts";
 import { createFormAdmissionStore } from "./admission-store.ts";
 import {
+  createReleasedCoreFormAuthorityEvidenceVerifier,
   createUnavailableFormAuthorityEvidenceVerifier,
   type FormAuthorityEnvironment,
   type FormAuthorityEvidenceVerifier,
+  type TakoformCoreVerifierContainerNamespace,
 } from "./form-authority-verification.ts";
 import { createFormPackageStore, type FormPackageInput } from "./form-packages.ts";
 import {
@@ -45,12 +47,15 @@ export interface FormAuthorityEndpointConfiguration {
   readonly implementationDigest: `sha256:${string}`;
   /** Code-owned capability manifest embedded into the public Worker build. */
   readonly capabilities: TakoformLifecycleCapabilityManifest;
+  /** Exact container artifact identity required on every verifier response. */
+  readonly coreVerifierArtifactDigest?: `sha256:${string}`;
 }
 
 export interface FormAuthorityEndpointBindings {
   readonly sql: Sql;
   readonly objects: ObjectStore;
   readonly publicHostIdentity: PublicHostIdentityRpc;
+  readonly coreVerifier?: TakoformCoreVerifierContainerNamespace;
 }
 
 export interface FormAuthorityComposition {
@@ -82,23 +87,49 @@ export class HostAdmissionEndpoint {
 }
 
 /**
- * Production composition is intentionally useful for plan/readback but not
- * apply. Verification remains unavailable until released Core verification
- * can be injected here; Host policy continues to live in this composition.
+ * Production uses the released-Core route-less Container. Host policy remains
+ * in this composition and no serialized Core report can mint an admission handle.
  */
 export async function createProductionFormAuthorityComposition(input: {
   readonly configuration: FormAuthorityEndpointConfiguration;
   readonly bindings: FormAuthorityEndpointBindings;
 }): Promise<FormAuthorityComposition> {
+  const artifactDigest = input.configuration.coreVerifierArtifactDigest;
+  const containers = input.bindings.coreVerifier;
+  if (!artifactDigest || !containers) {
+    return createComposition({
+      ...input,
+      verifier: createUnavailableFormAuthorityEvidenceVerifier(),
+      packages: {
+        async load(): Promise<never> {
+          throw new HostAdmissionCoordinatorError("package_unavailable");
+        },
+      },
+    });
+  }
+  const packageStore = createFormPackageStore(input.bindings.objects);
   return createComposition({
     ...input,
-    verifier: createUnavailableFormAuthorityEvidenceVerifier(),
+    verifier: createReleasedCoreFormAuthorityEvidenceVerifier({
+      containers,
+      containerName: `${input.configuration.environment}:${input.configuration.hostId}`,
+      artifactDigest,
+    }),
     packages: {
-      async load(): Promise<never> {
-        throw new HostAdmissionCoordinatorError(
-          "package_unavailable",
-          "production package source is unavailable without released verification evidence",
-        );
+      async load(expected): Promise<FormPackageInput> {
+        const stored = await packageStore.read(expected);
+        if (!stored) throw new HostAdmissionCoordinatorError("package_unavailable");
+        return {
+          packageDigest: stored.packageDigest,
+          formRef: stored.formRef,
+          manifest: stored.manifest,
+          files: stored.files.map((file) => ({
+            path: file.path,
+            bytes: file.bytes,
+            digest: file.digest,
+            ...(file.mediaType === undefined ? {} : { mediaType: file.mediaType }),
+          })),
+        };
       },
     },
   });
@@ -237,6 +268,8 @@ function validateConfiguration(configuration: FormAuthorityEndpointConfiguration
     !isSha256Digest(configuration.workerArtifactDigest) ||
     !isSha256Digest(configuration.implementationPayloadDigest) ||
     !isSha256Digest(configuration.implementationDigest) ||
+    (configuration.coreVerifierArtifactDigest !== undefined &&
+      !isSha256Digest(configuration.coreVerifierArtifactDigest)) ||
     typeof configuration.publicWorkerVersionId !== "string" ||
     !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(
       configuration.publicWorkerVersionId,

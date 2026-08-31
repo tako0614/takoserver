@@ -1,4 +1,13 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { canonicalDigest, canonicalJson } from "../../src/json.ts";
@@ -245,6 +254,8 @@ export async function runFormAuthority(
       publicWorkerVersionId: publicBefore.history.versionId,
       publicWorkerCommitMatches: publicBefore.commit === invocation.commit,
       capabilityDigest,
+      coreVerifierArtifactDigest:
+        selected.verificationMode === "released-core" ? takoformCoreVerifierArtifactDigest() : null,
       publicIdentityRpcReady: publicIdentityReadback.ready,
       implementationPayloadDigest:
         publicIdentityReadback.identity?.implementationPayloadDigest ?? null,
@@ -494,6 +505,8 @@ export async function runFormAuthority(
       workerArtifactDigest: publicBefore.workerArtifactDigest,
       publicWorkerVersionId: publicBefore.history.versionId,
       capabilityDigest,
+      coreVerifierArtifactDigest:
+        selected.verificationMode === "released-core" ? takoformCoreVerifierArtifactDigest() : null,
       publicIdentityRpcReady: true,
       implementationPayloadDigest: publicIdentityAfter.identity.implementationPayloadDigest,
       implementationDigest: operatorIdentity.implementationDigest,
@@ -552,6 +565,10 @@ export function writeFormAuthorityConfig(input: {
     preview_urls: false,
     observability: { enabled: true },
   } as const;
+  const coreVerifierArtifactDigest =
+    input.selected.verificationMode === "released-core"
+      ? takoformCoreVerifierArtifactDigest()
+      : null;
   const configuration =
     input.selected.kind === "operator-gateway"
       ? operatorGatewayConfiguration(input, shared)
@@ -561,6 +578,11 @@ export function writeFormAuthorityConfig(input: {
             TAKOSERVER_ENVIRONMENT: input.invocation.environment,
             TAKOSERVER_FORM_AUTHORITY_HOST_ID: input.selected.hostId,
             TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST: input.capabilityManifestJson,
+            ...(coreVerifierArtifactDigest === null
+              ? {}
+              : {
+                  TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST: coreVerifierArtifactDigest,
+                }),
             ...(input.invocation.surface === "takoserver-integration-form-authority-worker"
               ? {
                   TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK: canonicalJson(
@@ -590,9 +612,62 @@ export function writeFormAuthorityConfig(input: {
               entrypoint: "PublicHostIdentityEntrypoint",
             },
           ],
+          ...(coreVerifierArtifactDigest === null
+            ? {}
+            : {
+                durable_objects: {
+                  bindings: [
+                    {
+                      name: "CORE_VERIFIER",
+                      class_name: "TakoformCoreVerifierContainer",
+                    },
+                  ],
+                },
+                migrations: [
+                  {
+                    tag: "takoform-core-verifier-v1",
+                    new_sqlite_classes: ["TakoformCoreVerifierContainer"],
+                  },
+                ],
+                containers: [
+                  {
+                    class_name: "TakoformCoreVerifierContainer",
+                    image: resolve(REPOSITORY, "services/takoform-core-verifier/Dockerfile"),
+                    image_build_context: resolve(REPOSITORY, "services/takoform-core-verifier"),
+                    image_vars: {
+                      TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST: coreVerifierArtifactDigest,
+                    },
+                    max_instances: 1,
+                    instance_type: "lite",
+                  },
+                ],
+              }),
         };
   writeFileSync(input.path, `${JSON.stringify(configuration, null, 2)}\n`, { mode: 0o600 });
   return input.path;
+}
+
+/** Digest of every byte Wrangler passes to the native verifier image build. */
+export function takoformCoreVerifierArtifactDigest(): `sha256:${string}` {
+  const root = resolve(REPOSITORY, "services/takoform-core-verifier");
+  const hash = createHash("sha256");
+  for (const path of recursiveFiles(root)) {
+    const relative = path.slice(root.length + 1);
+    hash.update(relative);
+    hash.update("\0");
+    hash.update(readFileSync(path));
+    hash.update("\0");
+  }
+  return `sha256:${hash.digest("hex")}`;
+}
+
+function recursiveFiles(directory: string): string[] {
+  return readdirSync(directory)
+    .flatMap((name) => {
+      const path = join(directory, name);
+      return statSync(path).isDirectory() ? recursiveFiles(path) : [path];
+    })
+    .sort();
 }
 
 function operatorGatewayConfiguration(
@@ -1061,6 +1136,18 @@ function expectedBindings(
       type: "plain_text",
       fields: { text: capabilityManifestJson },
     },
+    ...(selected.verificationMode === "released-core"
+      ? {
+          CORE_VERIFIER: {
+            type: "durable_object_namespace",
+            fields: { class_name: "TakoformCoreVerifierContainer" },
+          },
+          TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST: {
+            type: "plain_text",
+            fields: { text: takoformCoreVerifierArtifactDigest() },
+          },
+        }
+      : {}),
     ...(invocationSurfaceIsIntegrationAuthority(selected)
       ? {
           TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK: {
@@ -1143,7 +1230,7 @@ function selectTarget(
     main: "src/entry-form-authority-worker.ts",
     policyAuthority: "takoserver-host",
     verificationMode: "released-core",
-    verificationAvailable: false,
+    verificationAvailable: true,
     productionEligible: false,
   };
 }

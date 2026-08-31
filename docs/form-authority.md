@@ -9,12 +9,14 @@ package reader, but they must not import `admission-store.ts`, `admission.ts`,
 Form mutation belongs to two separately named, route-less Cloudflare Workers:
 
 - `takoserver-form-authority-worker` exposes only service-binding RPC methods
-  `plan`, `apply`, and `readback`. Its production composition can plan and read
-  the exact durable state, but `apply` fails closed because no released Form
-  package verifier is available. Released Core may supply signature,
-  provenance, namespace, and revocation verification; Takoserver Host owns the
-  admission policy decision and private in-process handle. Persisted
-  verification evidence or `AdmissionReport` JSON is never authority.
+  `plan`, `apply`, and `readback`. Its production composition binds one native
+  Container Durable Object which pins released Takoform Core v1.1.0. One
+  bounded set-level call verifies `VerifyFS`, one package bundle per package,
+  the separate checkpoint bundle, the durable predecessor pin, provenance and
+  revocation before the first D1/R2 mutation. Takoserver Host separately owns
+  namespace grants, the admission policy decision, and the private in-process
+  handle. Persisted verification evidence or `AdmissionReport` JSON is never
+  authority.
 - `takoserver-integration-form-authority-worker` is an integration-only fixture
   bridge. It checks the exact environment before reading D1 or R2 bindings and
   permanently reports `policyAuthority: takoserver-host`,
@@ -27,6 +29,38 @@ requires an event handler to register the module. The named RPC entrypoints
 remain pure RPC classes and are bound explicitly. Both use the selected
 Takoserver target’s existing `STATE_DB` and `OBJECTS` bindings. The production
 bundle does not contain the integration package corpus.
+
+The production verifier Container is not a second public Worker. The authority
+Worker selects one deterministic instance per environment/Host through its
+`CORE_VERIFIER` Durable Object binding; the container has outbound internet
+disabled. Its only process paths are `POST /v1/verify-set` and
+`GET /v1/identity`, reachable through that binding. Every successful result
+must identify the adapter protocol, Core v1.1.0 tag, exact Core commit, and the
+Docker-context digest injected into both image and Worker. A stale rolling
+instance, malformed response, timeout, missing raw closure, package duplicate,
+checkpoint rollback/fork, revocation, or identity mismatch fails before Host
+mutation. The default authority Worker fetch remains `404`, so another Worker
+on the same account can reuse the named RPC entrypoint without a public
+gateway. An off-platform CLI cannot call a service binding directly and needs a
+separately authorized ingress; production deliberately has no such gateway.
+
+Production activation still requires distribution inputs which this adapter
+does not publish or invent:
+
+1. `takoform-forms` publisher changes must be pushed and merged to the exact
+   policy-selected ref.
+2. The workflow at that ref must keylessly sign every canonical package index
+   and the canonical cumulative revocation checkpoint, producing separate
+   Sigstore v0.3 bundles with offline inclusion evidence.
+3. One pinned publisher policy, trusted root, Host-owned namespace grant, exact
+   source commit, package/bundle map, checkpoint/bundle, and predecessor pin
+   must be assembled without a preverified-report shortcut.
+4. The exact package closures must be staged into the selected Form-authority
+   R2 prefix before apply. This repository still has no production operator
+   ingress that performs that staging.
+5. Owner gates, independent review, container-image upload, Worker upload, and
+   authoritative Worker/container identity readback must complete before an
+   operator invokes route-less production RPC.
 
 Every advertised Form-authority environment also has one permanent minimal
 `takoserver-form-authority-identity-probe` Worker. Its target-owned

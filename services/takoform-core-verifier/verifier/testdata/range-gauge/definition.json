@@ -1,0 +1,42 @@
+{
+  "apiVersion": "resources.publisher.example",
+  "kind": "RangeGauge",
+  "definitionVersion": "0.1.0",
+  "title": "RangeGauge independent conformance fixture",
+  "description": "External publisher RangeGauge Definition for family-neutral Host conformance.",
+  "role": "identity",
+  "requiresHostApi": "forms.takoform.com/v1",
+  "desiredSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "lower": {
+        "type": "integer"
+      },
+      "upper": {
+        "type": "integer"
+      },
+      "mode": {
+        "type": "string",
+        "enum": [
+          "safe",
+          "fast"
+        ],
+        "default": "safe"
+      }
+    },
+    "required": [
+      "lower",
+      "upper"
+    ]
+  },
+  "lifecycleCapabilities": [
+    "create",
+    "read",
+    "update",
+    "delete",
+    "import",
+    "observe"
+  ]
+}
