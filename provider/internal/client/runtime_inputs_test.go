@@ -194,6 +194,86 @@ func TestGetRuntimeInputPreparationRejectsMismatchedRuntimeInputReference(t *tes
 	}
 }
 
+func TestGetRuntimeInputPreparationRejectsDuplicateResponseJSONKeys(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name    string
+		payload string
+	}{
+		{
+			name:    "top-level runtime input reference",
+			payload: `{"runtimeInputReference":"top-level-secret","runtimeInputReference":"top-level-secret"}`,
+		},
+		{
+			name:    "nested target worker resource uid",
+			payload: `{"target":{"workerResourceUid":"nested-secret","workerResourceUid":"nested-secret"}}`,
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(test.payload))
+			}))
+			defer server.Close()
+
+			api, err := client.New(server.URL, "provider-token", "org-01", server.Client())
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			_, err = api.GetRuntimeInputPreparation(context.Background(), "op-01")
+			if err == nil || !strings.Contains(err.Error(), "duplicate JSON fields") {
+				t.Fatalf("GetRuntimeInputPreparation() error = %v, want duplicate JSON key rejection", err)
+			}
+			if strings.Contains(err.Error(), "top-level-secret") || strings.Contains(err.Error(), "nested-secret") {
+				t.Fatalf("duplicate response body leaked through error: %v", err)
+			}
+		})
+	}
+}
+
+func TestGetRuntimeInputPreparationRejectsExcessiveResponseJSONNesting(t *testing.T) {
+	t.Parallel()
+
+	const nestingDepth = 65
+	var payload strings.Builder
+	for index := 0; index < nestingDepth; index++ {
+		if index%2 == 0 {
+			payload.WriteByte('[')
+		} else {
+			payload.WriteString(`{"nested":`)
+		}
+	}
+	payload.WriteString(`"depth-secret"`)
+	for index := nestingDepth - 1; index >= 0; index-- {
+		if index%2 == 0 {
+			payload.WriteByte(']')
+		} else {
+			payload.WriteByte('}')
+		}
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(payload.String()))
+	}))
+	defer server.Close()
+
+	api, err := client.New(server.URL, "provider-token", "org-01", server.Client())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	_, err = api.GetRuntimeInputPreparation(context.Background(), "op-01")
+	if err == nil || !strings.Contains(err.Error(), "invalid response") {
+		t.Fatalf("GetRuntimeInputPreparation() error = %v, want excessive nesting rejection", err)
+	}
+	if strings.Contains(err.Error(), "depth-secret") {
+		t.Fatalf("deep response body leaked through error: %v", err)
+	}
+}
+
 func TestDeleteRuntimeInputPreparationIsIdempotent(t *testing.T) {
 	t.Parallel()
 

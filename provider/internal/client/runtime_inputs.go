@@ -22,6 +22,7 @@ import (
 const (
 	runtimeInputPreparationFormat = "takoserver.worker-runtime-input-preparation@v1"
 	maxResponseBytes              = 64 * 1024
+	maxResponseJSONDepth          = 64
 )
 
 var opaqueIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
@@ -304,6 +305,9 @@ func decodeRuntimeInputPreparation(reader io.Reader) (runtimeInputPreparationRes
 	if len(raw) > maxResponseBytes {
 		return runtimeInputPreparationResponse{}, errors.New("Takoserver runtime input preparation response is too large")
 	}
+	if err := rejectDuplicateResponseJSONKeys(raw); err != nil {
+		return runtimeInputPreparationResponse{}, err
+	}
 	var wire runtimeInputPreparationResponse
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
@@ -317,6 +321,70 @@ func decodeRuntimeInputPreparation(reader io.Reader) (runtimeInputPreparationRes
 		return runtimeInputPreparationResponse{}, errors.New("Takoserver runtime input preparation returned an unsupported format")
 	}
 	return wire, nil
+}
+
+var errDuplicateResponseJSONKey = errors.New("duplicate response object member")
+
+func rejectDuplicateResponseJSONKeys(raw []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	var walk func(int) error
+	walk = func(depth int) error {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		switch delimiter := token.(type) {
+		case json.Delim:
+			switch delimiter {
+			case '{':
+				if depth >= maxResponseJSONDepth {
+					return errors.New("response JSON nesting is too deep")
+				}
+				seen := make(map[string]struct{})
+				for decoder.More() {
+					key, err := decoder.Token()
+					if err != nil {
+						return err
+					}
+					name, ok := key.(string)
+					if !ok {
+						return errors.New("response object member name is not a string")
+					}
+					if _, exists := seen[name]; exists {
+						return errDuplicateResponseJSONKey
+					}
+					seen[name] = struct{}{}
+					if err := walk(depth + 1); err != nil {
+						return err
+					}
+				}
+				_, err = decoder.Token()
+				return err
+			case '[':
+				if depth >= maxResponseJSONDepth {
+					return errors.New("response JSON nesting is too deep")
+				}
+				for decoder.More() {
+					if err := walk(depth + 1); err != nil {
+						return err
+					}
+				}
+				_, err = decoder.Token()
+				return err
+			default:
+				return errors.New("response contains an invalid JSON delimiter")
+			}
+		default:
+			return nil
+		}
+	}
+	if err := walk(0); err != nil {
+		if errors.Is(err, errDuplicateResponseJSONKey) {
+			return errors.New("Takoserver runtime input preparation response contains duplicate JSON fields")
+		}
+		return errors.New("Takoserver runtime input preparation returned an invalid response")
+	}
+	return nil
 }
 
 func runtimeInputPreparationFromWire(wire runtimeInputPreparationResponse) RuntimeInputPreparation {
