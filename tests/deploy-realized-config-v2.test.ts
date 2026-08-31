@@ -270,6 +270,11 @@ describe("realized Worker configuration", () => {
         offerings: YURUCOMMU_IDENTITY_CAPABILITY_KINDS.map((formKind) => ({ formKind })),
       } as unknown as NonNullable<DeployTarget["edgeSupplies"]>,
       workerEndpointSuffix: "integration.example.workers.dev",
+      runtimeInputSealKeyring: {
+        currentKeyId: "runtime-current",
+        previousKeyIds: ["runtime-previous"],
+        commitment: `sha256:${"d".repeat(64)}` as const,
+      },
       formAuthority: {
         workerName: "takoserver-form-authority-integration",
         identityProbeWorkerName: "takoserver-form-identity-integration",
@@ -321,6 +326,11 @@ describe("realized Worker configuration", () => {
       const config = JSON.parse(readFileSync(path, "utf8")) as {
         vars: Record<string, string>;
       };
+      expect(config.vars).toMatchObject({
+        TAKOSERVER_RUNTIME_INPUT_SEAL_CURRENT_KEY_ID: "runtime-current",
+        TAKOSERVER_RUNTIME_INPUT_SEAL_PREVIOUS_KEY_IDS: '["runtime-previous"]',
+        TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING_COMMITMENT: `sha256:${"d".repeat(64)}`,
+      });
       expect(
         Object.fromEntries(
           Object.entries(config.vars).filter(([name]) =>

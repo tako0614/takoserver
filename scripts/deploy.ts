@@ -11,6 +11,7 @@ import { runOperatorIdentity } from "./deploy/identity.ts";
 import { runIntegrationE2eCredentials } from "./deploy/integration-e2e-credentials.ts";
 import type { DeployEnvironment } from "./deploy/qualification.ts";
 import { runRetirement } from "./deploy/retirement.ts";
+import { runRuntimeInputSealKey } from "./deploy/runtime-input-seal-key.ts";
 import { runD1Schema } from "./deploy/schema.ts";
 import { runSigning } from "./deploy/signing.ts";
 import { runStaticSite } from "./deploy/static.ts";
@@ -284,6 +285,16 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
           ...(invocation.legacyPredecessorVersionId === undefined
             ? {}
             : { legacyPredecessorVersionId: invocation.legacyPredecessorVersionId }),
+        },
+        target,
+      );
+    case "takoserver-runtime-input-seal-key":
+      return await runRuntimeInputSealKey(
+        {
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
         },
         target,
       );

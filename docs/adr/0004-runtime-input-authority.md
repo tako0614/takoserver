@@ -164,6 +164,33 @@ Corrupt or unavailable sealed material fails closed and never issues a second
 claim. The current non-extractable AES-256-GCM key seals new rows; bounded
 previous keys may decrypt existing prepared/claimed rows during rotation.
 
+## Runtime seal-key deployment authority
+
+An edge-supplies deployment requires one closed non-secret keyring descriptor:
+the exact current key ID, at most two ordered previous key IDs, and the
+`sha256:` commitment of the closed canonical keyring JSON bytes. The Worker
+receives only those values as plain variables plus the script-wide secret. At
+startup it canonicalizes the secret, recomputes the commitment, compares every
+ID exactly, imports only 32-byte AES-256-GCM keys as non-extractable WebCrypto
+keys, and fails before serving when any part differs. Key bytes never enter a
+public projection, log, or error.
+
+`takoserver-runtime-input-seal-key` is the only deployment authority that may
+bridge this secret/configuration boundary. It seals candidate code,
+configuration, and a one-name Wrangler secrets file into one artifact and uses
+one `deploy --no-bundle --strict --secrets-file` mutation. Routine and general
+Worker authority surfaces keep refusing secret/configuration drift. The exact
+legacy predecessor missing only this secret and metadata is a narrowly
+classified bootstrap state, not a weaker routine closure.
+
+Migration 0032's `seal_key_id` is also a rotation fence. Bootstrap requires no
+prepared or claimed row with a non-null key ID. Later rotations must retain
+every key ID used by such rows, and a prior key can be removed only at zero
+use. Missing or unreadable migration state is not interpreted as an empty
+table. Reversal is a separately reviewed forward repair with a retained prior
+keyring and matching descriptor: rolling back a Worker Version does not restore
+the script-wide secret.
+
 ## Composition consequence
 
 Origin derivation belongs to the same provider selected for ordinary Host

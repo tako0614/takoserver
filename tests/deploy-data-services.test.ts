@@ -126,6 +126,12 @@ const EDGE_SUPPLIES = {
   ],
 };
 
+const RUNTIME_INPUT_SEAL_KEYRING = {
+  currentKeyId: "runtime-input-2026-08",
+  previousKeyIds: ["runtime-input-2026-07"],
+  commitment: `sha256:${"1".repeat(64)}`,
+};
+
 describe("private data service deploy configuration", () => {
   test("realizes the exact Takos ID issuer and client without a direct upstream identity", () => {
     const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
@@ -183,6 +189,7 @@ describe("private data service deploy configuration", () => {
           r2ParentAccessKeyId: "parent-key",
           objectBucketSupplies: SUPPLIES,
           edgeSupplies: EDGE_SUPPLIES,
+          runtimeInputSealKeyring: RUNTIME_INPUT_SEAL_KEYRING,
           workerEndpointSuffix: "hosted.workers.dev",
           sponsorship: true,
         }),
@@ -197,6 +204,11 @@ describe("private data service deploy configuration", () => {
         SUPPLIES,
       );
       expect(JSON.parse(realized.vars.TAKOSERVER_EDGE_SUPPLIES ?? "null")).toEqual(EDGE_SUPPLIES);
+      expect(realized.vars).toMatchObject({
+        TAKOSERVER_RUNTIME_INPUT_SEAL_CURRENT_KEY_ID: "runtime-input-2026-08",
+        TAKOSERVER_RUNTIME_INPUT_SEAL_PREVIOUS_KEY_IDS: '["runtime-input-2026-07"]',
+        TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING_COMMITMENT: RUNTIME_INPUT_SEAL_KEYRING.commitment,
+      });
       expect(realized.vars.TAKOSERVER_WORKER_ENDPOINT_SUFFIX).toBe("hosted.workers.dev");
       expect(realized.vars).not.toHaveProperty("TAKOSERVER_ZONES");
       expect(JSON.stringify(realized)).not.toContain("TOKEN");
@@ -301,7 +313,7 @@ describe("private data service deploy configuration", () => {
       const path = join(directory, "target.json");
       writeFileSync(path, JSON.stringify({ ...BASE, edgeSupplies: EDGE_SUPPLIES }));
       expect(() => loadTarget(path, "production")).toThrow(
-        "edge supplies and `workerEndpointSuffix`",
+        "edge supplies, `workerEndpointSuffix`, and `runtimeInputSealKeyring`",
       );
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -317,12 +329,49 @@ describe("private data service deploy configuration", () => {
         JSON.stringify({
           ...BASE,
           edgeSupplies: EDGE_SUPPLIES,
+          runtimeInputSealKeyring: RUNTIME_INPUT_SEAL_KEYRING,
           workerEndpointSuffix: "hosted.workers.dev",
         }),
       );
       const target = loadTarget(path, "production");
       expect(JSON.stringify(target.edgeSupplies)).toBe(JSON.stringify(EDGE_SUPPLIES));
       expect(target.sponsorship).toBeUndefined();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects runtime-input seal metadata outside edge capacity and every open or unsafe descriptor", () => {
+    const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
+    try {
+      const path = join(directory, "target.json");
+      writeFileSync(
+        path,
+        JSON.stringify({ ...BASE, runtimeInputSealKeyring: RUNTIME_INPUT_SEAL_KEYRING }),
+      );
+      expect(() => loadTarget(path, "production")).toThrow(
+        "runtimeInputSealKeyring is allowed only with edge supplies",
+      );
+
+      for (const runtimeInputSealKeyring of [
+        { ...RUNTIME_INPUT_SEAL_KEYRING, extra: true },
+        { ...RUNTIME_INPUT_SEAL_KEYRING, previousKeyIds: ["old", "older", "oldest"] },
+        { ...RUNTIME_INPUT_SEAL_KEYRING, previousKeyIds: ["runtime-input-2026-08"] },
+        { ...RUNTIME_INPUT_SEAL_KEYRING, commitment: "not-a-commitment" },
+      ]) {
+        writeFileSync(
+          path,
+          JSON.stringify({
+            ...BASE,
+            edgeSupplies: EDGE_SUPPLIES,
+            workerEndpointSuffix: "hosted.workers.dev",
+            runtimeInputSealKeyring,
+          }),
+        );
+        expect(() => loadTarget(path, "production")).toThrow(
+          "deploy target `runtimeInputSealKeyring` is invalid",
+        );
+      }
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

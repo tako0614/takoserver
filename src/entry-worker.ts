@@ -18,7 +18,10 @@ import type {
 } from "./public-worker-implementation.ts";
 import { createResourceDeploymentStore } from "./resource-deployments.ts";
 import { createRuntimeInputAuthority } from "./runtime-input-preparations.ts";
-import { parseRuntimeInputSealKeyRing } from "./runtime-input-seal-keyring.ts";
+import {
+  parseRuntimeInputSealKeyRing,
+  type RuntimeInputSealKeyRing,
+} from "./runtime-input-seal-keyring.ts";
 import { loadSigningKey } from "./signing-key.ts";
 import { createD1Sql } from "./sql-d1.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
@@ -47,7 +50,15 @@ import { createWorkerProductionComposition } from "./worker-production-compositi
  * rejects a partial or ambiguous composition before the Worker serves.
  */
 
-export interface WorkerEnv {
+export interface WorkerRuntimeInputSealEnv {
+  readonly TAKOSERVER_EDGE_SUPPLIES?: string;
+  readonly TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING?: string;
+  readonly TAKOSERVER_RUNTIME_INPUT_SEAL_CURRENT_KEY_ID?: string;
+  readonly TAKOSERVER_RUNTIME_INPUT_SEAL_PREVIOUS_KEY_IDS?: string;
+  readonly TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING_COMMITMENT?: string;
+}
+
+export interface WorkerEnv extends WorkerRuntimeInputSealEnv {
   readonly AI?: CloudflareWorkersAiBinding;
   readonly STATE_DB: Parameters<typeof createD1Sql>[0];
   readonly OBJECTS: Parameters<typeof createR2ObjectStore>[0];
@@ -104,15 +115,49 @@ export interface WorkerEnv {
   readonly TAKOSERVER_R2_PARENT_TOKEN?: string;
   /** Versioned, non-secret commercial composition emitted by takoserver-private. */
   readonly TAKOSERVER_OBJECT_BUCKET_SUPPLIES?: string;
-  /** Reviewed Cloudflare sales for released identity Forms other than storage. */
-  readonly TAKOSERVER_EDGE_SUPPLIES?: string;
-  /** Operator-private AES key ring for one-shot Worker runtime inputs. */
-  readonly TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING?: string;
   /** Exact workers.dev suffix assigned to the configured provider account. */
   readonly TAKOSERVER_WORKER_ENDPOINT_SUFFIX?: string;
   /** Wasabi sub-user credentials. Both are Worker secrets. */
   readonly TAKOSERVER_WASABI_ACCESS_KEY_ID?: string;
   readonly TAKOSERVER_WASABI_SECRET_ACCESS_KEY?: string;
+}
+
+/**
+ * Resolves the all-or-none runtime-input seal authority before app composition.
+ * The public metadata binds the exact canonical secret bytes and key-id order;
+ * any partial, foreign, or mismatched profile fails before a request is served.
+ */
+export async function workerRuntimeInputSealKeyRing(
+  env: WorkerRuntimeInputSealEnv,
+): Promise<RuntimeInputSealKeyRing | undefined> {
+  const values = [
+    env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING,
+    env.TAKOSERVER_RUNTIME_INPUT_SEAL_CURRENT_KEY_ID,
+    env.TAKOSERVER_RUNTIME_INPUT_SEAL_PREVIOUS_KEY_IDS,
+    env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING_COMMITMENT,
+  ] as const;
+  const configured = values.filter((value) => value !== undefined).length;
+  const edgeConfigured = env.TAKOSERVER_EDGE_SUPPLIES !== undefined;
+  if ((!edgeConfigured && configured !== 0) || (edgeConfigured && configured !== values.length)) {
+    throw invalidRuntimeInputSealConfiguration();
+  }
+  if (configured === 0) return undefined;
+
+  let previousKeyIds: unknown;
+  try {
+    previousKeyIds = JSON.parse(env.TAKOSERVER_RUNTIME_INPUT_SEAL_PREVIOUS_KEY_IDS as string);
+    return await parseRuntimeInputSealKeyRing(env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING as string, {
+      currentKeyId: env.TAKOSERVER_RUNTIME_INPUT_SEAL_CURRENT_KEY_ID,
+      previousKeyIds,
+      commitment: env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING_COMMITMENT,
+    });
+  } catch {
+    throw invalidRuntimeInputSealConfiguration();
+  }
+}
+
+function invalidRuntimeInputSealConfiguration(): TypeError {
+  return new TypeError("runtime input seal key ring configuration is invalid");
 }
 
 /**
@@ -370,10 +415,11 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
   const clock = () => new Date();
   const randomId = () => crypto.randomUUID();
   const originReservationBinding = createWorkerEndpointOriginReservationBindingHandle();
-  const runtimeInputs = env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING
+  const runtimeInputSealKeys = await workerRuntimeInputSealKeyRing(env);
+  const runtimeInputs = runtimeInputSealKeys
     ? createRuntimeInputAuthority({
         sql,
-        sealKeys: await parseRuntimeInputSealKeyRing(env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING),
+        sealKeys: runtimeInputSealKeys,
         originReservations: originReservationBinding.port,
         clock,
         randomId,

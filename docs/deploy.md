@@ -1,6 +1,6 @@
 # Takoserver deploy surfaces
 
-This repository owns one deploy entrypoint and nineteen separate mutation surfaces.
+This repository owns one deploy entrypoint and twenty separate mutation surfaces.
 The contract is read-only:
 
 ```sh
@@ -65,6 +65,7 @@ no operator input.
 | --- | --- | --- | --- |
 | `takoserver-worker` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both actions. Stored Wrangler OAuth is refused because it cannot prove workers.dev enabled state or exhaustive custom-domain inventory. |
 | `takoserver-worker-authority-cutover` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
+| `takoserver-runtime-input-seal-key` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING_PATH` for `--apply` only. Status never reads key bytes. |
 | `takoserver-form-authority-identity-probe` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-form-authority-worker` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-integration-form-authority-worker` | `--status`, `--apply` | integration only | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
@@ -150,6 +151,46 @@ The separate authority and irreversible surfaces are:
   runtime-grant signing key. Its named legacy-edge transition
   profile is the only way to carry an observed Hosted service binding and
   secret into the candidate predecessor state.
+- `takoserver-runtime-input-seal-key`: the sole bridge for the script-wide
+  `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING` secret and its three exact plain-text
+  identity bindings. An edge-supplies target must carry a closed
+  `runtimeInputSealKeyring` descriptor containing `currentKeyId`, at most two
+  ordered `previousKeyIds`, and `sha256:` of the exact canonical keyring bytes;
+  non-edge targets reject it. Apply reads the absolute path from
+  `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING_PATH`. Every component must be
+  link-free and the final file must be owned by the operator process, have one
+  link, mode exactly `0600`, and be no larger than 16 KiB. The secret JSON is a
+  closed, whitespace-free object in exact member order:
+
+  ```json
+  {"current":{"id":"current-id","key":"<43-character-base64url-AES-256-key>"},"previous":[{"id":"previous-id","key":"<43-character-base64url-AES-256-key>"}]}
+  ```
+
+  Omit `previous` when empty; a trailing newline is noncanonical. The deploy
+  process recomputes the commitment and requires the exact target IDs before
+  any mutation. It then seals candidate code, configuration, and a secrets
+  file containing only this secret, re-fences the immediate predecessor and D1
+  key usage, and performs one
+  `wrangler deploy --no-bundle --strict --secrets-file` mutation. It never uses
+  `wrangler secret put`, never prints key bytes, and never splits code/config
+  from the secret.
+
+  Status recognizes `bootstrap-required` only when the current canonical
+  Version differs from desired state by exactly these metadata bindings and
+  this secret-name entry. Bootstrap requires schema migration 0032 and zero
+  prepared/claimed rows with non-null `seal_key_id`. Rotation requires every
+  grouped live row key ID to remain in the desired current/previous set; a
+  previous key may be removed only when its grouped count is zero. Missing or
+  unreadable schema 0032 is unavailable, never an empty inventory. Status and
+  post-readback prove stable deployment history, exact commit/artifact/config,
+  exhaustive secret names, descriptor binding, D1 counts, and the public
+  discovery/OpenAPI runtime probe.
+
+  Reversal is an explicit forward repair using a separately reviewed retained
+  prior canonical keyring plus its matching target descriptor. Worker Version
+  rollback cannot restore a script-wide secret and is never described as this
+  surface's reversal. A lost upload acknowledgement is settled only by exact
+  `--status`; apply is not retried.
 - `takoserver-form-authority-identity-probe`: one reviewed minimal read-only
   Worker upload in every Form-authority environment. Its permanent target-owned
   workers.dev endpoint exposes only `GET /v1/public-host-identity`, backed by a
@@ -525,6 +566,15 @@ the same surface with `--status`. A failed post-condition means the mutation
 was acknowledged but must be repaired or rolled back explicitly. Routine
 Worker, Console, and Pages output the immediately previous provider-history
 identity; irreversible surfaces state their forward-repair boundary.
+
+For a runtime-input seal-key upload acknowledgement failure, do not retry
+apply. Run `takoserver-runtime-input-seal-key --status` with the same exact
+environment, target descriptor, and selected commit. Only the canonical
+desired Version, exhaustive secret-name inventory, stable public probe, and D1
+live-key fence settle the operation. `bootstrap-required`, an unrelated
+Version, a partial metadata profile, missing schema 0032, or an omitted live
+row key remains not ready. Secret bytes are neither read by status nor returned
+in diagnostics.
 
 For an integration legacy Worker cutover, repeat `--status` with the same
 `--legacy-predecessor-version` after an indeterminate acknowledgement. The

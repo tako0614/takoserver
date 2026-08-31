@@ -25,6 +25,7 @@ async function deploy(args: readonly string[]): Promise<{
 const SURFACES = [
   ["takoserver-worker", []],
   ["takoserver-worker-authority-cutover", ["authority"]],
+  ["takoserver-runtime-input-seal-key", ["authority", "irreversible"]],
   ["takoserver-form-authority-identity-probe", ["authority"]],
   ["takoserver-form-authority-worker", ["authority"]],
   ["takoserver-integration-form-authority-worker", ["authority"]],
@@ -299,6 +300,23 @@ describe("Takoserver split deploy entrypoint", () => {
       expect(refused.exitCode).toBe(2);
       expect(refused.stdout).toBe("");
       expect(refused.stderr).toContain("no target was touched");
+    }
+  });
+
+  test("parses the dedicated runtime-input seal-key surface in every environment", async () => {
+    const sha = "a".repeat(40);
+    for (const environment of ["integration", "rehearsal", "production"] as const) {
+      for (const action of ["--status", "--apply"] as const) {
+        const accepted = await deploy([
+          "takoserver-runtime-input-seal-key",
+          action,
+          `--environment=${environment}`,
+          `--commit=${sha}`,
+        ]);
+        expect(accepted.exitCode).toBe(2);
+        expect(accepted.stderr).toContain("deploy target descriptor not found");
+        expect(accepted.stderr).not.toContain("no target was touched");
+      }
     }
   });
 

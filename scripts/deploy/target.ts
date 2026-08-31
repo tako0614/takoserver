@@ -11,6 +11,10 @@ import {
 import { INTEGRATION_E2E_ORGANIZATION_ID } from "../../src/integration-e2e-credential-authority.ts";
 import { parseOpenAiModelConfig } from "../../src/providers/openai.ts";
 import {
+  parseRuntimeInputSealKeyRingDescriptor,
+  type RuntimeInputSealKeyRingDescriptor,
+} from "../../src/runtime-input-seal-keyring.ts";
+import {
   type ProductionStandardServiceSupplies,
   parseProductionStandardServiceSupplies,
 } from "../../src/standard-service-production.ts";
@@ -76,6 +80,8 @@ export interface DeployTarget {
   readonly objectBucketSupplies?: HostedObjectBucketSupplies;
   /** Reviewed Cloudflare sales for released edge identity Forms. */
   readonly edgeSupplies?: HostedEdgeSupplies;
+  /** Closed non-secret identity of the operator-private runtime-input seal key ring. */
+  readonly runtimeInputSealKeyring?: RuntimeInputSealKeyRingDescriptor;
   /** Exact workers.dev suffix assigned to the provisioning account. */
   readonly workerEndpointSuffix?: string;
   /** Requires the private bearer that authorizes the sponsorship owner API. */
@@ -212,6 +218,7 @@ function validateTarget(
       "standardServiceSupplies",
       "objectBucketSupplies",
       "edgeSupplies",
+      "runtimeInputSealKeyring",
       "workerEndpointSuffix",
       "sponsorship",
       "formAuthority",
@@ -278,6 +285,9 @@ function validateTarget(
     ...(value.edgeSupplies === undefined
       ? {}
       : { edgeSupplies: edgeSupplyList(value.edgeSupplies) }),
+    ...(value.runtimeInputSealKeyring === undefined
+      ? {}
+      : { runtimeInputSealKeyring: runtimeInputSealKeyring(value.runtimeInputSealKeyring) }),
     ...(value.workerEndpointSuffix === undefined
       ? {}
       : {
@@ -315,9 +325,17 @@ function validateTarget(
       "deploy target Cloudflare ObjectBucket supply and `r2ParentAccessKeyId` must be configured together",
     );
   }
-  if (Boolean(target.edgeSupplies) !== Boolean(target.workerEndpointSuffix)) {
+  if (!target.edgeSupplies && target.runtimeInputSealKeyring) {
     throw preflightError(
-      "deploy target edge supplies and `workerEndpointSuffix` must be configured together",
+      "deploy target runtimeInputSealKeyring is allowed only with edge supplies",
+    );
+  }
+  if (
+    Boolean(target.edgeSupplies) !== Boolean(target.workerEndpointSuffix) ||
+    Boolean(target.edgeSupplies) !== Boolean(target.runtimeInputSealKeyring)
+  ) {
+    throw preflightError(
+      "deploy target edge supplies, `workerEndpointSuffix`, and `runtimeInputSealKeyring` must be configured together",
     );
   }
   if (target.takosId && target.googleClientId) {
@@ -651,6 +669,14 @@ function edgeSupplyList(value: unknown): HostedEdgeSupplies {
     return parseHostedEdgeSupplies(JSON.stringify(value));
   } catch {
     throw preflightError("deploy target `edgeSupplies` is invalid");
+  }
+}
+
+function runtimeInputSealKeyring(value: unknown): RuntimeInputSealKeyRingDescriptor {
+  try {
+    return parseRuntimeInputSealKeyRingDescriptor(value);
+  } catch {
+    throw preflightError("deploy target `runtimeInputSealKeyring` is invalid");
   }
 }
 

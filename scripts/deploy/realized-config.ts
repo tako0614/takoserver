@@ -222,6 +222,14 @@ export function deploymentVariables(
   if (target.edgeSupplies !== undefined) {
     vars.TAKOSERVER_EDGE_SUPPLIES = JSON.stringify(target.edgeSupplies);
   }
+  if (target.runtimeInputSealKeyring !== undefined) {
+    vars.TAKOSERVER_RUNTIME_INPUT_SEAL_CURRENT_KEY_ID = target.runtimeInputSealKeyring.currentKeyId;
+    vars.TAKOSERVER_RUNTIME_INPUT_SEAL_PREVIOUS_KEY_IDS = JSON.stringify(
+      target.runtimeInputSealKeyring.previousKeyIds,
+    );
+    vars.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING_COMMITMENT =
+      target.runtimeInputSealKeyring.commitment;
+  }
   if (target.formAuthority !== undefined && implementation.workerArtifactDigest !== undefined) {
     vars.TAKOSERVER_WORKER_ARTIFACT_DIGEST = implementation.workerArtifactDigest;
   }
@@ -277,7 +285,7 @@ function exactPublicWorkerProvenance(
 /** Names only; Cloudflare never returns or receives secret bytes here. */
 export function expectedWorkerSecrets(target: DeployTarget): readonly string[] {
   const names = new Set<string>(["TAKOSERVER_SIGNING_KEY"]);
-  if (target.edgeSupplies !== undefined) {
+  if (target.runtimeInputSealKeyring !== undefined) {
     names.add("TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING");
   }
   if (target.sponsorship === true) names.add("TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN");

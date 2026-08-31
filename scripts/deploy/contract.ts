@@ -41,6 +41,8 @@ const hostedTokenInput =
   "`TAKOSERVER_HOSTED_TOKEN_PATH` is required for `--apply` only; `--status` does not read it.";
 const operatorPrivateJwkInput =
   "`TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH` is required for `--apply` only; `--status` does not read it and this surface is integration-only.";
+const runtimeInputSealKeyringInput =
+  "`TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING_PATH` is required for `--apply` only; `--status` never reads key bytes.";
 
 function inputContractWithToken(
   tokenRequirement: string,
@@ -155,6 +157,55 @@ export const DEPLOY_CONTRACT = {
           "Production accepts this transition only with the exact pinned predecessor Version ID, " +
           "a clean/reachable exact commit and independent review; ordinary takoserver-worker deploy " +
           "cannot bypass the selector or carry the retired edge.",
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-runtime-input-seal-key",
+      target: "cloudflare-worker:environment-selected-runtime-input-seal-key-authority",
+      covers: [
+        "src/runtime-input-seal-keyring.ts",
+        "src/entry-worker.ts",
+        "scripts/deploy.ts",
+        "scripts/deploy/runtime-input-seal-key.ts",
+        "scripts/deploy/realized-config.ts",
+        "scripts/deploy/target.ts",
+        "scripts/deploy/worker-artifact.ts",
+        "scripts/deploy/worker-live.ts",
+        "scripts/deploy/worker-state.ts",
+        "migrations/0032_worker_runtime_input_preparations.sql",
+      ],
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING_PATH",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+      ],
+      triggers: ["authority", "irreversible"],
+      obligations: {
+        provenance:
+          `${exactSource} Apply reads one owner-private, link-free, exact-0600 bounded canonical ` +
+          "keyring file and binds its current/previous ids and SHA-256 commitment to the closed target descriptor. " +
+          "The owner gate runs once; candidate code, realized configuration and the one-secret Wrangler file are " +
+          "sealed and requalified before one `wrangler deploy --no-bundle --strict --secrets-file` mutation.",
+        "post-conditions":
+          "Authoritative stable Worker history proves the exact canonical commit, artifact, configuration and " +
+          "secret-name inventory, including the exact non-secret key ids and keyring commitment. The D1 query " +
+          "returns only grouped key ids/counts for prepared or claimed rows; the public product probe exercises " +
+          "runtime parsing before readiness. Exact legacy absence of only this secret and metadata is reported as bootstrap-required.",
+        reversal:
+          "Reversal is a forward repair using a separately reviewed retained prior canonical keyring and its " +
+          "matching target descriptor. Cloudflare Worker Version rollback does not restore this script-wide secret.",
+        "failure-handling":
+          `${highRiskFailure} Apply never retries acknowledgement loss and status alone settles the exact ` +
+          "successor. Missing schema 0032 is unavailable, not empty. Bootstrap requires zero live sealed rows; " +
+          "rotation refuses any desired key-id set that omits a live row key, so a previous key can be removed " +
+          "only at zero use. Other Worker surfaces continue refusing secret or configuration drift." +
+          inputContract(runtimeInputSealKeyringInput, applyReviewInput),
+        "pre-mutation-proof":
+          "Immediately before upload, the exact predecessor Version/config/secret closure and D1 live-key " +
+          "inventory are re-read, the selected source is requalified, and the sealed artifact is byte-requalified.",
         "independent-review": review,
       },
     },
