@@ -1,7 +1,254 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
+
+const ARTIFACT_LIFECYCLE = "0031_takoform_artifact_lifecycle.sql";
+const RUNTIME_INPUT_PREPARATIONS = "0032_worker_runtime_input_preparations.sql";
+const ARTIFACT_FORWARD_REPAIR = "0033_takoform_artifact_lifecycle_forward_repair.sql";
+const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
+  new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
+  "utf8",
+);
+
+type ArtifactLifecycleLineage = "original" | "modified";
+
+interface ArtifactLineageFixture {
+  readonly database: Database;
+  readonly manifestDigest: string;
+  readonly modifiedRowsBeforeRepair:
+    | {
+        readonly roots: Record<string, unknown>[];
+        readonly uncertainties: Record<string, unknown>[];
+        readonly receipts: Record<string, unknown>[];
+      }
+    | undefined;
+  readonly originalRootsBeforeRepair: readonly Record<string, unknown>[];
+}
+
+function prepareArtifactLineage(lineage: ArtifactLifecycleLineage): ArtifactLineageFixture {
+  const database = new Database(":memory:");
+  database.exec(`
+    CREATE TABLE applied_migrations (
+      name TEXT PRIMARY KEY NOT NULL,
+      applied_at TEXT NOT NULL
+    );
+  `);
+  const lifecycleIndex = MIGRATIONS.findIndex((migration) => migration.name === ARTIFACT_LIFECYCLE);
+  expect(lifecycleIndex).toBeGreaterThan(0);
+  for (const migration of MIGRATIONS.slice(0, lifecycleIndex)) {
+    applyHistoricalMigration(database, migration.name, migration.sql);
+  }
+
+  const manifestDigest = `sha256:${"1".repeat(64)}`;
+  const blobDigest = `sha256:${"2".repeat(64)}`;
+  const legacyDigest = `sha256:${"3".repeat(64)}`;
+  const manifest = JSON.stringify({
+    apiVersion: "artifacts.takoform.com/v1alpha1",
+    kind: "WorkerBundle",
+    mainModule: "worker.mjs",
+    modules: [
+      {
+        name: "worker.mjs",
+        mediaType: "application/javascript+module",
+        size: 1,
+        digest: blobDigest,
+      },
+    ],
+  });
+  const resource = JSON.stringify({
+    apiVersion: "edge.forms.takoform.com/v1beta1",
+    kind: "WorkerBundle",
+    metadata: {
+      space: "default",
+      name: "fixture-worker",
+      uid: "uid_fixture_worker",
+    },
+    form: {
+      formRef: {
+        apiVersion: "edge.forms.takoform.com",
+        kind: "WorkerBundle",
+        definitionVersion: "1.0.0",
+        schemaDigest: `sha256:${"4".repeat(64)}`,
+      },
+    },
+    spec: { manifestDigest },
+  });
+  database
+    .query(
+      `INSERT INTO tf_artifact_uploads
+         (id, tenant_id, principal_id, manifest_json, manifest_digest, created_at)
+       VALUES (?, 'tenant_fixture', 'run:fixture', ?, ?, 100)`,
+    )
+    .run("up_fixture", manifest, manifestDigest);
+  database
+    .query(
+      `INSERT INTO tf_artifact_manifests (digest, manifest_json, created_at)
+       VALUES (?, ?, 100)`,
+    )
+    .run(manifestDigest, manifest);
+  database
+    .query("INSERT INTO tf_artifact_holds (tenant_id, digest, kind) VALUES (?, ?, ?)")
+    .run("tenant_fixture", legacyDigest, "blob");
+  database
+    .query(
+      `INSERT INTO tf_artifact_replays (replay_key, status, body_json, expires_at)
+       VALUES (?, 201, ?, 1000)`,
+    )
+    .run(
+      ["tenant_fixture", "run:fixture", "start", "fixture"].join("\u0000"),
+      JSON.stringify({ uploadId: "up_fixture", manifestDigest }),
+    );
+  database
+    .query(
+      `INSERT INTO tf_resources
+         (tenant_id, space, api_version, kind, name, uid, generation, revision,
+          resource_json, relations_json, package_digest, implementation_digest, updated_at)
+       VALUES ('tenant_fixture', 'default', 'edge.forms.takoform.com/v1beta1',
+               'WorkerBundle', 'fixture-worker', 'uid_fixture_worker', '1',
+               'revision-fixture', ?, '[]', NULL, NULL, 100)`,
+    )
+    .run(resource);
+  database.exec(`
+    INSERT INTO tf_resource_deployments
+      (tenant_id, id, resource_uid, offering_id, provider_pack_ref,
+       provider_installation_ref, native_id, native_claimed, state,
+       observed_json, outputs_json, created_at, updated_at)
+    VALUES
+      ('tenant_fixture', 'dep_fixture', 'uid_fixture_worker', 'offering.fixture',
+       'provider.fixture', 'installation.fixture', 'native-fixture', 0,
+       'retained', '{}', '{}', 100, 100),
+      ('tenant_fixture', 'dep_unknown_fixture', 'uid_missing_fixture', 'offering.fixture',
+       'provider.fixture', 'installation.fixture', 'native-unknown-fixture', 0,
+       'retained', '{}', '{}', 110, 110);
+  `);
+
+  const lifecycleSql =
+    lineage === "original"
+      ? (MIGRATIONS[lifecycleIndex]?.sql ?? "")
+      : MODIFIED_ARTIFACT_LIFECYCLE_SQL;
+  applyHistoricalMigration(database, ARTIFACT_LIFECYCLE, lifecycleSql);
+  const runtimeInputs = MIGRATIONS.find(
+    (migration) => migration.name === RUNTIME_INPUT_PREPARATIONS,
+  );
+  expect(runtimeInputs).toBeDefined();
+  applyHistoricalMigration(database, RUNTIME_INPUT_PREPARATIONS, runtimeInputs?.sql ?? "");
+
+  if (lineage === "modified") {
+    database.exec(`
+      UPDATE tf_artifact_roots
+      SET fence = 5
+      WHERE tenant_id = 'tenant_fixture' AND root_kind = 'upload'
+        AND root_id = 'up_fixture' AND digest = '${manifestDigest}';
+
+      UPDATE tf_artifact_consumer_uncertainties
+      SET state = 'resolved', fence = 4, resolved_at = 150
+      WHERE tenant_id = 'tenant_fixture' AND consumer_id = 'dep_fixture';
+
+      UPDATE tf_artifact_consumer_uncertainties
+      SET fence = 9
+      WHERE tenant_id = 'tenant_fixture' AND consumer_id = 'dep_unknown_fixture';
+
+      INSERT INTO tf_artifact_roots
+        (tenant_id, root_kind, root_id, target_kind, digest, state, fence,
+         expires_at, release_reason, created_at, released_at)
+      VALUES
+        ('tenant_fixture', 'resource', 'retired-fixture', 'manifest',
+         'sha256:${"5".repeat(64)}', 'released', 6, NULL, 'consumer_replaced', 100, 200),
+        ('tenant_fixture', 'replay', 'retired-replay-fixture', 'manifest',
+         'sha256:${"6".repeat(64)}', 'released', 8, 180, 'replay_replaced', 100, 200);
+
+      INSERT INTO tf_artifact_owner_closure_receipts
+        (receipt_id, receipt_fence, tenant_id, principal_id, upload_id,
+         manifest_digest, upload_fence, root_fence, state, closed_at,
+         expires_at, created_at, updated_at)
+      VALUES
+        ('receipt_fixture', 7, 'tenant_fixture', 'run:fixture', 'up_fixture',
+         '${manifestDigest}', 1, 5, 'closed', 120, 1000, 120, 120);
+    `);
+  }
+
+  const originalRootsBeforeRepair = database
+    .query(
+      `SELECT tenant_id, root_kind, root_id, target_kind, digest, state, fence,
+              expires_at, release_reason, created_at, released_at
+       FROM tf_artifact_roots ORDER BY tenant_id, root_kind, root_id, target_kind, digest`,
+    )
+    .all() as Record<string, unknown>[];
+  const modifiedRowsBeforeRepair =
+    lineage === "modified"
+      ? {
+          roots: originalRootsBeforeRepair,
+          uncertainties: database
+            .query(
+              `SELECT tenant_id, consumer_kind, consumer_id, state, fence, reason,
+                      created_at, resolved_at
+               FROM tf_artifact_consumer_uncertainties
+               ORDER BY tenant_id, consumer_kind, consumer_id`,
+            )
+            .all() as Record<string, unknown>[],
+          receipts: database
+            .query(
+              `SELECT receipt_id, receipt_fence, tenant_id, principal_id, upload_id,
+                      manifest_digest, upload_fence, root_fence, state, closed_at,
+                      expires_at, created_at, updated_at
+               FROM tf_artifact_owner_closure_receipts ORDER BY receipt_id`,
+            )
+            .all() as Record<string, unknown>[],
+        }
+      : undefined;
+
+  return {
+    database,
+    manifestDigest,
+    modifiedRowsBeforeRepair,
+    originalRootsBeforeRepair,
+  };
+}
+
+function applyHistoricalMigration(database: Database, name: string, sql: string): void {
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database.exec(sql);
+    database
+      .query("INSERT INTO applied_migrations (name, applied_at) VALUES (?, 'fixture')")
+      .run(name);
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function canonicalSqliteSchema(database: Database): readonly Record<string, unknown>[] {
+  return (
+    database
+      .query(
+        `SELECT type, name, tbl_name, sql
+         FROM sqlite_schema
+         WHERE sql IS NOT NULL
+         ORDER BY type, name`,
+      )
+      .all() as { type: string; name: string; tbl_name: string; sql: string }[]
+  ).map((row) => ({
+    type: row.type,
+    name: row.name,
+    tbl_name: row.tbl_name,
+    sql: row.sql,
+  }));
+}
+
+function artifactRoots(database: Database): readonly Record<string, unknown>[] {
+  return database
+    .query(
+      `SELECT tenant_id, root_kind, root_id, target_kind, digest, state, fence,
+              expires_at, release_reason, created_at, released_at
+       FROM tf_artifact_roots ORDER BY tenant_id, root_kind, root_id, target_kind, digest`,
+    )
+    .all() as Record<string, unknown>[];
+}
 
 /**
  * A self-hosted deployment starts with an empty file. If the first run does
@@ -9,6 +256,266 @@ import { migrateSqlite } from "../src/migrate-sqlite.ts";
  * "no such table" — which is what it did.
  */
 describe("bringing a local database up to date", () => {
+  test("keeps the applied artifact lifecycle migration immutable and repairs it forward", () => {
+    const lifecycle = MIGRATIONS.find(
+      (migration) => migration.name === "0031_takoform_artifact_lifecycle.sql",
+    );
+    const repair = MIGRATIONS.find(
+      (migration) => migration.name === "0033_takoform_artifact_lifecycle_forward_repair.sql",
+    );
+
+    expect(lifecycle).toBeDefined();
+    expect(
+      createHash("sha256")
+        .update(lifecycle?.sql ?? "")
+        .digest("hex"),
+    ).toBe("dda3a01d915ef5871ad5a7fb8499761bce4309243044aa0b206076e1cf9bda45");
+    expect(repair).toBeDefined();
+    expect(MIGRATIONS.at(-2)?.name).toBe("0032_worker_runtime_input_preparations.sql");
+    expect(MIGRATIONS.at(-1)?.name).toBe("0033_takoform_artifact_lifecycle_forward_repair.sql");
+    expect(createHash("sha256").update(MODIFIED_ARTIFACT_LIFECYCLE_SQL).digest("hex")).toBe(
+      "9894eb347b8544875e3ebaef9802e9f2ab2680ff819a05b8fca4085d1c6688a7",
+    );
+  });
+
+  test("converges fresh, original 0031, and modified 0031 lineages without losing rows", () => {
+    const fresh = new Database(":memory:");
+    expect(migrateSqlite(fresh).applied.at(-1)).toBe(ARTIFACT_FORWARD_REPAIR);
+
+    const original = prepareArtifactLineage("original");
+    const modified = prepareArtifactLineage("modified");
+    expect(migrateSqlite(original.database).applied).toEqual([ARTIFACT_FORWARD_REPAIR]);
+    expect(migrateSqlite(modified.database).applied).toEqual([ARTIFACT_FORWARD_REPAIR]);
+
+    expect(canonicalSqliteSchema(original.database)).toEqual(canonicalSqliteSchema(fresh));
+    expect(canonicalSqliteSchema(modified.database)).toEqual(canonicalSqliteSchema(fresh));
+
+    const originalRootsAfterRepair = artifactRoots(original.database);
+    for (const row of original.originalRootsBeforeRepair) {
+      expect(originalRootsAfterRepair).toContainEqual(row);
+    }
+    expect(
+      original.database
+        .query(
+          `SELECT root_kind, root_id, state, fence
+           FROM tf_artifact_roots
+           WHERE tenant_id = 'tenant_fixture'
+           ORDER BY root_kind, root_id`,
+        )
+        .all(),
+    ).toEqual([
+      { root_kind: "deployment", root_id: "dep_fixture", state: "active", fence: 1 },
+      {
+        root_kind: "legacy-hold",
+        root_id: `blob:sha256:${"3".repeat(64)}`,
+        state: "active",
+        fence: 1,
+      },
+      {
+        root_kind: "replay",
+        root_id: ["tenant_fixture", "run:fixture", "start", "fixture"].join("\u0000"),
+        state: "active",
+        fence: 1,
+      },
+      {
+        root_kind: "resource",
+        root_id: [
+          "default",
+          "edge.forms.takoform.com/v1beta1",
+          "WorkerBundle",
+          "fixture-worker",
+        ].join("\u0000"),
+        state: "active",
+        fence: 1,
+      },
+      { root_kind: "upload", root_id: "up_fixture", state: "active", fence: 1 },
+    ]);
+    expect(
+      original.database
+        .query(
+          `SELECT consumer_id, state, fence, reason, created_at, resolved_at
+           FROM tf_artifact_consumer_uncertainties
+           WHERE tenant_id = 'tenant_fixture'
+           ORDER BY consumer_id`,
+        )
+        .all(),
+    ).toEqual([
+      {
+        consumer_id: "dep_fixture",
+        state: "active",
+        fence: 1,
+        reason: "historical_deployment_digest_unknown",
+        created_at: 100,
+        resolved_at: null,
+      },
+      {
+        consumer_id: "dep_unknown_fixture",
+        state: "active",
+        fence: 1,
+        reason: "historical_deployment_digest_unknown",
+        created_at: 110,
+        resolved_at: null,
+      },
+    ]);
+
+    const modifiedBefore = modified.modifiedRowsBeforeRepair;
+    expect(modifiedBefore).toBeDefined();
+    if (!modifiedBefore) throw new Error("modified lineage fixture is missing pre-repair rows");
+    const modifiedRootsAfterRepair = artifactRoots(modified.database);
+    expect(modifiedRootsAfterRepair).toEqual(modifiedBefore.roots);
+    expect(
+      modified.database
+        .query(
+          `SELECT tenant_id, consumer_kind, consumer_id, state, fence, reason,
+                  created_at, resolved_at
+           FROM tf_artifact_consumer_uncertainties
+           ORDER BY tenant_id, consumer_kind, consumer_id`,
+        )
+        .all(),
+    ).toEqual(modifiedBefore.uncertainties);
+    expect(
+      modified.database
+        .query(
+          `SELECT receipt_id, receipt_fence, tenant_id, principal_id, upload_id,
+                  manifest_digest, upload_fence, root_fence, state, closed_at,
+                  expires_at, created_at, updated_at
+           FROM tf_artifact_owner_closure_receipts ORDER BY receipt_id`,
+        )
+        .all(),
+    ).toEqual(modifiedBefore.receipts);
+  });
+
+  test("accepts the expanded root lifecycle and rejects undeclared values", () => {
+    const database = new Database(":memory:");
+    migrateSqlite(database);
+    const insert = database.query(`
+      INSERT INTO tf_artifact_roots
+        (tenant_id, root_kind, root_id, target_kind, digest, state, fence,
+         expires_at, release_reason, created_at, released_at)
+      VALUES ('tenant_checks', ?, ?, 'manifest', ?, 'released', 2, ?, ?, 10, 20)
+    `);
+
+    expect(() =>
+      insert.run(
+        "resource",
+        "resource-check",
+        `sha256:${"7".repeat(64)}`,
+        null,
+        "consumer_replaced",
+      ),
+    ).not.toThrow();
+    expect(() =>
+      insert.run(
+        "deployment",
+        "deployment-check",
+        `sha256:${"8".repeat(64)}`,
+        null,
+        "consumer_closed",
+      ),
+    ).not.toThrow();
+    expect(() =>
+      insert.run("replay", "replay-check", `sha256:${"9".repeat(64)}`, 15, "replay_replaced"),
+    ).not.toThrow();
+    expect(() =>
+      insert.run("undeclared", "invalid-kind", `sha256:${"a".repeat(64)}`, null, "consumer_closed"),
+    ).toThrow();
+    expect(() =>
+      insert.run(
+        "resource",
+        "invalid-reason",
+        `sha256:${"b".repeat(64)}`,
+        null,
+        "undeclared_reason",
+      ),
+    ).toThrow();
+  });
+
+  for (const lineage of ["original", "modified"] as const) {
+    test(`keeps previous and current Worker upload writes compatible after ${lineage} 0031`, () => {
+      const { database } = prepareArtifactLineage(lineage);
+      expect(migrateSqlite(database).applied).toEqual([ARTIFACT_FORWARD_REPAIR]);
+      const previousManifestDigest = `sha256:${(lineage === "original" ? "c" : "d").repeat(64)}`;
+      const currentManifestDigest = `sha256:${(lineage === "original" ? "e" : "f").repeat(64)}`;
+      const previousManifest = JSON.stringify({
+        apiVersion: "artifacts.takoform.com/v1alpha1",
+        kind: "WorkerBundle",
+        mainModule: "worker.mjs",
+        modules: [],
+      });
+
+      database
+        .query(
+          `INSERT INTO tf_artifact_uploads
+             (id, tenant_id, principal_id, manifest_json, manifest_digest, created_at)
+           VALUES (?, 'tenant_compat', 'run:compat', ?, ?, 300)`,
+        )
+        .run(`up_previous_${lineage}`, previousManifest, previousManifestDigest);
+      expect(
+        database
+          .query(
+            `SELECT upload.lifecycle_state, upload.lifecycle_fence, upload.updated_at,
+                    root.state AS root_state, root.fence AS root_fence
+             FROM tf_artifact_uploads AS upload
+             JOIN tf_artifact_roots AS root
+               ON root.tenant_id = upload.tenant_id AND root.root_kind = 'upload'
+              AND root.root_id = upload.id AND root.digest = upload.manifest_digest
+             WHERE upload.id = ?`,
+          )
+          .get(`up_previous_${lineage}`),
+      ).toEqual({
+        lifecycle_state: "open",
+        lifecycle_fence: 1,
+        updated_at: 300,
+        root_state: "active",
+        root_fence: 1,
+      });
+
+      database.exec("BEGIN IMMEDIATE");
+      try {
+        database
+          .query(
+            `INSERT INTO tf_artifact_uploads
+               (id, tenant_id, principal_id, manifest_json, manifest_digest,
+                created_at, lifecycle_state, lifecycle_fence, updated_at)
+             VALUES (?, 'tenant_compat', 'run:compat', ?, ?, 400, 'open', 1, 400)`,
+          )
+          .run(`up_current_${lineage}`, previousManifest, currentManifestDigest);
+        database
+          .query(
+            `INSERT INTO tf_artifact_roots
+               (tenant_id, root_kind, root_id, target_kind, digest, state, fence,
+                expires_at, release_reason, created_at, released_at)
+             VALUES ('tenant_compat', 'upload', ?, 'manifest', ?, 'active', 1,
+                     NULL, NULL, 400, NULL)`,
+          )
+          .run(`up_current_${lineage}`, currentManifestDigest);
+        database.exec("COMMIT");
+      } catch (error) {
+        database.exec("ROLLBACK");
+        throw error;
+      }
+      expect(
+        database
+          .query(
+            `SELECT upload.lifecycle_state, upload.lifecycle_fence, upload.updated_at,
+                    root.state AS root_state, root.fence AS root_fence
+             FROM tf_artifact_uploads AS upload
+             JOIN tf_artifact_roots AS root
+               ON root.tenant_id = upload.tenant_id AND root.root_kind = 'upload'
+              AND root.root_id = upload.id AND root.digest = upload.manifest_digest
+             WHERE upload.id = ?`,
+          )
+          .get(`up_current_${lineage}`),
+      ).toEqual({
+        lifecycle_state: "open",
+        lifecycle_fence: 1,
+        updated_at: 400,
+        root_state: "active",
+        root_fence: 1,
+      });
+    });
+  }
+
   test("creates everything on a fresh file", () => {
     const database = new Database(":memory:");
     const report = migrateSqlite(database);
@@ -66,7 +573,7 @@ describe("bringing a local database up to date", () => {
     const pairLifecycle = MIGRATIONS.findIndex(
       (migration) => migration.name === "0030_integration_e2e_credential_pairs.sql",
     );
-    expect(pairLifecycle).toBe(MIGRATIONS.length - 3);
+    expect(pairLifecycle).toBe(MIGRATIONS.length - 4);
     expect(MIGRATIONS[pairLifecycle - 1]?.name).toBe("0029_resource_deletion_attestations.sql");
     expect(MIGRATIONS[pairLifecycle + 1]?.name).toBe("0031_takoform_artifact_lifecycle.sql");
     for (const migration of MIGRATIONS.slice(0, pairLifecycle)) {
@@ -104,6 +611,7 @@ describe("bringing a local database up to date", () => {
       "0030_integration_e2e_credential_pairs.sql",
       "0031_takoform_artifact_lifecycle.sql",
       "0032_worker_runtime_input_preparations.sql",
+      "0033_takoform_artifact_lifecycle_forward_repair.sql",
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -126,7 +634,7 @@ describe("bringing a local database up to date", () => {
     const lifecycle = MIGRATIONS.findIndex(
       (migration) => migration.name === "0031_takoform_artifact_lifecycle.sql",
     );
-    expect(lifecycle).toBe(MIGRATIONS.length - 2);
+    expect(lifecycle).toBe(MIGRATIONS.length - 3);
     for (const migration of MIGRATIONS.slice(0, lifecycle)) {
       database.exec(migration.sql);
       database
@@ -213,6 +721,7 @@ describe("bringing a local database up to date", () => {
     expect(migrateSqlite(database).applied).toEqual([
       "0031_takoform_artifact_lifecycle.sql",
       "0032_worker_runtime_input_preparations.sql",
+      "0033_takoform_artifact_lifecycle_forward_repair.sql",
     ]);
     expect(
       database
