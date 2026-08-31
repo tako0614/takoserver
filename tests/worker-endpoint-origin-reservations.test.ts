@@ -496,14 +496,18 @@ test("activates only the exact Ready endpoint and retains its deletion witness o
     }),
   ).rejects.toMatchObject({ code: "conflict", status: 409 });
 
-  await sql.run("DELETE FROM tf_resources WHERE tenant_id = 'org_01' AND uid = 'uid-endpoint-01'");
   await sql.run(
-    "DELETE FROM tf_resource_deployments WHERE tenant_id = 'org_01' AND resource_uid = 'uid-endpoint-01'",
+    `UPDATE tf_resources
+     SET revision = '2',
+         resource_json = json_set(
+           resource_json,
+           '$.metadata.revision', '2',
+           '$.status.outputs.hostname', 'org_01-default-community.workers.test',
+           '$.status.outputs.url', 'https://org_01-default-community.workers.test/'
+         ),
+         updated_at = updated_at + 1
+     WHERE tenant_id = 'org_01' AND uid = 'uid-endpoint-01'`,
   );
-  await sql.run(
-    "DELETE FROM tf_resource_deletion_attestations WHERE tenant_id = 'org_01' AND resource_uid = 'uid-endpoint-01'",
-  );
-  await seedEndpoint(sql, "https://org_01-default-community.workers.test");
   expect(
     await authority.activate({
       organizationId: "org_01",
