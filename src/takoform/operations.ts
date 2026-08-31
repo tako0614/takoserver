@@ -4,7 +4,11 @@ import type { EngineContext, EngineMutationCommit, TakoformEngine } from "./engi
 import { exactInstalledForm, type FormRegistry, sameFormRef } from "./forms.ts";
 import type { TakoformHostAuthority } from "./host-authority.ts";
 import type { DeferredOperationRecord, ResourceAddress, TakoformStore } from "./store.ts";
-import { TakoformHostError, type TakoformV1Alpha3FormRef } from "./types.ts";
+import {
+  TakoformHostError,
+  type TakoformStoredResource,
+  type TakoformV1Alpha3FormRef,
+} from "./types.ts";
 import {
   applyRequest,
   exactQuery,
@@ -12,6 +16,7 @@ import {
   importRequest,
   jsonBody,
   mutationFingerprint,
+  portableResourceView,
   type ResourcePath,
   requestBodyDigest,
   requiredQuery,
@@ -532,8 +537,7 @@ function successTerminal(
       result: { deleted: true },
     });
   }
-  const resource = structuredClone(mutation.resource);
-  if (omitObservedStatus) delete (resource.status as { observed?: JsonObject }).observed;
+  const resource = portableResourceView(mutation.resource, omitObservedStatus);
   return canonicalJson({
     ...operationDocument(id, true),
     result: { resource },
@@ -573,7 +577,19 @@ function pendingResponse(id: string, retryAfterSeconds: number): Response {
 
 function terminalResponse(operation: DeferredOperationRecord): Response {
   if (!operation.terminalJson) throw new TakoformHostError("internal_error", 500);
-  return jsonResponse(operation.terminalJson);
+  let document: unknown;
+  try {
+    document = JSON.parse(operation.terminalJson);
+  } catch {
+    throw new TakoformHostError("internal_error", 500);
+  }
+  if (!isRecord(document)) throw new TakoformHostError("internal_error", 500);
+  if (isRecord(document.result) && isRecord(document.result.resource)) {
+    document.result.resource = portableResourceView(
+      document.result.resource as unknown as TakoformStoredResource,
+    );
+  }
+  return jsonResponse(canonicalJson(document));
 }
 
 function jsonResponse(body: string): Response {
@@ -581,6 +597,10 @@ function jsonResponse(body: string): Response {
     status: 200,
     headers: { "content-type": "application/json" },
   });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isTerminal(operation: DeferredOperationRecord): boolean {

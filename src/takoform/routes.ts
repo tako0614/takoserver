@@ -40,6 +40,7 @@ import {
   exactQuery,
   failure,
   parsedResourcePath,
+  portableResourceView,
   requiredQuery,
   resourceResponse,
   safeSegment,
@@ -568,7 +569,7 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
       }
       if (result.kind !== "prepared") throw new TakoformHostError();
       return Response.json({
-        resource: result.resource,
+        resource: renderedResource(result.resource, configuration.omitObservedStatus),
         review: result.review,
       });
     }
@@ -622,7 +623,9 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
         return failure("operation_not_cancellable", 409);
       }
       if (request.method !== "GET") return failure("invalid_argument", 404);
-      return Response.json({ operation: operationView(record) });
+      return Response.json({
+        operation: operationView(record, configuration.omitObservedStatus),
+      });
     }
 
     return failure("invalid_argument", 404);
@@ -969,7 +972,10 @@ async function provisionRoute(
       });
     }
     if (result.kind !== "prepared") throw new TakoformHostError();
-    return Response.json({ resource: result.resource, review: result.review });
+    return Response.json({
+      resource: renderedResource(result.resource),
+      review: result.review,
+    });
   }
 
   const resource = PROVISION_RESOURCE.exec(url.pathname);
@@ -1035,25 +1041,29 @@ function shaped(
   omitObservedStatus = false,
 ): Response {
   if (result.kind === "resource") {
-    return resourceResponse(renderedResource(result.resource, omitObservedStatus), result.status);
+    return resourceResponse(result.resource, result.status, omitObservedStatus);
   }
   if (result.kind === "deleted") return new Response(null, { status: 204 });
   throw new TakoformHostError();
 }
 
-function operationView(record: OperationRecord): JsonObject {
+function operationView(record: OperationRecord, omitObservedStatus = false): JsonObject {
   return {
     id: record.id,
     operation: record.operation,
     state: record.state,
     createdAt: record.createdAt,
-    ...(record.resource ? { resource: record.resource as unknown as JsonObject } : {}),
+    ...(record.resource
+      ? {
+          resource: renderedResource(record.resource, omitObservedStatus) as unknown as JsonObject,
+        }
+      : {}),
   };
 }
 
 function formDefinition(form: InstalledTakoformForm, exposeConstraints = false): JsonObject {
   return {
-    identity: structuredClone(form.identity) as unknown as JsonObject,
+    identity: portableFormIdentity(form),
     ...(form.displayName ? { displayName: form.displayName } : {}),
     ...(form.description ? { description: form.description } : {}),
     desiredSchema: structuredClone(form.desiredSchema),
@@ -1070,13 +1080,26 @@ function formAvailability(
   availability: TakoformFormAvailability,
 ): JsonObject {
   return {
-    identity: structuredClone(form.identity) as unknown as JsonObject,
+    identity: portableFormIdentity(form),
     definitionKnown: true,
     installed: true,
     executable: availability.executable,
     activated: availability.activated,
     availableToPrincipal: availability.availableToPrincipal,
     operations: [...form.operations],
+  };
+}
+
+/**
+ * Host implementation identity is admission and execution authority, not part
+ * of the portable Host API v1 FormReference. Keep it inside the durable Host
+ * projection while exposing only the immutable FormRef and package audit
+ * evidence accepted by released clients.
+ */
+function portableFormIdentity(form: InstalledTakoformForm): JsonObject {
+  return {
+    formRef: structuredClone(form.identity.formRef) as unknown as JsonObject,
+    ...(form.identity.packageDigest ? { packageDigest: form.identity.packageDigest } : {}),
   };
 }
 
@@ -1094,14 +1117,16 @@ async function availabilityOf(
     : { executable: true, activated: true, availableToPrincipal: true };
 }
 
-function renderedResource(
-  resource: Parameters<typeof resourceResponse>[0],
-  omitObservedStatus = false,
-): Parameters<typeof resourceResponse>[0] {
-  if (!omitObservedStatus || resource.status.observed === undefined) return resource;
-  const copy = structuredClone(resource);
-  delete (copy.status as { observed?: JsonObject }).observed;
-  return copy;
+function renderedResource<
+  T extends {
+    readonly form: {
+      readonly formRef: unknown;
+      readonly implementationDigest?: string;
+    };
+    readonly status?: { readonly observed?: JsonObject };
+  },
+>(resource: T, omitObservedStatus = false): T {
+  return portableResourceView(resource, omitObservedStatus);
 }
 
 /**

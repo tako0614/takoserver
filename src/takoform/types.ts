@@ -8,9 +8,10 @@ export type { TakoformBindingRef, TakoformInterfaceRef, TakoformV1Alpha3FormRef 
 /**
  * The Takoform Host wire vocabulary.
  *
- * These shapes are the product's primary contract. A released Terraform
- * provider pins the exact `formRef` quad and the resource envelope below, so
- * fields may be added but never renamed, reordered in meaning, or removed.
+ * These internal shapes carry both portable contract values and Host-only
+ * authority. Public Host API v1 responses are closed by the Takoform schema
+ * and must pass through the wire projector; never serialize this model
+ * directly or treat an internal field as an additive v1 extension.
  */
 
 export type TakoformOperation = "create" | "read" | "update" | "delete" | "import" | "observe";

@@ -25,6 +25,7 @@ const form: InstalledTakoformForm = {
       definitionVersion: "1.0.0",
       schemaDigest: `sha256:${"a".repeat(64)}`,
     },
+    implementationDigest: `sha256:${"b".repeat(64)}`,
   },
   desiredSchema: {
     type: "object",
@@ -275,7 +276,10 @@ describe("durable deferred Takoform operations", () => {
     const settled = await opened.host.handle(request(operationPath, "primary"));
     expect(settled?.status).toBe(200);
     const settledText = await settled?.text();
-    expect(JSON.parse(settledText ?? "null")).toMatchObject({
+    const settledBody = JSON.parse(settledText ?? "null") as {
+      readonly result: { readonly resource: { readonly form: unknown } };
+    };
+    expect(settledBody).toMatchObject({
       apiVersion: "operations.takoform.com/v1alpha1",
       kind: "Operation",
       id: acceptedBody.operation.id,
@@ -286,6 +290,9 @@ describe("durable deferred Takoform operations", () => {
           spec: { value: "first" },
         },
       },
+    });
+    expect(settledBody.result.resource.form).toEqual({
+      formRef: form.identity.formRef,
     });
     const settledAgain = await opened.host.handle(request(operationPath, "primary"));
     expect(await settledAgain?.text()).toBe(settledText);

@@ -339,8 +339,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 // --- responses -------------------------------------------------------------
 
-export function resourceResponse(resource: TakoformStoredResource, status = 200): Response {
-  return Response.json(resource, { status, headers: etag(resource) });
+export function portableResourceView<
+  T extends {
+    readonly form: {
+      readonly formRef: unknown;
+      readonly implementationDigest?: string;
+    };
+    readonly status?: { readonly observed?: JsonObject };
+  },
+>(resource: T, omitObservedStatus = false): T {
+  const copy = structuredClone(resource);
+  delete (copy.form as { implementationDigest?: string }).implementationDigest;
+  if (omitObservedStatus && copy.status) {
+    delete (copy.status as { observed?: JsonObject }).observed;
+  }
+  return copy;
+}
+
+export function resourceResponse(
+  resource: TakoformStoredResource,
+  status = 200,
+  omitObservedStatus = false,
+): Response {
+  const view = portableResourceView(resource, omitObservedStatus);
+  return Response.json(view, { status, headers: etag(view) });
 }
 
 export function etag(resource: TakoformStoredResource): HeadersInit {
