@@ -197,6 +197,41 @@ test("accepts the exact Go provider preflight golden across the full Unicode dom
   ).resolves.toMatchObject({ runtimeInputReference: expectedReference, status: "prepared" });
 });
 
+test("rejects unpaired UTF-16 surrogates instead of hashing a cross-language replacement", async () => {
+  for (const invalid of ["\ud800", "\ud800x", "\udc00", "x\udc00"]) {
+    await expect(
+      deriveRuntimeInputReference({
+        format: "takoserver.worker-runtime-input-preflight.v1",
+        materialSetNonce: "nonce-01",
+        target: {
+          space: PREPARATION_TARGET.space,
+          workerName: PREPARATION_TARGET.workerName,
+          bundleName: PREPARATION_TARGET.bundleName,
+          endpointName: "public",
+          originReservationId: PREPARATION_TARGET.originReservationId,
+          canonicalPublicOrigin: "https://community.example.test",
+        },
+        bindings: { A: invalid },
+      }),
+    ).rejects.toMatchObject({ code: "invalid_argument", status: 400 });
+  }
+  await expect(
+    deriveRuntimeInputReference({
+      format: "takoserver.worker-runtime-input-preflight.v1",
+      materialSetNonce: "nonce-01",
+      target: {
+        space: PREPARATION_TARGET.space,
+        workerName: PREPARATION_TARGET.workerName,
+        bundleName: PREPARATION_TARGET.bundleName,
+        endpointName: "public",
+        originReservationId: PREPARATION_TARGET.originReservationId,
+        canonicalPublicOrigin: "https://community.example.test",
+      },
+      bindings: { A: "valid-😀-�" },
+    }),
+  ).resolves.toMatchObject({ runtimeInputReference: expect.stringMatching(/^rip1\./u) });
+});
+
 function leaseInput(reference: string, overrides: { readonly operationId?: string } = {}) {
   return {
     organizationId: "org_01",

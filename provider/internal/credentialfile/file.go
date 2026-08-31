@@ -180,6 +180,9 @@ func load(path string, expectedTarget *Target, expectedReservationID string, exp
 	if !utf8.Valid(raw) {
 		return Envelope{}, errors.New("runtime input credential file is not valid UTF-8 JSON")
 	}
+	if err := rejectUnpairedSurrogateEscapes(raw); err != nil {
+		return Envelope{}, err
+	}
 
 	var envelope Envelope
 	if err := rejectDuplicateJSONKeys(raw); err != nil {
@@ -296,6 +299,81 @@ func requireJSONEOF(decoder *json.Decoder) error {
 		return errors.New("runtime input credential file contains trailing JSON")
 	}
 	return nil
+}
+
+var errUnpairedSurrogateEscape = errors.New("runtime input credential file contains an unpaired UTF-16 surrogate escape")
+
+// rejectUnpairedSurrogateEscapes checks JSON string escapes before
+// encoding/json decodes them. encoding/json replaces a lone UTF-16 surrogate
+// escape with U+FFFD, which would otherwise produce a different preflight
+// commitment from the TypeScript implementation. Valid high/low pairs are
+// left untouched and ordinary literal U+FFFD remains valid UTF-8.
+func rejectUnpairedSurrogateEscapes(raw []byte) error {
+	for index := 0; index < len(raw); index++ {
+		if raw[index] != '"' {
+			continue
+		}
+	stringScan:
+		for index++; index < len(raw); index++ {
+			switch raw[index] {
+			case '"':
+				// End of this JSON string; continue scanning for the next one.
+				break stringScan
+			case '\\':
+				if index+1 >= len(raw) {
+					continue
+				}
+				if raw[index+1] != 'u' || index+6 > len(raw) {
+					index++
+					continue
+				}
+				code, ok := parseHexQuad(raw[index+2 : index+6])
+				if !ok {
+					index++
+					continue
+				}
+				switch {
+				case code >= 0xD800 && code <= 0xDBFF:
+					if index+12 > len(raw) || raw[index+6] != '\\' || raw[index+7] != 'u' {
+						return errUnpairedSurrogateEscape
+					}
+					low, lowOK := parseHexQuad(raw[index+8 : index+12])
+					if !lowOK || low < 0xDC00 || low > 0xDFFF {
+						return errUnpairedSurrogateEscape
+					}
+					// Consume the complete high/low pair. The loop increment
+					// advances to the first byte after the low escape.
+					index += 11
+				case code >= 0xDC00 && code <= 0xDFFF:
+					return errUnpairedSurrogateEscape
+				default:
+					index += 5
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func parseHexQuad(raw []byte) (uint16, bool) {
+	if len(raw) != 4 {
+		return 0, false
+	}
+	var value uint16
+	for _, digit := range raw {
+		value <<= 4
+		switch {
+		case digit >= '0' && digit <= '9':
+			value += uint16(digit - '0')
+		case digit >= 'a' && digit <= 'f':
+			value += uint16(digit-'a') + 10
+		case digit >= 'A' && digit <= 'F':
+			value += uint16(digit-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	return value, true
 }
 
 func validateOrigin(value string) error {

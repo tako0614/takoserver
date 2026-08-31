@@ -271,6 +271,47 @@ func TestLoadRejectsDuplicateAndDeepJSON(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsUnpairedSurrogateEscapes(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name  string
+		value string
+	}{
+		{name: "high-only", value: `"\ud800"`},
+		{name: "low-only", value: `"\udc00"`},
+		{name: "broken-pair", value: `"\ud800\u0041"`},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "runtime-inputs.json")
+			writeEnvelope(t, path, validEnvelopeJSON(`"ENCRYPTION_KEY":`+test.value))
+			if _, err := credentialfile.Load(path, reservationID, []string{"ENCRYPTION_KEY"}); err == nil || !strings.Contains(err.Error(), "surrogate") {
+				t.Fatalf("Load() error = %v, want unpaired surrogate rejection", err)
+			}
+		})
+	}
+}
+
+func TestLoadAcceptsValidSurrogatePairAndLiteralReplacementRune(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "runtime-inputs.json")
+	writeEnvelope(t, path, validEnvelopeJSON(`"ENCRYPTION_KEY":"\ud83d\ude00","LITERAL_REPLACEMENT":"�","ESCAPED_TEXT":"\\uD800"`))
+	got, err := credentialfile.Load(path, reservationID, []string{"ENCRYPTION_KEY", "LITERAL_REPLACEMENT", "ESCAPED_TEXT"})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got.Values["ENCRYPTION_KEY"] != "😀" {
+		t.Fatalf("surrogate pair value = %q, want non-BMP rune", got.Values["ENCRYPTION_KEY"])
+	}
+	if got.Values["LITERAL_REPLACEMENT"] != "�" {
+		t.Fatalf("literal replacement value = %q, want U+FFFD", got.Values["LITERAL_REPLACEMENT"])
+	}
+	if got.Values["ESCAPED_TEXT"] != `\uD800` {
+		t.Fatalf("escaped literal value = %q, want the literal backslash-u text", got.Values["ESCAPED_TEXT"])
+	}
+}
+
 func writeEnvelope(t *testing.T, path, contents string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {

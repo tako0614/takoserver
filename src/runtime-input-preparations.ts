@@ -88,6 +88,7 @@ export async function deriveRuntimeInputReference(input: RuntimeInputPreflightDo
     if (
       typeof value !== "string" ||
       value.length === 0 ||
+      hasUnpairedSurrogate(value) ||
       encode(value).byteLength > MAX_VALUE_BYTES
     ) {
       throw new RuntimeInputPreparationError("invalid_argument", 400);
@@ -127,6 +128,21 @@ export async function deriveRuntimeInputReference(input: RuntimeInputPreflightDo
  */
 function crossLanguageJson(value: unknown): string {
   return JSON.stringify(value).replaceAll("\u2028", "\\u2028").replaceAll("\u2029", "\\u2029");
+}
+
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      if (index + 1 >= value.length) return true;
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      index += 1;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export interface RuntimeInputPreparationProjection {
