@@ -54,8 +54,8 @@ func TestProviderExposesOneValueFreeRuntimeInputResource(t *testing.T) {
 		"origin_resource_uid",
 		"canonical_public_origin",
 		"binding_names",
+		"material_set_id",
 		"operation_id",
-		"preparation_id",
 		"status",
 		"expires_at",
 	} {
@@ -63,14 +63,14 @@ func TestProviderExposesOneValueFreeRuntimeInputResource(t *testing.T) {
 			t.Errorf("resource schema omits %q", name)
 		}
 	}
-	for _, forbidden := range []string{"token", "credential_file", "binding_values", "secrets", "value_digest"} {
+	for _, forbidden := range []string{"token", "credential_file", "binding_values", "secrets", "value_digest", "preparation_id"} {
 		if _, ok := resourceSchema.Schema.Attributes[forbidden]; ok {
 			t.Errorf("resource state exposes forbidden attribute %q", forbidden)
 		}
 	}
-	for _, name := range []string{"space", "worker_name", "bundle_name", "origin_resource_uid", "canonical_public_origin"} {
+	for _, name := range []string{"space", "worker_name", "bundle_name", "origin_resource_uid", "canonical_public_origin", "material_set_id"} {
 		attribute, ok := resourceSchema.Schema.Attributes[name].(resourceschema.StringAttribute)
-		if !ok || len(attribute.PlanModifiers) == 0 {
+		if !ok || !attribute.Required || len(attribute.PlanModifiers) == 0 {
 			t.Errorf("%s must replace instead of mutating a preparation in place", name)
 		}
 	}

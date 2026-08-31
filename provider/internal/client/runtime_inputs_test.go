@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -53,7 +55,7 @@ func TestPutRuntimeInputPreparationUsesTheTakoserverControlBoundary(t *testing.T
 		t.Fatalf("New() error = %v", err)
 	}
 	result, err := api.PutRuntimeInputPreparation(context.Background(), "op-01", client.RuntimeInputPreparationInput{
-		MaterialSetID:         "material-set-01",
+		MaterialSetID:         "material-set:v1:5866abee0fff6a8765e02977561092a6f78cd3e97a5e2380a548aafbd030f4a3",
 		Space:                 "default",
 		WorkerName:            "yurucommu",
 		BundleName:            "bundle-01",
@@ -71,7 +73,7 @@ func TestPutRuntimeInputPreparationUsesTheTakoserverControlBoundary(t *testing.T
 	if gotBody["format"] != "takoserver.worker-runtime-input-preparation@v1" {
 		t.Fatalf("request format = %#v", gotBody["format"])
 	}
-	if gotBody["materialSetId"] != "material-set-01" {
+	if gotBody["materialSetId"] != "material-set:v1:5866abee0fff6a8765e02977561092a6f78cd3e97a5e2380a548aafbd030f4a3" {
 		t.Fatalf("materialSetId = %#v", gotBody["materialSetId"])
 	}
 	bindings, ok := gotBody["bindings"].(map[string]any)
@@ -155,5 +157,90 @@ func TestDeleteRuntimeInputPreparationIsIdempotent(t *testing.T) {
 				t.Fatalf("DeleteRuntimeInputPreparation() error = %v", err)
 			}
 		})
+	}
+}
+
+func TestNewRequiresOneCanonicalEndpointOrigin(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+
+	for _, endpoint := range []string{server.URL + "/", "https://EXAMPLE.test", "https://example.test/", "https://example.test?query=1", "https://example.test:443"} {
+		endpoint := endpoint
+		t.Run(endpoint, func(t *testing.T) {
+			t.Parallel()
+			if _, err := client.New(endpoint, "provider-token", "org-01", server.Client()); err == nil {
+				t.Fatalf("New(%q) accepted a non-canonical endpoint origin", endpoint)
+			}
+		})
+	}
+}
+
+func TestRuntimeInputClientDoesNotFollowRedirectsOrLeakResponseBody(t *testing.T) {
+	t.Parallel()
+	const secret = "redirect-body-must-not-appear-in-error"
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Location", "https://example.test/redirected")
+		w.WriteHeader(http.StatusFound)
+		_, _ = w.Write([]byte(secret))
+	}))
+	defer server.Close()
+
+	api, err := client.New(server.URL, "provider-token", "org-01", server.Client())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	_, err = api.PutRuntimeInputPreparation(context.Background(), "op-01", client.RuntimeInputPreparationInput{
+		MaterialSetID:         "material-set:v1:5866abee0fff6a8765e02977561092a6f78cd3e97a5e2380a548aafbd030f4a3",
+		Space:                 "default",
+		WorkerName:            "yurucommu",
+		BundleName:            "bundle-01",
+		OriginResourceUID:     "uid-origin-01",
+		CanonicalPublicOrigin: "https://community.example.test",
+		Bindings:              map[string]string{"ENCRYPTION_KEY": "placeholder-encryption-value"},
+	})
+	if err == nil {
+		t.Fatal("PutRuntimeInputPreparation() accepted a redirect response")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("redirect response body leaked through error: %v", err)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("HTTP requests = %d, want one request without redirect", got)
+	}
+}
+
+func TestRuntimeInputClientHonorsContextCancellation(t *testing.T) {
+	t.Parallel()
+	started := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+		w.WriteHeader(http.StatusGatewayTimeout)
+	}))
+	defer server.Close()
+
+	api, err := client.New(server.URL, "provider-token", "org-01", server.Client())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, callErr := api.GetRuntimeInputPreparation(ctx, "op-01")
+		result <- callErr
+	}()
+	<-started
+	cancel()
+	select {
+	case callErr := <-result:
+		if callErr == nil {
+			t.Fatal("GetRuntimeInputPreparation() succeeded after context cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("GetRuntimeInputPreparation() did not honor context cancellation")
 	}
 }

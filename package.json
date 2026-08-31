@@ -15,7 +15,7 @@
     "typecheck:worker": "tsc --noEmit -p tsconfig.worker.json",
     "typecheck:form-authority-worker": "tsc --noEmit -p tsconfig.form-authority-worker.json && tsc --noEmit -p tsconfig.integration-form-authority-worker.json && tsc --noEmit -p tsconfig.integration-form-authority-operator-worker.json && tsc --noEmit -p tsconfig.form-authority-identity-probe.json",
     "test": "bun test",
-    "check:provider": "cd provider && go test ./... && go vet ./... && go build ./...",
+    "check:provider": "cd provider && test -z \"$(gofmt -l .)\" && go test ./... && go vet ./... && go build ./...",
     "build": "bun scripts/build.ts",
     "build:worker": "bun scripts/build-worker.ts",
     "build:form-authority-worker": "bun scripts/build-form-authority-worker.ts",

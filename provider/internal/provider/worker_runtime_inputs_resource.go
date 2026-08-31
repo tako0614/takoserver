@@ -37,8 +37,8 @@ type workerRuntimeInputsModel struct {
 	OriginResourceUID     types.String `tfsdk:"origin_resource_uid"`
 	CanonicalPublicOrigin types.String `tfsdk:"canonical_public_origin"`
 	BindingNames          types.Set    `tfsdk:"binding_names"`
+	MaterialSetID         types.String `tfsdk:"material_set_id"`
 	OperationID           types.String `tfsdk:"operation_id"`
-	PreparationID         types.String `tfsdk:"preparation_id"`
 	Status                types.String `tfsdk:"status"`
 	ExpiresAt             types.String `tfsdk:"expires_at"`
 }
@@ -84,10 +84,16 @@ func (r *workerRuntimeInputsResource) Schema(_ context.Context, _ frameworkresou
 					setplanmodifier.RequiresReplace(),
 				},
 			},
-			"operation_id":   resourceschema.StringAttribute{Computed: true},
-			"preparation_id": resourceschema.StringAttribute{Computed: true},
-			"status":         resourceschema.StringAttribute{Computed: true},
-			"expires_at":     resourceschema.StringAttribute{Computed: true},
+			"material_set_id": resourceschema.StringAttribute{
+				Required: true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
+				Description: "Non-secret identity of the exact material set expected in the run-scoped credential file.",
+			},
+			"operation_id": resourceschema.StringAttribute{Computed: true},
+			"status":       resourceschema.StringAttribute{Computed: true},
+			"expires_at":   resourceschema.StringAttribute{Computed: true},
 		},
 	}
 }
@@ -125,12 +131,21 @@ func (r *workerRuntimeInputsResource) Create(ctx context.Context, request framew
 	}
 	sort.Strings(bindingNames)
 
-	envelope, err := credentialfile.Load(r.data.credentialFilePath, plan.CanonicalPublicOrigin.ValueString(), bindingNames)
+	envelope, err := credentialfile.LoadForTarget(r.data.credentialFilePath, credentialfile.Target{
+		Space:             plan.Space.ValueString(),
+		WorkerName:        plan.WorkerName.ValueString(),
+		BundleName:        plan.BundleName.ValueString(),
+		OriginResourceUID: plan.OriginResourceUID.ValueString(),
+	}, plan.CanonicalPublicOrigin.ValueString(), bindingNames)
 	if err != nil {
 		response.Diagnostics.AddError("Invalid runtime input credential file", err.Error())
 		return
 	}
-	operationID, err := deriveOperationID(plan, envelope.MaterialSetID, bindingNames)
+	if plan.MaterialSetID.ValueString() != envelope.MaterialSetID {
+		response.Diagnostics.AddAttributeError(path.Root("material_set_id"), "Runtime input material set does not match the credential file", "The planned non-secret material set identity must exactly match the credential file before Takoserver receives any material.")
+		return
+	}
+	operationID, err := deriveOperationID(plan, plan.MaterialSetID.ValueString(), bindingNames)
 	if err != nil {
 		response.Diagnostics.AddError("Cannot derive runtime input operation identity", err.Error())
 		return
@@ -150,7 +165,6 @@ func (r *workerRuntimeInputsResource) Create(ctx context.Context, request framew
 	}
 
 	plan.OperationID = types.StringValue(prepared.OperationID)
-	plan.PreparationID = types.StringValue(prepared.PreparationID)
 	plan.Status = types.StringValue(prepared.Status)
 	plan.ExpiresAt = types.StringValue(prepared.ExpiresAt.UTC().Format(time.RFC3339))
 	response.Diagnostics.Append(response.State.Set(ctx, &plan)...)
@@ -179,13 +193,21 @@ func (r *workerRuntimeInputsResource) Read(ctx context.Context, request framewor
 		response.Diagnostics.AddError("Takoserver runtime input read failed", err.Error())
 		return
 	}
+	if observed.Status == "expired" || observed.Status == "revoked" {
+		response.State.RemoveResource(ctx)
+		return
+	}
+	if observed.Status == "indeterminate" {
+		response.Diagnostics.AddError("Takoserver runtime input state is indeterminate", "The durable preparation outcome is unknown; refusing to clear or reuse the resource state.")
+		return
+	}
 	var stateNames []string
 	response.Diagnostics.Append(state.BindingNames.ElementsAs(ctx, &stateNames, false)...)
 	if response.Diagnostics.HasError() {
 		return
 	}
 	sort.Strings(stateNames)
-	if observed.PreparationID != state.PreparationID.ValueString() || observed.Space != state.Space.ValueString() || observed.WorkerName != state.WorkerName.ValueString() || observed.BundleName != state.BundleName.ValueString() || observed.OriginResourceUID != state.OriginResourceUID.ValueString() || observed.CanonicalPublicOrigin != state.CanonicalPublicOrigin.ValueString() || !equalStringSlices(observed.BindingNames, stateNames) {
+	if observed.Space != state.Space.ValueString() || observed.WorkerName != state.WorkerName.ValueString() || observed.BundleName != state.BundleName.ValueString() || observed.OriginResourceUID != state.OriginResourceUID.ValueString() || observed.CanonicalPublicOrigin != state.CanonicalPublicOrigin.ValueString() || !equalStringSlices(observed.BindingNames, stateNames) {
 		response.Diagnostics.AddError("Takoserver runtime input state drift", "The durable value-free preparation projection no longer matches the OpenTofu state identity.")
 		return
 	}
@@ -264,6 +286,7 @@ func requireKnownPlan(plan *workerRuntimeInputsModel, response *frameworkresourc
 		{name: "bundle_name", value: plan.BundleName},
 		{name: "origin_resource_uid", value: plan.OriginResourceUID},
 		{name: "canonical_public_origin", value: plan.CanonicalPublicOrigin},
+		{name: "material_set_id", value: plan.MaterialSetID},
 	} {
 		if candidate.value.IsUnknown() || candidate.value.IsNull() || candidate.value.ValueString() == "" {
 			response.Diagnostics.AddAttributeError(path.Root(candidate.name), "Runtime input target must be known", "The runtime input target and origin must be exact before Takoserver receives any material.")

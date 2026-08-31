@@ -14,6 +14,8 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -23,6 +25,8 @@ const (
 )
 
 var opaqueIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+
+var materialSetIDPattern = regexp.MustCompile(`^material-set:v1:[0-9a-f]{64}$`)
 
 // ErrNotFound means no durable preparation exists for the exact operation.
 var ErrNotFound = errors.New("runtime input preparation not found")
@@ -92,7 +96,7 @@ type preparationTarget struct {
 // loopback endpoint so local OpenTofu tests need no TLS exception elsewhere.
 func New(endpoint, token, organizationID string, httpClient *http.Client) (*Client, error) {
 	parsed, err := url.Parse(endpoint)
-	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.Opaque != "" || parsed.Path != "" || parsed.RawPath != "" || strings.HasSuffix(parsed.Host, ":") || nonCanonicalEndpointPort(parsed) || parsed.Host != strings.ToLower(parsed.Host) || parsed.String() != endpoint {
 		return nil, errors.New("Takoserver endpoint must be one absolute origin")
 	}
 	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopbackHost(parsed.Hostname())) {
@@ -123,6 +127,12 @@ func New(endpoint, token, organizationID string, httpClient *http.Client) (*Clie
 func (c *Client) PutRuntimeInputPreparation(ctx context.Context, operationID string, input RuntimeInputPreparationInput) (RuntimeInputPreparation, error) {
 	if !opaqueIDPattern.MatchString(operationID) {
 		return RuntimeInputPreparation{}, errors.New("runtime input operation identity is invalid")
+	}
+	if !materialSetIDPattern.MatchString(input.MaterialSetID) {
+		return RuntimeInputPreparation{}, errors.New("runtime input material set identity is invalid")
+	}
+	if err := validateCanonicalOrigin(input.CanonicalPublicOrigin); err != nil {
+		return RuntimeInputPreparation{}, err
 	}
 	requestBody := runtimeInputPreparationRequest{
 		Format:        runtimeInputPreparationFormat,
@@ -161,13 +171,8 @@ func (c *Client) PutRuntimeInputPreparation(ctx context.Context, operationID str
 		return RuntimeInputPreparation{}, fmt.Errorf("Takoserver runtime input preparation returned HTTP %d", response.StatusCode)
 	}
 
-	var wire runtimeInputPreparationResponse
-	decoder := json.NewDecoder(io.LimitReader(response.Body, maxResponseBytes+1))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&wire); err != nil {
-		return RuntimeInputPreparation{}, errors.New("Takoserver runtime input preparation returned an invalid response")
-	}
-	if err := requireEOF(decoder); err != nil {
+	wire, err := decodeRuntimeInputPreparation(response.Body)
+	if err != nil {
 		return RuntimeInputPreparation{}, err
 	}
 	if wire.Format != runtimeInputPreparationFormat || wire.OperationID != operationID || wire.PreparationID == "" || wire.Status != "prepared" || wire.ExpiresAt.IsZero() {
@@ -234,6 +239,9 @@ func (c *Client) GetRuntimeInputPreparation(ctx context.Context, operationID str
 	if wire.Target.Space == "" || wire.Target.WorkerName == "" || wire.Target.BundleName == "" || wire.Target.OriginResourceUID == "" || wire.CanonicalPublicOrigin == "" || len(wire.BindingNames) == 0 {
 		return RuntimeInputPreparation{}, errors.New("Takoserver runtime input preparation read returned an incomplete projection")
 	}
+	if err := validateCanonicalOrigin(wire.CanonicalPublicOrigin); err != nil {
+		return RuntimeInputPreparation{}, errors.New("Takoserver runtime input preparation read returned a non-canonical origin")
+	}
 	if !sort.StringsAreSorted(wire.BindingNames) || hasDuplicateStrings(wire.BindingNames) {
 		return RuntimeInputPreparation{}, errors.New("Takoserver runtime input preparation read returned non-canonical binding names")
 	}
@@ -276,8 +284,15 @@ func requireEOF(decoder *json.Decoder) error {
 }
 
 func decodeRuntimeInputPreparation(reader io.Reader) (runtimeInputPreparationResponse, error) {
+	raw, err := io.ReadAll(io.LimitReader(reader, maxResponseBytes+1))
+	if err != nil {
+		return runtimeInputPreparationResponse{}, errors.New("Takoserver runtime input preparation returned an invalid response")
+	}
+	if len(raw) > maxResponseBytes {
+		return runtimeInputPreparationResponse{}, errors.New("Takoserver runtime input preparation response is too large")
+	}
 	var wire runtimeInputPreparationResponse
-	decoder := json.NewDecoder(io.LimitReader(reader, maxResponseBytes+1))
+	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&wire); err != nil {
 		return runtimeInputPreparationResponse{}, errors.New("Takoserver runtime input preparation returned an invalid response")
@@ -351,4 +366,21 @@ func isLoopbackHost(host string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+func validateCanonicalOrigin(value string) error {
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.Opaque != "" || parsed.Path != "" || parsed.RawPath != "" || strings.HasSuffix(parsed.Host, ":") || nonCanonicalEndpointPort(parsed) || parsed.Host != strings.ToLower(parsed.Host) || parsed.String() != value {
+		return errors.New("Takoserver canonical public origin must be one canonical HTTPS origin")
+	}
+	return nil
+}
+
+func nonCanonicalEndpointPort(parsed *url.URL) bool {
+	port := parsed.Port()
+	if port == "" {
+		return false
+	}
+	numeric, err := strconv.Atoi(port)
+	return err != nil || numeric <= 0 || numeric > 65535 || strconv.Itoa(numeric) != port || (parsed.Scheme == "https" && numeric == 443) || (parsed.Scheme == "http" && numeric == 80)
 }
