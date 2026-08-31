@@ -995,6 +995,7 @@ describe("route-less Form authority deploy surfaces", () => {
       expect(config).toMatchObject({
         workers_dev: false,
         preview_urls: false,
+        version_metadata: { binding: "WORKER_VERSION" },
         vars: {
           TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST: artifactDigest,
         },

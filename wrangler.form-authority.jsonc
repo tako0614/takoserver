@@ -24,6 +24,9 @@
       "head_sampling_rate": 0.01
     }
   },
+  "version_metadata": {
+    "binding": "WORKER_VERSION"
+  },
   "d1_databases": [
     {
       "binding": "STATE_DB",

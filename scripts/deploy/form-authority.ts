@@ -10,8 +10,14 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import {
+  FORM_AUTHORITY_CORE_VERIFIER_IDENTITY_PATH,
+  type FormAuthorityCoreVerifierIdentity,
+  isFormAuthorityCoreVerifierIdentity,
+} from "../../src/form-authority-identity-probe.ts";
 import { canonicalDigest, canonicalJson } from "../../src/json.ts";
 import { publicFormCapabilityManifest } from "../../src/public-worker-implementation.ts";
+import { parseStrictJson } from "../../src/strict-json.ts";
 import { deriveFormAuthorityIdentity } from "../../src/takoform/host-admission-endpoint.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import {
@@ -100,6 +106,17 @@ export interface FormAuthorityDeployOptions {
   readonly cloudflareEnvironment?: Readonly<Record<string, string>>;
   readonly review?: string;
   readonly fetcher?: (input: string, init?: RequestInit) => Promise<Response>;
+}
+
+export interface FormAuthorityCoreVerifierReadbackExpectation {
+  readonly probeOrigin: string;
+  readonly authorityWorkerVersionId: string;
+  readonly artifactDigest: `sha256:${string}`;
+}
+
+export interface FormAuthorityCoreVerifierReadback {
+  readonly ready: boolean;
+  readonly identity: FormAuthorityCoreVerifierIdentity | null;
 }
 
 export interface SelectedFormAuthorityTarget {
@@ -224,6 +241,19 @@ export async function runFormAuthority(
     capabilityManifestJson,
     state,
   );
+  const statusCoreVerifierReadback =
+    invocation.action === "status" && selected.verificationMode === "released-core"
+      ? before === null
+        ? unavailableCoreVerifierReadback()
+        : await readFormAuthorityCoreVerifierIdentityProbe(
+            {
+              probeOrigin: requiredIdentityProbeOrigin(target),
+              authorityWorkerVersionId: before.history.versionId,
+              artifactDigest: takoformCoreVerifierArtifactDigest(),
+            },
+            options.fetcher ?? fetch,
+          )
+      : null;
   if (
     invocation.scopeTransition &&
     (before === null || (dependencySelected !== null && dependencyBefore === null))
@@ -256,6 +286,14 @@ export async function runFormAuthority(
       capabilityDigest,
       coreVerifierArtifactDigest:
         selected.verificationMode === "released-core" ? takoformCoreVerifierArtifactDigest() : null,
+      coreVerifierRpcReady: statusCoreVerifierReadback?.ready ?? null,
+      coreVerifierAuthorityWorkerVersionId:
+        statusCoreVerifierReadback?.identity?.authorityWorkerVersionId ?? null,
+      coreVerifierProtocol: statusCoreVerifierReadback?.identity?.verifier.protocol ?? null,
+      coreVerifierVersion: statusCoreVerifierReadback?.identity?.verifier.coreVersion ?? null,
+      coreVerifierCommit: statusCoreVerifierReadback?.identity?.verifier.coreCommit ?? null,
+      coreVerifierObservedArtifactDigest:
+        statusCoreVerifierReadback?.identity?.verifier.artifactDigest ?? null,
       publicIdentityRpcReady: publicIdentityReadback.ready,
       implementationPayloadDigest:
         publicIdentityReadback.identity?.implementationPayloadDigest ?? null,
@@ -282,6 +320,8 @@ export async function runFormAuthority(
       productionEligible: selected.productionEligible,
       ready:
         before?.commit === invocation.commit &&
+        (selected.verificationMode !== "released-core" ||
+          statusCoreVerifierReadback?.ready === true) &&
         publicIdentityReadback.ready &&
         operatorIdentity !== null &&
         before.publicWorkerBindingProfile === "dynamic-public-rpc" &&
@@ -491,6 +531,22 @@ export async function runFormAuthority(
         "Form authority authoritative history does not identify the exact uploaded successor",
       );
     }
+    const coreVerifierAfter =
+      selected.verificationMode === "released-core"
+        ? await readFormAuthorityCoreVerifierIdentityProbe(
+            {
+              probeOrigin: requiredIdentityProbeOrigin(target),
+              authorityWorkerVersionId: after.history.versionId,
+              artifactDigest: takoformCoreVerifierArtifactDigest(),
+            },
+            options.fetcher ?? fetch,
+          )
+        : null;
+    if (selected.verificationMode === "released-core" && coreVerifierAfter?.ready !== true) {
+      throw verificationError(
+        "released Core verifier live identity is unavailable or differs from the uploaded Worker Version",
+      );
+    }
     return {
       kind: "takoserver.form-authority-worker-apply@v1",
       surface: invocation.surface,
@@ -507,6 +563,14 @@ export async function runFormAuthority(
       capabilityDigest,
       coreVerifierArtifactDigest:
         selected.verificationMode === "released-core" ? takoformCoreVerifierArtifactDigest() : null,
+      coreVerifierRpcReady: coreVerifierAfter?.ready ?? null,
+      coreVerifierAuthorityWorkerVersionId:
+        coreVerifierAfter?.identity?.authorityWorkerVersionId ?? null,
+      coreVerifierProtocol: coreVerifierAfter?.identity?.verifier.protocol ?? null,
+      coreVerifierVersion: coreVerifierAfter?.identity?.verifier.coreVersion ?? null,
+      coreVerifierCommit: coreVerifierAfter?.identity?.verifier.coreCommit ?? null,
+      coreVerifierObservedArtifactDigest:
+        coreVerifierAfter?.identity?.verifier.artifactDigest ?? null,
       publicIdentityRpcReady: true,
       implementationPayloadDigest: publicIdentityAfter.identity.implementationPayloadDigest,
       implementationDigest: operatorIdentity.implementationDigest,
@@ -615,6 +679,7 @@ export function writeFormAuthorityConfig(input: {
           ...(coreVerifierArtifactDigest === null
             ? {}
             : {
+                version_metadata: { binding: "WORKER_VERSION" },
                 durable_objects: {
                   bindings: [
                     {
@@ -1138,6 +1203,7 @@ function expectedBindings(
     },
     ...(selected.verificationMode === "released-core"
       ? {
+          WORKER_VERSION: { type: "version_metadata", fields: {} },
           CORE_VERIFIER: {
             type: "durable_object_namespace",
             fields: { class_name: "TakoformCoreVerifierContainer" },
@@ -1165,6 +1231,100 @@ function expectedBindings(
         }
       : {}),
   } as const;
+}
+
+const MAX_CORE_VERIFIER_IDENTITY_BYTES = 16 * 1_024;
+
+/**
+ * Reads the permanent HTTP-to-named-RPC bridge and accepts only proof emitted
+ * by the exact currently served authority Worker Version and verifier image.
+ */
+export async function readFormAuthorityCoreVerifierIdentityProbe(
+  expectation: FormAuthorityCoreVerifierReadbackExpectation,
+  fetcher: (input: string, init?: RequestInit) => Promise<Response>,
+): Promise<FormAuthorityCoreVerifierReadback> {
+  try {
+    const response = await fetcher(
+      `${exactProbeOrigin(expectation.probeOrigin)}${FORM_AUTHORITY_CORE_VERIFIER_IDENTITY_PATH}`,
+      {
+        method: "GET",
+        headers: { accept: "application/json", "cache-control": "no-store" },
+        redirect: "error",
+        signal: AbortSignal.timeout(30_000),
+      },
+    );
+    if (
+      response.status !== 200 ||
+      !response.headers.get("content-type")?.toLowerCase().startsWith("application/json")
+    ) {
+      return unavailableCoreVerifierReadback();
+    }
+    const bytes = await boundedCoreVerifierIdentityResponse(response);
+    const value = parseStrictJson(bytes, MAX_CORE_VERIFIER_IDENTITY_BYTES);
+    if (
+      !isFormAuthorityCoreVerifierIdentity(value) ||
+      value.authorityWorkerVersionId !== expectation.authorityWorkerVersionId ||
+      value.verifier.artifactDigest !== expectation.artifactDigest
+    ) {
+      return unavailableCoreVerifierReadback();
+    }
+    return { ready: true, identity: structuredClone(value) };
+  } catch {
+    return unavailableCoreVerifierReadback();
+  }
+}
+
+function unavailableCoreVerifierReadback(): FormAuthorityCoreVerifierReadback {
+  return { ready: false, identity: null };
+}
+
+function requiredIdentityProbeOrigin(target: DeployTarget): string {
+  const origin = target.formAuthority?.identityProbeOrigin;
+  if (!origin) throw preflightError("selected target has no Form authority identity probe origin");
+  return exactProbeOrigin(origin);
+}
+
+function exactProbeOrigin(value: string): string {
+  const url = new URL(value);
+  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
+    throw new TypeError("Form authority identity probe origin is invalid");
+  }
+  return url.origin;
+}
+
+async function boundedCoreVerifierIdentityResponse(response: Response): Promise<Uint8Array> {
+  const declared = response.headers.get("content-length");
+  if (
+    declared &&
+    (!/^\d+$/u.test(declared) || Number(declared) > MAX_CORE_VERIFIER_IDENTITY_BYTES)
+  ) {
+    throw new TypeError("Core verifier identity response is too large");
+  }
+  if (!response.body) throw new TypeError("Core verifier identity response has no body");
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      size += next.value.byteLength;
+      if (size > MAX_CORE_VERIFIER_IDENTITY_BYTES) {
+        await reader.cancel();
+        throw new TypeError("Core verifier identity response is too large");
+      }
+      chunks.push(next.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
 }
 
 function selectTarget(

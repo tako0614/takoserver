@@ -14,6 +14,11 @@
       "binding": "PUBLIC_HOST_IDENTITY",
       "service": "takoserver-api",
       "entrypoint": "PublicHostIdentityEntrypoint"
+    },
+    {
+      "binding": "FORM_AUTHORITY",
+      "service": "takoserver-form-authority",
+      "entrypoint": "FormAuthorityEntrypoint"
     }
   ]
 }

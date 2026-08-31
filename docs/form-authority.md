@@ -9,7 +9,8 @@ package reader, but they must not import `admission-store.ts`, `admission.ts`,
 Form mutation belongs to two separately named, route-less Cloudflare Workers:
 
 - `takoserver-form-authority-worker` exposes only service-binding RPC methods
-  `plan`, `apply`, and `readback`. Its production composition binds one native
+  `plan`, `apply`, `readback`, and the read-only `verifierIdentity`. Its
+  production composition binds one native
   Container Durable Object which pins released Takoform Core v1.1.0. One
   bounded set-level call verifies `VerifyFS`, one package bundle per package,
   the separate checkpoint bundle, the durable predecessor pin, provenance and
@@ -41,8 +42,12 @@ instance, malformed response, timeout, missing raw closure, package duplicate,
 checkpoint rollback/fork, revocation, or identity mismatch fails before Host
 mutation. The default authority Worker fetch remains `404`, so another Worker
 on the same account can reuse the named RPC entrypoint without a public
-gateway. An off-platform CLI cannot call a service binding directly and needs a
-separately authorized ingress; production deliberately has no such gateway.
+authority route. `verifierIdentity` first binds its response to the executing
+immutable Worker Version through `WORKER_VERSION`, then starts and interrogates
+the selected Container through `CORE_VERIFIER`. It returns only the readback
+schema id, authority Worker Version id, adapter protocol, Core tag, Core commit,
+and Docker-context digest. Container ids, names, errors, and provider details do
+not cross the RPC boundary.
 
 Production activation still requires distribution inputs which this adapter
 does not publish or invent:
@@ -65,12 +70,25 @@ does not publish or invent:
 Every advertised Form-authority environment also has one permanent minimal
 `takoserver-form-authority-identity-probe` Worker. Its target-owned
 `identityProbeWorkerName` and `identityProbeOrigin` name a workers.dev endpoint
-with only `GET /v1/public-host-identity`. The probe has one service binding to
-the public Worker's `PublicHostIdentityEntrypoint`, one expected Host-id
-variable, and no D1, R2, secret, mutation RPC, route, preview, or custom domain.
-Deploy status actively calls this endpoint and validates the RPC result against
-the authoritative served public Version and artifact. An absent, thrown,
-malformed, stale, or semantically inconsistent response makes readiness false.
+with only `GET /v1/public-host-identity` and
+`GET /v1/core-verifier-identity`. The probe has read-only named service bindings
+to the public Worker's `PublicHostIdentityEntrypoint` and the route-less
+authority's `FormAuthorityEntrypoint`, one expected Host-id variable, and no D1,
+R2, secret, mutation RPC, route, preview, or custom domain. Failures collapse to
+one sanitized unavailable code. Deploy status reads authoritative Worker
+history first, calls both endpoints with caching disabled, and accepts Core
+readback only when the responding authority Version id and the released Core
+protocol/tag/commit/Docker-context digest are exact. Missing, nonstarting,
+thrown, oversized, malformed, stale, or mismatched identity keeps
+`coreVerifierRpcReady` and overall `ready` false.
+
+Production apply performs the same Core readback only after authoritative
+history identifies the exact uploaded successor. Upload success therefore is
+not readiness: a Container rollout that has not started, still serves the old
+image, or reports a mismatched identity ends as a verification failure. The
+operator does not upload again; the same surface's `--status` is the recovery
+readback and becomes ready only after that exact successor reaches the exact
+released Container identity.
 
 The only network ingress is a third, separately deployed integration Worker,
 `takoserver-integration-form-authority-operator-worker`. It owns the dedicated
@@ -300,8 +318,13 @@ build-derived `PublicHostIdentity@v2`. Deploy and verify
 the route-less integration authority and, after it is dynamic, for the operator
 gateway. This is the one-time migration from a verified legacy exact pin; no
 live request is signed until the probe and both authority status results are
-ready. Rehearsal and production use the same public Worker → identity probe →
-route-less authority order. These steps do not authorize deployment by
+ready. Where a route-less authority already exists, rehearsal and production
+use the same public Worker → identity probe → route-less authority order. A new
+environment has one explicit bootstrap exception because the probe's exact
+service binding cannot target an absent authority: upload the route-less
+authority once and expect its post-upload verifier readback to fail, deploy the
+probe binding, then settle the uploaded authority only with `--status`. Do not
+repeat the authority upload. These steps do not authorize deployment by
 themselves.
 
 The reviewed order is deliberately staged. First capture the old exact

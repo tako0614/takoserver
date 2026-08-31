@@ -24,6 +24,7 @@ describe("Form authority identity probe", () => {
             return IDENTITY;
           },
         },
+        FORM_AUTHORITY: unavailableVerifierRpc(),
       },
     );
 
@@ -43,6 +44,7 @@ describe("Form authority identity probe", () => {
             throw new Error("unavailable");
           },
         },
+        FORM_AUTHORITY: unavailableVerifierRpc(),
       },
     );
 
@@ -60,6 +62,7 @@ describe("Form authority identity probe", () => {
           return IDENTITY;
         },
       },
+      FORM_AUTHORITY: unavailableVerifierRpc(),
     };
     for (const request of [
       new Request("https://probe.example.test/"),
@@ -71,3 +74,11 @@ describe("Form authority identity probe", () => {
     expect(called).toBe(false);
   });
 });
+
+function unavailableVerifierRpc() {
+  return {
+    async verifierIdentity(): Promise<never> {
+      throw new Error("unexpected verifier identity call");
+    },
+  };
+}
