@@ -176,8 +176,22 @@ describe("Takoserver split deploy entrypoint", () => {
       expect(surface?.obligations["post-conditions"]).toContain("annotation-free");
     }
     expect(legacyRetirement?.obligations.reversal).toContain("operator capture");
+    expect(legacyRetirement?.obligations.provenance).toContain("capture-file digest");
+    expect(legacyRetirement?.obligations.provenance).toContain("canonical path identity");
+    expect(legacyRetirement?.obligations["post-conditions"]).toContain(
+      "no-overwrite retirement checkpoint",
+    );
+    expect(legacyRetirement?.obligations["failure-handling"]).toContain(
+      "no provider mutation when the checkpoint cannot be retained",
+    );
     expect(legacyRestore?.obligations.provenance).toContain(
       "need not equal the replacement identity",
+    );
+    expect(legacyRestore?.obligations.provenance).toContain(
+      "retained no-overwrite retirement checkpoint",
+    );
+    expect(legacyRestore?.obligations["failure-handling"]).toContain(
+      "missing, ambiguous, unsafe, or mismatched checkpoint",
     );
 
     for (const surface of contract.surfaces) {

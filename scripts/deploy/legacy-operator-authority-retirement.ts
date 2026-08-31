@@ -3,15 +3,17 @@ import {
   closeSync,
   constants,
   fstatSync,
+  fsyncSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   openSync,
   readFileSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { parseStrictJson } from "../../src/strict-json.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import {
@@ -58,8 +60,12 @@ export const LEGACY_OPERATOR_PUBLIC_JWK_SECRET = "OPERATOR_PUBLIC_JWK" as const;
 
 const MAX_PUBLIC_JWK_BYTES = 16_384;
 const MAX_CAPTURE_BYTES = 32_768;
+const MAX_RETIREMENT_CHECKPOINT_BYTES = 16_384;
 const BASE64URL_32 = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/u;
 const CAPTURE_KIND = "takoserver.legacy-operator-authority-capture@v1" as const;
+const RETIREMENT_CHECKPOINT_KIND =
+  "takoserver.legacy-operator-authority-retirement-checkpoint@v1" as const;
+const RETIREMENT_CHECKPOINT_SUFFIX = ".retirement-checkpoint.json" as const;
 
 export type LegacyOperatorAuthoritySurface =
   | "takoserver-integration-legacy-operator-authority-retirement"
@@ -102,6 +108,31 @@ interface LegacyOperatorAuthorityCapture {
   readonly legacyPredecessorVersionId: string;
   readonly publicJwkBytes: string;
   readonly publicJwkDigest: `sha256:${string}`;
+  readonly canonicalPath: string;
+  readonly captureDigest: `sha256:${string}`;
+  readonly captureBytes: number;
+  readonly capturePathDigest: `sha256:${string}`;
+}
+
+interface LegacyOperatorAuthorityRetirementCheckpoint {
+  readonly kind: typeof RETIREMENT_CHECKPOINT_KIND;
+  readonly environment: "integration";
+  readonly accountId: string;
+  readonly workerName: string;
+  readonly legacyPredecessorVersionId: string;
+  readonly sourceCommit: string;
+  readonly bundleDigest: `sha256:${string}`;
+  readonly scriptEtag: string;
+  readonly captureDigest: `sha256:${string}`;
+  readonly captureBytes: number;
+  readonly capturePathDigest: `sha256:${string}`;
+  readonly publicJwkDigest: `sha256:${string}`;
+}
+
+interface LoadedRetirementCheckpoint {
+  readonly value: LegacyOperatorAuthorityRetirementCheckpoint;
+  readonly digest: `sha256:${string}`;
+  readonly canonicalPath: string;
 }
 
 interface TransitionInspection {
@@ -137,6 +168,8 @@ export async function runLegacyOperatorAuthorityTransition(
     options.capturePath ?? requireEnvironment("TAKOSERVER_LEGACY_OPERATOR_AUTHORITY_CAPTURE_PATH"),
     target,
   );
+  const retirementCheckpointPath = checkpointPathForCapture(capture.canonicalPath);
+  const initialCheckpoint = readRetirementCheckpoint(retirementCheckpointPath, target);
   const environment =
     options.cloudflareEnvironment ??
     (options.state !== undefined && invocation.action === "status"
@@ -156,6 +189,13 @@ export async function runLegacyOperatorAuthorityTransition(
     state,
     capture.legacyPredecessorVersionId,
   );
+  assertRetirementCheckpointForTransition(
+    "preflight",
+    direction,
+    before,
+    capture,
+    initialCheckpoint,
+  );
 
   if (invocation.action === "status") {
     const probe = await probeProduct(target.publicOrigin, fetcher);
@@ -174,7 +214,44 @@ export async function runLegacyOperatorAuthorityTransition(
       final,
       "Worker changed during legacy operator authority status",
     );
-    return statusResult(invocation, direction, before, replacement, capture, probe);
+    const finalCapture = readLegacyOperatorAuthorityCapture(
+      capture.canonicalPath,
+      target,
+      "verification",
+    );
+    assertSameCapture(
+      "verification",
+      capture,
+      finalCapture,
+      "operator capture changed during legacy operator authority status",
+    );
+    const finalCheckpoint = readRetirementCheckpoint(
+      retirementCheckpointPath,
+      target,
+      "verification",
+    );
+    assertRetirementCheckpointForTransition(
+      "verification",
+      direction,
+      final,
+      finalCapture,
+      finalCheckpoint,
+    );
+    assertSameCheckpointSelection(
+      "verification",
+      initialCheckpoint,
+      finalCheckpoint,
+      "retirement checkpoint changed during legacy operator authority status",
+    );
+    return statusResult(
+      invocation,
+      direction,
+      before,
+      replacement,
+      finalCapture,
+      finalCheckpoint,
+      probe,
+    );
   }
 
   if (before.relationship !== "predecessor-current") {
@@ -239,6 +316,63 @@ export async function runLegacyOperatorAuthorityTransition(
       throw preflightError("selected predecessor changed before the authority mutation");
     }
 
+    const freshCapture = readLegacyOperatorAuthorityCapture(capture.canonicalPath, target);
+    assertSameCapture(
+      "preflight",
+      capture,
+      freshCapture,
+      "operator capture changed before the legacy authority mutation",
+    );
+    const freshCheckpoint = readRetirementCheckpoint(retirementCheckpointPath, target);
+    if (initialCheckpoint !== null && freshCheckpoint === null) {
+      throw preflightError("legacy operator authority retirement checkpoint disappeared");
+    }
+    const mutationCheckpoint =
+      direction === "retirement"
+        ? ensureRetirementCheckpoint(
+            retirementCheckpointPath,
+            target,
+            expectedRetirementCheckpoint(target, freshCapture, fresh),
+          )
+        : requireRetirementCheckpoint("preflight", fresh, freshCapture, freshCheckpoint);
+    assertRetirementCheckpointForTransition(
+      "preflight",
+      direction,
+      fresh,
+      freshCapture,
+      mutationCheckpoint,
+    );
+    if (initialCheckpoint !== null) {
+      assertSameCheckpointSelection(
+        "preflight",
+        initialCheckpoint,
+        mutationCheckpoint,
+        "retirement checkpoint changed before the legacy authority mutation",
+      );
+    }
+
+    // Re-open both retained files after checkpoint creation/adoption. The
+    // mutation consumes only bytes that remain bound to that exact evidence.
+    const mutationCapture = readLegacyOperatorAuthorityCapture(capture.canonicalPath, target);
+    assertSameCapture(
+      "preflight",
+      freshCapture,
+      mutationCapture,
+      "operator capture changed before the legacy authority mutation",
+    );
+    const sealedCheckpoint = requireRetirementCheckpoint(
+      "preflight",
+      fresh,
+      mutationCapture,
+      readRetirementCheckpoint(retirementCheckpointPath, target),
+    );
+    assertSameCheckpointSelection(
+      "preflight",
+      mutationCheckpoint,
+      sealedCheckpoint,
+      "retirement checkpoint changed before the legacy authority mutation",
+    );
+
     const command = wranglerCommand([
       "secret",
       direction === "retirement" ? "delete" : "put",
@@ -250,7 +384,7 @@ export async function runLegacyOperatorAuthorityTransition(
     ]);
     const mutation = await run(command, {
       env: environment,
-      ...(direction === "restore" ? { input: capture.publicJwkBytes } : {}),
+      ...(direction === "restore" ? { input: mutationCapture.publicJwkBytes } : {}),
     });
     if (mutation.exitCode !== 0) {
       const diagnostic = `${mutation.stdout}${mutation.stderr}`.trim();
@@ -267,7 +401,7 @@ export async function runLegacyOperatorAuthorityTransition(
       source.commit,
       target,
       state,
-      capture.legacyPredecessorVersionId,
+      mutationCapture.legacyPredecessorVersionId,
     );
     assertExactDirectSuccessor(direction, before, after);
     const probe = await probeProduct(target.publicOrigin, fetcher);
@@ -278,13 +412,36 @@ export async function runLegacyOperatorAuthorityTransition(
       source.commit,
       target,
       state,
-      capture.legacyPredecessorVersionId,
+      mutationCapture.legacyPredecessorVersionId,
     );
     assertSameInspection(
       "verification",
       after,
       final,
       "Worker changed during legacy operator authority verification",
+    );
+    const finalCapture = readLegacyOperatorAuthorityCapture(
+      capture.canonicalPath,
+      target,
+      "verification",
+    );
+    assertSameCapture(
+      "verification",
+      mutationCapture,
+      finalCapture,
+      "operator capture changed during legacy operator authority verification",
+    );
+    const finalCheckpoint = requireRetirementCheckpoint(
+      "verification",
+      final,
+      finalCapture,
+      readRetirementCheckpoint(retirementCheckpointPath, target, "verification"),
+    );
+    assertSameCheckpointSelection(
+      "verification",
+      sealedCheckpoint,
+      finalCheckpoint,
+      "retirement checkpoint changed during legacy operator authority verification",
     );
     return applyResult(
       invocation,
@@ -294,7 +451,8 @@ export async function runLegacyOperatorAuthorityTransition(
       before,
       after,
       replacement,
-      capture,
+      finalCapture,
+      finalCheckpoint,
       probe,
     );
   } finally {
@@ -629,37 +787,23 @@ function versionHasLegacySecret(phase: DeployPhase, versionId: string, value: un
 function readLegacyOperatorAuthorityCapture(
   path: string,
   target: DeployTarget,
+  phase: DeployPhase = "preflight",
 ): LegacyOperatorAuthorityCapture {
-  let descriptor: number | null = null;
-  let raw: Uint8Array;
-  try {
-    const normalized = linkFreePath(path);
-    descriptor = openSync(normalized, constants.O_RDONLY | constants.O_NOFOLLOW);
-    const status = fstatSync(descriptor);
-    if (
-      !status.isFile() ||
-      status.nlink !== 1 ||
-      typeof process.getuid !== "function" ||
-      status.uid !== process.getuid() ||
-      (status.mode & 0o7777) !== 0o600 ||
-      status.size < 1 ||
-      status.size > MAX_CAPTURE_BYTES
-    ) {
-      throw new Error("unsafe");
-    }
-    raw = readFileSync(descriptor);
-  } catch {
-    throw preflightError(
-      "legacy operator authority capture must be an owned 0600 link-free regular file of at most 32 KiB",
-    );
-  } finally {
-    if (descriptor !== null) closeSync(descriptor);
+  const loaded = readSecureEvidenceFile(
+    path,
+    "legacy operator authority capture",
+    MAX_CAPTURE_BYTES,
+    phase,
+  );
+  if (loaded === null) {
+    throw phaseFailure(phase, "legacy operator authority capture is missing");
   }
+  const { raw } = loaded;
   let value: unknown;
   try {
     value = parseStrictJson(raw, MAX_CAPTURE_BYTES);
   } catch {
-    throw preflightError("legacy operator authority capture is not strict bounded JSON");
+    throw phaseFailure(phase, "legacy operator authority capture is not strict bounded JSON");
   }
   if (
     !isRecord(value) ||
@@ -683,14 +827,17 @@ function readLegacyOperatorAuthorityCapture(
     typeof value.publicJwkDigest !== "string" ||
     !/^sha256:[0-9a-f]{64}$/u.test(value.publicJwkDigest)
   ) {
-    throw preflightError("legacy operator authority capture does not match the selected target");
+    throw phaseFailure(
+      phase,
+      "legacy operator authority capture does not match the selected target",
+    );
   }
   const publicJwkBytes = new TextEncoder().encode(value.publicJwk);
   let publicJwk: unknown;
   try {
     publicJwk = parseStrictJson(publicJwkBytes, MAX_PUBLIC_JWK_BYTES);
   } catch {
-    throw preflightError("legacy operator authority capture contains an invalid public JWK");
+    throw phaseFailure(phase, "legacy operator authority capture contains an invalid public JWK");
   }
   if (
     !isRecord(publicJwk) ||
@@ -701,25 +848,431 @@ function readLegacyOperatorAuthorityCapture(
     !BASE64URL_32.test(publicJwk.x) ||
     sha256(publicJwkBytes) !== value.publicJwkDigest
   ) {
-    throw preflightError("legacy operator authority capture contains an invalid public JWK");
+    throw phaseFailure(phase, "legacy operator authority capture contains an invalid public JWK");
   }
   return {
     legacyPredecessorVersionId: value.legacyPredecessorVersionId,
     publicJwkBytes: value.publicJwk,
     publicJwkDigest: value.publicJwkDigest as `sha256:${string}`,
+    canonicalPath: loaded.canonicalPath,
+    captureDigest: loaded.digest,
+    captureBytes: raw.byteLength,
+    capturePathDigest: loaded.pathDigest,
   };
 }
 
-function linkFreePath(path: string): string {
+interface SecureEvidenceFile {
+  readonly canonicalPath: string;
+  readonly raw: Uint8Array;
+  readonly digest: `sha256:${string}`;
+  readonly pathDigest: `sha256:${string}`;
+}
+
+function readSecureEvidenceFile(
+  path: string,
+  label: string,
+  maxBytes: number,
+  phase: DeployPhase,
+  allowMissing = false,
+): SecureEvidenceFile | null {
+  const normalized = canonicalEvidencePath(path, label, phase);
+  let descriptor: number | null = null;
+  let raw: Uint8Array;
+  try {
+    descriptor = openSync(normalized, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const status = fstatSync(descriptor);
+    if (
+      !status.isFile() ||
+      status.nlink !== 1 ||
+      typeof process.getuid !== "function" ||
+      status.uid !== process.getuid() ||
+      (status.mode & 0o7777) !== 0o600 ||
+      status.size < 1 ||
+      status.size > maxBytes
+    ) {
+      throw new Error("unsafe");
+    }
+    raw = readFileSync(descriptor);
+    const pathStatus = lstatSync(normalized);
+    if (
+      pathStatus.isSymbolicLink() ||
+      pathStatus.dev !== status.dev ||
+      pathStatus.ino !== status.ino ||
+      pathStatus.size !== status.size ||
+      pathStatus.mode !== status.mode ||
+      raw.byteLength !== status.size
+    ) {
+      throw new Error("drifted");
+    }
+  } catch (error) {
+    if (allowMissing && isErrno(error, "ENOENT")) return null;
+    throw phaseFailure(
+      phase,
+      `${label} must be an owned 0600 link-free regular file of at most ${Math.floor(maxBytes / 1024)} KiB`,
+    );
+  } finally {
+    if (descriptor !== null) closeSync(descriptor);
+  }
+  return {
+    canonicalPath: normalized,
+    raw,
+    digest: sha256(raw),
+    pathDigest: sha256(normalized),
+  };
+}
+
+function canonicalEvidencePath(path: string, label: string, phase: DeployPhase): string {
+  if (!isAbsolute(path)) {
+    throw phaseFailure(phase, `${label} path must be absolute`);
+  }
   const normalized = resolve(path);
-  const parts = normalized.split(sep).filter(Boolean);
+  const parent = dirname(normalized);
+  const parts = parent.split(sep).filter(Boolean);
   let current: string = sep;
   for (const part of parts) {
     current = join(current, part);
-    const status = lstatSync(current);
-    if (status.isSymbolicLink()) throw new Error("linked path");
+    let status: ReturnType<typeof lstatSync>;
+    try {
+      status = lstatSync(current);
+    } catch {
+      throw phaseFailure(phase, `${label} parent path is unavailable`);
+    }
+    if (status.isSymbolicLink() || !status.isDirectory()) {
+      throw phaseFailure(phase, `${label} path must be link-free`);
+    }
+  }
+  const parentStatus = lstatSync(parent);
+  if (
+    !parentStatus.isDirectory() ||
+    parentStatus.isSymbolicLink() ||
+    typeof process.getuid !== "function" ||
+    parentStatus.uid !== process.getuid() ||
+    (parentStatus.mode & 0o7777) !== 0o700
+  ) {
+    throw phaseFailure(phase, `${label} parent must be an owned exact-0700 directory`);
+  }
+  for (let cursor = parent; ; cursor = dirname(cursor)) {
+    let gitMarkerExists = false;
+    try {
+      lstatSync(join(cursor, ".git"));
+      gitMarkerExists = true;
+    } catch (error) {
+      if (!isErrno(error, "ENOENT")) {
+        throw phaseFailure(phase, `${label} Git-worktree boundary cannot be proven`);
+      }
+    }
+    if (gitMarkerExists) {
+      throw phaseFailure(phase, `${label} must stay outside every Git worktree`);
+    }
+    const next = dirname(cursor);
+    if (next === cursor) break;
   }
   return normalized;
+}
+
+function checkpointPathForCapture(canonicalCapturePath: string): string {
+  return `${canonicalCapturePath}${RETIREMENT_CHECKPOINT_SUFFIX}`;
+}
+
+function readRetirementCheckpoint(
+  path: string,
+  target: DeployTarget,
+  phase: DeployPhase = "preflight",
+): LoadedRetirementCheckpoint | null {
+  const loaded = readSecureEvidenceFile(
+    path,
+    "legacy operator authority retirement checkpoint",
+    MAX_RETIREMENT_CHECKPOINT_BYTES,
+    phase,
+    true,
+  );
+  if (loaded === null) return null;
+  let parsed: unknown;
+  try {
+    parsed = parseStrictJson(loaded.raw, MAX_RETIREMENT_CHECKPOINT_BYTES);
+  } catch {
+    throw phaseFailure(
+      phase,
+      "legacy operator authority retirement checkpoint is not strict bounded JSON",
+    );
+  }
+  const value = parseRetirementCheckpoint(parsed, target, phase);
+  const canonicalBytes = new TextEncoder().encode(serializeRetirementCheckpoint(value));
+  if (!sameBytes(canonicalBytes, loaded.raw)) {
+    throw phaseFailure(
+      phase,
+      "legacy operator authority retirement checkpoint does not contain the exact canonical generated bytes",
+    );
+  }
+  return { value, digest: loaded.digest, canonicalPath: loaded.canonicalPath };
+}
+
+function parseRetirementCheckpoint(
+  value: unknown,
+  target: DeployTarget,
+  phase: DeployPhase,
+): LegacyOperatorAuthorityRetirementCheckpoint {
+  const keys = [
+    "accountId",
+    "bundleDigest",
+    "captureBytes",
+    "captureDigest",
+    "capturePathDigest",
+    "environment",
+    "kind",
+    "legacyPredecessorVersionId",
+    "publicJwkDigest",
+    "scriptEtag",
+    "sourceCommit",
+    "workerName",
+  ];
+  if (
+    !isRecord(value) ||
+    JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(keys) ||
+    value.kind !== RETIREMENT_CHECKPOINT_KIND ||
+    value.environment !== "integration" ||
+    value.accountId !== target.accountId ||
+    value.workerName !== target.workerName ||
+    typeof value.legacyPredecessorVersionId !== "string" ||
+    !isWorkerVersionId(value.legacyPredecessorVersionId) ||
+    typeof value.sourceCommit !== "string" ||
+    !/^[0-9a-f]{40}$/u.test(value.sourceCommit) ||
+    typeof value.bundleDigest !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/u.test(value.bundleDigest) ||
+    typeof value.scriptEtag !== "string" ||
+    value.scriptEtag.length < 1 ||
+    value.scriptEtag.length > 1_024 ||
+    typeof value.captureDigest !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/u.test(value.captureDigest) ||
+    typeof value.captureBytes !== "number" ||
+    !Number.isSafeInteger(value.captureBytes) ||
+    value.captureBytes < 1 ||
+    value.captureBytes > MAX_CAPTURE_BYTES ||
+    typeof value.capturePathDigest !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/u.test(value.capturePathDigest) ||
+    typeof value.publicJwkDigest !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/u.test(value.publicJwkDigest)
+  ) {
+    throw phaseFailure(
+      phase,
+      "legacy operator authority retirement checkpoint is missing or ambiguous for the selected target",
+    );
+  }
+  return {
+    kind: RETIREMENT_CHECKPOINT_KIND,
+    environment: "integration",
+    accountId: value.accountId as string,
+    workerName: value.workerName as string,
+    legacyPredecessorVersionId: value.legacyPredecessorVersionId,
+    sourceCommit: value.sourceCommit,
+    bundleDigest: value.bundleDigest as `sha256:${string}`,
+    scriptEtag: value.scriptEtag,
+    captureDigest: value.captureDigest as `sha256:${string}`,
+    captureBytes: value.captureBytes,
+    capturePathDigest: value.capturePathDigest as `sha256:${string}`,
+    publicJwkDigest: value.publicJwkDigest as `sha256:${string}`,
+  };
+}
+
+function expectedRetirementCheckpoint(
+  target: DeployTarget,
+  capture: LegacyOperatorAuthorityCapture,
+  live: TransitionInspection,
+): LegacyOperatorAuthorityRetirementCheckpoint {
+  return {
+    kind: RETIREMENT_CHECKPOINT_KIND,
+    environment: "integration",
+    accountId: target.accountId,
+    workerName: target.workerName,
+    legacyPredecessorVersionId: capture.legacyPredecessorVersionId,
+    sourceCommit: live.commit,
+    bundleDigest: `sha256:${live.bundleDigestHex}`,
+    scriptEtag: live.scriptEtag,
+    captureDigest: capture.captureDigest,
+    captureBytes: capture.captureBytes,
+    capturePathDigest: capture.capturePathDigest,
+    publicJwkDigest: capture.publicJwkDigest,
+  };
+}
+
+function ensureRetirementCheckpoint(
+  path: string,
+  target: DeployTarget,
+  expected: LegacyOperatorAuthorityRetirementCheckpoint,
+): LoadedRetirementCheckpoint {
+  const existing = readRetirementCheckpoint(path, target);
+  if (existing !== null) {
+    assertCheckpointValue("preflight", existing, expected);
+    return existing;
+  }
+  const normalized = canonicalEvidencePath(
+    path,
+    "legacy operator authority retirement checkpoint",
+    "preflight",
+  );
+  let descriptor: number | null = null;
+  try {
+    descriptor = openSync(
+      normalized,
+      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
+      0o600,
+    );
+    writeFileSync(descriptor, serializeRetirementCheckpoint(expected), "utf8");
+    fsyncSync(descriptor);
+  } catch (error) {
+    if (!isErrno(error, "EEXIST")) {
+      throw preflightError(
+        "legacy operator authority retirement checkpoint could not be retained before provider mutation",
+      );
+    }
+  } finally {
+    if (descriptor !== null) closeSync(descriptor);
+  }
+  fsyncDirectory(dirname(normalized));
+  const retained = readRetirementCheckpoint(normalized, target);
+  if (retained === null) {
+    throw preflightError(
+      "legacy operator authority retirement checkpoint is missing before provider mutation",
+    );
+  }
+  assertCheckpointValue("preflight", retained, expected);
+  return retained;
+}
+
+function serializeRetirementCheckpoint(value: LegacyOperatorAuthorityRetirementCheckpoint): string {
+  return `${JSON.stringify(value, null, 2)}\n`;
+}
+
+function assertRetirementCheckpointForTransition(
+  phase: DeployPhase,
+  direction: Direction,
+  live: TransitionInspection,
+  capture: LegacyOperatorAuthorityCapture,
+  checkpoint: LoadedRetirementCheckpoint | null,
+): void {
+  if (checkpoint === null) {
+    if (direction === "retirement" && live.relationship === "predecessor-current") return;
+    throw phaseFailure(
+      phase,
+      "legacy operator authority retirement checkpoint is missing; restore and reconciled retirement require the retained pre-mutation evidence",
+    );
+  }
+  assertCheckpointMatchesTransition(phase, checkpoint, capture, live);
+}
+
+function requireRetirementCheckpoint(
+  phase: DeployPhase,
+  live: TransitionInspection,
+  capture: LegacyOperatorAuthorityCapture,
+  checkpoint: LoadedRetirementCheckpoint | null,
+): LoadedRetirementCheckpoint {
+  if (checkpoint === null) {
+    throw phaseFailure(
+      phase,
+      "legacy operator authority retirement checkpoint is missing; restore requires retained pre-mutation evidence",
+    );
+  }
+  assertCheckpointMatchesTransition(phase, checkpoint, capture, live);
+  return checkpoint;
+}
+
+function assertCheckpointMatchesTransition(
+  phase: DeployPhase,
+  checkpoint: LoadedRetirementCheckpoint,
+  capture: LegacyOperatorAuthorityCapture,
+  live: TransitionInspection,
+): void {
+  const value = checkpoint.value;
+  if (
+    value.legacyPredecessorVersionId !== capture.legacyPredecessorVersionId ||
+    value.sourceCommit !== live.commit ||
+    value.bundleDigest !== `sha256:${live.bundleDigestHex}` ||
+    value.scriptEtag !== live.scriptEtag ||
+    value.captureDigest !== capture.captureDigest ||
+    value.captureBytes !== capture.captureBytes ||
+    value.capturePathDigest !== capture.capturePathDigest ||
+    value.publicJwkDigest !== capture.publicJwkDigest
+  ) {
+    throw phaseFailure(
+      phase,
+      "legacy operator authority retirement checkpoint does not match the exact capture, path identity, predecessor, or Worker provenance",
+    );
+  }
+}
+
+function assertCheckpointValue(
+  phase: DeployPhase,
+  loaded: LoadedRetirementCheckpoint,
+  expected: LegacyOperatorAuthorityRetirementCheckpoint,
+): void {
+  if (serializeRetirementCheckpoint(loaded.value) !== serializeRetirementCheckpoint(expected)) {
+    throw phaseFailure(
+      phase,
+      "legacy operator authority retirement checkpoint is ambiguous and will not be overwritten",
+    );
+  }
+}
+
+function assertSameCapture(
+  phase: DeployPhase,
+  before: LegacyOperatorAuthorityCapture,
+  after: LegacyOperatorAuthorityCapture,
+  message: string,
+): void {
+  if (
+    before.legacyPredecessorVersionId !== after.legacyPredecessorVersionId ||
+    before.publicJwkBytes !== after.publicJwkBytes ||
+    before.publicJwkDigest !== after.publicJwkDigest ||
+    before.canonicalPath !== after.canonicalPath ||
+    before.captureDigest !== after.captureDigest ||
+    before.captureBytes !== after.captureBytes ||
+    before.capturePathDigest !== after.capturePathDigest
+  ) {
+    throw phaseFailure(phase, message);
+  }
+}
+
+function assertSameCheckpointSelection(
+  phase: DeployPhase,
+  before: LoadedRetirementCheckpoint | null,
+  after: LoadedRetirementCheckpoint | null,
+  message: string,
+): void {
+  if (
+    before?.canonicalPath !== after?.canonicalPath ||
+    before?.digest !== after?.digest ||
+    serializeOptionalCheckpoint(before) !== serializeOptionalCheckpoint(after)
+  ) {
+    throw phaseFailure(phase, message);
+  }
+}
+
+function serializeOptionalCheckpoint(value: LoadedRetirementCheckpoint | null): string | null {
+  return value === null ? null : serializeRetirementCheckpoint(value.value);
+}
+
+function fsyncDirectory(path: string): void {
+  let descriptor: number | null = null;
+  try {
+    descriptor = openSync(path, constants.O_RDONLY);
+    fsyncSync(descriptor);
+  } catch {
+    throw preflightError(
+      "legacy operator authority retirement checkpoint parent could not be durably synchronized",
+    );
+  } finally {
+    if (descriptor !== null) closeSync(descriptor);
+  }
+}
+
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+  return (
+    left.byteLength === right.byteLength && left.every((value, index) => value === right[index])
+  );
+}
+
+function isErrno(error: unknown, code: string): boolean {
+  return isRecord(error) && error.code === code;
 }
 
 function statusResult(
@@ -728,6 +1281,7 @@ function statusResult(
   live: TransitionInspection,
   replacement: ReplacementAuthorities,
   capture: LegacyOperatorAuthorityCapture,
+  checkpoint: LoadedRetirementCheckpoint | null,
   probe: Awaited<ReturnType<typeof probeProduct>>,
 ): Record<string, unknown> {
   const advanced = live.relationship === "direct-successor-current";
@@ -765,6 +1319,7 @@ function statusResult(
       secretBinding: "STRIPE_SECRET_KEY",
     },
     legacyCapture: captureSummary(capture),
+    retirementCheckpoint: retirementCheckpointSummary(checkpoint),
     probe,
   };
 }
@@ -778,6 +1333,7 @@ function applyResult(
   after: TransitionInspection,
   replacement: ReplacementAuthorities,
   capture: LegacyOperatorAuthorityCapture,
+  checkpoint: LoadedRetirementCheckpoint,
   probe: Awaited<ReturnType<typeof probeProduct>>,
 ): Record<string, unknown> {
   return {
@@ -804,6 +1360,7 @@ function applyResult(
             surface: "takoserver-integration-legacy-operator-authority-restore",
             predecessorVersionId: after.currentVersionId,
             publicJwkDigest: capture.publicJwkDigest,
+            retirementCheckpointDigest: checkpoint.digest,
           },
         }
       : {
@@ -823,6 +1380,7 @@ function applyResult(
       secretBinding: "STRIPE_SECRET_KEY",
     },
     legacyCapture: captureSummary(capture),
+    retirementCheckpoint: retirementCheckpointSummary(checkpoint),
     probe,
   };
 }
@@ -832,12 +1390,43 @@ function captureSummary(capture: LegacyOperatorAuthorityCapture): Record<string,
     kind: CAPTURE_KIND,
     legacyPredecessorVersionId: capture.legacyPredecessorVersionId,
     publicJwkDigest: capture.publicJwkDigest,
+    captureDigest: capture.captureDigest,
+    captureBytes: capture.captureBytes,
+    capturePathDigest: capture.capturePathDigest,
+    canonicalPathIdentityRetained: true,
     providerBinding: LEGACY_OPERATOR_PUBLIC_JWK_SECRET,
     providerBindingType: "secret_text",
     providerValueReadable: false,
     providerValueDigestVerified: false,
     verificationBoundary:
       "Cloudflare proves only the secret name/type; exact bytes and digest are operator-captured",
+  };
+}
+
+function retirementCheckpointSummary(
+  checkpoint: LoadedRetirementCheckpoint | null,
+): Record<string, unknown> {
+  if (checkpoint === null) {
+    return {
+      kind: RETIREMENT_CHECKPOINT_KIND,
+      retained: false,
+      requiredBeforeMutation: true,
+      requiredForRestore: true,
+    };
+  }
+  return {
+    kind: RETIREMENT_CHECKPOINT_KIND,
+    retained: true,
+    digest: checkpoint.digest,
+    captureDigest: checkpoint.value.captureDigest,
+    captureBytes: checkpoint.value.captureBytes,
+    capturePathDigest: checkpoint.value.capturePathDigest,
+    legacyPredecessorVersionId: checkpoint.value.legacyPredecessorVersionId,
+    sourceCommit: checkpoint.value.sourceCommit,
+    bundleDigest: checkpoint.value.bundleDigest,
+    scriptEtag: checkpoint.value.scriptEtag,
+    providerValueReadable: false,
+    providerValueDigestVerified: false,
   };
 }
 

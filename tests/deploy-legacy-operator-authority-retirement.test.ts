@@ -1,8 +1,17 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   LEGACY_OPERATOR_PUBLIC_JWK_SECRET,
   type LegacyOperatorAuthorityProcess,
@@ -33,6 +42,10 @@ const LEGACY_PUBLIC_JWK = {
 };
 const LEGACY_PUBLIC_JWK_BYTES = JSON.stringify(LEGACY_PUBLIC_JWK);
 const LEGACY_PUBLIC_JWK_DIGEST = sha256(LEGACY_PUBLIC_JWK_BYTES);
+const ALTERNATE_LEGACY_PUBLIC_JWK_BYTES = JSON.stringify({
+  ...LEGACY_PUBLIC_JWK,
+  x: `${"C".repeat(42)}A`,
+});
 
 const target = {
   kind: "takoserver.deploy-target@v2",
@@ -148,11 +161,15 @@ describe("legacy operator authority retirement and exact restore", () => {
       expect(statusOutput).not.toContain(LEGACY_PUBLIC_JWK_BYTES);
       expect(statusOutput).not.toContain(LEGACY_PUBLIC_JWK.x);
 
-      const retired = transitionFixture("retired");
+      await runLegacyOperatorAuthorityTransition(
+        retirementInvocation("apply", VERSION_LEGACY),
+        target,
+        { ...applyOptions(legacy, join(root, "retirement-work")), capturePath },
+      );
       const restored = await runLegacyOperatorAuthorityTransition(
         restoreInvocation("apply", VERSION_RETIRED),
         target,
-        { ...applyOptions(retired, join(root, "work")), capturePath },
+        { ...applyOptions(legacy, join(root, "work")), capturePath },
       );
       expect(restored).toMatchObject({
         publicJwkDigest: LEGACY_PUBLIC_JWK_DIGEST,
@@ -162,14 +179,272 @@ describe("legacy operator authority retirement and exact restore", () => {
         },
         replacementIdentity: { publicJwkDigest: PUBLIC_JWK_DIGEST },
       });
-      expect(retired.mutations[0]?.input).toBe(LEGACY_PUBLIC_JWK_BYTES);
-      expect(retired.mutations[0]?.input).not.toBe(PUBLIC_JWK_BYTES);
+      expect(legacy.mutations[1]?.input).toBe(LEGACY_PUBLIC_JWK_BYTES);
+      expect(legacy.mutations[1]?.input).not.toBe(PUBLIC_JWK_BYTES);
       const restoreOutput = JSON.stringify(restored);
       expect(restoreOutput).not.toContain(capturePath);
       expect(restoreOutput).not.toContain(LEGACY_PUBLIC_JWK_BYTES);
       expect(restoreOutput).not.toContain(LEGACY_PUBLIC_JWK.x);
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("restore refuses alternate valid capture bytes after retirement selected another capture", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-legacy-operator-capture-substitution-"));
+    try {
+      const selectedCapturePath = writeCapture(mkdtempSync(join(root, "selected-capture-")));
+      const alternateCapturePath = writeCapture(mkdtempSync(join(root, "alternate-capture-")), {
+        publicJwkBytes: ALTERNATE_LEGACY_PUBLIC_JWK_BYTES,
+      });
+      const fixture = transitionFixture("legacy");
+      await runLegacyOperatorAuthorityTransition(
+        retirementInvocation("apply", VERSION_LEGACY),
+        target,
+        {
+          ...applyOptions(fixture, join(root, "retirement-work")),
+          capturePath: selectedCapturePath,
+        },
+      );
+
+      const failure = await runLegacyOperatorAuthorityTransition(
+        restoreInvocation("apply", VERSION_RETIRED),
+        target,
+        {
+          ...applyOptions(fixture, join(root, "restore-work")),
+          capturePath: alternateCapturePath,
+        },
+      ).catch((error) => error);
+
+      expect(failure).toMatchObject({ phase: "preflight" });
+      expect(failure.message).toMatch(/retirement (receipt|checkpoint)|capture/i);
+      expect(fixture.mutations).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("restore refuses alternate valid bytes substituted at the selected capture path", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-legacy-operator-capture-byte-drift-"));
+    try {
+      const capturePath = writeCapture(root);
+      const fixture = transitionFixture("legacy");
+      await runLegacyOperatorAuthorityTransition(
+        retirementInvocation("apply", VERSION_LEGACY),
+        target,
+        { ...applyOptions(fixture, join(root, "retirement-work")), capturePath },
+      );
+      writeFileSync(
+        capturePath,
+        captureDocument({ publicJwkBytes: ALTERNATE_LEGACY_PUBLIC_JWK_BYTES }),
+        { mode: 0o600 },
+      );
+
+      const failure = await runLegacyOperatorAuthorityTransition(
+        restoreInvocation("apply", VERSION_RETIRED),
+        target,
+        { ...applyOptions(fixture, join(root, "restore-work")), capturePath },
+      ).catch((error) => error);
+
+      expect(failure).toMatchObject({ phase: "preflight" });
+      expect(failure.message).toMatch(/checkpoint.*capture|capture.*checkpoint/i);
+      expect(fixture.mutations).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("restore refuses identical capture bytes moved to another canonical path", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-legacy-operator-capture-path-drift-"));
+    try {
+      const capturePath = writeCapture(mkdtempSync(join(root, "selected-")));
+      const alternatePath = writeCapture(mkdtempSync(join(root, "alternate-")));
+      const fixture = transitionFixture("legacy");
+      await runLegacyOperatorAuthorityTransition(
+        retirementInvocation("apply", VERSION_LEGACY),
+        target,
+        { ...applyOptions(fixture, join(root, "retirement-work")), capturePath },
+      );
+
+      const failure = await runLegacyOperatorAuthorityTransition(
+        restoreInvocation("apply", VERSION_RETIRED),
+        target,
+        { ...applyOptions(fixture, join(root, "restore-work")), capturePath: alternatePath },
+      ).catch((error) => error);
+
+      expect(readFileSync(alternatePath, "utf8")).toBe(readFileSync(capturePath, "utf8"));
+      expect(failure).toMatchObject({ phase: "preflight" });
+      expect(failure.message).toContain("checkpoint is missing");
+      expect(fixture.mutations).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("retirement retains a value-free canonical checkpoint before provider deletion", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-legacy-operator-retained-checkpoint-"));
+    try {
+      const capturePath = writeCapture(root);
+      const fixture = transitionFixture("legacy");
+      const result = await runLegacyOperatorAuthorityTransition(
+        retirementInvocation("apply", VERSION_LEGACY),
+        target,
+        { ...applyOptions(fixture, join(root, "work")), capturePath },
+      );
+      const path = retirementCheckpointPath(capturePath);
+      const raw = readFileSync(path, "utf8");
+      const checkpoint = JSON.parse(raw);
+      const status = lstatSync(path);
+
+      expect(status.isFile()).toBe(true);
+      expect(status.nlink).toBe(1);
+      expect(status.mode & 0o7777).toBe(0o600);
+      expect(checkpoint).toEqual({
+        kind: "takoserver.legacy-operator-authority-retirement-checkpoint@v1",
+        environment: "integration",
+        accountId: target.accountId,
+        workerName: target.workerName,
+        legacyPredecessorVersionId: VERSION_LEGACY,
+        sourceCommit: COMMIT,
+        bundleDigest: `sha256:${BUNDLE_DIGEST}`,
+        scriptEtag: SCRIPT_ETAG,
+        captureDigest: sha256(captureDocument()),
+        captureBytes: Buffer.byteLength(captureDocument()),
+        capturePathDigest: sha256(resolve(capturePath)),
+        publicJwkDigest: LEGACY_PUBLIC_JWK_DIGEST,
+      });
+      expect(result).toMatchObject({
+        retirementCheckpoint: {
+          retained: true,
+          digest: sha256(raw),
+          captureDigest: sha256(captureDocument()),
+          capturePathDigest: sha256(resolve(capturePath)),
+          providerValueReadable: false,
+          providerValueDigestVerified: false,
+        },
+      });
+      expect(raw).not.toContain(capturePath);
+      expect(raw).not.toContain(LEGACY_PUBLIC_JWK_BYTES);
+      expect(raw).not.toContain(LEGACY_PUBLIC_JWK.x);
+      expect(fixture.mutations).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("restore refuses a wrong retired predecessor even with the exact retained checkpoint", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-legacy-operator-wrong-restore-pin-"));
+    try {
+      const capturePath = writeCapture(root);
+      const fixture = transitionFixture("legacy");
+      await runLegacyOperatorAuthorityTransition(
+        retirementInvocation("apply", VERSION_LEGACY),
+        target,
+        { ...applyOptions(fixture, join(root, "retirement-work")), capturePath },
+      );
+
+      const failure = await runLegacyOperatorAuthorityTransition(
+        restoreInvocation("apply", VERSION_WRONG),
+        target,
+        { ...applyOptions(fixture, join(root, "restore-work")), capturePath },
+      ).catch((error) => error);
+
+      expect(failure).toMatchObject({ phase: "preflight" });
+      expect(failure.message).toMatch(/selected predecessor|direct successor/i);
+      expect(fixture.mutations).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("restore fails closed on missing, unsafe, ambiguous, or wrong-predecessor checkpoints", async () => {
+    const cases: readonly {
+      readonly label: string;
+      readonly alter: (path: string) => void;
+      readonly message: RegExp;
+    }[] = [
+      {
+        label: "missing",
+        alter(path) {
+          rmSync(path);
+        },
+        message: /checkpoint is missing/i,
+      },
+      {
+        label: "mode drift",
+        alter(path) {
+          chmodSync(path, 0o644);
+        },
+        message: /owned 0600/i,
+      },
+      {
+        label: "symlink drift",
+        alter(path) {
+          const retained = `${path}.retained`;
+          renameSync(path, retained);
+          symlinkSync(retained, path);
+        },
+        message: /link-free/i,
+      },
+      {
+        label: "ambiguous members",
+        alter(path) {
+          const value = JSON.parse(readFileSync(path, "utf8"));
+          value.ambiguous = true;
+          writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+        },
+        message: /ambiguous/i,
+      },
+      {
+        label: "noncanonical bytes",
+        alter(path) {
+          const value = JSON.parse(readFileSync(path, "utf8"));
+          writeFileSync(path, JSON.stringify(value), { mode: 0o600 });
+        },
+        message: /canonical generated bytes/i,
+      },
+      {
+        label: "wrong predecessor",
+        alter(path) {
+          const value = JSON.parse(readFileSync(path, "utf8"));
+          value.legacyPredecessorVersionId = VERSION_WRONG;
+          writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+        },
+        message: /predecessor|capture/i,
+      },
+    ];
+
+    for (const selected of cases) {
+      const root = mkdtempSync(
+        join(
+          tmpdir(),
+          `takoserver-legacy-operator-checkpoint-${selected.label.replace(" ", "-")}-`,
+        ),
+      );
+      try {
+        const capturePath = writeCapture(root);
+        const fixture = transitionFixture("legacy");
+        await runLegacyOperatorAuthorityTransition(
+          retirementInvocation("apply", VERSION_LEGACY),
+          target,
+          { ...applyOptions(fixture, join(root, "retirement-work")), capturePath },
+        );
+        const checkpointPath = retirementCheckpointPath(capturePath);
+        selected.alter(checkpointPath);
+
+        const failure = await runLegacyOperatorAuthorityTransition(
+          restoreInvocation("apply", VERSION_RETIRED),
+          target,
+          { ...applyOptions(fixture, join(root, "restore-work")), capturePath },
+        ).catch((error) => error);
+
+        expect(failure).toMatchObject({ phase: "preflight" });
+        expect(failure.message).toMatch(selected.message);
+        expect(`${failure.message}\n${String(failure.detail)}`).not.toContain(capturePath);
+        expect(fixture.mutations).toHaveLength(1);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
     }
   });
 
@@ -341,6 +616,7 @@ describe("legacy operator authority retirement and exact restore", () => {
       expect(rendered).not.toContain(LEGACY_PUBLIC_JWK.x);
       expect(rendered).not.toContain(token);
       expect(fixture.mutations).toHaveLength(1);
+      const checkpointRaw = readFileSync(retirementCheckpointPath(capturePath), "utf8");
 
       const status = await runLegacyOperatorAuthorityTransition(
         retirementInvocation("status", VERSION_LEGACY),
@@ -353,6 +629,12 @@ describe("legacy operator authority retirement and exact restore", () => {
         retirementApplyReady: false,
         previousVersionId: VERSION_LEGACY,
         versionId: VERSION_RETIRED,
+        retirementCheckpoint: {
+          retained: true,
+          digest: sha256(checkpointRaw),
+          captureDigest: sha256(captureDocument()),
+          capturePathDigest: sha256(resolve(capturePath)),
+        },
       });
 
       await expect(
@@ -363,6 +645,61 @@ describe("legacy operator authority retirement and exact restore", () => {
         ),
       ).rejects.toThrow(/status|already retired/);
       expect(fixture.mutations).toHaveLength(1);
+
+      const restored = await runLegacyOperatorAuthorityTransition(
+        restoreInvocation("apply", VERSION_RETIRED),
+        target,
+        { ...applyOptions(fixture, join(root, "restore-work"), token), capturePath },
+      );
+      expect(restored).toMatchObject({
+        state: "legacy-operator-authority-restored",
+        retirementCheckpoint: { retained: true, digest: sha256(checkpointRaw) },
+      });
+      expect(fixture.mutations).toHaveLength(2);
+      expect(fixture.mutations[1]?.input).toBe(LEGACY_PUBLIC_JWK_BYTES);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a proved pre-mutation acknowledgement loss adopts the same checkpoint on explicit retry", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-legacy-operator-ack-before-mutation-"));
+    try {
+      const capturePath = writeCapture(root);
+      const fixture = transitionFixture("legacy", {
+        acknowledgementLossBeforeMutationOnce: "delete",
+      });
+      const first = await runLegacyOperatorAuthorityTransition(
+        retirementInvocation("apply", VERSION_LEGACY),
+        target,
+        { ...applyOptions(fixture, join(root, "first-work")), capturePath },
+      ).catch((error) => error);
+      expect(first).toMatchObject({ phase: "mutation" });
+      const checkpointRaw = readFileSync(retirementCheckpointPath(capturePath), "utf8");
+
+      const settled = await runLegacyOperatorAuthorityTransition(
+        retirementInvocation("status", VERSION_LEGACY),
+        target,
+        statusOptions(fixture, capturePath),
+      );
+      expect(settled).toMatchObject({
+        state: "legacy-operator-authority-present",
+        ready: false,
+        retirementApplyReady: true,
+        retirementCheckpoint: { retained: true, digest: sha256(checkpointRaw) },
+      });
+
+      const retried = await runLegacyOperatorAuthorityTransition(
+        retirementInvocation("apply", VERSION_LEGACY),
+        target,
+        { ...applyOptions(fixture, join(root, "second-work")), capturePath },
+      );
+      expect(retried).toMatchObject({
+        state: "legacy-operator-authority-retired",
+        retirementCheckpoint: { retained: true, digest: sha256(checkpointRaw) },
+      });
+      expect(readFileSync(retirementCheckpointPath(capturePath), "utf8")).toBe(checkpointRaw);
+      expect(fixture.mutations).toHaveLength(2);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -478,7 +815,15 @@ describe("legacy operator authority retirement and exact restore", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-legacy-operator-restore-"));
     try {
       const capturePath = writeCapture(root);
-      const fixture = transitionFixture("retired");
+      const fixture = transitionFixture("legacy");
+      await runLegacyOperatorAuthorityTransition(
+        retirementInvocation("apply", VERSION_LEGACY),
+        target,
+        {
+          ...applyOptions(fixture, join(root, "retirement-work")),
+          capturePath,
+        },
+      );
       const result = await runLegacyOperatorAuthorityTransition(
         restoreInvocation("apply", VERSION_RETIRED),
         target,
@@ -498,8 +843,8 @@ describe("legacy operator authority retirement and exact restore", () => {
         secretRestored: LEGACY_OPERATOR_PUBLIC_JWK_SECRET,
         probe: { status: 200, openapi: { status: 200 } },
       });
-      expect(fixture.mutations).toHaveLength(1);
-      const mutation = fixture.mutations[0];
+      expect(fixture.mutations).toHaveLength(2);
+      const mutation = fixture.mutations[1];
       expect(mutation?.command).toEqual(
         expect.arrayContaining([
           "secret",
@@ -601,7 +946,16 @@ describe("legacy operator authority retirement and exact restore", () => {
     try {
       const capturePath = writeCapture(root);
       const token = "provider-token-do-not-print";
-      const fixture = transitionFixture("retired", {
+      const fixture = transitionFixture("legacy");
+      await runLegacyOperatorAuthorityTransition(
+        retirementInvocation("apply", VERSION_LEGACY),
+        target,
+        {
+          ...applyOptions(fixture, join(root, "retirement-work"), token),
+          capturePath,
+        },
+      );
+      const restoring = transitionFixture("retired", {
         acknowledgementLoss: "put",
         providerDiagnostic: `${capturePath} ${LEGACY_PUBLIC_JWK_BYTES} ${LEGACY_PUBLIC_JWK.x} ${token}`,
       });
@@ -609,7 +963,7 @@ describe("legacy operator authority retirement and exact restore", () => {
         restoreInvocation("apply", VERSION_RETIRED),
         target,
         {
-          ...applyOptions(fixture, join(root, "work"), token),
+          ...applyOptions(restoring, join(root, "work"), token),
           capturePath,
         },
       ).catch((error) => error);
@@ -621,12 +975,12 @@ describe("legacy operator authority retirement and exact restore", () => {
       expect(rendered).not.toContain(LEGACY_PUBLIC_JWK_BYTES);
       expect(rendered).not.toContain(LEGACY_PUBLIC_JWK.x);
       expect(rendered).not.toContain(token);
-      expect(fixture.mutations).toHaveLength(1);
+      expect(restoring.mutations).toHaveLength(1);
 
       const status = await runLegacyOperatorAuthorityTransition(
         restoreInvocation("status", VERSION_RETIRED),
         target,
-        statusOptions(fixture, capturePath),
+        statusOptions(restoring, capturePath),
       );
       expect(status).toMatchObject({
         state: "legacy-operator-authority-restored",
@@ -637,11 +991,11 @@ describe("legacy operator authority retirement and exact restore", () => {
       });
       await expect(
         runLegacyOperatorAuthorityTransition(restoreInvocation("apply", VERSION_RETIRED), target, {
-          ...applyOptions(fixture, join(root, "retry-work"), token),
+          ...applyOptions(restoring, join(root, "retry-work"), token),
           capturePath,
         }),
       ).rejects.toThrow(/status|already restored/);
-      expect(fixture.mutations).toHaveLength(1);
+      expect(restoring.mutations).toHaveLength(1);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -766,6 +1120,7 @@ function transitionFixture(
     readonly selectedTarget?: DeployTarget;
     readonly inventory?: readonly string[];
     readonly acknowledgementLoss?: "delete" | "put";
+    readonly acknowledgementLossBeforeMutationOnce?: "delete" | "put";
     readonly providerDiagnostic?: string;
     readonly advanceBeforeMutation?: boolean;
     readonly annotationFreeSuccessors?: boolean;
@@ -775,6 +1130,7 @@ function transitionFixture(
   const selected = options.selectedTarget ?? target;
   let stage = initial;
   let deploymentReads = 0;
+  let acknowledgementLostBeforeMutation = false;
   const reads = { deployments: 0, versions: 0, secrets: 0, domains: 0 };
   const mutations: { command: string[]; input?: string }[] = [];
   const state: LegacyOperatorAuthorityState = {
@@ -810,6 +1166,13 @@ function transitionFixture(
     if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
     if (command.includes("secret") && command.includes("delete")) {
       mutations.push({ command: [...command] });
+      if (
+        options.acknowledgementLossBeforeMutationOnce === "delete" &&
+        !acknowledgementLostBeforeMutation
+      ) {
+        acknowledgementLostBeforeMutation = true;
+        return failed(options.providerDiagnostic ?? "acknowledgement lost before mutation");
+      }
       stage = stage === "restored" ? "reretired" : "retired";
       return options.acknowledgementLoss === "delete"
         ? failed(options.providerDiagnostic ?? "acknowledgement lost")
@@ -820,6 +1183,13 @@ function transitionFixture(
         command: [...command],
         ...(commandOptions?.input === undefined ? {} : { input: commandOptions.input }),
       });
+      if (
+        options.acknowledgementLossBeforeMutationOnce === "put" &&
+        !acknowledgementLostBeforeMutation
+      ) {
+        acknowledgementLostBeforeMutation = true;
+        return failed(options.providerDiagnostic ?? "acknowledgement lost before mutation");
+      }
       stage = "restored";
       return options.acknowledgementLoss === "put"
         ? failed(options.providerDiagnostic ?? "acknowledgement lost")
@@ -940,6 +1310,10 @@ function writeCapture(root: string, input: CaptureInput = {}): string {
   const path = join(root, "legacy-operator-authority-capture.json");
   writeFileSync(path, captureDocument(input), { mode: 0o600 });
   return path;
+}
+
+function retirementCheckpointPath(capturePath: string): string {
+  return `${resolve(capturePath)}.retirement-checkpoint.json`;
 }
 
 function sha256(value: string): string {

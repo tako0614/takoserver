@@ -833,19 +833,26 @@ export const DEPLOY_CONTRACT = {
           "desired closure plus only OPERATOR_PUBLIC_JWK, while the target and immutable Version " +
           "prove the replacement OPERATOR_IDENTITY_PUBLIC_JWK and Stripe settlement/checkout authority. " +
           "An owned link-free 0600 operator capture binds the historical legacy public JWK bytes/digest " +
-          "to the account, Worker and exact legacy predecessor. Cloudflare proves its secret name/type " +
+          "to the account, Worker and exact legacy predecessor. Before deletion, a deterministic " +
+          "same-directory no-overwrite retirement checkpoint binds the exact raw capture-file digest/byte length, " +
+          "canonical path identity digest, target, predecessor, source/artifact identity and provider script identity " +
+          "without retaining the path or JWK bytes. Cloudflare proves its secret name/type " +
           "but cannot expose or verify its value digest; status and the apply receipt report that boundary.",
         "post-conditions":
           "One stdin-free secret delete creates the selected predecessor's exact direct-successor " +
           "Worker Version. OPERATOR_PUBLIC_JWK alone is absent; script etag/code, every other variable, " +
           "binding and secret, domains, canonical source/artifact identity and the public product probe remain exact. " +
-          "A provider secret marker or annotation-free successor is attribution only after those exact proofs.",
+          "A provider secret marker or annotation-free successor is attribution only after those exact proofs. " +
+          "The no-overwrite retirement checkpoint remains the mechanically validated restore authority.",
         reversal:
           "Exact restoration is owned only by takoserver-integration-legacy-operator-authority-restore " +
-          "with the retired Version selected and the exact historical bytes from the same operator capture supplied through stdin.",
+          "with the retired Version selected and the exact historical bytes from the operator capture whose " +
+          "file digest and canonical path identity match the retained retirement checkpoint, supplied through stdin.",
         "failure-handling":
           `${highRiskFailure} The apply path re-reads the exact predecessor immediately before its one ` +
-          "delete. A lost acknowledgement is status-only reconciliation; already-retired apply, foreign " +
+          "delete and performs no provider mutation when the checkpoint cannot be retained. " +
+          "An existing exact checkpoint is adopted without overwrite. A lost acknowledgement is status-only " +
+          "reconciliation through that retained evidence; missing or ambiguous evidence, already-retired apply, foreign " +
           "secret/config drift, non-direct history and ordinary Worker or authority-cutover bypass are refused." +
           inputContract(applyReviewInput, legacyOperatorAuthorityCaptureInput),
         "independent-review": review,
@@ -876,7 +883,9 @@ export const DEPLOY_CONTRACT = {
           "source/artifact identity and replacement identity/Stripe closure are proven before the owned, " +
           "link-free 0600 operator capture supplies the exact historical legacy public JWK bytes/digest " +
           "bound to the account, Worker and original legacy predecessor; those bytes need not equal the replacement identity. " +
-          "Cloudflare proves the secret name/type but cannot expose or verify its value digest.",
+          "The retained no-overwrite retirement checkpoint must mechanically match the capture-file digest/byte length, " +
+          "canonical path identity, target, predecessor and Worker provenance. Cloudflare proves the secret name/type " +
+          "but cannot expose or verify its value digest.",
         "post-conditions":
           "One stdin-only secret put creates the selected predecessor's exact direct-successor Worker " +
           "Version. OPERATOR_PUBLIC_JWK alone is restored; script etag/code, every other variable, binding " +
@@ -888,7 +897,8 @@ export const DEPLOY_CONTRACT = {
         "failure-handling":
           `${highRiskFailure} Public-JWK bytes and their path never enter argv, output or diagnostics. ` +
           "The apply path re-reads the exact predecessor immediately before its one put; a lost " +
-          "acknowledgement is status-only reconciliation and never a blind retry." +
+          "acknowledgement is status-only reconciliation and never a blind retry. A missing, ambiguous, unsafe, or mismatched checkpoint " +
+          "or any capture byte/mode/symlink/path-identity drift is refused before provider mutation." +
           inputContract(applyReviewInput, legacyOperatorAuthorityCaptureInput),
         "independent-review": review,
       },
