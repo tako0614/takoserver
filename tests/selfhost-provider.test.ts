@@ -321,17 +321,42 @@ describe("publishing a Worker through the Edge Family", () => {
     expect(observed.phase === "succeeded" ? observed.result.outputs : {}).toEqual(outputs);
   });
 
-  test("a second deployment replaces the modules rather than merging them", async () => {
+  test("a differing Worker Version digest refuses overwrite and preserves the committed modules", async () => {
     const first = provider({ modules: { "index.js": "a", "old.js": "b" } });
     const script = await publish(first);
     expect(await readFile(join(root, "workers", script, "old.js"), "utf8")).toBe("b");
 
     const second = provider({ modules: { "index.js": "a2" } });
-    await publish(second);
-    // A module the new bundle does not contain must not survive, where it
-    // would be loadable and wrong.
-    const kept = await readFile(join(root, "workers", script, "old.js"), "utf8").catch(() => null);
-    expect(kept).toBeNull();
+    const worker = await second.apply({
+      operationId: "op_worker",
+      offering: offering("ModuleWorker"),
+      identity: identity("hello"),
+      spec: {},
+    });
+    expect(worker.phase).toBe("succeeded");
+    const version = await second.apply({
+      operationId: "op_version",
+      offering: offering("WorkerVersion"),
+      identity: identity("hello-v1"),
+      spec: {
+        bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+        handlers: ["fetch"],
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", "hello"),
+        relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+      ],
+    });
+    expect(version).toMatchObject({
+      phase: "failed",
+      failure: { code: "conflict" },
+    });
+    // Immutable Worker Version identities are create-only. A module the new
+    // bundle does not contain must not be able to erase or replace committed
+    // bytes under the same identity.
+    expect(await readFile(join(root, "workers", script, "old.js"), "utf8")).toBe("b");
+    expect(await readFile(join(root, "workers", script, "index.js"), "utf8")).toBe("a");
   });
 
   test("refuses a custom domain this deployment does not serve", async () => {

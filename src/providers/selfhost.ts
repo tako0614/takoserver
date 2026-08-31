@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
-import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { JsonObject } from "../ports.ts";
 import {
@@ -33,6 +33,11 @@ import {
   type SelfhostScriptStateSnapshot,
   SelfhostScriptStateStoreError,
 } from "./selfhost-script-state.ts";
+import {
+  createSelfhostVersionMaterializer,
+  SelfhostVersionMaterializationError,
+  type SelfhostVersionMaterializationRequest,
+} from "./selfhost-version-materialization.ts";
 
 /**
  * Provisioning the released Takoform Edge Family on the machine this runs on.
@@ -121,11 +126,6 @@ export interface SelfhostProviderOptions {
   readonly suffixes?: readonly string[];
 }
 
-interface VersionMeta {
-  readonly mainModule: string;
-  readonly assets?: { readonly notFoundHandling: string };
-}
-
 class SelfhostFailure extends Error {
   readonly ticket: ProviderTicket;
   constructor(ticket: ProviderTicket) {
@@ -142,6 +142,22 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   const scriptsRoot = join(dataRoot, "selfhost", "scripts");
   const databasesRoot = join(dataRoot, "databases");
   const scriptStates = createSelfhostScriptStateStore({ root: scriptsRoot });
+  const versionMaterializer = createSelfhostVersionMaterializer({
+    root: versionsRoot,
+    artifacts,
+  });
+  const inspectVersion = async (script: string, versionId: string) => {
+    try {
+      return await versionMaterializer.inspect({ script, versionId });
+    } catch (error) {
+      if (error instanceof SelfhostVersionMaterializationError) {
+        throw new SelfhostFailure(
+          failed(error.code, materializationMessage(error), error.code === "unavailable"),
+        );
+      }
+      throw error;
+    }
+  };
 
   const serves = (hostname: string): boolean => {
     const suffixes = options.suffixes ?? [];
@@ -244,13 +260,13 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       return;
     }
     const versionDirectory = join(versionsRoot, script, state.activeVersion);
-    const rawMeta = await readFile(join(versionDirectory, "meta.json"), "utf8").catch(() => null);
-    if (rawMeta === null) {
+    const inspected = await inspectVersion(script, state.activeVersion);
+    if (inspected.state === "absent" || inspected.state === "corrupt") {
       throw new SelfhostFailure(
         failed("provider_error", "the active Worker Version is not materialized on this machine"),
       );
     }
-    const meta = JSON.parse(rawMeta) as VersionMeta;
+    const meta = inspected.meta;
     const modules = await readTree(join(versionDirectory, "modules"));
     const assets = meta.assets ? await readTree(join(versionDirectory, "assets")) : undefined;
     const hostnames = [
@@ -333,32 +349,11 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       space: input.identity.space,
       name: input.identity.name,
     });
-    const manifest = await artifacts.manifest(input.identity.tenantRef, manifestDigest);
-    if (!manifest) {
-      return failed("invalid_spec", "the Worker Bundle is not available");
-    }
-    if (manifest.kind !== "WorkerBundle" || !manifest.mainModule) {
-      return failed("invalid_spec", "the Worker Bundle is not available");
-    }
-    const modules = manifest.modules ?? [];
-    if (modules.length === 0) return failed("invalid_spec", "the Worker Bundle has no modules");
-
-    const directory = join(versionsRoot, script, versionId);
-    // Replaced rather than merged, exactly like the runtime's own script
-    // directories: a module the new materialization does not contain must not
-    // survive from an earlier incarnation of the same name.
-    await rm(directory, { recursive: true, force: true });
-    for (const module of modules) {
-      const bytes = await artifacts.blob(module.digest);
-      if (!bytes) return failed("invalid_spec", `a declared module is missing: ${module.name}`);
-      await writeTreeFile(join(directory, "modules"), module.name, bytes);
-    }
-
     const assetsSpec =
       typeof input.spec.assets === "object" && input.spec.assets !== null
         ? (input.spec.assets as JsonObject)
         : null;
-    let assetsMeta: VersionMeta["assets"];
+    let assetsInput: SelfhostVersionMaterializationRequest["assets"] | undefined;
     if (assetsSpec) {
       const assetBundle = relationResource(input.relations, "/assets/bundle", "StaticAssetBundle");
       const assetsDigest =
@@ -366,20 +361,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           ? assetBundle.spec.manifestDigest
           : null;
       if (!assetsDigest) return failed("invalid_spec", "the Static Asset Bundle is unavailable");
-      const assetManifest = await artifacts.manifest(input.identity.tenantRef, assetsDigest);
-      if (!assetManifest) {
-        return failed("invalid_spec", "the Static Asset Bundle is unavailable");
-      }
-      const files = assetManifest?.files ?? [];
-      if (assetManifest.kind !== "StaticAssetBundle" || files.length === 0) {
-        return failed("invalid_spec", "the Static Asset Bundle is unavailable");
-      }
-      for (const file of files) {
-        const bytes = await artifacts.blob(file.digest);
-        if (!bytes) return failed("invalid_spec", `a declared asset is missing: ${file.path}`);
-        await writeTreeFile(join(directory, "assets"), file.path, bytes);
-      }
-      assetsMeta = {
+      assetsInput = {
+        manifestDigest: assetsDigest,
         notFoundHandling:
           assetsSpec.notFoundHandling === "single_page_application"
             ? "single-page-application"
@@ -387,17 +370,127 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       };
     }
 
-    // Written last: a version directory without a meta is not a version.
-    const meta: VersionMeta = {
-      mainModule: manifest.mainModule,
-      ...(assetsMeta ? { assets: assetsMeta } : {}),
-    };
-    await writeFile(join(directory, "meta.json"), JSON.stringify(meta), "utf8");
+    let materialized: Awaited<ReturnType<typeof versionMaterializer.materialize>>;
+    try {
+      materialized = await versionMaterializer.materialize({
+        tenantRef: input.identity.tenantRef,
+        script,
+        versionId,
+        manifestDigest,
+        ...(assetsInput ? { assets: assetsInput } : {}),
+      });
+    } catch (error) {
+      if (error instanceof SelfhostVersionMaterializationError) {
+        return failed(error.code, materializationMessage(error), error.code === "unavailable");
+      }
+      throw error;
+    }
 
     return succeeded({
       nativeId: nativeId(input, `selfhost-version:${script}:${versionId}`),
-      observed: { scriptName: script, versionId },
-      outputs: { scriptName: script, versionId },
+      observed: {
+        scriptName: script,
+        versionId,
+        materializationDigest: materialized.materializationDigest,
+      },
+      outputs: {
+        scriptName: script,
+        versionId,
+        materializationDigest: materialized.materializationDigest,
+      },
+    });
+  };
+
+  /**
+   * Apply acknowledgement recovery is read-only. Re-resolve the exact
+   * artifact closure to derive its expected digest, then inspect the local
+   * directory; never route an uncertain recovery back through `apply`.
+   */
+  const recoverWorkerVersionApply = async (input: ApplyInput): Promise<ProviderTicket> => {
+    if (input.previous) return failed("invalid_spec", "Worker Versions are immutable");
+    const requiredSensitive = input.spec.requiredSensitiveVars ?? [];
+    if (
+      !Array.isArray(requiredSensitive) ||
+      requiredSensitive.some((name) => typeof name !== "string")
+    ) {
+      return failed("invalid_spec", "the sensitive Worker binding declaration is invalid");
+    }
+    if (requiredSensitive.length > 0) {
+      return failed("denied", "sensitive Worker bindings are unsupported by this Host");
+    }
+    const worker = relationResource(input.relations, "/worker", "ModuleWorker");
+    const bundle = relationResource(input.relations, "/bundle", "WorkerBundle");
+    const manifestDigest =
+      typeof bundle?.spec.manifestDigest === "string" ? bundle.spec.manifestDigest : null;
+    if (!worker || !manifestDigest) {
+      return failed("invalid_spec", "the Worker Version is incomplete");
+    }
+    const script = await scriptOf(input.identity.tenantRef, worker.metadata);
+    const versionId = await versionIdOf(input.identity.tenantRef, {
+      space: input.identity.space,
+      name: input.identity.name,
+    });
+    const assetsSpec =
+      typeof input.spec.assets === "object" && input.spec.assets !== null
+        ? (input.spec.assets as JsonObject)
+        : null;
+    let assetsInput: SelfhostVersionMaterializationRequest["assets"] | undefined;
+    if (assetsSpec) {
+      const assetBundle = relationResource(input.relations, "/assets/bundle", "StaticAssetBundle");
+      const assetsDigest =
+        typeof assetBundle?.spec.manifestDigest === "string"
+          ? assetBundle.spec.manifestDigest
+          : null;
+      if (!assetsDigest) return failed("invalid_spec", "the Static Asset Bundle is unavailable");
+      assetsInput = {
+        manifestDigest: assetsDigest,
+        notFoundHandling:
+          assetsSpec.notFoundHandling === "single_page_application"
+            ? "single-page-application"
+            : "none",
+      };
+    }
+    let expected: Awaited<ReturnType<typeof versionMaterializer.prepare>>;
+    try {
+      expected = await versionMaterializer.prepare({
+        tenantRef: input.identity.tenantRef,
+        script,
+        versionId,
+        manifestDigest,
+        ...(assetsInput ? { assets: assetsInput } : {}),
+      });
+    } catch (error) {
+      if (error instanceof SelfhostVersionMaterializationError) {
+        return failed(error.code, materializationMessage(error), error.code === "unavailable");
+      }
+      throw error;
+    }
+    const materialized = await inspectVersion(script, versionId);
+    if (materialized.state === "absent") {
+      return failed("not_found", "the Worker Version is not materialized");
+    }
+    if (materialized.state === "corrupt") {
+      return failed("provider_error", "the Worker Version materialization is corrupt");
+    }
+    if (materialized.digest !== expected.materializationDigest) {
+      return failed(
+        "conflict",
+        "the committed Worker Version materialization conflicts with this recovery",
+      );
+    }
+    return succeeded({
+      nativeId: nativeId(input, `selfhost-version:${script}:${versionId}`),
+      observed: {
+        scriptName: script,
+        versionId,
+        materialized: true,
+        materializationDigest: materialized.digest,
+      },
+      outputs: {
+        scriptName: script,
+        versionId,
+        materializationDigest: materialized.digest,
+      },
     });
   };
 
@@ -666,7 +759,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           case "WorkerVersion":
             if (!parsed.script || !parsed.versionId) return selfhostUnknown("malformed", false);
             return await verifySelfhostVersionAbsence(
-              versionsRoot,
+              versionMaterializer,
               parsed.script,
               parsed.versionId,
               input.descriptor,
@@ -718,6 +811,22 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           return selfhostUnknown("malformed", false);
         }
         return selfhostUnknown("transport", true);
+      }
+    },
+
+    async recoverApply(input): Promise<ProviderTicket> {
+      if (dispatchKind(input.offering) !== "WorkerVersion") {
+        return failed(
+          "unavailable",
+          "self-host apply recovery is supported only for Worker Version materialization",
+          true,
+        );
+      }
+      try {
+        return await recoverWorkerVersionApply(input);
+      } catch (error) {
+        if (error instanceof SelfhostFailure) return error.ticket;
+        throw error;
       }
     },
 
@@ -778,11 +887,26 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
               space: input.identity.space,
               name: input.identity.name,
             });
-            const materialized = existsSync(join(versionsRoot, script, versionId, "meta.json"));
+            const materialized = await inspectVersion(script, versionId);
+            if (materialized.state === "absent") {
+              return failed("not_found", "the Worker Version is not materialized");
+            }
+            if (materialized.state === "corrupt") {
+              return failed("provider_error", "the Worker Version materialization is corrupt");
+            }
             return succeeded({
               nativeId: input.nativeId,
-              observed: { scriptName: script, versionId, materialized },
-              outputs: { scriptName: script, versionId },
+              observed: {
+                scriptName: script,
+                versionId,
+                materialized: true,
+                materializationDigest: materialized.digest,
+              },
+              outputs: {
+                scriptName: script,
+                versionId,
+                materializationDigest: materialized.digest,
+              },
             });
           }
           case "WorkerDeployment": {
@@ -1602,37 +1726,16 @@ async function verifySelfhostWorkerAbsence(
 }
 
 async function verifySelfhostVersionAbsence(
-  versionsRoot: string,
+  versionMaterializer: ReturnType<typeof createSelfhostVersionMaterializer>,
   script: string,
   versionId: string | undefined,
   descriptor: ProviderNativeReadbackDescriptor,
   kind: string,
 ): Promise<ProviderNativeAbsence> {
   if (!versionId) return selfhostUnknown("malformed", false);
-  const directory = join(versionsRoot, script, versionId);
-  const metaPath = join(directory, "meta.json");
-  const bytes = await readFile(metaPath).catch((error) => {
-    if (errorCode(error) === "ENOENT") return null;
-    throw error;
-  });
-  if (bytes === null) {
-    return existsSync(directory)
-      ? selfhostUnknown("malformed", false)
-      : selfhostAbsence("absent", descriptor, kind);
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
-  } catch {
-    return selfhostUnknown("malformed", false);
-  }
-  if (
-    !isJsonObject(parsed) ||
-    typeof parsed.mainModule !== "string" ||
-    parsed.mainModule.length === 0
-  ) {
-    return selfhostUnknown("malformed", false);
-  }
+  const inspected = await versionMaterializer.inspect({ script, versionId });
+  if (inspected.state === "absent") return selfhostAbsence("absent", descriptor, kind);
+  if (inspected.state === "corrupt") return selfhostUnknown("malformed", false);
   return selfhostAbsence("present", descriptor, kind);
 }
 
@@ -1723,6 +1826,17 @@ function errorCode(error: unknown): string | undefined {
     : undefined;
 }
 
+function materializationMessage(error: SelfhostVersionMaterializationError): string {
+  switch (error.code) {
+    case "invalid_spec":
+      return "the Worker Version artifacts are invalid";
+    case "conflict":
+      return "the committed Worker Version materialization conflicts with this apply";
+    case "unavailable":
+      return "the Worker Version materialization is unavailable";
+  }
+}
+
 /** Reads every file under a directory into module-name → bytes. */
 async function readTree(root: string): Promise<Map<string, Uint8Array>> {
   const result = new Map<string, Uint8Array>();
@@ -1738,17 +1852,6 @@ async function readTree(root: string): Promise<Map<string, Uint8Array>> {
     result.set(name, new Uint8Array(await readFile(path)));
   }
   return result;
-}
-
-async function writeTreeFile(root: string, name: string, bytes: Uint8Array): Promise<void> {
-  // Names come from a customer's bundle, so they are checked against escaping
-  // the directory they are written into.
-  if (name.includes("..") || name.startsWith("/")) {
-    throw new SelfhostFailure(failed("invalid_spec", `unusable file name: ${name}`));
-  }
-  const path = join(root, name);
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, bytes);
 }
 
 function sqlitePathOf(nativeId: string, databasePath: (name: string) => string): string | null {
