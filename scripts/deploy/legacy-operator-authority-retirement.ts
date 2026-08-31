@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
+import { parseStrictJson } from "../../src/strict-json.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import {
   type DeployError,
@@ -56,7 +57,9 @@ import {
 export const LEGACY_OPERATOR_PUBLIC_JWK_SECRET = "OPERATOR_PUBLIC_JWK" as const;
 
 const MAX_PUBLIC_JWK_BYTES = 16_384;
+const MAX_CAPTURE_BYTES = 32_768;
 const BASE64URL_32 = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/u;
+const CAPTURE_KIND = "takoserver.legacy-operator-authority-capture@v1" as const;
 
 export type LegacyOperatorAuthoritySurface =
   | "takoserver-integration-legacy-operator-authority-retirement"
@@ -82,15 +85,21 @@ export interface LegacyOperatorAuthorityOptions {
   readonly state?: LegacyOperatorAuthorityState;
   readonly review?: string;
   readonly outputDirectory?: string;
-  readonly publicJwkPath?: string;
+  readonly capturePath?: string;
   readonly cloudflareEnvironment?: Readonly<Record<string, string>>;
   readonly fetcher?: (input: string, init?: RequestInit) => Promise<Response>;
 }
 
 type Direction = "retirement" | "restore";
 type Relationship = "predecessor-current" | "direct-successor-current";
+type SuccessorAttribution = "provider-secret-marker" | "annotation-free-exact-secret-transition";
 
 interface ReplacementAuthorities {
+  readonly publicJwkDigest: `sha256:${string}`;
+}
+
+interface LegacyOperatorAuthorityCapture {
+  readonly legacyPredecessorVersionId: string;
   readonly publicJwkBytes: string;
   readonly publicJwkDigest: `sha256:${string}`;
 }
@@ -106,6 +115,7 @@ interface TransitionInspection {
   readonly bundleDigestHex: string;
   readonly scriptEtag: string;
   readonly legacySecretPresent: boolean;
+  readonly successorAttribution: SuccessorAttribution | null;
   readonly authorityProfile?: WorkerVersionAuthorityProfile;
   readonly chainFingerprint: string;
 }
@@ -123,6 +133,10 @@ export async function runLegacyOperatorAuthorityTransition(
 ): Promise<Record<string, unknown>> {
   const direction = validateInvocation(invocation, target);
   const replacement = requireReplacementAuthorities(target);
+  const capture = readLegacyOperatorAuthorityCapture(
+    options.capturePath ?? requireEnvironment("TAKOSERVER_LEGACY_OPERATOR_AUTHORITY_CAPTURE_PATH"),
+    target,
+  );
   const environment =
     options.cloudflareEnvironment ??
     (options.state !== undefined && invocation.action === "status"
@@ -140,6 +154,7 @@ export async function runLegacyOperatorAuthorityTransition(
     invocation.commit,
     target,
     state,
+    capture.legacyPredecessorVersionId,
   );
 
   if (invocation.action === "status") {
@@ -151,6 +166,7 @@ export async function runLegacyOperatorAuthorityTransition(
       invocation.commit,
       target,
       state,
+      capture.legacyPredecessorVersionId,
     );
     assertSameInspection(
       "verification",
@@ -158,7 +174,7 @@ export async function runLegacyOperatorAuthorityTransition(
       final,
       "Worker changed during legacy operator authority status",
     );
-    return statusResult(invocation, direction, before, replacement, probe);
+    return statusResult(invocation, direction, before, replacement, capture, probe);
   }
 
   if (before.relationship !== "predecessor-current") {
@@ -183,14 +199,6 @@ export async function runLegacyOperatorAuthorityTransition(
   const reviewer = exactReviewer(
     options.review ?? requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW"),
   );
-  const restoreInput =
-    direction === "restore"
-      ? readExactRestorePublicJwk(
-          options.publicJwkPath ?? requireEnvironment("TAKOSERVER_LEGACY_OPERATOR_PUBLIC_JWK_PATH"),
-          replacement,
-        )
-      : undefined;
-
   const root =
     options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-legacy-operator-authority-"));
   const temporary = options.outputDirectory === undefined;
@@ -219,6 +227,7 @@ export async function runLegacyOperatorAuthorityTransition(
       source.commit,
       target,
       state,
+      capture.legacyPredecessorVersionId,
     );
     assertSameInspection(
       "preflight",
@@ -241,17 +250,13 @@ export async function runLegacyOperatorAuthorityTransition(
     ]);
     const mutation = await run(command, {
       env: environment,
-      ...(restoreInput === undefined ? {} : { input: restoreInput.bytes }),
+      ...(direction === "restore" ? { input: capture.publicJwkBytes } : {}),
     });
     if (mutation.exitCode !== 0) {
       const diagnostic = `${mutation.stdout}${mutation.stderr}`.trim();
       throw mutationError(
         `legacy operator authority ${direction} acknowledgement is indeterminate; do not retry before --status`,
-        direction === "restore"
-          ? diagnostic.length === 0
-            ? undefined
-            : "[redacted]"
-          : redactDiagnostics(diagnostic, [environment.CLOUDFLARE_API_TOKEN]),
+        diagnostic.length === 0 ? undefined : "[redacted]",
       );
     }
 
@@ -262,6 +267,7 @@ export async function runLegacyOperatorAuthorityTransition(
       source.commit,
       target,
       state,
+      capture.legacyPredecessorVersionId,
     );
     assertExactDirectSuccessor(direction, before, after);
     const probe = await probeProduct(target.publicOrigin, fetcher);
@@ -272,6 +278,7 @@ export async function runLegacyOperatorAuthorityTransition(
       source.commit,
       target,
       state,
+      capture.legacyPredecessorVersionId,
     );
     assertSameInspection(
       "verification",
@@ -279,7 +286,17 @@ export async function runLegacyOperatorAuthorityTransition(
       final,
       "Worker changed during legacy operator authority verification",
     );
-    return applyResult(invocation, direction, source, reviewer, before, after, replacement, probe);
+    return applyResult(
+      invocation,
+      direction,
+      source,
+      reviewer,
+      before,
+      after,
+      replacement,
+      capture,
+      probe,
+    );
   } finally {
     if (temporary) rmSync(root, { recursive: true, force: true });
   }
@@ -350,7 +367,7 @@ function requireReplacementAuthorities(target: DeployTarget): ReplacementAuthori
     );
   }
   const publicJwkBytes = JSON.stringify(publicJwk);
-  return { publicJwkBytes, publicJwkDigest: sha256(publicJwkBytes) };
+  return { publicJwkDigest: sha256(publicJwkBytes) };
 }
 
 async function inspectTransition(
@@ -360,6 +377,7 @@ async function inspectTransition(
   selectedCommit: string,
   target: DeployTarget,
   state: LegacyOperatorAuthorityState,
+  capturedLegacyPredecessorVersionId: string,
 ): Promise<TransitionInspection> {
   const chain = parseWorkerDeploymentChain(
     await state.workerDeployments(target.workerName),
@@ -379,7 +397,20 @@ async function inspectTransition(
               "authoritative Worker is not the selected predecessor or its exact direct successor",
             );
           })();
-
+  const captureIndex =
+    direction === "retirement"
+      ? relationship === "predecessor-current"
+        ? 0
+        : 1
+      : relationship === "predecessor-current"
+        ? 1
+        : 2;
+  if (chain[captureIndex]?.versionId !== capturedLegacyPredecessorVersionId) {
+    throw phaseFailure(
+      phase,
+      "operator capture is not bound to the exact legacy predecessor in this selected transition",
+    );
+  }
   const inspected: {
     readonly entry: WorkerDeploymentChainEntry;
     readonly version: unknown;
@@ -401,10 +432,10 @@ async function inspectTransition(
       anchorIndex = index;
       break;
     }
-    if (profile !== "secret-created") {
+    if (profile !== "secret-created" && !isAnnotationFreeVersion(version)) {
       throw phaseFailure(
         phase,
-        `version ${entry.versionId} is neither a canonical anchor nor an exact secret-created successor`,
+        `version ${entry.versionId} is neither a canonical anchor nor an exact provider secret successor`,
       );
     }
   }
@@ -519,9 +550,25 @@ async function inspectTransition(
     bundleDigestHex: identity.bundleDigestHex,
     scriptEtag: currentInspection.scriptEtag,
     legacySecretPresent: currentInspection.legacyPresent,
+    successorAttribution: successorAttribution(currentInspection.version),
     ...(authorityProfile === undefined ? {} : { authorityProfile }),
     chainFingerprint: JSON.stringify(chain),
   };
+}
+
+function isAnnotationFreeVersion(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return (
+    !("annotations" in value) ||
+    (isRecord(value.annotations) && Object.keys(value.annotations).length === 0)
+  );
+}
+
+function successorAttribution(value: unknown): SuccessorAttribution | null {
+  if (workerVersionAnnotationProfile(value) === "secret-created") {
+    return "provider-secret-marker";
+  }
+  return isAnnotationFreeVersion(value) ? "annotation-free-exact-secret-transition" : null;
 }
 
 function exactAuthorityProfile(
@@ -579,12 +626,12 @@ function versionHasLegacySecret(phase: DeployPhase, versionId: string, value: un
   return true;
 }
 
-function readExactRestorePublicJwk(
+function readLegacyOperatorAuthorityCapture(
   path: string,
-  expected: ReplacementAuthorities,
-): { readonly bytes: string; readonly digest: `sha256:${string}` } {
+  target: DeployTarget,
+): LegacyOperatorAuthorityCapture {
   let descriptor: number | null = null;
-  let raw: string;
+  let raw: Uint8Array;
   try {
     const normalized = linkFreePath(path);
     descriptor = openSync(normalized, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -596,41 +643,71 @@ function readExactRestorePublicJwk(
       status.uid !== process.getuid() ||
       (status.mode & 0o7777) !== 0o600 ||
       status.size < 1 ||
-      status.size > MAX_PUBLIC_JWK_BYTES
+      status.size > MAX_CAPTURE_BYTES
     ) {
       throw new Error("unsafe");
     }
-    raw = readFileSync(descriptor, "utf8");
+    raw = readFileSync(descriptor);
   } catch {
     throw preflightError(
-      "legacy operator public JWK must be an owned 0600 link-free regular file of at most 16 KiB",
+      "legacy operator authority capture must be an owned 0600 link-free regular file of at most 32 KiB",
     );
   } finally {
     if (descriptor !== null) closeSync(descriptor);
   }
   let value: unknown;
   try {
-    value = JSON.parse(raw);
+    value = parseStrictJson(raw, MAX_CAPTURE_BYTES);
   } catch {
-    throw preflightError(
-      "legacy operator public JWK does not match the expected operator identity",
-    );
+    throw preflightError("legacy operator authority capture is not strict bounded JSON");
   }
   if (
     !isRecord(value) ||
-    value.kty !== "OKP" ||
-    value.crv !== "Ed25519" ||
-    typeof value.x !== "string" ||
-    !BASE64URL_32.test(value.x) ||
-    JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(["crv", "kty", "x"]) ||
-    raw !== expected.publicJwkBytes ||
-    sha256(raw) !== expected.publicJwkDigest
+    JSON.stringify(Object.keys(value).sort()) !==
+      JSON.stringify([
+        "accountId",
+        "environment",
+        "kind",
+        "legacyPredecessorVersionId",
+        "publicJwk",
+        "publicJwkDigest",
+        "workerName",
+      ]) ||
+    value.kind !== CAPTURE_KIND ||
+    value.environment !== "integration" ||
+    value.accountId !== target.accountId ||
+    value.workerName !== target.workerName ||
+    typeof value.legacyPredecessorVersionId !== "string" ||
+    !isWorkerVersionId(value.legacyPredecessorVersionId) ||
+    typeof value.publicJwk !== "string" ||
+    typeof value.publicJwkDigest !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/u.test(value.publicJwkDigest)
   ) {
-    throw preflightError(
-      "legacy operator public JWK does not match the expected operator identity",
-    );
+    throw preflightError("legacy operator authority capture does not match the selected target");
   }
-  return { bytes: raw, digest: expected.publicJwkDigest };
+  const publicJwkBytes = new TextEncoder().encode(value.publicJwk);
+  let publicJwk: unknown;
+  try {
+    publicJwk = parseStrictJson(publicJwkBytes, MAX_PUBLIC_JWK_BYTES);
+  } catch {
+    throw preflightError("legacy operator authority capture contains an invalid public JWK");
+  }
+  if (
+    !isRecord(publicJwk) ||
+    JSON.stringify(Object.keys(publicJwk).sort()) !== JSON.stringify(["crv", "kty", "x"]) ||
+    publicJwk.kty !== "OKP" ||
+    publicJwk.crv !== "Ed25519" ||
+    typeof publicJwk.x !== "string" ||
+    !BASE64URL_32.test(publicJwk.x) ||
+    sha256(publicJwkBytes) !== value.publicJwkDigest
+  ) {
+    throw preflightError("legacy operator authority capture contains an invalid public JWK");
+  }
+  return {
+    legacyPredecessorVersionId: value.legacyPredecessorVersionId,
+    publicJwkBytes: value.publicJwk,
+    publicJwkDigest: value.publicJwkDigest as `sha256:${string}`,
+  };
 }
 
 function linkFreePath(path: string): string {
@@ -650,6 +727,7 @@ function statusResult(
   direction: Direction,
   live: TransitionInspection,
   replacement: ReplacementAuthorities,
+  capture: LegacyOperatorAuthorityCapture,
   probe: Awaited<ReturnType<typeof probeProduct>>,
 ): Record<string, unknown> {
   const advanced = live.relationship === "direct-successor-current";
@@ -669,7 +747,7 @@ function statusResult(
     ready: advanced,
     ...(direction === "retirement"
       ? { retirementApplyReady: !advanced }
-      : { restoreApplyReady: !advanced, expectedPublicJwkDigest: replacement.publicJwkDigest }),
+      : { restoreApplyReady: !advanced, expectedPublicJwkDigest: capture.publicJwkDigest }),
     selectedPredecessorVersionId: live.selectorVersionId,
     ...(advanced ? { previousVersionId: live.selectorVersionId } : {}),
     versionId: live.currentVersionId,
@@ -677,6 +755,7 @@ function statusResult(
     bundleDigest: `sha256:${live.bundleDigestHex}`,
     scriptEtag: live.scriptEtag,
     legacySecretPresent: live.legacySecretPresent,
+    successorAttribution: live.successorAttribution,
     replacementIdentity: {
       binding: "OPERATOR_IDENTITY_PUBLIC_JWK",
       publicJwkDigest: replacement.publicJwkDigest,
@@ -685,6 +764,7 @@ function statusResult(
       provider: "stripe-checkout",
       secretBinding: "STRIPE_SECRET_KEY",
     },
+    legacyCapture: captureSummary(capture),
     probe,
   };
 }
@@ -697,6 +777,7 @@ function applyResult(
   before: TransitionInspection,
   after: TransitionInspection,
   replacement: ReplacementAuthorities,
+  capture: LegacyOperatorAuthorityCapture,
   probe: Awaited<ReturnType<typeof probeProduct>>,
 ): Record<string, unknown> {
   return {
@@ -715,18 +796,19 @@ function applyResult(
     versionId: after.currentVersionId,
     bundleDigest: `sha256:${after.bundleDigestHex}`,
     scriptEtag: after.scriptEtag,
+    successorAttribution: after.successorAttribution,
     ...(direction === "retirement"
       ? {
           secretRemoved: LEGACY_OPERATOR_PUBLIC_JWK_SECRET,
           exactRestore: {
             surface: "takoserver-integration-legacy-operator-authority-restore",
             predecessorVersionId: after.currentVersionId,
-            publicJwkDigest: replacement.publicJwkDigest,
+            publicJwkDigest: capture.publicJwkDigest,
           },
         }
       : {
           secretRestored: LEGACY_OPERATOR_PUBLIC_JWK_SECRET,
-          publicJwkDigest: replacement.publicJwkDigest,
+          publicJwkDigest: capture.publicJwkDigest,
           exactRetirement: {
             surface: "takoserver-integration-legacy-operator-authority-retirement",
             predecessorVersionId: after.currentVersionId,
@@ -740,7 +822,22 @@ function applyResult(
       provider: "stripe-checkout",
       secretBinding: "STRIPE_SECRET_KEY",
     },
+    legacyCapture: captureSummary(capture),
     probe,
+  };
+}
+
+function captureSummary(capture: LegacyOperatorAuthorityCapture): Record<string, unknown> {
+  return {
+    kind: CAPTURE_KIND,
+    legacyPredecessorVersionId: capture.legacyPredecessorVersionId,
+    publicJwkDigest: capture.publicJwkDigest,
+    providerBinding: LEGACY_OPERATOR_PUBLIC_JWK_SECRET,
+    providerBindingType: "secret_text",
+    providerValueReadable: false,
+    providerValueDigestVerified: false,
+    verificationBoundary:
+      "Cloudflare proves only the secret name/type; exact bytes and digest are operator-captured",
   };
 }
 
@@ -757,6 +854,7 @@ function assertExactDirectSuccessor(
     after.commit !== before.commit ||
     after.bundleDigestHex !== before.bundleDigestHex ||
     after.scriptEtag !== before.scriptEtag ||
+    after.successorAttribution === null ||
     after.legacySecretPresent !== (direction === "restore")
   ) {
     throw verificationError(
@@ -782,6 +880,7 @@ function assertSameInspection(
     before.bundleDigestHex !== after.bundleDigestHex ||
     before.scriptEtag !== after.scriptEtag ||
     before.legacySecretPresent !== after.legacySecretPresent ||
+    before.successorAttribution !== after.successorAttribution ||
     before.chainFingerprint !== after.chainFingerprint
   ) {
     throw phaseFailure(phase, message);
@@ -808,15 +907,7 @@ function exactToken(environment: Readonly<Record<string, string>>): string {
   return token;
 }
 
-function redactDiagnostics(value: string, secrets: readonly (string | undefined)[]): string {
-  let redacted = value;
-  for (const secret of secrets) {
-    if (secret) redacted = redacted.replaceAll(secret, "[redacted]");
-  }
-  return redacted;
-}
-
-function sha256(value: string): `sha256:${string}` {
+function sha256(value: string | Uint8Array): `sha256:${string}` {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
 

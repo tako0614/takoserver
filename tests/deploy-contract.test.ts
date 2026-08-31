@@ -113,6 +113,12 @@ describe("Takoserver split deploy entrypoint", () => {
       "uploaded Version is inactive",
     );
     expect(routineWorker?.obligations["failure-handling"]).toContain("Wrangler OAuth is refused");
+    const legacyRetirement = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-integration-legacy-operator-authority-retirement",
+    );
+    const legacyRestore = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-integration-legacy-operator-authority-restore",
+    );
     expect(integrationAuthority?.obligations["post-conditions"]).toContain(
       "exact operator tenant and Space plain-text bindings",
     );
@@ -162,6 +168,16 @@ describe("Takoserver split deploy entrypoint", () => {
     );
     expect(hosted?.obligations["post-conditions"]).toContain(
       "functionalProofPending=false, repairRequired=false, and ready=true",
+    );
+    for (const surface of [legacyRetirement, legacyRestore]) {
+      expect(surface?.requiresEnv).toContain("TAKOSERVER_LEGACY_OPERATOR_AUTHORITY_CAPTURE_PATH");
+      expect(surface?.obligations.provenance).toContain("historical legacy public JWK");
+      expect(surface?.obligations.provenance).toContain("cannot expose or verify its value digest");
+      expect(surface?.obligations["post-conditions"]).toContain("annotation-free");
+    }
+    expect(legacyRetirement?.obligations.reversal).toContain("operator capture");
+    expect(legacyRestore?.obligations.provenance).toContain(
+      "need not equal the replacement identity",
     );
 
     for (const surface of contract.surfaces) {

@@ -56,7 +56,14 @@ that exact Version being current or its exact direct successor. Retirement
 starts from the v2 desired Worker closure plus only the legacy
 `OPERATOR_PUBLIC_JWK` secret; exact restore starts from the same closure without
 it. Both require the replacement `OPERATOR_IDENTITY_PUBLIC_JWK` and Stripe
-settlement/checkout authority to be complete before any mutation.
+settlement/checkout authority to be complete before any mutation. Both also
+require `TAKOSERVER_LEGACY_OPERATOR_AUTHORITY_CAPTURE_PATH` for status and
+apply. That operator-private capture binds the historical legacy public-JWK
+bytes and digest to the account, Worker, and exact pre-retirement Version; the
+legacy bytes are deliberately independent of the replacement identity key.
+Cloudflare exposes only the secret name and type, so it cannot attest the
+captured value or digest. Status and apply receipts report that limitation
+explicitly instead of upgrading operator-captured evidence into provider proof.
 
 The environment selects only `.deploy/targets/<environment>.json` (or the
 matching absolute `TAKOSERVER_DEPLOY_TARGET_<ENVIRONMENT>` path). There is no
@@ -93,8 +100,8 @@ no operator input.
 | `takoserver-hosted-token-retirement` | `--status`, `--apply` | integration, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-worker-retirement-attribution-repair` | `--status`, `--apply` | integration, production | `CLOUDFLARE_API_TOKEN` for both actions. |
 | `takoserver-integration-operator-identity` | `--status`, `--apply` | integration only | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH` for `--apply` only. |
-| `takoserver-integration-legacy-operator-authority-retirement` | `--status`, `--apply` | integration only | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
-| `takoserver-integration-legacy-operator-authority-restore` | `--status`, `--apply` | integration only | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_LEGACY_OPERATOR_PUBLIC_JWK_PATH` for `--apply` only. |
+| `takoserver-integration-legacy-operator-authority-retirement` | `--status`, `--apply` | integration only | `CLOUDFLARE_API_TOKEN` and `TAKOSERVER_LEGACY_OPERATOR_AUTHORITY_CAPTURE_PATH` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
+| `takoserver-integration-legacy-operator-authority-restore` | `--status`, `--apply` | integration only | `CLOUDFLARE_API_TOKEN` and `TAKOSERVER_LEGACY_OPERATOR_AUTHORITY_CAPTURE_PATH` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 
 ## Surfaces
 
@@ -369,20 +376,26 @@ The separate authority and irreversible surfaces are:
   authority; replacing or removing it requires its own reviewed transition.
 - `takoserver-integration-legacy-operator-authority-retirement`: integration
   only. It pins the exact current legacy-bearing Version, proves the complete
-  replacement identity plus Stripe settlement/checkout closure, re-reads that
+  replacement identity plus Stripe settlement/checkout closure, binds the
+  operator capture to that exact pre-retirement Version, re-reads the current
   predecessor immediately before one `OPERATOR_PUBLIC_JWK` secret delete, and
-  accepts only the provider-created direct successor. The successor must have
-  the exact secret-created annotation, identical `resources.script.etag`,
-  canonical source/artifact identity, every other variable/binding/secret,
-  domain closure, and public product probe. A successful status is the only
-  reconciliation after a lost delete acknowledgement.
+  accepts only the provider-created direct successor. The successor may have
+  the exact provider secret marker or no annotations. In either case, identical
+  `resources.script.etag`, canonical source/artifact identity, every other
+  variable/binding/secret, domain closure, direct history, and public product
+  probe are mandatory. A successful status is the only reconciliation after a
+  lost delete acknowledgement.
 - `takoserver-integration-legacy-operator-authority-restore`: integration only
-  and the exact reversal owner. It accepts only the target public JWK's
-  byte-exact canonical JSON from an owned, link-free `0600` regular file, sends
-  those bytes solely through stdin to one secret put, and never emits the path,
-  JWK bytes, or public coordinate. The exact direct successor must restore only
-  `OPERATOR_PUBLIC_JWK` while preserving the same code, closure, domains and
-  public probe. A lost put acknowledgement is status-only and is never retried.
+  and the exact reversal owner. It accepts only the historical JWK bytes and
+  digest from the same owned, link-free `0600` capture bound to the original
+  legacy predecessor. It sends those captured bytes solely through stdin to
+  one secret put and never derives them from
+  `target.operatorIdentity.publicJwk`; the two keys may differ. The path, JWK
+  bytes, and public coordinate are never emitted. The exact direct successor,
+  whether provider-marked or annotation-free, must restore only
+  `OPERATOR_PUBLIC_JWK` while preserving the same code, closure, direct
+  history, domains, and public probe. A lost put acknowledgement is status-only
+  and is never retried.
 
 The intended forward order is schema, public-key registration, any required
 authority-sensitive Worker code, signing repair or explicit rotation, Hosted
@@ -482,7 +495,7 @@ payload or implementation digests; `P` and `I` remain build-derived.
 - `TAKOSERVER_SIGNING_NEXT_PRIVATE_JWK_PATH`
 - `TAKOSERVER_HOSTED_TOKEN_PATH`
 - `TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH`
-- `TAKOSERVER_LEGACY_OPERATOR_PUBLIC_JWK_PATH`
+- `TAKOSERVER_LEGACY_OPERATOR_AUTHORITY_CAPTURE_PATH`
 - `TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH`
 - `--form-authority-scope-transition=/absolute/operator-private/transition.json`
 - `TAKOSERVER_INTEGRATION_E2E_API_KEY_PRIVATE_JWK_PATH`
@@ -498,6 +511,42 @@ Secret inputs must be owned, link-free regular files with mode `0600`. They are
 sent only through stdin or an ephemeral sealed Wrangler secrets file, never as
 command arguments or output. A successful task, branch, check, or review does
 not authorize a deploy.
+
+`TAKOSERVER_LEGACY_OPERATOR_AUTHORITY_CAPTURE_PATH` names an operator-created
+transition record, not a Cloudflare export. Before retirement, the operator
+must preserve the exact UTF-8 bytes from the authoritative provisioning record
+for the legacy `OPERATOR_PUBLIC_JWK`, calculate SHA-256 over those exact bytes,
+and bind both to the current legacy-bearing Version. The strict JSON record is
+at most 32 KiB, has no optional fields, and has this exact shape:
+
+```json
+{
+  "kind": "takoserver.legacy-operator-authority-capture@v1",
+  "environment": "integration",
+  "accountId": "<exact target account id>",
+  "workerName": "<exact target Worker name>",
+  "legacyPredecessorVersionId": "<exact legacy-bearing Version uuid>",
+  "publicJwk": "<exact historical OPERATOR_PUBLIC_JWK UTF-8 JSON bytes>",
+  "publicJwkDigest": "sha256:<digest of the exact publicJwk bytes>"
+}
+```
+
+The file must be an owned, single-link exact-`0600` regular file and every path
+component must be symlink-free. Its nested public JWK must be strict bounded
+Ed25519 public JSON. Both retirement and restore status prove the capture's
+target and historical Version against live deployment history, and expose only
+its digest and the explicit `providerValueDigestVerified: false` boundary.
+Cloudflare can prove the current `secret_text` binding name/type but cannot
+return the secret value, so this workflow cannot independently verify that the
+operator-captured bytes equal the pre-retirement provider value. Restore sends
+only the captured bytes through stdin; it never substitutes the target's
+replacement identity JWK.
+
+One capture record owns one retirement/restore pair. After a successful restore,
+a later re-retirement must create a new record that binds the same exact bytes
+and digest to the restored Version now selected as the predecessor. The old
+record is refused for that new transition; rebinding does not claim that
+Cloudflare verified the value.
 
 `TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH` is never sent to Cloudflare. Apply opens
 the link-free `0600` file without following symlinks, accepts only the exact
@@ -571,10 +620,13 @@ refused rather than attributed to the interrupted attempt.
 For a legacy operator authority retirement or restore acknowledgement failure,
 do not retry apply. Run the same surface with the same
 `--legacy-operator-authority-predecessor-version=<uuid>` selector. Status accepts
-only that Version still being current or one exact secret-created direct
-successor whose sole closure difference is `OPERATOR_PUBLIC_JWK`; an unrelated
-or non-direct history advance fails closed. Restore status never reads the JWK
-file, and apply diagnostics never expose its path or bytes.
+only that Version still being current or one exact direct successor whose sole
+closure difference is `OPERATOR_PUBLIC_JWK`. A successor may carry the provider
+secret marker or be annotation-free; neither form is trusted without identical
+script etag/code, all other bindings/variables/secrets, domains, stable direct
+history, and the public probe. An unrelated or non-direct history advance fails
+closed. Status reads the same operator capture to bind and report its digest;
+neither action exposes its path or bytes, and apply never retries.
 
 For an integration credential issue failure, never replay the secret-bearing
 issue. Run the credential surface with `--status`; it validates the sealed pair

@@ -41,8 +41,8 @@ const hostedTokenInput =
   "`TAKOSERVER_HOSTED_TOKEN_PATH` is required for `--apply` only; `--status` does not read it.";
 const operatorPrivateJwkInput =
   "`TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH` is required for `--apply` only; `--status` does not read it and this surface is integration-only.";
-const legacyOperatorPublicJwkInput =
-  "`TAKOSERVER_LEGACY_OPERATOR_PUBLIC_JWK_PATH` is required for restore `--apply` only; `--status` does not read it and this surface is integration-only.";
+const legacyOperatorAuthorityCaptureInput =
+  "`TAKOSERVER_LEGACY_OPERATOR_AUTHORITY_CAPTURE_PATH` is required for both `--status` and `--apply`; both actions are integration-only.";
 
 function inputContractWithToken(
   tokenRequirement: string,
@@ -821,25 +821,33 @@ export const DEPLOY_CONTRACT = {
       ],
       requiresScripts: ["check", "deploy"],
       requiresTools: ["bun", "wrangler"],
-      requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+        "TAKOSERVER_LEGACY_OPERATOR_AUTHORITY_CAPTURE_PATH",
+      ],
       triggers: ["authority"],
       obligations: {
         provenance:
           `${exactSource} Integration only. The exact selected predecessor must carry the v2 ` +
           "desired closure plus only OPERATOR_PUBLIC_JWK, while the target and immutable Version " +
-          "prove the replacement OPERATOR_IDENTITY_PUBLIC_JWK and Stripe settlement/checkout authority.",
+          "prove the replacement OPERATOR_IDENTITY_PUBLIC_JWK and Stripe settlement/checkout authority. " +
+          "An owned link-free 0600 operator capture binds the historical legacy public JWK bytes/digest " +
+          "to the account, Worker and exact legacy predecessor. Cloudflare proves its secret name/type " +
+          "but cannot expose or verify its value digest; status and the apply receipt report that boundary.",
         "post-conditions":
           "One stdin-free secret delete creates the selected predecessor's exact direct-successor " +
           "Worker Version. OPERATOR_PUBLIC_JWK alone is absent; script etag/code, every other variable, " +
-          "binding and secret, domains, canonical source/artifact identity and the public product probe remain exact.",
+          "binding and secret, domains, canonical source/artifact identity and the public product probe remain exact. " +
+          "A provider secret marker or annotation-free successor is attribution only after those exact proofs.",
         reversal:
           "Exact restoration is owned only by takoserver-integration-legacy-operator-authority-restore " +
-          "with the retired Version selected and the expected public JWK supplied through stdin.",
+          "with the retired Version selected and the exact historical bytes from the same operator capture supplied through stdin.",
         "failure-handling":
           `${highRiskFailure} The apply path re-reads the exact predecessor immediately before its one ` +
           "delete. A lost acknowledgement is status-only reconciliation; already-retired apply, foreign " +
           "secret/config drift, non-direct history and ordinary Worker or authority-cutover bypass are refused." +
-          inputContract(applyReviewInput),
+          inputContract(applyReviewInput, legacyOperatorAuthorityCaptureInput),
         "independent-review": review,
       },
     },
@@ -859,18 +867,21 @@ export const DEPLOY_CONTRACT = {
       requiresEnv: [
         "CLOUDFLARE_API_TOKEN",
         "TAKOSERVER_INDEPENDENT_REVIEW",
-        "TAKOSERVER_LEGACY_OPERATOR_PUBLIC_JWK_PATH",
+        "TAKOSERVER_LEGACY_OPERATOR_AUTHORITY_CAPTURE_PATH",
       ],
       triggers: ["authority"],
       obligations: {
         provenance:
           `${exactSource} Integration only. The exact selected retired predecessor, canonical ` +
-          "source/artifact identity and replacement identity/Stripe closure are proven before an owned, " +
-          "link-free 0600 file is accepted only when its exact bytes and digest equal the target public JWK.",
+          "source/artifact identity and replacement identity/Stripe closure are proven before the owned, " +
+          "link-free 0600 operator capture supplies the exact historical legacy public JWK bytes/digest " +
+          "bound to the account, Worker and original legacy predecessor; those bytes need not equal the replacement identity. " +
+          "Cloudflare proves the secret name/type but cannot expose or verify its value digest.",
         "post-conditions":
           "One stdin-only secret put creates the selected predecessor's exact direct-successor Worker " +
           "Version. OPERATOR_PUBLIC_JWK alone is restored; script etag/code, every other variable, binding " +
-          "and secret, domains, canonical source/artifact identity and the public product probe remain exact.",
+          "and secret, domains, canonical source/artifact identity and the public product probe remain exact. " +
+          "A provider secret marker or annotation-free successor is attribution only after those exact proofs.",
         reversal:
           "A later removal returns to takoserver-integration-legacy-operator-authority-retirement with " +
           "the restored Version selected; no ordinary Worker surface may carry or remove the legacy secret.",
@@ -878,7 +889,7 @@ export const DEPLOY_CONTRACT = {
           `${highRiskFailure} Public-JWK bytes and their path never enter argv, output or diagnostics. ` +
           "The apply path re-reads the exact predecessor immediately before its one put; a lost " +
           "acknowledgement is status-only reconciliation and never a blind retry." +
-          inputContract(applyReviewInput, legacyOperatorPublicJwkInput),
+          inputContract(applyReviewInput, legacyOperatorAuthorityCaptureInput),
         "independent-review": review,
       },
     },
