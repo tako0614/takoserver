@@ -30,10 +30,10 @@ export type ProviderRuntimeInputRecoveryInput = ProviderRuntimeInputAcquireInput
 export interface ProviderRuntimeInputPreparationIdentity {
   readonly preparationId: string;
   readonly materialSetId: string;
-  readonly originResourceUid: string;
+  readonly originReservationId: string;
   readonly workerResourceUid: string;
   readonly canonicalPublicOrigin: string;
-  /** Digest of every immutable non-secret preparation field, including binding names. */
+  /** Plan-known commitment; no plaintext binding name or value is embedded in it. */
   readonly commitment: `sha256:${string}`;
 }
 

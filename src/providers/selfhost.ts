@@ -22,6 +22,10 @@ import {
   type ResourceIdentity,
   succeeded,
 } from "../provider-port.ts";
+import {
+  canonicalWorkerEndpointOrigin,
+  derivedProviderResourceName,
+} from "../provider-worker-endpoint-origin.ts";
 import type { WorkerdRuntime } from "../workerd-runtime.ts";
 import {
   createSelfhostScriptStateStore,
@@ -155,12 +159,21 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     tenantRef: string,
     resource: { readonly space: string; readonly name: string },
   ): Promise<string> =>
-    derivedName("sw", { tenantRef, space: resource.space, name: resource.name });
+    derivedProviderResourceName("sw", {
+      tenantRef,
+      space: resource.space,
+      name: resource.name,
+    });
 
   const versionIdOf = (
     tenantRef: string,
     resource: { readonly space: string; readonly name: string },
-  ): Promise<string> => derivedName("v", { tenantRef, space: resource.space, name: resource.name });
+  ): Promise<string> =>
+    derivedProviderResourceName("v", {
+      tenantRef,
+      space: resource.space,
+      name: resource.name,
+    });
 
   const databasePath = (name: string): string => join(databasesRoot, `${name}.sqlite`);
 
@@ -262,8 +275,12 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   };
 
   const endpointAddress = (script: string): { hostname: string; url: string } => {
-    const hostname = `${script}.${endpointSuffix}`.toLowerCase();
-    return { hostname, url: `https://${hostname}/` };
+    const origin = canonicalWorkerEndpointOrigin(script, endpointSuffix);
+    if (!origin) {
+      throw new SelfhostFailure(failed("invalid_spec", "the Worker endpoint suffix is invalid"));
+    }
+    const hostname = new URL(origin).hostname;
+    return { hostname, url: `${origin}/` };
   };
 
   /** The one relation a pointer names, held to the expected target kind. */
@@ -518,7 +535,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     const queue = relationResource(input.relations, "/queue", "AtLeastOnceQueue");
     if (!worker || !queue) return failed("invalid_spec", "the Queue Consumer is incomplete");
     const script = await scriptOf(input.identity.tenantRef, worker.metadata);
-    const queueName = await derivedName("tsq", {
+    const queueName = await derivedProviderResourceName("tsq", {
       tenantRef: input.identity.tenantRef,
       space: queue.metadata.space,
       name: queue.metadata.name,
@@ -546,7 +563,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         };
       }
       case "EdgeKVNamespace": {
-        const name = await derivedName("tskv", input.identity);
+        const name = await derivedProviderResourceName("tskv", input.identity);
         return {
           base: `selfhost-kv:${name}`,
           observed: { name },
@@ -554,7 +571,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         };
       }
       case "AtLeastOnceQueue": {
-        const name = await derivedName("tsq", input.identity);
+        const name = await derivedProviderResourceName("tsq", input.identity);
         return {
           base: `selfhost-queue:${name}`,
           observed: { queueName: name },
@@ -563,7 +580,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       }
       case "SQLiteDatabase":
       case "sql_database": {
-        const name = await derivedName("tsdb", input.identity);
+        const name = await derivedProviderResourceName("tsdb", input.identity);
         return {
           base: `selfhost-sqlite:${name}`,
           // Nothing is created eagerly: the file appears when something
@@ -594,6 +611,13 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   return {
     id,
     offerings: structuredClone(options.offerings) as ProviderOffering[],
+    workerEndpointOriginReservations: {
+      derive: async ({ identity }) => {
+        const script = await derivedProviderResourceName("sw", identity);
+        const canonicalPublicOrigin = canonicalWorkerEndpointOrigin(script, endpointSuffix);
+        return canonicalPublicOrigin ? { canonicalPublicOrigin } : null;
+      },
+    },
 
     /** Capture a pure, redacted descriptor for post-delete readback. */
     createNativeReadbackDescriptor(
@@ -1741,18 +1765,4 @@ function migrationPath(value: unknown): value is string {
 
 function sha256(value: unknown): value is `sha256:${string}` {
   return typeof value === "string" && /^sha256:[0-9a-f]{64}$/u.test(value);
-}
-
-async function derivedName(
-  prefix: string,
-  identity: { readonly tenantRef: string; readonly space: string; readonly name: string },
-): Promise<string> {
-  const bytes = new TextEncoder().encode(
-    `${identity.tenantRef}\0${identity.space}\0${identity.name}`,
-  );
-  const digest = new Uint8Array(
-    await crypto.subtle.digest("SHA-256", bytes as unknown as BufferSource),
-  );
-  const hex = [...digest.slice(0, 20)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-  return `${prefix}-${hex}`;
 }

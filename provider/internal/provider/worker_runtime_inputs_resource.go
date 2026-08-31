@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"os"
 	"sort"
 	"time"
 
@@ -22,8 +23,9 @@ import (
 )
 
 var (
-	_ frameworkresource.Resource              = (*workerRuntimeInputsResource)(nil)
-	_ frameworkresource.ResourceWithConfigure = (*workerRuntimeInputsResource)(nil)
+	_ frameworkresource.Resource               = (*workerRuntimeInputsResource)(nil)
+	_ frameworkresource.ResourceWithConfigure  = (*workerRuntimeInputsResource)(nil)
+	_ frameworkresource.ResourceWithModifyPlan = (*workerRuntimeInputsResource)(nil)
 )
 
 type workerRuntimeInputsResource struct {
@@ -35,10 +37,11 @@ type workerRuntimeInputsModel struct {
 	WorkerName            types.String `tfsdk:"worker_name"`
 	WorkerResourceUID     types.String `tfsdk:"worker_resource_uid"`
 	BundleName            types.String `tfsdk:"bundle_name"`
-	OriginResourceUID     types.String `tfsdk:"origin_resource_uid"`
-	CanonicalPublicOrigin types.String `tfsdk:"canonical_public_origin"`
+	EndpointName          types.String `tfsdk:"endpoint_name"`
 	BindingNames          types.Set    `tfsdk:"binding_names"`
 	MaterialSetID         types.String `tfsdk:"material_set_id"`
+	OriginReservationID   types.String `tfsdk:"origin_reservation_id"`
+	CanonicalPublicOrigin types.String `tfsdk:"canonical_public_origin"`
 	OperationID           types.String `tfsdk:"operation_id"`
 	RuntimeInputReference types.String `tfsdk:"runtime_input_reference"`
 	Status                types.String `tfsdk:"status"`
@@ -75,13 +78,10 @@ func (r *workerRuntimeInputsResource) Schema(_ context.Context, _ frameworkresou
 				Required:      true,
 				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
 			},
-			"origin_resource_uid": resourceschema.StringAttribute{
+			"endpoint_name": resourceschema.StringAttribute{
 				Required:      true,
 				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
-			},
-			"canonical_public_origin": resourceschema.StringAttribute{
-				Required:      true,
-				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
+				Description:   "Logical WorkerEndpoint name committed by the preflight origin reservation.",
 			},
 			"binding_names": resourceschema.SetAttribute{
 				Required:    true,
@@ -91,13 +91,9 @@ func (r *workerRuntimeInputsResource) Schema(_ context.Context, _ frameworkresou
 					setplanmodifier.RequiresReplace(),
 				},
 			},
-			"material_set_id": resourceschema.StringAttribute{
-				Required: true,
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
-				},
-				Description: "Non-secret identity of the exact material set expected in the run-scoped credential file.",
-			},
+			"material_set_id":         resourceschema.StringAttribute{Computed: true},
+			"origin_reservation_id":   resourceschema.StringAttribute{Computed: true},
+			"canonical_public_origin": resourceschema.StringAttribute{Computed: true},
 			"operation_id":            resourceschema.StringAttribute{Computed: true},
 			"runtime_input_reference": resourceschema.StringAttribute{Computed: true, Description: "Opaque runtime-input reference returned by Takoserver for the downstream Host operation idempotency key."},
 			"status":                  resourceschema.StringAttribute{Computed: true},
@@ -118,6 +114,78 @@ func (r *workerRuntimeInputsResource) Configure(_ context.Context, request frame
 	r.data = data
 }
 
+// ModifyPlan resolves the preflight-only runtime input reference before the
+// ordinary apply. The reference commits the nonce, logical target, origin
+// reservation, canonical origin, and binding values, but deliberately omits
+// the Worker UID that is created later in the same apply. No credential values
+// or file paths are copied into the plan.
+func (r *workerRuntimeInputsResource) ModifyPlan(ctx context.Context, request frameworkresource.ModifyPlanRequest, response *frameworkresource.ModifyPlanResponse) {
+	if request.Plan.Raw.IsNull() {
+		return
+	}
+	if r.data == nil {
+		response.Diagnostics.AddError("Takoserver provider is not configured", "Configure the Takoserver provider before resolving the runtime input preflight reference.")
+		return
+	}
+	var plan workerRuntimeInputsModel
+	response.Diagnostics.Append(response.Plan.Get(ctx, &plan)...)
+	if response.Diagnostics.HasError() || !preflightTargetKnown(&plan) {
+		return
+	}
+	var bindingNames []string
+	if plan.BindingNames.IsUnknown() || plan.BindingNames.IsNull() {
+		return
+	}
+	for _, element := range plan.BindingNames.Elements() {
+		if element.IsUnknown() || element.IsNull() {
+			return
+		}
+	}
+	response.Diagnostics.Append(plan.BindingNames.ElementsAs(ctx, &bindingNames, false)...)
+	if response.Diagnostics.HasError() {
+		return
+	}
+	sort.Strings(bindingNames)
+	var prior workerRuntimeInputsModel
+	priorStateAvailable := false
+	if !request.State.Raw.IsNull() {
+		response.Diagnostics.Append(request.State.Get(ctx, &prior)...)
+		if response.Diagnostics.HasError() {
+			return
+		}
+		priorStateAvailable = reusablePreflightState(ctx, &plan, &prior, bindingNames)
+	}
+	if !credentialFilePresent(r.data.credentialFilePath) {
+		if priorStateAvailable {
+			response.Diagnostics.Append(response.Plan.SetAttribute(ctx, path.Root("runtime_input_reference"), prior.RuntimeInputReference)...)
+			return
+		}
+		response.Diagnostics.AddError("Runtime input credential file is required", "A fresh run-scoped credential file is required for a new, replaced, or rotated runtime input preparation.")
+		return
+	}
+	envelope, err := credentialfile.LoadForTarget(r.data.credentialFilePath, credentialfile.Target{
+		Space:        plan.Space.ValueString(),
+		WorkerName:   plan.WorkerName.ValueString(),
+		BundleName:   plan.BundleName.ValueString(),
+		EndpointName: plan.EndpointName.ValueString(),
+	}, "", bindingNames)
+	if err != nil {
+		response.Diagnostics.AddError("Invalid runtime input credential file", err.Error())
+		return
+	}
+	runtimeInputReference, err := credentialfile.ComputeRuntimeInputReference(envelope)
+	if err != nil {
+		response.Diagnostics.AddError("Cannot derive runtime input preflight reference", err.Error())
+		return
+	}
+	if priorStateAvailable {
+		if prior.RuntimeInputReference.ValueString() != runtimeInputReference && !response.RequiresReplace.Contains(path.Root("runtime_input_reference")) {
+			response.RequiresReplace = append(response.RequiresReplace, path.Root("runtime_input_reference"))
+		}
+	}
+	response.Diagnostics.Append(response.Plan.SetAttribute(ctx, path.Root("runtime_input_reference"), types.StringValue(runtimeInputReference))...)
+}
+
 func (r *workerRuntimeInputsResource) Create(ctx context.Context, request frameworkresource.CreateRequest, response *frameworkresource.CreateResponse) {
 	if r.data == nil || r.data.client == nil {
 		response.Diagnostics.AddError("Takoserver provider is not configured", "Configure the Takoserver provider before preparing runtime inputs.")
@@ -126,10 +194,7 @@ func (r *workerRuntimeInputsResource) Create(ctx context.Context, request framew
 
 	var plan workerRuntimeInputsModel
 	response.Diagnostics.Append(request.Plan.Get(ctx, &plan)...)
-	if response.Diagnostics.HasError() {
-		return
-	}
-	if !requireKnownPlan(&plan, response) {
+	if response.Diagnostics.HasError() || !requireKnownPlan(&plan, response) {
 		return
 	}
 	var bindingNames []string
@@ -140,42 +205,75 @@ func (r *workerRuntimeInputsResource) Create(ctx context.Context, request framew
 	sort.Strings(bindingNames)
 
 	envelope, err := credentialfile.LoadForTarget(r.data.credentialFilePath, credentialfile.Target{
-		Space:             plan.Space.ValueString(),
-		WorkerName:        plan.WorkerName.ValueString(),
-		WorkerResourceUID: plan.WorkerResourceUID.ValueString(),
-		BundleName:        plan.BundleName.ValueString(),
-		OriginResourceUID: plan.OriginResourceUID.ValueString(),
-	}, plan.CanonicalPublicOrigin.ValueString(), bindingNames)
+		Space:        plan.Space.ValueString(),
+		WorkerName:   plan.WorkerName.ValueString(),
+		BundleName:   plan.BundleName.ValueString(),
+		EndpointName: plan.EndpointName.ValueString(),
+	}, "", bindingNames)
 	if err != nil {
 		response.Diagnostics.AddError("Invalid runtime input credential file", err.Error())
 		return
 	}
-	if plan.MaterialSetID.ValueString() != envelope.MaterialSetID {
-		response.Diagnostics.AddAttributeError(path.Root("material_set_id"), "Runtime input material set does not match the credential file", "The planned non-secret material set identity must exactly match the credential file before Takoserver receives any material.")
+
+	// The reservation is the only origin authority. Do not send values or
+	// materialSetId until its closed projection has been validated completely.
+	reservation, err := r.data.client.GetWorkerEndpointOriginReservation(ctx, envelope.OriginReservationID)
+	if err != nil {
+		response.Diagnostics.AddError("Takoserver origin reservation validation failed", err.Error())
 		return
 	}
-	operationID, err := deriveOperationID(plan, plan.MaterialSetID.ValueString(), bindingNames)
+	if !runtimePreparationReservationUsable(reservation) || reservation.ReservationID != envelope.OriginReservationID || reservation.Space != plan.Space.ValueString() || reservation.WorkerName != plan.WorkerName.ValueString() || reservation.EndpointName != plan.EndpointName.ValueString() || envelope.CanonicalPublicOrigin != reservation.CanonicalPublicOrigin || reservation.WorkerResourceUID != plan.WorkerResourceUID.ValueString() {
+		response.Diagnostics.AddError("Takoserver origin reservation does not match the runtime input target", "The closed reservation projection, credential envelope, and realized Worker identity must agree before any binding value is sent.")
+		return
+	}
+	runtimeInputReference, err := credentialfile.ComputeRuntimeInputReference(envelope)
+	if err != nil {
+		response.Diagnostics.AddError("Cannot derive runtime input preflight reference", err.Error())
+		return
+	}
+	if !plan.RuntimeInputReference.IsNull() && !plan.RuntimeInputReference.IsUnknown() && plan.RuntimeInputReference.ValueString() != "" && plan.RuntimeInputReference.ValueString() != runtimeInputReference {
+		response.Diagnostics.AddAttributeError(path.Root("runtime_input_reference"), "Runtime input preflight reference drift", "The plan reference no longer matches the exact preflight credential envelope.")
+		return
+	}
+	plan.RuntimeInputReference = types.StringValue(runtimeInputReference)
+
+	materialSetID, err := credentialfile.ComputeMaterialSetID(envelope, plan.WorkerResourceUID.ValueString())
+	if err != nil {
+		response.Diagnostics.AddError("Cannot derive runtime input material set identity", err.Error())
+		return
+	}
+	plan.OriginReservationID = types.StringValue(envelope.OriginReservationID)
+	operationID, err := deriveOperationID(plan, materialSetID, bindingNames)
 	if err != nil {
 		response.Diagnostics.AddError("Cannot derive runtime input operation identity", err.Error())
 		return
 	}
 	prepared, err := r.data.client.PutRuntimeInputPreparation(ctx, operationID, client.RuntimeInputPreparationInput{
-		MaterialSetID:         envelope.MaterialSetID,
+		MaterialSetID:         materialSetID,
+		MaterialSetNonce:      envelope.MaterialSetNonce,
+		RuntimeInputReference: runtimeInputReference,
 		Space:                 plan.Space.ValueString(),
 		WorkerName:            plan.WorkerName.ValueString(),
 		WorkerResourceUID:     plan.WorkerResourceUID.ValueString(),
 		BundleName:            plan.BundleName.ValueString(),
-		OriginResourceUID:     plan.OriginResourceUID.ValueString(),
-		CanonicalPublicOrigin: plan.CanonicalPublicOrigin.ValueString(),
+		EndpointName:          plan.EndpointName.ValueString(),
+		OriginReservationID:   envelope.OriginReservationID,
 		Bindings:              envelope.Values,
 	})
 	if err != nil {
 		response.Diagnostics.AddError("Takoserver runtime input preparation failed", err.Error())
 		return
 	}
+	if prepared.CanonicalPublicOrigin != reservation.CanonicalPublicOrigin {
+		response.Diagnostics.AddError("Takoserver runtime input origin authority drift", "Takoserver returned a canonical origin different from the validated reservation projection; refusing to retain the preparation state.")
+		return
+	}
 
-	plan.OperationID = types.StringValue(prepared.OperationID)
+	plan.MaterialSetID = types.StringValue(materialSetID)
+	plan.OriginReservationID = types.StringValue(prepared.OriginReservationID)
+	plan.CanonicalPublicOrigin = types.StringValue(prepared.CanonicalPublicOrigin)
 	plan.RuntimeInputReference = types.StringValue(prepared.RuntimeInputReference)
+	plan.OperationID = types.StringValue(prepared.OperationID)
 	plan.Status = types.StringValue(prepared.Status)
 	plan.ExpiresAt = types.StringValue(prepared.ExpiresAt.UTC().Format(time.RFC3339))
 	response.Diagnostics.Append(response.State.Set(ctx, &plan)...)
@@ -218,8 +316,22 @@ func (r *workerRuntimeInputsResource) Read(ctx context.Context, request framewor
 		return
 	}
 	sort.Strings(stateNames)
-	if observed.Space != state.Space.ValueString() || observed.WorkerName != state.WorkerName.ValueString() || observed.WorkerResourceUID != state.WorkerResourceUID.ValueString() || observed.BundleName != state.BundleName.ValueString() || observed.OriginResourceUID != state.OriginResourceUID.ValueString() || observed.CanonicalPublicOrigin != state.CanonicalPublicOrigin.ValueString() || observed.RuntimeInputReference != state.RuntimeInputReference.ValueString() || !equalStringSlices(observed.BindingNames, stateNames) {
+	if observed.Space != state.Space.ValueString() || observed.WorkerName != state.WorkerName.ValueString() || observed.WorkerResourceUID != state.WorkerResourceUID.ValueString() || observed.BundleName != state.BundleName.ValueString() || observed.OriginReservationID != state.OriginReservationID.ValueString() || observed.CanonicalPublicOrigin != state.CanonicalPublicOrigin.ValueString() || observed.RuntimeInputReference != state.RuntimeInputReference.ValueString() || !equalStringSlices(observed.BindingNames, stateNames) {
 		response.Diagnostics.AddError("Takoserver runtime input state drift", "The durable value-free preparation projection no longer matches the OpenTofu state identity.")
+		return
+	}
+	expectedOperationID, err := deriveOperationID(state, state.MaterialSetID.ValueString(), stateNames)
+	if err != nil || expectedOperationID != state.OperationID.ValueString() {
+		response.Diagnostics.AddError("Takoserver runtime input operation identity drift", "The durable operation identity no longer matches the computed material-set identity.")
+		return
+	}
+	reservation, err := r.data.client.GetWorkerEndpointOriginReservation(ctx, state.OriginReservationID.ValueString())
+	if err != nil {
+		response.Diagnostics.AddError("Takoserver origin reservation read failed", err.Error())
+		return
+	}
+	if !runtimePreparationReservationUsable(reservation) || reservation.ReservationID != state.OriginReservationID.ValueString() || reservation.Space != state.Space.ValueString() || reservation.WorkerName != state.WorkerName.ValueString() || reservation.EndpointName != state.EndpointName.ValueString() || reservation.CanonicalPublicOrigin != state.CanonicalPublicOrigin.ValueString() || reservation.WorkerResourceUID != state.WorkerResourceUID.ValueString() {
+		response.Diagnostics.AddError("Takoserver origin reservation state drift", "The closed origin reservation projection no longer matches the OpenTofu runtime input identity.")
 		return
 	}
 	state.Status = types.StringValue(observed.Status)
@@ -228,7 +340,7 @@ func (r *workerRuntimeInputsResource) Read(ctx context.Context, request framewor
 }
 
 func (r *workerRuntimeInputsResource) Update(_ context.Context, _ frameworkresource.UpdateRequest, response *frameworkresource.UpdateResponse) {
-	response.Diagnostics.AddError("Takoserver runtime input update is not implemented", "The provider tracer has not connected this lifecycle operation yet.")
+	response.Diagnostics.AddError("Takoserver runtime input update is not implemented", "Runtime input preparations are immutable and must be replaced when any identity changes.")
 }
 
 func (r *workerRuntimeInputsResource) Delete(ctx context.Context, request frameworkresource.DeleteRequest, response *frameworkresource.DeleteResponse) {
@@ -251,34 +363,34 @@ func (r *workerRuntimeInputsResource) Delete(ctx context.Context, request framew
 }
 
 type operationIdentityDocument struct {
-	Format                string                  `json:"format"`
-	MaterialSetID         string                  `json:"materialSetId"`
-	Target                operationIdentityTarget `json:"target"`
-	CanonicalPublicOrigin string                  `json:"canonicalPublicOrigin"`
-	BindingNames          []string                `json:"bindingNames"`
+	Format        string                  `json:"format"`
+	MaterialSetID string                  `json:"materialSetId"`
+	Target        operationIdentityTarget `json:"target"`
+	BindingNames  []string                `json:"bindingNames"`
 }
 
 type operationIdentityTarget struct {
-	Space             string `json:"space"`
-	WorkerName        string `json:"workerName"`
-	WorkerResourceUID string `json:"workerResourceUid"`
-	BundleName        string `json:"bundleName"`
-	OriginResourceUID string `json:"originResourceUid"`
+	Space               string `json:"space"`
+	WorkerName          string `json:"workerName"`
+	WorkerResourceUID   string `json:"workerResourceUid"`
+	BundleName          string `json:"bundleName"`
+	OriginReservationID string `json:"originReservationId"`
 }
 
 func deriveOperationID(plan workerRuntimeInputsModel, materialSetID string, bindingNames []string) (string, error) {
+	canonicalBindingNames := append([]string(nil), bindingNames...)
+	sort.Strings(canonicalBindingNames)
 	document := operationIdentityDocument{
 		Format:        "takoserver.worker-runtime-input-operation@v1",
 		MaterialSetID: materialSetID,
 		Target: operationIdentityTarget{
-			Space:             plan.Space.ValueString(),
-			WorkerName:        plan.WorkerName.ValueString(),
-			WorkerResourceUID: plan.WorkerResourceUID.ValueString(),
-			BundleName:        plan.BundleName.ValueString(),
-			OriginResourceUID: plan.OriginResourceUID.ValueString(),
+			Space:               plan.Space.ValueString(),
+			WorkerName:          plan.WorkerName.ValueString(),
+			WorkerResourceUID:   plan.WorkerResourceUID.ValueString(),
+			BundleName:          plan.BundleName.ValueString(),
+			OriginReservationID: plan.OriginReservationID.ValueString(),
 		},
-		CanonicalPublicOrigin: plan.CanonicalPublicOrigin.ValueString(),
-		BindingNames:          append([]string(nil), bindingNames...),
+		BindingNames: canonicalBindingNames,
 	}
 	encoded, err := json.Marshal(document)
 	if err != nil {
@@ -298,12 +410,10 @@ func requireKnownPlan(plan *workerRuntimeInputsModel, response *frameworkresourc
 		{name: "worker_name", value: plan.WorkerName},
 		{name: "worker_resource_uid", value: plan.WorkerResourceUID},
 		{name: "bundle_name", value: plan.BundleName},
-		{name: "origin_resource_uid", value: plan.OriginResourceUID},
-		{name: "canonical_public_origin", value: plan.CanonicalPublicOrigin},
-		{name: "material_set_id", value: plan.MaterialSetID},
+		{name: "endpoint_name", value: plan.EndpointName},
 	} {
 		if candidate.value.IsUnknown() || candidate.value.IsNull() || candidate.value.ValueString() == "" {
-			response.Diagnostics.AddAttributeError(path.Root(candidate.name), "Runtime input target must be known", "The runtime input target and origin must be exact before Takoserver receives any material.")
+			response.Diagnostics.AddAttributeError(path.Root(candidate.name), "Runtime input target must be known", "The exact logical target and realized Worker identity must be known before Takoserver receives any material.")
 			known = false
 		}
 	}
@@ -312,6 +422,77 @@ func requireKnownPlan(plan *workerRuntimeInputsModel, response *frameworkresourc
 		known = false
 	}
 	return known
+}
+
+func preflightTargetKnown(plan *workerRuntimeInputsModel) bool {
+	for _, value := range []types.String{
+		plan.Space,
+		plan.WorkerName,
+		plan.BundleName,
+		plan.EndpointName,
+	} {
+		if value.IsUnknown() || value.IsNull() || value.ValueString() == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func credentialFilePresent(filePath string) bool {
+	if filePath == "" {
+		return false
+	}
+	_, err := os.Lstat(filePath)
+	return err == nil || !errors.Is(err, os.ErrNotExist)
+}
+
+func reusablePreflightState(ctx context.Context, plan, prior *workerRuntimeInputsModel, plannedBindingNames []string) bool {
+	if prior.RuntimeInputReference.IsNull() || prior.RuntimeInputReference.IsUnknown() || prior.RuntimeInputReference.ValueString() == "" {
+		return false
+	}
+	if !sameLogicalTarget(plan, prior) {
+		return false
+	}
+	if !sameBindingNames(ctx, prior.BindingNames, plannedBindingNames) {
+		return false
+	}
+	if plan.WorkerResourceUID.IsNull() {
+		return false
+	}
+	// An unknown planned Worker UID with a realized prior UID can represent a
+	// replacement dependency. Do not reuse the old preflight envelope in that
+	// case: a fresh credential file is required for every replacement.
+	if plan.WorkerResourceUID.IsUnknown() && !prior.WorkerResourceUID.IsNull() && !prior.WorkerResourceUID.IsUnknown() {
+		return false
+	}
+	if !plan.WorkerResourceUID.IsUnknown() && !prior.WorkerResourceUID.IsNull() && !prior.WorkerResourceUID.IsUnknown() && plan.WorkerResourceUID.ValueString() != prior.WorkerResourceUID.ValueString() {
+		return false
+	}
+	if !plan.RuntimeInputReference.IsNull() && !plan.RuntimeInputReference.IsUnknown() && plan.RuntimeInputReference.ValueString() != prior.RuntimeInputReference.ValueString() {
+		return false
+	}
+	return true
+}
+
+func sameLogicalTarget(plan, prior *workerRuntimeInputsModel) bool {
+	return plan.Space.ValueString() != "" && plan.Space.ValueString() == prior.Space.ValueString() && plan.WorkerName.ValueString() != "" && plan.WorkerName.ValueString() == prior.WorkerName.ValueString() && plan.BundleName.ValueString() != "" && plan.BundleName.ValueString() == prior.BundleName.ValueString() && plan.EndpointName.ValueString() != "" && plan.EndpointName.ValueString() == prior.EndpointName.ValueString()
+}
+
+func sameBindingNames(ctx context.Context, prior types.Set, planned []string) bool {
+	if prior.IsNull() || prior.IsUnknown() {
+		return false
+	}
+	var previous []string
+	if prior.ElementsAs(ctx, &previous, false).HasError() {
+		return false
+	}
+	sort.Strings(previous)
+	sort.Strings(planned)
+	return equalStringSlices(previous, planned)
+}
+
+func runtimePreparationReservationUsable(reservation client.WorkerEndpointOriginReservation) bool {
+	return (reservation.Status == "bound" || reservation.Status == "activated") && reservation.WorkerResourceUID != ""
 }
 
 func equalStringSlices(left, right []string) bool {

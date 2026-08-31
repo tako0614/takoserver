@@ -4,6 +4,7 @@ import { isEdgeFormsApiVersion } from "./form-ref.ts";
 import { canonicalDigest } from "./json.ts";
 import type { Ledger } from "./ledger.ts";
 import type { JsonObject } from "./ports.ts";
+import { createSoldProviderPlacementSelector } from "./provider-placement.ts";
 import type {
   Provider,
   ProviderNativeAbsence,
@@ -89,6 +90,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
 
   const byId = new Map(providers.map((provider) => [provider.id, provider]));
+  const soldPlacements = createSoldProviderPlacementSelector({ providers, catalog });
   for (const provider of providers) {
     validateMaximumRuntimeInputBindings(provider.runtimeInputCapabilities?.maximumBindings ?? 0);
   }
@@ -112,16 +114,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     sold: ReturnType<Catalog["offeringsFor"]>[number];
     priceMinor: number;
   } => {
-    const matches = catalog.offeringsFor(form.identity.formRef);
-    const sold = offeringId
-      ? matches.find((candidate) => candidate.id === offeringId)
-      : matches.length === 1
-        ? matches[0]
-        : undefined;
-    if (!sold) throw new TakoformHostError("unsupported_capability", 422);
-    const provider = byId.get(sold.providerPackRef);
-    const offering = provider?.offerings.find((candidate) => candidate.id === sold.id);
-    if (!provider || !offering) throw new TakoformHostError("backend_unavailable", 503);
+    const { provider, offering, sold } = soldPlacements.select(form.identity.formRef, offeringId);
     return {
       provider,
       offering,

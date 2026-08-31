@@ -1,22 +1,24 @@
 import { expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import {
   buildApp,
   createEphemeralSql,
   createMemoryObjectStore,
   createRuntimeInputAuthority,
+  deriveRuntimeInputReference,
   InMemoryTakoformResourceDriver,
 } from "../src/index.ts";
 import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
 import { createTakoformStore } from "../src/takoform/store.ts";
 
 const PREPARATION_TIME = "2026-08-31T18:00:00Z";
-const ORIGIN_RESOURCE_REVISION = "1";
+const WORKER_RESOURCE_REVISION = "1";
 const PREPARATION_TARGET = {
   space: "default",
   workerName: "yurucommu",
   workerResourceUid: "uid-worker-01",
   bundleName: "bundle-01",
-  originResourceUid: "uid-origin-01",
+  originReservationId: "reservation-01",
 } as const;
 const CLAIM_TARGET = {
   space: PREPARATION_TARGET.space,
@@ -29,19 +31,22 @@ const PREPARATION_BINDINGS = {
   TAKOSUMI_ACCOUNTS_CLIENT_ID: "placeholder-client-id",
 } as const;
 const PREPARATION_BINDING_NAMES = ["ENCRYPTION_KEY", "TAKOSUMI_ACCOUNTS_CLIENT_ID"] as const;
-const ORIGIN_FORM_REF = {
+const WORKER_FORM_REF = {
   apiVersion: "edge.forms.takoform.com",
-  kind: "WorkerEndpoint",
+  kind: "ModuleWorker",
   definitionVersion: "0.1.0",
-  schemaDigest: `sha256:${"0".repeat(64)}` as const,
+  schemaDigest: "sha256:049df2fb1eda53e4ccb0d646022a3ded8bc17c44eb433fa2e5ac0861efe42ac7" as const,
 };
+const RESERVATION_REVISION = "2";
+const OFFERING_ID = "worker.module.test";
+const OFFERING_DIGEST = `sha256:${"a".repeat(64)}` as const;
 
 type PreparationTarget = {
   readonly space: string;
   readonly workerName: string;
   readonly workerResourceUid: string;
   readonly bundleName: string;
-  readonly originResourceUid: string;
+  readonly originReservationId: string;
 };
 
 async function runtimeInputFixture(
@@ -53,34 +58,49 @@ async function runtimeInputFixture(
     "decrypt",
   ]);
   let now = new Date(options.initialTime ?? PREPARATION_TIME);
-  await seedOriginLifecycle(sql, "org_01", PREPARATION_TARGET.originResourceUid, now.getTime());
-  const randomIds = options.randomIds ?? ["prep_01"];
-  let randomIndex = 0;
+  await seedReservationLifecycle(
+    sql,
+    "org_01",
+    PREPARATION_TARGET.originReservationId,
+    now.getTime(),
+  );
   let realizedOrigin = "https://community.example.test";
   let afterNextOriginResolution: (() => Promise<void>) | undefined;
+  const reservation = () => ({
+    organizationId: "org_01",
+    reservationId: PREPARATION_TARGET.originReservationId,
+    canonicalPublicOrigin: realizedOrigin,
+    revision: RESERVATION_REVISION,
+    expiresAtEpochMilliseconds: Date.parse(PREPARATION_TIME) + 60 * 60 * 1_000,
+    target: {
+      space: PREPARATION_TARGET.space,
+      workerName: PREPARATION_TARGET.workerName,
+      endpointName: "public",
+    },
+    status: "bound" as const,
+    workerResourceUid: PREPARATION_TARGET.workerResourceUid,
+    workerResourceRevision: WORKER_RESOURCE_REVISION,
+    providerPackRef: "fake",
+    providerInstallationRef: "fake.primary",
+    offeringId: OFFERING_ID,
+    offeringDigest: OFFERING_DIGEST,
+  });
+  const resolveReservation = async () => {
+    const resolution = reservation();
+    const afterResolve = afterNextOriginResolution;
+    afterNextOriginResolution = undefined;
+    if (afterResolve) await afterResolve();
+    return resolution;
+  };
   const authority = createRuntimeInputAuthority({
     sql,
     sealKeys: { current: { keyId: "runtime-input-test-key", key } },
-    origins: {
-      async resolve(input) {
-        const resolution =
-          input.resourceUid === PREPARATION_TARGET.originResourceUid &&
-          input.space === PREPARATION_TARGET.space &&
-          input.workerName === PREPARATION_TARGET.workerName &&
-          input.workerResourceUid === PREPARATION_TARGET.workerResourceUid
-            ? {
-                canonicalPublicOrigin: realizedOrigin,
-                resourceRevision: ORIGIN_RESOURCE_REVISION,
-              }
-            : null;
-        const afterResolve = afterNextOriginResolution;
-        afterNextOriginResolution = undefined;
-        if (afterResolve) await afterResolve();
-        return resolution;
-      },
+    originReservations: {
+      bind: resolveReservation,
+      inspectBound: resolveReservation,
     },
     clock: () => now,
-    randomId: () => randomIds[randomIndex++] ?? `prep_${String(randomIndex).padStart(2, "0")}`,
+    randomId: () => "unused-server-id",
   });
   return {
     sql,
@@ -102,20 +122,80 @@ function preparationInput(
   operationId: string,
   overrides: {
     readonly materialSetId?: string;
+    readonly materialSetNonce?: string;
     readonly target?: PreparationTarget;
     readonly canonicalPublicOrigin?: string;
     readonly bindings?: Readonly<Record<string, string>>;
   } = {},
 ) {
+  const target = overrides.target ?? PREPARATION_TARGET;
+  const bindings = overrides.bindings ?? PREPARATION_BINDINGS;
+  const materialSetNonce = overrides.materialSetNonce ?? "nonce-01";
+  const canonicalPublicOrigin = overrides.canonicalPublicOrigin ?? "https://community.example.test";
+  const preimage = JSON.stringify({
+    format: "takoserver.worker-runtime-input-preflight.v1",
+    materialSetNonce,
+    target: {
+      space: target.space,
+      workerName: target.workerName,
+      bundleName: target.bundleName,
+      endpointName: "public",
+      originReservationId: target.originReservationId,
+      canonicalPublicOrigin,
+    },
+    bindings: Object.fromEntries(
+      Object.entries(bindings).sort(([left], [right]) => left.localeCompare(right)),
+    ),
+  });
+  const hex = createHash("sha256").update(preimage).digest("hex");
+  const preparationId = `prep-${hex.slice(0, 32)}`;
   return {
     organizationId: "org_01",
     operationId,
     materialSetId: overrides.materialSetId ?? "material-set-01",
-    target: overrides.target ?? PREPARATION_TARGET,
-    canonicalPublicOrigin: overrides.canonicalPublicOrigin ?? "https://community.example.test",
-    bindings: overrides.bindings ?? PREPARATION_BINDINGS,
+    materialSetNonce,
+    runtimeInputReference: `rip1.${preparationId}.${hex}`,
+    target,
+    bindings,
   };
 }
+
+test("accepts the exact Go provider preflight golden across the full Unicode domain", async () => {
+  const materialSetNonce = "A".repeat(43);
+  const bindings = {
+    A: "<&>\u2028\u2029",
+    Z: "non-bmp-😀",
+  };
+  const expectedReference =
+    "rip1.prep-2e42bd63644611fe7a79da06e0993205.2e42bd63644611fe7a79da06e09932056f6ac00874251acb75f174d3a18d931c";
+  const derived = await deriveRuntimeInputReference({
+    format: "takoserver.worker-runtime-input-preflight.v1",
+    materialSetNonce,
+    target: {
+      space: PREPARATION_TARGET.space,
+      workerName: PREPARATION_TARGET.workerName,
+      bundleName: PREPARATION_TARGET.bundleName,
+      endpointName: "public",
+      originReservationId: PREPARATION_TARGET.originReservationId,
+      canonicalPublicOrigin: "https://community.example.test",
+    },
+    bindings,
+  });
+  expect(derived.runtimeInputReference).toBe(expectedReference);
+
+  const { authority } = await runtimeInputFixture();
+  await expect(
+    authority.preparations.prepare({
+      organizationId: "org_01",
+      operationId: "op_unicode",
+      materialSetId: "material-set-unicode",
+      materialSetNonce,
+      runtimeInputReference: expectedReference,
+      target: PREPARATION_TARGET,
+      bindings,
+    }),
+  ).resolves.toMatchObject({ runtimeInputReference: expectedReference, status: "prepared" });
+});
 
 function leaseInput(reference: string, overrides: { readonly operationId?: string } = {}) {
   return {
@@ -128,6 +208,28 @@ function leaseInput(reference: string, overrides: { readonly operationId?: strin
   };
 }
 
+function boundReservation(organizationId: string) {
+  return {
+    organizationId,
+    reservationId: PREPARATION_TARGET.originReservationId,
+    canonicalPublicOrigin: "https://community.example.test",
+    revision: RESERVATION_REVISION,
+    expiresAtEpochMilliseconds: Date.parse(PREPARATION_TIME) + 60 * 60 * 1_000,
+    target: {
+      space: PREPARATION_TARGET.space,
+      workerName: PREPARATION_TARGET.workerName,
+      endpointName: "public",
+    },
+    status: "bound" as const,
+    workerResourceUid: PREPARATION_TARGET.workerResourceUid,
+    workerResourceRevision: WORKER_RESOURCE_REVISION,
+    providerPackRef: "fake",
+    providerInstallationRef: "fake.primary",
+    offeringId: OFFERING_ID,
+    offeringDigest: OFFERING_DIGEST,
+  };
+}
+
 test("prepares one encrypted runtime-input set and returns its exact reference projection", async () => {
   const { sql, authority } = await runtimeInputFixture();
   const prepared = await authority.preparations.prepare(preparationInput("op_01"));
@@ -135,7 +237,7 @@ test("prepares one encrypted runtime-input set and returns its exact reference p
   expect(prepared).toMatchObject({
     format: "takoserver.worker-runtime-input-preparation@v1",
     operationId: "op_01",
-    preparationId: "prep_01",
+    preparationId: expect.stringMatching(/^prep-[0-9a-f]{32}$/u),
     status: "prepared",
     expiresAt: "2026-08-31T19:00:00.000Z",
     target: {
@@ -143,12 +245,12 @@ test("prepares one encrypted runtime-input set and returns its exact reference p
       workerName: "yurucommu",
       workerResourceUid: "uid-worker-01",
       bundleName: "bundle-01",
-      originResourceUid: "uid-origin-01",
+      originReservationId: "reservation-01",
     },
     canonicalPublicOrigin: "https://community.example.test",
     bindingNames: ["ENCRYPTION_KEY", "TAKOSUMI_ACCOUNTS_CLIENT_ID"],
   });
-  expect(prepared.runtimeInputReference).toMatch(/^rip1\.prep_01\.[0-9a-f]{64}$/u);
+  expect(prepared.runtimeInputReference).toMatch(/^rip1\.prep-[0-9a-f]{32}\.[0-9a-f]{64}$/u);
   expect(await authority.preparations.prepare(preparationInput("op_01"))).toEqual(prepared);
 
   const rows = await sql.query(
@@ -172,10 +274,12 @@ test("classifies an operation replay with a different non-secret target as confl
   await authority.preparations.prepare(original);
 
   await expect(
-    authority.preparations.prepare({
-      ...original,
-      target: { ...original.target, workerName: "another-worker" },
-    }),
+    authority.preparations.prepare(
+      preparationInput("op_01", {
+        target: { ...original.target, workerName: "another-worker" },
+        bindings: original.bindings,
+      }),
+    ),
   ).rejects.toMatchObject({ code: "conflict", status: 409 });
 });
 
@@ -187,7 +291,7 @@ test("rejects origin drift before preparation or claim state changes", async () 
         canonicalPublicOrigin: "https://other.example.test",
       }),
     ),
-  ).rejects.toMatchObject({ code: "conflict", status: 409 });
+  ).rejects.toMatchObject({ code: "invalid_argument", status: 400 });
   expect(
     await fixture.sql.query(
       "SELECT operation_id FROM worker_runtime_input_preparations WHERE organization_id = ?",
@@ -253,7 +357,7 @@ test("requires the exact preparation reference and refuses substitution", async 
       ...leaseInput(first.runtimeInputReference),
       reference: forgedReference,
     }),
-  ).rejects.toMatchObject({ code: "conflict", status: 409 });
+  ).rejects.toMatchObject({ code: "invalid_argument", status: 400 });
   expect(await authority.preparations.read("org_01", "op_01")).toMatchObject({
     status: "prepared",
   });
@@ -266,14 +370,14 @@ test("claims the exact reference with a commitment-bound preparation identity", 
 
   expect(lease.bindings).toEqual(PREPARATION_BINDINGS);
   expect(lease.preparation).toMatchObject({
-    preparationId: "prep_01",
+    preparationId: prepared.preparationId,
     materialSetId: "material-set-01",
-    originResourceUid: "uid-origin-01",
+    originReservationId: "reservation-01",
     canonicalPublicOrigin: "https://community.example.test",
   });
   expect(lease.preparation.commitment).toMatch(/^sha256:[0-9a-f]{64}$/u);
   expect(prepared.runtimeInputReference).toBe(
-    `rip1.prep_01.${lease.preparation.commitment.slice("sha256:".length)}`,
+    `rip1.${prepared.preparationId}.${lease.preparation.commitment.slice("sha256:".length)}`,
   );
 
   await lease.abort();
@@ -343,7 +447,7 @@ test("revalidates and revision-fences the origin immediately before dispatch", a
     await raced.sql.run(
       `UPDATE tf_resources SET revision = '2'
        WHERE tenant_id = ? AND uid = ? AND revision = ?`,
-      ["org_01", PREPARATION_TARGET.originResourceUid, ORIGIN_RESOURCE_REVISION],
+      ["org_01", PREPARATION_TARGET.workerResourceUid, WORKER_RESOURCE_REVISION],
     );
   });
 
@@ -360,15 +464,15 @@ test("serializes origin deletion against claim and releases the pin on abort", a
   const store = createTakoformStore(fixture.sql, fixture.clock);
   const deletion = {
     tenantId: "org_01",
-    resourceUid: PREPARATION_TARGET.originResourceUid,
+    resourceUid: PREPARATION_TARGET.workerResourceUid,
     address: {
       tenantId: "org_01",
       space: "default",
-      apiVersion: ORIGIN_FORM_REF.apiVersion,
-      kind: ORIGIN_FORM_REF.kind,
-      name: "origin",
+      apiVersion: WORKER_FORM_REF.apiVersion,
+      kind: WORKER_FORM_REF.kind,
+      name: PREPARATION_TARGET.workerName,
     },
-    formRef: ORIGIN_FORM_REF,
+    formRef: WORKER_FORM_REF,
     operationId: "delete-origin-01",
   } as const;
 
@@ -392,15 +496,15 @@ test("lets deletion win before claim and keeps recovery available after dispatch
   const deletionStore = createTakoformStore(deletionFirst.sql, deletionFirst.clock);
   await deletionStore.prepareResourceDeletion({
     tenantId: "org_01",
-    resourceUid: PREPARATION_TARGET.originResourceUid,
+    resourceUid: PREPARATION_TARGET.workerResourceUid,
     address: {
       tenantId: "org_01",
       space: "default",
-      apiVersion: ORIGIN_FORM_REF.apiVersion,
-      kind: ORIGIN_FORM_REF.kind,
-      name: "origin",
+      apiVersion: WORKER_FORM_REF.apiVersion,
+      kind: WORKER_FORM_REF.kind,
+      name: PREPARATION_TARGET.workerName,
     },
-    formRef: ORIGIN_FORM_REF,
+    formRef: WORKER_FORM_REF,
     operationId: "delete-origin-01",
   });
   await expect(
@@ -421,15 +525,15 @@ test("lets deletion win before claim and keeps recovery available after dispatch
   const dispatchStore = createTakoformStore(dispatchFirst.sql, dispatchFirst.clock);
   await dispatchStore.prepareResourceDeletion({
     tenantId: "org_01",
-    resourceUid: PREPARATION_TARGET.originResourceUid,
+    resourceUid: PREPARATION_TARGET.workerResourceUid,
     address: {
       tenantId: "org_01",
       space: "default",
-      apiVersion: ORIGIN_FORM_REF.apiVersion,
-      kind: ORIGIN_FORM_REF.kind,
-      name: "origin",
+      apiVersion: WORKER_FORM_REF.apiVersion,
+      kind: WORKER_FORM_REF.kind,
+      name: PREPARATION_TARGET.workerName,
     },
-    formRef: ORIGIN_FORM_REF,
+    formRef: WORKER_FORM_REF,
     operationId: "delete-origin-01",
   });
   await expect(
@@ -450,7 +554,7 @@ test("recovers one dispatched preparation by value-free identity and settles it"
   const forgedReference = `${prefix}.${preparationId}.${"0".repeat(64)}`;
   await expect(
     authority.leases.recover({ ...input, reference: forgedReference }),
-  ).rejects.toMatchObject({ code: "conflict", status: 409 });
+  ).rejects.toMatchObject({ code: "invalid_argument", status: 400 });
   expect(await authority.preparations.read("org_01", "op_01")).toMatchObject({
     status: "dispatched",
   });
@@ -511,17 +615,12 @@ test("serves the closed preparation control API to one resources writer", async 
   const runtimeInputs = createRuntimeInputAuthority({
     sql,
     sealKeys: { current: { keyId: "runtime-input-test-key", key } },
-    origins: {
-      async resolve(input) {
-        return input.resourceUid === "uid-origin-01" &&
-          input.space === "default" &&
-          input.workerName === "yurucommu" &&
-          input.workerResourceUid === "uid-worker-01"
-          ? {
-              canonicalPublicOrigin: "https://community.example.test",
-              resourceRevision: ORIGIN_RESOURCE_REVISION,
-            }
-          : null;
+    originReservations: {
+      async bind(input) {
+        return boundReservation(input.organizationId);
+      },
+      async inspectBound(input) {
+        return boundReservation(input.organizationId);
       },
     },
     clock: () => new Date("2026-08-31T18:00:00Z"),
@@ -610,7 +709,12 @@ test("serves the closed preparation control API to one resources writer", async 
   expect(organization.status).toBe(201);
   const organizationBody = (await organization.json()) as { organization: { id: string } };
   const organizationId = organizationBody.organization.id;
-  await seedOriginLifecycle(sql, organizationId, "uid-origin-01", Date.parse(PREPARATION_TIME));
+  await seedReservationLifecycle(
+    sql,
+    organizationId,
+    "reservation-01",
+    Date.parse(PREPARATION_TIME),
+  );
   const apiKey = await call(
     "POST",
     `/v1/organizations/${organizationId}/api-keys`,
@@ -629,21 +733,35 @@ test("serves the closed preparation control API to one resources writer", async 
   expect(readKey.status).toBe(201);
   const readKeyBody = (await readKey.json()) as { secret: string };
   const reader = `Bearer ${readKeyBody.secret}`;
+  const otherOrganization = await call("POST", "/v1/organizations", { name: "Other" }, owner);
+  expect(otherOrganization.status).toBe(201);
+  const otherOrganizationBody = (await otherOrganization.json()) as {
+    organization: { id: string };
+  };
+  const otherApiKey = await call(
+    "POST",
+    `/v1/organizations/${otherOrganizationBody.organization.id}/api-keys`,
+    { name: "other-runtime-input-writer", scopes: ["resources:write"], expiresInSeconds: 3_600 },
+    owner,
+  );
+  expect(otherApiKey.status).toBe(201);
+  const otherApiKeyBody = (await otherApiKey.json()) as { secret: string };
+  const otherWriter = `Bearer ${otherApiKeyBody.secret}`;
 
+  const preparedInput = preparationInput("op_01", {
+    bindings: { ENCRYPTION_KEY: "placeholder-encryption-value" },
+  });
   const input = {
     format: "takoserver.worker-runtime-input-preparation@v1",
-    materialSetId: "material-set-01",
-    target: {
-      space: "default",
-      workerName: "yurucommu",
-      workerResourceUid: "uid-worker-01",
-      bundleName: "bundle-01",
-      originResourceUid: "uid-origin-01",
-    },
-    canonicalPublicOrigin: "https://community.example.test",
-    bindings: { ENCRYPTION_KEY: "placeholder-encryption-value" },
+    materialSetId: preparedInput.materialSetId,
+    materialSetNonce: preparedInput.materialSetNonce,
+    runtimeInputReference: preparedInput.runtimeInputReference,
+    target: preparedInput.target,
+    bindings: preparedInput.bindings,
   };
   const path = `/v1/organizations/${organizationId}/worker-runtime-input-preparations/op_01`;
+  expect((await call("PUT", path, input, owner)).status).toBe(403);
+  expect((await call("PUT", path, input, otherWriter)).status).toBe(403);
   const readOnlyAttempt = await call("PUT", path, input, reader);
   expect(readOnlyAttempt.status).toBe(403);
   const malformed = await call("PUT", path, { ...input, ignoredTypo: true }, writer);
@@ -678,7 +796,7 @@ test("serves the closed preparation control API to one resources writer", async 
     { ...input, bindings: { ENCRYPTION_KEY: "different-placeholder-value" } },
     writer,
   );
-  expect(conflictingReplay.status).toBe(409);
+  expect(conflictingReplay.status).toBe(400);
 
   const read = await call("GET", path, undefined, writer);
   expect(read.status).toBe(200);
@@ -697,28 +815,96 @@ test("serves the closed preparation control API to one resources writer", async 
   expect(durable).toEqual({ state: "revoked", sealed_payload: null });
 });
 
-async function seedOriginLifecycle(
+async function seedReservationLifecycle(
   sql: ReturnType<typeof createEphemeralSql>,
   organizationId: string,
-  resourceUid: string,
+  reservationId: string,
   now: number,
 ): Promise<void> {
+  const resource = {
+    apiVersion: WORKER_FORM_REF.apiVersion,
+    kind: WORKER_FORM_REF.kind,
+    form: { formRef: WORKER_FORM_REF },
+    metadata: {
+      name: PREPARATION_TARGET.workerName,
+      space: PREPARATION_TARGET.space,
+      uid: PREPARATION_TARGET.workerResourceUid,
+      generation: "1",
+      revision: WORKER_RESOURCE_REVISION,
+    },
+    spec: {},
+    status: {
+      observedGeneration: "1",
+      conditions: [
+        {
+          type: "Ready",
+          status: "True",
+          reason: "Available",
+          lastTransitionTime: new Date(now).toISOString(),
+        },
+      ],
+    },
+  };
   await sql.run(
     `INSERT INTO tf_resources
        (tenant_id, space, api_version, kind, name, uid, generation, revision,
         resource_json, updated_at)
-     VALUES (?, 'default', 'edge.forms.takoform.com', 'WorkerEndpoint', 'origin', ?,
-             '1', ?, '{}', ?)`,
-    [organizationId, resourceUid, ORIGIN_RESOURCE_REVISION, now],
+     VALUES (?, 'default', 'edge.forms.takoform.com', 'ModuleWorker', 'yurucommu', ?,
+             '1', ?, ?, ?)`,
+    [
+      organizationId,
+      PREPARATION_TARGET.workerResourceUid,
+      WORKER_RESOURCE_REVISION,
+      JSON.stringify(resource),
+      now,
+    ],
+  );
+  await sql.run(
+    `INSERT INTO tf_resource_deployments
+       (tenant_id, id, resource_uid, offering_id, provider_pack_ref,
+        provider_installation_ref, native_id, native_claimed, state,
+        observed_json, outputs_json, created_at, updated_at)
+     VALUES (?, 'deployment-worker-01', ?, ?, 'fake', 'fake.primary',
+             'worker:native-01', 0, 'active', '{}', '{}', ?, ?)`,
+    [organizationId, PREPARATION_TARGET.workerResourceUid, OFFERING_ID, now, now],
+  );
+  await sql.run(
+    `INSERT INTO worker_endpoint_origin_reservations
+       (organization_id, reservation_id, space, worker_name, endpoint_name,
+        canonical_public_origin, provider_pack_ref, provider_installation_ref,
+        offering_id, offering_digest, requested_ttl_seconds, expires_at,
+        state, revision, worker_resource_uid, worker_resource_revision,
+        endpoint_resource_uid, endpoint_resource_revision, created_at, updated_at, released_at)
+     VALUES (?, ?, 'default', 'yurucommu', 'public', 'https://community.example.test',
+             'fake', 'fake.primary', ?, ?, 3600, ?, 'bound', ?, ?, ?,
+             NULL, NULL, ?, ?, NULL)`,
+    [
+      organizationId,
+      reservationId,
+      OFFERING_ID,
+      OFFERING_DIGEST,
+      now + 60 * 60 * 1_000,
+      Number(RESERVATION_REVISION),
+      PREPARATION_TARGET.workerResourceUid,
+      WORKER_RESOURCE_REVISION,
+      now,
+      now,
+    ],
   );
   await sql.run(
     `INSERT INTO tf_resource_deletion_attestations
        (tenant_id, resource_uid, space, api_version, kind, name, form_ref_json,
         state, closure_fence, effects_json, evidence_json, evidence_ref,
         evidence_effect_digest, evidence_checked_at, evidence_status, created_at, updated_at)
-     VALUES (?, ?, 'default', 'edge.forms.takoform.com', 'WorkerEndpoint', 'origin', ?,
+     VALUES (?, ?, 'default', 'edge.forms.takoform.com', 'ModuleWorker', 'yurucommu', ?,
              'live', 1, '[]', NULL, NULL, NULL, NULL, NULL, ?, ?)`,
-    [organizationId, resourceUid, JSON.stringify(ORIGIN_FORM_REF), now, now],
+    [
+      organizationId,
+      PREPARATION_TARGET.workerResourceUid,
+      JSON.stringify(WORKER_FORM_REF),
+      now,
+      now,
+    ],
   );
 }
 

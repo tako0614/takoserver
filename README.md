@@ -230,19 +230,33 @@ Takoserver's public protocol and standalone path do not depend on Takosumi.
 Stable Worker Forms with an omitted or empty `requiredSensitiveVars`
 declaration provision normally. A configured Cloudflare provider can also
 accept a non-empty declaration through Takoserver's RuntimeInputAuthority, up
-to 64 names when `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING` is configured. An
-authenticated control-plane `PUT` seals the exact material and returns a
-one-shot `rip1` reference; the caller reuses that value as the Host
-`Idempotency-Key`. Before sealing, Takoserver derives the canonical HTTPS
-origin from an exact live `WorkerEndpoint` or `WorkerCustomDomain` Resource and
-checks its UID-pinned ModuleWorker relation. The provider lease claims the
-exact operation, Resource, worker incarnation, and target before any asset or
-Worker Version mutation, erases ciphertext before dispatch, and settles only
-after provider readback. Origin deletion and claim are reciprocally fenced in
-D1, and dispatch atomically fences the exact Resource revision from its final
-origin read. Recovery after that authorization point is value-free and does
-not depend on the origin still existing. Self-host remains fail-closed without
-this authority and capability.
+to 64 names when `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING` is configured. Before
+the Resource graph exists, an organization key reserves the future canonical
+HTTPS origin at
+`/v1/worker-endpoint-origin-reservations/{reservationId}`. Takoserver selects
+and records the same exact sold ModuleWorker Offering and provider placement as
+ordinary Host mutation; an omitted Offering is accepted only when that
+selection has exactly one eligible result. The reservation is value-free and
+does not create a Takoform Resource or call the provider.
+
+A preflight client computes a plan-known `rip1` reference from a non-secret
+nonce, the reservation's logical endpoint identity and canonical origin, and
+the exact sorted bindings. Runtime-input `PUT` supplies that reference plus the
+actual ModuleWorker UID; Takoserver recomputes it, atomically binds the live
+reservation and exact Ready worker revision/placement, and seals the material.
+It never accepts a caller-supplied origin. The provider lease claims that exact
+identity before any asset or Worker Version mutation, erases ciphertext in the
+dispatch CAS, and settles only after provider readback. Dispatch revision-fences
+the worker and reservation again. Post-dispatch recovery is value-free and
+reservation-independent.
+
+Activation later proves the released, Ready `WorkerEndpoint`, its exact worker
+relation, provider placement, and canonical output. Deactivation retains the
+endpoint UID as a deletion witness: the endpoint and its provider deployment
+must be closed before the reservation can be released and its origin reused.
+TTL expiry does not unlock an origin while that deletion witness is retained.
+Self-host remains fail-closed without the runtime-input authority and provider
+capability.
 The declaration's names remain in the Worker Version spec; values do not enter
 portable state. Realization places the other non-secret values in Worker vars.
 AI uses the native Workers AI binding, so it does not copy an account API token
@@ -257,7 +271,7 @@ than using a demo backend.
 
 See [docs/adr/0001-provision-from-the-worker.md](docs/adr/0001-provision-from-the-worker.md)
 for why the deployed Worker holds the account credential, and what that costs.
-The RuntimeInputAuthority boundary is recorded in
+The reservation and RuntimeInputAuthority boundary is recorded in
 [docs/adr/0004-runtime-input-authority.md](docs/adr/0004-runtime-input-authority.md).
 
 ## Resource and supply model

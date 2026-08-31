@@ -166,12 +166,13 @@ export {
   type ResourceMigrationStore,
 } from "./resource-migrations.ts";
 export { createRouter, type Router } from "./router.ts";
-export { createTakoformRuntimeInputOriginAuthority } from "./runtime-input-origin-authority.ts";
 export {
   createRuntimeInputAuthority,
+  deriveRuntimeInputReference,
+  RUNTIME_INPUT_PREFLIGHT_FORMAT,
   RUNTIME_INPUT_PREPARATION_FORMAT,
   type RuntimeInputAuthority,
-  type RuntimeInputOriginAuthority,
+  type RuntimeInputPreflightDocument,
   RuntimeInputPreparationError,
   type RuntimeInputPreparationInput,
   type RuntimeInputPreparationProjection,
@@ -226,3 +227,13 @@ export {
   TokenError,
   type TokenService,
 } from "./token.ts";
+export {
+  type BoundWorkerEndpointOriginReservation,
+  createWorkerEndpointOriginReservations,
+  WORKER_ENDPOINT_ORIGIN_RESERVATION_ACTIVATION_FORMAT,
+  WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT,
+  WorkerEndpointOriginReservationError,
+  type WorkerEndpointOriginReservationProjection,
+  type WorkerEndpointOriginReservations,
+  type WorkerEndpointOriginReservationTarget,
+} from "./worker-endpoint-origin-reservations.ts";

@@ -28,23 +28,27 @@ const (
 	materialSetIDPrefix     = "material-set:v1:"
 	materialSetNonceBytes   = 32
 	maxFileBytes            = 128 * 1024
+	maxJSONDepth            = 64
+	maxBindings             = 64
 )
 
 var (
-	materialSetIDPattern = regexp.MustCompile(`^material-set:v1:[0-9a-f]{64}$`)
-	bindingNamePattern   = regexp.MustCompile(`^[A-Z_][A-Z0-9_]{0,127}$`)
-	targetValuePattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+	bindingNamePattern = regexp.MustCompile(`^[A-Z_][A-Z0-9_]{0,127}$`)
+	targetValuePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	opaqueIDPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 )
 
-// Target identifies the exact Worker realization to which a material set is
-// scoped. It is included in the credential-file commitment and is never
-// inferred from the file when the provider has a planned target.
+const runtimeInputPreflightFormatV1 = "takoserver.worker-runtime-input-preflight.v1"
+
+// Target identifies the logical Worker endpoint to which a material set is
+// scoped. The realized Worker UID is deliberately absent because the
+// credential file is created before the ordinary OpenTofu apply. The provider
+// binds that UID into the material-set commitment after the Worker exists.
 type Target struct {
-	Space             string `json:"space"`
-	WorkerName        string `json:"workerName"`
-	WorkerResourceUID string `json:"workerResourceUid"`
-	BundleName        string `json:"bundleName"`
-	OriginResourceUID string `json:"originResourceUid"`
+	Space        string `json:"space"`
+	WorkerName   string `json:"workerName"`
+	BundleName   string `json:"bundleName"`
+	EndpointName string `json:"endpointName"`
 }
 
 type commitmentBinding struct {
@@ -56,18 +60,44 @@ type commitmentBinding struct {
 // materialSetId. Its UTF-8 canonical JSON is emitted without insignificant
 // whitespace in this exact key order:
 // format, materialSetNonce, target (space, workerName, workerResourceUid,
-// bundleName, originResourceUid), canonicalPublicOrigin, bindings (sorted name/value
-// pairs). The nonce is stored only in the 0600 credential file; it is
-// deliberately never returned in state or sent to Takoserver. Bindings are a
+// bundleName, originReservationId), bindings (sorted name/value pairs). The
+// endpoint name and canonical origin are checked against the closed reservation
+// projection but are deliberately not included in this server commitment.
+// The nonce is stored only in the 0600 credential file and is never returned
+// in provider state. It is sent only in the exact runtime preparation request
+// after the closed reservation projection has been validated. Bindings are a
 // sorted slice rather than a map so encoding/json cannot introduce an order
 // ambiguity in the commitment. The resulting ID is
 // material-set:v1:<lowercase SHA-256 hex>.
 type materialSetCommitmentDocument struct {
-	Format                string              `json:"format"`
-	MaterialSetNonce      string              `json:"materialSetNonce"`
-	Target                Target              `json:"target"`
-	CanonicalPublicOrigin string              `json:"canonicalPublicOrigin"`
-	Bindings              []commitmentBinding `json:"bindings"`
+	Format           string              `json:"format"`
+	MaterialSetNonce string              `json:"materialSetNonce"`
+	Target           commitmentTarget    `json:"target"`
+	Bindings         []commitmentBinding `json:"bindings"`
+}
+
+type commitmentTarget struct {
+	Space               string `json:"space"`
+	WorkerName          string `json:"workerName"`
+	WorkerResourceUID   string `json:"workerResourceUid"`
+	BundleName          string `json:"bundleName"`
+	OriginReservationID string `json:"originReservationId"`
+}
+
+type runtimeInputPreflightDocument struct {
+	Format           string                      `json:"format"`
+	MaterialSetNonce string                      `json:"materialSetNonce"`
+	Target           runtimeInputPreflightTarget `json:"target"`
+	Bindings         map[string]string           `json:"bindings"`
+}
+
+type runtimeInputPreflightTarget struct {
+	Space                 string `json:"space"`
+	WorkerName            string `json:"workerName"`
+	BundleName            string `json:"bundleName"`
+	EndpointName          string `json:"endpointName"`
+	OriginReservationID   string `json:"originReservationId"`
+	CanonicalPublicOrigin string `json:"canonicalPublicOrigin"`
 }
 
 // Envelope is the exact credential-file contract consumed by the Takoserver
@@ -75,9 +105,9 @@ type materialSetCommitmentDocument struct {
 // accidentally format the whole material set.
 type Envelope struct {
 	Format                string            `json:"format"`
-	MaterialSetID         string            `json:"materialSetId"`
 	MaterialSetNonce      string            `json:"materialSetNonce"`
 	Target                Target            `json:"target"`
+	OriginReservationID   string            `json:"originReservationId"`
 	CanonicalPublicOrigin string            `json:"canonicalPublicOrigin"`
 	Values                map[string]string `json:"values"`
 }
@@ -94,20 +124,20 @@ func (e Envelope) Names() []string {
 
 // Load opens path without following a symlink, requires an owner-only regular
 // file, and validates the closed envelope before returning any values. Callers
-// that have a planned Worker target should use LoadForTarget so target drift is
-// rejected before any material is sent to Takoserver.
-func Load(path, expectedOrigin string, expectedNames []string) (Envelope, error) {
-	return load(path, nil, expectedOrigin, expectedNames)
+// that have a planned logical Worker target should use LoadForTarget so target
+// drift is rejected before any material is sent to Takoserver.
+func Load(path, expectedReservationID string, expectedNames []string) (Envelope, error) {
+	return load(path, nil, expectedReservationID, expectedNames)
 }
 
-// LoadForTarget is Load with an exact planned Worker target check. The target
-// is part of the material-set commitment, so changing it without changing the
-// materialSetId is rejected locally before an HTTP request is made.
-func LoadForTarget(path string, expectedTarget Target, expectedOrigin string, expectedNames []string) (Envelope, error) {
-	return load(path, &expectedTarget, expectedOrigin, expectedNames)
+// LoadForTarget is Load with an exact planned logical Worker target check. The
+// target and reservation identity are part of the material-set commitment, so
+// changing either requires a fresh preflight credential file.
+func LoadForTarget(path string, expectedTarget Target, expectedReservationID string, expectedNames []string) (Envelope, error) {
+	return load(path, &expectedTarget, expectedReservationID, expectedNames)
 }
 
-func load(path string, expectedTarget *Target, expectedOrigin string, expectedNames []string) (Envelope, error) {
+func load(path string, expectedTarget *Target, expectedReservationID string, expectedNames []string) (Envelope, error) {
 	if path == "" {
 		return Envelope{}, errors.New("runtime input credential file is not configured")
 	}
@@ -166,9 +196,6 @@ func load(path string, expectedTarget *Target, expectedOrigin string, expectedNa
 	if envelope.Format != FormatV1 {
 		return Envelope{}, errors.New("runtime input credential file has an unsupported format")
 	}
-	if !materialSetIDPattern.MatchString(envelope.MaterialSetID) {
-		return Envelope{}, errors.New("runtime input credential file has an invalid material set identity")
-	}
 	if err := validateNonce(envelope.MaterialSetNonce); err != nil {
 		return Envelope{}, err
 	}
@@ -178,11 +205,11 @@ func load(path string, expectedTarget *Target, expectedOrigin string, expectedNa
 	if expectedTarget != nil && envelope.Target != *expectedTarget {
 		return Envelope{}, errors.New("runtime input credential file target does not match the planned target")
 	}
+	if !opaqueIDPattern.MatchString(envelope.OriginReservationID) || (expectedReservationID != "" && envelope.OriginReservationID != expectedReservationID) {
+		return Envelope{}, errors.New("runtime input credential file origin reservation does not match the planned reservation")
+	}
 	if err := validateOrigin(envelope.CanonicalPublicOrigin); err != nil {
 		return Envelope{}, err
-	}
-	if envelope.CanonicalPublicOrigin != expectedOrigin {
-		return Envelope{}, errors.New("runtime input credential file origin does not match the planned origin")
 	}
 
 	wantNames, err := normalizeExpectedNames(expectedNames)
@@ -198,17 +225,13 @@ func load(path string, expectedTarget *Target, expectedOrigin string, expectedNa
 			return Envelope{}, fmt.Errorf("runtime input credential file binding %q is empty", name)
 		}
 	}
-	if expectedID := computeMaterialSetID(envelope); envelope.MaterialSetID != expectedID {
-		return Envelope{}, errors.New("runtime input credential file material set identity does not match its contents")
-	}
-
 	return envelope, nil
 }
 
 func rejectDuplicateJSONKeys(raw []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
-	var walk func() error
-	walk = func() error {
+	var walk func(int) error
+	walk = func(depth int) error {
 		token, err := decoder.Token()
 		if err != nil {
 			return err
@@ -217,6 +240,9 @@ func rejectDuplicateJSONKeys(raw []byte) error {
 		case json.Delim:
 			switch delimiter {
 			case '{':
+				if depth >= maxJSONDepth {
+					return errors.New("runtime input credential file JSON nesting is too deep")
+				}
 				seen := make(map[string]struct{})
 				for decoder.More() {
 					key, err := decoder.Token()
@@ -231,15 +257,18 @@ func rejectDuplicateJSONKeys(raw []byte) error {
 						return errors.New("runtime input credential file contains duplicate JSON fields")
 					}
 					seen[name] = struct{}{}
-					if err := walk(); err != nil {
+					if err := walk(depth + 1); err != nil {
 						return err
 					}
 				}
 				_, err = decoder.Token()
 				return err
 			case '[':
+				if depth >= maxJSONDepth {
+					return errors.New("runtime input credential file JSON nesting is too deep")
+				}
 				for decoder.More() {
-					if err := walk(); err != nil {
+					if err := walk(depth + 1); err != nil {
 						return err
 					}
 				}
@@ -252,7 +281,7 @@ func rejectDuplicateJSONKeys(raw []byte) error {
 			return nil
 		}
 	}
-	if err := walk(); err != nil {
+	if err := walk(0); err != nil {
 		return errors.New("runtime input credential file is not the exact v1 JSON envelope")
 	}
 	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
@@ -299,11 +328,10 @@ func validateNonce(value string) error {
 
 func validateTarget(target Target) error {
 	for name, value := range map[string]string{
-		"space":             target.Space,
-		"workerName":        target.WorkerName,
-		"workerResourceUid": target.WorkerResourceUID,
-		"bundleName":        target.BundleName,
-		"originResourceUid": target.OriginResourceUID,
+		"space":        target.Space,
+		"workerName":   target.WorkerName,
+		"bundleName":   target.BundleName,
+		"endpointName": target.EndpointName,
 	} {
 		if !targetValuePattern.MatchString(value) {
 			return fmt.Errorf("runtime input credential file target field %q is invalid", name)
@@ -312,30 +340,137 @@ func validateTarget(target Target) error {
 	return nil
 }
 
-func computeMaterialSetID(envelope Envelope) string {
+// ComputeMaterialSetID binds the preflight envelope to the actual realized
+// Worker UID. It is intentionally computed only after the provider has read
+// the closed Takoserver reservation projection; callers must not supply an ID
+// from HCL or the credential file.
+func ComputeMaterialSetID(envelope Envelope, workerResourceUID string) (string, error) {
+	if !opaqueIDPattern.MatchString(workerResourceUID) {
+		return "", errors.New("worker resource identity is invalid")
+	}
+	if envelope.Format != FormatV1 {
+		return "", errors.New("runtime input credential envelope is incomplete")
+	}
+	if err := validateNonce(envelope.MaterialSetNonce); err != nil {
+		return "", errors.New("runtime input credential envelope has an invalid material set nonce")
+	}
+	if err := validateTarget(envelope.Target); err != nil {
+		return "", errors.New("runtime input credential envelope has an invalid logical target")
+	}
+	if !opaqueIDPattern.MatchString(envelope.OriginReservationID) {
+		return "", errors.New("runtime input credential envelope has an invalid origin reservation identity")
+	}
+	if err := validateOrigin(envelope.CanonicalPublicOrigin); err != nil {
+		return "", errors.New("runtime input credential envelope has an invalid canonical public origin")
+	}
 	names := envelope.Names()
+	if len(names) == 0 || len(names) > maxBindings {
+		return "", errors.New("runtime input credential envelope has an invalid binding set")
+	}
 	bindings := make([]commitmentBinding, 0, len(names))
 	for _, name := range names {
+		if !bindingNamePattern.MatchString(name) || envelope.Values[name] == "" || !utf8.ValidString(envelope.Values[name]) {
+			return "", errors.New("runtime input credential envelope has an invalid binding set")
+		}
 		bindings = append(bindings, commitmentBinding{Name: name, Value: envelope.Values[name]})
 	}
 	document := materialSetCommitmentDocument{
-		Format:                MaterialSetCommitmentV1,
-		MaterialSetNonce:      envelope.MaterialSetNonce,
-		Target:                envelope.Target,
-		CanonicalPublicOrigin: envelope.CanonicalPublicOrigin,
-		Bindings:              bindings,
+		Format:           MaterialSetCommitmentV1,
+		MaterialSetNonce: envelope.MaterialSetNonce,
+		Target: commitmentTarget{
+			Space:               envelope.Target.Space,
+			WorkerName:          envelope.Target.WorkerName,
+			WorkerResourceUID:   workerResourceUID,
+			BundleName:          envelope.Target.BundleName,
+			OriginReservationID: envelope.OriginReservationID,
+		},
+		Bindings: bindings,
 	}
-	encoded, err := json.Marshal(document)
+	encoded, err := canonicalJSON(document)
 	if err != nil {
-		return ""
+		return "", errors.New("runtime input material set commitment cannot be encoded")
 	}
 	digest := sha256.Sum256(encoded)
-	return materialSetIDPrefix + hex.EncodeToString(digest[:])
+	return materialSetIDPrefix + hex.EncodeToString(digest[:]), nil
+}
+
+// ComputeRuntimeInputReference derives the deterministic, value-free
+// preparation reference that is safe to place in a Terraform plan. Unlike
+// ComputeMaterialSetID, this preflight commitment is deliberately independent
+// of the Worker resource UID because that UID does not exist until the ordinary
+// apply starts. The reference carries the deterministic preparation ID and the
+// full lowercase digest: rip1.prep-<first-32-hex>.<full-64-hex>.
+func ComputeRuntimeInputReference(envelope Envelope) (string, error) {
+	if envelope.Format != FormatV1 {
+		return "", errors.New("runtime input credential envelope is incomplete")
+	}
+	if err := validateNonce(envelope.MaterialSetNonce); err != nil {
+		return "", errors.New("runtime input credential envelope has an invalid material set nonce")
+	}
+	if err := validateTarget(envelope.Target); err != nil {
+		return "", errors.New("runtime input credential envelope has an invalid logical target")
+	}
+	if !opaqueIDPattern.MatchString(envelope.OriginReservationID) {
+		return "", errors.New("runtime input credential envelope has an invalid origin reservation identity")
+	}
+	if err := validateOrigin(envelope.CanonicalPublicOrigin); err != nil {
+		return "", errors.New("runtime input credential envelope has an invalid canonical public origin")
+	}
+	names := envelope.Names()
+	if len(names) == 0 || len(names) > maxBindings {
+		return "", errors.New("runtime input credential envelope has an invalid binding set")
+	}
+	bindings := make(map[string]string, len(names))
+	for _, name := range names {
+		if !bindingNamePattern.MatchString(name) || envelope.Values[name] == "" || !utf8.ValidString(envelope.Values[name]) {
+			return "", errors.New("runtime input credential envelope has an invalid binding set")
+		}
+		bindings[name] = envelope.Values[name]
+	}
+	document := runtimeInputPreflightDocument{
+		Format:           runtimeInputPreflightFormatV1,
+		MaterialSetNonce: envelope.MaterialSetNonce,
+		Target: runtimeInputPreflightTarget{
+			Space:                 envelope.Target.Space,
+			WorkerName:            envelope.Target.WorkerName,
+			BundleName:            envelope.Target.BundleName,
+			EndpointName:          envelope.Target.EndpointName,
+			OriginReservationID:   envelope.OriginReservationID,
+			CanonicalPublicOrigin: envelope.CanonicalPublicOrigin,
+		},
+		Bindings: bindings,
+	}
+	encoded, err := canonicalJSON(document)
+	if err != nil {
+		return "", errors.New("runtime input preflight commitment cannot be encoded")
+	}
+	digest := sha256.Sum256(encoded)
+	hexDigest := hex.EncodeToString(digest[:])
+	preparationID := "prep-" + hexDigest[:32]
+	return "rip1." + preparationID + "." + hexDigest, nil
+}
+
+// canonicalJSON emits the compact UTF-8 JSON used by the server commitment
+// algorithms. Encoder.SetEscapeHTML(false) is required because Takoserver's
+// reference implementation uses JSON.stringify; default Go marshaling would
+// turn characters such as '&' into a different preimage.
+func canonicalJSON(value any) ([]byte, error) {
+	var encoded bytes.Buffer
+	encoder := json.NewEncoder(&encoded)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
+	}
+	data := encoded.Bytes()
+	if len(data) == 0 || data[len(data)-1] != '\n' {
+		return nil, errors.New("canonical JSON encoder returned an invalid result")
+	}
+	return data[:len(data)-1], nil
 }
 
 func normalizeExpectedNames(names []string) ([]string, error) {
-	if len(names) == 0 {
-		return nil, errors.New("at least one runtime input binding name is required")
+	if len(names) == 0 || len(names) > maxBindings {
+		return nil, fmt.Errorf("runtime input binding name set must contain between 1 and %d names", maxBindings)
 	}
 	normalized := append([]string(nil), names...)
 	sort.Strings(normalized)

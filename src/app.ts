@@ -64,6 +64,10 @@ import type {
 } from "./takoform/types.ts";
 import { TakoformHostError } from "./takoform/types.ts";
 import { createTokenService, type SigningKey, TokenError } from "./token.ts";
+import {
+  createWorkerEndpointOriginReservations,
+  type WorkerEndpointOriginReservations,
+} from "./worker-endpoint-origin-reservations.ts";
 
 /**
  * The composition root.
@@ -97,6 +101,8 @@ export interface AppPorts {
   readonly integrationE2eCredentialAuthority?: IntegrationE2eCredentialAuthorityConfig;
   /** One Host-owned service shared by control, provider, and scheduled lifecycle cleanup. */
   readonly runtimeInputs?: RuntimeInputAuthority;
+  /** Optional precomposed authority used to close the runtime-input/provider assembly cycle. */
+  readonly originReservations?: WorkerEndpointOriginReservations;
   /** Where this deployment's console is served, if it has one. */
   readonly consoleOrigin?: string;
   /** Private Hosted-to-Takoserver sponsorship bearer; absent disables the seam. */
@@ -218,6 +224,18 @@ export function buildApp(ports: AppPorts): App {
   const catalog = createCatalog(ports.offerings);
   const deployments = createResourceDeploymentStore(ports.sql, clock);
   const inventory = createTakoformStore(ports.sql, clock);
+  const originReservations =
+    ports.originReservations ??
+    ((ports.providers?.length ?? 0) > 0
+      ? createWorkerEndpointOriginReservations({
+          sql: ports.sql,
+          clock,
+          catalog,
+          providers: ports.providers ?? [],
+          resources: inventory,
+          deployments,
+        })
+      : undefined);
   const attachments = createAttachmentService({
     store: createAttachmentStore(ports.sql, clock),
     deployments,
@@ -510,6 +528,7 @@ export function buildApp(ports: AppPorts): App {
         }
       : {}),
     ...(ports.runtimeInputs ? { runtimeInputs: ports.runtimeInputs.preparations } : {}),
+    ...(originReservations ? { originReservations } : {}),
     ...(driver.runtimeInputPolicy ? { runtimeInputPolicy: driver.runtimeInputPolicy } : {}),
   });
 

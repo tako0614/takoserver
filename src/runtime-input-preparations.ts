@@ -4,13 +4,18 @@ import {
   type ProviderRuntimeInputLeasePort,
   type ProviderRuntimeInputPreparationIdentity,
 } from "./provider-runtime-input-port.ts";
+import type {
+  BoundWorkerEndpointOriginReservation,
+  WorkerEndpointOriginReservations,
+} from "./worker-endpoint-origin-reservations.ts";
 
 export const RUNTIME_INPUT_PREPARATION_FORMAT =
   "takoserver.worker-runtime-input-preparation@v1" as const;
 
 const SEALED_PAYLOAD_FORMAT = "takoserver.worker-runtime-input-sealed-payload@v1" as const;
 const AAD_FORMAT = "takoserver.worker-runtime-input-aad@v1" as const;
-const COMMITMENT_FORMAT = "takoserver.worker-runtime-input-commitment@v1" as const;
+export const RUNTIME_INPUT_PREFLIGHT_FORMAT =
+  "takoserver.worker-runtime-input-preflight.v1" as const;
 const RUNTIME_INPUT_REFERENCE_PREFIX = "rip1";
 const PREPARATION_TTL_MILLISECONDS = 60 * 60 * 1_000;
 const CLAIM_TTL_MILLISECONDS = 15 * 60 * 1_000;
@@ -29,16 +34,99 @@ export interface RuntimeInputPreparationTarget {
   readonly workerName: string;
   readonly workerResourceUid: string;
   readonly bundleName: string;
-  readonly originResourceUid: string;
+  readonly originReservationId: string;
 }
 
 export interface RuntimeInputPreparationInput {
   readonly organizationId: string;
   readonly operationId: string;
   readonly materialSetId: string;
+  readonly materialSetNonce: string;
+  /** Plan-known commitment recomputed from the reservation and exact values. */
+  readonly runtimeInputReference: string;
   readonly target: RuntimeInputPreparationTarget;
-  readonly canonicalPublicOrigin: string;
   readonly bindings: Readonly<Record<string, string>>;
+}
+
+export interface RuntimeInputPreflightDocument {
+  readonly format: typeof RUNTIME_INPUT_PREFLIGHT_FORMAT;
+  readonly materialSetNonce: string;
+  readonly target: {
+    readonly space: string;
+    readonly workerName: string;
+    readonly bundleName: string;
+    readonly endpointName: string;
+    readonly originReservationId: string;
+    readonly canonicalPublicOrigin: string;
+  };
+  readonly bindings: Readonly<Record<string, string>>;
+}
+
+/** Cross-language plan-time reference derivation shared by preflight clients. */
+export async function deriveRuntimeInputReference(input: RuntimeInputPreflightDocument): Promise<{
+  readonly preparationId: string;
+  readonly commitment: `sha256:${string}`;
+  readonly runtimeInputReference: string;
+}> {
+  if (input.format !== RUNTIME_INPUT_PREFLIGHT_FORMAT) {
+    throw new RuntimeInputPreparationError("invalid_argument", 400);
+  }
+  validateOpaqueId(input.materialSetNonce);
+  for (const value of Object.values(input.target)) validateBoundedText(value, 2_048);
+  validateCanonicalOrigin(input.target.canonicalPublicOrigin);
+  const names = Object.keys(input.bindings).sort();
+  if (
+    names.length === 0 ||
+    names.length > MAX_PROVIDER_RUNTIME_INPUT_BINDINGS ||
+    names.some((name) => !bindingName.test(name))
+  ) {
+    throw new RuntimeInputPreparationError("invalid_argument", 400);
+  }
+  const bindings: Record<string, string> = {};
+  for (const name of names) {
+    const value = input.bindings[name];
+    if (
+      typeof value !== "string" ||
+      value.length === 0 ||
+      encode(value).byteLength > MAX_VALUE_BYTES
+    ) {
+      throw new RuntimeInputPreparationError("invalid_argument", 400);
+    }
+    bindings[name] = value;
+  }
+  const canonical = crossLanguageJson({
+    format: RUNTIME_INPUT_PREFLIGHT_FORMAT,
+    materialSetNonce: input.materialSetNonce,
+    target: {
+      space: input.target.space,
+      workerName: input.target.workerName,
+      bundleName: input.target.bundleName,
+      endpointName: input.target.endpointName,
+      originReservationId: input.target.originReservationId,
+      canonicalPublicOrigin: input.target.canonicalPublicOrigin,
+    },
+    bindings,
+  });
+  const bytes = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", encode(canonical) as unknown as BufferSource),
+  );
+  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  const preparationId = `prep-${hex.slice(0, 32)}`;
+  const commitment = `sha256:${hex}` as const;
+  return {
+    preparationId,
+    commitment,
+    runtimeInputReference: runtimeInputReferenceValue(preparationId, commitment),
+  };
+}
+
+/**
+ * Go's encoding/json always escapes the two ECMAScript line-separator scalars
+ * even with HTML escaping disabled. Preserve that exact wire behavior so a
+ * provider-computed plan reference and the server commitment are byte-equal.
+ */
+function crossLanguageJson(value: unknown): string {
+  return JSON.stringify(value).replaceAll("\u2028", "\\u2028").replaceAll("\u2029", "\\u2029");
 }
 
 export interface RuntimeInputPreparationProjection {
@@ -74,21 +162,6 @@ export interface RuntimeInputClaimInput {
   readonly bindingNames: readonly string[];
 }
 
-/** Independent lookup of the Resource that owns one canonical public origin. */
-export interface RuntimeInputOriginAuthority {
-  resolve(input: {
-    readonly organizationId: string;
-    readonly resourceUid: string;
-    readonly space: string;
-    readonly workerName: string;
-    readonly workerResourceUid: string;
-  }): Promise<{
-    readonly canonicalPublicOrigin: string;
-    /** Exact Resource representation revision read with the validated origin and relations. */
-    readonly resourceRevision: string;
-  } | null>;
-}
-
 export interface RuntimeInputClaim {
   readonly operationId: string;
   readonly preparationId: string;
@@ -96,8 +169,14 @@ export interface RuntimeInputClaim {
   readonly fence: number;
   readonly materialSetId: string;
   readonly canonicalPublicOrigin: string;
-  readonly originResourceUid: string;
+  readonly originReservationId: string;
   readonly workerResourceUid: string;
+  readonly workerResourceRevision: string;
+  readonly originReservationRevision: string;
+  readonly providerPackRef: string;
+  readonly providerInstallationRef: string;
+  readonly offeringId: string;
+  readonly offeringDigest: `sha256:${string}`;
   readonly bindings: Readonly<Record<string, string>>;
 }
 
@@ -111,10 +190,7 @@ export interface RuntimeInputClaimIdentity {
   readonly fence: number;
 }
 
-export interface RuntimeInputDispatchIdentity extends RuntimeInputClaimIdentity {
-  /** Revision returned by the final origin read and fenced by the dispatch CAS. */
-  readonly originResourceRevision: string;
-}
+export type RuntimeInputDispatchIdentity = RuntimeInputClaimIdentity;
 
 export interface RuntimeInputConsumption extends RuntimeInputClaimIdentity {
   readonly receiptDigest: `sha256:${string}`;
@@ -145,7 +221,7 @@ export class RuntimeInputPreparationError extends Error {
 }
 
 export interface RuntimeInputPreparations {
-  prepare(input: RuntimeInputPreparationInput): Promise<RuntimeInputPreparationProjection>;
+  prepare(input: BoundRuntimeInputPreparationInput): Promise<RuntimeInputPreparationProjection>;
   read(
     organizationId: string,
     operationId: string,
@@ -168,7 +244,14 @@ export interface RuntimeInputPreparations {
 
 export interface RuntimeInputAuthority {
   /** Closed control-plane surface used only by authenticated HTTP routes. */
-  readonly preparations: Pick<RuntimeInputPreparations, "prepare" | "read" | "revoke">;
+  readonly preparations: {
+    prepare(input: RuntimeInputPreparationInput): Promise<RuntimeInputPreparationProjection>;
+    read(
+      organizationId: string,
+      operationId: string,
+    ): Promise<RuntimeInputPreparationProjection | null>;
+    revoke(organizationId: string, operationId: string): Promise<void>;
+  };
   /** Provider-neutral one-shot lease seam used by concrete provider adapters. */
   readonly leases: ProviderRuntimeInputLeasePort;
   /** Bounded lifecycle cleanup composed into the product scheduler. */
@@ -179,57 +262,92 @@ export interface RuntimeInputAuthority {
 
 export function createRuntimeInputAuthority(
   options: Parameters<typeof createRuntimeInputPreparations>[0] & {
-    readonly origins: RuntimeInputOriginAuthority;
+    readonly originReservations: Pick<WorkerEndpointOriginReservations, "bind" | "inspectBound">;
   },
 ): RuntimeInputAuthority {
   const internals = createRuntimeInputPreparations(options);
-  const assertOrigin = async (
+  const assertReservation = async (
     organizationId: string,
-    target: Pick<
-      RuntimeInputPreparationTarget,
-      "space" | "workerName" | "workerResourceUid" | "originResourceUid"
-    >,
-    canonicalPublicOrigin: string,
-  ): Promise<NonNullable<Awaited<ReturnType<RuntimeInputOriginAuthority["resolve"]>>>> => {
-    let realized: Awaited<ReturnType<RuntimeInputOriginAuthority["resolve"]>>;
+    target: RuntimeInputPreparationTarget,
+    expected?: RuntimeInputRecoveryIdentity,
+  ): Promise<BoundWorkerEndpointOriginReservation> => {
+    let reservation: BoundWorkerEndpointOriginReservation;
     try {
-      realized = await options.origins.resolve({
+      reservation = await options.originReservations.inspectBound({
         organizationId,
-        resourceUid: target.originResourceUid,
+        reservationId: target.originReservationId,
         space: target.space,
         workerName: target.workerName,
         workerResourceUid: target.workerResourceUid,
       });
     } catch (error) {
       if (error instanceof RuntimeInputPreparationError) throw error;
+      if (
+        typeof error === "object" &&
+        error !== null &&
+        "status" in error &&
+        (error.status === 404 || error.status === 409)
+      ) {
+        throw new RuntimeInputPreparationError("conflict", 409);
+      }
       throw new RuntimeInputPreparationError("unavailable", 503);
     }
-    if (!realized || realized.canonicalPublicOrigin !== canonicalPublicOrigin) {
+    if (
+      expected &&
+      (expected.originReservationId !== reservation.reservationId ||
+        expected.canonicalPublicOrigin !== reservation.canonicalPublicOrigin ||
+        expected.workerResourceUid !== reservation.workerResourceUid ||
+        expected.workerResourceRevision !== reservation.workerResourceRevision ||
+        expected.originReservationRevision !== reservation.revision ||
+        expected.providerPackRef !== reservation.providerPackRef ||
+        expected.providerInstallationRef !== reservation.providerInstallationRef ||
+        expected.offeringId !== reservation.offeringId ||
+        expected.offeringDigest !== reservation.offeringDigest)
+    ) {
       throw new RuntimeInputPreparationError("conflict", 409);
     }
-    return realized;
+    return reservation;
   };
   const inspect = async (
     input: Parameters<RuntimeInputPreparations["inspect"]>[0],
   ): Promise<RuntimeInputRecoveryIdentity> => {
     const inspected = await internals.inspect(input);
-    await assertOrigin(
+    await assertReservation(
       input.organizationId,
       {
-        space: input.target.space,
-        workerName: input.target.workerName,
+        ...input.target,
         workerResourceUid: inspected.workerResourceUid,
-        originResourceUid: inspected.originResourceUid,
+        originReservationId: inspected.originReservationId,
       },
-      inspected.canonicalPublicOrigin,
+      inspected,
     );
     return inspected;
   };
   return {
     preparations: {
       prepare: async (input) => {
-        await assertOrigin(input.organizationId, input.target, input.canonicalPublicOrigin);
-        return await internals.prepare(input);
+        let reservation: BoundWorkerEndpointOriginReservation;
+        try {
+          reservation = await options.originReservations.bind({
+            organizationId: input.organizationId,
+            reservationId: input.target.originReservationId,
+            space: input.target.space,
+            workerName: input.target.workerName,
+            workerResourceUid: input.target.workerResourceUid,
+          });
+        } catch (error) {
+          if (error instanceof RuntimeInputPreparationError) throw error;
+          if (
+            typeof error === "object" &&
+            error !== null &&
+            "status" in error &&
+            (error.status === 404 || error.status === 409)
+          ) {
+            throw new RuntimeInputPreparationError("conflict", 409);
+          }
+          throw new RuntimeInputPreparationError("unavailable", 503);
+        }
+        return await internals.prepare({ ...input, reservation });
       },
       read: (organizationId, operationId) => internals.read(organizationId, operationId),
       revoke: (organizationId, operationId) => internals.revoke(organizationId, operationId),
@@ -261,15 +379,16 @@ export function createRuntimeInputAuthority(
               fence: claim.fence,
             }),
           async dispatch() {
-            const origin = await assertOrigin(
+            await assertReservation(
               input.organizationId,
               {
                 space: input.target.space,
                 workerName: input.target.workerName,
                 workerResourceUid: claim.workerResourceUid,
-                originResourceUid: claim.originResourceUid,
+                bundleName: input.target.bundleName,
+                originReservationId: claim.originReservationId,
               },
-              claim.canonicalPublicOrigin,
+              claim,
             );
             const dispatched = await internals.dispatch({
               organizationId: input.organizationId,
@@ -277,7 +396,6 @@ export function createRuntimeInputAuthority(
               claimOwner: input.operationId,
               resourceUid: input.resourceUid,
               fence: claim.fence,
-              originResourceRevision: origin.resourceRevision,
             });
             return {
               settle: async (providerReceiptDigest) =>
@@ -310,7 +428,6 @@ export function createRuntimeInputAuthority(
           target: input.target,
           bindingNames: input.bindingNames,
         };
-        await internals.inspect(recoveryInput);
         const recovered = await internals.recover(recoveryInput);
         if (recovered.preparationCommitment !== reference.commitment) {
           throw new RuntimeInputPreparationError("conflict", 409);
@@ -371,6 +488,10 @@ export function createRuntimeInputPreparations(options: {
   return {
     async prepare(input) {
       const normalized = normalizeInput(input);
+      const reference = await computeBoundRuntimeInputReference(normalized);
+      if (input.runtimeInputReference !== reference.value) {
+        throw new RuntimeInputPreparationError("invalid_argument", 400);
+      }
       const existing = await readRow(
         options.sql,
         normalized.organizationId,
@@ -378,10 +499,17 @@ export function createRuntimeInputPreparations(options: {
       );
       if (existing) return await adoptExisting(existing, normalized, keys, options.clock);
 
-      const preparationId = validateGeneratedId(options.randomId());
-      const preparationCommitment = await computePreparationCommitment(normalized, preparationId);
+      const preparationId = reference.preparationId;
+      const preparationCommitment = reference.commitment;
       const createdAt = options.clock().getTime();
-      const expiresAt = createdAt + PREPARATION_TTL_MILLISECONDS;
+      const expiresAt =
+        normalized.reservation.status === "activated"
+          ? createdAt + PREPARATION_TTL_MILLISECONDS
+          : Math.min(
+              createdAt + PREPARATION_TTL_MILLISECONDS,
+              normalized.reservation.expiresAtEpochMilliseconds,
+            );
+      if (expiresAt <= createdAt) throw new RuntimeInputPreparationError("conflict", 409);
       const key = options.sealKeys.current;
       const nonce = Uint8Array.from(randomBytes(12));
       if (nonce.byteLength !== 12)
@@ -397,16 +525,35 @@ export function createRuntimeInputPreparations(options: {
       try {
         const inserted = await options.sql.run(
           `INSERT INTO worker_runtime_input_preparations
-             (organization_id, operation_id, preparation_id, preparation_commitment, material_set_id,
-              space, worker_name, worker_resource_uid, bundle_name, origin_resource_uid,
-              canonical_public_origin, binding_names_json,
+             (organization_id, operation_id, preparation_id, preparation_commitment,
+              material_set_id, material_set_nonce,
+              space, worker_name, endpoint_name, worker_resource_uid, worker_resource_revision, bundle_name,
+              origin_reservation_id, origin_reservation_revision, canonical_public_origin,
+              provider_pack_ref, provider_installation_ref, offering_id, offering_digest,
+              binding_names_json,
               sealed_payload, seal_nonce, seal_key_id,
               state, fence, claim_owner, claim_expires_at,
               claimed_resource_uid, dispatched_operation_id, consumed_receipt_digest,
               expires_at, created_at, updated_at, consumed_at, revoked_at)
-           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                   'prepared', 1, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, NULL, NULL
            WHERE EXISTS (
+             SELECT 1 FROM worker_endpoint_origin_reservations
+             WHERE organization_id = ? AND reservation_id = ?
+               AND revision = ? AND state IN ('bound', 'activated')
+               AND (state = 'activated' OR expires_at > ?)
+               AND canonical_public_origin = ? AND worker_resource_uid = ?
+               AND worker_resource_revision = ? AND provider_pack_ref = ?
+               AND provider_installation_ref = ? AND offering_id = ? AND offering_digest = ?
+           ) AND EXISTS (
+             SELECT 1 FROM tf_resources
+             WHERE tenant_id = ? AND uid = ? AND space = ? AND name = ? AND kind = 'ModuleWorker'
+               AND revision = ?
+           ) AND EXISTS (
+             SELECT 1 FROM tf_resource_deployments
+             WHERE tenant_id = ? AND resource_uid = ? AND state = 'active'
+               AND offering_id = ? AND provider_pack_ref = ? AND provider_installation_ref = ?
+           ) AND EXISTS (
              SELECT 1 FROM tf_resource_deletion_attestations
              WHERE tenant_id = ? AND resource_uid = ? AND state = 'live'
            )`,
@@ -416,12 +563,20 @@ export function createRuntimeInputPreparations(options: {
             preparationId,
             preparationCommitment,
             normalized.materialSetId,
+            normalized.materialSetNonce,
             normalized.target.space,
             normalized.target.workerName,
+            normalized.reservation.target.endpointName,
             normalized.target.workerResourceUid,
+            normalized.reservation.workerResourceRevision,
             normalized.target.bundleName,
-            normalized.target.originResourceUid,
+            normalized.target.originReservationId,
+            Number(normalized.reservation.revision),
             normalized.canonicalPublicOrigin,
+            normalized.reservation.providerPackRef,
+            normalized.reservation.providerInstallationRef,
+            normalized.reservation.offeringId,
+            normalized.reservation.offeringDigest,
             JSON.stringify(normalized.bindingNames),
             base64Url(new Uint8Array(ciphertext)),
             base64Url(nonce),
@@ -430,7 +585,28 @@ export function createRuntimeInputPreparations(options: {
             createdAt,
             createdAt,
             normalized.organizationId,
-            normalized.target.originResourceUid,
+            normalized.target.originReservationId,
+            Number(normalized.reservation.revision),
+            createdAt,
+            normalized.canonicalPublicOrigin,
+            normalized.target.workerResourceUid,
+            normalized.reservation.workerResourceRevision,
+            normalized.reservation.providerPackRef,
+            normalized.reservation.providerInstallationRef,
+            normalized.reservation.offeringId,
+            normalized.reservation.offeringDigest,
+            normalized.organizationId,
+            normalized.target.workerResourceUid,
+            normalized.target.space,
+            normalized.target.workerName,
+            normalized.reservation.workerResourceRevision,
+            normalized.organizationId,
+            normalized.target.workerResourceUid,
+            normalized.reservation.offeringId,
+            normalized.reservation.providerPackRef,
+            normalized.reservation.providerInstallationRef,
+            normalized.organizationId,
+            normalized.target.workerResourceUid,
           ],
         );
         if (inserted.changes !== 1) {
@@ -439,15 +615,7 @@ export function createRuntimeInputPreparations(options: {
       } catch {
         const raced = await readRow(options.sql, normalized.organizationId, normalized.operationId);
         if (raced) return await adoptExisting(raced, normalized, keys, options.clock);
-        const origin = await originLifecycleState(
-          options.sql,
-          normalized.organizationId,
-          normalized.target.originResourceUid,
-        );
-        throw new RuntimeInputPreparationError(
-          origin === "live" ? "unavailable" : "conflict",
-          origin === "live" ? 503 : 409,
-        );
+        throw new RuntimeInputPreparationError("unavailable", 503);
       }
 
       return projection({
@@ -456,12 +624,20 @@ export function createRuntimeInputPreparations(options: {
         preparation_id: preparationId,
         preparation_commitment: preparationCommitment,
         material_set_id: normalized.materialSetId,
+        material_set_nonce: normalized.materialSetNonce,
         space: normalized.target.space,
         worker_name: normalized.target.workerName,
+        endpoint_name: normalized.reservation.target.endpointName,
         worker_resource_uid: normalized.target.workerResourceUid,
+        worker_resource_revision: normalized.reservation.workerResourceRevision,
         bundle_name: normalized.target.bundleName,
-        origin_resource_uid: normalized.target.originResourceUid,
+        origin_reservation_id: normalized.target.originReservationId,
+        origin_reservation_revision: Number(normalized.reservation.revision),
         canonical_public_origin: normalized.canonicalPublicOrigin,
+        provider_pack_ref: normalized.reservation.providerPackRef,
+        provider_installation_ref: normalized.reservation.providerInstallationRef,
+        offering_id: normalized.reservation.offeringId,
+        offering_digest: normalized.reservation.offeringDigest,
         binding_names_json: JSON.stringify(normalized.bindingNames),
         sealed_payload: base64Url(new Uint8Array(ciphertext)),
         seal_nonce: base64Url(nonce),
@@ -506,9 +682,7 @@ export function createRuntimeInputPreparations(options: {
       if (candidate.preparation_commitment !== normalized.preparationCommitment) {
         throw new RuntimeInputPreparationError("conflict", 409);
       }
-      if (
-        candidate.preparation_commitment !== (await computePreparationCommitmentFromRow(candidate))
-      ) {
+      if (candidate.preparation_commitment !== validatedReferenceCommitment(candidate)) {
         throw new RuntimeInputPreparationError("unavailable", 503);
       }
       if (rowExpired(candidate, now)) {
@@ -538,8 +712,22 @@ export function createRuntimeInputPreparations(options: {
              AND EXISTS (
                SELECT 1 FROM tf_resource_deletion_attestations
                WHERE tenant_id = ?
-                 AND resource_uid = worker_runtime_input_preparations.origin_resource_uid
+                 AND resource_uid = worker_runtime_input_preparations.worker_resource_uid
                  AND state = 'live'
+             )
+             AND EXISTS (
+               SELECT 1 FROM worker_endpoint_origin_reservations AS reservation
+               WHERE reservation.organization_id = ?
+                 AND reservation.reservation_id = worker_runtime_input_preparations.origin_reservation_id
+                 AND reservation.revision = worker_runtime_input_preparations.origin_reservation_revision
+                 AND reservation.state IN ('bound', 'activated')
+                 AND (reservation.state = 'activated' OR reservation.expires_at > ?)
+                 AND reservation.worker_resource_uid = worker_runtime_input_preparations.worker_resource_uid
+                 AND reservation.worker_resource_revision = worker_runtime_input_preparations.worker_resource_revision
+                 AND reservation.provider_pack_ref = worker_runtime_input_preparations.provider_pack_ref
+                 AND reservation.provider_installation_ref = worker_runtime_input_preparations.provider_installation_ref
+                 AND reservation.offering_id = worker_runtime_input_preparations.offering_id
+                 AND reservation.offering_digest = worker_runtime_input_preparations.offering_digest
              )`,
           [
             normalized.claimOwner,
@@ -551,6 +739,8 @@ export function createRuntimeInputPreparations(options: {
             candidate.fence,
             now,
             normalized.organizationId,
+            normalized.organizationId,
+            now,
           ],
         );
       } catch {
@@ -594,7 +784,7 @@ export function createRuntimeInputPreparations(options: {
       if (row.preparation_commitment !== normalized.preparationCommitment) {
         throw new RuntimeInputPreparationError("conflict", 409);
       }
-      if (row.preparation_commitment !== (await computePreparationCommitmentFromRow(row))) {
+      if (row.preparation_commitment !== validatedReferenceCommitment(row)) {
         throw new RuntimeInputPreparationError("unavailable", 503);
       }
       if (rowExpired(row, options.clock().getTime())) {
@@ -645,7 +835,6 @@ export function createRuntimeInputPreparations(options: {
 
     async dispatch(input) {
       validateClaimIdentity(input);
-      validateResourceRevision(input.originResourceRevision);
       const now = options.clock().getTime();
       try {
         const result = await options.sql.run(
@@ -659,15 +848,42 @@ export function createRuntimeInputPreparations(options: {
              AND EXISTS (
                SELECT 1 FROM tf_resource_deletion_attestations
                WHERE tenant_id = ?
-                 AND resource_uid = worker_runtime_input_preparations.origin_resource_uid
+                 AND resource_uid = worker_runtime_input_preparations.worker_resource_uid
                  AND state = 'live'
              )
+             AND EXISTS (
+               SELECT 1 FROM worker_endpoint_origin_reservations AS reservation
+               WHERE reservation.organization_id = ?
+                 AND reservation.reservation_id = worker_runtime_input_preparations.origin_reservation_id
+                 AND reservation.revision = worker_runtime_input_preparations.origin_reservation_revision
+                 AND reservation.state IN ('bound', 'activated')
+                 AND (reservation.state = 'activated' OR reservation.expires_at > ?)
+                 AND reservation.canonical_public_origin = worker_runtime_input_preparations.canonical_public_origin
+                 AND reservation.worker_resource_uid = worker_runtime_input_preparations.worker_resource_uid
+                 AND reservation.worker_resource_revision = worker_runtime_input_preparations.worker_resource_revision
+                 AND reservation.provider_pack_ref = worker_runtime_input_preparations.provider_pack_ref
+                 AND reservation.provider_installation_ref = worker_runtime_input_preparations.provider_installation_ref
+                 AND reservation.offering_id = worker_runtime_input_preparations.offering_id
+                 AND reservation.offering_digest = worker_runtime_input_preparations.offering_digest
+             )
              AND (
-               SELECT COUNT(*) FROM tf_resources AS origin_resource
-               WHERE origin_resource.tenant_id = ?
-                 AND origin_resource.uid = worker_runtime_input_preparations.origin_resource_uid
-                 AND origin_resource.revision = ?
-             ) = 1`,
+               SELECT COUNT(*) FROM tf_resources AS worker_resource
+               WHERE worker_resource.tenant_id = ?
+                 AND worker_resource.uid = worker_runtime_input_preparations.worker_resource_uid
+                 AND worker_resource.space = worker_runtime_input_preparations.space
+                 AND worker_resource.name = worker_runtime_input_preparations.worker_name
+                 AND worker_resource.kind = 'ModuleWorker'
+                 AND worker_resource.revision = worker_runtime_input_preparations.worker_resource_revision
+             ) = 1
+             AND EXISTS (
+               SELECT 1 FROM tf_resource_deployments AS deployment
+               WHERE deployment.tenant_id = ?
+                 AND deployment.resource_uid = worker_runtime_input_preparations.worker_resource_uid
+                 AND deployment.state = 'active'
+                 AND deployment.offering_id = worker_runtime_input_preparations.offering_id
+                 AND deployment.provider_pack_ref = worker_runtime_input_preparations.provider_pack_ref
+                 AND deployment.provider_installation_ref = worker_runtime_input_preparations.provider_installation_ref
+             )`,
           [
             input.claimOwner,
             now,
@@ -679,7 +895,9 @@ export function createRuntimeInputPreparations(options: {
             now,
             input.organizationId,
             input.organizationId,
-            input.originResourceRevision,
+            now,
+            input.organizationId,
+            input.organizationId,
           ],
         );
         if (result.changes === 1) return { fence: input.fence + 1 };
@@ -818,7 +1036,12 @@ async function consumeDispatched(
   throw new RuntimeInputPreparationError("conflict", 409);
 }
 
-interface NormalizedInput extends RuntimeInputPreparationInput {
+interface BoundRuntimeInputPreparationInput extends RuntimeInputPreparationInput {
+  readonly reservation: BoundWorkerEndpointOriginReservation;
+}
+
+interface NormalizedInput extends BoundRuntimeInputPreparationInput {
+  readonly canonicalPublicOrigin: string;
   readonly bindingNames: readonly string[];
   readonly bindings: Readonly<Record<string, string>>;
 }
@@ -829,12 +1052,20 @@ type PreparationRow = Row & {
   readonly preparation_id: string;
   readonly preparation_commitment: `sha256:${string}`;
   readonly material_set_id: string;
+  readonly material_set_nonce: string;
   readonly space: string;
   readonly worker_name: string;
+  readonly endpoint_name: string;
   readonly worker_resource_uid: string;
+  readonly worker_resource_revision: string;
   readonly bundle_name: string;
-  readonly origin_resource_uid: string;
+  readonly origin_reservation_id: string;
+  readonly origin_reservation_revision: number;
   readonly canonical_public_origin: string;
+  readonly provider_pack_ref: string;
+  readonly provider_installation_ref: string;
+  readonly offering_id: string;
+  readonly offering_digest: `sha256:${string}`;
   readonly binding_names_json: string;
   readonly sealed_payload: string | null;
   readonly seal_nonce: string | null;
@@ -855,9 +1086,12 @@ async function readRow(
   operationId: string,
 ): Promise<PreparationRow | null> {
   const rows = await sql.query(
-    `SELECT organization_id, operation_id, preparation_id, preparation_commitment, material_set_id,
-            space, worker_name, worker_resource_uid, bundle_name, origin_resource_uid,
-            canonical_public_origin, binding_names_json,
+    `SELECT organization_id, operation_id, preparation_id, preparation_commitment,
+            material_set_id, material_set_nonce,
+            space, worker_name, endpoint_name, worker_resource_uid, worker_resource_revision,
+            bundle_name, origin_reservation_id, origin_reservation_revision,
+            canonical_public_origin, provider_pack_ref, provider_installation_ref,
+            offering_id, offering_digest, binding_names_json,
             sealed_payload, seal_nonce, seal_key_id, state, fence,
             claim_owner, claim_expires_at, claimed_resource_uid,
             dispatched_operation_id, consumed_receipt_digest, expires_at
@@ -874,9 +1108,12 @@ async function readByPreparationId(
   preparationId: string,
 ): Promise<PreparationRow | null> {
   const rows = await sql.query(
-    `SELECT organization_id, operation_id, preparation_id, preparation_commitment, material_set_id,
-            space, worker_name, worker_resource_uid, bundle_name, origin_resource_uid,
-            canonical_public_origin, binding_names_json,
+    `SELECT organization_id, operation_id, preparation_id, preparation_commitment,
+            material_set_id, material_set_nonce,
+            space, worker_name, endpoint_name, worker_resource_uid, worker_resource_revision,
+            bundle_name, origin_reservation_id, origin_reservation_revision,
+            canonical_public_origin, provider_pack_ref, provider_installation_ref,
+            offering_id, offering_digest, binding_names_json,
             sealed_payload, seal_nonce, seal_key_id, state, fence,
             claim_owner, claim_expires_at, claimed_resource_uid,
             dispatched_operation_id, consumed_receipt_digest, expires_at
@@ -885,19 +1122,6 @@ async function readByPreparationId(
     [organizationId, preparationId],
   );
   return rows.length === 0 ? null : (rows[0] as PreparationRow);
-}
-
-async function originLifecycleState(
-  sql: Sql,
-  organizationId: string,
-  resourceUid: string,
-): Promise<string | null> {
-  const rows = await sql.query(
-    `SELECT state FROM tf_resource_deletion_attestations
-     WHERE tenant_id = ? AND resource_uid = ? LIMIT 2`,
-    [organizationId, resourceUid],
-  );
-  return rows.length === 1 && typeof rows[0]?.state === "string" ? rows[0].state : null;
 }
 
 interface NormalizedClaimInput extends RuntimeInputClaimInput {
@@ -910,12 +1134,6 @@ function validateClaimIdentity(input: RuntimeInputClaimIdentity): void {
   validateOpaqueId(input.claimOwner);
   validateOpaqueId(input.resourceUid);
   if (!Number.isSafeInteger(input.fence) || input.fence < 1) {
-    throw new RuntimeInputPreparationError("invalid_argument", 400);
-  }
-}
-
-function validateResourceRevision(value: string): void {
-  if (!/^[1-9][0-9]{0,18}$/u.test(value) || BigInt(value) > 9_223_372_036_854_775_807n) {
     throw new RuntimeInputPreparationError("invalid_argument", 400);
   }
 }
@@ -990,7 +1208,7 @@ async function readRecoveryRow(sql: Sql, input: NormalizedRecoveredInput): Promi
   ) {
     throw new RuntimeInputPreparationError("conflict", 409);
   }
-  if (row.preparation_commitment !== (await computePreparationCommitmentFromRow(row))) {
+  if (row.preparation_commitment !== validatedReferenceCommitment(row)) {
     throw new RuntimeInputPreparationError("unavailable", 503);
   }
   return row;
@@ -1004,8 +1222,14 @@ function recoveryIdentity(row: PreparationRow): RuntimeInputRecoveryIdentity {
     fence: row.fence,
     materialSetId: row.material_set_id,
     canonicalPublicOrigin: row.canonical_public_origin,
-    originResourceUid: row.origin_resource_uid,
+    originReservationId: row.origin_reservation_id,
     workerResourceUid: row.worker_resource_uid,
+    workerResourceRevision: row.worker_resource_revision,
+    originReservationRevision: String(row.origin_reservation_revision),
+    providerPackRef: row.provider_pack_ref,
+    providerInstallationRef: row.provider_installation_ref,
+    offeringId: row.offering_id,
+    offeringDigest: row.offering_digest,
   };
 }
 
@@ -1015,7 +1239,7 @@ function preparationIdentity(
   return {
     preparationId: claim.preparationId,
     materialSetId: claim.materialSetId,
-    originResourceUid: claim.originResourceUid,
+    originReservationId: claim.originReservationId,
     workerResourceUid: claim.workerResourceUid,
     canonicalPublicOrigin: claim.canonicalPublicOrigin,
     commitment: claim.preparationCommitment,
@@ -1084,9 +1308,11 @@ async function decryptClaim(
   if (!constantTimeEqual(plaintext, encode(canonicalSealedPayload(normalized)))) {
     throw new RuntimeInputPreparationError("unavailable", 503);
   }
+  const reference = await computeBoundRuntimeInputReference(normalized);
   if (
-    row.preparation_commitment !==
-    (await computePreparationCommitment(normalized, row.preparation_id))
+    row.preparation_commitment !== reference.commitment ||
+    row.preparation_id !== reference.preparationId ||
+    normalized.runtimeInputReference !== reference.value
   ) {
     throw new RuntimeInputPreparationError("unavailable", 503);
   }
@@ -1097,8 +1323,14 @@ async function decryptClaim(
     fence: row.fence,
     materialSetId: row.material_set_id,
     canonicalPublicOrigin: row.canonical_public_origin,
-    originResourceUid: row.origin_resource_uid,
+    originReservationId: row.origin_reservation_id,
     workerResourceUid: row.worker_resource_uid,
+    workerResourceRevision: row.worker_resource_revision,
+    originReservationRevision: String(row.origin_reservation_revision),
+    providerPackRef: row.provider_pack_ref,
+    providerInstallationRef: row.provider_installation_ref,
+    offeringId: row.offering_id,
+    offeringDigest: row.offering_digest,
     bindings: { ...normalized.bindings },
   };
 }
@@ -1132,15 +1364,38 @@ function parseSealedPayload(row: PreparationRow, bytes: Uint8Array): NormalizedI
       organizationId: row.organization_id,
       operationId: row.operation_id,
       materialSetId: row.material_set_id,
+      materialSetNonce: row.material_set_nonce,
+      runtimeInputReference: runtimeInputReferenceValue(
+        row.preparation_id,
+        row.preparation_commitment,
+      ),
       target: {
         space: row.space,
         workerName: row.worker_name,
         workerResourceUid: row.worker_resource_uid,
         bundleName: row.bundle_name,
-        originResourceUid: row.origin_resource_uid,
+        originReservationId: row.origin_reservation_id,
       },
-      canonicalPublicOrigin: row.canonical_public_origin,
       bindings: payload.values as Readonly<Record<string, string>>,
+      reservation: {
+        organizationId: row.organization_id,
+        reservationId: row.origin_reservation_id,
+        canonicalPublicOrigin: row.canonical_public_origin,
+        revision: String(row.origin_reservation_revision),
+        expiresAtEpochMilliseconds: row.expires_at,
+        target: {
+          space: row.space,
+          workerName: row.worker_name,
+          endpointName: row.endpoint_name,
+        },
+        status: "bound",
+        workerResourceUid: row.worker_resource_uid,
+        workerResourceRevision: row.worker_resource_revision,
+        providerPackRef: row.provider_pack_ref,
+        providerInstallationRef: row.provider_installation_ref,
+        offeringId: row.offering_id,
+        offeringDigest: row.offering_digest,
+      },
     });
   } catch {
     throw new RuntimeInputPreparationError("unavailable", 503);
@@ -1163,7 +1418,7 @@ function canonicalAadFromRow(row: PreparationRow): string {
       workerName: row.worker_name,
       workerResourceUid: row.worker_resource_uid,
       bundleName: row.bundle_name,
-      originResourceUid: row.origin_resource_uid,
+      originReservationId: row.origin_reservation_id,
     },
     canonicalPublicOrigin: row.canonical_public_origin,
     bindingNames: bindingNamesFromRow(row),
@@ -1197,20 +1452,31 @@ async function adoptExisting(
     row.organization_id !== input.organizationId ||
     row.operation_id !== input.operationId ||
     row.material_set_id !== input.materialSetId ||
+    row.material_set_nonce !== input.materialSetNonce ||
     row.space !== input.target.space ||
     row.worker_name !== input.target.workerName ||
+    row.endpoint_name !== input.reservation.target.endpointName ||
     row.worker_resource_uid !== input.target.workerResourceUid ||
+    row.worker_resource_revision !== input.reservation.workerResourceRevision ||
     row.bundle_name !== input.target.bundleName ||
-    row.origin_resource_uid !== input.target.originResourceUid ||
+    row.origin_reservation_id !== input.target.originReservationId ||
+    row.origin_reservation_revision !== Number(input.reservation.revision) ||
     row.canonical_public_origin !== input.canonicalPublicOrigin ||
+    row.provider_pack_ref !== input.reservation.providerPackRef ||
+    row.provider_installation_ref !== input.reservation.providerInstallationRef ||
+    row.offering_id !== input.reservation.offeringId ||
+    row.offering_digest !== input.reservation.offeringDigest ||
     row.binding_names_json !== JSON.stringify(input.bindingNames)
   ) {
     throw new RuntimeInputPreparationError("conflict", 409);
   }
+  const reference = await computeBoundRuntimeInputReference(input);
   if (
-    row.preparation_commitment !== (await computePreparationCommitment(input, row.preparation_id))
+    row.preparation_commitment !== reference.commitment ||
+    row.preparation_id !== reference.preparationId ||
+    input.runtimeInputReference !== reference.value
   ) {
-    throw new RuntimeInputPreparationError("unavailable", 503);
+    throw new RuntimeInputPreparationError("conflict", 409);
   }
   if (!row.sealed_payload || !row.seal_nonce || !row.seal_key_id) {
     throw new RuntimeInputPreparationError("unavailable", 503);
@@ -1238,12 +1504,37 @@ async function adoptExisting(
   return projection(row);
 }
 
-function normalizeInput(input: RuntimeInputPreparationInput): NormalizedInput {
+function normalizeInput(input: BoundRuntimeInputPreparationInput): NormalizedInput {
   validateOpaqueId(input.organizationId);
   validateOpaqueId(input.operationId);
   validateOpaqueId(input.materialSetId);
+  validateOpaqueId(input.materialSetNonce);
+  runtimeInputReference(input.runtimeInputReference);
   for (const value of Object.values(input.target)) validateBoundedText(value, 255);
-  validateCanonicalOrigin(input.canonicalPublicOrigin);
+  const reservation = input.reservation;
+  if (
+    reservation.organizationId !== input.organizationId ||
+    reservation.reservationId !== input.target.originReservationId ||
+    reservation.target.space !== input.target.space ||
+    reservation.target.workerName !== input.target.workerName ||
+    reservation.workerResourceUid !== input.target.workerResourceUid ||
+    (reservation.status !== "bound" && reservation.status !== "activated") ||
+    !Number.isSafeInteger(Number(reservation.revision)) ||
+    Number(reservation.revision) < 1 ||
+    !digest.test(reservation.offeringDigest)
+  ) {
+    throw new RuntimeInputPreparationError("conflict", 409);
+  }
+  validateCanonicalOrigin(reservation.canonicalPublicOrigin);
+  for (const value of [
+    reservation.target.endpointName,
+    reservation.workerResourceRevision,
+    reservation.providerPackRef,
+    reservation.providerInstallationRef,
+    reservation.offeringId,
+  ]) {
+    validateBoundedText(value, 255);
+  }
   const bindingNames = Object.keys(input.bindings).sort();
   if (bindingNames.length === 0 || bindingNames.length > MAX_PROVIDER_RUNTIME_INPUT_BINDINGS) {
     throw new RuntimeInputPreparationError("invalid_argument", 400);
@@ -1261,7 +1552,12 @@ function normalizeInput(input: RuntimeInputPreparationInput): NormalizedInput {
     }
     bindings[name] = value;
   }
-  return { ...input, bindings, bindingNames };
+  return {
+    ...input,
+    canonicalPublicOrigin: reservation.canonicalPublicOrigin,
+    bindings,
+    bindingNames,
+  };
 }
 
 function canonicalSealedPayload(input: NormalizedInput): string {
@@ -1273,50 +1569,47 @@ function canonicalSealedPayload(input: NormalizedInput): string {
   });
 }
 
-async function computePreparationCommitment(
-  input: NormalizedInput,
-  preparationId: string,
-): Promise<`sha256:${string}`> {
-  const canonical = JSON.stringify({
-    format: COMMITMENT_FORMAT,
-    organizationId: input.organizationId,
-    preparationOperationId: input.operationId,
-    preparationId,
-    materialSetId: input.materialSetId,
-    target: input.target,
-    canonicalPublicOrigin: input.canonicalPublicOrigin,
-    bindingNames: input.bindingNames,
+async function computeBoundRuntimeInputReference(input: NormalizedInput): Promise<{
+  readonly preparationId: string;
+  readonly commitment: `sha256:${string}`;
+  readonly value: string;
+}> {
+  const derived = await deriveRuntimeInputReference({
+    format: RUNTIME_INPUT_PREFLIGHT_FORMAT,
+    materialSetNonce: input.materialSetNonce,
+    target: {
+      space: input.target.space,
+      workerName: input.target.workerName,
+      bundleName: input.target.bundleName,
+      endpointName: input.reservation.target.endpointName,
+      originReservationId: input.target.originReservationId,
+      canonicalPublicOrigin: input.canonicalPublicOrigin,
+    },
+    bindings: input.bindings,
   });
-  const bytes = new Uint8Array(
-    await crypto.subtle.digest("SHA-256", encode(canonical) as unknown as BufferSource),
-  );
-  return `sha256:${[...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+  return {
+    preparationId: derived.preparationId,
+    commitment: derived.commitment,
+    value: derived.runtimeInputReference,
+  };
 }
 
-async function computePreparationCommitmentFromRow(
-  row: PreparationRow,
-): Promise<`sha256:${string}`> {
-  const bindingNames = bindingNamesFromRow(row);
-  const canonical = JSON.stringify({
-    format: COMMITMENT_FORMAT,
-    organizationId: row.organization_id,
-    preparationOperationId: row.operation_id,
-    preparationId: row.preparation_id,
-    materialSetId: row.material_set_id,
-    target: {
-      space: row.space,
-      workerName: row.worker_name,
-      workerResourceUid: row.worker_resource_uid,
-      bundleName: row.bundle_name,
-      originResourceUid: row.origin_resource_uid,
-    },
-    canonicalPublicOrigin: row.canonical_public_origin,
-    bindingNames,
-  });
-  const bytes = new Uint8Array(
-    await crypto.subtle.digest("SHA-256", encode(canonical) as unknown as BufferSource),
-  );
-  return `sha256:${[...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+/**
+ * Validate the durable plan-time reference commitment without pretending it
+ * can be recomputed after the secret values have been erased. Worker/resource
+ * and material-set identity are fenced by their dedicated columns instead of
+ * being overloaded into this commitment.
+ */
+function validatedReferenceCommitment(row: PreparationRow): `sha256:${string}` {
+  bindingNamesFromRow(row);
+  if (
+    !digest.test(row.preparation_commitment) ||
+    row.preparation_id !==
+      `prep-${row.preparation_commitment.slice("sha256:".length, "sha256:".length + 32)}`
+  ) {
+    throw new RuntimeInputPreparationError("unavailable", 503);
+  }
+  return row.preparation_commitment;
 }
 
 async function runtimeInputReceiptDigest(input: {
@@ -1356,6 +1649,9 @@ function runtimeInputReference(value: string): {
   if (!match?.[1] || !match[2]) {
     throw new RuntimeInputPreparationError("invalid_argument", 400);
   }
+  if (match[1] !== `prep-${match[2].slice(0, 32)}`) {
+    throw new RuntimeInputPreparationError("invalid_argument", 400);
+  }
   return { preparationId: match[1], commitment: `sha256:${match[2]}` };
 }
 
@@ -1392,7 +1688,7 @@ function projection(row: PreparationRow): RuntimeInputPreparationProjection {
       workerName: row.worker_name,
       workerResourceUid: row.worker_resource_uid,
       bundleName: row.bundle_name,
-      originResourceUid: row.origin_resource_uid,
+      originReservationId: row.origin_reservation_id,
     },
     canonicalPublicOrigin: row.canonical_public_origin,
     bindingNames: names,
@@ -1442,13 +1738,6 @@ function validateSealKey(candidate: RuntimeInputSealKey): void {
 
 function validateOpaqueId(value: string): void {
   if (!opaqueId.test(value)) throw new RuntimeInputPreparationError("invalid_argument", 400);
-}
-
-function validateGeneratedId(value: string): string {
-  if (!/^[A-Za-z0-9_-]{3,42}$/u.test(value)) {
-    throw new RuntimeInputPreparationError("invalid_argument", 400);
-  }
-  return value;
 }
 
 function validateBoundedText(value: string, maximum: number): void {

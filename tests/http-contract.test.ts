@@ -79,6 +79,8 @@ const PUBLIC_PATHS = [
   "/v1/organizations/{organizationId}/operations",
   "/v1/organizations/{organizationId}/resources",
   "/v1/organizations/{organizationId}/worker-runtime-input-preparations/{operationId}",
+  "/v1/worker-endpoint-origin-reservations/{reservationId}",
+  "/v1/worker-endpoint-origin-reservations/{reservationId}/activation",
   "/v1/organizations/{organizationId}/resources/{resourceUid}",
   "/v1/organizations/{organizationId}/resources/{resourceUid}/native-residual",
   "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations",
@@ -154,6 +156,28 @@ describe("published API description", () => {
         .source.enum,
     ).toEqual(["intrinsic", "provider"]);
     expect(JSON.stringify(path)).not.toContain("nativeId");
+  });
+
+  test("publishes closed reservation, activation, and plan-known runtime-input schemas", () => {
+    const schemas = openApiDocument.components.schemas;
+    expect(schemas.WorkerEndpointOriginReservationRequest.additionalProperties).toBe(false);
+    expect(schemas.WorkerEndpointOriginReservation.additionalProperties).toBe(false);
+    expect(schemas.WorkerEndpointOriginReservation.properties.status.enum).toEqual([
+      "prepared",
+      "bound",
+      "activated",
+    ]);
+    expect(schemas.WorkerEndpointOriginReservationActivationRequest.additionalProperties).toBe(
+      false,
+    );
+    expect(schemas.WorkerRuntimeInputPreparationRequest.additionalProperties).toBe(false);
+    expect(schemas.WorkerRuntimeInputPreparationRequest.required).toContain("materialSetNonce");
+    expect(schemas.WorkerRuntimeInputPreparationRequest.required).toContain(
+      "runtimeInputReference",
+    );
+    expect(JSON.stringify(schemas.WorkerRuntimeInputPreparationRequest)).not.toContain(
+      "canonicalPublicOrigin",
+    );
   });
 
   test("mentions no other product and leaks no upstream identity vocabulary", () => {

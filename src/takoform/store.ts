@@ -1186,7 +1186,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
              AND NOT EXISTS (
                SELECT 1 FROM worker_runtime_input_preparations AS runtime_input
                WHERE runtime_input.organization_id = ?
-                 AND runtime_input.origin_resource_uid = ?
+                 AND runtime_input.worker_resource_uid = ?
                  AND runtime_input.state = 'claimed'
                  AND runtime_input.claim_expires_at > ?
              )`,

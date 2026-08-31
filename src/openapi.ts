@@ -98,6 +98,129 @@ const TAKOFORM_PATHS: readonly {
   },
 ];
 
+const IDENTIFIER_SCHEMA = { type: "string", minLength: 1, maxLength: 128 } as const;
+const RESOURCE_NAME_SCHEMA = {
+  type: "string",
+  minLength: 1,
+  maxLength: 128,
+  pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+} as const;
+const CANONICAL_HTTPS_ORIGIN_SCHEMA = {
+  type: "string",
+  format: "uri",
+  pattern: "^https://[^/]+$",
+  maxLength: 2_048,
+} as const;
+
+const RESERVATION_ID_PARAMETER = {
+  name: "reservationId",
+  in: "path",
+  required: true,
+  schema: IDENTIFIER_SCHEMA,
+} as const;
+
+const WORKER_ENDPOINT_ORIGIN_RESERVATION_OPERATIONS = {
+  put: {
+    summary: "Prepare or exactly replay a future Worker endpoint origin reservation",
+    parameters: [RESERVATION_ID_PARAMETER],
+    requestBody: {
+      required: true,
+      content: {
+        "application/json": {
+          schema: { $ref: "#/components/schemas/WorkerEndpointOriginReservationRequest" },
+        },
+      },
+    },
+    responses: {
+      "201": reservationResponse(
+        "Prepared reservation; an exact replay returns the same closed projection",
+      ),
+      "400": { description: "Malformed or open request" },
+      "401": { description: "Organization API key required" },
+      "403": { description: "The key lacks resources:write" },
+      "409": { description: "Replay, logical-worker, canonical-origin, or placement conflict" },
+      "422": { description: "No unique eligible ModuleWorker offering or provider capability" },
+      "503": { description: "Placement or reservation authority unavailable" },
+    },
+  },
+  get: {
+    summary: "Read one live Worker endpoint origin reservation",
+    parameters: [RESERVATION_ID_PARAMETER],
+    responses: {
+      "200": reservationResponse("Live value-free reservation projection"),
+      "401": { description: "Organization API key required" },
+      "403": { description: "The key lacks resources:write" },
+      "404": { description: "Reservation absent, released, or expired" },
+    },
+  },
+  delete: {
+    summary: "Release a Worker endpoint origin reservation",
+    description:
+      "Idempotent after release. Activation must first be deleted, and a retained endpoint UID " +
+      "continues to fence release until that exact Resource is deleted with closed provider absence.",
+    parameters: [RESERVATION_ID_PARAMETER],
+    responses: {
+      "204": { description: "Released or already absent/released" },
+      "401": { description: "Organization API key required" },
+      "403": { description: "The key lacks resources:write" },
+      "409": { description: "Still activated, claimed, or fenced by the retained endpoint" },
+      "503": { description: "Reservation authority unavailable" },
+    },
+  },
+} as const;
+
+const WORKER_ENDPOINT_ORIGIN_ACTIVATION_OPERATIONS = {
+  put: reservationActivationOperation(
+    "Activate the reservation against one exact released Ready WorkerEndpoint",
+  ),
+  delete: reservationActivationOperation(
+    "Deactivate the exact endpoint while retaining its UID as the release witness",
+  ),
+} as const;
+
+const RUNTIME_INPUT_PREPARATION_OPERATIONS = {
+  put: {
+    summary: "Prepare one encrypted Worker runtime-input handoff",
+    parameters: runtimeInputPathParameters(),
+    requestBody: {
+      required: true,
+      content: {
+        "application/json": {
+          schema: { $ref: "#/components/schemas/WorkerRuntimeInputPreparationRequest" },
+        },
+      },
+    },
+    responses: {
+      "201": runtimeInputResponse("Prepared value-free handoff projection"),
+      "400": { description: "Malformed request or invalid preflight reference" },
+      "401": { description: "Organization API key required" },
+      "403": { description: "The key lacks resources:write or belongs to another organization" },
+      "409": { description: "Replay, reservation, worker revision, or placement conflict" },
+      "503": { description: "Sealing or authority unavailable" },
+    },
+  },
+  get: {
+    summary: "Read a Worker runtime-input handoff without secret values",
+    parameters: runtimeInputPathParameters(),
+    responses: {
+      "200": runtimeInputResponse("Value-free lifecycle projection"),
+      "401": { description: "Organization API key required" },
+      "403": { description: "The key lacks resources:write or belongs to another organization" },
+      "404": { description: "Preparation not found" },
+    },
+  },
+  delete: {
+    summary: "Revoke one undispatched Worker runtime-input handoff",
+    parameters: runtimeInputPathParameters(),
+    responses: {
+      "204": { description: "Revoked or already revoked" },
+      "401": { description: "Organization API key required" },
+      "403": { description: "The key lacks resources:write or belongs to another organization" },
+      "409": { description: "The handoff is already dispatched or indeterminate" },
+    },
+  },
+} as const;
+
 const PUBLIC_PATHS: Record<string, Record<string, unknown>> = {
   "/": operation("get", "Console", { security: [] }),
   "/openapi.json": operation("get", "This document", { security: [] }),
@@ -144,11 +267,12 @@ const PUBLIC_PATHS: Record<string, Record<string, unknown>> = {
     post: "Create a scoped API key",
     get: "List the organization's live API keys",
   }),
-  "/v1/organizations/{organizationId}/worker-runtime-input-preparations/{operationId}": operations({
-    put: "Prepare one encrypted Worker runtime-input handoff",
-    get: "Read its value-free lifecycle projection",
-    delete: "Revoke one unclaimed Worker runtime-input handoff",
-  }),
+  "/v1/worker-endpoint-origin-reservations/{reservationId}":
+    WORKER_ENDPOINT_ORIGIN_RESERVATION_OPERATIONS,
+  "/v1/worker-endpoint-origin-reservations/{reservationId}/activation":
+    WORKER_ENDPOINT_ORIGIN_ACTIVATION_OPERATIONS,
+  "/v1/organizations/{organizationId}/worker-runtime-input-preparations/{operationId}":
+    RUNTIME_INPUT_PREPARATION_OPERATIONS,
   "/v1/organizations/{organizationId}/resources": operation(
     "get",
     "List the organization's Takoform resources",
@@ -300,6 +424,73 @@ function operations(summaries: Readonly<Record<string, string>>): Record<string,
   ) as Record<string, unknown>;
 }
 
+function reservationResponse(description: string) {
+  return {
+    description,
+    content: {
+      "application/json": {
+        schema: { $ref: "#/components/schemas/WorkerEndpointOriginReservation" },
+      },
+    },
+  } as const;
+}
+
+function reservationActivationOperation(summary: string) {
+  return {
+    summary,
+    parameters: [RESERVATION_ID_PARAMETER],
+    requestBody: {
+      required: true,
+      content: {
+        "application/json": {
+          schema: {
+            $ref: "#/components/schemas/WorkerEndpointOriginReservationActivationRequest",
+          },
+        },
+      },
+    },
+    responses: {
+      "200": reservationResponse("Updated reservation projection"),
+      "400": { description: "Malformed or open request" },
+      "401": { description: "Organization API key required" },
+      "403": { description: "The key lacks resources:write" },
+      "404": { description: "Reservation not found" },
+      "409": {
+        description: "Endpoint identity, relation, readiness, origin, or placement conflict",
+      },
+      "503": { description: "Reservation or Resource authority unavailable" },
+    },
+  } as const;
+}
+
+function runtimeInputPathParameters() {
+  return [
+    {
+      name: "organizationId",
+      in: "path",
+      required: true,
+      schema: IDENTIFIER_SCHEMA,
+    },
+    {
+      name: "operationId",
+      in: "path",
+      required: true,
+      schema: IDENTIFIER_SCHEMA,
+    },
+  ] as const;
+}
+
+function runtimeInputResponse(description: string) {
+  return {
+    description,
+    content: {
+      "application/json": {
+        schema: { $ref: "#/components/schemas/WorkerRuntimeInputPreparation" },
+      },
+    },
+  } as const;
+}
+
 function operation(
   method: string,
   summary: string,
@@ -349,6 +540,149 @@ export const openApiDocument = {
         description:
           "A session secret, an organization API key, or a resource-scoped token, " +
           "depending on the route.",
+      },
+    },
+    schemas: {
+      WorkerEndpointOriginReservationTarget: {
+        type: "object",
+        required: ["space", "workerName", "endpointName"],
+        additionalProperties: false,
+        properties: {
+          space: RESOURCE_NAME_SCHEMA,
+          workerName: RESOURCE_NAME_SCHEMA,
+          endpointName: RESOURCE_NAME_SCHEMA,
+        },
+      },
+      WorkerEndpointOriginReservationRequest: {
+        type: "object",
+        required: ["format", "target", "expiresInSeconds"],
+        additionalProperties: false,
+        properties: {
+          format: { const: "takoserver.worker-endpoint-origin-reservation.v1" },
+          target: { $ref: "#/components/schemas/WorkerEndpointOriginReservationTarget" },
+          offeringId: IDENTIFIER_SCHEMA,
+          expiresInSeconds: { type: "integer", minimum: 60, maximum: 86_400 },
+        },
+      },
+      WorkerEndpointOriginReservation: {
+        type: "object",
+        required: [
+          "format",
+          "reservationId",
+          "canonicalPublicOrigin",
+          "revision",
+          "expiresAt",
+          "target",
+          "status",
+        ],
+        additionalProperties: false,
+        properties: {
+          format: { const: "takoserver.worker-endpoint-origin-reservation.v1" },
+          reservationId: IDENTIFIER_SCHEMA,
+          canonicalPublicOrigin: CANONICAL_HTTPS_ORIGIN_SCHEMA,
+          revision: { type: "string", pattern: "^[1-9][0-9]*$" },
+          expiresAt: { type: "string", format: "date-time" },
+          target: { $ref: "#/components/schemas/WorkerEndpointOriginReservationTarget" },
+          status: { type: "string", enum: ["prepared", "bound", "activated"] },
+          workerResourceUid: IDENTIFIER_SCHEMA,
+          endpointResourceUid: IDENTIFIER_SCHEMA,
+        },
+      },
+      WorkerEndpointOriginReservationActivationRequest: {
+        type: "object",
+        required: ["format", "endpointResourceUid"],
+        additionalProperties: false,
+        properties: {
+          format: { const: "takoserver.worker-endpoint-origin-reservation-activation.v1" },
+          endpointResourceUid: IDENTIFIER_SCHEMA,
+        },
+      },
+      WorkerRuntimeInputPreparationTarget: {
+        type: "object",
+        required: ["space", "workerName", "workerResourceUid", "bundleName", "originReservationId"],
+        additionalProperties: false,
+        properties: {
+          space: RESOURCE_NAME_SCHEMA,
+          workerName: RESOURCE_NAME_SCHEMA,
+          workerResourceUid: IDENTIFIER_SCHEMA,
+          bundleName: RESOURCE_NAME_SCHEMA,
+          originReservationId: IDENTIFIER_SCHEMA,
+        },
+      },
+      WorkerRuntimeInputPreparationRequest: {
+        type: "object",
+        required: [
+          "format",
+          "materialSetId",
+          "materialSetNonce",
+          "runtimeInputReference",
+          "target",
+          "bindings",
+        ],
+        additionalProperties: false,
+        properties: {
+          format: { const: "takoserver.worker-runtime-input-preparation@v1" },
+          materialSetId: IDENTIFIER_SCHEMA,
+          materialSetNonce: IDENTIFIER_SCHEMA,
+          runtimeInputReference: {
+            type: "string",
+            pattern: "^rip1\\.prep-[0-9a-f]{32}\\.[0-9a-f]{64}$",
+          },
+          target: { $ref: "#/components/schemas/WorkerRuntimeInputPreparationTarget" },
+          bindings: {
+            type: "object",
+            minProperties: 1,
+            maxProperties: 64,
+            propertyNames: { pattern: "^[A-Z_][A-Z0-9_]{0,127}$" },
+            additionalProperties: { type: "string", minLength: 1, maxLength: 32_768 },
+          },
+        },
+      },
+      WorkerRuntimeInputPreparation: {
+        type: "object",
+        required: [
+          "format",
+          "operationId",
+          "preparationId",
+          "runtimeInputReference",
+          "status",
+          "expiresAt",
+          "target",
+          "canonicalPublicOrigin",
+          "bindingNames",
+        ],
+        additionalProperties: false,
+        properties: {
+          format: { const: "takoserver.worker-runtime-input-preparation@v1" },
+          operationId: IDENTIFIER_SCHEMA,
+          preparationId: { type: "string", pattern: "^prep-[0-9a-f]{32}$" },
+          runtimeInputReference: {
+            type: "string",
+            pattern: "^rip1\\.prep-[0-9a-f]{32}\\.[0-9a-f]{64}$",
+          },
+          status: {
+            type: "string",
+            enum: [
+              "prepared",
+              "claimed",
+              "dispatched",
+              "consumed",
+              "revoked",
+              "expired",
+              "indeterminate",
+            ],
+          },
+          expiresAt: { type: "string", format: "date-time" },
+          target: { $ref: "#/components/schemas/WorkerRuntimeInputPreparationTarget" },
+          canonicalPublicOrigin: CANONICAL_HTTPS_ORIGIN_SCHEMA,
+          bindingNames: {
+            type: "array",
+            minItems: 1,
+            maxItems: 64,
+            uniqueItems: true,
+            items: { type: "string", pattern: "^[A-Z_][A-Z0-9_]{0,127}$" },
+          },
+        },
       },
     },
   },

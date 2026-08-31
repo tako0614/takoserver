@@ -53,7 +53,7 @@ const ASSET_BUNDLE = `sha256:${"c".repeat(64)}`;
 const SENSITIVE_PREPARATION: ProviderRuntimeInputPreparationIdentity = {
   preparationId: "prep_sensitive",
   materialSetId: "material_sensitive",
-  originResourceUid: "origin-worker-uid",
+  originReservationId: "origin-reservation-id",
   workerResourceUid: "worker-uid",
   canonicalPublicOrigin: "https://version.example.test",
   commitment: `sha256:${"b".repeat(64)}`,

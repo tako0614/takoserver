@@ -3,6 +3,7 @@ package client_test
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -14,40 +15,32 @@ import (
 	"github.com/tako0614/takoserver/provider/internal/client"
 )
 
-func TestPutRuntimeInputPreparationUsesTheTakoserverControlBoundary(t *testing.T) {
-	t.Parallel()
+const (
+	reservationID       = "reservation-01"
+	endpointUID         = "uid-endpoint-01"
+	runtimeInputNonce   = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	runtimeInputRef     = "rip1.prep-00000000000000000000000000000000.0000000000000000000000000000000000000000000000000000000000000000"
+	prepResponse        = `{"format":"takoserver.worker-runtime-input-preparation@v1","operationId":"op-01","preparationId":"prep-00000000000000000000000000000000","runtimeInputReference":"rip1.prep-00000000000000000000000000000000.0000000000000000000000000000000000000000000000000000000000000000","status":"prepared","expiresAt":"2026-08-31T18:30:00Z","target":{"space":"default","workerName":"yurucommu","workerResourceUid":"uid-worker-01","bundleName":"bundle-01","originReservationId":"reservation-01"},"canonicalPublicOrigin":"https://community.example.test","bindingNames":["ENCRYPTION_KEY","TAKOSUMI_ACCOUNTS_CLIENT_ID"]}`
+	reservationResponse = `{"format":"takoserver.worker-endpoint-origin-reservation.v1","reservationId":"reservation-01","canonicalPublicOrigin":"https://community.example.test","revision":"7","expiresAt":"2026-08-31T18:30:00Z","target":{"space":"default","workerName":"yurucommu","endpointName":"public"},"status":"bound","workerResourceUid":"uid-worker-01"}`
+	activationResponse  = `{"format":"takoserver.worker-endpoint-origin-reservation.v1","reservationId":"reservation-01","canonicalPublicOrigin":"https://community.example.test","revision":"8","expiresAt":"2026-08-31T18:30:00Z","target":{"space":"default","workerName":"yurucommu","endpointName":"public"},"status":"activated","workerResourceUid":"uid-worker-01","endpointResourceUid":"uid-endpoint-01"}`
+)
 
+func TestPutRuntimeInputPreparationUsesReservationTargetAndSendsPreflightIdentity(t *testing.T) {
+	t.Parallel()
 	var gotBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPut {
-			t.Errorf("method = %s", r.Method)
-		}
-		if r.URL.EscapedPath() != "/v1/organizations/org-01/worker-runtime-input-preparations/op-01" {
-			t.Errorf("path = %s", r.URL.EscapedPath())
+		if r.Method != http.MethodPut || r.URL.EscapedPath() != "/v1/organizations/org-01/worker-runtime-input-preparations/op-01" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.EscapedPath())
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer provider-token" {
-			t.Errorf("Authorization = %q", got)
-		}
-		if got := r.Header.Get("Cache-Control"); got != "no-store" {
-			t.Errorf("Cache-Control = %q", got)
+			t.Fatalf("Authorization = %q", got)
 		}
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
-
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{
-          "format":"takoserver.worker-runtime-input-preparation@v1",
-          "operationId":"op-01",
-          "preparationId":"prep-01",
-          "runtimeInputReference":"rip1.prep-01.0000000000000000000000000000000000000000000000000000000000000000",
-          "status":"prepared",
-          "expiresAt":"2026-08-31T18:30:00Z",
-          "target":{"space":"default","workerName":"yurucommu","workerResourceUid":"uid-worker-01","bundleName":"bundle-01","originResourceUid":"uid-origin-01"},
-          "canonicalPublicOrigin":"https://community.example.test",
-          "bindingNames":["ENCRYPTION_KEY","TAKOSUMI_ACCOUNTS_CLIENT_ID"]
-        }`))
+		_, _ = io.WriteString(w, prepResponse)
 	}))
 	defer server.Close()
 
@@ -57,12 +50,14 @@ func TestPutRuntimeInputPreparationUsesTheTakoserverControlBoundary(t *testing.T
 	}
 	result, err := api.PutRuntimeInputPreparation(context.Background(), "op-01", client.RuntimeInputPreparationInput{
 		MaterialSetID:         "material-set:v1:5866abee0fff6a8765e02977561092a6f78cd3e97a5e2380a548aafbd030f4a3",
+		MaterialSetNonce:      runtimeInputNonce,
+		RuntimeInputReference: runtimeInputRef,
 		Space:                 "default",
 		WorkerName:            "yurucommu",
 		WorkerResourceUID:     "uid-worker-01",
 		BundleName:            "bundle-01",
-		OriginResourceUID:     "uid-origin-01",
-		CanonicalPublicOrigin: "https://community.example.test",
+		EndpointName:          "public",
+		OriginReservationID:   reservationID,
 		Bindings: map[string]string{
 			"ENCRYPTION_KEY":              "placeholder-encryption-value",
 			"TAKOSUMI_ACCOUNTS_CLIENT_ID": "placeholder-client-id",
@@ -71,255 +66,227 @@ func TestPutRuntimeInputPreparationUsesTheTakoserverControlBoundary(t *testing.T
 	if err != nil {
 		t.Fatalf("PutRuntimeInputPreparation() error = %v", err)
 	}
-
-	if gotBody["format"] != "takoserver.worker-runtime-input-preparation@v1" {
-		t.Fatalf("request format = %#v", gotBody["format"])
-	}
-	if gotBody["materialSetId"] != "material-set:v1:5866abee0fff6a8765e02977561092a6f78cd3e97a5e2380a548aafbd030f4a3" {
-		t.Fatalf("materialSetId = %#v", gotBody["materialSetId"])
-	}
 	target, ok := gotBody["target"].(map[string]any)
-	if !ok || target["workerResourceUid"] != "uid-worker-01" {
-		t.Fatalf("target workerResourceUid = %#v", gotBody["target"])
+	if !ok || target["originReservationId"] != reservationID || target["workerResourceUid"] != "uid-worker-01" {
+		t.Fatalf("request target = %#v", gotBody["target"])
 	}
-	bindings, ok := gotBody["bindings"].(map[string]any)
-	if !ok || bindings["ENCRYPTION_KEY"] != "placeholder-encryption-value" || bindings["TAKOSUMI_ACCOUNTS_CLIENT_ID"] != "placeholder-client-id" {
-		t.Fatalf("bindings = %#v", gotBody["bindings"])
+	if gotBody["materialSetNonce"] != runtimeInputNonce || gotBody["runtimeInputReference"] != runtimeInputRef {
+		t.Fatalf("request preflight identity = %#v", gotBody)
 	}
-	if result.OperationID != "op-01" || result.PreparationID != "prep-01" || result.RuntimeInputReference != "rip1.prep-01.0000000000000000000000000000000000000000000000000000000000000000" || result.WorkerResourceUID != "uid-worker-01" || result.Status != "prepared" {
-		t.Fatalf("result identity/status = %#v", result)
-	}
-	if !result.ExpiresAt.Equal(time.Date(2026, 8, 31, 18, 30, 0, 0, time.UTC)) {
-		t.Fatalf("expiresAt = %s", result.ExpiresAt)
-	}
-	if !reflect.DeepEqual(result.BindingNames, []string{"ENCRYPTION_KEY", "TAKOSUMI_ACCOUNTS_CLIENT_ID"}) {
-		t.Fatalf("binding names = %#v", result.BindingNames)
-	}
-}
-
-func TestGetRuntimeInputPreparationReturnsOnlyTheValueFreeProjection(t *testing.T) {
-	t.Parallel()
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			t.Errorf("method = %s", r.Method)
+	for _, forbidden := range []string{"originResourceUid", "canonicalPublicOrigin", "endpointName"} {
+		if _, ok := gotBody[forbidden]; ok {
+			t.Fatalf("request unexpectedly contains %q", forbidden)
 		}
-		if r.URL.EscapedPath() != "/v1/organizations/org-01/worker-runtime-input-preparations/op-01" {
-			t.Errorf("path = %s", r.URL.EscapedPath())
+		if _, ok := target[forbidden]; ok {
+			t.Fatalf("request target unexpectedly contains %q", forbidden)
 		}
-		if got := r.Header.Get("Authorization"); got != "Bearer provider-token" {
-			t.Errorf("Authorization = %q", got)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-          "format":"takoserver.worker-runtime-input-preparation@v1",
-          "operationId":"op-01",
-          "preparationId":"prep-01",
-          "runtimeInputReference":"rip1.prep-01.0000000000000000000000000000000000000000000000000000000000000000",
-          "status":"consumed",
-          "expiresAt":"2026-08-31T18:30:00Z",
-          "target":{"space":"default","workerName":"yurucommu","workerResourceUid":"uid-worker-01","bundleName":"bundle-01","originResourceUid":"uid-origin-01"},
-          "canonicalPublicOrigin":"https://community.example.test",
-          "bindingNames":["ENCRYPTION_KEY","TAKOSUMI_ACCOUNTS_CLIENT_ID"]
-        }`))
-	}))
-	defer server.Close()
-
-	api, err := client.New(server.URL, "provider-token", "org-01", server.Client())
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
 	}
-	result, err := api.GetRuntimeInputPreparation(context.Background(), "op-01")
-	if err != nil {
-		t.Fatalf("GetRuntimeInputPreparation() error = %v", err)
-	}
-	if result.OperationID != "op-01" || result.PreparationID != "prep-01" || result.RuntimeInputReference != "rip1.prep-01.0000000000000000000000000000000000000000000000000000000000000000" || result.WorkerResourceUID != "uid-worker-01" || result.Status != "consumed" {
+	if result.OriginReservationID != reservationID || result.CanonicalPublicOrigin != "https://community.example.test" || result.EndpointName != "public" {
 		t.Fatalf("result = %#v", result)
 	}
 }
 
-func TestGetRuntimeInputPreparationRejectsMissingWorkerResourceUID(t *testing.T) {
+func TestGetWorkerEndpointOriginReservationReturnsClosedProjection(t *testing.T) {
 	t.Parallel()
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.EscapedPath() != "/v1/worker-endpoint-origin-reservations/"+reservationID {
+			t.Fatalf("request = %s %s", r.Method, r.URL.EscapedPath())
+		}
+		if r.URL.RawQuery != "" {
+			t.Fatalf("reservation request unexpectedly carries query organization scope: %q", r.URL.RawQuery)
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-          "format":"takoserver.worker-runtime-input-preparation@v1",
-          "operationId":"op-01",
-          "preparationId":"prep-01",
-          "runtimeInputReference":"rip1.prep-01.0000000000000000000000000000000000000000000000000000000000000000",
-          "status":"prepared",
-          "expiresAt":"2026-08-31T18:30:00Z",
-          "target":{"space":"default","workerName":"yurucommu","bundleName":"bundle-01","originResourceUid":"uid-origin-01"},
-          "canonicalPublicOrigin":"https://community.example.test",
-          "bindingNames":["ENCRYPTION_KEY"]
-        }`))
+		_, _ = io.WriteString(w, reservationResponse)
 	}))
 	defer server.Close()
-
 	api, err := client.New(server.URL, "provider-token", "org-01", server.Client())
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	if _, err := api.GetRuntimeInputPreparation(context.Background(), "op-01"); err == nil || !strings.Contains(err.Error(), "incomplete projection") {
-		t.Fatalf("GetRuntimeInputPreparation() error = %v, want missing worker resource identity rejection", err)
+	result, err := api.GetWorkerEndpointOriginReservation(context.Background(), reservationID)
+	if err != nil {
+		t.Fatalf("GetWorkerEndpointOriginReservation() error = %v", err)
+	}
+	if result.ReservationID != reservationID || result.Status != "bound" || result.Revision != "7" || result.WorkerResourceUID != "uid-worker-01" || result.EndpointResourceUID != "" {
+		t.Fatalf("reservation = %#v", result)
 	}
 }
 
-func TestGetRuntimeInputPreparationRejectsMismatchedRuntimeInputReference(t *testing.T) {
+func TestGetWorkerEndpointOriginReservationRejectsActivationFormat(t *testing.T) {
 	t.Parallel()
-
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-          "format":"takoserver.worker-runtime-input-preparation@v1",
-          "operationId":"op-01",
-          "preparationId":"prep-01",
-          "runtimeInputReference":"rip1.other-preparation.0000000000000000000000000000000000000000000000000000000000000000",
-          "status":"prepared",
-          "expiresAt":"2026-08-31T18:30:00Z",
-          "target":{"space":"default","workerName":"yurucommu","workerResourceUid":"uid-worker-01","bundleName":"bundle-01","originResourceUid":"uid-origin-01"},
-          "canonicalPublicOrigin":"https://community.example.test",
-          "bindingNames":["ENCRYPTION_KEY"]
-        }`))
+		_, _ = io.WriteString(w, strings.Replace(activationResponse, `"format":"takoserver.worker-endpoint-origin-reservation.v1"`, `"format":"takoserver.worker-endpoint-origin-reservation-activation.v1"`, 1))
 	}))
 	defer server.Close()
-
 	api, err := client.New(server.URL, "provider-token", "org-01", server.Client())
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	if _, err := api.GetRuntimeInputPreparation(context.Background(), "op-01"); err == nil || !strings.Contains(err.Error(), "mismatched identity") {
-		t.Fatalf("GetRuntimeInputPreparation() error = %v, want mismatched runtime input reference rejection", err)
+	if _, err := api.GetWorkerEndpointOriginReservation(context.Background(), reservationID); err == nil || !strings.Contains(err.Error(), "unsupported format") {
+		t.Fatalf("reservation read error = %v, want strict reservation format rejection", err)
 	}
 }
 
-func TestGetRuntimeInputPreparationRejectsDuplicateResponseJSONKeys(t *testing.T) {
+func TestGetWorkerEndpointOriginReservationRejectsBoundProjectionWithoutWorkerUID(t *testing.T) {
 	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, strings.Replace(reservationResponse, `,"workerResourceUid":"uid-worker-01"`, "", 1))
+	}))
+	defer server.Close()
+	api, err := client.New(server.URL, "provider-token", "org-01", server.Client())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if _, err := api.GetWorkerEndpointOriginReservation(context.Background(), reservationID); err == nil || !strings.Contains(err.Error(), "incomplete projection") {
+		t.Fatalf("reservation read error = %v, want bound worker identity rejection", err)
+	}
+}
 
+func TestGetWorkerEndpointOriginReservationRejectsNullOptionalUID(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, strings.Replace(reservationResponse, `"workerResourceUid":"uid-worker-01"`, `"workerResourceUid":null`, 1))
+	}))
+	defer server.Close()
+	api, err := client.New(server.URL, "provider-token", "org-01", server.Client())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if _, err := api.GetWorkerEndpointOriginReservation(context.Background(), reservationID); err == nil || !strings.Contains(err.Error(), "incomplete projection") {
+		t.Fatalf("reservation read error = %v, want null optional UID rejection", err)
+	}
+}
+
+func TestRuntimeInputAndReservationReadsRejectDuplicateKeysAndDeepJSON(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
-		name    string
-		payload string
+		name string
+		body string
 	}{
-		{
-			name:    "top-level runtime input reference",
-			payload: `{"runtimeInputReference":"top-level-secret","runtimeInputReference":"top-level-secret"}`,
-		},
-		{
-			name:    "nested target worker resource uid",
-			payload: `{"target":{"workerResourceUid":"nested-secret","workerResourceUid":"nested-secret"}}`,
-		},
+		{name: "duplicate", body: `{"reservationId":"reservation-01","reservationId":"secret"}`},
+		{name: "deep", body: strings.Repeat(`[`, 65) + `"secret"` + strings.Repeat(`]`, 65)},
 	} {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(test.payload))
+				_, _ = io.WriteString(w, test.body)
 			}))
 			defer server.Close()
-
 			api, err := client.New(server.URL, "provider-token", "org-01", server.Client())
 			if err != nil {
 				t.Fatalf("New() error = %v", err)
 			}
-			_, err = api.GetRuntimeInputPreparation(context.Background(), "op-01")
-			if err == nil || !strings.Contains(err.Error(), "duplicate JSON fields") {
-				t.Fatalf("GetRuntimeInputPreparation() error = %v, want duplicate JSON key rejection", err)
-			}
-			if strings.Contains(err.Error(), "top-level-secret") || strings.Contains(err.Error(), "nested-secret") {
-				t.Fatalf("duplicate response body leaked through error: %v", err)
+			_, err = api.GetWorkerEndpointOriginReservation(context.Background(), reservationID)
+			if err == nil || strings.Contains(err.Error(), "secret") {
+				t.Fatalf("reservation read error = %v", err)
 			}
 		})
 	}
 }
 
-func TestGetRuntimeInputPreparationRejectsExcessiveResponseJSONNesting(t *testing.T) {
+func TestPutWorkerEndpointOriginActivationIsIdempotentAndDeleteIsExact(t *testing.T) {
 	t.Parallel()
-
-	const nestingDepth = 65
-	var payload strings.Builder
-	for index := 0; index < nestingDepth; index++ {
-		if index%2 == 0 {
-			payload.WriteByte('[')
-		} else {
-			payload.WriteString(`{"nested":`)
+	var puts atomic.Int64
+	var deletes atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.EscapedPath() != "/v1/worker-endpoint-origin-reservations/"+reservationID+"/activation" {
+			t.Fatalf("path = %s", r.URL.EscapedPath())
 		}
-	}
-	payload.WriteString(`"depth-secret"`)
-	for index := nestingDepth - 1; index >= 0; index-- {
-		if index%2 == 0 {
-			payload.WriteByte(']')
+		if r.Method == http.MethodPut {
+			puts.Add(1)
+		} else if r.Method == http.MethodDelete {
+			deletes.Add(1)
 		} else {
-			payload.WriteByte('}')
+			t.Fatalf("method = %s", r.Method)
 		}
-	}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		if body["format"] != "takoserver.worker-endpoint-origin-reservation-activation.v1" || body["endpointResourceUid"] != endpointUID {
+			t.Fatalf("activation body = %#v", body)
+		}
+		if r.Method == http.MethodPut {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, activationResponse)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(payload.String()))
+		_, _ = io.WriteString(w, strings.Replace(activationResponse, `"status":"activated"`, `"status":"bound"`, 1))
 	}))
 	defer server.Close()
-
 	api, err := client.New(server.URL, "provider-token", "org-01", server.Client())
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	_, err = api.GetRuntimeInputPreparation(context.Background(), "op-01")
-	if err == nil || !strings.Contains(err.Error(), "invalid response") {
-		t.Fatalf("GetRuntimeInputPreparation() error = %v, want excessive nesting rejection", err)
+	for range 2 {
+		projection, callErr := api.PutWorkerEndpointOriginActivation(context.Background(), reservationID, endpointUID)
+		if callErr != nil || projection.Status != "activated" || projection.EndpointResourceUID != endpointUID {
+			t.Fatalf("activation = %#v, error = %v", projection, callErr)
+		}
 	}
-	if strings.Contains(err.Error(), "depth-secret") {
-		t.Fatalf("deep response body leaked through error: %v", err)
+	if err := api.DeleteWorkerEndpointOriginActivation(context.Background(), reservationID, endpointUID); err != nil {
+		t.Fatalf("delete activation error = %v", err)
+	}
+	if puts.Load() != 2 || deletes.Load() != 1 {
+		t.Fatalf("puts=%d deletes=%d", puts.Load(), deletes.Load())
 	}
 }
 
-func TestDeleteRuntimeInputPreparationIsIdempotent(t *testing.T) {
+func TestDeleteWorkerEndpointOriginActivationRejectsMissingEndpointProjection(t *testing.T) {
 	t.Parallel()
-
-	for _, status := range []int{http.StatusNoContent, http.StatusNotFound} {
-		status := status
-		t.Run(http.StatusText(status), func(t *testing.T) {
+	boundProjection := strings.Replace(activationResponse, `"status":"activated"`, `"status":"bound"`, 1)
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{name: "omitted", body: strings.Replace(boundProjection, `,"endpointResourceUid":"uid-endpoint-01"`, "", 1)},
+		{name: "null", body: strings.Replace(boundProjection, `"endpointResourceUid":"uid-endpoint-01"`, `"endpointResourceUid":null`, 1)},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method != http.MethodDelete {
-					t.Errorf("method = %s", r.Method)
+				if r.Method != http.MethodDelete || r.URL.EscapedPath() != "/v1/worker-endpoint-origin-reservations/"+reservationID+"/activation" {
+					t.Fatalf("request = %s %s", r.Method, r.URL.EscapedPath())
 				}
-				if r.URL.EscapedPath() != "/v1/organizations/org-01/worker-runtime-input-preparations/op-01" {
-					t.Errorf("path = %s", r.URL.EscapedPath())
-				}
-				w.WriteHeader(status)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, test.body)
 			}))
 			defer server.Close()
-
 			api, err := client.New(server.URL, "provider-token", "org-01", server.Client())
 			if err != nil {
 				t.Fatalf("New() error = %v", err)
 			}
-			if err := api.DeleteRuntimeInputPreparation(context.Background(), "op-01"); err != nil {
-				t.Fatalf("DeleteRuntimeInputPreparation() error = %v", err)
+			if err := api.DeleteWorkerEndpointOriginActivation(context.Background(), reservationID, endpointUID); err == nil || !strings.Contains(err.Error(), "mismatched identity or state") {
+				t.Fatalf("delete activation error = %v, want non-null exact endpoint projection rejection", err)
 			}
 		})
 	}
 }
 
-func TestNewRequiresOneCanonicalEndpointOrigin(t *testing.T) {
+func TestPutWorkerEndpointOriginActivationRejectsMismatchedProjection(t *testing.T) {
 	t.Parallel()
-	server := httptest.NewServer(http.NotFoundHandler())
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, strings.Replace(activationResponse, `"endpointResourceUid":"uid-endpoint-01"`, `"endpointResourceUid":"uid-endpoint-02"`, 1))
+	}))
 	defer server.Close()
-
-	for _, endpoint := range []string{server.URL + "/", "https://EXAMPLE.test", "https://example.test/", "https://example.test?query=1", "https://example.test:443"} {
-		endpoint := endpoint
-		t.Run(endpoint, func(t *testing.T) {
-			t.Parallel()
-			if _, err := client.New(endpoint, "provider-token", "org-01", server.Client()); err == nil {
-				t.Fatalf("New(%q) accepted a non-canonical endpoint origin", endpoint)
-			}
-		})
+	api, err := client.New(server.URL, "provider-token", "org-01", server.Client())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if _, err := api.PutWorkerEndpointOriginActivation(context.Background(), reservationID, endpointUID); err == nil || !strings.Contains(err.Error(), "mismatched identity") {
+		t.Fatalf("activation error = %v, want exact endpoint identity rejection", err)
 	}
 }
 
-func TestRuntimeInputClientDoesNotFollowRedirectsOrLeakResponseBody(t *testing.T) {
+func TestRuntimeInputClientRejectsRedirectWithoutLeakingBody(t *testing.T) {
 	t.Parallel()
 	const secret = "redirect-body-must-not-appear-in-error"
 	var requests atomic.Int64
@@ -327,32 +294,16 @@ func TestRuntimeInputClientDoesNotFollowRedirectsOrLeakResponseBody(t *testing.T
 		requests.Add(1)
 		w.Header().Set("Location", "https://example.test/redirected")
 		w.WriteHeader(http.StatusFound)
-		_, _ = w.Write([]byte(secret))
+		_, _ = io.WriteString(w, secret)
 	}))
 	defer server.Close()
-
 	api, err := client.New(server.URL, "provider-token", "org-01", server.Client())
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	_, err = api.PutRuntimeInputPreparation(context.Background(), "op-01", client.RuntimeInputPreparationInput{
-		MaterialSetID:         "material-set:v1:5866abee0fff6a8765e02977561092a6f78cd3e97a5e2380a548aafbd030f4a3",
-		Space:                 "default",
-		WorkerName:            "yurucommu",
-		WorkerResourceUID:     "uid-worker-01",
-		BundleName:            "bundle-01",
-		OriginResourceUID:     "uid-origin-01",
-		CanonicalPublicOrigin: "https://community.example.test",
-		Bindings:              map[string]string{"ENCRYPTION_KEY": "placeholder-encryption-value"},
-	})
-	if err == nil {
-		t.Fatal("PutRuntimeInputPreparation() accepted a redirect response")
-	}
-	if strings.Contains(err.Error(), secret) {
-		t.Fatalf("redirect response body leaked through error: %v", err)
-	}
-	if got := requests.Load(); got != 1 {
-		t.Fatalf("HTTP requests = %d, want one request without redirect", got)
+	_, err = api.GetWorkerEndpointOriginReservation(context.Background(), reservationID)
+	if err == nil || strings.Contains(err.Error(), secret) || requests.Load() != 1 {
+		t.Fatalf("redirect error = %v requests = %d", err, requests.Load())
 	}
 }
 
@@ -365,7 +316,6 @@ func TestRuntimeInputClientHonorsContextCancellation(t *testing.T) {
 		w.WriteHeader(http.StatusGatewayTimeout)
 	}))
 	defer server.Close()
-
 	api, err := client.New(server.URL, "provider-token", "org-01", server.Client())
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -374,7 +324,7 @@ func TestRuntimeInputClientHonorsContextCancellation(t *testing.T) {
 	defer cancel()
 	result := make(chan error, 1)
 	go func() {
-		_, callErr := api.GetRuntimeInputPreparation(ctx, "op-01")
+		_, callErr := api.GetWorkerEndpointOriginReservation(ctx, reservationID)
 		result <- callErr
 	}()
 	<-started
@@ -382,9 +332,17 @@ func TestRuntimeInputClientHonorsContextCancellation(t *testing.T) {
 	select {
 	case callErr := <-result:
 		if callErr == nil {
-			t.Fatal("GetRuntimeInputPreparation() succeeded after context cancellation")
+			t.Fatal("reservation read succeeded after context cancellation")
 		}
 	case <-time.After(time.Second):
-		t.Fatal("GetRuntimeInputPreparation() did not honor context cancellation")
+		t.Fatal("reservation read did not honor context cancellation")
+	}
+}
+
+func TestOriginReservationProjectionKeepsOnlyValueFreeFields(t *testing.T) {
+	t.Parallel()
+	var projection client.WorkerEndpointOriginReservation
+	if !reflect.DeepEqual(projection, client.WorkerEndpointOriginReservation{}) {
+		t.Fatal("zero projection changed unexpectedly")
 	}
 }

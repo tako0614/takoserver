@@ -31,6 +31,7 @@ describe("bringing a local database up to date", () => {
       "tf_resource_claims",
       "tf_resource_deletion_attestations",
       "tf_resource_provider_effects",
+      "worker_endpoint_origin_reservations",
       "worker_runtime_input_preparations",
       "reservations",
     ]) {

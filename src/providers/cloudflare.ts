@@ -25,6 +25,10 @@ import type {
 } from "../provider-runtime-input-port.ts";
 import { MAX_PROVIDER_RUNTIME_INPUT_BINDINGS } from "../provider-runtime-input-port.ts";
 import {
+  canonicalWorkerEndpointOrigin,
+  derivedProviderResourceName,
+} from "../provider-worker-endpoint-origin.ts";
+import {
   AMAZON_S3_STANDARD_SERVICE,
   CLOUDFLARE_R2_CREDENTIAL_KIND,
   CLOUDFLARE_R2_ENDPOINT_KIND,
@@ -176,6 +180,9 @@ export interface CloudflareProviderOptions {
 export class CloudflareProvider implements Provider {
   readonly id: string;
   readonly offerings: readonly ProviderOffering[];
+  readonly workerEndpointOriginReservations: NonNullable<
+    Provider["workerEndpointOriginReservations"]
+  >;
   readonly runtimeInputCapabilities?: { readonly maximumBindings: number };
   readonly #accountId: string;
   readonly #origin: string;
@@ -199,6 +206,17 @@ export class CloudflareProvider implements Provider {
     this.#workerEndpointSuffix = options.workerEndpointSuffix;
     this.#workerCompatibilityDate = options.workerCompatibilityDate ?? "2026-08-19";
     this.#runtimeInputs = options.runtimeInputs;
+    this.workerEndpointOriginReservations = {
+      derive: async ({ identity }) => {
+        if (!this.#workerEndpointSuffix) return null;
+        const script = await derivedProviderResourceName("tsw", identity);
+        const canonicalPublicOrigin = canonicalWorkerEndpointOrigin(
+          script,
+          this.#workerEndpointSuffix,
+        );
+        return canonicalPublicOrigin ? { canonicalPublicOrigin } : null;
+      },
+    };
     if (options.runtimeInputs) {
       this.runtimeInputCapabilities = {
         maximumBindings: MAX_PROVIDER_RUNTIME_INPUT_BINDINGS,
@@ -751,7 +769,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
   async #applyModuleWorker(input: ApplyInput): Promise<ProviderTicket> {
     const name = input.previous
       ? (parseNativeId(input.previous.nativeId)?.name ?? "")
-      : await derivedName("tsw", input.identity);
+      : await derivedProviderResourceName("tsw", input.identity);
     if (!name) return failed("invalid_spec", "the previous native identity is unusable");
     if (!input.previous) {
       const form = new FormData();
@@ -793,7 +811,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
         nativeId: input.previous.nativeId,
       });
     }
-    const title = await derivedName("tskv", input.identity);
+    const title = await derivedProviderResourceName("tskv", input.identity);
     const created = await this.#call("POST", `/accounts/${this.#accountId}/storage/kv/namespaces`, {
       title,
     });
@@ -814,7 +832,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
         nativeId: input.previous.nativeId,
       });
     }
-    const queueName = await derivedName("tsq", input.identity);
+    const queueName = await derivedProviderResourceName("tsq", input.identity);
     const created = await this.#call("POST", `/accounts/${this.#accountId}/queues`, {
       queue_name: queueName,
       settings: {
@@ -1419,7 +1437,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
   async #applyBucket(input: ApplyInput): Promise<ProviderTicket> {
     const name = input.previous
       ? (parseNativeId(input.previous.nativeId)?.name ?? "")
-      : await derivedName("ts", input.identity);
+      : await derivedProviderResourceName("ts", input.identity);
     if (!name) return failed("invalid_spec", "the previous native identity is unusable");
     if (input.previous) {
       // A bucket has nothing mutable in this Form; the update is a no-op that
@@ -1448,7 +1466,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
         nativeId: input.previous.nativeId,
       });
     }
-    const name = await derivedName("tsdb", input.identity);
+    const name = await derivedProviderResourceName("tsdb", input.identity);
     const created = await this.#call("POST", `/accounts/${this.#accountId}/d1/database`, {
       name,
       ...(input.region ? { primary_location_hint: input.region } : {}),
@@ -1488,7 +1506,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
 
     const name = input.previous
       ? (parseNativeId(input.previous.nativeId)?.name ?? "")
-      : await derivedName("tsw", input.identity);
+      : await derivedProviderResourceName("tsw", input.identity);
     if (!name) return failed("invalid_spec", "the previous native identity is unusable");
 
     // Durable Object classes must be created by a migration in the same upload
@@ -2359,25 +2377,6 @@ function migrationPath(value: string | undefined): value is string {
 
 function sha256Digest(value: string | undefined): value is `sha256:${string}` {
   return typeof value === "string" && /^sha256:[0-9a-f]{64}$/u.test(value);
-}
-
-/**
- * A stable, collision-free backend name derived from the tenant and address.
- * Customer-chosen names are never used directly: two organizations may both
- * call something "assets", and Cloudflare names are account-global.
- */
-async function derivedName(
-  prefix: string,
-  identity: { tenantRef: string; space: string; name: string },
-): Promise<string> {
-  const bytes = new TextEncoder().encode(
-    `${identity.tenantRef}\0${identity.space}\0${identity.name}`,
-  );
-  const digest = new Uint8Array(
-    await crypto.subtle.digest("SHA-256", bytes as unknown as BufferSource),
-  );
-  const hex = [...digest.slice(0, 20)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-  return `${prefix}-${hex}`;
 }
 
 type NativeId =

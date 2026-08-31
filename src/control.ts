@@ -39,6 +39,12 @@ import type {
 import { TakoformHostError } from "./takoform/types.ts";
 import { TakosIdIdentityError } from "./takos-id-identity.ts";
 import { TokenError, type TokenService } from "./token.ts";
+import {
+  WORKER_ENDPOINT_ORIGIN_RESERVATION_ACTIVATION_FORMAT,
+  WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT,
+  WorkerEndpointOriginReservationError,
+  type WorkerEndpointOriginReservations,
+} from "./worker-endpoint-origin-reservations.ts";
 
 /**
  * The direct Console and API-key control plane.
@@ -124,6 +130,8 @@ export interface CreateControlRoutesOptions {
   readonly nativeResidual?: NativeResidualReader;
   /** Closed, encrypted handoff from the Takoserver companion provider to the Host. */
   readonly runtimeInputs?: RuntimeInputAuthority["preparations"];
+  /** Value-free pre-mutation authority for one future stable Worker endpoint. */
+  readonly originReservations?: WorkerEndpointOriginReservations;
   readonly runtimeInputPolicy?: Pick<TakoformRuntimeInputPolicy, "guaranteedMaximum">;
 }
 
@@ -148,6 +156,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     consoleOrigin,
     nativeResidual,
     runtimeInputs,
+    originReservations,
     runtimeInputPolicy,
   } = options;
 
@@ -200,6 +209,18 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     return actor;
   };
 
+  const organizationWriter = async (request: Request): Promise<string> => {
+    const actor = await accounts.authenticate(authorization(request));
+    if (
+      actor?.kind !== "api_key" ||
+      !actor.organizationId ||
+      !grants(actor.scopes, "resources:write")
+    ) {
+      throw new AuthError(actor ? "permission_denied" : "unauthenticated");
+    }
+    return actor.organizationId;
+  };
+
   return async (request, url) => {
     if (!url.pathname.startsWith("/v1/")) return null;
     try {
@@ -210,6 +231,74 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
   };
 
   async function route(request: Request, url: URL): Promise<Response> {
+    const originReservationActivation =
+      /^\/v1\/worker-endpoint-origin-reservations\/([^/]+)\/activation$/u.exec(url.pathname);
+    if (originReservationActivation) {
+      if (!originReservations) controlError("not_found", 404);
+      const organizationId = await organizationWriter(request);
+      const reservationId = segment(originReservationActivation[1]);
+      const headers = { "cache-control": "private, no-store", "x-content-type-options": "nosniff" };
+      if (request.method === "PUT" || request.method === "DELETE") {
+        const body = await jsonObject(request);
+        exactKeys(body, ["format", "endpointResourceUid"]);
+        if (body.format !== WORKER_ENDPOINT_ORIGIN_RESERVATION_ACTIVATION_FORMAT) {
+          controlError("invalid_argument", 400);
+        }
+        const input = {
+          organizationId,
+          reservationId,
+          endpointResourceUid: text(body.endpointResourceUid),
+        };
+        const projection =
+          request.method === "PUT"
+            ? await originReservations.activate(input)
+            : await originReservations.deactivate(input);
+        return Response.json(projection, { headers });
+      }
+      controlError("not_found", 404);
+    }
+
+    const originReservation = /^\/v1\/worker-endpoint-origin-reservations\/([^/]+)$/u.exec(
+      url.pathname,
+    );
+    if (originReservation) {
+      if (!originReservations) controlError("not_found", 404);
+      const organizationId = await organizationWriter(request);
+      const reservationId = segment(originReservation[1]);
+      const headers = { "cache-control": "private, no-store", "x-content-type-options": "nosniff" };
+      if (request.method === "PUT") {
+        const body = await jsonObject(request);
+        exactKeys(body, ["format", "target", "expiresInSeconds"], ["offeringId"]);
+        if (body.format !== WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT) {
+          controlError("invalid_argument", 400);
+        }
+        const target = record(body.target);
+        exactKeys(target, ["space", "workerName", "endpointName"]);
+        const projection = await originReservations.prepare({
+          organizationId,
+          reservationId,
+          target: {
+            space: text(target.space),
+            workerName: text(target.workerName),
+            endpointName: text(target.endpointName),
+          },
+          ...(body.offeringId === undefined ? {} : { offeringId: text(body.offeringId) }),
+          expiresInSeconds: integer(body.expiresInSeconds),
+        });
+        return Response.json(projection, { status: 201, headers });
+      }
+      if (request.method === "GET") {
+        const projection = await originReservations.read(organizationId, reservationId);
+        if (!projection) controlError("not_found", 404);
+        return Response.json(projection, { headers });
+      }
+      if (request.method === "DELETE") {
+        await originReservations.release(organizationId, reservationId);
+        return new Response(null, { status: 204, headers });
+      }
+      controlError("not_found", 404);
+    }
+
     // Which Forms exist is a property of the platform, not of a tenant, and it
     // is the first thing anyone integrating needs. The exact-pin lanes can
     // answer this too, but only to an organization key — a person reading the
@@ -584,14 +673,24 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       if (!runtimeInputs) controlError("not_found", 404);
       const organizationId = segment(runtimeInputPreparation[1]);
       const operationId = segment(runtimeInputPreparation[2]);
-      await scoped(request, organizationId, "resources:write");
+      const authorizedOrganizationId = await organizationWriter(request);
+      if (authorizedOrganizationId !== organizationId) {
+        throw new AuthError("permission_denied");
+      }
       const headers = {
         "cache-control": "private, no-store",
         "x-content-type-options": "nosniff",
       };
       if (request.method === "PUT") {
         const body = await jsonObject(request);
-        exactKeys(body, ["format", "materialSetId", "target", "canonicalPublicOrigin", "bindings"]);
+        exactKeys(body, [
+          "format",
+          "materialSetId",
+          "materialSetNonce",
+          "runtimeInputReference",
+          "target",
+          "bindings",
+        ]);
         if (body.format !== RUNTIME_INPUT_PREPARATION_FORMAT) {
           controlError("invalid_argument", 400);
         }
@@ -601,20 +700,21 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
           "workerName",
           "workerResourceUid",
           "bundleName",
-          "originResourceUid",
+          "originReservationId",
         ]);
         const prepared = await runtimeInputs.prepare({
           organizationId,
           operationId,
           materialSetId: text(body.materialSetId),
+          materialSetNonce: text(body.materialSetNonce),
+          runtimeInputReference: text(body.runtimeInputReference),
           target: {
             space: text(target.space),
             workerName: text(target.workerName),
             workerResourceUid: text(target.workerResourceUid),
             bundleName: text(target.bundleName),
-            originResourceUid: text(target.originResourceUid),
+            originReservationId: text(target.originReservationId),
           },
-          canonicalPublicOrigin: text(body.canonicalPublicOrigin),
           bindings: stringRecord(body.bindings),
         });
         return Response.json(prepared, { status: 201, headers });
@@ -1078,6 +1178,9 @@ export function controlErrorResponse(error: unknown): Response {
 function classify(error: unknown): { code: string; status: number } {
   if (error instanceof ControlError) return { code: error.code, status: error.status };
   if (error instanceof RuntimeInputPreparationError) {
+    return { code: error.code, status: error.status };
+  }
+  if (error instanceof WorkerEndpointOriginReservationError) {
     return { code: error.code, status: error.status };
   }
   if (error instanceof TakoformHostError) return { code: error.code, status: error.status };

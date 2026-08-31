@@ -1,94 +1,185 @@
-# ADR 0004 — Host-owned one-shot runtime-input authority
+# ADR 0004 — Worker origin reservation and one-shot runtime-input authority
 
 **Status:** accepted, 2026-08-31
 
-## The boundary
+## Decision
 
-Takoserver owns `RuntimeInputAuthority` in its control plane. It is the
-authenticated handoff for values named by a Worker Version's
-`requiredSensitiveVars`; it is separate from the stable Takoform Host API and
-Form fields. The declaration carries names only. The authority carries the
-corresponding values out of band, and no provider identity, native identifier,
-or credential is added to a Form or portable desired/observed state.
+Takoserver owns two related control-plane authorities outside the stable Takoform
+Host API:
 
-An owner session or an organization API key with `resources:write` may call
-`PUT /v1/organizations/{organizationId}/worker-runtime-input-preparations/{operationId}`.
-The closed request is sealed in the control database and the response is a
-value-free projection containing a one-shot `rip1` reference. The caller must
-reuse that reference as the existing Host `Idempotency-Key`; the reference is
-not authentication or authorization.
+- `WorkerEndpointOriginReservation` chooses and holds the canonical public
+  origin of a future ModuleWorker before either the worker or endpoint Resource
+  exists.
+- `RuntimeInputAuthority` seals values named by a Worker Version's
+  `requiredSensitiveVars` and hands them to the exact selected provider through
+  a one-shot lease.
 
-The preparation commitment binds the organization, operation and preparation
-identities, material set, full target (including the origin Resource),
-canonical public origin, and sorted binding names. A replay with any of those
-fields changed is a conflict.
+The earlier design derived the origin from an already Ready `WorkerEndpoint` or
+`WorkerCustomDomain`. That created an unshippable dependency cycle: the provider
+needed the runtime-input reference to create the worker, while the reference
+could not be prepared until a downstream endpoint already existed. A
+reservation is value-free and can safely precede the Resource graph.
 
-The origin is not trusted from that request. Before sealing anything,
-Takoserver resolves the named, live Resource from its own inventory. Only the
-exact released `WorkerEndpoint` and `WorkerCustomDomain` Forms may supply an
-origin. The resolver derives the HTTPS origin from their immutable output or
-hostname and verifies their stored `/worker` relation against the exact
-ModuleWorker UID. That UID is also part of the preparation target and
-commitment. URL-like fields on any other Resource have no authority.
+These authorities do not change frozen Takoform Host v1 routes, Forms, desired
+state, or outputs. Takoform continues to describe portable Resources. The
+Takoserver control plane owns sold Offering selection, provider installation
+placement, future native naming, leases, and secret transport.
 
-## Lifecycle
+## Public control contract
 
-The provider-neutral `ProviderRuntimeInputLeasePort` is the only seam from the
-Host to a provider adapter:
+An organization API key with `resources:write` calls these closed routes. The
+organization is taken only from the authenticated key, not from a request body.
+Where the runtime-input route also carries `organizationId` in its path, that
+value must exactly equal the key's organization; an owner session is not a
+machine credential for these routes:
 
-- A provider acquires an exact operation/Resource/target claim and receives
-  values only in the in-memory lease.
-- Claim and origin deletion are reciprocal D1 fences. Claim succeeds only
-  while the origin incarnation tombstone is `live`; deletion can move it to
-  `pending` only while no unexpired claim exists. Immediately before dispatch,
-  the authority resolves the complete origin again. Its authorization CAS
-  requires both `live` and the exact Resource revision returned by that read,
-  so a status/output/relation race fails instead of authorizing a stale origin.
-- Abort revokes an un-dispatched claim. Dispatch clears the durable ciphertext
-  before the provider request carrying the values is sent.
-- Settle consumes the one-shot handoff only with a digest of the provider's
-  authoritative readback receipt. A dispatched handoff is retained for
-  value-free recovery; recovery cannot redispatch or return values. Recovery
-does not require an origin that may legitimately have been deleted after the
-dispatch authorization point.
+- `GET|PUT|DELETE /v1/worker-endpoint-origin-reservations/{reservationId}`
+- `PUT|DELETE /v1/worker-endpoint-origin-reservations/{reservationId}/activation`
+- `GET|PUT|DELETE /v1/organizations/{organizationId}/worker-runtime-input-preparations/{operationId}`
 
-Prepared rows expire after one hour and claimed leases after fifteen minutes;
-bounded maintenance clears ciphertext for those rows. Dispatched rows are not
-claimed-TTL garbage: they remain for value-free recovery until consumed or
-otherwise reconciled.
-Corrupt or unavailable sealed material fails closed and does not issue a second
-claim.
+The reservation format is
+`takoserver.worker-endpoint-origin-reservation.v1`. Its public projection
+contains only the reservation ID, canonical origin, revision, expiry, logical
+target (`space`, `workerName`, `endpointName`), status, and the exact worker or
+endpoint UIDs once known. Provider placement is deliberately retained in the
+ledger but not exposed as portable identity.
 
-## Capability and recovery
+Reservation PUT may omit `offeringId` only when the same sold-placement
+authority used by ordinary Host mutation finds exactly one eligible
+ModuleWorker Offering. Zero or multiple eligible Offerings fail with 422. The
+selected Offering digest, provider pack, and provider installation are always
+stored and later drift-fenced. Provider adapters expose only a narrow,
+non-mutating derivation capability. Cloudflare and self-host derivation use the
+same worker-name and endpoint-suffix code as their real mutation path; preparing
+a reservation creates no Takoform Resource and performs no provider mutation.
 
-Public capability discovery is conservative for each exact Form: it reports the
-minimum runtime-input capacity across matching configured providers, and zero
-when no matching provider can consume leases. Mutation admission then selects
-the exact sold or inherited provider and checks that provider again before any
-provider mutation or Offering claim. A capability advertised for one provider
-does not authorize another.
+## Reservation lifecycle and deletion ordering
 
-The Cloudflare adapter advertises at most 64 bindings, and only when a
-`RuntimeInputAuthority` is configured with the operator-private
-`TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING`; without it, sensitive runtime inputs
-are unavailable. Ordinary self-host composition has no such authority and
-remains fail-closed. If an upload acknowledgement is lost, the exact provider
-readback is used to settle the retained dispatched handoff without another
-upload. Lease acquisition precedes asset-upload session creation, so an invalid
-reference or origin causes zero Cloudflare mutations; an asset failure aborts
-the still-undispatched lease.
+```text
+prepared --bind exact Ready ModuleWorker--> bound
+bound --activate exact Ready WorkerEndpoint--> activated
+activated --deactivate exact endpoint UID--> bound (endpoint UID retained)
+prepared|unactivated bound --expiry--> terminal
+prepared|bound --release with absence fences--> terminal
+```
 
-The key ring's current AES-256-GCM key seals new preparations. Bounded previous
-keys may decrypt existing prepared or claimed rows during rotation; operators
-retain them until those rows can no longer be claimed, then retire them. Key
-material is imported as non-extractable keys and is never returned by the
-control or recovery projections.
+There is one live reservation per organization, space, and logical worker, and
+one global owner per canonical origin. A PUT replay succeeds only when its
+target, TTL, selected placement, Offering digest, and derived origin are exact.
+
+Binding records the exact Ready/current-generation ModuleWorker UID and
+revision and its matching active provider deployment. Activation accepts an
+actual released stable `WorkerEndpoint` only: its UID, logical address,
+Ready/current generation, `/worker` relation, canonical output, and provider
+placement must all match. Custom-domain activation is not currently supported.
+After that proof, the stable Host contract makes a `WorkerEndpoint` UID's worker
+relation and hostname/URL immutable; changing any of them requires replacement
+with a new UID. Reservation reads therefore rely on the pinned endpoint UID
+rather than inventing a second mutable endpoint authority.
+
+Deactivation changes `activated` to `bound` but intentionally retains the
+endpoint UID and revision as a deletion witness. This makes the projection of a
+deactivated reservation unambiguous: `status: "bound"` plus
+`endpointResourceUid` means activation has ended but that endpoint still owns
+the origin. Release then requires all of the following in one SQL authorization
+check:
+
+1. no activation and no unexpired claimed runtime-input lease;
+2. the retained endpoint Resource is absent;
+3. its deletion attestation is closed; and
+4. no provider deployment remains outside `deleted` or `failed`.
+
+Therefore the safe destroy order is activation DELETE, endpoint Resource
+DELETE and absence closure, then reservation DELETE. The origin cannot be
+reallocated during the interval in which the old native endpoint may still
+exist. Expiry also cannot bypass that ownership: an expired row with a retained
+endpoint UID remains inside both uniqueness constraints until the same absence
+fences allow explicit release. Release is idempotent once terminal.
+
+## Plan-known reference and exact binding
+
+Runtime-input PUT uses format
+`takoserver.worker-runtime-input-preparation@v1`. It contains a non-secret
+`materialSetNonce`, the caller-computed `runtimeInputReference`, logical target
+including `originReservationId`, the actual ModuleWorker UID, and the secret
+bindings. It does not accept a caller-supplied origin.
+
+The caller and server compute the reference from the UTF-8 SHA-256 of canonical
+JSON with this exact insertion order:
+
+```json
+{
+  "format": "takoserver.worker-runtime-input-preflight.v1",
+  "materialSetNonce": "...",
+  "target": {
+    "space": "...",
+    "workerName": "...",
+    "bundleName": "...",
+    "endpointName": "...",
+    "originReservationId": "...",
+    "canonicalPublicOrigin": "..."
+  },
+  "bindings": {
+    "LEXICALLY_SORTED_NAME": "exact value"
+  }
+}
+```
+
+For lowercase digest hex `H`, the identities are
+`preparationId = "prep-" + H[0:32]` and
+`runtimeInputReference = "rip1." + preparationId + "." + H`. The future
+worker UID is excluded so the reference is plan-known; preparation separately
+binds the actual UID, worker revision, material-set ID, reservation revision,
+and provider placement in dedicated columns. The `preparation_commitment`
+column means only this preflight SHA-256 commitment. It is never overloaded
+with post-creation Resource identity.
+
+Before sealing, Takoserver resolves and atomically binds the reservation to the
+exact Ready ModuleWorker. It takes the endpoint name and canonical origin only
+from the reservation, recomputes the reference from the exact binding values,
+and rejects any mismatch. A replay must match both the preflight commitment and
+all separately stored exact identities.
+
+## Lease, dispatch, and recovery
+
+The provider-neutral `ProviderRuntimeInputLeasePort` is the only value-bearing
+seam from the Host to a provider adapter:
+
+- Acquisition validates the reference and live bound/activated reservation
+  before any provider call, then claims the exact operation, target, and worker.
+- Dispatch revalidates the reservation, exact worker UID and revision,
+  placement, Offering digest, and live deletion attestation. The same D1 CAS
+  fences those identities and the reservation revision while clearing durable
+  ciphertext before the provider request.
+- ModuleWorker deletion cannot begin while an unexpired exact claim exists.
+- Abort revokes a prepared or claimed but undispatched handoff. Settle consumes the handoff only with a
+  digest of authoritative provider readback.
+- A dispatched handoff retains only value-free recovery identity. Recovery can
+  settle an acknowledgement loss but cannot redispatch, return values, or
+  depend on a reservation or endpoint that may legitimately be deleted after
+  dispatch authorization.
+
+Prepared rows expire after one hour and claimed leases after fifteen minutes.
+Corrupt or unavailable sealed material fails closed and never issues a second
+claim. The current non-extractable AES-256-GCM key seals new rows; bounded
+previous keys may decrypt existing prepared/claimed rows during rotation.
+
+## Composition consequence
+
+Origin derivation belongs to the same provider selected for ordinary Host
+mutation, while that provider consumes runtime-input leases and the runtime
+authority consumes the reservation port. The Worker entry composition therefore
+has a genuine construction cycle. It is closed by a narrow single-assignment
+reservation handle: calls fail closed before connection, connection is allowed
+exactly once, and the handle exposes only `bind` and `inspectBound`. General
+mutable composition state is not an authority.
 
 ## Non-goals
 
-- This is not a new Takoform API or a new Form field; `requiredSensitiveVars`
-  remains a declaration consumed by the Host's existing lifecycle.
+- A reservation is not a Takoform Resource, Form field, sale-catalog default,
+  or a provider-native credential.
 - A `rip1` reference is not a bearer credential and never replaces Host
-  authentication, authorization, or the Host's idempotency rules.
-- Provider identity, provider-native IDs, and credentials do not become Form
-  identity or portable state.
+  authentication, authorization, or idempotency.
+- Secret values never enter a public projection, log, provider identity, or
+  portable state.
+- Activation does not infer authority from arbitrary URL-like outputs.

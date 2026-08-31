@@ -1,4 +1,5 @@
 import { type App, buildApp } from "./app.ts";
+import { createCatalog } from "./catalog.ts";
 import { buildEdgeForms } from "./edge-forms.ts";
 import { resolveIdentity } from "./identity-setup.ts";
 import {
@@ -15,7 +16,7 @@ import type {
   PublicFormImplementationIdentity,
   PublicWorkerImplementationIdentity,
 } from "./public-worker-implementation.ts";
-import { createTakoformRuntimeInputOriginAuthority } from "./runtime-input-origin-authority.ts";
+import { createResourceDeploymentStore } from "./resource-deployments.ts";
 import { createRuntimeInputAuthority } from "./runtime-input-preparations.ts";
 import { parseRuntimeInputSealKeyRing } from "./runtime-input-seal-keyring.ts";
 import { loadSigningKey } from "./signing-key.ts";
@@ -25,6 +26,10 @@ import { currentTakoformCandidates } from "./takoform/current-candidates.ts";
 import { createTakoformStore } from "./takoform/store.ts";
 import { createJavaScriptWorkerModuleInspector } from "./takoform/worker-module-inspector.ts";
 import { createWorkerDataServices } from "./worker-data-services.ts";
+import {
+  createWorkerEndpointOriginReservationBindingHandle,
+  createWorkerEndpointOriginReservations,
+} from "./worker-endpoint-origin-reservations.ts";
 import { createWorkerProductionComposition } from "./worker-production-composition.ts";
 
 /**
@@ -364,11 +369,12 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
   const objects = createR2ObjectStore(env.OBJECTS);
   const clock = () => new Date();
   const randomId = () => crypto.randomUUID();
+  const originReservationBinding = createWorkerEndpointOriginReservationBindingHandle();
   const runtimeInputs = env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING
     ? createRuntimeInputAuthority({
         sql,
         sealKeys: await parseRuntimeInputSealKeyRing(env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING),
-        origins: createTakoformRuntimeInputOriginAuthority(createTakoformStore(sql, clock)),
+        originReservations: originReservationBinding.port,
         clock,
         randomId,
       })
@@ -395,6 +401,15 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     ...(runtimeInputs ? { runtimeInputs: runtimeInputs.leases } : {}),
     now: new Date(),
   });
+  const originReservations = createWorkerEndpointOriginReservations({
+    sql,
+    clock,
+    catalog: createCatalog(deployment.offerings),
+    providers: deployment.providers,
+    resources: createTakoformStore(sql, clock),
+    deployments: createResourceDeploymentStore(sql, clock),
+  });
+  originReservationBinding.connect(originReservations);
   const app = buildApp({
     sql,
     objects,
@@ -406,6 +421,7 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
       : {}),
     ...(integrationE2eCredentialAuthority ? { integrationE2eCredentialAuthority } : {}),
     ...(runtimeInputs ? { runtimeInputs } : {}),
+    originReservations,
     artifacts,
     workerModuleInspector: createJavaScriptWorkerModuleInspector(),
     ...(signingKey ? { signingKey } : {}),

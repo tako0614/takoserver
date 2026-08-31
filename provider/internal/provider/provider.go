@@ -100,7 +100,10 @@ func (p *takoserverProvider) Configure(ctx context.Context, request frameworkpro
 }
 
 func (p *takoserverProvider) Resources(_ context.Context) []func() frameworkresource.Resource {
-	return []func() frameworkresource.Resource{NewWorkerRuntimeInputsResource}
+	return []func() frameworkresource.Resource{
+		NewWorkerRuntimeInputsResource,
+		NewWorkerEndpointOriginActivationResource,
+	}
 }
 
 func (p *takoserverProvider) DataSources(_ context.Context) []func() datasource.DataSource {

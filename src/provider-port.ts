@@ -85,6 +85,17 @@ export interface ResourceIdentity {
   readonly uid?: string;
 }
 
+/**
+ * Provider-specific derivation of the endpoint that a future ModuleWorker will
+ * receive. This is deliberately non-mutating: Takoserver's reservation ledger
+ * owns exclusivity, while the adapter owns only its exact naming/suffix rules.
+ */
+export interface ProviderWorkerEndpointOriginReservationCapability {
+  derive(input: {
+    readonly identity: ResourceIdentity;
+  }): Promise<{ readonly canonicalPublicOrigin: string } | null>;
+}
+
 /** Durable identity and recovery evidence for every provider mutation. */
 export interface ProviderMutationInput {
   /** Stable across retries of the same logical operation. */
@@ -239,6 +250,8 @@ export interface Provider {
   readonly id: string;
   /** Static configuration, not a per-request discovery call. */
   readonly offerings: readonly ProviderOffering[];
+  /** Exact future WorkerEndpoint derivation; never creates a Resource or provider object. */
+  readonly workerEndpointOriginReservations?: ProviderWorkerEndpointOriginReservationCapability;
   /** Present only when this configured adapter can durably receive one-shot runtime inputs. */
   readonly runtimeInputCapabilities?: ProviderRuntimeInputCapabilities;
   apply(input: ApplyInput): Promise<ProviderTicket>;
