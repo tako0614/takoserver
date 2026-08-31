@@ -19,24 +19,11 @@
       },
       "mode": {
         "type": "string",
-        "enum": [
-          "safe",
-          "fast"
-        ],
+        "enum": ["safe", "fast"],
         "default": "safe"
       }
     },
-    "required": [
-      "lower",
-      "upper"
-    ]
+    "required": ["lower", "upper"]
   },
-  "lifecycleCapabilities": [
-    "create",
-    "read",
-    "update",
-    "delete",
-    "import",
-    "observe"
-  ]
+  "lifecycleCapabilities": ["create", "read", "update", "delete", "import", "observe"]
 }
