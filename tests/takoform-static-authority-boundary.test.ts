@@ -23,10 +23,13 @@ import { createTakoformHost } from "../src/takoform/host.ts";
 import { createTakoformHostAuthority } from "../src/takoform/host-authority.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
 
-// The entry modules target the Workers runtime's built-in module. Mock only
-// that constructor so the default registration handlers can be exercised in
+// The entry modules and the Container helper target Workers runtime built-ins.
+// Mock only those constructors so registration handlers can be exercised in
 // Bun without changing their production bundle or RPC class shape.
-mock.module("cloudflare:workers", () => ({ WorkerEntrypoint: class WorkerEntrypoint {} }));
+mock.module("cloudflare:workers", () => ({
+  DurableObject: class DurableObject {},
+  WorkerEntrypoint: class WorkerEntrypoint {},
+}));
 
 type RegistrationHandler = {
   readonly fetch: (request: Request) => Response | Promise<Response>;
@@ -137,7 +140,7 @@ async function reachableModules(entrypoints: readonly string[]): Promise<Readonl
   return new Set([...visited].map((path) => relative(repositoryRoot, path)));
 }
 
-test("the generated 16-Form corpus is candidate input, never runtime admission", async () => {
+test("the generated 17-Form corpus is candidate input, never runtime admission", async () => {
   const [appSource, bunEntrySource, workerEntrySource, edge] = await Promise.all([
     source("src/app.ts"),
     source("src/entry-bun.ts"),
@@ -175,17 +178,15 @@ test("the generated 16-Form corpus is candidate input, never runtime admission",
     true,
   );
   expect(edge.forms.some((form) => form.identity.formRef.kind === "ObjectBucket")).toBe(true);
-  expect(candidates.forms).toHaveLength(16);
-  expect(new Set(candidates.forms.map((form) => form.identity.formRef.kind)).size).toBe(16);
+  expect(candidates.forms).toHaveLength(17);
+  expect(new Set(candidates.forms.map((form) => form.identity.formRef.kind)).size).toBe(17);
   expect(candidates.forms.every((form) => form.requiresHostApi === "forms.takoform.com/v1")).toBe(
     true,
   );
   expect(
     candidates.forms.some((form) => form.identity.formRef.apiVersion.endsWith("/v1beta1")),
   ).toBe(false);
-  expect(candidates.forms.some((form) => form.identity.formRef.kind === "ObjectBucket")).toBe(
-    false,
-  );
+  expect(candidates.forms.some((form) => form.identity.formRef.kind === "ObjectBucket")).toBe(true);
 });
 
 test("public Worker, router, and OpenAPI graphs reach readers but never Form authority", async () => {

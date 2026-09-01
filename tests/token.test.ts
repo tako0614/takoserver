@@ -206,6 +206,26 @@ describe("Takoform run tokens", () => {
     expect(claims).not.toHaveProperty("runtimeMaterialization");
   });
 
+  test("binds only the opaque endpoint reservation authority into a tenant-run credential", async () => {
+    const tokens = service(await provisionKey("sign-tenant-run-reservation"));
+    const issued = await tokens.issueTakoformTenantRunToken({
+      organizationId: "org_alpha",
+      tenantRef: "tenant_workspace_x",
+      spaceRef: "tsp_capsule_yurucommu",
+      runRef: "run_host_endpoint",
+      workerEndpointOriginReservationId: "reservation_endpoint_01",
+      ttlSeconds: 300,
+    });
+    expect(await tokens.verifyTakoformTenantRunToken(issued.token)).toMatchObject({
+      organizationId: "org_alpha",
+      tenantRef: "tenant_workspace_x",
+      spaceRef: "tsp_capsule_yurucommu",
+      runRef: "run_host_endpoint",
+      mode: "tenant-run",
+      workerEndpointOriginReservationId: "reservation_endpoint_01",
+    });
+  });
+
   test("bind one reusable credential to an exact reservation, Form, space, and address", async () => {
     const tokens = service(await provisionKey("sign-2026-08"));
     const formRef = {

@@ -111,6 +111,8 @@ export interface EngineContext {
   readonly provisionOnly?: boolean;
   readonly expectedResourceUid?: string;
   readonly commercialAuthority?: TakoformCommercialAuthority;
+  /** Private tenant-run context. It is never included in a public Resource. */
+  readonly workerEndpointOriginReservationId?: string;
   /** Stable identity and atomic commit owned by a durable Host Operation. */
   readonly durableOperation?: {
     readonly id: string;
@@ -988,15 +990,43 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         }
       }
 
-      const review = await store.readPrepare(context.tenantId, body.review.prepareDigest);
-      if (
-        !review ||
-        review.fingerprint !== canonicalJson(stripApplyReview(body)) ||
-        review.expectedGeneration !== (current?.metadata.generation ?? undefined) ||
-        review.currentUid !== (current?.metadata.uid ?? undefined) ||
-        review.authorityHeadDigest !== authority.fence?.headDigest
-      ) {
-        throw new TakoformHostError();
+      const proposedOperationId = context.durableOperation?.id ?? operationId();
+      const proposedResourceUid =
+        current?.metadata.uid ?? context.durableOperation?.resourceUid ?? nextResourceUid(randomId);
+      const proposedSaga = {
+        operationId: proposedOperationId,
+        replayKey,
+        tenantId: context.tenantId,
+        fingerprint,
+        resourceUid: proposedResourceUid,
+        ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
+        target: address,
+        ...(current
+          ? {
+              acceptedUid: current.metadata.uid,
+              acceptedGeneration: current.metadata.generation,
+              acceptedRevision: current.metadata.revision,
+            }
+          : {}),
+      };
+      // The saga row is created only after the initial prepare review below
+      // succeeds. On a dispatched recovery it is therefore the durable exact
+      // command authority; an expired short-lived prepare must not strand the
+      // external mutation. Mismatched saga identity fails closed in the store.
+      const establishedSaga =
+        context.durableOperation !== undefined &&
+        (await store.establishedProviderMutationSaga(proposedSaga));
+      if (!establishedSaga) {
+        const review = await store.readPrepare(context.tenantId, body.review.prepareDigest);
+        if (
+          !review ||
+          review.fingerprint !== canonicalJson(stripApplyReview(body)) ||
+          review.expectedGeneration !== (current?.metadata.generation ?? undefined) ||
+          review.currentUid !== (current?.metadata.uid ?? undefined) ||
+          review.authorityHeadDigest !== authority.fence?.headDigest
+        ) {
+          throw new TakoformHostError();
+        }
       }
 
       // Reasserting an identical desired state is a no-op, not an update.
@@ -1160,25 +1190,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         artifacts,
         ...(options.workerModuleInspector ? { inspector: options.workerModuleInspector } : {}),
       });
-      const proposedOperationId = context.durableOperation?.id ?? operationId();
-      const proposedResourceUid =
-        current?.metadata.uid ?? context.durableOperation?.resourceUid ?? nextResourceUid(randomId);
-      const saga = await store.acceptProviderMutationSaga({
-        operationId: proposedOperationId,
-        replayKey,
-        tenantId: context.tenantId,
-        fingerprint,
-        resourceUid: proposedResourceUid,
-        ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
-        target: address,
-        ...(current
-          ? {
-              acceptedUid: current.metadata.uid,
-              acceptedGeneration: current.metadata.generation,
-              acceptedRevision: current.metadata.revision,
-            }
-          : {}),
-      });
+      const saga = await store.acceptProviderMutationSaga(proposedSaga);
       const opId = saga.operationId;
       const uid = saga.resourceUid;
       const claimOwnerId = context.durableOperation?.claimOwnerId ?? opId;
@@ -1338,6 +1350,11 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               atomicDeploymentCommit: true,
               ...(context.commercialAuthority
                 ? { commercialAuthority: context.commercialAuthority }
+                : {}),
+              ...(create && context.workerEndpointOriginReservationId
+                ? {
+                    workerEndpointOriginReservationId: context.workerEndpointOriginReservationId,
+                  }
                 : {}),
               ...(standardServices.length > 0 ? { standardServices } : {}),
               ...(current ? { previous: structuredClone(current) } : {}),

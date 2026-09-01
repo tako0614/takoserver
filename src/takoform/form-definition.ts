@@ -24,7 +24,7 @@ const ROLES = new Set<NonNullable<InstalledTakoformForm["role"]>>([
  *
  * This does not make the Definition executable. The Host authority separately
  * intersects it with an exact build/provider implementation candidate. Keeping
- * the materialization package-derived lets a valid third-party install remain
+ * the materialization package-derived lets any valid publisher install remain
  * discoverable as installed-but-unsupported without turning the build corpus
  * into a publisher allowlist.
  */

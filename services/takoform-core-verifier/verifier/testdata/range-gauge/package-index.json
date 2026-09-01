@@ -1,0 +1,19 @@
+{
+  "apiVersion": "packages.forms.takoform.com/v1alpha5",
+  "kind": "FormPackage",
+  "formRef": {
+    "apiVersion": "resources.publisher.example",
+    "kind": "RangeGauge",
+    "definitionVersion": "0.1.0",
+    "schemaDigest": "sha256:0c07bf0142f296c65c2e39deef563d92403fce8c7c40bd726b0c6abfac39152c"
+  },
+  "definitionPath": "definition.json",
+  "files": [
+    {
+      "path": "definition.json",
+      "mediaType": "application/vnd.takoform.form-definition.v1+json",
+      "size": 839,
+      "digest": "sha256:083701bcdbb7028bb63e35631ec0a5a44d7daf8f7aa73477a39e43045e6e3bae"
+    }
+  ]
+}

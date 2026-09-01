@@ -21,15 +21,8 @@ import {
   type RuntimeInputAuthority,
   RuntimeInputPreparationError,
 } from "./runtime-input-preparations.ts";
-import {
-  type S3Access,
-  S3CredentialError,
-  type S3CredentialIssuer,
-  validateS3CredentialSet,
-} from "./s3-port.ts";
 import { parseStrictJson, StrictJsonError } from "./strict-json.ts";
-import { formSupportProfile, sameFormRef } from "./takoform/forms.ts";
-import { TAKOFORM_EDGE_OBJECTS_INTERFACE } from "./takoform/official-forms.ts";
+import { formSupportProfile } from "./takoform/forms.ts";
 import type { OperationListing, ResourceListing } from "./takoform/store.ts";
 import type {
   InstalledTakoformForm,
@@ -121,8 +114,6 @@ export interface CreateControlRoutesOptions {
    * would begin a checkout is simply not served.
    */
   readonly checkout?: Checkout | undefined;
-  /** Standard S3 credentials for already-provisioned ObjectBuckets. */
-  readonly s3?: S3CredentialIssuer | undefined;
   readonly clock: Clock;
   /** Exact browser console origin allowed to carry the HttpOnly session cookie. */
   readonly consoleOrigin?: string;
@@ -151,7 +142,6 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     reseller,
     tokens,
     settlement,
-    s3,
     clock,
     consoleOrigin,
     nativeResidual,
@@ -268,20 +258,14 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       const headers = { "cache-control": "private, no-store", "x-content-type-options": "nosniff" };
       if (request.method === "PUT") {
         const body = await jsonObject(request);
-        exactKeys(body, ["format", "target", "expiresInSeconds"], ["offeringId"]);
+        exactKeys(body, ["format", "requestedSubdomain", "expiresInSeconds"], ["offeringId"]);
         if (body.format !== WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT) {
           controlError("invalid_argument", 400);
         }
-        const target = record(body.target);
-        exactKeys(target, ["space", "workerName", "endpointName"]);
         const projection = await originReservations.prepare({
           organizationId,
           reservationId,
-          target: {
-            space: text(target.space),
-            workerName: text(target.workerName),
-            endpointName: text(target.endpointName),
-          },
+          requestedSubdomain: text(body.requestedSubdomain),
           ...(body.offeringId === undefined ? {} : { offeringId: text(body.offeringId) }),
           expiresInSeconds: integer(body.expiresInSeconds),
         });
@@ -991,83 +975,6 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       }
     }
 
-    const s3Credentials =
-      /^\/v1\/organizations\/([^/]+)\/resources\/([^/]+)\/s3-credentials$/u.exec(url.pathname);
-    if (request.method === "POST" && s3Credentials) {
-      const organizationId = segment(s3Credentials[1]);
-      const resourceUid = segment(s3Credentials[2]);
-      const body = await jsonObject(request);
-      exactKeys(body, ["access"], ["expiresInSeconds"]);
-      const access = enumValue(body.access, ["read-only", "read-write"]) as S3Access;
-      await scoped(
-        request,
-        organizationId,
-        access === "read-write" ? "resources:write" : "resources:read",
-      );
-      if (!s3) controlError("backend_unavailable", 503);
-
-      const resource = await inventory.resourceByUid(organizationId, resourceUid);
-      if (!resource) controlError("not_found", 404);
-      const installed = forms.find((form) =>
-        sameFormRef(form.identity.formRef, resource.resource.form.formRef),
-      );
-      const exposesObjects = installed?.providedInterfaces?.some(
-        (candidate) =>
-          candidate.apiVersion === TAKOFORM_EDGE_OBJECTS_INTERFACE.apiVersion &&
-          candidate.name === TAKOFORM_EDGE_OBJECTS_INTERFACE.name &&
-          candidate.version === TAKOFORM_EDGE_OBJECTS_INTERFACE.version &&
-          candidate.schemaDigest === TAKOFORM_EDGE_OBJECTS_INTERFACE.schemaDigest,
-      );
-      const deployment = await deployments.active(organizationId, resourceUid);
-      if (!installed || !exposesObjects || !deployment) {
-        controlError("unsupported_capability", 409);
-      }
-      const ready = resource.resource.status.conditions.some(
-        (condition) => condition.type === "Ready" && condition.status === "True",
-      );
-      if (!ready) controlError("resource_not_ready", 409);
-
-      const authority = {
-        organizationId,
-        resourceUid,
-        deploymentId: deployment.id,
-        offeringId: deployment.offeringId,
-        providerPackRef: deployment.providerPackRef,
-        providerInstallationRef: deployment.providerInstallationRef,
-        nativeId: deployment.nativeId,
-        access,
-      };
-      const limits = s3.limits(authority);
-      if (!limits) controlError("unsupported_capability", 409);
-      const ttlSeconds =
-        body.expiresInSeconds === undefined
-          ? limits.defaultSeconds
-          : integer(body.expiresInSeconds);
-      if (ttlSeconds < limits.minimumSeconds || ttlSeconds > limits.maximumSeconds) {
-        controlError("invalid_argument", 400);
-      }
-      const issue = { ...authority, ttlSeconds };
-      const connection = validateS3CredentialSet(await s3.issue(issue), issue, options.clock());
-      return Response.json(
-        {
-          kind: "takoserver.s3-connection@v1",
-          endpoint: connection.endpoint,
-          region: connection.region,
-          bucket: connection.bucket,
-          credentials: {
-            accessKeyId: connection.accessKeyId,
-            secretAccessKey: connection.secretAccessKey,
-            sessionToken: connection.sessionToken,
-            expiresAt: connection.expiresAt,
-          },
-        },
-        {
-          status: 201,
-          headers: { "cache-control": "private, no-store", pragma: "no-cache" },
-        },
-      );
-    }
-
     const operations = /^\/v1\/organizations\/([^/]+)\/operations$/u.exec(url.pathname);
     if (request.method === "GET" && operations) {
       const organizationId = segment(operations[1]);
@@ -1204,9 +1111,6 @@ function classify(error: unknown): { code: string; status: number } {
     };
   }
   if (error instanceof TokenError) return { code: error.code, status: 400 };
-  if (error instanceof S3CredentialError) {
-    return { code: error.code, status: error.code === "backend_unavailable" ? 503 : 502 };
-  }
   if (error instanceof AttachmentError) {
     const status =
       error.code === "resource_not_found"

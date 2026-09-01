@@ -73,4 +73,10 @@ export interface ProviderRuntimeInputRecoveryLease {
 export interface ProviderRuntimeInputLeasePort {
   acquire(input: ProviderRuntimeInputAcquireInput): Promise<ProviderRuntimeInputLease>;
   recover(input: ProviderRuntimeInputRecoveryInput): Promise<ProviderRuntimeInputRecoveryLease>;
+  /**
+   * Definitively revokes an exact claimed or dispatched handoff after the
+   * provider proves that no native object received it. Implementations must
+   * erase any still-sealed bytes and be idempotent for the same handoff.
+   */
+  abandon?(input: ProviderRuntimeInputRecoveryInput): Promise<void>;
 }

@@ -71,6 +71,41 @@ describe("strict paginated Cloudflare state", () => {
     }
   });
 
+  test("reads official Version module bytes only through include=modules", async () => {
+    const requests: Request[] = [];
+    const version = {
+      id: "11111111-1111-4111-8111-111111111111",
+      main_module: "worker.js",
+      modules: [
+        {
+          name: "worker.js",
+          content_type: "application/javascript+module",
+          content_base64: "ZXhwb3J0IGRlZmF1bHQge307Cg==",
+        },
+      ],
+    };
+    const state = new CloudflareState({
+      accountId: ACCOUNT,
+      token: "operator-token",
+      fetcher: async (request) => {
+        requests.push(request);
+        return Response.json({ success: true, errors: [], messages: [], result: version });
+      },
+    });
+
+    expect(
+      await state.workerVersionWithModules(
+        "takoserver-dispatch",
+        "11111111-1111-4111-8111-111111111111",
+      ),
+    ).toEqual(version);
+    const url = new URL(requests[0]?.url ?? "");
+    expect(url.pathname).toBe(
+      `/client/v4/accounts/${ACCOUNT}/workers/workers/takoserver-dispatch/versions/11111111-1111-4111-8111-111111111111`,
+    );
+    expect(url.search).toBe("?include=modules");
+  });
+
   test("reads the Worker secret inventory array without pagination", async () => {
     const requests: Request[] = [];
     const secrets = [

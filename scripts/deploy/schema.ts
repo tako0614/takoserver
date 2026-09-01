@@ -39,6 +39,8 @@ import { type DeployEnvironment, qualifySource, sealDirectory } from "./qualific
 import type { DeployTarget } from "./target.ts";
 
 const RECEIPT_KIND = "takoserver.d1-schema-rehearsal-receipt@v1";
+const PROVIDER_REPAIR_MIGRATION = "0036_provider_repair_and_managed_schedule_reconciliation.sql";
+const PROVIDER_EXECUTION_LEASE_MIGRATION = "0024_takoform_provider_execution_leases.sql";
 
 export type SchemaProcess = (
   command: readonly string[],
@@ -47,6 +49,8 @@ export type SchemaProcess = (
 
 export interface SchemaReader {
   read(phase: DeployPhase): Promise<D1SchemaState>;
+  /** Read-only 0036 preflight; required when that migration is the pending head. */
+  unmatchedProviderRepairSagaCount?(phase: DeployPhase): Promise<number>;
 }
 
 export interface SchemaInvocation {
@@ -116,6 +120,15 @@ export async function runD1Schema(
       options.reader,
     );
     const pending = pendingMigrations(sourceMigrations.names, initial.applied);
+    const providerRepairPreflight = await inspectProviderRepairPreflight({
+      phase: "preflight",
+      pending,
+      applied: initial.applied,
+      configPath: inspectionConfig,
+      environment,
+      run,
+      injected: options.reader,
+    });
     if (invocation.action === "status") {
       return {
         kind: "takoserver.d1-schema-status@v2",
@@ -127,7 +140,14 @@ export async function runD1Schema(
         appliedMigrations: initial.applied,
         pendingMigrations: pending,
         schemaShapeDigest: initial.shapeDigest,
+        providerRepairPreflight,
       };
+    }
+    if (providerRepairPreflight.status === "operator_reconciliation_required") {
+      throw preflightError(
+        "0036 requires provider-specific operator reconciliation before migration apply",
+        `unmatchedDispatchedSagaCount=${providerRepairPreflight.unmatchedDispatchedSagaCount}`,
+      );
     }
     if (pending.length === 0) {
       throw preflightError(
@@ -182,6 +202,21 @@ export async function runD1Schema(
     const requalifiedPending = pendingMigrations(sourceMigrations.names, requalified.applied);
     if (JSON.stringify(requalifiedPending) !== JSON.stringify(pending)) {
       throw preflightError("D1 pending migration suffix changed during qualification");
+    }
+    const requalifiedProviderRepair = await inspectProviderRepairPreflight({
+      phase: "preflight",
+      pending: requalifiedPending,
+      applied: requalified.applied,
+      configPath,
+      environment,
+      run,
+      injected: options.reader,
+    });
+    if (
+      JSON.stringify(requalifiedProviderRepair) !== JSON.stringify(providerRepairPreflight) ||
+      requalifiedProviderRepair.status === "operator_reconciliation_required"
+    ) {
+      throw preflightError("D1 provider repair preflight changed during qualification");
     }
 
     const receipt =
@@ -259,6 +294,7 @@ export async function runD1Schema(
       migrationDigest: sourceMigrations.digest,
       migrationBytes: sourceMigrations.bytes,
       pendingMigrations: pending,
+      providerRepairPreflight: requalifiedProviderRepair,
       preShapeDigest: requalified.shapeDigest,
       postShapeDigest: post.shapeDigest,
       appliedMigrations: post.applied,
@@ -273,6 +309,80 @@ export async function runD1Schema(
   } finally {
     if (temporary) rmSync(root, { recursive: true, force: true });
   }
+}
+
+interface ProviderRepairPreflight {
+  readonly status: "not_pending" | "ready" | "operator_reconciliation_required";
+  readonly unmatchedDispatchedSagaCount: number;
+}
+
+async function inspectProviderRepairPreflight(input: {
+  readonly phase: DeployPhase;
+  readonly pending: readonly string[];
+  readonly applied: readonly string[];
+  readonly configPath: string;
+  readonly environment: Readonly<Record<string, string>>;
+  readonly run: SchemaProcess;
+  readonly injected: SchemaReader | undefined;
+}): Promise<ProviderRepairPreflight> {
+  if (!input.pending.includes(PROVIDER_REPAIR_MIGRATION)) {
+    return { status: "not_pending", unmatchedDispatchedSagaCount: 0 };
+  }
+  // Before 0024 no row can carry execution_started_at, so no dispatched
+  // historical saga exists for 0036 to reconstruct.
+  if (!input.applied.includes(PROVIDER_EXECUTION_LEASE_MIGRATION)) {
+    return { status: "ready", unmatchedDispatchedSagaCount: 0 };
+  }
+  const count = input.injected
+    ? await input.injected.unmatchedProviderRepairSagaCount?.(input.phase)
+    : await readUnmatchedProviderRepairSagaCount(
+        new RemoteD1(input.configPath, { environment: input.environment, run: input.run }),
+        input.phase,
+      );
+  if (!Number.isSafeInteger(count) || Number(count) < 0) {
+    throw preflightError("D1 provider repair preflight is unavailable");
+  }
+  return {
+    status: count === 0 ? "ready" : "operator_reconciliation_required",
+    unmatchedDispatchedSagaCount: Number(count),
+  };
+}
+
+async function readUnmatchedProviderRepairSagaCount(
+  database: RemoteD1,
+  phase: DeployPhase,
+): Promise<number> {
+  const rows = await database.query(
+    phase,
+    "0036 unmatched provider repair preflight",
+    `SELECT COUNT(*) AS unmatched_count
+     FROM tf_provider_mutation_sagas AS saga
+     WHERE saga.phase = 'planned'
+       AND saga.receipt_json IS NULL
+       AND saga.execution_started_at IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1
+         FROM tf_deferred_operations AS operation
+         WHERE operation.id = saga.operation_id
+           AND operation.tenant_id = saga.tenant_id
+           AND operation.resource_uid = saga.resource_uid
+           AND operation.replay_key = saga.replay_key
+           AND operation.fingerprint = saga.fingerprint
+           AND operation.target_space = saga.target_space
+           AND operation.target_api_version = saga.target_api_version
+           AND operation.target_kind = saga.target_kind
+           AND operation.target_name = saga.target_name
+           AND operation.accepted_uid IS saga.accepted_uid
+           AND operation.accepted_generation IS saga.accepted_generation
+           AND operation.accepted_revision IS saga.accepted_revision
+           AND operation.phase = 'committing'
+           AND operation.terminal_json IS NULL
+       )`,
+  );
+  if (rows.length !== 1 || !Number.isSafeInteger(rows[0]?.unmatched_count)) {
+    throw preflightError("D1 provider repair preflight returned a malformed count");
+  }
+  return Number(rows[0]?.unmatched_count);
 }
 
 async function readState(

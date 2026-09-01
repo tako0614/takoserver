@@ -17,6 +17,7 @@ import type {
   FormAuthorityVerificationMode,
   VerifiedFormAuthorityEvidence,
 } from "./form-authority-verification.ts";
+import { assertPackageBundleEvidence, packageIdentityKey } from "./form-authority-verification.ts";
 import type { FormPackageInput, FormPackageStore } from "./form-packages.ts";
 import { takoformActivationAudience } from "./host-authority.ts";
 import type {
@@ -31,6 +32,18 @@ export interface FormAuthorityIdentity {
   readonly publicWorkerVersionId: string;
   readonly capabilityDigest: AdmissionDigest;
   readonly implementationDigest: AdmissionDigest;
+}
+
+/**
+ * One exact package identity in the publisher/import set.
+ *
+ * Package publication is deliberately independent from the implementation
+ * catalog.  A package can therefore be imported and retained by the Host
+ * before (or without) the Worker having code-owned support for that Form.
+ */
+export interface FormAuthorityPackageIdentity {
+  readonly formRef: TakoformImplementationCatalogEntry["formRef"];
+  readonly packageDigest: AdmissionDigest;
 }
 
 export interface FormAuthorityPlanRequest extends FormAuthorityIdentity {
@@ -193,7 +206,8 @@ interface AuthorityState {
   readonly publisher: AuthorityRow | null;
   readonly checkpoint: AuthorityRow | null;
   readonly forms: readonly {
-    readonly entry: TakoformImplementationCatalogEntry;
+    readonly entry: FormAuthorityPackageIdentity;
+    readonly implementationEntry: TakoformImplementationCatalogEntry | null;
     readonly install: AuthorityRow | null;
     readonly support: AuthorityRow | null;
     readonly activation: AuthorityRow | null;
@@ -217,6 +231,18 @@ interface PreparedHostAdmission {
 export function createHostAdmissionCoordinator(options: {
   readonly identity: FormAuthorityIdentity;
   readonly catalog: TakoformImplementationCatalog;
+  /**
+   * Exact publisher package identities to import.  When omitted, the
+   * implementation catalog remains the package set for compatibility with
+   * existing callers.
+   */
+  readonly packageSet?: readonly FormAuthorityPackageIdentity[];
+  /**
+   * Exact evidence every request must carry verbatim. Production binds this
+   * to the embedded publisher-set closure so a caller cannot substitute
+   * publisher, checkpoint, or bundle identities for the import.
+   */
+  readonly expectedEvidence?: FormAuthorityVerificationEvidence;
   readonly packages: FormAuthorityPackageSource;
   /** Exact R2 package closure shared with the admission store. */
   readonly storedPackages: Pick<FormPackageStore, "read">;
@@ -238,12 +264,28 @@ export function createHostAdmissionCoordinator(options: {
       "implementation catalog digests do not match the Worker identity",
     );
   }
-  const entries = [...options.catalog.entries].sort((left, right) =>
+  const implementationEntries = [...options.catalog.entries].sort((left, right) =>
     canonicalJson(left.formRef).localeCompare(canonicalJson(right.formRef)),
   );
+  const implementationByIdentity = new Map(
+    implementationEntries.map((entry) => [
+      packageIdentityKey(entry.formRef, entry.packageDigest),
+      entry,
+    ]),
+  );
+  const packageEntries = normalizePackageSet(options.packageSet ?? implementationEntries);
 
   const readState = async (request: FormAuthorityPlanRequest): Promise<AuthorityState> => {
     assertRequestIdentity(request, options.identity);
+    if (
+      options.expectedEvidence !== undefined &&
+      canonicalJson(request.evidence) !== canonicalJson(options.expectedEvidence)
+    ) {
+      throw new HostAdmissionCoordinatorError(
+        "invalid_request",
+        "request evidence differs from the exact publisher-set import bound to this Host",
+      );
+    }
     const desiredActive = request.activation.desiredActive;
     const [publishers, checkpoints, installs, supports, activations] = await Promise.all([
       history(options.admission, "publisher"),
@@ -266,7 +308,10 @@ export function createHostAdmissionCoordinator(options: {
     );
     const audience = spaceAudience(request.activation);
     const forms = await Promise.all(
-      entries.map(async (entry) => {
+      packageEntries.map(async (entry) => {
+        const implementationEntry =
+          implementationByIdentity.get(packageIdentityKey(entry.formRef, entry.packageDigest)) ??
+          null;
         const formRefKey = await canonicalDigest(entry.formRef);
         const supportKey = await canonicalDigest({
           formRefKey,
@@ -281,15 +326,21 @@ export function createHostAdmissionCoordinator(options: {
           installs.filter((row) => row.form_ref_key === formRefKey),
           "form_ref_key",
         );
-        const support = exactHead(
-          supports.filter((row) => row.support_key === supportKey),
-          "support_key",
-        );
-        const activation = exactHead(
-          activations.filter((row) => row.activation_key === activationKey),
-          "activation_key",
-        );
-        const activationHead = await activationFacts(activation, entry, audience);
+        const support = implementationEntry
+          ? exactHead(
+              supports.filter((row) => row.support_key === supportKey),
+              "support_key",
+            )
+          : null;
+        const activation = implementationEntry
+          ? exactHead(
+              activations.filter((row) => row.activation_key === activationKey),
+              "activation_key",
+            )
+          : null;
+        const activationHead = implementationEntry
+          ? await activationFacts(activation, implementationEntry, audience)
+          : emptyActivationHead();
         // Deactivation is deliberately independent of package/R2 availability:
         // the durable activation head is the only state it may change. The
         // install-chain identity is enough to report the retained boolean
@@ -302,6 +353,7 @@ export function createHostAdmissionCoordinator(options: {
           : installIdentityMatches(install, entry);
         return {
           entry,
+          implementationEntry,
           install,
           support,
           activation,
@@ -336,11 +388,15 @@ export function createHostAdmissionCoordinator(options: {
           eventDigest: form.packagePresent ? form.entry.packageDigest : null,
         },
         head("install", formKey, form.install),
-        head("support", `${formKey}\0${form.entry.packageDigest}`, form.support),
+        head(
+          "support",
+          `${formKey}\0${form.entry.packageDigest}`,
+          form.implementationEntry ? form.support : null,
+        ),
         head(
           "activation",
           `${formKey}\0${form.entry.packageDigest}\0${audience.value}`,
-          form.activation,
+          form.implementationEntry ? form.activation : null,
         ),
       );
     }
@@ -364,17 +420,22 @@ export function createHostAdmissionCoordinator(options: {
       activation: structuredClone(request.activation),
       currentHeads: structuredClone(state.heads),
       currentHeadDigest: state.headDigest,
-      forms: state.forms.map(({ entry, support, activationHead, installCurrent }) => {
-        const installed = installCurrent;
-        return {
-          formRef: structuredClone(entry.formRef),
-          packageDigest: entry.packageDigest,
-          operations: [...entry.operations],
-          installed,
-          supported: installed && supportMatches(support, entry, options.identity),
-          activationHead: structuredClone(activationHead),
-        };
-      }),
+      forms: state.forms.map(
+        ({ entry, implementationEntry, support, activationHead, installCurrent }) => {
+          const installed = installCurrent;
+          return {
+            formRef: structuredClone(entry.formRef),
+            packageDigest: entry.packageDigest,
+            operations: [...(implementationEntry?.operations ?? [])],
+            installed,
+            supported:
+              implementationEntry !== null &&
+              installed &&
+              supportMatches(support, implementationEntry, options.identity),
+            activationHead: structuredClone(activationHead),
+          };
+        },
+      ),
     };
   };
 
@@ -394,6 +455,7 @@ export function createHostAdmissionCoordinator(options: {
     }
     for (const {
       entry,
+      implementationEntry,
       install,
       support,
       activation,
@@ -428,19 +490,22 @@ export function createHostAdmissionCoordinator(options: {
           predecessorDigest: eventDigest(install) ?? ADMISSION_GENESIS_DIGEST,
         });
       }
-      if (!supportMatches(support, entry, options.identity)) {
+      if (implementationEntry && !supportMatches(support, implementationEntry, options.identity)) {
         descriptors.push({
           kind: "SetSupport",
-          formRef: structuredClone(entry.formRef),
+          formRef: structuredClone(implementationEntry.formRef),
           packageDigest: entry.packageDigest,
-          operations: [...entry.operations],
+          operations: [...implementationEntry.operations],
           predecessorDigest: eventDigest(support) ?? ADMISSION_GENESIS_DIGEST,
         });
       }
-      if (!activationMatches(activation, options.identity.implementationDigest)) {
+      if (
+        implementationEntry &&
+        !activationMatches(activation, options.identity.implementationDigest)
+      ) {
         descriptors.push({
           kind: "SetActivation",
-          formRef: structuredClone(entry.formRef),
+          formRef: structuredClone(implementationEntry.formRef),
           packageDigest: entry.packageDigest,
           audience,
           active: true,
@@ -453,11 +518,14 @@ export function createHostAdmissionCoordinator(options: {
     const unsigned = {
       kind: "takoserver.form-authority-plan@v2" as const,
       request: structuredClone(request),
-      packages: entries.map((entry) => ({
+      packages: packageEntries.map((entry) => ({
         formRef: structuredClone(entry.formRef),
         schemaDigest: entry.formRef.schemaDigest as AdmissionDigest,
         packageDigest: entry.packageDigest,
-        operations: [...entry.operations],
+        operations: [
+          ...(implementationByIdentity.get(packageIdentityKey(entry.formRef, entry.packageDigest))
+            ?.operations ?? []),
+        ],
       })),
       currentHeads: structuredClone(state.heads),
       currentHeadDigest: state.headDigest,
@@ -505,40 +573,53 @@ export function createHostAdmissionCoordinator(options: {
       { package: FormPackageInput; admission: PreparedHostAdmission }
     >();
     if (candidate.request.activation.desiredActive) {
-      for (const command of candidate.commands) {
-        if (command.kind === "AllowPublisher" || command.kind === "AppendCheckpoint") continue;
-        const key = canonicalJson(command.formRef);
-        if (prepared.has(key)) continue;
-        const pkg = await options.packages.load({
-          formRef: command.formRef,
-          packageDigest: command.packageDigest,
-        });
-        if (pkg.packageDigest !== command.packageDigest || canonicalJson(pkg.formRef) !== key) {
-          throw new HostAdmissionCoordinatorError("package_unavailable");
+      // A set-level verifier must see one closed package corpus. Loading only
+      // the commands that happen to be pending would let a partial apply
+      // silently omit evidence for an otherwise installed package, and would
+      // make duplicate/missing/extra package evidence depend on retry order.
+      if (candidate.commands.length > 0) {
+        const loaded = new Map<string, FormPackageInput>();
+        for (const entry of packageEntries) {
+          const key = packageIdentityKey(entry.formRef, entry.packageDigest);
+          const pkg = await options.packages.load({
+            formRef: entry.formRef,
+            packageDigest: entry.packageDigest,
+          });
+          if (
+            pkg.packageDigest !== entry.packageDigest ||
+            canonicalJson(pkg.formRef) !== canonicalJson(entry.formRef)
+          ) {
+            throw new HostAdmissionCoordinatorError("package_unavailable");
+          }
+          loaded.set(key, pkg);
         }
-        const verified = await options.verifier.verify({
+        assertPackageBundleEvidence(candidate.request.evidence, [...loaded.values()]);
+        const verified = await options.verifier.verifySet({
           environment: candidate.request.environment,
           hostId: candidate.request.hostId,
-          package: pkg,
+          packages: [...loaded.values()],
           evidence: candidate.request.evidence,
         });
-        const packageCommand = candidate.commands.find(
-          (value) =>
-            (value.kind === "InstallPackage" || value.kind === "ReplacePackage") &&
-            canonicalJson(value.formRef) === key,
-        );
-        prepared.set(key, {
-          package: pkg,
-          admission: prepareHostAdmission({
-            environment: candidate.request.environment,
-            operation: packageCommand?.kind === "InstallPackage" ? "install" : "replace",
+        assertPackageBundleEvidence(verified.evidence, [...loaded.values()]);
+        for (const [key, pkg] of loaded) {
+          const packageCommand = candidate.commands.find(
+            (value) =>
+              (value.kind === "InstallPackage" || value.kind === "ReplacePackage") &&
+              packageIdentityKey(value.formRef, value.packageDigest) === key,
+          );
+          prepared.set(key, {
             package: pkg,
-            requestedEvidence: candidate.request.evidence,
-            verified,
-            handles: options.handles,
-            verifierReleased: options.verifier.readiness.released,
-          }),
-        });
+            admission: prepareHostAdmission({
+              environment: candidate.request.environment,
+              operation: packageCommand?.kind === "InstallPackage" ? "install" : "replace",
+              package: pkg,
+              requestedEvidence: candidate.request.evidence,
+              verified,
+              handles: options.handles,
+              verifierReleased: options.verifier.readiness.released,
+            }),
+          });
+        }
       }
     }
 
@@ -684,7 +765,7 @@ function executableCommand(
       if (!publisherEventDigest || !checkpointEventDigest) {
         throw new HostAdmissionCoordinatorError("authority_state_conflict");
       }
-      const value = prepared.get(canonicalJson(command.formRef));
+      const value = prepared.get(packageIdentityKey(command.formRef, command.packageDigest));
       if (!value) throw new HostAdmissionCoordinatorError("package_unavailable");
       return {
         command: {
@@ -802,7 +883,11 @@ function prepareHostAdmission(input: {
     },
     signature: {
       subjectDigest: input.package.packageDigest,
-      bundleDigest: evidence.bundleDigest,
+      bundleDigest: packageBundleDigest(
+        evidence,
+        input.package.formRef,
+        input.package.packageDigest,
+      ),
       trustedRootDigest: evidence.publisher.trustedRootDigest,
     },
     revocation: {
@@ -909,7 +994,7 @@ function exactHead(rows: readonly AuthorityRow[], key: string): AuthorityRow | n
 
 async function activationFacts(
   row: AuthorityRow | null,
-  entry: TakoformImplementationCatalogEntry,
+  entry: FormAuthorityPackageIdentity,
   audience: { readonly kind: "space"; readonly value: string },
 ): Promise<FormAuthorityActivationHead> {
   if (row === null) {
@@ -982,7 +1067,7 @@ async function activationFacts(
 
 function installIdentityMatches(
   row: AuthorityRow | null,
-  entry: TakoformImplementationCatalogEntry,
+  entry: FormAuthorityPackageIdentity,
 ): boolean {
   return (
     (row?.event_type === "install" || row?.event_type === "replace") &&
@@ -1000,6 +1085,57 @@ function spaceAudience(activation: FormAuthorityPlanRequest["activation"]): {
     throw new HostAdmissionCoordinatorError("invalid_request", "space activation is required");
   }
   return { kind: "space", value: audience.value };
+}
+
+function normalizePackageSet(
+  values: readonly FormAuthorityPackageIdentity[],
+): readonly FormAuthorityPackageIdentity[] {
+  if (!Array.isArray(values)) {
+    throw new HostAdmissionCoordinatorError(
+      "invalid_request",
+      "Form authority package set must be an array",
+    );
+  }
+  const seenFormRefs = new Set<string>();
+  const normalized = values.map((value) => {
+    if (
+      !value ||
+      typeof value !== "object" ||
+      !value.formRef ||
+      typeof value.formRef !== "object" ||
+      !isSha256Digest(value.packageDigest)
+    ) {
+      throw new HostAdmissionCoordinatorError(
+        "invalid_request",
+        "Form authority package set contains an invalid identity",
+      );
+    }
+    const formRefKey = canonicalJson(value.formRef);
+    if (seenFormRefs.has(formRefKey)) {
+      throw new HostAdmissionCoordinatorError(
+        "invalid_request",
+        "Form authority package set contains a duplicate FormRef",
+      );
+    }
+    seenFormRefs.add(formRefKey);
+    return {
+      formRef: structuredClone(value.formRef),
+      packageDigest: value.packageDigest,
+    };
+  });
+  normalized.sort((left, right) =>
+    canonicalJson(left.formRef).localeCompare(canonicalJson(right.formRef)),
+  );
+  return normalized;
+}
+
+function emptyActivationHead(): FormAuthorityActivationHead {
+  return {
+    present: false,
+    active: false,
+    implementationDigest: null,
+    eventDigest: null,
+  };
 }
 
 function head(
@@ -1024,7 +1160,7 @@ function eventDigest(row: AuthorityRow | null): AdmissionDigest | null {
 
 async function installMatches(
   row: AuthorityRow | null,
-  entry: TakoformImplementationCatalogEntry,
+  entry: FormAuthorityPackageIdentity,
   evidence: FormAuthorityVerificationEvidence,
   implementationDigest: AdmissionDigest,
 ): Promise<boolean> {
@@ -1045,7 +1181,7 @@ async function installMatches(
  */
 async function installEvidenceMatches(
   row: AuthorityRow,
-  entry: TakoformImplementationCatalogEntry,
+  entry: FormAuthorityPackageIdentity,
   evidence: FormAuthorityVerificationEvidence,
 ): Promise<boolean> {
   if (
@@ -1095,7 +1231,7 @@ async function installEvidenceMatches(
     canonicalJson(packageReport.formRef) === canonicalJson(entry.formRef) &&
     isRecord(signature) &&
     signature.subjectDigest === entry.packageDigest &&
-    signature.bundleDigest === evidence.bundleDigest &&
+    signature.bundleDigest === packageBundleDigest(evidence, entry.formRef, entry.packageDigest) &&
     signature.trustedRootDigest === evidence.publisher.trustedRootDigest &&
     isRecord(revocation) &&
     revocation.checkpointApiVersion === evidence.checkpoint.apiVersion &&
@@ -1104,6 +1240,27 @@ async function installEvidenceMatches(
     revocation.entriesDigest === evidence.checkpoint.entriesDigest &&
     revocation.revoked !== true
   );
+}
+
+function packageBundleDigest(
+  evidence: FormAuthorityVerificationEvidence,
+  formRef: FormAuthorityPackageIdentity["formRef"],
+  packageDigest: AdmissionDigest,
+): AdmissionDigest {
+  const matches = (
+    Array.isArray(evidence.packageBundleDigests) ? evidence.packageBundleDigests : []
+  ).filter(
+    (entry) =>
+      entry.packageDigest === packageDigest &&
+      (entry.formRef === undefined || canonicalJson(entry.formRef) === canonicalJson(formRef)),
+  );
+  if (matches.length !== 1 || !isSha256Digest(matches[0]?.bundleDigest)) {
+    throw new HostAdmissionCoordinatorError(
+      "invalid_request",
+      "verified package bundle identity is absent or ambiguous",
+    );
+  }
+  return matches[0].bundleDigest;
 }
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {

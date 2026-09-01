@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { buildEdgeForms, objectBucketProviderOffering } from "../src/edge-forms.ts";
+import { objectBucketProviderOffering } from "../src/edge-forms.ts";
 import { createWasabiProvider } from "../src/providers/wasabi.ts";
+import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
 
 async function fixture(statuses: readonly number[] = [200, 200, 204]) {
-  const edge = await buildEdgeForms();
-  const offering = objectBucketProviderOffering(edge.objectBucket.form, {
+  const offering = objectBucketProviderOffering(currentObjectBucket(), {
     id: "storage.object.wasabi.eu-central-1",
     displayName: "Object bucket in Wasabi EU Central",
     regions: ["eu-central-1"],
@@ -142,8 +142,7 @@ describe("Wasabi ObjectBucket provisioner", () => {
   });
 
   test("keeps upstream error bodies behind the provider boundary", async () => {
-    const edge = await buildEdgeForms();
-    const offering = objectBucketProviderOffering(edge.objectBucket.form, {
+    const offering = objectBucketProviderOffering(currentObjectBucket(), {
       id: "storage.object.wasabi.eu-central-1",
       displayName: "Object bucket",
       regions: ["eu-central-1"],
@@ -170,3 +169,11 @@ describe("Wasabi ObjectBucket provisioner", () => {
     expect(JSON.stringify(result)).not.toContain("PRIVATE-UPSTREAM-DETAIL");
   });
 });
+
+function currentObjectBucket() {
+  const form = currentTakoformCandidates().forms.find(
+    (candidate) => candidate.identity.formRef.kind === "ObjectBucket",
+  );
+  if (!form) throw new Error("current ObjectBucket fixture missing");
+  return form;
+}

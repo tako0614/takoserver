@@ -9,32 +9,32 @@ import { FakeProvider } from "../src/providers/fake.ts";
 import { createResourceDeploymentStore } from "../src/resource-deployments.ts";
 
 const FORM = {
-  apiVersion: "edge.forms.takoform.com/v1beta1",
-  kind: "ObjectBucket",
-  definitionVersion: "0.1.0",
+  apiVersion: "example.forms.test",
+  kind: "ExampleWorkload",
+  definitionVersion: "1.0.0",
   schemaDigest: `sha256:${"a".repeat(64)}`,
 } as const;
 
 const OFFERING: Offering = {
-  id: "storage.object.test",
+  id: "compute.edge.test",
   providerPackRef: "test-provider",
   providerInstallationRef: "test-provider.production",
   supplyContractRef: "test-provider.contract",
-  pricePlanRef: "storage.object.test.price-v1",
-  resourceClass: "storage.object",
-  deliveryMode: "native-credentials",
+  pricePlanRef: "compute.edge.test.price-v1",
+  resourceClass: "compute.edge",
+  deliveryMode: "embedded-binding",
   supportPolicyRef: "support:test",
   abusePolicyRef: "abuse:test",
-  kind: "object_bucket",
-  displayName: "Object storage",
+  kind: "worker",
+  displayName: "Edge compute",
   form: FORM,
   pricePlan: {
-    id: "storage.object.test.price-v1",
+    id: "compute.edge.test.price-v1",
     currency: "USD",
     provisioning: { meter: "resource.create", amountMinor: 0 },
     meters: [
-      { meter: "storage.gib-hour", amountMinor: 10 },
-      { meter: "requests.million", amountMinor: 2 },
+      { meter: "compute.millisecond", amountMinor: 10 },
+      { meter: "compute.requests", amountMinor: 2 },
     ],
   },
   providedInterfaces: [],
@@ -42,9 +42,9 @@ const OFFERING: Offering = {
   regions: ["test"],
   portability: {
     api: "portable",
-    exportFormats: ["s3.object-set.takoform.com/v1"],
-    importFormats: ["s3.object-set.takoform.com/v1"],
-    migrationModes: ["offline"],
+    exportFormats: [],
+    importFormats: [],
+    migrationModes: [],
   },
   isolation: "dedicated-resource",
   available: true,
@@ -58,32 +58,32 @@ describe("provider usage reconciliation", () => {
     const deployments = createResourceDeploymentStore(sql, clock);
     await deployments.create({
       tenantId: "org_1",
-      id: "dep_bucket",
-      resourceUid: "uid_bucket",
+      id: "dep_workload",
+      resourceUid: "uid_workload",
       offeringId: OFFERING.id,
       providerPackRef: "test-provider",
       providerInstallationRef: "test-provider.production",
-      nativeId: "test:bucket",
+      nativeId: "worker:test",
       state: "active",
       observed: {},
       outputs: {},
     });
     await sql.run(
       "UPDATE tf_resource_deployments SET created_at = ?, updated_at = ? WHERE id = ?",
-      [now.getTime() - 7_200_000, now.getTime() - 7_200_000, "dep_bucket"],
+      [now.getTime() - 7_200_000, now.getTime() - 7_200_000, "dep_workload"],
     );
     let reads = 0;
     let unrelatedReads = 0;
     const source: MeterSource = {
       id: "test-meter",
-      meters: ["storage.gib-hour", "requests.million"],
+      meters: ["compute.millisecond", "compute.requests"],
       settlementDelaySeconds: 0,
       maximumWindowSeconds: 3_600,
       read: async () => {
         reads += 1;
         return [
-          { meter: "storage.gib-hour", quantity: 2 },
-          { meter: "requests.million", quantity: 3 },
+          { meter: "compute.millisecond", quantity: 2 },
+          { meter: "compute.requests", quantity: 3 },
         ];
       },
     };
@@ -127,8 +127,8 @@ describe("provider usage reconciliation", () => {
     expect(reads).toBe(1);
     expect(unrelatedReads).toBe(0);
     expect(await sql.query("SELECT meter, quantity FROM usage_events ORDER BY meter")).toEqual([
-      { meter: "requests.million", quantity: 3 },
-      { meter: "storage.gib-hour", quantity: 2 },
+      { meter: "compute.millisecond", quantity: 2 },
+      { meter: "compute.requests", quantity: 3 },
     ]);
     expect(await metering.rollUp(100)).toBe(2);
     expect((await ledger.wallet("org_1")).availableMinor).toBe(974);
@@ -160,7 +160,7 @@ describe("provider usage reconciliation", () => {
     ]);
     const source: MeterSource = {
       id: "test-meter",
-      meters: ["storage.gib-hour", "requests.million"],
+      meters: ["compute.millisecond", "compute.requests"],
       settlementDelaySeconds: 0,
       maximumWindowSeconds: 3_600,
       read: async () => {

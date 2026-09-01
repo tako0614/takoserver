@@ -6,6 +6,7 @@ import {
   type IntegrationFormAuthorityRawWorkerEnv,
   invokeAuthenticatedIntegrationFormAuthorityFromWorkerEnv,
 } from "../src/form-authority-worker-composition.ts";
+import { INTEGRATION_FORM_PACKAGES } from "../src/generated/takoform-integration-form-packages.ts";
 import { canonicalDigest, canonicalJson } from "../src/json.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { signOperatorAssertion } from "../src/operator-key.ts";
@@ -29,6 +30,7 @@ import {
   yurucommuLifecycleCapabilityManifest,
 } from "../src/takoform/implementation-catalog.ts";
 import { createIntegrationFormAuthorityComposition } from "../src/takoform/integration-operator-endpoint.ts";
+import { loadPublisherSetClosure } from "../src/takoform/publisher-set-closure.ts";
 
 const digest = (hex: string) => `sha256:${hex.repeat(64)}` as const;
 const PUBLIC_VERSION_ID = "00000000-0000-4000-8000-000000000001";
@@ -82,7 +84,11 @@ function trustEvidence(): FormAuthorityVerificationEvidence {
       previousDigest: null,
       revokedPackageDigests: [],
     },
-    bundleDigest: digest("4"),
+    packageBundleDigests: INTEGRATION_FORM_PACKAGES.map((pkg, index) => ({
+      formRef: structuredClone(pkg.formRef),
+      packageDigest: pkg.packageDigest,
+      bundleDigest: digest((index + 4).toString(16)),
+    })),
   };
 }
 
@@ -437,9 +443,12 @@ describe("integration Form authority bridge", () => {
   test("installs and Space-activates only the exact 12 Yurucommu Forms", async () => {
     const fixture = await integrationFixture();
     const plan = await fixture.endpoint.plan(fixture.request);
-    expect(plan.packages.map(({ formRef }) => [formRef.kind, formRef.definitionVersion])).toEqual(
-      Object.entries(YURUCOMMU_FORM_VERSIONS),
-    );
+    expect(plan.packages).toHaveLength(12);
+    expect(
+      Object.fromEntries(
+        plan.packages.map(({ formRef }) => [formRef.kind, formRef.definitionVersion]),
+      ),
+    ).toEqual(YURUCOMMU_FORM_VERSIONS);
     expect(plan.commands).toHaveLength(2 + 12 * 3);
     expect(
       plan.commands
@@ -472,6 +481,19 @@ describe("integration Form authority bridge", () => {
           receipt.productionEligible === false,
       ),
     ).toBe(true);
+    const installReports = await fixture.sql.query(
+      "SELECT admission_report_json FROM tf_form_install_events ORDER BY event_at, id",
+    );
+    const bundleDigests = new Set(
+      installReports.map((row) => {
+        const report = JSON.parse(String(row.admission_report_json)) as {
+          readonly signature?: { readonly bundleDigest?: string };
+        };
+        return report.signature?.bundleDigest;
+      }),
+    );
+    expect(installReports).toHaveLength(12);
+    expect(bundleDigests.size).toBe(12);
     expect(applied.nextPlan.commands).toEqual([]);
   });
 
@@ -931,15 +953,19 @@ test("production composition plans exact Forms but apply remains adapter-fail-cl
       space: "space-yurucommu",
       desiredActive: true,
     },
-    evidence: trustEvidence(),
+    evidence: (await loadPublisherSetClosure()).evidence,
     actor: "production-operator",
     reason: "prove the released-adapter refusal",
   };
   const plan = await composition.endpoint.plan(request);
-  expect(plan.packages).toHaveLength(12);
+  expect(plan.packages).toHaveLength(17);
+  expect(plan.packages.some((entry) => entry.formRef.kind === "ObjectBucket")).toBe(true);
   await expect(composition.endpoint.apply(plan)).rejects.toMatchObject({
     code: "production_not_ready",
   });
+  await expect(
+    composition.endpoint.plan({ ...request, evidence: trustEvidence() }),
+  ).rejects.toMatchObject({ code: "invalid_request" });
   expect(await sql.query("SELECT * FROM tf_form_publisher_events")).toEqual([]);
   expect((await objects.list({ prefix: "formpkg/", limit: 1_000 })).objects).toEqual([]);
 });

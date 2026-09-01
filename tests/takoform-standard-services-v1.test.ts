@@ -53,7 +53,7 @@ const form: InstalledTakoformForm = {
 };
 
 describe("stable StandardServiceRef", () => {
-  test("accepts unknown grammar-valid identifiers but support and required resolution fail closed", async () => {
+  test("does not publish service-retail discovery and required resolution fails closed", async () => {
     let mutations = 0;
     const host = stableHost({
       async apply() {
@@ -66,19 +66,10 @@ describe("stable StandardServiceRef", () => {
       async delete() {},
     });
 
-    const support = await host.handle(
-      request(`${lane}/support/standard-services/com.example.future-store`),
-    );
-    expect(support?.status).toBe(200);
-    expect(await support?.json()).toEqual({
-      apiVersion: "support.takoform.com/v1",
-      kind: "StandardServiceSupport",
-      serviceRef: {
-        apiVersion: serviceApiVersion,
-        protocol: "com.example.future-store",
-      },
-      satisfiable: false,
-    });
+    expect(
+      (await host.handle(request(`${lane}/support/standard-services/com.example.future-store`)))
+        ?.status,
+    ).toBe(404);
 
     const refused = await host.handle(
       request(`${lane}/resources/prepare`, {
@@ -109,7 +100,7 @@ describe("stable StandardServiceRef", () => {
     const refused = await host.handle(
       request(`${lane}/resources/prepare`, {
         method: "POST",
-        body: JSON.stringify(resource("com.amazonaws.s3")),
+        body: JSON.stringify(resource("com.example.archive")),
       }),
     );
     expect(refused?.status).toBe(422);
@@ -130,7 +121,7 @@ describe("stable StandardServiceRef", () => {
       async delete() {},
     });
 
-    const desired = resource("com.amazonaws.s3", undefined, [
+    const desired = resource("com.example.archive", undefined, [
       {
         name: "FUTURE_STORE",
         required: false,
@@ -156,7 +147,7 @@ describe("stable StandardServiceRef", () => {
         {
           name: "ARCHIVE",
           required: true,
-          service: { apiVersion: serviceApiVersion, protocol: "com.amazonaws.s3" },
+          service: { apiVersion: serviceApiVersion, protocol: "com.example.archive" },
           endpoint: { endpoint: "sealed-endpoint:main" },
           credential: { token: "sealed-credential" },
         },
@@ -183,7 +174,7 @@ describe("stable StandardServiceRef", () => {
       { formRef: { apiVersion: "edge.forms.takoform.com", kind: "ObjectBucket" } },
       { resource: { name: "bucket" } },
     ]) {
-      const candidate = resource("com.amazonaws.s3");
+      const candidate = resource("com.example.archive");
       Object.assign(candidate.spec.externalServices[0] as object, extra);
       const response = await host.handle(
         request(`${lane}/resources/validate`, {
@@ -214,14 +205,14 @@ function stableHost(driver: TakoformResourceDriver, withResolver = true) {
               return (
                 tenantId === "tenant-a" &&
                 (space === undefined || space === "main") &&
-                serviceRef.protocol === "com.amazonaws.s3"
+                serviceRef.protocol === "com.example.archive"
               );
             },
             async resolve({ tenantId, space, slot }) {
               if (
                 tenantId !== "tenant-a" ||
                 space !== "main" ||
-                slot.service.protocol !== "com.amazonaws.s3"
+                slot.service.protocol !== "com.example.archive"
               ) {
                 return null;
               }

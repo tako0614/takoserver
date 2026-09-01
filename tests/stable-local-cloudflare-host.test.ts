@@ -227,7 +227,7 @@ export { index_default as default };`,
           {
             name: "worker.js",
             mediaType: "application/javascript+module",
-            bytes: `const assertRuntimeBindings = async (env, mediaKey) => {
+            bytes: `const assertRuntimeBindings = async (env) => {
   const table = await env.DB.prepare(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'native_handler_probe'",
   ).first();
@@ -236,20 +236,6 @@ export { index_default as default };`,
   if (typeof env.DELIVERY_QUEUE?.send !== "function") {
     throw new Error("queue binding unavailable");
   }
-  if (
-    typeof env.MEDIA?.put !== "function" ||
-    typeof env.MEDIA?.get !== "function" ||
-    typeof env.MEDIA?.delete !== "function"
-  ) {
-    throw new Error("MEDIA binding unavailable");
-  }
-  await env.MEDIA.put(mediaKey, "ready");
-  const mediaObject = await env.MEDIA.get(mediaKey);
-  if (!mediaObject || (await mediaObject.text()) !== "ready") {
-    throw new Error("MEDIA read unavailable");
-  }
-  await env.MEDIA.delete(mediaKey);
-  if ((await env.MEDIA.get(mediaKey)) !== null) throw new Error("MEDIA delete unavailable");
 };
 
 export default {
@@ -266,11 +252,11 @@ export default {
     });
   },
   async queue(_batch, env) {
-    await assertRuntimeBindings(env, "queue-media");
+    await assertRuntimeBindings(env);
     await env.KV.put("queue-handler", "ready");
   },
   async scheduled(_controller, env) {
-    await assertRuntimeBindings(env, "scheduled-media");
+    await assertRuntimeBindings(env);
     await env.KV.put("scheduled-handler", "ready");
   },
 };`,
@@ -322,15 +308,6 @@ export default {
       await applyResource(host.endpoint, forms, "WorkerVersion", version, {
         worker: reference("ModuleWorker", worker),
         bundle: reference("WorkerBundle", bundle),
-        externalServices: [
-          {
-            name: "MEDIA",
-            service: {
-              apiVersion: "standards.takoform.com/v1",
-              protocol: "com.amazonaws.s3",
-            },
-          },
-        ],
         handlers: ["fetch", "queue", "scheduled"],
         requiredSensitiveVars: [],
         kvBindings: [{ name: "KV", resource: reference("EdgeKVNamespace", kv) }],

@@ -73,6 +73,9 @@ const PROVIDER_OFFERING: ProviderOffering = {
   capabilities: ["create", "update", "delete", "observe"],
 };
 
+const FORBIDDEN_OBJECT_BUCKET_STATE =
+  /"(?:endpoint|region|bucket|bucketName|accessKey|accessKeyId|secretAccessKey|providerSupply)"\s*:/u;
+
 const identity: ExternalIdentityVerifier = {
   async verify() {
     return { providerSubject: "subject", email: "owner@example.com", displayName: "Owner" };
@@ -240,6 +243,29 @@ describe("prepaid vertical over HTTP", () => {
       definitionVersion: OFFERING.form.definitionVersion,
       schemaDigest: OFFERING.form.schemaDigest,
     });
+    const discovered = await call(
+      fetch,
+      "GET",
+      `/apis/forms.takoform.com/v1/forms?${new URLSearchParams({
+        ...Object.fromEntries(query),
+        group: OFFERING.form.apiVersion,
+        kind: OFFERING.form.kind,
+      })}`,
+      undefined,
+      bearer,
+    );
+    const definition = await call(
+      fetch,
+      "GET",
+      `/apis/forms.takoform.com/v1/form-definitions/edge.forms.takoform.com/ObjectBucket?${query}`,
+      undefined,
+      bearer,
+    );
+    expect(discovered.status).toBe(200);
+    expect(definition.status).toBe(200);
+    expect(
+      JSON.stringify({ discovered: discovered.body, definition: definition.body }),
+    ).not.toMatch(FORBIDDEN_OBJECT_BUCKET_STATE);
     const mutationPath =
       "/apis/forms.takoform.com/v1/resources/edge.forms.takoform.com/ObjectBucket/media";
     const resourcePath = `${mutationPath}?${query}`;
@@ -251,6 +277,7 @@ describe("prepaid vertical over HTTP", () => {
       { ...bearer, "idempotency-key": "run-http-apply", "if-none-match": "*" },
     );
     expect(applied.status).toBe(201);
+    expect(JSON.stringify(applied.body)).not.toMatch(FORBIDDEN_OBJECT_BUCKET_STATE);
     const generation = String((applied.body.metadata as { generation: string }).generation);
     const resourceUid = String((applied.body.metadata as { uid: string }).uid);
 

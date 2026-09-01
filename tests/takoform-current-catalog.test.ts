@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { buildEdgeForms } from "../src/edge-forms.ts";
+import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
 import { currentTakoformCatalog } from "../src/takoform/current-catalog.ts";
 import type { InstalledTakoformForm } from "../src/takoform/types.ts";
 
@@ -44,41 +45,44 @@ describe("current stable Takoform catalog", () => {
     expect(current.bindings).toEqual([accepted]);
   });
 
-  test("fails closed on ObjectBucket or edge.objects in a stable-v1 catalog", () => {
-    expect(() =>
-      currentTakoformCatalog({
-        forms: [
-          stableForm({
-            identity: {
-              formRef: {
-                apiVersion: "edge.forms.takoform.com",
-                kind: "ObjectBucket",
-                definitionVersion: "1.0.0",
-                schemaDigest: `sha256:${"2".repeat(64)}`,
-              },
-            },
-          }),
-        ],
-        bindings: [],
-      }),
-    ).toThrow("current_takoform_object_bucket_forbidden");
+  test("admits the owning current ObjectBucket and its exact edge.objects Binding", () => {
+    const source = currentTakoformCandidates();
+    const current = currentTakoformCatalog(source);
+    const bucket = current.forms.find((form) => form.identity.formRef.kind === "ObjectBucket");
+    const binding = current.bindings.find(
+      (candidate) => candidate.bindingRef.name === "module-worker.object-bucket",
+    );
 
-    expect(() =>
-      currentTakoformCatalog({
-        forms: [
-          stableForm({
-            providedInterfaces: [
-              {
-                apiVersion: "interfaces.takoform.com/v1alpha1",
-                name: "edge.objects",
-                version: "1.0.0",
-                schemaDigest: `sha256:${"3".repeat(64)}`,
-              },
-            ],
-          }),
-        ],
-        bindings: [],
-      }),
-    ).toThrow("current_takoform_edge_objects_forbidden");
+    expect(bucket?.identity).toEqual({
+      formRef: {
+        apiVersion: "edge.forms.takoform.com",
+        kind: "ObjectBucket",
+        definitionVersion: "0.1.0",
+        schemaDigest: "sha256:154e2dcf100b1278f3badb7f7f2f25bba8c6bcf387c75fb6b9abc5ede1cbd557",
+      },
+      packageDigest: "sha256:46cd435d838d89de641d38180680e99c8bc7be1a3ae9c123494440d3e6e202ec",
+    });
+    expect(binding?.bindingRef).toEqual({
+      apiVersion: "bindings.takoform.com/v1alpha2",
+      name: "module-worker.object-bucket",
+      version: "1.1.0",
+      schemaDigest: "sha256:ff8661459b73a8d229e0915c698afad2aa297b5db90fe5e1693d346a7ae3adfb",
+    });
+
+    const workerVersion = current.forms.find(
+      (form) => form.identity.formRef.kind === "WorkerVersion",
+    );
+    const publicState = JSON.stringify(
+      [bucket, workerVersion].map((form) => ({
+        desiredSchema: form?.desiredSchema,
+        observedSchema: form?.observedSchema,
+        outputSchema: form?.outputSchema,
+      })),
+    );
+    expect(publicState).not.toMatch(
+      /"(?:endpoint|region|bucket|bucketName|accessKey|accessKeyId|secretAccessKey|sessionToken|providerSupply)"\s*:/u,
+    );
+    expect(bucket?.observedSchema).toBeUndefined();
+    expect(bucket?.outputSchema).toBeUndefined();
   });
 });

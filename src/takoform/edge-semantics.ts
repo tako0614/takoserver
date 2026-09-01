@@ -2,7 +2,7 @@ import type { JsonObject } from "../ports.ts";
 import { isEdgeFormsApiVersion } from "./edge-family.ts";
 import type { InstalledTakoformForm, TakoformDiagnostic } from "./types.ts";
 
-/** Semantic rules that a JSON Schema cannot express for the official Edge Forms. */
+/** Semantic rules that a JSON Schema cannot express for these mapped Edge Forms. */
 export function validateEdgeSemantics(
   form: InstalledTakoformForm,
   spec: JsonObject,

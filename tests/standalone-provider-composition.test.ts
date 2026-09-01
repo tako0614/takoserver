@@ -109,9 +109,10 @@ describe("the standalone Bun provider composition", () => {
     const composition = await compose(mode);
     expect(composition.mode).toBe(RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN);
     expect(composition.offerings).toEqual([]);
+    expect(composition.providers.flatMap((provider) => provider.offerings)).toEqual([]);
     expect(
       composition.providers
-        .flatMap((provider) => provider.offerings)
+        .flatMap((provider) => provider.recoveryOfferings ?? [])
         .map((offering) => ({
           apiVersion: offering.form.apiVersion,
           kind: offering.form.kind,
@@ -141,7 +142,7 @@ describe("the standalone Bun provider composition", () => {
         result: request.method === "GET" ? { name: "retired-bucket" } : {},
       });
     });
-    const offering = composition.providers[0]?.offerings[0];
+    const offering = composition.providers[0]?.recoveryOfferings?.[0];
     if (!offering) throw new Error("expected the retired ObjectBucket offering");
     const credential = "retired-drain-endpoint-credential";
     const endpoint = createProvisionerEndpoint({

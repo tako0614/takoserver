@@ -12,6 +12,7 @@ import {
 import {
   applyRequest,
   exactQuery,
+  failure,
   idempotencyKey,
   importRequest,
   jsonBody,
@@ -20,6 +21,7 @@ import {
   type ResourcePath,
   requestBodyDigest,
   requiredQuery,
+  resourceResponse,
   samePathResource,
 } from "./wire.ts";
 
@@ -36,6 +38,12 @@ export interface DeferredOperationsConfiguration {
   readonly pollsBeforeCommit?: number;
   readonly retryAfterSeconds?: number;
   readonly leaseMilliseconds?: number;
+  /**
+   * Execute the durable command under its lease before answering the mutation.
+   * A terminal result retains the ordinary resource wire response; a provider
+   * repair remains durable and is resumed by maintenance after process loss.
+   */
+  readonly executeOnAccept?: boolean;
 }
 
 export interface DeferredOperations {
@@ -45,6 +53,12 @@ export interface DeferredOperations {
     operation: "apply" | "import" | "delete",
   ): Promise<Response | null>;
   handle(context: EngineContext, id: string, cancel: boolean): Promise<Response | null>;
+  drainProviderRepairs(limit?: number): Promise<{
+    readonly candidates: number;
+    readonly acquired: number;
+    readonly settled: number;
+    readonly pending: number;
+  }>;
 }
 
 /**
@@ -103,6 +117,7 @@ export function createDeferredOperations(input: {
         input.resourceQueryIncludesPathIdentity,
       );
       if (
+        !context.workerEndpointOriginReservationId &&
         !(await input.configuration.shouldDefer({
           request: context.request,
           operation: accepted.lifecycleOperation,
@@ -134,7 +149,9 @@ export function createDeferredOperations(input: {
           }
           await input.store.retireDeferredOperation(replay.id, replay.replayKey);
         } else {
-          return acceptedResponse(replay.id, retryAfterSeconds);
+          return input.configuration.executeOnAccept
+            ? await executeAccepted(replay, accepted.lifecycleOperation)
+            : acceptedResponse(replay.id, retryAfterSeconds);
         }
       }
 
@@ -168,11 +185,16 @@ export function createDeferredOperations(input: {
             }
           : {}),
         resourceUid,
+        ...(context.workerEndpointOriginReservationId
+          ? { workerEndpointOriginReservationId: context.workerEndpointOriginReservationId }
+          : {}),
         pollsRemaining: pollsBeforeCommit,
         createdAt: input.clock().toISOString(),
       });
       if (record.fingerprint !== fingerprint) throw new TakoformHostError();
-      return acceptedResponse(record.id, retryAfterSeconds);
+      return input.configuration.executeOnAccept
+        ? await executeAccepted(record, accepted.lifecycleOperation)
+        : acceptedResponse(record.id, retryAfterSeconds);
     },
 
     async handle(context, id, cancel) {
@@ -244,9 +266,100 @@ export function createDeferredOperations(input: {
         ? terminalResponse(settled)
         : pendingResponse(settled.id, retryAfterSeconds);
     },
+
+    async drainProviderRepairs(limit = 64) {
+      const boundedLimit = boundedInteger(limit, 1, 1_000, "provider repair limit");
+      const candidates = await input.store.recoverableDeferredProviderOperations(boundedLimit);
+      let acquired = 0;
+      let settled = 0;
+      let pending = 0;
+      for (const candidate of candidates) {
+        const leaseToken = nextIdentifier("lease", input.randomId);
+        const advanced = await input.store.advanceDeferredOperation({
+          tenantId: candidate.tenantId,
+          principalId: candidate.principalId,
+          id: candidate.id,
+          leaseToken,
+          leaseUntil: input.clock().getTime() + leaseMilliseconds,
+        });
+        if (!advanced.acquired || !advanced.operation) continue;
+        acquired += 1;
+        await execute(advanced.operation, leaseToken);
+        const current = await input.store.readDeferredOperation(
+          candidate.tenantId,
+          candidate.principalId,
+          candidate.id,
+        );
+        if (current && isTerminal(current)) settled += 1;
+        else pending += 1;
+      }
+      return { candidates: candidates.length, acquired, settled, pending };
+    },
   };
 
-  async function execute(operation: DeferredOperationRecord, leaseToken: string): Promise<void> {
+  async function executeAccepted(
+    record: DeferredOperationRecord,
+    lifecycleOperation: "create" | "update" | "import" | "delete",
+  ): Promise<Response> {
+    const responseOperation =
+      record.operation === "apply"
+        ? record.acceptedUid === undefined
+          ? "create"
+          : "update"
+        : lifecycleOperation;
+    if (isTerminal(record)) {
+      return immediateTerminalResponse(record, responseOperation, input.omitObservedStatus);
+    }
+    const leaseToken = nextIdentifier("lease", input.randomId);
+    let advanced = await input.store.advanceDeferredOperation({
+      tenantId: record.tenantId,
+      principalId: record.principalId,
+      id: record.id,
+      leaseToken,
+      leaseUntil: input.clock().getTime() + leaseMilliseconds,
+    });
+    // The first transition persists the non-cancellable committing boundary;
+    // a distinct fenced write then acquires execution. Inline mode performs
+    // both writes, preserving the same crash point used by asynchronous polls.
+    if (!advanced.acquired && advanced.operation?.phase === "committing") {
+      advanced = await input.store.advanceDeferredOperation({
+        tenantId: record.tenantId,
+        principalId: record.principalId,
+        id: record.id,
+        leaseToken,
+        leaseUntil: input.clock().getTime() + leaseMilliseconds,
+      });
+    }
+    if (!advanced.operation) throw new TakoformHostError("operation_not_found", 404);
+    if (isTerminal(advanced.operation)) {
+      return immediateTerminalResponse(
+        advanced.operation,
+        responseOperation,
+        input.omitObservedStatus,
+      );
+    }
+    if (!advanced.acquired) return acceptedResponse(record.id, retryAfterSeconds);
+    const outcome = await execute(advanced.operation, leaseToken);
+    if (outcome.kind === "repair") {
+      return failure(outcome.error.code, outcome.error.status);
+    }
+    const settled = await input.store.readDeferredOperation(
+      record.tenantId,
+      record.principalId,
+      record.id,
+    );
+    if (!settled) throw new TakoformHostError("operation_not_found", 404);
+    return isTerminal(settled)
+      ? immediateTerminalResponse(settled, responseOperation, input.omitObservedStatus)
+      : acceptedResponse(settled.id, retryAfterSeconds);
+  }
+
+  async function execute(
+    operation: DeferredOperationRecord,
+    leaseToken: string,
+  ): Promise<
+    { readonly kind: "settled" } | { readonly kind: "repair"; readonly error: TakoformHostError }
+  > {
     const url = new URL(
       `https://durable-operation.invalid${operation.requestPath}${operation.requestQuery}`,
     );
@@ -265,6 +378,9 @@ export function createDeferredOperations(input: {
       url,
       tenantId: operation.tenantId,
       principalId: operation.principalId,
+      ...(operation.workerEndpointOriginReservationId
+        ? { workerEndpointOriginReservationId: operation.workerEndpointOriginReservationId }
+        : {}),
       durableOperation: {
         id: operation.id,
         resourceUid: operation.resourceUid,
@@ -316,7 +432,13 @@ export function createDeferredOperations(input: {
           }),
         );
         await input.store.holdDeferredProviderRepair({ operation, leaseToken });
-        return;
+        return {
+          kind: "repair",
+          error:
+            error instanceof TakoformHostError
+              ? error
+              : new TakoformHostError("internal_error", 500),
+        };
       }
       const hostError =
         error instanceof TakoformHostError ? error : new TakoformHostError("internal_error", 500);
@@ -340,6 +462,7 @@ export function createDeferredOperations(input: {
         ),
       });
     }
+    return { kind: "settled" };
   }
 }
 
@@ -518,6 +641,7 @@ function storedCommit(
     replayKey: mutation.replayKey,
     replay: mutation.replay,
     ...(mutation.providerReceipt ? { providerReceipt: mutation.providerReceipt } : {}),
+    ...(mutation.providerEffect ? { providerEffect: mutation.providerEffect } : {}),
     ...(mutation.kind === "delete" && mutation.deletionTombstone
       ? { deletionTombstone: mutation.deletionTombstone }
       : {}),
@@ -576,6 +700,38 @@ function pendingResponse(id: string, retryAfterSeconds: number): Response {
 }
 
 function terminalResponse(operation: DeferredOperationRecord): Response {
+  const document = terminalDocument(operation);
+  if (isRecord(document.result) && isRecord(document.result.resource)) {
+    document.result.resource = portableResourceView(
+      document.result.resource as unknown as TakoformStoredResource,
+    );
+  }
+  return jsonResponse(canonicalJson(document));
+}
+
+function immediateTerminalResponse(
+  operation: DeferredOperationRecord,
+  lifecycleOperation: "create" | "update" | "import" | "delete",
+  omitObservedStatus = false,
+): Response {
+  const document = terminalDocument(operation);
+  if (isRecord(document.result) && isRecord(document.result.resource)) {
+    return resourceResponse(
+      document.result.resource as unknown as TakoformStoredResource,
+      lifecycleOperation === "create" ? 201 : 200,
+      omitObservedStatus,
+    );
+  }
+  if (lifecycleOperation === "delete" && isRecord(document.result) && document.result.deleted) {
+    return new Response(null, { status: 204 });
+  }
+  if (isRecord(document.error) && typeof document.error.code === "string") {
+    return failure(document.error.code, deferredFailureStatus(document.error.code));
+  }
+  throw new TakoformHostError("internal_error", 500);
+}
+
+function terminalDocument(operation: DeferredOperationRecord): Record<string, unknown> {
   if (!operation.terminalJson) throw new TakoformHostError("internal_error", 500);
   let document: unknown;
   try {
@@ -584,12 +740,43 @@ function terminalResponse(operation: DeferredOperationRecord): Response {
     throw new TakoformHostError("internal_error", 500);
   }
   if (!isRecord(document)) throw new TakoformHostError("internal_error", 500);
-  if (isRecord(document.result) && isRecord(document.result.resource)) {
-    document.result.resource = portableResourceView(
-      document.result.resource as unknown as TakoformStoredResource,
-    );
+  return document;
+}
+
+function deferredFailureStatus(code: string): number {
+  switch (code) {
+    case "insufficient_funds":
+      return 402;
+    case "policy_denied":
+      return 403;
+    case "artifact_missing":
+    case "form_unknown":
+    case "operation_not_found":
+    case "resource_not_found":
+      return 404;
+    case "dependency_in_use":
+    case "import_conflict":
+    case "migration_required":
+    case "offering_mismatch":
+    case "operation_cancelled":
+    case "resource_busy":
+    case "space_mismatch":
+    case "uid_mismatch":
+      return 409;
+    case "generation_conflict":
+    case "revision_conflict":
+      return 412;
+    case "unsupported_capability":
+      return 422;
+    case "backend_unavailable":
+    case "form_unavailable":
+    case "unavailable":
+      return 503;
+    case "internal_error":
+      return 500;
+    default:
+      return 400;
   }
-  return jsonResponse(canonicalJson(document));
 }
 
 function jsonResponse(body: string): Response {

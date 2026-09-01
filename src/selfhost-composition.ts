@@ -5,11 +5,7 @@ import {
   createProvisioningProviderPack,
   type DeploymentComposition,
 } from "./deployment-composition.ts";
-import {
-  type EdgeFormBundle,
-  edgeProviderOffering,
-  objectBucketProviderOffering,
-} from "./edge-forms.ts";
+import { type EdgeFormBundle, edgeProviderOffering } from "./edge-forms.ts";
 import { HOSTED_EDGE_IDENTITY_CLASSES } from "./hosted-edge-supplies.ts";
 import type { Provider, ProviderOffering } from "./provider-port.ts";
 import {
@@ -68,7 +64,7 @@ export interface SelfhostComposition extends DeploymentComposition {
 export function createSelfhostComposition(
   options: SelfhostCompositionOptions,
 ): SelfhostComposition {
-  const objectBucketOffering = objectBucketProviderOffering(options.edge.objectBucket.form, {
+  const objectBucketOffering = edgeProviderOffering(options.edge.objectBucket.form, {
     id: "storage.object.standard",
     displayName: "Object bucket",
     regions: ["global"],
@@ -181,9 +177,9 @@ export function createSelfhostComposition(
         resourceClass === "storage.object"
           ? {
               api: "portable",
-              exportFormats: ["s3.object-set.takoform.com/v1"],
-              importFormats: ["s3.object-set.takoform.com/v1"],
-              migrationModes: ["offline", "online"],
+              exportFormats: [],
+              importFormats: [],
+              migrationModes: [],
             }
           : {
               api: "portable",
@@ -206,8 +202,8 @@ export function createSelfhostComposition(
 
   // Only stable identities entered `candidates`; released beta Forms remain
   // technical drain capabilities and therefore cannot appear at `/v1` or
-  // `/provision/v1`. Stable S3 enters Workers through a standard-service
-  // supply; it is not a revived ObjectBucket sale.
+  // `/provision/v1`. This standalone composition exposes no current managed
+  // object-storage sale; the retained ObjectBucket is recovery-only.
   return { ...compiled, provider };
 }
 

@@ -86,14 +86,26 @@ export interface ResourceIdentity {
 }
 
 /**
- * Provider-specific derivation of the endpoint that a future ModuleWorker will
- * receive. This is deliberately non-mutating: Takoserver's reservation ledger
- * owns exclusivity, while the adapter owns only its exact naming/suffix rules.
+ * Provider-specific derivation of a future public endpoint from one explicit,
+ * provider-neutral reservation request. This is deliberately non-mutating:
+ * Takoserver's reservation ledger owns exclusivity, while the adapter owns only
+ * its exact naming/suffix rules. ResourceIdentity is intentionally absent;
+ * resources do not exist yet and a caller must never invent their names.
  */
 export interface ProviderWorkerEndpointOriginReservationCapability {
   derive(input: {
-    readonly identity: ResourceIdentity;
+    readonly tenantRef: string;
+    readonly requestedSubdomain: string;
   }): Promise<{ readonly canonicalPublicOrigin: string } | null>;
+}
+
+/**
+ * Host-resolved private authority for one exact WorkerEndpoint mutation.
+ * The opaque reservation reference deliberately stops at the Host.
+ */
+export interface ProviderWorkerEndpointOriginAssignment {
+  readonly canonicalPublicOrigin: string;
+  readonly assignmentDigest: `sha256:${string}`;
 }
 
 /** Durable identity and recovery evidence for every provider mutation. */
@@ -121,19 +133,18 @@ export interface ApplyInput extends ProviderMutationInput {
   readonly previous?: { readonly nativeId: string; readonly spec: JsonObject };
   /** Exact Host-pinned dependencies with any active provider realization. */
   readonly relations?: readonly ProviderRelation[];
-  /** Host-resolved runtime material. Never portable state or provider output. */
-  readonly standardServices?: readonly ProviderStandardServiceProjection[];
+  /** Provider-pack materialized bindings. Never portable state or provider output. */
+  readonly runtimeBindings?: readonly ProviderRuntimeBinding[];
+  /** Exact private origin authority for a reservation-backed WorkerEndpoint. */
+  readonly workerEndpointOriginAssignment?: ProviderWorkerEndpointOriginAssignment;
 }
 
-export interface ProviderStandardServiceProjection {
+export interface ProviderRuntimeBinding {
   readonly name: string;
-  readonly required: boolean;
-  readonly service: {
-    readonly apiVersion: string;
-    readonly protocol: string;
-  };
-  readonly endpoint: JsonObject;
-  readonly credential: JsonObject;
+  readonly targetUid: string;
+  readonly bindingRef: TakoformBindingRef;
+  /** Opaque to the Host and meaningful only to the selected provider adapter. */
+  readonly material: unknown;
 }
 
 /** Exact logical target projected to a Provider Pack at the mutation barrier. */
@@ -250,6 +261,8 @@ export interface Provider {
   readonly id: string;
   /** Static configuration, not a per-request discovery call. */
   readonly offerings: readonly ProviderOffering[];
+  /** Exact historical capabilities usable only for recorded Deployment recovery. */
+  readonly recoveryOfferings?: readonly ProviderOffering[];
   /** Exact future WorkerEndpoint derivation; never creates a Resource or provider object. */
   readonly workerEndpointOriginReservations?: ProviderWorkerEndpointOriginReservationCapability;
   /** Present only when this configured adapter can durably receive one-shot runtime inputs. */
@@ -279,6 +292,18 @@ export interface Provider {
    * recovery retry can never accidentally issue a second write.
    */
   recoverApply?(input: ApplyInput): Promise<ProviderTicket>;
+  /**
+   * Mutating convergence for an apply command whose durable Host dispatch may
+   * already have crossed the provider boundary. The Host calls this only while
+   * holding the exact operation lease. Implementations must key every effect
+   * by `operationId` (and `operationKey` where supplied), adopt the same
+   * realized closure after acknowledgement loss, and never create a second
+   * logical native resource for the command.
+   *
+   * This is deliberately distinct from `recoverApply`, which remains a
+   * strictly read-only inspection seam.
+   */
+  convergeApply?(input: ApplyInput): Promise<ProviderTicket>;
   poll?(input: { readonly operationId: string; readonly handle: string }): Promise<ProviderTicket>;
   observe(input: {
     readonly offering: ProviderOffering;

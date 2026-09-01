@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import type { AttachmentFactory } from "../src/attachments.ts";
 import { createProviderPack, type ProviderPackDefinition } from "../src/provider-pack.ts";
 import type { Provider, ProviderOffering } from "../src/provider-port.ts";
+import { EDGE_OBJECTS_BINDING_REF } from "../src/providers/cloudflare-runtime-bindings.ts";
 import { FakeProvider } from "../src/providers/fake.ts";
 
 const FORM = {
-  apiVersion: "edge.forms.takoform.com/v1beta1",
+  apiVersion: "edge.forms.takoform.com",
   kind: "ObjectBucket",
   definitionVersion: "0.1.0",
   schemaDigest: `sha256:${"a".repeat(64)}`,
@@ -13,15 +13,15 @@ const FORM = {
 
 const OBJECTS = {
   apiVersion: "interfaces.takoform.com/v1alpha1",
-  name: "object.s3.takoform.com",
+  name: "edge.objects",
   version: "1.0.0",
   schemaDigest: `sha256:${"b".repeat(64)}`,
 } as const;
 
 const OFFERING: ProviderOffering = {
-  id: "storage.s3.wasabi.ap-northeast",
+  id: "storage.object.wasabi.ap-northeast",
   kind: "object_bucket",
-  displayName: "S3 bucket",
+  displayName: "Object bucket",
   form: FORM,
   providedInterfaces: [OBJECTS],
   bindingRefs: [],
@@ -30,41 +30,14 @@ const OFFERING: ProviderOffering = {
 };
 
 function pack(overrides: Partial<ProviderPackDefinition> = {}) {
-  const provisioner: Provider = new FakeProvider({ id: "wasabi-s3", offerings: [OFFERING] });
-  const attachmentFactory: AttachmentFactory = {
-    id: "wasabi-s3-credentials",
-    providerPackRef: "wasabi",
-    supports: ({ interfaceRef }) => interfaceRef.name === OBJECTS.name,
-    resolve: async () => ({ kind: "credential-grant-ref", ref: "grant:s3:test" }),
-  };
+  const provisioner: Provider = new FakeProvider({ id: "wasabi-object", offerings: [OFFERING] });
   return createProviderPack({
     id: "wasabi",
     providerType: "wasabi",
     provisioners: [provisioner],
-    attachmentFactories: [attachmentFactory],
-    transferEndpoints: [
-      {
-        id: "wasabi-s3-transfer",
-        exportFormats: ["s3.object-set.takoform.com/v1"],
-        importFormats: ["s3.object-set.takoform.com/v1"],
-        migrationModes: ["offline", "online"],
-        export: async () => ({ transferRef: "transfer:export:test" }),
-        import: async () => undefined,
-        verify: async () => ({
-          schema: true,
-          rowCounts: true,
-          checksums: true,
-          evidenceDigest: `sha256:${"d".repeat(64)}`,
-        }),
-      },
-    ],
-    credentialIssuers: [
-      {
-        id: "wasabi-s3-temporary-credential",
-        interfaceRefs: [OBJECTS],
-        issue: async () => ({ grantRef: "grant:s3:test", expiresAt: "2026-08-18T01:00:00.000Z" }),
-      },
-    ],
+    attachmentFactories: [],
+    transferEndpoints: [],
+    credentialIssuers: [],
     meterSources: [
       {
         id: "wasabi-storage",
@@ -97,7 +70,7 @@ describe("Provider Pack capabilities", () => {
       bindingRefs: [],
       meterSources: ["egress.gib", "requests.million", "storage.gib-hour"],
     });
-    expect(wasabi.provisionerForOffering(OFFERING.id).id).toBe("wasabi-s3");
+    expect(wasabi.provisionerForOffering(OFFERING.id).id).toBe("wasabi-object");
     expect(JSON.stringify(wasabi)).not.toMatch(/price|supplyContract|credentialValue/u);
   });
 
@@ -107,5 +80,36 @@ describe("Provider Pack capabilities", () => {
     expect(() =>
       pack({ provisioners: [new FakeProvider({ offerings: [OFFERING] }), duplicate] }),
     ).toThrow("ambiguous Provider Pack offering");
+  });
+
+  test("does not advertise an importer-only Binding before deployment composition proves a target route", () => {
+    const consumer: ProviderOffering = {
+      ...OFFERING,
+      id: "compute.worker-version.consumer",
+      kind: "takoform.WorkerVersion",
+      form: { ...FORM, kind: "WorkerVersion" },
+      providedInterfaces: [],
+      bindingRefs: [EDGE_OBJECTS_BINDING_REF],
+    };
+    const provider = new FakeProvider({ id: "consumer", offerings: [consumer] });
+    const incomplete = pack({
+      provisioners: [provider],
+      runtimeBindingMaterializer: {
+        id: "consumer-runtime-bindings",
+        importer: {
+          routes: [
+            {
+              bindingRef: EDGE_OBJECTS_BINDING_REF,
+              materialKind: "test.object-capability@v1",
+            },
+          ],
+          async importBinding() {
+            return { kind: "private-test" };
+          },
+        },
+      },
+    });
+
+    expect(incomplete.descriptor.bindingRefs).toEqual([]);
   });
 });

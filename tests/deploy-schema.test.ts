@@ -20,6 +20,7 @@ import {
   type SchemaReader,
 } from "../scripts/deploy/schema.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
+import { MIGRATIONS } from "../src/db-schema.ts";
 
 const COMMIT = "a".repeat(40);
 const target = {
@@ -74,6 +75,23 @@ function readerSequence(states: readonly D1SchemaState[]): SchemaReader {
   };
 }
 
+function providerRepairReader(
+  state: D1SchemaState,
+  unmatched: number,
+): SchemaReader & { readonly preflightReads: () => number } {
+  let reads = 0;
+  return {
+    async read() {
+      return state;
+    },
+    async unmatchedProviderRepairSagaCount() {
+      reads += 1;
+      return unmatched;
+    },
+    preflightReads: () => reads,
+  };
+}
+
 const PRE: D1SchemaState = {
   applied: ["0001_first.sql"],
   shape: "pre-shape\n",
@@ -124,6 +142,71 @@ describe("forward-only D1 schema surface", () => {
         schemaShapeDigest: PRE.shapeDigest,
       });
       expect(fixture.calls).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("status reports dispatched provider sagas that block the 0036 backfill", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-provider-repair-status-"));
+    try {
+      const repairIndex = MIGRATIONS.findIndex(
+        ({ name }) => name === "0036_provider_repair_and_managed_schedule_reconciliation.sql",
+      );
+      expect(repairIndex).toBeGreaterThan(0);
+      const reader = providerRepairReader(
+        { ...PRE, applied: MIGRATIONS.slice(0, repairIndex).map(({ name }) => name) },
+        1,
+      );
+      const result = await runD1Schema(
+        { action: "status", environment: "rehearsal", commit: COMMIT },
+        target,
+        {
+          reader,
+          outputDirectory: join(root, "work"),
+          cloudflareEnvironment: {},
+        },
+      );
+      expect(result).toMatchObject({
+        providerRepairPreflight: {
+          status: "operator_reconciliation_required",
+          unmatchedDispatchedSagaCount: 1,
+        },
+      });
+      expect(reader.preflightReads()).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("apply refuses 0036 before qualification when unmatched dispatched sagas remain", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-provider-repair-apply-"));
+    try {
+      const repairIndex = MIGRATIONS.findIndex(
+        ({ name }) => name === "0036_provider_repair_and_managed_schedule_reconciliation.sql",
+      );
+      expect(repairIndex).toBeGreaterThan(0);
+      const reader = providerRepairReader(
+        { ...PRE, applied: MIGRATIONS.slice(0, repairIndex).map(({ name }) => name) },
+        1,
+      );
+      const fixture = processFixture("rehearsal");
+      const failure = await runD1Schema(
+        { action: "apply", environment: "rehearsal", commit: COMMIT },
+        target,
+        {
+          reader,
+          run: fixture.run,
+          outputDirectory: join(root, "work"),
+          receiptPath: join(root, "receipt.json"),
+          review: "reviewer@example.test",
+          cloudflareEnvironment: {},
+        },
+      ).catch((error) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect(failure.message).toContain("provider-specific operator reconciliation");
+      expect(fixture.calls).toHaveLength(0);
+      expect(reader.preflightReads()).toBe(1);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

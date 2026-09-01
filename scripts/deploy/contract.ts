@@ -177,8 +177,8 @@ export const DEPLOY_CONTRACT = {
       triggers: ["authority"],
       obligations: {
         provenance:
-          `${exactSource} The minimal probe bundle, one public identity service binding and one ` +
-          "target Host id are sealed before one upload.",
+          `${exactSource} The minimal probe bundle, one public identity service binding, one ` +
+          "route-less Form-authority service binding and one target Host id are sealed before one upload.",
         "post-conditions":
           "Authoritative Worker history and exact binding closure identify the upload. Its permanent " +
           "workers.dev endpoint must actively return the exact PublicHostIdentity@v2 value read through " +
@@ -204,12 +204,16 @@ export const DEPLOY_CONTRACT = {
         "src/public-worker-implementation.ts",
         "src/form-authority-public-identity.ts",
         "src/public-host-identity.ts",
+        "src/takoform/publisher-set-closure.ts",
+        "src/generated/takoform-publisher-set-receipt.ts",
+        "src/generated/takoform-publisher-set-authority-closure.ts",
+        "services/takoform-core-verifier",
         "wrangler.form-authority.jsonc",
         "scripts/deploy/form-authority-capability.ts",
         "scripts/deploy/form-authority.ts",
       ],
       requiresScripts: ["check", "deploy"],
-      requiresTools: ["bun", "wrangler"],
+      requiresTools: ["bun", "docker", "wrangler"],
       requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
       triggers: ["authority"],
       obligations: {
@@ -219,16 +223,18 @@ export const DEPLOY_CONTRACT = {
           "internal PublicHostIdentity@v2 RPC is the runtime authority for its served Version, artifact, and implementation identities.",
         "post-conditions":
           "Authoritative Worker history must name the exact commit/artifact. The immutable Version " +
-          "must contain exactly STATE_DB, OBJECTS, PUBLIC_HOST_IDENTITY and the three plain-text " +
-          "variables TAKOSERVER_ENVIRONMENT, TAKOSERVER_FORM_AUTHORITY_HOST_ID and " +
-          "TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST, with no public Worker identity pins, " +
+          "must contain exactly STATE_DB, OBJECTS, PUBLIC_HOST_IDENTITY, CORE_VERIFIER, WORKER_VERSION " +
+          "and the four plain-text variables TAKOSERVER_ENVIRONMENT, TAKOSERVER_FORM_AUTHORITY_HOST_ID, " +
+          "TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST and TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST, " +
+          "with no public Worker identity pins, " +
           "secret, route, or public-domain ownership. Status is ready only after the permanent minimal " +
           "identity probe actively calls PublicHostIdentity@v2 and matches live Version/A/P/capability/I.",
         reversal:
           "The immediately previous Form authority Worker version is printed as the provider-history rollback target.",
         "failure-handling":
-          `${highRiskFailure} Deploying this shell does not enable Form mutation: RPC apply remains ` +
-          "fail-closed until released Form package verification is present. Admission policy and private handle issuance remain Takoserver Host-owned." +
+          `${highRiskFailure} RPC apply remains fail-closed unless the released Core Container returns the ` +
+          "exact raw 17-package set, checkpoint and artifact identity proof for the embedded publisher-set closure. " +
+          "Admission policy and private handle issuance remain Takoserver Host-owned." +
           inputContract(applyReviewInput),
         "independent-review": review,
       },
@@ -803,6 +809,61 @@ export const DEPLOY_CONTRACT = {
           "Identity removal is a separate reviewed configuration transition; this surface never deletes it.",
         "failure-handling":
           highRiskFailure + inputContract(applyReviewInput, operatorPrivateJwkInput),
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-managed-worker-gateway",
+      target: "cloudflare-workers-for-platforms:environment-selected-dispatch-gateway-route",
+      covers: [
+        "src/providers/cloudflare-managed-worker-gateway.ts",
+        "src/providers/cloudflare-managed-worker-sqlite.ts",
+        "src/providers/cloudflare-managed-worker-wrapper.ts",
+        "src/entry-cloudflare-managed-worker-gateway.ts",
+        "wrangler.managed-worker-gateway.jsonc",
+        "managed-worker-gateway-worker-configuration.d.ts",
+        "tsconfig.managed-worker-gateway.json",
+        "scripts/deploy.ts",
+        "scripts/deploy/managed-worker-gateway.ts",
+      ],
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_MANAGED_WORKER_ROUTE_PATTERN",
+        "TAKOSERVER_MANAGED_WORKER_GATEWAY_SCRIPT",
+        "TAKOSERVER_MANAGED_WORKER_LEGACY_SCRIPT",
+        "TAKOSERVER_MANAGED_WORKER_ZONE_ID",
+        "TAKOSERVER_MANAGED_WORKER_PROVIDER_ID",
+        "TAKOSERVER_MANAGED_WORKER_DISPATCH_NAMESPACE",
+        "TAKOSERVER_MANAGED_WORKER_GATEWAY_ID",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+      ],
+      triggers: ["authority"],
+      obligations: {
+        provenance:
+          `${exactSource} The gateway Worker bundle, DISPATCHER namespace, STATE_DB binding, ` +
+          "provider identity and exact route pattern are operator-selected inputs. `TAKOSERVER_MANAGED_WORKER_ROUTE_PATTERN`, `TAKOSERVER_MANAGED_WORKER_GATEWAY_SCRIPT`, `TAKOSERVER_MANAGED_WORKER_LEGACY_SCRIPT`, `TAKOSERVER_MANAGED_WORKER_ZONE_ID`, `TAKOSERVER_MANAGED_WORKER_PROVIDER_ID`, `TAKOSERVER_MANAGED_WORKER_DISPATCH_NAMESPACE`, and `TAKOSERVER_MANAGED_WORKER_GATEWAY_ID` are required alongside `CLOUDFLARE_API_TOKEN`. Integration may " +
+          "create only the explicitly configured staging wildcard; production starts from an exact " +
+          "readback of the legacy route and never guesses a zone, account, namespace or domain.",
+        "post-conditions":
+          "Status reads the complete exact-pattern route inventory and authoritative gateway deployment " +
+          "history. Apply stages one immutable Version, reads back its exact code ETag, STATE_DB, " +
+          "DISPATCHER, SQLite Durable Object, provider/gateway identity and workers.dev-disabled settings, " +
+          "then creates a separate 100 percent traffic deployment and proves the exact predecessor. Only " +
+          "after that proof may integration create the configured staging route or production replace the " +
+          "read-back legacy route; customer-specific routes remain untouched.",
+        reversal:
+          "Production reversal derives the immutable predecessor only from provider deployment history, " +
+          "proves that predecessor's exact code, bindings and settings, redeploys and reads it back without " +
+          "requiring the broken successor to be ready, then updates the recorded exact route id back to the " +
+          "read-back legacy script. Integration creation has no implicit production reversal.",
+        "failure-handling":
+          `${highRiskFailure} Missing, duplicate or drifted exact-pattern routes fail closed. Production ` +
+          "never adopts an unknown script, route id or domain; a lost acknowledgement stops before retry " +
+          "and requires exact status readback. The surface does not mutate live production from tests or " +
+          "from a guessed Cloudflare identifier." +
+          inputContract(applyReviewInput),
         "independent-review": review,
       },
     },

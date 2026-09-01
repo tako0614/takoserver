@@ -120,42 +120,6 @@ export async function startStableLocalCloudflareHost(input: {
     fetch: (request) => cloudflare.fetch(request),
   });
   const driver = localProviderDriver(provider, offerings);
-  const standardServiceResolver = {
-    async satisfiable({ serviceRef }: { serviceRef: { apiVersion: string; protocol: string } }) {
-      return (
-        serviceRef.apiVersion === "standards.takoform.com/v1" &&
-        serviceRef.protocol === "com.amazonaws.s3"
-      );
-    },
-    async resolve({
-      tenantId,
-      space: targetSpace,
-      slot,
-    }: {
-      tenantId: string;
-      space: string;
-      slot: { name: string; service: { apiVersion: string; protocol: string } };
-    }) {
-      if (
-        slot.service.apiVersion !== "standards.takoform.com/v1" ||
-        slot.service.protocol !== "com.amazonaws.s3"
-      ) {
-        return null;
-      }
-      const bucketName = `tss3-${createHash("sha256")
-        .update(`${tenantId}\0${targetSpace}\0${slot.name}`)
-        .digest("hex")
-        .slice(0, 40)}`;
-      cloudflare.registerStandardBucket(bucketName);
-      return {
-        endpoint: {
-          kind: "takoserver.cloudflare-r2-bucket@v1",
-          bucketName,
-        },
-        credential: { kind: "takoserver.cloudflare-r2-binding@v1" },
-      };
-    },
-  };
 
   let route = async (_request: Request): Promise<Response> =>
     new Response("stable local Host is starting\n", { status: 503 });
@@ -172,7 +136,6 @@ export async function startStableLocalCloudflareHost(input: {
     forms,
     bindings: catalog.bindings,
     driver,
-    standardServiceResolver,
     workerModuleInspector: createJavaScriptWorkerModuleInspector(),
     authenticate: async (request) =>
       request.headers.get("authorization") === `Bearer ${input.token}`
@@ -278,9 +241,6 @@ function localProviderDriver(
           },
           spec: value.spec,
           relations: relations(value.relations),
-          ...(value.standardServices
-            ? { standardServices: structuredClone(value.standardServices) }
-            : {}),
           ...(current
             ? {
                 previous: {
@@ -467,7 +427,6 @@ interface LocalVersionAssets {
 class LocalCloudflare {
   runtime: Miniflare | undefined;
   readonly #root: string;
-  readonly #buckets = new Set<string>();
   readonly #scripts = new Set<string>();
   readonly #databases = new Map<string, string>();
   readonly #kvNamespaces = new Map<string, string>();
@@ -516,13 +475,8 @@ class LocalCloudflare {
     this.#root = root;
   }
 
-  registerStandardBucket(name: string): void {
-    this.#buckets.add(name);
-  }
-
   resourceCounts(): Readonly<Record<string, number>> {
     return Object.freeze({
-      buckets: this.#buckets.size,
       scripts: this.#scripts.size,
       databases: this.#databases.size,
       kvNamespaces: this.#kvNamespaces.size,

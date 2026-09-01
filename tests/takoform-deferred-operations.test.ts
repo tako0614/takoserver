@@ -529,6 +529,146 @@ describe("durable deferred Takoform operations", () => {
     opened.close();
   });
 
+  test("background drain converges every dispatched no-receipt operation exactly once", async () => {
+    let now = Date.parse("2026-09-01T00:00:00.000Z");
+    const memory = new InMemoryTakoformResourceDriver();
+    const initialEntered = deferred();
+    const releaseInitial = deferred();
+    const recoveryEntered = deferred();
+    const releaseRecovery = deferred();
+    const operationIds: string[] = [];
+    const modes: Array<"initial" | "recovery" | undefined> = [];
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      async apply(input) {
+        operationIds.push(input.operationId);
+        modes.push(input.operationMode);
+        if (input.operationMode !== "recovery") {
+          initialEntered.resolve();
+          await releaseInitial.promise;
+          throw new ProviderMutationRecoveryError("indeterminate");
+        }
+        recoveryEntered.resolve();
+        await releaseRecovery.promise;
+        return await memory.apply(input);
+      },
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+    };
+    const opened = persistentHarness(() => new Date(now), driver).open();
+    const operationId = await acceptCreate(
+      opened.host,
+      "automatic-provider-repair",
+      "automatic-provider-repair-0001",
+    );
+    const operationPath = `${lane}/operations/${operationId}`;
+    await opened.host.handle(request(operationPath, "primary"));
+    await opened.host.handle(request(operationPath, "primary"));
+    const initial = opened.host.handle(request(operationPath, "primary"));
+    await initialEntered.promise;
+    expect(
+      opened.database
+        .query(
+          `SELECT operation.expires_at AS operation_expiry, saga.expires_at AS saga_expiry
+           FROM tf_deferred_operations AS operation
+           INNER JOIN tf_provider_mutation_sagas AS saga ON saga.operation_id = operation.id
+           WHERE operation.id = ?`,
+        )
+        .get(operationId),
+    ).toEqual({
+      operation_expiry: 253402300799999,
+      saga_expiry: 253402300799999,
+    });
+    // The exact dispatched command remains drainable beyond the ordinary
+    // seven-day replay window, even if this worker died before its catch path.
+    now += 8 * 24 * 60 * 60_000;
+    releaseInitial.resolve();
+    const held = await initial;
+    expect(await held?.json()).toMatchObject({ id: operationId, done: false });
+
+    const maintenance = opened.host.maintenance;
+    if (!maintenance) throw new Error("durable Host maintenance is unavailable");
+    const firstDrain = maintenance.drainProviderRepairs(8);
+    await recoveryEntered.promise;
+    const duplicateDrain = await maintenance.drainProviderRepairs(8);
+    expect(duplicateDrain).toEqual({ candidates: 0, acquired: 0, settled: 0, pending: 0 });
+    releaseRecovery.resolve();
+    expect(await firstDrain).toEqual({ candidates: 1, acquired: 1, settled: 1, pending: 0 });
+
+    const terminal = await opened.host.handle(request(operationPath, "primary"));
+    expect(await terminal?.json()).toMatchObject({
+      id: operationId,
+      done: true,
+      result: { resource: { metadata: { name: "automatic-provider-repair" } } },
+    });
+    expect(operationIds).toEqual([operationId, operationId]);
+    expect(modes).toEqual(["initial", "recovery"]);
+    expect(await maintenance.drainProviderRepairs(8)).toEqual({
+      candidates: 0,
+      acquired: 0,
+      settled: 0,
+      pending: 0,
+    });
+    opened.close();
+  });
+
+  test("reservation-bearing requests are durable before dispatch and cancellation stays terminal", async () => {
+    const opened = persistentHarness().open();
+    const desired = desiredResource("reserved-durable", "reserved");
+    const prepared = await opened.host.handle(
+      request(`${lane}/resources/prepare`, "reserved", {
+        method: "POST",
+        body: JSON.stringify(desired),
+      }),
+    );
+    if (!prepared?.ok) throw new Error(`reserved prepare failed: ${prepared?.status}`);
+    const review = ((await prepared.json()) as { review: Record<string, string> }).review;
+    const accepted = await opened.host.handle(
+      request(
+        `${lane}/resources/example.forms.invalid/DeferredThing/reserved-durable`,
+        "reserved",
+        {
+          method: "PUT",
+          headers: {
+            "idempotency-key": "reserved-durable-0001",
+            "if-none-match": "*",
+          },
+          body: JSON.stringify({ ...desired, review }),
+        },
+      ),
+    );
+    expect(accepted?.status).toBe(202);
+    if (!accepted) throw new Error("reservation operation was not accepted");
+    const operationId = ((await accepted.json()) as { operation: { id: string } }).operation.id;
+    expect(
+      opened.database
+        .query(
+          `SELECT phase, worker_endpoint_origin_reservation_id AS reservation
+           FROM tf_deferred_operations WHERE id = ?`,
+        )
+        .get(operationId),
+    ).toEqual({ phase: "pending", reservation: "endpoint-reservation-01" });
+
+    const cancelled = await opened.host.handle(
+      request(`${lane}/operations/${operationId}/cancel`, "reserved", {
+        method: "POST",
+        headers: { "idempotency-key": "reserved-durable-cancel-0001" },
+      }),
+    );
+    expect(await cancelled?.json()).toMatchObject({
+      id: operationId,
+      done: true,
+      error: { code: "operation_cancelled" },
+    });
+    expect(await opened.host.maintenance?.drainProviderRepairs(8)).toEqual({
+      candidates: 0,
+      acquired: 0,
+      settled: 0,
+      pending: 0,
+    });
+    opened.close();
+  });
+
   test("a stale lease cannot release the recovered worker's claim reservation", async () => {
     let now = Date.parse("2026-08-23T00:00:00.000Z");
     const root = mkdtempSync(join(tmpdir(), "takoserver-deferred-claim-"));
@@ -1009,6 +1149,17 @@ function persistentHarness(
           }
           if (token === "Bearer other-tenant") {
             return { tenantId: "tenant-b", principalId: "principal-a" };
+          }
+          if (token === "Bearer reserved") {
+            return {
+              tenantId: "tenant-a",
+              principalId: "principal-reserved",
+              scope: {
+                space: "main",
+                mode: "tenant-run" as const,
+                workerEndpointOriginReservationId: "endpoint-reservation-01",
+              },
+            };
           }
           return null;
         },

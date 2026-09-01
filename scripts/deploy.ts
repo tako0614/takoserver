@@ -9,6 +9,7 @@ import { loadFormAuthorityScopeTransition } from "./deploy/form-authority-scope-
 import { runHosted } from "./deploy/hosted.ts";
 import { runOperatorIdentity } from "./deploy/identity.ts";
 import { runIntegrationE2eCredentials } from "./deploy/integration-e2e-credentials.ts";
+import { runManagedWorkerGateway } from "./deploy/managed-worker-gateway.ts";
 import type { DeployEnvironment } from "./deploy/qualification.ts";
 import { runRetirement } from "./deploy/retirement.ts";
 import { runD1Schema } from "./deploy/schema.ts";
@@ -218,7 +219,8 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     reverse &&
     !(
       surfaceValue === "takoserver-worker-authority-cutover" ||
-      surfaceValue === "takoserver-host-runtime-topology-retirement"
+      surfaceValue === "takoserver-host-runtime-topology-retirement" ||
+      surfaceValue === "takoserver-managed-worker-gateway"
     )
   ) {
     return null;
@@ -374,6 +376,17 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
           action: invocation.action,
           environment: invocation.environment,
           commit: invocation.commit,
+        },
+        target,
+      );
+    case "takoserver-managed-worker-gateway":
+      return await runManagedWorkerGateway(
+        {
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
+          ...(invocation.reverse ? { reverse: true } : {}),
         },
         target,
       );

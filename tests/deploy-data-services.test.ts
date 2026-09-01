@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deploymentVariables } from "../scripts/deploy/realized-config.ts";
 import { loadTarget } from "../scripts/deploy/target.ts";
-import { PRODUCTION_STANDARD_SERVICE_SUPPLIES_KIND } from "../src/standard-service-production.ts";
 
 const BASE = {
   kind: "takoserver.deploy-target@v2",
@@ -31,19 +30,6 @@ const MODEL = {
   outputMinorPerMillionTokens: 300,
 };
 
-const STANDARD_SERVICE_SUPPLIES = {
-  kind: PRODUCTION_STANDARD_SERVICE_SUPPLIES_KIND,
-  supplies: [
-    {
-      serviceRef: {
-        apiVersion: "standards.takoform.com/v1",
-        protocol: "com.amazonaws.s3",
-      },
-      backend: { kind: "cloudflare-r2", supplyNamespace: "production-primary" },
-    },
-  ],
-};
-
 const SUPPLIES = {
   kind: "takoserver.hosted-object-bucket-supplies@v2",
   supplies: [
@@ -62,8 +48,8 @@ const SUPPLIES = {
         id: "cloudflare.contract",
         providerType: "cloudflare",
         permittedResourceClasses: ["storage.object", "compute.edge"],
-        deliveryModes: ["native-credentials", "embedded-binding"],
-        customerAccess: "scoped-native-access",
+        deliveryModes: ["embedded-binding"],
+        customerAccess: "operator-only",
         whiteLabelAllowed: true,
         endUserTermsRequired: false,
         regions: ["global"],
@@ -80,13 +66,13 @@ const SUPPLIES = {
         ],
       },
       placement: {
-        deliveryMode: "native-credentials",
+        deliveryMode: "embedded-binding",
         supportPolicyRef: "support:hosted:standard",
         abusePolicyRef: "abuse:hosted:standard",
         portability: {
           api: "portable",
-          exportFormats: ["s3.object-set.takoform.com/v1"],
-          importFormats: ["s3.object-set.takoform.com/v1"],
+          exportFormats: [],
+          importFormats: [],
           migrationModes: ["offline"],
         },
         isolation: "dedicated-resource",
@@ -180,7 +166,6 @@ describe("private data service deploy configuration", () => {
           ...BASE,
           aiModels: [MODEL],
           stripeCheckout: true,
-          r2ParentAccessKeyId: "parent-key",
           objectBucketSupplies: SUPPLIES,
           edgeSupplies: EDGE_SUPPLIES,
           workerEndpointSuffix: "hosted.workers.dev",
@@ -191,7 +176,6 @@ describe("private data service deploy configuration", () => {
       const realized = deploymentVariables(target) as { vars: Record<string, string> };
       expect(JSON.parse(realized.vars.TAKOSERVER_AI_MODELS ?? "null")).toEqual([MODEL]);
       expect(realized.vars.CLOUDFLARE_ACCOUNT_ID).toBe(BASE.accountId);
-      expect(realized.vars.TAKOSERVER_R2_PARENT_ACCESS_KEY_ID).toBe("parent-key");
       expect(realized.vars.TAKOSERVER_STRIPE_CHECKOUT_ENABLED).toBe("1");
       expect(JSON.parse(realized.vars.TAKOSERVER_OBJECT_BUCKET_SUPPLIES ?? "null")).toEqual(
         SUPPLIES,
@@ -202,58 +186,6 @@ describe("private data service deploy configuration", () => {
       expect(JSON.stringify(realized)).not.toContain("TOKEN");
       expect(JSON.stringify(realized)).not.toContain("sk_");
       expect(target.sponsorship).toBe(true);
-    } finally {
-      rmSync(directory, { recursive: true, force: true });
-    }
-  });
-
-  test("realizes stable S3 supply without a current ObjectBucket sale", () => {
-    const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
-    try {
-      const path = join(directory, "target.json");
-      writeFileSync(
-        path,
-        JSON.stringify({
-          ...BASE,
-          standardServiceSupplies: STANDARD_SERVICE_SUPPLIES,
-        }),
-      );
-      const realized = deploymentVariables(loadTarget(path, "production")) as {
-        vars: Record<string, string>;
-      };
-      expect(realized.vars.CLOUDFLARE_ACCOUNT_ID).toBe(BASE.accountId);
-      expect(JSON.parse(realized.vars.TAKOSERVER_STANDARD_SERVICE_SUPPLIES ?? "null")).toEqual(
-        STANDARD_SERVICE_SUPPLIES,
-      );
-      expect(realized.vars).not.toHaveProperty("TAKOSERVER_OBJECT_BUCKET_SUPPLIES");
-      expect(realized.vars).not.toHaveProperty("TAKOSERVER_R2_PARENT_ACCESS_KEY_ID");
-    } finally {
-      rmSync(directory, { recursive: true, force: true });
-    }
-  });
-
-  test("rejects an unbounded stable standard-service supply", () => {
-    const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
-    try {
-      const path = join(directory, "target.json");
-      writeFileSync(
-        path,
-        JSON.stringify({
-          ...BASE,
-          standardServiceSupplies: {
-            ...STANDARD_SERVICE_SUPPLIES,
-            supplies: [
-              {
-                ...STANDARD_SERVICE_SUPPLIES.supplies[0],
-                credential: "must-not-be-here",
-              },
-            ],
-          },
-        }),
-      );
-      expect(() => loadTarget(path, "production")).toThrow(
-        "invalid production standard-service supplies",
-      );
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -284,12 +216,18 @@ describe("private data service deploy configuration", () => {
     }
   });
 
-  test("will not sell a Cloudflare bucket without its ordinary S3 data plane", () => {
+  test("realizes ObjectBucket supply without any public S3 credential configuration", () => {
     const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
     try {
       const path = join(directory, "target.json");
       writeFileSync(path, JSON.stringify({ ...BASE, objectBucketSupplies: SUPPLIES }));
-      expect(() => loadTarget(path, "production")).toThrow("must be configured together");
+      const realized = deploymentVariables(loadTarget(path, "production")) as {
+        vars: Record<string, string>;
+      };
+      expect(JSON.parse(realized.vars.TAKOSERVER_OBJECT_BUCKET_SUPPLIES ?? "null")).toEqual(
+        SUPPLIES,
+      );
+      expect(JSON.stringify(realized)).not.toMatch(/S3|R2_PARENT|ACCESS_KEY/iu);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

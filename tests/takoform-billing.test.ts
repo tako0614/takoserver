@@ -79,6 +79,23 @@ const PROVIDER_OFFERING: ProviderOffering = {
   capabilities: ["create", "update", "delete", "observe"],
 };
 
+const RETAINED_FORM_REF = {
+  ...FORM_REF,
+  apiVersion: "edge.forms.takoform.com/v1beta1",
+  definitionVersion: "0.2.0",
+  schemaDigest: `sha256:${"1".repeat(64)}`,
+} as const;
+
+const RETAINED_FORM: InstalledTakoformForm = {
+  ...FORM,
+  identity: { formRef: RETAINED_FORM_REF },
+};
+
+const RETAINED_PROVIDER_OFFERING: ProviderOffering = {
+  ...PROVIDER_OFFERING,
+  form: RETAINED_FORM_REF,
+};
+
 const SOLD: Offering = {
   id: PROVIDER_OFFERING.id,
   providerPackRef: "fake",
@@ -446,7 +463,7 @@ describe("Takoform apply on a real backend", () => {
     });
   });
 
-  test("recovers a handle-less apply only through the provider's read-only seam", async () => {
+  test("converges a handle-less apply only through the provider's mutating resume seam", async () => {
     const sql = createEphemeralSql();
     const clock = () => new Date("2026-08-24T00:00:00.000Z");
     const ledger = createLedger(sql, clock);
@@ -456,7 +473,8 @@ describe("Takoform apply on a real backend", () => {
       amountMinor: 2_000,
     });
     let applyCalls = 0;
-    let recoverCalls = 0;
+    let readOnlyRecoverCalls = 0;
+    let convergeCalls = 0;
     const provider: Provider = {
       id: "fake",
       offerings: [PROVIDER_OFFERING],
@@ -466,7 +484,15 @@ describe("Takoform apply on a real backend", () => {
         return failed("timeout", "the acknowledgement was lost", true);
       },
       async recoverApply(input) {
-        recoverCalls += 1;
+        readOnlyRecoverCalls += 1;
+        return succeeded({
+          nativeId: `recoverable:${input.identity.tenantRef}/${input.identity.space}/${input.identity.name}`,
+          observed: structuredClone(input.spec),
+          outputs: {},
+        });
+      },
+      async convergeApply(input) {
+        convergeCalls += 1;
         return succeeded({
           nativeId: `recoverable:${input.identity.tenantRef}/${input.identity.space}/${input.identity.name}`,
           observed: structuredClone(input.spec),
@@ -504,11 +530,75 @@ describe("Takoform apply on a real backend", () => {
     const recovered = await makeDriver().apply({ ...input, operationMode: "recovery" });
     expect(recovered.observed).toEqual(input.spec);
     expect(applyCalls).toBe(1);
-    expect(recoverCalls).toBe(1);
+    expect(readOnlyRecoverCalls).toBe(0);
+    expect(convergeCalls).toBe(1);
     expect(await ledger.wallet("org_recover_apply")).toMatchObject({
       settledMinor: 1_500,
       heldMinor: 0,
     });
+  });
+
+  test("the app tick automatically drains a dispatched no-receipt provider command", async () => {
+    const sql = createEphemeralSql();
+    let applyCalls = 0;
+    let convergeCalls = 0;
+    const provider: Provider = {
+      id: "fake",
+      offerings: [PROVIDER_OFFERING],
+      ...fakeReadback,
+      async apply() {
+        applyCalls += 1;
+        return failed("unavailable", "provider acknowledgement was lost", true);
+      },
+      async convergeApply(input) {
+        convergeCalls += 1;
+        return succeeded({
+          nativeId: `recovered:${input.identity.tenantRef}/${input.identity.name}`,
+          observed: structuredClone(input.spec),
+          outputs: {},
+        });
+      },
+      async observe(input) {
+        return succeeded({ nativeId: input.nativeId, observed: input.spec, outputs: {} });
+      },
+      async delete(input) {
+        return succeeded({ nativeId: input.nativeId, observed: {}, outputs: {} });
+      },
+    };
+    const app = buildApp({
+      sql,
+      objects: createMemoryObjectStore(),
+      identity,
+      settlement,
+      publicOrigin: "https://api.takoserver.com",
+      forms: [FORM],
+      hostForms: [FORM],
+      takoformHostFactory: createStaticStableTestTakoformHost,
+      providers: [provider],
+      offerings: [SOLD],
+    });
+    const { provider: auth } = await tenant(app.fetch);
+    const initial = await applyBucket(app.fetch, auth, "tick-repair", {}, "tick-repair-0001");
+    expect(initial.status).toBe(503);
+    expect(applyCalls).toBe(1);
+    expect(convergeCalls).toBe(0);
+
+    expect((await app.tick()).providerRepairs).toEqual({
+      candidates: 1,
+      acquired: 1,
+      settled: 1,
+      pending: 0,
+    });
+    expect(convergeCalls).toBe(1);
+    expect(await initial.replay()).toMatchObject({ status: 201 });
+    expect((await app.tick()).providerRepairs).toEqual({
+      candidates: 0,
+      acquired: 0,
+      settled: 0,
+      pending: 0,
+    });
+    expect(applyCalls).toBe(1);
+    expect(convergeCalls).toBe(1);
   });
 
   test("inherits one exact provider installation for a revision Form", async () => {
@@ -1502,7 +1592,97 @@ describe("Takoform apply on a real backend", () => {
     ).toBe(false);
   });
 
-  test("proves a retained deployment absent only after provider readback", async () => {
+  test("uses an exact retained offering for recorded lifecycle but never for authoring", async () => {
+    const sql = createEphemeralSql();
+    const clock = () => new Date("2026-08-24T00:00:00.000Z");
+    const deployments = createResourceDeploymentStore(sql, clock);
+    const tenantId = "org_retained_lifecycle";
+    const resourceUid = "uid_retained_lifecycle";
+    const nativeId = "fake:retained-lifecycle";
+    const calls: string[] = [];
+    const provider: Provider = {
+      id: "fake",
+      offerings: [PROVIDER_OFFERING],
+      recoveryOfferings: [RETAINED_PROVIDER_OFFERING],
+      async apply(input) {
+        calls.push(`apply:${input.offering.form.apiVersion}`);
+        return succeeded({ nativeId, observed: input.spec, outputs: {} });
+      },
+      async observe(input) {
+        calls.push(`observe:${input.offering.form.apiVersion}`);
+        return succeeded({ nativeId: input.nativeId, observed: input.spec, outputs: {} });
+      },
+      async delete(input) {
+        calls.push(`delete:${input.offering.form.apiVersion}`);
+        return succeeded({
+          nativeId: input.nativeId,
+          observed: { deleted: true },
+          outputs: {},
+          disposition: "deleted",
+        });
+      },
+    };
+    await deployments.create({
+      tenantId,
+      id: "dep_retained_lifecycle",
+      resourceUid,
+      offeringId: SOLD.id,
+      providerPackRef: SOLD.providerPackRef,
+      providerInstallationRef: SOLD.providerInstallationRef,
+      nativeId,
+      state: "active",
+      observed: {},
+      outputs: {},
+    });
+    const driver = createProviderDriver({
+      providers: [provider],
+      catalog: createCatalog([SOLD]),
+      ledger: createLedger(sql, clock),
+      deployments,
+    });
+    const resource = {
+      apiVersion: RETAINED_FORM_REF.apiVersion,
+      kind: RETAINED_FORM_REF.kind,
+      form: RETAINED_FORM.identity,
+      metadata: {
+        name: "retained-lifecycle",
+        space: "default",
+        uid: resourceUid,
+        generation: "1",
+        revision: "1",
+      },
+      spec: {},
+      status: { observedGeneration: "1", conditions: [] },
+    } as const;
+
+    await expect(
+      driver.apply({
+        operationId: "op_retained_authoring",
+        operationKey: "key_retained_authoring",
+        tenantId,
+        resourceUid: "uid_retained_authoring",
+        form: RETAINED_FORM,
+        name: "retained-authoring",
+        space: "default",
+        spec: {},
+        relations: [],
+      }),
+    ).rejects.toMatchObject({ code: "unsupported_capability", status: 422 });
+    await driver.observe({ tenantId, resourceUid, resource, relations: [] });
+    await driver.delete({
+      operationId: "op_retained_lifecycle_delete",
+      tenantId,
+      resourceUid,
+      resource,
+      relations: [],
+    });
+    expect(calls).toEqual([
+      "observe:edge.forms.takoform.com/v1beta1",
+      "delete:edge.forms.takoform.com/v1beta1",
+    ]);
+  });
+
+  test("proves a retained deployment absent only through its exact recovery offering", async () => {
     const sql = createEphemeralSql();
     const clock = () => new Date("2026-08-24T00:00:00.000Z");
     const deletions = createTakoformStore(sql, clock);
@@ -1511,7 +1691,7 @@ describe("Takoform apply on a real backend", () => {
     const resourceUid = "uid_retained_absence";
     const operationId = "op_retained_delete";
     const nativeId = "fake:retained-native";
-    const formRef = FORM_REF;
+    const formRef = RETAINED_FORM_REF;
     await deletions.prepareResourceDeletion({
       tenantId,
       resourceUid,
@@ -1576,6 +1756,7 @@ describe("Takoform apply on a real backend", () => {
     const provider: Provider = {
       id: "fake",
       offerings: [PROVIDER_OFFERING],
+      recoveryOfferings: [RETAINED_PROVIDER_OFFERING],
       ...fakeReadback,
       async verifyNativeAbsence() {
         readbacks += 1;

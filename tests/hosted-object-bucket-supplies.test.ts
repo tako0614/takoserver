@@ -23,8 +23,8 @@ const SUPPLY = {
     id: "wasabi.reseller-2026",
     providerType: "wasabi",
     permittedResourceClasses: ["storage.object"],
-    deliveryModes: ["native-credentials"],
-    customerAccess: "scoped-native-access",
+    deliveryModes: ["embedded-binding"],
+    customerAccess: "operator-only",
     whiteLabelAllowed: true,
     endUserTermsRequired: true,
     regions: ["eu-central-2"],
@@ -42,26 +42,47 @@ const SUPPLY = {
     ],
   },
   placement: {
-    deliveryMode: "native-credentials",
+    deliveryMode: "embedded-binding",
     supportPolicyRef: "support:hosted:standard",
     abusePolicyRef: "abuse:hosted:standard",
     portability: {
       api: "portable",
-      exportFormats: ["s3.object-set.takoform.com/v1"],
-      importFormats: ["s3.object-set.takoform.com/v1"],
-      migrationModes: ["offline"],
+      exportFormats: [],
+      importFormats: [],
+      migrationModes: [],
     },
     isolation: "dedicated-resource",
   },
 } as const;
 
 describe("hosted ObjectBucket supply contract", () => {
-  test("accepts an exact private Wasabi composition without credentials", () => {
+  test("accepts private S3 supply only behind the portable object-bucket Binding", () => {
     const parsed = parseHostedObjectBucketSupplies(
       JSON.stringify({ kind: HOSTED_OBJECT_BUCKET_SUPPLIES_KIND, supplies: [SUPPLY] }),
     );
     expect(parsed.supplies[0]).toEqual(SUPPLY);
     expect(JSON.stringify(parsed)).not.toMatch(/accessKey|secret|token/iu);
+  });
+
+  test("does not turn ObjectBucket authority into public native-credential retail", () => {
+    expect(() =>
+      parseHostedObjectBucketSupplies(
+        JSON.stringify({
+          kind: HOSTED_OBJECT_BUCKET_SUPPLIES_KIND,
+          supplies: [
+            {
+              ...SUPPLY,
+              supplyContract: {
+                ...SUPPLY.supplyContract,
+                deliveryModes: ["native-credentials"],
+                customerAccess: "scoped-native-access",
+              },
+              placement: { ...SUPPLY.placement, deliveryMode: "native-credentials" },
+            },
+          ],
+        }),
+      ),
+    ).toThrow("invalid hosted ObjectBucket supplies");
   });
 
   test("rejects provider identity drift and duplicate providers", () => {

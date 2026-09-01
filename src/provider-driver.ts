@@ -4,6 +4,7 @@ import { isEdgeFormsApiVersion } from "./form-ref.ts";
 import { canonicalDigest } from "./json.ts";
 import type { Ledger } from "./ledger.ts";
 import type { JsonObject } from "./ports.ts";
+import type { ProviderPack } from "./provider-pack.ts";
 import { createSoldProviderPlacementSelector } from "./provider-placement.ts";
 import type {
   Provider,
@@ -15,6 +16,10 @@ import type {
   ProviderTicket,
   ProviderValue,
 } from "./provider-port.ts";
+import {
+  canMaterializeAcrossProviderPacks,
+  materializeProviderRuntimeBindings,
+} from "./provider-runtime-bindings.ts";
 import type { ResourceDeployment, ResourceDeploymentStore } from "./resource-deployments.ts";
 import { validateMaximumRuntimeInputBindings } from "./takoform/forms.ts";
 import type { TakoformStore } from "./takoform/store.ts";
@@ -29,6 +34,11 @@ import type {
   TakoformStoredResource,
 } from "./takoform/types.ts";
 import { TakoformHostError } from "./takoform/types.ts";
+import {
+  type WorkerEndpointOriginAssignment,
+  WorkerEndpointOriginReservationError,
+  type WorkerEndpointOriginReservations,
+} from "./worker-endpoint-origin-reservations.ts";
 
 /**
  * The provider accepted a mutation but the driver could not observe a
@@ -64,9 +74,20 @@ export class ProviderMutationRecoveryError extends TakoformHostError {
 
 export interface CreateProviderDriverOptions {
   readonly providers: readonly Provider[];
+  /** Provider-private capabilities paired to the provisioners above. */
+  readonly providerPacks?: readonly ProviderPack[];
   readonly catalog: Catalog;
   readonly ledger: Ledger;
   readonly deployments: ResourceDeploymentStore;
+  /** Host-private reservation lifecycle. Opaque refs never cross the Provider port. */
+  readonly originReservations?: Pick<
+    WorkerEndpointOriginReservations,
+    | "assignEndpoint"
+    | "cancelEndpointAssignment"
+    | "activateEndpointAssignment"
+    | "endpointAssignment"
+    | "deactivateEndpointAssignment"
+  >;
   /** Host-owned deletion tombstones and effect-closure evidence. */
   readonly deletions?: Pick<
     TakoformStore,
@@ -83,13 +104,14 @@ export interface CreateProviderDriverOptions {
 }
 
 export function createProviderDriver(options: CreateProviderDriverOptions): TakoformResourceDriver {
-  const { providers, catalog, ledger, deployments, deletions } = options;
+  const { providers, catalog, ledger, deployments, deletions, originReservations } = options;
   const pollBudget = options.inlinePollBudget ?? 5;
   const sleep =
     options.sleep ??
     ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
 
   const byId = new Map(providers.map((provider) => [provider.id, provider]));
+  const packsById = new Map((options.providerPacks ?? []).map((pack) => [pack.id, pack]));
   const soldPlacements = createSoldProviderPlacementSelector({ providers, catalog });
   for (const provider of providers) {
     validateMaximumRuntimeInputBindings(provider.runtimeInputCapabilities?.maximumBindings ?? 0);
@@ -148,23 +170,42 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     relations: readonly ProviderRelation[];
   }> => {
     const resolved = await providerRelations(tenantId, relations);
-    const parents = resolved.flatMap((relation) =>
-      relation.deployment ? [relation.deployment] : [],
-    );
+    const parents = resolved.flatMap((relation) => (relation.deployment ? [relation] : []));
     if (parents.length === 0) throw new TakoformHostError("unsupported_capability", 422);
-    const providerPackRef = parents[0]?.providerPackRef;
-    const providerInstallationRef = parents[0]?.providerInstallationRef;
+    // Non-Binding relations remain the native placement anchor. A Binding is
+    // allowed to name a different pack only when both target export and
+    // consumer import capabilities claim its exact identity. This preserves
+    // the mixed-native-parent guard instead of turning it into provider
+    // guessing.
+    const nativeParents = parents.filter((relation) => !relation.bindingRef);
+    const anchors = nativeParents.length > 0 ? nativeParents : parents;
+    const providerPackRef = anchors[0]?.deployment?.providerPackRef;
+    const providerInstallationRef = anchors[0]?.deployment?.providerInstallationRef;
     if (
       !providerPackRef ||
       !providerInstallationRef ||
-      parents.some(
-        (deployment) =>
-          deployment.providerPackRef !== providerPackRef ||
-          deployment.providerInstallationRef !== providerInstallationRef,
+      anchors.some(
+        (relation) =>
+          relation.deployment?.providerPackRef !== providerPackRef ||
+          relation.deployment?.providerInstallationRef !== providerInstallationRef,
       )
     ) {
       // A native attachment cannot silently bridge two provider accounts.
       throw new TakoformHostError("unsupported_capability", 422);
+    }
+    const consumerPack = packsById.get(providerPackRef);
+    for (const relation of parents) {
+      const deployment = relation.deployment;
+      if (!deployment || deployment.providerPackRef === providerPackRef) continue;
+      if (
+        !canMaterializeAcrossProviderPacks({
+          bindingRef: relation.bindingRef,
+          consumerPack,
+          targetPack: packsById.get(deployment.providerPackRef),
+        })
+      ) {
+        throw new TakoformHostError("unsupported_capability", 422);
+      }
     }
     const provider = byId.get(providerPackRef);
     const offerings = provider?.offerings.filter((candidate) =>
@@ -410,18 +451,26 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     form: TakoformV1Alpha3FormRef,
   ): { provider: Provider; offering: ProviderOffering } => {
     const provider = byId.get(deployment.providerPackRef);
-    const offering = provider?.offerings.find(
-      (candidate) => candidate.id === deployment.offeringId,
-    );
     const sold = catalog.findOffering(deployment.offeringId);
+    const currentOffering = provider?.offerings.find(
+      (candidate) => candidate.id === deployment.offeringId && sameForm(candidate.form, form),
+    );
+    const recoveryOffering = provider?.recoveryOfferings?.find(
+      (candidate) => candidate.id === deployment.offeringId && sameForm(candidate.form, form),
+    );
+    // A current catalog row may reuse an offering id after its Form family
+    // advances. Recorded Deployments may cross that boundary only through an
+    // exact recovery-only capability; the ordinary offering remains the sole
+    // authoring path.
+    const offering =
+      sold && !sameForm(sold.form, form) ? recoveryOffering : (currentOffering ?? recoveryOffering);
     if (
       !provider ||
       !offering ||
       !sameForm(offering.form, form) ||
       (sold !== undefined &&
         (sold.providerPackRef !== deployment.providerPackRef ||
-          sold.providerInstallationRef !== deployment.providerInstallationRef ||
-          !sameForm(sold.form, form)))
+          sold.providerInstallationRef !== deployment.providerInstallationRef))
     ) {
       throw new TakoformHostError("backend_unavailable", 503);
     }
@@ -529,51 +578,174 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
             spec: input.previous?.spec ?? input.spec,
           }
         : undefined;
+      const providerInstallationRef =
+        sold?.providerInstallationRef ??
+        inheritedSelection?.providerInstallationRef ??
+        (() => {
+          throw new TakoformHostError("backend_unavailable", 503);
+        })();
+      const providerIdentity = {
+        tenantRef: input.tenantId,
+        space: input.space,
+        name: input.name,
+        uid: input.resourceUid,
+      } as const;
+      const runtimeBindings = await materializeProviderRuntimeBindings({
+        tenantId: input.tenantId,
+        source: providerIdentity,
+        sourceSpec: input.spec,
+        consumerPack: packsById.get(provider.id),
+        packs: packsById,
+        relations: relationTargets,
+      });
+      for (const relation of relationTargets) {
+        if (
+          relation.deployment &&
+          relation.deployment.providerPackRef !== provider.id &&
+          !runtimeBindings.some(
+            (binding) =>
+              binding.targetUid === relation.targetUid &&
+              binding.bindingRef.apiVersion === relation.bindingRef?.apiVersion &&
+              binding.bindingRef.name === relation.bindingRef?.name &&
+              binding.bindingRef.version === relation.bindingRef?.version &&
+              binding.bindingRef.schemaDigest === relation.bindingRef?.schemaDigest,
+          )
+        ) {
+          throw new TakoformHostError("unsupported_capability", 422);
+        }
+      }
+      let endpointAssignment: WorkerEndpointOriginAssignment | undefined;
+      if (input.form.identity.formRef.kind === "WorkerEndpoint") {
+        if (!originReservations) {
+          throw new TakoformHostError("unsupported_capability", 422);
+        }
+        const workerRelations = input.relations.filter(
+          (relation) =>
+            relation.pointer === "/worker" &&
+            relation.relation === "/worker" &&
+            relation.resource.kind === "ModuleWorker",
+        );
+        const worker = workerRelations.length === 1 ? workerRelations[0]?.resource : undefined;
+        if (!worker || worker.metadata.space !== input.space) {
+          throw new TakoformHostError("invalid_argument", 400);
+        }
+        if (current) {
+          try {
+            endpointAssignment =
+              (await originReservations.endpointAssignment(input.tenantId, input.resourceUid)) ??
+              undefined;
+          } catch (error) {
+            throw endpointReservationHostError(error);
+          }
+          if (
+            !endpointAssignment ||
+            (input.workerEndpointOriginReservationId !== undefined &&
+              input.workerEndpointOriginReservationId !== endpointAssignment.reservationId) ||
+            endpointAssignment.endpoint.space !== input.space ||
+            endpointAssignment.endpoint.name !== input.name ||
+            endpointAssignment.endpoint.uid !== input.resourceUid ||
+            endpointAssignment.worker.name !== worker.metadata.name ||
+            endpointAssignment.worker.uid !== worker.metadata.uid ||
+            endpointAssignment.worker.revision !== worker.metadata.revision ||
+            endpointAssignment.placement.providerPackRef !== provider.id ||
+            endpointAssignment.placement.providerInstallationRef !== providerInstallationRef
+          ) {
+            throw new TakoformHostError("resource_busy", 409);
+          }
+        } else {
+          if (input.workerEndpointOriginReservationId === undefined) {
+            throw new TakoformHostError("unsupported_capability", 422);
+          }
+          try {
+            endpointAssignment = await originReservations.assignEndpoint({
+              organizationId: input.tenantId,
+              reservationId: input.workerEndpointOriginReservationId,
+              space: input.space,
+              endpointName: input.name,
+              endpointResourceUid: input.resourceUid,
+              endpointResourceRevision: "1",
+              workerName: worker.metadata.name,
+              workerResourceUid: worker.metadata.uid,
+              providerPackRef: provider.id,
+              providerInstallationRef,
+            });
+          } catch (error) {
+            throw endpointReservationHostError(error);
+          }
+        }
+      }
       const providerInput = {
         operationId: input.operationId,
         operationKey: input.operationKey,
         ...(input.operationMode ? { operationMode: input.operationMode } : {}),
         offering,
-        identity: {
-          tenantRef: input.tenantId,
-          space: input.space,
-          name: input.name,
-          uid: input.resourceUid,
-        },
+        identity: providerIdentity,
         spec: input.spec,
         relations: relationTargets,
-        ...(input.standardServices
-          ? { standardServices: structuredClone(input.standardServices) }
+        ...(runtimeBindings.length > 0 ? { runtimeBindings } : {}),
+        ...(endpointAssignment
+          ? {
+              workerEndpointOriginAssignment: {
+                canonicalPublicOrigin: endpointAssignment.canonicalPublicOrigin,
+                assignmentDigest: endpointAssignment.assignmentDigest,
+              },
+            }
           : {}),
         ...(previous ? { previous } : {}),
       } satisfies import("./provider-port.ts").ApplyInput;
-      const work = async () =>
-        await settle(
+      let providerBoundaryEntered = false;
+      const work = async () => {
+        providerBoundaryEntered = true;
+        const ticket = await settle(
           provider,
           input.operationId,
           input.providerHandle
             ? await pollHandle(provider, input.operationId, input.providerHandle)
             : input.operationMode === "recovery"
-              ? provider.recoverApply
-                ? await provider.recoverApply(providerInput)
+              ? provider.convergeApply
+                ? await provider.convergeApply(providerInput)
                 : (() => {
-                    // Recovery without an opaque handle is safe only when the
-                    // concrete provider advertises an explicit deterministic,
-                    // read-only recovery seam. Never route it back through
-                    // `apply`, whose contract permits a fresh mutation.
+                    // A Host recovery lease may resume a mutation only through
+                    // an explicitly operation-keyed convergence seam. The
+                    // read-only `recoverApply` capability is never promoted
+                    // into mutation authority here.
                     throw new ProviderMutationRecoveryError("indeterminate");
                   })()
               : await provider.apply(providerInput),
           Boolean(input.providerHandle),
         );
+        if (endpointAssignment && ticket.phase === "succeeded") {
+          try {
+            await originReservations?.activateEndpointAssignment({
+              assignment: endpointAssignment,
+              providerOutputs: ticket.result.outputs,
+            });
+          } catch (error) {
+            throw endpointReservationHostError(error);
+          }
+        }
+        return ticket;
+      };
       // A reseller reservation already holds this exact Offering's price.
       // Charging the organization wallet again here would double-settle the
       // same Resource. Direct organization credentials have no such authority
       // and retain the ordinary hold/capture path.
-      const result =
-        input.commercialAuthority || priceMinor === 0
-          ? resultOf(await work())
-          : await charged(input.tenantId, input.operationId, priceMinor, work);
+      let result: ProviderResult;
+      try {
+        result =
+          input.commercialAuthority || priceMinor === 0
+            ? resultOf(await work())
+            : await charged(input.tenantId, input.operationId, priceMinor, work);
+      } catch (error) {
+        if (endpointAssignment && !providerBoundaryEntered) {
+          try {
+            await originReservations?.cancelEndpointAssignment(endpointAssignment);
+          } catch (cancelError) {
+            throw endpointReservationHostError(cancelError);
+          }
+        }
+        throw error;
+      }
       if (input.atomicDeploymentCommit) {
         return {
           ...receiptOf(result),
@@ -594,12 +766,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
                   resourceUid: input.resourceUid,
                   offeringId: offering.id,
                   providerPackRef: provider.id,
-                  providerInstallationRef:
-                    sold?.providerInstallationRef ??
-                    inheritedSelection?.providerInstallationRef ??
-                    (() => {
-                      throw new TakoformHostError("backend_unavailable", 503);
-                    })(),
+                  providerInstallationRef,
                   nativeId: result.nativeId,
                   state: "active",
                   observed: result.observed,
@@ -618,12 +785,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
             resourceUid: input.resourceUid,
             offeringId: offering.id,
             providerPackRef: provider.id,
-            providerInstallationRef:
-              sold?.providerInstallationRef ??
-              inheritedSelection?.providerInstallationRef ??
-              (() => {
-                throw new TakoformHostError("backend_unavailable", 503);
-              })(),
+            providerInstallationRef,
             nativeId: result.nativeId,
             state: "active",
             observed: result.observed,
@@ -670,6 +832,31 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
       if (intrinsicFormRef(input.resource.form.formRef)) return;
       const deployment = await active(input.tenantId, input.resourceUid);
       const { provider, offering } = installed(deployment, input.resource.form.formRef);
+      let endpointAssignment: WorkerEndpointOriginAssignment | null = null;
+      if (input.resource.form.formRef.kind === "WorkerEndpoint") {
+        if (!originReservations) {
+          throw new TakoformHostError("unsupported_capability", 422);
+        }
+        try {
+          endpointAssignment = await originReservations.endpointAssignment(
+            input.tenantId,
+            input.resourceUid,
+          );
+        } catch (error) {
+          throw endpointReservationHostError(error);
+        }
+        if (
+          !endpointAssignment ||
+          endpointAssignment.endpoint.space !== input.resource.metadata.space ||
+          endpointAssignment.endpoint.name !== input.resource.metadata.name ||
+          endpointAssignment.endpoint.uid !== input.resourceUid ||
+          endpointAssignment.placement.providerPackRef !== deployment.providerPackRef ||
+          endpointAssignment.placement.providerInstallationRef !==
+            deployment.providerInstallationRef
+        ) {
+          throw new TakoformHostError("resource_busy", 409);
+        }
+      }
       const ticket = await settle(
         provider,
         input.operationId,
@@ -713,6 +900,13 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
       const result = resultOf(ticket);
       if (result.nativeId !== deployment.nativeId) {
         throw new TakoformHostError("resource_busy", 409);
+      }
+      if (endpointAssignment) {
+        try {
+          await originReservations?.deactivateEndpointAssignment(endpointAssignment);
+        } catch (error) {
+          throw endpointReservationHostError(error);
+        }
       }
       if (input.atomicDeploymentCommit) {
         return {
@@ -973,15 +1167,15 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
       )) {
         // A retained Deployment is an historical provider identity, not a
         // license to ask whichever installation currently happens to expose
-        // the same offering id.  Resolve the exact catalog tuple first; a
-        // missing/retired/drifted installation fails closed without a native
-        // provider readback call.
+        // the same offering id. Resolve the exact current catalog tuple first;
+        // a Form-family advance may cross that tuple only through an exact
+        // recovery-only capability. A missing/retired/drifted installation
+        // fails closed without a native provider readback call.
         const catalogOffering = catalog.findOffering(deployment.offeringId);
         if (
           !catalogOffering ||
           catalogOffering.providerPackRef !== deployment.providerPackRef ||
-          catalogOffering.providerInstallationRef !== deployment.providerInstallationRef ||
-          !sameForm(catalogOffering.form, tombstone.formRef)
+          catalogOffering.providerInstallationRef !== deployment.providerInstallationRef
         ) {
           return await attest("indeterminate", "provider_unavailable");
         }
@@ -993,13 +1187,20 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
           return await attest("indeterminate", "provider_unavailable");
         }
         const provider = byId.get(deployment.providerPackRef);
-        const offering = provider?.offerings.find(
-          (candidate) => candidate.id === deployment.offeringId,
+        const currentOffering = provider?.offerings.find(
+          (candidate) =>
+            candidate.id === deployment.offeringId && sameForm(candidate.form, tombstone.formRef),
         );
+        const recoveryOffering = provider?.recoveryOfferings?.find(
+          (candidate) =>
+            candidate.id === deployment.offeringId && sameForm(candidate.form, tombstone.formRef),
+        );
+        const offering = sameForm(catalogOffering.form, tombstone.formRef)
+          ? (currentOffering ?? recoveryOffering)
+          : recoveryOffering;
         if (
           !provider ||
           !offering ||
-          !sameForm(offering.form, catalogOffering.form) ||
           !sameForm(offering.form, tombstone.formRef) ||
           !provider.createNativeReadbackDescriptor ||
           !provider.verifyNativeAbsence
@@ -1263,6 +1464,24 @@ function sameForm(left: TakoformV1Alpha3FormRef, right: TakoformV1Alpha3FormRef)
     left.definitionVersion === right.definitionVersion &&
     left.schemaDigest === right.schemaDigest
   );
+}
+
+function endpointReservationHostError(error: unknown): TakoformHostError {
+  if (!(error instanceof WorkerEndpointOriginReservationError)) {
+    return new TakoformHostError("backend_unavailable", 503);
+  }
+  switch (error.code) {
+    case "invalid_argument":
+      return new TakoformHostError("invalid_argument", 400);
+    case "not_found":
+      return new TakoformHostError("resource_not_found", 404);
+    case "conflict":
+      return new TakoformHostError("resource_busy", 409);
+    case "unsupported_capability":
+      return new TakoformHostError("unsupported_capability", 422);
+    case "backend_unavailable":
+      return new TakoformHostError("backend_unavailable", 503);
+  }
 }
 
 export function failureToWire(code: string): [string, number] {

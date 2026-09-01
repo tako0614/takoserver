@@ -21,7 +21,6 @@ import type {
   TakoformHostAuthority,
 } from "./host-authority.ts";
 import type { DeferredOperations } from "./operations.ts";
-import { isStableStandardServiceProtocol } from "./standard-services.ts";
 import type { OperationRecord, TakoformStore } from "./store.ts";
 import {
   type InstalledTakoformForm,
@@ -34,7 +33,6 @@ import {
   type TakoformHostResourceScope,
   type TakoformInterfaceRef,
   type TakoformRuntimeInputPolicy,
-  type TakoformStandardServiceResolver,
 } from "./types.ts";
 import {
   etag,
@@ -72,11 +70,6 @@ export interface TakoformRouteConfiguration {
   readonly omitObservedStatus?: boolean;
   readonly bodyGenerationFence?: boolean;
   readonly reviewSpecDigest?: boolean;
-  readonly standardServices?: {
-    readonly apiVersion: "standards.takoform.com/v1alpha1" | "standards.takoform.com/v1";
-    /** Retained beta-only closed support set. Stable support is resolver-owned. */
-    readonly protocols?: readonly string[];
-  };
 }
 
 export const DEFAULT_TAKOFORM_ROUTES: TakoformRouteConfiguration = Object.freeze({
@@ -88,7 +81,6 @@ export const DEFAULT_TAKOFORM_ROUTES: TakoformRouteConfiguration = Object.freeze
   omitObservedStatus: true,
   bodyGenerationFence: true,
   reviewSpecDigest: true,
-  standardServices: { apiVersion: "standards.takoform.com/v1" as const },
 });
 
 /**
@@ -147,7 +139,6 @@ export interface CreateTakoformRoutesOptions {
   readonly routes?: TakoformRouteConfiguration;
   readonly provision?: ProvisionLanePorts;
   readonly deferredOperations?: DeferredOperations;
-  readonly standardServiceResolver?: TakoformStandardServiceResolver;
   readonly availability?: TakoformFormAvailabilityResolver;
   readonly runtimeInputPolicy?: Pick<TakoformRuntimeInputPolicy, "guaranteedMaximum">;
   /** Durable public discovery/support/activation authority. */
@@ -164,7 +155,6 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
     artifacts,
     provision,
     deferredOperations,
-    standardServiceResolver,
     availability,
     runtimeInputPolicy,
     authority,
@@ -185,10 +175,6 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
   );
   const supportContractPattern = new RegExp(
     `^${escaped(lane)}/support/(interfaces|bindings)/([^/]+)/([^/]+)$`,
-    "u",
-  );
-  const standardServicePattern = new RegExp(
-    `^${escaped(lane)}/support/standard-services/([^/]+)$`,
     "u",
   );
   const formDefinitionPattern = new RegExp(
@@ -298,6 +284,14 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
   };
 
   return {
+    ...(deferredOperations
+      ? {
+          maintenance: {
+            drainProviderRepairs: async (limit?: number) =>
+              await deferredOperations.drainProviderRepairs(limit),
+          },
+        }
+      : {}),
     async handle(incoming): Promise<Response | null> {
       const request = laneRequest(incoming, configuration);
       const url = new URL(request.url);
@@ -329,6 +323,12 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
         url,
         tenantId: boundedTenantReference(principal.tenantId),
         principalId: boundedTenantReference(principal.principalId),
+        ...(principal.scope?.mode === "tenant-run" &&
+        principal.scope.workerEndpointOriginReservationId
+          ? {
+              workerEndpointOriginReservationId: principal.scope.workerEndpointOriginReservationId,
+            }
+          : {}),
         ...(exactScope?.mode === "provision" && exactScope.claimCreate
           ? { beforeCreate: exactScope.claimCreate, provisionOnly: true }
           : {}),
@@ -448,31 +448,6 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
               bindingRef: structuredClone(reference),
             },
       );
-    }
-
-    const standardService = standardServicePattern.exec(url.pathname);
-    if (request.method === "GET" && standardService) {
-      const protocol = safeSegment(standardService[1]);
-      const service = configuration.standardServices;
-      if (!service) return failure("resource_not_found", 404);
-      const stable = service.apiVersion === "standards.takoform.com/v1";
-      if (
-        stable ? !isStableStandardServiceProtocol(protocol) : !service.protocols?.includes(protocol)
-      ) {
-        return stable ? failure("invalid_argument", 400) : failure("resource_not_found", 404);
-      }
-      const serviceRef = { apiVersion: service.apiVersion, protocol } as const;
-      return Response.json({
-        apiVersion: configuration.supportProfileApiVersion,
-        kind: "StandardServiceSupport",
-        serviceRef,
-        satisfiable:
-          standardServiceResolver !== undefined &&
-          (await standardServiceResolver.satisfiable({
-            tenantId: context.tenantId,
-            serviceRef,
-          })),
-      });
     }
 
     if (request.method === "GET" && url.pathname === `${lane}/forms`) {

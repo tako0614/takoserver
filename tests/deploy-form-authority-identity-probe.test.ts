@@ -47,7 +47,7 @@ const target = {
 } satisfies DeployTarget;
 
 describe("Form authority identity probe deploy surface", () => {
-  test("realizes only the public identity binding and Host id", () => {
+  test("realizes only the two read-only identity RPC bindings and Host id", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-form-identity-config-"));
     try {
       const path = writeProbeConfig({
@@ -66,6 +66,11 @@ describe("Form authority identity probe deploy surface", () => {
             binding: "PUBLIC_HOST_IDENTITY",
             service: target.workerName,
             entrypoint: "PublicHostIdentityEntrypoint",
+          },
+          {
+            binding: "FORM_AUTHORITY",
+            service: target.formAuthority.workerName,
+            entrypoint: "FormAuthorityEntrypoint",
           },
         ],
       });
@@ -178,6 +183,12 @@ function probeState(present: boolean): FormAuthorityIdentityProbeState {
               type: "service",
               service: target.workerName,
               entrypoint: "PublicHostIdentityEntrypoint",
+            },
+            {
+              name: "FORM_AUTHORITY",
+              type: "service",
+              service: target.formAuthority.workerName,
+              entrypoint: "FormAuthorityEntrypoint",
             },
           ],
         },

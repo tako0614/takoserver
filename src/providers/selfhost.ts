@@ -290,13 +290,40 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     await runtimeOperation(() => runtime.reload());
   };
 
-  const endpointAddress = (script: string): { hostname: string; url: string } => {
-    const origin = canonicalWorkerEndpointOrigin(script, endpointSuffix);
-    if (!origin) {
-      throw new SelfhostFailure(failed("invalid_spec", "the Worker endpoint suffix is invalid"));
+  const endpointAddress = (
+    input: ApplyInput,
+  ): { hostname: string; url: string; assignmentDigest: `sha256:${string}` } => {
+    const assignment = input.workerEndpointOriginAssignment;
+    const origin = assignment?.canonicalPublicOrigin;
+    if (!assignment || !origin || origin.length > 2_048) {
+      throw new SelfhostFailure(
+        failed("invalid_spec", "the Host-assigned Worker endpoint origin is unavailable"),
+      );
     }
-    const hostname = new URL(origin).hostname;
-    return { hostname, url: `${origin}/` };
+    try {
+      const url = new URL(origin);
+      if (
+        url.protocol !== "https:" ||
+        url.username !== "" ||
+        url.password !== "" ||
+        url.pathname !== "/" ||
+        url.search !== "" ||
+        url.hash !== "" ||
+        url.origin !== origin ||
+        !serves(url.hostname)
+      ) {
+        throw new TypeError();
+      }
+      return {
+        hostname: url.hostname,
+        url: `${origin}/`,
+        assignmentDigest: assignment.assignmentDigest,
+      };
+    } catch {
+      throw new SelfhostFailure(
+        failed("invalid_spec", "the Host-assigned Worker endpoint origin is invalid"),
+      );
+    }
   };
 
   /** The one relation a pointer names, held to the expected target kind. */
@@ -544,7 +571,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     const worker = relationResource(input.relations, "/worker", "ModuleWorker");
     if (!worker) return failed("invalid_spec", "the Worker Endpoint is incomplete");
     const script = await scriptOf(input.identity.tenantRef, worker.metadata);
-    const address = endpointAddress(script);
+    const address = endpointAddress(input);
     const current = await readScriptState(script);
     if (current.state.endpointHostname !== address.hostname) {
       await writeScriptState(script, current, {
@@ -565,8 +592,12 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       }
     }
     return succeeded({
-      nativeId: nativeId(input, `selfhost-endpoint:${script}`),
-      observed: { enabled: true, scriptName: script },
+      nativeId: nativeId(input, `selfhost-endpoint:${script}:${address.hostname}`),
+      observed: {
+        enabled: true,
+        scriptName: script,
+        assignmentDigest: address.assignmentDigest,
+      },
       outputs: { hostname: address.hostname, url: address.url },
     });
   };
@@ -705,9 +736,11 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     id,
     offerings: structuredClone(options.offerings) as ProviderOffering[],
     workerEndpointOriginReservations: {
-      derive: async ({ identity }) => {
-        const script = await derivedProviderResourceName("sw", identity);
-        const canonicalPublicOrigin = canonicalWorkerEndpointOrigin(script, endpointSuffix);
+      derive: async ({ requestedSubdomain }) => {
+        const canonicalPublicOrigin = canonicalWorkerEndpointOrigin(
+          requestedSubdomain,
+          endpointSuffix,
+        );
         return canonicalPublicOrigin ? { canonicalPublicOrigin } : null;
       },
     },
@@ -720,8 +753,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       const parsed = parseSelfhostNativeId(kind, input.nativeId, input.spec, input.relations);
       if (!parsed) throw new ProviderReadbackDescriptorError();
       const data =
-        kind === "WorkerEndpoint" && parsed.script
-          ? { ...parsed.data, hostname: endpointAddress(parsed.script).hostname }
+        kind === "WorkerEndpoint" && parsed.script && parsed.hostname
+          ? { ...parsed.data, hostname: parsed.hostname }
           : parsed.data;
       return {
         apiVersion: PROVIDER_READBACK_API_VERSION,
@@ -815,10 +848,41 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     },
 
     async recoverApply(input): Promise<ProviderTicket> {
+      if (dispatchKind(input.offering) === "WorkerEndpoint") {
+        try {
+          const worker = relationResource(input.relations, "/worker", "ModuleWorker");
+          if (!worker) return failed("invalid_spec", "the Worker Endpoint is incomplete");
+          const address = endpointAddress(input);
+          const script = await scriptOf(input.identity.tenantRef, worker.metadata);
+          const { state } = await readScriptState(script);
+          if (state.endpointHostname !== address.hostname || !state.activeVersion) {
+            return failed(
+              "unavailable",
+              "the Worker Endpoint apply outcome is indeterminate",
+              true,
+            );
+          }
+          if (!(await runtimeOperation(() => runtime.has(script, runtimeGeneration(state))))) {
+            return failed("unavailable", "the Worker runtime is not serving the endpoint", true);
+          }
+          return succeeded({
+            nativeId: nativeId(input, `selfhost-endpoint:${script}:${address.hostname}`),
+            observed: {
+              enabled: true,
+              scriptName: script,
+              assignmentDigest: address.assignmentDigest,
+            },
+            outputs: { hostname: address.hostname, url: address.url },
+          });
+        } catch (error) {
+          if (error instanceof SelfhostFailure) return error.ticket;
+          throw error;
+        }
+      }
       if (dispatchKind(input.offering) !== "WorkerVersion") {
         return failed(
           "unavailable",
-          "self-host apply recovery is supported only for Worker Version materialization",
+          "self-host apply recovery is supported only for Worker Version or Endpoint materialization",
           true,
         );
       }
@@ -828,6 +892,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         if (error instanceof SelfhostFailure) return error.ticket;
         throw error;
       }
+    },
+
+    async convergeApply(input): Promise<ProviderTicket> {
+      return await this.apply({ ...input, operationMode: "recovery" });
     },
 
     async apply(input): Promise<ProviderTicket> {
@@ -938,9 +1006,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             const worker = relationResource(input.relations, "/worker", "ModuleWorker");
             if (!worker) return failed("not_found", "the Worker Endpoint has no worker relation");
             const script = await scriptOf(input.identity.tenantRef, worker.metadata);
-            const address = endpointAddress(script);
             const { state } = await readScriptState(script);
-            if (state.endpointHostname !== address.hostname || !state.activeVersion) {
+            if (!state.endpointHostname || !state.activeVersion) {
               return failed("not_found", "the Worker endpoint is not durably attached");
             }
             if (!(await runtimeOperation(() => runtime.has(script, runtimeGeneration(state))))) {
@@ -949,7 +1016,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             return succeeded({
               nativeId: input.nativeId,
               observed: { enabled: true, scriptName: script, serving: true },
-              outputs: { hostname: address.hostname, url: address.url },
+              outputs: {
+                hostname: state.endpointHostname,
+                url: `https://${state.endpointHostname}/`,
+              },
             });
           }
           case "WorkerCustomDomain": {
@@ -1176,7 +1246,26 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             );
             return current.state.activeVersion === undefined && !serving ? done() : uncertain();
           }
-          case "WorkerEndpoint":
+          case "WorkerEndpoint": {
+            const worker = relationResource(input.relations, "/worker", "ModuleWorker");
+            if (!worker) return failed("not_found", "the Worker route has no worker relation");
+            const script = await scriptOf(input.identity.tenantRef, worker.metadata);
+            const parsed = parseSelfhostNativeId(
+              "WorkerEndpoint",
+              input.nativeId,
+              input.spec,
+              input.relations,
+            );
+            if (!parsed?.hostname || parsed.script !== script) {
+              return failed("not_found", "the Worker Endpoint identity is malformed");
+            }
+            const current = await readScriptState(script);
+            const manifest = await readSelfhostRuntimeManifest(dataRoot, script);
+            return current.state.endpointHostname !== parsed.hostname &&
+              manifest?.hostnames.includes(parsed.hostname) !== true
+              ? done()
+              : uncertain();
+          }
           case "WorkerCustomDomain": {
             const worker = relationResource(input.relations, "/worker", "ModuleWorker");
             if (!worker) return failed("not_found", "the Worker route has no worker relation");
@@ -1188,12 +1277,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             // Workerd's boolean seam reports script activation, not a
             // per-host route. When another route still serves the script we
             // cannot prove this route's absence, so fail closed.
-            return !serving &&
-              (dispatchKind(input.offering) === "WorkerEndpoint"
-                ? current.state.endpointHostname === undefined
-                : current.state.domains.length === 0)
-              ? done()
-              : uncertain();
+            return !serving && current.state.domains.length === 0 ? done() : uncertain();
           }
           default:
             // Namespace resources have no mutable local object; their delete
@@ -1438,6 +1522,7 @@ function parseSelfhostNativeId(
     selfhostWorkerScript(relations) ??
     (safeSegment(spec?.scriptName) ? spec.scriptName : undefined) ??
     (safeSegment(spec?.workerScript) ? spec.workerScript : null);
+  const endpointHostname = normalizedHostname(parts[2]);
   switch (kind) {
     case "ModuleWorker":
       return parts[0] === "selfhost-worker" && script
@@ -1456,8 +1541,12 @@ function parseSelfhostNativeId(
         ? { script, data: { scriptName: script, ...relationData } }
         : null;
     case "WorkerEndpoint":
-      return parts[0] === "selfhost-endpoint" && script
-        ? { script, data: { scriptName: script } }
+      return parts[0] === "selfhost-endpoint" && script && endpointHostname
+        ? {
+            script,
+            hostname: endpointHostname,
+            data: { scriptName: script, hostname: endpointHostname },
+          }
         : null;
     case "WorkerCustomDomain": {
       const hostname = normalizedHostname(spec?.hostname);
@@ -1572,7 +1661,7 @@ function validateSelfhostReadbackDescriptor(
 }
 
 function selfhostEndpointDataMatches(parsed: SelfhostReadbackParsed, actual: JsonObject): boolean {
-  if (!parsed.script || !normalizedHostname(actual.hostname)) return false;
+  if (!parsed.script || !parsed.hostname || !normalizedHostname(actual.hostname)) return false;
   const keys = Object.keys(actual).sort();
   return (
     keys.length === 2 &&
@@ -1580,7 +1669,7 @@ function selfhostEndpointDataMatches(parsed: SelfhostReadbackParsed, actual: Jso
     keys[1] === "scriptName" &&
     actual.scriptName === parsed.script &&
     typeof actual.hostname === "string" &&
-    actual.hostname.startsWith(`${parsed.script}.`)
+    actual.hostname === parsed.hostname
   );
 }
 

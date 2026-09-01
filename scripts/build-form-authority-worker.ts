@@ -11,14 +11,21 @@ try {
       "identity-probe",
       "wrangler.form-authority-identity-probe.jsonc",
       false,
-      ["PUBLIC_HOST_IDENTITY", "TAKOSERVER_FORM_AUTHORITY_HOST_ID"],
+      ["PUBLIC_HOST_IDENTITY", "FORM_AUTHORITY", "TAKOSERVER_FORM_AUTHORITY_HOST_ID"],
       ["STATE_DB", "OBJECTS"],
     ],
     [
       "production",
       "wrangler.form-authority.jsonc",
       false,
-      ["STATE_DB", "OBJECTS", "PUBLIC_HOST_IDENTITY"],
+      [
+        "STATE_DB",
+        "OBJECTS",
+        "PUBLIC_HOST_IDENTITY",
+        "CORE_VERIFIER",
+        "WORKER_VERSION",
+        "TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST",
+      ],
       [],
     ],
     [
@@ -59,6 +66,11 @@ try {
         resolve(repository, config),
         "--outdir",
         directory,
+        // The portable build proves the Worker bundle and binding closure only.
+        // The released-Core Container image is a native, deploy-time build that
+        // needs Docker; its source digest is sealed by the deploy surface.
+        "--containers-rollout",
+        "none",
       ],
       { cwd: repository, stdout: "pipe", stderr: "pipe", stdin: "ignore" },
     );

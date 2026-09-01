@@ -201,8 +201,6 @@ export function deploymentVariables(
   if (
     target.zones !== undefined ||
     target.aiModels !== undefined ||
-    target.r2ParentAccessKeyId !== undefined ||
-    target.standardServiceSupplies !== undefined ||
     target.objectBucketSupplies !== undefined ||
     target.edgeSupplies !== undefined
   ) {
@@ -210,12 +208,6 @@ export function deploymentVariables(
   }
   if (target.zones !== undefined) vars.TAKOSERVER_ZONES = JSON.stringify(target.zones);
   if (target.aiModels !== undefined) vars.TAKOSERVER_AI_MODELS = JSON.stringify(target.aiModels);
-  if (target.r2ParentAccessKeyId !== undefined) {
-    vars.TAKOSERVER_R2_PARENT_ACCESS_KEY_ID = target.r2ParentAccessKeyId;
-  }
-  if (target.standardServiceSupplies !== undefined) {
-    vars.TAKOSERVER_STANDARD_SERVICE_SUPPLIES = JSON.stringify(target.standardServiceSupplies);
-  }
   if (target.objectBucketSupplies !== undefined) {
     vars.TAKOSERVER_OBJECT_BUCKET_SUPPLIES = JSON.stringify(target.objectBucketSupplies);
   }
@@ -283,13 +275,11 @@ export function expectedWorkerSecrets(target: DeployTarget): readonly string[] {
   if (target.sponsorship === true) names.add("TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN");
   if (target.stripeCheckout === true) names.add("STRIPE_SECRET_KEY");
   if (
-    target.standardServiceSupplies !== undefined ||
     target.edgeSupplies !== undefined ||
     target.objectBucketSupplies?.supplies.some((supply) => supply.provider.kind === "cloudflare")
   ) {
     names.add("CLOUDFLARE_API_TOKEN");
   }
-  if (target.r2ParentAccessKeyId !== undefined) names.add("TAKOSERVER_R2_PARENT_TOKEN");
   if (target.objectBucketSupplies?.supplies.some((supply) => supply.provider.kind === "wasabi")) {
     names.add("TAKOSERVER_WASABI_ACCESS_KEY_ID");
     names.add("TAKOSERVER_WASABI_SECRET_ACCESS_KEY");

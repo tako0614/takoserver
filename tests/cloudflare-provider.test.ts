@@ -1631,7 +1631,7 @@ describe("released edge Form placement", () => {
     }
   });
 
-  test("provisions a stable Worker Version with no sensitive bindings", async () => {
+  test("refuses a portable object Binding without the managed Worker adapter", async () => {
     const workerOffering = technical("ModuleWorker");
     const versionOffering = technical("WorkerVersion");
     const calls: Call[] = [];
@@ -1660,30 +1660,28 @@ describe("released edge Form placement", () => {
         return Response.json({
           success: true,
           errors: [],
-          result: { id: "version-s3" },
+          result: { id: "version-objects" },
         });
       },
     });
-    const bucketName = `tss3-${"a".repeat(40)}`;
+    const bucketName = `ts-${"a".repeat(40)}`;
     const ticket = await provider.apply({
-      operationId: "op-version-s3",
+      operationId: "op-version-objects",
       operationMode: "initial",
       offering: versionOffering,
       identity: { ...IDENTITY, name: "version" },
       spec: { handlers: ["fetch"], requiredSensitiveVars: [] },
-      standardServices: [
+      runtimeBindings: [
         {
           name: "MEDIA",
-          required: true,
-          service: {
-            apiVersion: "standards.takoform.com/v1",
-            protocol: "com.amazonaws.s3",
+          targetUid: "bucket-uid",
+          bindingRef: {
+            apiVersion: "bindings.takoform.com/v1alpha2",
+            name: "module-worker.object-bucket",
+            version: "1.1.0",
+            schemaDigest: "sha256:ff8661459b73a8d229e0915c698afad2aa297b5db90fe5e1693d346a7ae3adfb",
           },
-          endpoint: {
-            kind: "takoserver.cloudflare-r2-bucket@v1",
-            bucketName,
-          },
-          credential: { kind: "takoserver.cloudflare-r2-binding@v1" },
+          material: { kind: "takoserver.cloudflare-r2.edge-objects@v1", bucketName },
         },
       ],
       relations: [
@@ -1703,18 +1701,11 @@ describe("released edge Form placement", () => {
     });
 
     expect(ticket).toMatchObject({
-      phase: "succeeded",
-      result: { nativeId: "version:script-name:version-s3" },
+      phase: "failed",
+      failure: { code: "invalid_spec" },
     });
-    const versionUpload = calls.find(
-      (call) => call.method === "POST" && call.url.includes("/versions"),
-    );
-    expect(versionUpload?.body).toContain(
-      `"type":"r2_bucket","name":"MEDIA","bucket_name":"${bucketName}"`,
-    );
-    expect(versionUpload?.body).not.toContain('"type":"secret_text"');
+    expect(calls).toEqual([]);
     expect(JSON.stringify(ticket)).not.toContain(bucketName);
-    expect(JSON.stringify(ticket)).not.toContain("com.amazonaws.s3");
   });
 
   test("provisions a fetch-only Worker Version without secret bindings", async () => {

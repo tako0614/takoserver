@@ -43,6 +43,7 @@ const SURFACES = [
   ["takoserver-hosted-token-retirement", ["irreversible", "authority"]],
   ["takoserver-worker-retirement-attribution-repair", []],
   ["takoserver-integration-operator-identity", ["authority"]],
+  ["takoserver-managed-worker-gateway", ["authority"]],
 ] as const;
 
 describe("Takoserver split deploy entrypoint", () => {

@@ -163,6 +163,13 @@ export class CloudflareState {
     );
   }
 
+  workerVersionWithModules(workerName: string, versionId: string): Promise<unknown> {
+    return this.read(
+      `/workers/workers/${encodeURIComponent(workerName)}/versions/${encodeURIComponent(versionId)}?include=modules`,
+      `${workerName} version ${versionId} module closure`,
+    );
+  }
+
   async workerSecrets(workerName: string): Promise<readonly unknown[]> {
     const label = `${workerName} secret inventory`;
     const result = await this.read(

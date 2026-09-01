@@ -77,18 +77,16 @@ export function createConfiguredHistoricalTakoformHost(
       : {}),
     ...(options.availability ? { availability: options.availability } : {}),
   });
-  const deferredOperations = options.deferredOperations
-    ? createDeferredOperations({
-        configuration: options.deferredOperations,
-        engine,
-        store,
-        forms,
-        clock,
-        randomId,
-        ...(resourceQueryIncludesPathIdentity ? { resourceQueryIncludesPathIdentity: true } : {}),
-        ...(options.routes.omitObservedStatus ? { omitObservedStatus: true } : {}),
-      })
-    : undefined;
+  const deferredOperations = createDeferredOperations({
+    configuration: options.deferredOperations ?? { shouldDefer: () => false },
+    engine,
+    store,
+    forms,
+    clock,
+    randomId,
+    ...(resourceQueryIncludesPathIdentity ? { resourceQueryIncludesPathIdentity: true } : {}),
+    ...(options.routes.omitObservedStatus ? { omitObservedStatus: true } : {}),
+  });
   return createTakoformRoutes({
     authenticate: options.authenticate,
     engine,
@@ -97,7 +95,7 @@ export function createConfiguredHistoricalTakoformHost(
     bindings,
     artifacts,
     routes: options.routes,
-    ...(deferredOperations ? { deferredOperations } : {}),
+    deferredOperations,
     ...(options.standardServiceResolver
       ? { standardServiceResolver: options.standardServiceResolver }
       : {}),

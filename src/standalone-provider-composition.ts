@@ -2,7 +2,7 @@ import {
   createProvisioningProviderPack,
   type DeploymentComposition,
 } from "./deployment-composition.ts";
-import { type EdgeFormBundle, objectBucketProviderOffering } from "./edge-forms.ts";
+import { type EdgeFormBundle, edgeProviderOffering } from "./edge-forms.ts";
 import type { ProviderPack } from "./provider-pack.ts";
 import type { Provider } from "./provider-port.ts";
 import { CloudflareProvider, type CloudflareProviderOptions } from "./providers/cloudflare.ts";
@@ -144,14 +144,15 @@ export function createStandaloneProviderComposition(input: {
       "retired Cloudflare ObjectBucket drain cannot be mixed with stable self-host provider settings",
     );
   }
-  const objectBucketOffering = objectBucketProviderOffering(input.edge.objectBucket.form, {
+  const objectBucketOffering = edgeProviderOffering(input.edge.objectBucket.form, {
     id: "storage.object.standard",
     displayName: "Object bucket",
     regions: ["global"],
   });
   const provider = new CloudflareProvider({
     ...input.retiredCloudflare,
-    offerings: [objectBucketOffering],
+    offerings: [],
+    recoveryOfferings: [objectBucketOffering],
   });
   const pack = createProvisioningProviderPack({ provider, providerType: "cloudflare" });
 

@@ -1,0 +1,53 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "takoserver-managed-worker-gateway",
+  "main": "src/entry-cloudflare-managed-worker-gateway.ts",
+  "compatibility_date": "2026-08-31",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": true
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.01
+    }
+  },
+  "vars": {
+    "TAKOSERVER_MANAGED_WORKER_GATEWAY_ID": "unconfigured",
+    "TAKOSERVER_ENVIRONMENT": "unconfigured",
+    "MANAGED_PROVIDER_ID": "unconfigured"
+  },
+  "d1_databases": [
+    {
+      "binding": "STATE_DB",
+      "database_name": "unconfigured",
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+  "dispatch_namespaces": [
+    {
+      "binding": "DISPATCHER",
+      "namespace": "unconfigured"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "SQLITE_DATABASES",
+        "class_name": "TakoserverManagedWorkerSqlite"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["TakoserverManagedWorkerSqlite"]
+    }
+  ]
+}

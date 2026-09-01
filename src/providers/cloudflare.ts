@@ -28,11 +28,24 @@ import {
   canonicalWorkerEndpointOrigin,
   derivedProviderResourceName,
 } from "../provider-worker-endpoint-origin.ts";
-import {
-  AMAZON_S3_STANDARD_SERVICE,
-  CLOUDFLARE_R2_CREDENTIAL_KIND,
-  CLOUDFLARE_R2_ENDPOINT_KIND,
-} from "./cloudflare-r2-standard-service.ts";
+import { CloudflareWfpBackend } from "./cloudflare-wfp-backend.ts";
+import type {
+  ArtifactBytes,
+  CloudflareManagedScheduleOperatorProof,
+  CloudflareManagedScheduleReconciliationStatus,
+  CloudflareWorkerBackend,
+  CloudflareWorkerBackendOptions,
+} from "./cloudflare-worker-backend.ts";
+
+export type {
+  ArtifactBytes,
+  CloudflareManagedScheduleOperatorProof,
+  CloudflareManagedScheduleReconciliationStatus,
+  CloudflareOrdinaryWorkerBackendOptions,
+  CloudflareWorkerBackendOptions,
+  CloudflareWorkersForPlatformsBackendOptions,
+  TakoformBundleManifest,
+} from "./cloudflare-worker-backend.ts";
 
 /**
  * Provisioning on Cloudflare through its REST API.
@@ -100,28 +113,6 @@ const SQLITE_MIGRATION_LEDGER_DDL = `CREATE TABLE IF NOT EXISTS ${SQLITE_MIGRATI
 /** Cloudflare's code for "that hostname already resolves to something else". */
 const DNS_RECORDS_PRESENT = 100_117;
 
-export interface ArtifactBytes {
-  /** The committed manifest a tenant holds, or null if it holds none. */
-  manifest(tenantRef: string, digest: string): Promise<TakoformBundleManifest | null>;
-  blob(digest: string): Promise<Uint8Array | null>;
-}
-
-export interface TakoformBundleManifest {
-  readonly kind: string;
-  readonly mainModule?: string;
-  readonly modules?: readonly {
-    readonly name: string;
-    readonly mediaType: string;
-    readonly digest: string;
-  }[];
-  readonly files?: readonly {
-    readonly path: string;
-    readonly mediaType: string;
-    readonly size: number;
-    readonly digest: string;
-  }[];
-}
-
 /**
  * A DNS zone this deployment may attach customer Workers to.
  *
@@ -165,11 +156,15 @@ export interface CloudflareProviderOptions {
   readonly accountId: string;
   readonly zones?: readonly CloudflareZone[];
   readonly offerings: readonly ProviderOffering[];
+  readonly recoveryOfferings?: readonly ProviderOffering[];
   readonly artifacts: ArtifactBytes;
   /** Returns an `Authorization` header value. Credentials never live here. */
   readonly authorize: () => Promise<string> | string;
   readonly apiOrigin?: string;
+  /** Closed placement contract for every Worker-shaped resource. */
+  readonly workerBackend?: CloudflareWorkerBackendOptions;
   /** Exact suffix assigned to this account, for example `team.workers.dev`. */
+  /** @deprecated Prefer `workerBackend: { kind: "ordinary-workers", ... }`. */
   readonly workerEndpointSuffix?: string;
   readonly workerCompatibilityDate?: string;
   /** Host-owned one-shot runtime input authority; absent disables sensitive bindings. */
@@ -180,6 +175,7 @@ export interface CloudflareProviderOptions {
 export class CloudflareProvider implements Provider {
   readonly id: string;
   readonly offerings: readonly ProviderOffering[];
+  readonly recoveryOfferings?: readonly ProviderOffering[];
   readonly workerEndpointOriginReservations: NonNullable<
     Provider["workerEndpointOriginReservations"]
   >;
@@ -191,6 +187,7 @@ export class CloudflareProvider implements Provider {
   readonly #authorize: CloudflareProviderOptions["authorize"];
   readonly #fetch: (request: Request) => Promise<Response>;
   readonly #workerEndpointSuffix: string | undefined;
+  readonly #workerBackend: CloudflareWorkerBackend | undefined;
   readonly #workerCompatibilityDate: string;
   readonly #runtimeInputs: ProviderRuntimeInputLeasePort | undefined;
 
@@ -199,19 +196,43 @@ export class CloudflareProvider implements Provider {
     this.#accountId = options.accountId;
     this.#origin = options.apiOrigin ?? API_ORIGIN;
     this.offerings = structuredClone(options.offerings);
+    if (options.recoveryOfferings) {
+      this.recoveryOfferings = structuredClone(options.recoveryOfferings);
+    }
     this.#artifacts = options.artifacts;
     this.#zones = [...(options.zones ?? [])];
     this.#authorize = options.authorize;
     this.#fetch = options.fetch ?? ((request) => fetch(request));
-    this.#workerEndpointSuffix = options.workerEndpointSuffix;
     this.#workerCompatibilityDate = options.workerCompatibilityDate ?? "2026-08-19";
     this.#runtimeInputs = options.runtimeInputs;
+    const workerBackend = options.workerBackend ?? {
+      kind: "ordinary-workers" as const,
+      ...(options.workerEndpointSuffix === undefined
+        ? {}
+        : { workerEndpointSuffix: options.workerEndpointSuffix }),
+    };
+    this.#workerEndpointSuffix =
+      workerBackend.kind === "ordinary-workers" ? workerBackend.workerEndpointSuffix : undefined;
+    this.#workerBackend =
+      workerBackend.kind === "workers-for-platforms"
+        ? new CloudflareWfpBackend({
+            ...workerBackend,
+            providerId: this.id,
+            accountId: this.#accountId,
+            apiOrigin: this.#origin,
+            authorize: this.#authorize,
+            fetch: this.#fetch,
+            artifacts: this.#artifacts,
+            ...(this.#runtimeInputs === undefined ? {} : { runtimeInputs: this.#runtimeInputs }),
+            workerCompatibilityDate: this.#workerCompatibilityDate,
+          })
+        : undefined;
     this.workerEndpointOriginReservations = {
-      derive: async ({ identity }) => {
+      derive: async (input) => {
+        if (this.#workerBackend) return await this.#workerBackend.deriveOrigin(input);
         if (!this.#workerEndpointSuffix) return null;
-        const script = await derivedProviderResourceName("tsw", identity);
         const canonicalPublicOrigin = canonicalWorkerEndpointOrigin(
-          script,
+          input.requestedSubdomain,
           this.#workerEndpointSuffix,
         );
         return canonicalPublicOrigin ? { canonicalPublicOrigin } : null;
@@ -224,10 +245,37 @@ export class CloudflareProvider implements Provider {
     }
   }
 
+  async managedScheduleReconciliationStatus(): Promise<
+    ProviderValue<CloudflareManagedScheduleReconciliationStatus>
+  > {
+    if (!this.#workerBackend?.managedScheduleReconciliationStatus) {
+      return providerValueFailure(
+        "invalid_spec",
+        "the managed Worker schedule operator is unavailable",
+      );
+    }
+    return await this.#workerBackend.managedScheduleReconciliationStatus();
+  }
+
+  async reconcileManagedSchedules(
+    proof: CloudflareManagedScheduleOperatorProof,
+  ): Promise<ProviderValue<CloudflareManagedScheduleReconciliationStatus>> {
+    if (!this.#workerBackend?.reconcileManagedSchedules) {
+      return providerValueFailure(
+        "invalid_spec",
+        "the managed Worker schedule operator is unavailable",
+      );
+    }
+    return await this.#workerBackend.reconcileManagedSchedules(proof);
+  }
+
   readonly sqliteMigrations = {
     readLedger: async (input: {
       readonly nativeId: string;
     }): Promise<ProviderValue<readonly ProviderSqliteMigrationIdentity[]>> => {
+      if (this.#workerBackend?.readSqliteMigrationLedger) {
+        return await this.#workerBackend.readSqliteMigrationLedger(input);
+      }
       const databaseId = d1DatabaseId(input.nativeId);
       if (!databaseId)
         return providerValueFailure("invalid_spec", "the database identity is invalid");
@@ -268,6 +316,9 @@ export class CloudflareProvider implements Provider {
       readonly expectedPrefix: readonly ProviderSqliteMigrationIdentity[];
       readonly migrations: readonly ProviderSqliteMigration[];
     }): Promise<ProviderValue<undefined>> => {
+      if (this.#workerBackend?.applySqliteMigrationSuffix) {
+        return await this.#workerBackend.applySqliteMigrationSuffix(input);
+      }
       const databaseId = d1DatabaseId(input.nativeId);
       if (!databaseId)
         return providerValueFailure("invalid_spec", "the database identity is invalid");
@@ -334,6 +385,9 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
   };
 
   async apply(input: ApplyInput): Promise<ProviderTicket> {
+    if (this.#workerBackend?.owns(input.offering)) {
+      return await this.#workerBackend.apply(input);
+    }
     const canRecoverWorkerVersion =
       input.offering.kind.startsWith("takoform.") &&
       isEdgeFormsApiVersion(input.offering.form.apiVersion) &&
@@ -398,6 +452,9 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
    * marker, so its recovery path only lists and reads matching versions.
    */
   async recoverApply(input: ApplyInput): Promise<ProviderTicket> {
+    if (this.#workerBackend?.owns(input.offering)) {
+      return await this.#workerBackend.recoverApply(input);
+    }
     const deterministicWorkerVersion =
       input.offering.kind.startsWith("takoform.") &&
       isEdgeFormsApiVersion(input.offering.form.apiVersion) &&
@@ -406,6 +463,25 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       return failed(
         "unavailable",
         "the provider mutation outcome is indeterminate; operator repair is required",
+        true,
+      );
+    }
+    return await this.#applyWorkerVersion({ ...input, operationMode: "recovery" });
+  }
+
+  /** Resume one exact Host-owned command; never inferred from read-only recovery. */
+  async convergeApply(input: ApplyInput): Promise<ProviderTicket> {
+    if (this.#workerBackend?.owns(input.offering)) {
+      return await this.#workerBackend.convergeApply({ ...input, operationMode: "recovery" });
+    }
+    const deterministicWorkerVersion =
+      input.offering.kind.startsWith("takoform.") &&
+      isEdgeFormsApiVersion(input.offering.form.apiVersion) &&
+      input.offering.form.kind === "WorkerVersion";
+    if (!deterministicWorkerVersion) {
+      return failed(
+        "unavailable",
+        "the provider mutation cannot be converged without an operation-keyed backend",
         true,
       );
     }
@@ -421,6 +497,9 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
   createNativeReadbackDescriptor(
     input: ProviderNativeReadbackInput,
   ): ProviderNativeReadbackDescriptor {
+    if (this.#workerBackend?.owns(input.offering)) {
+      return this.#workerBackend.createNativeReadbackDescriptor(input);
+    }
     const native = parseNativeId(input.nativeId);
     if (!native || !cloudflareKindMatches(providerKind(input.offering), native.kind)) {
       throw new ProviderReadbackDescriptorError();
@@ -445,6 +524,9 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     offering: ProviderOffering;
     descriptor: ProviderNativeReadbackDescriptor;
   }): Promise<ProviderNativeAbsence> {
+    if (this.#workerBackend?.owns(input.offering)) {
+      return await this.#workerBackend.verifyNativeAbsence(input);
+    }
     const native = validateCloudflareReadbackDescriptor(this.id, input.offering, input.descriptor);
     if (!native) return unknownAbsence("malformed", false);
     const path = cloudflareReadbackPath(this.#accountId, native);
@@ -478,8 +560,22 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
   async observe(input: {
     offering: ProviderOffering;
     nativeId: string;
+    identity?: import("../provider-port.ts").ResourceIdentity;
     spec: JsonObject;
+    relations?: readonly ProviderRelation[];
   }): Promise<ProviderTicket> {
+    if (this.#workerBackend?.owns(input.offering)) {
+      if (!input.identity) {
+        return failed("invalid_spec", "the managed resource identity is missing");
+      }
+      return await this.#workerBackend.observe({
+        offering: input.offering,
+        nativeId: input.nativeId,
+        identity: input.identity,
+        spec: input.spec,
+        ...(input.relations === undefined ? {} : { relations: input.relations }),
+      });
+    }
     const native = parseNativeId(input.nativeId);
     if (!native) return failed("not_found", "unrecognised native identity");
     if (native.kind === "worker" && input.offering.form.kind === "ModuleWorker") {
@@ -618,9 +714,13 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     providerHandle?: string;
     offering: ProviderOffering;
     nativeId: string;
-    identity: { tenantRef: string; space: string; name: string };
+    identity: import("../provider-port.ts").ResourceIdentity;
     spec?: JsonObject;
+    relations?: readonly ProviderRelation[];
   }): Promise<ProviderTicket> {
+    if (this.#workerBackend?.owns(input.offering)) {
+      return await this.#workerBackend.delete(input);
+    }
     if (input.operationMode === "recovery" && !input.providerHandle) {
       // Cloudflare exposes no opaque delete handle. A transport close after a
       // DELETE therefore cannot be safely replayed; leave recovery to an
@@ -702,16 +802,22 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     providerHandle?: string;
     offering: ProviderOffering;
     nativeId: string;
-    identity: { tenantRef: string; space: string; name: string };
+    identity: import("../provider-port.ts").ResourceIdentity;
     spec?: JsonObject;
+    relations?: readonly ProviderRelation[];
   }): Promise<ProviderTicket> {
+    if (this.#workerBackend?.owns(input.offering)) {
+      return await this.#workerBackend.recoverDelete(input);
+    }
     if (input.providerHandle) {
       return failed("unavailable", "Cloudflare delete recovery cannot poll this handle", true);
     }
     const observed = await this.observe({
       offering: input.offering,
       nativeId: input.nativeId,
+      identity: input.identity,
       spec: input.spec ?? {},
+      ...(input.relations === undefined ? {} : { relations: input.relations }),
     });
     if (observed.phase === "failed" && observed.failure.code === "not_found") {
       return succeeded({ nativeId: input.nativeId, observed: { deleted: true }, outputs: {} });
@@ -878,12 +984,11 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
 
     const bindings = edgeBindings(input.spec, input.relations);
     if (!bindings) return failed("invalid_spec", "a Worker binding has no provider deployment");
-    const standardServiceBindings = cloudflareStandardServiceBindings(
-      input.standardServices,
-      bindings,
-    );
-    if (!standardServiceBindings) {
-      return failed("invalid_spec", "standard-service runtime material is invalid");
+    if ((input.runtimeBindings?.length ?? 0) > 0) {
+      return failed(
+        "invalid_spec",
+        "portable runtime Bindings require an exact managed Worker adapter",
+      );
     }
     const requiredSensitive = sensitiveBindingNames(input.spec.requiredSensitiveVars);
     if (!requiredSensitive) {
@@ -896,7 +1001,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       return failed("denied", "required sensitive Worker runtime inputs are unavailable");
     }
     if (
-      [...bindings, ...standardServiceBindings].some(
+      bindings.some(
         (binding) =>
           binding.name === WORKER_VERSION_OPERATION_MARKER_BINDING ||
           binding.name === WORKER_VERSION_RUNTIME_INPUT_COMMITMENT_BINDING,
@@ -905,9 +1010,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       return failed("invalid_spec", "an internal Worker Version binding is reserved");
     }
     const occupiedNames = new Set(
-      [...bindings, ...standardServiceBindings]
-        .map((binding) => optionalString(binding.name))
-        .filter(isString),
+      bindings.map((binding) => optionalString(binding.name)).filter(isString),
     );
     if (requiredSensitive.some((name) => occupiedNames.has(name))) {
       return failed("invalid_spec", "a sensitive Worker binding collides with another binding");
@@ -1054,7 +1157,6 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
               compatibility_date: this.#workerCompatibilityDate,
               bindings: [
                 ...bindings,
-                ...standardServiceBindings,
                 ...sensitiveBindings,
                 ...(runtimeInputLease
                   ? [
@@ -2523,7 +2625,6 @@ function edgeBindings(
   }
   for (const [field, relationPrefix, type, output, targetKey] of [
     ["kvBindings", "/kvBindings", "kv_namespace", "namespaceId", "namespace_id"],
-    ["bucketBindings", "/bucketBindings", "r2_bucket", "bucketName", "bucket_name"],
     ["sqliteBindings", "/sqliteBindings", "d1", "databaseId", "id"],
     ["queueProducerBindings", "/queueProducerBindings", "queue", "queueName", "queue_name"],
     ["serviceBindings", "/serviceBindings", "service", "scriptName", "service"],
@@ -2538,41 +2639,6 @@ function edgeBindings(
     }
   }
   return result;
-}
-
-function cloudflareStandardServiceBindings(
-  services: ApplyInput["standardServices"],
-  existing: readonly JsonObject[],
-): readonly JsonObject[] | null {
-  if (!services) return [];
-  const occupied = new Set(
-    existing.flatMap((binding) => (typeof binding.name === "string" ? [binding.name] : [])),
-  );
-  const bindings: JsonObject[] = [];
-  for (const service of services) {
-    const endpoint = record(service.endpoint);
-    const credential = record(service.credential);
-    const bucketName = optionalString(endpoint?.bucketName);
-    if (
-      service.service.apiVersion !== AMAZON_S3_STANDARD_SERVICE.apiVersion ||
-      service.service.protocol !== AMAZON_S3_STANDARD_SERVICE.protocol ||
-      !/^[A-Z][A-Z0-9_]{0,63}$/u.test(service.name) ||
-      occupied.has(service.name) ||
-      endpoint?.kind !== CLOUDFLARE_R2_ENDPOINT_KIND ||
-      credential?.kind !== CLOUDFLARE_R2_CREDENTIAL_KIND ||
-      !bucketName ||
-      !/^tss3-[0-9a-f]{40}$/u.test(bucketName)
-    ) {
-      return null;
-    }
-    occupied.add(service.name);
-    bindings.push({
-      type: "r2_bucket",
-      name: service.name,
-      bucket_name: bucketName,
-    });
-  }
-  return bindings;
 }
 
 async function shortDigest(value: string): Promise<string> {

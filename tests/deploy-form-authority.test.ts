@@ -8,6 +8,7 @@ import {
   type FormAuthorityProcess,
   publicFormCapabilityManifest,
   runFormAuthority as runFormAuthorityImpl,
+  takoformCoreVerifierArtifactDigest,
   writeFormAuthorityConfig,
 } from "../scripts/deploy/form-authority.ts";
 import { expectedWorkerSecrets } from "../scripts/deploy/realized-config.ts";
@@ -463,10 +464,6 @@ function evolvedIntegrationTarget(): DeployTarget {
     ...target,
     zones: [{ zoneId: "zone-integration", suffix: "apps.integration.example.test" }],
     aiModels: [{ id: "model-integration", provider: "openai" }],
-    standardServiceSupplies: {
-      kind: "takoserver.standard-service-supplies@v1",
-      supplies: [],
-    } as unknown as NonNullable<DeployTarget["standardServiceSupplies"]>,
     sponsorship: true,
     operatorIdentity: { publicJwk: OPERATOR_PUBLIC_JWK },
     integrationE2eCredentialAuthority: {
@@ -964,6 +961,64 @@ function ok(stdout: string) {
 }
 
 describe("route-less Form authority deploy surfaces", () => {
+  test("writes one route-less released-Core Container with exact build identity", () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-core-config-"));
+    try {
+      const path = writeFormAuthorityConfig({
+        path: join(root, "wrangler.jsonc"),
+        main: "worker.js",
+        invocation: {
+          surface: "takoserver-form-authority-worker",
+          action: "apply",
+          environment: "production",
+          commit: COMMIT,
+        },
+        target,
+        selected: {
+          kind: "authority",
+          workerName: target.formAuthority.workerName,
+          hostId: target.formAuthority.hostId,
+          main: "src/entry-form-authority-worker.ts",
+          policyAuthority: "takoserver-host",
+          verificationMode: "released-core",
+          verificationAvailable: true,
+          productionEligible: false,
+        },
+        capabilityManifestJson: CAPABILITY_MANIFEST_JSON,
+      });
+      const config = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+      const artifactDigest = takoformCoreVerifierArtifactDigest();
+      expect(config).toMatchObject({
+        workers_dev: false,
+        preview_urls: false,
+        version_metadata: { binding: "WORKER_VERSION" },
+        vars: {
+          TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST: artifactDigest,
+        },
+        durable_objects: {
+          bindings: [{ name: "CORE_VERIFIER", class_name: "TakoformCoreVerifierContainer" }],
+        },
+        migrations: [
+          {
+            tag: "takoform-core-verifier-v1",
+            new_sqlite_classes: ["TakoformCoreVerifierContainer"],
+          },
+        ],
+        containers: [
+          {
+            class_name: "TakoformCoreVerifierContainer",
+            image_vars: { TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST: artifactDigest },
+            max_instances: 1,
+            instance_type: "lite",
+          },
+        ],
+      });
+      expect(config).not.toHaveProperty("routes");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("writes exact D1/R2/identity bindings and no public route", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-config-"));
     try {
@@ -1235,7 +1290,6 @@ describe("route-less Form authority deploy surfaces", () => {
     ["account id", "CLOUDFLARE_ACCOUNT_ID", "text", "f".repeat(32)],
     ["zones", "TAKOSERVER_ZONES", "text", "[]"],
     ["AI models", "TAKOSERVER_AI_MODELS", "text", "[]"],
-    ["standard supplies", "TAKOSERVER_STANDARD_SERVICE_SUPPLIES", "text", "{}"],
     ["edge supplies", "TAKOSERVER_EDGE_SUPPLIES", "text", "{}"],
     ["Worker endpoint suffix", "TAKOSERVER_WORKER_ENDPOINT_SUFFIX", "text", "foreign.test"],
     ["operator public key", "OPERATOR_IDENTITY_PUBLIC_JWK", "text", "{}"],

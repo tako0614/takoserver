@@ -72,14 +72,14 @@ async function runtimeInputFixture(
     canonicalPublicOrigin: realizedOrigin,
     revision: RESERVATION_REVISION,
     expiresAtEpochMilliseconds: Date.parse(PREPARATION_TIME) + 60 * 60 * 1_000,
-    target: {
+    binding: {
       space: PREPARATION_TARGET.space,
       workerName: PREPARATION_TARGET.workerName,
+      workerResourceUid: PREPARATION_TARGET.workerResourceUid,
+      workerResourceRevision: WORKER_RESOURCE_REVISION,
       endpointName: "public",
     },
     status: "bound" as const,
-    workerResourceUid: PREPARATION_TARGET.workerResourceUid,
-    workerResourceRevision: WORKER_RESOURCE_REVISION,
     providerPackRef: "fake",
     providerInstallationRef: "fake.primary",
     offeringId: OFFERING_ID,
@@ -250,14 +250,14 @@ function boundReservation(organizationId: string) {
     canonicalPublicOrigin: "https://community.example.test",
     revision: RESERVATION_REVISION,
     expiresAtEpochMilliseconds: Date.parse(PREPARATION_TIME) + 60 * 60 * 1_000,
-    target: {
+    binding: {
       space: PREPARATION_TARGET.space,
       workerName: PREPARATION_TARGET.workerName,
+      workerResourceUid: PREPARATION_TARGET.workerResourceUid,
+      workerResourceRevision: WORKER_RESOURCE_REVISION,
       endpointName: "public",
     },
     status: "bound" as const,
-    workerResourceUid: PREPARATION_TARGET.workerResourceUid,
-    workerResourceRevision: WORKER_RESOURCE_REVISION,
     providerPackRef: "fake",
     providerInstallationRef: "fake.primary",
     offeringId: OFFERING_ID,
@@ -905,14 +905,17 @@ async function seedReservationLifecycle(
   );
   await sql.run(
     `INSERT INTO worker_endpoint_origin_reservations
-       (organization_id, reservation_id, space, worker_name, endpoint_name,
+       (organization_id, reservation_id, reservation_format,
+        legacy_space, legacy_worker_name, legacy_endpoint_name, requested_subdomain,
         canonical_public_origin, provider_pack_ref, provider_installation_ref,
         offering_id, offering_digest, requested_ttl_seconds, expires_at,
-        state, revision, worker_resource_uid, worker_resource_revision,
+        state, revision, bound_space, bound_worker_name,
+        worker_resource_uid, worker_resource_revision, bound_endpoint_name,
         endpoint_resource_uid, endpoint_resource_revision, created_at, updated_at, released_at)
-     VALUES (?, ?, 'default', 'yurucommu', 'public', 'https://community.example.test',
-             'fake', 'fake.primary', ?, ?, 3600, ?, 'bound', ?, ?, ?,
-             NULL, NULL, ?, ?, NULL)`,
+     VALUES (?, ?, 'takoserver.worker-endpoint-origin-reservation.v2',
+             NULL, NULL, NULL, 'community', 'https://community.example.test',
+             'fake', 'fake.primary', ?, ?, 3600, ?, 'bound', ?, 'default', 'yurucommu',
+             ?, ?, 'public', 'uid-endpoint-01', '1', ?, ?, NULL)`,
     [
       organizationId,
       reservationId,

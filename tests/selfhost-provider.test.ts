@@ -73,6 +73,11 @@ function relation(
 
 const identity = (name: string) => ({ tenantRef: "org_demo", space: "default", name });
 
+const endpointAssignment = (hostname = "reserved.localhost") => ({
+  canonicalPublicOrigin: `https://${hostname}`,
+  assignmentDigest: `sha256:${"e".repeat(64)}` as const,
+});
+
 let root: string;
 
 beforeEach(() => {
@@ -295,11 +300,12 @@ describe("publishing a Worker through the Edge Family", () => {
       identity: identity("hello-endpoint"),
       spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" } },
       relations: [relation("/worker", "ModuleWorker", "hello")],
+      workerEndpointOriginAssignment: endpointAssignment(),
     });
     expect(endpoint.phase).toBe("succeeded");
     const outputs = endpoint.phase === "succeeded" ? endpoint.result.outputs : {};
-    expect(outputs.hostname).toBe(`${script}.localhost`);
-    expect(outputs.url).toBe(`https://${script}.localhost/`);
+    expect(outputs.hostname).toBe("reserved.localhost");
+    expect(outputs.url).toBe("https://reserved.localhost/");
     // The published address matches the closed outputs grammar: lowercase
     // labels, at least two of them, no trailing dot.
     expect(String(outputs.hostname)).toMatch(
@@ -307,7 +313,8 @@ describe("publishing a Worker through the Edge Family", () => {
     );
 
     const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
-    expect(config).toContain(`${script}.localhost`);
+    expect(config).toContain("reserved.localhost");
+    expect(config).not.toContain(`${script}.localhost`);
 
     // The address is deterministic for the worker, so a re-observation reports
     // exactly what was assigned.
@@ -319,6 +326,45 @@ describe("publishing a Worker through the Edge Family", () => {
       relations: [relation("/worker", "ModuleWorker", "hello")],
     });
     expect(observed.phase === "succeeded" ? observed.result.outputs : {}).toEqual(outputs);
+
+    if (endpoint.phase !== "succeeded") throw new Error("the endpoint allocation failed");
+    if (!local.createNativeReadbackDescriptor || !local.verifyNativeAbsence) {
+      throw new Error("the selfhost provider is missing native readback");
+    }
+    const endpointOffering = offering("WorkerEndpoint");
+    const endpointRelations = [relation("/worker", "ModuleWorker", "hello")];
+    const descriptor = local.createNativeReadbackDescriptor({
+      offering: endpointOffering,
+      nativeId: endpoint.result.nativeId,
+      identity: identity("hello-endpoint"),
+      spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" } },
+      relations: endpointRelations,
+    });
+    expect(descriptor.data).toEqual({
+      hostname: "reserved.localhost",
+      scriptName: script,
+    });
+    expect(
+      await local.verifyNativeAbsence({ offering: endpointOffering, descriptor }),
+    ).toMatchObject({ outcome: "present" });
+    const deleteInput = {
+      operationId: "op_endpoint_delete",
+      operationMode: "initial" as const,
+      offering: endpointOffering,
+      nativeId: endpoint.result.nativeId,
+      identity: identity("hello-endpoint"),
+      spec: {},
+      relations: endpointRelations,
+    };
+    expect(await local.delete(deleteInput)).toMatchObject({ phase: "succeeded" });
+    expect(
+      await local.verifyNativeAbsence({ offering: endpointOffering, descriptor }),
+    ).toMatchObject({ outcome: "absent" });
+    if (!local.recoverDelete) throw new Error("the selfhost provider is missing delete recovery");
+    expect(await local.recoverDelete({ ...deleteInput, operationMode: "recovery" })).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: endpoint.result.nativeId, observed: { deleted: true } },
+    });
   });
 
   test("a differing Worker Version digest refuses overwrite and preserves the committed modules", async () => {
@@ -377,7 +423,7 @@ describe("publishing a Worker through the Edge Family", () => {
   test("republishes an endpoint after a runtime reload failure persisted its desired state", async () => {
     const runtime = flakyRuntime();
     const local = provider({ runtime: runtime.runtime });
-    const script = await publish(local);
+    await publish(local);
     runtime.state.failNextReload = true;
 
     const endpointInput = {
@@ -385,6 +431,7 @@ describe("publishing a Worker through the Edge Family", () => {
       identity: identity("hello-endpoint"),
       spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" } },
       relations: [relation("/worker", "ModuleWorker", "hello")],
+      workerEndpointOriginAssignment: endpointAssignment(),
     } as const;
     const failedApply = await local.apply({
       ...endpointInput,
@@ -402,7 +449,7 @@ describe("publishing a Worker through the Edge Family", () => {
     });
     expect(retried).toMatchObject({
       phase: "succeeded",
-      result: { outputs: { hostname: `${script}.localhost` } },
+      result: { outputs: { hostname: "reserved.localhost" } },
     });
     expect(runtime.state.serving).toBe(true);
     expect(runtime.state.reloads).toBe(3);
@@ -451,6 +498,7 @@ describe("publishing a Worker through the Edge Family", () => {
       identity: identity("hello-endpoint"),
       spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" } },
       relations: [relation("/worker", "ModuleWorker", "hello")],
+      workerEndpointOriginAssignment: endpointAssignment(),
     });
     expect(endpoint.phase).toBe("succeeded");
     runtime.state.serving = false;
@@ -489,6 +537,7 @@ describe("publishing a Worker through the Edge Family", () => {
       identity: identity("hello-endpoint"),
       spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" } },
       relations: [relation("/worker", "ModuleWorker", "hello")],
+      workerEndpointOriginAssignment: endpointAssignment(),
     } as const;
     const failedApply = await local.apply({
       ...endpointInput,

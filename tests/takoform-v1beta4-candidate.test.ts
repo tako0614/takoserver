@@ -42,25 +42,6 @@ function candidateHost(installed: readonly InstalledTakoformForm[]) {
       omitObservedStatus: true,
       bodyGenerationFence: true,
       reviewSpecDigest: true,
-      standardServices: {
-        apiVersion: "standards.takoform.com/v1alpha1",
-        protocols: ["postgresql", "redis", "s3-compatible", "smtp"],
-      },
-    },
-    standardServiceResolver: {
-      async satisfiable({ tenantId, serviceRef }) {
-        return (
-          tenantId === "tenant-a" &&
-          ["postgresql", "redis", "s3-compatible", "smtp"].includes(serviceRef.protocol)
-        );
-      },
-      async resolve({ tenantId, slot }) {
-        if (tenantId !== "tenant-a") return null;
-        return {
-          endpoint: { handle: `test-endpoint:${slot.service.protocol}` },
-          credential: { handle: `test-credential:${slot.service.protocol}` },
-        };
-      },
     },
   });
 }
@@ -211,25 +192,5 @@ describe("unpublished v1beta4 candidate installation", () => {
     expect(applied?.status).toBe(201);
     const created = (await applied?.json()) as { status: Record<string, unknown> };
     expect(created.status.observed).toBeUndefined();
-  });
-
-  test("advertises only the sealed candidate standard-service slots", async () => {
-    const host = candidateHost([form("forms.takoform.com/v1beta4")]);
-    const supported = await host.handle(
-      request(`${candidateLane}/support/standard-services/s3-compatible`),
-    );
-    expect(supported?.status).toBe(200);
-    expect(await supported?.json()).toEqual({
-      apiVersion: "support.takoform.com/v1alpha2",
-      kind: "StandardServiceSupport",
-      serviceRef: {
-        apiVersion: "standards.takoform.com/v1alpha1",
-        protocol: "s3-compatible",
-      },
-      satisfiable: true,
-    });
-    expect(
-      (await host.handle(request(`${candidateLane}/support/standard-services/http`)))?.status,
-    ).toBe(404);
   });
 });

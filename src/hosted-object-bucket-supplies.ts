@@ -65,6 +65,9 @@ function parseSupply(value: unknown): HostedObjectBucketSupply {
     pricePlan.provisioning.meter !== "resource.create" ||
     pricePlan.provisioning.amountMinor !== 0 ||
     pricePlan.meters.length === 0 ||
+    placement.deliveryMode !== "embedded-binding" ||
+    !supplyContract.deliveryModes.includes("embedded-binding") ||
+    supplyContract.customerAccess !== "operator-only" ||
     providerInstallation.providerPackRef !== providerPack ||
     providerInstallation.supplyContractRef !== supplyContract.id ||
     supplyContract.providerType !== providerPack ||

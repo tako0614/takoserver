@@ -9,10 +9,10 @@ the local workerd-backed provider.
 The Bun process can expose that provider through one authenticated endpoint for
 an explicitly composed external control-plane client. A provider call enters,
 and a classified ticket leaves. No current official Takoserver Worker composes
-that remote client. Generic Cloudflare credentials may let the process share
-R2 or an explicitly configured standard-service supply; control state remains
-local SQLite, and they never switch current Worker execution from workerd to
-Cloudflare.
+that remote client. Generic Cloudflare credentials may let the process share an
+R2 artifact store; control state remains local SQLite, and they never switch
+current Worker execution from workerd to Cloudflare or authorize a public
+storage product.
 
 Most providers will not need this. One that reaches its backend by calling an
 HTTP API with a credential fits a Worker exactly, and adding it means adding a
@@ -47,8 +47,8 @@ implicit `TAKOSERVER_EDGE_FORMS` switch is rejected as well.
 Use a token created for the exact optional adapter, not a `wrangler login`
 session. Grant only what the selected Bun inputs use:
 
-- Account · Workers R2 Storage · Edit, only when an R2 artifact store, stable S3
-  supply, or the retired ObjectBucket drain is selected.
+- Account · Workers R2 Storage · Edit, only when an R2 artifact store or the
+  retired ObjectBucket drain is selected.
 
 The ordinary Bun stable provider does not need Workers Scripts, Workers Routes,
 or DNS permission. Production Cloudflare Worker execution and its zone

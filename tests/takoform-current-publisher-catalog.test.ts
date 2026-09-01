@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -15,8 +15,13 @@ import {
   loadCurrentPublisherCatalog,
 } from "../src/takoform/current-publisher-catalog.ts";
 
-const PUBLISHER_ROOT = publisherRoot();
 const temporaryRoots: string[] = [];
+const PUBLISHER_SOURCE_ROOT = publisherRoot();
+const PUBLISHER_ROOT = cleanPublisher();
+
+afterAll(() => {
+  rmSync(PUBLISHER_ROOT, { recursive: true, force: true });
+});
 
 afterEach(() => {
   for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -212,6 +217,14 @@ function clonePublisher(): string {
   const root = mkdtempSync(join(tmpdir(), "takoserver-current-publisher-"));
   temporaryRoots.push(root);
   execFileSync("git", ["clone", "--shared", "--quiet", PUBLISHER_ROOT, root]);
+  git(root, "remote", "set-url", "origin", CURRENT_PUBLISHER_REPOSITORY);
+  return root;
+}
+
+function cleanPublisher(): string {
+  const root = mkdtempSync(join(tmpdir(), "takoserver-current-publisher-source-"));
+  execFileSync("git", ["clone", "--shared", "--quiet", PUBLISHER_SOURCE_ROOT, root]);
+  git(root, "checkout", "--detach", CURRENT_PUBLISHER_COMMIT);
   git(root, "remote", "set-url", "origin", CURRENT_PUBLISHER_REPOSITORY);
   return root;
 }

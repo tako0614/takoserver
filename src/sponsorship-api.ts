@@ -71,13 +71,25 @@ export function createSponsorshipRoutes(
         rest.length === 2 &&
         rest[1] === "takoform-run-credentials"
       ) {
-        const body = await jsonObject(request, ["runRef", "spaceRef", "expiresInSeconds"]);
+        const body = await jsonObject(
+          request,
+          ["runRef", "spaceRef", "expiresInSeconds"],
+          ["workerEndpointOriginReservationId"],
+        );
         const issued = await options.tokens.issueTakoformTenantRunToken({
           organizationId,
           tenantRef,
           spaceRef: text(body.spaceRef, 256),
           runRef: text(body.runRef, 256),
           ttlSeconds: boundedTtl(body.expiresInSeconds),
+          ...(body.workerEndpointOriginReservationId === undefined
+            ? {}
+            : {
+                workerEndpointOriginReservationId: text(
+                  body.workerEndpointOriginReservationId,
+                  128,
+                ),
+              }),
         });
         return Response.json({ takoformRunCredential: issued }, { status: 201 });
       }

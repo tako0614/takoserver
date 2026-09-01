@@ -173,7 +173,7 @@ describe("Hosted sponsorship owner API", () => {
     });
   });
 
-  test("issues one short-lived multi-Resource credential without runtime materialization authority", async () => {
+  test("issues one short-lived multi-Resource credential with only private endpoint authority", async () => {
     const sql = createEphemeralSql();
     const now = new Date("2026-08-20T00:00:00.000Z");
     await sql.run(
@@ -204,6 +204,7 @@ describe("Hosted sponsorship owner API", () => {
     const response = await call(route, "POST", `${base}/takoform-run-credentials`, {
       runRef: "run_host_1",
       spaceRef: "tsp_capsule_yurucommu",
+      workerEndpointOriginReservationId: "reservation_endpoint_01",
       expiresInSeconds: 300,
     });
     expect(response.status).toBe(201);
@@ -219,6 +220,7 @@ describe("Hosted sponsorship owner API", () => {
         tenantRef: "tenant_opaque",
         spaceRef: "tsp_capsule_yurucommu",
         runRef: "run_host_1",
+        workerEndpointOriginReservationId: "reservation_endpoint_01",
         ttlSeconds: 300,
       },
     ]);

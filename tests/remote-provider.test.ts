@@ -148,6 +148,8 @@ describe("provisioning across the road", () => {
     let observes = 0;
     let deletes = 0;
     const provider = backend({
+      offerings: [],
+      recoveryOfferings: [OFFERING],
       async apply(input) {
         applies += 1;
         return succeeded({ nativeId: input.operationId, observed: {}, outputs: {} });

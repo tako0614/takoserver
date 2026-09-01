@@ -120,9 +120,6 @@ const stableRoutes: TakoformRouteConfiguration = {
   omitObservedStatus: true,
   bodyGenerationFence: true,
   reviewSpecDigest: true,
-  standardServices: {
-    apiVersion: "standards.takoform.com/v1",
-  },
 };
 
 const databasePath = `${dataRoot}/control.sqlite`;
@@ -618,13 +615,13 @@ const host = createTakoformHost({
     async satisfiable(input) {
       return (
         [...principals.values()].some((principal) => principal.tenantId === input.tenantId) &&
-        input.serviceRef.protocol === "com.amazonaws.s3"
+        input.serviceRef.protocol === "com.example.conformance-service"
       );
     },
     async resolve(input) {
       if (
         ![...principals.values()].some((principal) => principal.tenantId === input.tenantId) ||
-        input.slot.service.protocol !== "com.amazonaws.s3"
+        input.slot.service.protocol !== "com.example.conformance-service"
       ) {
         return null;
       }

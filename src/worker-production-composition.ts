@@ -1,8 +1,10 @@
 import type { ProviderInstallation, SupplyContract } from "./catalog-compiler.ts";
+import { createCloudflareRuntimeBindingMaterializer } from "./cloudflare-runtime-binding-materializer.ts";
 import {
   compileDeploymentComposition,
   createCatalogCandidate,
   createProvisioningProviderPack,
+  type DeploymentRuntimeBindingRelation,
 } from "./deployment-composition.ts";
 import { edgeProviderOffering, objectBucketProviderOffering } from "./edge-forms.ts";
 import {
@@ -16,17 +18,16 @@ import {
 } from "./hosted-object-bucket-supplies.ts";
 import type { MeterSource, ProviderPack } from "./provider-pack.ts";
 import type { Provider, ProviderOffering } from "./provider-port.ts";
+import { resolveRuntimeBindingMaterialRoute } from "./provider-runtime-bindings.ts";
 import type { ProviderRuntimeInputLeasePort } from "./provider-runtime-input-port.ts";
 import type { ArtifactBytes, CloudflareZone } from "./providers/cloudflare.ts";
 import { createCloudflareEdgeMeterSources } from "./providers/cloudflare-edge-meter.ts";
 import { createCloudflareR2MeterSource } from "./providers/cloudflare-r2-meter.ts";
+import { EDGE_OBJECTS_BINDING_REF } from "./providers/cloudflare-runtime-bindings.ts";
 import { createWasabiProvider } from "./providers/wasabi.ts";
 import { createWasabiBucketMeterSource } from "./providers/wasabi-meter.ts";
 import { CloudflareProvider } from "./public-form-runtime.ts";
-import { createS3AttachmentFactory } from "./s3-attachment-factory.ts";
-import type { S3CredentialIssuer } from "./s3-port.ts";
-import { createProductionStandardServiceResolver } from "./standard-service-production.ts";
-import type { InstalledTakoformForm, TakoformStandardServiceResolver } from "./takoform/types.ts";
+import type { InstalledTakoformForm } from "./takoform/types.ts";
 
 const HOST_INTRINSIC = new Set([
   "WorkerBundle",
@@ -45,7 +46,6 @@ const CLOUDFLARE_EDGE_RELATION_KINDS = new Set([
 ]);
 
 export interface WorkerProductionCompositionEnv {
-  readonly TAKOSERVER_STANDARD_SERVICE_SUPPLIES?: string;
   readonly TAKOSERVER_OBJECT_BUCKET_SUPPLIES?: string;
   readonly TAKOSERVER_EDGE_SUPPLIES?: string;
   readonly CLOUDFLARE_ACCOUNT_ID?: string;
@@ -62,7 +62,6 @@ export interface WorkerProductionComposition {
   readonly providers: readonly Provider[];
   readonly providerPacks: readonly ProviderPack[];
   readonly offerings: ReturnType<typeof compileDeploymentComposition>["offerings"];
-  readonly standardServiceResolver?: TakoformStandardServiceResolver;
 }
 
 /**
@@ -79,27 +78,12 @@ export function createWorkerProductionComposition(input: {
   /** Exact old definitions used only to observe/delete recorded Deployments. */
   readonly retainedForms?: readonly InstalledTakoformForm[];
   readonly artifacts: ArtifactBytes;
-  readonly s3CredentialIssuer?: S3CredentialIssuer;
   readonly fetch?: (request: Request) => Promise<Response>;
   /** Host-owned one-shot input authority shared with capable provider adapters. */
   readonly runtimeInputs?: ProviderRuntimeInputLeasePort;
   readonly now: Date;
 }): WorkerProductionComposition {
   const { env } = input;
-  const standardServiceResolver = createProductionStandardServiceResolver({
-    ...(env.TAKOSERVER_STANDARD_SERVICE_SUPPLIES === undefined
-      ? {}
-      : { raw: env.TAKOSERVER_STANDARD_SERVICE_SUPPLIES }),
-    ...(env.CLOUDFLARE_ACCOUNT_ID && env.CLOUDFLARE_API_TOKEN
-      ? {
-          cloudflare: {
-            accountId: env.CLOUDFLARE_ACCOUNT_ID,
-            authorize: () => `Bearer ${env.CLOUDFLARE_API_TOKEN}`,
-            ...(input.fetch ? { fetch: input.fetch } : {}),
-          },
-        }
-      : {}),
-  });
   const objectBucketSupplies = env.TAKOSERVER_OBJECT_BUCKET_SUPPLIES
     ? parseHostedObjectBucketSupplies(env.TAKOSERVER_OBJECT_BUCKET_SUPPLIES)
     : null;
@@ -110,12 +94,34 @@ export function createWorkerProductionComposition(input: {
     objectBucketSupplies?.supplies.filter((supply) => supply.provider.kind === "cloudflare") ?? [];
   const wasabiObjects =
     objectBucketSupplies?.supplies.filter((supply) => supply.provider.kind === "wasabi") ?? [];
+  const cloudflareRuntimeBindingMaterializer =
+    createCloudflareRuntimeBindingMaterializer("cloudflare");
+  // ObjectBucket is sold only when this exact process has both the target
+  // exporter and the selected Worker consumer importer for one material kind.
+  // The current Cloudflare adapter is exporter-only until WfP owns durable
+  // multipart receipts; Wasabi has no exporter route. Both therefore remain
+  // recovery/private transports rather than current catalog capabilities.
+  const objectBindingConsumer = edgeSupplies ? cloudflareRuntimeBindingMaterializer : undefined;
+  const sellableCloudflareObjects = resolveRuntimeBindingMaterialRoute({
+    bindingRef: EDGE_OBJECTS_BINDING_REF,
+    consumer: objectBindingConsumer,
+    target: cloudflareRuntimeBindingMaterializer,
+  })
+    ? cloudflareObjects
+    : [];
+  const sellableWasabiObjects = resolveRuntimeBindingMaterialRoute({
+    bindingRef: EDGE_OBJECTS_BINDING_REF,
+    consumer: objectBindingConsumer,
+    target: undefined,
+  })
+    ? wasabiObjects
+    : [];
   const hasCloudflareCredential = Boolean(env.CLOUDFLARE_ACCOUNT_ID || env.CLOUDFLARE_API_TOKEN);
   const hasWasabiCredential = Boolean(
     env.TAKOSERVER_WASABI_ACCESS_KEY_ID || env.TAKOSERVER_WASABI_SECRET_ACCESS_KEY,
   );
   if (!objectBucketSupplies && !edgeSupplies) {
-    if ((hasCloudflareCredential && !standardServiceResolver) || hasWasabiCredential) {
+    if (hasCloudflareCredential || hasWasabiCredential) {
       throw new TypeError("provider credentials require reviewed hosted supplies");
     }
     return {
@@ -124,32 +130,23 @@ export function createWorkerProductionComposition(input: {
       providers: [],
       providerPacks: [],
       offerings: [],
-      ...(standardServiceResolver ? { standardServiceResolver } : {}),
     };
-  }
-  if (cloudflareObjects.length > 0 && !input.s3CredentialIssuer) {
-    throw new TypeError("hosted ObjectBucket supplies require an S3 credential issuer");
-  }
-  if (wasabiObjects.length > 0 && !input.s3CredentialIssuer) {
-    throw new TypeError("hosted ObjectBucket supplies require an S3 credential issuer");
   }
 
   const forms = edgeFormMap(input.forms);
   const retainedForms = edgeFormMap(input.retainedForms ?? []);
   const objectBucket =
-    cloudflareObjects.length > 0 || wasabiObjects.length > 0
-      ? requiredForm(
-          retainedForms.has("ObjectBucket") ? retainedForms : forms,
-          "ObjectBucket",
-          "edge.forms.takoform.com/v1beta1",
-        )
+    sellableCloudflareObjects.length > 0 || sellableWasabiObjects.length > 0
+      ? requiredForm(forms, "ObjectBucket", "edge.forms.takoform.com")
       : undefined;
+  const retainedObjectBucket = retainedForms.get("ObjectBucket");
   const providers: Provider[] = [];
   const packs: ProviderPack[] = [];
   const candidates = [];
   const installations: ProviderInstallation[] = [];
   const contracts: SupplyContract[] = [];
   const prices = [];
+  const runtimeBindingRelations: DeploymentRuntimeBindingRelation[] = [];
 
   if (cloudflareObjects.length > 0 || edgeSupplies) {
     const credentials = paired(
@@ -187,7 +184,19 @@ export function createWorkerProductionComposition(input: {
     }
 
     const technical: ProviderOffering[] = [];
+    const recoveryTechnical: ProviderOffering[] = [];
     for (const supply of cloudflareObjects) {
+      if (retainedObjectBucket) {
+        recoveryTechnical.push(
+          edgeProviderOffering(retainedObjectBucket, {
+            id: supply.offeringId,
+            displayName: supply.displayName,
+            regions: supply.providerInstallation.regions.map((region) => region.id),
+          }),
+        );
+      }
+    }
+    for (const supply of sellableCloudflareObjects) {
       const offering = objectBucketProviderOffering(objectBucket as InstalledTakoformForm, {
         id: supply.offeringId,
         displayName: supply.displayName,
@@ -204,6 +213,11 @@ export function createWorkerProductionComposition(input: {
           ...supply.placement,
         }),
       );
+      runtimeBindingRelations.push({
+        targetOfferingId: offering.id,
+        consumerProviderPackRef: "cloudflare",
+        bindingRef: EDGE_OBJECTS_BINDING_REF,
+      });
       prices.push(supply.pricePlan);
     }
     for (const supply of edgeSupplies?.offerings ?? []) {
@@ -217,6 +231,16 @@ export function createWorkerProductionComposition(input: {
         regions: installation.regions.map((region) => region.id),
       });
       technical.push(offering);
+      const retained = retainedForms.get(supply.formKind);
+      if (retained) {
+        recoveryTechnical.push(
+          edgeProviderOffering(retained, {
+            id: supply.offeringId,
+            displayName: supply.displayName,
+            regions: installation.regions.map((region) => region.id),
+          }),
+        );
+      }
       candidates.push(
         createCatalogCandidate(offering, {
           providerPackRef: "cloudflare",
@@ -232,46 +256,39 @@ export function createWorkerProductionComposition(input: {
     // The relation-owned Forms are provider capabilities, not retail items.
     // There is exactly one technical projection for each exact Form so the
     // provider driver can inherit it from the identity Deployment.
-    for (const form of forms.values()) {
-      if (
-        form.role === "identity" ||
-        HOST_INTRINSIC.has(form.identity.formRef.kind) ||
-        !CLOUDFLARE_EDGE_RELATION_KINDS.has(form.identity.formRef.kind)
-      ) {
-        continue;
-      }
-      technical.push(
-        edgeProviderOffering(form, {
-          id:
-            form.identity.formRef.apiVersion === "edge.forms.takoform.com"
-              ? `cloudflare.edge.stable-v1.${form.identity.formRef.kind.toLowerCase()}`
-              : `cloudflare.edge.${form.identity.formRef.kind.toLowerCase()}`,
-        }),
-      );
-    }
-    for (const form of retainedForms.values()) {
-      const kind = form.identity.formRef.kind;
-      if (HOST_INTRINSIC.has(kind)) continue;
-      if (kind === "ObjectBucket") {
+    if (edgeSupplies) {
+      for (const form of forms.values()) {
+        if (
+          form.role === "identity" ||
+          HOST_INTRINSIC.has(form.identity.formRef.kind) ||
+          !CLOUDFLARE_EDGE_RELATION_KINDS.has(form.identity.formRef.kind)
+        ) {
+          continue;
+        }
         technical.push(
-          objectBucketProviderOffering(form, {
-            id: "storage.object.cloudflare.global",
-            displayName: form.displayName ?? kind,
+          edgeProviderOffering(form, {
+            id:
+              form.identity.formRef.apiVersion === "edge.forms.takoform.com"
+                ? `cloudflare.edge.stable-v1.${form.identity.formRef.kind.toLowerCase()}`
+                : `cloudflare.edge.${form.identity.formRef.kind.toLowerCase()}`,
           }),
         );
-        continue;
       }
-      if (!(kind in HOSTED_EDGE_IDENTITY_CLASSES) && !CLOUDFLARE_EDGE_RELATION_KINDS.has(kind)) {
-        continue;
+      for (const form of retainedForms.values()) {
+        const kind = form.identity.formRef.kind;
+        if (HOST_INTRINSIC.has(kind) || kind === "ObjectBucket") continue;
+        if (!(kind in HOSTED_EDGE_IDENTITY_CLASSES) && !CLOUDFLARE_EDGE_RELATION_KINDS.has(kind)) {
+          continue;
+        }
+        recoveryTechnical.push(
+          edgeProviderOffering(form, {
+            id:
+              kind in HOSTED_EDGE_IDENTITY_CLASSES
+                ? `${HOSTED_EDGE_IDENTITY_CLASSES[kind as keyof typeof HOSTED_EDGE_IDENTITY_CLASSES]}.cloudflare.global`
+                : `cloudflare.edge.${kind.toLowerCase()}`,
+          }),
+        );
       }
-      technical.push(
-        edgeProviderOffering(form, {
-          id:
-            kind in HOSTED_EDGE_IDENTITY_CLASSES
-              ? `${HOSTED_EDGE_IDENTITY_CLASSES[kind as keyof typeof HOSTED_EDGE_IDENTITY_CLASSES]}.cloudflare.global`
-              : `cloudflare.edge.${kind.toLowerCase()}`,
-        }),
-      );
     }
     uniqueIds(
       technical.map((offering) => offering.id),
@@ -280,6 +297,7 @@ export function createWorkerProductionComposition(input: {
     const provider = new CloudflareProvider({
       accountId: credentials.left,
       offerings: technical,
+      recoveryOfferings: recoveryTechnical,
       authorize: () => `Bearer ${credentials.right}`,
       zones: parseZones(env.TAKOSERVER_ZONES),
       ...(env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX
@@ -289,7 +307,7 @@ export function createWorkerProductionComposition(input: {
       ...(input.runtimeInputs ? { runtimeInputs: input.runtimeInputs } : {}),
     });
     const meterSources: MeterSource[] = [];
-    if (cloudflareObjects.length > 0) {
+    if (sellableCloudflareObjects.length > 0) {
       meterSources.push(
         createCloudflareR2MeterSource({
           accountId: credentials.left,
@@ -305,24 +323,15 @@ export function createWorkerProductionComposition(input: {
         }),
       );
     }
-    const attachmentFactories =
-      cloudflareObjects.length > 0 && input.s3CredentialIssuer
-        ? [
-            createS3AttachmentFactory({
-              providerPackRef: "cloudflare",
-              interfaceRef: requiredInterface(
-                technical.find((offering) => offering.form.kind === "ObjectBucket"),
-              ),
-              issuer: input.s3CredentialIssuer,
-            }),
-          ]
-        : [];
     providers.push(provider);
     packs.push(
       createProvisioningProviderPack({
         provider,
         providerType: "cloudflare",
-        capabilities: { meterSources, attachmentFactories },
+        capabilities: {
+          meterSources,
+          runtimeBindingMaterializer: cloudflareRuntimeBindingMaterializer,
+        },
       }),
     );
     installations.push(installation);
@@ -340,54 +349,69 @@ export function createWorkerProductionComposition(input: {
       env.TAKOSERVER_WASABI_SECRET_ACCESS_KEY,
       "Wasabi provisioning",
     );
-    const technical = objectBucketProviderOffering(objectBucket as InstalledTakoformForm, {
-      id: supply.offeringId,
-      displayName: supply.displayName,
-      regions: supply.providerInstallation.regions.map((region) => region.id),
-    });
+    const sellable = sellableWasabiObjects.includes(supply);
+    const technical = sellable
+      ? objectBucketProviderOffering(objectBucket as InstalledTakoformForm, {
+          id: supply.offeringId,
+          displayName: supply.displayName,
+          regions: supply.providerInstallation.regions.map((region) => region.id),
+        })
+      : undefined;
     const provider = createWasabiProvider({
       region: supply.provider.region,
       accessKeyId: credentials.left,
       secretAccessKey: credentials.right,
-      offerings: [technical],
+      offerings: technical ? [technical] : [],
+      ...(retainedObjectBucket
+        ? {
+            recoveryOfferings: [
+              edgeProviderOffering(retainedObjectBucket, {
+                id: supply.offeringId,
+                displayName: supply.displayName,
+                regions: supply.providerInstallation.regions.map((region) => region.id),
+              }),
+            ],
+          }
+        : {}),
     });
-    const interfaceRef = requiredInterface(technical);
     providers.push(provider);
     packs.push(
       createProvisioningProviderPack({
         provider,
         providerType: "wasabi",
         capabilities: {
-          meterSources: [
-            createWasabiBucketMeterSource({
-              region: supply.provider.region,
-              accessKeyId: credentials.left,
-              secretAccessKey: credentials.right,
-            }),
-          ],
-          attachmentFactories: [
-            createS3AttachmentFactory({
-              providerPackRef: "wasabi",
-              interfaceRef,
-              issuer: input.s3CredentialIssuer as S3CredentialIssuer,
-            }),
-          ],
+          meterSources: technical
+            ? [
+                createWasabiBucketMeterSource({
+                  region: supply.provider.region,
+                  accessKeyId: credentials.left,
+                  secretAccessKey: credentials.right,
+                }),
+              ]
+            : [],
         },
       }),
     );
-    candidates.push(
-      createCatalogCandidate(technical, {
-        providerPackRef: "wasabi",
-        providerInstallationRef: supply.providerInstallation.id,
-        supplyContractRef: supply.supplyContract.id,
-        pricePlanRef: supply.pricePlan.id,
-        resourceClass: "storage.object",
-        ...supply.placement,
-      }),
-    );
-    installations.push(supply.providerInstallation);
-    contracts.push(supply.supplyContract);
-    prices.push(supply.pricePlan);
+    if (technical) {
+      candidates.push(
+        createCatalogCandidate(technical, {
+          providerPackRef: "wasabi",
+          providerInstallationRef: supply.providerInstallation.id,
+          supplyContractRef: supply.supplyContract.id,
+          pricePlanRef: supply.pricePlan.id,
+          resourceClass: "storage.object",
+          ...supply.placement,
+        }),
+      );
+      runtimeBindingRelations.push({
+        targetOfferingId: technical.id,
+        consumerProviderPackRef: "cloudflare",
+        bindingRef: EDGE_OBJECTS_BINDING_REF,
+      });
+      installations.push(supply.providerInstallation);
+      contracts.push(supply.supplyContract);
+      prices.push(supply.pricePlan);
+    }
   }
   if (hasWasabiCredential !== wasabiObjects.length > 0) {
     throw new TypeError("Wasabi credentials and hosted supplies do not match");
@@ -399,6 +423,7 @@ export function createWorkerProductionComposition(input: {
     providerInstallations: uniqueById(installations, "provider installation"),
     supplyContracts: uniqueById(contracts, "supply contract"),
     pricePlans: uniqueById(prices, "price plan"),
+    runtimeBindingRelations,
     now: input.now,
   });
   return {
@@ -411,7 +436,6 @@ export function createWorkerProductionComposition(input: {
     offerings: compiled.offerings.filter(
       (offering) => offering.form.apiVersion === "edge.forms.takoform.com",
     ),
-    ...(standardServiceResolver ? { standardServiceResolver } : {}),
   };
 }
 
@@ -422,7 +446,7 @@ function requiredForm(
 ): InstalledTakoformForm {
   const form = forms.get(kind);
   if (!form || (apiVersion !== undefined && form.identity.formRef.apiVersion !== apiVersion)) {
-    throw new TypeError(`official Takoform Edge Form missing: ${kind}`);
+    throw new TypeError(`mapped Takoform Edge Form missing: ${kind}`);
   }
   return form;
 }
@@ -439,19 +463,11 @@ function edgeFormMap(
       continue;
     }
     if (result.has(form.identity.formRef.kind)) {
-      throw new TypeError(
-        `official Takoform Edge Form is ambiguous: ${form.identity.formRef.kind}`,
-      );
+      throw new TypeError(`mapped Takoform Edge Form is ambiguous: ${form.identity.formRef.kind}`);
     }
     result.set(form.identity.formRef.kind, form);
   }
   return result;
-}
-
-function requiredInterface(offering: ProviderOffering | undefined) {
-  const interfaceRef = offering?.providedInterfaces[0];
-  if (!interfaceRef) throw new TypeError("ObjectBucket S3 interface is not installed");
-  return interfaceRef;
 }
 
 function paired(

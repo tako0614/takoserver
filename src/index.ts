@@ -178,21 +178,6 @@ export {
   type RuntimeInputPreparationProjection,
   type RuntimeInputPreparationTarget,
 } from "./runtime-input-preparations.ts";
-export { createS3AttachmentFactory } from "./s3-attachment-factory.ts";
-export {
-  createS3CredentialIssuerRouter,
-  type S3CredentialIssuerRoute,
-} from "./s3-issuer-router.ts";
-export {
-  type S3Access,
-  type S3CredentialAuthority,
-  S3CredentialError,
-  type S3CredentialIssue,
-  type S3CredentialIssuer,
-  type S3CredentialSet,
-  type S3CredentialTtlLimits,
-  validateS3CredentialSet,
-} from "./s3-port.ts";
 export { createSponsorshipRoutes, type SponsorshipRoutes } from "./sponsorship-api.ts";
 export { createD1Sql } from "./sql-d1.ts";
 export { createMemorySql, createSqliteSql } from "./sql-sqlite.ts";
@@ -229,9 +214,14 @@ export {
 } from "./token.ts";
 export {
   type BoundWorkerEndpointOriginReservation,
+  type CurrentWorkerEndpointOriginReservationProjection,
   createWorkerEndpointOriginReservations,
+  LEGACY_WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT,
+  type LegacyWorkerEndpointOriginReservationProjection,
+  type LegacyWorkerEndpointOriginReservationTarget,
   WORKER_ENDPOINT_ORIGIN_RESERVATION_ACTIVATION_FORMAT,
   WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT,
+  type WorkerEndpointOriginReservationBinding,
   WorkerEndpointOriginReservationError,
   type WorkerEndpointOriginReservationProjection,
   type WorkerEndpointOriginReservations,

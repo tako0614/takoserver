@@ -57,6 +57,7 @@ export interface TakoformTenantRunTokenClaims {
   /** Opaque Capsule-scoped Takoform namespace selected by the reseller. */
   readonly spaceRef: string;
   readonly runRef: string;
+  readonly workerEndpointOriginReservationId?: string;
   readonly mode: "tenant-run";
   readonly issuedAtEpochSeconds: number;
   readonly expiresAtEpochSeconds: number;
@@ -129,6 +130,7 @@ export interface TokenService {
     readonly tenantRef: string;
     readonly spaceRef: string;
     readonly runRef: string;
+    readonly workerEndpointOriginReservationId?: string;
     readonly ttlSeconds: number;
   }): Promise<{ readonly token: string; readonly expiresAt: string }>;
 
@@ -314,6 +316,13 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
           runRef: reference(input.runRef),
           spaceRef: reference(input.spaceRef),
           tenantRef: reference(input.tenantRef),
+          ...(input.workerEndpointOriginReservationId === undefined
+            ? {}
+            : {
+                workerEndpointOriginReservationId: reference(
+                  input.workerEndpointOriginReservationId,
+                ),
+              }),
         },
         input.ttlSeconds,
         maxTakoformRunLifetime,
@@ -628,6 +637,9 @@ function takoformTenantRunClaims(payload: Record<string, unknown>): TakoformTena
     "runRef",
     "spaceRef",
     "tenantRef",
+    ...(payload.workerEndpointOriginReservationId === undefined
+      ? []
+      : ["workerEndpointOriginReservationId"]),
   ]);
   if (payload.mode !== "tenant-run") fail("malformed_token");
   return {
@@ -635,6 +647,13 @@ function takoformTenantRunClaims(payload: Record<string, unknown>): TakoformTena
     tenantRef: claimReference(payload.tenantRef),
     spaceRef: claimReference(payload.spaceRef),
     runRef: claimReference(payload.runRef),
+    ...(payload.workerEndpointOriginReservationId === undefined
+      ? {}
+      : {
+          workerEndpointOriginReservationId: claimReference(
+            payload.workerEndpointOriginReservationId,
+          ),
+        }),
     mode: "tenant-run",
     issuedAtEpochSeconds: epochSeconds(payload.iat),
     expiresAtEpochSeconds: epochSeconds(payload.exp),

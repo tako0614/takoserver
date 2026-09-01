@@ -96,12 +96,6 @@ export interface WorkerEnv {
   readonly TAKOSERVER_SIGNING_KEY?: string;
   /** Private model mapping and retail price configuration. */
   readonly TAKOSERVER_AI_MODELS?: string;
-  /** Explicit Host-owned standard-service supplies; absent is fail-closed. */
-  readonly TAKOSERVER_STANDARD_SERVICE_SUPPLIES?: string;
-  /** Metadata identifying the R2 parent token used for temporary credentials. */
-  readonly TAKOSERVER_R2_PARENT_ACCESS_KEY_ID?: string;
-  /** R2 parent token. A secret distinct from the general Cloudflare API token. */
-  readonly TAKOSERVER_R2_PARENT_TOKEN?: string;
   /** Versioned, non-secret commercial composition emitted by takoserver-private. */
   readonly TAKOSERVER_OBJECT_BUCKET_SUPPLIES?: string;
   /** Reviewed Cloudflare sales for released identity Forms other than storage. */
@@ -397,7 +391,6 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
         return stored ? new Uint8Array(await new Response(stored.body).arrayBuffer()) : null;
       },
     },
-    ...(dataServices.s3 ? { s3CredentialIssuer: dataServices.s3 } : {}),
     ...(runtimeInputs ? { runtimeInputs: runtimeInputs.leases } : {}),
     now: new Date(),
   });
@@ -442,9 +435,6 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     providers: deployment.providers,
     providerPacks: deployment.providerPacks,
     offerings: deployment.offerings,
-    ...(deployment.standardServiceResolver
-      ? { standardServiceResolver: deployment.standardServiceResolver }
-      : {}),
   });
   cached = { env, app };
   return app;

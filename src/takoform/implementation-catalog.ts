@@ -11,9 +11,9 @@ export const YURUCOMMU_FORM_VERSIONS = {
   SQLiteMigrationSet: "0.1.0",
   WorkerBundle: "0.1.0",
   WorkerCronTrigger: "0.1.0",
-  WorkerDeployment: "0.1.0",
+  WorkerDeployment: "0.2.0",
   WorkerEndpoint: "0.1.0",
-  WorkerVersion: "0.2.0",
+  WorkerVersion: "0.3.0",
 } as const;
 
 export type YurucommuFormKind = keyof typeof YURUCOMMU_FORM_VERSIONS;

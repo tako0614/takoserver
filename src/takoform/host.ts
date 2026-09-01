@@ -98,18 +98,16 @@ export function createTakoformHost(options: CreateTakoformHostOptions): Takoform
     ...(options.availability ? { availability: options.availability } : {}),
     authority: options.authority,
   });
-  const deferredOperations = options.deferredOperations
-    ? createDeferredOperations({
-        configuration: options.deferredOperations,
-        engine,
-        store,
-        forms,
-        authority: options.authority,
-        clock,
-        randomId,
-        ...(routes.omitObservedStatus ? { omitObservedStatus: true } : {}),
-      })
-    : undefined;
+  const deferredOperations = createDeferredOperations({
+    configuration: options.deferredOperations ?? { shouldDefer: () => false },
+    engine,
+    store,
+    forms,
+    authority: options.authority,
+    clock,
+    randomId,
+    ...(routes.omitObservedStatus ? { omitObservedStatus: true } : {}),
+  });
   return createTakoformRoutes({
     authenticate: options.authenticate,
     engine,
@@ -117,7 +115,7 @@ export function createTakoformHost(options: CreateTakoformHostOptions): Takoform
     forms,
     bindings,
     artifacts,
-    ...(deferredOperations ? { deferredOperations } : {}),
+    deferredOperations,
     ...(options.standardServiceResolver
       ? { standardServiceResolver: options.standardServiceResolver }
       : {}),

@@ -106,7 +106,7 @@ export function formPackageKey(packageDigest: string, relativePath: string): str
  * Builds the canonical package index used by the package digest check.  The
  * index contains only data and exact identity pins; it cannot carry an
  * executable implementation, credentials, target, price, capacity, policy,
- * or an `official` lane.
+ * or a publisher classification lane.
  */
 export function packageManifest(input: {
   readonly formRef: TakoformV1Alpha3FormRef;

@@ -3,13 +3,18 @@ import type { InstalledTakoformBinding, InstalledTakoformForm } from "./types.ts
 
 export interface StableProductionTakoformCatalog {
   readonly provenance: {
-    readonly classification: "public-unsigned-package-corpus";
+    readonly classification: "public-publisher-set-projection";
     readonly repository: string;
-    readonly commit: string;
-    readonly gitTags: "unsigned";
-    readonly sigstoreBundle: null;
+    readonly repositoryCommit: string;
+    readonly setId: string;
+    readonly setTag: string;
+    readonly sourceCommit: string;
+    readonly coreVersion: "v1.1.0";
+    readonly verificationReceiptDigest: `sha256:${string}`;
+    readonly publicationStatus: "published";
+    readonly candidateTreeDigest: `sha256:${string}`;
     readonly familyIndexSha256: `sha256:${string}`;
-    readonly familyConformanceSha256: `sha256:${string}`;
+    readonly familyCandidateSetSha256: `sha256:${string}`;
     readonly interfaceCandidateSetSha256: `sha256:${string}`;
     readonly bindingCandidateSetSha256: `sha256:${string}`;
     readonly familyCount: number;
@@ -21,7 +26,7 @@ export interface StableProductionTakoformCatalog {
   readonly bindings: readonly InstalledTakoformBinding[];
 }
 
-/** Exact source-pinned stable catalog installed by the official service. */
+/** Exact source-pinned catalog available to this Takoserver build. */
 export function stableProductionTakoformCatalog(): StableProductionTakoformCatalog {
   return currentTakoformCandidates();
 }

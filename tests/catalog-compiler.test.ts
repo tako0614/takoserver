@@ -9,21 +9,21 @@ import {
 import type { ProviderPackDescriptor } from "../src/provider-pack.ts";
 
 const FORM = {
-  apiVersion: "edge.forms.takoform.com/v1beta1",
-  kind: "ObjectBucket",
-  definitionVersion: "0.1.0",
+  apiVersion: "example.forms.test",
+  kind: "ExampleCache",
+  definitionVersion: "1.0.0",
   schemaDigest: `sha256:${"a".repeat(64)}`,
 } as const;
 
 const OBJECTS = {
   apiVersion: "interfaces.takoform.com/v1alpha1",
-  name: "object.s3.takoform.com",
+  name: "example.cache",
   version: "1.0.0",
   schemaDigest: `sha256:${"b".repeat(64)}`,
 } as const;
 
 const PRICE: PricePlan = {
-  id: "storage.s3.standard.price-v1",
+  id: "cache.edge.standard.price-v1",
   currency: "USD",
   provisioning: { meter: "resource-month", amountMinor: 500 },
   meters: [
@@ -34,8 +34,8 @@ const PRICE: PricePlan = {
 };
 
 const PACK: ProviderPackDescriptor = {
-  id: "wasabi",
-  providerType: "wasabi",
+  id: "internal-cache",
+  providerType: "internal-cache",
   forms: [FORM],
   providedInterfaces: [OBJECTS],
   bindingRefs: [],
@@ -43,50 +43,50 @@ const PACK: ProviderPackDescriptor = {
 };
 
 const CONTRACT: SupplyContract = {
-  id: "wasabi.resale-2026",
-  providerType: "wasabi",
-  permittedResourceClasses: ["storage.s3"],
-  deliveryModes: ["native-credentials", "provider-subaccount"],
-  customerAccess: "scoped-native-access",
-  whiteLabelAllowed: true,
-  endUserTermsRequired: true,
+  id: "internal-cache.operator-2026",
+  providerType: "internal-cache",
+  permittedResourceClasses: ["cache.edge"],
+  deliveryModes: ["embedded-binding"],
+  customerAccess: "operator-only",
+  whiteLabelAllowed: false,
+  endUserTermsRequired: false,
   regions: ["ap-northeast"],
   validFrom: "2026-01-01T00:00:00.000Z",
   validUntil: "2027-01-01T00:00:00.000Z",
-  evidenceRef: "contract:wasabi:2026",
+  evidenceRef: "private:internal-cache:2026",
 };
 
 const INSTALLATION: ProviderInstallation = {
-  id: "wasabi.primary",
-  providerPackRef: "wasabi",
+  id: "internal-cache.primary",
+  providerPackRef: "internal-cache",
   supplyContractRef: CONTRACT.id,
   state: "active",
   regions: [{ id: "ap-northeast", capacity: "available" }],
 };
 
 const CANDIDATE: CatalogCandidate = {
-  id: "storage.s3.wasabi.ap-northeast",
-  resourceClass: "storage.s3",
+  id: "cache.edge.internal.ap-northeast",
+  resourceClass: "cache.edge",
   providerPackRef: PACK.id,
   providerInstallationRef: INSTALLATION.id,
   supplyContractRef: CONTRACT.id,
   pricePlanRef: PRICE.id,
   supportPolicyRef: "support:storage:oncall",
   abusePolicyRef: "abuse:storage:standard",
-  deliveryMode: "native-credentials",
-  kind: "object_bucket",
-  displayName: "S3 bucket (AP Northeast)",
+  deliveryMode: "embedded-binding",
+  kind: "example_cache",
+  displayName: "Internal cache (AP Northeast)",
   form: FORM,
   providedInterfaces: [OBJECTS],
   bindingRefs: [],
   regions: ["ap-northeast"],
   portability: {
     api: "portable",
-    exportFormats: ["s3.object-set.takoform.com/v1"],
-    importFormats: ["s3.object-set.takoform.com/v1"],
+    exportFormats: ["example.cache-snapshot/v1"],
+    importFormats: ["example.cache-snapshot/v1"],
     migrationModes: ["offline", "online"],
   },
-  isolation: "provider-subaccount",
+  isolation: "dedicated-resource",
 };
 
 function compile(
@@ -122,7 +122,7 @@ describe("commercial Catalog compiler", () => {
 
   test("does not publish an Offering outside its signed commercial authority", () => {
     const result = compile({
-      contract: { ...CONTRACT, deliveryModes: ["provider-subaccount"] },
+      contract: { ...CONTRACT, deliveryModes: ["managed-endpoint"] },
     });
 
     expect(result.catalog.list()).toEqual([]);

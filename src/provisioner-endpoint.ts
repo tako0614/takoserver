@@ -1,4 +1,9 @@
-import { failed, type Provider, type ProviderTicket } from "./provider-port.ts";
+import {
+  failed,
+  type Provider,
+  type ProviderOffering,
+  type ProviderTicket,
+} from "./provider-port.ts";
 import { PROVISIONER_PATH } from "./providers/remote.ts";
 
 /**
@@ -39,6 +44,9 @@ export function createProvisionerEndpoint(
   const byOffering = new Map<string, Provider>();
   for (const provider of options.providers) {
     for (const offering of provider.offerings) byOffering.set(offering.id, provider);
+    for (const offering of provider.recoveryOfferings ?? []) {
+      if (!byOffering.has(offering.id)) byOffering.set(offering.id, provider);
+    }
   }
   const applyOfferingIds =
     options.applyOfferingIds === undefined ? undefined : new Set(options.applyOfferingIds);
@@ -78,13 +86,17 @@ async function run(
   operation: string,
   input: Record<string, unknown>,
 ): Promise<ProviderTicket> {
-  const offering = input.offering as { readonly id?: unknown } | undefined;
+  const offering = input.offering as { readonly id?: unknown; readonly form?: unknown } | undefined;
   const provider =
     typeof offering?.id === "string" ? byOffering.get(offering.id) : firstOf(byOffering);
   if (!provider) return failed("invalid_spec", "no provisioner serves that offering");
+  const currentAuthority = provider.offerings.some(
+    (candidate) => candidate.id === offering?.id && sameForm(candidate.form, offering.form),
+  );
   if (
     (operation === "apply" || operation === "adopt") &&
-    (typeof offering?.id !== "string" ||
+    (!currentAuthority ||
+      typeof offering?.id !== "string" ||
       (applyOfferingIds !== undefined && !applyOfferingIds.has(offering.id)))
   ) {
     return failed("invalid_spec", "that offering has no current provision authority");
@@ -122,6 +134,16 @@ async function run(
     );
     return failed("unavailable", "the provisioner could not complete this", true);
   }
+}
+
+function sameForm(left: ProviderOffering["form"], right: unknown): boolean {
+  if (!isRecord(right)) return false;
+  return (
+    right.apiVersion === left.apiVersion &&
+    right.kind === left.kind &&
+    right.definitionVersion === left.definitionVersion &&
+    right.schemaDigest === left.schemaDigest
+  );
 }
 
 function firstOf(byOffering: ReadonlyMap<string, Provider>): Provider | undefined {

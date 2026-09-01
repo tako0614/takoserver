@@ -37,10 +37,6 @@ const TAKOFORM_PATHS: readonly {
     methods: [{ method: "get", summary: "Read an accepted Binding contract" }],
   },
   {
-    path: "/support/standard-services/{protocol}",
-    methods: [{ method: "get", summary: "Read exact standard-service support" }],
-  },
-  {
     path: "/resources/validate",
     methods: [{ method: "post", summary: "Validate desired state without recording it" }],
   },
@@ -111,6 +107,12 @@ const CANONICAL_HTTPS_ORIGIN_SCHEMA = {
   pattern: "^https://[^/]+$",
   maxLength: 2_048,
 } as const;
+const REQUESTED_SUBDOMAIN_SCHEMA = {
+  type: "string",
+  minLength: 1,
+  maxLength: 63,
+  pattern: "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+} as const;
 
 const RESERVATION_ID_PARAMETER = {
   name: "reservationId",
@@ -132,13 +134,15 @@ const WORKER_ENDPOINT_ORIGIN_RESERVATION_OPERATIONS = {
       },
     },
     responses: {
-      "201": reservationResponse(
+      "201": currentReservationResponse(
         "Prepared reservation; an exact replay returns the same closed projection",
       ),
       "400": { description: "Malformed or open request" },
       "401": { description: "Organization API key required" },
       "403": { description: "The key lacks resources:write" },
-      "409": { description: "Replay, logical-worker, canonical-origin, or placement conflict" },
+      "409": {
+        description: "Replay, requested-subdomain, canonical-origin, or placement conflict",
+      },
       "422": { description: "No unique eligible ModuleWorker offering or provider capability" },
       "503": { description: "Placement or reservation authority unavailable" },
     },
@@ -171,7 +175,7 @@ const WORKER_ENDPOINT_ORIGIN_RESERVATION_OPERATIONS = {
 
 const WORKER_ENDPOINT_ORIGIN_ACTIVATION_OPERATIONS = {
   put: reservationActivationOperation(
-    "Activate the reservation against one exact released Ready WorkerEndpoint",
+    "Activate the reservation against one exact realized Ready WorkerEndpoint",
   ),
   delete: reservationActivationOperation(
     "Deactivate the exact endpoint while retaining its UID as the release witness",
@@ -370,10 +374,6 @@ const PUBLIC_PATHS: Record<string, Record<string, unknown>> = {
     get: "Read one Resource Attachment",
     delete: "Delete one Resource Attachment",
   }),
-  "/v1/organizations/{organizationId}/resources/{resourceUid}/s3-credentials": operation(
-    "post",
-    "Issue short-lived S3 credentials for a historical ObjectBucket record",
-  ),
   "/v1/organizations/{organizationId}/operations": operation(
     "get",
     "List the organization's recent Takoform operations",
@@ -430,6 +430,17 @@ function reservationResponse(description: string) {
     content: {
       "application/json": {
         schema: { $ref: "#/components/schemas/WorkerEndpointOriginReservation" },
+      },
+    },
+  } as const;
+}
+
+function currentReservationResponse(description: string) {
+  return {
+    description,
+    content: {
+      "application/json": {
+        schema: { $ref: "#/components/schemas/WorkerEndpointOriginReservationV2" },
       },
     },
   } as const;
@@ -543,7 +554,7 @@ export const openApiDocument = {
       },
     },
     schemas: {
-      WorkerEndpointOriginReservationTarget: {
+      WorkerEndpointOriginReservationLegacyTarget: {
         type: "object",
         required: ["space", "workerName", "endpointName"],
         additionalProperties: false,
@@ -555,16 +566,91 @@ export const openApiDocument = {
       },
       WorkerEndpointOriginReservationRequest: {
         type: "object",
-        required: ["format", "target", "expiresInSeconds"],
+        required: ["format", "requestedSubdomain", "expiresInSeconds"],
         additionalProperties: false,
         properties: {
-          format: { const: "takoserver.worker-endpoint-origin-reservation.v1" },
-          target: { $ref: "#/components/schemas/WorkerEndpointOriginReservationTarget" },
+          format: { const: "takoserver.worker-endpoint-origin-reservation.v2" },
+          requestedSubdomain: REQUESTED_SUBDOMAIN_SCHEMA,
           offeringId: IDENTIFIER_SCHEMA,
           expiresInSeconds: { type: "integer", minimum: 60, maximum: 86_400 },
         },
       },
-      WorkerEndpointOriginReservation: {
+      WorkerEndpointOriginReservationBinding: {
+        type: "object",
+        required: ["space", "workerName", "workerResourceUid", "workerResourceRevision"],
+        additionalProperties: false,
+        oneOf: [
+          {
+            not: {
+              anyOf: [
+                { required: ["endpointName"] },
+                { required: ["endpointResourceUid"] },
+                { required: ["endpointResourceRevision"] },
+              ],
+            },
+          },
+          {
+            required: ["endpointName", "endpointResourceUid", "endpointResourceRevision"],
+          },
+        ],
+        properties: {
+          space: RESOURCE_NAME_SCHEMA,
+          workerName: RESOURCE_NAME_SCHEMA,
+          workerResourceUid: IDENTIFIER_SCHEMA,
+          workerResourceRevision: { type: "string", pattern: "^[1-9][0-9]*$" },
+          endpointName: RESOURCE_NAME_SCHEMA,
+          endpointResourceUid: IDENTIFIER_SCHEMA,
+          endpointResourceRevision: { type: "string", pattern: "^[1-9][0-9]*$" },
+        },
+      },
+      WorkerEndpointOriginReservationV2: {
+        type: "object",
+        required: [
+          "format",
+          "reservationId",
+          "requestedSubdomain",
+          "canonicalPublicOrigin",
+          "revision",
+          "expiresAt",
+          "status",
+        ],
+        additionalProperties: false,
+        oneOf: [
+          {
+            properties: { status: { const: "prepared" } },
+            not: { required: ["binding"] },
+          },
+          {
+            properties: { status: { const: "bound" } },
+            required: ["binding"],
+          },
+          {
+            properties: {
+              status: { const: "activated" },
+              binding: {
+                allOf: [
+                  { $ref: "#/components/schemas/WorkerEndpointOriginReservationBinding" },
+                  {
+                    required: ["endpointName", "endpointResourceUid", "endpointResourceRevision"],
+                  },
+                ],
+              },
+            },
+            required: ["binding"],
+          },
+        ],
+        properties: {
+          format: { const: "takoserver.worker-endpoint-origin-reservation.v2" },
+          reservationId: IDENTIFIER_SCHEMA,
+          requestedSubdomain: REQUESTED_SUBDOMAIN_SCHEMA,
+          canonicalPublicOrigin: CANONICAL_HTTPS_ORIGIN_SCHEMA,
+          revision: { type: "string", pattern: "^[1-9][0-9]*$" },
+          expiresAt: { type: "string", format: "date-time" },
+          status: { type: "string", enum: ["prepared", "bound", "activated"] },
+          binding: { $ref: "#/components/schemas/WorkerEndpointOriginReservationBinding" },
+        },
+      },
+      WorkerEndpointOriginReservationV1: {
         type: "object",
         required: [
           "format",
@@ -582,18 +668,24 @@ export const openApiDocument = {
           canonicalPublicOrigin: CANONICAL_HTTPS_ORIGIN_SCHEMA,
           revision: { type: "string", pattern: "^[1-9][0-9]*$" },
           expiresAt: { type: "string", format: "date-time" },
-          target: { $ref: "#/components/schemas/WorkerEndpointOriginReservationTarget" },
+          target: { $ref: "#/components/schemas/WorkerEndpointOriginReservationLegacyTarget" },
           status: { type: "string", enum: ["prepared", "bound", "activated"] },
           workerResourceUid: IDENTIFIER_SCHEMA,
           endpointResourceUid: IDENTIFIER_SCHEMA,
         },
+      },
+      WorkerEndpointOriginReservation: {
+        oneOf: [
+          { $ref: "#/components/schemas/WorkerEndpointOriginReservationV2" },
+          { $ref: "#/components/schemas/WorkerEndpointOriginReservationV1" },
+        ],
       },
       WorkerEndpointOriginReservationActivationRequest: {
         type: "object",
         required: ["format", "endpointResourceUid"],
         additionalProperties: false,
         properties: {
-          format: { const: "takoserver.worker-endpoint-origin-reservation-activation.v1" },
+          format: { const: "takoserver.worker-endpoint-origin-reservation-activation.v2" },
           endpointResourceUid: IDENTIFIER_SCHEMA,
         },
       },

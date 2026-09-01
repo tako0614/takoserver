@@ -9,7 +9,6 @@ import { createSqliteSql } from "./sql-sqlite.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import { createJavaScriptWorkerModuleInspector } from "./takoform/worker-module-inspector.ts";
 import {
-  createStableLocalS3Resolver,
   createStableLocalWorkerComposition,
   loadProviderEraTestCatalog,
 } from "./worker-stable-local-composition.ts";
@@ -88,7 +87,6 @@ export async function startStableLocalWorkerHost(input: {
     artifacts,
     forms,
     driver: composition.driver,
-    standardServiceResolver: createStableLocalS3Resolver(),
     workerModuleInspector: createJavaScriptWorkerModuleInspector(),
     authenticate: async (request) =>
       request.headers.get("authorization") === `Bearer ${input.token}`

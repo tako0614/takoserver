@@ -10,10 +10,6 @@ import {
 } from "../../src/hosted-object-bucket-supplies.ts";
 import { INTEGRATION_E2E_ORGANIZATION_ID } from "../../src/integration-e2e-credential-authority.ts";
 import { parseOpenAiModelConfig } from "../../src/providers/openai.ts";
-import {
-  type ProductionStandardServiceSupplies,
-  parseProductionStandardServiceSupplies,
-} from "../../src/standard-service-production.ts";
 import { preflightError } from "./errors.ts";
 import { REPOSITORY } from "./process.ts";
 import type { DeployEnvironment } from "./qualification.ts";
@@ -68,10 +64,6 @@ export interface DeployTarget {
   readonly zones?: readonly Record<string, unknown>[];
   /** Private model mapping and retail prices for the ordinary AI API. */
   readonly aiModels?: readonly Record<string, unknown>[];
-  /** Public id of the R2 parent token used to mint temporary S3 credentials. */
-  readonly r2ParentAccessKeyId?: string;
-  /** Host-owned stable protocol supplies; no Form or commercial Offering identity. */
-  readonly standardServiceSupplies?: ProductionStandardServiceSupplies;
   /** Non-secret commercial/provider composition emitted by takoserver-private. */
   readonly objectBucketSupplies?: HostedObjectBucketSupplies;
   /** Reviewed Cloudflare sales for released edge identity Forms. */
@@ -208,8 +200,6 @@ function validateTarget(
       "stripeCheckout",
       "zones",
       "aiModels",
-      "r2ParentAccessKeyId",
-      "standardServiceSupplies",
       "objectBucketSupplies",
       "edgeSupplies",
       "workerEndpointSuffix",
@@ -260,18 +250,6 @@ function validateTarget(
       : { stripeCheckout: boolean(value.stripeCheckout, "stripeCheckout") }),
     ...(value.zones === undefined ? {} : { zones: zoneList(value.zones) }),
     ...(value.aiModels === undefined ? {} : { aiModels: modelList(value.aiModels) }),
-    ...(value.r2ParentAccessKeyId === undefined
-      ? {}
-      : {
-          r2ParentAccessKeyId: pattern(value.r2ParentAccessKeyId, KEY_ID, "r2ParentAccessKeyId"),
-        }),
-    ...(value.standardServiceSupplies === undefined
-      ? {}
-      : {
-          standardServiceSupplies: parseProductionStandardServiceSupplies(
-            value.standardServiceSupplies,
-          ),
-        }),
     ...(value.objectBucketSupplies === undefined
       ? {}
       : { objectBucketSupplies: supplyList(value.objectBucketSupplies) }),
@@ -307,14 +285,6 @@ function validateTarget(
         }),
     signing: signing(value.signing),
   };
-  const cloudflareObjectSupply = target.objectBucketSupplies?.supplies.some(
-    (supply) => supply.provider.kind === "cloudflare",
-  );
-  if (Boolean(target.r2ParentAccessKeyId) !== Boolean(cloudflareObjectSupply)) {
-    throw preflightError(
-      "deploy target Cloudflare ObjectBucket supply and `r2ParentAccessKeyId` must be configured together",
-    );
-  }
   if (Boolean(target.edgeSupplies) !== Boolean(target.workerEndpointSuffix)) {
     throw preflightError(
       "deploy target edge supplies and `workerEndpointSuffix` must be configured together",

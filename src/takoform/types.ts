@@ -122,6 +122,8 @@ export interface TakoformHostPrincipal {
     | {
         readonly space: string;
         readonly mode: "tenant-run";
+        /** Private reservation authority; never rendered into the Host v1 wire model. */
+        readonly workerEndpointOriginReservationId?: string;
       }
     | {
         readonly space: string;
@@ -261,6 +263,8 @@ export interface TakoformResourceDriver {
     readonly spec: JsonObject;
     readonly relations: readonly TakoformDriverRelation[];
     readonly commercialAuthority?: TakoformCommercialAuthority;
+    /** Private Host context. The driver resolves it before provider dispatch. */
+    readonly workerEndpointOriginReservationId?: string;
     readonly standardServices?: readonly TakoformStandardServiceProjection[];
     readonly previous?: TakoformStoredResource;
     /** Commit the Deployment realization with the portable Resource. */
@@ -414,6 +418,15 @@ export interface TakoformStoredResource {
 
 export interface TakoformHost {
   handle(request: Request): Promise<Response | null>;
+  /** Route-less Host maintenance; never exposed through the public API. */
+  readonly maintenance?: {
+    drainProviderRepairs(limit?: number): Promise<{
+      readonly candidates: number;
+      readonly acquired: number;
+      readonly settled: number;
+      readonly pending: number;
+    }>;
+  };
 }
 
 /**

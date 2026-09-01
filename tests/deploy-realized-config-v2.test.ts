@@ -212,9 +212,8 @@ describe("realized Worker configuration", () => {
       expectedWorkerSecrets({
         ...withoutSponsorship,
         stripeCheckout: true,
-        r2ParentAccessKeyId: "parent-key",
       }),
-    ).toEqual(["STRIPE_SECRET_KEY", "TAKOSERVER_R2_PARENT_TOKEN", "TAKOSERVER_SIGNING_KEY"]);
+    ).toEqual(["STRIPE_SECRET_KEY", "TAKOSERVER_SIGNING_KEY"]);
   });
 
   test("adds the canonical operator public JWK only in desired identity state", () => {

@@ -438,10 +438,15 @@ async function integrationPlanRequest(input: {
     kind: "takoserver.integration-fixture-root@v1",
     packageClosure,
   });
-  const bundleDigest = await canonicalDigest({
-    kind: "takoserver.integration-fixture-bundle@v1",
-    packageClosure,
-  });
+  const packageBundleDigests = await Promise.all(
+    packageClosure.map(async (entry) => ({
+      ...entry,
+      bundleDigest: await canonicalDigest({
+        kind: "takoserver.integration-fixture-package-bundle@v1",
+        ...entry,
+      }),
+    })),
+  );
   const namespaceGrantDigest = await canonicalDigest({
     kind: "takoserver.integration-fixture-namespace@v1",
     group: "edge.forms.takoform.com",
@@ -465,7 +470,7 @@ async function integrationPlanRequest(input: {
   const publisherGenerationDigest = await canonicalDigest({
     kind: "takoserver.integration-fixture-publisher-generation@v1",
     policyDigest,
-    bundleDigest,
+    packageBundleDigests,
     ...publisherPins,
   });
   const evidence: FormAuthorityVerificationEvidence = {
@@ -483,7 +488,7 @@ async function integrationPlanRequest(input: {
       previousDigest: null,
       revokedPackageDigests: [],
     },
-    bundleDigest,
+    packageBundleDigests,
   };
   return {
     kind: "takoserver.form-authority-plan-request@v2",

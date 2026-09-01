@@ -36,7 +36,7 @@ export interface AdmissionNamespaceGrant {
   readonly namespaceGrantDigest: AdmissionDigest;
 }
 
-/** Exact policy/signature inputs shared by official-like and external values. */
+/** Exact policy/signature inputs shared by every publisher identity. */
 export interface AdmissionPublisherPin extends AdmissionSourcePin, AdmissionNamespaceGrant {
   readonly publisherKey?: string;
   readonly policyDigest: AdmissionDigest;
@@ -72,8 +72,8 @@ export interface AdmissionPackageReport {
 }
 
 /**
- * The report is evidence, not authority.  In particular, it has no `official`
- * field and cannot be used as an install command after JSON round-tripping.
+ * The report is evidence, not authority. It carries no publisher class and
+ * cannot be used as an install command after JSON round-tripping.
  */
 export interface AdmissionReport {
   readonly status: "admitted" | "denied";

@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { buildEdgeForms, objectBucketProviderOffering } from "../src/edge-forms.ts";
-import { TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM } from "../src/takoform/official-forms.ts";
+import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
+import { TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM } from "../src/takoform/released-provider-object-bucket.ts";
 
-describe("official Takoform catalog", () => {
+describe("retained Takoform Provider catalog", () => {
   test("exposes only exact Forms carried by the released Takoform provider", async () => {
     const edge = await buildEdgeForms();
 
@@ -28,7 +29,7 @@ describe("official Takoform catalog", () => {
     });
   });
 
-  test("does not mint Takoserver definitions in the official namespace", async () => {
+  test("does not mint Takoserver definitions in the publisher namespace", async () => {
     const edge = await buildEdgeForms();
 
     expect(edge.forms.some((form) => form.identity.formRef.kind === "WorkerScript")).toBe(false);
@@ -40,7 +41,11 @@ describe("official Takoform catalog", () => {
 
   test("keeps price, supply authority, and availability outside the portable Form", async () => {
     const edge = await buildEdgeForms();
-    const technical = objectBucketProviderOffering(edge.objectBucket.form, {
+    const currentObjectBucket = currentTakoformCandidates().forms.find(
+      (candidate) => candidate.identity.formRef.kind === "ObjectBucket",
+    );
+    if (!currentObjectBucket) throw new Error("current ObjectBucket fixture missing");
+    const technical = objectBucketProviderOffering(currentObjectBucket, {
       id: "storage.object.standard",
       displayName: "Object bucket",
       regions: ["global"],

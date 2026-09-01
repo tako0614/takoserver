@@ -42,7 +42,7 @@ export function releasedTakoformProviderBindings(): readonly InstalledTakoformBi
   return structuredClone(RELEASED_BINDINGS);
 }
 
-/** Refuse an official identity paired with local or incomplete semantics. */
+/** Refuse a retained Provider identity paired with local or incomplete semantics. */
 export function assertReleasedTakoformProviderForms(forms: readonly InstalledTakoformForm[]): void {
   assertReleasedMembers(
     forms,

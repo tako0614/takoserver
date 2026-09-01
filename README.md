@@ -8,19 +8,24 @@ source-pinned Takoform commit. That downstream pin is Takoserver adoption
 authority, not a Takoform release, Form promotion, or claim that the current
 `0.x` FormRefs are no longer Experimental.
 
-The released provider-v2.1.1 Edge Family remains immutable historical input so
-Takoserver can read and drain Deployments already recorded under it. It is not
-a current `/v1` sale or `/provision/v1` authority, and its ObjectBucket /
-`edge.objects` identities are not relabelled as stable. Current Worker object
-storage is a portable external-service slot containing only `{name, service,
-required}` with service `{apiVersion: "standards.takoform.com/v1", protocol:
-"com.amazonaws.s3"}`. The Host resolves that slot out of band and gives the
-runtime one sealed native binding; bucket name, endpoint, credential, FormRef,
-and resource selector never enter portable desired or observed state.
+Current managed object storage is one exact portable chain: the versionless
+`edge.forms.takoform.com/ObjectBucket` Resource provides `edge.objects`, and a
+Worker Version consumes it only through the exact
+`module-worker.object-bucket` Binding declared in `bucketBindings`. The runtime
+facade has the nine object operations fixed by that Binding. Provider bucket
+names, regions, endpoints, credentials, and supply documents remain inside the
+selected Provider Pack and Deployment; none is Resource desired, observed,
+output, discovery, or Worker binding state.
 
-The existing `/v1/organizations/{organizationId}/resources/{resourceUid}/s3-credentials`
-shape is retained only for draining historical ObjectBucket records. It does
-not create a current ObjectBucket or grant new lifecycle authority.
+Takoserver serves no public S3-credential or managed standard-service retail
+route. Separate S3 retail is not composed by default, and provider credentials
+alone never authorize it. Private R2 and S3 transports are implementation
+adapters behind `edge.objects`, not alternate public contracts.
+
+The released provider-v2.1.1 Edge Family remains immutable historical input so
+Takoserver can observe and delete Deployments already recorded under it. Its
+v1beta1 ObjectBucket identity is recovery-only and is never installed as a
+current sale, authoring, or `/provision/v1` authority.
 
 Run it on your own machine and it uses your disk and [workerd](https://github.com/cloudflare/workerd),
 the runtime Cloudflare runs at the edge. A Bun process may share R2 with a
@@ -37,10 +42,11 @@ bun src/entry-bun.ts
 That is the whole first run. It creates its schema, generates the keys it signs
 with, prints a sign-in you can paste into its console, and starts serving.
 Ordinary Bun always keeps the stable self-host Provider3 execution pack.
-`CLOUDFLARE_ACCOUNT_ID` may separately back shared R2 or a configured
-standard-service supply, but it is not provider-selection authority and does
-not switch stable Forms off. `TAKOSERVER_D1_DATABASE_ID` is rejected by the Bun
-entry before it opens local state; use the Worker entry for D1-bound execution.
+`CLOUDFLARE_ACCOUNT_ID` may separately back shared R2 or an explicitly reviewed
+ObjectBucket supply, but it is neither provider-selection nor resale authority
+and does not switch stable Forms off. `TAKOSERVER_D1_DATABASE_ID` is rejected by
+the Bun entry before it opens local state; use the Worker entry for D1-bound
+execution.
 
 The released Cloudflare ObjectBucket provider survives only as an explicit
 recovery lane for observing and deleting its already-recorded beta
@@ -91,9 +97,10 @@ the part that owns accounts, money, and the machines.
   balance and captures it when it succeeds; if it fails, the hold is released
   and nothing is charged. There is no balance column anywhere — available is
   settled minus held, computed from entries that are only ever appended.
-- **Reach** standard services through sealed runtime bindings. A stable Worker
-  names the S3 protocol and its local slot; the Host owns supply selection and
-  keeps native bucket identity and credentials outside portable state.
+- **Bind** a current ObjectBucket through `bucketBindings`. The Host resolves
+  the exact Resource relation and active Deployment, then the provider's
+  two-stage materializer gives the Worker only the `edge.objects` facade.
+  Native bucket identity and credentials stay private to that adapter.
 - **Run** the ordinary Takoform provider without handing a hosted runner the
   reseller's organization API key. A reseller reservation can mint a
   short-lived bearer pinned to one opaque tenant, exact Form, and exact
@@ -195,11 +202,11 @@ same way it does on Cloudflare.
 
 ## Running it on Cloudflare
 
-Set `CLOUDFLARE_ACCOUNT_ID` and a scoped API token to make configured Host-owned
-standard-service supplies available in that account. Historical released
-provider adapters may remain installed to observe and delete recorded
-Deployments, but their beta Forms are not republished as a sale catalog. The
-control plane itself can also run as a Worker. `bun run deploy -- --contract`
+Set `CLOUDFLARE_ACCOUNT_ID` and a scoped API token only with a reviewed hosted
+Edge or ObjectBucket supply. A credential without that supply is rejected.
+Historical released provider adapters may remain installed to observe and
+delete recorded Deployments, but their beta Forms are not republished as a sale
+catalog. The control plane itself can also run as a Worker. `bun run deploy -- --contract`
 prints the side-effect-free split deploy contract. Every operation then names
 one surface, one `--status` or `--apply` action, an exact environment, and an
 exact 40-hex commit; there is no mixed controller, plan, ledger, journal, or
@@ -208,18 +215,18 @@ ordering, private inputs, and failure rules. The landing-page details are in
 [`docs/deploy-site.md`](docs/deploy-site.md).
 
 The official operator-private deploy target may declare `aiModels`,
-`standardServiceSupplies`, and whether hosted sponsorship is enabled.
+`objectBucketSupplies`, and whether hosted sponsorship is enabled.
 Sponsorship adds only the product-owned bearer secret required by that API; it
 does not add a service binding or an external entrypoint to the Takoserver
 Worker.
-`standardServiceSupplies` is a closed, non-secret operator choice. The current
-adapter accepts exactly
-`standards.takoform.com/v1/com.amazonaws.s3 -> cloudflare-r2` plus an
-operator-owned `supplyNamespace`; realization writes that exact document to
-`TAKOSERVER_STANDARD_SERVICE_SUPPLIES` and requires the ordinary
-`CLOUDFLARE_API_TOKEN` secret before publication. It does not create, sell, or
-reference a current ObjectBucket Form. `aiModels` is the exact public-model to
-upstream-model mapping, limits, and retail token prices. Deploy realization and
+`objectBucketSupplies` is a closed, non-secret operator composition tying one
+exact current ObjectBucket Form to a Provider Installation, Supply Contract,
+price plan, and `embedded-binding` delivery. It accepts only operator-internal
+provider access; native-credential retail is not inferred from that document.
+Realization writes it to `TAKOSERVER_OBJECT_BUCKET_SUPPLIES` and separately
+requires the provider's provisioning secrets before publication. `aiModels` is
+the exact public-model to upstream-model mapping, limits, and retail token
+prices. Deploy realization and
 immutable Worker Version readback require the exact D1, R2, and secret-name
 closure and reject unexpected bindings.
 The read-only surface-specific `--status` path proves the applicable exact D1,
@@ -261,13 +268,11 @@ The declaration's names remain in the Worker Version spec; values do not enter
 portable state. Realization places the other non-secret values in Worker vars.
 AI uses the native Workers AI binding, so it does not copy an account API token
 into inference requests. `CLOUDFLARE_API_TOKEN` remains the provisioning
-secret. `r2ParentAccessKeyId` and `TAKOSERVER_R2_PARENT_TOKEN` belong only to
-the retained historical ObjectBucket credential path and must be paired with
-its historical supply record; they are not required by a stable S3 runtime
-binding. Deploy
+secret. No R2 parent access key or public S3 credential issuer is part of the
+current deployment contract. Deploy
 preflight refuses an enabled capability whose required secret is absent. With
-no such target fields, `/v1/ai` and S3 credential issuance stay absent rather
-than using a demo backend.
+no such target fields, `/v1/ai` and ObjectBucket retail stay absent rather than
+using a demo backend.
 
 See [docs/adr/0001-provision-from-the-worker.md](docs/adr/0001-provision-from-the-worker.md)
 for why the deployed Worker holds the account credential, and what that costs.
@@ -316,7 +321,7 @@ per-entry ban, so the Workers entry cannot reach a filesystem it does not have.
 Three properties are worth knowing before reading the code:
 
 **Shipped Form definitions come from exact Takoform bytes.** Takoserver cannot
-author a name in the Takoform namespace. `bun run check:official-forms` pins
+author a name in the Takoform namespace. `bun run check:form-corpora` pins
 both the canonical source commit and the generated catalog bytes, while still
 pinning immutable provider-v2.1.1 history used to drain old records. A current
 sale additionally needs an implemented backend and explicit operator supply;

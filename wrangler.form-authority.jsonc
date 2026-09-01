@@ -9,7 +9,11 @@
   "vars": {
     "TAKOSERVER_ENVIRONMENT": "production",
     "TAKOSERVER_FORM_AUTHORITY_HOST_ID": "unconfigured.invalid",
-    "TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST": "unconfigured"
+    "TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST": "unconfigured",
+    "TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "version_metadata": {
+    "binding": "WORKER_VERSION"
   },
   "observability": {
     "enabled": true,
@@ -39,6 +43,32 @@
       "binding": "PUBLIC_HOST_IDENTITY",
       "service": "takoserver-api",
       "entrypoint": "PublicHostIdentityEntrypoint"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CORE_VERIFIER",
+        "class_name": "TakoformCoreVerifierContainer"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "takoform-core-verifier-v1",
+      "new_sqlite_classes": ["TakoformCoreVerifierContainer"]
+    }
+  ],
+  "containers": [
+    {
+      "class_name": "TakoformCoreVerifierContainer",
+      "image": "./services/takoform-core-verifier/Dockerfile",
+      "image_build_context": "./services/takoform-core-verifier",
+      "image_vars": {
+        "TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "max_instances": 1,
+      "instance_type": "lite"
     }
   ]
 }

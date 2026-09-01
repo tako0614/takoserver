@@ -34,7 +34,6 @@ import {
 } from "./resource-migrations.ts";
 import { createRouter, type Router } from "./router.ts";
 import type { RuntimeInputAuthority } from "./runtime-input-preparations.ts";
-import type { S3CredentialIssuer } from "./s3-port.ts";
 import { createSponsorshipRoutes } from "./sponsorship-api.ts";
 import {
   type ArtifactReconcileReport,
@@ -90,8 +89,6 @@ export interface AppPorts {
   readonly meteringRates?: MeteringRates | undefined;
   /** OpenAI-compatible inference backend. Absent keeps the AI route unavailable. */
   readonly ai?: AiGateway;
-  /** Short-lived standard S3 credentials for a provisioned ObjectBucket. */
-  readonly s3?: S3CredentialIssuer;
   readonly publicOrigin: string;
   /** Current Cloudflare Worker Version, retained only as operation and audit provenance. */
   readonly publicWorkerVersionId?: string;
@@ -176,6 +173,13 @@ export interface TickReport {
   readonly providerMeterFailures: readonly string[];
   /** Bounded SQL-only repair; external artifact deletion is always operator-explicit. */
   readonly artifactMaintenance: ArtifactReconcileReport;
+  /** Dispatched Host provider commands automatically resumed under exact leases. */
+  readonly providerRepairs: {
+    readonly candidates: number;
+    readonly acquired: number;
+    readonly settled: number;
+    readonly pending: number;
+  };
 }
 
 export function buildApp(ports: AppPorts): App {
@@ -283,10 +287,12 @@ export function buildApp(ports: AppPorts): App {
     ports.driver ??
     createProviderDriver({
       providers: ports.providers ?? [],
+      providerPacks: ports.providerPacks ?? [],
       catalog,
       ledger,
       deployments,
       deletions: inventory,
+      ...(originReservations ? { originReservations } : {}),
     });
   const availability =
     ports.availability ??
@@ -370,6 +376,11 @@ export function buildApp(ports: AppPorts): App {
             scope: {
               space: claims.spaceRef,
               mode: "tenant-run" as const,
+              ...(claims.workerEndpointOriginReservationId
+                ? {
+                    workerEndpointOriginReservationId: claims.workerEndpointOriginReservationId,
+                  }
+                : {}),
             },
           };
         } catch {
@@ -441,6 +452,21 @@ export function buildApp(ports: AppPorts): App {
     ...(availability ? { availability } : {}),
     clock,
     randomId,
+    ...(ports.providers && ports.providers.length > 0
+      ? {
+          deferredOperations: {
+            // Provider-backed mutations are external sagas. Their public
+            // operation record is the durable command a scheduled drain can
+            // reconstruct after a Worker process disappears.
+            shouldDefer: () => true,
+            pollsBeforeCommit: 1,
+            // Preserve the stable synchronous Resource response when the
+            // provider and the final durable commit settle in this request.
+            // Only an indeterminate command remains for automatic drainage.
+            executeOnAccept: true,
+          },
+        }
+      : {}),
     // The redemption lane: a reseller's single-use provision token buys
     // exactly one apply of the offering it names, in the tenant's space.
     provision: { tokens, catalog },
@@ -516,7 +542,6 @@ export function buildApp(ports: AppPorts): App {
     catalog,
     reseller,
     tokens,
-    ...(ports.s3 ? { s3: ports.s3 } : {}),
     settlement: ports.settlement,
     clock,
     ...(ports.consoleOrigin === undefined ? {} : { consoleOrigin: ports.consoleOrigin }),
@@ -586,6 +611,12 @@ export function buildApp(ports: AppPorts): App {
       : router,
     maintenance: { artifacts: artifactReconciler },
     async tick(): Promise<TickReport> {
+      const providerRepairs = (await takoformHost.maintenance?.drainProviderRepairs(64)) ?? {
+        candidates: 0,
+        acquired: 0,
+        settled: 0,
+        pending: 0,
+      };
       await reseller.reconcileDue(64, async (intent) => {
         if (!intent.authorityRef) return "ready";
         const migration = await migrations.read(intent.organizationId, intent.authorityRef);
@@ -628,6 +659,7 @@ export function buildApp(ports: AppPorts): App {
         providerMeterWindows: providerUsage.windows,
         providerMeterFailures: providerUsage.failures,
         artifactMaintenance,
+        providerRepairs,
       };
     },
   };

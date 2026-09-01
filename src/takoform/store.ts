@@ -129,6 +129,7 @@ export interface DeferredOperationRecord {
   readonly acceptedGeneration?: string;
   readonly acceptedRevision?: string;
   readonly resourceUid: string;
+  readonly workerEndpointOriginReservationId?: string;
   readonly pollsRemaining: number;
   readonly leaseToken?: string;
   readonly leaseUntil?: number;
@@ -358,6 +359,8 @@ export interface TakoformStore {
   }): Promise<boolean>;
 
   acceptProviderMutationSaga(record: ProviderMutationSaga): Promise<ProviderMutationSaga>;
+  /** Read-only proof that this exact command already crossed Host review. */
+  establishedProviderMutationSaga(record: ProviderMutationSaga): Promise<boolean>;
   acquireProviderMutationExecution(input: {
     readonly tenantId: string;
     readonly operationId: string;
@@ -457,6 +460,8 @@ export interface TakoformStore {
     readonly operation: DeferredOperationRecord | null;
     readonly acquired: boolean;
   }>;
+  /** Dispatched provider commands with no receipt and no live execution lease. */
+  recoverableDeferredProviderOperations(limit: number): Promise<readonly DeferredOperationRecord[]>;
   cancelDeferredOperation(input: {
     readonly tenantId: string;
     readonly principalId: string;
@@ -1363,6 +1368,24 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       return { ...stored, replayKey: record.replayKey };
     },
 
+    async establishedProviderMutationSaga(record) {
+      const rows = await sql.query(
+        `SELECT * FROM tf_provider_mutation_sagas
+         WHERE operation_id = ? AND tenant_id = ? AND resource_uid = ?
+           AND (phase = 'executed' OR expires_at > ?) LIMIT 2`,
+        [record.operationId, record.tenantId, record.resourceUid, now()],
+      );
+      if (rows.length === 0) return false;
+      if (rows.length !== 1) throw new TakoformHostError("resource_busy", 409);
+      const row = rows[0];
+      if (!row) throw new TakoformHostError("resource_busy", 409);
+      const stored = providerMutationSaga(row);
+      if (!sameProviderMutationSaga(record, stored)) {
+        throw new TakoformHostError("resource_busy", 409);
+      }
+      return true;
+    },
+
     async acquireProviderMutationExecution(input) {
       const timestamp = now();
       if (input.leaseUntil <= timestamp)
@@ -1437,25 +1460,53 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async markProviderMutationDispatch(input) {
       const timestamp = now();
-      const marked = await sql.run(
-        `UPDATE tf_provider_mutation_sagas
-         SET execution_started_at = ?, provider_outcome = 'running', updated_at = ?
-         WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
-           AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
-           AND execution_lease_token = ? AND execution_lease_until > ?
-           AND execution_started_at IS NULL`,
-        [
-          timestamp,
-          timestamp,
-          input.tenantId,
-          input.operationId,
-          input.resourceUid,
-          timestamp,
-          input.leaseToken,
-          timestamp,
-        ],
-      );
-      return marked.changes === 1;
+      const [marked] = await sql.batch([
+        {
+          sql: `UPDATE tf_provider_mutation_sagas
+                SET execution_started_at = ?, provider_outcome = 'running', updated_at = ?,
+                    expires_at = 253402300799999
+                WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+                  AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
+                  AND execution_lease_token = ? AND execution_lease_until > ?
+                  AND execution_started_at IS NULL`,
+          params: [
+            timestamp,
+            timestamp,
+            input.tenantId,
+            input.operationId,
+            input.resourceUid,
+            timestamp,
+            input.leaseToken,
+            timestamp,
+          ],
+        },
+        {
+          // A deferred Host command and its dispatched provider saga become
+          // one non-expiring repair unit in this transactional batch. An
+          // immediate (non-deferred) mutation simply matches no Host row.
+          sql: `UPDATE tf_deferred_operations
+                SET expires_at = 253402300799999, updated_at = ?
+                WHERE id = ? AND tenant_id = ? AND resource_uid = ?
+                  AND phase = 'committing'
+                  AND EXISTS (
+                    SELECT 1 FROM tf_provider_mutation_sagas AS saga
+                    WHERE saga.operation_id = tf_deferred_operations.id
+                      AND saga.tenant_id = tf_deferred_operations.tenant_id
+                      AND saga.resource_uid = tf_deferred_operations.resource_uid
+                      AND saga.phase = 'planned' AND saga.receipt_json IS NULL
+                      AND saga.execution_started_at IS NOT NULL
+                      AND saga.execution_lease_token = ?
+                  )`,
+          params: [
+            timestamp,
+            input.operationId,
+            input.tenantId,
+            input.resourceUid,
+            input.leaseToken,
+          ],
+        },
+      ]);
+      return marked?.changes === 1;
     },
 
     async recordProviderMutationOutcome(input) {
@@ -1732,9 +1783,10 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
             request_headers_json, request_body_json, fingerprint, replay_key,
             target_space, target_api_version, target_kind, target_name,
             target_form_ref_json, accepted_uid, accepted_generation, accepted_revision,
-            resource_uid, polls_remaining, lease_token, lease_until, terminal_json,
+            resource_uid, worker_endpoint_origin_reservation_id, polls_remaining,
+            lease_token, lease_until, terminal_json,
             committed_uid, created_at, updated_at, expires_at)
-         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                  NULL, NULL, NULL, NULL, ?, ?, ?)`,
         [
           record.id,
@@ -1756,6 +1808,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           record.acceptedGeneration ?? null,
           record.acceptedRevision ?? null,
           record.resourceUid,
+          record.workerEndpointOriginReservationId ?? null,
           record.pollsRemaining,
           record.createdAt,
           now(),
@@ -1849,6 +1902,33 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         operation: await this.readDeferredOperation(input.tenantId, input.principalId, input.id),
         acquired: acquired.changes === 1,
       };
+    },
+
+    async recoverableDeferredProviderOperations(limit) {
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
+        throw new TypeError("invalid provider repair limit");
+      }
+      const timestamp = now();
+      const rows = await sql.query(
+        `SELECT operation.*
+         FROM tf_deferred_operations AS operation
+         INNER JOIN tf_provider_mutation_sagas AS saga
+           ON saga.operation_id = operation.id
+          AND saga.tenant_id = operation.tenant_id
+          AND saga.resource_uid = operation.resource_uid
+         WHERE operation.phase = 'committing'
+           AND operation.terminal_json IS NULL
+           AND operation.expires_at > ?
+           AND (operation.lease_until IS NULL OR operation.lease_until <= ?)
+           AND saga.phase = 'planned'
+           AND saga.receipt_json IS NULL
+           AND saga.execution_started_at IS NOT NULL
+           AND (saga.execution_lease_until IS NULL OR saga.execution_lease_until <= ?)
+         ORDER BY operation.updated_at, operation.id
+         LIMIT ?`,
+        [timestamp, timestamp, timestamp, limit],
+      );
+      return rows.map(deferredOperation);
     },
 
     async cancelDeferredOperation(input) {
@@ -3137,6 +3217,9 @@ function deferredOperation(row: Row): DeferredOperationRecord {
       ? { acceptedRevision: row.accepted_revision }
       : {}),
     resourceUid: text(row.resource_uid),
+    ...(typeof row.worker_endpoint_origin_reservation_id === "string"
+      ? { workerEndpointOriginReservationId: row.worker_endpoint_origin_reservation_id }
+      : {}),
     pollsRemaining: Number(row.polls_remaining),
     ...(typeof row.lease_token === "string" ? { leaseToken: row.lease_token } : {}),
     ...(typeof row.lease_until === "number" ? { leaseUntil: row.lease_until } : {}),

@@ -8,6 +8,16 @@ import { migrateSqlite } from "../src/migrate-sqlite.ts";
 const ARTIFACT_LIFECYCLE = "0031_takoform_artifact_lifecycle.sql";
 const RUNTIME_INPUT_PREPARATIONS = "0032_worker_runtime_input_preparations.sql";
 const ARTIFACT_FORWARD_REPAIR = "0033_takoform_artifact_lifecycle_forward_repair.sql";
+const CLOUDFLARE_MANAGED_WORKER_STATE = "0034_cloudflare_managed_worker_state.sql";
+const WORKER_ENDPOINT_ORIGIN_RESERVATION_V2 = "0035_worker_endpoint_origin_reservation_v2.sql";
+const PROVIDER_REPAIR_AND_MANAGED_SCHEDULE_RECONCILIATION =
+  "0036_provider_repair_and_managed_schedule_reconciliation.sql";
+const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
+  ARTIFACT_FORWARD_REPAIR,
+  CLOUDFLARE_MANAGED_WORKER_STATE,
+  WORKER_ENDPOINT_ORIGIN_RESERVATION_V2,
+  PROVIDER_REPAIR_AND_MANAGED_SCHEDULE_RECONCILIATION,
+] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
   "utf8",
@@ -271,8 +281,11 @@ describe("bringing a local database up to date", () => {
         .digest("hex"),
     ).toBe("dda3a01d915ef5871ad5a7fb8499761bce4309243044aa0b206076e1cf9bda45");
     expect(repair).toBeDefined();
-    expect(MIGRATIONS.at(-2)?.name).toBe("0032_worker_runtime_input_preparations.sql");
-    expect(MIGRATIONS.at(-1)?.name).toBe("0033_takoform_artifact_lifecycle_forward_repair.sql");
+    expect(
+      MIGRATIONS.slice(-(POST_ARTIFACT_LINEAGE_MIGRATIONS.length + 1)).map(
+        (migration) => migration.name,
+      ),
+    ).toEqual([RUNTIME_INPUT_PREPARATIONS, ...POST_ARTIFACT_LINEAGE_MIGRATIONS]);
     expect(createHash("sha256").update(MODIFIED_ARTIFACT_LIFECYCLE_SQL).digest("hex")).toBe(
       "9894eb347b8544875e3ebaef9802e9f2ab2680ff819a05b8fca4085d1c6688a7",
     );
@@ -280,12 +293,14 @@ describe("bringing a local database up to date", () => {
 
   test("converges fresh, original 0031, and modified 0031 lineages without losing rows", () => {
     const fresh = new Database(":memory:");
-    expect(migrateSqlite(fresh).applied.at(-1)).toBe(ARTIFACT_FORWARD_REPAIR);
+    expect(migrateSqlite(fresh).applied.slice(-POST_ARTIFACT_LINEAGE_MIGRATIONS.length)).toEqual([
+      ...POST_ARTIFACT_LINEAGE_MIGRATIONS,
+    ]);
 
     const original = prepareArtifactLineage("original");
     const modified = prepareArtifactLineage("modified");
-    expect(migrateSqlite(original.database).applied).toEqual([ARTIFACT_FORWARD_REPAIR]);
-    expect(migrateSqlite(modified.database).applied).toEqual([ARTIFACT_FORWARD_REPAIR]);
+    expect(migrateSqlite(original.database).applied).toEqual([...POST_ARTIFACT_LINEAGE_MIGRATIONS]);
+    expect(migrateSqlite(modified.database).applied).toEqual([...POST_ARTIFACT_LINEAGE_MIGRATIONS]);
 
     expect(canonicalSqliteSchema(original.database)).toEqual(canonicalSqliteSchema(fresh));
     expect(canonicalSqliteSchema(modified.database)).toEqual(canonicalSqliteSchema(fresh));
@@ -433,7 +448,7 @@ describe("bringing a local database up to date", () => {
   for (const lineage of ["original", "modified"] as const) {
     test(`keeps previous and current Worker upload writes compatible after ${lineage} 0031`, () => {
       const { database } = prepareArtifactLineage(lineage);
-      expect(migrateSqlite(database).applied).toEqual([ARTIFACT_FORWARD_REPAIR]);
+      expect(migrateSqlite(database).applied).toEqual([...POST_ARTIFACT_LINEAGE_MIGRATIONS]);
       const previousManifestDigest = `sha256:${(lineage === "original" ? "c" : "d").repeat(64)}`;
       const currentManifestDigest = `sha256:${(lineage === "original" ? "e" : "f").repeat(64)}`;
       const previousManifest = JSON.stringify({
@@ -573,7 +588,12 @@ describe("bringing a local database up to date", () => {
     const pairLifecycle = MIGRATIONS.findIndex(
       (migration) => migration.name === "0030_integration_e2e_credential_pairs.sql",
     );
-    expect(pairLifecycle).toBe(MIGRATIONS.length - 4);
+    expect(MIGRATIONS.slice(pairLifecycle).map((migration) => migration.name)).toEqual([
+      "0030_integration_e2e_credential_pairs.sql",
+      ARTIFACT_LIFECYCLE,
+      RUNTIME_INPUT_PREPARATIONS,
+      ...POST_ARTIFACT_LINEAGE_MIGRATIONS,
+    ]);
     expect(MIGRATIONS[pairLifecycle - 1]?.name).toBe("0029_resource_deletion_attestations.sql");
     expect(MIGRATIONS[pairLifecycle + 1]?.name).toBe("0031_takoform_artifact_lifecycle.sql");
     for (const migration of MIGRATIONS.slice(0, pairLifecycle)) {
@@ -612,6 +632,9 @@ describe("bringing a local database up to date", () => {
       "0031_takoform_artifact_lifecycle.sql",
       "0032_worker_runtime_input_preparations.sql",
       "0033_takoform_artifact_lifecycle_forward_repair.sql",
+      "0034_cloudflare_managed_worker_state.sql",
+      "0035_worker_endpoint_origin_reservation_v2.sql",
+      "0036_provider_repair_and_managed_schedule_reconciliation.sql",
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -634,7 +657,11 @@ describe("bringing a local database up to date", () => {
     const lifecycle = MIGRATIONS.findIndex(
       (migration) => migration.name === "0031_takoform_artifact_lifecycle.sql",
     );
-    expect(lifecycle).toBe(MIGRATIONS.length - 3);
+    expect(MIGRATIONS.slice(lifecycle).map((migration) => migration.name)).toEqual([
+      ARTIFACT_LIFECYCLE,
+      RUNTIME_INPUT_PREPARATIONS,
+      ...POST_ARTIFACT_LINEAGE_MIGRATIONS,
+    ]);
     for (const migration of MIGRATIONS.slice(0, lifecycle)) {
       database.exec(migration.sql);
       database
@@ -722,6 +749,9 @@ describe("bringing a local database up to date", () => {
       "0031_takoform_artifact_lifecycle.sql",
       "0032_worker_runtime_input_preparations.sql",
       "0033_takoform_artifact_lifecycle_forward_repair.sql",
+      "0034_cloudflare_managed_worker_state.sql",
+      "0035_worker_endpoint_origin_reservation_v2.sql",
+      "0036_provider_repair_and_managed_schedule_reconciliation.sql",
     ]);
     expect(
       database
@@ -1598,6 +1628,131 @@ describe("bringing a local database up to date", () => {
         execution_started_at: null,
       },
     ]);
+  });
+
+  test("pins previously dispatched provider repairs until their Host command is terminal", () => {
+    const database = new Database(":memory:");
+    database.exec(`
+      CREATE TABLE applied_migrations (
+        name TEXT PRIMARY KEY NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+    const repairMigration = MIGRATIONS.findIndex(
+      (migration) => migration.name === PROVIDER_REPAIR_AND_MANAGED_SCHEDULE_RECONCILIATION,
+    );
+    expect(repairMigration).toBeGreaterThan(0);
+    for (const migration of MIGRATIONS.slice(0, repairMigration)) {
+      applyHistoricalMigration(database, migration.name, migration.sql);
+    }
+    database.exec(`
+      INSERT INTO tf_deferred_operations
+        (id, tenant_id, principal_id, operation, phase, request_path, request_query,
+         request_headers_json, request_body_json, fingerprint, replay_key,
+         target_space, target_api_version, target_kind, target_name,
+         target_form_ref_json, accepted_uid, accepted_generation, accepted_revision,
+         resource_uid, polls_remaining, lease_token, lease_until, terminal_json,
+         committed_uid, created_at, updated_at, expires_at)
+      VALUES
+        ('op_dispatched', 'tenant-a', 'principal-a', 'apply', 'committing',
+         '/apis/forms/resources/example/Thing/dispatched', '', '{}', '{}',
+         'fingerprint', 'replay-dispatched', 'main', 'example.forms.invalid',
+         'Thing', 'dispatched', '{}', NULL, NULL, NULL, 'uid_dispatched', 0,
+         NULL, NULL, NULL, NULL, '2026-09-01T00:00:00.000Z', 100, 123);
+
+      INSERT INTO tf_provider_mutation_sagas
+        (operation_id, replay_key, tenant_id, fingerprint, resource_uid,
+         target_space, target_api_version, target_kind, target_name,
+         accepted_uid, accepted_generation, accepted_revision, phase,
+         receipt_json, authority_head_digest, created_at, updated_at, expires_at,
+         execution_lease_token, execution_lease_until, execution_started_at,
+         provider_handle, provider_outcome)
+      VALUES
+        ('op_dispatched', 'replay-dispatched', 'tenant-a', 'fingerprint',
+         'uid_dispatched', 'main', 'example.forms.invalid', 'Thing', 'dispatched',
+         NULL, NULL, NULL, 'planned', NULL, NULL, 100, 100, 123,
+         NULL, NULL, 100, NULL, 'indeterminate');
+    `);
+
+    expect(migrateSqlite(database).applied).toEqual([
+      PROVIDER_REPAIR_AND_MANAGED_SCHEDULE_RECONCILIATION,
+    ]);
+    expect(
+      database
+        .query(
+          `SELECT operation.expires_at AS operation_expiry, saga.expires_at AS saga_expiry
+           FROM tf_deferred_operations AS operation
+           INNER JOIN tf_provider_mutation_sagas AS saga ON saga.operation_id = operation.id
+           WHERE operation.id = 'op_dispatched'`,
+        )
+        .get(),
+    ).toEqual({
+      operation_expiry: 253402300799999,
+      saga_expiry: 253402300799999,
+    });
+  });
+
+  test("rolls 0036 back without schema drift when a dispatched saga has no exact Host command", () => {
+    const database = new Database(":memory:");
+    database.exec(`
+      CREATE TABLE applied_migrations (
+        name TEXT PRIMARY KEY NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+    const repairMigration = MIGRATIONS.findIndex(
+      (migration) => migration.name === PROVIDER_REPAIR_AND_MANAGED_SCHEDULE_RECONCILIATION,
+    );
+    expect(repairMigration).toBeGreaterThan(0);
+    for (const migration of MIGRATIONS.slice(0, repairMigration)) {
+      applyHistoricalMigration(database, migration.name, migration.sql);
+    }
+    database.exec(`
+      INSERT INTO tf_provider_mutation_sagas
+        (operation_id, replay_key, tenant_id, fingerprint, resource_uid,
+         target_space, target_api_version, target_kind, target_name,
+         accepted_uid, accepted_generation, accepted_revision, phase,
+         receipt_json, authority_head_digest, created_at, updated_at, expires_at,
+         execution_lease_token, execution_lease_until, execution_started_at,
+         provider_handle, provider_outcome)
+      VALUES
+        ('op_unmatched', 'replay-unmatched', 'tenant-a', 'fingerprint',
+         'uid_unmatched', 'main', 'example.forms.invalid', 'Thing', 'unmatched',
+         NULL, NULL, NULL, 'planned', NULL, NULL, 100, 100, 123,
+         NULL, NULL, 100, NULL, 'indeterminate');
+    `);
+    const schemaBefore = database
+      .query(
+        `SELECT type, name, tbl_name, sql FROM sqlite_schema
+         WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name`,
+      )
+      .all();
+
+    expect(() => migrateSqlite(database)).toThrow(
+      PROVIDER_REPAIR_AND_MANAGED_SCHEDULE_RECONCILIATION,
+    );
+
+    expect(
+      database
+        .query(
+          `SELECT type, name, tbl_name, sql FROM sqlite_schema
+           WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name`,
+        )
+        .all(),
+    ).toEqual(schemaBefore);
+    expect(
+      database
+        .query("SELECT name FROM applied_migrations WHERE name = ?")
+        .get(PROVIDER_REPAIR_AND_MANAGED_SCHEDULE_RECONCILIATION),
+    ).toBeNull();
+    expect(
+      database
+        .query(
+          `SELECT expires_at FROM tf_provider_mutation_sagas
+           WHERE operation_id = 'op_unmatched'`,
+        )
+        .get(),
+    ).toEqual({ expires_at: 123 });
   });
 
   test("makes existing in-flight Resource Migrations recovery-only without changing state", () => {

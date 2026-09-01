@@ -44,7 +44,6 @@ const TAKOFORM_SUFFIXES = [
   "/support/forms/{group}/{kind}/{definitionVersion}",
   "/support/interfaces/{name}/{version}",
   "/support/bindings/{name}/{version}",
-  "/support/standard-services/{protocol}",
   "/resources/validate",
   "/resources/prepare",
   "/resources/{group}/{kind}/{name}",
@@ -89,7 +88,6 @@ const PUBLIC_PATHS = [
   "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/cutover",
   "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/execute",
   "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/rollback",
-  "/v1/organizations/{organizationId}/resources/{resourceUid}/s3-credentials",
   "/v1/organizations/{organizationId}/wallet",
   "/v1/organizations/{organizationId}/wallet/checkout",
   "/v1/organizations/{organizationId}/wallet/funding",
@@ -113,6 +111,9 @@ describe("published API description", () => {
     expect(TAKOFORM_SUFFIXES.length + PUBLIC_PATHS.length).toBe(openApiPaths().length);
     expect(JSON.stringify(openApiDocument)).not.toMatch(
       /forms\.takoform\.com\/(?:v1alpha3|v1beta1|v1beta4)/u,
+    );
+    expect(JSON.stringify(openApiDocument)).not.toMatch(
+      /s3-credentials|takoserver\.s3-connection|support\/standard-services/u,
     );
   });
 
@@ -161,15 +162,101 @@ describe("published API description", () => {
   test("publishes closed reservation, activation, and plan-known runtime-input schemas", () => {
     const schemas = openApiDocument.components.schemas;
     expect(schemas.WorkerEndpointOriginReservationRequest.additionalProperties).toBe(false);
-    expect(schemas.WorkerEndpointOriginReservation.additionalProperties).toBe(false);
-    expect(schemas.WorkerEndpointOriginReservation.properties.status.enum).toEqual([
+    expect(schemas.WorkerEndpointOriginReservationRequest.required).toEqual([
+      "format",
+      "requestedSubdomain",
+      "expiresInSeconds",
+    ]);
+    expect(schemas.WorkerEndpointOriginReservationRequest.properties.format.const).toBe(
+      "takoserver.worker-endpoint-origin-reservation.v2",
+    );
+    expect(schemas.WorkerEndpointOriginReservationRequest.properties.requestedSubdomain).toEqual({
+      type: "string",
+      minLength: 1,
+      maxLength: 63,
+      pattern: "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+    });
+    expect(JSON.stringify(schemas.WorkerEndpointOriginReservationRequest)).not.toMatch(
+      /target|space|workerName|endpointName|resourceUid/,
+    );
+
+    expect(schemas.WorkerEndpointOriginReservationV2.additionalProperties).toBe(false);
+    expect(schemas.WorkerEndpointOriginReservationV2.properties.status.enum).toEqual([
       "prepared",
       "bound",
       "activated",
     ]);
+    expect(schemas.WorkerEndpointOriginReservationBinding.additionalProperties).toBe(false);
+    expect(schemas.WorkerEndpointOriginReservationBinding.required).toEqual([
+      "space",
+      "workerName",
+      "workerResourceUid",
+      "workerResourceRevision",
+    ]);
+    expect(schemas.WorkerEndpointOriginReservationBinding.oneOf).toEqual([
+      {
+        not: {
+          anyOf: [
+            { required: ["endpointName"] },
+            { required: ["endpointResourceUid"] },
+            { required: ["endpointResourceRevision"] },
+          ],
+        },
+      },
+      { required: ["endpointName", "endpointResourceUid", "endpointResourceRevision"] },
+    ]);
+    expect(schemas.WorkerEndpointOriginReservationV2.oneOf).toHaveLength(3);
+    expect(schemas.WorkerEndpointOriginReservation.oneOf).toEqual([
+      { $ref: "#/components/schemas/WorkerEndpointOriginReservationV2" },
+      { $ref: "#/components/schemas/WorkerEndpointOriginReservationV1" },
+    ]);
+    expect(schemas.WorkerEndpointOriginReservationV1.properties.format.const).toBe(
+      "takoserver.worker-endpoint-origin-reservation.v1",
+    );
+
     expect(schemas.WorkerEndpointOriginReservationActivationRequest.additionalProperties).toBe(
       false,
     );
+    expect(schemas.WorkerEndpointOriginReservationActivationRequest.required).toEqual([
+      "format",
+      "endpointResourceUid",
+    ]);
+    expect(schemas.WorkerEndpointOriginReservationActivationRequest.properties.format.const).toBe(
+      "takoserver.worker-endpoint-origin-reservation-activation.v2",
+    );
+    expect(JSON.stringify(schemas.WorkerEndpointOriginReservationActivationRequest)).not.toMatch(
+      /space|workerName|endpointName/,
+    );
+
+    const reservationPath = openApiDocument.paths[
+      "/v1/worker-endpoint-origin-reservations/{reservationId}"
+    ] as unknown as {
+      readonly put: {
+        readonly responses: {
+          readonly "201": {
+            readonly content: {
+              readonly "application/json": { readonly schema: { readonly $ref: string } };
+            };
+          };
+        };
+      };
+      readonly get: {
+        readonly responses: {
+          readonly "200": {
+            readonly content: {
+              readonly "application/json": { readonly schema: { readonly $ref: string } };
+            };
+          };
+        };
+      };
+    };
+    expect(reservationPath.put.responses["201"].content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/WorkerEndpointOriginReservationV2",
+    );
+    expect(reservationPath.get.responses["200"].content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/WorkerEndpointOriginReservation",
+    );
+
     expect(schemas.WorkerRuntimeInputPreparationRequest.additionalProperties).toBe(false);
     expect(schemas.WorkerRuntimeInputPreparationRequest.required).toContain("materialSetNonce");
     expect(schemas.WorkerRuntimeInputPreparationRequest.required).toContain(
@@ -246,7 +333,7 @@ describe("published API description", () => {
     expect(await response.json()).toMatchObject({ error: { code: "not_found" } });
   });
 
-  test("does not publish a Takoserver-specific object protocol beside standard S3", async () => {
+  test("does not publish S3 credential or managed-service retail beside ObjectBucket", async () => {
     const fetch = handler();
     for (const path of [
       "/data/v1/objects/uid_bucket/file.txt",

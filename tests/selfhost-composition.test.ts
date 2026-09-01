@@ -8,8 +8,8 @@ import type { WorkerdRuntime } from "../src/workerd-runtime.ts";
 /**
  * Released provider Forms remain installed behind the Provider Pack only to
  * drain already-recorded Deployments. They are not a current product catalog:
- * stable S3 is a Host-owned standard service and no current ObjectBucket or
- * edge.objects identity may regain sale/provision authority here.
+ * this standalone composition has no current managed ObjectBucket supply, and
+ * the retained identity may not regain sale/provision authority here.
  */
 
 const runtime: WorkerdRuntime = {

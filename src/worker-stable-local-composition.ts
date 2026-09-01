@@ -9,7 +9,6 @@ import {
   type InstalledTakoformForm,
   TakoformHostError,
   type TakoformResourceDriver,
-  type TakoformStandardServiceResolver,
 } from "./takoform/types.ts";
 
 const FAMILY_INDEX = "forms/candidates/current-family-index.json";
@@ -64,14 +63,6 @@ export interface StableLocalWorkerComposition {
     readonly publishedWorkers: number;
     readonly portableObjectBucketIdentities: 0;
     readonly currentEdgeObjectsReferences: 0;
-    readonly nativeBindings: readonly {
-      readonly name: string;
-      readonly type: "r2_bucket";
-      readonly service: {
-        readonly apiVersion: string;
-        readonly protocol: string;
-      };
-    }[];
   };
   dispose(): Promise<void>;
 }
@@ -247,34 +238,6 @@ export async function loadProviderEraTestCatalog(
   return catalog;
 }
 
-export function createStableLocalS3Resolver(): TakoformStandardServiceResolver {
-  return {
-    async satisfiable(input) {
-      return (
-        input.serviceRef.apiVersion === "standards.takoform.com/v1" &&
-        input.serviceRef.protocol === "com.amazonaws.s3"
-      );
-    },
-    async resolve(input) {
-      if (
-        input.slot.service.apiVersion !== "standards.takoform.com/v1" ||
-        input.slot.service.protocol !== "com.amazonaws.s3"
-      ) {
-        return null;
-      }
-      const bucket = `stable-local-${(
-        await sha256(
-          new TextEncoder().encode(`${input.tenantId}\0${input.space}\0${input.slot.name}`),
-        )
-      ).slice(0, 24)}`;
-      return {
-        endpoint: { implementation: "test-only-memory-r2", bucket },
-        credential: { authority: "sealed-local-test-material" },
-      };
-    },
-  };
-}
-
 export function createStableLocalWorkerComposition(input: {
   readonly catalog: StableLocalCatalog;
   readonly artifacts: StableArtifacts;
@@ -291,26 +254,11 @@ export function createStableLocalWorkerComposition(input: {
     string,
     {
       readonly module: { readonly default?: { fetch?: StableFetchHandler } };
-      readonly tenantId: string;
-      readonly space: string;
       readonly vars: Readonly<Record<string, unknown>>;
-      readonly services: readonly {
-        readonly name: string;
-        readonly service: {
-          readonly apiVersion: string;
-          readonly protocol: string;
-        };
-      }[];
     }
   >();
   const activeVersions = new Map<string, string>();
   const endpoints = new Map<string, string>();
-  const buckets = new Map<string, MemoryR2Bucket>();
-  const nativeBindings: {
-    name: string;
-    type: "r2_bucket";
-    service: { apiVersion: string; protocol: string };
-  }[] = [];
 
   const form = (kind: string): InstalledTakoformForm => {
     const matches = input.catalog.forms.filter(
@@ -335,19 +283,13 @@ export function createStableLocalWorkerComposition(input: {
             ? value.spec.externalServices
             : [];
           const supplied = value.standardServices ?? [];
+          if (supplied.length > 0) {
+            throw new TakoformHostError("unsupported_capability", 422);
+          }
           for (const slotValue of declared) {
             const slot = object(slotValue);
-            const service = object(slot.service);
             const required = slot.required !== false;
-            if (
-              required &&
-              !supplied.some(
-                (candidate) =>
-                  candidate.name === slot.name &&
-                  candidate.service.apiVersion === service.apiVersion &&
-                  candidate.service.protocol === service.protocol,
-              )
-            ) {
+            if (required) {
               throw new TakoformHostError("unsupported_capability", 422);
             }
           }
@@ -370,38 +312,15 @@ export function createStableLocalWorkerComposition(input: {
           const module = (await import(
             `${pathToFileURL(modulePath).href}?operation=${encodeURIComponent(value.operationId)}`
           )) as { readonly default?: { fetch?: StableFetchHandler } };
-          const services = supplied.map((candidate) => ({
-            name: candidate.name,
-            service: structuredClone(candidate.service),
-          }));
           versions.set(value.resourceUid, {
             module,
-            tenantId: value.tenantId,
-            space: value.space,
             vars:
               typeof value.spec.vars === "object" &&
               value.spec.vars !== null &&
               !Array.isArray(value.spec.vars)
                 ? structuredClone(value.spec.vars as Record<string, unknown>)
                 : {},
-            services,
           });
-          for (const candidate of services) {
-            if (
-              candidate.service.apiVersion === "standards.takoform.com/v1" &&
-              candidate.service.protocol === "com.amazonaws.s3"
-            ) {
-              const key = `${value.tenantId}\0${value.space}\0${candidate.name}`;
-              if (!buckets.has(key)) buckets.set(key, new MemoryR2Bucket());
-              if (!nativeBindings.some((binding) => binding.name === candidate.name)) {
-                nativeBindings.push({
-                  name: candidate.name,
-                  type: "r2_bucket",
-                  service: structuredClone(candidate.service),
-                });
-              }
-            }
-          }
           return { observed: {}, outputs: {} };
         }
         case "WorkerDeployment": {
@@ -462,15 +381,6 @@ export function createStableLocalWorkerComposition(input: {
         return new Response("stable local worker not found\n", { status: 404 });
       }
       const env: Record<string, unknown> = structuredClone(version.vars);
-      for (const slot of version.services) {
-        if (
-          slot.service.apiVersion === "standards.takoform.com/v1" &&
-          slot.service.protocol === "com.amazonaws.s3"
-        ) {
-          const key = `${version.tenantId}\0${version.space}\0${slot.name}`;
-          env[slot.name] = buckets.get(key) ?? new MemoryR2Bucket();
-        }
-      }
       const response = await handler.call(version.module.default, request, env, {
         waitUntil() {},
         passThroughOnException() {},
@@ -501,7 +411,6 @@ export function createStableLocalWorkerComposition(input: {
         publishedWorkers: endpoints.size,
         portableObjectBucketIdentities: 0,
         currentEdgeObjectsReferences: 0,
-        nativeBindings: structuredClone(nativeBindings),
       };
     },
     async dispose() {
@@ -509,89 +418,9 @@ export function createStableLocalWorkerComposition(input: {
       versions.clear();
       activeVersions.clear();
       endpoints.clear();
-      buckets.clear();
       await rm(root, { recursive: true, force: true });
     },
   };
-}
-
-class MemoryR2Bucket {
-  readonly #objects = new Map<
-    string,
-    {
-      readonly bytes: Uint8Array;
-      readonly etag: string;
-      readonly httpMetadata?: Record<string, string>;
-      readonly customMetadata?: Record<string, string>;
-    }
-  >();
-
-  async put(
-    key: string,
-    value: string | ArrayBuffer | Uint8Array,
-    options: {
-      readonly httpMetadata?: Record<string, string>;
-      readonly customMetadata?: Record<string, string>;
-    } = {},
-  ) {
-    const bytes =
-      typeof value === "string"
-        ? new TextEncoder().encode(value)
-        : value instanceof Uint8Array
-          ? value
-          : new Uint8Array(value);
-    const etag = await sha256(bytes);
-    this.#objects.set(key, {
-      bytes: new Uint8Array(bytes),
-      etag,
-      ...(options.httpMetadata ? { httpMetadata: structuredClone(options.httpMetadata) } : {}),
-      ...(options.customMetadata
-        ? { customMetadata: structuredClone(options.customMetadata) }
-        : {}),
-    });
-    return this.#head(key);
-  }
-
-  async head(key: string) {
-    return this.#head(key);
-  }
-
-  async get(key: string) {
-    const value = this.#objects.get(key);
-    if (!value) return null;
-    return {
-      ...this.#head(key),
-      text: async () => new TextDecoder().decode(value.bytes),
-      arrayBuffer: async () => value.bytes.buffer.slice(0),
-    };
-  }
-
-  async list(options: { readonly prefix?: string; readonly limit?: number } = {}) {
-    const prefix = options.prefix ?? "";
-    const limit = options.limit ?? 1_000;
-    const objects = [...this.#objects.keys()]
-      .filter((key) => key.startsWith(prefix))
-      .sort()
-      .slice(0, limit)
-      .map((key) => this.#head(key));
-    return { objects, truncated: objects.length < this.#objects.size };
-  }
-
-  async delete(keys: string | readonly string[]) {
-    for (const key of typeof keys === "string" ? [keys] : keys) this.#objects.delete(key);
-  }
-
-  #head(key: string) {
-    const value = this.#objects.get(key);
-    if (!value) return null;
-    return {
-      key,
-      size: value.bytes.byteLength,
-      etag: value.etag,
-      ...(value.httpMetadata ? { httpMetadata: structuredClone(value.httpMetadata) } : {}),
-      ...(value.customMetadata ? { customMetadata: structuredClone(value.customMetadata) } : {}),
-    };
-  }
 }
 
 function installedForm(

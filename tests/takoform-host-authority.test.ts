@@ -312,9 +312,9 @@ function resourcePath(
 }
 
 describe("durable read-only Takoform Host authority", () => {
-  test("is unseeded and fails closed even with all 16 byte candidates compiled in", async () => {
+  test("is unseeded and fails closed even with all 17 byte candidates compiled in", async () => {
     const fixture = unseeded();
-    expect(fixture.catalog.forms).toHaveLength(16);
+    expect(fixture.catalog.forms).toHaveLength(17);
 
     const discovered = await fixture.authority.catalog(CONTEXT);
     expect(discovered.forms).toEqual([]);

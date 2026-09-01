@@ -9,12 +9,17 @@ package reader, but they must not import `admission-store.ts`, `admission.ts`,
 Form mutation belongs to two separately named, route-less Cloudflare Workers:
 
 - `takoserver-form-authority-worker` exposes only service-binding RPC methods
-  `plan`, `apply`, and `readback`. Its production composition can plan and read
-  the exact durable state, but `apply` fails closed because no released Form
-  package verifier is available. Released Core may supply signature,
-  provenance, namespace, and revocation verification; Takoserver Host owns the
-  admission policy decision and private in-process handle. Persisted
-  verification evidence or `AdmissionReport` JSON is never authority.
+  `plan`, `apply`, `readback`, and the read-only `verifierIdentity`. Its
+  production composition binds the embedded exact publisher-set closure (see
+  [Exact publisher-set import](#exact-publisher-set-import)) as the package
+  set, the package source, and the evidence every request must carry verbatim.
+  `apply` hands the raw closure — publisher policy, trusted root, revocation
+  checkpoint and its bundle, and every package index, payload, and Sigstore
+  bundle — to the released Takoform Core verifier once per apply and fails
+  closed unless Core returns the exact set, checkpoint, and artifact identity.
+  Core supplies signature, provenance, and revocation verification; Takoserver
+  Host owns the admission policy decision and private in-process handle.
+  Persisted verification evidence or `AdmissionReport` JSON is never authority.
 - `takoserver-integration-form-authority-worker` is an integration-only fixture
   bridge. It checks the exact environment before reading D1 or R2 bindings and
   permanently reports `policyAuthority: takoserver-host`,
@@ -28,15 +33,35 @@ remain pure RPC classes and are bound explicitly. Both use the selected
 Takoserver target’s existing `STATE_DB` and `OBJECTS` bindings. The production
 bundle does not contain the integration package corpus.
 
+The production Worker additionally binds the route-less `CORE_VERIFIER`
+Container class and `WORKER_VERSION` metadata. The Container image is built at
+deploy time from `services/takoform-core-verifier`, which pins released Core
+`v1.1.0` (commit `e0e48b864de2a127a255cb0574d37bbb0f1cac29`), runs with
+outbound internet disabled, and answers only `GET /v1/identity` and
+`POST /v1/verify-set` over the Durable Object binding. The digest of every
+source byte handed to that image build is sealed as
+`TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST` and injected into the image;
+the Worker refuses any Core response whose identity does not name the exact
+protocol, Core tag, Core commit, and artifact digest. The portable
+`bun run check` proves the Worker bundle and binding closure with
+`--containers-rollout none`; the native image build belongs to the deploy
+surface and requires Docker on the operator machine.
+
 Every advertised Form-authority environment also has one permanent minimal
 `takoserver-form-authority-identity-probe` Worker. Its target-owned
 `identityProbeWorkerName` and `identityProbeOrigin` name a workers.dev endpoint
-with only `GET /v1/public-host-identity`. The probe has one service binding to
-the public Worker's `PublicHostIdentityEntrypoint`, one expected Host-id
-variable, and no D1, R2, secret, mutation RPC, route, preview, or custom domain.
-Deploy status actively calls this endpoint and validates the RPC result against
-the authoritative served public Version and artifact. An absent, thrown,
-malformed, stale, or semantically inconsistent response makes readiness false.
+with only `GET /v1/public-host-identity` and `GET /v1/core-verifier-identity`.
+The probe has two read-only service bindings — the public Worker's
+`PublicHostIdentityEntrypoint` and the route-less authority's
+`FormAuthorityEntrypoint.verifierIdentity` — one expected Host-id variable, and
+no D1, R2, secret, mutation RPC, route, preview, or custom domain. Deploy status
+actively calls the first endpoint and validates the RPC result against the
+authoritative served public Version and artifact. For a released-Core target it
+also calls the second endpoint, which starts the Container under the served
+authority Worker Version and returns its live identity; status and apply
+readback require that identity to name the exact authority Worker Version and
+image artifact digest. An absent, thrown, malformed, stale, or semantically
+inconsistent response makes readiness false.
 
 The only network ingress is a third, separately deployed integration Worker,
 `takoserver-integration-form-authority-operator-worker`. It owns the dedicated
@@ -257,6 +282,48 @@ booleans. Normal activation readiness still requires installed, supported, and
 a present active head whose implementation digest equals the current code
 identity.
 
+## Exact publisher-set import
+
+Production installs one exact publisher set and nothing else. The set is the
+verified checkout of `https://github.com/tako0614/takoform-forms.git` at the
+evidence commit recorded in `src/generated/takoform-publisher-set-receipt.ts`,
+with set tag `forms/sets/<setId>` and the 17 released packages that tag names.
+`scripts/import-publisher-set.ts` regenerates three public data files from that
+checkout: the catalog projection, the receipt, and the authority closure
+(`src/generated/takoform-publisher-set-authority-closure.ts`, which embeds every
+package index, payload byte, and Sigstore bundle plus the publisher policy,
+trusted root, and signed revocation checkpoint). None of them is executable
+authority; `src/takoform/publisher-set-closure.ts` cross-checks closure against
+receipt byte-for-byte at composition time and released Core re-verifies the raw
+closure before every mutation.
+
+One import identity binds exact repository, repository commit, set id, set tag,
+receipt digest, and Core version. Its canonical digest is the durable publisher
+key (`takoform-forms:<digest>`), so a different set is a different publisher
+chain and existing packages move through explicit replacement rather than
+silent overwrite. The Host-local namespace grant digest is derived from the
+Form group, publisher identity, and source repository. The Host pins the
+canonical policy digest; Core attests the digest of the exact policy bytes it
+verified, and the adapter requires both to describe the same document.
+
+A plan request whose evidence differs from the embedded closure in any field is
+refused as `invalid_request` before D1, R2, or the Container is touched. Plan,
+apply, and readback always cover all 17 packages; `apply` loads every package
+from the embedded closure and sends the whole raw set to Core in one request,
+also on retry after a refused or partial apply. Support and activation are the
+intersection of the package set with the code-owned implementation catalog:
+`ActorNamespace`, `DurableWorkflow`, `ObjectBucket`, `StaticAssetBundle`, and
+`WorkerCustomDomain` are installed durable packages with empty executable
+operations, never supported, never activated, and not offered by any
+Takoserver supply. Readback exposes them as `installed: true`,
+`supported: false`, and an absent activation head.
+
+Production currently has no operator ingress: the route-less production Worker
+can be deployed, its Container identity can be read back through the probe,
+and its RPC apply is fully implemented, but no production surface signs and
+forwards a plan or apply request yet. Adding that ingress is a separate
+authority surface decision.
+
 ## Integration cutover order
 
 Before the first invocation after this identity change, deploy the public
@@ -333,20 +400,23 @@ Worker-version rollback alone never reverses an append-only activation event.
 
 ## Integration fixture corpus
 
-The fixture contains exactly these identities from the verified unsigned
-publisher corpus:
+The integration fixture contains exactly these identities projected from the
+released-Core-verified public publisher set:
 
 - `AtLeastOnceQueue`, `EdgeKVNamespace`, `ModuleWorker`, `QueueConsumer`,
   `SQLiteDatabase`, `SQLiteMigrationApplication`, `SQLiteMigrationSet`,
-  `WorkerBundle`, `WorkerCronTrigger`, `WorkerDeployment`, and `WorkerEndpoint`
-  at definition version `0.1.0`;
-- `WorkerVersion` at definition version `0.2.0`.
+  `WorkerBundle`, `WorkerCronTrigger`, and `WorkerEndpoint` at definition version
+  `0.1.0`;
+- `WorkerDeployment` at definition version `0.2.0` and `WorkerVersion` at
+  definition version `0.3.0`.
 
-`ActorNamespace`, `DurableWorkflow`, `StaticAssetBundle`, and
-`WorkerCustomDomain` are excluded. The generator derives package, schema, and
-payload digests from `tests/fixtures/takoform-v1`; literals in the operator do
-not confer trust. The integration verifier accepts only those exact package
-closures, stable-v1 empty revocation genesis, and matching namespace evidence.
+`ActorNamespace`, `DurableWorkflow`, `ObjectBucket`, `StaticAssetBundle`, and
+`WorkerCustomDomain` are excluded. The owning current-catalog importer derives
+package, schema, and payload digests directly from the verified source checkout;
+literals in the operator do not confer trust. The portable gate then rechecks
+the embedded manifest and every payload against those exact current identities.
+The integration verifier accepts only those exact package closures, stable-v1
+empty revocation genesis, and matching namespace evidence.
 The Host then makes its own policy decision and issues the private handle shared
 only with its admission store.
 Activation is always scoped to one exact tenant/Space audience. There is no
@@ -363,10 +433,12 @@ provenance or require a support-profile reseal by itself. Explicit
 reconvergence is required only when the semantic implementation digest changes;
 an existing activation remains effective while that digest is unchanged.
 
-Regenerate after the verified fixture changes:
+Regenerate after the verified current package closure changes:
 
 ```sh
-bun scripts/generate-integration-form-packages.ts
+bun scripts/import-publisher-set.ts \
+  --source <verified-takoform-forms-checkout> \
+  --set <exact-source-commit>
 ```
 
 The owner gate checks the generated bytes with

@@ -5,10 +5,12 @@ import {
   createCatalogCandidate,
   createProvisioningProviderPack,
   type DeploymentComposition,
+  type DeploymentRuntimeBindingRelation,
 } from "./deployment-composition.ts";
 import { objectBucketProviderOffering } from "./edge-forms.ts";
 import type { ProviderPackDefinition } from "./provider-pack.ts";
 import type { Provider } from "./provider-port.ts";
+import { EDGE_OBJECTS_BINDING_REF } from "./providers/cloudflare-runtime-bindings.ts";
 import type { InstalledTakoformForm } from "./takoform/types.ts";
 
 export type ObjectBucketPlacement = Omit<
@@ -47,6 +49,7 @@ export function compileObjectBucketDeployment(input: {
       | "credentialIssuers"
       | "meterSources"
       | "costEstimators"
+      | "runtimeBindingMaterializer"
     >
   >;
   readonly now: Date;
@@ -69,6 +72,7 @@ export function compileObjectBucketDeployments(input: {
   const providerInstallations = [];
   const supplyContracts = [];
   const pricePlans = [];
+  const runtimeBindingRelations: DeploymentRuntimeBindingRelation[] = [];
   for (const deployment of input.deployments) {
     const technical = objectBucketProviderOffering(deployment.form, {
       id: deployment.offeringId,
@@ -94,6 +98,11 @@ export function compileObjectBucketDeployments(input: {
     providerInstallations.push(deployment.providerInstallation);
     supplyContracts.push(deployment.supplyContract);
     pricePlans.push(deployment.pricePlan);
+    runtimeBindingRelations.push({
+      targetOfferingId: technical.id,
+      consumerProviderPackRef: pack.id,
+      bindingRef: EDGE_OBJECTS_BINDING_REF,
+    });
   }
   return compileDeploymentComposition({
     candidates,
@@ -101,6 +110,7 @@ export function compileObjectBucketDeployments(input: {
     providerInstallations,
     supplyContracts,
     pricePlans,
+    runtimeBindingRelations,
     now: input.now,
   });
 }

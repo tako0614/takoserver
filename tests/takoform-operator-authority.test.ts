@@ -67,7 +67,11 @@ async function moduleWorkerPackage(): Promise<FormPackageInput> {
   };
 }
 
-function evidence(identity = "external-integration-publisher"): FormAuthorityVerificationEvidence {
+function evidence(
+  identity = "external-integration-publisher",
+  pkg?: FormPackageInput,
+  bundleDigest = digest("4"),
+): FormAuthorityVerificationEvidence {
   return {
     publisher: {
       publisherKey: `publisher-${identity}`,
@@ -95,7 +99,16 @@ function evidence(identity = "external-integration-publisher"): FormAuthorityVer
       previousDigest: null,
       revokedPackageDigests: [],
     },
-    bundleDigest: digest("4"),
+    packageBundleDigests:
+      pkg === undefined
+        ? []
+        : [
+            {
+              formRef: structuredClone(pkg.formRef),
+              packageDigest: pkg.packageDigest,
+              bundleDigest,
+            },
+          ],
   };
 }
 
@@ -141,13 +154,13 @@ async function fixture(
     : createIntegrationFixtureEvidenceVerifier({
         packages: [{ formRef: pkg.formRef, packageDigest: pkg.packageDigest }],
       });
-  const adapterCalls = { verify: 0 };
+  const adapterCalls = { verifySet: 0 };
   const packageLoads = { count: 0 };
   const verifier = {
     ...baseVerifier,
-    async verify(request: Parameters<typeof baseVerifier.verify>[0]) {
-      adapterCalls.verify += 1;
-      return await baseVerifier.verify(request);
+    async verifySet(request: Parameters<typeof baseVerifier.verifySet>[0]) {
+      adapterCalls.verifySet += 1;
+      return await baseVerifier.verifySet(request);
     },
   };
   const sql = createEphemeralSql();
@@ -190,7 +203,7 @@ async function fixture(
       space: "capsule-yuru",
       desiredActive: true,
     },
-    evidence: evidence(input.publisherIdentity),
+    evidence: evidence(input.publisherIdentity, pkg),
     actor: "integration-operator",
     reason: "install the exact Yurucommu Form package set",
   };
@@ -358,6 +371,36 @@ describe("route-less Takoserver Host admission coordinator", () => {
     ]);
   });
 
+  test("fails closed on duplicate, missing, or extra package bundle evidence", async () => {
+    const f = await fixture();
+    const packageEvidence = f.request.evidence.packageBundleDigests[0];
+    if (!packageEvidence) throw new Error("package bundle evidence missing");
+    const variants = [
+      [packageEvidence, packageEvidence],
+      [],
+      [
+        packageEvidence,
+        {
+          formRef: structuredClone(f.pkg.formRef),
+          packageDigest: digest("6"),
+          bundleDigest: digest("7"),
+        },
+      ],
+    ] as const;
+    for (const packageBundleDigests of variants) {
+      const request = {
+        ...f.request,
+        evidence: { ...f.request.evidence, packageBundleDigests },
+      };
+      const plan = await f.operator.plan(request);
+      await expect(f.operator.apply(plan)).rejects.toMatchObject({
+        code: "verification_evidence_refused",
+      });
+      expect(await f.sql.query("SELECT * FROM tf_form_publisher_events")).toEqual([]);
+      expect((await f.objects.list({ prefix: "formpkg/", limit: 1_000 })).objects).toEqual([]);
+    }
+  });
+
   test("fails production apply before any D1 or R2 mutation without released verification", async () => {
     let creates = 0;
     const memory = createMemoryObjectStore();
@@ -409,7 +452,7 @@ describe("route-less Takoserver Host admission coordinator", () => {
       }),
     });
     const applied = await f.operator.apply(await f.operator.plan(f.request));
-    expect(f.adapterCalls).toEqual({ verify: 1 });
+    expect(f.adapterCalls).toEqual({ verifySet: 1 });
     expect(applied).toMatchObject({
       status: "partial",
       receipts: [],
@@ -529,11 +572,11 @@ describe("route-less Takoserver Host admission coordinator", () => {
       "SetActivation",
     ]);
 
-    f.adapterCalls.verify = 0;
+    f.adapterCalls.verifySet = 0;
     const second = await f.operator.apply(first.nextPlan);
     expect(second.status).toBe("converged");
     expect(second.receipts.map((receipt) => receipt.kind)).toEqual(["SetSupport", "SetActivation"]);
-    expect(f.adapterCalls).toEqual({ verify: 1 });
+    expect(f.adapterCalls).toEqual({ verifySet: 1 });
     expect(await canonicalDigest(second.readback.currentHeads)).toBe(
       second.readback.currentHeadDigest,
     );
@@ -544,7 +587,13 @@ describe("route-less Takoserver Host admission coordinator", () => {
     expect((await f.operator.apply(await f.operator.plan(f.request))).status).toBe("converged");
     const changed = {
       ...f.request,
-      evidence: { ...f.request.evidence, bundleDigest: digest("6") },
+      evidence: {
+        ...f.request.evidence,
+        packageBundleDigests: f.request.evidence.packageBundleDigests.map((entry) => ({
+          ...entry,
+          bundleDigest: digest("6"),
+        })),
+      },
     };
     const replacement = await f.operator.plan(changed);
     expect(replacement.commands.map((command) => command.kind)).toEqual(["ReplacePackage"]);
@@ -704,7 +753,7 @@ describe("route-less Takoserver Host admission coordinator", () => {
     expect((await f.operator.apply(await f.operator.plan(f.request))).status).toBe("converged");
     const nextRequest: FormAuthorityPlanRequest = {
       ...f.request,
-      evidence: evidence("stable-corpus-generation"),
+      evidence: evidence("stable-corpus-generation", f.pkg),
     };
 
     const migration = await f.operator.plan(nextRequest);
@@ -778,7 +827,7 @@ describe("route-less Takoserver Host admission coordinator", () => {
     const f = await fixture();
     expect((await f.operator.apply(await f.operator.plan(f.request))).status).toBe("converged");
     const loadsAfterActivation = f.packageLoads.count;
-    const verifiesAfterActivation = f.adapterCalls.verify;
+    const verifiesAfterActivation = f.adapterCalls.verifySet;
     const deactivationRequest: FormAuthorityPlanRequest = {
       ...f.request,
       activation: { ...f.request.activation, desiredActive: false },
@@ -793,7 +842,7 @@ describe("route-less Takoserver Host admission coordinator", () => {
     expect(plan.commands[0]?.predecessorDigest).toMatch(/^sha256:/);
     expect(plan.commands.map((command) => command.kind)).toEqual(["SetActivation"]);
     expect(f.packageLoads.count).toBe(loadsAfterActivation);
-    expect(f.adapterCalls.verify).toBe(verifiesAfterActivation);
+    expect(f.adapterCalls.verifySet).toBe(verifiesAfterActivation);
 
     const applied = await f.operator.apply(plan);
     expect(applied.status).toBe("converged");
@@ -808,7 +857,7 @@ describe("route-less Takoserver Host admission coordinator", () => {
       },
     });
     expect(f.packageLoads.count).toBe(loadsAfterActivation);
-    expect(f.adapterCalls.verify).toBe(verifiesAfterActivation);
+    expect(f.adapterCalls.verifySet).toBe(verifiesAfterActivation);
   });
 
   test("treats an already inactive activation as a converged no-op", async () => {

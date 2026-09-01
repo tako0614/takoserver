@@ -265,6 +265,11 @@ export function writeProbeConfig(input: {
         service: input.target.workerName,
         entrypoint: "PublicHostIdentityEntrypoint",
       },
+      {
+        binding: "FORM_AUTHORITY",
+        service: selected.authorityWorkerName,
+        entrypoint: "FormAuthorityEntrypoint",
+      },
     ],
   };
   writeFileSync(input.path, `${JSON.stringify(configuration, null, 2)}\n`, { mode: 0o600 });
@@ -320,6 +325,13 @@ async function inspectProbe(
     PUBLIC_HOST_IDENTITY: {
       type: "service",
       fields: { service: target.workerName, entrypoint: "PublicHostIdentityEntrypoint" },
+    },
+    FORM_AUTHORITY: {
+      type: "service",
+      fields: {
+        service: selected.authorityWorkerName,
+        entrypoint: "FormAuthorityEntrypoint",
+      },
     },
   });
   assertExactSecretInventory(await state.workerSecrets(selected.workerName), [], phase);
@@ -442,6 +454,7 @@ function requireProbeTarget(target: DeployTarget): {
   readonly workerName: string;
   readonly origin: string;
   readonly hostId: string;
+  readonly authorityWorkerName: string;
 } {
   const authority = target.formAuthority;
   if (!authority) throw preflightError("deploy target has no Form authority identity probe");
@@ -449,6 +462,7 @@ function requireProbeTarget(target: DeployTarget): {
     workerName: authority.identityProbeWorkerName,
     origin: authority.identityProbeOrigin,
     hostId: authority.hostId,
+    authorityWorkerName: authority.workerName,
   };
 }
 

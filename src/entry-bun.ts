@@ -25,7 +25,6 @@ import {
   RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN,
   resolveStandaloneProviderMode,
 } from "./standalone-provider-composition.ts";
-import { createProductionStandardServiceResolver } from "./standard-service-production.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import { currentTakoformCandidates } from "./takoform/current-candidates.ts";
 import { createJavaScriptWorkerModuleInspector } from "./takoform/worker-module-inspector.ts";
@@ -46,8 +45,8 @@ import { createWorkerdSupervisor, findWorkerd } from "./workerd-supervisor.ts";
  *   TAKOSERVER_DB=/var/lib/takoserver/state.sqlite \
  *   bun src/entry-bun.ts
  *
- * Cloudflare account credentials may back shared R2 or standard services; they
- * never select the ordinary Provider3 execution pack.
+ * Cloudflare account credentials may back the explicitly selected provider
+ * pack; they never create a separate storage-retail surface.
  */
 
 function required(name: string): string {
@@ -209,7 +208,8 @@ const providerArtifacts = {
 /**
  * Ordinary Bun always executes current Provider3 Edge Forms on the local
  * workerd-backed provider. Generic Cloudflare credentials may separately back
- * R2 or standard services; they are not provider-selection authority.
+ * the Host's R2 object store or an explicitly composed current ObjectBucket
+ * supply; they are neither provider-selection nor resale authority.
  *
  * The old Cloudflare ObjectBucket adapter remains reachable only through the
  * explicit recovery mode resolved before any local state is opened. That mode
@@ -340,19 +340,6 @@ const signingKey = await ensureSigningKey({
 });
 
 const configuredAi = aiGateway();
-const standardServiceResolver = createProductionStandardServiceResolver({
-  ...(process.env.TAKOSERVER_STANDARD_SERVICE_SUPPLIES
-    ? { raw: process.env.TAKOSERVER_STANDARD_SERVICE_SUPPLIES }
-    : {}),
-  ...(process.env.CLOUDFLARE_ACCOUNT_ID
-    ? {
-        cloudflare: {
-          accountId: process.env.CLOUDFLARE_ACCOUNT_ID,
-          authorize: () => `Bearer ${cloudflareToken()}`,
-        },
-      }
-    : {}),
-});
 const app = buildApp({
   sql,
   objects,
@@ -374,7 +361,6 @@ const app = buildApp({
   bindings: currentCandidates.bindings,
   hostForms: currentCandidates.forms,
   hostBindings: currentCandidates.bindings,
-  ...(standardServiceResolver ? { standardServiceResolver } : {}),
   providers,
   providerPacks,
   offerings,

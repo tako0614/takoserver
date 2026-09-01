@@ -9,7 +9,6 @@ import type {
   TakoformStoredResource,
 } from "../src/takoform/types.ts";
 import {
-  createStableLocalS3Resolver,
   createStableLocalWorkerComposition,
   loadProviderEraTestCatalog,
   type StableLocalWorkerComposition,
@@ -105,7 +104,7 @@ describe("the test-only stable worker runtime", () => {
       )}, path: url.pathname }); } };`,
     );
     const local = await localComposition(moduleBytes);
-    const resources = await applyWorkerChain(local, []);
+    const resources = await applyWorkerChain(local);
     const endpoint = resources.endpoint.status.outputs as {
       hostname: string;
       url: string;
@@ -135,92 +134,7 @@ describe("the test-only stable worker runtime", () => {
     });
   });
 
-  test("projects stable com.amazonaws.s3 as a native MEDIA binding with full object operations", async () => {
-    const moduleBytes = new TextEncoder().encode(`
-      export default {
-        async fetch(_request, env) {
-          await env.MEDIA.put("media/a.json", JSON.stringify({ ok: true }), {
-            httpMetadata: { contentType: "application/json" },
-            customMetadata: { owner: "stable-local" },
-          });
-          const head = await env.MEDIA.head("media/a.json");
-          const object = await env.MEDIA.get("media/a.json");
-          const listing = await env.MEDIA.list({ prefix: "media/", limit: 10, delimiter: "/" });
-          const text = await object.text();
-          await env.MEDIA.delete(["media/a.json"]);
-          const deleted = await env.MEDIA.get("media/a.json");
-          return Response.json({
-            text,
-            head: {
-              key: head.key,
-              size: head.size,
-              etag: head.etag,
-              contentType: head.httpMetadata?.contentType,
-              owner: head.customMetadata?.owner,
-            },
-            listed: listing.objects.map(({ key, size, etag }) => ({ key, size, etag })),
-            truncated: listing.truncated,
-            deleted: deleted === null,
-          });
-        },
-      };
-    `);
-    const local = await localComposition(moduleBytes);
-    const slot = {
-      name: "MEDIA",
-      required: true,
-      service: {
-        apiVersion: "standards.takoform.com/v1" as const,
-        protocol: "com.amazonaws.s3",
-      },
-    };
-    const material = await createStableLocalS3Resolver().resolve({
-      tenantId: "org_stable_local",
-      space: "default",
-      form: local.form("WorkerVersion"),
-      slot,
-    });
-    expect(material).not.toBeNull();
-    const resources = await applyWorkerChain(local, [
-      {
-        ...slot,
-        endpoint: material?.endpoint ?? {},
-        credential: material?.credential ?? {},
-      },
-    ]);
-    const endpoint = resources.endpoint.status.outputs as { hostname: string };
-    const response = await local.dispatch(
-      endpoint.hostname,
-      new Request("https://diagnostic.stable-local.invalid/media"),
-    );
-    expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({
-      text: '{"ok":true}',
-      head: {
-        key: "media/a.json",
-        contentType: "application/json",
-        owner: "stable-local",
-      },
-      listed: [{ key: "media/a.json" }],
-      truncated: false,
-      deleted: true,
-    });
-    const report = local.report();
-    expect(report.portableObjectBucketIdentities).toBe(0);
-    expect(report.currentEdgeObjectsReferences).toBe(0);
-    expect(report.nativeBindings).toEqual([
-      {
-        name: "MEDIA",
-        type: "r2_bucket",
-        service: {
-          apiVersion: "standards.takoform.com/v1",
-          protocol: "com.amazonaws.s3",
-        },
-      },
-    ]);
-  });
-
-  test("refuses a required MEDIA service before materializing a Worker Version", async () => {
+  test("refuses an unsupported required external service before materializing a Worker Version", async () => {
     const local = await localComposition(
       new TextEncoder().encode("export default { fetch() { return new Response('no'); } }"),
     );
@@ -237,10 +151,10 @@ describe("the test-only stable worker runtime", () => {
       worker: ref(worker),
       externalServices: [
         {
-          name: "MEDIA",
+          name: "ARCHIVE",
           service: {
             apiVersion: "standards.takoform.com/v1",
-            protocol: "com.amazonaws.s3",
+            protocol: "com.example.archive",
           },
         },
       ],
@@ -304,10 +218,7 @@ function artifacts(moduleBytes: Uint8Array) {
   };
 }
 
-async function applyWorkerChain(
-  local: StableLocalWorkerComposition,
-  standardServices: NonNullable<Parameters<typeof local.driver.apply>[0]["standardServices"]>,
-) {
+async function applyWorkerChain(local: StableLocalWorkerComposition) {
   const worker = resource(local.form("ModuleWorker"), "worker", {});
   const bundle = resource(local.form("WorkerBundle"), "bundle", {
     manifestDigest: "sha256:manifest",
@@ -316,15 +227,6 @@ async function applyWorkerChain(
     bundle: ref(bundle),
     handlers: ["fetch"],
     worker: ref(worker),
-    ...(standardServices.length > 0
-      ? {
-          externalServices: standardServices.map(({ name, required, service }) => ({
-            name,
-            required,
-            service,
-          })),
-        }
-      : {}),
   });
   const deployment = resource(local.form("WorkerDeployment"), "deployment", {
     worker: ref(worker),
@@ -337,9 +239,7 @@ async function applyWorkerChain(
   await local.driver.apply(applyInput(worker, []));
   await local.driver.apply(applyInput(bundle, []));
   await local.driver.apply(
-    applyInput(version, [relation("/worker", worker), relation("/bundle", bundle)], {
-      standardServices,
-    }),
+    applyInput(version, [relation("/worker", worker), relation("/bundle", bundle)]),
   );
   await local.driver.apply(
     applyInput(deployment, [

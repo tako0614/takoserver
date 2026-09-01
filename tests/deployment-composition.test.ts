@@ -10,12 +10,41 @@ import {
   createCatalogCandidate,
   createProvisioningProviderPack,
 } from "../src/deployment-composition.ts";
-import { buildEdgeForms, objectBucketProviderOffering } from "../src/edge-forms.ts";
 import {
-  compileObjectBucketDeployment,
-  compileObjectBucketDeployments,
-} from "../src/object-bucket-deployment.ts";
+  buildEdgeForms,
+  edgeProviderOffering,
+  objectBucketProviderOffering,
+} from "../src/edge-forms.ts";
+import { compileObjectBucketDeployment } from "../src/object-bucket-deployment.ts";
+import { EDGE_OBJECTS_BINDING_REF } from "../src/providers/cloudflare-runtime-bindings.ts";
 import { FakeProvider } from "../src/providers/fake.ts";
+import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
+
+const COMPLETE_OBJECT_ROUTE = {
+  id: "cloudflare-runtime-bindings",
+  exporter: {
+    routes: [
+      {
+        bindingRef: EDGE_OBJECTS_BINDING_REF,
+        materialKind: "test.object-capability@v1",
+      },
+    ],
+    async exportTarget() {
+      return { opaque: true };
+    },
+  },
+  importer: {
+    routes: [
+      {
+        bindingRef: EDGE_OBJECTS_BINDING_REF,
+        materialKind: "test.object-capability@v1",
+      },
+    ],
+    async importBinding() {
+      return { kind: "test.object-runtime" };
+    },
+  },
+} as const;
 
 const PRICE: PricePlan = {
   id: "storage.object.cloudflare.price-v1",
@@ -46,16 +75,24 @@ const INSTALLATION: ProviderInstallation = {
 };
 
 describe("deployment composition", () => {
-  test("compiles a sellable Offering from the actual runtime Provider Pack", async () => {
-    const edge = await buildEdgeForms();
-    const technical = objectBucketProviderOffering(edge.objectBucket.form, {
+  test("compiles an operator placement from the actual runtime Provider Pack", () => {
+    const form = currentObjectBucket();
+    const technical = objectBucketProviderOffering(form, {
       id: "storage.object.standard",
       displayName: "Object bucket",
       regions: ["global"],
     });
-    const provider = new FakeProvider({ id: "cloudflare", offerings: [technical] });
+    const workerVersion = currentTakoformCandidates().forms.find(
+      (candidate) => candidate.identity.formRef.kind === "WorkerVersion",
+    );
+    if (!workerVersion) throw new Error("current WorkerVersion fixture missing");
+    const consumer = edgeProviderOffering(workerVersion, { id: "cloudflare.worker-version" });
+    const provider = new FakeProvider({
+      id: "cloudflare",
+      offerings: [technical, consumer],
+    });
     const composed = compileObjectBucketDeployment({
-      form: edge.objectBucket.form,
+      form,
       provider,
       providerType: "cloudflare",
       offeringId: technical.id,
@@ -70,12 +107,13 @@ describe("deployment composition", () => {
         abusePolicyRef: "abuse:operator:standard",
         portability: {
           api: "portable",
-          exportFormats: ["s3.object-set.takoform.com/v1"],
-          importFormats: ["s3.object-set.takoform.com/v1"],
-          migrationModes: ["offline", "online"],
+          exportFormats: [],
+          importFormats: [],
+          migrationModes: [],
         },
         isolation: "dedicated-resource",
       },
+      capabilities: { runtimeBindingMaterializer: COMPLETE_OBJECT_ROUTE },
       now: new Date("2026-08-19T00:00:00.000Z"),
     });
 
@@ -87,18 +125,161 @@ describe("deployment composition", () => {
       available: true,
     });
     expect(composed.providerPacks[0]?.id).toBe("cloudflare");
+    expect(composed.providerPacks[0]?.descriptor.bindingRefs).toEqual([EDGE_OBJECTS_BINDING_REF]);
   });
 
-  test("fails the whole deployment instead of partially publishing invalid supply", async () => {
-    const edge = await buildEdgeForms();
-    const technical = objectBucketProviderOffering(edge.objectBucket.form, {
+  test("refuses an ObjectBucket catalog without a complete same-pack material route", () => {
+    const form = currentObjectBucket();
+    const technical = objectBucketProviderOffering(form, {
       id: "storage.object.standard",
       displayName: "Object bucket",
+      regions: ["global"],
+    });
+
+    expect(() =>
+      compileObjectBucketDeployment({
+        form,
+        provider: new FakeProvider({ id: "cloudflare", offerings: [technical] }),
+        providerType: "cloudflare",
+        offeringId: technical.id,
+        displayName: technical.displayName,
+        regions: ["global"],
+        providerInstallation: INSTALLATION,
+        supplyContract: CONTRACT,
+        pricePlan: PRICE,
+        placement: {
+          deliveryMode: "embedded-binding",
+          supportPolicyRef: "support:operator:standard",
+          abusePolicyRef: "abuse:operator:standard",
+          portability: {
+            api: "portable",
+            exportFormats: [],
+            importFormats: [],
+            migrationModes: [],
+          },
+          isolation: "dedicated-resource",
+        },
+        now: new Date("2026-08-19T00:00:00.000Z"),
+      }),
+    ).toThrow(
+      "deployment_catalog_invalid:storage.object.standard:runtime_binding_relation_incomplete",
+    );
+  });
+
+  test("generic catalog admission rejects a hand-built ObjectBucket without an explicit consumer relation", () => {
+    const form = currentObjectBucket();
+    const technical = objectBucketProviderOffering(form, {
+      id: "storage.object.hand-built",
+      displayName: "Hand-built object bucket",
       regions: ["global"],
     });
     const pack = createProvisioningProviderPack({
       provider: new FakeProvider({ id: "cloudflare", offerings: [technical] }),
       providerType: "cloudflare",
+      capabilities: { runtimeBindingMaterializer: COMPLETE_OBJECT_ROUTE },
+    });
+    const candidate = createCatalogCandidate(technical, {
+      providerPackRef: pack.id,
+      providerInstallationRef: INSTALLATION.id,
+      supplyContractRef: CONTRACT.id,
+      pricePlanRef: PRICE.id,
+      resourceClass: "storage.object",
+      deliveryMode: "embedded-binding",
+      supportPolicyRef: "support:operator:standard",
+      abusePolicyRef: "abuse:operator:standard",
+      portability: {
+        api: "portable",
+        exportFormats: [],
+        importFormats: [],
+        migrationModes: [],
+      },
+      isolation: "dedicated-resource",
+    });
+
+    expect(() =>
+      compileDeploymentComposition({
+        candidates: [candidate],
+        providerPacks: [pack],
+        providerInstallations: [INSTALLATION],
+        supplyContracts: [CONTRACT],
+        pricePlans: [PRICE],
+        now: new Date("2026-08-19T00:00:00.000Z"),
+      }),
+    ).toThrow(
+      "deployment_catalog_invalid:storage.object.hand-built:runtime_binding_relation_missing",
+    );
+  });
+
+  test("an explicit route cannot substitute for a consumer Offering that declares the Binding", () => {
+    const form = currentObjectBucket();
+    const technical = objectBucketProviderOffering(form, {
+      id: "storage.object.no-consumer",
+      displayName: "Object bucket without consumer",
+      regions: ["global"],
+    });
+    const pack = createProvisioningProviderPack({
+      provider: new FakeProvider({ id: "cloudflare", offerings: [technical] }),
+      providerType: "cloudflare",
+      capabilities: { runtimeBindingMaterializer: COMPLETE_OBJECT_ROUTE },
+    });
+    const candidate = createCatalogCandidate(technical, {
+      providerPackRef: pack.id,
+      providerInstallationRef: INSTALLATION.id,
+      supplyContractRef: CONTRACT.id,
+      pricePlanRef: PRICE.id,
+      resourceClass: "storage.object",
+      deliveryMode: "embedded-binding",
+      supportPolicyRef: "support:operator:standard",
+      abusePolicyRef: "abuse:operator:standard",
+      portability: {
+        api: "portable",
+        exportFormats: [],
+        importFormats: [],
+        migrationModes: [],
+      },
+      isolation: "dedicated-resource",
+    });
+
+    expect(() =>
+      compileDeploymentComposition({
+        candidates: [candidate],
+        providerPacks: [pack],
+        providerInstallations: [INSTALLATION],
+        supplyContracts: [CONTRACT],
+        pricePlans: [PRICE],
+        runtimeBindingRelations: [
+          {
+            targetOfferingId: technical.id,
+            consumerProviderPackRef: pack.id,
+            bindingRef: EDGE_OBJECTS_BINDING_REF,
+          },
+        ],
+        now: new Date("2026-08-19T00:00:00.000Z"),
+      }),
+    ).toThrow(
+      "deployment_catalog_invalid:storage.object.no-consumer:runtime_binding_relation_incomplete",
+    );
+  });
+
+  test("fails the whole deployment instead of partially publishing invalid supply", () => {
+    const form = currentObjectBucket();
+    const technical = objectBucketProviderOffering(form, {
+      id: "storage.object.standard",
+      displayName: "Object bucket",
+      regions: ["global"],
+    });
+    const workerVersion = currentTakoformCandidates().forms.find(
+      (candidate) => candidate.identity.formRef.kind === "WorkerVersion",
+    );
+    if (!workerVersion) throw new Error("current WorkerVersion fixture missing");
+    const consumer = edgeProviderOffering(workerVersion, { id: "cloudflare.worker-version" });
+    const pack = createProvisioningProviderPack({
+      provider: new FakeProvider({
+        id: "cloudflare",
+        offerings: [technical, consumer],
+      }),
+      providerType: "cloudflare",
+      capabilities: { runtimeBindingMaterializer: COMPLETE_OBJECT_ROUTE },
     });
     const candidate: CatalogCandidate = createCatalogCandidate(technical, {
       providerPackRef: pack.id,
@@ -130,77 +311,57 @@ describe("deployment composition", () => {
         ],
         supplyContracts: [CONTRACT],
         pricePlans: [PRICE],
+        runtimeBindingRelations: [
+          {
+            targetOfferingId: technical.id,
+            consumerProviderPackRef: pack.id,
+            bindingRef: EDGE_OBJECTS_BINDING_REF,
+          },
+        ],
         now: new Date("2026-08-19T00:00:00.000Z"),
       }),
     ).toThrow("deployment_catalog_invalid:storage.object.standard:capacity_unavailable");
   });
 
-  test("publishes multiple Offerings for one exact Form with explicit providers", async () => {
+  test("refuses to author the retained v1beta1 ObjectBucket", async () => {
     const edge = await buildEdgeForms();
-    const make = (id: string, providerId: string, providerType: string) => {
-      const technical = objectBucketProviderOffering(edge.objectBucket.form, {
-        id,
-        displayName: id,
-        regions: ["global"],
-      });
-      return {
+    expect(() =>
+      compileObjectBucketDeployment({
         form: edge.objectBucket.form,
-        provider: new FakeProvider({ id: providerId, offerings: [technical] }),
-        providerType,
-        offeringId: id,
-        displayName: id,
+        provider: new FakeProvider({ id: "retained", offerings: [] }),
+        providerType: "retained",
+        offeringId: "storage.object.retained",
+        displayName: "Retained object bucket",
         regions: ["global"],
-        providerInstallation: {
-          id: `${providerId}.primary`,
-          providerPackRef: providerId,
-          supplyContractRef: `${providerId}.contract`,
-          state: "active" as const,
-          regions: [{ id: "global", capacity: "available" as const }],
-        },
+        providerInstallation: INSTALLATION,
         supplyContract: {
-          id: `${providerId}.contract`,
-          providerType,
+          ...CONTRACT,
+          providerType: "retained",
           permittedResourceClasses: ["storage.object"],
-          deliveryModes: ["native-credentials" as const],
-          customerAccess: "scoped-native-access" as const,
-          whiteLabelAllowed: true,
-          endUserTermsRequired: true,
-          regions: ["global"],
-          validFrom: "2026-01-01T00:00:00.000Z",
-          evidenceRef: `private:${providerId}`,
         },
-        pricePlan: {
-          id: `${id}.price-v1`,
-          currency: "USD" as const,
-          provisioning: { meter: "resource.create", amountMinor: 500 },
-          meters: [],
-        },
+        pricePlan: PRICE,
         placement: {
-          deliveryMode: "native-credentials" as const,
-          supportPolicyRef: "support:hosted:standard",
-          abusePolicyRef: "abuse:hosted:standard",
+          deliveryMode: "embedded-binding",
+          supportPolicyRef: "support:operator:standard",
+          abusePolicyRef: "abuse:operator:standard",
           portability: {
-            api: "portable" as const,
-            exportFormats: ["s3.object-set.takoform.com/v1"],
-            importFormats: ["s3.object-set.takoform.com/v1"],
-            migrationModes: ["offline" as const],
+            api: "portable",
+            exportFormats: [],
+            importFormats: [],
+            migrationModes: [],
           },
-          isolation: "dedicated-resource" as const,
+          isolation: "dedicated-resource",
         },
-      };
-    };
-    const composed = compileObjectBucketDeployments({
-      deployments: [
-        make("storage.object.cloudflare", "cloudflare", "cloudflare"),
-        make("storage.object.wasabi", "wasabi", "wasabi"),
-      ],
-      now: new Date("2026-08-19T00:00:00.000Z"),
-    });
-
-    expect(composed.offerings.map((offering) => offering.id).sort()).toEqual([
-      "storage.object.cloudflare",
-      "storage.object.wasabi",
-    ]);
-    expect(composed.providerPacks.map((pack) => pack.id).sort()).toEqual(["cloudflare", "wasabi"]);
+        now: new Date("2026-08-19T00:00:00.000Z"),
+      }),
+    ).toThrow("released_provider_object_bucket_required");
   });
 });
+
+function currentObjectBucket() {
+  const form = currentTakoformCandidates().forms.find(
+    (candidate) => candidate.identity.formRef.kind === "ObjectBucket",
+  );
+  if (!form) throw new Error("current ObjectBucket fixture missing");
+  return form;
+}

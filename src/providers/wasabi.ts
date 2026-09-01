@@ -20,6 +20,7 @@ export interface WasabiProviderOptions {
   readonly accessKeyId: string;
   readonly secretAccessKey: string;
   readonly offerings: readonly ProviderOffering[];
+  readonly recoveryOfferings?: readonly ProviderOffering[];
   readonly clock?: () => Date;
   readonly fetch?: (request: Request) => Promise<Response>;
 }
@@ -30,6 +31,8 @@ export function createWasabiProvider(options: WasabiProviderOptions): Provider {
   const region = identifier(options.region, "region", 64);
   const endpoint = wasabiEndpoint(region);
   const offerings = structuredClone(options.offerings) as ProviderOffering[];
+  const recoveryOfferings = structuredClone(options.recoveryOfferings ?? []) as ProviderOffering[];
+  const acceptedOfferings = [...offerings, ...recoveryOfferings];
   const clock = options.clock ?? (() => new Date());
   const send = options.fetch ?? ((request: Request) => fetch(request));
   const credentials = {
@@ -89,11 +92,15 @@ export function createWasabiProvider(options: WasabiProviderOptions): Provider {
   return {
     id,
     offerings,
+    ...(recoveryOfferings.length > 0 ? { recoveryOfferings } : {}),
 
     createNativeReadbackDescriptor(
       input: ProviderNativeReadbackInput,
     ): ProviderNativeReadbackDescriptor {
-      if (!offering(offerings, input.offering) || wasabiKind(input.offering) !== "ObjectBucket") {
+      if (
+        !offering(acceptedOfferings, input.offering) ||
+        wasabiKind(input.offering) !== "ObjectBucket"
+      ) {
         throw new ProviderReadbackDescriptorError();
       }
       const native = parseNativeId(input.nativeId, region);
@@ -112,7 +119,10 @@ export function createWasabiProvider(options: WasabiProviderOptions): Provider {
       offering: ProviderOffering;
       descriptor: ProviderNativeReadbackDescriptor;
     }): Promise<ProviderNativeAbsence> {
-      if (!offering(offerings, input.offering) || wasabiKind(input.offering) !== "ObjectBucket") {
+      if (
+        !offering(acceptedOfferings, input.offering) ||
+        wasabiKind(input.offering) !== "ObjectBucket"
+      ) {
         return wasabiUnknown("unsupported", false);
       }
       const native = validateWasabiReadbackDescriptor(id, input.offering, region, input.descriptor);
@@ -132,7 +142,8 @@ export function createWasabiProvider(options: WasabiProviderOptions): Provider {
     },
 
     async apply(input: ApplyInput): Promise<ProviderTicket> {
-      if (!offering(offerings, input.offering) || input.offering.kind !== "object_bucket") {
+      const available = input.operationMode === "recovery" ? acceptedOfferings : offerings;
+      if (!offering(available, input.offering) || input.offering.kind !== "object_bucket") {
         return failed("invalid_spec", "this offering is not provisionable here");
       }
       if (input.region !== undefined && input.region !== region) {
@@ -169,7 +180,7 @@ export function createWasabiProvider(options: WasabiProviderOptions): Provider {
     },
 
     async recoverApply(input: ApplyInput): Promise<ProviderTicket> {
-      if (!offering(offerings, input.offering) || input.offering.kind !== "object_bucket") {
+      if (!offering(acceptedOfferings, input.offering) || input.offering.kind !== "object_bucket") {
         return failed("invalid_spec", "this offering is not provisionable here");
       }
       if (input.region !== undefined && input.region !== region) {
@@ -181,7 +192,7 @@ export function createWasabiProvider(options: WasabiProviderOptions): Provider {
     },
 
     async observe(input): Promise<ProviderTicket> {
-      if (!offering(offerings, input.offering)) {
+      if (!offering(acceptedOfferings, input.offering)) {
         return failed("invalid_spec", "this offering is not provisionable here");
       }
       return await observed(input.nativeId);
@@ -194,7 +205,7 @@ export function createWasabiProvider(options: WasabiProviderOptions): Provider {
       if (input.providerHandle) {
         return failed("unavailable", "Wasabi delete recovery cannot poll this handle", true);
       }
-      if (!offering(offerings, input.offering)) {
+      if (!offering(acceptedOfferings, input.offering)) {
         return failed("invalid_spec", "this offering is not provisionable here");
       }
       const native = parseNativeId(input.nativeId, region);
@@ -206,7 +217,7 @@ export function createWasabiProvider(options: WasabiProviderOptions): Provider {
     },
 
     async recoverDelete(input): Promise<ProviderTicket> {
-      if (!offering(offerings, input.offering)) {
+      if (!offering(acceptedOfferings, input.offering)) {
         return failed("invalid_spec", "this offering is not provisionable here");
       }
       if (input.providerHandle) {
@@ -235,7 +246,7 @@ export function createWasabiProvider(options: WasabiProviderOptions): Provider {
       if (input.providerHandle) {
         return failed("unavailable", "Wasabi adopt recovery cannot poll this handle", true);
       }
-      if (!offering(offerings, input.offering)) {
+      if (!offering(acceptedOfferings, input.offering)) {
         return failed("invalid_spec", "this offering is not provisionable here");
       }
       return await observed(input.nativeId);
@@ -243,7 +254,7 @@ export function createWasabiProvider(options: WasabiProviderOptions): Provider {
 
     /** Adoption recovery is read-only: HEAD the deterministic bucket identity. */
     async recoverAdopt(input): Promise<ProviderTicket> {
-      if (!offering(offerings, input.offering)) {
+      if (!offering(acceptedOfferings, input.offering)) {
         return failed("invalid_spec", "this offering is not provisionable here");
       }
       if (input.providerHandle) {

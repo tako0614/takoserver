@@ -120,10 +120,10 @@ describe("Resource Deployments", () => {
     const base = {
       tenantId: "org_1",
       resourceUid: "uid_main",
-      offeringId: "storage.s3.wasabi.ap-northeast",
-      providerPackRef: "wasabi",
-      providerInstallationRef: "wasabi.primary",
-      nativeId: "bucket:main",
+      offeringId: "compute.edge.internal",
+      providerPackRef: "internal",
+      providerInstallationRef: "internal.primary",
+      nativeId: "worker:main",
       state: "active" as const,
       observed: {},
       outputs: {},
@@ -133,7 +133,7 @@ describe("Resource Deployments", () => {
       deployments.create({
         ...base,
         id: "dep_two",
-        nativeId: "bucket:other",
+        nativeId: "worker:other",
       }),
     ).rejects.toThrow();
     await expect(

@@ -9,15 +9,19 @@ import {
 import { createAdmissionHandleIssuer } from "./admission.ts";
 import { createFormAdmissionStore } from "./admission-store.ts";
 import {
+  createReleasedCoreFormAuthorityEvidenceVerifier,
   createUnavailableFormAuthorityEvidenceVerifier,
   type FormAuthorityEnvironment,
   type FormAuthorityEvidenceVerifier,
+  type FormAuthorityVerificationEvidence,
+  type TakoformCoreVerifierContainerNamespace,
 } from "./form-authority-verification.ts";
 import { createFormPackageStore, type FormPackageInput } from "./form-packages.ts";
 import {
   createHostAdmissionCoordinator,
   type FormAuthorityApplyResult,
   type FormAuthorityIdentity,
+  type FormAuthorityPackageIdentity,
   type FormAuthorityPackageSource,
   type FormAuthorityPlan,
   type FormAuthorityPlanRequest,
@@ -29,6 +33,7 @@ import type {
   TakoformImplementationCatalog,
   TakoformLifecycleCapabilityManifest,
 } from "./implementation-catalog.ts";
+import { loadPublisherSetClosure } from "./publisher-set-closure.ts";
 
 export { parseFormAuthorityCapabilityManifest, providerResourceOperationHandlers };
 
@@ -45,12 +50,15 @@ export interface FormAuthorityEndpointConfiguration {
   readonly implementationDigest: `sha256:${string}`;
   /** Code-owned capability manifest embedded into the public Worker build. */
   readonly capabilities: TakoformLifecycleCapabilityManifest;
+  /** Exact Container artifact identity required on every released-Core response. */
+  readonly coreVerifierArtifactDigest?: `sha256:${string}`;
 }
 
 export interface FormAuthorityEndpointBindings {
   readonly sql: Sql;
   readonly objects: ObjectStore;
   readonly publicHostIdentity: PublicHostIdentityRpc;
+  readonly coreVerifier?: TakoformCoreVerifierContainerNamespace;
 }
 
 export interface FormAuthorityComposition {
@@ -82,25 +90,33 @@ export class HostAdmissionEndpoint {
 }
 
 /**
- * Production composition is intentionally useful for plan/readback but not
- * apply. Verification remains unavailable until released Core verification
- * can be injected here; Host policy continues to live in this composition.
+ * Production binds the embedded exact publisher-set closure as the package
+ * set, the package source and the required request evidence, then verifies the
+ * raw closure through the released-Core route-less Container before any
+ * durable mutation. Host policy remains in this composition and no serialized
+ * Core report can mint an admission handle. Without a Container binding the
+ * verifier is unavailable and apply fails closed.
  */
 export async function createProductionFormAuthorityComposition(input: {
   readonly configuration: FormAuthorityEndpointConfiguration;
   readonly bindings: FormAuthorityEndpointBindings;
 }): Promise<FormAuthorityComposition> {
+  const closure = await loadPublisherSetClosure();
+  const artifactDigest = input.configuration.coreVerifierArtifactDigest;
+  const containers = input.bindings.coreVerifier;
   return createComposition({
     ...input,
-    verifier: createUnavailableFormAuthorityEvidenceVerifier(),
-    packages: {
-      async load(): Promise<never> {
-        throw new HostAdmissionCoordinatorError(
-          "package_unavailable",
-          "production package source is unavailable without released verification evidence",
-        );
-      },
-    },
+    verifier:
+      artifactDigest && containers
+        ? createReleasedCoreFormAuthorityEvidenceVerifier({
+            containers,
+            containerName: `${input.configuration.environment}:${input.configuration.hostId}`,
+            artifactDigest,
+          })
+        : createUnavailableFormAuthorityEvidenceVerifier(),
+    packages: closure.packages,
+    packageSet: closure.packageSet,
+    expectedEvidence: closure.evidence,
   });
 }
 
@@ -109,6 +125,8 @@ export async function createFormAuthorityComposition(input: {
   readonly bindings: FormAuthorityEndpointBindings;
   readonly verifier: FormAuthorityEvidenceVerifier;
   readonly packages: FormAuthorityPackageSource;
+  readonly packageSet?: readonly FormAuthorityPackageIdentity[];
+  readonly expectedEvidence?: FormAuthorityVerificationEvidence;
 }): Promise<FormAuthorityComposition> {
   return createComposition(input);
 }
@@ -141,6 +159,8 @@ async function createComposition(input: {
   readonly bindings: FormAuthorityEndpointBindings;
   readonly verifier: FormAuthorityEvidenceVerifier;
   readonly packages: FormAuthorityPackageSource;
+  readonly packageSet?: readonly FormAuthorityPackageIdentity[];
+  readonly expectedEvidence?: FormAuthorityVerificationEvidence;
 }): Promise<FormAuthorityComposition> {
   const catalog = await deriveRuntimeImplementationCatalog({
     implementationPayloadDigest: input.configuration.implementationPayloadDigest,
@@ -183,6 +203,10 @@ async function createComposition(input: {
       createHostAdmissionCoordinator({
         identity,
         catalog,
+        ...(input.packageSet === undefined ? {} : { packageSet: input.packageSet }),
+        ...(input.expectedEvidence === undefined
+          ? {}
+          : { expectedEvidence: input.expectedEvidence }),
         packages: input.packages,
         storedPackages,
         admission,
@@ -237,6 +261,8 @@ function validateConfiguration(configuration: FormAuthorityEndpointConfiguration
     !isSha256Digest(configuration.workerArtifactDigest) ||
     !isSha256Digest(configuration.implementationPayloadDigest) ||
     !isSha256Digest(configuration.implementationDigest) ||
+    (configuration.coreVerifierArtifactDigest !== undefined &&
+      !isSha256Digest(configuration.coreVerifierArtifactDigest)) ||
     typeof configuration.publicWorkerVersionId !== "string" ||
     !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(
       configuration.publicWorkerVersionId,

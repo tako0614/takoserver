@@ -24,7 +24,7 @@
       }
     },
     "schemas": {
-      "WorkerEndpointOriginReservationTarget": {
+      "WorkerEndpointOriginReservationLegacyTarget": {
         "type": "object",
         "required": [
           "space",
@@ -57,16 +57,19 @@
         "type": "object",
         "required": [
           "format",
-          "target",
+          "requestedSubdomain",
           "expiresInSeconds"
         ],
         "additionalProperties": false,
         "properties": {
           "format": {
-            "const": "takoserver.worker-endpoint-origin-reservation.v1"
+            "const": "takoserver.worker-endpoint-origin-reservation.v2"
           },
-          "target": {
-            "$ref": "#/components/schemas/WorkerEndpointOriginReservationTarget"
+          "requestedSubdomain": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 63,
+            "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
           },
           "offeringId": {
             "type": "string",
@@ -80,7 +83,187 @@
           }
         }
       },
-      "WorkerEndpointOriginReservation": {
+      "WorkerEndpointOriginReservationBinding": {
+        "type": "object",
+        "required": [
+          "space",
+          "workerName",
+          "workerResourceUid",
+          "workerResourceRevision"
+        ],
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "endpointName"
+                  ]
+                },
+                {
+                  "required": [
+                    "endpointResourceUid"
+                  ]
+                },
+                {
+                  "required": [
+                    "endpointResourceRevision"
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "required": [
+              "endpointName",
+              "endpointResourceUid",
+              "endpointResourceRevision"
+            ]
+          }
+        ],
+        "properties": {
+          "space": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+          },
+          "workerName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+          },
+          "workerResourceUid": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "workerResourceRevision": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]*$"
+          },
+          "endpointName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+          },
+          "endpointResourceUid": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "endpointResourceRevision": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]*$"
+          }
+        }
+      },
+      "WorkerEndpointOriginReservationV2": {
+        "type": "object",
+        "required": [
+          "format",
+          "reservationId",
+          "requestedSubdomain",
+          "canonicalPublicOrigin",
+          "revision",
+          "expiresAt",
+          "status"
+        ],
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "properties": {
+              "status": {
+                "const": "prepared"
+              }
+            },
+            "not": {
+              "required": [
+                "binding"
+              ]
+            }
+          },
+          {
+            "properties": {
+              "status": {
+                "const": "bound"
+              }
+            },
+            "required": [
+              "binding"
+            ]
+          },
+          {
+            "properties": {
+              "status": {
+                "const": "activated"
+              },
+              "binding": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/WorkerEndpointOriginReservationBinding"
+                  },
+                  {
+                    "required": [
+                      "endpointName",
+                      "endpointResourceUid",
+                      "endpointResourceRevision"
+                    ]
+                  }
+                ]
+              }
+            },
+            "required": [
+              "binding"
+            ]
+          }
+        ],
+        "properties": {
+          "format": {
+            "const": "takoserver.worker-endpoint-origin-reservation.v2"
+          },
+          "reservationId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "requestedSubdomain": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 63,
+            "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+          },
+          "canonicalPublicOrigin": {
+            "type": "string",
+            "format": "uri",
+            "pattern": "^https://[^/]+$",
+            "maxLength": 2048
+          },
+          "revision": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]*$"
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "prepared",
+              "bound",
+              "activated"
+            ]
+          },
+          "binding": {
+            "$ref": "#/components/schemas/WorkerEndpointOriginReservationBinding"
+          }
+        }
+      },
+      "WorkerEndpointOriginReservationV1": {
         "type": "object",
         "required": [
           "format",
@@ -116,7 +299,7 @@
             "format": "date-time"
           },
           "target": {
-            "$ref": "#/components/schemas/WorkerEndpointOriginReservationTarget"
+            "$ref": "#/components/schemas/WorkerEndpointOriginReservationLegacyTarget"
           },
           "status": {
             "type": "string",
@@ -138,6 +321,16 @@
           }
         }
       },
+      "WorkerEndpointOriginReservation": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/WorkerEndpointOriginReservationV2"
+          },
+          {
+            "$ref": "#/components/schemas/WorkerEndpointOriginReservationV1"
+          }
+        ]
+      },
       "WorkerEndpointOriginReservationActivationRequest": {
         "type": "object",
         "required": [
@@ -147,7 +340,7 @@
         "additionalProperties": false,
         "properties": {
           "format": {
-            "const": "takoserver.worker-endpoint-origin-reservation-activation.v1"
+            "const": "takoserver.worker-endpoint-origin-reservation-activation.v2"
           },
           "endpointResourceUid": {
             "type": "string",
@@ -504,7 +697,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/WorkerEndpointOriginReservation"
+                  "$ref": "#/components/schemas/WorkerEndpointOriginReservationV2"
                 }
               }
             }
@@ -519,7 +712,7 @@
             "description": "The key lacks resources:write"
           },
           "409": {
-            "description": "Replay, logical-worker, canonical-origin, or placement conflict"
+            "description": "Replay, requested-subdomain, canonical-origin, or placement conflict"
           },
           "422": {
             "description": "No unique eligible ModuleWorker offering or provider capability"
@@ -601,7 +794,7 @@
     },
     "/v1/worker-endpoint-origin-reservations/{reservationId}/activation": {
       "put": {
-        "summary": "Activate the reservation against one exact released Ready WorkerEndpoint",
+        "summary": "Activate the reservation against one exact realized Ready WorkerEndpoint",
         "parameters": [
           {
             "name": "reservationId",
@@ -1098,16 +1291,6 @@
         }
       }
     },
-    "/v1/organizations/{organizationId}/resources/{resourceUid}/s3-credentials": {
-      "post": {
-        "summary": "Issue short-lived S3 credentials for a historical ObjectBucket record",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
     "/v1/organizations/{organizationId}/operations": {
       "get": {
         "summary": "List the organization's recent Takoform operations",
@@ -1291,16 +1474,6 @@
     "/apis/forms.takoform.com/v1/support/bindings/{name}/{version}": {
       "get": {
         "summary": "Read an accepted Binding contract",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1/support/standard-services/{protocol}": {
-      "get": {
-        "summary": "Read exact standard-service support",
         "responses": {
           "200": {
             "description": "Success"

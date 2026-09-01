@@ -245,6 +245,11 @@ export interface WranglerVersionPublication {
   readonly deploymentId: string;
 }
 
+export interface WranglerExistingVersionDeployment {
+  readonly versionId: string;
+  readonly deploymentId: string;
+}
+
 export interface WranglerVersionPublicationLease {
   readonly accountId: string;
   readonly workerName: string;
@@ -682,6 +687,8 @@ export async function publishWranglerVersion(input: {
   readonly lease: WranglerVersionPublicationLease;
   /** Re-read and compare the pinned active deployment after upload, immediately before traffic. */
   readonly assertPredecessorStillCurrent: () => Promise<void>;
+  /** Prove the exact staged immutable Version before any traffic deployment. */
+  readonly assertUploadedVersion?: (versionId: string) => Promise<void>;
   readonly environment?: Readonly<Record<string, string>>;
   readonly run?: WranglerProcess;
 }): Promise<WranglerVersionPublication> {
@@ -708,6 +715,7 @@ async function publishWranglerVersionWhileLeased(
     readonly message: string;
     readonly lease: WranglerVersionPublicationLease;
     readonly assertPredecessorStillCurrent: () => Promise<void>;
+    readonly assertUploadedVersion?: (versionId: string) => Promise<void>;
     readonly environment?: Readonly<Record<string, string>>;
   },
   run: WranglerProcess,
@@ -754,6 +762,17 @@ async function publishWranglerVersionWhileLeased(
       "Worker Version upload returned no exact publication identity; do not retry before --status",
       safeErrorDetail(error),
     );
+  }
+
+  if (input.assertUploadedVersion) {
+    try {
+      await input.assertUploadedVersion(uploaded.versionId);
+    } catch (error) {
+      throw mutationError(
+        "staged Worker Version readback failed; this invocation did not start a traffic deployment",
+        safeErrorDetail(error),
+      );
+    }
   }
 
   try {
@@ -803,6 +822,78 @@ async function publishWranglerVersionWhileLeased(
     );
   }
   return { versionId: uploaded.versionId, deploymentId: deployment.deploymentId };
+}
+
+/** Deploy one provider-history predecessor without uploading or rebuilding it. */
+export async function deployExistingWranglerVersion(input: {
+  readonly root: string;
+  readonly configPath: string;
+  readonly accountId: string;
+  readonly workerName: string;
+  readonly versionId: string;
+  readonly message: string;
+  readonly lease: WranglerVersionPublicationLease;
+  readonly assertCurrentStillExpected: () => Promise<void>;
+  readonly environment?: Readonly<Record<string, string>>;
+  readonly run?: WranglerProcess;
+}): Promise<WranglerExistingVersionDeployment> {
+  if (!isAbsolute(input.root) || !isAbsolute(input.configPath)) {
+    throw preflightError("Wrangler existing Version deployment requires absolute paths");
+  }
+  if (!WORKER_NAME.test(input.workerName) || !UUID.test(input.versionId)) {
+    throw preflightError("Wrangler existing Version deployment requires one exact target");
+  }
+  if (input.lease.accountId !== input.accountId || input.lease.workerName !== input.workerName) {
+    throw preflightError("Wrangler existing Version deployment lease does not match the target");
+  }
+  try {
+    await input.assertCurrentStillExpected();
+  } catch (error) {
+    throw mutationError(
+      "Worker rollback predecessor re-fence failed; this invocation did not mutate traffic",
+      safeErrorDetail(error),
+    );
+  }
+  mkdirSync(input.root, { recursive: true, mode: 0o700 });
+  const outputPath = join(input.root, "wrangler-existing-version-deploy.jsonl");
+  rmSync(outputPath, { force: true });
+  const deployed = await runPublicationCommand(
+    input.run ?? runCommand,
+    wranglerCommand([
+      "versions",
+      "deploy",
+      `${input.versionId}@100%`,
+      "--name",
+      input.workerName,
+      "--config",
+      input.configPath,
+      "--yes",
+      "--message",
+      input.message,
+    ]),
+    { ...(input.environment ?? {}), WRANGLER_OUTPUT_FILE_PATH: outputPath },
+    "Worker rollback deployment could not be started; run --status before repair",
+  );
+  if (deployed.exitCode !== 0) {
+    throw mutationError(
+      "Worker rollback deployment acknowledgement is indeterminate; run --status before repair",
+      `exit=${deployed.exitCode}`,
+    );
+  }
+  let deployment: { readonly deploymentId: string };
+  try {
+    deployment = parseWranglerVersionDeployOutput(
+      readOutput(outputPath, deployed.stdout),
+      input.workerName,
+      input.versionId,
+    );
+  } catch (error) {
+    throw mutationError(
+      "Worker rollback returned no exact deployment identity; run --status before repair",
+      safeErrorDetail(error),
+    );
+  }
+  return { versionId: input.versionId, deploymentId: deployment.deploymentId };
 }
 
 async function runPublicationCommand(

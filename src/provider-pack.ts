@@ -2,7 +2,12 @@ import type { AttachmentFactory } from "./attachments.ts";
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import type { TakoformBindingRef, TakoformInterfaceRef } from "./interface-ref.ts";
 import type { MeterSource } from "./provider-meter-port.ts";
-import type { Provider, ProviderFailure } from "./provider-port.ts";
+import type {
+  Provider,
+  ProviderFailure,
+  ProviderRelation,
+  ResourceIdentity,
+} from "./provider-port.ts";
 import type { ResourceDeployment } from "./resource-deployments.ts";
 
 export type { MeterSource } from "./provider-meter-port.ts";
@@ -141,6 +146,56 @@ export interface CostEstimator {
   }): Promise<{ readonly currency: "USD"; readonly amountMinor: number }>;
 }
 
+/** One provider-private transport route for one exact portable Binding. */
+export interface RuntimeBindingMaterialRoute {
+  readonly bindingRef: TakoformBindingRef;
+  /** Opaque internal material protocol. Never a public Interface or Resource output. */
+  readonly materialKind: string;
+}
+
+/** Target-side, read-only export from one already-realized Deployment. */
+export interface RuntimeBindingExporter {
+  readonly routes: readonly RuntimeBindingMaterialRoute[];
+  exportTarget(input: {
+    readonly tenantId: string;
+    readonly relation: ProviderRelation & { readonly deployment: ResourceDeployment };
+    readonly route: RuntimeBindingMaterialRoute;
+  }): Promise<unknown | null>;
+}
+
+/** Consumer-side import into the exact selected provider runtime. */
+export interface RuntimeBindingImporter {
+  readonly routes: readonly RuntimeBindingMaterialRoute[];
+  importBinding(input: {
+    readonly tenantId: string;
+    readonly source: ResourceIdentity;
+    readonly sourceSpec: Readonly<Record<string, unknown>>;
+    readonly name: string;
+    readonly relation: ProviderRelation & { readonly deployment: ResourceDeployment };
+    readonly route: RuntimeBindingMaterialRoute;
+    readonly exported: {
+      readonly providerPackRef: string;
+      readonly materialKind: string;
+      readonly material: unknown;
+    };
+  }): Promise<unknown | null>;
+}
+
+/**
+ * Provider-private, directional materialization of an exact portable Binding.
+ *
+ * Export and import are deliberately independent. A pack may safely expose a
+ * target exporter without claiming that its runtime can consume the material.
+ * A complete capability exists only where one exporter route and one importer
+ * route agree on the exact Binding and material kind, including within one
+ * Provider Pack.
+ */
+export interface RuntimeBindingMaterializer {
+  readonly id: string;
+  readonly exporter?: RuntimeBindingExporter;
+  readonly importer?: RuntimeBindingImporter;
+}
+
 export interface ProviderPackDefinition {
   readonly id: string;
   readonly providerType: string;
@@ -150,6 +205,7 @@ export interface ProviderPackDefinition {
   readonly credentialIssuers: readonly CredentialIssuer[];
   readonly meterSources: readonly MeterSource[];
   readonly costEstimators: readonly CostEstimator[];
+  readonly runtimeBindingMaterializer?: RuntimeBindingMaterializer;
 }
 
 export interface ProviderPack extends ProviderPackDefinition {
@@ -166,6 +222,25 @@ export function createProviderPack(definition: ProviderPackDefinition): Provider
   uniqueIds(definition.credentialIssuers, "CredentialIssuer");
   uniqueIds(definition.meterSources, "MeterSource");
   uniqueIds(definition.costEstimators, "CostEstimator");
+  if (definition.runtimeBindingMaterializer) {
+    validateId(definition.runtimeBindingMaterializer.id);
+    const { exporter, importer } = definition.runtimeBindingMaterializer;
+    if (!exporter && !importer) {
+      throw new TypeError("runtime Binding materializer has no directional route");
+    }
+    if (exporter) {
+      uniqueRuntimeBindingRoutes(exporter.routes, "export");
+      if (typeof exporter.exportTarget !== "function") {
+        throw new TypeError("runtime Binding exporter is unavailable");
+      }
+    }
+    if (importer) {
+      uniqueRuntimeBindingRoutes(importer.routes, "import");
+      if (typeof importer.importBinding !== "function") {
+        throw new TypeError("runtime Binding importer is unavailable");
+      }
+    }
+  }
   if (definition.attachmentFactories.some((factory) => factory.providerPackRef !== definition.id)) {
     throw new TypeError("AttachmentFactory belongs to another Provider Pack");
   }
@@ -203,7 +278,10 @@ export function createProviderPack(definition: ProviderPackDefinition): Provider
     providerType: definition.providerType,
     forms: uniqueValues(offerings.map((offering) => offering.form)),
     providedInterfaces: uniqueValues(offerings.flatMap((offering) => offering.providedInterfaces)),
-    bindingRefs: uniqueValues(offerings.flatMap((offering) => offering.bindingRefs)),
+    // A local importer is only one direction. The deployment compiler projects
+    // Binding advertisements after an explicit target exporter relation proves
+    // the complete route; a standalone Provider Pack therefore advertises none.
+    bindingRefs: [],
     meterSources: [...new Set(definition.meterSources.flatMap((source) => source.meters))].sort(),
   };
 
@@ -216,6 +294,47 @@ export function createProviderPack(definition: ProviderPackDefinition): Provider
       return provisioner;
     },
   };
+}
+
+function uniqueRuntimeBindingRoutes(
+  values: readonly RuntimeBindingMaterialRoute[],
+  direction: "export" | "import",
+): void {
+  if (values.length < 1) {
+    throw new TypeError(`runtime Binding ${direction} routes are empty`);
+  }
+  const seen = new Set<string>();
+  for (const value of values) {
+    const { bindingRef } = value;
+    if (
+      bindingRef.apiVersion.length < 1 ||
+      bindingRef.name.length < 1 ||
+      bindingRef.version.length < 1 ||
+      !/^sha256:[0-9a-f]{64}$/u.test(bindingRef.schemaDigest)
+    ) {
+      throw new TypeError(`invalid runtime Binding ${direction} route`);
+    }
+    validateMaterialKind(value.materialKind);
+    const key = [
+      bindingRef.apiVersion,
+      bindingRef.name,
+      bindingRef.version,
+      bindingRef.schemaDigest,
+      value.materialKind,
+    ].join("\0");
+    if (seen.has(key)) {
+      throw new TypeError(
+        `duplicate runtime Binding ${direction} route: ${bindingRef.name}@${bindingRef.version}`,
+      );
+    }
+    seen.add(key);
+  }
+}
+
+function validateMaterialKind(value: string): void {
+  if (value.length < 1 || value.length > 255 || !/^[a-z0-9][a-z0-9._:/@-]*$/u.test(value)) {
+    throw new TypeError("invalid runtime Binding material kind");
+  }
 }
 
 function uniqueIds(values: readonly { readonly id: string }[], kind: string): void {

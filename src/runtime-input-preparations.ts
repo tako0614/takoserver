@@ -254,6 +254,8 @@ export interface RuntimeInputPreparations {
   ): Promise<RuntimeInputRecoveryIdentity>;
   /** Settles the one dispatched handoff after provider acknowledgement recovery. */
   consumeRecovered(input: RuntimeInputRecoveredConsumption): Promise<void>;
+  /** Revokes an exact claimed/dispatched handoff after proven provider absence. */
+  abandon(input: Omit<RuntimeInputRecoveredConsumption, "receiptDigest">): Promise<void>;
   revoke(organizationId: string, operationId: string): Promise<void>;
   expireDue(limit: number): Promise<number>;
 }
@@ -312,8 +314,8 @@ export function createRuntimeInputAuthority(
       expected &&
       (expected.originReservationId !== reservation.reservationId ||
         expected.canonicalPublicOrigin !== reservation.canonicalPublicOrigin ||
-        expected.workerResourceUid !== reservation.workerResourceUid ||
-        expected.workerResourceRevision !== reservation.workerResourceRevision ||
+        expected.workerResourceUid !== reservation.binding.workerResourceUid ||
+        expected.workerResourceRevision !== reservation.binding.workerResourceRevision ||
         expected.originReservationRevision !== reservation.revision ||
         expected.providerPackRef !== reservation.providerPackRef ||
         expected.providerInstallationRef !== reservation.providerInstallationRef ||
@@ -470,6 +472,18 @@ export function createRuntimeInputAuthority(
             }),
         };
       },
+      async abandon(input) {
+        const reference = runtimeInputReference(input.reference);
+        await internals.abandon({
+          organizationId: input.organizationId,
+          preparationId: reference.preparationId,
+          preparationCommitment: reference.commitment,
+          claimOwner: input.operationId,
+          resourceUid: input.resourceUid,
+          target: input.target,
+          bindingNames: input.bindingNames,
+        });
+      },
     },
     maintenance: {
       expireDue: (limit) => internals.expireDue(limit),
@@ -582,9 +596,9 @@ export function createRuntimeInputPreparations(options: {
             normalized.materialSetNonce,
             normalized.target.space,
             normalized.target.workerName,
-            normalized.reservation.target.endpointName,
+            normalized.reservation.binding.endpointName,
             normalized.target.workerResourceUid,
-            normalized.reservation.workerResourceRevision,
+            normalized.reservation.binding.workerResourceRevision,
             normalized.target.bundleName,
             normalized.target.originReservationId,
             Number(normalized.reservation.revision),
@@ -606,7 +620,7 @@ export function createRuntimeInputPreparations(options: {
             createdAt,
             normalized.canonicalPublicOrigin,
             normalized.target.workerResourceUid,
-            normalized.reservation.workerResourceRevision,
+            normalized.reservation.binding.workerResourceRevision,
             normalized.reservation.providerPackRef,
             normalized.reservation.providerInstallationRef,
             normalized.reservation.offeringId,
@@ -615,7 +629,7 @@ export function createRuntimeInputPreparations(options: {
             normalized.target.workerResourceUid,
             normalized.target.space,
             normalized.target.workerName,
-            normalized.reservation.workerResourceRevision,
+            normalized.reservation.binding.workerResourceRevision,
             normalized.organizationId,
             normalized.target.workerResourceUid,
             normalized.reservation.offeringId,
@@ -643,9 +657,9 @@ export function createRuntimeInputPreparations(options: {
         material_set_nonce: normalized.materialSetNonce,
         space: normalized.target.space,
         worker_name: normalized.target.workerName,
-        endpoint_name: normalized.reservation.target.endpointName,
+        endpoint_name: normalized.reservation.binding.endpointName,
         worker_resource_uid: normalized.target.workerResourceUid,
-        worker_resource_revision: normalized.reservation.workerResourceRevision,
+        worker_resource_revision: normalized.reservation.binding.workerResourceRevision,
         bundle_name: normalized.target.bundleName,
         origin_reservation_id: normalized.target.originReservationId,
         origin_reservation_revision: Number(normalized.reservation.revision),
@@ -962,6 +976,81 @@ export function createRuntimeInputPreparations(options: {
       });
     },
 
+    async abandon(input) {
+      const normalized = normalizeRecoveredInput(input);
+      const row = await readByPreparationId(
+        options.sql,
+        normalized.organizationId,
+        normalized.preparationId,
+      );
+      if (!row) throw new RuntimeInputPreparationError("not_found", 404);
+      assertClaimMatches(row, normalized);
+      if (
+        row.preparation_commitment !== normalized.preparationCommitment ||
+        row.preparation_commitment !== validatedReferenceCommitment(row)
+      ) {
+        throw new RuntimeInputPreparationError("conflict", 409);
+      }
+      const exactClaimed =
+        row.state === "claimed" &&
+        row.claim_owner === normalized.claimOwner &&
+        row.claimed_resource_uid === normalized.resourceUid;
+      const exactDispatched =
+        row.state === "dispatched" &&
+        row.dispatched_operation_id === normalized.claimOwner &&
+        row.claimed_resource_uid === normalized.resourceUid;
+      if (row.state === "revoked") {
+        if (
+          row.dispatched_operation_id === normalized.claimOwner &&
+          row.claimed_resource_uid === normalized.resourceUid
+        ) {
+          return;
+        }
+        throw new RuntimeInputPreparationError("conflict", 409);
+      }
+      if (!exactClaimed && !exactDispatched) {
+        throw new RuntimeInputPreparationError("conflict", 409);
+      }
+      const now = options.clock().getTime();
+      const changed = await options.sql.run(
+        `UPDATE worker_runtime_input_preparations
+         SET state = 'revoked', sealed_payload = NULL, seal_nonce = NULL, seal_key_id = NULL,
+             fence = fence + 1, claim_owner = NULL, claim_expires_at = NULL,
+             dispatched_operation_id = ?, updated_at = ?, revoked_at = ?
+         WHERE organization_id = ? AND preparation_id = ? AND fence = ?
+           AND claimed_resource_uid = ?
+           AND (
+             (state = 'claimed' AND claim_owner = ?)
+             OR (state = 'dispatched' AND dispatched_operation_id = ?)
+           )`,
+        [
+          normalized.claimOwner,
+          now,
+          now,
+          normalized.organizationId,
+          normalized.preparationId,
+          row.fence,
+          normalized.resourceUid,
+          normalized.claimOwner,
+          normalized.claimOwner,
+        ],
+      );
+      if (changed.changes === 1) return;
+      const observed = await readByPreparationId(
+        options.sql,
+        normalized.organizationId,
+        normalized.preparationId,
+      );
+      if (
+        observed?.state === "revoked" &&
+        observed.dispatched_operation_id === normalized.claimOwner &&
+        observed.claimed_resource_uid === normalized.resourceUid
+      ) {
+        return;
+      }
+      throw new RuntimeInputPreparationError("conflict", 409);
+    },
+
     async revoke(organizationId, operationId) {
       validateOpaqueId(organizationId);
       validateOpaqueId(operationId);
@@ -1056,7 +1145,14 @@ interface BoundRuntimeInputPreparationInput extends RuntimeInputPreparationInput
   readonly reservation: BoundWorkerEndpointOriginReservation;
 }
 
-interface NormalizedInput extends BoundRuntimeInputPreparationInput {
+interface RuntimeInputBoundReservation extends BoundWorkerEndpointOriginReservation {
+  readonly binding: BoundWorkerEndpointOriginReservation["binding"] & {
+    readonly endpointName: string;
+  };
+}
+
+interface NormalizedInput extends Omit<BoundRuntimeInputPreparationInput, "reservation"> {
+  readonly reservation: RuntimeInputBoundReservation;
   readonly canonicalPublicOrigin: string;
   readonly bindingNames: readonly string[];
   readonly bindings: Readonly<Record<string, string>>;
@@ -1399,14 +1495,14 @@ function parseSealedPayload(row: PreparationRow, bytes: Uint8Array): NormalizedI
         canonicalPublicOrigin: row.canonical_public_origin,
         revision: String(row.origin_reservation_revision),
         expiresAtEpochMilliseconds: row.expires_at,
-        target: {
+        binding: {
           space: row.space,
           workerName: row.worker_name,
+          workerResourceUid: row.worker_resource_uid,
+          workerResourceRevision: row.worker_resource_revision,
           endpointName: row.endpoint_name,
         },
         status: "bound",
-        workerResourceUid: row.worker_resource_uid,
-        workerResourceRevision: row.worker_resource_revision,
         providerPackRef: row.provider_pack_ref,
         providerInstallationRef: row.provider_installation_ref,
         offeringId: row.offering_id,
@@ -1471,9 +1567,9 @@ async function adoptExisting(
     row.material_set_nonce !== input.materialSetNonce ||
     row.space !== input.target.space ||
     row.worker_name !== input.target.workerName ||
-    row.endpoint_name !== input.reservation.target.endpointName ||
+    row.endpoint_name !== input.reservation.binding.endpointName ||
     row.worker_resource_uid !== input.target.workerResourceUid ||
-    row.worker_resource_revision !== input.reservation.workerResourceRevision ||
+    row.worker_resource_revision !== input.reservation.binding.workerResourceRevision ||
     row.bundle_name !== input.target.bundleName ||
     row.origin_reservation_id !== input.target.originReservationId ||
     row.origin_reservation_revision !== Number(input.reservation.revision) ||
@@ -1531,9 +1627,10 @@ function normalizeInput(input: BoundRuntimeInputPreparationInput): NormalizedInp
   if (
     reservation.organizationId !== input.organizationId ||
     reservation.reservationId !== input.target.originReservationId ||
-    reservation.target.space !== input.target.space ||
-    reservation.target.workerName !== input.target.workerName ||
-    reservation.workerResourceUid !== input.target.workerResourceUid ||
+    reservation.binding.space !== input.target.space ||
+    reservation.binding.workerName !== input.target.workerName ||
+    reservation.binding.workerResourceUid !== input.target.workerResourceUid ||
+    reservation.binding.endpointName === undefined ||
     (reservation.status !== "bound" && reservation.status !== "activated") ||
     !Number.isSafeInteger(Number(reservation.revision)) ||
     Number(reservation.revision) < 1 ||
@@ -1543,8 +1640,8 @@ function normalizeInput(input: BoundRuntimeInputPreparationInput): NormalizedInp
   }
   validateCanonicalOrigin(reservation.canonicalPublicOrigin);
   for (const value of [
-    reservation.target.endpointName,
-    reservation.workerResourceRevision,
+    reservation.binding.endpointName,
+    reservation.binding.workerResourceRevision,
     reservation.providerPackRef,
     reservation.providerInstallationRef,
     reservation.offeringId,
@@ -1568,8 +1665,16 @@ function normalizeInput(input: BoundRuntimeInputPreparationInput): NormalizedInp
     }
     bindings[name] = value;
   }
+  const normalizedReservation: RuntimeInputBoundReservation = {
+    ...reservation,
+    binding: {
+      ...reservation.binding,
+      endpointName: reservation.binding.endpointName,
+    },
+  };
   return {
     ...input,
+    reservation: normalizedReservation,
     canonicalPublicOrigin: reservation.canonicalPublicOrigin,
     bindings,
     bindingNames,
@@ -1597,7 +1702,7 @@ async function computeBoundRuntimeInputReference(input: NormalizedInput): Promis
       space: input.target.space,
       workerName: input.target.workerName,
       bundleName: input.target.bundleName,
-      endpointName: input.reservation.target.endpointName,
+      endpointName: input.reservation.binding.endpointName,
       originReservationId: input.target.originReservationId,
       canonicalPublicOrigin: input.canonicalPublicOrigin,
     },
