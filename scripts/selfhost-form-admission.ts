@@ -57,7 +57,7 @@ export interface SelfhostFormAdmissionOptions {
   readonly apply: boolean;
   readonly sql: Sql;
   readonly objects: ObjectStore;
-  readonly fetch?: typeof fetch;
+  readonly fetch?: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 }
 
 export interface SelfhostFormAdmissionResult {
