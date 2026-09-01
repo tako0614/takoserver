@@ -176,6 +176,11 @@ the operator vouching in a form the server can check and nobody else can forge
 — not an identity provider, and it stops being the way in the moment a real one
 is configured.
 
+The Takoform Host of a fresh self-host serves no Form until the operator
+records the publisher-set admission chain with
+`bun scripts/selfhost-form-admission.ts <organizationId> <space> --apply`; see
+[docs/form-authority.md](docs/form-authority.md#self-host-admission).
+
 Everything durable is under that one directory, so backing up a deployment is
 copying it and moving one is moving it:
 

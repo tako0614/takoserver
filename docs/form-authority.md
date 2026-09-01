@@ -324,6 +324,33 @@ and its RPC apply is fully implemented, but no production surface signs and
 forwards a plan or apply request yet. Adding that ingress is a separate
 authority surface decision.
 
+## Self-host admission
+
+A Bun self-host reads the same durable admission chain as the Worker but has
+no route-less authority Worker, so a fresh deployment serves zero Forms until
+its operator records the chain. The repository-owned operator command does
+exactly that for the embedded exact publisher set:
+
+```sh
+# 1. start the released Core verifier with the digest this checkout computes
+cd services/takoform-core-verifier && go build -o /tmp/takoform-core-verifier ./cmd/server
+TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST=<sha256:…> /tmp/takoform-core-verifier &
+
+# 2. stop the Takoserver process (the file object store admits one writer), then
+bun scripts/selfhost-form-admission.ts <organizationId> <space> \
+  --data-root .takoserver --host-id https://takoserver.example \
+  --core-verifier http://127.0.0.1:8080            # plan only
+bun scripts/selfhost-form-admission.ts <organizationId> <space> ... --apply
+```
+
+The command refuses a verifier whose live identity is not the exact released
+Core, sends the whole 17-package raw closure to it once per apply, installs
+every package, and supports and activates only the implemented subset for the
+named organization and Space. The self-host's Form implementation identity is
+the canonical digest of the capability manifest it serves; it has no
+separately sealed Worker payload. Re-running the command re-plans from the
+durable heads and converges with zero commands when nothing changed.
+
 ## Integration cutover order
 
 Before the first invocation after this identity change, deploy the public
