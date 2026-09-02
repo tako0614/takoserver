@@ -1451,11 +1451,19 @@ function objectLimit(value: unknown): number {
   return value as number;
 }
 
+/**
+ * The facade's own bound, restated where the trust boundary is.
+ *
+ * The facade service copies a tenant's operation header across verbatim, so
+ * anything holding the plain service binding writes this document directly and
+ * the plane is what decides whether the field is one this Host will store. A
+ * value the facade would refuse to read back is a value the plane must refuse
+ * to write: 256 code points, no control characters — the same bound the
+ * `edge.objects` facade applies and the same one migration 0041's CHECK
+ * enforces.
+ */
 function objectEtag(value: unknown): string {
-  if (typeof value !== "string" || value.length < 1 || value.length > 1_024) {
-    throw new SelfhostObjectError("backend_unavailable");
-  }
-  return value;
+  return boundedObjectField(value);
 }
 
 function objectAny(value: unknown): "*" {
@@ -1464,8 +1472,18 @@ function objectAny(value: unknown): "*" {
 }
 
 function objectContentType(value: unknown): string {
-  if (typeof value !== "string" || value.length < 1 || value.length > 1_024) {
+  return boundedObjectField(value);
+}
+
+function boundedObjectField(value: unknown): string {
+  if (typeof value !== "string") throw new SelfhostObjectError("backend_unavailable");
+  const points = [...value];
+  if (points.length < 1 || points.length > 256) {
     throw new SelfhostObjectError("backend_unavailable");
+  }
+  for (const point of points) {
+    const code = point.codePointAt(0) ?? 0;
+    if (code <= 31 || code === 127) throw new SelfhostObjectError("backend_unavailable");
   }
   return value;
 }

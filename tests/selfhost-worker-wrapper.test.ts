@@ -488,7 +488,13 @@ test("a main module that escapes its own directory is refused at generation", ()
  * same closed error names — and that the wire underneath is the one this Host's
  * own plane parses.
  */
-function objectPlane(answers: readonly (Record<string, unknown> | Uint8Array)[]): {
+function objectPlane(
+  answers: readonly (
+    | Record<string, unknown>
+    | Uint8Array
+    | { readonly bytes: Uint8Array; readonly metadata: Record<string, unknown> }
+  )[],
+): {
   readonly service: { fetch(url: string, init: RequestInit): Promise<Response> };
   readonly calls: { url: string; document: Record<string, unknown>; body: string }[];
 } {
@@ -509,17 +515,22 @@ function objectPlane(answers: readonly (Record<string, unknown> | Uint8Array)[])
         calls.push({ url, document, body });
         const answer = answers[index] ?? { ok: false, error: { code: "backend_unavailable" } };
         index += 1;
-        if (answer instanceof Uint8Array) {
-          const metadata = Buffer.from(
-            new TextEncoder().encode(
-              JSON.stringify({ etag: "etag-1", size: answer.byteLength, partial: false }),
-            ),
-          )
+        const streamed =
+          answer instanceof Uint8Array
+            ? {
+                bytes: answer,
+                metadata: { etag: "etag-1", size: answer.byteLength, partial: false },
+              }
+            : (answer as { bytes?: Uint8Array; metadata?: Record<string, unknown> }).bytes
+              ? (answer as { bytes: Uint8Array; metadata: Record<string, unknown> })
+              : null;
+        if (streamed) {
+          const metadata = Buffer.from(new TextEncoder().encode(JSON.stringify(streamed.metadata)))
             .toString("base64")
             .replaceAll("+", "-")
             .replaceAll("/", "_")
             .replace(/=+$/u, "");
-          return new Response(answer as unknown as BodyInit, {
+          return new Response(streamed.bytes as unknown as BodyInit, {
             status: 200,
             headers: {
               "content-type": SELFHOST_DATA_PLANE_OBJECT_CONTENT_TYPE,
@@ -714,6 +725,112 @@ test("a multipart complete is refused against the receipts this isolate holds", 
       part: { etag: "part-1", partNumber: 1 },
       refused: "invalid_part",
     });
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("a partial answer the plane could not have written is a backend failure", async () => {
+  // The managed adapter refuses these three, and so does this one: a
+  // zero-length window is not a range anything asked for, a suffix is a field
+  // this facade never sends, and a window past the object is a backend that
+  // answered a different question.
+  const bytes = new TextEncoder().encode("abcd");
+  const { service } = objectPlane([
+    { bytes, metadata: { etag: "e", size: 4, partial: true, range: { offset: 1, length: 0 } } },
+    {
+      bytes,
+      metadata: { etag: "e", size: 4, partial: true, range: { offset: 0, length: 2, suffix: 2 } },
+    },
+    { bytes, metadata: { etag: "e", size: 4, partial: true, range: { offset: 3, length: 4 } } },
+    { bytes, metadata: { etag: "e", size: 4, partial: true, range: { offset: 1, length: 3 } } },
+  ]);
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       const attempts = {};
+       const record = async (name, run) => {
+         try { attempts[name] = await run(); }
+         catch (error) { attempts[name] = error.name; }
+       };
+       await record("zeroLength", async () =>
+         (await env.MEDIA.get("k", { range: { offset: 1, length: 1 } })).range);
+       await record("suffix", async () =>
+         (await env.MEDIA.get("k", { range: { offset: 0, length: 2 } })).range);
+       await record("pastEnd", async () =>
+         (await env.MEDIA.get("k", { range: { offset: 3, length: 1 } })).range);
+       await record("honest", async () =>
+         (await env.MEDIA.get("k", { range: { offset: 1, length: 3 } })).range);
+       return Response.json(attempts);
+     } };`,
+    OBJECTS_ONLY,
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(await response.json()).toEqual({
+      zeroLength: "backend_unavailable",
+      suffix: "backend_unavailable",
+      pastEnd: "backend_unavailable",
+      honest: { offset: 1, length: 3 },
+    });
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("a tenant that forges Symbol.hasInstance cannot move what counts as a stream", async () => {
+  // The tenant's top-level code runs before its first put, on an ordinary
+  // extensible global. `instanceof` would therefore be the tenant's answer;
+  // taking a reader and releasing it is nobody's.
+  const { service, calls } = objectPlane([
+    { ok: true, value: { etag: "etag-2", size: 2 } },
+    { ok: true, value: { etag: "etag-8", size: 8 } },
+  ]);
+  const generated = await loadGenerated(
+    `Object.defineProperty(ReadableStream, Symbol.hasInstance, {
+       value: () => true,
+       configurable: true,
+     });
+
+     export default { async fetch(request, env) {
+       const attempts = {};
+       const record = async (name, run) => {
+         try { attempts[name] = await run(); }
+         catch (error) { attempts[name] = error.name; }
+       };
+       attempts.instanceofLies = ({}) instanceof ReadableStream;
+       // Forged to true: a value that is not a BodyInit must still be a type
+       // error rather than something handed to fetch and coerced to a string.
+       await record("plainObject", () => env.MEDIA.put("k", { nope: true }, { contentLength: 4 }));
+       await record("string", () => env.MEDIA.put("k", "ok"));
+       // Forged the other way: a real stream must still be one.
+       Object.defineProperty(ReadableStream, Symbol.hasInstance, {
+         value: () => false,
+         configurable: true,
+       });
+       const body = new Blob(["streamed"]).stream();
+       await record("stream", () => env.MEDIA.put("k", body, { contentLength: 8 }));
+       return Response.json(attempts);
+     } };`,
+    OBJECTS_ONLY,
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(await response.json()).toEqual({
+      instanceofLies: true,
+      plainObject: "TypeError",
+      string: { etag: "etag-2", size: 2 },
+      stream: { etag: "etag-8", size: 8 },
+    });
+    // Nothing but the two legitimate bodies ever left the isolate.
+    expect(calls.map((call) => call.body)).toEqual(["ok", "streamed"]);
   } finally {
     await generated.dispose();
   }

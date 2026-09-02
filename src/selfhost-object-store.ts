@@ -439,10 +439,11 @@ export function createSelfhostObjectStore(
         throw new SelfhostObjectError("precondition_failed");
       }
       const requested = options.range;
-      if (requested && requested.offset >= current.size && current.size > 0) {
-        throw new SelfhostObjectError("range_not_satisfiable");
-      }
-      if (requested && requested.offset > current.size) {
+      // `>=`, with no exemption for an empty object: the managed adapter heads
+      // first and refuses any offset at or past the size, so a range on a
+      // zero-byte object is `range_not_satisfiable` on both backends rather
+      // than a 200 carrying an empty partial answer on one of them.
+      if (requested && requested.offset >= current.size) {
         throw new SelfhostObjectError("range_not_satisfiable");
       }
       const offset = requested?.offset ?? 0;

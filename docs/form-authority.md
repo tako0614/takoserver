@@ -375,13 +375,20 @@ bun scripts/selfhost-form-admission.ts <organizationId> <space> ... --apply
 The command refuses a verifier whose live identity is not the exact released
 Core, sends the whole 17-package raw closure to it once per apply, installs
 every package, and supports and activates only the implemented subset for the
-named organization and Space. That subset is derived from the composition this
-machine actually builds — `SELFHOST_IDENTITY_CAPABILITY_KINDS` is filtered from
-the identity classes the composition offers rather than restated — so a Host
-cannot record an operation whose only possible answer would be a refusal. The self-host's Form implementation identity is
-the canonical digest of the capability manifest it serves; it has no
-separately sealed Worker payload. Re-running the command re-plans from the
-durable heads and converges with zero commands when nothing changed.
+named organization and Space. That subset is derived rather than restated:
+`SELFHOST_IDENTITY_CAPABILITY_KINDS` is `SELFHOST_IDENTITY_CLASSES` — the
+static map naming every identity Form a self-host build realizes a supply for —
+filtered against the catalog's identity kinds. It is a fact about this build,
+not about one machine's configuration, so a machine that switches the released
+Edge Family off (`edgeForms: false`) offers no identity Forms at all while
+admission still records all five with their full operation sets. Widening the
+map is what rotates the capability digest; narrowing what one machine happens
+to compose is not.
+
+The self-host's Form implementation identity is the canonical digest of the
+capability manifest it serves; it has no separately sealed Worker payload.
+Re-running the command re-plans from the durable heads and converges with zero
+commands when nothing changed.
 
 ## Integration cutover order
 

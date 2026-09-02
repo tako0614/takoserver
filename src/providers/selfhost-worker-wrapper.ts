@@ -394,6 +394,7 @@ const SafePromiseResolve = Promise.resolve;
 const SafePromiseThen = Promise.prototype.then;
 const SafeRegExpTest = RegExp.prototype.test;
 const SafeReadableStream = ReadableStream;
+const SafeReadableStreamLockedGet = captureGetter(ReadableStream.prototype, "locked");
 const SafeReadableStreamControllerClose = ReadableStreamDefaultController.prototype.close;
 const SafeReadableStreamControllerEnqueue = ReadableStreamDefaultController.prototype.enqueue;
 const SafeResponse = Response;
@@ -1025,7 +1026,10 @@ function createObjectsAdapter(call, binding) {
     const result = SafeObjectCreate(null);
     result.etag = objectEtag(value.etag);
     result.size = objectSize(value.size);
-    if (result.size !== source.length) throw portableError("backend_unavailable");
+    // The managed adapter's answer to the same disagreement: a stored size that
+    // is not the length the caller declared is the body's problem, not the
+    // backend's.
+    if (result.size !== source.length) throw portableError("invalid_body");
     return freezeObject(result);
   };
   portable.delete = async function (key) {
@@ -1189,7 +1193,9 @@ function createObjectCaller(rawEnv) {
       const metadata = decodeObjectDocument(
         SafeApply(SafeHeadersGet, responseHeaders, [OBJECT_RESULT_HEADER]),
       );
-      if (status !== 200 || !isReadableStream(stream)) throw portableError("backend_unavailable");
+      if (status !== 200 || !isResponseBodyStream(stream)) {
+        throw portableError("backend_unavailable");
+      }
       const answer = SafeObjectCreate(null);
       answer.metadata = metadata;
       answer.body = stream;
@@ -1488,7 +1494,12 @@ function objectParts(value) {
 }
 
 function objectUploadIdentity(key, uploadId) {
-  return key + " " + uploadId;
+  // NUL, exactly as the managed wrapper joins it: a key may contain a space,
+  // so a space would let two (key, uploadId) pairs share one map entry. The
+  // escape is doubled because this module is emitted from a template literal;
+  // what the generated source carries is the two-character escape, and what it
+  // evaluates to is the separator.
+  return key + "\\0" + uploadId;
 }
 
 function validateKnownObjectParts(multipart, key, uploadId, parts) {
@@ -1517,13 +1528,19 @@ function validateKnownObjectParts(multipart, key, uploadId, parts) {
 }
 
 function objectResultRange(value, size) {
+  // The managed adapter's exact shape check, including the two it makes that a
+  // shorter one would drop: a zero-length partial answer and a suffix this
+  // facade never asks for are both a backend that did not answer the question
+  // it was asked.
   if (
     !isRecord(value) ||
-    !onlyKeys(value, ["offset", "length"]) ||
+    !onlyKeys(value, ["offset", "length", "suffix"]) ||
     !SafeObjectHasOwn(value, "offset") ||
     !SafeObjectHasOwn(value, "length") ||
+    value.suffix !== undefined ||
     !nonNegativeInteger(value.offset) ||
     !nonNegativeInteger(value.length) ||
+    value.length < 1 ||
     value.offset + value.length > size
   ) {
     throw portableError("backend_unavailable");
@@ -1712,14 +1729,33 @@ function isArrayBuffer(value) {
 }
 
 /**
- * Whether this is a stream, without touching it.
+ * Whether this is a stream, asked of a value the tenant handed in.
  *
- * The managed wrapper answers by taking a reader and releasing it. That is a
- * stronger brand check, and it is the wrong one here: some runtimes count a
- * released reader as a stream that has been used, and the one object this is
- * asked about most is a body the tenant is about to read.
+ * instanceof is not an answer here. It calls the constructor's own
+ * Symbol.hasInstance, and the tenant's top-level code runs before its first put
+ * on an ordinary extensible global it can define that property on — so the
+ * discrimination between "a stream" and "not a BodyInit" would be the tenant's
+ * to decide, where the managed wrapper's is nobody's.
+ *
+ * The captured "locked" accessor is the same class of answer the managed
+ * wrapper's getReader probe gives — an internal-slot brand check on a
+ * prototype accessor captured before tenant code runs, which no property a
+ * tenant defines can satisfy — and it is the one that does not disturb the
+ * value. Taking a reader and releasing it counts as using the stream on some
+ * runtimes, and the value asked about here is the body this module is about to
+ * hand to the plane.
  */
 function isReadableStream(value) {
+  try {
+    SafeApply(SafeReadableStreamLockedGet, value, []);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The other question: is what this plane answered with a body at all. */
+function isResponseBodyStream(value) {
   try {
     return value instanceof SafeReadableStream;
   } catch {

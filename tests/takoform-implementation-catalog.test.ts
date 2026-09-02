@@ -41,12 +41,14 @@ describe("Form authority implementation catalog", () => {
   });
 
   /**
-   * ADR 0007 rotates the digests of both Hosts, and they are no longer the same
-   * digest: the public Worker realizes an ObjectBucket supply and a self-host
-   * does not, so each Host's capability manifest names its own supply set. They
-   * are pinned here so a later edit of a manifest or an admitted operation set
-   * cannot slip through as an accident: changing these values is an explicit
-   * reconvergence obligation, never a refresh of a stale expectation.
+   * ADR 0007 rotates the digests of both Hosts, twice. After the second
+   * rotation both realize an ObjectBucket supply, so they share a
+   * `capabilityDigest` again while keeping distinct implementation digests: a
+   * self-host binds the manifest through its own payload kind, and the public
+   * Worker additionally binds its sealed runtime payload. Both are pinned here
+   * so a later edit of a manifest or an admitted operation set cannot slip
+   * through as an accident: changing these values is an explicit reconvergence
+   * obligation, never a refresh of a stale expectation.
    */
   test("pins the public Worker capability digest ADR 0007 rotates", async () => {
     const capabilities = publicFormCapabilityManifest();

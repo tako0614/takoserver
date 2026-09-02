@@ -1037,6 +1037,39 @@ test("a bucket binding the version never declared is not a bucket this token can
   expect(await theirs.text()).toBe("beta");
 });
 
+test("the plane bounds contentType and etag exactly as the facade does", async () => {
+  // The facade service copies a tenant's operation header across verbatim, so
+  // the plane is the trust boundary for these two fields — not the facade that
+  // happens to be in front of it. A value the facade would refuse to read back
+  // is one the plane must refuse to write: a control character makes every
+  // later head and get on that object fail, and a value past the CHECK turns a
+  // put into a backend failure after the body was already staged.
+  const injected = await objects(
+    { op: "put", key: "poisoned", contentLength: 2, contentType: "text/html\r\nx-injected: 1" },
+    "ok",
+  );
+  expect(await injected.json()).toEqual({ ok: false, error: { code: "backend_unavailable" } });
+  const oversized = await objects(
+    { op: "put", key: "poisoned", contentLength: 2, contentType: `text/${"p".repeat(300)}` },
+    "ok",
+  );
+  expect(await oversized.json()).toEqual({ ok: false, error: { code: "backend_unavailable" } });
+  const badEtag = await objects({ op: "get", key: "poisoned", ifMatch: "e".repeat(257) });
+  expect(await badEtag.json()).toEqual({ ok: false, error: { code: "backend_unavailable" } });
+  expect(await objectValue({ op: "head", key: "poisoned" })).toEqual({ found: false });
+
+  // 256 code points is the bound, and code points are what is counted: a
+  // 256-astral-character value is inside it and a 257th is not.
+  const wide = "😀".repeat(256);
+  await objectValue({ op: "put", key: "wide", contentLength: 2, contentType: wide }, "ok");
+  expect(await objectValue({ op: "head", key: "wide" })).toMatchObject({ contentType: wide });
+  const tooWide = await objects(
+    { op: "put", key: "wider", contentLength: 2, contentType: `${wide}😀` },
+    "ok",
+  );
+  expect(await tooWide.json()).toEqual({ ok: false, error: { code: "backend_unavailable" } });
+});
+
 test("the object route refuses an unauthenticated caller before it reads a byte", async () => {
   const request = new Request(`${ORIGIN}${SELFHOST_DATA_PLANE_OBJECTS_PATH}`, {
     method: "POST",

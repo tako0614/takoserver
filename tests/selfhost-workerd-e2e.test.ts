@@ -1352,8 +1352,59 @@ const OBJECT_MODULE = `export default {
 };
 `;
 
+/**
+ * A tenant that redefines what `instanceof ReadableStream` answers, before its
+ * first `put`.
+ *
+ * `ReadableStream` is an ordinary extensible constructor and the tenant's
+ * top-level code runs first, so `instanceof` would make the facade's
+ * discrimination between "a stream" and "not a BodyInit" the tenant's to
+ * decide. Only the real runtime can say whether workerd's global is extensible
+ * the way Bun's is, and whether the brand check the facade uses instead holds
+ * there.
+ */
+const FORGED_STREAM_MODULE = `let forged = "no";
+try {
+  Object.defineProperty(ReadableStream, Symbol.hasInstance, {
+    value: () => true,
+    configurable: true,
+  });
+  forged = "yes";
+} catch (error) { forged = "threw:" + String(error && error.name); }
+
+export default {
+  async fetch(request, env) {
+    const attempts = { forged, instanceofLies: ({}) instanceof ReadableStream };
+    const record = async (name, run) => {
+      try { attempts[name] = await run(); }
+      catch (error) { attempts[name] = error.name; }
+    };
+    // Forged to true: a value that is not a BodyInit must still be a type error
+    // rather than something handed to the plane and coerced to a string.
+    await record("plainObject", () => env.MEDIA.put("forged", { nope: true }, { contentLength: 4 }));
+    await record("string", async () => (await env.MEDIA.put("forged", "ok")).size);
+    // Forged the other way: a real stream must still be one.
+    try {
+      Object.defineProperty(ReadableStream, Symbol.hasInstance, {
+        value: () => false,
+        configurable: true,
+      });
+    } catch (error) { attempts.reforged = "threw:" + String(error && error.name); }
+    await record("stream", async () => (await env.MEDIA.put(
+      "streamed",
+      new Blob(["streamed"]).stream(),
+      { contentLength: 8 },
+    )).size);
+    delete ReadableStream[Symbol.hasInstance];
+    await record("readBack", async () =>
+      await new Response((await env.MEDIA.get("streamed")).body).text());
+    return Response.json(attempts);
+  },
+};
+`;
+
 /** Publishes a Worker that binds one bucket, and boots workerd in front of it. */
-async function bootObjects(): Promise<{
+async function bootObjects(tenantModule: string = OBJECT_MODULE): Promise<{
   readonly origin: string;
   readonly planeOrigin: string;
   readonly store: ReturnType<typeof createSelfhostObjectStore>;
@@ -1391,7 +1442,7 @@ async function bootObjects(): Promise<{
           : null;
       },
       async blob(digest) {
-        return digest === "sha256:index.js" ? new TextEncoder().encode(OBJECT_MODULE) : null;
+        return digest === "sha256:index.js" ? new TextEncoder().encode(tenantModule) : null;
       },
     },
   });
@@ -1576,6 +1627,32 @@ test.skipIf(WORKERD === null)(
     // workerd's default outbound network refuses loopback, so the attempt
     // throws rather than reaching a status of any kind.
     expect(String(body.direct)).not.toContain("status:");
+  },
+  60_000,
+);
+
+test.skipIf(WORKERD === null)(
+  "a tenant that forges Symbol.hasInstance cannot move what the facade calls a stream",
+  async () => {
+    const { origin, store } = await bootObjects(FORGED_STREAM_MODULE);
+    const response = await ask(origin, "/");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      // workerd's ReadableStream is an ordinary extensible constructor, exactly
+      // as Bun's is, so the forgery takes — and changes nothing.
+      forged: "yes",
+      instanceofLies: true,
+      plainObject: "TypeError",
+      string: 2,
+      stream: 8,
+      readBack: "streamed",
+    });
+    // Nothing the forgery produced reached the bucket.
+    expect((await store.list(BUCKET_ID)).objects.map((object) => object.key)).toEqual([
+      "forged",
+      "streamed",
+    ]);
+    expect((await store.head(BUCKET_ID, "forged"))?.size).toBe(2);
   },
   60_000,
 );

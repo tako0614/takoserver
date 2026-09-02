@@ -123,6 +123,23 @@ describe("the self-host object store", () => {
     );
     // A range on an object that is not there is an absence, not a range error.
     expect(await store.get(BUCKET_A, "absent", { range: { offset: 0 } })).toBeNull();
+
+    // And an empty object has no byte at offset 0 either. The managed adapter
+    // heads first and refuses any offset at or past the size, so an exemption
+    // for a zero-byte object would make one portable Binding answer two ways
+    // depending on which Takoserver backend was behind it.
+    await store.put(BUCKET_A, "empty", bytes(""), { contentLength: 0 });
+    expect((await store.head(BUCKET_A, "empty"))?.size).toBe(0);
+    expect(await failure(store.get(BUCKET_A, "empty", { range: { offset: 0 } }))).toBe(
+      "range_not_satisfiable",
+    );
+    expect(await failure(store.get(BUCKET_A, "empty", { range: { offset: 0, length: 1 } }))).toBe(
+      "range_not_satisfiable",
+    );
+    // Without a range it is still an ordinary, empty answer.
+    const whole = await store.get(BUCKET_A, "empty");
+    expect(whole?.partial).toBe(false);
+    expect(await text(whole?.body as never)).toBe("");
   });
 
   test("honours ifMatch and ifNoneMatch on both halves", async () => {

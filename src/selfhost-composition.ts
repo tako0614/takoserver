@@ -10,7 +10,6 @@ import { type EdgeFormBundle, edgeProviderOffering } from "./edge-forms.ts";
 import { HOSTED_EDGE_IDENTITY_CLASSES } from "./hosted-edge-supplies.ts";
 import type { Provider, ProviderOffering } from "./provider-port.ts";
 import type { ProviderRuntimeInputLeasePort } from "./provider-runtime-input-port.ts";
-import { EDGE_OBJECTS_BINDING_REF } from "./providers/cloudflare-runtime-bindings.ts";
 import {
   createSelfhostProvider,
   type SelfhostArtifacts,
@@ -18,6 +17,7 @@ import {
   type SelfhostEventRuntime,
   type SelfhostProviderOptions,
 } from "./providers/selfhost.ts";
+import { SELFHOST_EDGE_OBJECTS_BINDING_REF } from "./providers/selfhost-runtime-bindings.ts";
 import { createSelfhostRuntimeBindingMaterializer } from "./selfhost-runtime-binding-materializer.ts";
 import {
   YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
@@ -195,10 +195,15 @@ export function createSelfhostComposition(
     id: SUPPLY_CONTRACT_REF,
     providerType: "selfhost",
     permittedResourceClasses: [
-      // Named unconditionally because the retained v1beta1 drain is a technical
-      // capability of this same contract even where no current bucket is sold.
-      "storage.object",
-      ...new Set(identityOfferings.map((entry) => entry.resourceClass)),
+      ...new Set([
+        // Named unconditionally because the retained v1beta1 drain is a
+        // technical capability of this same contract even where no current
+        // bucket is sold. It is the class the current ObjectBucket offering
+        // also carries, so one Set covers both rather than a literal beside a
+        // Set that can no longer subtract it.
+        "storage.object",
+        ...identityOfferings.map((entry) => entry.resourceClass),
+      ]),
     ].sort(),
     deliveryModes: ["managed-endpoint"],
     customerAccess: "operator-only",
@@ -276,7 +281,7 @@ export function createSelfhostComposition(
     .map(({ offering }) => ({
       targetOfferingId: offering.id,
       consumerProviderPackRef: pack.id,
-      bindingRef: EDGE_OBJECTS_BINDING_REF,
+      bindingRef: SELFHOST_EDGE_OBJECTS_BINDING_REF,
     }));
 
   const compiled = compileDeploymentComposition({
