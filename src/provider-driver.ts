@@ -667,12 +667,16 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
           if (reservationId === undefined) {
             let minted: Awaited<ReturnType<typeof originReservations.mintForWorker>>;
             try {
+              // No Offering is named here on purpose. `offering` in this branch
+              // is always the WorkerEndpoint's, and a reservation is placed on
+              // the ModuleWorker's — the authority reads that off the Worker's
+              // own active Deployment, which is the placement everything
+              // downstream compares against.
               minted = await originReservations.mintForWorker({
                 organizationId: input.tenantId,
                 space: input.space,
                 workerName: worker.metadata.name,
                 workerResourceUid: worker.metadata.uid,
-                offeringId: offering.id,
               });
             } catch (error) {
               throw endpointReservationHostError(error);

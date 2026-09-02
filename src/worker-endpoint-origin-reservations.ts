@@ -202,13 +202,20 @@ export interface WorkerEndpointOriginReservations {
    * address, so there is nothing to mint and the caller must supply one. The
    * returned reservation is `bound` to the exact Worker and is ready for
    * `assignEndpoint`.
+   *
+   * There is deliberately no `offeringId` input. A reservation is placed on
+   * the **ModuleWorker's** Offering — everything downstream compares it with
+   * the Worker's active provider Deployment — and the only caller is a
+   * `WorkerEndpoint` mutation, which holds the WorkerEndpoint's Offering. A
+   * WorkerEndpoint Offering id is never in the ModuleWorker candidate list, so
+   * passing one refused every mint with `unsupported_capability`. The
+   * authority therefore reads the placement off the exact Worker itself.
    */
   mintForWorker(input: {
     readonly organizationId: string;
     readonly space: string;
     readonly workerName: string;
     readonly workerResourceUid: string;
-    readonly offeringId?: string;
   }): Promise<BoundWorkerEndpointOriginReservation | null>;
   /** CAS-pins a future endpoint before the Provider mutation boundary. */
   assignEndpoint(input: {
@@ -631,6 +638,42 @@ export function createWorkerEndpointOriginReservations(options: {
    * advances a binding rather than inventing one. Nothing here touches a
    * reservation a caller made: those keep the exact-replay semantics they had.
    */
+  /**
+   * The Offering a Host-minted reservation is placed on: the ModuleWorker's.
+   *
+   * A reservation's placement is compared, everywhere downstream, against the
+   * Worker's **active provider Deployment** — `validateWorker` refuses a row
+   * whose `offering_id` is not that Deployment's. So the one authoritative
+   * answer to "which Offering is this reservation on" is the Deployment's own,
+   * and reading it here means the mint can never prepare a row `bind` will
+   * then refuse.
+   *
+   * The alternative — letting the WorkerEndpoint mutation name the Offering —
+   * is what broke: the only Offering that mutation holds is the endpoint's,
+   * and looking an endpoint Offering up in the ModuleWorker candidate list can
+   * never match, so every Host-minted reservation was refused 422. Omitting it
+   * instead would silently work only where exactly one ModuleWorker Offering
+   * is sold, which is a property of the catalog rather than of this Worker.
+   */
+  const hostMintedWorkerOfferingId = async (identity: {
+    readonly organizationId: string;
+    readonly workerResourceUid: string;
+  }): Promise<string> => {
+    const deployment = await activeDeployment(
+      options.deployments,
+      identity.organizationId,
+      identity.workerResourceUid,
+    );
+    // No active Deployment is not a placement problem: it means this is not
+    // the Ready, deployed Worker a reservation can be made for, which is the
+    // same refusal `validateWorker` gives one moment later.
+    if (!deployment || deployment.resourceUid !== identity.workerResourceUid) {
+      throw new WorkerEndpointOriginReservationError("conflict", 409);
+    }
+    validateOpaque(deployment.offeringId);
+    return deployment.offeringId;
+  };
+
   const advanceHostMintToCurrentRevision = async (input: {
     readonly organizationId: string;
     readonly reservationId: string;
@@ -1138,8 +1181,8 @@ export function createWorkerEndpointOriginReservations(options: {
       normalizeIdentity(input.organizationId, input.workerResourceUid);
       validateTargetName(input.space);
       validateTargetName(input.workerName);
-      if (input.offeringId !== undefined) validateOpaque(input.offeringId);
-      const selection = await selectedPlacement(input.offeringId);
+      const offeringId = await hostMintedWorkerOfferingId(input);
+      const selection = await selectedPlacement(offeringId);
       const derive = selection.provider.workerEndpointOriginReservations?.hostMintedSubdomain;
       if (!derive) return null;
       let subdomain: string | null;
@@ -1184,7 +1227,7 @@ export function createWorkerEndpointOriginReservations(options: {
         organizationId: input.organizationId,
         reservationId,
         requestedSubdomain: subdomain,
-        ...(input.offeringId ? { offeringId: input.offeringId } : {}),
+        offeringId,
         expiresInSeconds: HOST_MINTED_TTL_SECONDS,
       });
       return await authority.bind({

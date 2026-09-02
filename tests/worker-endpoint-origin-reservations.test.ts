@@ -6,11 +6,14 @@ import type { TakoformV1Alpha3FormRef } from "../src/form-ref.ts";
 import { STABLE_PRODUCTION_TAKOFORM_CATALOG } from "../src/generated/takoform-stable-v1-catalog.ts";
 import {
   createCatalog,
+  createLedger,
   createResourceDeploymentStore,
   createWorkerEndpointOriginReservations,
   type Offering,
 } from "../src/index.ts";
-import type { Provider, ProviderOffering } from "../src/provider-port.ts";
+import { createProviderDriver } from "../src/provider-driver.ts";
+import type { ApplyInput, Provider, ProviderOffering } from "../src/provider-port.ts";
+import { succeeded } from "../src/provider-port.ts";
 import { FakeProvider } from "../src/providers/fake.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformStore } from "../src/takoform/store.ts";
@@ -140,6 +143,28 @@ function technical(id = "worker.module.test"): ProviderOffering {
   };
 }
 
+function soldEndpointOffering(id = "worker.endpoint.test"): Offering {
+  return {
+    ...sold(id),
+    kind: "WorkerEndpoint",
+    displayName: "Worker endpoint",
+    form: ENDPOINT_FORM,
+    resourceClass: "worker.endpoint",
+  };
+}
+
+function technicalEndpointOffering(id = "worker.endpoint.test"): ProviderOffering {
+  return {
+    id,
+    kind: "WorkerEndpoint",
+    displayName: "Worker endpoint",
+    form: ENDPOINT_FORM,
+    providedInterfaces: [],
+    bindingRefs: [],
+    capabilities: ["create", "delete", "observe"],
+  };
+}
+
 function fixture(
   input: {
     readonly offerings?: readonly Offering[];
@@ -148,6 +173,8 @@ function fixture(
     /** `false` removes the capability; a string is the label it derives. */
     readonly hostMintedSubdomain?: string | false;
     readonly sql?: ReturnType<typeof createReservationV2Sql>;
+    /** Replaces the fake provider's mutation, for driver-level cases. */
+    readonly apply?: (input: ApplyInput) => ReturnType<Provider["apply"]>;
   } = {},
 ) {
   const sql = input.sql ?? createReservationV2Sql();
@@ -155,6 +182,7 @@ function fixture(
   const deriveCalls: { readonly tenantRef: string; readonly requestedSubdomain: string }[] = [];
   const base = new FakeProvider({ id: "fake", offerings: input.technical ?? [technical()] });
   const provider = Object.assign(base, {
+    ...(input.apply ? { apply: input.apply } : {}),
     workerEndpointOriginReservations: {
       async derive({
         tenantRef,
@@ -189,10 +217,11 @@ function fixture(
           }),
     },
   }) satisfies Provider;
+  const catalog = createCatalog(input.offerings ?? [sold()]);
   const authority = createWorkerEndpointOriginReservations({
     sql,
     clock: () => current,
-    catalog: createCatalog(input.offerings ?? [sold()]),
+    catalog,
     providers: [provider],
     resources: createTakoformStore(sql, () => current),
     deployments: createResourceDeploymentStore(sql, () => current),
@@ -200,6 +229,9 @@ function fixture(
   return {
     sql,
     authority,
+    catalog,
+    provider,
+    clock: () => current,
     deriveCalls,
     advance(milliseconds: number) {
       current = new Date(current.getTime() + milliseconds);
@@ -1613,3 +1645,103 @@ async function seedResource(
     ],
   );
 }
+
+/**
+ * The whole Host-minted lane, driven the way a `takoform_worker_endpoint`
+ * create drives it.
+ *
+ * This is the case the released provider actually makes: no reservation input,
+ * a catalog that sells a ModuleWorker Offering *and* a WorkerEndpoint
+ * Offering, and a mutation whose own Offering is the endpoint's. The mint has
+ * to place the reservation on the Worker's Offering; naming the mutation's own
+ * one looked it up in the ModuleWorker candidate list, never matched, and
+ * refused every self-host WorkerEndpoint with `unsupported_capability` 422.
+ */
+test("creates a WorkerEndpoint with no reservation on the placement the Worker itself holds", async () => {
+  const applied: ApplyInput[] = [];
+  const harness = fixture({
+    offerings: [sold(), soldEndpointOffering()],
+    technical: [technical(), technicalEndpointOffering()],
+    hostMintedSubdomain: "sw-community",
+    apply: async (applyInput) => {
+      applied.push(applyInput);
+      const origin = applyInput.workerEndpointOriginAssignment?.canonicalPublicOrigin ?? "";
+      return succeeded({
+        nativeId: `endpoint:${applyInput.identity.uid}`,
+        observed: { assigned: true },
+        outputs: { hostname: new URL(origin).hostname, url: `${origin}/` },
+      });
+    },
+  });
+  await seedWorker(harness.sql);
+  const endpointForm = STABLE_PRODUCTION_TAKOFORM_CATALOG.forms.find(
+    (candidate) => candidate.identity.formRef.kind === "WorkerEndpoint",
+  );
+  if (!endpointForm) throw new Error("WorkerEndpoint Form missing");
+  const driver = createProviderDriver({
+    providers: [harness.provider],
+    catalog: harness.catalog,
+    ledger: createLedger(harness.sql, harness.clock),
+    deployments: createResourceDeploymentStore(harness.sql, harness.clock),
+    originReservations: harness.authority,
+  });
+
+  const receipt = await driver.apply({
+    operationId: "op-endpoint-hostmint",
+    operationKey: "key-endpoint-hostmint",
+    tenantId: "org_01",
+    resourceUid: "uid-endpoint-01",
+    form: endpointForm,
+    name: TARGET.endpointName,
+    space: TARGET.space,
+    spec: {
+      worker: { apiVersion: FORM.apiVersion, kind: "ModuleWorker", name: TARGET.workerName },
+    },
+    relations: [
+      {
+        pointer: "/worker",
+        relation: "/worker",
+        targetUid: "uid-worker-01",
+        resource: {
+          apiVersion: FORM.apiVersion,
+          kind: "ModuleWorker",
+          form: { formRef: FORM },
+          metadata: {
+            name: TARGET.workerName,
+            space: TARGET.space,
+            uid: "uid-worker-01",
+            generation: "1",
+            revision: "1",
+          },
+          spec: {},
+          status: { observedGeneration: "1", conditions: [] },
+        },
+      },
+    ],
+  });
+
+  const origin = "https://sw-community.org_01.workers.test";
+  expect(receipt.outputs).toEqual({
+    hostname: "sw-community.org_01.workers.test",
+    url: `${origin}/`,
+  });
+  expect(applied).toHaveLength(1);
+  expect(applied[0]?.workerEndpointOriginAssignment?.canonicalPublicOrigin).toBe(origin);
+
+  // The reservation this Host made for the caller: a derived id in the
+  // Host-minted namespace, on the ModuleWorker's own Offering, activated by
+  // the endpoint the provider just created.
+  expect(
+    await harness.sql.query(
+      `SELECT reservation_id, offering_id, state, endpoint_resource_uid
+       FROM worker_endpoint_origin_reservations`,
+    ),
+  ).toEqual([
+    {
+      reservation_id: expect.stringMatching(/^hostmint-[0-9a-f]{40}$/u),
+      offering_id: "worker.module.test",
+      state: "activated",
+      endpoint_resource_uid: "uid-endpoint-01",
+    },
+  ]);
+});

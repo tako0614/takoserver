@@ -244,6 +244,19 @@ Host reserves on the caller's behalf. Three things make that safe to say:
   Ready, so a reservation that refused a moved revision would refuse the retry
   of every apply that made one.
 
+- **The Offering is the Worker's, and only the Worker can name it.** A
+  reservation is placed on a *ModuleWorker* Offering: binding, activation and
+  every later placement fence compare the reservation's `offeringId` with the
+  Worker's active provider Deployment. The only caller of the mint is a
+  `WorkerEndpoint` mutation, and the one Offering it holds is the endpoint's —
+  looking that up in the ModuleWorker candidate list can never match, so a mint
+  told to use it refused every Host-minted reservation with
+  `unsupported_capability` 422. The mint therefore names no Offering at all and
+  reads the placement off the exact Worker's own active Deployment. Omitting it
+  instead would have worked only where a catalog happens to sell exactly one
+  ModuleWorker Offering, which is a fact about the catalog rather than about
+  this Worker.
+
 Everything else stands. A supplied reservation is still the authority for the
 origin it holds; binding, activation, deactivation, the deletion witness and
 the destroy order are untouched; and the reservation remains value-free and
