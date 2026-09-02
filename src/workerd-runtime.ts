@@ -236,6 +236,15 @@ const INTERNAL_ROUTE_SUFFIX = ".selfhost-internal.invalid";
  * Written after the customer routes for the same reason.
  */
 const EVENT_ROUTE_SUFFIX = ".selfhost-events.invalid";
+/**
+ * The asset layer's binding on the tenant's own service.
+ *
+ * Exported because a script published through a generated entrypoint sees the
+ * environment that entrypoint projects, so the projection has to be told which
+ * Host-owned service bindings this runtime declared. Naming it in one place is
+ * what keeps the rendered binding and the projected one the same binding.
+ */
+export const WORKERD_ASSETS_BINDING = "ASSETS";
 /** Where a script's static files live inside its directory. */
 const ASSETS_DIRECTORY = "__assets";
 
@@ -689,7 +698,9 @@ function renderConfig(published: readonly Published[], port: number, scriptsRoot
       // as having none: every path that is not an exact file reaches the
       // script, and `notFoundHandling` never applies.
       const bindings = [
-        ...(entry.manifest.assets ? [`(name = "ASSETS", service = "${entry.name}-assets")`] : []),
+        ...(entry.manifest.assets
+          ? [`(name = "${WORKERD_ASSETS_BINDING}", service = "${entry.name}-assets")`]
+          : []),
         ...(entry.manifest.dataPlane
           ? [`(name = "${DATA_SERVICE_BINDING}", service = "${entry.name}-selfhost-data")`]
           : []),
@@ -816,8 +827,11 @@ function renderConfig(published: readonly Published[], port: number, scriptsRoot
     ),
     // Last, so a customer domain that happens to claim one of these names
     // cannot capture this Host's own probe for another script.
+    // Every script published through a generated entrypoint, not only the ones
+    // that bind a data plane: the entrypoint answers the readiness question and
+    // a script this Host cannot ask is one it publishes without checking.
     ...published
-      .filter((entry) => entry.manifest.dataPlane)
+      .filter((entry) => entry.manifest.dataPlane || entry.manifest.events)
       .map((entry) => ({ hostname: internalHostname(entry.name), service: entry.name })),
     ...published
       .filter((entry) => entry.manifest.events)

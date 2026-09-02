@@ -176,6 +176,21 @@ export interface SelfhostWorkerEntrypointSourceInput {
    * delivers to publishes the module it would have published anyway.
    */
   readonly events?: boolean;
+  /**
+   * Host-owned service bindings the tenant's own workerd service carries.
+   *
+   * `ASSETS` is the one today. It is declared on the tenant service by the
+   * runtime rather than projected from a Version's own environment, so a module
+   * published through this entrypoint would lose it unless the entrypoint hands
+   * it on: the whole point of the projection is that `env` contains exactly
+   * what it should, and the asset layer is part of what it should.
+   *
+   * The list is the caller's, derived from what the site actually renders,
+   * rather than a name this module assumes. Nothing secret is ever on this
+   * service, so passing one of its bindings through gives away nothing that
+   * `import { env } from "cloudflare:workers"` would not have.
+   */
+  readonly services?: readonly string[];
 }
 
 const ARTIFACT_PART_NAME = /^[A-Za-z0-9_.][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_.][A-Za-z0-9._-]*)*$/u;
@@ -203,6 +218,7 @@ export function selfhostWorkerEntrypointSource(input: SelfhostWorkerEntrypointSo
   const configuration = {
     declaredHandlers: [...normalized.declaredHandlers].sort(),
     bindings: normalized.bindings,
+    services: normalized.services,
   };
   // `fetch` is always exported, whether or not the version declared it. The
   // readiness route lives on it, and a version that declares only `queue` must
@@ -465,9 +481,15 @@ function sealGeneratedConfiguration(raw) {
     bindings[index] = SafeApply(SafeObjectFreeze, SafeObject, [descriptor]);
   }
   SafeApply(SafeObjectFreeze, SafeObject, [bindings]);
+  const services = internalArray();
+  for (let index = 0; index < raw.services.length; index += 1) {
+    services[index] = raw.services[index];
+  }
+  SafeApply(SafeObjectFreeze, SafeObject, [services]);
   const configuration = SafeObjectCreate(null);
   configuration.declaredHandlers = declaredHandlers;
   configuration.bindings = bindings;
+  configuration.services = services;
   return SafeApply(SafeObjectFreeze, SafeObject, [configuration]);
 }
 
@@ -519,6 +541,17 @@ function projectEnv(rawEnv) {
     throw portableError("backend_unavailable");
   }
   const projected = SafeObjectCreate(null);
+  // The Host's own service bindings first, so a Version that declared a var
+  // under one of these names still gets the value it declared. On this service
+  // they carry no secret: the plane token and the event token live on services
+  // the tenant holds no binding to at all.
+  for (let index = 0; index < CONFIGURATION.services.length; index += 1) {
+    const name = CONFIGURATION.services[index];
+    // Absent rather than undefined when the runtime did not declare it: a
+    // binding that is not there must look exactly like one that was never
+    // named, or a module testing for it reads a lie.
+    if (SafeObjectHasOwn(rawEnv, name)) projected[name] = rawEnv[name];
+  }
   let call;
   for (let index = 0; index < CONFIGURATION.bindings.length; index += 1) {
     const descriptor = CONFIGURATION.bindings[index];
@@ -1343,24 +1376,24 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
   readonly bindings: SelfhostWorkerBindingDescriptor[];
   readonly publication: string;
   readonly events: boolean;
+  readonly services: string[];
 } {
   const fields = dataProperties(input, "input");
-  // `events` is optional, so both shapes are exact rather than one being a
-  // superset nothing checks.
-  if (!Object.hasOwn(fields, "events")) {
-    exactNormalizedKeys(
-      fields,
-      ["originalMainModule", "declaredHandlers", "bindings", "publication"],
-      "input",
-    );
-  } else {
-    exactNormalizedKeys(
-      fields,
-      ["originalMainModule", "declaredHandlers", "bindings", "publication", "events"],
-      "input",
-    );
-    if (typeof fields.events !== "boolean") invalid("events");
-  }
+  // `events` and `services` are optional, so the accepted key set is built from
+  // what is present rather than one shape being a superset nothing checks.
+  exactNormalizedKeys(
+    fields,
+    [
+      "originalMainModule",
+      "declaredHandlers",
+      "bindings",
+      "publication",
+      ...(Object.hasOwn(fields, "events") ? ["events"] : []),
+      ...(Object.hasOwn(fields, "services") ? ["services"] : []),
+    ],
+    "input",
+  );
+  if (Object.hasOwn(fields, "events") && typeof fields.events !== "boolean") invalid("events");
   validateArtifactPartName(fields.originalMainModule);
   if (fields.originalMainModule === SELFHOST_WORKER_ENTRYPOINT_MODULE)
     invalid("originalMainModule");
@@ -1408,6 +1441,27 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
     });
   }
   const events = fields.events === true;
+  // The Host's own service bindings, held to the same grammar workerd will
+  // accept and to this module's reserved prefix, so a caller cannot ask the
+  // entrypoint to hand on a name this Host keeps for itself.
+  const services: string[] = [];
+  if (Object.hasOwn(fields, "services")) {
+    const seen = new Set<string>();
+    for (const name of dataArray(fields.services, "services")) {
+      if (
+        typeof name !== "string" ||
+        name.length === 0 ||
+        name.length > 64 ||
+        !BINDING_NAME.test(name) ||
+        name.startsWith(SELFHOST_WORKER_INTERNAL_BINDING_PREFIX) ||
+        seen.has(name)
+      ) {
+        invalid("services");
+      }
+      seen.add(name);
+      services.push(name);
+    }
+  }
   // The wrapper exists to carry a facade or to receive an event. Generating one
   // for a version that needs neither would replace a publication that needs no
   // entrypoint with one that does, and the byte-identical guarantee for those
@@ -1419,6 +1473,7 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
     bindings,
     publication: fields.publication,
     events,
+    services,
   };
 }
 

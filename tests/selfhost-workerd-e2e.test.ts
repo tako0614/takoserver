@@ -972,3 +972,274 @@ test.skipIf(WORKERD === null)(
   },
   60_000,
 );
+
+/**
+ * The events-only half of the lane: a Worker whose only reason for a generated
+ * entrypoint is that something delivers to it.
+ *
+ * Everything above binds a data plane, so the generated entrypoint and its
+ * internal readiness route came along for free. A Worker with a Cron Trigger
+ * and nothing else is the case where both have to be built for the event alone
+ * — and it is the case where two things used to go silently wrong: the asset
+ * layer disappeared out of `env` the moment the trigger was attached, and the
+ * readiness route was never rendered, so the publication was never checked.
+ */
+const SITE_INDEX = "<!doctype html><title>site</title>";
+
+const ASSETS_EVENT_MODULE = `export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname === "/asset") {
+      const answer = await env.ASSETS.fetch("http://assets.invalid/index.html");
+      return Response.json({ status: answer.status, body: await answer.text() });
+    }
+    return Response.json({ assets: typeof env.ASSETS });
+  },
+  async scheduled() {},
+};
+`;
+
+/** Publishes an assets Worker that binds no data plane, and boots it watching. */
+async function bootEventsOnly(input: {
+  readonly module: string;
+  readonly handlers: readonly string[];
+}): Promise<{
+  readonly origin: string;
+  readonly local: ReturnType<typeof createSelfhostProvider>;
+}> {
+  const reserved = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+  const workerdPort = Number(reserved.port);
+  reserved.stop(true);
+  const origin = `http://127.0.0.1:${workerdPort}`;
+  // Watching, because the attachment is applied while the runtime is up and the
+  // readiness probe has to be answered by the configuration that attachment
+  // wrote rather than the one workerd still had.
+  const start = async (): Promise<void> => {
+    if (workerd) return;
+    workerd = Bun.spawn(
+      [WORKERD as string, "serve", "--watch", join(root, "workers", "workerd.capnp")],
+      { stdout: "ignore", stderr: "ignore" },
+    );
+    expect(await reachable(`${origin}/`)).toBe(true);
+  };
+  const runtime = createWorkerdRuntime({
+    root,
+    port: workerdPort,
+    isReady: () => true,
+    onReload: start,
+  });
+  // No data plane address at all: this Version binds nothing, which is the
+  // whole point of the case.
+  const local = createSelfhostProvider({
+    offerings: [],
+    dataRoot: root,
+    runtime,
+    suffixes: ["localhost"],
+    events: { async forgetSchedules() {} },
+    artifacts: {
+      async manifest(_tenant, digest) {
+        if (digest === "sha256:worker") {
+          return {
+            kind: "WorkerBundle",
+            mainModule: "index.js",
+            modules: [{ name: "index.js", digest: "sha256:index.js" }],
+          };
+        }
+        if (digest === "sha256:site") {
+          return {
+            kind: "StaticAssetBundle",
+            files: [{ path: "index.html", digest: "sha256:index.html" }],
+          };
+        }
+        return null;
+      },
+      async blob(digest) {
+        if (digest === "sha256:index.js") return new TextEncoder().encode(input.module);
+        if (digest === "sha256:index.html") return new TextEncoder().encode(SITE_INDEX);
+        return null;
+      },
+    },
+  });
+
+  expect(
+    (
+      await local.apply({
+        operationId: "op_worker",
+        offering: offering("ModuleWorker"),
+        identity: identity("hello"),
+        spec: {},
+      })
+    ).phase,
+  ).toBe("succeeded");
+
+  expect(
+    (
+      await local.apply({
+        operationId: "op_version",
+        offering: offering("WorkerVersion"),
+        identity: identity("hello-v1"),
+        spec: {
+          bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+          handlers: [...input.handlers],
+          worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+          assets: {
+            bundle: { apiVersion: EDGE_API, kind: "StaticAssetBundle", name: "site" },
+            notFoundHandling: "none",
+            runWorkerFirst: false,
+          },
+        },
+        relations: [
+          relation("/worker", "ModuleWorker", "hello"),
+          relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+          relation("/assets/bundle", "StaticAssetBundle", "site", {
+            manifestDigest: "sha256:site",
+          }),
+        ],
+      })
+    ).phase,
+  ).toBe("succeeded");
+
+  expect(
+    (
+      await local.apply({
+        operationId: "op_deploy",
+        offering: offering("WorkerDeployment"),
+        identity: identity("hello-live"),
+        spec: {
+          worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+          versions: [
+            {
+              workerVersion: { apiVersion: EDGE_API, kind: "WorkerVersion", name: "hello-v1" },
+              weight: 10_000,
+            },
+          ],
+        },
+        relations: [
+          relation("/worker", "ModuleWorker", "hello"),
+          relation("/versions/0/workerVersion", "WorkerVersion", "hello-v1"),
+        ],
+      })
+    ).phase,
+  ).toBe("succeeded");
+
+  expect(
+    (
+      await local.apply({
+        operationId: "op_endpoint",
+        offering: offering("WorkerEndpoint"),
+        identity: identity("hello-endpoint"),
+        spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" } },
+        relations: [relation("/worker", "ModuleWorker", "hello")],
+        workerEndpointOriginAssignment: {
+          canonicalPublicOrigin: `https://${HOSTNAME}`,
+          assignmentDigest: `sha256:${"e".repeat(64)}`,
+        },
+      })
+    ).phase,
+  ).toBe("succeeded");
+
+  await start();
+  return { origin, local };
+}
+
+/**
+ * Asks until the router has the route, because a publication with no generated
+ * entrypoint has no readiness answer for the apply to have waited on: workerd
+ * notices the rewritten configuration on its own schedule.
+ */
+async function served(origin: string, path: string, attempts = 200): Promise<Response> {
+  let last: Response | undefined;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      // A watching workerd restarts on a rewritten configuration, so the socket
+      // is refused for a moment. That is the reload, not a failure.
+      const response = await ask(origin, path);
+      if (response.status !== 404) return response;
+      last = response;
+    } catch {}
+    await new Promise<void>((wake) => setTimeout(wake, 50));
+  }
+  return last ?? (await ask(origin, path));
+}
+
+const attachCron = (local: ReturnType<typeof createSelfhostProvider>, cron: string) =>
+  local.apply({
+    operationId: "op_cron",
+    offering: offering("WorkerCronTrigger"),
+    identity: identity("hello-cron"),
+    spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" }, cron },
+    relations: [relation("/worker", "ModuleWorker", "hello")],
+  });
+
+test.skipIf(WORKERD === null)(
+  "attaching a cron trigger leaves an assets Worker's env.ASSETS exactly where it was",
+  async () => {
+    const { origin, local } = await bootEventsOnly({
+      module: ASSETS_EVENT_MODULE,
+      handlers: ["fetch", "scheduled"],
+    });
+    // No attachment yet: no generated entrypoint, and the asset binding comes
+    // straight off the tenant's own service.
+    // No attachment yet: no generated entrypoint, and the asset binding comes
+    // straight off the tenant's own service.
+    expect(await (await served(origin, "/asset")).json()).toEqual({
+      status: 200,
+      body: SITE_INDEX,
+    });
+
+    expect((await attachCron(local, "0 * * * *")).phase).toBe("succeeded");
+
+    // Now published through the generated entrypoint, which builds `env`
+    // itself. A binding the runtime declared and the projection forgot is a
+    // Worker that starts throwing the moment an unrelated cron is attached.
+    expect(await (await served(origin, "/asset")).json()).toEqual({
+      status: 200,
+      body: SITE_INDEX,
+    });
+    // And the gate is really in front of it.
+    const config = await Bun.file(join(root, "workers", "workerd.capnp")).text();
+    expect(config).toContain("-selfhost-events");
+    expect(config).toContain("selfhost-internal.invalid");
+  },
+  60_000,
+);
+
+test.skipIf(WORKERD === null)(
+  "attaching a Consumer to a Version that declares queue and never exports it is refused",
+  async () => {
+    const { local } = await bootEventsOnly({
+      module: ASSETS_EVENT_MODULE,
+      handlers: ["fetch", "queue"],
+    });
+    // The fixture exports `fetch` and `scheduled`. Until the internal route was
+    // rendered for an events-only script this attachment succeeded, and every
+    // batch it enabled 500ed straight into the dead-letter queue.
+    expect(
+      await local.apply({
+        operationId: "op_consumer",
+        offering: offering("QueueConsumer"),
+        identity: identity("hello-consumer"),
+        spec: {
+          worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+          queue: { apiVersion: EDGE_API, kind: "AtLeastOnceQueue", name: "delivery" },
+          maxBatchSize: 10,
+          maxBatchTimeoutSeconds: 0,
+          maxRetries: 3,
+          retryDelaySeconds: 60,
+          maxConcurrency: 1,
+        },
+        relations: [
+          relation("/worker", "ModuleWorker", "hello"),
+          queueRelation("/queue", "delivery", QUEUE_ID),
+        ],
+      }),
+    ).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "invalid_spec",
+        message: "the Worker Version's module does not export every handler it declares",
+      },
+    });
+  },
+  60_000,
+);

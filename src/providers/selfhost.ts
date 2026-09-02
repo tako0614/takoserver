@@ -37,7 +37,7 @@ import {
   derivedProviderResourceIncarnationName,
   derivedProviderResourceName,
 } from "../provider-worker-endpoint-origin.ts";
-import type { WorkerdRuntime } from "../workerd-runtime.ts";
+import { WORKERD_ASSETS_BINDING, type WorkerdRuntime } from "../workerd-runtime.ts";
 import { parseSelfhostCron } from "./selfhost-cron.ts";
 import {
   SELFHOST_WORKER_DATA_SERVICE_MODULE,
@@ -149,6 +149,14 @@ const SQLITE_MIGRATION_LEDGER = "_takoform_sqlite_migrations";
  * migration reports a conflict that was never real.
  */
 const SQLITE_LOCK_WAIT_MS = 5_000;
+/**
+ * How long a publication waits for the runtime to confirm it is the one served.
+ *
+ * Long enough for workerd to notice a rewritten configuration and reload on it,
+ * short enough that an apply is still an apply. Reaching the end of it is a
+ * refusal, not a pass.
+ */
+const READINESS_DEADLINE_MILLIS = 5_000;
 const SQLITE_MIGRATION_LEDGER_DDL = `CREATE TABLE IF NOT EXISTS ${SQLITE_MIGRATION_LEDGER} (
   sequence INTEGER PRIMARY KEY NOT NULL CHECK (sequence > 0),
   path TEXT NOT NULL UNIQUE CHECK (length(path) BETWEEN 1 AND 255),
@@ -628,6 +636,15 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     bindings: StoredSelfhostVersionBindings | null,
     events: boolean,
     generation: string,
+    /**
+     * Host-owned service bindings the rendered site gives the tenant service.
+     *
+     * Derived from what this publication actually renders rather than assumed,
+     * because the generated entrypoint builds `env` from a list and a binding
+     * missing from that list is a binding the module loses. Attaching a Cron
+     * Trigger must not be the thing that empties `env.ASSETS`.
+     */
+    services: readonly string[],
   ): {
     source: Uint8Array;
     facade: Uint8Array | null;
@@ -682,6 +699,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         originalMainModule: mainModule,
         declaredHandlers: bindings.handlers,
         ...(events ? { events: true } : {}),
+        ...(services.length > 0 ? { services: [...services] } : {}),
         bindings: [
           ...bindings.vars.map((binding) => ({
             name: binding.name,
@@ -746,17 +764,20 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
    * and dropped. So the publication asks, over the router this runtime serves,
    * and refuses on a definite bad answer.
    *
-   * A runtime that does not answer is not a bad answer. workerd may be
-   * restarting on the configuration just written, or not running at all on a
-   * machine whose serving half is composed separately, and turning "I could not
-   * ask" into "your Worker is broken" would refuse valid publications. The
-   * answer carries the publication it came from, so a stale configuration is
-   * told apart from the one being published rather than believed.
+   * A runtime that does not answer AT ALL is not a bad answer. workerd may not
+   * be running on a machine whose serving half is composed separately, and
+   * turning "I could not ask" into "your Worker is broken" would refuse valid
+   * publications. But a runtime that answers something else is a different
+   * matter: the internal route is rendered for every publication that has a
+   * generated entrypoint, so once anything has answered on that address, an
+   * answer that is not this publication's readiness answer means the check did
+   * not happen. Waiting out the deadline and returning would publish exactly
+   * the Version this exists to refuse, so the deadline fails closed.
    */
   const probeReadiness = async (script: string, publication: string): Promise<void> => {
     const probe = runtime.probe;
     if (!probe) return;
-    const deadline = Date.now() + 5_000;
+    const deadline = Date.now() + READINESS_DEADLINE_MILLIS;
     let alive = false;
     for (let attempt = 0; ; attempt += 1) {
       const response = await probe(script, SELFHOST_WORKER_READINESS_PATH, {
@@ -778,10 +799,19 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       }
       // Nothing has answered on that address and nothing ever did: this
       // deployment does not run the runtime in this process, so there is
-      // nothing to ask and waiting would turn "I could not ask" into a refused
-      // publication. Once it has answered once, an answer that is not this
-      // publication's is a configuration on its way out, and worth waiting for.
-      if (!alive || Date.now() >= deadline) return;
+      // nothing to ask and waiting would be waiting for nobody.
+      if (!alive) return;
+      if (Date.now() >= deadline) {
+        // Retryable: the runtime is up but has not reached this configuration,
+        // which is a reconcile away rather than a defect in the declaration.
+        throw new SelfhostFailure(
+          failed(
+            "unavailable",
+            "the Worker runtime did not confirm this publication is the one it serves",
+            true,
+          ),
+        );
+      }
       await new Promise<void>((wake) => setTimeout(wake, attempt === 0 ? 25 : 100));
     }
   };
@@ -825,6 +855,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       bindings,
       receivesEvents(state),
       generation,
+      meta.assets ? [WORKERD_ASSETS_BINDING] : [],
     );
     if (projection) {
       // Written into the workerd script directory, never into the version
