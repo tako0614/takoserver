@@ -5,7 +5,7 @@ import {
   type ManagedWorkerDispatchNamespace,
 } from "./providers/cloudflare-managed-worker-gateway.ts";
 
-export { TakoserverManagedWorkerSqlite } from "./providers/cloudflare-managed-worker-sqlite.ts";
+export { TakoserverManagedWorkerSqlite } from "./providers/cloudflare-managed-worker-sqlite-object.ts";
 
 /** Bindings and non-secret identity selected by the owning deploy target. */
 export interface ManagedWorkerGatewayWorkerEnv {
