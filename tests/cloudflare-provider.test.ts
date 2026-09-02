@@ -16,6 +16,10 @@ import type {
   ProviderRuntimeInputRecoveryInput,
 } from "../src/provider-runtime-input-port.ts";
 import {
+  derivedProviderResourceIncarnationName,
+  derivedProviderResourceName,
+} from "../src/provider-worker-endpoint-origin.ts";
+import {
   type ArtifactBytes,
   CloudflareProvider,
   type CloudflareZone,
@@ -621,7 +625,21 @@ describe("current ObjectBucket Form on the ordinary-workers backend", () => {
     regions: ["global"],
   });
 
+  // A Resource UID: the current Form derives its bucket from the incarnation,
+  // so destroying a bucket and declaring one with the same name gets an empty
+  // one rather than the old bytes.
+  const MEDIA = { ...IDENTITY, name: "media", uid: "res_media_1" } as const;
+
   function bucketProvider(status = 200, body: unknown = { success: true, errors: [], result: {} }) {
+    return scriptedBucketProvider(() => ({ status, body }));
+  }
+
+  function scriptedBucketProvider(
+    script: (call: { method: string; path: string; index: number }) => {
+      status: number;
+      body: unknown;
+    },
+  ) {
     const calls: Call[] = [];
     const provider = new CloudflareProvider({
       accountId: "acct_1",
@@ -630,11 +648,17 @@ describe("current ObjectBucket Form on the ordinary-workers backend", () => {
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
       async fetch(request) {
+        const index = calls.length;
         calls.push({
           method: request.method,
           url: request.url,
           authorization: request.headers.get("authorization"),
           body: await request.clone().text(),
+        });
+        const { status, body } = script({
+          method: request.method,
+          path: new URL(request.url).pathname,
+          index,
         });
         return new Response(JSON.stringify(body), {
           status,
@@ -643,6 +667,16 @@ describe("current ObjectBucket Form on the ordinary-workers backend", () => {
       },
     });
     return { provider, calls };
+  }
+
+  /** The exact name this Host derives for one Resource incarnation. */
+  async function derivedBucket(identity: {
+    tenantRef: string;
+    space: string;
+    name: string;
+    uid: string;
+  }): Promise<string> {
+    return await derivedProviderResourceIncarnationName("ts", identity);
   }
 
   test("names the offering by the exact current FormRef", () => {
@@ -662,14 +696,19 @@ describe("current ObjectBucket Form on the ordinary-workers backend", () => {
     const ticket = await provider.apply({
       operationId: "op-current-bucket",
       offering,
-      identity: { ...IDENTITY, name: "media" },
+      identity: MEDIA,
       spec: {},
     });
 
     expect(ticket).toMatchObject({
       phase: "succeeded",
-      result: { nativeId: expect.stringMatching(/^r2:ts-[0-9a-f]{40}$/u) },
+      result: { nativeId: `r2:${await derivedBucket(MEDIA)}` },
     });
+    // The address alone is not the name: a second incarnation of the same
+    // address is a different bucket, exactly as the self-host KV store does.
+    expect(await derivedBucket(MEDIA)).not.toBe(
+      await derivedBucket({ ...MEDIA, uid: "res_media_2" }),
+    );
     expect(calls).toHaveLength(1);
     expect(new URL(calls[0]?.url ?? "").pathname).toBe("/client/v4/accounts/acct_1/r2/buckets");
     expect(calls[0]?.body).not.toContain("media");
@@ -681,7 +720,7 @@ describe("current ObjectBucket Form on the ordinary-workers backend", () => {
     const created = await provider.apply({
       operationId: "op-current-bucket-observe",
       offering,
-      identity: { ...IDENTITY, name: "media" },
+      identity: MEDIA,
       spec: {},
     });
     if (created.phase !== "succeeded") throw new Error("expected success");
@@ -691,7 +730,7 @@ describe("current ObjectBucket Form on the ordinary-workers backend", () => {
     const observed = await provider.observe({
       offering,
       nativeId,
-      identity: { ...IDENTITY, name: "media" },
+      identity: MEDIA,
       spec: {},
     });
     expect(observed).toMatchObject({ phase: "succeeded", result: { nativeId } });
@@ -700,7 +739,7 @@ describe("current ObjectBucket Form on the ordinary-workers backend", () => {
       operationId: "op-current-bucket-delete",
       offering,
       nativeId,
-      identity: { ...IDENTITY, name: "media" },
+      identity: MEDIA,
     });
     expect(deleted).toMatchObject({
       phase: "succeeded",
@@ -722,12 +761,302 @@ describe("current ObjectBucket Form on the ordinary-workers backend", () => {
       operationId: "op-current-bucket-delete-absent",
       offering,
       nativeId: `r2:ts-${"c".repeat(40)}`,
-      identity: { ...IDENTITY, name: "media" },
+      identity: MEDIA,
     });
     expect(deleted).toMatchObject({
       phase: "succeeded",
       result: { observed: { deleted: true } },
     });
+  });
+
+  test("refuses a create whose derived bucket already exists, and says how to repair it", async () => {
+    const { provider, calls } = scriptedBucketProvider(({ method }) =>
+      method === "POST"
+        ? { status: 400, body: { success: false, errors: [{ message: "already exists" }] } }
+        : { status: 200, body: { success: true, errors: [], result: {} } },
+    );
+    const ticket = await provider.apply({
+      operationId: "op-current-bucket-conflict",
+      offering,
+      identity: MEDIA,
+      spec: {},
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "conflict", retryable: false },
+    });
+    if (ticket.phase !== "failed") throw new Error("expected failure");
+    expect(ticket.failure.message).toContain("import it onto this Resource");
+    // Exactly one readback proves the claim; nothing was mutated twice.
+    expect(calls.map((call) => call.method)).toEqual(["POST", "GET"]);
+  });
+
+  test("keeps a create refusal that is not an existing bucket as the backend classified it", async () => {
+    const { provider } = scriptedBucketProvider(({ method }) =>
+      method === "POST"
+        ? { status: 400, body: { success: false, errors: [{ message: "bad location" }] } }
+        : { status: 404, body: { success: false, errors: [] } },
+    );
+    const ticket = await provider.apply({
+      operationId: "op-current-bucket-invalid",
+      offering,
+      identity: MEDIA,
+      spec: {},
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", retryable: false },
+    });
+  });
+
+  test("refuses to destroy a bucket R2 still reports as present", async () => {
+    const name = await derivedBucket(MEDIA);
+    const { provider, calls } = scriptedBucketProvider(({ method }) =>
+      method === "DELETE"
+        ? { status: 400, body: { success: false, errors: [{ message: "bucket not empty" }] } }
+        : { status: 200, body: { success: true, errors: [], result: {} } },
+    );
+    const ticket = await provider.delete({
+      operationId: "op-current-bucket-not-empty",
+      offering,
+      nativeId: `r2:${name}`,
+      identity: MEDIA,
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "conflict", retryable: false },
+    });
+    if (ticket.phase !== "failed") throw new Error("expected failure");
+    expect(ticket.failure.message).toContain("empty it and destroy again");
+    expect(calls.map((call) => call.method)).toEqual(["DELETE", "GET"]);
+  });
+
+  test("names the exact repair when a create acknowledgement was lost", async () => {
+    const { provider, calls } = bucketProvider();
+    const ticket = await provider.apply({
+      operationId: "op-current-bucket-lost",
+      operationMode: "recovery",
+      offering,
+      identity: MEDIA,
+      spec: {},
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    if (ticket.phase !== "failed") throw new Error("expected failure");
+    expect(ticket.failure.message).toContain(
+      "import the bucket this Host derives for this Resource address",
+    );
+    expect(calls).toEqual([]);
+  });
+
+  test("refuses a create with no Resource incarnation to derive a bucket from", async () => {
+    const { provider, calls } = bucketProvider();
+    const ticket = await provider.apply({
+      operationId: "op-current-bucket-no-uid",
+      offering,
+      identity: { ...IDENTITY, name: "media" },
+      spec: {},
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", retryable: false },
+    });
+    expect(calls).toEqual([]);
+  });
+});
+
+/**
+ * Import is the one lifecycle whose native address comes from the caller. The
+ * account credential this adapter holds reaches every object in the operator's
+ * Cloudflare account, so adoption is fenced to the object this Host derives for
+ * the exact Resource address being imported onto.
+ */
+describe("import fence on the ordinary-workers backend", () => {
+  const bucketForm = currentTakoformCandidates().forms.find(
+    (candidate) => candidate.identity.formRef.kind === "ObjectBucket",
+  );
+  const workerForm = currentTakoformCandidates().forms.find(
+    (candidate) => candidate.identity.formRef.kind === "ModuleWorker",
+  );
+  if (!bucketForm || !workerForm) throw new Error("current Form missing");
+  const bucketOffering = objectBucketProviderOffering(bucketForm, {
+    id: "storage.object.standard",
+    displayName: "Object bucket",
+    regions: ["global"],
+  });
+  const workerOffering = edgeProviderOffering(workerForm, {
+    id: "compute.edge.standard",
+    regions: ["global"],
+  });
+  const VICTIM = {
+    tenantRef: "org_victim",
+    space: "default",
+    name: "media",
+    uid: "res_v",
+  } as const;
+  const ATTACKER = {
+    tenantRef: "org_attacker",
+    space: "default",
+    name: "media",
+    uid: "res_a",
+  } as const;
+
+  function fenceProvider() {
+    const calls: Call[] = [];
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [bucketOffering, workerOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        calls.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body: await request.clone().text(),
+        });
+        return new Response(JSON.stringify({ success: true, errors: [], result: {} }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    return { provider, calls };
+  }
+
+  test("refuses the control plane's own bucket before any API call", async () => {
+    const { provider, calls } = fenceProvider();
+    const ticket = await provider.adopt({
+      operationId: "op-import-control-plane",
+      offering: bucketOffering,
+      nativeId: "r2:takoserver-objects-production",
+      identity: ATTACKER,
+      spec: {},
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", retryable: false },
+    });
+    expect(calls).toEqual([]);
+  });
+
+  test("refuses another tenant's derived bucket name before any API call", async () => {
+    const { provider, calls } = fenceProvider();
+    const victimBucket = await derivedProviderResourceIncarnationName("ts", VICTIM);
+    const ticket = await provider.adopt({
+      operationId: "op-import-cross-tenant",
+      offering: bucketOffering,
+      nativeId: `r2:${victimBucket}`,
+      identity: ATTACKER,
+      spec: {},
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", retryable: false },
+    });
+    expect(calls).toEqual([]);
+  });
+
+  test("adopts the bucket this Host minted for this exact address", async () => {
+    const { provider, calls } = fenceProvider();
+    const own = await derivedProviderResourceIncarnationName("ts", ATTACKER);
+    const ticket = await provider.adopt({
+      operationId: "op-import-own",
+      offering: bucketOffering,
+      nativeId: `r2:${own}`,
+      identity: ATTACKER,
+      spec: {},
+    });
+    expect(ticket).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: `r2:${own}` },
+    });
+    expect(calls.map((call) => `${call.method} ${new URL(call.url).pathname}`)).toEqual([
+      `GET /client/v4/accounts/acct_1/r2/buckets/${own}`,
+    ]);
+  });
+
+  test("refuses a native identity of the wrong Cloudflare kind", async () => {
+    const { provider, calls } = fenceProvider();
+    const own = await derivedProviderResourceIncarnationName("ts", ATTACKER);
+    const ticket = await provider.adopt({
+      operationId: "op-import-wrong-kind",
+      offering: bucketOffering,
+      nativeId: `kv:${own}`,
+      identity: ATTACKER,
+      spec: {},
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", retryable: false },
+    });
+    expect(calls).toEqual([]);
+  });
+
+  test("fences every kind, not only R2: a foreign script is refused and this Host's own is not", async () => {
+    const { provider, calls } = fenceProvider();
+    const foreign = await provider.adopt({
+      operationId: "op-import-foreign-script",
+      offering: workerOffering,
+      nativeId: "worker:takoserver-production",
+      identity: ATTACKER,
+      spec: {},
+    });
+    expect(foreign).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", retryable: false },
+    });
+    const own = await derivedProviderResourceName("tsw", ATTACKER);
+    const mine = await provider.adopt({
+      operationId: "op-import-own-script",
+      offering: workerOffering,
+      nativeId: `worker:${own}`,
+      identity: ATTACKER,
+      spec: {},
+    });
+    expect(mine).toMatchObject({ phase: "succeeded", result: { nativeId: `worker:${own}` } });
+    // ModuleWorker observation is answered from the native identity itself.
+    expect(calls).toEqual([]);
+  });
+
+  test("refuses a kind whose native name Cloudflare assigns, because none can be recomputed", async () => {
+    const { provider, calls } = fenceProvider();
+    const kvForm = currentTakoformCandidates().forms.find(
+      (candidate) => candidate.identity.formRef.kind === "EdgeKVNamespace",
+    );
+    if (!kvForm) throw new Error("current EdgeKVNamespace Form missing");
+    const ticket = await provider.adopt({
+      operationId: "op-import-kv",
+      offering: edgeProviderOffering(kvForm, { id: "storage.kv.standard", regions: ["global"] }),
+      nativeId: "kv:0123456789abcdef0123456789abcdef",
+      identity: ATTACKER,
+      spec: {},
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", retryable: false },
+    });
+    expect(calls).toEqual([]);
+  });
+
+  test("fences adoption recovery on the same derivation", async () => {
+    const { provider, calls } = fenceProvider();
+    const victimBucket = await derivedProviderResourceIncarnationName("ts", VICTIM);
+    const ticket = await provider.recoverAdopt({
+      operationId: "op-import-recover",
+      offering: bucketOffering,
+      nativeId: `r2:${victimBucket}`,
+      identity: ATTACKER,
+      spec: {},
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", retryable: false },
+    });
+    expect(calls).toEqual([]);
   });
 });
 
@@ -1963,6 +2292,42 @@ describe("released edge Form placement", () => {
         spec: MEDIA_DECLARATION as Record<string, unknown>,
         runtimeBindings: [runtimeBinding()],
         relations: () => [bucketRelation({ ...ACTIVE_BUCKET, state: "draining" })],
+      },
+      {
+        // Cloudflare accepts a metadata list carrying one name twice and keeps
+        // whichever it prefers, so two declarations under one name are refused
+        // here rather than resolved by the backend's taste.
+        label: "a var that shares its name with the bucket Binding",
+        spec: { vars: { MEDIA: "plain" }, ...MEDIA_DECLARATION },
+        runtimeBindings: [runtimeBinding()],
+        relations: () => [bucketRelation()],
+      },
+      {
+        label: "a KV Binding that shares its name with a var",
+        spec: {
+          vars: { CACHE: "plain" },
+          kvBindings: [
+            {
+              name: "CACHE",
+              resource: {
+                apiVersion: "edge.forms.takoform.com",
+                kind: "EdgeKVNamespace",
+                name: "cache",
+              },
+            },
+          ],
+          ...MEDIA_DECLARATION,
+        },
+        runtimeBindings: [runtimeBinding()],
+        relations: () => [
+          bucketRelation(),
+          related("/kvBindings/0/resource", stored("EdgeKVNamespace", "kv-uid", {}), {
+            nativeId: "kv:kv-id",
+            offeringId: "storage.kv.standard",
+            providerPackRef: "cloudflare",
+            outputs: { namespaceId: "kv-id" },
+          }),
+        ],
       },
     ];
 

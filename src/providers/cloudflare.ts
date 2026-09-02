@@ -1,6 +1,10 @@
 import { isEdgeFormsApiVersion } from "../form-ref.ts";
 import type { JsonObject, JsonValue } from "../ports.ts";
-import type { ProviderRelation, ProviderRuntimeBinding } from "../provider-port.ts";
+import type {
+  ProviderRelation,
+  ProviderRuntimeBinding,
+  ResourceIdentity,
+} from "../provider-port.ts";
 import {
   type ApplyInput,
   failed,
@@ -27,6 +31,7 @@ import type {
 import { MAX_PROVIDER_RUNTIME_INPUT_BINDINGS } from "../provider-runtime-input-port.ts";
 import {
   canonicalWorkerEndpointOrigin,
+  derivedProviderResourceIncarnationName,
   derivedProviderResourceName,
 } from "../provider-worker-endpoint-origin.ts";
 import {
@@ -402,11 +407,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       // response was lost. Unless this operation has a deterministic recovery
       // identity, a second POST/PUT would be an unbounded duplicate mutation.
       // Leave the durable Host saga in its repair state instead.
-      return failed(
-        "unavailable",
-        "the provider mutation outcome is indeterminate; operator repair is required",
-        true,
-      );
+      return failed("unavailable", indeterminateMutationRepair(input.offering), true);
     }
     if (
       input.offering.kind.startsWith("takoform.") &&
@@ -465,11 +466,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       isEdgeFormsApiVersion(input.offering.form.apiVersion) &&
       input.offering.form.kind === "WorkerVersion";
     if (!deterministicWorkerVersion) {
-      return failed(
-        "unavailable",
-        "the provider mutation outcome is indeterminate; operator repair is required",
-        true,
-      );
+      return failed("unavailable", indeterminateMutationRepair(input.offering), true);
     }
     return await this.#applyWorkerVersion({ ...input, operationMode: "recovery" });
   }
@@ -792,7 +789,24 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
                       : `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(native.name)}`;
     const removed = await this.#call("DELETE", path);
     // A resource that is already gone is a successful delete, not a failure.
-    if (!removed.ok && removed.status !== 404) return removed.ticket;
+    if (!removed.ok && removed.status !== 404) {
+      // R2 will not destroy a bucket that still holds objects or unfinished
+      // multipart uploads, and only the customer can empty it. Say so, once the
+      // bucket is proven to still be there, rather than returning a generic
+      // refusal a Host would keep retrying.
+      if (
+        native.kind === "r2" &&
+        (removed.status === 400 || removed.status === 409) &&
+        (await this.#r2BucketPresent(native.name)) === true
+      ) {
+        return failed(
+          "conflict",
+          "the bucket was refused and is still present; R2 does not destroy a bucket that " +
+            "still holds objects or unfinished multipart uploads, so empty it and destroy again",
+        );
+      }
+      return removed.ticket;
+    }
     return succeeded({
       nativeId: input.nativeId,
       observed: { deleted: true },
@@ -843,7 +857,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     providerHandle?: string;
     offering: ProviderOffering;
     nativeId: string;
-    identity: { tenantRef: string; space: string; name: string };
+    identity: ResourceIdentity;
     spec: JsonObject;
     relations?: readonly ProviderRelation[];
   }): Promise<ProviderTicket> {
@@ -853,7 +867,12 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     if (input.providerHandle) {
       return failed("unavailable", "Cloudflare adopt recovery cannot poll this handle", true);
     }
-    return await this.observe(input);
+    const refusal = await this.#refuseForeignAdoption(
+      input.offering,
+      input.nativeId,
+      input.identity,
+    );
+    return refusal ?? (await this.observe(input));
   }
 
   /** Read-only adoption recovery through the provider's observe path. */
@@ -863,14 +882,112 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     providerHandle?: string;
     offering: ProviderOffering;
     nativeId: string;
-    identity: { tenantRef: string; space: string; name: string };
+    identity: ResourceIdentity;
     spec: JsonObject;
     relations?: readonly ProviderRelation[];
   }): Promise<ProviderTicket> {
     if (input.providerHandle) {
       return failed("unavailable", "Cloudflare adoption recovery cannot poll this handle", true);
     }
-    return await this.observe(input);
+    const refusal = await this.#refuseForeignAdoption(
+      input.offering,
+      input.nativeId,
+      input.identity,
+    );
+    return refusal ?? (await this.observe(input));
+  }
+
+  /**
+   * The fence on import, for every Form this adapter serves.
+   *
+   * `import` is the one lifecycle where the native address comes from the
+   * caller rather than from a mutation this adapter performed, and the account
+   * credential it holds reaches every object in the operator's Cloudflare
+   * account — the control plane's own buckets included. So adoption is allowed
+   * exactly onto the object this Host itself derives for the exact Resource
+   * address being imported onto. That keeps the ordinary import onto an address
+   * a configuration already manages, which is what migration 0019 records as
+   * the case worth supporting, and refuses another tenant's object and
+   * `r2:takoserver-objects-production` alike before a single API call.
+   *
+   * A kind whose native name Cloudflare assigns — a KV id, a D1 uuid, a queue
+   * id — or that a relation supplies — a Version, Deployment, endpoint, domain,
+   * cron, or consumer — has no name this Host can recompute, so there is
+   * nothing to compare against and adoption fails closed rather than trusting
+   * the string it was handed.
+   */
+  async #refuseForeignAdoption(
+    offering: ProviderOffering,
+    nativeId: string,
+    identity: ResourceIdentity,
+  ): Promise<ProviderTicket | null> {
+    const native = parseNativeId(nativeId);
+    if (!native || !cloudflareKindMatches(providerKind(offering), native.kind)) {
+      return failed("invalid_spec", "the native identity is not this offering's Cloudflare kind");
+    }
+    const derived = await this.#derivedNativeId(offering, identity);
+    return derived === nativeId
+      ? null
+      : failed(
+          "invalid_spec",
+          "this Host adopts only the native object it derives for this Resource address",
+        );
+  }
+
+  /** The exact native address this Host mints for one Resource identity. */
+  async #derivedNativeId(
+    offering: ProviderOffering,
+    identity: ResourceIdentity,
+  ): Promise<string | null> {
+    const kind = providerKind(offering);
+    if (kind === "ObjectBucket" || kind === "object_bucket") {
+      const name = await this.#bucketName(offering, identity);
+      return name ? `r2:${name}` : null;
+    }
+    if (kind === "ModuleWorker" || kind === "worker_script") {
+      return `worker:${await derivedProviderResourceName("tsw", identity)}`;
+    }
+    return null;
+  }
+
+  /**
+   * The native R2 name for one ObjectBucket incarnation.
+   *
+   * The current Form keys on the Resource UID as well as its address, for the
+   * reason `derivedProviderResourceIncarnationName` states and the self-host KV
+   * store already follows: a customer who destroys a bucket and declares one
+   * with the same name has asked for an empty bucket, and recomputing the
+   * address alone would hand them the old one whenever the destroy did not
+   * finish. The retained v1beta1 drain keeps the address-only derivation it was
+   * recorded under, because its Deployments already exist under those names.
+   */
+  async #bucketName(
+    offering: ProviderOffering,
+    identity: ResourceIdentity,
+  ): Promise<string | null> {
+    if (!currentObjectBucketForm(offering)) {
+      return await derivedProviderResourceName("ts", identity);
+    }
+    const uid = identity.uid;
+    return uid
+      ? await derivedProviderResourceIncarnationName("ts", {
+          tenantRef: identity.tenantRef,
+          space: identity.space,
+          name: identity.name,
+          uid,
+        })
+      : null;
+  }
+
+  /** Tri-state readback of one R2 bucket: present, absent, or unproven. */
+  async #r2BucketPresent(name: string): Promise<boolean | null> {
+    const read = await this.#call(
+      "GET",
+      `/accounts/${this.#accountId}/r2/buckets/${encodeURIComponent(name)}`,
+    );
+    if (read.ok) return true;
+    if (read.status === 404) return false;
+    return null;
   }
 
   // --- object storage -------------------------------------------------------
@@ -1544,21 +1661,42 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
   }
 
   async #applyBucket(input: ApplyInput): Promise<ProviderTicket> {
-    const name = input.previous
-      ? (parseNativeId(input.previous.nativeId)?.name ?? "")
-      : await derivedProviderResourceName("ts", input.identity);
-    if (!name) return failed("invalid_spec", "the previous native identity is unusable");
     if (input.previous) {
+      const previous = parseNativeId(input.previous.nativeId)?.name;
+      if (!previous) return failed("invalid_spec", "the previous native identity is unusable");
       // A bucket has nothing mutable in this Form; the update is a no-op that
       // still confirms the resource is there.
-      return await this.observe({ ...input, nativeId: `r2:${name}` });
+      return await this.observe({ ...input, nativeId: `r2:${previous}` });
+    }
+    const name = await this.#bucketName(input.offering, input.identity);
+    if (!name) {
+      return failed("invalid_spec", "the bucket declaration carries no Resource identity");
     }
     const location = optionalString(input.spec.location);
     const created = await this.#call("POST", `/accounts/${this.#accountId}/r2/buckets`, {
       name,
       ...(location ? { locationHint: location } : {}),
     });
-    if (!created.ok) return created.ticket;
+    if (!created.ok) {
+      // R2 bucket names are account-global, so a refusal at this exact derived
+      // name usually means a bucket is already sitting at this Resource's
+      // address — most often a create whose acknowledgement was lost. Reported
+      // as "the backend rejected the request" that reads as a bad declaration
+      // the customer could edit; it is neither, and the repair is exact. The
+      // claim is only made once the bucket is proven present: every other
+      // refusal keeps the code the transport gave it.
+      if (
+        (created.status === 400 || created.status === 409) &&
+        (await this.#r2BucketPresent(name)) === true
+      ) {
+        return failed(
+          "conflict",
+          "a bucket already exists at the name this Host derives for this Resource; " +
+            "import it onto this Resource, or destroy it, before creating again",
+        );
+      }
+      return created.ticket;
+    }
     return succeeded({
       nativeId: `r2:${name}`,
       observed: { name, ...(location ? { location } : {}) },
@@ -2170,6 +2308,29 @@ function absenceResult(
   };
 }
 
+/** The current versionless ObjectBucket Form, not the retained v1beta1 drain. */
+function currentObjectBucketForm(offering: ProviderOffering): boolean {
+  return (
+    offering.form.kind === "ObjectBucket" && offering.form.apiVersion === "edge.forms.takoform.com"
+  );
+}
+
+/**
+ * What an operator has to do after a mutation acknowledgement was lost.
+ *
+ * For a bucket the answer is exact, and saying so is the point: the native name
+ * is derived from the Resource address, and adoption is fenced to that same
+ * derivation, so the object a half-finished create may have left behind is the
+ * one — and the only one — this Host will import back onto this address.
+ */
+function indeterminateMutationRepair(offering: ProviderOffering): string {
+  const base = "the provider mutation outcome is indeterminate; operator repair is required";
+  const kind = providerKind(offering);
+  return kind === "ObjectBucket" || kind === "object_bucket"
+    ? `${base}: import the bucket this Host derives for this Resource address, or prove it absent`
+    : base;
+}
+
 function providerKind(offering: ProviderOffering): string {
   return offering.kind.startsWith("takoform.") && isEdgeFormsApiVersion(offering.form.apiVersion)
     ? offering.form.kind
@@ -2628,10 +2789,23 @@ function edgeBindings(
   runtimeBindings: readonly ProviderRuntimeBinding[] | undefined,
 ): readonly JsonObject[] | null {
   const result: JsonObject[] = [];
+  // One name is one binding. Cloudflare accepts a metadata list carrying the
+  // same name twice and silently keeps one of them, so a Version declaring
+  // `vars: { MEDIA }` beside `bucketBindings: [{ name: "MEDIA" }]` would get
+  // whichever the backend happened to prefer. Refuse instead. (The separate
+  // collision between these and `requiredSensitiveVars` is checked by the
+  // caller, which is where the sensitive names are known.)
+  const claimed = new Set<string>();
+  const claim = (name: string): boolean => {
+    if (claimed.has(name)) return false;
+    claimed.add(name);
+    return true;
+  };
   const vars = (record(spec.vars) ?? {}) as Readonly<Record<string, JsonValue>>;
   for (const [name, value] of Object.entries(vars).sort(([left], [right]) =>
     left.localeCompare(right),
   )) {
+    if (!claim(name)) return null;
     // Cloudflare's plain_text binding exposes its text byte-for-byte. Preserve
     // strings and use a JSON binding for every other portable JsonValue.
     result.push(
@@ -2651,7 +2825,7 @@ function edgeBindings(
       const declaration = record(declarations[index]);
       const name = optionalString(declaration?.name);
       const target = relationOutputName(relations, `${relationPrefix}/${index}/resource`, output);
-      if (!name || !target) return null;
+      if (!name || !target || !claim(name)) return null;
       result.push({ type, name, [targetKey]: target });
     }
   }
@@ -2688,7 +2862,8 @@ function edgeBindings(
       relation.deployment?.state !== "active" ||
       !installationRef ||
       relation.deployment.providerInstallationRef !== installationRef ||
-      !material
+      !material ||
+      !claim(name)
     ) {
       return null;
     }

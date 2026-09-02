@@ -1291,6 +1291,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
                       tenantRef: input.tenantId,
                       space: input.space,
                       name: input.name,
+                      uid: input.resourceUid,
                     },
                     spec: input.spec,
                     relations: await providerRelations(input.tenantId, input.relations),
@@ -1305,10 +1306,14 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
                   ...(input.operationMode ? { operationMode: input.operationMode } : {}),
                   offering,
                   nativeId: input.nativeId,
+                  // The adopting provider needs the Resource UID: a bucket's
+                  // native name is derived from the incarnation, and adoption is
+                  // fenced to that exact derivation.
                   identity: {
                     tenantRef: input.tenantId,
                     space: input.space,
                     name: input.name,
+                    uid: input.resourceUid,
                   },
                   spec: input.spec,
                   relations: await providerRelations(input.tenantId, input.relations),
