@@ -19,17 +19,17 @@ supply. Provider bucket names, regions, endpoints, credentials, and supply
 documents remain inside the selected Provider Pack and Deployment; none is
 Resource desired, observed, output, discovery, or Worker binding state.
 
-Two runtimes carry that Binding, and they differ in what the Worker's `env`
-holds. The managed Worker backend wraps the tenant module and projects the
-`edge.objects` facade with the nine object operations the Binding fixes. The
-ordinary-workers backend — the one an operator's own Cloudflare account runs —
-uploads the tenant's exact bundle bytes with no wrapper, so the declared name
-carries Cloudflare's native R2 binding, exactly as `sqliteBindings` carries a
-native D1 binding and `kvBindings` a native KV namespace. Neither runtime
-exposes a bucket name, region, endpoint, or credential to the Worker. ADR 0007
-records that divergence from
-[ADR 0005](docs/adr/0005-object-storage-is-an-exact-objectbucket-binding.md)
-rather than leaving it implied.
+One runtime carries that Binding: the ordinary-workers backend, the one an
+operator's own Cloudflare account runs. It uploads the tenant's exact bundle
+bytes with no wrapper, so the declared name carries Cloudflare's native R2
+binding, exactly as `sqliteBindings` carries a native D1 binding and
+`kvBindings` a native KV namespace; no bucket name, region, endpoint, or
+credential reaches the Worker. The managed Worker backend refuses
+`bucketBindings` by name, because the `edge.objects` facade it would project
+keeps its multipart receipts in isolate memory and cannot survive an eviction.
+ADR 0007 records both, and the divergence from
+[ADR 0005](docs/adr/0005-object-storage-is-an-exact-objectbucket-binding.md),
+rather than leaving them implied.
 
 Takoserver serves no public S3-credential or managed standard-service retail
 route. Separate S3 retail is not composed by default, and provider credentials
@@ -113,10 +113,9 @@ the part that owns accounts, money, and the machines.
   settled minus held, computed from entries that are only ever appended.
 - **Bind** a current ObjectBucket through `bucketBindings`. The Host resolves
   the exact Resource relation and active Deployment, then the provider's
-  two-stage materializer hands the selected runtime one opaque capability —
-  the `edge.objects` facade on the managed backend, a native R2 binding under
-  the declared name on the ordinary-workers backend. Native bucket identity and
-  credentials stay private to that adapter either way.
+  two-stage materializer hands the ordinary-workers runtime one opaque
+  capability, which becomes a native R2 binding under the declared name.
+  Native bucket identity and credentials stay private to that adapter.
 - **Run** the ordinary Takoform provider without handing a hosted runner the
   reseller's organization API key. A reseller reservation can mint a
   short-lived bearer pinned to one opaque tenant, exact Form, and exact

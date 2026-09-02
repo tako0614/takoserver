@@ -33,6 +33,13 @@ import { createIntegrationFormAuthorityComposition } from "../src/takoform/integ
 import { loadPublisherSetClosure } from "../src/takoform/publisher-set-closure.ts";
 
 const digest = (hex: string) => `sha256:${hex.repeat(64)}` as const;
+/**
+ * A distinct bundle digest per fixture package, for any corpus size. Cycling a
+ * single hex character was unique only while the corpus stayed under sixteen
+ * packages, and it also collided with the fixed digests above.
+ */
+const packageBundleDigest = (index: number): `sha256:${string}` =>
+  `sha256:${index.toString(16).padStart(64, "b")}`;
 const PUBLIC_VERSION_ID = "00000000-0000-4000-8000-000000000001";
 const DRIFTED_PUBLIC_VERSION_ID = "00000000-0000-4000-8000-000000000002";
 const CAPABILITIES = yurucommuLifecycleCapabilityManifest(YURUCOMMU_IDENTITY_CAPABILITY_KINDS);
@@ -89,7 +96,7 @@ function trustEvidence(): FormAuthorityVerificationEvidence {
     packageBundleDigests: INTEGRATION_FORM_PACKAGES.map((pkg, index) => ({
       formRef: structuredClone(pkg.formRef),
       packageDigest: pkg.packageDigest,
-      bundleDigest: digest((((index + 4) % 16) as number).toString(16)),
+      bundleDigest: packageBundleDigest(index),
     })),
   };
 }
@@ -496,6 +503,11 @@ describe("integration Form authority bridge", () => {
     );
     expect(installReports).toHaveLength(FORM_COUNT);
     expect(bundleDigests.size).toBe(FORM_COUNT);
+    // The generator itself stays distinct past the current corpus, so this
+    // count keeps meaning what it says as packages are added.
+    expect(new Set(Array.from({ length: 64 }, (_, index) => packageBundleDigest(index))).size).toBe(
+      64,
+    );
     expect(applied.nextPlan.commands).toEqual([]);
   });
 

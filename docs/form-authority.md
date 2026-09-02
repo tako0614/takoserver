@@ -322,17 +322,25 @@ Takoserver supply. Readback exposes them as `installed: true`,
 [ADR 0007](adr/0007-objectbucket-joins-the-implementation-catalog.md). The exact
 current package at definition version `0.1.0` is now supported and activated
 with the operations its Form declares — `create`, `read`, `delete`, `import`,
-`observe`, never `update` — on any Host whose deploy target realizes an
-ObjectBucket supply. It is an identity capability, so a Host without that
-supply still serves an empty operation set for it. That change rotated the
-capability digest to
-`sha256:a5bc1508638fb1c47182d4ee68be5eedb7acc050394bd3507b532a78daacc024`, and
-therefore requires explicit reconvergence in every advertised environment.
+`observe`, never `update` — on any Host that realizes an ObjectBucket supply.
+It is an identity capability, so a Host without that supply installs, supports,
+and activates it with an EMPTY operation set: the Form is known there and none
+of it executes. That is what a self-host does, because its composition builds
+no ObjectBucket Offering at all — the machine has no `edge.objects` backend —
+so `scripts/selfhost-form-admission.ts` records only the identity Forms that
+composition offers. The two Hosts therefore no longer share one capability
+digest: the public Worker's is
+`sha256:a5bc1508638fb1c47182d4ee68be5eedb7acc050394bd3507b532a78daacc024` and a
+self-host's is
+`sha256:0d471b6ebe2bf43c60ba2b8a000cd8aa2293c0cc9b4b4a048b9abc1d75a13669`. Both
+rotated, so both require explicit reconvergence in every advertised
+environment.
 Reconvergence is an append-only support and activation event through the
 existing admission chain — the operator surface in an environment that has one,
 `scripts/selfhost-form-admission.ts` on a self-host — never an in-place edit of
 a durable head. ADR 0007 carries the exact predecessor and successor digests
-and the exact operator commands.
+for both Hosts, and the operator commands for the environments that have an
+ingress.
 
 Production currently has no operator ingress: the route-less production Worker
 can be deployed, its Container identity can be read back through the probe,

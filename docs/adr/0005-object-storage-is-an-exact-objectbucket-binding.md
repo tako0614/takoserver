@@ -2,6 +2,15 @@
 
 **Status:** accepted, 2026-09-01
 
+> **Amended 2026-09-02 by
+> [ADR 0007](0007-objectbucket-joins-the-implementation-catalog.md).** The
+> consequence below that "Worker code receives the exact Binding facade, not
+> raw `edge.objects` wire envelopes and not a provider-native R2 or S3 client"
+> holds on the wrapper hosts. On the ordinary-workers backend, which uploads
+> the tenant's exact bundle bytes and has nowhere to interpose a wrapper, the
+> declared name carries Cloudflare's native R2 binding. ADR 0007 records that
+> divergence and its reasons; this decision's body is unchanged.
+
 ## Decision
 
 Takoserver's managed object-storage contract is exactly the current
