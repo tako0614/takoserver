@@ -23,6 +23,8 @@ import {
   SELFHOST_WORKER_READINESS_PROTOCOL,
   SELFHOST_WORKER_READINESS_RESULT_SCHEMA,
   type SelfhostWorkerEntrypointSourceInput,
+  selfhostReadinessAnswer,
+  selfhostReadinessFailureMessage,
   selfhostWorkerEntrypointSource,
 } from "../src/providers/selfhost-worker-wrapper.ts";
 
@@ -391,13 +393,59 @@ test("the readiness route reports a declared handler the tenant module lacks", a
     );
     expect(answered.status).toBe(500);
     // The publication is named even on the refusal, so a prober can tell this
-    // answer from a stale configuration's. Nothing about the tenant's own
-    // failure crosses.
+    // answer from a stale configuration's, and the reason names the Version's
+    // own declaration rather than anything the tenant's module said.
     expect(await answered.json()).toEqual({
       schema: SELFHOST_WORKER_READINESS_RESULT_SCHEMA,
       publication: "sw1.v1",
       handlers: ["fetch", "scheduled"],
+      failure: { reason: "declaration", message: "self-host Worker declared handler is missing" },
     });
+  } finally {
+    await generated.dispose();
+  }
+});
+
+/**
+ * A module that throws at import time and a module missing a declared handler
+ * are different defects in different files. Reporting both as the second sent
+ * the self-host end-to-end run's operator to read a complete export list: the
+ * real cause was a dead `import path from "node:path"` in a dependency, and it
+ * was visible only by running the runtime by hand.
+ */
+test("the readiness route distinguishes an import-time failure from a missing export", async () => {
+  const { service } = plane([]);
+  // Bun resolves `node:path`, so the module that would fail on workerd is
+  // simulated by the same thing that failure is: a throw during import.
+  const generated = await loadGenerated(
+    `throw new TypeError('No such module "node:path".\\n  imported from "tenant.js"');\n` +
+      `export default { async fetch() { return new Response("ok"); } };`,
+    KV_ONLY,
+  );
+  try {
+    const answered = await generated.worker.fetch(
+      new Request(`https://worker.example${SELFHOST_WORKER_READINESS_PATH}`, {
+        method: "POST",
+        headers: { [SELFHOST_WORKER_READINESS_HEADER]: SELFHOST_WORKER_READINESS_PROTOCOL },
+      }),
+      rawEnv(service),
+      context,
+    );
+    expect(answered.status).toBe(500);
+    const body = (await answered.json()) as {
+      readonly failure: {
+        readonly reason: string;
+        readonly name: string;
+        readonly message: string;
+      };
+    };
+    expect(body.failure.reason).toBe("module");
+    expect(body.failure.name).toBe("TypeError");
+    expect(body.failure.message).toContain("node:path");
+    // Sanitized and bounded: no control characters, no unbounded tenant text.
+    expect(body.failure.message.length).toBeLessThanOrEqual(400);
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: proving none survive
+    expect(body.failure.message).not.toMatch(/[\u0000-\u001f\u007f]/u);
   } finally {
     await generated.dispose();
   }
@@ -839,4 +887,38 @@ test("a tenant that forges Symbol.hasInstance cannot move what counts as a strea
     delete (ReadableStream as unknown as Record<symbol, unknown>)[Symbol.hasInstance];
     await generated.dispose();
   }
+});
+
+test("the Host reports an import-time failure as one, and a missing export as one", async () => {
+  const envelope = (failure?: Record<string, unknown>) =>
+    JSON.stringify({
+      schema: SELFHOST_WORKER_READINESS_RESULT_SCHEMA,
+      publication: "sw1.v1",
+      handlers: ["fetch"],
+      ...(failure ? { failure } : {}),
+    });
+
+  expect(selfhostReadinessAnswer(envelope())).toEqual({ publication: "sw1.v1" });
+  expect(selfhostReadinessFailureMessage(undefined)).toBe(
+    "the Worker Version's module does not export every handler it declares",
+  );
+
+  const declaration = selfhostReadinessAnswer(
+    envelope({ reason: "declaration", message: "self-host Worker declared handler is missing" }),
+  );
+  expect(selfhostReadinessFailureMessage(declaration?.failure)).toBe(
+    "the Worker Version's module does not export every handler it declares",
+  );
+
+  const module = selfhostReadinessAnswer(
+    envelope({ reason: "module", name: "TypeError", message: 'No such module "node:path".' }),
+  );
+  expect(selfhostReadinessFailureMessage(module?.failure)).toBe(
+    'the Worker Version\'s module failed to load: TypeError: No such module "node:path".',
+  );
+
+  // An envelope whose failure is not one of the two shapes is read as no
+  // failure at all rather than as a third meaning.
+  expect(selfhostReadinessAnswer(envelope({ reason: "whatever" }))?.failure).toBeUndefined();
+  expect(selfhostReadinessAnswer('{"schema":"other"}')).toBeNull();
 });
