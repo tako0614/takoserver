@@ -144,7 +144,7 @@ const artifacts = { manifest: async () => null, blob: async () => null };
 const now = new Date("2026-09-01T00:00:00.000Z");
 
 describe("Worker production composition", () => {
-  test("advertises zero current ObjectBucket offerings without a complete executable route", () => {
+  test("advertises zero current ObjectBucket offerings without a Worker to consume it", () => {
     const catalog = stableProductionTakoformCatalog();
     const composed = createWorkerProductionComposition({
       env: {
@@ -164,10 +164,15 @@ describe("Worker production composition", () => {
     expect(pack?.descriptor.providedInterfaces.some((item) => item.name === "edge.objects")).toBe(
       false,
     );
+    // ADR 0007 gave the Cloudflare pack both halves of the route. The bucket
+    // is still not sellable here, because no edge supply realizes a Worker to
+    // consume the Binding, and an unconsumable capability is not an Offering.
     expect(pack?.runtimeBindingMaterializer?.exporter?.routes).toEqual([
       expect.objectContaining({ bindingRef: EDGE_OBJECTS_BINDING_REF }),
     ]);
-    expect(pack?.runtimeBindingMaterializer?.importer).toBeUndefined();
+    expect(pack?.runtimeBindingMaterializer?.importer?.routes).toEqual([
+      expect.objectContaining({ bindingRef: EDGE_OBJECTS_BINDING_REF }),
+    ]);
     expect(pack?.attachmentFactories).toEqual([]);
     expect(pack?.credentialIssuers).toEqual([]);
     expect(
@@ -231,7 +236,7 @@ describe("Worker production composition", () => {
     expect(JSON.stringify(composed.offerings)).not.toContain("ObjectBucket");
   });
 
-  test("keeps ordinary Cloudflare workers sellable while ObjectBucket supply stays closed", () => {
+  test("sells the current ObjectBucket beside the Worker once both supplies exist", () => {
     const catalog = stableProductionTakoformCatalog();
     const composed = createWorkerProductionComposition({
       env: {
@@ -246,12 +251,26 @@ describe("Worker production composition", () => {
       now,
     });
 
-    expect(composed.offerings.map((offering) => offering.form.kind)).toEqual(["ModuleWorker"]);
-    expect(
-      composed.providers
-        .flatMap((provider) => provider.offerings)
-        .some((offering) => offering.form.kind === "ObjectBucket"),
-    ).toBe(false);
+    expect(composed.offerings.map((offering) => offering.form.kind).sort()).toEqual([
+      "ModuleWorker",
+      "ObjectBucket",
+    ]);
+    const bucket = composed.providers
+      .flatMap((provider) => provider.offerings)
+      .find((offering) => offering.form.kind === "ObjectBucket");
+    expect(bucket?.form).toMatchObject({
+      apiVersion: "edge.forms.takoform.com",
+      definitionVersion: "0.1.0",
+    });
+    // The consumer pack may now advertise the Binding, because one exporter
+    // route and one importer route agree on it and a bucket target exists.
+    expect(composed.providerPacks[0]?.descriptor.bindingRefs).toContainEqual(
+      EDGE_OBJECTS_BINDING_REF,
+    );
+    // The Offering still carries no provider address of any kind.
+    expect(JSON.stringify(composed.offerings)).not.toMatch(
+      /endpoint|bucketName|accessKey|secretAccessKey/iu,
+    );
   });
 
   test("does not turn Wasabi private transport into an ObjectBucket catalog offering", () => {

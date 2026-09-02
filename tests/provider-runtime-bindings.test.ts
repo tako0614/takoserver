@@ -252,30 +252,96 @@ describe("provider-private runtime Binding materialization", () => {
     ).rejects.toMatchObject({ code: "unsupported_capability", status: 422 });
   });
 
-  test("Cloudflare exports R2 privately but advertises no importer before durable receipts exist", async () => {
+  test("Cloudflare exports and imports R2 on one route (ADR 0007)", async () => {
     const cloudflare = pack("cloudflare", createCloudflareRuntimeBindingMaterializer("cloudflare"));
     const materializer = cloudflare.runtimeBindingMaterializer;
-
-    expect(materializer?.exporter?.routes).toEqual([
+    const expected = [
       {
         bindingRef: EDGE_OBJECTS_BINDING_REF,
         materialKind: CLOUDFLARE_R2_EDGE_OBJECTS_MATERIAL_KIND,
       },
-    ]);
-    expect(materializer?.importer).toBeUndefined();
+    ];
+
+    expect(materializer?.exporter?.routes).toEqual(expected);
+    expect(materializer?.importer?.routes).toEqual(expected);
     expect(
       canMaterializeAcrossProviderPacks({
         bindingRef: EDGE_OBJECTS_BINDING_REF,
         consumerPack: cloudflare,
         targetPack: cloudflare,
       }),
-    ).toBe(false);
+    ).toBe(true);
+    const bindings = await materializeProviderRuntimeBindings({
+      ...baseInput,
+      consumerPack: cloudflare,
+      packs: new Map([[cloudflare.id, cloudflare]]),
+      relations: [relation()],
+    });
+    expect(bindings).toEqual([
+      {
+        name: "OBJECTS",
+        targetUid: "uid-bucket",
+        bindingRef: EDGE_OBJECTS_BINDING_REF,
+        material: {
+          kind: CLOUDFLARE_R2_EDGE_OBJECTS_MATERIAL_KIND,
+          bucketName: `ts-${"a".repeat(40)}`,
+        },
+      },
+    ]);
+  });
+
+  test("refuses to import an edge.objects capability this Cloudflare pack did not export", async () => {
+    const cloudflare = pack("cloudflare", createCloudflareRuntimeBindingMaterializer("cloudflare"));
+    // A foreign pack that claims the same Binding and material kind still
+    // cannot mint the private export token, so the import returns null and the
+    // driver refuses before any provider mutation.
+    const forger = pack("forger", {
+      id: "forger-runtime-bindings",
+      exporter: {
+        routes: [
+          {
+            bindingRef: EDGE_OBJECTS_BINDING_REF,
+            materialKind: CLOUDFLARE_R2_EDGE_OBJECTS_MATERIAL_KIND,
+          },
+        ],
+        async exportTarget() {
+          return Object.freeze({
+            providerPackRef: "cloudflare",
+            bucketName: `ts-${"a".repeat(40)}`,
+          });
+        },
+      },
+    });
+    await expect(
+      materializeProviderRuntimeBindings({
+        ...baseInput,
+        consumerPack: cloudflare,
+        packs: new Map([
+          [cloudflare.id, cloudflare],
+          [forger.id, forger],
+        ]),
+        relations: [relation("forger")],
+      }),
+    ).rejects.toMatchObject({ code: "unsupported_capability", status: 422 });
+  });
+
+  test("refuses to export a bucket Deployment whose native identity disagrees", async () => {
+    const cloudflare = pack("cloudflare", createCloudflareRuntimeBindingMaterializer("cloudflare"));
+    const drifted = relation();
     await expect(
       materializeProviderRuntimeBindings({
         ...baseInput,
         consumerPack: cloudflare,
         packs: new Map([[cloudflare.id, cloudflare]]),
-        relations: [relation()],
+        relations: [
+          {
+            ...drifted,
+            deployment: {
+              ...(drifted.deployment as NonNullable<ProviderRelation["deployment"]>),
+              nativeId: `r2:ts-${"b".repeat(40)}`,
+            },
+          },
+        ],
       }),
     ).rejects.toMatchObject({ code: "unsupported_capability", status: 422 });
   });

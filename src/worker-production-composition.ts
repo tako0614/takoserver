@@ -98,9 +98,10 @@ export function createWorkerProductionComposition(input: {
     createCloudflareRuntimeBindingMaterializer("cloudflare");
   // ObjectBucket is sold only when this exact process has both the target
   // exporter and the selected Worker consumer importer for one material kind.
-  // The current Cloudflare adapter is exporter-only until WfP owns durable
-  // multipart receipts; Wasabi has no exporter route. Both therefore remain
-  // recovery/private transports rather than current catalog capabilities.
+  // The Cloudflare pack owns both halves (ADR 0007) and is the consumer only
+  // where an edge supply realizes a Worker to consume it. Wasabi has no
+  // exporter route, so a Wasabi bucket stays a recovery/private transport
+  // rather than a current catalog capability.
   const objectBindingConsumer = edgeSupplies ? cloudflareRuntimeBindingMaterializer : undefined;
   const sellableCloudflareObjects = resolveRuntimeBindingMaterialRoute({
     bindingRef: EDGE_OBJECTS_BINDING_REF,

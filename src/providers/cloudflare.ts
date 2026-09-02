@@ -1,6 +1,6 @@
 import { isEdgeFormsApiVersion } from "../form-ref.ts";
 import type { JsonObject, JsonValue } from "../ports.ts";
-import type { ProviderRelation } from "../provider-port.ts";
+import type { ProviderRelation, ProviderRuntimeBinding } from "../provider-port.ts";
 import {
   type ApplyInput,
   failed,
@@ -29,6 +29,10 @@ import {
   canonicalWorkerEndpointOrigin,
   derivedProviderResourceName,
 } from "../provider-worker-endpoint-origin.ts";
+import {
+  cloudflareR2EdgeObjectsMaterial,
+  EDGE_OBJECTS_BINDING_REF,
+} from "./cloudflare-runtime-bindings.ts";
 import { CloudflareWfpBackend } from "./cloudflare-wfp-backend.ts";
 import type {
   ArtifactBytes,
@@ -983,14 +987,8 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     const modules = manifest.modules ?? [];
     if (modules.length === 0) return failed("invalid_spec", "the Worker Bundle has no modules");
 
-    const bindings = edgeBindings(input.spec, input.relations);
+    const bindings = edgeBindings(input.spec, input.relations, input.runtimeBindings);
     if (!bindings) return failed("invalid_spec", "a Worker binding has no provider deployment");
-    if ((input.runtimeBindings?.length ?? 0) > 0) {
-      return failed(
-        "invalid_spec",
-        "portable runtime Bindings require an exact managed Worker adapter",
-      );
-    }
     const requiredSensitive = sensitiveBindingNames(input.spec.requiredSensitiveVars);
     if (!requiredSensitive) {
       return failed("invalid_spec", "the sensitive Worker binding declaration is invalid");
@@ -2615,9 +2613,19 @@ function relationOutputName(
   return optionalString(relation?.deployment?.outputs[output]);
 }
 
+/**
+ * Native bindings for one Worker Version.
+ *
+ * `bucketBindings` is different in kind from the others: the Provider Pack has
+ * already materialized it into an opaque capability before this adapter runs,
+ * so the declaration is validated against that result rather than read from
+ * the spec. A missing, extra, misnamed, or foreign entry returns `null`, which
+ * the caller turns into `invalid_spec` before any Cloudflare mutation.
+ */
 function edgeBindings(
   spec: JsonObject,
   relations: readonly ProviderRelation[] | undefined,
+  runtimeBindings: readonly ProviderRuntimeBinding[] | undefined,
 ): readonly JsonObject[] | null {
   const result: JsonObject[] = [];
   const vars = (record(spec.vars) ?? {}) as Readonly<Record<string, JsonValue>>;
@@ -2646,6 +2654,45 @@ function edgeBindings(
       if (!name || !target) return null;
       result.push({ type, name, [targetKey]: target });
     }
+  }
+
+  // A Worker Version inherits its placement from the ModuleWorker it revises.
+  // A bucket realized under a different installation is a different Cloudflare
+  // account, which this adapter's credential cannot reach, so it is refused
+  // here rather than uploaded and discovered at runtime.
+  const installationRef = relations?.find((candidate) => candidate.pointer === "/worker")
+    ?.deployment?.providerInstallationRef;
+  const bucketDeclarations = Array.isArray(spec.bucketBindings) ? spec.bucketBindings : [];
+  const materialized = runtimeBindings ?? [];
+  if (bucketDeclarations.length !== materialized.length) return null;
+  for (let index = 0; index < materialized.length; index += 1) {
+    const service = materialized[index];
+    const declaration = record(bucketDeclarations[index]);
+    const relation = relations?.find(
+      (candidate) => candidate.pointer === `/bucketBindings/${index}/resource`,
+    );
+    const material = cloudflareR2EdgeObjectsMaterial(service?.material);
+    const name = optionalString(service?.name);
+    if (
+      !service ||
+      service.bindingRef.apiVersion !== EDGE_OBJECTS_BINDING_REF.apiVersion ||
+      service.bindingRef.name !== EDGE_OBJECTS_BINDING_REF.name ||
+      service.bindingRef.version !== EDGE_OBJECTS_BINDING_REF.version ||
+      service.bindingRef.schemaDigest !== EDGE_OBJECTS_BINDING_REF.schemaDigest ||
+      !name ||
+      !/^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/u.test(name) ||
+      optionalString(declaration?.name) !== name ||
+      !relation ||
+      relation.resource.kind !== "ObjectBucket" ||
+      relation.targetUid !== service.targetUid ||
+      relation.deployment?.state !== "active" ||
+      !installationRef ||
+      relation.deployment.providerInstallationRef !== installationRef ||
+      !material
+    ) {
+      return null;
+    }
+    result.push({ type: "r2_bucket", name, bucket_name: material.bucketName });
   }
   return result;
 }

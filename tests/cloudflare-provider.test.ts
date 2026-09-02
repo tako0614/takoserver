@@ -1,7 +1,15 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { buildEdgeForms, edgeProviderOffering } from "../src/edge-forms.ts";
+import {
+  buildEdgeForms,
+  edgeProviderOffering,
+  objectBucketProviderOffering,
+} from "../src/edge-forms.ts";
 import type { JsonObject } from "../src/ports.ts";
-import type { ProviderOffering, ProviderRelation } from "../src/provider-port.ts";
+import type {
+  ProviderOffering,
+  ProviderRelation,
+  ProviderRuntimeBinding,
+} from "../src/provider-port.ts";
 import type {
   ProviderRuntimeInputLeasePort,
   ProviderRuntimeInputPreparationIdentity,
@@ -12,6 +20,7 @@ import {
   CloudflareProvider,
   type CloudflareZone,
 } from "../src/providers/cloudflare.ts";
+import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
 
 const FORM_REF = {
   apiVersion: "edge.forms.takoform.com/v1beta1",
@@ -592,6 +601,133 @@ describe("Cloudflare provider", () => {
       failure: { code: "unavailable", retryable: true },
     });
     expect(posts).toBe(1);
+  });
+});
+
+/**
+ * The current versionless ObjectBucket Form, which ADR 0007 admitted. Its
+ * technical offering keeps the legacy `object_bucket` provider kind, so this
+ * proves the ordinary-workers backend reaches the R2 lifecycle through the
+ * exact current identity rather than through the retained v1beta1 one.
+ */
+describe("current ObjectBucket Form on the ordinary-workers backend", () => {
+  const form = currentTakoformCandidates().forms.find(
+    (candidate) => candidate.identity.formRef.kind === "ObjectBucket",
+  );
+  if (!form) throw new Error("current ObjectBucket Form missing");
+  const offering = objectBucketProviderOffering(form, {
+    id: "storage.object.standard",
+    displayName: "Object bucket",
+    regions: ["global"],
+  });
+
+  function bucketProvider(status = 200, body: unknown = { success: true, errors: [], result: {} }) {
+    const calls: Call[] = [];
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [offering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        calls.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body: await request.clone().text(),
+        });
+        return new Response(JSON.stringify(body), {
+          status,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    return { provider, calls };
+  }
+
+  test("names the offering by the exact current FormRef", () => {
+    expect(offering.form).toEqual({
+      apiVersion: "edge.forms.takoform.com",
+      kind: "ObjectBucket",
+      definitionVersion: "0.1.0",
+      schemaDigest: "sha256:154e2dcf100b1278f3badb7f7f2f25bba8c6bcf387c75fb6b9abc5ede1cbd557",
+    });
+    expect(offering.providedInterfaces.map(({ name }) => name)).toEqual(["edge.objects"]);
+    // The Form declares no update, so the offering never claims one.
+    expect(offering.capabilities).toEqual(["create", "delete", "import", "observe"]);
+  });
+
+  test("creates a bucket under a derived name and reports no tenant name", async () => {
+    const { provider, calls } = bucketProvider();
+    const ticket = await provider.apply({
+      operationId: "op-current-bucket",
+      offering,
+      identity: { ...IDENTITY, name: "media" },
+      spec: {},
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: expect.stringMatching(/^r2:ts-[0-9a-f]{40}$/u) },
+    });
+    expect(calls).toHaveLength(1);
+    expect(new URL(calls[0]?.url ?? "").pathname).toBe("/client/v4/accounts/acct_1/r2/buckets");
+    expect(calls[0]?.body).not.toContain("media");
+    expect(calls[0]?.body).not.toContain("org_acme");
+  });
+
+  test("observes and deletes by the derived native identity only", async () => {
+    const { provider, calls } = bucketProvider();
+    const created = await provider.apply({
+      operationId: "op-current-bucket-observe",
+      offering,
+      identity: { ...IDENTITY, name: "media" },
+      spec: {},
+    });
+    if (created.phase !== "succeeded") throw new Error("expected success");
+    const nativeId = created.result.nativeId;
+    const name = nativeId.slice("r2:".length);
+
+    const observed = await provider.observe({
+      offering,
+      nativeId,
+      identity: { ...IDENTITY, name: "media" },
+      spec: {},
+    });
+    expect(observed).toMatchObject({ phase: "succeeded", result: { nativeId } });
+
+    const deleted = await provider.delete({
+      operationId: "op-current-bucket-delete",
+      offering,
+      nativeId,
+      identity: { ...IDENTITY, name: "media" },
+    });
+    expect(deleted).toMatchObject({
+      phase: "succeeded",
+      result: { observed: { deleted: true } },
+    });
+    expect(calls.map((call) => `${call.method} ${new URL(call.url).pathname}`)).toEqual([
+      "POST /client/v4/accounts/acct_1/r2/buckets",
+      `GET /client/v4/accounts/acct_1/r2/buckets/${name}`,
+      `DELETE /client/v4/accounts/acct_1/r2/buckets/${name}`,
+    ]);
+  });
+
+  test("treats an already-absent bucket as a completed delete", async () => {
+    const { provider } = bucketProvider(404, {
+      success: false,
+      errors: [{ code: 10006, message: "bucket not found" }],
+    });
+    const deleted = await provider.delete({
+      operationId: "op-current-bucket-delete-absent",
+      offering,
+      nativeId: `r2:ts-${"c".repeat(40)}`,
+      identity: { ...IDENTITY, name: "media" },
+    });
+    expect(deleted).toMatchObject({
+      phase: "succeeded",
+      result: { observed: { deleted: true } },
+    });
   });
 });
 
@@ -1636,63 +1772,94 @@ describe("released edge Form placement", () => {
     }
   });
 
-  test("refuses a portable object Binding without the managed Worker adapter", async () => {
-    const workerOffering = technical("ModuleWorker");
-    const versionOffering = technical("WorkerVersion");
-    const calls: Call[] = [];
-    const provider = new CloudflareProvider({
-      accountId: "acct_1",
-      offerings: [workerOffering, versionOffering],
-      artifacts,
-      authorize: () => "Bearer secret-account-token",
-      apiOrigin: "https://api.cloudflare.test/client/v4",
-      async fetch(request) {
-        const url = new URL(request.url);
-        calls.push({
-          method: request.method,
-          url: request.url,
-          authorization: request.headers.get("authorization"),
-          body: await request.clone().text(),
-        });
-        if (request.method === "GET" && url.pathname.endsWith("/versions")) {
+  /**
+   * ADR 0007: the ordinary-workers backend consumes the materialized
+   * edge.objects capability and projects Cloudflare's native R2 binding under
+   * the declared name. Everything a caller controls is validated against the
+   * Provider Pack's result before the first Cloudflare call.
+   */
+  describe("portable object Bindings on the ordinary-workers backend", () => {
+    const BUCKET_NAME = `ts-${"a".repeat(40)}`;
+    const OBJECT_BUCKET_BINDING = {
+      apiVersion: "bindings.takoform.com/v1alpha2",
+      name: "module-worker.object-bucket",
+      version: "1.1.0",
+      schemaDigest: "sha256:ff8661459b73a8d229e0915c698afad2aa297b5db90fe5e1693d346a7ae3adfb",
+    } as const;
+    const MEDIA_DECLARATION = {
+      bucketBindings: [
+        {
+          name: "MEDIA",
+          resource: {
+            apiVersion: "edge.forms.takoform.com",
+            kind: "ObjectBucket",
+            name: "media",
+          },
+        },
+      ],
+    } as const;
+
+    function objectsProvider() {
+      const workerOffering = technical("ModuleWorker");
+      const versionOffering = technical("WorkerVersion");
+      const calls: Call[] = [];
+      const provider = new CloudflareProvider({
+        accountId: "acct_1",
+        offerings: [workerOffering, versionOffering],
+        artifacts,
+        authorize: () => "Bearer secret-account-token",
+        apiOrigin: "https://api.cloudflare.test/client/v4",
+        async fetch(request) {
+          calls.push({
+            method: request.method,
+            url: request.url,
+            authorization: request.headers.get("authorization"),
+            body: await request.clone().text(),
+          });
           return Response.json({
             success: true,
             errors: [],
-            result: { items: [] },
-            result_info: { page: 1, per_page: 100 },
+            result: { id: "version-objects" },
           });
-        }
-        return Response.json({
-          success: true,
-          errors: [],
-          result: { id: "version-objects" },
-        });
-      },
-    });
-    const bucketName = `ts-${"a".repeat(40)}`;
-    const ticket = await provider.apply({
-      operationId: "op-version-objects",
-      operationMode: "initial",
-      offering: versionOffering,
-      identity: { ...IDENTITY, name: "version" },
-      spec: { handlers: ["fetch"], requiredSensitiveVars: [] },
-      runtimeBindings: [
-        {
-          name: "MEDIA",
-          targetUid: "bucket-uid",
-          bindingRef: {
-            apiVersion: "bindings.takoform.com/v1alpha2",
-            name: "module-worker.object-bucket",
-            version: "1.1.0",
-            schemaDigest: "sha256:ff8661459b73a8d229e0915c698afad2aa297b5db90fe5e1693d346a7ae3adfb",
-          },
-          material: { kind: "takoserver.cloudflare-r2.edge-objects@v1", bucketName },
         },
-      ],
-      relations: [
+      });
+      return { provider, calls, workerOffering, versionOffering };
+    }
+
+    function runtimeBinding(overrides: Record<string, unknown> = {}) {
+      return {
+        name: "MEDIA",
+        targetUid: "bucket-uid",
+        bindingRef: OBJECT_BUCKET_BINDING,
+        material: {
+          kind: "takoserver.cloudflare-r2.edge-objects@v1",
+          bucketName: BUCKET_NAME,
+        },
+        ...overrides,
+      } as ProviderRuntimeBinding;
+    }
+
+    const ACTIVE_BUCKET = {
+      nativeId: `r2:${BUCKET_NAME}`,
+      offeringId: "storage.object.standard",
+      providerPackRef: "cloudflare",
+      outputs: { protocol: "s3", bucketName: BUCKET_NAME },
+    } as const;
+
+    function bucketRelation(deployment: Parameters<typeof related>[2] = ACTIVE_BUCKET) {
+      return related(
+        "/bucketBindings/0/resource",
+        stored("ObjectBucket", "bucket-uid", {}),
+        deployment,
+        OBJECT_BUCKET_BINDING,
+      );
+    }
+
+    function workerRelations(workerOfferingId: string) {
+      return [
         related("/worker", stored("ModuleWorker", "worker-uid", {}), {
           nativeId: "worker:script-name",
-          offeringId: workerOffering.id,
+          offeringId: workerOfferingId,
           providerPackRef: "cloudflare",
           outputs: { scriptName: "script-name" },
         }),
@@ -1702,15 +1869,121 @@ describe("released edge Form placement", () => {
             manifestDigest: `sha256:${"d".repeat(64)}`,
           }),
         ),
-      ],
+      ];
+    }
+
+    test("projects the declared name as a native R2 binding", async () => {
+      const { provider, calls, workerOffering, versionOffering } = objectsProvider();
+      const ticket = await provider.apply({
+        operationId: "op-version-objects",
+        operationMode: "initial",
+        offering: versionOffering,
+        identity: { ...IDENTITY, name: "version" },
+        spec: { handlers: ["fetch"], requiredSensitiveVars: [], ...MEDIA_DECLARATION },
+        runtimeBindings: [runtimeBinding()],
+        relations: [...workerRelations(workerOffering.id), bucketRelation()],
+      });
+
+      expect(ticket).toMatchObject({
+        phase: "succeeded",
+        result: { nativeId: "version:script-name:version-objects" },
+      });
+      const upload = calls[0]?.body ?? "";
+      expect(upload).toContain(
+        `{"type":"r2_bucket","name":"MEDIA","bucket_name":"${BUCKET_NAME}"}`,
+      );
+      // The bucket's public Resource name is never a provider address.
+      expect(upload).not.toContain('"media"');
+      // Nothing about the bucket reaches the ticket the Host records.
+      expect(JSON.stringify(ticket)).not.toContain(BUCKET_NAME);
     });
 
-    expect(ticket).toMatchObject({
-      phase: "failed",
-      failure: { code: "invalid_spec" },
-    });
-    expect(calls).toEqual([]);
-    expect(JSON.stringify(ticket)).not.toContain(bucketName);
+    const refusals = [
+      {
+        label: "a declaration the Provider Pack did not materialize",
+        spec: MEDIA_DECLARATION as Record<string, unknown>,
+        runtimeBindings: [] as ProviderRuntimeBinding[],
+        relations: () => [bucketRelation()],
+      },
+      {
+        label: "a materialized Binding the version never declared",
+        spec: {},
+        runtimeBindings: [runtimeBinding()],
+        relations: () => [bucketRelation()],
+      },
+      {
+        label: "a declaration name that disagrees with the Binding name",
+        spec: {
+          bucketBindings: [
+            {
+              name: "ASSETS",
+              resource: {
+                apiVersion: "edge.forms.takoform.com",
+                kind: "ObjectBucket",
+                name: "media",
+              },
+            },
+          ],
+        },
+        runtimeBindings: [runtimeBinding()],
+        relations: () => [bucketRelation()],
+      },
+      {
+        label: "a Binding whose target uid is not the relation's",
+        spec: MEDIA_DECLARATION as Record<string, unknown>,
+        runtimeBindings: [runtimeBinding({ targetUid: "other-uid" })],
+        relations: () => [bucketRelation()],
+      },
+      {
+        label: "a foreign Binding identity",
+        spec: MEDIA_DECLARATION as Record<string, unknown>,
+        runtimeBindings: [
+          runtimeBinding({
+            bindingRef: { ...OBJECT_BUCKET_BINDING, schemaDigest: `sha256:${"f".repeat(64)}` },
+          }),
+        ],
+        relations: () => [bucketRelation()],
+      },
+      {
+        label: "a material this provider did not derive",
+        spec: MEDIA_DECLARATION as Record<string, unknown>,
+        runtimeBindings: [runtimeBinding({ material: { kind: "other@v1", bucketName: "media" } })],
+        relations: () => [bucketRelation()],
+      },
+      {
+        label: "a bucket realized under another provider installation",
+        spec: MEDIA_DECLARATION as Record<string, unknown>,
+        runtimeBindings: [runtimeBinding()],
+        relations: () => [
+          bucketRelation({ ...ACTIVE_BUCKET, providerInstallationRef: "cloudflare.secondary" }),
+        ],
+      },
+      {
+        label: "a bucket Deployment that is not active",
+        spec: MEDIA_DECLARATION as Record<string, unknown>,
+        runtimeBindings: [runtimeBinding()],
+        relations: () => [bucketRelation({ ...ACTIVE_BUCKET, state: "draining" })],
+      },
+    ];
+
+    for (const [index, scenario] of refusals.entries()) {
+      test(`refuses ${scenario.label} before any Cloudflare call`, async () => {
+        const { provider, calls, workerOffering, versionOffering } = objectsProvider();
+        const ticket = await provider.apply({
+          operationId: `op-version-objects-refusal-${index}`,
+          operationMode: "initial",
+          offering: versionOffering,
+          identity: { ...IDENTITY, name: "version" },
+          spec: { handlers: ["fetch"], requiredSensitiveVars: [], ...scenario.spec },
+          runtimeBindings: scenario.runtimeBindings,
+          relations: [...workerRelations(workerOffering.id), ...scenario.relations()],
+        });
+
+        expect(ticket).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
+        expect(calls).toEqual([]);
+        expect(JSON.stringify(ticket)).not.toContain(BUCKET_NAME);
+      });
+    }
   });
 
   test("provisions a fetch-only Worker Version without secret bindings", async () => {
@@ -2984,13 +3257,17 @@ describe("released edge Form placement", () => {
       offeringId: string;
       providerPackRef: string;
       outputs: JsonObject;
+      providerInstallationRef?: string;
+      state?: NonNullable<ProviderRelation["deployment"]>["state"];
     },
+    bindingRef?: ProviderRelation["bindingRef"],
   ): ProviderRelation {
     return {
       pointer,
       relation: pointer.replace(/\/\d+/gu, "/*"),
       targetUid: resource.metadata.uid,
       resource,
+      ...(bindingRef ? { bindingRef } : {}),
       ...(deployment
         ? {
             deployment: {
@@ -2999,9 +3276,9 @@ describe("released edge Form placement", () => {
               resourceUid: resource.metadata.uid,
               offeringId: deployment.offeringId,
               providerPackRef: deployment.providerPackRef,
-              providerInstallationRef: "cloudflare.primary",
+              providerInstallationRef: deployment.providerInstallationRef ?? "cloudflare.primary",
               nativeId: deployment.nativeId,
-              state: "active",
+              state: deployment.state ?? "active",
               observed: {},
               outputs: deployment.outputs,
               createdAt: "2026-08-19T00:00:00.000Z",
