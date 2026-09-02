@@ -492,7 +492,13 @@ async function assertAcceptedTarget(
   if (current.metadata.generation !== operation.acceptedGeneration) {
     throw new TakoformHostError("generation_conflict", 412);
   }
-  if (current.metadata.revision !== operation.acceptedRevision) {
+  // A delete is not fenced by the revision it was accepted at. The store
+  // repeats this rule inside the commit batch; `deleteFencesRevision` there
+  // carries why.
+  if (
+    operation.operation !== "delete" &&
+    current.metadata.revision !== operation.acceptedRevision
+  ) {
     throw new TakoformHostError("revision_conflict", 412);
   }
 }
@@ -798,10 +804,26 @@ function isTerminal(operation: DeferredOperationRecord): boolean {
   );
 }
 
+/**
+ * Whether a stored acceptance under this replay key has stopped being the
+ * answer to the request that just arrived.
+ *
+ * Two cases retire one. A committed mutation whose Resource no longer exists
+ * describes an incarnation that is gone. And a **settled failure** is not a
+ * result at all: the released provider recomputes the same plan-derived
+ * idempotency key on every run, so replaying a refusal the caller has already
+ * acted on strands the resource. `tofu destroy` gets `dependency_in_use` on a
+ * parent, deletes the dependents the refusal named, and asks again under the
+ * same key — and would be handed the same refusal forever. A settled failure is
+ * also known not to have crossed the provider boundary: an operation whose
+ * provider mutation was planned or receipted is held for repair rather than
+ * settled, so retiring one replays nothing.
+ */
 async function replayRetired(
   operation: DeferredOperationRecord,
   store: TakoformStore,
 ): Promise<boolean> {
+  if (operation.phase === "failed") return true;
   if (!isTerminal(operation) || !operation.committedUid) return false;
   return (await store.resourceByUid(operation.tenantId, operation.committedUid)) === null;
 }
