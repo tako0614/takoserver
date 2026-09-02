@@ -9,6 +9,7 @@ import type { ProviderRuntimeInputLeasePort } from "../src/provider-runtime-inpu
 import {
   createSelfhostDataPlaneAccess,
   createSelfhostProvider,
+  type SelfhostDataPlaneMaintenance,
 } from "../src/providers/selfhost.ts";
 import { createRuntimeInputAuthority } from "../src/runtime-input-preparations.ts";
 import {
@@ -144,6 +145,7 @@ interface ProviderCase {
   readonly runtime?: WorkerdRuntime;
   readonly missingBlobs?: boolean;
   readonly runtimeInputs?: ProviderRuntimeInputLeasePort;
+  readonly dataPlaneMaintenance?: SelfhostDataPlaneMaintenance;
 }
 
 const SECRET_VALUE = "placeholder-encryption-value";
@@ -302,6 +304,7 @@ function provider(options: ProviderCase = {}) {
     ...(options.suffixes ? { suffixes: options.suffixes } : {}),
     ...(options.runtimeInputs ? { runtimeInputs: options.runtimeInputs } : {}),
     ...(options.dataPlaneAddress ? { dataPlaneAddress: options.dataPlaneAddress } : {}),
+    ...(options.dataPlaneMaintenance ? { dataPlaneMaintenance: options.dataPlaneMaintenance } : {}),
     artifacts: {
       async manifest(_tenant, digest) {
         if (digest === "sha256:worker") {
@@ -877,6 +880,31 @@ describe("publishing a Worker through the Edge Family", () => {
       relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
     ],
     ...extra,
+  });
+
+  test("a sensitive var named after this Host's reserved prefix is refused", async () => {
+    const { port } = fakeLeases(() => root);
+    const local = provider({ runtimeInputs: port });
+    // The one declaration whose grammar admits `__TAKOSERVER_`: a `vars` name
+    // must start with a letter, and a data-binding name is checked explicitly.
+    // Without this the reserved namespace is not reserved, and a tenant can
+    // name a binding after the data service the entrypoint reaches its storage
+    // through.
+    for (const name of ["__TAKOSERVER_SELFHOST_DATA", "__TAKOSERVER_SELFHOST_DATA_TOKEN"]) {
+      expect(
+        await local.apply(
+          sensitiveApply({
+            spec: {
+              bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+              handlers: ["fetch"],
+              requiredSensitiveVars: [name],
+              worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+            },
+          }),
+        ),
+      ).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
+    }
+    expect(existsSync(join(root, "selfhost", "versions"))).toBe(false);
   });
 
   test("an unconfigured machine still refuses sensitive Worker bindings", async () => {
@@ -1690,6 +1718,64 @@ describe("local namespaces", () => {
     expect(observed.phase === "succeeded" ? observed.result.outputs : {}).toEqual(
       created.result.outputs,
     );
+  });
+
+  test("deleting a namespace or a database reaches the planes that hold them", async () => {
+    const deletedNamespaces: string[] = [];
+    const forgotten: string[] = [];
+    const local = provider({
+      dataPlaneMaintenance: {
+        async deleteKvNamespace(namespaceId) {
+          deletedNamespaces.push(namespaceId);
+        },
+        forgetDatabase(name) {
+          forgotten.push(name);
+        },
+        async sweepExpiredKv() {
+          return 0;
+        },
+      },
+    });
+    const created = await local.apply({
+      operationId: "op_1",
+      offering: offering("EdgeKVNamespace"),
+      identity: kvIdentity("cache", "uid-1"),
+      spec: {},
+    });
+    if (created.phase !== "succeeded") throw new Error("namespace allocation failed");
+    const namespaceId = String(created.result.outputs.namespaceId);
+    expect(
+      await local.delete({
+        operationId: "op_2",
+        offering: offering("EdgeKVNamespace"),
+        nativeId: created.result.nativeId,
+        identity: identity("cache"),
+        spec: {},
+      }),
+    ).toMatchObject({ phase: "succeeded" });
+    // The rows go with the namespace: leaving them was defensible while this
+    // was a name with nothing behind it.
+    expect(deletedNamespaces).toEqual([namespaceId]);
+
+    const database = await local.apply({
+      operationId: "op_3",
+      offering: offering("SQLiteDatabase"),
+      identity: identity("app"),
+      spec: {},
+    });
+    if (database.phase !== "succeeded") throw new Error("database allocation failed");
+    expect(
+      await local.delete({
+        operationId: "op_4",
+        offering: offering("SQLiteDatabase"),
+        nativeId: database.result.nativeId,
+        identity: identity("app"),
+        spec: {},
+      }),
+    ).toMatchObject({ phase: "succeeded" });
+    // The file stays; the open handle on it must not, or a database declared
+    // again under the same name would be served through the old inode.
+    expect(forgotten).toEqual([String(database.result.observed.name)]);
   });
 
   test("the bucket keeps its pre-Edge readable name", async () => {

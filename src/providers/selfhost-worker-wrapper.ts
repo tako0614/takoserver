@@ -39,7 +39,17 @@
  * `JSON.stringify` it replaced would otherwise be the one this module calls.
  */
 
-/** Closed handler vocabulary of worker.runtime@1.1.0. */
+/**
+ * Closed handler vocabulary of worker.runtime@1.1.0.
+ *
+ * `queue` and `scheduled` are re-exported when a Version declares them, and on
+ * this Host nothing invokes them yet: no queue producer, no consumer, and no
+ * cron trigger is rendered. Two known gaps travel with that, and both are part
+ * of making the events real rather than separate repairs — the events do not
+ * exist to be delivered, and if they did, this wrapper would hand workerd's raw
+ * event to the tenant where the managed wrapper projects a portable batch with
+ * `ack`/`retry`.
+ */
 export const SELFHOST_WORKER_HANDLER_NAMES = ["fetch", "queue", "scheduled"] as const;
 
 export type SelfhostWorkerHandlerName = (typeof SELFHOST_WORKER_HANDLER_NAMES)[number];
@@ -102,7 +112,16 @@ export const SELFHOST_DATA_PLANE_CONTENT_TYPE =
  */
 export const SELFHOST_DATA_PLANE_ORIGIN = "http://takoserver-selfhost-data.invalid" as const;
 
-/** Bytes a plane answer may carry, mirroring the managed facade's SQL ceiling. */
+/**
+ * Bytes a plane request or answer may carry, mirroring the managed facade's
+ * SQL ceiling.
+ *
+ * It is also what bounds a KV value in practice. `edge.kv` permits 25 MiB and
+ * values cross this seam base64-encoded, which is four bytes for every three:
+ * a full 25 MiB value is about 33.3 MiB of body, so the largest value the
+ * facade accepts fits inside this with room to spare rather than being refused
+ * by a ceiling nobody wrote down.
+ */
 export const SELFHOST_DATA_PLANE_MAX_RESPONSE_BYTES = 40 * 1024 * 1024;
 
 /** A plain, secret, or JSON value workerd already carries as an env binding. */
