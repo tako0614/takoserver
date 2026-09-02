@@ -235,9 +235,16 @@ beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "takoserver-selfhost-e2e-"));
 });
 
-afterEach(() => {
-  workerd?.kill();
-  workerd = undefined;
+afterEach(async () => {
+  if (workerd) {
+    // Waited out rather than merely signalled. A 150 MB runtime still holding
+    // its socket — and still reading a configuration whose directory is about
+    // to be removed — while the next file starts one of its own is how a suite
+    // becomes flaky for reasons that have nothing to do with what it proves.
+    workerd.kill();
+    await workerd.exited;
+    workerd = undefined;
+  }
   planeServer?.stop(true);
   planeServer = undefined;
   rmSync(root, { recursive: true, force: true });
