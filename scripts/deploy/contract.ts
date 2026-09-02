@@ -41,6 +41,8 @@ const hostedTokenInput =
   "`TAKOSERVER_HOSTED_TOKEN_PATH` is required for `--apply` only; `--status` does not read it.";
 const operatorPrivateJwkInput =
   "`TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH` is required for `--apply` only; `--status` does not read it and this surface is integration-only.";
+const closureSecretDirectoryInput =
+  "`TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY` is required for `--apply` only, and only when the declared closure delta names an added or rotated secret; `--status` never reads it.";
 
 function inputContractWithToken(
   tokenRequirement: string,
@@ -120,6 +122,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy.ts",
         "scripts/deploy/worker.ts",
         "scripts/deploy/worker-authority-paths.ts",
+        "scripts/deploy/worker-closure-transition.ts",
         "scripts/deploy/realized-config.ts",
         "scripts/deploy/target.ts",
         "scripts/deploy/worker-live.ts",
@@ -128,7 +131,11 @@ export const DEPLOY_CONTRACT = {
       ],
       requiresScripts: ["check", "deploy"],
       requiresTools: ["bun", "wrangler"],
-      requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+        "TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY",
+      ],
       triggers: ["authority"],
       obligations: {
         provenance:
@@ -149,12 +156,26 @@ export const DEPLOY_CONTRACT = {
           "mismatch are refused. " +
           "The named --legacy-host-runtime-predecessor-version transition profile is the only " +
           "path that may carry the observed legacy service binding and Hosted secret into a " +
-          "candidate; ordinary target realization remains free of both retired fields." +
-          inputContract(applyReviewInput),
+          "candidate; ordinary target realization remains free of both retired fields. " +
+          "The named --closure-predecessor-version profile refuses before any mutation and names " +
+          "every binding its declared delta does not account for." +
+          inputContract(applyReviewInput, closureSecretDirectoryInput),
         "production-selector":
           "Production accepts this transition only with the exact pinned predecessor Version ID, " +
           "a clean/reachable exact commit and independent review; ordinary takoserver-worker deploy " +
           "cannot bypass the selector or carry the retired edge.",
+        "closure-transition-selector":
+          "`--closure-predecessor-version=<uuid>` plus the repeatable `--retire-var=NAME`, " +
+          "`--add-var=NAME`, `--add-secret=NAME` and `--rotate-secret=NAME` declaration is the only " +
+          "path that brings a live Version forward when the operator-private target descriptor " +
+          "legitimately changed shape. It is admitted only when the authoritative current Version " +
+          "is exactly the pinned id, the declared delta is non-empty, and that declaration equals " +
+          "the entire difference between the predecessor closure and the target closure. One upload " +
+          "then realizes the complete current closure: target plain-text vars exactly as the routine " +
+          "surface produces them, every required secret, added and rotated values supplied only " +
+          "through the owned 0700 secret-input directory as one ephemeral sealed Wrangler secrets " +
+          "file, and every other live secret carried without being re-entered. The routine surfaces " +
+          "stay strict and never accept this predecessor.",
         "independent-review": review,
       },
     },

@@ -48,6 +48,21 @@ topology retirement surfaces. Secret deletion can create an unannotated direct s
 is never reported as complete and is repaired only through the dedicated
 post-token attribution surface below.
 
+A reviewed closure transition is the separate profile for a live Version whose
+realized closure legitimately predates the current operator-private target
+shape. `takoserver-worker-authority-cutover` accepts
+`--closure-predecessor-version=<uuid>` together with an explicit declaration
+built from the repeatable `--retire-var=NAME`, `--add-var=NAME`,
+`--add-secret=NAME` and `--rotate-secret=NAME` flags. The declaration is
+machine-checked: the profile admits the predecessor only when the authoritative
+current Version is exactly that id, the declaration is non-empty, and it equals
+the entire difference between the predecessor closure and the target closure.
+Any undeclared difference refuses before mutation and names the binding.
+Retired values are the one thing left unconstrained, because the current target
+no longer derives them; every other binding name, type and plain-text value,
+the secret inventory and the routing closure stay as strict as the routine path.
+The routine surfaces stay strict too and never accept such a predecessor.
+
 The environment selects only `.deploy/targets/<environment>.json` (or the
 matching absolute `TAKOSERVER_DEPLOY_TARGET_<ENVIRONMENT>` path). There is no
 target flag, mixed preflight/apply controller, deploy-plan flag, evidence
@@ -64,7 +79,7 @@ no operator input.
 | Surface | Supported action(s) | Environment | Required input condition |
 | --- | --- | --- | --- |
 | `takoserver-worker` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both actions. Stored Wrangler OAuth is refused because it cannot prove workers.dev enabled state or exhaustive custom-domain inventory. |
-| `takoserver-worker-authority-cutover` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
+| `takoserver-worker-authority-cutover` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; `TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY` for `--apply` only, and only when the declared closure delta names an added or rotated secret. |
 | `takoserver-form-authority-identity-probe` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-form-authority-worker` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-integration-form-authority-worker` | `--status`, `--apply` | integration only | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
@@ -150,6 +165,50 @@ The separate authority and irreversible surfaces are:
   runtime-grant signing key. Its named legacy-edge transition
   profile is the only way to carry an observed Hosted service binding and
   secret into the candidate predecessor state.
+  Its named closure-transition profile is the only way to bring a live Version
+  forward after the operator-private target descriptor legitimately changes
+  shape. Apply performs exactly one upload of the complete current closure: the
+  target plain-text vars exactly as the routine surface produces them, every
+  required secret, and the same authoritative readback, annotation, closure and
+  public product probe the cutover already performs. Added and rotated secret
+  values arrive only through the owned `0700`
+  `TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY`, are sent only as one ephemeral
+  sealed Wrangler secrets file beside the sealed bundle, and never enter
+  command arguments, the child environment, success output or diagnostics.
+  Every other secret already on the live Version is carried, never re-entered.
+  The result records the predecessor Version id and the exact declared delta.
+  A raw `wrangler secret put` is not a substitute: it creates a `secret`-annotated
+  successor whose non-canonical annotation inventory the ordinary inspectors
+  then refuse.
+
+  For the current integration Worker — retire
+  `TAKOSERVER_STANDARD_SERVICE_SUPPLIES`, add
+  `TAKOSERVER_OBJECT_BUCKET_SUPPLIES`, add the
+  `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING` secret and replace the revoked
+  `CLOUDFLARE_API_TOKEN` provisioner credential — the exact commands are:
+
+  ```sh
+  bun run deploy -- takoserver-worker-authority-cutover --status \
+    --environment=integration --commit=<40-hex-sha> \
+    --closure-predecessor-version=<exact-live-version-uuid> \
+    --retire-var=TAKOSERVER_STANDARD_SERVICE_SUPPLIES \
+    --add-var=TAKOSERVER_OBJECT_BUCKET_SUPPLIES \
+    --add-secret=TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING \
+    --rotate-secret=CLOUDFLARE_API_TOKEN
+
+  bun run deploy -- takoserver-worker-authority-cutover --apply \
+    --environment=integration --commit=<40-hex-sha> \
+    --closure-predecessor-version=<exact-live-version-uuid> \
+    --retire-var=TAKOSERVER_STANDARD_SERVICE_SUPPLIES \
+    --add-var=TAKOSERVER_OBJECT_BUCKET_SUPPLIES \
+    --add-secret=TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING \
+    --rotate-secret=CLOUDFLARE_API_TOKEN
+  ```
+
+  `--status` reports the delta it would apply and mutates nothing. `--apply`
+  additionally requires `TAKOSERVER_INDEPENDENT_REVIEW` and reads
+  `$TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY/TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING`
+  and `$TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY/CLOUDFLARE_API_TOKEN`.
 - `takoserver-form-authority-identity-probe`: one reviewed minimal read-only
   Worker upload in every Form-authority environment. Its permanent target-owned
   workers.dev endpoint exposes only `GET /v1/public-host-identity`, backed by a
@@ -454,6 +513,7 @@ payload or implementation digests; `P` and `I` remain build-derived.
 - `TAKOSERVER_SIGNING_NEXT_PRIVATE_JWK_PATH`
 - `TAKOSERVER_HOSTED_TOKEN_PATH`
 - `TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH`
+- `TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY`
 - `TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH`
 - `--form-authority-scope-transition=/absolute/operator-private/transition.json`
 - `TAKOSERVER_INTEGRATION_E2E_API_KEY_PRIVATE_JWK_PATH`
@@ -469,6 +529,13 @@ Secret inputs must be owned, link-free regular files with mode `0600`. They are
 sent only through stdin or an ephemeral sealed Wrangler secrets file, never as
 command arguments or output. A successful task, branch, check, or review does
 not authorize a deploy.
+
+`TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY` is an owned, exact-`0700`,
+link-free absolute directory holding one such `0600` file per declared secret,
+named exactly as the binding. It is read only by a closure-transition `--apply`
+whose declaration names an added or rotated secret, only for those names, and
+its contents are written straight into the sealed secrets file beside the
+bundle.
 
 `TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH` is never sent to Cloudflare. Apply opens
 the link-free `0600` file without following symlinks, accepts only the exact
@@ -532,6 +599,13 @@ readback distinguishes the legacy predecessor still being current, its direct
 canonical successor matching the selected commit, and a direct successor from
 a different commit. An unrelated history advance or malformed successor fails
 closed. The status path never retries the upload.
+
+For a closure-transition upload acknowledgement failure, do not retry apply.
+Run the same surface with `--status` and the same
+`--closure-predecessor-version` and declaration. The pinned predecessor still
+being current means the upload never landed; its exact direct successor with
+the strict target closure means the transition completed. Any other history
+advance fails closed and is never attributed to the interrupted attempt.
 
 For an operator-identity upload acknowledgement failure, do not retry apply.
 Run the same surface with `--status`: an exact configured digest means the
