@@ -354,7 +354,23 @@ test("a priced pre-dispatch refusal exact-cancels the assigned endpoint", async 
   });
 });
 
-test("provider dispatch never cancels and activation gates the successful receipt", async () => {
+/**
+ * An assignment that never activated is let go of, whatever the provider did.
+ *
+ * It used to be released only when the provider had not been entered, on the
+ * reasoning that a dispatched mutation might have landed. What that left behind
+ * was worse: the reservation stayed bound to an endpoint UID whose Resource was
+ * never committed, whose deletion attestation was opened `live` by the
+ * incarnation reservation and could therefore never close, so every later apply
+ * — under the fresh UID a re-created resource always has — was refused
+ * `resource_busy` 409 until the reservation aged out a day later.
+ *
+ * Releasing it reallocates nothing. The reservation stays bound and still owns
+ * its canonical origin under the live uniqueness constraint; only the witness
+ * for an endpoint this Host does not have goes. Activation still gates the
+ * receipt, and the reservation id still never crosses the Provider port.
+ */
+test("releases an assignment the provider never got activated, and gates the receipt", async () => {
   const context = await fixture({ activationFails: true });
   await expect(
     context.driver.apply({
@@ -362,10 +378,15 @@ test("provider dispatch never cancels and activation gates the successful receip
       workerEndpointOriginReservationId: "reservation-01",
     }),
   ).rejects.toMatchObject({ code: "resource_busy", status: 409 });
-  expect(context.events).toEqual(["reservation.assign", "provider.apply", "reservation.activate"]);
+  expect(context.events).toEqual([
+    "reservation.assign",
+    "provider.apply",
+    "reservation.activate",
+    "reservation.cancel",
+  ]);
   expect(context.calls()).toEqual({
     assignCalls: 1,
-    cancelCalls: 0,
+    cancelCalls: 1,
     activateCalls: 1,
     deactivateCalls: 0,
   });

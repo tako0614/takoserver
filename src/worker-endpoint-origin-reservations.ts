@@ -627,6 +627,18 @@ export function createWorkerEndpointOriginReservations(options: {
    * deployment outside `deleted` or `failed`. While any of those is unmet the
    * old endpoint may still be serving, the witness stays, and the apply is
    * refused rather than pointed at an origin somebody else answers on.
+   *
+   * One incarnation can never satisfy "attestation closed", and it is the one a
+   * failed create leaves behind. `reserveResourceIncarnation` opens the record
+   * `live` before the Resource is committed, and a create that fails commits
+   * nothing — so the record stays `live` for an incarnation that never existed,
+   * a deletion that never happened can never close it, and the witness stood
+   * forever. That shape is therefore released too: `live` with no Resource row
+   * is an incarnation that was reserved and never committed. It is fenced on
+   * identity and on the incarnation's own state — the endpoint UID, its
+   * attestation, its deployments, and no provider effect still open on it —
+   * never on a revision, which moves under an apply for reasons that have
+   * nothing to do with whether the endpoint is there.
    */
   const clearSettledHostMintWitness = async (input: {
     readonly organizationId: string;
@@ -648,11 +660,34 @@ export function createWorkerEndpointOriginReservations(options: {
              WHERE endpoint_resource.tenant_id = worker_endpoint_origin_reservations.organization_id
                AND endpoint_resource.uid = worker_endpoint_origin_reservations.endpoint_resource_uid
            )
-           AND EXISTS (
-             SELECT 1 FROM tf_resource_deletion_attestations AS endpoint_deletion
-             WHERE endpoint_deletion.tenant_id = worker_endpoint_origin_reservations.organization_id
-               AND endpoint_deletion.resource_uid = worker_endpoint_origin_reservations.endpoint_resource_uid
-               AND endpoint_deletion.state = 'closed'
+           AND (
+             EXISTS (
+               SELECT 1 FROM tf_resource_deletion_attestations AS endpoint_deletion
+               WHERE endpoint_deletion.tenant_id = worker_endpoint_origin_reservations.organization_id
+                 AND endpoint_deletion.resource_uid = worker_endpoint_origin_reservations.endpoint_resource_uid
+                 AND endpoint_deletion.state = 'closed'
+             )
+             OR (
+               EXISTS (
+                 SELECT 1 FROM tf_resource_deletion_attestations AS endpoint_reservation
+                 WHERE endpoint_reservation.tenant_id = worker_endpoint_origin_reservations.organization_id
+                   AND endpoint_reservation.resource_uid = worker_endpoint_origin_reservations.endpoint_resource_uid
+                   AND endpoint_reservation.state = 'live'
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM tf_resource_provider_effects AS open_effect
+                 WHERE open_effect.tenant_id = worker_endpoint_origin_reservations.organization_id
+                   AND open_effect.resource_uid = worker_endpoint_origin_reservations.endpoint_resource_uid
+                   AND open_effect.phase IN ('planned', 'dispatched')
+                   AND NOT EXISTS (
+                     SELECT 1 FROM tf_resource_provider_effects AS terminal_effect
+                     WHERE terminal_effect.tenant_id = open_effect.tenant_id
+                       AND terminal_effect.resource_uid = open_effect.resource_uid
+                       AND terminal_effect.effect_id = open_effect.effect_id
+                       AND terminal_effect.phase IN ('succeeded', 'cancelled')
+                   )
+               )
+             )
            )
            AND NOT EXISTS (
              SELECT 1 FROM tf_resource_deployments AS endpoint_deployment
