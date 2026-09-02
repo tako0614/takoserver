@@ -1784,6 +1784,10 @@ describe("local namespaces", () => {
         forgetDatabase(name) {
           forgotten.push(name);
         },
+        async objectBucketOccupancy() {
+          return { objects: 0, uploads: 0 };
+        },
+        async deleteObjectBucket() {},
         async sweepExpiredKv() {
           return 0;
         },
@@ -2452,6 +2456,10 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
           dropped.push(id);
         },
         forgetDatabase() {},
+        async objectBucketOccupancy() {
+          return { objects: 0, uploads: 0 };
+        },
+        async deleteObjectBucket() {},
         async sweepExpiredKv() {
           return 0;
         },

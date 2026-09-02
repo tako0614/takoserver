@@ -17,7 +17,11 @@ import {
 } from "./operator-key.ts";
 import { resolvePayment } from "./payment-setup.ts";
 import { createOpenAiGateway, parseOpenAiModelConfig } from "./providers/openai.ts";
-import { createSelfhostDataPlaneAccess, createSelfhostEventTargets } from "./providers/selfhost.ts";
+import {
+  createSelfhostDataPlaneAccess,
+  createSelfhostEventTargets,
+  selfhostObjectsRoot,
+} from "./providers/selfhost.ts";
 import { createProvisionerEndpoint } from "./provisioner-endpoint.ts";
 import {
   createRuntimeInputAuthority,
@@ -289,6 +293,7 @@ const dataPlanes =
         sql,
         grant: (script, versionId) => selfhostDataAccess.grant(script, versionId),
         databasePath: (name) => selfhostDataAccess.databasePath(name),
+        objectRoot: selfhostObjectsRoot(dataRoot),
         clock,
         ...(configuredDataPlanePort ? { port: Number(configuredDataPlanePort.trim()) } : {}),
       });

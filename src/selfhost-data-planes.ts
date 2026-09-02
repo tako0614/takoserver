@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { Buffer } from "node:buffer";
 import { chmodSync, mkdirSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 import type { JsonValue, Row, Sql, SqlParam, SqlStatement } from "./ports.ts";
@@ -9,11 +10,23 @@ import {
   MAX_SELFHOST_QUEUE_MESSAGES,
 } from "./providers/selfhost-events.ts";
 import {
+  MAX_SELFHOST_OBJECT_DOCUMENT_BYTES,
   SELFHOST_DATA_PLANE_KV_PATH,
+  SELFHOST_DATA_PLANE_OBJECT_CONTENT_TYPE,
+  SELFHOST_DATA_PLANE_OBJECT_PROTOCOL,
+  SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER,
+  SELFHOST_DATA_PLANE_OBJECT_RESULT_HEADER,
+  SELFHOST_DATA_PLANE_OBJECTS_PATH,
   SELFHOST_DATA_PLANE_PROTOCOL,
   SELFHOST_DATA_PLANE_QUEUE_PATH,
   SELFHOST_DATA_PLANE_SQL_PATH,
 } from "./providers/selfhost-worker-wrapper.ts";
+import {
+  createSelfhostObjectStore,
+  prefixCeiling,
+  SelfhostObjectError,
+  type SelfhostObjectStore,
+} from "./selfhost-object-store.ts";
 
 /**
  * What a self-hosted Worker's KV and SQL bindings actually talk to.
@@ -54,6 +67,7 @@ import {
 /** The one path prefix these planes answer under. */
 export const SELFHOST_DATA_PLANE_PATHS = [
   SELFHOST_DATA_PLANE_KV_PATH,
+  SELFHOST_DATA_PLANE_OBJECTS_PATH,
   SELFHOST_DATA_PLANE_QUEUE_PATH,
   SELFHOST_DATA_PLANE_SQL_PATH,
 ] as const;
@@ -68,6 +82,8 @@ export interface SelfhostDataPlaneGrant {
   readonly sql: Readonly<Record<string, string>>;
   /** Public binding name to the queue, with the promise that queue makes. */
   readonly queue: Readonly<Record<string, SelfhostGrantedQueue>>;
+  /** Public binding name to the bucket incarnation this Host derived. */
+  readonly objects: Readonly<Record<string, string>>;
 }
 
 export interface SelfhostDataPlaneOptions {
@@ -80,6 +96,8 @@ export interface SelfhostDataPlaneOptions {
   ) => Promise<SelfhostDataPlaneGrant | null | undefined>;
   /** Absolute path of one SQLite database this machine keeps. */
   readonly databasePath: (name: string) => string;
+  /** Directory holding one subdirectory per bucket incarnation. */
+  readonly objectRoot: string;
   readonly clock?: () => Date;
   /** The acceptance identity of one message; injected so a test can name them. */
   readonly messageId?: () => string;
@@ -149,6 +167,11 @@ export function createSelfhostDataPlanes(options: SelfhostDataPlaneOptions): Sel
   const now = options.clock ?? (() => new Date());
   const messageId = options.messageId ?? (() => crypto.randomUUID());
   const databases = new Map<string, Database>();
+  const objectStore = createSelfhostObjectStore({
+    sql: options.sql,
+    root: options.objectRoot,
+    ...(options.clock ? { clock: options.clock } : {}),
+  });
 
   /**
    * One handle per database file, kept open.
@@ -192,6 +215,33 @@ export function createSelfhostDataPlanes(options: SelfhostDataPlaneOptions): Sel
   };
 
   const routes: SelfhostDataPlaneRoutes = async (request, url) => {
+    if (url.pathname === SELFHOST_DATA_PLANE_OBJECTS_PATH) {
+      if (request.method !== "POST") return objectRefusal("backend_unavailable", 405);
+      const grant = await authorize(request, options.grant);
+      if (!grant) return objectRefusal("backend_unavailable", 401);
+      try {
+        const document = parseObjectDocument(
+          request.headers.get(SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER),
+        );
+        // `hasOwn`, not a truthiness test, for the reason the other planes give:
+        // `__proto__` is a property of every ordinary object, and a binding name
+        // no record carried must never resolve to a bucket.
+        if (!Object.hasOwn(grant.objects, document.binding)) {
+          return objectRefusal("backend_unavailable", 404);
+        }
+        return await objectOperation(
+          objectStore,
+          grant.objects[document.binding] as string,
+          document,
+          request,
+        );
+      } catch (error) {
+        return objectRefusal(
+          error instanceof SelfhostObjectError ? error.code : "backend_unavailable",
+          200,
+        );
+      }
+    }
     const kv = url.pathname === SELFHOST_DATA_PLANE_KV_PATH;
     const sql = url.pathname === SELFHOST_DATA_PLANE_SQL_PATH;
     const queue = url.pathname === SELFHOST_DATA_PLANE_QUEUE_PATH;
@@ -269,6 +319,17 @@ export function createSelfhostDataPlanes(options: SelfhostDataPlaneOptions): Sel
       try {
         opened.close();
       } catch {}
+    },
+
+    async objectBucketOccupancy(bucketId) {
+      return await objectStore.occupancy(bucketId);
+    },
+
+    async deleteObjectBucket(bucketId) {
+      // The bytes go with the bucket, for the same reason a namespace's rows do:
+      // a bucket id is derived from the Resource incarnation, so this can never
+      // reach a live bucket's objects.
+      await objectStore.destroy(bucketId);
     },
 
     async sweepExpiredKv(limit = KV_SWEEP_BATCH) {
@@ -565,32 +626,6 @@ function encodeCursor(key: string): string {
     .replaceAll("+", "-")
     .replaceAll("/", "_")
     .replace(/=+$/u, "");
-}
-
-/**
- * The exclusive upper bound of a prefix range.
- *
- * Comparing on `key LIKE prefix || '%'` would make the prefix a pattern, so a
- * key containing `%` or `_` would list somebody else's keys. A range does not
- * have that problem, and it uses the primary key.
- */
-function prefixCeiling(prefix: string): string | null {
-  // Code points, not code units. A key outside the basic plane ends in a
-  // surrogate pair, and incrementing its low half while dropping one code unit
-  // leaves a lone high surrogate as the bound — which sorts below the keys the
-  // caller asked for, so a matching key simply vanishes from the listing.
-  const points = [...prefix];
-  while (points.length > 0) {
-    const code = (points.pop() as string).codePointAt(0) ?? 0;
-    // U+10FFFF has no successor, so the carry moves left. A prefix that is
-    // nothing but U+10FFFF runs out of places to carry into and has no ceiling.
-    if (code >= 0x10ffff) continue;
-    // The surrogate block is not a code point a well-formed key can contain,
-    // and SQLite compares the UTF-8 those keys are stored as.
-    const next = code + 1 >= 0xd800 && code + 1 <= 0xdfff ? 0xe000 : code + 1;
-    return `${points.join("")}${String.fromCodePoint(next)}`;
-  }
-  return null;
 }
 
 function kvMetadata(value: unknown): string | null {
@@ -1170,4 +1205,330 @@ function decodeBase64Url(value: string, maximum: number): Uint8Array {
     maximum,
     "invalid_cursor",
   );
+}
+
+// ---------------------------------------------------------------------------
+// Objects
+// ---------------------------------------------------------------------------
+
+/**
+ * The route that does not speak JSON envelopes in both directions.
+ *
+ * An `edge.objects` body is up to 5 GiB, so it travels as the request or
+ * response body and the operation travels as one header. Nothing here is
+ * buffered: a put is written to a file as it arrives, and a get is a `pread`
+ * streamed straight back out.
+ *
+ * The binding name is still the whole authorization model. A Worker addresses
+ * `MEDIA`, never the bucket incarnation this Host derived, and a name the
+ * Version's own record does not carry is refused rather than resolved.
+ */
+const OBJECT_OPERATION_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  head: ["key"],
+  get: ["key", "range", "ifMatch", "ifNoneMatch"],
+  put: ["key", "contentLength", "contentType", "ifMatch", "ifNoneMatch"],
+  delete: ["key"],
+  list: ["prefix", "delimiter", "cursor", "limit"],
+  createMultipartUpload: ["key", "contentType"],
+  uploadPart: ["key", "uploadId", "partNumber", "contentLength"],
+  completeMultipartUpload: ["key", "uploadId", "parts"],
+  abortMultipartUpload: ["key", "uploadId"],
+};
+
+interface ObjectDocument {
+  readonly binding: string;
+  readonly op: string;
+  readonly fields: Readonly<Record<string, unknown>>;
+}
+
+async function objectOperation(
+  store: SelfhostObjectStore,
+  bucketId: string,
+  document: ObjectDocument,
+  request: Request,
+): Promise<Response> {
+  const fields = document.fields;
+  switch (document.op) {
+    case "head": {
+      const found = await store.head(bucketId, objectKey(fields.key));
+      return objectAnswer(found ? { found: true, ...found } : { found: false });
+    }
+
+    case "get": {
+      const found = await store.get(bucketId, objectKey(fields.key), {
+        ...(fields.range === undefined ? {} : { range: objectRange(fields.range) }),
+        ...(fields.ifMatch === undefined ? {} : { ifMatch: objectEtag(fields.ifMatch) }),
+        ...(fields.ifNoneMatch === undefined
+          ? {}
+          : { ifNoneMatch: objectEtag(fields.ifNoneMatch) }),
+      });
+      if (!found) return objectAnswer({ found: false });
+      return new Response(found.body, {
+        status: 200,
+        headers: {
+          "content-type": SELFHOST_DATA_PLANE_OBJECT_CONTENT_TYPE,
+          [SELFHOST_DATA_PLANE_OBJECT_RESULT_HEADER]: encodeObjectDocument({
+            etag: found.etag,
+            size: found.size,
+            ...(found.contentType === undefined ? {} : { contentType: found.contentType }),
+            partial: found.partial,
+            ...(found.range === undefined ? {} : { range: found.range }),
+          }),
+        },
+      });
+    }
+
+    case "put": {
+      const written = await store.put(bucketId, objectKey(fields.key), objectBody(request), {
+        contentLength: objectLength(fields.contentLength),
+        ...(fields.contentType === undefined
+          ? {}
+          : { contentType: objectContentType(fields.contentType) }),
+        ...(fields.ifMatch === undefined ? {} : { ifMatch: objectEtag(fields.ifMatch) }),
+        ...(fields.ifNoneMatch === undefined ? {} : { ifNoneMatch: objectAny(fields.ifNoneMatch) }),
+      });
+      return objectAnswer({ ...written });
+    }
+
+    case "delete": {
+      await store.delete(bucketId, objectKey(fields.key));
+      return objectAnswer({});
+    }
+
+    case "list": {
+      const page = await store.list(bucketId, {
+        ...(fields.prefix === undefined ? {} : { prefix: objectPrefix(fields.prefix) }),
+        ...(fields.delimiter === undefined ? {} : { delimiter: objectDelimiter(fields.delimiter) }),
+        ...(fields.cursor === undefined ? {} : { cursor: objectCursor(fields.cursor) }),
+        ...(fields.limit === undefined ? {} : { limit: objectLimit(fields.limit) }),
+      });
+      return objectAnswer({
+        objects: page.objects,
+        prefixes: page.prefixes,
+        truncated: page.truncated,
+        ...(page.cursor === undefined ? {} : { cursor: page.cursor }),
+      });
+    }
+
+    case "createMultipartUpload": {
+      const created = await store.createMultipartUpload(bucketId, objectKey(fields.key), {
+        ...(fields.contentType === undefined
+          ? {}
+          : { contentType: objectContentType(fields.contentType) }),
+      });
+      return objectAnswer({ ...created });
+    }
+
+    case "uploadPart": {
+      const part = await store.uploadPart(
+        bucketId,
+        objectKey(fields.key),
+        objectUploadId(fields.uploadId),
+        objectPartNumber(fields.partNumber),
+        objectBody(request),
+        { contentLength: objectLength(fields.contentLength) },
+      );
+      return objectAnswer({ ...part });
+    }
+
+    case "completeMultipartUpload": {
+      const completed = await store.completeMultipartUpload(
+        bucketId,
+        objectKey(fields.key),
+        objectUploadId(fields.uploadId),
+        objectParts(fields.parts),
+      );
+      return objectAnswer({ ...completed });
+    }
+
+    case "abortMultipartUpload": {
+      await store.abortMultipartUpload(
+        bucketId,
+        objectKey(fields.key),
+        objectUploadId(fields.uploadId),
+      );
+      return objectAnswer({});
+    }
+
+    default:
+      throw new SelfhostObjectError("backend_unavailable");
+  }
+}
+
+function objectAnswer(value: Record<string, unknown>): Response {
+  return Response.json({ ok: true, value }, { status: 200 });
+}
+
+function objectRefusal(code: string, status: number): Response {
+  return Response.json({ ok: false, error: { code } }, { status });
+}
+
+/** The operation document, or a refusal before the body is touched. */
+function parseObjectDocument(raw: string | null): ObjectDocument {
+  if (
+    raw === null ||
+    raw.length === 0 ||
+    raw.length > MAX_SELFHOST_OBJECT_DOCUMENT_BYTES ||
+    !/^[A-Za-z0-9_-]+$/u.test(raw)
+  ) {
+    throw new SelfhostObjectError("backend_unavailable");
+  }
+  let parsed: unknown;
+  try {
+    const padded = raw.replaceAll("-", "+").replaceAll("_", "/");
+    parsed = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(padded, "base64")),
+    );
+  } catch {
+    throw new SelfhostObjectError("backend_unavailable");
+  }
+  const document = record(parsed);
+  if (!document || document.protocol !== SELFHOST_DATA_PLANE_OBJECT_PROTOCOL) {
+    throw new SelfhostObjectError("backend_unavailable");
+  }
+  const binding = text(document.binding, 64);
+  const op = text(document.op, 64);
+  if (!binding || !op || !Object.hasOwn(OBJECT_OPERATION_FIELDS, op)) {
+    throw new SelfhostObjectError("backend_unavailable");
+  }
+  const allowed = OBJECT_OPERATION_FIELDS[op] as readonly string[];
+  const fields: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  for (const [name, value] of Object.entries(document)) {
+    if (name === "protocol" || name === "binding" || name === "op") continue;
+    if (!allowed.includes(name)) throw new SelfhostObjectError("backend_unavailable");
+    fields[name] = value;
+  }
+  // A key-bearing operation without one is a document this Host did not write.
+  if (allowed.includes("key") && fields.key === undefined) {
+    throw new SelfhostObjectError("backend_unavailable");
+  }
+  return { binding, op, fields };
+}
+
+function encodeObjectDocument(value: Record<string, unknown>): string {
+  const encoded = Buffer.from(new TextEncoder().encode(JSON.stringify(value)))
+    .toString("base64")
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/u, "");
+  if (encoded.length > MAX_SELFHOST_OBJECT_DOCUMENT_BYTES) {
+    throw new SelfhostObjectError("backend_unavailable");
+  }
+  return encoded;
+}
+
+/** An absent body is an empty one; a plane never guesses a length from it. */
+function objectBody(request: Request): ReadableStream<Uint8Array> {
+  return (request.body as ReadableStream<Uint8Array> | null) ?? new Blob([]).stream();
+}
+
+function objectKey(value: unknown): string {
+  if (typeof value !== "string") throw new SelfhostObjectError("invalid_key");
+  return value;
+}
+
+function objectPrefix(value: unknown): string {
+  if (typeof value !== "string") throw new SelfhostObjectError("invalid_key");
+  return value;
+}
+
+function objectDelimiter(value: unknown): string {
+  if (typeof value !== "string" || value.length < 1 || value.length > 16) {
+    throw new SelfhostObjectError("backend_unavailable");
+  }
+  return value;
+}
+
+function objectCursor(value: unknown): string {
+  if (typeof value !== "string") throw new SelfhostObjectError("invalid_cursor");
+  return value;
+}
+
+function objectLimit(value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > 1_000) {
+    throw new SelfhostObjectError("backend_unavailable");
+  }
+  return value as number;
+}
+
+function objectEtag(value: unknown): string {
+  if (typeof value !== "string" || value.length < 1 || value.length > 1_024) {
+    throw new SelfhostObjectError("backend_unavailable");
+  }
+  return value;
+}
+
+function objectAny(value: unknown): "*" {
+  if (value !== "*") throw new SelfhostObjectError("backend_unavailable");
+  return "*";
+}
+
+function objectContentType(value: unknown): string {
+  if (typeof value !== "string" || value.length < 1 || value.length > 1_024) {
+    throw new SelfhostObjectError("backend_unavailable");
+  }
+  return value;
+}
+
+function objectLength(value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new SelfhostObjectError("invalid_body");
+  }
+  return value as number;
+}
+
+function objectUploadId(value: unknown): string {
+  if (typeof value !== "string" || value.length < 1 || value.length > 256) {
+    throw new SelfhostObjectError("upload_not_found");
+  }
+  return value;
+}
+
+function objectPartNumber(value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > 10_000) {
+    throw new SelfhostObjectError("upload_not_found");
+  }
+  return value as number;
+}
+
+function objectParts(
+  value: unknown,
+): readonly { readonly etag: string; readonly partNumber: number }[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 10_000) {
+    throw new SelfhostObjectError("invalid_part");
+  }
+  return value.map((entry) => {
+    const part = record(entry);
+    if (
+      !part ||
+      Object.keys(part).sort().join(",") !== "etag,partNumber" ||
+      typeof part.etag !== "string" ||
+      part.etag.length < 1 ||
+      part.etag.length > 1_024 ||
+      !Number.isSafeInteger(part.partNumber) ||
+      (part.partNumber as number) < 1 ||
+      (part.partNumber as number) > 10_000
+    ) {
+      throw new SelfhostObjectError("invalid_part");
+    }
+    return { etag: part.etag, partNumber: part.partNumber as number };
+  });
+}
+
+function objectRange(value: unknown): { readonly offset: number; readonly length?: number } {
+  const range = record(value);
+  if (
+    !range ||
+    !Number.isSafeInteger(range.offset) ||
+    (range.offset as number) < 0 ||
+    Object.keys(range).some((key) => key !== "offset" && key !== "length") ||
+    (range.length !== undefined &&
+      (!Number.isSafeInteger(range.length) || (range.length as number) < 1))
+  ) {
+    throw new SelfhostObjectError("range_not_satisfiable");
+  }
+  return {
+    offset: range.offset as number,
+    ...(range.length === undefined ? {} : { length: range.length as number }),
+  };
 }

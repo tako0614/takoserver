@@ -1,7 +1,12 @@
 import {
+  MAX_SELFHOST_OBJECT_DOCUMENT_BYTES,
   SELFHOST_DATA_PLANE_CONTENT_TYPE,
   SELFHOST_DATA_PLANE_KV_PATH,
   SELFHOST_DATA_PLANE_MAX_RESPONSE_BYTES,
+  SELFHOST_DATA_PLANE_OBJECT_CONTENT_TYPE,
+  SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER,
+  SELFHOST_DATA_PLANE_OBJECT_RESULT_HEADER,
+  SELFHOST_DATA_PLANE_OBJECTS_PATH,
   SELFHOST_DATA_PLANE_ORIGIN,
   SELFHOST_DATA_PLANE_QUEUE_PATH,
   SELFHOST_DATA_PLANE_SQL_PATH,
@@ -29,6 +34,14 @@ import {
  *
  * The source is a constant. Nothing a tenant declares reaches it, which is what
  * makes it safe for this module to be the one holding the secret.
+ *
+ * The object route is the one that does not buffer. An object is up to 5 GiB
+ * and reading one into an isolate to hand it on would be a ceiling nobody
+ * asked for, so its body streams through in both directions and the operation
+ * travels as one header this module copies verbatim and bounds. Copying is not
+ * forwarding: the method, the URL, the credential, and every other header are
+ * still this module's, and the one header that does cross is opaque to it and
+ * validated field by field by the plane behind.
  */
 
 /** Module name the generated data service is published under. */
@@ -46,6 +59,12 @@ export const SELFHOST_WORKER_DATA_PLANE_BINDING = "__TAKOSERVER_SELFHOST_DATA_PL
  */
 export function selfhostDataServiceSource(): string {
   return `const KV_PATH = ${JSON.stringify(SELFHOST_DATA_PLANE_KV_PATH)};
+const OBJECTS_PATH = ${JSON.stringify(SELFHOST_DATA_PLANE_OBJECTS_PATH)};
+const OBJECTS_URL = ${JSON.stringify(`${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_OBJECTS_PATH}`)};
+const OBJECT_REQUEST_HEADER = ${JSON.stringify(SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER)};
+const OBJECT_RESULT_HEADER = ${JSON.stringify(SELFHOST_DATA_PLANE_OBJECT_RESULT_HEADER)};
+const OBJECT_CONTENT_TYPE = ${JSON.stringify(SELFHOST_DATA_PLANE_OBJECT_CONTENT_TYPE)};
+const MAX_OBJECT_DOCUMENT_BYTES = ${MAX_SELFHOST_OBJECT_DOCUMENT_BYTES};
 const SQL_PATH = ${JSON.stringify(SELFHOST_DATA_PLANE_SQL_PATH)};
 const QUEUE_PATH = ${JSON.stringify(SELFHOST_DATA_PLANE_QUEUE_PATH)};
 const KV_URL = ${JSON.stringify(`${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_KV_PATH}`)};
@@ -67,11 +86,82 @@ function refuse(status) {
   });
 }
 
+/**
+ * The object route: one method, one URL, one credential, one copied header.
+ *
+ * The body is never read here. A 5 GiB object would otherwise have to fit in an
+ * isolate twice over, and there is nothing this module could learn from the
+ * bytes anyway — the operation is entirely in the header, which the plane
+ * behind validates field by field.
+ */
+async function objects(request, env) {
+  if (request.method !== "POST") return refuse(404);
+  const token = env[TOKEN];
+  const plane = env[PLANE];
+  if (typeof token !== "string" || token.length === 0 || !plane) return refuse(503);
+  const document = request.headers.get(OBJECT_REQUEST_HEADER);
+  if (
+    typeof document !== "string" ||
+    document.length === 0 ||
+    document.length > MAX_OBJECT_DOCUMENT_BYTES
+  ) {
+    return refuse(400);
+  }
+  const headers = {
+    authorization: "Bearer " + token,
+    "content-type": OBJECT_CONTENT_TYPE,
+  };
+  headers[OBJECT_REQUEST_HEADER] = document;
+  let response;
+  try {
+    const init = { method: "POST", headers };
+    if (request.body) {
+      init.body = request.body;
+      // workerd needs to be told the body is a stream it may forward without
+      // knowing the length, which is exactly what an object body is.
+      init.duplex = "half";
+    }
+    response = await plane.fetch(OBJECTS_URL, init);
+  } catch {
+    return refuse(502);
+  }
+  if (response.headers.get("content-type") !== OBJECT_CONTENT_TYPE) {
+    // The closed JSON envelope, read under the ordinary ceiling. Nothing else
+    // this plane could answer with is something a tenant may see.
+    let text;
+    try {
+      text = await response.text();
+    } catch {
+      return refuse(502);
+    }
+    if (text.length > MAX_BYTES) return refuse(502);
+    return new Response(text, {
+      status: response.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const result = response.headers.get(OBJECT_RESULT_HEADER);
+  if (typeof result !== "string" || result.length === 0 || result.length > MAX_OBJECT_DOCUMENT_BYTES) {
+    return refuse(502);
+  }
+  // Two headers and the bytes. Every other header the plane set is this Host's
+  // business rather than the tenant's.
+  const answer = { "content-type": OBJECT_CONTENT_TYPE };
+  answer[OBJECT_RESULT_HEADER] = result;
+  return new Response(response.body, { status: response.status, headers: answer });
+}
+
 export default {
   async fetch(request, env) {
+    let pathname = null;
+    try {
+      pathname = new URL(request.url).pathname;
+    } catch {
+      return refuse(404);
+    }
+    if (pathname === OBJECTS_PATH) return await objects(request, env);
     let target = null;
     try {
-      const pathname = new URL(request.url).pathname;
       target =
         pathname === KV_PATH
           ? KV_URL

@@ -48,7 +48,12 @@ const FORMAT_V2 = "takoserver.selfhost-version-bindings@v2";
  */
 const FORMAT_V3 = "takoserver.selfhost-version-bindings@v3";
 
-export const SELFHOST_VERSION_DATA_BINDING_KINDS = ["edge.kv", "edge.queue", "edge.sql"] as const;
+export const SELFHOST_VERSION_DATA_BINDING_KINDS = [
+  "edge.kv",
+  "edge.objects",
+  "edge.queue",
+  "edge.sql",
+] as const;
 export type SelfhostVersionDataBindingKind = (typeof SELFHOST_VERSION_DATA_BINDING_KINDS)[number];
 
 export const SELFHOST_WORKER_HANDLER_NAMES = ["fetch", "queue", "scheduled"] as const;
@@ -66,11 +71,12 @@ export interface SelfhostVersionBinding {
 }
 
 /**
- * One `kvBindings` or `sqliteBindings` entry, resolved to what it addresses.
+ * One `kvBindings`, `bucketBindings`, `queueProducerBindings`, or
+ * `sqliteBindings` entry, resolved to what it addresses.
  *
- * `target` is the namespace id, queue id, or database name this Host derived
- * for the related Resource, never a customer string and never a filesystem
- * path. The
+ * `target` is the namespace id, bucket incarnation, queue id, or database name
+ * this Host derived for the related Resource, never a customer string and never
+ * a filesystem path. The
  * Worker never sees it: it addresses its own binding by name and the data plane
  * resolves the name through this record, so a Worker cannot reach a namespace
  * its Version did not declare.
@@ -427,7 +433,10 @@ function normalizeDataPlane(plane: SelfhostVersionDataPlane): SelfhostVersionDat
     throw new SelfhostVersionBindingStoreError("corrupt");
   }
   const bindings = [...plane.bindings].sort((left, right) => (left?.name < right?.name ? -1 : 1));
-  if (bindings.length === 0 || bindings.length > 3 * MAX_DATA_BINDINGS) {
+  if (
+    bindings.length === 0 ||
+    bindings.length > SELFHOST_VERSION_DATA_BINDING_KINDS.length * MAX_DATA_BINDINGS
+  ) {
     throw new SelfhostVersionBindingStoreError("corrupt");
   }
   for (const binding of bindings) {

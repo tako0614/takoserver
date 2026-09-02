@@ -1,15 +1,22 @@
 import { expect, test } from "bun:test";
+import { Buffer } from "node:buffer";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   SELFHOST_DATA_PLANE_KV_PATH,
+  SELFHOST_DATA_PLANE_OBJECT_CONTENT_TYPE,
+  SELFHOST_DATA_PLANE_OBJECT_PROTOCOL,
+  SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER,
+  SELFHOST_DATA_PLANE_OBJECT_RESULT_HEADER,
+  SELFHOST_DATA_PLANE_OBJECTS_PATH,
   SELFHOST_DATA_PLANE_PROTOCOL,
   SELFHOST_DATA_PLANE_SQL_PATH,
   SELFHOST_WORKER_DATA_SERVICE_BINDING,
   SELFHOST_WORKER_DATA_TOKEN_BINDING,
   SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
+  SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND,
   SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
   SELFHOST_WORKER_READINESS_HEADER,
   SELFHOST_WORKER_READINESS_PATH,
@@ -471,4 +478,243 @@ test("a main module that escapes its own directory is refused at generation", ()
   expect(() =>
     selfhostWorkerEntrypointSource({ ...KV_ONLY, originalMainModule: "../secrets.js" }),
   ).toThrow("originalMainModule is invalid");
+});
+
+/**
+ * The object facade is the one that streams, so it has a caller of its own:
+ * the operation travels base64url in a header and the bytes travel as the body.
+ * What is worth proving from the tenant's side is that the surface is the exact
+ * one the managed wrapper projects — nine methods, the same option names, the
+ * same closed error names — and that the wire underneath is the one this Host's
+ * own plane parses.
+ */
+function objectPlane(answers: readonly (Record<string, unknown> | Uint8Array)[]): {
+  readonly service: { fetch(url: string, init: RequestInit): Promise<Response> };
+  readonly calls: { url: string; document: Record<string, unknown>; body: string }[];
+} {
+  const calls: { url: string; document: Record<string, unknown>; body: string }[] = [];
+  let index = 0;
+  return {
+    calls,
+    service: {
+      async fetch(url, init) {
+        const headers = init.headers as Record<string, string>;
+        const raw = headers[SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER] as string;
+        const document = JSON.parse(
+          new TextDecoder().decode(
+            Buffer.from(raw.replaceAll("-", "+").replaceAll("_", "/"), "base64"),
+          ),
+        ) as Record<string, unknown>;
+        const body = init.body === undefined ? "" : await new Response(init.body).text();
+        calls.push({ url, document, body });
+        const answer = answers[index] ?? { ok: false, error: { code: "backend_unavailable" } };
+        index += 1;
+        if (answer instanceof Uint8Array) {
+          const metadata = Buffer.from(
+            new TextEncoder().encode(
+              JSON.stringify({ etag: "etag-1", size: answer.byteLength, partial: false }),
+            ),
+          )
+            .toString("base64")
+            .replaceAll("+", "-")
+            .replaceAll("/", "_")
+            .replace(/=+$/u, "");
+          return new Response(answer as unknown as BodyInit, {
+            status: 200,
+            headers: {
+              "content-type": SELFHOST_DATA_PLANE_OBJECT_CONTENT_TYPE,
+              [SELFHOST_DATA_PLANE_OBJECT_RESULT_HEADER]: metadata,
+            },
+          });
+        }
+        return new Response(JSON.stringify(answer), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    },
+  };
+}
+
+const OBJECTS_ONLY: SelfhostWorkerEntrypointSourceInput = {
+  originalMainModule: "index.js",
+  publication: "sw1.v1",
+  declaredHandlers: ["fetch"],
+  bindings: [{ kind: SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND, publicName: "MEDIA" }],
+};
+
+test("the edge.objects facade offers exactly the nine methods the Binding fixes", async () => {
+  const { service } = objectPlane([]);
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       return Response.json(Object.keys(env.MEDIA).sort());
+     } };`,
+    OBJECTS_ONLY,
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(await response.json()).toEqual([
+      "abortMultipartUpload",
+      "completeMultipartUpload",
+      "createMultipartUpload",
+      "delete",
+      "get",
+      "head",
+      "list",
+      "put",
+      "uploadPart",
+    ]);
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("a put sends the bytes as the body and the operation as one header", async () => {
+  const { service, calls } = objectPlane([
+    { ok: true, value: { etag: "etag-1", size: 5 } },
+    new TextEncoder().encode("bytes"),
+  ]);
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       const written = await env.MEDIA.put("poster.png", "bytes", { contentType: "image/png" });
+       const got = await env.MEDIA.get("poster.png");
+       return Response.json({
+         written,
+         etag: got.etag,
+         partial: got.partial,
+         body: await new Response(got.body).text(),
+       });
+     } };`,
+    OBJECTS_ONLY,
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(await response.json()).toEqual({
+      written: { etag: "etag-1", size: 5 },
+      etag: "etag-1",
+      partial: false,
+      body: "bytes",
+    });
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.url).toEndWith(SELFHOST_DATA_PLANE_OBJECTS_PATH);
+    expect(calls[0]?.document).toEqual({
+      protocol: SELFHOST_DATA_PLANE_OBJECT_PROTOCOL,
+      binding: "MEDIA",
+      op: "put",
+      key: "poster.png",
+      contentLength: 5,
+      contentType: "image/png",
+    });
+    // The bytes are the body, not a base64 field of the document.
+    expect(calls[0]?.body).toBe("bytes");
+    expect(calls[1]?.document).toEqual({
+      protocol: SELFHOST_DATA_PLANE_OBJECT_PROTOCOL,
+      binding: "MEDIA",
+      op: "get",
+      key: "poster.png",
+    });
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("the facade holds the exact edge.objects ceilings and error vocabulary", async () => {
+  const { service } = objectPlane([
+    { ok: false, error: { code: "precondition_failed" } },
+    { ok: true, value: { found: false } },
+  ]);
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       const attempts = {};
+       const record = async (name, run) => {
+         try { attempts[name] = await run(); }
+         catch (error) { attempts[name] = error.name; }
+       };
+       await record("longKey", () => env.MEDIA.head("k".repeat(980)));
+       // A stream declares its length rather than carrying it, so this is the
+       // one shape where a body can be too large without being wrong.
+       const empty = () => new ReadableStream({ start(controller) { controller.close(); } });
+       await record("hugePut", () => env.MEDIA.put("k", empty(), { contentLength: 314572801 }));
+       await record("wrongPutLength", () => env.MEDIA.put("k", "x", { contentLength: 314572801 }));
+       await record("wrongLength", () => env.MEDIA.put("k", "abc", { contentLength: 4 }));
+       await record("badOption", () => env.MEDIA.put("k", "x", { nope: 1 }));
+       await record("bothConditions", () =>
+         env.MEDIA.put("k", "x", { ifMatch: "a", ifNoneMatch: "*" }));
+       await record("badPartNumber", () => env.MEDIA.uploadPart("k", "u", 0, "x"));
+       await record("unorderedParts", () =>
+         env.MEDIA.completeMultipartUpload("k", "u", [
+           { etag: "b", partNumber: 2 },
+           { etag: "a", partNumber: 1 },
+         ]));
+       await record("refused", () => env.MEDIA.put("k", "x", { ifNoneMatch: "*" }));
+       await record("absent", () => env.MEDIA.head("gone"));
+       return Response.json(attempts);
+     } };`,
+    OBJECTS_ONLY,
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(await response.json()).toEqual({
+      longKey: "invalid_key",
+      hugePut: "value_too_large",
+      wrongPutLength: "invalid_body",
+      wrongLength: "invalid_body",
+      badOption: "TypeError",
+      bothConditions: "TypeError",
+      badPartNumber: "TypeError",
+      unorderedParts: "invalid_part",
+      refused: "precondition_failed",
+      absent: null,
+    });
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("a multipart complete is refused against the receipts this isolate holds", async () => {
+  const { service } = objectPlane([
+    { ok: true, value: { uploadId: "upload-1" } },
+    { ok: true, value: { etag: "part-1", partNumber: 1 } },
+  ]);
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       const created = await env.MEDIA.createMultipartUpload("film");
+       const part = await env.MEDIA.uploadPart("film", created.uploadId, 1, "small");
+       let refused = null;
+       try {
+         await env.MEDIA.completeMultipartUpload("film", created.uploadId, [
+           { etag: part.etag, partNumber: 1 },
+           { etag: "unknown", partNumber: 2 },
+         ]);
+       } catch (error) { refused = error.name; }
+       return Response.json({ uploadId: created.uploadId, part, refused });
+     } };`,
+    OBJECTS_ONLY,
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(await response.json()).toEqual({
+      uploadId: "upload-1",
+      part: { etag: "part-1", partNumber: 1 },
+      refused: "invalid_part",
+    });
+  } finally {
+    await generated.dispose();
+  }
 });

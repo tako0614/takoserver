@@ -276,6 +276,7 @@ async function boot(
     sql,
     grant: (script, versionId) => access.grant(script, versionId),
     databasePath: (name) => access.databasePath(name),
+    objectRoot: join(root, "selfhost", "objects"),
   });
   planeServer = served;
   const dataPlaneAddress = served.address;
@@ -717,6 +718,7 @@ async function bootEvents(): Promise<{
     sql,
     grant: (script, versionId) => access.grant(script, versionId),
     databasePath: (name) => access.databasePath(name),
+    objectRoot: join(root, "selfhost", "objects"),
   });
   planeServer = served;
 

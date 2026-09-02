@@ -281,6 +281,20 @@ export interface SelfhostDataPlaneMaintenance {
   deleteQueue(queueId: string): Promise<void>;
   /** Closes and forgets the cached handle on one SQLite database. */
   forgetDatabase(name: string): void;
+  /**
+   * What one bucket still holds.
+   *
+   * Read-only, and the one question a lifecycle delete has to ask before it
+   * removes a bucket: this Host does not destroy objects a customer never
+   * asked it to, so a bucket that still holds any is refused rather than
+   * emptied.
+   */
+  objectBucketOccupancy(bucketId: string): Promise<{
+    readonly objects: number;
+    readonly uploads: number;
+  }>;
+  /** Drops every row and every file of one bucket incarnation. */
+  deleteObjectBucket(bucketId: string): Promise<void>;
   /** Reclaims expired KV rows, bounded, for the maintenance tick. */
   sweepExpiredKv(limit?: number): Promise<number>;
 }
@@ -295,6 +309,11 @@ export function selfhostVersionBindingsRoot(dataRoot: string): string {
   return join(dataRoot, "selfhost", "version-bindings");
 }
 
+/** Where it keeps the objects of every bucket incarnation it realizes. */
+export function selfhostObjectsRoot(dataRoot: string): string {
+  return join(dataRoot, "selfhost", "objects");
+}
+
 /** What one running Worker Version may reach, resolved from its own record. */
 export interface SelfhostVersionDataGrant {
   readonly secret: string;
@@ -302,6 +321,8 @@ export interface SelfhostVersionDataGrant {
   readonly sql: Readonly<Record<string, string>>;
   /** Producer bindings, with the promise each queue makes about its messages. */
   readonly queue: Readonly<Record<string, SelfhostGrantedQueue>>;
+  /** Bucket bindings, resolved to the incarnation this Host derived. */
+  readonly objects: Readonly<Record<string, string>>;
 }
 
 export interface SelfhostGrantedQueue {
@@ -434,9 +455,11 @@ export function createSelfhostDataPlaneAccess(dataRoot: string): SelfhostDataPla
         string,
         SelfhostGrantedQueue
       >;
+      const objects: Record<string, string> = Object.create(null) as Record<string, string>;
       for (const binding of plane.bindings) {
         if (binding.kind === "edge.kv") kv[binding.name] = binding.target;
         else if (binding.kind === "edge.sql") sql[binding.name] = binding.target;
+        else if (binding.kind === "edge.objects") objects[binding.name] = binding.target;
         else if (binding.queue) {
           queue[binding.name] = {
             queueId: binding.target,
@@ -445,7 +468,7 @@ export function createSelfhostDataPlaneAccess(dataRoot: string): SelfhostDataPla
           };
         }
       }
-      return { secret: stored.planeToken, kv, sql, queue };
+      return { secret: stored.planeToken, kv, sql, queue, objects };
     },
   };
 }

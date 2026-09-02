@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { Buffer } from "node:buffer";
 import { existsSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,6 +7,11 @@ import { createEphemeralSql } from "../src/compat.ts";
 import type { Sql } from "../src/ports.ts";
 import {
   SELFHOST_DATA_PLANE_KV_PATH,
+  SELFHOST_DATA_PLANE_OBJECT_CONTENT_TYPE,
+  SELFHOST_DATA_PLANE_OBJECT_PROTOCOL,
+  SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER,
+  SELFHOST_DATA_PLANE_OBJECT_RESULT_HEADER,
+  SELFHOST_DATA_PLANE_OBJECTS_PATH,
   SELFHOST_DATA_PLANE_PROTOCOL,
   SELFHOST_DATA_PLANE_QUEUE_PATH,
   SELFHOST_DATA_PLANE_SQL_PATH,
@@ -31,12 +37,14 @@ const ALPHA: SelfhostDataPlaneGrant = {
   kv: { KV: "tskv-alpha" },
   sql: { DB: "tsdb-alpha" },
   queue: { DELIVERY: { queueId: "tsq-alpha", ...QUEUE } },
+  objects: { MEDIA: `tsb-${"a".repeat(40)}` },
 };
 const BETA: SelfhostDataPlaneGrant = {
   secret: "beta-secret-value-00000",
   kv: { KV: "tskv-beta" },
   sql: { DB: "tsdb-beta" },
   queue: { DELIVERY: { queueId: "tsq-beta", ...QUEUE } },
+  objects: { MEDIA: `tsb-${"b".repeat(40)}` },
 };
 const GRANTS: Record<string, SelfhostDataPlaneGrant> = {
   "alpha\u0000v1": ALPHA,
@@ -56,6 +64,7 @@ beforeEach(() => {
     sql,
     grant: async (script, versionId) => GRANTS[`${script}\u0000${versionId}`] ?? null,
     databasePath: (name) => join(root, `${name}.sqlite`),
+    objectRoot: join(root, "objects"),
     clock: () => now,
   });
 });
@@ -803,4 +812,267 @@ test("a queue binding the version never declared is not a queue this token can n
   // And one tenant's binding name never reaches another tenant's queue.
   value((await queue({ op: "send", body: encode("mine") }, `beta.v1.${BETA.secret}`)).envelope);
   expect((await messages())[0]?.queue_id).toBe("tsq-beta");
+});
+
+// ---------------------------------------------------------------------------
+// Objects
+// ---------------------------------------------------------------------------
+
+/**
+ * The object route is the one that does not speak JSON in both directions: the
+ * operation is a header and the body is the object. What is worth proving here
+ * is that nothing about that changes the authorization model — a binding name
+ * still resolves only inside the grant the presented token carries — and that a
+ * body really does stream rather than arrive base64 inside an envelope.
+ */
+function objectRequest(
+  document: Record<string, unknown>,
+  body?: BodyInit,
+  token = `alpha.v1.${ALPHA.secret}`,
+): Request {
+  const encoded = Buffer.from(
+    new TextEncoder().encode(
+      JSON.stringify({ protocol: SELFHOST_DATA_PLANE_OBJECT_PROTOCOL, ...document }),
+    ),
+  )
+    .toString("base64")
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/u, "");
+  return new Request(`${ORIGIN}${SELFHOST_DATA_PLANE_OBJECTS_PATH}`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": SELFHOST_DATA_PLANE_OBJECT_CONTENT_TYPE,
+      [SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER]: encoded,
+    },
+    ...(body === undefined ? {} : { body }),
+  });
+}
+
+async function objects(
+  document: Record<string, unknown>,
+  body?: BodyInit,
+  token?: string,
+): Promise<Response> {
+  const request = objectRequest({ binding: "MEDIA", ...document }, body, token);
+  const response = await planes.routes(request, new URL(request.url));
+  if (!response) throw new Error("the data planes did not claim the request");
+  return response;
+}
+
+async function objectValue(
+  document: Record<string, unknown>,
+  body?: BodyInit,
+  token?: string,
+): Promise<Record<string, unknown>> {
+  const response = await objects(document, body, token);
+  expect(response.headers.get("content-type")).toContain("application/json");
+  return value((await response.json()) as Record<string, unknown>);
+}
+
+function objectResult(response: Response): Record<string, unknown> {
+  const raw = response.headers.get(SELFHOST_DATA_PLANE_OBJECT_RESULT_HEADER) as string;
+  const padded = raw.replaceAll("-", "+").replaceAll("_", "/");
+  return JSON.parse(new TextDecoder().decode(Buffer.from(padded, "base64"))) as Record<
+    string,
+    unknown
+  >;
+}
+
+test("an object crosses as bytes and comes back as bytes with its metadata in a header", async () => {
+  const written = await objectValue(
+    { op: "put", key: "poster.png", contentLength: 5, contentType: "image/png" },
+    "bytes",
+  );
+  expect(written).toEqual({ etag: expect.any(String), size: 5 });
+
+  const head = await objectValue({ op: "head", key: "poster.png" });
+  expect(head).toEqual({
+    found: true,
+    etag: written.etag,
+    size: 5,
+    contentType: "image/png",
+    uploadedAtMillis: now.getTime(),
+  });
+
+  const got = await objects({ op: "get", key: "poster.png" });
+  expect(got.headers.get("content-type")).toBe(SELFHOST_DATA_PLANE_OBJECT_CONTENT_TYPE);
+  expect(objectResult(got)).toEqual({
+    etag: written.etag,
+    size: 5,
+    contentType: "image/png",
+    partial: false,
+  });
+  expect(await got.text()).toBe("bytes");
+
+  const ranged = await objects({ op: "get", key: "poster.png", range: { offset: 1, length: 3 } });
+  expect(objectResult(ranged)).toMatchObject({ partial: true, range: { offset: 1, length: 3 } });
+  expect(await ranged.text()).toBe("yte");
+
+  expect(await objectValue({ op: "head", key: "absent" })).toEqual({ found: false });
+  const missing = await objects({ op: "get", key: "absent" });
+  expect(missing.headers.get("content-type")).toContain("application/json");
+  expect(await missing.json()).toEqual({ ok: true, value: { found: false } });
+});
+
+test("a large body streams rather than arriving inside an envelope", async () => {
+  // Eight megabytes is comfortably past anything a JSON envelope on this seam
+  // would carry, and it is delivered as a stream with no declared framing.
+  const size = 8 * 1024 * 1024;
+  const chunk = new Uint8Array(64 * 1024).fill(65);
+  let sent = 0;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (sent >= size) {
+        controller.close();
+        return;
+      }
+      sent += chunk.byteLength;
+      controller.enqueue(chunk);
+    },
+  });
+  const written = await objectValue(
+    { op: "put", key: "big", contentLength: size },
+    body as unknown as BodyInit,
+  );
+  expect(written.size).toBe(size);
+  const tail = await objects({ op: "get", key: "big", range: { offset: size - 4, length: 4 } });
+  expect(await tail.text()).toBe("AAAA");
+});
+
+test("a body that is not the declared length is refused and stores nothing", async () => {
+  const response = await objects({ op: "put", key: "short", contentLength: 99 }, "abc");
+  expect(await response.json()).toEqual({ ok: false, error: { code: "invalid_body" } });
+  expect(await objectValue({ op: "head", key: "short" })).toEqual({ found: false });
+});
+
+test("conditional writes and reads answer with the closed error vocabulary", async () => {
+  const first = await objectValue({ op: "put", key: "c", contentLength: 3 }, "one");
+  const clash = await objects({ op: "put", key: "c", contentLength: 3, ifNoneMatch: "*" }, "two");
+  expect(await clash.json()).toEqual({ ok: false, error: { code: "precondition_failed" } });
+  const stale = await objects({ op: "put", key: "c", contentLength: 3, ifMatch: "no" }, "two");
+  expect(await stale.json()).toEqual({ ok: false, error: { code: "precondition_failed" } });
+  await objectValue({ op: "put", key: "c", contentLength: 3, ifMatch: first.etag }, "two");
+  const conditional = await objects({ op: "get", key: "c", ifMatch: first.etag as string });
+  expect(await conditional.json()).toEqual({
+    ok: false,
+    error: { code: "precondition_failed" },
+  });
+  const past = await objects({ op: "get", key: "c", range: { offset: 99 } });
+  expect(await past.json()).toEqual({ ok: false, error: { code: "range_not_satisfiable" } });
+});
+
+test("a multipart upload completes through the plane and lists what it wrote", async () => {
+  const created = await objectValue({
+    op: "createMultipartUpload",
+    key: "film",
+    contentType: "video/mp4",
+  });
+  const size = 5 * 1024 * 1024;
+  const one = await objectValue(
+    {
+      op: "uploadPart",
+      key: "film",
+      uploadId: created.uploadId,
+      partNumber: 1,
+      contentLength: size,
+    },
+    new Uint8Array(size).fill(97),
+  );
+  const two = await objectValue(
+    { op: "uploadPart", key: "film", uploadId: created.uploadId, partNumber: 2, contentLength: 3 },
+    "end",
+  );
+  const short = await objects({
+    op: "completeMultipartUpload",
+    key: "film",
+    uploadId: created.uploadId,
+    parts: [
+      { etag: two.etag, partNumber: 2 },
+      { etag: one.etag, partNumber: 1 },
+    ],
+  });
+  expect(await short.json()).toEqual({ ok: false, error: { code: "invalid_part" } });
+  const completed = await objectValue({
+    op: "completeMultipartUpload",
+    key: "film",
+    uploadId: created.uploadId,
+    parts: [
+      { etag: one.etag, partNumber: 1 },
+      { etag: two.etag, partNumber: 2 },
+    ],
+  });
+  expect(completed.size).toBe(size + 3);
+
+  const listed = await objectValue({ op: "list", prefix: "f" });
+  expect((listed.objects as { key: string }[]).map((object) => object.key)).toEqual(["film"]);
+  expect(listed.truncated).toBe(false);
+
+  const aborted = await objectValue({ op: "createMultipartUpload", key: "gone" });
+  await objectValue({ op: "abortMultipartUpload", key: "gone", uploadId: aborted.uploadId });
+  const spent = await objects({
+    op: "abortMultipartUpload",
+    key: "gone",
+    uploadId: aborted.uploadId,
+  });
+  expect(await spent.json()).toEqual({ ok: false, error: { code: "upload_not_found" } });
+});
+
+test("a bucket binding the version never declared is not a bucket this token can name", async () => {
+  const foreign = await objects({ binding: "OTHER", op: "head", key: "k" } as never);
+  expect(foreign.status).toBe(404);
+  expect(await foreign.json()).toEqual({ ok: false, error: { code: "backend_unavailable" } });
+
+  // One tenant's binding name never reaches another tenant's bucket.
+  await objectValue({ op: "put", key: "shared", contentLength: 5 }, "alpha");
+  await objectValue(
+    { op: "put", key: "shared", contentLength: 4 },
+    "beta",
+    `beta.v1.${BETA.secret}`,
+  );
+  const mine = await objects({ op: "get", key: "shared" });
+  expect(await mine.text()).toBe("alpha");
+  const theirs = await objects({ op: "get", key: "shared" }, undefined, `beta.v1.${BETA.secret}`);
+  expect(await theirs.text()).toBe("beta");
+});
+
+test("the object route refuses an unauthenticated caller before it reads a byte", async () => {
+  const request = new Request(`${ORIGIN}${SELFHOST_DATA_PLANE_OBJECTS_PATH}`, {
+    method: "POST",
+    headers: { [SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER]: "x" },
+    body: "bytes",
+  });
+  const response = await planes.routes(request, new URL(request.url));
+  expect(response?.status).toBe(401);
+  expect(await response?.json()).toEqual({ ok: false, error: { code: "backend_unavailable" } });
+
+  const wrongMethod = new Request(`${ORIGIN}${SELFHOST_DATA_PLANE_OBJECTS_PATH}`, {
+    method: "GET",
+  });
+  expect((await planes.routes(wrongMethod, new URL(wrongMethod.url)))?.status).toBe(405);
+});
+
+test("an operation document this Host did not write is refused whole", async () => {
+  for (const document of [
+    { op: "put", key: "k" },
+    { op: "get" },
+    { op: "head", key: "k", uploadId: "x" },
+    { op: "nope", key: "k" },
+    { op: "head", key: 7 },
+  ]) {
+    const response = await objects(document as Record<string, unknown>);
+    expect(response.status).toBe(200);
+    const envelope = (await response.json()) as { ok: boolean; error?: { code: string } };
+    expect(envelope.ok).toBe(false);
+  }
+  const raw = new Request(`${ORIGIN}${SELFHOST_DATA_PLANE_OBJECTS_PATH}`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer alpha.v1.${ALPHA.secret}`,
+      [SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER]: "not base64url!!",
+    },
+  });
+  const response = await planes.routes(raw, new URL(raw.url));
+  expect(await response?.json()).toEqual({ ok: false, error: { code: "backend_unavailable" } });
 });

@@ -74,6 +74,16 @@ export type SelfhostWorkerHandlerName = (typeof SELFHOST_WORKER_HANDLER_NAMES)[n
 
 export const SELFHOST_WORKER_EDGE_KV_BINDING_KIND = "edge.kv@1.0.0" as const;
 export const SELFHOST_WORKER_EDGE_SQL_BINDING_KIND = "edge.sql@1.0.0" as const;
+/**
+ * The exact Binding a `bucketBindings` declaration projects.
+ *
+ * Byte for byte the surface the managed Cloudflare wrapper projects over a
+ * native `r2_bucket`: same nine methods, same option names, same error names,
+ * same ceilings. What differs is only what is behind it — this Host's own
+ * object plane rather than R2 — which is precisely what ADR 0005 says a
+ * Binding facade is allowed to differ in.
+ */
+export const SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND = "edge.objects@1.0.0" as const;
 
 /** Names reserved for this Host; a public binding may never start with it. */
 export const SELFHOST_WORKER_INTERNAL_BINDING_PREFIX = "__TAKOSERVER_" as const;
@@ -119,6 +129,33 @@ export const SELFHOST_DATA_PLANE_KV_PATH = `${SELFHOST_DATA_PLANE_PATH_PREFIX}/k
 export const SELFHOST_DATA_PLANE_SQL_PATH = `${SELFHOST_DATA_PLANE_PATH_PREFIX}/sql` as const;
 /** Where the `edge.queue` producer facade sends what a Worker accepted. */
 export const SELFHOST_DATA_PLANE_QUEUE_PATH = `${SELFHOST_DATA_PLANE_PATH_PREFIX}/queue` as const;
+/**
+ * Where an object body crosses, and why it is not one of the three above.
+ *
+ * A KV value, a SQL row, and a queue message are small enough to be JSON. An
+ * object is up to 5 GiB, and base64 inside a JSON envelope would mean holding
+ * a third of a gigabyte in an isolate to write a hundred megabytes. So this
+ * route carries the bytes as the body and the operation as one header, in both
+ * directions, and nothing on it is ever buffered whole.
+ */
+export const SELFHOST_DATA_PLANE_OBJECTS_PATH =
+  `${SELFHOST_DATA_PLANE_PATH_PREFIX}/objects` as const;
+export const SELFHOST_DATA_PLANE_OBJECT_PROTOCOL = "takoserver.selfhost-object@v1" as const;
+/** Base64url of the operation document, on the request. */
+export const SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER = "x-takoserver-selfhost-object" as const;
+/** Base64url of the object's own metadata, on a body-bearing answer. */
+export const SELFHOST_DATA_PLANE_OBJECT_RESULT_HEADER =
+  "x-takoserver-selfhost-object-result" as const;
+export const SELFHOST_DATA_PLANE_OBJECT_CONTENT_TYPE = "application/octet-stream" as const;
+/**
+ * The ceiling on either header.
+ *
+ * A key is at most 979 bytes and a content type 256 code points, so the whole
+ * document fits several times over; the bound exists so a caller cannot make
+ * this Host parse an arbitrary header before it has decided anything.
+ */
+export const MAX_SELFHOST_OBJECT_DOCUMENT_BYTES = 8_192;
+
 export const SELFHOST_DATA_PLANE_PROTOCOL = "takoserver.selfhost-data@v1" as const;
 export const SELFHOST_DATA_PLANE_CONTENT_TYPE =
   "application/vnd.takoserver.selfhost-data.v1+json" as const;
@@ -154,6 +191,7 @@ export interface SelfhostWorkerNativeBindingDescriptor {
 export interface SelfhostWorkerDataBindingDescriptor {
   readonly kind:
     | typeof SELFHOST_WORKER_EDGE_KV_BINDING_KIND
+    | typeof SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND
     | typeof SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND
     | typeof SELFHOST_WORKER_EDGE_SQL_BINDING_KIND;
   readonly publicName: string;
@@ -204,6 +242,7 @@ const VARIABLE_NAME = /^[A-Za-z][A-Za-z0-9._-]*$/u;
 const NATIVE_BINDING_TYPES = new Set(["plain_text", "json", "secret_text"]);
 const DATA_BINDING_KINDS = new Set<string>([
   SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
+  SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND,
   SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND,
   SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
 ]);
@@ -301,6 +340,13 @@ const PROTOCOL = ${JSON.stringify(SELFHOST_DATA_PLANE_PROTOCOL)};
 const CONTENT_TYPE = ${JSON.stringify(SELFHOST_DATA_PLANE_CONTENT_TYPE)};
 const MAX_RESPONSE_BYTES = ${SELFHOST_DATA_PLANE_MAX_RESPONSE_BYTES};
 const QUEUE_URL = ${JSON.stringify(`${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_QUEUE_PATH}`)};
+const OBJECTS_URL = ${JSON.stringify(`${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_OBJECTS_PATH}`)};
+const OBJECT_PROTOCOL = ${JSON.stringify(SELFHOST_DATA_PLANE_OBJECT_PROTOCOL)};
+const OBJECT_REQUEST_HEADER = ${JSON.stringify(SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER)};
+const OBJECT_RESULT_HEADER = ${JSON.stringify(SELFHOST_DATA_PLANE_OBJECT_RESULT_HEADER)};
+const OBJECT_CONTENT_TYPE = ${JSON.stringify(SELFHOST_DATA_PLANE_OBJECT_CONTENT_TYPE)};
+const OBJECTS_KIND = ${JSON.stringify(SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND)};
+const MAX_OBJECT_DOCUMENT_BYTES = ${MAX_SELFHOST_OBJECT_DOCUMENT_BYTES};
 const EVENT_PATH = ${JSON.stringify(SELFHOST_WORKER_EVENT_PATH)};
 const EVENT_PROTOCOL = ${JSON.stringify(SELFHOST_WORKER_EVENT_PROTOCOL)};
 const EVENT_CONTENT_TYPE = ${JSON.stringify(SELFHOST_WORKER_EVENT_CONTENT_TYPE)};
@@ -328,6 +374,7 @@ const SafeMap = Map;
 const SafeMapGet = Map.prototype.get;
 const SafeMapHas = Map.prototype.has;
 const SafeMapSet = Map.prototype.set;
+const SafeMapDelete = Map.prototype.delete;
 const SafeMathAbs = Math.abs;
 const SafeMathMin = Math.min;
 const SafeNumberIsFinite = Number.isFinite;
@@ -346,8 +393,15 @@ const SafePromise = Promise;
 const SafePromiseResolve = Promise.resolve;
 const SafePromiseThen = Promise.prototype.then;
 const SafeRegExpTest = RegExp.prototype.test;
+const SafeReadableStream = ReadableStream;
+const SafeReadableStreamControllerClose = ReadableStreamDefaultController.prototype.close;
+const SafeReadableStreamControllerEnqueue = ReadableStreamDefaultController.prototype.enqueue;
 const SafeResponse = Response;
 const SafeResponseText = Response.prototype.text;
+const SafeResponseBodyGet = captureGetter(Response.prototype, "body");
+const SafeResponseHeadersGet = captureGetter(Response.prototype, "headers");
+const SafeResponseStatusGet = captureGetter(Response.prototype, "status");
+const SafeStringCharCodeAt = String.prototype.charCodeAt;
 const SafeURL = URL;
 const SafeHeadersGet = Headers.prototype.get;
 const SafeRequestText = Request.prototype.text;
@@ -370,6 +424,7 @@ const SafeTypedArrayByteLengthGet = captureGetter(Uint8Array.prototype, "byteLen
 const SafeTypedArrayByteOffsetGet = captureGetter(Uint8Array.prototype, "byteOffset");
 
 const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
+const BASE64URL_PATTERN = /^[A-Za-z0-9_-]*$/u;
 const MAX_KV_KEY_BYTES = 467;
 const MAX_KV_VALUE_BYTES = 26214400;
 const MAX_KV_METADATA_BYTES = 1024;
@@ -390,6 +445,22 @@ const KV_ERROR_CODES = [
   "invalid_cursor",
   "value_too_large",
   "metadata_too_large",
+  "backend_unavailable",
+];
+const MAX_OBJECT_KEY_BYTES = 979;
+const MAX_OBJECT_BYTES = 5368709120;
+const MAX_OBJECT_SINGLE_PUT_BYTES = 314572800;
+const MAX_OBJECT_PARTS = 10000;
+const MIN_OBJECT_NON_FINAL_PART_BYTES = 5242880;
+const OBJECT_ERROR_CODES = [
+  "invalid_key",
+  "invalid_body",
+  "value_too_large",
+  "precondition_failed",
+  "range_not_satisfiable",
+  "invalid_cursor",
+  "invalid_part",
+  "upload_not_found",
   "backend_unavailable",
 ];
 const QUEUE_ERROR_CODES = [
@@ -557,9 +628,17 @@ function projectEnv(rawEnv) {
     if (SafeObjectHasOwn(rawEnv, name)) projected[name] = rawEnv[name];
   }
   let call;
+  let objectCall;
   for (let index = 0; index < CONFIGURATION.bindings.length; index += 1) {
     const descriptor = CONFIGURATION.bindings[index];
     if (SafeObjectHasOwn(descriptor, "kind")) {
+      // The object facade streams, so it has a caller of its own: everything
+      // else on this seam is one JSON envelope in and one out.
+      if (descriptor.kind === OBJECTS_KIND) {
+        if (!objectCall) objectCall = createObjectCaller(rawEnv);
+        projected[descriptor.publicName] = createObjectsAdapter(objectCall, descriptor.publicName);
+        continue;
+      }
       if (!call) call = createPlaneCaller(rawEnv);
       projected[descriptor.publicName] =
         descriptor.kind === ${JSON.stringify(SELFHOST_WORKER_EDGE_KV_BINDING_KIND)}
@@ -878,6 +957,784 @@ function validateQueueSendOptions(options) {
   const result = SafeObjectCreate(null);
   result.delaySeconds = options.delaySeconds;
   return result;
+}
+
+/**
+ * edge.objects@1.0.0, byte for byte the surface the managed wrapper projects.
+ *
+ * Same nine methods, same option names, same closed error vocabulary, same
+ * ceilings — 979-byte keys, 5 GiB objects, 300 MiB single put, 10 000 parts, a
+ * 5 MiB floor on every part but the last. What is different is only what is
+ * behind it: a plane on this machine rather than a native R2 binding.
+ *
+ * The in-isolate part ledger is here for the same reason the managed one has
+ * it, and it is deliberately NOT the authority: this Host's plane records every
+ * part durably and validates a complete against those rows, so an eviction
+ * between createMultipartUpload and completeMultipartUpload costs nothing. That
+ * is the difference ADR 0007 names between the two runtimes.
+ */
+function createObjectsAdapter(call, binding) {
+  const multipart = new SafeMap();
+  const portable = SafeObjectCreate(null);
+  portable.head = async function (key) {
+    exactObjectArgumentCount(arguments.length, 1);
+    objectKey(key);
+    const value = objectJson(await call(objectDocument(binding, "head", key)));
+    if (value.found !== true) return null;
+    return objectMetadata(value);
+  };
+  portable.get = async function (key, rawOptions) {
+    exactObjectArgumentCount(arguments.length, 2);
+    objectKey(key);
+    const options = objectGetOptions(rawOptions);
+    const document = objectDocument(binding, "get", key);
+    if (options.range !== undefined) document.range = options.range;
+    if (options.ifMatch !== undefined) document.ifMatch = options.ifMatch;
+    if (options.ifNoneMatch !== undefined) document.ifNoneMatch = options.ifNoneMatch;
+    const answer = await call(document);
+    if (answer.body === undefined) {
+      const value = objectJson(answer);
+      if (value.found !== true) return null;
+      throw portableError("backend_unavailable");
+    }
+    const metadata = objectMetadata(answer.metadata);
+    const result = SafeObjectCreate(null);
+    result.etag = metadata.etag;
+    result.size = metadata.size;
+    if (metadata.contentType !== undefined) result.contentType = metadata.contentType;
+    result.body = answer.body;
+    result.partial = answer.metadata.partial === true;
+    if (result.partial) {
+      result.range = objectResultRange(answer.metadata.range, metadata.size);
+    } else if (answer.metadata.range !== undefined) {
+      throw portableError("backend_unavailable");
+    }
+    return freezeObject(result);
+  };
+  portable.put = async function (key, body, rawOptions) {
+    exactObjectArgumentCount(arguments.length, 3);
+    objectKey(key);
+    const options = objectPutOptions(rawOptions);
+    const source = objectBodySource(body, MAX_OBJECT_SINGLE_PUT_BYTES, options.contentLength);
+    const document = objectDocument(binding, "put", key);
+    document.contentLength = source.length;
+    if (options.contentType !== undefined) document.contentType = options.contentType;
+    if (options.ifMatch !== undefined) document.ifMatch = options.ifMatch;
+    if (options.ifNoneMatch !== undefined) document.ifNoneMatch = options.ifNoneMatch;
+    const value = objectJson(await call(document, source.body));
+    const result = SafeObjectCreate(null);
+    result.etag = objectEtag(value.etag);
+    result.size = objectSize(value.size);
+    if (result.size !== source.length) throw portableError("backend_unavailable");
+    return freezeObject(result);
+  };
+  portable.delete = async function (key) {
+    exactObjectArgumentCount(arguments.length, 1);
+    objectKey(key);
+    objectJson(await call(objectDocument(binding, "delete", key)));
+  };
+  portable.list = async function (rawOptions) {
+    exactObjectArgumentCount(arguments.length, 1);
+    const options = objectListOptions(rawOptions);
+    const document = objectDocument(binding, "list", undefined);
+    if (options.prefix !== undefined) document.prefix = options.prefix;
+    if (options.delimiter !== undefined) document.delimiter = options.delimiter;
+    if (options.cursor !== undefined) document.cursor = options.cursor;
+    if (options.limit !== undefined) document.limit = options.limit;
+    const page = objectJson(await call(document));
+    if (!SafeArrayIsArray(page.objects) || typeof page.truncated !== "boolean") {
+      throw portableError("backend_unavailable");
+    }
+    const limit = options.limit === undefined ? 1000 : options.limit;
+    if (page.objects.length > limit) throw portableError("backend_unavailable");
+    const objects = [];
+    for (let index = 0; index < page.objects.length; index += 1) {
+      const item = page.objects[index];
+      if (!isRecord(item)) throw portableError("backend_unavailable");
+      objectProviderKey(item.key);
+      const projected = SafeObjectCreate(null);
+      projected.key = item.key;
+      projected.etag = objectEtag(item.etag);
+      projected.size = objectSize(item.size);
+      if (item.uploadedAtMillis !== undefined) {
+        if (!nonNegativeInteger(item.uploadedAtMillis)) throw portableError("backend_unavailable");
+        projected.uploadedAtMillis = item.uploadedAtMillis;
+      }
+      objects[index] = freezeObject(projected);
+    }
+    const prefixes = [];
+    if (page.prefixes !== undefined) {
+      if (!SafeArrayIsArray(page.prefixes) || page.prefixes.length > 1000) {
+        throw portableError("backend_unavailable");
+      }
+      for (let index = 0; index < page.prefixes.length; index += 1) {
+        objectProviderPrefix(page.prefixes[index]);
+        if (!includes(prefixes, page.prefixes[index])) {
+          prefixes[prefixes.length] = page.prefixes[index];
+        }
+      }
+    }
+    const result = SafeObjectCreate(null);
+    result.objects = freezeObject(objects);
+    result.prefixes = freezeObject(prefixes);
+    result.truncated = page.truncated;
+    if (page.truncated) {
+      objectCursor(page.cursor);
+      result.cursor = page.cursor;
+    }
+    return freezeObject(result);
+  };
+  portable.createMultipartUpload = async function (key, rawOptions) {
+    exactObjectArgumentCount(arguments.length, 2);
+    objectKey(key);
+    const contentType = objectMultipartOptions(rawOptions);
+    const document = objectDocument(binding, "createMultipartUpload", key);
+    if (contentType !== undefined) document.contentType = contentType;
+    const value = objectJson(await call(document));
+    objectUploadId(value.uploadId);
+    SafeApply(SafeMapSet, multipart, [objectUploadIdentity(key, value.uploadId), new SafeMap()]);
+    const result = SafeObjectCreate(null);
+    result.uploadId = value.uploadId;
+    return freezeObject(result);
+  };
+  portable.uploadPart = async function (key, uploadId, partNumber, body, rawOptions) {
+    exactObjectArgumentCount(arguments.length, 5);
+    objectKey(key);
+    objectUploadId(uploadId);
+    objectPartNumber(partNumber);
+    const options = objectUploadPartOptions(rawOptions);
+    const source = objectBodySource(body, MAX_OBJECT_BYTES, options.contentLength, "invalid_body");
+    const document = objectDocument(binding, "uploadPart", key);
+    document.uploadId = uploadId;
+    document.partNumber = partNumber;
+    document.contentLength = source.length;
+    const value = objectJson(await call(document, source.body));
+    const etag = objectEtag(value.etag);
+    if (value.partNumber !== partNumber) throw portableError("backend_unavailable");
+    const known = SafeApply(SafeMapGet, multipart, [objectUploadIdentity(key, uploadId)]);
+    if (known) {
+      const recorded = SafeObjectCreate(null);
+      recorded.etag = etag;
+      recorded.size = source.length;
+      SafeApply(SafeMapSet, known, [partNumber, freezeObject(recorded)]);
+    }
+    const result = SafeObjectCreate(null);
+    result.etag = etag;
+    result.partNumber = partNumber;
+    return freezeObject(result);
+  };
+  portable.completeMultipartUpload = async function (key, uploadId, rawParts) {
+    exactObjectArgumentCount(arguments.length, 3);
+    objectKey(key);
+    objectUploadId(uploadId);
+    const parts = objectParts(rawParts);
+    validateKnownObjectParts(multipart, key, uploadId, parts);
+    const document = objectDocument(binding, "completeMultipartUpload", key);
+    document.uploadId = uploadId;
+    document.parts = parts;
+    const value = objectJson(await call(document));
+    const result = SafeObjectCreate(null);
+    result.etag = objectEtag(value.etag);
+    result.size = objectSize(value.size);
+    SafeApply(SafeMapDelete, multipart, [objectUploadIdentity(key, uploadId)]);
+    return freezeObject(result);
+  };
+  portable.abortMultipartUpload = async function (key, uploadId) {
+    exactObjectArgumentCount(arguments.length, 2);
+    objectKey(key);
+    objectUploadId(uploadId);
+    const document = objectDocument(binding, "abortMultipartUpload", key);
+    document.uploadId = uploadId;
+    objectJson(await call(document));
+    SafeApply(SafeMapDelete, multipart, [objectUploadIdentity(key, uploadId)]);
+  };
+  return portable;
+}
+
+/**
+ * The object half of the seam: one fixed method, one fixed URL, one header
+ * carrying the operation, and the bytes as the body in both directions.
+ *
+ * The facade service in front rewrites everything but that header and the body,
+ * so this module can name an operation and nothing else — not a destination,
+ * not a token, and not a second route on this machine.
+ */
+function createObjectCaller(rawEnv) {
+  const service = rawEnv[DATA_SERVICE];
+  const send = captureMethod(service, "fetch");
+  return async (document, body) => {
+    const headers = SafeObjectCreate(null);
+    headers[OBJECT_REQUEST_HEADER] = encodeObjectDocument(document);
+    const init = SafeObjectCreate(null);
+    init.method = "POST";
+    init.headers = headers;
+    if (body !== undefined) init.body = body;
+    let response;
+    try {
+      response = await SafeApply(send, service, [OBJECTS_URL, init]);
+    } catch {
+      throw portableError("backend_unavailable");
+    }
+    let responseHeaders;
+    let contentType;
+    try {
+      responseHeaders = SafeApply(SafeResponseHeadersGet, response, []);
+      contentType = SafeApply(SafeHeadersGet, responseHeaders, ["content-type"]);
+    } catch {
+      throw portableError("backend_unavailable");
+    }
+    if (contentType === OBJECT_CONTENT_TYPE) {
+      const status = SafeApply(SafeResponseStatusGet, response, []);
+      const stream = SafeApply(SafeResponseBodyGet, response, []);
+      const metadata = decodeObjectDocument(
+        SafeApply(SafeHeadersGet, responseHeaders, [OBJECT_RESULT_HEADER]),
+      );
+      if (status !== 200 || !isReadableStream(stream)) throw portableError("backend_unavailable");
+      const answer = SafeObjectCreate(null);
+      answer.metadata = metadata;
+      answer.body = stream;
+      return answer;
+    }
+    let text;
+    try {
+      text = await SafeApply(SafeResponseText, response, []);
+    } catch {
+      throw portableError("backend_unavailable");
+    }
+    if (typeof text !== "string" || text.length > MAX_RESPONSE_BYTES) {
+      throw portableError("backend_unavailable");
+    }
+    let envelope;
+    try {
+      envelope = SafeJSONParse(text);
+    } catch {
+      throw portableError("backend_unavailable");
+    }
+    if (!isRecord(envelope)) throw portableError("backend_unavailable");
+    if (envelope.ok === true && exactKeys(envelope, ["ok", "value"])) {
+      const answer = SafeObjectCreate(null);
+      answer.value = envelope.value;
+      return answer;
+    }
+    if (
+      envelope.ok === false &&
+      exactKeys(envelope, ["ok", "error"]) &&
+      isRecord(envelope.error) &&
+      exactKeys(envelope.error, ["code"]) &&
+      includes(OBJECT_ERROR_CODES, envelope.error.code)
+    ) {
+      throw portableError(envelope.error.code);
+    }
+    throw portableError("backend_unavailable");
+  };
+}
+
+function objectDocument(binding, op, key) {
+  const document = SafeObjectCreate(null);
+  document.protocol = OBJECT_PROTOCOL;
+  document.binding = binding;
+  document.op = op;
+  if (key !== undefined) document.key = key;
+  return document;
+}
+
+function objectJson(answer) {
+  if (answer.body !== undefined) throw portableError("backend_unavailable");
+  if (!isRecord(answer.value)) throw portableError("backend_unavailable");
+  return answer.value;
+}
+
+function encodeObjectDocument(document) {
+  const encoded = base64Url(
+    encodeBase64(SafeApply(SafeTextEncoderEncode, encoder, [SafeJSONStringify(document)])),
+  );
+  if (encoded.length > MAX_OBJECT_DOCUMENT_BYTES) throw portableError("invalid_key");
+  return encoded;
+}
+
+function decodeObjectDocument(value) {
+  if (
+    typeof value !== "string" ||
+    value.length < 1 ||
+    value.length > MAX_OBJECT_DOCUMENT_BYTES ||
+    !SafeApply(SafeRegExpTest, BASE64URL_PATTERN, [value])
+  ) {
+    throw portableError("backend_unavailable");
+  }
+  let parsed;
+  try {
+    const decoder = new SafeTextDecoder("utf-8", { fatal: true });
+    parsed = SafeJSONParse(
+      SafeApply(SafeTextDecoderDecode, decoder, [
+        new SafeUint8Array(decodeBase64(base64Pad(value))),
+      ]),
+    );
+  } catch {
+    throw portableError("backend_unavailable");
+  }
+  if (!isRecord(parsed)) throw portableError("backend_unavailable");
+  return parsed;
+}
+
+function base64Url(value) {
+  let output = "";
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    output +=
+      character === "+" ? "-" : character === "/" ? "_" : character === "=" ? "" : character;
+  }
+  return output;
+}
+
+function base64Pad(value) {
+  let output = "";
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    output += character === "-" ? "+" : character === "_" ? "/" : character;
+  }
+  while (output.length % 4 !== 0) output += "=";
+  return output;
+}
+
+function objectMetadata(value) {
+  if (!isRecord(value)) throw portableError("backend_unavailable");
+  const result = SafeObjectCreate(null);
+  result.etag = objectEtag(value.etag);
+  result.size = objectSize(value.size);
+  if (value.contentType !== undefined) result.contentType = objectContentType(value.contentType);
+  if (value.uploadedAtMillis !== undefined) {
+    if (!nonNegativeInteger(value.uploadedAtMillis)) throw portableError("backend_unavailable");
+    result.uploadedAtMillis = value.uploadedAtMillis;
+  }
+  return freezeObject(result);
+}
+
+function objectGetOptions(value) {
+  if (value === undefined) return freezeObject(SafeObjectCreate(null));
+  objectOptions(value, ["range", "ifMatch", "ifNoneMatch"]);
+  if (value.ifMatch !== undefined && value.ifNoneMatch !== undefined) objectBindingTypeError();
+  const result = SafeObjectCreate(null);
+  if (value.range !== undefined) {
+    objectOptions(value.range, ["offset", "length"]);
+    if (
+      typeof value.range.offset !== "number" ||
+      (value.range.length !== undefined && typeof value.range.length !== "number")
+    ) {
+      objectBindingTypeError();
+    }
+    if (!nonNegativeInteger(value.range.offset) || value.range.offset > MAX_OBJECT_BYTES) {
+      objectBindingTypeError();
+    }
+    if (
+      value.range.length !== undefined &&
+      (!nonNegativeInteger(value.range.length) ||
+        value.range.length < 1 ||
+        value.range.length > MAX_OBJECT_BYTES)
+    ) {
+      objectBindingTypeError();
+    }
+    const range = SafeObjectCreate(null);
+    range.offset = value.range.offset;
+    if (value.range.length !== undefined) range.length = value.range.length;
+    result.range = freezeObject(range);
+  }
+  if (value.ifMatch !== undefined) result.ifMatch = objectConditionEtag(value.ifMatch);
+  if (value.ifNoneMatch !== undefined) result.ifNoneMatch = objectConditionEtag(value.ifNoneMatch);
+  return freezeObject(result);
+}
+
+function objectPutOptions(value) {
+  if (value === undefined) return freezeObject(SafeObjectCreate(null));
+  objectOptions(value, ["contentLength", "contentType", "ifMatch", "ifNoneMatch"]);
+  if (value.ifMatch !== undefined && value.ifNoneMatch !== undefined) objectBindingTypeError();
+  if (value.ifNoneMatch !== undefined && typeof value.ifNoneMatch !== "string") {
+    objectBindingTypeError();
+  }
+  if (value.ifNoneMatch !== undefined && value.ifNoneMatch !== "*") objectBindingTypeError();
+  const result = SafeObjectCreate(null);
+  if (SafeObjectHasOwn(value, "contentLength")) {
+    result.contentLength = objectContentLength(value.contentLength);
+  }
+  if (value.contentType !== undefined) {
+    result.contentType = objectInputContentType(value.contentType);
+  }
+  if (value.ifMatch !== undefined) result.ifMatch = objectConditionEtag(value.ifMatch);
+  if (value.ifNoneMatch !== undefined) result.ifNoneMatch = "*";
+  return freezeObject(result);
+}
+
+function objectUploadPartOptions(value) {
+  if (value === undefined) return freezeObject(SafeObjectCreate(null));
+  objectOptions(value, ["contentLength"]);
+  const result = SafeObjectCreate(null);
+  if (SafeObjectHasOwn(value, "contentLength")) {
+    result.contentLength = objectContentLength(value.contentLength);
+  }
+  return freezeObject(result);
+}
+
+function objectListOptions(value) {
+  if (value === undefined) return freezeObject(SafeObjectCreate(null));
+  objectOptions(value, ["prefix", "delimiter", "cursor", "limit"]);
+  const result = SafeObjectCreate(null);
+  if (value.prefix !== undefined) {
+    objectPrefix(value.prefix);
+    result.prefix = value.prefix;
+  }
+  if (value.delimiter !== undefined) {
+    if (typeof value.delimiter !== "string") objectBindingTypeError();
+    if (
+      unicodeCodePointLength(value.delimiter) < 1 ||
+      unicodeCodePointLength(value.delimiter) > 16
+    ) {
+      objectBindingTypeError();
+    }
+    result.delimiter = value.delimiter;
+  }
+  if (value.cursor !== undefined) {
+    objectInputCursor(value.cursor);
+    result.cursor = value.cursor;
+  }
+  if (value.limit !== undefined) {
+    if (typeof value.limit !== "number") objectBindingTypeError();
+    if (!nonNegativeInteger(value.limit) || value.limit < 1 || value.limit > 1000) {
+      objectBindingTypeError();
+    }
+    result.limit = value.limit;
+  }
+  return freezeObject(result);
+}
+
+function objectMultipartOptions(value) {
+  if (value === undefined) return undefined;
+  objectOptions(value, ["contentType"]);
+  return value.contentType === undefined ? undefined : objectInputContentType(value.contentType);
+}
+
+function objectOptions(value, allowed) {
+  if (!isPlainRecord(value) || !onlyKeys(value, allowed)) objectBindingTypeError();
+}
+
+/**
+ * The body, its exact length, and nothing discovered by buffering it.
+ *
+ * A stream must declare its length because the ceiling has to be decided before
+ * the bytes cross, and because the plane needs the count to refuse a body that
+ * ran long. A string or an ArrayBuffer already knows its own, and a declared
+ * length that disagrees with it is the caller's mistake rather than a silent
+ * truncation.
+ */
+function objectBodySource(value, maximum, declaredLength, intrinsicTooLargeError) {
+  const tooLarge =
+    intrinsicTooLargeError === undefined ? "value_too_large" : intrinsicTooLargeError;
+  let body;
+  let known;
+  if (typeof value === "string") {
+    const bytes = SafeApply(SafeTextEncoderEncode, encoder, [value]);
+    known = viewByteLength(bytes);
+    body = readableObjectBytes(bytes);
+  } else if (isArrayBuffer(value)) {
+    const bytes = new SafeUint8Array(SafeApply(SafeArrayBufferSlice, value, [0]));
+    known = viewByteLength(bytes);
+    body = readableObjectBytes(bytes);
+  } else if (isReadableStream(value)) {
+    body = value;
+  } else {
+    objectBindingTypeError();
+  }
+  if (declaredLength !== undefined) objectContentLength(declaredLength);
+  const length = declaredLength === undefined ? known : declaredLength;
+  if (length === undefined || (known !== undefined && length !== known)) {
+    throw portableError("invalid_body");
+  }
+  if (length > maximum) throw portableError(known === undefined ? "value_too_large" : tooLarge);
+  const result = SafeObjectCreate(null);
+  result.body = body;
+  result.length = length;
+  return freezeObject(result);
+}
+
+function readableObjectBytes(bytes) {
+  let sent = false;
+  return new SafeReadableStream({
+    pull(controller) {
+      if (sent) {
+        SafeApply(SafeReadableStreamControllerClose, controller, []);
+        return;
+      }
+      sent = true;
+      SafeApply(SafeReadableStreamControllerEnqueue, controller, [bytes]);
+    },
+  });
+}
+
+function objectParts(value) {
+  if (!SafeArrayIsArray(value)) objectBindingTypeError();
+  if (value.length < 1 || value.length > MAX_OBJECT_PARTS) objectBindingTypeError();
+  const result = [];
+  let previous = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const part = value[index];
+    if (!isPlainRecord(part) || !exactKeys(part, ["etag", "partNumber"])) objectBindingTypeError();
+    objectPartNumber(part.partNumber);
+    if (part.partNumber <= previous) throw portableError("invalid_part");
+    previous = part.partNumber;
+    const projected = SafeObjectCreate(null);
+    projected.etag = objectPartEtag(part.etag);
+    projected.partNumber = part.partNumber;
+    result[index] = freezeObject(projected);
+  }
+  return freezeObject(result);
+}
+
+function objectUploadIdentity(key, uploadId) {
+  return key + " " + uploadId;
+}
+
+function validateKnownObjectParts(multipart, key, uploadId, parts) {
+  const known = SafeApply(SafeMapGet, multipart, [objectUploadIdentity(key, uploadId)]);
+  if (!known) return;
+  let total = 0;
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    const recorded = SafeApply(SafeMapGet, known, [part.partNumber]);
+    if (
+      !recorded ||
+      recorded.etag !== part.etag ||
+      (index < parts.length - 1 && recorded.size < MIN_OBJECT_NON_FINAL_PART_BYTES)
+    ) {
+      throw portableError("invalid_part");
+    }
+    if (
+      !nonNegativeInteger(total) ||
+      !nonNegativeInteger(recorded.size) ||
+      recorded.size > MAX_OBJECT_BYTES - total
+    ) {
+      throw portableError("value_too_large");
+    }
+    total += recorded.size;
+  }
+}
+
+function objectResultRange(value, size) {
+  if (
+    !isRecord(value) ||
+    !onlyKeys(value, ["offset", "length"]) ||
+    !SafeObjectHasOwn(value, "offset") ||
+    !SafeObjectHasOwn(value, "length") ||
+    !nonNegativeInteger(value.offset) ||
+    !nonNegativeInteger(value.length) ||
+    value.offset + value.length > size
+  ) {
+    throw portableError("backend_unavailable");
+  }
+  const result = SafeObjectCreate(null);
+  result.offset = value.offset;
+  result.length = value.length;
+  return freezeObject(result);
+}
+
+function objectKey(value) {
+  if (typeof value !== "string") objectBindingTypeError();
+  if (!boundedUtf8(value, MAX_OBJECT_KEY_BYTES) || hasControlCharacters(value)) {
+    throw portableError("invalid_key");
+  }
+}
+
+function objectPrefix(value) {
+  if (typeof value !== "string") objectBindingTypeError();
+  if (utf8Length(value) > MAX_OBJECT_KEY_BYTES || hasControlCharacters(value)) {
+    objectBindingTypeError();
+  }
+}
+
+function objectProviderKey(value) {
+  if (
+    typeof value !== "string" ||
+    !boundedUtf8(value, MAX_OBJECT_KEY_BYTES) ||
+    hasControlCharacters(value)
+  ) {
+    throw portableError("backend_unavailable");
+  }
+}
+
+function objectProviderPrefix(value) {
+  if (
+    typeof value !== "string" ||
+    value.length < 1 ||
+    utf8Length(value) > MAX_OBJECT_KEY_BYTES ||
+    hasControlCharacters(value)
+  ) {
+    throw portableError("backend_unavailable");
+  }
+}
+
+function objectSize(value) {
+  if (!nonNegativeInteger(value) || value > MAX_OBJECT_BYTES) {
+    throw portableError("backend_unavailable");
+  }
+  return value;
+}
+
+function objectEtag(value) {
+  if (
+    typeof value !== "string" ||
+    unicodeCodePointLength(value) < 1 ||
+    unicodeCodePointLength(value) > 256 ||
+    hasControlCharacters(value)
+  ) {
+    throw portableError("backend_unavailable");
+  }
+  return value;
+}
+
+function objectConditionEtag(value) {
+  if (typeof value !== "string") objectBindingTypeError();
+  if (
+    unicodeCodePointLength(value) < 1 ||
+    unicodeCodePointLength(value) > 256 ||
+    hasControlCharacters(value)
+  ) {
+    objectBindingTypeError();
+  }
+  return value;
+}
+
+function objectPartEtag(value) {
+  if (typeof value !== "string") objectBindingTypeError();
+  if (
+    unicodeCodePointLength(value) < 1 ||
+    unicodeCodePointLength(value) > 256 ||
+    hasControlCharacters(value)
+  ) {
+    objectBindingTypeError();
+  }
+  return value;
+}
+
+function objectContentType(value) {
+  if (typeof value !== "string") objectBindingTypeError();
+  if (
+    unicodeCodePointLength(value) < 1 ||
+    unicodeCodePointLength(value) > 256 ||
+    hasControlCharacters(value)
+  ) {
+    throw portableError("backend_unavailable");
+  }
+  return value;
+}
+
+function objectInputContentType(value) {
+  if (typeof value !== "string") objectBindingTypeError();
+  if (
+    unicodeCodePointLength(value) < 1 ||
+    unicodeCodePointLength(value) > 256 ||
+    hasControlCharacters(value)
+  ) {
+    objectBindingTypeError();
+  }
+  return value;
+}
+
+function objectContentLength(value) {
+  if (typeof value !== "number") objectBindingTypeError();
+  if (!nonNegativeInteger(value) || value > MAX_OBJECT_BYTES) throw portableError("invalid_body");
+  return value;
+}
+
+function objectCursor(value) {
+  if (
+    typeof value !== "string" ||
+    unicodeCodePointLength(value) < 1 ||
+    unicodeCodePointLength(value) > 4096
+  ) {
+    throw portableError("backend_unavailable");
+  }
+}
+
+function objectInputCursor(value) {
+  if (typeof value !== "string") objectBindingTypeError();
+  if (unicodeCodePointLength(value) < 1 || unicodeCodePointLength(value) > 4096) {
+    objectBindingTypeError();
+  }
+}
+
+function objectUploadId(value) {
+  if (typeof value !== "string") objectBindingTypeError();
+  if (value.length < 1 || value.length > 256 || hasControlCharacters(value)) {
+    objectBindingTypeError();
+  }
+}
+
+function objectPartNumber(value) {
+  if (typeof value !== "number") objectBindingTypeError();
+  if (!nonNegativeInteger(value) || value < 1 || value > MAX_OBJECT_PARTS) {
+    objectBindingTypeError();
+  }
+}
+
+function exactObjectArgumentCount(actual, maximum) {
+  if (actual > maximum) objectBindingTypeError();
+}
+
+function objectBindingTypeError() {
+  throw new SafeTypeError("invalid module-worker.object-bucket arguments");
+}
+
+function hasControlCharacters(value) {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = SafeApply(SafeStringCharCodeAt, value, [index]);
+    if (code <= 31 || code === 127) return true;
+  }
+  return false;
+}
+
+function unicodeCodePointLength(value) {
+  let length = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const first = SafeApply(SafeStringCharCodeAt, value, [index]);
+    if (first >= 0xd800 && first <= 0xdbff && index + 1 < value.length) {
+      const second = SafeApply(SafeStringCharCodeAt, value, [index + 1]);
+      if (second >= 0xdc00 && second <= 0xdfff) index += 1;
+    }
+    length += 1;
+  }
+  return length;
+}
+
+function isArrayBuffer(value) {
+  try {
+    SafeApply(SafeArrayBufferSlice, value, [0, 0]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether this is a stream, without touching it.
+ *
+ * The managed wrapper answers by taking a reader and releasing it. That is a
+ * stronger brand check, and it is the wrong one here: some runtimes count a
+ * released reader as a stream that has been used, and the one object this is
+ * asked about most is a body the tenant is about to read.
+ */
+function isReadableStream(value) {
+  try {
+    return value instanceof SafeReadableStream;
+  } catch {
+    return false;
+  }
+}
+
+function isPlainRecord(value) {
+  if (!isRecord(value)) return false;
+  const prototype = SafeApply(SafeObjectGetPrototypeOf, SafeObject, [value]);
+  return prototype === SafeObjectPrototype || prototype === null;
+}
+
+function freezeObject(value) {
+  return SafeApply(SafeObjectFreeze, SafeObject, [value]);
 }
 
 /**

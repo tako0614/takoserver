@@ -195,9 +195,11 @@ test("the planes answer on their own loopback listener and never on the public o
             kv: { KV: "tskv-1" },
             sql: { DB: "tsdb-1" },
             queue: {},
+            objects: {},
           }
         : null,
     databasePath: (name) => join(databases, `${name}.sqlite`),
+    objectRoot: join(databases, "objects"),
   });
   expect(served.address).toStartWith("127.0.0.1:");
 
