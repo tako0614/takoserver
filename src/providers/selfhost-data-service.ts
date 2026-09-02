@@ -3,6 +3,7 @@ import {
   SELFHOST_DATA_PLANE_KV_PATH,
   SELFHOST_DATA_PLANE_MAX_RESPONSE_BYTES,
   SELFHOST_DATA_PLANE_ORIGIN,
+  SELFHOST_DATA_PLANE_QUEUE_PATH,
   SELFHOST_DATA_PLANE_SQL_PATH,
   SELFHOST_WORKER_DATA_TOKEN_BINDING,
 } from "./selfhost-worker-wrapper.ts";
@@ -22,7 +23,7 @@ import {
  * nothing else: no token, no address, and no way to name a destination. What
  * crosses that binding is a request this module rewrites completely — fixed
  * method, fixed URL, fixed headers, the tenant's JSON body and nothing more —
- * so a binding that leaked into tenant code would still reach exactly two
+ * so a binding that leaked into tenant code would still reach exactly three
  * routes and could not be turned on the control API, the provisioner, or any
  * other address this machine listens on.
  *
@@ -46,8 +47,10 @@ export const SELFHOST_WORKER_DATA_PLANE_BINDING = "__TAKOSERVER_SELFHOST_DATA_PL
 export function selfhostDataServiceSource(): string {
   return `const KV_PATH = ${JSON.stringify(SELFHOST_DATA_PLANE_KV_PATH)};
 const SQL_PATH = ${JSON.stringify(SELFHOST_DATA_PLANE_SQL_PATH)};
+const QUEUE_PATH = ${JSON.stringify(SELFHOST_DATA_PLANE_QUEUE_PATH)};
 const KV_URL = ${JSON.stringify(`${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_KV_PATH}`)};
 const SQL_URL = ${JSON.stringify(`${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_SQL_PATH}`)};
+const QUEUE_URL = ${JSON.stringify(`${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_QUEUE_PATH}`)};
 const CONTENT_TYPE = ${JSON.stringify(SELFHOST_DATA_PLANE_CONTENT_TYPE)};
 const TOKEN = ${JSON.stringify(SELFHOST_WORKER_DATA_TOKEN_BINDING)};
 const PLANE = ${JSON.stringify(SELFHOST_WORKER_DATA_PLANE_BINDING)};
@@ -69,7 +72,14 @@ export default {
     let target = null;
     try {
       const pathname = new URL(request.url).pathname;
-      target = pathname === KV_PATH ? KV_URL : pathname === SQL_PATH ? SQL_URL : null;
+      target =
+        pathname === KV_PATH
+          ? KV_URL
+          : pathname === SQL_PATH
+            ? SQL_URL
+            : pathname === QUEUE_PATH
+              ? QUEUE_URL
+              : null;
     } catch {
       return refuse(404);
     }

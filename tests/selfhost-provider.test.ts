@@ -1815,6 +1815,7 @@ describe("read-only native absence verification", () => {
       identity: identity("hello-v1"),
       spec: {
         bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+        handlers: ["fetch"],
       },
       relations: [
         relation("/worker", "ModuleWorker", "hello"),

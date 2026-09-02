@@ -240,7 +240,7 @@ test("the provider maps missing/corrupt observation and recovers an exact apply"
     operationId: "op-version",
     offering: offering("WorkerVersion"),
     identity: { tenantRef: "tenant-a", space: "default", name: "version-a" },
-    spec: {},
+    spec: { handlers: ["fetch"] },
     relations: [
       relation("/worker", "ModuleWorker", "worker-a"),
       relation("/bundle", "WorkerBundle", "bundle-a", { manifestDigest: fixture.manifestDigest }),

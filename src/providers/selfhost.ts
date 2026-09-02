@@ -38,12 +38,21 @@ import {
   derivedProviderResourceName,
 } from "../provider-worker-endpoint-origin.ts";
 import type { WorkerdRuntime } from "../workerd-runtime.ts";
+import { parseSelfhostCron } from "./selfhost-cron.ts";
 import {
   SELFHOST_WORKER_DATA_SERVICE_MODULE,
   selfhostDataServiceSource,
 } from "./selfhost-data-service.ts";
 import {
+  SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND,
+  SELFHOST_WORKER_EVENT_SERVICE_MODULE,
+  SELFHOST_WORKER_EVENT_TOKEN_BINDING,
+  selfhostEventServiceSource,
+} from "./selfhost-events.ts";
+import {
   createSelfhostScriptStateStore,
+  type SelfhostQueueConsumerAttachment,
+  type SelfhostQueueTarget,
   type SelfhostScriptState,
   type SelfhostScriptStateSnapshot,
   SelfhostScriptStateStoreError,
@@ -56,6 +65,7 @@ import {
   type SelfhostVersionBindingSet,
   SelfhostVersionBindingStoreError,
   type SelfhostVersionDataBinding,
+  type SelfhostVersionQueueSettings,
   type SelfhostWorkerHandlerName,
   type StoredSelfhostVersionBindings,
 } from "./selfhost-version-bindings.ts";
@@ -103,10 +113,12 @@ import {
  *   hostnames route to it. workerd cannot split traffic by percentage, so a
  *   weighted deployment serves its heaviest version and records the split it
  *   was asked for.
- * - **WorkerCronTrigger / QueueConsumer** are recorded declarations. This
- *   machine runs no scheduler and no queue pump yet; the aggregate rules that
- *   gate them on a serving deployment are enforced by the Host, and saying
- *   "recorded, not firing" here beats a scheduler nobody implemented.
+ * - **WorkerCronTrigger / QueueConsumer** are executed when this deployment
+ *   composed a pump and a scheduler, and recorded honestly when it did not. An
+ *   attachment writes itself into the script's own durable state and
+ *   republishes, which is what puts the event gate in front of the Worker;
+ *   `delivering` and `scheduled` say `true` only when something on this machine
+ *   actually moves the message or fires the minute.
  *
  * A version's `vars` are projected into the workerd configuration as ordinary
  * environment bindings, kept in a `0600` record beside — never inside — the
@@ -213,6 +225,30 @@ export interface SelfhostProviderOptions {
    * serve storage, and there is nothing to reclaim.
    */
   readonly dataPlaneMaintenance?: SelfhostDataPlaneMaintenance;
+  /**
+   * The pump and the scheduler, when this deployment runs them.
+   *
+   * Absent is a real answer and the honest one: a Consumer or a Trigger is
+   * still recorded and still republished — the declaration is desired state
+   * either way — but the ticket says `delivering: false` and
+   * `scheduled: false`, because nothing on this machine moves the message or
+   * fires the minute. Saying otherwise would make a Host's own observation the
+   * thing that lies.
+   */
+  readonly events?: SelfhostEventRuntime;
+}
+
+/**
+ * The housekeeping a queue and a schedule need from whatever runs them.
+ *
+ * Declared here rather than imported, because the pump and the scheduler are
+ * composed above this provider and this provider must not depend on them.
+ */
+export interface SelfhostEventRuntime {
+  /** Drops every stored message of one queue, when the queue stops existing. */
+  deleteQueue(queueId: string): Promise<void>;
+  /** Forgets the next-fire state of one script's triggers, or of one trigger. */
+  forgetSchedules(script: string, cron?: string): Promise<void>;
 }
 
 /**
@@ -245,6 +281,14 @@ export interface SelfhostVersionDataGrant {
   readonly secret: string;
   readonly kv: Readonly<Record<string, string>>;
   readonly sql: Readonly<Record<string, string>>;
+  /** Producer bindings, with the promise each queue makes about its messages. */
+  readonly queue: Readonly<Record<string, SelfhostGrantedQueue>>;
+}
+
+export interface SelfhostGrantedQueue {
+  readonly queueId: string;
+  readonly messageRetentionSeconds: number;
+  readonly deliveryDelaySeconds: number;
 }
 
 /**
@@ -259,6 +303,88 @@ export interface SelfhostVersionDataGrant {
 export interface SelfhostDataPlaneAccess {
   grant(script: string, versionId: string): Promise<SelfhostVersionDataGrant | null>;
   databasePath(name: string): string;
+}
+
+/** Where this machine keeps the durable state of one Worker script. */
+export function selfhostScriptStateRoot(dataRoot: string): string {
+  return join(dataRoot, "selfhost", "scripts");
+}
+
+/**
+ * One Worker this machine may have to deliver an event to.
+ *
+ * `versionId` is the deployment identity carried in the envelope: it names the
+ * exact immutable Version the handler will run in, which is the only
+ * "deployment" a self-hosted machine has.
+ */
+export interface SelfhostEventTarget {
+  readonly script: string;
+  readonly versionId: string;
+  /** Presented to the gate in front of the Worker; never logged, never shown. */
+  readonly eventToken: string;
+  readonly handlers: readonly SelfhostWorkerHandlerName[];
+  readonly consumers: readonly SelfhostQueueConsumerAttachment[];
+  readonly crons: readonly string[];
+}
+
+/**
+ * The read-only half of the event seam, for the pump and the scheduler.
+ *
+ * Exported from here for the same reason the data-plane access is: the on-disk
+ * layout is this module's, and a pump that recomputed where a script's state
+ * and its Version's token live would be a second definition of it.
+ */
+export interface SelfhostEventTargets {
+  /** Every serving script with at least one Consumer or Trigger attached. */
+  list(): Promise<readonly SelfhostEventTarget[]>;
+}
+
+export function createSelfhostEventTargets(dataRoot: string): SelfhostEventTargets {
+  const scriptStates = createSelfhostScriptStateStore({ root: selfhostScriptStateRoot(dataRoot) });
+  const bindings = createSelfhostVersionBindingStore({
+    root: selfhostVersionBindingsRoot(dataRoot),
+  });
+  return {
+    async list() {
+      const entries = await readdir(selfhostScriptStateRoot(dataRoot)).catch(() => []);
+      const targets: SelfhostEventTarget[] = [];
+      for (const entry of entries) {
+        if (!entry.endsWith(".json")) continue;
+        const script = entry.slice(0, -".json".length);
+        if (!/^[a-z0-9][a-z0-9_-]{0,127}$/u.test(script)) continue;
+        let state: SelfhostScriptState;
+        try {
+          state = (await scriptStates.read(script)).state;
+        } catch {
+          // A script whose durable state this Host cannot read is not one it
+          // can deliver to. The next reconcile is what repairs it.
+          continue;
+        }
+        const consumers = state.consumers ?? [];
+        const crons = state.crons ?? [];
+        if (!state.activeVersion || (consumers.length === 0 && crons.length === 0)) continue;
+        let stored: StoredSelfhostVersionBindings | null;
+        try {
+          stored = await bindings.read(script, state.activeVersion);
+        } catch {
+          continue;
+        }
+        // A Version published before this Host could carry events has neither
+        // a token nor a recorded handler list. Nothing is delivered to it, and
+        // publishing a new Version is what changes that.
+        if (!stored?.eventToken || !stored.handlers) continue;
+        targets.push({
+          script,
+          versionId: state.activeVersion,
+          eventToken: stored.eventToken,
+          handlers: stored.handlers,
+          consumers,
+          crons,
+        });
+      }
+      return targets;
+    },
+  };
 }
 
 export function createSelfhostDataPlaneAccess(dataRoot: string): SelfhostDataPlaneAccess {
@@ -285,11 +411,22 @@ export function createSelfhostDataPlaneAccess(dataRoot: string): SelfhostDataPla
       // record declared — the same one for every Version on the machine.
       const kv: Record<string, string> = Object.create(null) as Record<string, string>;
       const sql: Record<string, string> = Object.create(null) as Record<string, string>;
+      const queue: Record<string, SelfhostGrantedQueue> = Object.create(null) as Record<
+        string,
+        SelfhostGrantedQueue
+      >;
       for (const binding of plane.bindings) {
         if (binding.kind === "edge.kv") kv[binding.name] = binding.target;
-        else sql[binding.name] = binding.target;
+        else if (binding.kind === "edge.sql") sql[binding.name] = binding.target;
+        else if (binding.queue) {
+          queue[binding.name] = {
+            queueId: binding.target,
+            messageRetentionSeconds: binding.queue.messageRetentionSeconds,
+            deliveryDelaySeconds: binding.queue.deliveryDelaySeconds,
+          };
+        }
       }
-      return { secret: stored.planeToken, kv, sql };
+      return { secret: stored.planeToken, kv, sql, queue };
     },
   };
 }
@@ -474,25 +611,28 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   /**
    * The generated entrypoint one publication needs, or null when it needs none.
    *
-   * A version that binds no KV namespace and no SQLite database is published
-   * exactly as it was before this Host could generate anything: same main
-   * module, same module list, same bindings, same bytes.
+   * A version that binds no namespace, queue, or database and receives no event
+   * is published exactly as it was before this Host could generate anything:
+   * same main module, same module list, same bindings, same bytes.
    */
   const wrapperProjection = (
     script: string,
     versionId: string,
     mainModule: string,
     bindings: StoredSelfhostVersionBindings | null,
+    events: boolean,
     generation: string,
   ): {
     source: Uint8Array;
-    facade: Uint8Array;
+    facade: Uint8Array | null;
+    gate: Uint8Array | null;
     publication: string;
-    token: SelfhostVersionBinding;
+    token: SelfhostVersionBinding | null;
+    eventToken: SelfhostVersionBinding | null;
   } | null => {
     const plane = bindings?.dataPlane;
-    if (!plane || !bindings) return null;
-    if (!options.dataPlaneAddress || !bindings.planeToken) {
+    if (!bindings || (!plane && !events)) return null;
+    if (plane && (!options.dataPlaneAddress || !bindings.planeToken)) {
       throw new SelfhostFailure(
         failed(
           "provider_error",
@@ -500,13 +640,28 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         ),
       );
     }
-    if (
-      mainModule === SELFHOST_WORKER_ENTRYPOINT_MODULE ||
-      mainModule === SELFHOST_WORKER_DATA_SERVICE_MODULE
-    ) {
+    // A Version published before this Host recorded handlers has no way to be
+    // wrapped: the wrapper must re-export exactly what the Version declared,
+    // and that declaration is not recoverable from the materialized bundle.
+    // Refusing beats publishing an entrypoint that drops the event.
+    if (!bindings.handlers || (events && !bindings.eventToken)) {
       throw new SelfhostFailure(
-        failed("invalid_spec", "the Worker bundle claims this Host's entrypoint module name"),
+        failed(
+          "invalid_spec",
+          "the active Worker Version predates event delivery on this Host; publish a new Version",
+        ),
       );
+    }
+    for (const generated of [
+      SELFHOST_WORKER_ENTRYPOINT_MODULE,
+      SELFHOST_WORKER_DATA_SERVICE_MODULE,
+      SELFHOST_WORKER_EVENT_SERVICE_MODULE,
+    ]) {
+      if (mainModule === generated) {
+        throw new SelfhostFailure(
+          failed("invalid_spec", "the Worker bundle claims this Host's entrypoint module name"),
+        );
+      }
     }
     // The generation, not the version: two publications of one Version differ
     // when its routes do, and a readiness answer has to be attributable to the
@@ -519,7 +674,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       source = selfhostWorkerEntrypointSource({
         publication,
         originalMainModule: mainModule,
-        declaredHandlers: plane.handlers,
+        declaredHandlers: bindings.handlers,
+        ...(events ? { events: true } : {}),
         bindings: [
           ...bindings.vars.map((binding) => ({
             name: binding.name,
@@ -529,11 +685,13 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             name: binding.name,
             type: "secret_text" as const,
           })),
-          ...plane.bindings.map((binding) => ({
+          ...(plane?.bindings ?? []).map((binding) => ({
             kind:
               binding.kind === "edge.kv"
                 ? SELFHOST_WORKER_EDGE_KV_BINDING_KIND
-                : SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
+                : binding.kind === "edge.queue"
+                  ? SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND
+                  : SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
             publicName: binding.name,
           })),
         ],
@@ -545,16 +703,30 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     }
     return {
       source: new TextEncoder().encode(source),
-      facade: new TextEncoder().encode(selfhostDataServiceSource()),
+      facade: plane ? new TextEncoder().encode(selfhostDataServiceSource()) : null,
+      gate: events ? new TextEncoder().encode(selfhostEventServiceSource()) : null,
       publication,
       // The token names the version it was minted for, so the plane resolves
       // one record rather than searching every version for a matching secret.
       // It is declared on the facade service and nowhere else.
-      token: {
-        name: SELFHOST_WORKER_DATA_TOKEN_BINDING,
-        value: `${script}.${versionId}.${bindings.planeToken}`,
-        kind: "text",
-      },
+      token:
+        plane && bindings.planeToken
+          ? {
+              name: SELFHOST_WORKER_DATA_TOKEN_BINDING,
+              value: `${script}.${versionId}.${bindings.planeToken}`,
+              kind: "text",
+            }
+          : null,
+      // The event token names nothing: the gate compares it whole, and the
+      // script it protects is the one it is declared beside.
+      eventToken:
+        events && bindings.eventToken
+          ? {
+              name: SELFHOST_WORKER_EVENT_TOKEN_BINDING,
+              value: bindings.eventToken,
+              kind: "text",
+            }
+          : null,
     };
   };
 
@@ -608,6 +780,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     }
   };
 
+  /** Whether anything is attached to this script that delivers it an event. */
+  const receivesEvents = (state: SelfhostScriptState): boolean =>
+    (state.consumers ?? []).length > 0 || (state.crons ?? []).length > 0;
+
   /** Rewrites what workerd serves for one script from durable state alone. */
   const republish = async (script: string): Promise<void> => {
     const { state } = await readScriptState(script);
@@ -641,6 +817,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       state.activeVersion,
       meta.mainModule,
       bindings,
+      receivesEvents(state),
       generation,
     );
     if (projection) {
@@ -653,6 +830,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       for (const generated of [
         SELFHOST_WORKER_ENTRYPOINT_MODULE,
         SELFHOST_WORKER_DATA_SERVICE_MODULE,
+        SELFHOST_WORKER_EVENT_SERVICE_MODULE,
       ]) {
         if (modules.has(generated)) {
           throw new SelfhostFailure(
@@ -661,7 +839,12 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         }
       }
       modules.set(SELFHOST_WORKER_ENTRYPOINT_MODULE, projection.source);
-      modules.set(SELFHOST_WORKER_DATA_SERVICE_MODULE, projection.facade);
+      if (projection.facade) {
+        modules.set(SELFHOST_WORKER_DATA_SERVICE_MODULE, projection.facade);
+      }
+      if (projection.gate) {
+        modules.set(SELFHOST_WORKER_EVENT_SERVICE_MODULE, projection.gate);
+      }
     }
     await runtimeOperation(() =>
       runtime.write(
@@ -678,11 +861,26 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
                 modules: [meta.mainModule],
                 // The token rides on the facade service's own binding list, so
                 // it is never a binding of the service that runs tenant code.
-                dataPlane: {
-                  address: options.dataPlaneAddress as string,
-                  module: SELFHOST_WORKER_DATA_SERVICE_MODULE,
-                  vars: [projection.token],
-                },
+                ...(projection.facade && projection.token
+                  ? {
+                      dataPlane: {
+                        address: options.dataPlaneAddress as string,
+                        module: SELFHOST_WORKER_DATA_SERVICE_MODULE,
+                        vars: [projection.token],
+                      },
+                    }
+                  : {}),
+                // Same discipline for the event token, and one more thing: the
+                // gate is the only service holding a binding that names this
+                // script's event entrypoint.
+                ...(projection.gate && projection.eventToken
+                  ? {
+                      events: {
+                        module: SELFHOST_WORKER_EVENT_SERVICE_MODULE,
+                        vars: [projection.eventToken],
+                      },
+                    }
+                  : {}),
               }
             : {}),
         },
@@ -811,7 +1009,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   };
 
   /**
-   * The Worker Version's KV and SQLite bindings, resolved to what they address.
+   * The Worker Version's KV, queue, and SQLite bindings, resolved to what they
+   * address.
    *
    * Every declaration has to line up with a relation this Host itself
    * provisioned: the related Resource's kind, the native id this provider
@@ -834,6 +1033,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     };
     for (const [field, kind, resourceKind, prefix] of [
       ["kvBindings", "edge.kv", "EdgeKVNamespace", "selfhost-kv"],
+      ["queueProducerBindings", "edge.queue", "AtLeastOnceQueue", "selfhost-queue"],
       ["sqliteBindings", "edge.sql", "SQLiteDatabase", "selfhost-sqlite"],
     ] as const) {
       const raw = input.spec[field];
@@ -859,18 +1059,56 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           invalid();
         }
         names.add(name as string);
-        bindings.push({ kind, name: name as string, target: target as string });
+        // A queue's own promise about its messages travels with the binding,
+        // because the plane applies it at the moment one is accepted.
+        const settings = kind === "edge.queue" ? queueSettings(relation) : undefined;
+        if ((settings === undefined) !== (kind !== "edge.queue")) invalid();
+        bindings.push({
+          kind,
+          name: name as string,
+          target: target as string,
+          ...(settings ? { queue: settings } : {}),
+        });
       }
     }
     return bindings;
   };
 
   /**
+   * What a queue promises about the messages put into it, read from the exact
+   * Resource the relation names.
+   *
+   * Both fields come from the queue's own desired state, which is the only
+   * place they exist: `messageRetentionSeconds` is required by the Form and
+   * `deliveryDelaySeconds` defaults to none.
+   */
+  const queueSettings = (
+    relation: ProviderRelation | undefined,
+  ): SelfhostVersionQueueSettings | undefined => {
+    const spec = relation?.resource.spec;
+    const retention = spec?.messageRetentionSeconds;
+    const delay = spec?.deliveryDelaySeconds ?? 0;
+    if (
+      typeof retention !== "number" ||
+      !Number.isSafeInteger(retention) ||
+      retention < 60 ||
+      retention > 1_209_600 ||
+      typeof delay !== "number" ||
+      !Number.isSafeInteger(delay) ||
+      delay < 0 ||
+      delay > 43_200
+    ) {
+      return undefined;
+    }
+    return { messageRetentionSeconds: retention, deliveryDelaySeconds: delay };
+  };
+
+  /**
    * The events the version says its module answers.
    *
-   * Read only when a wrapper is actually generated, because the wrapper is the
-   * only thing on this Host that consumes it: a version with no data binding
-   * publishes exactly as it did before this declaration was looked at.
+   * Recorded for every Version now, because a Cron Trigger or a Queue Consumer
+   * is attached long after the Version was published and the wrapper that
+   * receives the event has to re-export exactly these.
    */
   const declaredHandlers = (spec: JsonObject): readonly SelfhostWorkerHandlerName[] => {
     const declared = spec.handlers;
@@ -893,19 +1131,20 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   };
 
   /**
-   * Records the environment for one immutable version, or removes the record
-   * when it declares none — so a version without bindings publishes the exact
-   * bytes it published before this Host could project any.
+   * Records the environment and the declared handlers for one immutable
+   * version.
+   *
+   * Written for every version, including one that declares nothing: the
+   * handlers and the event token are facts about the Version that a Consumer or
+   * a Trigger attached later has no other way to learn. It changes no rendered
+   * byte — a version with no binding and no attachment still publishes the
+   * exact configuration it published before this Host could project any.
    */
   const writeVersionBindings = async (
     script: string,
     versionId: string,
     set: SelfhostVersionBindingSet,
   ): Promise<void> => {
-    if (set.vars.length === 0 && set.sensitiveVars.length === 0 && !set.dataPlane) {
-      await bindingStoreOperation(() => versionBindings.remove(script, versionId));
-      return;
-    }
     await bindingStoreOperation(() => versionBindings.write(script, versionId, set));
   };
 
@@ -954,13 +1193,11 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     if (dataBindings.length > 0 && !options.dataPlaneAddress) {
       return failed(
         "denied",
-        "this deployment serves no KV or SQLite data plane, so the Worker Version's bindings cannot be projected",
+        "this deployment serves no data plane, so the Worker Version's bindings cannot be projected",
       );
     }
-    const dataPlane =
-      dataBindings.length > 0
-        ? { handlers: declaredHandlers(input.spec), bindings: dataBindings }
-        : undefined;
+    const handlers = declaredHandlers(input.spec);
+    const dataPlane = dataBindings.length > 0 ? { bindings: dataBindings } : undefined;
     const assetsSpec =
       typeof input.spec.assets === "object" && input.spec.assets !== null
         ? (input.spec.assets as JsonObject)
@@ -1023,6 +1260,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     let bindingSet: SelfhostVersionBindingSet;
     try {
       bindingSet = normalizeSelfhostVersionBindingSet({
+        handlers,
         vars,
         sensitiveVars,
         ...(dataPlane ? { dataPlane } : {}),
@@ -1158,13 +1396,13 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     if (dataBindings.length > 0 && !options.dataPlaneAddress) {
       return failed(
         "denied",
-        "this deployment serves no KV or SQLite data plane, so the Worker Version's bindings cannot be projected",
+        "this deployment serves no data plane, so the Worker Version's bindings cannot be projected",
       );
     }
-    const dataPlane =
-      dataBindings.length > 0
-        ? { handlers: declaredHandlers(input.spec), bindings: dataBindings }
-        : undefined;
+    // Read for its refusal only: a Version whose handler declaration is invalid
+    // is not one this recovery can confirm.
+    declaredHandlers(input.spec);
+    const dataPlane = dataBindings.length > 0 ? { bindings: dataBindings } : undefined;
     const assetsSpec =
       typeof input.spec.assets === "object" && input.spec.assets !== null
         ? (input.spec.assets as JsonObject)
@@ -1418,33 +1656,111 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     });
   };
 
+  /**
+   * The exact queue one relation names, as this provider deployed it.
+   *
+   * Resolved through the Deployment rather than derived from the declaration:
+   * the native id this provider minted and the output it published both have to
+   * name the same queue, so a relation another provider deployed is refused
+   * rather than guessed at.
+   */
+  const attachedQueue = (
+    input: { readonly relations?: readonly ProviderRelation[] },
+    pointer: string,
+  ): SelfhostQueueTarget | null => {
+    const relation = input.relations?.find((candidate) => candidate.pointer === pointer);
+    const queue = selfhostNamespaceTarget(
+      relation,
+      "selfhost-queue",
+      "AtLeastOnceQueue",
+      databasePath,
+    );
+    const settings = queueSettings(relation);
+    return queue && settings ? { queue, ...settings } : null;
+  };
+
+  /** One required integer limit of a Queue Consumer, inside its Form's range. */
+  const consumerLimit = (spec: JsonObject, field: string, low: number, high: number): number => {
+    const value = spec[field];
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < low || value > high) {
+      throw new SelfhostFailure(failed("invalid_spec", "the Queue Consumer limits are invalid"));
+    }
+    return value;
+  };
+
+  /** Rewrites one script's attachments and republishes what workerd serves. */
+  const rewriteAttachments = async (
+    script: string,
+    change: (state: SelfhostScriptState) => SelfhostScriptState,
+  ): Promise<void> => {
+    const current = await readScriptState(script);
+    const next = change(current.state);
+    if (JSON.stringify(next) !== JSON.stringify(current.state)) {
+      await writeScriptState(script, current, next);
+    }
+    // Always, even when the desired state was already this: a committed
+    // attachment is not proof that the runtime accepted the gate it needs, and
+    // the publication is what puts that gate in front of the Worker.
+    if (next.activeVersion) await republish(script);
+  };
+
   const applyWorkerCronTrigger = async (input: ApplyInput): Promise<ProviderTicket> => {
     const worker = relationResource(input.relations, "/worker", "ModuleWorker");
     const cron = typeof input.spec.cron === "string" ? input.spec.cron : null;
     if (!worker || !cron) return failed("invalid_spec", "the cron trigger is incomplete");
+    // Parsed here rather than at the first tick, because a schedule this Host
+    // cannot read is a trigger that would be recorded and never fire.
+    if (!parseSelfhostCron(cron)) {
+      return failed(
+        "invalid_spec",
+        "the cron expression is not five UTC fields this Host can read",
+      );
+    }
     const script = await scriptOf(input.identity.tenantRef, worker.metadata);
+    await rewriteAttachments(script, (state) => ({
+      ...state,
+      crons: [...new Set([...(state.crons ?? []), cron])].sort(),
+    }));
     return succeeded({
       nativeId: nativeId(input, `selfhost-cron:${script}`),
-      // Recorded, not firing: this machine runs no scheduler yet.
-      observed: { cron, scriptName: script, scheduled: false },
+      observed: { cron, scriptName: script, scheduled: Boolean(options.events) },
       outputs: {},
     });
   };
 
   const applyQueueConsumer = async (input: ApplyInput): Promise<ProviderTicket> => {
     const worker = relationResource(input.relations, "/worker", "ModuleWorker");
-    const queue = relationResource(input.relations, "/queue", "AtLeastOnceQueue");
+    const queue = attachedQueue(input, "/queue");
     if (!worker || !queue) return failed("invalid_spec", "the Queue Consumer is incomplete");
+    const declaredDeadLetter = input.spec.deadLetterQueue !== undefined;
+    const deadLetterQueue = declaredDeadLetter ? attachedQueue(input, "/deadLetterQueue") : null;
+    if (declaredDeadLetter && !deadLetterQueue) {
+      return failed("invalid_spec", "the Queue Consumer's dead-letter queue is unavailable");
+    }
+    const attachment: SelfhostQueueConsumerAttachment = {
+      queue: queue.queue,
+      maxBatchSize: consumerLimit(input.spec, "maxBatchSize", 1, 100),
+      maxBatchTimeoutSeconds: consumerLimit(input.spec, "maxBatchTimeoutSeconds", 0, 60),
+      maxConcurrency: consumerLimit(input.spec, "maxConcurrency", 1, 250),
+      maxRetries: consumerLimit(input.spec, "maxRetries", 0, 100),
+      retryDelaySeconds: consumerLimit(input.spec, "retryDelaySeconds", 0, 43_200),
+      ...(deadLetterQueue ? { deadLetterQueue } : {}),
+    };
     const script = await scriptOf(input.identity.tenantRef, worker.metadata);
-    const queueName = await derivedProviderResourceName("tsq", {
-      tenantRef: input.identity.tenantRef,
-      space: queue.metadata.space,
-      name: queue.metadata.name,
-    });
+    await rewriteAttachments(script, (state) => ({
+      ...state,
+      consumers: [
+        ...(state.consumers ?? []).filter((entry) => entry.queue !== attachment.queue),
+        attachment,
+      ].sort((left, right) => (left.queue < right.queue ? -1 : 1)),
+    }));
     return succeeded({
-      nativeId: nativeId(input, `selfhost-consumer:${queueName}:${script}`),
-      // Recorded, not pumping: this machine moves no queue messages yet.
-      observed: { queueName, scriptName: script, delivering: false },
+      nativeId: nativeId(input, `selfhost-consumer:${queue.queue}:${script}`),
+      observed: {
+        queueName: queue.queue,
+        scriptName: script,
+        delivering: Boolean(options.events),
+      },
       outputs: {},
     });
   };
@@ -1876,20 +2192,47 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             });
           }
           case "WorkerCronTrigger": {
+            const worker = relationResource(input.relations, "/worker", "ModuleWorker");
             const cron = typeof input.spec.cron === "string" ? input.spec.cron : null;
             if (!cron) return failed("not_found", "the cron trigger records no expression");
+            if (!worker) return failed("not_found", "the cron trigger has no worker relation");
+            const script = await scriptOf(input.identity.tenantRef, worker.metadata);
+            const { state } = await readScriptState(script);
+            if (!(state.crons ?? []).includes(cron)) {
+              return failed("not_found", "the cron trigger is not durably attached");
+            }
             return succeeded({
               nativeId: input.nativeId,
-              observed: { cron, scheduled: false },
+              observed: {
+                cron,
+                scriptName: script,
+                // Attached and, if this deployment runs a scheduler, firing.
+                scheduled: Boolean(options.events) && Boolean(state.activeVersion),
+              },
               outputs: {},
             });
           }
-          case "QueueConsumer":
+          case "QueueConsumer": {
+            const worker = relationResource(input.relations, "/worker", "ModuleWorker");
+            const queue = attachedQueue(input, "/queue");
+            if (!worker || !queue) {
+              return failed("not_found", "the Queue Consumer has no attachment relations");
+            }
+            const script = await scriptOf(input.identity.tenantRef, worker.metadata);
+            const { state } = await readScriptState(script);
+            if (!(state.consumers ?? []).some((entry) => entry.queue === queue.queue)) {
+              return failed("not_found", "the Queue Consumer is not durably attached");
+            }
             return succeeded({
               nativeId: input.nativeId,
-              observed: { delivering: false },
+              observed: {
+                queueName: queue.queue,
+                scriptName: script,
+                delivering: Boolean(options.events) && Boolean(state.activeVersion),
+              },
               outputs: {},
             });
+          }
           default: {
             const made = await namespaceResult(dispatchKind(input.offering), input, input.nativeId);
             return succeeded({
@@ -1925,6 +2268,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             await rm(join(versionsRoot, script), { recursive: true, force: true });
             await bindingStoreOperation(() => versionBindings.removeScript(script));
             await removeScriptState(script);
+            // The next-fire state goes with the Worker. Leaving it would make a
+            // Worker declared again under the same name inherit a schedule
+            // nobody asked for.
+            await options.events?.forgetSchedules(script);
             await runtimeOperation(() => runtime.reload());
             return done();
           }
@@ -2001,6 +2348,49 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             }
             return done();
           }
+          case "WorkerCronTrigger": {
+            const worker = relationResource(input.relations, "/worker", "ModuleWorker");
+            const cron = typeof input.spec?.cron === "string" ? input.spec.cron : null;
+            if (worker && cron) {
+              const script = await scriptOf(input.identity.tenantRef, worker.metadata);
+              await rewriteAttachments(script, (state) => ({
+                ...state,
+                crons: (state.crons ?? []).filter((entry) => entry !== cron),
+              }));
+              await options.events?.forgetSchedules(script, cron);
+            }
+            return done();
+          }
+          case "QueueConsumer": {
+            const worker = relationResource(input.relations, "/worker", "ModuleWorker");
+            const parsed = parseSelfhostNativeId(
+              "QueueConsumer",
+              input.nativeId,
+              input.spec,
+              input.relations,
+            );
+            const queueName =
+              typeof parsed?.data.queueName === "string" ? parsed.data.queueName : null;
+            if (worker && queueName) {
+              const script = await scriptOf(input.identity.tenantRef, worker.metadata);
+              // The messages stay: they belong to the queue, not to the
+              // attachment that was draining it, and dropping durable bytes
+              // inside an apply is not this seam's job.
+              await rewriteAttachments(script, (state) => ({
+                ...state,
+                consumers: (state.consumers ?? []).filter((entry) => entry.queue !== queueName),
+              }));
+            }
+            return done();
+          }
+          case "AtLeastOnceQueue": {
+            // The messages go with the queue, for the same reason a namespace's
+            // rows do: a customer who deleted a queue and declares one with the
+            // same name has asked for an empty queue.
+            const queueId = selfhostNamespaceName("selfhost-queue", input.nativeId);
+            if (queueId && options.events) await options.events.deleteQueue(queueId);
+            return done();
+          }
           case "EdgeKVNamespace": {
             // The rows go with the namespace. Leaving them was defensible while
             // `EdgeKVNamespace` was a name with nothing behind it; now that it
@@ -2024,9 +2414,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             return done();
           }
           default:
-            // Cron declarations, consumers, buckets, queues: the lifecycle
-            // delete removes the declaration. Removing stored bytes too is a
-            // reconciliation step, done deliberately and not inside an apply.
+            // Buckets and anything else with nothing durable behind it here:
+            // the lifecycle delete removes the declaration and there is nothing
+            // else on this machine that was the Resource.
             return done();
         }
       } catch (error) {
@@ -2482,6 +2872,9 @@ function selfhostNamespaceTarget(
   const outputs = relation.deployment?.outputs;
   if (resourceKind === "SQLiteDatabase") {
     return outputs?.engine === "sqlite" && outputs.path === databasePath(name) ? name : null;
+  }
+  if (resourceKind === "AtLeastOnceQueue") {
+    return outputs?.queueId === name && outputs.queueName === name ? name : null;
   }
   return outputs?.namespaceId === name ? name : null;
 }
@@ -2945,7 +3338,13 @@ function sameBindingNames(
     JSON.stringify(
       [...bindings]
         .sort((left, right) => (left.name < right.name ? -1 : 1))
-        .map((binding) => [binding.kind, binding.name, binding.target]),
+        .map((binding) => [
+          binding.kind,
+          binding.name,
+          binding.target,
+          binding.queue?.messageRetentionSeconds ?? null,
+          binding.queue?.deliveryDelaySeconds ?? null,
+        ]),
     );
   return (
     JSON.stringify(expectedVars) === JSON.stringify(observedVars) &&

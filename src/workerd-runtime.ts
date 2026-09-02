@@ -84,6 +84,27 @@ export interface WorkerdSite {
    * every binding of a service to every module that service runs.
    */
   readonly dataPlane?: WorkerdDataPlane;
+  /**
+   * The Host-owned gate a queue batch or a cron match reaches this script
+   * through.
+   *
+   * Absent means nothing delivers events to this script, and it renders exactly
+   * the configuration it always did. Present renders one more service beside
+   * the script — its own module, its own token — and a route on a hostname of
+   * this Host's own that reaches the gate and never the script. The gate is the
+   * only holder of a binding that names the script's event entrypoint, so a
+   * customer request at the script's own hostname reaches `fetch` and nothing
+   * else.
+   */
+  readonly events?: WorkerdEventGate;
+}
+
+/** The gate service one script receives its events through. */
+export interface WorkerdEventGate {
+  /** Module inside the script's directory that implements the gate. */
+  readonly module: string;
+  /** Bindings for the gate alone; this is where the event token lives. */
+  readonly vars: readonly WorkerdBinding[];
 }
 
 /** The facade service one script's entrypoint reaches its storage through. */
@@ -121,7 +142,19 @@ export interface WorkerdRuntime {
   probe?(
     name: string,
     path: string,
-    init: { readonly method: string; readonly headers: Readonly<Record<string, string>> },
+    init: {
+      readonly method: string;
+      readonly headers: Readonly<Record<string, string>>;
+      /** The exact body, when the question carries one. */
+      readonly body?: string;
+      /**
+       * Which of this Host's own hostnames to ask on. `internal` reaches the
+       * script itself and is what readiness uses; `events` reaches the gate in
+       * front of it, which is the only way an event may enter.
+       */
+      readonly route?: "internal" | "events";
+      readonly timeoutMillis?: number;
+    },
   ): Promise<{ readonly status: number; readonly body: string } | null>;
 }
 
@@ -151,6 +184,7 @@ interface Manifest {
   readonly vars?: readonly WorkerdBinding[];
   readonly modules?: readonly string[];
   readonly dataPlane?: WorkerdDataPlane;
+  readonly events?: WorkerdEventGate;
 }
 
 const MANIFEST = "takoserver-site.json";
@@ -164,6 +198,16 @@ const MANIFEST = "takoserver-site.json";
  */
 const DATA_SERVICE_BINDING = "__TAKOSERVER_SELFHOST_DATA";
 const DATA_PLANE_BINDING = "__TAKOSERVER_SELFHOST_DATA_PLANE";
+/**
+ * The gate's binding to the script's event entrypoint, and the named export it
+ * addresses.
+ *
+ * Kept in step with the provider's constants by name for the same reason as
+ * the two above: this module is the runtime, and it must not depend on the
+ * provider that publishes into it.
+ */
+const EVENT_TARGET_BINDING = "__TAKOSERVER_SELFHOST_EVENT_TARGET";
+const EVENT_ENTRYPOINT = "takoserverSelfhostEvents";
 /**
  * Compatibility flags for a script published through a generated entrypoint.
  *
@@ -184,6 +228,14 @@ const DATA_PLANE_COMPATIBILITY_FLAGS = ["disallow_importable_env"] as const;
  * after the customer routes so a claimed custom domain cannot capture it.
  */
 const INTERNAL_ROUTE_SUFFIX = ".selfhost-internal.invalid";
+/**
+ * The hostname this Host delivers a script's events on.
+ *
+ * Separate from the readiness one because they reach different services: the
+ * readiness probe asks the script itself, and an event must never be able to.
+ * Written after the customer routes for the same reason.
+ */
+const EVENT_ROUTE_SUFFIX = ".selfhost-events.invalid";
 /** Where a script's static files live inside its directory. */
 const ASSETS_DIRECTORY = "__assets";
 
@@ -246,6 +298,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): WorkerdRun
             ? { modules: validModules(site.modules) }
             : {}),
           ...(site.dataPlane ? { dataPlane: validDataPlane(site.dataPlane) } : {}),
+          ...(site.events ? { events: validEventGate(site.events) } : {}),
         }),
         "utf8",
       );
@@ -277,7 +330,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): WorkerdRun
     async probe(name, path, init) {
       let hostname: string;
       try {
-        hostname = internalHostname(name);
+        hostname = init.route === "events" ? eventHostname(name) : internalHostname(name);
       } catch {
         return null;
       }
@@ -285,7 +338,11 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): WorkerdRun
         const response = await fetch(`http://127.0.0.1:${port}${path}`, {
           method: init.method,
           headers: { ...init.headers, host: hostname },
-          signal: AbortSignal.timeout(2_000),
+          ...(init.body === undefined ? {} : { body: init.body }),
+          // A readiness question is answered by this Host's own module and is
+          // over in milliseconds. An event runs a customer's handler, so the
+          // caller says how long it is willing to wait for one.
+          signal: AbortSignal.timeout(init.timeoutMillis ?? 2_000),
         });
         // Bounded because the answer is this Host's own small envelope and the
         // body on the other side of that router is a tenant's Worker.
@@ -465,6 +522,14 @@ function validDataPlane(plane: WorkerdDataPlane): WorkerdDataPlane {
   return plane;
 }
 
+/** The event gate one script publishes beside itself, checked whole. */
+function validEventGate(gate: WorkerdEventGate): WorkerdEventGate {
+  if (typeof gate !== "object" || gate === null) throw new Error("unusable event gate");
+  validModules([gate.module]);
+  validBindings(gate.vars ?? []);
+  return gate;
+}
+
 /**
  * The hostname the router answers this Host's own questions about a script on.
  *
@@ -476,6 +541,14 @@ export function internalHostname(script: string): string {
     throw new Error(`unusable script name: ${script}`);
   }
   return `${script}${INTERNAL_ROUTE_SUFFIX}`;
+}
+
+/** The hostname a queue batch or a cron match is delivered on. */
+export function eventHostname(script: string): string {
+  if (!/^[a-z0-9][a-z0-9_-]{0,127}$/u.test(script)) {
+    throw new Error(`unusable script name: ${script}`);
+  }
+  return `${script}${EVENT_ROUTE_SUFFIX}`;
 }
 
 /**
@@ -589,7 +662,9 @@ async function readPublished(scriptsRoot: string): Promise<readonly Published[]>
       validBindings(manifest.vars ?? []);
       validModules(manifest.modules ?? []);
       if (manifest.dataPlane !== undefined) validDataPlane(manifest.dataPlane);
+      if (manifest.events !== undefined) validEventGate(manifest.events);
       internalHostname(entry.name);
+      eventHostname(entry.name);
     } catch {
       continue;
     }
@@ -635,9 +710,10 @@ function renderConfig(published: readonly Published[], port: number, scriptsRoot
         .join(", ");
       // Rendered only for a script published through a generated entrypoint, so
       // a script that binds no data plane produces the bytes it always did.
-      const flagList = entry.manifest.dataPlane
-        ? `\n      compatibilityFlags = [ ${DATA_PLANE_COMPATIBILITY_FLAGS.map((flag) => capnpText(flag)).join(", ")} ],`
-        : "";
+      const flagList =
+        entry.manifest.dataPlane || entry.manifest.events
+          ? `\n      compatibilityFlags = [ ${DATA_PLANE_COMPATIBILITY_FLAGS.map((flag) => capnpText(flag)).join(", ")} ],`
+          : "";
       return `  ( name = "${entry.name}",
     worker = (
       modules = [ ${moduleList} ],${bindingList}
@@ -709,6 +785,31 @@ function renderConfig(published: readonly Published[], port: number, scriptsRoot
     })
     .join("\n");
 
+  // One gate per script that receives events. It holds the token and the only
+  // binding on this machine that names the script's event entrypoint; the
+  // script itself is not reachable on the event hostname at all, and the
+  // entrypoint the gate calls is a named export the router never addresses.
+  const eventServices = published
+    .filter((entry) => entry.manifest.events)
+    .map((entry) => {
+      const gate = validEventGate(entry.manifest.events as WorkerdEventGate);
+      const gateBindings = [
+        `(name = "${EVENT_TARGET_BINDING}", service = (name = ${capnpText(entry.name)}, entrypoint = "${EVENT_ENTRYPOINT}"))`,
+        ...validBindings(gate.vars).map(
+          (binding) =>
+            `(name = ${capnpText(binding.name)}, ${binding.kind} = ${capnpText(binding.value)})`,
+        ),
+      ].join(", ");
+      return `  ( name = "${entry.name}-selfhost-events",
+    worker = (
+      modules = [ (name = ${capnpText(gate.module)}, esModule = embed ${capnpText(`${entry.name}/${gate.module}`)}) ],
+      bindings = [ ${gateBindings} ],
+      compatibilityDate = "2026-01-01",
+    )
+  ),`;
+    })
+    .join("\n");
+
   const routes = [
     ...published.flatMap((entry) =>
       entry.manifest.hostnames.map((hostname) => ({ hostname, service: entry.name })),
@@ -718,18 +819,30 @@ function renderConfig(published: readonly Published[], port: number, scriptsRoot
     ...published
       .filter((entry) => entry.manifest.dataPlane)
       .map((entry) => ({ hostname: internalHostname(entry.name), service: entry.name })),
+    ...published
+      .filter((entry) => entry.manifest.events)
+      .map((entry) => ({
+        hostname: eventHostname(entry.name),
+        service: `${entry.name}-selfhost-events`,
+      })),
   ];
   const routeTable = JSON.stringify(Object.fromEntries(routes.map((r) => [r.hostname, r.service])));
-  const bindings = published
-    .map((entry) => `      (name = "${entry.name}", service = "${entry.name}"),`)
-    .join("\n");
+  const bindings = [
+    ...published.map((entry) => `      (name = "${entry.name}", service = "${entry.name}"),`),
+    ...published
+      .filter((entry) => entry.manifest.events)
+      .map(
+        (entry) =>
+          `      (name = "${entry.name}-selfhost-events", service = "${entry.name}-selfhost-events"),`,
+      ),
+  ].join("\n");
 
   return `using Workerd = import "/workerd/workerd.capnp";
 
 const config :Workerd.Config = (
   services = [
 ${services}
-${assetServices}${dataServices === "" ? "" : `\n${dataServices}`}
+${assetServices}${dataServices === "" ? "" : `\n${dataServices}`}${eventServices === "" ? "" : `\n${eventServices}`}
   ( name = "router",
     worker = (
       modules = [ (name = "router.js", esModule = embed "router.js") ],

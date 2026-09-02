@@ -28,6 +28,7 @@ afterEach(() => {
 });
 
 const SET = {
+  handlers: ["fetch" as const],
   vars: [{ name: "LANE", value: "takoform-v1", kind: "text" as const }],
   sensitiveVars: [{ name: "ENCRYPTION_KEY", value: "placeholder-secret", kind: "text" as const }],
 };
@@ -45,6 +46,7 @@ test("keeps one salt for one version so a retry does not move its digest", async
   const first = await store.write("sw-a", "v-1", SET);
   const second = await store.write("sw-a", "v-1", {
     // Order is normalized, so presenting the same set differently is the same set.
+    handlers: ["fetch"],
     vars: [...SET.vars],
     sensitiveVars: [...SET.sensitiveVars],
   });
@@ -65,6 +67,7 @@ test("commits to the values with a salt rather than a guessable hash of them", a
 test("changing a value changes the digest", async () => {
   const first = await store.write("sw-a", "v-1", SET);
   const changed = await store.write("sw-a", "v-1", {
+    handlers: ["fetch"],
     vars: SET.vars,
     sensitiveVars: [{ name: "ENCRYPTION_KEY", value: "rotated", kind: "text" }],
   });
@@ -86,6 +89,7 @@ test("refuses a name that is not a script or a version", async () => {
 test("refuses a set that names the same binding twice", async () => {
   await expect(
     store.write("sw-a", "v-1", {
+      handlers: ["fetch"],
       vars: [{ name: "SAME", value: "a", kind: "text" }],
       sensitiveVars: [{ name: "SAME", value: "b", kind: "text" }],
     }),
@@ -100,6 +104,34 @@ test("reports a tampered record as corrupt instead of serving it", async () => {
   await expect(store.read("sw-a", "v-1")).rejects.toMatchObject({ code: "corrupt" });
   await writeFile(path, "{not json", "utf8");
   await expect(store.read("sw-a", "v-1")).rejects.toMatchObject({ code: "corrupt" });
+});
+
+test("a record an earlier build wrote is still read, and carries no handlers", async () => {
+  // `@v1` predates event delivery on this Host: it has no handler list and no
+  // event token, so a Version published under it keeps serving and simply
+  // cannot be wrapped.
+  const path = join(root, "sw-a", "v-1.json");
+  await store.write("sw-a", "v-1", SET);
+  const legacy = JSON.stringify({
+    format: "takoserver.selfhost-version-bindings@v1",
+    salt: "A".repeat(43),
+    vars: SET.vars,
+    sensitiveVars: SET.sensitiveVars,
+  });
+  await writeFile(path, legacy, "utf8");
+  const read = await store.read("sw-a", "v-1");
+  expect(read?.handlers).toBeUndefined();
+  expect(read?.eventToken).toBeUndefined();
+  expect(read?.vars).toEqual(SET.vars);
+});
+
+test("mints an event token the caller never chose, once per version", async () => {
+  const first = await store.write("sw-a", "v-1", SET);
+  expect(first.eventToken).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+  const again = await store.write("sw-a", "v-1", SET);
+  expect(again.eventToken).toBe(first.eventToken);
+  const other = await store.write("sw-a", "v-2", SET);
+  expect(other.eventToken).not.toBe(first.eventToken);
 });
 
 test("forgets one version, and every version of a deleted script", async () => {

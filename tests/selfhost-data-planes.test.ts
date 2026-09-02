@@ -24,15 +24,18 @@ import {
  */
 
 const ORIGIN = "http://takoserver-selfhost-data.invalid";
+const QUEUE = { messageRetentionSeconds: 345_600, deliveryDelaySeconds: 0 } as const;
 const ALPHA: SelfhostDataPlaneGrant = {
   secret: "alpha-secret-value-0000",
   kv: { KV: "tskv-alpha" },
   sql: { DB: "tsdb-alpha" },
+  queue: { DELIVERY: { queueId: "tsq-alpha", ...QUEUE } },
 };
 const BETA: SelfhostDataPlaneGrant = {
   secret: "beta-secret-value-00000",
   kv: { KV: "tskv-beta" },
   sql: { DB: "tsdb-beta" },
+  queue: { DELIVERY: { queueId: "tsq-beta", ...QUEUE } },
 };
 const GRANTS: Record<string, SelfhostDataPlaneGrant> = {
   "alpha\u0000v1": ALPHA,

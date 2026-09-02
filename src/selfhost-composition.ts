@@ -13,6 +13,7 @@ import {
   createSelfhostProvider,
   type SelfhostArtifacts,
   type SelfhostDataPlaneMaintenance,
+  type SelfhostEventRuntime,
   type SelfhostProviderOptions,
 } from "./providers/selfhost.ts";
 import type { InstalledTakoformForm } from "./takoform/types.ts";
@@ -69,6 +70,12 @@ export interface SelfhostCompositionOptions {
   readonly dataPlaneAddress?: string;
   /** The housekeeping half of those planes: reclaiming rows and handles. */
   readonly dataPlaneMaintenance?: SelfhostDataPlaneMaintenance;
+  /**
+   * The pump and the scheduler, when this entry runs them. Absent means a Queue
+   * Consumer and a Cron Trigger are recorded and republished but honestly
+   * reported as not delivering and not firing.
+   */
+  readonly events?: SelfhostEventRuntime;
   readonly now: Date;
 }
 
@@ -142,6 +149,7 @@ export function createSelfhostComposition(
     ...(options.runtimeInputs ? { runtimeInputs: options.runtimeInputs } : {}),
     ...(options.dataPlaneAddress ? { dataPlaneAddress: options.dataPlaneAddress } : {}),
     ...(options.dataPlaneMaintenance ? { dataPlaneMaintenance: options.dataPlaneMaintenance } : {}),
+    ...(options.events ? { events: options.events } : {}),
   } satisfies SelfhostProviderOptions);
 
   const supplyContract: SupplyContract = {

@@ -14,6 +14,7 @@ const PROVIDER_REPAIR_AND_MANAGED_SCHEDULE_RECONCILIATION =
   "0036_provider_repair_and_managed_schedule_reconciliation.sql";
 const RUNTIME_INPUT_PREPARATION_V2 = "0037_worker_runtime_input_preparation_v2.sql";
 const SELFHOST_EDGE_KV = "0038_selfhost_edge_kv.sql";
+const SELFHOST_QUEUES_AND_SCHEDULES = "0039_selfhost_queues_and_schedules.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
@@ -21,6 +22,7 @@ const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   PROVIDER_REPAIR_AND_MANAGED_SCHEDULE_RECONCILIATION,
   RUNTIME_INPUT_PREPARATION_V2,
   SELFHOST_EDGE_KV,
+  SELFHOST_QUEUES_AND_SCHEDULES,
 ] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
@@ -641,6 +643,7 @@ describe("bringing a local database up to date", () => {
       "0036_provider_repair_and_managed_schedule_reconciliation.sql",
       "0037_worker_runtime_input_preparation_v2.sql",
       "0038_selfhost_edge_kv.sql",
+      "0039_selfhost_queues_and_schedules.sql",
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -760,6 +763,7 @@ describe("bringing a local database up to date", () => {
       "0036_provider_repair_and_managed_schedule_reconciliation.sql",
       "0037_worker_runtime_input_preparation_v2.sql",
       "0038_selfhost_edge_kv.sql",
+      "0039_selfhost_queues_and_schedules.sql",
     ]);
     expect(
       database
@@ -1686,6 +1690,7 @@ describe("bringing a local database up to date", () => {
       PROVIDER_REPAIR_AND_MANAGED_SCHEDULE_RECONCILIATION,
       RUNTIME_INPUT_PREPARATION_V2,
       SELFHOST_EDGE_KV,
+      SELFHOST_QUEUES_AND_SCHEDULES,
     ]);
     expect(
       database

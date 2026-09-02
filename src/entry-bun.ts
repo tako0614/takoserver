@@ -17,7 +17,7 @@ import {
 } from "./operator-key.ts";
 import { resolvePayment } from "./payment-setup.ts";
 import { createOpenAiGateway, parseOpenAiModelConfig } from "./providers/openai.ts";
-import { createSelfhostDataPlaneAccess } from "./providers/selfhost.ts";
+import { createSelfhostDataPlaneAccess, createSelfhostEventTargets } from "./providers/selfhost.ts";
 import { createProvisionerEndpoint } from "./provisioner-endpoint.ts";
 import {
   createRuntimeInputAuthority,
@@ -25,6 +25,8 @@ import {
 } from "./runtime-input-preparations.ts";
 import { parseRuntimeInputSealKeyRing } from "./runtime-input-seal-keyring.ts";
 import { serveSelfhostDataPlanes } from "./selfhost-data-planes.ts";
+import { createSelfhostQueuePump } from "./selfhost-queue-pump.ts";
+import { createSelfhostWorkerScheduler } from "./selfhost-scheduler.ts";
 import { ensureSigningKey } from "./signing-key.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import {
@@ -310,23 +312,60 @@ const providerArtifacts = {
  * reconstructs historical observation/deletion authority and publishes no
  * current Offering.
  */
+const workerdRuntime = createWorkerdRuntime({
+  root: dataRoot,
+  port: workerdPort,
+  isReady: () => workerd.isReady(),
+  async onReload(configPath) {
+    // Started on the first publish rather than at boot, so a machine
+    // that never runs a Worker never runs a runtime for one. After
+    // that it watches the file itself: one tenant's deploy must not
+    // bounce every other tenant's in-flight requests.
+    await workerd.ensure(configPath);
+  },
+});
+
+/**
+ * The half of the Edge Family that is a clock rather than a request.
+ *
+ * A queue message and a cron match have no caller: something on this machine
+ * has to notice they are due and invoke the Worker itself. Both reach the
+ * Worker through the runtime above, on a hostname of this Host's own, past a
+ * gate holding a token the tenant cannot read.
+ *
+ * Retired-drain mode publishes no Worker Version, so it runs neither; the
+ * provider then reports a Consumer as not delivering and a Trigger as not
+ * firing, which is the truth on that machine.
+ */
+const eventTargets = createSelfhostEventTargets(dataRoot);
+const queuePump =
+  providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
+    ? undefined
+    : createSelfhostQueuePump({ sql, runtime: workerdRuntime, targets: eventTargets, clock });
+const workerScheduler =
+  providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
+    ? undefined
+    : createSelfhostWorkerScheduler({
+        sql,
+        runtime: workerdRuntime,
+        targets: eventTargets,
+        clock,
+      });
+const selfhostEvents =
+  queuePump && workerScheduler
+    ? {
+        deleteQueue: (queueId: string) => queuePump.deleteQueue(queueId),
+        forgetSchedules: (script: string, cron?: string) =>
+          workerScheduler.forgetSchedules(script, cron),
+      }
+    : undefined;
+
 const providerComposition = createStandaloneProviderComposition({
   mode: providerMode,
   edge,
   stableForms: currentCandidates.forms,
   dataRoot,
-  runtime: createWorkerdRuntime({
-    root: dataRoot,
-    port: workerdPort,
-    isReady: () => workerd.isReady(),
-    async onReload(configPath) {
-      // Started on the first publish rather than at boot, so a machine
-      // that never runs a Worker never runs a runtime for one. After
-      // that it watches the file itself: one tenant's deploy must not
-      // bounce every other tenant's in-flight requests.
-      await workerd.ensure(configPath);
-    },
-  }),
+  runtime: workerdRuntime,
   artifacts: providerArtifacts,
   ...(process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX
     ? { workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX }
@@ -338,6 +377,7 @@ const providerComposition = createStandaloneProviderComposition({
   ...(dataPlanes
     ? { dataPlaneAddress: dataPlanes.address, dataPlaneMaintenance: dataPlanes.maintenance }
     : {}),
+  ...(selfhostEvents ? { events: selfhostEvents } : {}),
   now: clock(),
   ...(providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
     ? {
@@ -482,12 +522,51 @@ setInterval(() => {
     // that exists for exactly this would only cost writes.
     .then(async () => {
       if (dataPlanes) await dataPlanes.maintenance.sweepExpiredKv();
+      // A message nobody asked for again is reclaimed on the same pass, for the
+      // same reason: retention is a promise about how long it is kept, not
+      // about when somebody notices.
+      if (queuePump) await queuePump.sweep();
     })
     .catch((error: unknown) => console.error("tick failed", error))
     .finally(() => {
       ticking = false;
     });
 }, 30_000);
+
+// The event clock, separate from settlement and much faster. A consumer may ask
+// for a one-second batch timeout, and a tick every thirty seconds would make
+// that number mean nothing. One pass at a time, because two would compete for
+// the same rows and only one can win the lease.
+let pumping = false;
+if (queuePump) {
+  setInterval(() => {
+    if (pumping) return;
+    pumping = true;
+    queuePump
+      .tick()
+      .catch((error: unknown) => console.error("queue pump failed", error))
+      .finally(() => {
+        pumping = false;
+      });
+  }, 1_000);
+}
+
+// The finest field of a cron expression is the minute, and a match is fired
+// only inside the minute it belongs to, so five seconds is plenty of margin and
+// far less work than one.
+let scheduling = false;
+if (workerScheduler) {
+  setInterval(() => {
+    if (scheduling) return;
+    scheduling = true;
+    workerScheduler
+      .tick()
+      .catch((error: unknown) => console.error("worker scheduler failed", error))
+      .finally(() => {
+        scheduling = false;
+      });
+  }, 5_000);
+}
 
 Bun.serve({
   port,

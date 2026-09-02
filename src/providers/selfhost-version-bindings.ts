@@ -22,6 +22,7 @@ import { join, resolve } from "node:path";
 const MAX_BYTES = 4 * 1_024 * 1_024;
 const SALT_BYTES = 32;
 const PLANE_TOKEN_BYTES = 32;
+const EVENT_TOKEN_BYTES = 32;
 /** The Form's own `maxItems` for `kvBindings` and for `sqliteBindings`. */
 const MAX_DATA_BINDINGS = 64;
 const MUTEXES = new Map<string, Promise<void>>();
@@ -30,8 +31,24 @@ const MUTEXES = new Map<string, Promise<void>>();
 const FORMAT_V1 = "takoserver.selfhost-version-bindings@v1";
 /** The shape that also carries the KV/SQL projection and its plane secret. */
 const FORMAT_V2 = "takoserver.selfhost-version-bindings@v2";
+/**
+ * The shape every version writes now: handlers at the top level rather than
+ * inside the data plane, and an event token beside the plane token.
+ *
+ * Handlers moved because a Cron Trigger or a Queue Consumer is attached long
+ * after the Version that answers it was published, and the wrapper that
+ * receives the event has to re-export exactly the handlers the Version
+ * declared. Keeping them inside the data plane made them a fact only a Version
+ * with KV or SQL had.
+ *
+ * The event token is minted with the record for the same reason. A Worker
+ * Version is immutable, so there is no later moment at which one could be
+ * added: by the time a Consumer exists, the record it would have to go in is
+ * already written.
+ */
+const FORMAT_V3 = "takoserver.selfhost-version-bindings@v3";
 
-export const SELFHOST_VERSION_DATA_BINDING_KINDS = ["edge.kv", "edge.sql"] as const;
+export const SELFHOST_VERSION_DATA_BINDING_KINDS = ["edge.kv", "edge.queue", "edge.sql"] as const;
 export type SelfhostVersionDataBindingKind = (typeof SELFHOST_VERSION_DATA_BINDING_KINDS)[number];
 
 export const SELFHOST_WORKER_HANDLER_NAMES = ["fetch", "queue", "scheduled"] as const;
@@ -51,8 +68,9 @@ export interface SelfhostVersionBinding {
 /**
  * One `kvBindings` or `sqliteBindings` entry, resolved to what it addresses.
  *
- * `target` is the namespace id or database name this Host derived for the
- * related Resource, never a customer string and never a filesystem path. The
+ * `target` is the namespace id, queue id, or database name this Host derived
+ * for the related Resource, never a customer string and never a filesystem
+ * path. The
  * Worker never sees it: it addresses its own binding by name and the data plane
  * resolves the name through this record, so a Worker cannot reach a namespace
  * its Version did not declare.
@@ -61,33 +79,63 @@ export interface SelfhostVersionDataBinding {
   readonly kind: SelfhostVersionDataBindingKind;
   readonly name: string;
   readonly target: string;
+  /**
+   * Only for `edge.queue`: the retention and default delay the queue itself
+   * promises, recorded with the binding because the plane has to apply them at
+   * the moment a message is accepted.
+   *
+   * Recorded rather than looked up, for the same reason `vars` are: a
+   * publication projects exactly what its apply resolved. The cost is that
+   * raising a queue's retention reaches a Worker on its next published Version,
+   * not immediately.
+   */
+  readonly queue?: SelfhostVersionQueueSettings;
+}
+
+export interface SelfhostVersionQueueSettings {
+  readonly messageRetentionSeconds: number;
+  readonly deliveryDelaySeconds: number;
 }
 
 /**
- * The half of a version's environment that needs a wrapper module.
+ * The half of a version's environment that needs a data plane behind it.
  *
- * A KV or SQL binding is not a value workerd can carry — there is no such
- * binding type — so the version is published through a generated entrypoint
- * that projects the exact `edge.kv` / `edge.sql` facades over this Host's data
- * planes. The declared handlers are recorded here because the wrapper has to
- * re-export exactly them, and a republish happens long after the apply that
- * read the declaration.
+ * A KV, queue, or SQL binding is not a value workerd can carry — there is no
+ * such binding type — so the version is published through a generated
+ * entrypoint that projects the exact `edge.kv` / `edge.queue` / `edge.sql`
+ * facades over this Host's data planes.
  */
 export interface SelfhostVersionDataPlane {
-  readonly handlers: readonly SelfhostWorkerHandlerName[];
   readonly bindings: readonly SelfhostVersionDataBinding[];
 }
 
 export interface SelfhostVersionBindingSet {
+  /**
+   * The events the Version says its module answers.
+   *
+   * Recorded for every Version, with or without a binding, because the wrapper
+   * that receives a queue batch or a cron match has to re-export exactly them
+   * and is generated long after the apply that read the declaration.
+   */
+  readonly handlers: readonly SelfhostWorkerHandlerName[];
   /** Non-secret configuration from the Worker Version's own `vars`. */
   readonly vars: readonly SelfhostVersionBinding[];
   /** Values delivered through the runtime-input lease, never from portable state. */
   readonly sensitiveVars: readonly SelfhostVersionBinding[];
-  /** Absent when the version binds no KV namespace and no SQLite database. */
+  /** Absent when the version binds no namespace, queue, or database. */
   readonly dataPlane?: SelfhostVersionDataPlane;
 }
 
-export interface StoredSelfhostVersionBindings extends SelfhostVersionBindingSet {
+export interface StoredSelfhostVersionBindings {
+  /**
+   * Absent on a record an earlier build wrote with no data plane. Such a
+   * Version publishes exactly as it did; it simply cannot be given a wrapper,
+   * so attaching an event to it is refused rather than half-served.
+   */
+  readonly handlers?: readonly SelfhostWorkerHandlerName[];
+  readonly vars: readonly SelfhostVersionBinding[];
+  readonly sensitiveVars: readonly SelfhostVersionBinding[];
+  readonly dataPlane?: SelfhostVersionDataPlane;
   /** Salted commitment to this exact binding set; safe to place in a generation. */
   readonly digest: `sha256:${string}`;
   /**
@@ -98,6 +146,13 @@ export interface StoredSelfhostVersionBindings extends SelfhostVersionBindingSet
    * never observed, never projected into the module environment.
    */
   readonly planeToken?: string;
+  /**
+   * The per-version secret this Host presents to the event gate in front of the
+   * Worker. Declared on the gate service and nowhere else, so tenant code
+   * cannot read it and cannot forge a delivery to its own handlers — or, more
+   * to the point, to another script's.
+   */
+  readonly eventToken?: string;
 }
 
 export class SelfhostVersionBindingStoreError extends Error {
@@ -185,13 +240,18 @@ export function createSelfhostVersionBindingStore(options: {
         const planeToken = normalized.dataPlane
           ? base64Url(Uint8Array.from(randomBytes(PLANE_TOKEN_BYTES)))
           : undefined;
+        // Minted for every Version, because a Worker Version is immutable and
+        // the Consumer or Trigger that needs it is attached after this record
+        // is the only one there will ever be.
+        const eventToken = base64Url(Uint8Array.from(randomBytes(EVENT_TOKEN_BYTES)));
         if (
           decodedLength(salt) !== SALT_BYTES ||
+          decodedLength(eventToken) !== EVENT_TOKEN_BYTES ||
           (planeToken !== undefined && decodedLength(planeToken) !== PLANE_TOKEN_BYTES)
         ) {
           throw new SelfhostVersionBindingStoreError("unavailable");
         }
-        const raw = canonicalRecord(salt, normalized, planeToken);
+        const raw = canonicalRecord(FORMAT_V3, salt, normalized, planeToken, eventToken);
         const bytes = new TextEncoder().encode(raw);
         if (bytes.byteLength > MAX_BYTES) throw new SelfhostVersionBindingStoreError("corrupt");
         const temporary = `${path}.tmp`;
@@ -220,8 +280,9 @@ export function createSelfhostVersionBindingStore(options: {
         }
         return {
           ...normalized,
-          digest: digestOf(salt, normalized, planeToken),
+          digest: digestOf(FORMAT_V3, salt, normalized, planeToken, eventToken),
           ...(planeToken === undefined ? {} : { planeToken }),
+          eventToken,
         };
       });
     },
@@ -303,6 +364,7 @@ export function normalizeSelfhostVersionBindingSet(
 }
 
 function normalizeSet(set: SelfhostVersionBindingSet): SelfhostVersionBindingSet {
+  const handlers = normalizeHandlers(set.handlers);
   const vars = normalizeBindings(set.vars);
   const sensitiveVars = normalizeBindings(set.sensitiveVars);
   const dataPlane = set.dataPlane === undefined ? undefined : normalizeDataPlane(set.dataPlane);
@@ -315,7 +377,26 @@ function normalizeSet(set: SelfhostVersionBindingSet): SelfhostVersionBindingSet
     if (names.has(name)) throw new SelfhostVersionBindingStoreError("corrupt");
     names.add(name);
   }
-  return { vars, sensitiveVars, ...(dataPlane ? { dataPlane } : {}) };
+  return { handlers, vars, sensitiveVars, ...(dataPlane ? { dataPlane } : {}) };
+}
+
+/** The closed handler vocabulary, sorted, non-empty, without a duplicate. */
+function normalizeHandlers(
+  handlers: readonly SelfhostWorkerHandlerName[],
+): readonly SelfhostWorkerHandlerName[] {
+  if (!Array.isArray(handlers)) throw new SelfhostVersionBindingStoreError("corrupt");
+  const sorted = [...handlers].sort();
+  if (
+    sorted.length === 0 ||
+    sorted.length > SELFHOST_WORKER_HANDLER_NAMES.length ||
+    new Set(sorted).size !== sorted.length ||
+    sorted.some(
+      (handler) => !(SELFHOST_WORKER_HANDLER_NAMES as readonly string[]).includes(handler),
+    )
+  ) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  return sorted;
 }
 
 /**
@@ -329,22 +410,11 @@ function normalizeDataPlane(plane: SelfhostVersionDataPlane): SelfhostVersionDat
   if (typeof plane !== "object" || plane === null || Array.isArray(plane)) {
     throw new SelfhostVersionBindingStoreError("corrupt");
   }
-  if (!Array.isArray(plane.handlers) || !Array.isArray(plane.bindings)) {
-    throw new SelfhostVersionBindingStoreError("corrupt");
-  }
-  const handlers = [...plane.handlers].sort();
-  if (
-    handlers.length === 0 ||
-    handlers.length > SELFHOST_WORKER_HANDLER_NAMES.length ||
-    new Set(handlers).size !== handlers.length ||
-    handlers.some(
-      (handler) => !(SELFHOST_WORKER_HANDLER_NAMES as readonly string[]).includes(handler),
-    )
-  ) {
+  if (!Array.isArray(plane.bindings)) {
     throw new SelfhostVersionBindingStoreError("corrupt");
   }
   const bindings = [...plane.bindings].sort((left, right) => (left?.name < right?.name ? -1 : 1));
-  if (bindings.length === 0 || bindings.length > 2 * MAX_DATA_BINDINGS) {
+  if (bindings.length === 0 || bindings.length > 3 * MAX_DATA_BINDINGS) {
     throw new SelfhostVersionBindingStoreError("corrupt");
   }
   for (const binding of bindings) {
@@ -359,15 +429,43 @@ function normalizeDataPlane(plane: SelfhostVersionDataPlane): SelfhostVersionDat
     ) {
       throw new SelfhostVersionBindingStoreError("corrupt");
     }
+    // A queue binding carries its queue's promise; nothing else may.
+    if ((binding.queue !== undefined) !== (binding.kind === "edge.queue")) {
+      throw new SelfhostVersionBindingStoreError("corrupt");
+    }
+    if (binding.queue !== undefined) normalizeQueueSettings(binding.queue);
   }
   return {
-    handlers,
     bindings: bindings.map((binding) => ({
       kind: binding.kind,
       name: binding.name,
       target: binding.target,
+      ...(binding.queue ? { queue: normalizeQueueSettings(binding.queue) } : {}),
     })),
   };
+}
+
+function normalizeQueueSettings(
+  settings: SelfhostVersionQueueSettings,
+): SelfhostVersionQueueSettings {
+  if (typeof settings !== "object" || settings === null || Array.isArray(settings)) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  if (Object.keys(settings).sort().join(",") !== "deliveryDelaySeconds,messageRetentionSeconds") {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  const { messageRetentionSeconds, deliveryDelaySeconds } = settings;
+  if (
+    !Number.isSafeInteger(messageRetentionSeconds) ||
+    messageRetentionSeconds < 60 ||
+    messageRetentionSeconds > 1_209_600 ||
+    !Number.isSafeInteger(deliveryDelaySeconds) ||
+    deliveryDelaySeconds < 0 ||
+    deliveryDelaySeconds > 43_200
+  ) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  return { messageRetentionSeconds, deliveryDelaySeconds };
 }
 
 function normalizeBindings(
@@ -392,12 +490,24 @@ function normalizeBindings(
   }));
 }
 
-function sameBindings(left: SelfhostVersionBindingSet, right: SelfhostVersionBindingSet): boolean {
-  return canonicalBindings(left) === canonicalBindings(right);
+function sameBindings(
+  left: StoredSelfhostVersionBindings,
+  right: SelfhostVersionBindingSet,
+): boolean {
+  return (
+    left.handlers !== undefined &&
+    canonicalBindings({
+      handlers: left.handlers,
+      vars: left.vars,
+      sensitiveVars: left.sensitiveVars,
+      ...(left.dataPlane ? { dataPlane: left.dataPlane } : {}),
+    }) === canonicalBindings(right)
+  );
 }
 
 function canonicalBindings(set: SelfhostVersionBindingSet): string {
   return JSON.stringify({
+    handlers: set.handlers,
     vars: set.vars,
     sensitiveVars: set.sensitiveVars,
     dataPlane: set.dataPlane ?? null,
@@ -408,18 +518,36 @@ function canonicalBindings(set: SelfhostVersionBindingSet): string {
  * The exact bytes on disk, in one place, so `parseStored` can prove a record it
  * read back is the record this function would have written.
  *
- * A version with no data plane writes the shape it always wrote, under the
- * format it always wrote — the fields the wrapper needs appear together with
- * the `@v2` name that says they are there. That is what lets a machine
- * published by an earlier build keep serving, and what makes "no KV, no SQL,
- * byte-identical" a property of the file rather than of a code path.
+ * Every format this Host has ever written is reproducible here, because that
+ * proof is what tells a torn or tampered file from a good one. `@v1` and `@v2`
+ * are read, never written: a machine published by an earlier build keeps
+ * serving, and the next Version it publishes is written at `@v3`.
  */
 function canonicalRecord(
+  format: typeof FORMAT_V1 | typeof FORMAT_V2 | typeof FORMAT_V3,
   salt: string,
-  set: SelfhostVersionBindingSet,
+  set: SelfhostVersionBindingSet | LegacySet,
   planeToken: string | undefined,
+  eventToken: string | undefined,
 ): string {
-  if (!set.dataPlane) {
+  const plane = set.dataPlane
+    ? {
+        bindings: set.dataPlane.bindings.map((binding) => ({
+          kind: binding.kind,
+          name: binding.name,
+          target: binding.target,
+          ...(binding.queue
+            ? {
+                queue: {
+                  messageRetentionSeconds: binding.queue.messageRetentionSeconds,
+                  deliveryDelaySeconds: binding.queue.deliveryDelaySeconds,
+                },
+              }
+            : {}),
+        })),
+      }
+    : undefined;
+  if (format === FORMAT_V1) {
     return JSON.stringify({
       format: FORMAT_V1,
       salt,
@@ -427,21 +555,34 @@ function canonicalRecord(
       sensitiveVars: set.sensitiveVars,
     });
   }
+  if (format === FORMAT_V2) {
+    return JSON.stringify({
+      format: FORMAT_V2,
+      salt,
+      vars: set.vars,
+      sensitiveVars: set.sensitiveVars,
+      dataPlane: { handlers: set.handlers, bindings: plane?.bindings },
+      planeToken,
+    });
+  }
   return JSON.stringify({
-    format: FORMAT_V2,
+    format: FORMAT_V3,
     salt,
+    handlers: set.handlers,
     vars: set.vars,
     sensitiveVars: set.sensitiveVars,
-    dataPlane: {
-      handlers: set.dataPlane.handlers,
-      bindings: set.dataPlane.bindings.map((binding) => ({
-        kind: binding.kind,
-        name: binding.name,
-        target: binding.target,
-      })),
-    },
-    planeToken,
+    ...(plane ? { dataPlane: plane } : {}),
+    ...(planeToken === undefined ? {} : { planeToken }),
+    eventToken,
   });
+}
+
+/** What a record read back carries, before it is proved to be one. */
+interface LegacySet {
+  readonly handlers?: readonly SelfhostWorkerHandlerName[];
+  readonly vars: readonly SelfhostVersionBinding[];
+  readonly sensitiveVars: readonly SelfhostVersionBinding[];
+  readonly dataPlane?: SelfhostVersionDataPlane;
 }
 
 /**
@@ -451,11 +592,13 @@ function canonicalRecord(
  * generation string is not a place to put one.
  */
 function digestOf(
+  format: typeof FORMAT_V1 | typeof FORMAT_V2 | typeof FORMAT_V3,
   salt: string,
-  set: SelfhostVersionBindingSet,
+  set: SelfhostVersionBindingSet | LegacySet,
   planeToken: string | undefined,
+  eventToken: string | undefined,
 ): `sha256:${string}` {
-  const record = canonicalRecord(salt, set, planeToken);
+  const record = canonicalRecord(format, salt, set, planeToken, eventToken);
   return `sha256:${createHash("sha256").update(record, "utf8").digest("hex")}`;
 }
 
@@ -471,34 +614,126 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
   }
   const record = parsed as Record<string, unknown>;
   const keys = Object.keys(record).sort().join(",");
-  const planeRecord =
-    record.format === FORMAT_V2 && keys === "dataPlane,format,planeToken,salt,sensitiveVars,vars";
+  const format =
+    record.format === FORMAT_V1 && keys === "format,salt,sensitiveVars,vars"
+      ? FORMAT_V1
+      : record.format === FORMAT_V2 &&
+          keys === "dataPlane,format,planeToken,salt,sensitiveVars,vars"
+        ? FORMAT_V2
+        : record.format === FORMAT_V3 && isVersion3Keys(keys)
+          ? FORMAT_V3
+          : null;
   if (
-    !(planeRecord || (record.format === FORMAT_V1 && keys === "format,salt,sensitiveVars,vars")) ||
+    format === null ||
     typeof record.salt !== "string" ||
     decodedLength(record.salt) !== SALT_BYTES
   ) {
     throw new SelfhostVersionBindingStoreError("corrupt");
   }
-  const planeToken = planeRecord ? record.planeToken : undefined;
+  const hasPlane = format === FORMAT_V2 || (format === FORMAT_V3 && "dataPlane" in record);
+  const planeToken = format === FORMAT_V1 ? undefined : (record.planeToken as unknown);
   if (
-    planeRecord &&
+    hasPlane &&
     (typeof planeToken !== "string" || decodedLength(planeToken) !== PLANE_TOKEN_BYTES)
   ) {
     throw new SelfhostVersionBindingStoreError("corrupt");
   }
-  const set = normalizeSet({
+  const eventToken = format === FORMAT_V3 ? record.eventToken : undefined;
+  if (
+    format === FORMAT_V3 &&
+    (typeof eventToken !== "string" || decodedLength(eventToken) !== EVENT_TOKEN_BYTES)
+  ) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  // `@v2` kept the handlers inside the data plane; `@v3` keeps them beside it,
+  // because a Version with no binding declares them too.
+  const legacyPlane = format === FORMAT_V2 ? parsedLegacyDataPlane(record.dataPlane) : null;
+  const handlers =
+    format === FORMAT_V3
+      ? normalizeHandlers(parsedHandlers(record.handlers))
+      : legacyPlane
+        ? normalizeHandlers(legacyPlane.handlers)
+        : undefined;
+  const set = normalizeSetOrLegacy({
+    ...(handlers ? { handlers } : {}),
     vars: parsedBindings(record.vars),
     sensitiveVars: parsedBindings(record.sensitiveVars),
-    ...(planeRecord ? { dataPlane: parsedDataPlane(record.dataPlane) } : {}),
+    ...(hasPlane
+      ? { dataPlane: parsedDataPlane(format === FORMAT_V2 ? legacyPlane : record.dataPlane) }
+      : {}),
   });
-  if (canonicalRecord(record.salt, set, planeToken as string | undefined) !== decodeUtf8(bytes)) {
+  if (
+    canonicalRecord(
+      format,
+      record.salt,
+      set,
+      planeToken as string | undefined,
+      eventToken as string | undefined,
+    ) !== decodeUtf8(bytes)
+  ) {
     throw new SelfhostVersionBindingStoreError("corrupt");
   }
   return {
     ...set,
-    digest: digestOf(record.salt, set, planeToken as string | undefined),
-    ...(planeToken === undefined ? {} : { planeToken: planeToken as string }),
+    digest: digestOf(
+      format,
+      record.salt,
+      set,
+      planeToken as string | undefined,
+      eventToken as string | undefined,
+    ),
+    ...(typeof planeToken === "string" ? { planeToken } : {}),
+    ...(typeof eventToken === "string" ? { eventToken } : {}),
+  };
+}
+
+/** A `@v3` record with or without its optional data plane and plane token. */
+function isVersion3Keys(keys: string): boolean {
+  return (
+    keys === "eventToken,format,handlers,salt,sensitiveVars,vars" ||
+    keys === "dataPlane,eventToken,format,handlers,planeToken,salt,sensitiveVars,vars"
+  );
+}
+
+function parsedHandlers(value: unknown): readonly SelfhostWorkerHandlerName[] {
+  if (!Array.isArray(value)) throw new SelfhostVersionBindingStoreError("corrupt");
+  for (const entry of value) {
+    if (typeof entry !== "string") throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  return value as readonly SelfhostWorkerHandlerName[];
+}
+
+/** Normalizes a set that may predate handlers, without inventing any. */
+function normalizeSetOrLegacy(set: LegacySet): LegacySet {
+  const normalized = normalizeSet({
+    handlers: set.handlers ?? ["fetch"],
+    vars: set.vars,
+    sensitiveVars: set.sensitiveVars,
+    ...(set.dataPlane ? { dataPlane: set.dataPlane } : {}),
+  });
+  return {
+    ...(set.handlers ? { handlers: normalized.handlers } : {}),
+    vars: normalized.vars,
+    sensitiveVars: normalized.sensitiveVars,
+    ...(normalized.dataPlane ? { dataPlane: normalized.dataPlane } : {}),
+  };
+}
+
+/** The `@v2` data plane, whose handlers travelled inside it. */
+function parsedLegacyDataPlane(value: unknown): {
+  readonly handlers: readonly SelfhostWorkerHandlerName[];
+  readonly bindings: readonly SelfhostVersionDataBinding[];
+} {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  const plane = value as Record<string, unknown>;
+  if (Object.keys(plane).sort().join(",") !== "bindings,handlers") {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  return {
+    handlers: parsedHandlers(plane.handlers),
+    bindings: parsedDataPlane({ bindings: plane.bindings }).bindings,
   };
 }
 
@@ -511,7 +746,7 @@ function parsedDataPlane(value: unknown): SelfhostVersionDataPlane {
     throw new SelfhostVersionBindingStoreError("corrupt");
   }
   const plane = value as Record<string, unknown>;
-  if (Object.keys(plane).sort().join(",") !== "bindings,handlers") {
+  if (Object.keys(plane).sort().join(",") !== "bindings") {
     throw new SelfhostVersionBindingStoreError("corrupt");
   }
   if (!Array.isArray(plane.bindings)) throw new SelfhostVersionBindingStoreError("corrupt");
@@ -519,11 +754,10 @@ function parsedDataPlane(value: unknown): SelfhostVersionDataPlane {
     if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
       throw new SelfhostVersionBindingStoreError("corrupt");
     }
-    if (
-      Object.keys(entry as Record<string, unknown>)
-        .sort()
-        .join(",") !== "kind,name,target"
-    ) {
+    const keys = Object.keys(entry as Record<string, unknown>)
+      .sort()
+      .join(",");
+    if (keys !== "kind,name,target" && keys !== "kind,name,queue,target") {
       throw new SelfhostVersionBindingStoreError("corrupt");
     }
   }

@@ -190,7 +190,12 @@ test("the planes answer on their own loopback listener and never on the public o
     sql: createEphemeralSql(),
     grant: async (script, versionId) =>
       script === "sw1" && versionId === "v1"
-        ? { secret: "plane-secret-value-0", kv: { KV: "tskv-1" }, sql: { DB: "tsdb-1" } }
+        ? {
+            secret: "plane-secret-value-0",
+            kv: { KV: "tskv-1" },
+            sql: { DB: "tsdb-1" },
+            queue: {},
+          }
         : null,
     databasePath: (name) => join(databases, `${name}.sqlite`),
   });

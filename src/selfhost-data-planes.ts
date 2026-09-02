@@ -1,11 +1,17 @@
 import { Database } from "bun:sqlite";
 import { chmodSync, mkdirSync, statSync } from "node:fs";
 import { dirname } from "node:path";
-import type { JsonValue, Row, Sql, SqlParam } from "./ports.ts";
-import type { SelfhostDataPlaneMaintenance } from "./providers/selfhost.ts";
+import type { JsonValue, Row, Sql, SqlParam, SqlStatement } from "./ports.ts";
+import type { SelfhostDataPlaneMaintenance, SelfhostGrantedQueue } from "./providers/selfhost.ts";
+import {
+  MAX_SELFHOST_QUEUE_DELAY_SECONDS,
+  MAX_SELFHOST_QUEUE_MESSAGE_BYTES,
+  MAX_SELFHOST_QUEUE_MESSAGES,
+} from "./providers/selfhost-events.ts";
 import {
   SELFHOST_DATA_PLANE_KV_PATH,
   SELFHOST_DATA_PLANE_PROTOCOL,
+  SELFHOST_DATA_PLANE_QUEUE_PATH,
   SELFHOST_DATA_PLANE_SQL_PATH,
 } from "./providers/selfhost-worker-wrapper.ts";
 
@@ -48,6 +54,7 @@ import {
 /** The one path prefix these planes answer under. */
 export const SELFHOST_DATA_PLANE_PATHS = [
   SELFHOST_DATA_PLANE_KV_PATH,
+  SELFHOST_DATA_PLANE_QUEUE_PATH,
   SELFHOST_DATA_PLANE_SQL_PATH,
 ] as const;
 
@@ -59,6 +66,8 @@ export interface SelfhostDataPlaneGrant {
   readonly kv: Readonly<Record<string, string>>;
   /** Public binding name to the SQLite database name this Host derived. */
   readonly sql: Readonly<Record<string, string>>;
+  /** Public binding name to the queue, with the promise that queue makes. */
+  readonly queue: Readonly<Record<string, SelfhostGrantedQueue>>;
 }
 
 export interface SelfhostDataPlaneOptions {
@@ -72,6 +81,8 @@ export interface SelfhostDataPlaneOptions {
   /** Absolute path of one SQLite database this machine keeps. */
   readonly databasePath: (name: string) => string;
   readonly clock?: () => Date;
+  /** The acceptance identity of one message; injected so a test can name them. */
+  readonly messageId?: () => string;
 }
 
 export type SelfhostDataPlaneRoutes = (request: Request, url: URL) => Promise<Response | null>;
@@ -122,6 +133,9 @@ type PlaneErrorCode =
   | "sql_error"
   | "numeric_out_of_range"
   | "busy"
+  | "invalid_body"
+  | "message_too_large"
+  | "batch_too_large"
   | "backend_unavailable";
 
 class PlaneError extends Error {
@@ -133,6 +147,7 @@ class PlaneError extends Error {
 
 export function createSelfhostDataPlanes(options: SelfhostDataPlaneOptions): SelfhostDataPlanes {
   const now = options.clock ?? (() => new Date());
+  const messageId = options.messageId ?? (() => crypto.randomUUID());
   const databases = new Map<string, Database>();
 
   /**
@@ -179,7 +194,8 @@ export function createSelfhostDataPlanes(options: SelfhostDataPlaneOptions): Sel
   const routes: SelfhostDataPlaneRoutes = async (request, url) => {
     const kv = url.pathname === SELFHOST_DATA_PLANE_KV_PATH;
     const sql = url.pathname === SELFHOST_DATA_PLANE_SQL_PATH;
-    if (!kv && !sql) return null;
+    const queue = url.pathname === SELFHOST_DATA_PLANE_QUEUE_PATH;
+    if (!kv && !sql && !queue) return null;
     if (request.method !== "POST") return refusal("backend_unavailable", 405);
 
     // Before the body, deliberately. Reading and parsing up to the request
@@ -212,6 +228,11 @@ export function createSelfhostDataPlanes(options: SelfhostDataPlaneOptions): Sel
         if (!Object.hasOwn(grant.kv, binding)) return refusal("backend_unavailable", 404);
         const namespace = grant.kv[binding] as string;
         return answer(await kvOperation(options.sql, now, namespace, op, payload));
+      }
+      if (queue) {
+        if (!Object.hasOwn(grant.queue, binding)) return refusal("backend_unavailable", 404);
+        const target = grant.queue[binding] as SelfhostGrantedQueue;
+        return answer(await queueOperation(options.sql, now, target, op, payload, messageId));
       }
       if (!Object.hasOwn(grant.sql, binding)) return refusal("backend_unavailable", 404);
       const name = grant.sql[binding] as string;
@@ -582,6 +603,112 @@ function kvMetadata(value: unknown): string | null {
     throw new PlaneError("metadata_too_large");
   }
   return encoded;
+}
+
+// ---------------------------------------------------------------------------
+// Queue producer
+// ---------------------------------------------------------------------------
+
+/**
+ * The accept half of a queue. The pump owns everything after.
+ *
+ * A message is a row the moment it is accepted, with its whole future already
+ * decided: when it first becomes deliverable, and when it stops being worth
+ * delivering. Both are absolute instants rather than durations, because a row
+ * that outlives a restart must not have its clock restarted with the process.
+ */
+async function queueOperation(
+  sql: Sql,
+  clock: () => Date,
+  target: SelfhostGrantedQueue,
+  op: string,
+  payload: Readonly<Record<string, unknown>>,
+  mintMessageId: () => string,
+): Promise<Record<string, unknown>> {
+  const millis = clock().getTime();
+  const accept = (body: unknown, delay: unknown): SqlStatement => {
+    let bytes: Uint8Array;
+    try {
+      bytes = decodeBase64(body, MAX_SELFHOST_QUEUE_MESSAGE_BYTES, "message_too_large");
+    } catch (error) {
+      // The facade's own vocabulary: a body that is not bytes is `invalid_body`
+      // here, where a KV value that is not bytes is `invalid_value`.
+      throw new PlaneError(
+        error instanceof PlaneError && error.code === "message_too_large"
+          ? "message_too_large"
+          : "invalid_body",
+      );
+    }
+    const delaySeconds = queueDelay(delay, target.deliveryDelaySeconds);
+    const id = mintMessageId();
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(id)) {
+      throw new PlaneError("backend_unavailable");
+    }
+    return {
+      sql:
+        "INSERT INTO selfhost_queue_messages " +
+        "(queue_id, message_id, body, enqueued_at_ms, visible_at_ms, expires_at_ms, deliveries) " +
+        "VALUES (?, ?, ?, ?, ?, ?, 0)",
+      params: [
+        target.queueId,
+        id,
+        bufferOf(bytes),
+        millis,
+        millis + delaySeconds * 1_000,
+        millis + target.messageRetentionSeconds * 1_000,
+      ],
+    };
+  };
+  switch (op) {
+    case "send": {
+      const statement = accept(payload.body, payload.delaySeconds);
+      const id = String((statement.params as readonly SqlParam[])[1]);
+      await sql.run(statement.sql, statement.params);
+      return { messageId: id };
+    }
+    case "sendBatch": {
+      const messages = payload.messages;
+      if (!Array.isArray(messages) || messages.length < 1) {
+        throw new PlaneError("invalid_body");
+      }
+      if (messages.length > MAX_SELFHOST_QUEUE_MESSAGES) {
+        throw new PlaneError("batch_too_large");
+      }
+      const statements = messages.map((entry) => {
+        const message = record(entry);
+        if (!message) throw new PlaneError("invalid_body");
+        for (const key of Object.keys(message)) {
+          if (key !== "body" && key !== "delaySeconds") throw new PlaneError("invalid_body");
+        }
+        return accept(message.body, message.delaySeconds);
+      });
+      // All or none: a partially accepted batch is a batch the caller has no
+      // way to reason about, and `sendBatch` is the reason this seam has an
+      // atomic capability at all.
+      await sql.batch(statements);
+      return {
+        messageIds: statements.map((statement) =>
+          String((statement.params as readonly SqlParam[])[1]),
+        ),
+      };
+    }
+    default:
+      throw new PlaneError("backend_unavailable");
+  }
+}
+
+/** A delay in seconds, or the queue's own default when none was asked for. */
+function queueDelay(value: unknown, fallback: number): number {
+  if (value === undefined) return fallback;
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < 0 ||
+    value > MAX_SELFHOST_QUEUE_DELAY_SECONDS
+  ) {
+    throw new PlaneError("invalid_argument");
+  }
+  return value;
 }
 
 // ---------------------------------------------------------------------------

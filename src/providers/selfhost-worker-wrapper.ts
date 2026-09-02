@@ -1,3 +1,16 @@
+import {
+  MAX_SELFHOST_EVENT_RESPONSE_BYTES,
+  MAX_SELFHOST_QUEUE_DELAY_SECONDS,
+  MAX_SELFHOST_QUEUE_MESSAGE_BYTES,
+  MAX_SELFHOST_QUEUE_MESSAGES,
+  SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND,
+  SELFHOST_WORKER_EVENT_CONTENT_TYPE,
+  SELFHOST_WORKER_EVENT_ENTRYPOINT,
+  SELFHOST_WORKER_EVENT_HEADER,
+  SELFHOST_WORKER_EVENT_PATH,
+  SELFHOST_WORKER_EVENT_PROTOCOL,
+} from "./selfhost-events.ts";
+
 /**
  * The entrypoint a self-hosted Worker Version is actually published as.
  *
@@ -42,13 +55,14 @@
 /**
  * Closed handler vocabulary of worker.runtime@1.1.0.
  *
- * `queue` and `scheduled` are re-exported when a Version declares them, and on
- * this Host nothing invokes them yet: no queue producer, no consumer, and no
- * cron trigger is rendered. Two known gaps travel with that, and both are part
- * of making the events real rather than separate repairs — the events do not
- * exist to be delivered, and if they did, this wrapper would hand workerd's raw
- * event to the tenant where the managed wrapper projects a portable batch with
- * `ack`/`retry`.
+ * `queue` and `scheduled` are re-exported when a Version declares them, so a
+ * runtime that has a native trigger for either still reaches the tenant. On
+ * this Host workerd has neither, so a declared `queue` or `scheduled` handler
+ * is invoked through the event entrypoint below instead: a Host-owned gate
+ * hands it one `takoserver.managed-worker-event@v1` envelope, and this module
+ * projects the same portable batch the managed wrapper projects — same
+ * `acknowledge`/`retry`/`acknowledgeAll`/`retryAll`, same base64 body, same
+ * whole-batch default — so a Worker sees one contract on both backends.
  */
 export const SELFHOST_WORKER_HANDLER_NAMES = ["fetch", "queue", "scheduled"] as const;
 
@@ -99,6 +113,8 @@ export const SELFHOST_WORKER_READINESS_HEADER = "x-takoserver-selfhost-readiness
 export const SELFHOST_DATA_PLANE_PATH_PREFIX = "/.well-known/takoserver/selfhost-data/v1" as const;
 export const SELFHOST_DATA_PLANE_KV_PATH = `${SELFHOST_DATA_PLANE_PATH_PREFIX}/kv` as const;
 export const SELFHOST_DATA_PLANE_SQL_PATH = `${SELFHOST_DATA_PLANE_PATH_PREFIX}/sql` as const;
+/** Where the `edge.queue` producer facade sends what a Worker accepted. */
+export const SELFHOST_DATA_PLANE_QUEUE_PATH = `${SELFHOST_DATA_PLANE_PATH_PREFIX}/queue` as const;
 export const SELFHOST_DATA_PLANE_PROTOCOL = "takoserver.selfhost-data@v1" as const;
 export const SELFHOST_DATA_PLANE_CONTENT_TYPE =
   "application/vnd.takoserver.selfhost-data.v1+json" as const;
@@ -134,6 +150,7 @@ export interface SelfhostWorkerNativeBindingDescriptor {
 export interface SelfhostWorkerDataBindingDescriptor {
   readonly kind:
     | typeof SELFHOST_WORKER_EDGE_KV_BINDING_KIND
+    | typeof SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND
     | typeof SELFHOST_WORKER_EDGE_SQL_BINDING_KIND;
   readonly publicName: string;
 }
@@ -151,6 +168,14 @@ export interface SelfhostWorkerEntrypointSourceInput {
    * can tell the configuration it asked for from the one workerd still served.
    */
   readonly publication: string;
+  /**
+   * Whether this publication exports the event entrypoint.
+   *
+   * True when the Worker has a Queue Consumer or a Cron Trigger attached, which
+   * is the only reason to generate the named export at all: a version nothing
+   * delivers to publishes the module it would have published anyway.
+   */
+  readonly events?: boolean;
 }
 
 const ARTIFACT_PART_NAME = /^[A-Za-z0-9_.][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_.][A-Za-z0-9._-]*)*$/u;
@@ -160,6 +185,7 @@ const VARIABLE_NAME = /^[A-Za-z][A-Za-z0-9._-]*$/u;
 const NATIVE_BINDING_TYPES = new Set(["plain_text", "json", "secret_text"]);
 const DATA_BINDING_KINDS = new Set<string>([
   SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
+  SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND,
   SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
 ]);
 const HANDLER_NAMES = new Set<string>(SELFHOST_WORKER_HANDLER_NAMES);
@@ -201,6 +227,47 @@ ${
       ),
   ].join("\n");
 
+  // The named export exists only when something delivers to it. A Version with
+  // no Consumer and no Cron Trigger publishes the module it published before
+  // events were a thing this Host could carry.
+  //
+  // It is a named entrypoint rather than a path on `fetch` because that is the
+  // isolation: the router hands customer traffic to the default export, and the
+  // only binding that names this one is on a Host-owned gate service holding a
+  // token no tenant can read. A customer POSTing the event path at the Worker's
+  // own hostname reaches `fetch`, which does not know what an event is.
+  const eventEntrypoint = normalized.events
+    ? `
+export const ${SELFHOST_WORKER_EVENT_ENTRYPOINT} = SafeApply(SafeObjectFreeze, SafeObject, [{
+  async fetch(request, rawEnv, rawContext) {
+    try {
+      const url = new SafeURL(SafeApply(SafeRequestUrlGet, request, []));
+      if (SafeApply(SafeURLPathnameGet, url, []) !== EVENT_PATH) return statusResponse(404);
+      if (SafeApply(SafeRequestMethodGet, request, []) !== "POST") return statusResponse(404);
+      const headers = SafeApply(SafeRequestHeadersGet, request, []);
+      if (
+        SafeApply(SafeHeadersGet, headers, ["content-type"]) !== EVENT_CONTENT_TYPE ||
+        SafeApply(SafeHeadersGet, headers, [EVENT_HEADER]) !== EVENT_PROTOCOL
+      ) {
+        return statusResponse(404);
+      }
+      const event = await boundedEvent(request);
+      if (event.kind === "queue") {
+        if (!declares("queue")) return statusResponse(404);
+        return await invokeQueue(event, rawEnv, rawContext);
+      }
+      if (!declares("scheduled")) return statusResponse(404);
+      return await invokeScheduled(event, rawEnv, rawContext);
+    } catch {
+      // A status and nothing else. What the tenant threw is the tenant's, and
+      // the pump reads a non-200 as "deliver this batch again".
+      return statusResponse(500);
+    }
+  },
+}]);
+`
+    : "";
+
   return `const RAW_CONFIGURATION = ${JSON.stringify(configuration)};
 const DATA_SERVICE = ${JSON.stringify(SELFHOST_WORKER_DATA_SERVICE_BINDING)};
 const READINESS_PATH = ${JSON.stringify(SELFHOST_WORKER_READINESS_PATH)};
@@ -213,6 +280,15 @@ const SQL_URL = ${JSON.stringify(`${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_P
 const PROTOCOL = ${JSON.stringify(SELFHOST_DATA_PLANE_PROTOCOL)};
 const CONTENT_TYPE = ${JSON.stringify(SELFHOST_DATA_PLANE_CONTENT_TYPE)};
 const MAX_RESPONSE_BYTES = ${SELFHOST_DATA_PLANE_MAX_RESPONSE_BYTES};
+const QUEUE_URL = ${JSON.stringify(`${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_QUEUE_PATH}`)};
+const EVENT_PATH = ${JSON.stringify(SELFHOST_WORKER_EVENT_PATH)};
+const EVENT_PROTOCOL = ${JSON.stringify(SELFHOST_WORKER_EVENT_PROTOCOL)};
+const EVENT_CONTENT_TYPE = ${JSON.stringify(SELFHOST_WORKER_EVENT_CONTENT_TYPE)};
+const EVENT_HEADER = ${JSON.stringify(SELFHOST_WORKER_EVENT_HEADER)};
+const MAX_EVENT_BYTES = ${MAX_SELFHOST_EVENT_RESPONSE_BYTES};
+const MAX_QUEUE_MESSAGES = ${MAX_SELFHOST_QUEUE_MESSAGES};
+const MAX_QUEUE_MESSAGE_BYTES = ${MAX_SELFHOST_QUEUE_MESSAGE_BYTES};
+const MAX_QUEUE_DELAY_SECONDS = ${MAX_SELFHOST_QUEUE_DELAY_SECONDS};
 
 // Captured before the tenant module is imported: after its first request its
 // code has run, and anything it replaced on a shared prototype would otherwise
@@ -228,6 +304,10 @@ const SafeError = Error;
 const SafeTypeError = TypeError;
 const SafeJSONParse = JSON.parse;
 const SafeJSONStringify = JSON.stringify;
+const SafeMap = Map;
+const SafeMapGet = Map.prototype.get;
+const SafeMapHas = Map.prototype.has;
+const SafeMapSet = Map.prototype.set;
 const SafeMathAbs = Math.abs;
 const SafeMathMin = Math.min;
 const SafeNumberIsFinite = Number.isFinite;
@@ -250,6 +330,9 @@ const SafeResponse = Response;
 const SafeResponseText = Response.prototype.text;
 const SafeURL = URL;
 const SafeHeadersGet = Headers.prototype.get;
+const SafeCrypto = crypto;
+const SafeCryptoRandomUUID = crypto.randomUUID;
+const SafeRequestText = Request.prototype.text;
 const SafeRequestUrlGet = captureGetter(Request.prototype, "url");
 const SafeRequestMethodGet = captureGetter(Request.prototype, "method");
 const SafeRequestHeadersGet = captureGetter(Request.prototype, "headers");
@@ -291,6 +374,13 @@ const KV_ERROR_CODES = [
   "metadata_too_large",
   "backend_unavailable",
 ];
+const QUEUE_ERROR_CODES = [
+  "invalid_body",
+  "invalid_argument",
+  "message_too_large",
+  "batch_too_large",
+  "backend_unavailable",
+];
 const encoder = new SafeTextEncoder();
 const CONFIGURATION = sealGeneratedConfiguration(RAW_CONFIGURATION);
 let originalPromise;
@@ -308,6 +398,7 @@ function captureGetter(prototype, name) {
 export default SafeApply(SafeObjectFreeze, SafeObject, [{
 ${handlers}
 }]);
+${eventEntrypoint}
 
 async function invoke(handler, args, rawEnv, rawContext) {
   const env = projectEnv(rawEnv);
@@ -438,7 +529,9 @@ function projectEnv(rawEnv) {
       projected[descriptor.publicName] =
         descriptor.kind === ${JSON.stringify(SELFHOST_WORKER_EDGE_KV_BINDING_KIND)}
           ? createKvAdapter(call, descriptor.publicName)
-          : createSqlAdapter(call, descriptor.publicName);
+          : descriptor.kind === ${JSON.stringify(SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND)}
+            ? createQueueAdapter(call, descriptor.publicName)
+            : createSqlAdapter(call, descriptor.publicName);
       continue;
     }
     // A text, JSON, or sensitive value is already exactly what the module must
@@ -459,6 +552,294 @@ function createPortableContext(rawContext) {
     }
   };
   return SafeApply(SafeObjectFreeze, SafeObject, [portable]);
+}
+
+function declares(handler) {
+  return includes(CONFIGURATION.declaredHandlers, handler);
+}
+
+/**
+ * The event envelope, read under a ceiling and validated field by field.
+ *
+ * The gate in front already refused anything without the exact token, method,
+ * path, and protocol headers, so what arrives here is this Host's own. It is
+ * still parsed strictly: a Host bug that sent a malformed envelope must be a
+ * refused delivery rather than a batch the tenant sees half of.
+ */
+async function boundedEvent(request) {
+  let body;
+  try {
+    body = await SafeApply(SafeRequestText, request, []);
+  } catch {
+    throw new SafeTypeError("self-host Worker event body is unreadable");
+  }
+  if (typeof body !== "string" || body.length > MAX_EVENT_BYTES * 32) {
+    throw new SafeTypeError("self-host Worker event is too large");
+  }
+  let event;
+  try {
+    event = SafeJSONParse(body);
+  } catch {
+    throw new SafeTypeError("self-host Worker event is not JSON");
+  }
+  if (!isRecord(event) || event.protocol !== EVENT_PROTOCOL) {
+    throw new SafeTypeError("self-host Worker event protocol is invalid");
+  }
+  if (event.kind === "queue") {
+    if (
+      !exactKeys(event, ["protocol", "kind", "batchId", "logicalWorkerId", "deploymentId", "queue", "messages"]) ||
+      !boundedText(event.batchId, 512) ||
+      !boundedText(event.queue, 512)
+    ) {
+      throw new SafeTypeError("self-host Worker queue event is invalid");
+    }
+    return event;
+  }
+  if (event.kind === "schedule") {
+    if (
+      !exactKeys(event, ["protocol", "kind", "logicalWorkerId", "deploymentId", "cron", "scheduledTime"]) ||
+      !boundedText(event.cron, 512) ||
+      !nonNegativeInteger(event.scheduledTime)
+    ) {
+      throw new SafeTypeError("self-host Worker schedule event is invalid");
+    }
+    return event;
+  }
+  throw new SafeTypeError("self-host Worker event kind is invalid");
+}
+
+/**
+ * The portable batch, exactly as the managed wrapper projects it.
+ *
+ * A handler that returns without settling anything acknowledges the whole
+ * batch; one that throws retries every message it had not already settled.
+ * Both are the Form's own rule, and both are decided here rather than by the
+ * pump, so the two backends cannot drift on what "the handler said nothing"
+ * means.
+ */
+async function invokeQueue(event, rawEnv, rawContext) {
+  if (!SafeArrayIsArray(event.messages) || event.messages.length < 1 || event.messages.length > MAX_QUEUE_MESSAGES) {
+    throw new SafeTypeError("self-host Worker queue event is invalid");
+  }
+  const env = projectEnv(rawEnv);
+  const context = createPortableContext(rawContext);
+  const original = await loadOriginal();
+  const messages = internalArray();
+  const messageIds = internalArray();
+  const decisions = new SafeMap();
+  const seen = new SafeMap();
+  for (let index = 0; index < event.messages.length; index += 1) {
+    const input = event.messages[index];
+    if (
+      !isRecord(input) ||
+      !exactKeys(input, ["messageId", "timestampMillis", "attempts", "body"]) ||
+      !boundedText(input.messageId, 512) ||
+      !nonNegativeInteger(input.timestampMillis) ||
+      !SafeNumberIsSafeInteger(input.attempts) ||
+      input.attempts < 1
+    ) {
+      throw new SafeTypeError("self-host Worker queue message is invalid");
+    }
+    const id = input.messageId;
+    if (SafeApply(SafeMapHas, seen, [id])) {
+      throw new SafeTypeError("self-host Worker queue message id is duplicated");
+    }
+    SafeApply(SafeMapSet, seen, [id, true]);
+    messageIds[index] = id;
+    const message = SafeObjectCreate(null);
+    message.id = id;
+    message.timestampMillis = input.timestampMillis;
+    message.attempts = input.attempts;
+    message.body = projectEncodedBody(input.body);
+    message.acknowledge = () => settleOne(decisions, id, "ack");
+    message.retry = (options) => settleOne(decisions, id, "retry", options);
+    messages[index] = message;
+  }
+  const batch = SafeObjectCreate(null);
+  batch.batchId = event.batchId;
+  batch.queue = event.queue;
+  batch.messages = messages;
+  batch.acknowledgeAll = () => settleAll(messageIds, decisions, "ack");
+  batch.retryAll = (options) => settleAll(messageIds, decisions, "retry", options);
+  let failed = false;
+  try {
+    await SafeApply(original.handlers.queue, original.target, [batch, env, context]);
+  } catch {
+    failed = true;
+  }
+  const output = internalArray();
+  for (let index = 0; index < messageIds.length; index += 1) {
+    const messageId = messageIds[index];
+    output[index] =
+      SafeApply(SafeMapGet, decisions, [messageId]) || decision(messageId, failed ? "retry" : "ack");
+  }
+  const result = SafeObjectCreate(null);
+  result.protocol = EVENT_PROTOCOL;
+  result.kind = "queue";
+  result.decisions = output;
+  return jsonResponse(result);
+}
+
+function settleOne(decisions, messageId, outcome, options) {
+  if (SafeApply(SafeMapHas, decisions, [messageId])) throw portableError("already_settled");
+  let delaySeconds;
+  if (outcome === "retry") {
+    if (options !== undefined && (!isRecord(options) || !onlyKeys(options, ["delaySeconds"]))) {
+      throw portableError("invalid_argument");
+    }
+    delaySeconds = options && options.delaySeconds;
+    if (
+      delaySeconds !== undefined &&
+      (!SafeNumberIsSafeInteger(delaySeconds) || delaySeconds < 1 || delaySeconds > MAX_QUEUE_DELAY_SECONDS)
+    ) {
+      throw portableError("invalid_argument");
+    }
+  } else if (options !== undefined) {
+    throw portableError("invalid_argument");
+  }
+  SafeApply(SafeMapSet, decisions, [messageId, decision(messageId, outcome, delaySeconds)]);
+}
+
+function settleAll(messageIds, decisions, outcome, options) {
+  if (outcome === "retry" && options !== undefined && (!isRecord(options) || !onlyKeys(options, ["delaySeconds"]))) {
+    throw portableError("invalid_argument");
+  }
+  const delay = outcome === "retry" && options ? options.delaySeconds : undefined;
+  if (delay !== undefined && (!SafeNumberIsSafeInteger(delay) || delay < 1 || delay > MAX_QUEUE_DELAY_SECONDS)) {
+    throw portableError("invalid_argument");
+  }
+  for (let index = 0; index < messageIds.length; index += 1) {
+    const id = messageIds[index];
+    if (!SafeApply(SafeMapHas, decisions, [id])) {
+      SafeApply(SafeMapSet, decisions, [id, decision(id, outcome, delay)]);
+    }
+  }
+}
+
+function decision(messageId, outcome, delaySeconds) {
+  const value = SafeObjectCreate(null);
+  value.messageId = messageId;
+  value.outcome = outcome;
+  if (delaySeconds !== undefined) value.delaySeconds = delaySeconds;
+  return value;
+}
+
+async function invokeScheduled(event, rawEnv, rawContext) {
+  const env = projectEnv(rawEnv);
+  const context = createPortableContext(rawContext);
+  const original = await loadOriginal();
+  const scheduled = SafeObjectCreate(null);
+  scheduled.cron = event.cron;
+  scheduled.scheduledTime = event.scheduledTime;
+  // The throw is the answer. A scheduled invocation has no per-message
+  // settlement, so a handler that failed is a failed invocation and this Host
+  // reports it by refusing the delivery rather than acknowledging one.
+  await SafeApply(original.handlers.scheduled, original.target, [scheduled, env, context]);
+  const result = SafeObjectCreate(null);
+  result.protocol = EVENT_PROTOCOL;
+  result.kind = "schedule";
+  result.outcome = "ack";
+  return jsonResponse(result);
+}
+
+function jsonResponse(value) {
+  return new SafeResponse(SafeJSONStringify(value), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/** The family-wide encoded-bytes shape, projected as it arrived. */
+function projectEncodedBody(value) {
+  if (!isRecord(value) || !exactKeys(value, ["encoding", "data"]) || value.encoding !== "base64") {
+    throw new SafeTypeError("self-host Worker queue body is invalid");
+  }
+  if (!isCanonicalBase64(value.data, MAX_QUEUE_MESSAGE_BYTES)) {
+    throw new SafeTypeError("self-host Worker queue body is invalid");
+  }
+  const body = SafeObjectCreate(null);
+  body.encoding = "base64";
+  body.data = value.data;
+  return SafeApply(SafeObjectFreeze, SafeObject, [body]);
+}
+
+/**
+ * edge.queue@1.0.0, projecting send and sendBatch and nothing else.
+ *
+ * Bodies are bytes on this Interface — there is no structured clone — and the
+ * acceptance id this returns is the Host's own, not a provider dedupe id, which
+ * is exactly what the managed adapter promises.
+ */
+function createQueueAdapter(call, binding) {
+  const portable = SafeObjectCreate(null);
+  portable.send = async (body, options) => {
+    const bytes = runtimeBytes(body, "invalid_body");
+    if (viewByteLength(bytes) > MAX_QUEUE_MESSAGE_BYTES) throw portableError("message_too_large");
+    const normalized = validateQueueSendOptions(options);
+    const payload = planeRequest(binding, "send");
+    payload.body = encodeBase64(bytes);
+    if (normalized.delaySeconds !== undefined) payload.delaySeconds = normalized.delaySeconds;
+    const value = await call(QUEUE_URL, payload, QUEUE_ERROR_CODES);
+    if (!isRecord(value) || !exactKeys(value, ["messageId"]) || !boundedText(value.messageId, 512)) {
+      throw portableError("backend_unavailable");
+    }
+    return value.messageId;
+  };
+  portable.sendBatch = async (messages) => {
+    if (!SafeArrayIsArray(messages) || messages.length < 1 || messages.length > MAX_QUEUE_MESSAGES) {
+      throw portableError("batch_too_large");
+    }
+    const entries = internalArray();
+    for (let index = 0; index < messages.length; index += 1) {
+      const message = messages[index];
+      if (!isRecord(message) || !onlyKeys(message, ["body", "delaySeconds"]) || !SafeObjectHasOwn(message, "body")) {
+        throw portableError("invalid_body");
+      }
+      const bytes = runtimeBytes(message.body, "invalid_body");
+      if (viewByteLength(bytes) > MAX_QUEUE_MESSAGE_BYTES) throw portableError("message_too_large");
+      const optionInput = SafeObjectCreate(null);
+      if (message.delaySeconds !== undefined) optionInput.delaySeconds = message.delaySeconds;
+      const normalized = validateQueueSendOptions(
+        message.delaySeconds === undefined ? undefined : optionInput,
+      );
+      const entry = SafeObjectCreate(null);
+      entry.body = encodeBase64(bytes);
+      if (normalized.delaySeconds !== undefined) entry.delaySeconds = normalized.delaySeconds;
+      entries[index] = entry;
+    }
+    const payload = planeRequest(binding, "sendBatch");
+    payload.messages = entries;
+    const value = await call(QUEUE_URL, payload, QUEUE_ERROR_CODES);
+    if (
+      !isRecord(value) ||
+      !exactKeys(value, ["messageIds"]) ||
+      !SafeArrayIsArray(value.messageIds) ||
+      value.messageIds.length !== entries.length
+    ) {
+      throw portableError("backend_unavailable");
+    }
+    return mapArray(value.messageIds, (id) => {
+      if (!boundedText(id, 512)) throw portableError("backend_unavailable");
+      return id;
+    });
+  };
+  return portable;
+}
+
+function validateQueueSendOptions(options) {
+  if (options === undefined) return SafeObjectCreate(null);
+  if (!isRecord(options) || !onlyKeys(options, ["delaySeconds"])) throw portableError("invalid_argument");
+  if (options.delaySeconds === undefined) return SafeObjectCreate(null);
+  if (
+    !SafeNumberIsSafeInteger(options.delaySeconds) ||
+    options.delaySeconds < 0 ||
+    options.delaySeconds > MAX_QUEUE_DELAY_SECONDS
+  ) {
+    throw portableError("invalid_argument");
+  }
+  const result = SafeObjectCreate(null);
+  result.delaySeconds = options.delaySeconds;
+  return result;
 }
 
 /**
@@ -960,13 +1341,25 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
   readonly declaredHandlers: SelfhostWorkerHandlerName[];
   readonly bindings: SelfhostWorkerBindingDescriptor[];
   readonly publication: string;
+  readonly events: boolean;
 } {
   const fields = dataProperties(input, "input");
-  exactNormalizedKeys(
-    fields,
-    ["originalMainModule", "declaredHandlers", "bindings", "publication"],
-    "input",
-  );
+  // `events` is optional, so both shapes are exact rather than one being a
+  // superset nothing checks.
+  if (!Object.hasOwn(fields, "events")) {
+    exactNormalizedKeys(
+      fields,
+      ["originalMainModule", "declaredHandlers", "bindings", "publication"],
+      "input",
+    );
+  } else {
+    exactNormalizedKeys(
+      fields,
+      ["originalMainModule", "declaredHandlers", "bindings", "publication", "events"],
+      "input",
+    );
+    if (typeof fields.events !== "boolean") invalid("events");
+  }
   validateArtifactPartName(fields.originalMainModule);
   if (fields.originalMainModule === SELFHOST_WORKER_ENTRYPOINT_MODULE)
     invalid("originalMainModule");
@@ -1013,15 +1406,18 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
       type: binding.type as SelfhostWorkerNativeBindingDescriptor["type"],
     });
   }
-  // The wrapper exists to carry a facade. Generating one for a version that
-  // declares none would replace a publication that needs no entrypoint with one
-  // that does, and the byte-identical guarantee for those versions with it.
-  if (dataBindings === 0) invalid("bindings");
+  const events = fields.events === true;
+  // The wrapper exists to carry a facade or to receive an event. Generating one
+  // for a version that needs neither would replace a publication that needs no
+  // entrypoint with one that does, and the byte-identical guarantee for those
+  // versions with it.
+  if (dataBindings === 0 && !events) invalid("bindings");
   return {
     originalMainModule: fields.originalMainModule,
     declaredHandlers,
     bindings,
     publication: fields.publication,
+    events,
   };
 }
 
