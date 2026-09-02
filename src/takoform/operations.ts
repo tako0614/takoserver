@@ -1,3 +1,4 @@
+import { sanitizedMessage } from "../error-envelope.ts";
 import { canonicalJson } from "../json.ts";
 import type { Clock, JsonObject } from "../ports.ts";
 import type { EngineContext, EngineMutationCommit, TakoformEngine } from "./engine.ts";
@@ -341,7 +342,12 @@ export function createDeferredOperations(input: {
     if (!advanced.acquired) return acceptedResponse(record.id, retryAfterSeconds);
     const outcome = await execute(advanced.operation, leaseToken);
     if (outcome.kind === "repair") {
-      return failure(outcome.error.code, outcome.error.status);
+      return failure(
+        outcome.error.code,
+        outcome.error.status,
+        undefined,
+        outcome.error.publicMessage,
+      );
     }
     const settled = await input.store.readDeferredOperation(
       record.tenantId,
@@ -458,7 +464,10 @@ export function createDeferredOperations(input: {
         terminalJson: failureTerminal(
           operation.id,
           hostError.code,
-          diagnosticMessage(hostError.code),
+          // The Host's own sentence wins over the code's when it has one: a
+          // provider refusal names the cause, and "the deferred mutation was
+          // refused" names nothing the operator can act on.
+          hostError.publicMessage ?? diagnosticMessage(hostError.code),
         ),
       });
     }
@@ -677,7 +686,12 @@ function successTerminal(
 function failureTerminal(id: string, code: string, message: string): string {
   return canonicalJson({
     ...operationDocument(id, true),
-    error: { code, message, requestId: `req_${id}`, retryable: false },
+    error: {
+      code,
+      message: sanitizedMessage(message) ?? code.replaceAll("_", " "),
+      requestId: `req_${id}`,
+      retryable: false,
+    },
   });
 }
 
@@ -732,7 +746,12 @@ function immediateTerminalResponse(
     return new Response(null, { status: 204 });
   }
   if (isRecord(document.error) && typeof document.error.code === "string") {
-    return failure(document.error.code, deferredFailureStatus(document.error.code));
+    return failure(
+      document.error.code,
+      deferredFailureStatus(document.error.code),
+      undefined,
+      typeof document.error.message === "string" ? document.error.message : undefined,
+    );
   }
   throw new TakoformHostError("internal_error", 500);
 }

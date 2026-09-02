@@ -447,6 +447,18 @@ export class TakoformHostError extends Error {
     readonly status = 400,
     /** Extra wire detail, such as validation diagnostics. Never driver text. */
     readonly details?: unknown,
+    /**
+     * One sanitized sentence the caller may read *instead of* the code-derived
+     * message, when the Host knows something the code cannot say.
+     *
+     * A provider refusal names the cause — "the bucket still holds objects",
+     * "No such module \"node:path\"" — and dropping it left a remote operator
+     * reading "Correct the desired state the message names" against a message
+     * that named nothing. Only text a provider already declared safe for a
+     * customer to read reaches this, and it is bounded and stripped of control
+     * characters at the boundary. It is never a raw provider or driver error.
+     */
+    readonly publicMessage?: string,
   ) {
     super(code.replaceAll("_", " "));
     this.name = "TakoformHostError";

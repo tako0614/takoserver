@@ -1,4 +1,5 @@
 import type { Catalog } from "./catalog.ts";
+import { sanitizedMessage } from "./error-envelope.ts";
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import { isEdgeFormsApiVersion } from "./form-ref.ts";
 import { canonicalDigest } from "./json.ts";
@@ -51,8 +52,9 @@ export class ProviderMutationRecoveryError extends TakoformHostError {
     readonly providerHandle?: string,
     code = "backend_unavailable",
     status = 503,
+    message?: string,
   ) {
-    super(code, status);
+    super(code, status, undefined, sanitizedMessage(message));
     this.name = "ProviderMutationRecoveryError";
   }
 }
@@ -349,9 +351,20 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
       // response rather than a pre-dispatch rejection. Keep the saga in an
       // explicit indeterminate state and require deterministic recovery.
       const [code, status] = failureToWire(ticket.failure.code);
-      throw new ProviderMutationRecoveryError("indeterminate", ticket.handle, code, status);
+      throw new ProviderMutationRecoveryError(
+        "indeterminate",
+        ticket.handle,
+        code,
+        status,
+        ticket.failure.message,
+      );
     }
-    throw new TakoformHostError(...failureToWire(ticket.failure.code));
+    // The provider's own sentence, not the code's. `ProviderFailure.message`
+    // is declared safe for a customer to read, and dropping it left the caller
+    // with `invalid_argument` and a repair line telling them to "correct the
+    // desired state the message names" against a message that named nothing.
+    const [code, status] = failureToWire(ticket.failure.code);
+    throw new TakoformHostError(code, status, undefined, sanitizedMessage(ticket.failure.message));
   };
 
   /**

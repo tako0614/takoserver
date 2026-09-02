@@ -11,8 +11,10 @@
  * envelope. A two-member 404 made the answer unreadable, so the whole sealed
  * runtime-input path was unreachable from the released provider (E2E defect 1).
  *
- * `requestId` is always fresh and the message is derived from the code, so no
- * internal text and no caller-supplied value escapes through an error.
+ * `requestId` is always fresh. The message is derived from the code unless the
+ * Host supplies one it has already sanitized — a provider refusal naming the
+ * cause, bounded and stripped by `sanitizedMessage` — so no caller-supplied
+ * value and no raw internal text escapes through an error.
  */
 
 /**
@@ -91,16 +93,41 @@ export function errorEnvelope(
   code: string,
   details?: unknown,
   requestId = `req_${crypto.randomUUID()}`,
+  message?: string,
 ): WireErrorEnvelope {
   return {
     error: {
       code,
-      message: code.replaceAll("_", " "),
+      message: sanitizedMessage(message) ?? code.replaceAll("_", " "),
       requestId,
       retryable: AUTOMATICALLY_RETRYABLE_ERROR_CODES.includes(code),
       ...(details === undefined ? {} : { details }),
     },
   };
+}
+
+/** How much of a diagnosis one failure may carry. */
+export const MAXIMUM_ERROR_MESSAGE_LENGTH = 400;
+
+/**
+ * The one gate a non-derived message passes through.
+ *
+ * A message that reaches here has already been declared safe for a customer to
+ * read by whoever produced it, so this is not redaction — it is the bound that
+ * keeps a refusal a sentence rather than a stranger's stack trace, and it
+ * flattens every control character so nothing can forge a second line, a JSON
+ * break, or a terminal escape inside an error envelope.
+ */
+export function sanitizedMessage(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  let text = "";
+  for (const character of value.slice(0, MAXIMUM_ERROR_MESSAGE_LENGTH * 2)) {
+    const code = character.codePointAt(0) ?? 0;
+    text += code < 0x20 || code === 0x7f ? " " : character;
+    if (text.length >= MAXIMUM_ERROR_MESSAGE_LENGTH) break;
+  }
+  const trimmed = text.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
 }
 
 /** The envelope as an HTTP response. Both lanes render errors through this. */
@@ -109,6 +136,7 @@ export function errorEnvelopeResponse(
   status: number,
   details?: unknown,
   init?: ResponseInit,
+  message?: string,
 ): Response {
-  return Response.json(errorEnvelope(code, details), { ...init, status });
+  return Response.json(errorEnvelope(code, details, undefined, message), { ...init, status });
 }
