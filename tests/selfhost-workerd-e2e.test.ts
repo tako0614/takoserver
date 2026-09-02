@@ -1242,7 +1242,11 @@ test.skipIf(WORKERD === null)(
       phase: "failed",
       failure: {
         code: "invalid_spec",
-        message: "the Worker Version's module does not export every handler it declares",
+        // Which handler, and in which way. The fixture exports `fetch` and
+        // `scheduled`, so "does not export every handler it declares" would
+        // send an operator to read a list that is right about two of three.
+        message:
+          "the Worker Version's module is not what it declares: declared handler queue is not exported",
       },
     });
   },

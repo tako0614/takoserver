@@ -1518,15 +1518,20 @@ function isReadableStream(value) {
   }
 }
 
+// The wrong kind of thing is invalid_value; only too much of it is
+// metadata_too_large. Kept identical to the self-host facade: one Binding, one
+// vocabulary, whichever backend a Worker landed on.
 function projectStringRecord(value) {
-  if (!isRecord(value)) throw portableError("metadata_too_large");
+  if (!isRecord(value)) throw portableError("invalid_value");
   const keys = SafeObjectKeys(value);
   sortStrings(keys);
-  if (SafeOwnKeys(value).length !== keys.length || keys.length > 64) throw portableError("metadata_too_large");
+  if (SafeOwnKeys(value).length !== keys.length) throw portableError("invalid_value");
+  if (keys.length > 64) throw portableError("metadata_too_large");
   const result = SafeObjectCreate(null);
   for (let index = 0; index < keys.length; index += 1) {
     const key = keys[index]; const item = value[key];
-    if (key.length > 256 || typeof item !== "string" || item.length > 8192) throw portableError("metadata_too_large");
+    if (typeof item !== "string") throw portableError("invalid_value");
+    if (key.length > 256 || item.length > 8192) throw portableError("metadata_too_large");
     result[key] = item;
   }
   return result;

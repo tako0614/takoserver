@@ -38,7 +38,11 @@ import {
   derivedProviderResourceIncarnationName,
   derivedProviderResourceName,
 } from "../provider-worker-endpoint-origin.ts";
-import { WORKERD_ASSETS_BINDING, type WorkerdRuntime } from "../workerd-runtime.ts";
+import {
+  internalHostname,
+  WORKERD_ASSETS_BINDING,
+  type WorkerdRuntime,
+} from "../workerd-runtime.ts";
 import { parseSelfhostCron } from "./selfhost-cron.ts";
 import {
   SELFHOST_WORKER_DATA_SERVICE_MODULE,
@@ -754,6 +758,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     try {
       source = selfhostWorkerEntrypointSource({
         publication,
+        // Where this Host's own probe reaches this script, so the failure
+        // detail is answered to the probe and not to the internet.
+        probeHostname: internalHostname(script),
         originalMainModule: mainModule,
         declaredHandlers: bindings.handlers,
         ...(events ? { events: true } : {}),
