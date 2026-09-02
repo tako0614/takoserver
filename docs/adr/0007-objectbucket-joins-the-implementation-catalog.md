@@ -294,11 +294,15 @@ binding. **Until it is provisioned the Durable Object executes no admin
 operation at all** — which is the honest posture for a lane nothing composes,
 and the thing to fix first for anyone who wants to.
 
-The DO instance name still leaves as the `databaseId` Output. Replacing it would
-mean minting a second stable identifier with no source of truth and changing a
-declared Form output, and it is no longer load-bearing: knowing the name buys
-nothing now that every admin operation wants a proof and the runtime facade is
-the only other way in.
+The Durable Object instance name still leaves as the `databaseId` Output. The
+SQLiteDatabase Form declares no outputs, so this is a Host invention and nothing
+in the portable contract requires it — but the ordinary-workers backend emits
+`databaseId` too, as the native D1 id its own binding closure reads, and the two
+backends serving one Form should answer the same question the same way.
+Replacing the managed one would mean minting a second stable identifier with no
+source of truth, and the name is no longer load-bearing: knowing it buys nothing
+now that every admin operation wants a proof and the runtime facade is the only
+other way in.
 
 **The release script name moved.** `compatibility_flags` is part of
 `settingsIdentity`, which is part of the release descriptor digest, which is the
