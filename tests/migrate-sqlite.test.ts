@@ -16,6 +16,7 @@ const RUNTIME_INPUT_PREPARATION_V2 = "0037_worker_runtime_input_preparation_v2.s
 const SELFHOST_EDGE_KV = "0038_selfhost_edge_kv.sql";
 const LIVE_NATIVE_CLAIM_ACROSS_TENANTS = "0039_takoform_live_native_claim_across_tenants.sql";
 const SELFHOST_QUEUES_AND_SCHEDULES = "0040_selfhost_queues_and_schedules.sql";
+const SELFHOST_OBJECT_BUCKETS = "0041_selfhost_object_buckets.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
@@ -25,6 +26,7 @@ const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   SELFHOST_EDGE_KV,
   LIVE_NATIVE_CLAIM_ACROSS_TENANTS,
   SELFHOST_QUEUES_AND_SCHEDULES,
+  SELFHOST_OBJECT_BUCKETS,
 ] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
@@ -360,6 +362,7 @@ describe("bringing a local database up to date", () => {
       expect(migrateSqlite(database).applied).toEqual([
         LIVE_NATIVE_CLAIM_ACROSS_TENANTS,
         SELFHOST_QUEUES_AND_SCHEDULES,
+        SELFHOST_OBJECT_BUCKETS,
       ]);
       expect(() => database.exec(LIVE_CLAIM("tenant_b", "dep_b"))).toThrow(/UNIQUE|constraint/iu);
     });
@@ -713,6 +716,7 @@ describe("bringing a local database up to date", () => {
       "0038_selfhost_edge_kv.sql",
       "0039_takoform_live_native_claim_across_tenants.sql",
       "0040_selfhost_queues_and_schedules.sql",
+      "0041_selfhost_object_buckets.sql",
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -834,6 +838,7 @@ describe("bringing a local database up to date", () => {
       "0038_selfhost_edge_kv.sql",
       "0039_takoform_live_native_claim_across_tenants.sql",
       "0040_selfhost_queues_and_schedules.sql",
+      "0041_selfhost_object_buckets.sql",
     ]);
     expect(
       database
@@ -1762,6 +1767,7 @@ describe("bringing a local database up to date", () => {
       SELFHOST_EDGE_KV,
       LIVE_NATIVE_CLAIM_ACROSS_TENANTS,
       SELFHOST_QUEUES_AND_SCHEDULES,
+      SELFHOST_OBJECT_BUCKETS,
     ]);
     expect(
       database

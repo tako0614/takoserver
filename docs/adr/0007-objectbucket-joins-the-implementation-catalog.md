@@ -2,6 +2,17 @@
 
 **Status:** accepted, 2026-09-02
 
+> **Amended 2026-09-02 by this decision's own second rotation.** Where the body
+> below says a self-host "realizes none" of the ObjectBucket supply and records
+> the Form with an EMPTY operation set, that is no longer true: a self-host now
+> holds object bodies under its data root and their metadata in its control
+> database, and its Provider Pack owns both halves of the
+> `module-worker.object-bucket` materialization. The rule is unchanged — an
+> identity capability is admitted with the operations its Form declares exactly
+> where the Host realizes the supply — but the self-host's answer to it moved,
+> and its digests moved with it. See
+> [Second rotation](#second-rotation-the-self-host-realizes-the-supply).
+
 ## Decision
 
 The exact current `edge.forms.takoform.com/ObjectBucket` package at definition
@@ -26,12 +37,14 @@ capable only when the Host realizes an ObjectBucket supply: a Host without one
 installs, supports, and activates the Form with an EMPTY operation set, which
 is the honest statement that the Form is known here and none of it executes.
 
-Two Hosts exist and they differ. The public Worker realizes the supply and
-serves all five operations. A **self-host realizes none** — its composition
-builds no ObjectBucket Offering at all, because the machine has no
-`edge.objects` backend — so `scripts/selfhost-form-admission.ts` narrows the
-capability set it records to the identity Forms that composition does offer.
-The two Hosts therefore no longer share one capability digest.
+Two Hosts exist. At the time this decision was taken they differed: the public
+Worker realized the supply and served all five operations, and a self-host
+realized none — its composition built no ObjectBucket Offering at all, because
+the machine had no `edge.objects` backend — so
+`scripts/selfhost-form-admission.ts` narrowed the capability set it records to
+the identity Forms that composition did offer. The
+[second rotation](#second-rotation-the-self-host-realizes-the-supply) closed
+that gap; the rule that produced both answers is the same one.
 
 The four other installed-but-unsupported packages — `ActorNamespace`,
 `DurableWorkflow`, `StaticAssetBundle`, `WorkerCustomDomain` — are unchanged.
@@ -147,6 +160,62 @@ reproducible from this document.
 names this ADR. Changing those literals again is an explicit reconvergence
 decision, not a stale-expectation refresh.
 
+### Second rotation: the self-host realizes the supply
+
+A self-host now has an `edge.objects` backend. Object bodies are files under
+`<data root>/selfhost/objects/<bucket>/` and their metadata is rows under
+migration `0041`; the object data plane serves the Binding beside the KV, SQL,
+and queue planes; and `createSelfhostRuntimeBindingMaterializer` publishes both
+the target export and the consumer import of `module-worker.object-bucket`, so
+the route resolves and a `bucketBindings` declaration is materializable. The
+self-host Worker backend is a wrapper, so what the declared name carries there
+is the exact `edge.objects` facade of ADR 0005 rather than the native binding
+the ordinary-workers backend carries.
+
+Two things follow, and only these two. `SELFHOST_IDENTITY_CAPABILITY_KINDS`
+names `ObjectBucket`, so a self-host admission records the Form with the five
+operations it declares rather than an empty set — `update` is still never
+admitted, because the Form does not declare it. And the self-host's capability
+manifest is once again the same five-supply manifest the public Worker serves,
+so the two Hosts share a `capabilityDigest` again while keeping distinct
+implementation digests: a self-host binds the manifest through
+`takoserver.selfhost-form-implementation@v1`, and the public Worker
+additionally binds its sealed runtime payload.
+
+| identity | after the first rotation | after this one |
+| --- | --- | --- |
+| self-host `capabilityDigest` | `sha256:0d471b6ebe2bf43c60ba2b8a000cd8aa2293c0cc9b4b4a048b9abc1d75a13669` | `sha256:a5bc1508638fb1c47182d4ee68be5eedb7acc050394bd3507b532a78daacc024` |
+| self-host `implementationPayloadDigest` | `sha256:da5ff6f98d0cd147cdb74c168e271ab9576c109c82313c14fa4ee0cd1c650ac4` | `sha256:b7ea4f2da3f5dca05827442cb9a9f2419bf2063e3a9457cf6f97b7409da9f2c4` |
+| self-host `implementationDigest` | `sha256:6e566932ddad3ef48360d8f3ee643c2ccdf2eb3a05307c483e225f6d6f622459` | `sha256:8c9c862558356c41c487e8a18a020fedb0a5eb970046bfbac3664376420f1962` |
+
+The public Worker's identities are untouched: its supply set did not move, and
+the exact publisher-set import, its receipt, catalog projection, and authority
+closure are untouched here as they were there.
+
+Reconvergence is the same append-only event chain, run the same way. A machine
+already converged on the predecessor identity emits exactly the support and
+activation successors the rotated implementation digest requires, plus the
+ObjectBucket operation-set delta:
+
+```sh
+bun scripts/selfhost-form-admission.ts <organizationId> <space> \
+  --data-root .takoserver --host-id https://takoserver.example \
+  --core-verifier http://127.0.0.1:8080            # plan only
+bun scripts/selfhost-form-admission.ts <organizationId> <space> ... --apply
+```
+
+**What a self-host provider does with the Form.** `create` derives the bucket
+name from the Resource INCARNATION — tenant, Space, name, and Resource UID —
+for the reason stated under [Naming and import](#naming-and-import): a customer
+who destroys a bucket and declares one with the same name has asked for an
+empty bucket. `delete` refuses a bucket that still holds an object or an
+unfinished multipart upload, as a named non-retryable failure proven by one
+readback; the Form declares no field that could ask this Host to empty one, and
+emptying a customer's storage is not a decision a lifecycle delete may take.
+`import` is fenced to the exact incarnation this Host itself derives for the
+Resource address being imported onto, so another tenant's bucket and a name
+this Host never minted are both refused before anything is read.
+
 ### Deploy-target obligation
 
 `assertPublicFormCapabilityTarget` now proves two supplies: `edgeSupplies` must
@@ -213,10 +282,11 @@ bun scripts/selfhost-form-admission.ts <organizationId> <space> ... --apply
   authority closure — is untouched. All 17 packages were already installed;
   only the supported and activated subset moved.
 - A self-host records the current ObjectBucket as installed, supported, and
-  activated with an empty operation set, so nothing about it is executable
-  there. The self-host provider's `denied` refusal at `apply` and `adopt`
-  remains as defence in depth behind that, for a composition assembled by hand
-  rather than by `createSelfhostComposition`. Its retained v1beta1 ObjectBucket
-  drain capability is untouched and remains observe/delete only.
+  activated with the five operations its Form declares, and executes them. Its
+  retained v1beta1 ObjectBucket drain capability is untouched and remains
+  observe/delete only, under the address-derived `local-bucket:` names its
+  already-recorded Deployments carry.
 - The managed Worker backend refuses `bucketBindings` by name. The
-  ordinary-workers backend is the only runtime that binds one.
+  ordinary-workers backend and the self-host wrapper backend are the two
+  runtimes that bind one, and they bind it differently: Cloudflare's own R2
+  binding there, the exact `edge.objects` facade here.

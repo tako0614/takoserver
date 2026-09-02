@@ -4,11 +4,13 @@ import {
   createCatalogCandidate,
   createProvisioningProviderPack,
   type DeploymentComposition,
+  type DeploymentRuntimeBindingRelation,
 } from "./deployment-composition.ts";
 import { type EdgeFormBundle, edgeProviderOffering } from "./edge-forms.ts";
 import { HOSTED_EDGE_IDENTITY_CLASSES } from "./hosted-edge-supplies.ts";
 import type { Provider, ProviderOffering } from "./provider-port.ts";
 import type { ProviderRuntimeInputLeasePort } from "./provider-runtime-input-port.ts";
+import { EDGE_OBJECTS_BINDING_REF } from "./providers/cloudflare-runtime-bindings.ts";
 import {
   createSelfhostProvider,
   type SelfhostArtifacts,
@@ -16,6 +18,7 @@ import {
   type SelfhostEventRuntime,
   type SelfhostProviderOptions,
 } from "./providers/selfhost.ts";
+import { createSelfhostRuntimeBindingMaterializer } from "./selfhost-runtime-binding-materializer.ts";
 import {
   YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
   type YurucommuIdentityCapabilityKind,
@@ -39,17 +42,36 @@ import type { WorkerdRuntime } from "./workerd-runtime.ts";
  */
 
 /**
+ * The resource class each identity Form is sold as here.
+ *
+ * The four hosted edge classes plus the current ObjectBucket. It is a self-host
+ * map rather than the hosted one because the two Hosts no longer realize the
+ * same supplies in the same way: this machine backs a bucket with files under
+ * its own data root, where the hosted map describes what a reviewed Cloudflare
+ * installation sells.
+ */
+const SELFHOST_IDENTITY_CLASSES = {
+  ...HOSTED_EDGE_IDENTITY_CLASSES,
+  ObjectBucket: "storage.object",
+} as const;
+
+/**
  * The identity Forms a self-host composition can actually offer.
  *
  * Derived from the one rule the composition below applies — a stable identity
- * Form becomes an Offering only when `HOSTED_EDGE_IDENTITY_CLASSES` names it —
- * rather than restated as a second list that could drift from it. The current
- * ObjectBucket is deliberately outside: this machine has no `edge.objects`
- * backend, so it has no Offering for one, and a Host must not advertise an
- * operation whose only possible answer is a refusal (ADR 0007).
+ * Form becomes an Offering only when `SELFHOST_IDENTITY_CLASSES` names it —
+ * rather than restated as a second list that could drift from it.
+ *
+ * `ObjectBucket` is inside it now. This machine realizes the supply: object
+ * bodies under the data root, metadata in the control database, and a Provider
+ * Pack that owns both halves of the `module-worker.object-bucket`
+ * materialization, so a `bucketBindings` declaration reaches the Worker as the
+ * exact `edge.objects` facade. Widening this rotates the self-host capability
+ * and implementation digests, which is an explicit reconvergence obligation
+ * rather than a refresh (ADR 0007).
  */
 export const SELFHOST_IDENTITY_CAPABILITY_KINDS: readonly YurucommuIdentityCapabilityKind[] =
-  YURUCOMMU_IDENTITY_CAPABILITY_KINDS.filter((kind) => kind in HOSTED_EDGE_IDENTITY_CLASSES);
+  YURUCOMMU_IDENTITY_CAPABILITY_KINDS.filter((kind) => kind in SELFHOST_IDENTITY_CLASSES);
 
 const SUPPLY_CONTRACT_REF = "local.ownership-contract";
 const PROVIDER_INSTALLATION_REF = "local.primary";
@@ -117,9 +139,9 @@ export function createSelfhostComposition(
       if (form.identity.formRef.apiVersion !== "edge.forms.takoform.com") continue;
       const kind = form.identity.formRef.kind;
       if (form.role === "identity") {
-        if (!(kind in HOSTED_EDGE_IDENTITY_CLASSES)) continue;
+        if (!(kind in SELFHOST_IDENTITY_CLASSES)) continue;
         const resourceClass =
-          HOSTED_EDGE_IDENTITY_CLASSES[kind as keyof typeof HOSTED_EDGE_IDENTITY_CLASSES];
+          SELFHOST_IDENTITY_CLASSES[kind as keyof typeof SELFHOST_IDENTITY_CLASSES];
         const offering = edgeProviderOffering(form, {
           id: `${resourceClass}.stable-v1.standard`,
           regions: ["global"],
@@ -173,7 +195,8 @@ export function createSelfhostComposition(
     id: SUPPLY_CONTRACT_REF,
     providerType: "selfhost",
     permittedResourceClasses: [
-      // ObjectBucket is retained drain authority, not a current catalog item.
+      // Named unconditionally because the retained v1beta1 drain is a technical
+      // capability of this same contract even where no current bucket is sold.
       "storage.object",
       ...new Set(identityOfferings.map((entry) => entry.resourceClass)),
     ].sort(),
@@ -194,7 +217,17 @@ export function createSelfhostComposition(
     regions: [{ id: "global", capacity: "available" }],
   };
 
-  const pack = createProvisioningProviderPack({ provider, providerType: "selfhost" });
+  // Both halves of the object Binding, always. The exporter refuses anything
+  // that is not a bucket this provider derived, so attaching it to a drain-only
+  // composition advertises nothing: the retained v1beta1 identity is recorded
+  // under an address-derived name the exporter does not accept.
+  const pack = createProvisioningProviderPack({
+    provider,
+    providerType: "selfhost",
+    capabilities: {
+      runtimeBindingMaterializer: createSelfhostRuntimeBindingMaterializer(provider.id),
+    },
+  });
 
   const pricePlans: PricePlan[] = [];
   const candidates = identityOfferings.map(({ offering, resourceClass }) => {
@@ -234,19 +267,33 @@ export function createSelfhostComposition(
     });
   });
 
+  // A bucket Offering exists only where something on this machine can consume
+  // it. The pack owns the export and the import, and the Worker backend behind
+  // it is a wrapper, so the declaration reaches the Worker as the exact
+  // `edge.objects` facade rather than a provider-native client (ADR 0005).
+  const runtimeBindingRelations: DeploymentRuntimeBindingRelation[] = identityOfferings
+    .filter(({ offering }) => offering.form.kind === "ObjectBucket")
+    .map(({ offering }) => ({
+      targetOfferingId: offering.id,
+      consumerProviderPackRef: pack.id,
+      bindingRef: EDGE_OBJECTS_BINDING_REF,
+    }));
+
   const compiled = compileDeploymentComposition({
     candidates,
     providerPacks: [pack],
     providerInstallations: [providerInstallation],
     supplyContracts: [supplyContract],
     pricePlans,
+    runtimeBindingRelations,
     now: options.now,
   });
 
   // Only stable identities entered `candidates`; released beta Forms remain
   // technical drain capabilities and therefore cannot appear at `/v1` or
-  // `/provision/v1`. This standalone composition exposes no current managed
-  // object-storage sale; the retained ObjectBucket is recovery-only.
+  // `/provision/v1`. The current ObjectBucket is a candidate now — this machine
+  // realizes the supply — while the retained v1beta1 identity stays
+  // recovery-only under its own address-derived names.
   return { ...compiled, provider };
 }
 

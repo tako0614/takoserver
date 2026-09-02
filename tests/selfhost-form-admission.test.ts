@@ -72,17 +72,17 @@ describe("self-host Form admission", () => {
       expect(forms.filter((form) => form.installed)).toHaveLength(17);
       expect(forms.filter((form) => form.supported)).toHaveLength(IMPLEMENTED);
       expect(forms.filter((form) => form.activationHead.active)).toHaveLength(IMPLEMENTED);
-      // ADR 0007: a self-host admission installs, supports, and activates the
-      // exact current ObjectBucket package with an EMPTY operation set. That is
-      // the rule for an identity Form whose supply the Host does not realize,
-      // and this machine realizes none: it has no `edge.objects` backend. The
-      // Form is present and nothing about it is executable, which is a
-      // different and more honest statement than claiming five operations and
-      // refusing every one of them at the mutation barrier.
+      // ADR 0007: an identity Form is admitted with the operations its Form
+      // declares on a Host that realizes its supply, and with an EMPTY set on
+      // one that does not. A self-host realizes the ObjectBucket supply now —
+      // object bodies under its data root, metadata in its control database,
+      // and a Provider Pack owning both halves of the object Binding — so the
+      // Form is admitted with the five operations it declares and never with
+      // `update`, which it does not declare however wide the other sets are.
       expect(forms.find((form) => form.formRef.kind === "ObjectBucket")).toMatchObject({
         installed: true,
         supported: true,
-        operations: [],
+        operations: ["create", "read", "delete", "import", "observe"],
         activationHead: { present: true, active: true },
       });
       // Every other supported Form still carries the operations it declares.

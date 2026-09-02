@@ -49,7 +49,8 @@ Use a token created for the exact optional adapter, not a `wrangler login`
 session. Grant only what the selected Bun inputs use:
 
 - Account · Workers R2 Storage · Edit, only when an R2 artifact store or the
-  retired ObjectBucket drain is selected.
+  retired ObjectBucket drain is selected. A current `ObjectBucket` on this
+  machine needs no Cloudflare permission at all: its bytes are local.
 
 The ordinary Bun stable provider does not need Workers Scripts, Workers Routes,
 or DNS permission. Production Cloudflare Worker execution and its zone
@@ -60,11 +61,13 @@ file is read at the moment of each call, so a rotation does not need a restart.
 
 ## Worker storage on this machine
 
-A Worker Version that declares `kvBindings`, `queueProducerBindings`, or
-`sqliteBindings` needs a backend, and a machine standing on its own has to be
-one. Three small HTTP services provide it: KV entries and queue messages live in
-the control database under migrations 0038 and 0040, and each `SQLiteDatabase`
-is a file under `<data root>/databases`.
+A Worker Version that declares `kvBindings`, `bucketBindings`,
+`queueProducerBindings`, or `sqliteBindings` needs a backend, and a machine
+standing on its own has to be one. Four small HTTP services provide it: KV
+entries and queue messages live in the control database under migrations 0038
+and 0040, each `SQLiteDatabase` is a file under `<data root>/databases`, and an
+`ObjectBucket` is a directory under `<data root>/selfhost/objects` with its
+metadata in the control database under migration 0041.
 
 They are served on their own listener, bound to `127.0.0.1`, never on `PORT`.
 What authenticates there is a bearer token minted per Worker Version, and a
@@ -90,14 +93,19 @@ A Worker with a Queue Consumer or a Cron Trigger attached gets one more:
 |---|---|---|
 | `<script>-selfhost-events` | A Takoserver-owned gate module, no tenant code | The Version's event token, and a service binding naming the script's `takoserverSelfhostEvents` entrypoint |
 
+The object route travels the same three services; only its framing differs, and
+the facade streams it through rather than reading it.
+
 The split is the isolation. A binding belongs to the service it is declared on,
 and workerd hands every one of them to every module that service runs —
 including through `import { env } from "cloudflare:workers"` — so a value left
 out of a projected `env` was never hidden. The tenant's service therefore
 declares no token and no address. The facade rewrites every request it is
-handed into a fixed method, one of two fixed URLs, and two fixed headers, so a
-service binding that leaked into tenant code reaches those two routes and
-nothing else on this machine. `disallow_importable_env` is set on the tenant's
+handed into a fixed method, one of four fixed URLs, and a fixed header set, so a
+service binding that leaked into tenant code reaches those four routes and
+nothing else on this machine. Exactly one header crosses it unchanged — the
+opaque object-operation document — and the plane behind parses that field by
+field before it resolves a binding name. `disallow_importable_env` is set on the tenant's
 service as well, which is the second lock rather than the first.
 
 Publishing also asks the published services, over the workerd router, whether the
@@ -127,6 +135,40 @@ The SQL plane parses each statement before preparing it and refuses:
 managed backend does it, so a write smuggled through it never commits. bun's
 SQLite bindings expose no `SQLITE_LIMIT_ATTACHED`, so the statement gate is the
 control rather than a second one behind it.
+
+### What a Worker's bucket binding may say
+
+`env.MEDIA` is the exact `edge.objects@1.0.0` facade the managed Cloudflare
+wrapper projects — the same nine methods, the same option names, the same closed
+error names, and the same ceilings: 979-byte keys, 5 GiB objects, 300 MiB for a
+single `put`, 10 000 parts, and a 5 MiB floor on every part but the last. What
+differs is only what is behind it.
+
+The object route is the one on this seam that does not speak JSON in both
+directions. An object body is up to 5 GiB, and base64 inside an envelope would
+mean holding a third of a gigabyte in an isolate to write a hundred megabytes,
+so the bytes travel as the request or response body and the operation travels as
+one header the facade copies verbatim and the plane validates field by field.
+Nothing is buffered: a `put` is written to a file as it arrives, and a ranged
+`get` is one `pread` streamed back.
+
+A key never becomes a path. Bodies live at names this Host minted, under a
+directory named by the bucket INCARNATION — tenant, Space, name, and Resource
+UID — so a customer who destroys a bucket and declares one with the same name
+gets an empty one rather than the old bytes. Directories are `0700` and files
+`0600`, and both are tightened and re-read rather than created hopefully.
+
+Multipart receipts are rows rather than isolate memory, which is the difference
+[ADR 0007](adr/0007-objectbucket-joins-the-implementation-catalog.md) names
+between this runtime and the managed one: a restart between
+`createMultipartUpload` and `completeMultipartUpload` costs nothing here, so the
+part sizes and etags a complete is validated against survive it.
+
+**Destroying a bucket that still holds anything is refused.** The Form's desired
+state is empty, so nothing in it could ask this Host to empty one, and emptying
+a customer's storage is not a decision a lifecycle delete may take. An object or
+an unfinished multipart upload is enough; the refusal is named, non-retryable,
+and proven by one readback.
 
 ### Ceilings
 

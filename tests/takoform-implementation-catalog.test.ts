@@ -69,11 +69,14 @@ describe("Form authority implementation catalog", () => {
 
   test("pins the self-host implementation digests ADR 0007 rotates", async () => {
     const capabilities = yurucommuLifecycleCapabilityManifest(SELFHOST_IDENTITY_CAPABILITY_KINDS);
-    // A self-host offers no ObjectBucket supply, so it never names one.
+    // A self-host realizes the ObjectBucket supply now, so it names one — and
+    // its capability manifest is once again the same five-supply manifest the
+    // public Worker serves. The implementation digests still differ, because a
+    // self-host's binds the manifest through its own payload kind rather than a
+    // sealed Worker artifact.
     expect(capabilities.implementation).toBe(
-      "takoserver.public-worker-target@v1:AtLeastOnceQueue,EdgeKVNamespace,ModuleWorker,SQLiteDatabase",
+      "takoserver.public-worker-target@v1:AtLeastOnceQueue,EdgeKVNamespace,ModuleWorker,ObjectBucket,SQLiteDatabase",
     );
-    expect(capabilities.forms.ObjectBucket).toEqual([]);
     const implementationPayloadDigest = await canonicalDigest({
       kind: "takoserver.selfhost-form-implementation@v1",
       capabilities,
@@ -83,21 +86,23 @@ describe("Form authority implementation catalog", () => {
       capabilities,
     });
     expect(semantic.capabilityDigest).toBe(
-      "sha256:0d471b6ebe2bf43c60ba2b8a000cd8aa2293c0cc9b4b4a048b9abc1d75a13669",
+      "sha256:a5bc1508638fb1c47182d4ee68be5eedb7acc050394bd3507b532a78daacc024",
     );
     expect(semantic.implementationPayloadDigest).toBe(
-      "sha256:da5ff6f98d0cd147cdb74c168e271ab9576c109c82313c14fa4ee0cd1c650ac4",
+      "sha256:b7ea4f2da3f5dca05827442cb9a9f2419bf2063e3a9457cf6f97b7409da9f2c4",
     );
     expect(semantic.implementationDigest).toBe(
-      "sha256:6e566932ddad3ef48360d8f3ee643c2ccdf2eb3a05307c483e225f6d6f622459",
+      "sha256:8c9c862558356c41c487e8a18a020fedb0a5eb970046bfbac3664376420f1962",
     );
-    // The predecessor pair a converged self-host is moving away from.
-    expect(semantic.capabilityDigest).not.toBe(
-      "sha256:630899ce5e482e7e274c87dab17d74edd904620852a71c2b021aade236a1ea73",
-    );
-    expect(semantic.implementationDigest).not.toBe(
+    // The two predecessor identities a converged self-host moves away from: the
+    // one it served before ADR 0007, and the supply-less one ADR 0007 first
+    // gave it.
+    for (const predecessor of [
       "sha256:3788374901bbbb413a8be78d56d1220a3b82d352c12f03d2ce32b0a10454d756",
-    );
+      "sha256:6e566932ddad3ef48360d8f3ee643c2ccdf2eb3a05307c483e225f6d6f622459",
+    ]) {
+      expect(semantic.implementationDigest).not.toBe(predecessor);
+    }
   });
 
   test("keeps ObjectBucket unsupported on a Host with no realized bucket supply", async () => {

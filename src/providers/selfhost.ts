@@ -16,6 +16,7 @@ import {
   type ProviderOffering,
   ProviderReadbackDescriptorError,
   type ProviderRelation,
+  type ProviderRuntimeBinding,
   type ProviderSqliteMigration,
   type ProviderSqliteMigrationIdentity,
   type ProviderTicket,
@@ -50,6 +51,12 @@ import {
   selfhostEventServiceSource,
 } from "./selfhost-events.ts";
 import {
+  SELFHOST_EDGE_OBJECTS_BINDING_REF,
+  SELFHOST_OBJECT_BUCKET_ID,
+  selfhostEdgeObjectsMaterial,
+  selfhostObjectBucketNativeId,
+} from "./selfhost-runtime-bindings.ts";
+import {
   createSelfhostScriptStateStore,
   type SelfhostQueueConsumerAttachment,
   type SelfhostQueueTarget,
@@ -77,6 +84,7 @@ import {
 import {
   SELFHOST_WORKER_DATA_TOKEN_BINDING,
   SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
+  SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND,
   SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
   SELFHOST_WORKER_ENTRYPOINT_MODULE,
   SELFHOST_WORKER_INTERNAL_BINDING_PREFIX,
@@ -104,10 +112,15 @@ import {
  *   exists — the same promise Cloudflare charges per bucket for, with less
  *   machinery. The retained v1beta1 **ObjectBucket** is the same shape, kept
  *   only so already-recorded Deployments can be observed and deleted.
- * - The current **ObjectBucket** is refused at apply and import with `denied`.
- *   A Host may support and activate the Form (ADR 0007), but this machine has
- *   no `edge.objects` backend, and recording a namespace for storage that does
- *   not exist would be a lie a Worker Version later binds to.
+ * - The current **ObjectBucket** is a real store now. Its native name is derived
+ *   from the Resource INCARNATION rather than its address alone, for the reason
+ *   a KV namespace already is: a customer who destroys a bucket and declares
+ *   one with the same name has asked for an empty bucket. Its bytes live under
+ *   the data root, its metadata in the control database, and a `bucketBindings`
+ *   declaration reaches it as the exact `edge.objects` facade (ADR 0007). A
+ *   delete refuses a bucket that still holds anything: emptying a customer's
+ *   storage is not something a lifecycle delete may decide, and the Form
+ *   declares no field that would ask for it.
  * - **SQLiteDatabase** is a file under the data root. It appears when
  *   something writes to it, and the migration ledger below executes real SQL
  *   against it.
@@ -567,6 +580,25 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
 
   const databasePath = (name: string): string => selfhostDatabasePath(dataRoot, name);
 
+  /**
+   * The native name of one current ObjectBucket incarnation.
+   *
+   * Keyed by the Resource UID as well as its address, exactly as a KV namespace
+   * and a queue are and for exactly the same reason: this is a store rather
+   * than a label, and a customer who destroyed a bucket and declared one with
+   * the same name has asked for an empty bucket. Recomputing the address alone
+   * would hand them the old bytes whenever a destroy did not finish.
+   */
+  const bucketIncarnationName = async (identity: ResourceIdentity): Promise<string | null> =>
+    identity.uid
+      ? await derivedProviderResourceIncarnationName("tsb", {
+          tenantRef: identity.tenantRef,
+          space: identity.space,
+          name: identity.name,
+          uid: identity.uid,
+        })
+      : null;
+
   const scriptStateOperation = async <T>(operation: () => Promise<T>): Promise<T> => {
     try {
       return await operation();
@@ -753,9 +785,11 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             kind:
               binding.kind === "edge.kv"
                 ? SELFHOST_WORKER_EDGE_KV_BINDING_KIND
-                : binding.kind === "edge.queue"
-                  ? SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND
-                  : SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
+                : binding.kind === "edge.objects"
+                  ? SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND
+                  : binding.kind === "edge.queue"
+                    ? SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND
+                    : SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
             publicName: binding.name,
           })),
         ],
@@ -1173,6 +1207,86 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   };
 
   /**
+   * The Worker Version's `bucketBindings`, validated against what the Provider
+   * Pack materialized rather than against what the spec claims.
+   *
+   * A bucket is different in kind from a KV namespace here: the pack has
+   * already turned the relation into an opaque capability before this adapter
+   * runs, so the declaration is held against that result. The checks are the
+   * ones ADR 0007 states, in the same order the ordinary-workers backend makes
+   * them: one runtime Binding per declaration in the same order, the exact
+   * `module-worker.object-bucket@1.1.0` identity with its exact schema digest,
+   * a relation at `/bucketBindings/<index>/resource` whose `targetUid` equals
+   * the Binding's, a declaration `name` equal to the Binding's name, a name
+   * shared with no other binding of any type on the same Version, an active
+   * target Deployment in the same provider installation, and a material naming
+   * a bucket this provider derived. Any mismatch is a refusal before a byte
+   * moves.
+   */
+  const declaredBucketBindings = (
+    input: ApplyInput,
+    reserved: ReadonlySet<string>,
+  ): readonly SelfhostVersionDataBinding[] => {
+    const invalid = (): never => {
+      throw new SelfhostFailure(
+        failed("invalid_spec", "the Worker Version bucket bindings are invalid"),
+      );
+    };
+    const raw = input.spec.bucketBindings;
+    if (raw !== undefined && !Array.isArray(raw)) invalid();
+    const declared = Array.isArray(raw) ? (raw as readonly JsonValue[]) : [];
+    const materialized = input.runtimeBindings ?? [];
+    if (declared.length !== materialized.length) invalid();
+    if (declared.length === 0) return [];
+    if (declared.length > MAX_WORKER_VERSION_DATA_BINDINGS) invalid();
+    // A Worker Version inherits its placement from the ModuleWorker it revises,
+    // and a bucket realized under another installation is another machine's.
+    const installationRef = input.relations?.find((candidate) => candidate.pointer === "/worker")
+      ?.deployment?.providerInstallationRef;
+    if (!installationRef) invalid();
+    const names = new Set<string>(reserved);
+    const bindings: SelfhostVersionDataBinding[] = [];
+    for (let index = 0; index < materialized.length; index += 1) {
+      const service = materialized[index] as ProviderRuntimeBinding | undefined;
+      const declaration = isJsonObject(declared[index]) ? (declared[index] as JsonObject) : null;
+      const relation = input.relations?.find(
+        (candidate) => candidate.pointer === `/bucketBindings/${index}/resource`,
+      );
+      const material = selfhostEdgeObjectsMaterial(service?.material);
+      const name = typeof service?.name === "string" ? service.name : null;
+      if (
+        !service ||
+        service.bindingRef.apiVersion !== SELFHOST_EDGE_OBJECTS_BINDING_REF.apiVersion ||
+        service.bindingRef.name !== SELFHOST_EDGE_OBJECTS_BINDING_REF.name ||
+        service.bindingRef.version !== SELFHOST_EDGE_OBJECTS_BINDING_REF.version ||
+        service.bindingRef.schemaDigest !== SELFHOST_EDGE_OBJECTS_BINDING_REF.schemaDigest ||
+        !name ||
+        name.length > 64 ||
+        !DATA_BINDING_NAME.test(name) ||
+        name.startsWith(SELFHOST_WORKER_INTERNAL_BINDING_PREFIX) ||
+        names.has(name) ||
+        typeof declaration?.name !== "string" ||
+        declaration.name !== name ||
+        !relation ||
+        relation.resource.kind !== "ObjectBucket" ||
+        relation.targetUid !== service.targetUid ||
+        relation.deployment?.state !== "active" ||
+        relation.deployment.providerInstallationRef !== installationRef ||
+        !material
+      ) {
+        invalid();
+      }
+      names.add(name as string);
+      bindings.push({
+        kind: "edge.objects",
+        name: name as string,
+        target: (material as { readonly bucketId: string }).bucketId,
+      });
+    }
+    return bindings;
+  };
+
+  /**
    * What a queue promises about the messages put into it, read from the exact
    * Resource the relation names.
    *
@@ -1199,6 +1313,28 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       return undefined;
     }
     return { messageRetentionSeconds: retention, deliveryDelaySeconds: delay };
+  };
+
+  /**
+   * Every binding one Version projects, in one place.
+   *
+   * Namespaces first and buckets after, so a name declared twice is refused by
+   * whichever declaration came second rather than by whichever list happened to
+   * be walked first. Both halves are purely declarative: they must be able to
+   * refuse before a one-shot runtime-input lease is spent.
+   */
+  const declaredVersionBindings = (
+    input: ApplyInput,
+    vars: readonly SelfhostVersionBinding[],
+    requiredSensitive: readonly string[],
+  ): readonly SelfhostVersionDataBinding[] => {
+    const reserved = new Set([...vars.map((binding) => binding.name), ...requiredSensitive]);
+    const namespaces = declaredDataBindings(input, reserved);
+    const buckets = declaredBucketBindings(
+      input,
+      new Set([...reserved, ...namespaces.map((binding) => binding.name)]),
+    );
+    return [...namespaces, ...buckets];
   };
 
   /**
@@ -1284,10 +1420,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     // Resolved before the lease is acquired, because everything here is a
     // declarative refusal and a refusal after dispatch would strand the
     // operation key with its ciphertext already erased.
-    const dataBindings = declaredDataBindings(
-      input,
-      new Set([...vars.map((binding) => binding.name), ...requiredSensitive]),
-    );
+    const dataBindings = declaredVersionBindings(input, vars, requiredSensitive);
     if (dataBindings.length > 0 && !options.dataPlaneAddress) {
       return failed(
         "denied",
@@ -1487,10 +1620,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     // Resolved before the lease is acquired, because everything here is a
     // declarative refusal and a refusal after dispatch would strand the
     // operation key with its ciphertext already erased.
-    const dataBindings = declaredDataBindings(
-      input,
-      new Set([...vars.map((binding) => binding.name), ...requiredSensitive]),
-    );
+    const dataBindings = declaredVersionBindings(input, vars, requiredSensitive);
     if (dataBindings.length > 0 && !options.dataPlaneAddress) {
       return failed(
         "denied",
@@ -2009,18 +2139,85 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   /**
    * The current ObjectBucket Form, as opposed to the retained v1beta1 drain.
    *
-   * A self-host admission activates this Form with an empty operation set
-   * (ADR 0007), so nothing should reach here at all. This is the barrier behind
-   * that: a composition assembled by hand could still offer the Form, and
-   * reporting a `local-bucket:` namespace for it would record a Deployment for
-   * storage that does not exist, which a later Worker Version would bind
-   * nothing to. The v1beta1 identity keeps its observe/delete drain.
+   * They are two Forms with one kind, and only one of them is a store: the
+   * retained beta identity keeps the address-derived `local-bucket:` name its
+   * already-recorded Deployments were written under and stays observe/delete
+   * only, while the current one is an incarnation this machine actually holds
+   * bytes for.
    */
   const currentObjectBucket = (offering: ProviderOffering): boolean =>
     offering.form.kind === "ObjectBucket" && offering.form.apiVersion === "edge.forms.takoform.com";
 
-  const objectBucketUnsupported = (): ProviderTicket =>
-    failed("denied", "this Host has no object-storage backend for the current ObjectBucket Form");
+  /**
+   * The bucket this Host would derive for one Resource address, and the name
+   * its Deployment must already carry.
+   */
+  const objectBucketIdentity = async (
+    input: { readonly identity: ResourceIdentity },
+    existingNativeId?: string,
+  ): Promise<string> => {
+    const recorded = selfhostNamespaceName("selfhost-bucket", existingNativeId);
+    const name = recorded ?? (await bucketIncarnationName(input.identity));
+    if (!name || !SELFHOST_OBJECT_BUCKET_ID.test(name)) {
+      throw new SelfhostFailure(
+        failed("invalid_spec", "the bucket declaration carries no Resource identity"),
+      );
+    }
+    return name;
+  };
+
+  const objectBucketResult = (name: string): ProviderTicket =>
+    succeeded({
+      nativeId: selfhostObjectBucketNativeId(name),
+      // No endpoint, no region, no credential, and no supply document: a
+      // Worker reaches this bucket through the Binding and nothing else.
+      observed: { name, allocated: true },
+      outputs: { bucketName: name },
+    });
+
+  /**
+   * Creating a bucket is agreeing that an incarnation exists.
+   *
+   * Nothing is written eagerly — the directory appears when an object does —
+   * and a retry of the same create is the same agreement rather than a second
+   * bucket, because the derived name is a pure function of the Resource
+   * incarnation. That is also why there is no "already exists" refusal here
+   * where Cloudflare has one: an R2 name is account-global and could belong to
+   * something else, while this one can only ever be this Resource's.
+   */
+  const applyObjectBucket = async (input: ApplyInput): Promise<ProviderTicket> => {
+    const name = await objectBucketIdentity(input, input.previous?.nativeId);
+    return objectBucketResult(name);
+  };
+
+  /**
+   * Destroying one is refusing to destroy a customer's objects for them.
+   *
+   * The Form declares no field that could ask for it — its desired state is
+   * empty — so a bucket that still holds an object or an unfinished multipart
+   * upload is a named, non-retryable refusal proven by one readback, exactly as
+   * R2 refuses. A machine that serves no object plane has nothing to read and
+   * nothing to hold, so its delete is the declaration transition alone.
+   */
+  const deleteObjectBucket = async (input: {
+    readonly nativeId: string;
+    readonly identity: ResourceIdentity;
+  }): Promise<ProviderTicket> => {
+    const name = selfhostNamespaceName("selfhost-bucket", input.nativeId);
+    const done = (): ProviderTicket =>
+      succeeded({ nativeId: input.nativeId, observed: { deleted: true }, outputs: {} });
+    if (!name || !options.dataPlaneMaintenance) return done();
+    const occupancy = await options.dataPlaneMaintenance.objectBucketOccupancy(name);
+    if (occupancy.objects > 0 || occupancy.uploads > 0) {
+      return failed(
+        "conflict",
+        "the bucket still holds objects or unfinished multipart uploads, and this Host does " +
+          "not empty a bucket for you; delete its contents and destroy again",
+      );
+    }
+    await options.dataPlaneMaintenance.deleteObjectBucket(name);
+    return done();
+  };
 
   return {
     id,
@@ -2148,11 +2345,35 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
               input.descriptor,
               id,
             );
+          // The current ObjectBucket is the one namespace here with durable
+          // bytes behind it, so its absence is something this Host reads rather
+          // than asserts: a bucket still holding an object or an unfinished
+          // upload is present, and that is exactly the condition its delete
+          // refuses on. The retained v1beta1 drain never held anything locally.
+          case "ObjectBucket":
+          case "object_bucket": {
+            const bucketName = optionalSafeString(parsed.data.bucketName);
+            const maintenance = options.dataPlaneMaintenance;
+            if (
+              !currentObjectBucket(input.offering) ||
+              !maintenance ||
+              !bucketName ||
+              !SELFHOST_OBJECT_BUCKET_ID.test(bucketName)
+            ) {
+              return selfhostAbsence("absent", input.descriptor, kind, id, parsed.data);
+            }
+            const occupancy = await maintenance.objectBucketOccupancy(bucketName);
+            return selfhostAbsence(
+              occupancy.objects > 0 || occupancy.uploads > 0 ? "present" : "absent",
+              input.descriptor,
+              kind,
+              id,
+              parsed.data,
+            );
+          }
           // These declarations have no separate provider-native object on a
           // self-hosted machine. Their descriptor is still captured so the
           // Host can prove that no provider readback is required.
-          case "ObjectBucket":
-          case "object_bucket":
           case "EdgeKVNamespace":
           case "AtLeastOnceQueue":
             return selfhostAbsence("absent", input.descriptor, kind, id, parsed.data);
@@ -2225,8 +2446,11 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     },
 
     async apply(input): Promise<ProviderTicket> {
-      if (currentObjectBucket(input.offering)) return objectBucketUnsupported();
       try {
+        // The current ObjectBucket before the switch, because the switch
+        // dispatches on kind alone and the retained v1beta1 drain answers to
+        // the same one with an address-derived name it must keep.
+        if (currentObjectBucket(input.offering)) return await applyObjectBucket(input);
         switch (dispatchKind(input.offering)) {
           case "ModuleWorker":
             return await applyModuleWorker(input);
@@ -2454,6 +2678,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       const done = (): ProviderTicket =>
         succeeded({ nativeId: input.nativeId, observed: { deleted: true }, outputs: {} });
       try {
+        // The current ObjectBucket holds bytes, so its delete is the one on this
+        // Host that can refuse. The retained v1beta1 drain falls through to the
+        // default below: it never held anything here.
+        if (currentObjectBucket(input.offering)) return await deleteObjectBucket(input);
         switch (dispatchKind(input.offering)) {
           case "ModuleWorker": {
             const script = await scriptOf(input.identity.tenantRef, {
@@ -2731,14 +2959,32 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     },
 
     async adopt(input): Promise<ProviderTicket> {
-      // Import is the other way a Deployment for this Form could appear, and
-      // this machine still cannot back one.
-      if (currentObjectBucket(input.offering)) return objectBucketUnsupported();
       if (input.operationMode === "recovery" && !input.providerHandle) {
         return failed("unavailable", "provider mutation recovery requires an opaque handle", true);
       }
       if (input.providerHandle) {
         return failed("unavailable", "self-host adopt recovery cannot poll this handle", true);
+      }
+      // `import` is the one lifecycle whose native address comes from the
+      // caller, and a bucket id is the whole of the isolation between two
+      // tenants' objects on this machine. So adoption is fenced to the exact
+      // incarnation this Host itself derives for the Resource address being
+      // imported onto: another tenant's bucket, and a name that is not one of
+      // this Host's at all, are both refused before anything is read.
+      if (currentObjectBucket(input.offering)) {
+        try {
+          const derived = await objectBucketIdentity(input);
+          if (input.nativeId !== selfhostObjectBucketNativeId(derived)) {
+            return failed(
+              "invalid_spec",
+              "this Host adopts only the bucket it derives for this Resource address",
+            );
+          }
+          return objectBucketResult(derived);
+        } catch (error) {
+          if (error instanceof SelfhostFailure) return error.ticket;
+          throw error;
+        }
       }
       // Adoption records a claim on a native identity the caller names. Local
       // resources are namespace agreements keyed by declared identity, so the
@@ -3027,7 +3273,10 @@ function parseSelfhostNativeId(
     }
     case "ObjectBucket":
     case "object_bucket": {
-      const name = parts[0] === "local-bucket" ? parts[1] : null;
+      // Two Forms share this kind: the retained v1beta1 drain, recorded under
+      // an address-derived `local-bucket:` name, and the current one, recorded
+      // under the incarnation this Host derives.
+      const name = parts[0] === "local-bucket" || parts[0] === "selfhost-bucket" ? parts[1] : null;
       return name && safeSegment(name) ? { data: { bucketName: name } } : null;
     }
     case "EdgeKVNamespace":

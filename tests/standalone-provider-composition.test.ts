@@ -85,6 +85,7 @@ describe("the standalone Bun provider composition", () => {
       "AtLeastOnceQueue",
       "EdgeKVNamespace",
       "ModuleWorker",
+      "ObjectBucket",
       "QueueConsumer",
       "SQLiteDatabase",
       "SQLiteMigrationApplication",

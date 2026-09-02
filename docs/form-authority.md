@@ -323,18 +323,23 @@ Takoserver supply. Readback exposes them as `installed: true`,
 current package at definition version `0.1.0` is now supported and activated
 with the operations its Form declares — `create`, `read`, `delete`, `import`,
 `observe`, never `update` — on any Host that realizes an ObjectBucket supply.
-It is an identity capability, so a Host without that supply installs, supports,
-and activates it with an EMPTY operation set: the Form is known there and none
-of it executes. That is what a self-host does, because its composition builds
-no ObjectBucket Offering at all — the machine has no `edge.objects` backend —
-so `scripts/selfhost-form-admission.ts` records only the identity Forms that
-composition offers. The two Hosts therefore no longer share one capability
-digest: the public Worker's is
-`sha256:a5bc1508638fb1c47182d4ee68be5eedb7acc050394bd3507b532a78daacc024` and a
-self-host's is
-`sha256:0d471b6ebe2bf43c60ba2b8a000cd8aa2293c0cc9b4b4a048b9abc1d75a13669`. Both
-rotated, so both require explicit reconvergence in every advertised
-environment.
+It is an identity capability, so a Host without that supply would install,
+support, and activate it with an EMPTY operation set: the Form known there and
+none of it executing.
+
+Both Hosts realize it. The public Worker sells a reviewed Cloudflare supply; a
+self-host is its own, holding object bodies under
+`<data root>/selfhost/objects/` and their metadata under migration `0041`, with
+a Provider Pack that owns both halves of the `module-worker.object-bucket`
+materialization. So `scripts/selfhost-form-admission.ts` records the Form with
+its five operations, and the two Hosts share one capability digest again:
+`sha256:a5bc1508638fb1c47182d4ee68be5eedb7acc050394bd3507b532a78daacc024`. Their
+implementation digests still differ — a self-host's binds the manifest through
+its own payload kind, the public Worker's additionally binds a sealed runtime
+payload — and both rotated, so both require explicit reconvergence in every
+advertised environment. The self-host's rotated twice: once when the Form
+entered the catalog with an empty operation set, and once when the machine grew
+the backend that fills it. ADR 0007 carries both pairs.
 Reconvergence is an append-only support and activation event through the
 existing admission chain — the operator surface in an environment that has one,
 `scripts/selfhost-form-admission.ts` on a self-host — never an in-place edit of
@@ -370,7 +375,10 @@ bun scripts/selfhost-form-admission.ts <organizationId> <space> ... --apply
 The command refuses a verifier whose live identity is not the exact released
 Core, sends the whole 17-package raw closure to it once per apply, installs
 every package, and supports and activates only the implemented subset for the
-named organization and Space. The self-host's Form implementation identity is
+named organization and Space. That subset is derived from the composition this
+machine actually builds — `SELFHOST_IDENTITY_CAPABILITY_KINDS` is filtered from
+the identity classes the composition offers rather than restated — so a Host
+cannot record an operation whose only possible answer would be a refusal. The self-host's Form implementation identity is
 the canonical digest of the capability manifest it serves; it has no
 separately sealed Worker payload. Re-running the command re-plans from the
 durable heads and converges with zero commands when nothing changed.

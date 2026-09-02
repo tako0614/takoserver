@@ -4,13 +4,19 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEphemeralSql } from "../src/compat.ts";
-import type { ProviderOffering, ProviderRelation } from "../src/provider-port.ts";
+import type {
+  ProviderOffering,
+  ProviderRelation,
+  ProviderRuntimeBinding,
+} from "../src/provider-port.ts";
 import type { ProviderRuntimeInputLeasePort } from "../src/provider-runtime-input-port.ts";
+import { EDGE_OBJECTS_BINDING_REF } from "../src/providers/cloudflare-runtime-bindings.ts";
 import {
   createSelfhostDataPlaneAccess,
   createSelfhostProvider,
   type SelfhostDataPlaneMaintenance,
 } from "../src/providers/selfhost.ts";
+import { SELFHOST_EDGE_OBJECTS_MATERIAL_KIND } from "../src/providers/selfhost-runtime-bindings.ts";
 import { createRuntimeInputAuthority } from "../src/runtime-input-preparations.ts";
 import {
   createWorkerdRuntime,
@@ -1856,6 +1862,272 @@ describe("local namespaces", () => {
  * `edge.objects` backend, so the mutation barrier is where the truth is told.
  * Slice D2 replaces the refusal with a backend, not the refusal's reason.
  */
+describe("bucketBindings on a self-host Worker Version", () => {
+  const address = "127.0.0.1:65535";
+  const BUCKET_ID = `tsb-${"f".repeat(40)}`;
+
+  /** The realized bucket Deployment the Provider Pack materialized from. */
+  function bucketRelation(overrides: Record<string, unknown> = {}): ProviderRelation {
+    const base = deployedRelation(
+      "/bucketBindings/0/resource",
+      "ObjectBucket",
+      "media",
+      `selfhost-bucket:${BUCKET_ID}`,
+      { bucketName: BUCKET_ID },
+    );
+    return {
+      ...base,
+      bindingRef: EDGE_OBJECTS_BINDING_REF,
+      ...overrides,
+      deployment: {
+        ...(base.deployment as NonNullable<ProviderRelation["deployment"]>),
+        ...((overrides.deployment as Record<string, unknown>) ?? {}),
+      },
+    } as ProviderRelation;
+  }
+
+  /** The `/worker` relation, deployed — a Version inherits its installation. */
+  function deployedWorker(installationRef = "local.primary"): ProviderRelation {
+    const base = deployedRelation("/worker", "ModuleWorker", "hello", "selfhost-worker:sw", {
+      scriptName: "sw",
+    });
+    return {
+      ...base,
+      deployment: {
+        ...(base.deployment as NonNullable<ProviderRelation["deployment"]>),
+        providerInstallationRef: installationRef,
+      },
+    };
+  }
+
+  const runtimeBinding = (overrides: Record<string, unknown> = {}): ProviderRuntimeBinding =>
+    ({
+      name: "MEDIA",
+      targetUid: "uid-ObjectBucket-media",
+      bindingRef: EDGE_OBJECTS_BINDING_REF,
+      material: { kind: SELFHOST_EDGE_OBJECTS_MATERIAL_KIND, bucketId: BUCKET_ID },
+      ...overrides,
+    }) as ProviderRuntimeBinding;
+
+  async function applyVersion(
+    local: ReturnType<typeof provider>,
+    input: {
+      readonly spec?: Record<string, unknown>;
+      readonly relations?: readonly ProviderRelation[];
+      readonly runtimeBindings?: readonly ProviderRuntimeBinding[];
+    } = {},
+  ) {
+    return await local.apply({
+      operationId: "op_version_bucket",
+      offering: offering("WorkerVersion"),
+      identity: identity("hello-v1"),
+      spec: {
+        bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+        handlers: ["fetch"],
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+        bucketBindings: [
+          {
+            name: "MEDIA",
+            resource: { apiVersion: EDGE_API, kind: "ObjectBucket", name: "media" },
+          },
+        ],
+        ...(input.spec ?? {}),
+      },
+      relations: input.relations ?? [
+        deployedWorker(),
+        relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+        bucketRelation(),
+      ],
+      runtimeBindings: input.runtimeBindings ?? [runtimeBinding()],
+    });
+  }
+
+  test("publishes a Worker whose env.MEDIA is the exact edge.objects facade", async () => {
+    const local = provider({ dataPlaneAddress: address });
+    const worker = await local.apply({
+      operationId: "op_worker",
+      offering: offering("ModuleWorker"),
+      identity: identity("hello"),
+      spec: {},
+    });
+    if (worker.phase !== "succeeded") throw new Error("worker allocation failed");
+    const script = String(worker.result.outputs.scriptName);
+
+    const version = await applyVersion(local);
+    if (version.phase !== "succeeded") {
+      throw new Error(`version apply failed: ${JSON.stringify(version)}`);
+    }
+    expect(version.result.observed.dataBindingNames).toEqual(["MEDIA"]);
+    // Names only: a bucket id is a fact about this machine, not identity.
+    expect(JSON.stringify(version.result)).not.toContain(BUCKET_ID);
+
+    const deployment = await local.apply({
+      operationId: "op_deploy",
+      offering: offering("WorkerDeployment"),
+      identity: identity("hello-live"),
+      spec: {
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+        versions: [
+          {
+            workerVersion: { apiVersion: EDGE_API, kind: "WorkerVersion", name: "hello-v1" },
+            weight: 10_000,
+          },
+        ],
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", "hello"),
+        relation("/versions/0/workerVersion", "WorkerVersion", "hello-v1"),
+      ],
+    });
+    expect(deployment.phase).toBe("succeeded");
+
+    const entrypoint = await readFile(
+      join(root, "workers", script, "__takoserver-selfhost-entrypoint.js"),
+      "utf8",
+    );
+    expect(entrypoint).toContain('"kind":"edge.objects@1.0.0","publicName":"MEDIA"');
+    expect(entrypoint).toContain("createObjectsAdapter");
+    // The bucket id lives in the Version's own record and never in the module.
+    expect(entrypoint).not.toContain(BUCKET_ID);
+
+    const versionId = versionDirectoryName(root, script);
+    const stored = JSON.parse(
+      await readFile(
+        join(root, "selfhost", "version-bindings", script, `${versionId}.json`),
+        "utf8",
+      ),
+    ) as { dataPlane: { bindings: { kind: string; name: string; target: string }[] } };
+    expect(stored.dataPlane.bindings).toEqual([
+      { kind: "edge.objects", name: "MEDIA", target: BUCKET_ID },
+    ]);
+  });
+
+  test("refuses every mismatch between the declaration and what the pack materialized", async () => {
+    const local = provider({ dataPlaneAddress: address });
+    const cases: Record<string, Parameters<typeof applyVersion>[1]> = {
+      // One runtime Binding per declaration, in the same order.
+      noMaterial: { runtimeBindings: [] },
+      extraMaterial: { runtimeBindings: [runtimeBinding(), runtimeBinding({ name: "OTHER" })] },
+      // The exact Binding identity, digest included.
+      wrongBindingVersion: {
+        runtimeBindings: [
+          runtimeBinding({ bindingRef: { ...EDGE_OBJECTS_BINDING_REF, version: "1.0.0" } }),
+        ],
+      },
+      wrongSchemaDigest: {
+        runtimeBindings: [
+          runtimeBinding({
+            bindingRef: { ...EDGE_OBJECTS_BINDING_REF, schemaDigest: `sha256:${"0".repeat(64)}` },
+          }),
+        ],
+      },
+      // The declaration's name and the Binding's name are one name.
+      renamedDeclaration: {
+        spec: {
+          bucketBindings: [
+            {
+              name: "OTHER",
+              resource: { apiVersion: EDGE_API, kind: "ObjectBucket", name: "media" },
+            },
+          ],
+        },
+      },
+      // The relation's target and the Binding's target are one Resource.
+      wrongTargetUid: { runtimeBindings: [runtimeBinding({ targetUid: "uid-somebody-else" })] },
+      // A material another pack could have produced is not this Host's.
+      foreignMaterial: {
+        runtimeBindings: [
+          runtimeBinding({
+            material: { kind: "takoserver.cloudflare-r2.edge-objects@v1", bucketId: BUCKET_ID },
+          }),
+        ],
+      },
+      unshapedMaterial: {
+        runtimeBindings: [
+          runtimeBinding({
+            material: { kind: SELFHOST_EDGE_OBJECTS_MATERIAL_KIND, bucketId: "../escape" },
+          }),
+        ],
+      },
+      // An active Deployment in the same installation, or nothing.
+      draining: {
+        relations: [
+          deployedWorker(),
+          relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+          bucketRelation({ deployment: { state: "draining" } }),
+        ],
+      },
+      otherInstallation: {
+        relations: [
+          deployedWorker("local.secondary"),
+          relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+          bucketRelation(),
+        ],
+      },
+      undeployedWorker: {
+        relations: [
+          relation("/worker", "ModuleWorker", "hello"),
+          relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+          bucketRelation(),
+        ],
+      },
+      // A relation pointing at something that is not a bucket.
+      wrongRelationKind: {
+        relations: [
+          deployedWorker(),
+          relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+          deployedRelation(
+            "/bucketBindings/0/resource",
+            "EdgeKVNamespace",
+            "media",
+            `selfhost-bucket:${BUCKET_ID}`,
+            { bucketName: BUCKET_ID },
+          ),
+        ],
+      },
+      // One name is one binding, across every kind on the Version.
+      collidesWithVar: { spec: { vars: { MEDIA: "taken" } } },
+      reservedName: {
+        spec: {
+          bucketBindings: [
+            {
+              name: "__TAKOSERVER_MEDIA",
+              resource: { apiVersion: EDGE_API, kind: "ObjectBucket", name: "media" },
+            },
+          ],
+        },
+        runtimeBindings: [runtimeBinding({ name: "__TAKOSERVER_MEDIA" })],
+      },
+    };
+    for (const [name, input] of Object.entries(cases)) {
+      const ticket = await applyVersion(local, input);
+      expect({ name, phase: ticket.phase }).toEqual({ name, phase: "failed" });
+      expect(ticket.phase === "failed" ? ticket.failure.retryable : true).toBe(false);
+      // Nothing is materialized behind a refusal.
+      expect(existsSync(join(root, "selfhost", "versions"))).toBe(false);
+    }
+  });
+
+  test("refuses a bucket binding on a deployment that serves no plane", async () => {
+    const local = provider();
+    expect(await applyVersion(local)).toMatchObject({
+      phase: "failed",
+      failure: { code: "denied", retryable: false },
+    });
+  });
+
+  test("renders a version without bucket bindings byte-for-byte as it always did", async () => {
+    const withoutBuckets = provider({ dataPlaneAddress: address });
+    await publish(withoutBuckets, false, undefined, false);
+    const plain = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+    // A plain Version carries no generated entrypoint and no facade service at
+    // all, which is the whole of the byte-identity claim.
+    expect(plain).not.toContain("selfhost-entrypoint");
+    expect(plain).not.toContain("selfhost-data");
+    expect(plain).not.toContain("edge.objects");
+  });
+});
+
 describe("the current ObjectBucket Form on a self-host", () => {
   const currentBucket: ProviderOffering = {
     id: "storage.object.stable-v1.standard",
@@ -1873,7 +2145,27 @@ describe("the current ObjectBucket Form on a self-host", () => {
   };
   const retainedBucket = offering("ObjectBucket");
 
-  test("refuses to create one, and records nothing", async () => {
+  const bucketMaintenance = (
+    state: { objects: number; uploads: number },
+    destroyed: string[] = [],
+  ) => ({
+    async deleteKvNamespace() {},
+    async deleteQueue() {},
+    forgetDatabase() {},
+    async objectBucketOccupancy() {
+      return { objects: state.objects, uploads: state.uploads };
+    },
+    async deleteObjectBucket(bucketId: string) {
+      destroyed.push(bucketId);
+      state.objects = 0;
+      state.uploads = 0;
+    },
+    async sweepExpiredKv() {
+      return 0;
+    },
+  });
+
+  test("creates one under the incarnation this Host derives", async () => {
     const local = provider();
     const ticket = await local.apply({
       operationId: "op_current_bucket",
@@ -1881,29 +2173,164 @@ describe("the current ObjectBucket Form on a self-host", () => {
       identity: { ...identity("media"), uid: "uid-media" },
       spec: {},
     });
-    expect(ticket).toMatchObject({
-      phase: "failed",
-      failure: {
-        code: "denied",
-        retryable: false,
-        message: "this Host has no object-storage backend for the current ObjectBucket Form",
-      },
+    if (ticket.phase !== "succeeded") throw new Error("the bucket was not created");
+    const name = String(ticket.result.outputs.bucketName);
+    expect(name).toMatch(/^tsb-[0-9a-f]{40}$/u);
+    expect(ticket.result.nativeId).toBe(`selfhost-bucket:${name}`);
+    // No endpoint, region, credential, or supply document crosses the seam.
+    expect(Object.keys(ticket.result.outputs)).toEqual(["bucketName"]);
+
+    // The name is a pure function of the incarnation, so a retry is the same
+    // agreement rather than a second bucket.
+    const again = await local.apply({
+      operationId: "op_current_bucket_retry",
+      offering: currentBucket,
+      identity: { ...identity("media"), uid: "uid-media" },
+      spec: {},
     });
-    expect(existsSync(join(root, "selfhost"))).toBe(false);
+    expect(again).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: ticket.result.nativeId },
+    });
+
+    // A bucket declared again under the same NAME after a destroy is a
+    // different incarnation, and therefore a different bucket.
+    const reborn = await local.apply({
+      operationId: "op_current_bucket_reborn",
+      offering: currentBucket,
+      identity: { ...identity("media"), uid: "uid-media-2" },
+      spec: {},
+    });
+    if (reborn.phase !== "succeeded") throw new Error("the bucket was not created");
+    expect(reborn.result.nativeId).not.toBe(ticket.result.nativeId);
   });
 
-  test("refuses to import one rather than adopting a bucket it cannot back", async () => {
+  test("refuses a declaration with no Resource identity to derive from", async () => {
+    const local = provider();
+    expect(
+      await local.apply({
+        operationId: "op_current_bucket_anonymous",
+        offering: currentBucket,
+        identity: identity("media"),
+        spec: {},
+      }),
+    ).toMatchObject({ phase: "failed", failure: { code: "invalid_spec", retryable: false } });
+  });
+
+  test("adopts only the bucket it derives for this Resource address", async () => {
     const local = provider();
     const adopt = local.adopt;
     if (!adopt) throw new Error("the self-host provider must offer import");
-    const ticket = await adopt.call(local, {
-      operationId: "op_current_bucket_adopt",
+    const derived = await local.apply({
+      operationId: "op_current_bucket_for_import",
       offering: currentBucket,
-      nativeId: "local-bucket:whatever",
-      identity: identity("media"),
+      identity: { ...identity("media"), uid: "uid-media" },
       spec: {},
     });
-    expect(ticket).toMatchObject({ phase: "failed", failure: { code: "denied" } });
+    if (derived.phase !== "succeeded") throw new Error("the bucket was not created");
+
+    for (const nativeId of [
+      "local-bucket:whatever",
+      `selfhost-bucket:tsb-${"0".repeat(40)}`,
+      "selfhost-bucket:../escape",
+      "takoserver-objects-production",
+    ]) {
+      expect(
+        await adopt.call(local, {
+          operationId: "op_current_bucket_adopt_foreign",
+          offering: currentBucket,
+          nativeId,
+          identity: { ...identity("media"), uid: "uid-media" },
+          spec: {},
+        }),
+      ).toMatchObject({ phase: "failed", failure: { code: "invalid_spec", retryable: false } });
+    }
+
+    // The one address a configuration already manages is adoptable, which is
+    // the documented repair after a lost create acknowledgement.
+    expect(
+      await adopt.call(local, {
+        operationId: "op_current_bucket_adopt",
+        offering: currentBucket,
+        nativeId: derived.result.nativeId,
+        identity: { ...identity("media"), uid: "uid-media" },
+        spec: {},
+      }),
+    ).toMatchObject({ phase: "succeeded", result: { nativeId: derived.result.nativeId } });
+  });
+
+  test("refuses to destroy a bucket that still holds anything", async () => {
+    const destroyed: string[] = [];
+    const state = { objects: 2, uploads: 0 };
+    const local = provider({ dataPlaneMaintenance: bucketMaintenance(state, destroyed) });
+    const created = await local.apply({
+      operationId: "op_current_bucket_delete",
+      offering: currentBucket,
+      identity: { ...identity("media"), uid: "uid-media" },
+      spec: {},
+    });
+    if (created.phase !== "succeeded") throw new Error("the bucket was not created");
+
+    expect(
+      await local.delete({
+        operationId: "op_current_bucket_delete_full",
+        offering: currentBucket,
+        nativeId: created.result.nativeId,
+        identity: { ...identity("media"), uid: "uid-media" },
+      }),
+    ).toMatchObject({ phase: "failed", failure: { code: "conflict", retryable: false } });
+    expect(destroyed).toEqual([]);
+
+    // An unfinished multipart upload counts too: it is storage the customer
+    // started and nobody else may finish or discard.
+    state.objects = 0;
+    state.uploads = 1;
+    expect(
+      await local.delete({
+        operationId: "op_current_bucket_delete_uploads",
+        offering: currentBucket,
+        nativeId: created.result.nativeId,
+        identity: { ...identity("media"), uid: "uid-media" },
+      }),
+    ).toMatchObject({ phase: "failed", failure: { code: "conflict" } });
+
+    state.uploads = 0;
+    expect(
+      await local.delete({
+        operationId: "op_current_bucket_delete_empty",
+        offering: currentBucket,
+        nativeId: created.result.nativeId,
+        identity: { ...identity("media"), uid: "uid-media" },
+      }),
+    ).toMatchObject({ phase: "succeeded", result: { observed: { deleted: true } } });
+    expect(destroyed).toEqual([String(created.result.outputs.bucketName)]);
+  });
+
+  test("proves a bucket present while it holds anything and absent once it does not", async () => {
+    const state = { objects: 1, uploads: 0 };
+    const local = provider({ dataPlaneMaintenance: bucketMaintenance(state) });
+    const created = await local.apply({
+      operationId: "op_current_bucket_absence",
+      offering: currentBucket,
+      identity: { ...identity("media"), uid: "uid-media" },
+      spec: {},
+    });
+    if (created.phase !== "succeeded") throw new Error("the bucket was not created");
+    if (!local.createNativeReadbackDescriptor || !local.verifyNativeAbsence) {
+      throw new Error("selfhost provider must expose native absence readback");
+    }
+    const descriptor = local.createNativeReadbackDescriptor({
+      offering: currentBucket,
+      nativeId: created.result.nativeId,
+      identity: { ...identity("media"), uid: "uid-media" },
+    });
+    expect(await local.verifyNativeAbsence({ offering: currentBucket, descriptor })).toMatchObject({
+      outcome: "present",
+    });
+    state.objects = 0;
+    expect(await local.verifyNativeAbsence({ offering: currentBucket, descriptor })).toMatchObject({
+      outcome: "absent",
+    });
   });
 
   test("keeps the retained v1beta1 drain working", async () => {
