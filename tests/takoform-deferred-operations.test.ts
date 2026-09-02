@@ -1432,6 +1432,79 @@ describe("durable deferred Takoform operations", () => {
   });
 
   /**
+   * A Host defect must not be pinned to a resource name forever.
+   *
+   * The released provider's idempotency key is a pure function of the plan, so
+   * the operator who repairs the Host re-runs the identical request. When the
+   * Host replayed a settled `unsupported_capability`, a fixed Host answered the
+   * same 422 without the driver being entered at all, and the only escapes were
+   * renaming the resource or editing the Host's database.
+   */
+  test("re-attempts a settled refusal that described the Host, once the Host can answer", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    let capable = false;
+    const applies: string[] = [];
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      apply: async (input) => {
+        applies.push(input.name);
+        if (!capable) throw new TakoformHostError("unsupported_capability", 422);
+        return await memory.apply(input);
+      },
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+    };
+    const opened = persistentHarness(undefined, driver).open();
+    const desired = desiredResource("repaired-host", "initial");
+    const review = await prepareReview(opened.host, desired);
+    const create = async () =>
+      await opened.host.handle(
+        request(`${lane}/resources/example.forms.invalid/DeferredThing/repaired-host`, "primary", {
+          method: "PUT",
+          headers: {
+            "idempotency-key": "create-repaired-host-0001",
+            "if-none-match": "*",
+            "takoform-conformance-probe": "async",
+          },
+          body: JSON.stringify({ ...desired, review }),
+        }),
+      );
+
+    const accepted = await create();
+    expect(accepted?.status).toBe(202);
+    if (!accepted) throw new Error("create returned no response");
+    const operationId = ((await accepted.json()) as { operation: { id: string } }).operation.id;
+    const drive = async (id: string): Promise<Record<string, unknown>> => {
+      let document: Record<string, unknown> | undefined;
+      for (let poll = 0; poll < 8 && !document?.done; poll += 1) {
+        const polled = await opened.host.handle(request(`${lane}/operations/${id}`, "primary"));
+        document = (await polled?.json()) as Record<string, unknown>;
+      }
+      if (!document) throw new Error("the operation never answered");
+      return document;
+    };
+    expect(await drive(operationId)).toMatchObject({
+      done: true,
+      error: { code: "unsupported_capability" },
+    });
+    expect(applies).toEqual(["repaired-host"]);
+
+    // The Host is repaired. The identical request is a second attempt.
+    capable = true;
+    const retried = await create();
+    expect(retried?.status).toBe(202);
+    if (!retried) throw new Error("create retry returned no response");
+    const retriedId = ((await retried.json()) as { operation: { id: string } }).operation.id;
+    expect(retriedId).not.toBe(operationId);
+    expect(await drive(retriedId)).toMatchObject({
+      done: true,
+      result: { resource: { metadata: { name: "repaired-host" } } },
+    });
+    expect(applies).toEqual(["repaired-host", "repaired-host"]);
+    opened.close();
+  });
+
+  /**
    * Only that one code. Every other settled failure is still a result the same
    * key replays — widening it would also retry a refusal a provider answered
    * *after* it was invoked, and that is a second provider call rather than a
