@@ -20,7 +20,10 @@ import {
   YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
   yurucommuLifecycleCapabilityManifest,
 } from "../src/takoform/implementation-catalog.ts";
-import { edgeSuppliesFixture, objectBucketSuppliesFixture } from "./helpers/hosted-supply-fixtures.ts";
+import {
+  edgeSuppliesFixture,
+  objectBucketSuppliesFixture,
+} from "./helpers/hosted-supply-fixtures.ts";
 
 const COMMIT = "a".repeat(40);
 const PREVIOUS_COMMIT = "b".repeat(40);
