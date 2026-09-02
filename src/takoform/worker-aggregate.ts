@@ -3,7 +3,11 @@ import { isEdgeFormsApiVersion } from "./edge-family.ts";
 import { exclusiveRelationClaimKey, type TakoformStoredRelation } from "./relations.ts";
 import type { TakoformStore } from "./store.ts";
 import type { TakoformCondition, TakoformStoredResource } from "./types.ts";
-import { type InstalledTakoformForm, TakoformHostError } from "./types.ts";
+import {
+  crossResourcePrecondition,
+  type InstalledTakoformForm,
+  TakoformHostError,
+} from "./types.ts";
 
 const MODULE_WORKER = "ModuleWorker";
 const WORKER_DEPLOYMENT = "WorkerDeployment";
@@ -135,7 +139,9 @@ export async function validateWorkerAggregate(input: {
       limit: 2,
     });
     if (active.some((candidate) => candidate.resource.metadata.name !== input.resourceName)) {
-      throw new TakoformHostError("invalid_argument", 400);
+      throw crossResourcePrecondition({
+        message: `another WorkerDeployment already serves the ModuleWorker ${worker.targetName}; delete it first, then apply again`,
+      });
     }
     const weighted = input.relations.filter(
       (relation) => relation.relation === DEPLOYMENT_VERSION_RELATION,
@@ -157,7 +163,9 @@ export async function validateWorkerAggregate(input: {
             candidate.relation === WORKER_RELATION && candidate.targetUid === worker.targetUid,
         )
       ) {
-        throw new TakoformHostError("invalid_argument", 400);
+        throw crossResourcePrecondition({
+          message: `the WorkerVersion ${relation.targetName} this WorkerDeployment selects belongs to a different ModuleWorker than ${worker.targetName}; point it at this ModuleWorker, then apply again`,
+        });
       }
     }
     const requiredHandlers = await dependentHandlers(input, worker.targetUid, edgeApiVersion);
@@ -186,7 +194,10 @@ export async function validateWorkerAggregate(input: {
       (candidate) => candidate.space !== input.space || candidate.name !== input.resourceName,
     );
     if (holder) {
-      throw new TakoformHostError("invalid_argument", 400, { holder: holder.name });
+      throw crossResourcePrecondition({
+        details: { holder: holder.name },
+        message: `the hostname this WorkerCustomDomain claims is already claimed by ${holder.name}; release it there, then apply again`,
+      });
     }
   }
   const worker = input.relations.find((relation) => relation.relation === WORKER_RELATION);
@@ -203,7 +214,9 @@ export async function validateWorkerAggregate(input: {
       limit: 2,
     });
     if (endpoints.some((candidate) => candidate.resource.metadata.name !== input.resourceName)) {
-      throw new TakoformHostError("invalid_argument", 400);
+      throw crossResourcePrecondition({
+        message: `another WorkerEndpoint already activates the ModuleWorker ${worker.targetName}; delete it first, then apply again`,
+      });
     }
   }
   if (input.form.identity.formRef.kind === "QueueConsumer") {
@@ -219,7 +232,9 @@ export async function validateWorkerAggregate(input: {
         toQueueUid: queue.targetUid,
       }))
     ) {
-      throw new TakoformHostError("invalid_argument", 400);
+      throw crossResourcePrecondition({
+        message: `the dead-letter queue this QueueConsumer names already reaches its own queue through other QueueConsumers; break that cycle, then apply again`,
+      });
     }
     const consumers = await input.store.resourcesByRelation({
       tenantId: input.tenantId,
@@ -231,7 +246,9 @@ export async function validateWorkerAggregate(input: {
       limit: 2,
     });
     if (consumers.some((candidate) => candidate.resource.metadata.name !== input.resourceName)) {
-      throw new TakoformHostError("invalid_argument", 400);
+      throw crossResourcePrecondition({
+        message: `another QueueConsumer already consumes the Queue ${queue.targetName}; delete it first, then apply again`,
+      });
     }
   }
 }
@@ -247,6 +264,14 @@ export async function validateWorkerAggregate(input: {
  * capability that does not exist, which is what this used to say — sending an
  * operator to "apply against a host whose Host Support Profile declares it"
  * while the only thing missing was a deployment their own graph creates.
+ *
+ * The definitive half is still definitive — `invalid_argument` 400, not
+ * retryable, surfaced to the operator now — but it is a
+ * `crossResourcePrecondition`, because what makes it true is a *neighbour*.
+ * Adding the missing `WorkerDeployment` changes nothing in this endpoint's
+ * plan, so the cured `tofu apply` arrives under the identical plan-derived
+ * idempotency key, and a Host that replayed the stored refusal would hand back
+ * an answer that stopped being true the moment the deployment landed.
  */
 async function requireServingWorker(
   input: {
@@ -281,12 +306,9 @@ async function requireServingWorker(
     limit: 2,
   });
   if (deployments.length === 0) {
-    throw new TakoformHostError(
-      "invalid_argument",
-      400,
-      undefined,
-      `the ModuleWorker ${worker.targetName} has no WorkerDeployment, so nothing serves its ${handler} handler; declare a WorkerDeployment that selects a WorkerVersion serving ${handler}, then apply again`,
-    );
+    throw crossResourcePrecondition({
+      message: `the ModuleWorker ${worker.targetName} has no WorkerDeployment, so nothing serves its ${handler} handler; declare a WorkerDeployment that selects a WorkerVersion serving ${handler}, then apply again`,
+    });
   }
   throw new TakoformHostError(
     "resource_busy",

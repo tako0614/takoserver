@@ -24,6 +24,12 @@ Everything else replays: `invalid_argument`, `artifact_invalid`,
 `offering_mismatch`. A cancelled operation is not a failure code at all and
 stays terminal.
 
+The closed set answers every code that means one thing. Two of the codes above
+mean two things, and for those the classification is carried by the refusal
+rather than by its code — see the 2026-09-02 amendment
+[*what the refusal is about is not always its code*](#amendment--2026-09-02-what-the-refusal-is-about-is-not-always-its-code).
+
+
 ## Why the split is what the refusal is *about*
 
 The released Takoform provider derives its `Idempotency-Key` from the plan —
@@ -118,3 +124,64 @@ under proof that it produced nothing: no Resource row, no provider deployment
 outside `deleted`/`failed`, the attestation still `live`, and every effect on the
 uid belonging to that one command with none of them `succeeded`. A refusal that
 may have mutated something keeps its record, which is what a repair reads.
+
+## Amendment — 2026-09-02: what the refusal is about is not always its code
+
+The rule above is "request-shaped refusals replay, Host-shaped refusals
+re-attempt", and it reads that shape off the wire code. That works only while
+one code means one thing. One does not.
+
+`invalid_argument` is the answer to a malformed desired document — weights that
+do not sum to 10000, a duplicated binding name, a relation the document does not
+declare — and every one of those is a fact about the request that the fingerprint
+proves has not changed. It is *also* the answer to a `WorkerEndpoint` whose
+ModuleWorker declares no `WorkerDeployment`, to a hostname another
+`WorkerCustomDomain` already claims, to a second deployment on one Worker, to a
+`claim` or `exclusive` or `uniquePair` constraint somebody else holds, and to a
+relation whose target resource is not there yet. None of those is a fact about
+the request. Each is a fact about a **neighbour**, and the operator cures it by
+adding the deployment, releasing the hostname, deleting the other deployment, or
+declaring the missing resource — without one byte of *this* resource's plan
+moving. The provider's plan-derived key is therefore identical on the cured run,
+so replaying the stored refusal hands back an answer the Host stopped believing
+the moment the neighbour changed, and pins it for the operation TTL. Under this
+ADR's own split that is a refusal about the Host.
+
+**A refusal whose truth is held by another resource carries
+`hostCode: cross_resource_precondition`, and a marked refusal is re-attempted
+whatever its code.** `REATTEMPTED_SETTLED_FAILURE_CODES` is unchanged and still
+answers every code that means one thing; the marker answers the code that does
+not. Malformed input keeps replaying, because for malformed input the stored
+answer really is still the answer.
+
+### Why a marker and not a new code
+
+A new code would have been the tidier list. It is not available. The portable
+taxonomy is closed and released: `stableErrorHTTPStatusByCode` in the provider's
+`internal/clientv3/errors.go` — mirrored here as `STABLE_ERROR_HTTP_STATUS` —
+is the complete set `parseAPIError` will classify, and a code outside it is read
+as an opaque rejection carrying no portable semantics at all. Minting
+`precondition_unmet` would answer outside the taxonomy every released provider
+speaks, to fix a defect that lives entirely on this side of the wire.
+
+`hostCode` is the seam that contract already leaves for exactly this: a Host's
+own finer name beside the portable code, declared by `host-api-wire-v1` and
+`operation-v1` as a free-form non-empty string, decoded by both the envelope and
+the terminal-operation paths, and acted on by neither. It is also the only
+member this Host may add — both decoders use `DisallowUnknownFields`, so a field
+of our own invention would make the whole envelope protocol-invalid.
+
+### What does not change
+
+The wire answer is the same refusal it was: the same portable code, the same
+status, `retryable: false`, and provider 4.0.0's retry table
+(`resource_busy | backend_unavailable | rate_limited | deadline_exceeded`) is
+untouched, so nothing auto-retries. The operator gets a definitive refusal
+*now*, naming the neighbour and what to do about it. Only the **next** identical
+apply — after they have changed that neighbour — is attempted afresh instead of
+being answered from the record.
+
+And a re-attempt is still never a second mutation. The safety property is the
+store's, as above: every marked refusal is a precondition failure raised before
+the driver is entered, so the provider was not invoked and there is nothing to
+attempt twice.

@@ -32,6 +32,7 @@ import type {
   TakoformStore,
 } from "./store.ts";
 import {
+  crossResourcePrecondition,
   type InstalledTakoformForm,
   type TakoformCommercialAuthority,
   type TakoformDiagnostic,
@@ -631,7 +632,10 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       );
     } catch (error) {
       if (error instanceof SqlError && error.code === "constraint") {
-        throw new TakoformHostError("invalid_argument", 400);
+        // Somebody else holds the declared claim. That is a fact about the
+        // holder, not about this document, and it stops being true the moment
+        // the holder goes.
+        throw crossResourcePrecondition();
       }
       throw error;
     }
@@ -681,8 +685,10 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         resource.metadata.uid !== relation.targetUid ||
         !sameFormRef(resource.form.formRef, relation.targetFormRef)
       ) {
-        throw new TakoformHostError("resource_not_found", 404, {
-          pointer: relation.pointer,
+        throw crossResourcePrecondition({
+          code: "resource_not_found",
+          status: 404,
+          details: { pointer: relation.pointer },
         });
       }
       resolved.push({

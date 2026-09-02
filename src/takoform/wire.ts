@@ -403,6 +403,7 @@ export function failure(
   status: number,
   details?: unknown,
   message?: string,
+  hostCode?: string,
 ): Response {
-  return Response.json(errorEnvelope(code, details, undefined, message), { status });
+  return Response.json(errorEnvelope(code, details, undefined, message, hostCode), { status });
 }

@@ -459,8 +459,68 @@ export class TakoformHostError extends Error {
      * characters at the boundary. It is never a raw provider or driver error.
      */
     readonly publicMessage?: string,
+    /**
+     * The Host's own finer name for this refusal, published as the wire
+     * envelope's optional `hostCode`.
+     *
+     * The portable code taxonomy is closed and released: a code outside
+     * `STABLE_ERROR_HTTP_STATUS` is read by the provider as an opaque
+     * rejection carrying no classification at all. `hostCode` is the seam the
+     * released contract already leaves for a Host that knows something the
+     * taxonomy cannot say, and `CROSS_RESOURCE_PRECONDITION` is the one value
+     * this Host uses it for.
+     */
+    readonly hostCode?: string,
   ) {
     super(code.replaceAll("_", " "));
     this.name = "TakoformHostError";
   }
+}
+
+/**
+ * The `hostCode` of a refusal whose truth is held by *another resource*.
+ *
+ * One portable code covers two different refusals. `invalid_argument` says
+ * "this document is wrong" — malformed weights, a duplicated binding name, a
+ * relation the document does not declare — and that is a fact about the
+ * request, so the stored answer stays the answer for as long as the request is
+ * byte-identical. It also says "the ModuleWorker this endpoint names has no
+ * WorkerDeployment", "another resource already claims this hostname", "a second
+ * deployment already holds this Worker" — and none of those is a fact about the
+ * request at all. Each is a fact about a *neighbour*, which the operator cures
+ * by adding the deployment, releasing the hostname, or deleting the other
+ * deployment, without touching one byte of this resource's plan.
+ *
+ * The released provider derives its idempotency key from that plan, so the
+ * cured re-run arrives under the identical key. Replaying the refusal then
+ * hands back an answer the Host stopped believing the moment the neighbour
+ * changed, and pins it for the operation TTL.
+ *
+ * So the classification ADR 0008 makes is a property of the refusal rather than
+ * only of its code: a refusal carrying this marker is a refusal about the Host,
+ * and the next identical request is attempted afresh. It stays definitive on
+ * the wire — the code is unchanged and `retryable` is still false, so provider
+ * 4.0.0 surfaces it to the operator rather than retrying it on its own.
+ */
+export const CROSS_RESOURCE_PRECONDITION = "cross_resource_precondition";
+
+/**
+ * A refusal about a neighbouring resource rather than about the request.
+ *
+ * `code` and `status` default to the `invalid_argument` 400 these refusals
+ * already answer with; a site whose portable code is a different one names it.
+ */
+export function crossResourcePrecondition(input?: {
+  readonly code?: string;
+  readonly status?: number;
+  readonly details?: unknown;
+  readonly message?: string;
+}): TakoformHostError {
+  return new TakoformHostError(
+    input?.code ?? "invalid_argument",
+    input?.status ?? 400,
+    input?.details,
+    input?.message,
+    CROSS_RESOURCE_PRECONDITION,
+  );
 }
