@@ -214,7 +214,13 @@ async function boot(): Promise<{ readonly origin: string }> {
   });
   const dataPlaneAddress = `127.0.0.1:${planeServer.port}`;
 
-  const workerdPort = 30_000 + Math.floor(Math.random() * 20_000);
+  // workerd binds a socket named in its configuration, so the port has to be
+  // chosen before it starts. Asking the kernel for a free one and handing it
+  // straight over is the closest thing to `port: 0` available here.
+  const reserved = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+  const workerdPort = Number(reserved.port);
+  reserved.stop(true);
+  expect(Number.isSafeInteger(workerdPort)).toBe(true);
   const runtime = createWorkerdRuntime({ root, port: workerdPort, isReady: () => true });
   const local = createSelfhostProvider({
     offerings: [],
