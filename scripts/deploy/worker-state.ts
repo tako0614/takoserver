@@ -230,6 +230,16 @@ export interface WorkerClosureDelta {
   readonly retiredVars: readonly string[];
   /** Plain-text bindings the current target derives and the predecessor lacks. */
   readonly addedVars: readonly string[];
+  /**
+   * Plain-text bindings both sides declare whose value this upload corrects.
+   *
+   * A corrected target descriptor often changes no binding name at all: it
+   * changes one value. Without this the routine surface refuses the predecessor
+   * for binding that value with unexpected text, and the transition refuses the
+   * declaration for naming a var the target still derives — so a value-only
+   * correction would be unpublishable by any surface.
+   */
+  readonly refreshedVars: readonly string[];
   /** Secrets the current target requires and the predecessor does not carry. */
   readonly addedSecrets: readonly string[];
   /** Secrets carried by both sides whose value this one upload replaces. */
@@ -241,6 +251,7 @@ export function workerClosureDeltaIsEmpty(delta: WorkerClosureDelta): boolean {
   return (
     delta.retiredVars.length === 0 &&
     delta.addedVars.length === 0 &&
+    delta.refreshedVars.length === 0 &&
     delta.addedSecrets.length === 0 &&
     delta.rotatedSecrets.length === 0
   );
@@ -260,6 +271,14 @@ export function expectedClosureTransitionPredecessorClosure(
   target: DeployTarget,
   input: {
     readonly delta: WorkerClosureDelta;
+    /**
+     * Secrets the script-level store holds that the pinned Version does not
+     * declare. They are the one part of this closure read from live state: a
+     * rollback leaves the store ahead of the served Version, and requiring the
+     * Version to declare a secret the Worker already holds would wedge the
+     * only surface that can repair it.
+     */
+    readonly carriedStoreSecrets?: readonly string[];
     readonly signingKeyId?: string;
     readonly expectedSecrets?: readonly string[];
     readonly authorityProfile?: WorkerVersionAuthorityProfile;
@@ -276,10 +295,16 @@ export function expectedClosureTransitionPredecessorClosure(
         : { workerArtifactDigest: input.workerArtifactDigest }),
     }),
   };
-  for (const name of [...input.delta.addedVars, ...input.delta.addedSecrets]) {
+  for (const name of [
+    ...input.delta.addedVars,
+    ...input.delta.addedSecrets,
+    ...(input.carriedStoreSecrets ?? []),
+  ]) {
     closure[name] = null;
   }
-  for (const name of input.delta.retiredVars) {
+  // A refreshed var must still be declared; only its value is unconstrained,
+  // because the whole point of the declaration is that the value is wrong.
+  for (const name of [...input.delta.retiredVars, ...input.delta.refreshedVars]) {
     closure[name] = { type: "plain_text", fields: {} };
   }
   return closure;
@@ -591,6 +616,75 @@ export function parseWorkerSecretInventory(
   return names;
 }
 
+/** Exact declared `secret_text` binding names on one immutable Version. */
+export function versionSecretBindingNames(
+  phase: DeployPhase,
+  versionId: string,
+  version: unknown,
+): readonly string[] {
+  // Fails closed on an unnamed or duplicated binding before classifying types.
+  const declared = new Set(exactVersionBindingNames(phase, versionId, version));
+  return versionBindings(phase, versionId, version)
+    .filter((binding) => binding.type === "secret_text")
+    .map((binding) => `${binding.name ?? binding.binding}`)
+    .filter((name) => declared.has(name))
+    .sort();
+}
+
+/**
+ * What a Worker actually holds a secret value for, as opposed to what the
+ * served Version happens to declare.
+ *
+ * Cloudflare keeps secrets on the script, not on the immutable Version. A
+ * rollback therefore leaves the store ahead: it still holds every secret a
+ * later Version installed, while the Version now serving declares fewer. The
+ * inventory a transition reasons about is the union of the two, so a secret the
+ * store already holds is carried into the upload rather than demanded again —
+ * with or without `--add-secret`, which only decides whether its value is
+ * re-entered.
+ */
+export interface WorkerTransitionSecretInventory {
+  /** Secret bindings the pinned Version itself declares. */
+  readonly versionSecrets: readonly string[];
+  /** Secret names the script-level store holds. */
+  readonly storeSecrets: readonly string[];
+  /** The union: every secret this Worker already holds a value for. */
+  readonly held: readonly string[];
+  /** Held by the store, undeclared by the served Version. Carried, never re-entered. */
+  readonly carriedStoreSecrets: readonly string[];
+}
+
+/**
+ * Reads that union and refuses anything in it the current target does not
+ * require. An extra secret is still drift; what is no longer drift is a
+ * required secret arriving from the store rather than from the Version.
+ */
+export function workerTransitionSecretInventory(
+  phase: DeployPhase,
+  versionId: string,
+  version: unknown,
+  storeInventory: readonly unknown[],
+  targetSecrets: readonly string[],
+): WorkerTransitionSecretInventory {
+  const versionSecrets = versionSecretBindingNames(phase, versionId, version);
+  const storeSecrets = [...parseWorkerSecretInventory(storeInventory, phase)].sort();
+  const held = [...new Set([...versionSecrets, ...storeSecrets])].sort();
+  const expected = [...new Set(targetSecrets)].sort();
+  if (held.some((name) => !expected.includes(name))) {
+    throw new DeployError(
+      phase,
+      "Worker secret inventory drift",
+      `expected=${JSON.stringify(expected)} actual=${JSON.stringify(held)}`,
+    );
+  }
+  return {
+    versionSecrets,
+    storeSecrets,
+    held,
+    carriedStoreSecrets: storeSecrets.filter((name) => !versionSecrets.includes(name)),
+  };
+}
+
 /** Shared membership check used by Hosted and signing transition classifiers. */
 export function workerSecretInventoryIncludes(
   inventory: readonly unknown[],
@@ -652,13 +746,21 @@ export function assertVersionBindingClosure(
       );
     }
     for (const [field, value] of Object.entries(requirement.fields)) {
-      if (node[field] !== value) {
-        throw new DeployError(
-          phase,
-          `version ${versionId} binds ${binding} with unexpected ${field}`,
-          JSON.stringify(node),
-        );
-      }
+      if (node[field] === value) continue;
+      // A plain-text value difference is the one drift with a published
+      // remedy, so the refusal names it instead of leaving the operator to
+      // discover that no selector accepts a changed value.
+      const remedy =
+        requirement.type === "plain_text" && field === "text"
+          ? "; publish a value-only target correction with " +
+            `takoserver-worker-authority-cutover --closure-predecessor-version=${versionId} ` +
+            `--refresh-var=${binding}`
+          : "";
+      throw new DeployError(
+        phase,
+        `version ${versionId} binds ${binding} with unexpected ${field}${remedy}`,
+        JSON.stringify(node),
+      );
     }
   }
 }

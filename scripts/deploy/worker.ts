@@ -31,6 +31,7 @@ import {
 import type { DeployTarget } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import { authoritySensitiveWorkerPaths } from "./worker-authority-paths.ts";
+import { assertTargetComposes } from "./worker-composition.ts";
 import { parseWorkerDeploymentHistory, type WorkerDeploymentHistory } from "./worker-state.ts";
 import {
   acquireWranglerVersionPublicationLease,
@@ -137,6 +138,9 @@ export async function runWorker(
     (options.state !== undefined && invocation.action === "status"
       ? {}
       : cloudflareChildEnvironment());
+  // Before any live read or upload: the selected target must compose the
+  // Worker the same way the Worker composes itself on its first request.
+  await assertTargetComposes("preflight", target);
   if (invocation.legacyHostRuntimePredecessorVersionId !== undefined) {
     if (invocation.surface !== "takoserver-worker-authority-cutover") {
       throw preflightError(

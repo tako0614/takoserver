@@ -712,6 +712,7 @@ describe("Takoserver split deploy entrypoint", () => {
       "--closure-predecessor-version=<uuid>",
     );
     expect(cutover?.obligations["closure-transition-selector"]).toContain("--rotate-secret=NAME");
+    expect(cutover?.obligations["closure-transition-selector"]).toContain("--refresh-var=NAME");
     expect(cutover?.obligations["closure-transition-selector"]).toContain(
       "The routine surfaces stay strict",
     );
@@ -727,6 +728,7 @@ describe("Takoserver split deploy entrypoint", () => {
         `--closure-predecessor-version=${predecessor}`,
         "--retire-var=TAKOSERVER_STANDARD_SERVICE_SUPPLIES",
         "--add-var=TAKOSERVER_OBJECT_BUCKET_SUPPLIES",
+        "--refresh-var=TAKOSERVER_EDGE_SUPPLIES",
         "--add-secret=TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING",
         "--rotate-secret=CLOUDFLARE_API_TOKEN",
       ]);
@@ -799,6 +801,25 @@ describe("Takoserver split deploy entrypoint", () => {
         `--commit=${sha}`,
         `--closure-predecessor-version=${predecessor}`,
         "--add-var=takoserver_object_bucket_supplies",
+      ],
+      // A refreshed var is still one binding named once.
+      [
+        "takoserver-worker-authority-cutover",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+        "--refresh-var=TAKOSERVER_EDGE_SUPPLIES",
+        "--retire-var=TAKOSERVER_EDGE_SUPPLIES",
+      ],
+      // And the routine surface never accepts it either.
+      [
+        "takoserver-worker",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+        "--refresh-var=TAKOSERVER_EDGE_SUPPLIES",
       ],
     ] as const) {
       const refused = await deploy(args);

@@ -53,15 +53,49 @@ realized closure legitimately predates the current operator-private target
 shape. `takoserver-worker-authority-cutover` accepts
 `--closure-predecessor-version=<uuid>` together with an explicit declaration
 built from the repeatable `--retire-var=NAME`, `--add-var=NAME`,
-`--add-secret=NAME` and `--rotate-secret=NAME` flags. The declaration is
+`--refresh-var=NAME`, `--add-secret=NAME` and `--rotate-secret=NAME` flags. The
+declaration is
 machine-checked: the profile admits the predecessor only when the authoritative
 current Version is exactly that id, the declaration is non-empty, and it equals
 the entire difference between the predecessor closure and the target closure.
 Any undeclared difference refuses before mutation and names the binding.
-Retired values are the one thing left unconstrained, because the current target
-no longer derives them; every other binding name, type and plain-text value,
-the secret inventory and the routing closure stay as strict as the routine path.
+Retired and refreshed values are the one thing left unconstrained, because the
+declaration is what says the current target either no longer derives them or
+derives them differently; every other binding name, type and plain-text value
+and the routing closure stay as strict as the routine path.
 The routine surfaces stay strict too and never accept such a predecessor.
+
+`--refresh-var=NAME` covers the difference that changes no binding name at all.
+A corrected target descriptor often changes exactly one value, and without this
+selector such a correction is unpublishable by any surface: the routine surface
+refuses the predecessor for binding that value with unexpected text, and the
+transition refuses the declaration for naming a var the target still derives. It
+is admitted only when the predecessor declares `NAME` as plain text with a value
+different from the one the target derives, and the rest of the closure still
+matches the declaration; the upload then publishes the target's value. Declaring
+a var whose value already matches is refused, because that is an ordinary
+publication and the routine surface owns it. The routine surface's own
+value-only refusal now names `--refresh-var` as the remedy.
+
+The transition's secret inventory is the union of what the served Version
+declares and what Cloudflare's script-level secret store holds. Secrets live on
+the script, not on the immutable Version, so a `wrangler rollback` leaves the
+store ahead: it still holds every secret a later Version installed while the
+restored Version declares fewer. A secret in the store that the served Version
+does not declare is carried — declared in the upload, never re-entered — and is
+admitted whether or not the declaration names it under `--add-secret`. Naming it
+only decides that its value is read from the secret-input directory and
+re-entered, which is what a rotation is. A secret in that union that the current
+target does not require at all is still refused as inventory drift.
+
+Every Worker publication, routine and cutover alike, also composes the selected
+target with the Worker's own startup path before it uploads anything. A target
+whose realized closure is exactly right can still fail to compose — two supply
+halves that name one Cloudflare `SupplyContract` with different content are
+legal plain text in their own bindings and ambiguous only when the runtime joins
+them — and the Worker composes lazily on its first request, so the failure would
+otherwise arrive after traffic had already moved. The refusal carries the
+composition's exact words and no target is touched.
 
 The environment selects only `.deploy/targets/<environment>.json` (or the
 matching absolute `TAKOSERVER_DEPLOY_TARGET_<ENVIRONMENT>` path). There is no
@@ -103,7 +137,10 @@ no operator input.
 
 The routine surfaces are:
 
-- `takoserver-worker`: one Worker code publication. Every environment requires
+- `takoserver-worker`: one Worker code publication. Before any live read or
+  upload it composes the selected target with the Worker's own startup path and
+  refuses with that composition's exact words, so a target that parses and yet
+  cannot serve never reaches an upload. Every environment requires
   the explicit API-token/direct-REST path. Stored Wrangler OAuth is disabled:
   its supported readers cannot prove whether workers.dev is enabled or list an
   exhaustive custom-domain inventory, and target URL/alias declarations are
@@ -183,27 +220,38 @@ The separate authority and irreversible surfaces are:
 
   For the current integration Worker — retire
   `TAKOSERVER_STANDARD_SERVICE_SUPPLIES`, add
-  `TAKOSERVER_OBJECT_BUCKET_SUPPLIES`, add the
+  `TAKOSERVER_OBJECT_BUCKET_SUPPLIES`, publish the corrected
+  `TAKOSERVER_EDGE_SUPPLIES` value, add the
   `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING` secret and replace the revoked
   `CLOUDFLARE_API_TOKEN` provisioner credential — the exact commands are:
 
   ```sh
   bun run deploy -- takoserver-worker-authority-cutover --status \
     --environment=integration --commit=<40-hex-sha> \
-    --closure-predecessor-version=<exact-live-version-uuid> \
+    --closure-predecessor-version=2bb7b9d3-7ac7-4df3-ad50-15bcaa67a5b6 \
     --retire-var=TAKOSERVER_STANDARD_SERVICE_SUPPLIES \
     --add-var=TAKOSERVER_OBJECT_BUCKET_SUPPLIES \
+    --refresh-var=TAKOSERVER_EDGE_SUPPLIES \
     --add-secret=TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING \
     --rotate-secret=CLOUDFLARE_API_TOKEN
 
   bun run deploy -- takoserver-worker-authority-cutover --apply \
     --environment=integration --commit=<40-hex-sha> \
-    --closure-predecessor-version=<exact-live-version-uuid> \
+    --closure-predecessor-version=2bb7b9d3-7ac7-4df3-ad50-15bcaa67a5b6 \
     --retire-var=TAKOSERVER_STANDARD_SERVICE_SUPPLIES \
     --add-var=TAKOSERVER_OBJECT_BUCKET_SUPPLIES \
+    --refresh-var=TAKOSERVER_EDGE_SUPPLIES \
     --add-secret=TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING \
     --rotate-secret=CLOUDFLARE_API_TOKEN
   ```
+
+  That predecessor is the Version a `wrangler rollback` restored after the
+  ambiguous-`SupplyContract` incident, so the run exercises all three rules at
+  once: the corrected `TAKOSERVER_EDGE_SUPPLIES` value travels as a refresh, the
+  seal keyring and the rotated provisioner token are already in the script-level
+  store and are admitted from there, and the corrected descriptor is composed
+  before anything is uploaded. Replace `<40-hex-sha>` with the exact reviewed
+  commit; the predecessor UUID must still be the authoritative current Version.
 
   `--status` reports the delta it would apply and mutates nothing. `--apply`
   additionally requires `TAKOSERVER_INDEPENDENT_REVIEW` and reads
@@ -606,6 +654,24 @@ Run the same surface with `--status` and the same
 being current means the upload never landed; its exact direct successor with
 the strict target closure means the transition completed. Any other history
 advance fails closed and is never attributed to the interrupted attempt.
+
+After an explicit `wrangler rollback`, the restored Version is a usable
+predecessor again. The script-level secret store is left ahead of it — it still
+holds every secret the rolled-back Version installed — and the transition reads
+the union of the two, so those secrets are carried rather than demanded. Name
+one under `--add-secret` only when its value should be re-entered from the
+secret-input directory. The status output reports both sets: `carriedSecrets` is
+everything this upload does not re-enter, and `carriedStoreSecrets` is the part
+of it the served Version does not itself declare.
+
+A Worker that cannot start answers `503 backend_unavailable` on every route,
+including `/healthz` and `/.well-known/takoserver`, with `details.reason` naming
+the class — `public-origin`, `supply-composition`, `runtime-configuration` or
+`unavailable` — and the product's own refusal sentence as the message. Startup
+is lazy and only its success is cached, so a repaired target serves on the next
+request without a redeploy. The routine and cutover surfaces compose the target
+before uploading, so this state should be reachable only through a change made
+outside them.
 
 For an operator-identity upload acknowledgement failure, do not retry apply.
 Run the same surface with `--status`: an exact configured digest means the

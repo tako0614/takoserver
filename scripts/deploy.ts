@@ -30,8 +30,9 @@ const USAGE = `takoserver deploy
   Hosted-edge authority transition requires the named
   --legacy-host-runtime-predecessor-version=<uuid> selector in integration or production.
   The reviewed closure transition uses --closure-predecessor-version=<uuid> with an explicit
-  delta of repeatable --retire-var=NAME, --add-var=NAME, --add-secret=NAME and --rotate-secret=NAME;
-  added and rotated secret values come only from TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY.
+  delta of repeatable --retire-var=NAME, --add-var=NAME, --refresh-var=NAME, --add-secret=NAME and
+  --rotate-secret=NAME; --refresh-var publishes a changed value of a var both sides already declare,
+  and added and rotated secret values come only from TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY.
   Hosted-edge authority/topology retirement uses --legacy-host-runtime-predecessor-version=<uuid>
   and --reverse; token retirement is forward-only.
   Post-token attribution repair uses both --legacy-host-runtime-predecessor-version=<uuid>
@@ -104,6 +105,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let closurePredecessorVersionId: string | null = null;
   const retireVars: string[] = [];
   const addVars: string[] = [];
+  const refreshVars: string[] = [];
   const addSecrets: string[] = [];
   const rotateSecrets: string[] = [];
   let unattributedSuccessorVersionId: string | null = null;
@@ -178,9 +180,11 @@ function parseInvocation(args: readonly string[]): Invocation | null {
           ? retireVars
           : deltaFlag.kind === "add-var"
             ? addVars
-            : deltaFlag.kind === "add-secret"
-              ? addSecrets
-              : rotateSecrets;
+            : deltaFlag.kind === "refresh-var"
+              ? refreshVars
+              : deltaFlag.kind === "add-secret"
+                ? addSecrets
+                : rotateSecrets;
       list.push(deltaFlag.name);
       continue;
     }
@@ -206,7 +210,13 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     return null;
   }
   if (!action || !environment || !commit) return null;
-  const closureDeltaNames = [...retireVars, ...addVars, ...addSecrets, ...rotateSecrets];
+  const closureDeltaNames = [
+    ...retireVars,
+    ...addVars,
+    ...refreshVars,
+    ...addSecrets,
+    ...rotateSecrets,
+  ];
   if (closurePredecessorVersionId === null) {
     // Every other invocation keeps the historical exact flag budget.
     if (args.length > 6 || closureDeltaNames.length > 0) return null;
@@ -321,6 +331,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
           closureDelta: {
             retiredVars: [...retireVars].sort(),
             addedVars: [...addVars].sort(),
+            refreshedVars: [...refreshVars].sort(),
             addedSecrets: [...addSecrets].sort(),
             rotatedSecrets: [...rotateSecrets].sort(),
           },
@@ -331,12 +342,23 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   } as Invocation;
 }
 
-type ClosureDeltaFlagKind = "retire-var" | "add-var" | "add-secret" | "rotate-secret";
+type ClosureDeltaFlagKind =
+  | "retire-var"
+  | "add-var"
+  | "refresh-var"
+  | "add-secret"
+  | "rotate-secret";
 
 function closureDeltaFlag(
   flag: string,
 ): { readonly kind: ClosureDeltaFlagKind; readonly name: string } | null {
-  for (const kind of ["retire-var", "add-var", "add-secret", "rotate-secret"] as const) {
+  for (const kind of [
+    "retire-var",
+    "add-var",
+    "refresh-var",
+    "add-secret",
+    "rotate-secret",
+  ] as const) {
     const prefix = `--${kind}=`;
     if (flag.startsWith(prefix)) return { kind, name: flag.slice(prefix.length) };
   }
