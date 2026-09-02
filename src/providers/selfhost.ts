@@ -34,6 +34,13 @@ import {
   SelfhostScriptStateStoreError,
 } from "./selfhost-script-state.ts";
 import {
+  createSelfhostVersionBindingStore,
+  type SelfhostVersionBinding,
+  type SelfhostVersionBindingSet,
+  SelfhostVersionBindingStoreError,
+  type StoredSelfhostVersionBindings,
+} from "./selfhost-version-bindings.ts";
+import {
   createSelfhostVersionMaterializer,
   SelfhostVersionMaterializationError,
   type SelfhostVersionMaterializationRequest,
@@ -70,11 +77,14 @@ import {
  *   gate them on a serving deployment are enforced by the Host, and saying
  *   "recorded, not firing" here beats a scheduler nobody implemented.
  *
- * Version environment (`vars`, non-sensitive bindings) is recorded but not yet
- * projected into the workerd configuration; the runtime serves modules and
- * static assets. Sensitive names are rejected explicitly because this Host does
- * not support sensitive Worker bindings.
+ * A version's `vars` are projected into the workerd configuration as ordinary
+ * environment bindings, kept in a `0600` record beside — never inside — the
+ * immutable version directory, whose digest means "the bytes the tenant
+ * committed" and must not move because a variable did.
  */
+
+const MAX_WORKER_VERSION_VARS = 64;
+const WORKER_VERSION_VAR_NAME = /^[A-Za-z][A-Za-z0-9._-]{0,63}$/u;
 
 const SQLITE_MIGRATION_LEDGER = "_takoform_sqlite_migrations";
 const SQLITE_MIGRATION_LEDGER_DDL = `CREATE TABLE IF NOT EXISTS ${SQLITE_MIGRATION_LEDGER} (
@@ -140,8 +150,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   const endpointSuffix = (options.workerEndpointSuffix ?? "localhost").toLowerCase();
   const versionsRoot = join(dataRoot, "selfhost", "versions");
   const scriptsRoot = join(dataRoot, "selfhost", "scripts");
+  const versionBindingsRoot = join(dataRoot, "selfhost", "version-bindings");
   const databasesRoot = join(dataRoot, "databases");
   const scriptStates = createSelfhostScriptStateStore({ root: scriptsRoot });
+  const versionBindings = createSelfhostVersionBindingStore({ root: versionBindingsRoot });
   const versionMaterializer = createSelfhostVersionMaterializer({
     root: versionsRoot,
     artifacts,
@@ -227,16 +239,46 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     }
   };
 
-  // Runtime activation is identified by the complete desired route set, not
-  // merely by the active version. An endpoint/domain write can stage a new
-  // manifest while reload still serves the previous route table; keeping the
-  // route set in the generation lets `has` reject that stale activation.
-  const runtimeGeneration = (state: SelfhostScriptState): string =>
-    JSON.stringify({
+  const bindingStoreOperation = async <T>(operation: () => Promise<T>): Promise<T> => {
+    try {
+      return await operation();
+    } catch (error) {
+      if (!(error instanceof SelfhostVersionBindingStoreError)) throw error;
+      if (error.code === "corrupt") {
+        throw new SelfhostFailure(
+          failed("provider_error", "the durable Worker Version bindings are malformed"),
+        );
+      }
+      throw new SelfhostFailure(
+        failed("unavailable", "the durable Worker Version bindings are unavailable", true),
+      );
+    }
+  };
+
+  const readVersionBindings = (
+    script: string,
+    versionId: string,
+  ): Promise<StoredSelfhostVersionBindings | null> =>
+    bindingStoreOperation(() => versionBindings.read(script, versionId));
+
+  // Runtime activation is identified by the complete desired route set and the
+  // exact environment, not merely by the active version. An endpoint/domain
+  // write can stage a new manifest while reload still serves the previous route
+  // table, and a version whose bindings were written after its first publish
+  // would otherwise report a stale environment as serving. A version that
+  // declares no binding contributes nothing, so its generation is byte-for-byte
+  // what it was before bindings existed.
+  const runtimeGeneration = async (script: string, state: SelfhostScriptState): Promise<string> => {
+    const bindings = state.activeVersion
+      ? await readVersionBindings(script, state.activeVersion)
+      : null;
+    return JSON.stringify({
       activeVersion: state.activeVersion ?? null,
       endpointHostname: state.endpointHostname ?? null,
       domains: state.domains,
+      ...(bindings ? { bindingsDigest: bindings.digest } : {}),
     });
+  };
 
   const readScriptState = (script: string): Promise<SelfhostScriptStateSnapshot> =>
     scriptStateOperation(() => scriptStates.read(script));
@@ -273,6 +315,12 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       ...(state.endpointHostname ? [state.endpointHostname] : []),
       ...state.domains,
     ];
+    // Environment comes from the version's own durable record, not from the
+    // materialized tree, so a republish projects exactly what its apply
+    // recorded and nothing a later edit of the directory could introduce.
+    const bindings = await readVersionBindings(script, state.activeVersion);
+    const vars = bindings ? [...bindings.vars, ...bindings.sensitiveVars] : [];
+    const generation = await runtimeGeneration(script, state);
     await runtimeOperation(() =>
       runtime.write(
         script,
@@ -280,8 +328,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           directory: script,
           mainModule: meta.mainModule,
           hostnames,
-          generation: runtimeGeneration(state),
+          generation,
           ...(meta.assets ? { assets: { notFoundHandling: meta.assets.notFoundHandling } } : {}),
+          ...(vars.length > 0 ? { vars } : {}),
         },
         modules,
         assets,
@@ -340,6 +389,55 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   const nativeId = (input: ApplyInput, base: string): string =>
     input.previous?.nativeId ?? `${base}:${input.operationId}`;
 
+  /**
+   * The Worker Version's own non-secret environment.
+   *
+   * A string becomes a `text` binding and anything else a `json` one, which is
+   * exactly the split the managed backend makes, so the same declaration means
+   * the same thing on both. Names are held to the Form's own grammar rather
+   * than rewritten: a mangled variable is one the module cannot find.
+   */
+  const declaredVars = (spec: JsonObject): readonly SelfhostVersionBinding[] => {
+    const declared = spec.vars;
+    if (declared === undefined) return [];
+    if (typeof declared !== "object" || declared === null || Array.isArray(declared)) {
+      throw new SelfhostFailure(failed("invalid_spec", "the Worker Version vars are invalid"));
+    }
+    const entries = Object.entries(declared as JsonObject);
+    if (entries.length > MAX_WORKER_VERSION_VARS) {
+      throw new SelfhostFailure(
+        failed("invalid_spec", "the Worker Version declares too many vars"),
+      );
+    }
+    return entries
+      .map(([name, value]) => {
+        if (!WORKER_VERSION_VAR_NAME.test(name) || value === undefined) {
+          throw new SelfhostFailure(failed("invalid_spec", "the Worker Version vars are invalid"));
+        }
+        return typeof value === "string"
+          ? { name, value, kind: "text" as const }
+          : { name, value: JSON.stringify(value), kind: "json" as const };
+      })
+      .sort((left, right) => (left.name < right.name ? -1 : 1));
+  };
+
+  /**
+   * Records the environment for one immutable version, or removes the record
+   * when it declares none — so a version without bindings publishes the exact
+   * bytes it published before this Host could project any.
+   */
+  const writeVersionBindings = async (
+    script: string,
+    versionId: string,
+    set: SelfhostVersionBindingSet,
+  ): Promise<void> => {
+    if (set.vars.length === 0 && set.sensitiveVars.length === 0) {
+      await bindingStoreOperation(() => versionBindings.remove(script, versionId));
+      return;
+    }
+    await bindingStoreOperation(() => versionBindings.write(script, versionId, set));
+  };
+
   const applyModuleWorker = async (input: ApplyInput): Promise<ProviderTicket> => {
     const script = await scriptOf(input.identity.tenantRef, {
       space: input.identity.space,
@@ -376,6 +474,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       space: input.identity.space,
       name: input.identity.name,
     });
+    const vars = declaredVars(input.spec);
     const assetsSpec =
       typeof input.spec.assets === "object" && input.spec.assets !== null
         ? (input.spec.assets as JsonObject)
@@ -412,6 +511,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       }
       throw error;
     }
+    await writeVersionBindings(script, versionId, { vars, sensitiveVars: [] });
 
     return succeeded({
       nativeId: nativeId(input, `selfhost-version:${script}:${versionId}`),
@@ -419,6 +519,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         scriptName: script,
         versionId,
         materializationDigest: materialized.materializationDigest,
+        // Names only, and only when there are any: an environment is not
+        // identity, and an empty declaration must observe as it always did.
+        ...(vars.length > 0 ? { varNames: vars.map((binding) => binding.name) } : {}),
       },
       outputs: {
         scriptName: script,
@@ -457,6 +560,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       space: input.identity.space,
       name: input.identity.name,
     });
+    const vars = declaredVars(input.spec);
     const assetsSpec =
       typeof input.spec.assets === "object" && input.spec.assets !== null
         ? (input.spec.assets as JsonObject)
@@ -505,6 +609,13 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         "the committed Worker Version materialization conflicts with this recovery",
       );
     }
+    // Recovery is readback-only: an environment this Host never recorded is not
+    // written here, it is reported as an apply that did not complete, and the
+    // ordinary retry of an immutable create is what finishes the job.
+    const recorded = await readVersionBindings(script, versionId);
+    if (!sameBindingNames(recorded, vars, [])) {
+      return failed("not_found", "the Worker Version environment was not recorded");
+    }
     return succeeded({
       nativeId: nativeId(input, `selfhost-version:${script}:${versionId}`),
       observed: {
@@ -512,6 +623,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         versionId,
         materialized: true,
         materializationDigest: materialized.digest,
+        ...(vars.length > 0 ? { varNames: vars.map((binding) => binding.name) } : {}),
       },
       outputs: {
         scriptName: script,
@@ -862,7 +974,11 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
               true,
             );
           }
-          if (!(await runtimeOperation(() => runtime.has(script, runtimeGeneration(state))))) {
+          if (
+            !(await runtimeOperation(async () =>
+              runtime.has(script, await runtimeGeneration(script, state)),
+            ))
+          ) {
             return failed("unavailable", "the Worker runtime is not serving the endpoint", true);
           }
           return succeeded({
@@ -982,8 +1098,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             if (!worker) return failed("not_found", "the Worker Deployment has no worker relation");
             const script = await scriptOf(input.identity.tenantRef, worker.metadata);
             const { state } = await readScriptState(script);
-            const serving = await runtimeOperation(() =>
-              runtime.has(script, runtimeGeneration(state)),
+            const serving = await runtimeOperation(async () =>
+              runtime.has(script, await runtimeGeneration(script, state)),
             );
             if (state.activeVersion && !serving) {
               return failed(
@@ -1010,7 +1126,11 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             if (!state.endpointHostname || !state.activeVersion) {
               return failed("not_found", "the Worker endpoint is not durably attached");
             }
-            if (!(await runtimeOperation(() => runtime.has(script, runtimeGeneration(state))))) {
+            if (
+              !(await runtimeOperation(async () =>
+                runtime.has(script, await runtimeGeneration(script, state)),
+              ))
+            ) {
               return failed("unavailable", "the Worker runtime is not serving the endpoint", true);
             }
             return succeeded({
@@ -1035,7 +1155,11 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             if (!state.domains.includes(hostname) || !state.activeVersion) {
               return failed("not_found", "the custom domain is not durably attached");
             }
-            if (!(await runtimeOperation(() => runtime.has(script, runtimeGeneration(state))))) {
+            if (
+              !(await runtimeOperation(async () =>
+                runtime.has(script, await runtimeGeneration(script, state)),
+              ))
+            ) {
               return failed(
                 "unavailable",
                 "the Worker runtime is not serving the custom domain",
@@ -1096,6 +1220,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             });
             await runtimeOperation(() => runtime.remove(script));
             await rm(join(versionsRoot, script), { recursive: true, force: true });
+            await bindingStoreOperation(() => versionBindings.removeScript(script));
             await removeScriptState(script);
             await runtimeOperation(() => runtime.reload());
             return done();
@@ -1117,9 +1242,11 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
                     : {}),
                 });
                 await rm(join(versionsRoot, script, versionId), { recursive: true, force: true });
+                await bindingStoreOperation(() => versionBindings.remove(script, versionId));
                 await republish(script);
               } else {
                 await rm(join(versionsRoot, script, versionId), { recursive: true, force: true });
+                await bindingStoreOperation(() => versionBindings.remove(script, versionId));
               }
             }
             return done();
@@ -1213,8 +1340,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
               name: input.identity.name,
             });
             const current = await readScriptState(script);
-            const serving = await runtimeOperation(() =>
-              runtime.has(script, runtimeGeneration(current.state)),
+            const serving = await runtimeOperation(async () =>
+              runtime.has(script, await runtimeGeneration(script, current.state)),
             );
             return current.revision === null && !serving ? done() : uncertain();
           }
@@ -1241,8 +1368,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             if (!worker) return failed("not_found", "the Worker Deployment has no worker relation");
             const script = await scriptOf(input.identity.tenantRef, worker.metadata);
             const current = await readScriptState(script);
-            const serving = await runtimeOperation(() =>
-              runtime.has(script, runtimeGeneration(current.state)),
+            const serving = await runtimeOperation(async () =>
+              runtime.has(script, await runtimeGeneration(script, current.state)),
             );
             return current.state.activeVersion === undefined && !serving ? done() : uncertain();
           }
@@ -1271,8 +1398,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             if (!worker) return failed("not_found", "the Worker route has no worker relation");
             const script = await scriptOf(input.identity.tenantRef, worker.metadata);
             const current = await readScriptState(script);
-            const serving = await runtimeOperation(() =>
-              runtime.has(script, runtimeGeneration(current.state)),
+            const serving = await runtimeOperation(async () =>
+              runtime.has(script, await runtimeGeneration(script, current.state)),
             );
             // Workerd's boolean seam reports script activation, not a
             // per-host route. When another route still serves the script we
@@ -1913,6 +2040,27 @@ function errorCode(error: unknown): string | undefined {
   return typeof error === "object" && error !== null && "code" in error
     ? String(error.code)
     : undefined;
+}
+
+/**
+ * Whether the recorded environment is exactly the one this apply declares.
+ *
+ * Names only. A recovery compares what it can prove from durable state against
+ * what the desired spec asks for; it never opens a value to do it.
+ */
+function sameBindingNames(
+  recorded: StoredSelfhostVersionBindings | null,
+  vars: readonly SelfhostVersionBinding[],
+  sensitiveNames: readonly string[],
+): boolean {
+  const expectedVars = vars.map((binding) => binding.name).sort();
+  const expectedSensitive = [...sensitiveNames].sort();
+  const observedVars = (recorded?.vars ?? []).map((binding) => binding.name).sort();
+  const observedSensitive = (recorded?.sensitiveVars ?? []).map((binding) => binding.name).sort();
+  return (
+    JSON.stringify(expectedVars) === JSON.stringify(observedVars) &&
+    JSON.stringify(expectedSensitive) === JSON.stringify(observedSensitive)
+  );
 }
 
 function materializationMessage(error: SelfhostVersionMaterializationError): string {

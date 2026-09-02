@@ -1,4 +1,5 @@
-import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 /**
@@ -20,7 +21,22 @@ import { dirname, join } from "node:path";
  * host gets a refusal rather than whichever script sorted first: answering one
  * customer's address with another customer's site is the failure worth
  * preventing, and it is silent when it happens.
+ *
+ * A script's environment variables are rendered into this configuration as
+ * ordinary capnp bindings, because workerd has no separate notion of a secret:
+ * a sensitive value looks exactly like a plain one here. That makes the
+ * generated file itself the secret, so it is written `0600` inside a `0700`
+ * directory, through a temporary file and a rename — a config half-written when
+ * a process died must never be the one workerd picks up.
  */
+
+/** One environment entry the module sees on `env`. */
+export interface WorkerdBinding {
+  readonly name: string;
+  readonly value: string;
+  /** `text` is a string; `json` is parsed by the runtime before the module sees it. */
+  readonly kind: "text" | "json";
+}
 
 export interface WorkerdSite {
   /** Directory holding this script's modules. */
@@ -34,6 +50,11 @@ export interface WorkerdSite {
    * declared assets. Absent means it declared none.
    */
   readonly assets?: { readonly notFoundHandling: string };
+  /**
+   * Environment entries for this script. Absent and empty both render nothing,
+   * so a script that declares none produces the same bytes it always did.
+   */
+  readonly vars?: readonly WorkerdBinding[];
 }
 
 /** The seam a provider publishes through: files present, config rewritten. */
@@ -76,6 +97,7 @@ interface Manifest {
   readonly hostnames: readonly string[];
   readonly generation?: string;
   readonly assets?: { readonly notFoundHandling: string };
+  readonly vars?: readonly WorkerdBinding[];
 }
 
 const MANIFEST = "takoserver-site.json";
@@ -102,7 +124,8 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): WorkerdRun
       // must not survive from the old one, where it would be loadable and
       // wrong.
       await rm(directory, { recursive: true, force: true });
-      await mkdir(directory, { recursive: true });
+      await mkdir(scriptsRoot, { recursive: true, mode: 0o700 });
+      await mkdir(directory, { recursive: true, mode: 0o700 });
 
       for (const [moduleName, bytes] of modules) {
         if (moduleName.includes("..") || moduleName.startsWith("/")) {
@@ -125,14 +148,17 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): WorkerdRun
         await writeFile(path, bytes);
       }
 
-      // Written last. Until it exists the directory is not a script.
-      await writeFile(
+      // Written last. Until it exists the directory is not a script. It now
+      // carries binding values, so it is written with the same `0600` care as
+      // the configuration rendered from it.
+      await writePrivate(
         join(directory, MANIFEST),
         JSON.stringify({
           mainModule: site.mainModule,
           hostnames: site.hostnames,
           ...(site.generation === undefined ? {} : { generation: site.generation }),
           ...(site.assets ? { assets: site.assets } : {}),
+          ...(site.vars && site.vars.length > 0 ? { vars: validBindings(site.vars) } : {}),
         }),
         "utf8",
       );
@@ -163,14 +189,16 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): WorkerdRun
 
     async reload() {
       const published = await readPublished(scriptsRoot);
-      await mkdir(scriptsRoot, { recursive: true });
+      await mkdir(scriptsRoot, { recursive: true, mode: 0o700 });
       // Written before the config that embeds it, every time, so a router
       // improvement reaches a deployment on its next reload rather than
       // whenever somebody remembers.
       await writeFile(join(scriptsRoot, "router.js"), ROUTER_SOURCE, "utf8");
       await writeFile(join(scriptsRoot, "assets.js"), ASSETS_SOURCE, "utf8");
-      await mkdir(dirname(configPath), { recursive: true });
-      await writeFile(configPath, renderConfig(published, port, scriptsRoot), "utf8");
+      await mkdir(dirname(configPath), { recursive: true, mode: 0o700 });
+      // The rendered configuration contains every binding value, sensitive ones
+      // included, so it is created `0600` and moved into place atomically.
+      await writePrivate(configPath, renderConfig(published, port, scriptsRoot), "utf8");
       await options.onReload?.(configPath);
       // A staged manifest is not runtime truth. Only after the reload hook
       // returns successfully do we persist the generation actually activated;
@@ -183,6 +211,116 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): WorkerdRun
       );
     },
   };
+}
+
+/**
+ * Creates a file only this process's user can read, then moves it into place.
+ *
+ * `O_EXCL` plus `O_NOFOLLOW` means an attacker who can create paths in the
+ * directory cannot pre-place a symlink and have the secret written through it,
+ * and the rename means a reader never observes a partially written config.
+ */
+async function writePrivate(path: string, contents: string, encoding: "utf8"): Promise<void> {
+  const temporary = `${path}.tmp`;
+  await rm(temporary, { force: true });
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  let closed = false;
+  try {
+    handle = await open(
+      temporary,
+      fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,
+      0o600,
+    );
+    await handle.writeFile(contents, encoding);
+    await handle.sync();
+    await handle.close();
+    closed = true;
+    await rename(temporary, path);
+  } finally {
+    if (!closed) await handle?.close().catch(() => undefined);
+    await rm(temporary, { force: true }).catch(() => undefined);
+  }
+}
+
+/**
+ * The environment names workerd will accept from here.
+ *
+ * The union is deliberately the union of what the two declarations upstream can
+ * produce: a Worker Version's `vars` keys and the sensitive names a runtime
+ * input carries. A name outside it is refused rather than rewritten — a mangled
+ * binding is a variable the module silently cannot find, which is worse than a
+ * publication that stops and says so.
+ */
+const BINDING_NAME = /^[A-Za-z_][A-Za-z0-9._-]{0,127}$/u;
+
+function validBindings(bindings: readonly WorkerdBinding[]): readonly WorkerdBinding[] {
+  const seen = new Set<string>();
+  for (const binding of bindings) {
+    if (
+      typeof binding?.name !== "string" ||
+      !BINDING_NAME.test(binding.name) ||
+      typeof binding.value !== "string" ||
+      (binding.kind !== "text" && binding.kind !== "json")
+    ) {
+      throw new Error("unusable worker binding");
+    }
+    if (seen.has(binding.name)) throw new Error("unusable worker binding");
+    seen.add(binding.name);
+  }
+  return bindings;
+}
+
+/**
+ * A capnp text literal.
+ *
+ * This configuration is assembled by concatenating strings, and the values in
+ * it are a tenant's. An unescaped quote would close the literal and let the
+ * rest of a value be read as configuration — the next binding, the next
+ * service, or the socket. Everything printable stays as itself so the file
+ * remains readable by an operator; the rest is escaped, and the two characters
+ * capnp Text cannot carry at all are refused.
+ */
+function capnpText(value: string): string {
+  let out = '"';
+  for (const character of value) {
+    const code = character.codePointAt(0) ?? 0;
+    if (code === 0) throw new Error("unusable worker binding value");
+    if (code >= 0xd800 && code <= 0xdfff) throw new Error("unusable worker binding value");
+    switch (character) {
+      case '"':
+        out += '\\"';
+        continue;
+      case "\\":
+        out += "\\\\";
+        continue;
+      case "\n":
+        out += "\\n";
+        continue;
+      case "\r":
+        out += "\\r";
+        continue;
+      case "\t":
+        out += "\\t";
+        continue;
+      case "\b":
+        out += "\\b";
+        continue;
+      case "\f":
+        out += "\\f";
+        continue;
+      case "\v":
+        out += "\\v";
+        continue;
+      default:
+        break;
+    }
+    if (code < 0x20 || code === 0x7f) {
+      out += `\\x${code.toString(16).padStart(2, "0")}`;
+      continue;
+    }
+    out += character;
+  }
+  return `${out}"`;
 }
 
 async function readActivation(path: string): Promise<Record<string, string | null>> {
@@ -233,6 +371,14 @@ async function readPublished(scriptsRoot: string): Promise<readonly Published[]>
     ) {
       continue;
     }
+    // A manifest whose bindings cannot be rendered is not a script this process
+    // will serve. Skipping it keeps one broken directory from taking every
+    // other customer's site down with it on the next reload.
+    try {
+      if (manifest.vars !== undefined) validBindings(manifest.vars);
+    } catch {
+      continue;
+    }
     published.push({ name: entry.name, manifest });
   }
   return published.sort((left, right) => left.name.localeCompare(right.name));
@@ -253,12 +399,18 @@ function renderConfig(published: readonly Published[], port: number, scriptsRoot
       // alternative is an asset layer the script cannot ask, which is the same
       // as having none: every path that is not an exact file reaches the
       // script, and `notFoundHandling` never applies.
-      const assetBindings = entry.manifest.assets
-        ? `\n      bindings = [ (name = "ASSETS", service = "${entry.name}-assets") ],`
-        : "";
+      const bindings = [
+        ...(entry.manifest.assets ? [`(name = "ASSETS", service = "${entry.name}-assets")`] : []),
+        ...validBindings(entry.manifest.vars ?? []).map(
+          (binding) =>
+            `(name = ${capnpText(binding.name)}, ${binding.kind} = ${capnpText(binding.value)})`,
+        ),
+      ];
+      const bindingList =
+        bindings.length === 0 ? "" : `\n      bindings = [ ${bindings.join(", ")} ],`;
       return `  ( name = "${entry.name}",
     worker = (
-      modules = [ (name = "${entry.manifest.mainModule}", esModule = embed "${entry.name}/${entry.manifest.mainModule}") ],${assetBindings}
+      modules = [ (name = "${entry.manifest.mainModule}", esModule = embed "${entry.name}/${entry.manifest.mainModule}") ],${bindingList}
       compatibilityDate = "2026-01-01",
     )
   ),`;

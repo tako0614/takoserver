@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -72,6 +72,14 @@ function relation(
 }
 
 const identity = (name: string) => ({ tenantRef: "org_demo", space: "default", name });
+
+/** The one materialized version directory under a script, whichever id it got. */
+function versionDirectoryName(dataRoot: string, script: string): string {
+  const entries = readdirSync(join(dataRoot, "selfhost", "versions", script));
+  const first = entries[0];
+  if (entries.length !== 1 || !first) throw new Error("expected exactly one materialized version");
+  return first;
+}
 
 const endpointAssignment = (hostname = "reserved.localhost") => ({
   canonicalPublicOrigin: `https://${hostname}`,
@@ -179,7 +187,11 @@ function provider(options: ProviderCase = {}) {
 }
 
 /** Drives the worker → version → deployment chain one apply at a time. */
-async function publish(local: ReturnType<typeof provider>, assets = false) {
+async function publish(
+  local: ReturnType<typeof provider>,
+  assets = false,
+  vars?: Record<string, string | number>,
+) {
   const worker = await local.apply({
     operationId: "op_worker",
     offering: offering("ModuleWorker"),
@@ -197,6 +209,7 @@ async function publish(local: ReturnType<typeof provider>, assets = false) {
       bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
       handlers: ["fetch"],
       worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+      ...(vars ? { vars } : {}),
       ...(assets
         ? {
             assets: {
@@ -254,6 +267,67 @@ describe("publishing a Worker through the Edge Family", () => {
     // directory and silently fails to read an absolute one.
     expect(config).toContain(`embed "${script}/index.js"`);
     expect(config).not.toContain(`embed "${root}`);
+  });
+
+  test("a version's vars reach the running worker's environment", async () => {
+    const local = provider();
+    const script = await publish(local, false, {
+      "yurucommu.lane": "takoform-v1",
+      RETRIES: 3,
+      QUOTED: 'he said "hi"',
+    });
+
+    const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+    expect(config).toContain('(name = "QUOTED", text = "he said \\"hi\\"")');
+    expect(config).toContain('(name = "RETRIES", json = "3")');
+    expect(config).toContain('(name = "yurucommu.lane", text = "takoform-v1")');
+    // The environment is a fact about the version, not part of the immutable
+    // materialization whose digest means "the bytes the tenant committed".
+    const meta = await readFile(
+      join(root, "selfhost", "versions", script, versionDirectoryName(root, script), "meta.json"),
+      "utf8",
+    );
+    expect(meta).not.toContain("takoform-v1");
+    expect(meta).not.toContain("vars");
+  });
+
+  test("a version without vars publishes exactly the bytes it always did", async () => {
+    const plain = provider();
+    const plainScript = await publish(plain);
+    const withoutVars = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+
+    rmSync(root, { recursive: true, force: true });
+    root = mkdtempSync(join(tmpdir(), "takoserver-selfhost-"));
+    const empty = provider();
+    const emptyScript = await publish(empty, false, {});
+    const withEmptyVars = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+
+    expect(emptyScript).toBe(plainScript);
+    expect(withEmptyVars).toBe(withoutVars);
+    expect(withoutVars).not.toContain('bindings = [ (name = "');
+  });
+
+  test("refuses a var name the module could never find under that spelling", async () => {
+    const local = provider();
+    const ticket = await local.apply({
+      operationId: "op_bad_var",
+      offering: offering("WorkerVersion"),
+      identity: identity("hello-badvar"),
+      spec: {
+        bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+        handlers: ["fetch"],
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+        vars: { "1leading": "x" },
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", "hello"),
+        relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+      ],
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", message: "the Worker Version vars are invalid" },
+    });
   });
 
   test("reports malformed durable script state instead of observing an empty deployment", async () => {
