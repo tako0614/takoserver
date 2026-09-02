@@ -824,29 +824,77 @@ function isTerminal(operation: DeferredOperationRecord): boolean {
 }
 
 /**
+ * Refusals that describe this Host rather than the request, and are therefore
+ * re-attempted when the same request is presented again.
+ *
+ * The split is what the refusal is *about*. `generation_conflict` says the
+ * desired state moved under the caller's fence; `uid_mismatch` says they named
+ * an incarnation that is not there; `invalid_argument` says the document is
+ * wrong. Those are facts about the request, the fingerprint proves the request
+ * has not changed, so the stored answer is still the answer.
+ *
+ * These are not. A capability this Host does not offer, a Form not installed,
+ * a backend that was down, a dependency that still existed, a wallet that was
+ * empty — none of them is a statement about the request, and each is cured
+ * somewhere other than the configuration. The operator fixes the Host and runs
+ * the same `tofu apply`, whose plan-derived idempotency key is identical by
+ * design; handing them the old refusal pins a Host defect to a resource name
+ * until the record ages out, and the only escapes measured on a real self-host
+ * were renaming the resource or editing the Host's database.
+ */
+const REATTEMPTED_SETTLED_FAILURE_CODES: ReadonlySet<string> = new Set([
+  "backend_unavailable",
+  "deadline_exceeded",
+  "dependency_in_use",
+  "deletion_protected",
+  "form_identity_conflict",
+  "form_not_installed",
+  "form_unavailable",
+  "form_unknown",
+  "insufficient_funds",
+  "internal_error",
+  "migration_required",
+  "quota_exceeded",
+  "rate_limited",
+  "resource_busy",
+  "unavailable",
+  "unsupported_capability",
+]);
+
+/**
  * Whether a stored acceptance under this replay key has stopped being the
  * answer to the request that just arrived.
  *
  * Two cases retire one. A committed mutation whose Resource no longer exists
- * describes an incarnation that is gone. And a settled `dependency_in_use` is
- * not a result at all, it is a statement about facts the caller then changes:
- * the released provider recomputes the same plan-derived idempotency key on
- * every run, so `tofu destroy` gets that refusal on a parent, deletes the
- * dependents it named, asks again under the same key — and would be handed the
- * same refusal until the record aged out.
+ * describes an incarnation that is gone. And a settled failure whose code names
+ * something about *this Host* rather than about the request is a statement
+ * about facts the operator then changes: the released provider recomputes the
+ * same plan-derived idempotency key on every run, so `tofu destroy` gets
+ * `dependency_in_use` on a parent, deletes the dependents it named, asks again
+ * under the same key — and a Host that replayed the refusal would refuse it
+ * until the record expired. The same held for `unsupported_capability` after a
+ * Host defect was repaired.
  *
- * Only that one code, and deliberately. The engine raises it before it accepts
- * a provider mutation saga at all, so retiring one is provably retiring
- * something that never reached a provider. Widening this to every settled
- * failure would also retire a refusal a provider answered *after* it was
- * invoked — a precondition failure deletes its saga row on the way out — and a
- * retry there is a second provider call, not a second attempt.
+ * The rule and its supersession are recorded in
+ * [ADR 0008](../../docs/adr/0008-a-settled-refusal-about-the-host-is-re-attempted.md).
+ *
+ * Retrying one is a second *attempt*, never a second mutation, and the store is
+ * what makes that true rather than the code list: an operation whose provider
+ * mutation was receipted, or whose plan is still live, is held for repair and
+ * never settled at all. A settled failure is one where either the provider was
+ * never invoked, or it answered definitively enough for the engine to
+ * terminalize the saga — a precondition failure, whose whole meaning is that
+ * nothing was mutated. Cancellation stays terminal: it is not a failure code
+ * and never reaches this list.
  */
 async function replayRetired(
   operation: DeferredOperationRecord,
   store: TakoformStore,
 ): Promise<boolean> {
-  if (operation.phase === "failed") return terminalErrorCode(operation) === "dependency_in_use";
+  if (operation.phase === "failed") {
+    const code = terminalErrorCode(operation);
+    return code !== null && REATTEMPTED_SETTLED_FAILURE_CODES.has(code);
+  }
   if (!isTerminal(operation) || !operation.committedUid) return false;
   return (await store.resourceByUid(operation.tenantId, operation.committedUid)) === null;
 }
