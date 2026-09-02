@@ -154,28 +154,35 @@ test("the published document pins the envelope the provider decodes", () => {
     "retryable",
   ]);
 
-  // Every documented failure on the private runtime-input route names it, so
-  // the wire contract pins the shape instead of leaving a status with a prose
-  // description and no schema — which is how the two lanes came to disagree.
-  const route = (
-    openApiDocument.paths as Record<
-      string,
-      Record<string, { readonly responses: Record<string, Record<string, unknown>> }>
-    >
-  )["/v1/takoform/worker-runtime-input-preparations/{operationKey}"];
-  if (!route) throw new TypeError("the private runtime-input route is not documented");
-  for (const operation of Object.values(route)) {
-    for (const [status, response] of Object.entries(operation.responses)) {
-      if (status.startsWith("2")) continue;
-      expect({ status, response }).toEqual({
-        status,
-        response: {
-          description: expect.any(String),
-          content: {
-            "application/json": { schema: { $ref: "#/components/schemas/Error" } },
+  // Every documented failure on the private runtime-input route and on both
+  // reservation routes names it, so the wire contract pins the shape instead of
+  // leaving a status with a prose description and no schema — which is how the
+  // two lanes came to disagree.
+  const paths = openApiDocument.paths as Record<
+    string,
+    Record<string, { readonly responses: Record<string, Record<string, unknown>> }>
+  >;
+  for (const path of [
+    "/v1/takoform/worker-runtime-input-preparations/{operationKey}",
+    "/v1/worker-endpoint-origin-reservations/{reservationId}",
+    "/v1/worker-endpoint-origin-reservations/{reservationId}/activation",
+  ]) {
+    const route = paths[path];
+    if (!route) throw new TypeError(`${path} is not documented`);
+    for (const operation of Object.values(route)) {
+      for (const [status, response] of Object.entries(operation.responses)) {
+        if (status.startsWith("2")) continue;
+        expect({ path, status, response }).toEqual({
+          path,
+          status,
+          response: {
+            description: expect.any(String),
+            content: {
+              "application/json": { schema: { $ref: "#/components/schemas/Error" } },
+            },
           },
-        },
-      });
+        });
+      }
     }
   }
 });
