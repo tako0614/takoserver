@@ -1,4 +1,4 @@
-import type { Clock, Row, Sql } from "./ports.ts";
+import type { Clock, Row, Sql, SqlWrite } from "./ports.ts";
 import {
   MAX_PROVIDER_RUNTIME_INPUT_BINDINGS,
   type ProviderRuntimeInputLeasePort,
@@ -472,10 +472,13 @@ export function createRuntimeInputPreparations(
         if (existing.state === "prepared" && existing.expires_at > now) {
           return await adoptExisting(existing, normalized, keys);
         }
-        if (!replaceablePreparation(existing, now)) {
+        if (await spentOnAbsentIncarnation(options.sql, existing)) {
+          await discardSpent(options.sql, existing);
+        } else if (!replaceablePreparation(existing, now)) {
           throw new RuntimeInputPreparationError("conflict", 409);
+        } else {
+          await discardReplaceable(options.sql, existing);
         }
-        await discardReplaceable(options.sql, existing);
       }
 
       const sealed = await seal(normalized, preparationId);
@@ -559,6 +562,11 @@ export function createRuntimeInputPreparations(
       // vocabulary the contract does not have; absence is the honest answer,
       // and it is also what lets a retry prepare the same operation key again.
       if (!wireStatus(row.state)) return null;
+      // And so is a handoff spent on an incarnation that has since been
+      // destroyed. Answering `consumed` with the previous run's
+      // `hostOperationId` is what let a caller poll a settled success for a
+      // Worker Version this Host no longer has and report it as created.
+      if (await spentOnAbsentIncarnation(options.sql, row)) return null;
       return projection(row);
     },
 
@@ -1192,6 +1200,68 @@ function replaceablePreparation(row: PreparationRow, now: number): boolean {
     return true;
   }
   return (row.state === "prepared" || row.state === "claimed") && rowExpired(row, now);
+}
+
+/**
+ * Whether a spent handoff was spent on an incarnation that no longer exists.
+ *
+ * "Its values already reached a provider, and the object they configured may
+ * exist" is the whole reason a dispatched or consumed handoff is not
+ * replaceable. When the object provably does *not* exist any more, that reason
+ * is gone with it — and what was left instead was a `destroy` followed by an
+ * `apply` under the same plan-derived operation key silently producing nothing:
+ * the preparation answered `consumed` with the previous run's
+ * `hostOperationId`, the provider polled that settled operation and printed
+ * "Creation complete" for a Worker Version the Host had not made, and the next
+ * resource failed `resource_not_found` 404. This is the rule
+ * [ADR 0008](../docs/adr/0008-a-settled-refusal-about-the-host-is-re-attempted.md)
+ * already states for the operation ledger — a committed mutation is replayed
+ * under its key and retired once the Resource it committed is gone — applied to
+ * the route that bypassed it.
+ *
+ * The proof is the incarnation's own: no `tf_resources` row, and a deletion
+ * attestation that is `closed`, which is written in the same commit that
+ * removes the row. An incarnation still being created has neither, so nothing
+ * in flight is ever retired here. Apply commitment stays fenced in the claim
+ * CAS: a fresh preparation is a fresh commitment, and `claim` re-derives it.
+ */
+async function spentOnAbsentIncarnation(sql: Sql, row: PreparationRow): Promise<boolean> {
+  if (row.state !== "dispatched" && row.state !== "consumed") return false;
+  if (!row.claimed_resource_uid) return false;
+  let rows: readonly Row[];
+  try {
+    rows = await sql.query(
+      `SELECT 1 AS gone FROM tf_resource_deletion_attestations AS incarnation
+       WHERE incarnation.tenant_id = ? AND incarnation.resource_uid = ?
+         AND incarnation.state = 'closed'
+         AND NOT EXISTS (
+           SELECT 1 FROM tf_resources
+           WHERE tf_resources.tenant_id = incarnation.tenant_id
+             AND tf_resources.uid = incarnation.resource_uid
+         )
+       LIMIT 1`,
+      [row.organization_id, row.claimed_resource_uid],
+    );
+  } catch {
+    throw new RuntimeInputPreparationError("backend_unavailable", 503);
+  }
+  return rows.length === 1;
+}
+
+/** Removes a spent handoff whose incarnation is gone, on its exact fence. */
+async function discardSpent(sql: Sql, row: PreparationRow): Promise<void> {
+  let removed: SqlWrite;
+  try {
+    removed = await sql.run(
+      `DELETE FROM worker_runtime_input_preparations
+       WHERE organization_id = ? AND operation_key = ? AND fence = ?
+         AND state = ? AND claimed_resource_uid = ?`,
+      [row.organization_id, row.operation_key, row.fence, row.state, row.claimed_resource_uid],
+    );
+  } catch {
+    throw new RuntimeInputPreparationError("backend_unavailable", 503);
+  }
+  if (removed.changes !== 1) throw new RuntimeInputPreparationError("conflict", 409);
 }
 
 async function discardReplaceable(sql: Sql, row: PreparationRow): Promise<void> {
