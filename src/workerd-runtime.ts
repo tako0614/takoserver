@@ -74,6 +74,18 @@ export interface WorkerdSite {
    */
   readonly modules?: readonly string[];
   /**
+   * Whether this script is published through a generated entrypoint.
+   *
+   * The entrypoint is what answers this Host's readiness question, so it is
+   * also what decides whether the internal probe route is rendered and whether
+   * the entrypoint's compatibility flags apply. It used to be inferred from
+   * `dataPlane || events`, which was true only while a wrapper existed solely
+   * to carry those: a Worker with no bindings and no events was published
+   * unwrapped, was never asked whether its module loads, and reported Ready
+   * while workerd's own stderr said `No such module`.
+   */
+  readonly generatedEntrypoint?: boolean;
+  /**
    * The Host-owned facade service this script's generated entrypoint calls.
    *
    * Absent means this script binds no KV namespace and no SQLite database, and
@@ -183,6 +195,7 @@ interface Manifest {
   readonly assets?: { readonly notFoundHandling: string };
   readonly vars?: readonly WorkerdBinding[];
   readonly modules?: readonly string[];
+  readonly generatedEntrypoint?: boolean;
   readonly dataPlane?: WorkerdDataPlane;
   readonly events?: WorkerdEventGate;
 }
@@ -306,6 +319,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): WorkerdRun
           ...(site.modules && site.modules.length > 0
             ? { modules: validModules(site.modules) }
             : {}),
+          ...(site.generatedEntrypoint ? { generatedEntrypoint: true } : {}),
           ...(site.dataPlane ? { dataPlane: validDataPlane(site.dataPlane) } : {}),
           ...(site.events ? { events: validEventGate(site.events) } : {}),
         }),
@@ -642,6 +656,18 @@ interface Published {
   readonly manifest: Manifest;
 }
 
+/**
+ * Whether this publication runs through a generated entrypoint.
+ *
+ * `dataPlane` and `events` are read as well as the flag itself, so a manifest
+ * already on disk from before the flag existed keeps the configuration it had.
+ */
+function generatedEntrypoint(entry: Published): boolean {
+  return Boolean(
+    entry.manifest.generatedEntrypoint || entry.manifest.dataPlane || entry.manifest.events,
+  );
+}
+
 async function readPublished(scriptsRoot: string): Promise<readonly Published[]> {
   const entries = await readdir(scriptsRoot, { withFileTypes: true }).catch(() => []);
   const published: Published[] = [];
@@ -721,10 +747,9 @@ function renderConfig(published: readonly Published[], port: number, scriptsRoot
         .join(", ");
       // Rendered only for a script published through a generated entrypoint, so
       // a script that binds no data plane produces the bytes it always did.
-      const flagList =
-        entry.manifest.dataPlane || entry.manifest.events
-          ? `\n      compatibilityFlags = [ ${DATA_PLANE_COMPATIBILITY_FLAGS.map((flag) => capnpText(flag)).join(", ")} ],`
-          : "";
+      const flagList = generatedEntrypoint(entry)
+        ? `\n      compatibilityFlags = [ ${DATA_PLANE_COMPATIBILITY_FLAGS.map((flag) => capnpText(flag)).join(", ")} ],`
+        : "";
       return `  ( name = "${entry.name}",
     worker = (
       modules = [ ${moduleList} ],${bindingList}
@@ -831,7 +856,7 @@ function renderConfig(published: readonly Published[], port: number, scriptsRoot
     // that bind a data plane: the entrypoint answers the readiness question and
     // a script this Host cannot ask is one it publishes without checking.
     ...published
-      .filter((entry) => entry.manifest.dataPlane || entry.manifest.events)
+      .filter((entry) => generatedEntrypoint(entry))
       .map((entry) => ({ hostname: internalHostname(entry.name), service: entry.name })),
     ...published
       .filter((entry) => entry.manifest.events)

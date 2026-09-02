@@ -2543,7 +2543,6 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
   const bindingInputs = dataArray(fields.bindings, "bindings");
   const bindings: SelfhostWorkerBindingDescriptor[] = [];
   const publicNames = new Set<string>();
-  let dataBindings = 0;
   for (const bindingInput of bindingInputs) {
     const binding = dataProperties(bindingInput, "bindings");
     if (Object.hasOwn(binding, "kind")) {
@@ -2552,7 +2551,6 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
         invalid("bindings");
       }
       validatePublicName(binding.publicName, publicNames, false);
-      dataBindings += 1;
       bindings.push({
         kind: binding.kind as SelfhostWorkerDataBindingDescriptor["kind"],
         publicName: binding.publicName as string,
@@ -2591,11 +2589,12 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
       services.push(name);
     }
   }
-  // The wrapper exists to carry a facade or to receive an event. Generating one
-  // for a version that needs neither would replace a publication that needs no
-  // entrypoint with one that does, and the byte-identical guarantee for those
-  // versions with it.
-  if (dataBindings === 0 && !events) invalid("bindings");
+  // A wrapper with no data binding and no event is not a degenerate wrapper: it
+  // is the load probe. The entrypoint imports the tenant module and answers
+  // whether it loaded, and a publication that carried no facade used to skip
+  // that entirely — so an unloadable module deployed, reported Ready, and
+  // failed with a 500 on the first real request instead. Carrying a facade is
+  // therefore no longer a precondition for generating one.
   return {
     originalMainModule: fields.originalMainModule,
     declaredHandlers,

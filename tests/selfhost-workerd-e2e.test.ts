@@ -323,16 +323,28 @@ async function boot(
     suffixes: ["localhost"],
     artifacts: {
       async manifest(_tenant, digest) {
-        return digest === "sha256:worker"
+        if (digest === "sha256:worker") {
+          return {
+            kind: "WorkerBundle",
+            mainModule: "index.js",
+            modules: [{ name: "index.js", digest: "sha256:index.js" }],
+          };
+        }
+        // A second bundle whose module cannot load at all, used to prove the
+        // load probe runs for a Worker that binds nothing.
+        return digest === "sha256:unloadable"
           ? {
               kind: "WorkerBundle",
-              mainModule: "index.js",
-              modules: [{ name: "index.js", digest: "sha256:index.js" }],
+              mainModule: "unloadable.js",
+              modules: [{ name: "unloadable.js", digest: "sha256:unloadable.js" }],
             }
           : null;
       },
       async blob(digest) {
-        return digest === "sha256:index.js" ? new TextEncoder().encode(tenantModule) : null;
+        if (digest === "sha256:index.js") return new TextEncoder().encode(tenantModule);
+        return digest === "sha256:unloadable.js"
+          ? new TextEncoder().encode(UNLOADABLE_MODULE)
+          : null;
       },
     },
   });
@@ -421,6 +433,16 @@ async function boot(
 
 const ask = (origin: string, path: string) =>
   fetch(`${origin}${path}`, { headers: { host: HOSTNAME } });
+
+/** A module workerd refuses to load, for exactly the reason it names. */
+const UNLOADABLE_MODULE = `import "node:path";
+
+export default {
+  async fetch() {
+    return new Response("unreachable");
+  },
+};
+`;
 
 /** Materializes one more Version of the fixture Worker and makes it the live one. */
 async function publishVersion(
@@ -595,6 +617,71 @@ test.skipIf(WORKERD === null)(
       through: { rows: [], rowsWritten: 0 },
       after: { rows: [{ n: 1 }], rowsWritten: 0 },
     });
+  },
+  30_000,
+);
+
+/**
+ * The load probe runs for every publication, including the simplest one.
+ *
+ * The generated entrypoint is what imports the tenant module and answers
+ * whether it loaded, and it used to be written only for a Version that bound a
+ * facade or received an event. A Worker with neither was therefore published
+ * without being asked: an unloadable module deployed, reported `Ready=True`,
+ * and failed with a 500 on the first real request, while only workerd's own
+ * stderr said `No such module`.
+ */
+test.skipIf(WORKERD === null)(
+  "publishing a Version with no bindings whose module cannot load is refused",
+  async () => {
+    const { local } = await boot(TENANT_MODULE, true);
+    const version = await local.apply({
+      operationId: "op_version_unloadable",
+      offering: offering("WorkerVersion"),
+      identity: identity("hello-unloadable"),
+      spec: {
+        bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "unloadable" },
+        handlers: ["fetch"],
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", "hello"),
+        relation("/bundle", "WorkerBundle", "unloadable", {
+          manifestDigest: "sha256:unloadable",
+        }),
+      ],
+    });
+    expect(version.phase).toBe("succeeded");
+
+    const deployment = await local.apply({
+      operationId: "op_deploy_unloadable",
+      offering: offering("WorkerDeployment"),
+      identity: identity("hello-live"),
+      spec: {
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+        versions: [
+          {
+            workerVersion: {
+              apiVersion: EDGE_API,
+              kind: "WorkerVersion",
+              name: "hello-unloadable",
+            },
+            weight: 10_000,
+          },
+        ],
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", "hello"),
+        relation("/versions/0/workerVersion", "WorkerVersion", "hello-unloadable"),
+      ],
+    });
+    expect(deployment).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", retryable: false },
+    });
+    if (deployment.phase !== "failed") throw new Error("the unloadable Version was published");
+    expect(deployment.failure.message).toContain("the Worker Version's module failed to load");
+    expect(deployment.failure.message).toContain("node:path");
   },
   30_000,
 );
@@ -1008,9 +1095,12 @@ const ASSETS_EVENT_MODULE = `export default {
 async function bootEventsOnly(input: {
   readonly module: string;
   readonly handlers: readonly string[];
+  /** Returns the deployment ticket instead of asserting it succeeded. */
+  readonly deploymentTicket?: boolean;
 }): Promise<{
   readonly origin: string;
   readonly local: ReturnType<typeof createSelfhostProvider>;
+  readonly deployment?: Awaited<ReturnType<ReturnType<typeof createSelfhostProvider>["apply"]>>;
 }> {
   const reserved = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
   const workerdPort = Number(reserved.port);
@@ -1104,28 +1194,26 @@ async function bootEventsOnly(input: {
     ).phase,
   ).toBe("succeeded");
 
-  expect(
-    (
-      await local.apply({
-        operationId: "op_deploy",
-        offering: offering("WorkerDeployment"),
-        identity: identity("hello-live"),
-        spec: {
-          worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
-          versions: [
-            {
-              workerVersion: { apiVersion: EDGE_API, kind: "WorkerVersion", name: "hello-v1" },
-              weight: 10_000,
-            },
-          ],
+  const deployment = await local.apply({
+    operationId: "op_deploy",
+    offering: offering("WorkerDeployment"),
+    identity: identity("hello-live"),
+    spec: {
+      worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+      versions: [
+        {
+          workerVersion: { apiVersion: EDGE_API, kind: "WorkerVersion", name: "hello-v1" },
+          weight: 10_000,
         },
-        relations: [
-          relation("/worker", "ModuleWorker", "hello"),
-          relation("/versions/0/workerVersion", "WorkerVersion", "hello-v1"),
-        ],
-      })
-    ).phase,
-  ).toBe("succeeded");
+      ],
+    },
+    relations: [
+      relation("/worker", "ModuleWorker", "hello"),
+      relation("/versions/0/workerVersion", "WorkerVersion", "hello-v1"),
+    ],
+  });
+  if (input.deploymentTicket) return { origin, local, deployment };
+  expect(deployment.phase).toBe("succeeded");
 
   expect(
     (
@@ -1210,35 +1298,20 @@ test.skipIf(WORKERD === null)(
 );
 
 test.skipIf(WORKERD === null)(
-  "attaching a Consumer to a Version that declares queue and never exports it is refused",
+  "publishing a Version that declares queue and never exports it is refused",
   async () => {
-    const { local } = await bootEventsOnly({
+    const { deployment } = await bootEventsOnly({
       module: ASSETS_EVENT_MODULE,
       handlers: ["fetch", "queue"],
+      deploymentTicket: true,
     });
-    // The fixture exports `fetch` and `scheduled`. Until the internal route was
-    // rendered for an events-only script this attachment succeeded, and every
-    // batch it enabled 500ed straight into the dead-letter queue.
-    expect(
-      await local.apply({
-        operationId: "op_consumer",
-        offering: offering("QueueConsumer"),
-        identity: identity("hello-consumer"),
-        spec: {
-          worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
-          queue: { apiVersion: EDGE_API, kind: "AtLeastOnceQueue", name: "delivery" },
-          maxBatchSize: 10,
-          maxBatchTimeoutSeconds: 0,
-          maxRetries: 3,
-          retryDelaySeconds: 60,
-          maxConcurrency: 1,
-        },
-        relations: [
-          relation("/worker", "ModuleWorker", "hello"),
-          queueRelation("/queue", "delivery", QUEUE_ID),
-        ],
-      }),
-    ).toMatchObject({
+    // The fixture exports `fetch` and `scheduled`. This used to publish, and
+    // only the Consumer attachment — the thing that first asked for a generated
+    // entrypoint — refused it; before the internal route was rendered for an
+    // events-only script even that succeeded, and every batch it enabled 500ed
+    // straight into the dead-letter queue. Now every publication is probed, so
+    // the declaration is checked where it is made.
+    expect(deployment).toMatchObject({
       phase: "failed",
       failure: {
         code: "invalid_spec",
