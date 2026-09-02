@@ -466,14 +466,12 @@ function reservationActivationOperation(summary: string) {
     },
     responses: {
       "200": reservationResponse("Updated reservation projection"),
-      "400": { description: "Malformed or open request" },
-      "401": { description: "Organization API key required" },
-      "403": { description: "The key lacks resources:write" },
-      "404": { description: "Reservation not found" },
-      "409": {
-        description: "Endpoint identity, relation, readiness, origin, or placement conflict",
-      },
-      "503": { description: "Reservation or Resource authority unavailable" },
+      "400": errorResponse("Malformed or open request"),
+      "401": errorResponse("Organization API key required"),
+      "403": errorResponse("The key lacks resources:write"),
+      "404": errorResponse("Reservation not found"),
+      "409": errorResponse("Endpoint identity, relation, readiness, origin, or placement conflict"),
+      "503": errorResponse("Reservation or Resource authority unavailable"),
     },
   } as const;
 }
@@ -579,7 +577,7 @@ export const openApiDocument = {
       Error: {
         type: "object",
         description:
-          "The one wire error envelope. Every failure on every lane of this Host answers with exactly these members.",
+          "The wire error envelope of the stable Takoform Host lane and the /v1/* control lane. Every response documented against this schema carries exactly these members. The OpenAI-compatible /v1/ai/* lane answers that API's own error shape and is documented separately.",
         required: ["error"],
         additionalProperties: false,
         properties: {

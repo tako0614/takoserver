@@ -26,7 +26,7 @@
     "schemas": {
       "Error": {
         "type": "object",
-        "description": "The one wire error envelope. Every failure on every lane of this Host answers with exactly these members.",
+        "description": "The wire error envelope of the stable Takoform Host lane and the /v1/* control lane. Every response documented against this schema carries exactly these members. The OpenAI-compatible /v1/ai/* lane answers that API's own error shape and is documented separately.",
         "required": [
           "error"
         ],
@@ -940,22 +940,64 @@
             }
           },
           "400": {
-            "description": "Malformed or open request"
+            "description": "Malformed or open request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           },
           "401": {
-            "description": "Organization API key required"
+            "description": "Organization API key required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           },
           "403": {
-            "description": "The key lacks resources:write"
+            "description": "The key lacks resources:write",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           },
           "404": {
-            "description": "Reservation not found"
+            "description": "Reservation not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           },
           "409": {
-            "description": "Endpoint identity, relation, readiness, origin, or placement conflict"
+            "description": "Endpoint identity, relation, readiness, origin, or placement conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Reservation or Resource authority unavailable"
+            "description": "Reservation or Resource authority unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           }
         }
       },
@@ -995,22 +1037,64 @@
             }
           },
           "400": {
-            "description": "Malformed or open request"
+            "description": "Malformed or open request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           },
           "401": {
-            "description": "Organization API key required"
+            "description": "Organization API key required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           },
           "403": {
-            "description": "The key lacks resources:write"
+            "description": "The key lacks resources:write",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           },
           "404": {
-            "description": "Reservation not found"
+            "description": "Reservation not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           },
           "409": {
-            "description": "Endpoint identity, relation, readiness, origin, or placement conflict"
+            "description": "Endpoint identity, relation, readiness, origin, or placement conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Reservation or Resource authority unavailable"
+            "description": "Reservation or Resource authority unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           }
         }
       }
