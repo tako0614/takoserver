@@ -218,3 +218,24 @@ record, not a fence.
   v2 a preparation has no reservation, so the old coupling is not restorable —
   the reservation authority would have to fence on the Host operation instead,
   which is a separate decision and is not made here.
+
+## Amendment — 2026-09-02: "never projected" needed a flag to be true
+
+"Never logged, never projected" says that no sealed value reaches a projection,
+an Output, a native id, the ledger, or a log line. On the managed
+(Workers-for-Platforms) backend that was not enough. A sensitive binding is
+uploaded as a `secret_text` binding on the tenant's own Worker, and the runtime
+hands every binding of a script to every module that script runs — so
+`import { env } from "cloudflare:workers"` returned the value whatever the
+wrapper chose to project. That is not a leak *across* tenants: the value belongs
+to the Worker it was installed on, and the tenant's handler already receives it
+under the declared name. It did mean the wrapper's projection was a convention
+rather than a boundary, and that anything else on the raw environment — the
+internal SQLite Durable Object namespace, an internal bucket handle — came with
+it.
+
+Managed tenant user Workers are now uploaded with `disallow_importable_env`, and
+the release readback refuses a release whose settings do not carry it. See
+[ADR 0007](0007-objectbucket-joins-the-implementation-catalog.md)'s managed-lane
+amendment for what that closes and what remains. Nothing about this contract's
+wire shape, sealing, erase-before-mutation, or one-shot settlement changes.
