@@ -224,14 +224,75 @@ describe("Hosted sponsorship owner API", () => {
         ttlSeconds: 300,
       },
     ]);
-    expect(
-      await call(route, "POST", `${base}/takoform-run-credentials`, {
-        runRef: "run_legacy_materialization",
-        spaceRef: "tsp_capsule_yurucommu",
-        expiresInSeconds: 300,
-        runtimeMaterialization: { kind: "retired" },
-      }),
-    ).toMatchObject({ status: 400 });
+    // The sponsor's exact request body, copied from
+    // `takosumi-hosted/src/adapters/takoserver-contract.ts`. This route's
+    // exact-key parser refused the whole request because of the last key, so
+    // the private seam that mints a run credential could not be used at all.
+    const sponsored = await call(route, "POST", `${base}/takoform-run-credentials`, {
+      runRef: "run_hosted_1",
+      spaceRef: "tsp_capsule_yurucommu",
+      expiresInSeconds: 300,
+      runtimeMaterialization: {
+        contract: "takosumi.runtime-bindings/v1",
+        workspaceId: "wks_01",
+        capsuleId: "cap_01",
+        runId: "run_hosted_1",
+        phase: "apply",
+      },
+    });
+    expect(sponsored.status).toBe(201);
+    // Validated and then carried nowhere: the credential names an
+    // organization, a tenant, a Space and a run, and the sponsor's own run
+    // identity is not an authority this Host grants anything for.
+    expect(issued[1]).toEqual({
+      organizationId: "org_legal",
+      tenantRef: "tenant_opaque",
+      spaceRef: "tsp_capsule_yurucommu",
+      runRef: "run_hosted_1",
+      ttlSeconds: 300,
+    });
+
+    // Every other shape is still refused, exactly as every other field is.
+    for (const runtimeMaterialization of [
+      { kind: "retired" },
+      {
+        contract: "takosumi.runtime-bindings/v2",
+        workspaceId: "wks_01",
+        capsuleId: "cap_01",
+        runId: "run_x",
+        phase: "apply",
+      },
+      {
+        contract: "takosumi.runtime-bindings/v1",
+        workspaceId: "wks_01",
+        capsuleId: "cap_01",
+        runId: "run_x",
+        phase: "refresh",
+      },
+      {
+        contract: "takosumi.runtime-bindings/v1",
+        workspaceId: "wks_01",
+        capsuleId: "cap_01",
+        runId: "run_x",
+        phase: "apply",
+        extra: "no",
+      },
+      {
+        contract: "takosumi.runtime-bindings/v1",
+        workspaceId: "wks_01",
+        capsuleId: "cap_01",
+        phase: "apply",
+      },
+    ]) {
+      expect(
+        await call(route, "POST", `${base}/takoform-run-credentials`, {
+          runRef: "run_bad_materialization",
+          spaceRef: "tsp_capsule_yurucommu",
+          expiresInSeconds: 300,
+          runtimeMaterialization,
+        }),
+      ).toMatchObject({ status: 400 });
+    }
     expect(
       await call(route, "POST", `${base}/takoform-run-credentials`, {
         runRef: "run_host_2",
@@ -245,7 +306,7 @@ describe("Hosted sponsorship owner API", () => {
         expiresInSeconds: 300,
       }),
     ).toMatchObject({ status: 400 });
-    expect(issued).toHaveLength(1);
+    expect(issued).toHaveLength(2);
   });
 
   test("authorizes only an active WorkerEndpoint in the exact opaque Capsule space", async () => {

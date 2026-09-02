@@ -2,6 +2,7 @@ import { and, eq } from "drizzle-orm";
 import type { ResourceInventory } from "./control.ts";
 import { createDatabase } from "./database.ts";
 import { takoformResourceDeployments, takoformResources } from "./database-schema.ts";
+import { errorEnvelopeResponse } from "./error-envelope.ts";
 import type { Ledger } from "./ledger.ts";
 import type { Clock, Sql } from "./ports.ts";
 import type { TakoformHost } from "./takoform/types.ts";
@@ -74,14 +75,22 @@ export function createSponsorshipRoutes(
         const body = await jsonObject(
           request,
           ["runRef", "spaceRef", "expiresInSeconds"],
-          ["workerEndpointOriginReservationId"],
+          ["workerEndpointOriginReservationId", "runtimeMaterialization"],
         );
+        // Validated for its exact shape and then deliberately not carried
+        // anywhere: see `runtimeMaterialization`.
+        if (body.runtimeMaterialization !== undefined) {
+          runtimeMaterialization(body.runtimeMaterialization);
+        }
         const issued = await options.tokens.issueTakoformTenantRunToken({
           organizationId,
           tenantRef,
           spaceRef: text(body.spaceRef, 256),
           runRef: text(body.runRef, 256),
           ttlSeconds: boundedTtl(body.expiresInSeconds),
+          // A supplied reservation stays the sponsor's authority for the
+          // origin. It is optional because an installation that derives its own
+          // endpoint address mints one for a caller that has none.
           ...(body.workerEndpointOriginReservationId === undefined
             ? {}
             : {
@@ -406,6 +415,41 @@ async function jsonObject(
   return object;
 }
 
+/**
+ * The sponsor's value-free statement of which run is asking.
+ *
+ * The Hosted sponsor sends this key on every run-credential request, and this
+ * route's exact-key parser refused the whole request because of it — so the
+ * private seam that mints a run credential could not be used at all. It is
+ * accepted here under the same exact-key discipline as every other field: one
+ * closed contract string, three bounded references, one phase. No value, no
+ * secret, and no field this Host does not understand.
+ *
+ * Accepting it is not the retired hosted materialization seam coming back.
+ * That seam was a service binding this Host called Hosted through, retired by
+ * its own reviewed sequence, and nothing here reinstates it: the request is
+ * validated and then carried nowhere. It does not reach the credential, the
+ * token claims, the ledger, or a provider.
+ * `tests/independent-host-boundary.test.ts` still refuses the name everywhere
+ * except this one seam that receives it.
+ */
+function runtimeMaterialization(value: unknown): void {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  if (keys.join("\0") !== "capsuleId\0contract\0phase\0runId\0workspaceId") throw new Error();
+  const phase = record.phase;
+  if (
+    record.contract !== "takosumi.runtime-bindings/v1" ||
+    (phase !== "plan" && phase !== "apply" && phase !== "destroy")
+  ) {
+    throw new Error();
+  }
+  text(record.workspaceId, 256);
+  text(record.capsuleId, 256);
+  text(record.runId, 256);
+}
+
 function segment(value: string): string {
   const decoded = decodeURIComponent(value);
   if (!decoded || decoded.length > 256 || decoded.trim() !== decoded || decoded.includes("/")) {
@@ -435,5 +479,5 @@ function nullableInstant(value: unknown): string | null {
 }
 
 function failure(code: string, status: number): Response {
-  return Response.json({ error: { code } }, { status });
+  return errorEnvelopeResponse(code, status);
 }

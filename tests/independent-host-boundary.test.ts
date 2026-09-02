@@ -89,12 +89,31 @@ describe("independent Takoserver Host boundary", () => {
       ["Takosumi", "RuntimeBindingMaterializerEntrypoint"].join(""),
       ["Takosumi", "HostRuntimeMaterializerEntrypoint"].join(""),
     ];
+    /**
+     * One retired name still arrives on the wire.
+     *
+     * The Hosted sponsor sends `runtimeMaterialization` on every private
+     * run-credential request, and this Host's exact-key parser refused the
+     * whole request because of it — so the seam that mints a run credential
+     * could not be used at all. Accepting and validating that key is not the
+     * retired seam: that was a service binding this Host called Hosted
+     * through, and the value is carried nowhere — not
+     * into the credential, the token claims, the ledger, or a provider. The
+     * allowance is exactly the one file that receives the request. Every other
+     * file, and every other retired name, still fails here.
+     */
+    const allowed = new Map<string, ReadonlySet<string>>([
+      ["src/sponsorship-api.ts", new Set([["runtime", "Materialization"].join("")])],
+    ]);
     const retained: string[] = [];
     for (const root of [join(repository, "src"), join(repository, "scripts")]) {
       for (const path of sourceFiles(root)) {
         const source = readFileSync(path, "utf8");
+        const relativePath = relative(repository, path);
         for (const name of retiredNames) {
-          if (source.includes(name)) retained.push(`${relative(repository, path)}: ${name}`);
+          if (!source.includes(name)) continue;
+          if (allowed.get(relativePath)?.has(name)) continue;
+          retained.push(`${relativePath}: ${name}`);
         }
       }
     }
