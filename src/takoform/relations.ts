@@ -672,21 +672,48 @@ export async function declaredResourceClaims(input: {
       throw new TakoformHostError("invalid_argument", 400);
     }
     claims.push({
-      key: `exclusive_${await canonicalDigest({
+      key: await exclusiveRelationClaimKey({
         tenantId: input.tenantId,
         space: input.space,
-        form: {
-          apiVersion: input.form.identity.formRef.apiVersion,
-          kind: input.form.identity.formRef.kind,
-        },
+        apiVersion: input.form.identity.formRef.apiVersion,
+        kind: input.form.identity.formRef.kind,
         reference: constraint.reference,
         targetUid: relation.targetUid,
         keyedBy: constraint.keyedBy ?? null,
         keyedValue,
-      })}`,
+      }),
     });
   }
   return claims.sort((left, right) => left.key.localeCompare(right.key));
+}
+
+/**
+ * The one spelling of the canonical key an `exclusive` constraint reserves.
+ *
+ * A reader that only wants to know whether somebody is *already* creating the
+ * one resource this constraint admits needs the identical key the writer
+ * reserves, so both go through here rather than through two copies of the same
+ * digest input.
+ */
+export async function exclusiveRelationClaimKey(input: {
+  readonly tenantId: string;
+  readonly space: string;
+  readonly apiVersion: string;
+  readonly kind: string;
+  readonly reference: string;
+  readonly targetUid: string;
+  readonly keyedBy?: string | null;
+  readonly keyedValue?: unknown;
+}): Promise<string> {
+  return `exclusive_${await canonicalDigest({
+    tenantId: input.tenantId,
+    space: input.space,
+    form: { apiVersion: input.apiVersion, kind: input.kind },
+    reference: input.reference,
+    targetUid: input.targetUid,
+    keyedBy: input.keyedBy ?? null,
+    keyedValue: input.keyedValue ?? null,
+  })}`;
 }
 
 async function claimConstraintKey(input: {

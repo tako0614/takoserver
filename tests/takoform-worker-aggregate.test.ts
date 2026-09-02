@@ -1,10 +1,39 @@
 import { expect, test } from "bun:test";
 import type { TakoformStoredRelation } from "../src/takoform/relations.ts";
+import type { ResourceDeletionTombstone } from "../src/takoform/store.ts";
 import type { TakoformStoredResource } from "../src/takoform/types.ts";
 import {
+  type TakoformWaveSettlement,
   validateWorkerAggregate,
+  validateWorkerDeploymentRemoval,
   workerServiceCondition,
 } from "../src/takoform/worker-aggregate.ts";
+
+/** No command in this wave holds the deployment claim of any Worker. */
+const noClaims = {
+  async resourceClaimHolder() {
+    return null;
+  },
+  async committedResourceClaimHolder() {
+    return null;
+  },
+};
+
+/**
+ * A wave whose clock is its own, so a refusal these tests want to read is
+ * reached in microseconds instead of after the production idle budget.
+ */
+function testWave(overrides: Partial<TakoformWaveSettlement> = {}): TakoformWaveSettlement {
+  let elapsed = 0;
+  return {
+    now: () => (elapsed += 10),
+    sleep: async () => {},
+    pollMilliseconds: 1,
+    idleMilliseconds: 100,
+    ceilingMilliseconds: 1_000,
+    ...overrides,
+  };
+}
 
 const formRef = {
   apiVersion: "edge.forms.takoform.com/v1beta1",
@@ -61,7 +90,7 @@ test("a ModuleWorker is Provisioning until a deployment serves fetch", async () 
   expect(serving).toMatchObject({ status: "True", reason: "Available" });
 });
 
-test("an inward activation is rejected before mutation when no deployment serves it", async () => {
+test("an inward activation with no WorkerDeployment at all names the missing deployment", async () => {
   const workerRelation: TakoformStoredRelation = {
     pointer: "/worker",
     relation: "/worker",
@@ -89,6 +118,7 @@ test("an inward activation is rejected before mutation when no deployment serves
       },
       spec: { hostname: "domain.portable-conformance.invalid" },
       relations: [workerRelation],
+      wave: testWave(),
       store: {
         async hostnameClaims() {
           return [];
@@ -105,9 +135,14 @@ test("an inward activation is rejected before mutation when no deployment serves
         async readRelations() {
           return [];
         },
+        ...noClaims,
       },
     }),
-  ).rejects.toMatchObject({ code: "unsupported_capability", status: 422 });
+  ).rejects.toMatchObject({
+    code: "invalid_argument",
+    status: 400,
+    publicMessage: expect.stringContaining("has no WorkerDeployment"),
+  });
 });
 
 test("an inbound service binding is rejected until its target worker serves fetch", async () => {
@@ -134,6 +169,7 @@ test("an inbound service binding is rejected until its target worker serves fetc
           targetFormRef: worker.form.formRef,
         },
       ],
+      wave: testWave(),
       store: {
         async hostnameClaims() {
           return [];
@@ -150,9 +186,14 @@ test("an inbound service binding is rejected until its target worker serves fetc
         async readRelations() {
           return [];
         },
+        ...noClaims,
       },
     }),
-  ).rejects.toMatchObject({ code: "unsupported_capability", status: 422 });
+  ).rejects.toMatchObject({
+    code: "invalid_argument",
+    status: 400,
+    publicMessage: expect.stringContaining("has no WorkerDeployment"),
+  });
 });
 
 test("WorkerVersion vars, sensitive names, and bindings share one namespace", async () => {
@@ -189,6 +230,7 @@ test("WorkerVersion vars, sensitive names, and bindings share one namespace", as
         async readRelations() {
           return [];
         },
+        ...noClaims,
       },
     }),
   ).rejects.toMatchObject({ code: "invalid_argument", status: 400 });
@@ -224,6 +266,7 @@ test("a WorkerDeployment requires exactly 10000 basis points", async () => {
         async readRelations() {
           return [];
         },
+        ...noClaims,
       },
     }),
   ).rejects.toMatchObject({ code: "invalid_argument", status: 400 });
@@ -283,6 +326,7 @@ test("a queue incarnation has at most one consumer", async () => {
         async readRelations() {
           return [];
         },
+        ...noClaims,
       },
     }),
   ).rejects.toMatchObject({ code: "invalid_argument", status: 400 });
@@ -347,6 +391,7 @@ test("a QueueConsumer cannot close a dead-letter cycle", async () => {
         async readRelations() {
           return [];
         },
+        ...noClaims,
       },
     }),
   ).rejects.toMatchObject({ code: "invalid_argument", status: 400 });
@@ -404,6 +449,7 @@ test("a custom-domain hostname is unique across every space of one tenant", asyn
         async readRelations() {
           return [];
         },
+        ...noClaims,
       },
     }),
   ).rejects.toMatchObject({
@@ -412,6 +458,259 @@ test("a custom-domain hostname is unique across every space of one tenant", asyn
     details: { holder: "first-domain" },
   });
 });
+
+test("an inward activation waits for the WorkerDeployment its own apply wave is creating", async () => {
+  const workerRelation: TakoformStoredRelation = {
+    ...versionRelation,
+    pointer: "/worker",
+    relation: "/worker",
+    targetKind: "ModuleWorker",
+    targetName: worker.metadata.name,
+    targetUid: worker.metadata.uid,
+  };
+  let landed = false;
+  await validateWorkerAggregate({
+    tenantId: "tenant-a",
+    space: "conformance",
+    resourceName: "endpoint",
+    form: {
+      identity: { formRef: { ...formRef, kind: "WorkerEndpoint" } },
+      role: "attachment",
+      desiredSchema: {},
+      operations: ["create", "read", "delete"],
+    },
+    spec: {},
+    relations: [workerRelation],
+    wave: testWave(),
+    store: {
+      async hostnameClaims() {
+        return [];
+      },
+      async queuePathReaches() {
+        return false;
+      },
+      async resourcesByRelation(input) {
+        if (input.sourceKind !== "WorkerDeployment" || !landed) return [];
+        return [{ resource: deployment, relations: [versionRelation] }];
+      },
+      async readResource() {
+        return version;
+      },
+      async readRelations() {
+        return [];
+      },
+      // The deployment's own create holds the reserved `exclusive` claim until
+      // it commits, which is exactly "somebody in this wave is making this
+      // Worker serve"; the third sighting is the commit.
+      async resourceClaimHolder() {
+        return {
+          tenantId: "tenant-a",
+          holderSpace: "conformance",
+          holderApiVersion: formRef.apiVersion,
+          holderKind: "WorkerDeployment",
+          holderName: "deployment",
+          holderUid: "deployment-uid",
+        };
+      },
+      async committedResourceClaimHolder() {
+        landed = true;
+        return null;
+      },
+    },
+  });
+  expect(landed).toBe(true);
+});
+
+test("an inward activation whose deployment has not become Ready is refused retryably", async () => {
+  const workerRelation: TakoformStoredRelation = {
+    ...versionRelation,
+    pointer: "/worker",
+    relation: "/worker",
+    targetKind: "ModuleWorker",
+    targetName: worker.metadata.name,
+    targetUid: worker.metadata.uid,
+  };
+  await expect(
+    validateWorkerAggregate({
+      tenantId: "tenant-a",
+      space: "conformance",
+      resourceName: "trigger",
+      form: {
+        identity: { formRef: { ...formRef, kind: "WorkerCronTrigger" } },
+        role: "attachment",
+        desiredSchema: {},
+        operations: ["create", "read", "delete"],
+      },
+      spec: { cron: "*/5 * * * *" },
+      relations: [workerRelation],
+      wave: testWave(),
+      store: {
+        async hostnameClaims() {
+          return [];
+        },
+        async queuePathReaches() {
+          return false;
+        },
+        async resourcesByRelation(input) {
+          return input.sourceKind === "WorkerDeployment"
+            ? [{ resource: deployment, relations: [versionRelation] }]
+            : [];
+        },
+        // The deployment exists but the Version it selects is not there yet.
+        async readResource() {
+          return null;
+        },
+        async readRelations() {
+          return [];
+        },
+        ...noClaims,
+      },
+    }),
+  ).rejects.toMatchObject({
+    code: "resource_busy",
+    status: 409,
+    publicMessage: expect.stringContaining("no serving deployment yet"),
+  });
+});
+
+test("a WorkerDeployment delete waits out a holder whose own delete is in flight", async () => {
+  const workerRelation: TakoformStoredRelation = {
+    ...versionRelation,
+    pointer: "/worker",
+    relation: "/worker",
+    targetKind: "ModuleWorker",
+    targetName: worker.metadata.name,
+    targetUid: worker.metadata.uid,
+  };
+  const endpoint = resource("WorkerEndpoint", "endpoint", "endpoint-uid", {});
+  let reads = 0;
+  await validateWorkerDeploymentRemoval({
+    tenantId: "tenant-a",
+    space: "conformance",
+    form: {
+      identity: { formRef: { ...formRef, kind: "WorkerDeployment" } },
+      role: "deployment",
+      desiredSchema: {},
+      operations: ["create", "read", "update", "delete"],
+    },
+    relations: [workerRelation],
+    wave: testWave(),
+    store: {
+      async resourcesByRelation(input) {
+        if (input.sourceKind !== "WorkerEndpoint" || reads > 1) return [];
+        return [{ resource: endpoint, relations: [workerRelation] }];
+      },
+      async readResourceDeletion() {
+        reads += 1;
+        return tombstone("endpoint-uid", "pending");
+      },
+    },
+  });
+  expect(reads).toBeGreaterThan(0);
+});
+
+test("a WorkerDeployment delete still refuses a holder nobody is deleting", async () => {
+  const workerRelation: TakoformStoredRelation = {
+    ...versionRelation,
+    pointer: "/worker",
+    relation: "/worker",
+    targetKind: "ModuleWorker",
+    targetName: worker.metadata.name,
+    targetUid: worker.metadata.uid,
+  };
+  const endpoint = resource("WorkerEndpoint", "endpoint", "endpoint-uid", {});
+  await expect(
+    validateWorkerDeploymentRemoval({
+      tenantId: "tenant-a",
+      space: "conformance",
+      form: {
+        identity: { formRef: { ...formRef, kind: "WorkerDeployment" } },
+        role: "deployment",
+        desiredSchema: {},
+        operations: ["create", "read", "update", "delete"],
+      },
+      relations: [workerRelation],
+      wave: testWave(),
+      store: {
+        async resourcesByRelation(input) {
+          return input.sourceKind === "WorkerEndpoint"
+            ? [{ resource: endpoint, relations: [workerRelation] }]
+            : [];
+        },
+        async readResourceDeletion() {
+          return tombstone("endpoint-uid", "live");
+        },
+      },
+    }),
+  ).rejects.toMatchObject({
+    code: "dependency_in_use",
+    status: 409,
+    publicMessage: expect.stringContaining("WorkerEndpoint endpoint"),
+  });
+});
+
+test("a WorkerDeployment delete whose holder never finishes leaving is refused retryably", async () => {
+  const workerRelation: TakoformStoredRelation = {
+    ...versionRelation,
+    pointer: "/worker",
+    relation: "/worker",
+    targetKind: "ModuleWorker",
+    targetName: worker.metadata.name,
+    targetUid: worker.metadata.uid,
+  };
+  const endpoint = resource("WorkerEndpoint", "endpoint", "endpoint-uid", {});
+  await expect(
+    validateWorkerDeploymentRemoval({
+      tenantId: "tenant-a",
+      space: "conformance",
+      form: {
+        identity: { formRef: { ...formRef, kind: "WorkerDeployment" } },
+        role: "deployment",
+        desiredSchema: {},
+        operations: ["create", "read", "update", "delete"],
+      },
+      relations: [workerRelation],
+      wave: testWave(),
+      store: {
+        async resourcesByRelation(input) {
+          return input.sourceKind === "WorkerEndpoint"
+            ? [{ resource: endpoint, relations: [workerRelation] }]
+            : [];
+        },
+        async readResourceDeletion() {
+          return tombstone("endpoint-uid", "pending");
+        },
+      },
+    }),
+  ).rejects.toMatchObject({
+    code: "resource_busy",
+    status: 409,
+    publicMessage: expect.stringContaining("WorkerEndpoint endpoint"),
+  });
+});
+
+function tombstone(
+  resourceUid: string,
+  state: ResourceDeletionTombstone["state"],
+): ResourceDeletionTombstone {
+  return {
+    tenantId: "tenant-a",
+    resourceUid,
+    address: {
+      tenantId: "tenant-a",
+      space: "conformance",
+      apiVersion: formRef.apiVersion,
+      kind: "WorkerEndpoint",
+      name: "endpoint",
+    },
+    formRef: { ...formRef, kind: "WorkerEndpoint" },
+    state,
+    closureFence: 1,
+    effects: [],
+    createdAt: "2026-09-02T00:00:00.000Z",
+    updatedAt: "2026-09-02T00:00:00.000Z",
+  };
+}
 
 function resource(
   kind: string,

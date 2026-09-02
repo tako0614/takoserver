@@ -1,6 +1,6 @@
 import type { JsonObject } from "../ports.ts";
 import { isEdgeFormsApiVersion } from "./edge-family.ts";
-import type { TakoformStoredRelation } from "./relations.ts";
+import { exclusiveRelationClaimKey, type TakoformStoredRelation } from "./relations.ts";
 import type { TakoformStore } from "./store.ts";
 import type { TakoformCondition, TakoformStoredResource } from "./types.ts";
 import { type InstalledTakoformForm, TakoformHostError } from "./types.ts";
@@ -17,6 +17,73 @@ const ATTACHMENT_HANDLER: Readonly<Record<string, string>> = {
   WorkerCronTrigger: "scheduled",
   QueueConsumer: "queue",
 };
+const DEPENDENT_SOURCES: readonly (readonly [string, string, string])[] = [
+  ["WorkerCustomDomain", WORKER_RELATION, "fetch"],
+  ["WorkerEndpoint", WORKER_RELATION, "fetch"],
+  ["WorkerCronTrigger", WORKER_RELATION, "scheduled"],
+  ["QueueConsumer", WORKER_RELATION, "queue"],
+  ["WorkerVersion", SERVICE_BINDING_RELATION, "fetch"],
+];
+
+/**
+ * How long this Host waits for a neighbour the same apply wave is still
+ * creating or deleting.
+ *
+ * One `tofu apply` sends the resources of a wave in parallel and orders only
+ * what the graph declares an edge for. A `WorkerEndpoint` and the
+ * `WorkerDeployment` that makes its Worker serve carry no such edge — both
+ * point at the ModuleWorker — so the endpoint routinely asks "does this Worker
+ * serve fetch" a few hundred milliseconds before the answer becomes yes, and
+ * the deployment's delete routinely asks "is anything still attached" a few
+ * hundred milliseconds before the endpoint's own delete has landed. Neither is
+ * a defect in the declaration; both are ordering inside one wave.
+ *
+ * The budget is shaped like the runtime's own readiness probe: it is spent
+ * while nothing is provably in flight, and a sighting of the neighbour starts
+ * it again under a ceiling, so a wave that really is working is waited for and
+ * a graph that declared nothing is refused promptly rather than held open.
+ */
+export interface TakoformWaveSettlement {
+  /** Wall clock, never a logical one: this budget is real elapsed time. */
+  readonly now: () => number;
+  readonly sleep: (milliseconds: number) => Promise<void>;
+  readonly pollMilliseconds: number;
+  readonly idleMilliseconds: number;
+  readonly ceilingMilliseconds: number;
+}
+
+export const DEFAULT_WAVE_SETTLEMENT: TakoformWaveSettlement = Object.freeze({
+  now: () => Date.now(),
+  sleep: (milliseconds: number) =>
+    new Promise<void>((wake) => {
+      setTimeout(wake, milliseconds);
+    }),
+  pollMilliseconds: 25,
+  idleMilliseconds: 1_000,
+  ceilingMilliseconds: 10_000,
+});
+
+/**
+ * Waits for one question to settle while somebody else in the wave answers it.
+ *
+ * `settled` is the question; `progressing` is the evidence that another command
+ * in this wave is still working on it. Returns whether it settled.
+ */
+async function awaitWave(
+  wave: TakoformWaveSettlement,
+  settled: () => Promise<boolean>,
+  progressing: () => Promise<boolean>,
+): Promise<boolean> {
+  if (await settled()) return true;
+  const ceiling = wave.now() + wave.ceilingMilliseconds;
+  let idle = wave.now() + wave.idleMilliseconds;
+  for (;;) {
+    if (await progressing()) idle = wave.now() + wave.idleMilliseconds;
+    if (wave.now() >= idle || wave.now() >= ceiling) return false;
+    await wave.sleep(wave.pollMilliseconds);
+    if (await settled()) return true;
+  }
+}
 
 /** Refuses an inward activation unless the worker really serves its handler. */
 export async function validateWorkerAggregate(input: {
@@ -28,8 +95,15 @@ export async function validateWorkerAggregate(input: {
   readonly relations: readonly TakoformStoredRelation[];
   readonly store: Pick<
     TakoformStore,
-    "hostnameClaims" | "queuePathReaches" | "resourcesByRelation" | "readResource" | "readRelations"
+    | "hostnameClaims"
+    | "queuePathReaches"
+    | "resourcesByRelation"
+    | "readResource"
+    | "readRelations"
+    | "resourceClaimHolder"
+    | "committedResourceClaimHolder"
   >;
+  readonly wave?: TakoformWaveSettlement;
 }): Promise<void> {
   const edgeApiVersion = input.form.identity.formRef.apiVersion;
   if (!isEdgeFormsApiVersion(edgeApiVersion)) return;
@@ -98,9 +172,7 @@ export async function validateWorkerAggregate(input: {
     validateEnvironmentNamespace(input.spec);
     for (const relation of input.relations) {
       if (relation.relation !== SERVICE_BINDING_RELATION) continue;
-      if (!(await workerServes(input, relation.targetUid, "fetch", edgeApiVersion))) {
-        throw new TakoformHostError("unsupported_capability", 422);
-      }
+      await requireServingWorker(input, relation, "fetch", edgeApiVersion);
     }
     return;
   }
@@ -119,9 +191,7 @@ export async function validateWorkerAggregate(input: {
   }
   const worker = input.relations.find((relation) => relation.relation === WORKER_RELATION);
   if (!worker) throw new TakoformHostError("invalid_argument", 400);
-  if (!(await workerServes(input, worker.targetUid, handler, edgeApiVersion))) {
-    throw new TakoformHostError("unsupported_capability", 422);
-  }
+  await requireServingWorker(input, worker, handler, edgeApiVersion);
   if (input.form.identity.formRef.kind === "WorkerEndpoint") {
     const endpoints = await input.store.resourcesByRelation({
       tenantId: input.tenantId,
@@ -166,13 +236,116 @@ export async function validateWorkerAggregate(input: {
   }
 }
 
-/** A live attachment or inbound service binding keeps its serving deployment alive. */
+/**
+ * Refuses an inward activation whose target Worker is not serving the handler.
+ *
+ * The refusal is about *what is missing*, which is two different facts and was
+ * one wrong answer. A Worker for which nothing declares a `WorkerDeployment` is
+ * a precondition the operator has to fix in the configuration; a Worker whose
+ * deployment has simply not landed yet is ordering inside one apply wave, cured
+ * by the wave itself and, failing that, by asking again. Neither is a Host
+ * capability that does not exist, which is what this used to say — sending an
+ * operator to "apply against a host whose Host Support Profile declares it"
+ * while the only thing missing was a deployment their own graph creates.
+ */
+async function requireServingWorker(
+  input: {
+    readonly tenantId: string;
+    readonly space: string;
+    readonly store: Pick<
+      TakoformStore,
+      | "resourcesByRelation"
+      | "readResource"
+      | "resourceClaimHolder"
+      | "committedResourceClaimHolder"
+    >;
+    readonly wave?: TakoformWaveSettlement;
+  },
+  worker: TakoformStoredRelation,
+  handler: string,
+  edgeApiVersion: string,
+): Promise<void> {
+  const settled = await awaitWave(
+    input.wave ?? DEFAULT_WAVE_SETTLEMENT,
+    () => workerServes(input, worker.targetUid, handler, edgeApiVersion),
+    () => workerDeploymentInFlight(input, worker.targetUid, edgeApiVersion),
+  );
+  if (settled) return;
+  const deployments = await input.store.resourcesByRelation({
+    tenantId: input.tenantId,
+    space: input.space,
+    sourceApiVersion: edgeApiVersion,
+    sourceKind: WORKER_DEPLOYMENT,
+    relation: WORKER_RELATION,
+    targetUid: worker.targetUid,
+    limit: 2,
+  });
+  if (deployments.length === 0) {
+    throw new TakoformHostError(
+      "invalid_argument",
+      400,
+      undefined,
+      `the ModuleWorker ${worker.targetName} has no WorkerDeployment, so nothing serves its ${handler} handler; declare a WorkerDeployment that selects a WorkerVersion serving ${handler}, then apply again`,
+    );
+  }
+  throw new TakoformHostError(
+    "resource_busy",
+    409,
+    undefined,
+    `the ModuleWorker ${worker.targetName} has no serving deployment yet: no WorkerDeployment of it currently selects a WorkerVersion that serves ${handler}; apply again once that deployment is Ready`,
+  );
+}
+
+/**
+ * Whether another command is creating this Worker's `WorkerDeployment` now.
+ *
+ * The deployment Form declares `exclusive` on `/worker`, so a create reserves
+ * that canonical claim before it awaits its provider and commits it with the
+ * Resource. A reserved-but-uncommitted holder is therefore exactly "somebody in
+ * this wave is making this Worker serve"; a committed one is a deployment that
+ * already exists, which `workerServes` answers on its own.
+ */
+async function workerDeploymentInFlight(
+  input: {
+    readonly tenantId: string;
+    readonly space: string;
+    readonly store: Pick<TakoformStore, "resourceClaimHolder" | "committedResourceClaimHolder">;
+  },
+  workerUid: string,
+  edgeApiVersion: string,
+): Promise<boolean> {
+  const key = await exclusiveRelationClaimKey({
+    tenantId: input.tenantId,
+    space: input.space,
+    apiVersion: edgeApiVersion,
+    kind: WORKER_DEPLOYMENT,
+    reference: WORKER_RELATION,
+    targetUid: workerUid,
+  });
+  if ((await input.store.resourceClaimHolder(key)) === null) return false;
+  return (await input.store.committedResourceClaimHolder(key)) === null;
+}
+
+/**
+ * A live attachment or inbound service binding keeps its serving deployment
+ * alive — but one that is itself being deleted in this wave is not live.
+ *
+ * `tofu destroy` orders only what the graph declares an edge for, and a
+ * `WorkerEndpoint` names the ModuleWorker rather than the deployment, so the
+ * two deletes run at once. Answering that as `dependency_in_use` said "the
+ * resource gained a blocking dependency" about a holder that was in the act of
+ * going away and had gone by the time the operator read the sentence, and the
+ * code is not retryable, so the destroy stopped on a condition that had already
+ * cured itself. A holder whose own deletion is under way is waited for; a
+ * holder nobody is deleting is still the blocking dependency it always was.
+ */
 export async function validateWorkerDeploymentRemoval(input: {
   readonly tenantId: string;
   readonly space: string;
   readonly form: InstalledTakoformForm;
   readonly relations: readonly TakoformStoredRelation[];
-  readonly store: Pick<TakoformStore, "resourcesByRelation">;
+  readonly store: Pick<TakoformStore, "resourcesByRelation" | "readResourceDeletion">;
+  readonly wave?: TakoformWaveSettlement;
 }): Promise<void> {
   if (
     !isEdgeFormsApiVersion(input.form.identity.formRef.apiVersion) ||
@@ -183,12 +356,68 @@ export async function validateWorkerDeploymentRemoval(input: {
   }
   const worker = input.relations.find((relation) => relation.relation === WORKER_RELATION);
   if (!worker) throw new TakoformHostError("invalid_argument", 400);
-  if (
-    (await dependentHandlers(input, worker.targetUid, input.form.identity.formRef.apiVersion))
-      .size > 0
-  ) {
-    throw new TakoformHostError("dependency_in_use", 409);
+  const edgeApiVersion = input.form.identity.formRef.apiVersion;
+  const holders = (): Promise<readonly WorkerDependent[]> =>
+    workerDependents(input, worker.targetUid, edgeApiVersion);
+  const settled = await awaitWave(
+    input.wave ?? DEFAULT_WAVE_SETTLEMENT,
+    async () => (await holders()).length === 0,
+    async () => (await departing(input, await holders())).departing !== undefined,
+  );
+  if (settled) return;
+  const remaining = await departing(input, await holders());
+  if (remaining.blocking) {
+    throw new TakoformHostError(
+      "dependency_in_use",
+      409,
+      undefined,
+      `${remaining.blocking.kind} ${remaining.blocking.name} still activates the ModuleWorker this WorkerDeployment serves and is not being deleted; remove it first, then delete this WorkerDeployment`,
+    );
   }
+  if (!remaining.departing) return;
+  throw new TakoformHostError(
+    "resource_busy",
+    409,
+    undefined,
+    `${remaining.departing.kind} ${remaining.departing.name} still activates the ModuleWorker this WorkerDeployment serves and its own deletion has not settled yet; delete this WorkerDeployment again once that one is gone`,
+  );
+}
+
+interface WorkerDependent {
+  readonly kind: string;
+  readonly name: string;
+  readonly uid: string;
+  readonly handler: string;
+}
+
+/**
+ * Splits the holders into the one that blocks and the one that is leaving.
+ *
+ * A holder whose deletion attestation is `pending` has had its delete accepted
+ * and its provider effect planned; it is a command in flight, not a relation
+ * somebody intends to keep.
+ */
+async function departing(
+  input: {
+    readonly tenantId: string;
+    readonly store: Pick<TakoformStore, "readResourceDeletion">;
+  },
+  holders: readonly WorkerDependent[],
+): Promise<{
+  readonly blocking?: WorkerDependent;
+  readonly departing?: WorkerDependent;
+}> {
+  let blocking: WorkerDependent | undefined;
+  let leaving: WorkerDependent | undefined;
+  for (const holder of holders) {
+    const attestation = await input.store.readResourceDeletion(input.tenantId, holder.uid);
+    if (attestation?.state === "pending") leaving ??= holder;
+    else blocking ??= holder;
+  }
+  return {
+    ...(blocking ? { blocking } : {}),
+    ...(leaving ? { departing: leaving } : {}),
+  };
 }
 
 async function dependentHandlers(
@@ -200,14 +429,23 @@ async function dependentHandlers(
   workerUid: string,
   edgeApiVersion: string,
 ): Promise<ReadonlySet<string>> {
-  const required = new Set<string>();
-  for (const [sourceKind, relation, handler] of [
-    ["WorkerCustomDomain", WORKER_RELATION, "fetch"],
-    ["WorkerEndpoint", WORKER_RELATION, "fetch"],
-    ["WorkerCronTrigger", WORKER_RELATION, "scheduled"],
-    ["QueueConsumer", WORKER_RELATION, "queue"],
-    ["WorkerVersion", SERVICE_BINDING_RELATION, "fetch"],
-  ] as const) {
+  return new Set(
+    (await workerDependents(input, workerUid, edgeApiVersion)).map((entry) => entry.handler),
+  );
+}
+
+/** Every resource whose inward activation this Worker's deployment must serve. */
+async function workerDependents(
+  input: {
+    readonly tenantId: string;
+    readonly space: string;
+    readonly store: Pick<TakoformStore, "resourcesByRelation">;
+  },
+  workerUid: string,
+  edgeApiVersion: string,
+): Promise<readonly WorkerDependent[]> {
+  const found: WorkerDependent[] = [];
+  for (const [sourceKind, relation, handler] of DEPENDENT_SOURCES) {
     const dependents = await input.store.resourcesByRelation({
       tenantId: input.tenantId,
       space: input.space,
@@ -215,11 +453,18 @@ async function dependentHandlers(
       sourceKind,
       relation,
       targetUid: workerUid,
-      limit: 1,
+      limit: 2,
     });
-    if (dependents.length > 0) required.add(handler);
+    for (const dependent of dependents) {
+      found.push({
+        kind: sourceKind,
+        name: dependent.resource.metadata.name,
+        uid: dependent.resource.metadata.uid,
+        handler,
+      });
+    }
   }
-  return required;
+  return found;
 }
 
 async function selectedVersionsServe(
