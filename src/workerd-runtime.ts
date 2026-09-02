@@ -1,5 +1,15 @@
 import { constants as fsConstants } from "node:fs";
-import { mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  open,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 /**
@@ -124,8 +134,8 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): WorkerdRun
       // must not survive from the old one, where it would be loadable and
       // wrong.
       await rm(directory, { recursive: true, force: true });
-      await mkdir(scriptsRoot, { recursive: true, mode: 0o700 });
-      await mkdir(directory, { recursive: true, mode: 0o700 });
+      await privateDirectory(scriptsRoot);
+      await privateDirectory(directory);
 
       for (const [moduleName, bytes] of modules) {
         if (moduleName.includes("..") || moduleName.startsWith("/")) {
@@ -189,13 +199,14 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): WorkerdRun
 
     async reload() {
       const published = await readPublished(scriptsRoot);
-      await mkdir(scriptsRoot, { recursive: true, mode: 0o700 });
+      await privateDirectory(scriptsRoot);
+      for (const entry of published) await privateDirectory(join(scriptsRoot, entry.name));
       // Written before the config that embeds it, every time, so a router
       // improvement reaches a deployment on its next reload rather than
       // whenever somebody remembers.
       await writeFile(join(scriptsRoot, "router.js"), ROUTER_SOURCE, "utf8");
       await writeFile(join(scriptsRoot, "assets.js"), ASSETS_SOURCE, "utf8");
-      await mkdir(dirname(configPath), { recursive: true, mode: 0o700 });
+      await privateDirectory(dirname(configPath));
       // The rendered configuration contains every binding value, sensitive ones
       // included, so it is created `0600` and moved into place atomically.
       await writePrivate(configPath, renderConfig(published, port, scriptsRoot), "utf8");
@@ -239,6 +250,25 @@ async function writePrivate(path: string, contents: string, encoding: "utf8"): P
   } finally {
     if (!closed) await handle?.close().catch(() => undefined);
     await rm(temporary, { force: true }).catch(() => undefined);
+  }
+}
+
+/**
+ * A directory this process is willing to keep a secret in.
+ *
+ * `mkdir(mode)` is a no-op on a directory that already exists, so a tree
+ * created by an earlier version of this Host — or by an operator's `mkdir -p` —
+ * keeps whatever mode it was made with, and the `0o700` above is silently not
+ * applied. These directories hold rendered binding values and the manifests
+ * they were rendered from, so the mode is tightened and then re-read: a
+ * directory this process cannot make private is one it refuses to publish into,
+ * rather than one it publishes into and hopes about.
+ */
+async function privateDirectory(path: string): Promise<void> {
+  await mkdir(path, { recursive: true, mode: 0o700 });
+  await chmod(path, 0o700).catch(() => undefined);
+  if (((await stat(path)).mode & 0o077) !== 0) {
+    throw new Error(`refusing to publish into a group- or world-accessible directory: ${path}`);
   }
 }
 

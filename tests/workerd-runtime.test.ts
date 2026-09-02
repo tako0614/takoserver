@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
+import { chmod, mkdir, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createWorkerdRuntime, type WorkerdBinding } from "../src/workerd-runtime.ts";
@@ -162,4 +162,19 @@ test("skips a published script whose recorded binding value cannot be rendered",
   const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
   expect(config).toContain('name = "good"');
   expect(config).not.toContain('name = "broken"');
+});
+
+test("tightens a scripts tree an older tree left group- or world-readable", async () => {
+  // `mkdir(mode)` is a no-op on a directory that already exists, so an upgraded
+  // deployment kept whatever `workers/` and its script directories were made
+  // with. The rendered config and every manifest under them carry binding
+  // values, so publishing repairs the mode rather than inheriting it.
+  await mkdir(join(root, "workers", "site"), { recursive: true, mode: 0o755 });
+  await chmod(join(root, "workers", "site"), 0o777);
+  await chmod(join(root, "workers"), 0o755);
+
+  await publish([{ name: "SECRET_SHAPED", value: "value", kind: "text" }]);
+
+  expect((await stat(join(root, "workers"))).mode & 0o777).toBe(0o700);
+  expect((await stat(join(root, "workers", "site"))).mode & 0o777).toBe(0o700);
 });
