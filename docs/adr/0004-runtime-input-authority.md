@@ -324,3 +324,46 @@ endpoint Resource absent, its deletion attestation settled, and no provider
 deployment outside `deleted` or `failed`. While any of those is unmet the mint
 is refused, the same way it is for a live reservation whose endpoint is still
 serving.
+
+## Amendment — 2026-09-02: what a repair is allowed to read
+
+The two amendments above added a lane that lets go of things *in place*: an
+endpoint witness that is provably gone, an aged-out hold that published
+nothing. The fifth self-host end-to-end run measured both against a database
+the fourth run had wedged, and neither reached it. Three sentences change.
+
+**"No provider effect still open" is the ledger's answer, not the effect row's.**
+An effect goes `planned`, then `dispatched`, and its terminal event is written
+by the commit — so a create refused *after* dispatch left an `apply` effect with
+no terminal event for ever, and the witness clear read that as a create that
+might still land. It could not: the Host itself had refused the command and
+recorded that refusal in its operation ledger. An effect whose command is
+recorded there as refused is settled, whatever its own last event says. One
+whose command is still running is not touched, which is what this fence has
+always been for: an in-flight create must not have its address taken away. An
+endpoint UID with no attestation at all reads the same way as a closed one —
+nothing was ever committed under it.
+
+**An `activated` row is let go of by clearing its witness first.** Release
+refuses an `activated` reservation outright, and that is right while an endpoint
+is answering on the address. It is wrong when the endpoint it names was never
+committed, which is exactly the shape a refusal after activation leaves. So a
+superseded Host-minted row is offered the same in-place witness clear a live
+mint gets, under the same four fences, before release is asked of it: if the
+clear takes, the row is `bound` holding nothing and the release that follows is
+the ordinary one; if it does not, release refuses and the mint fails rather than
+reallocating an origin something may still be answering on.
+
+Neither sentence reallocates an address. A Host-minted id is derived from
+tenant, Space and Worker name, so the mint that takes the address back publishes
+at the identical origin. There is no second owner for the old one to lose it to.
+
+**The revival runs the mint's own sweep.** The expiry amendment says an expired
+mint that never published is taken back by the next mint. This lane's sweep is
+lazy — nothing ages a reservation on a timer, and a row past its TTL stays
+`bound` until some call reads it through `expire` — and inside a mint the only
+such call is `prepare`, which runs *after* the revival. So the revival read a
+row that was still `bound`, declined it for not being `expired`, and watched
+`prepare` sweep it one statement later and refuse to replay a terminal row: the
+state the repair exists for was unreachable from the only caller that has it.
+The mint therefore sweeps its own row before asking whether to take it back.
