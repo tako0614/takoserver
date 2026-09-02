@@ -82,6 +82,7 @@ export interface CreateProviderDriverOptions {
   /** Host-private reservation lifecycle. Opaque refs never cross the Provider port. */
   readonly originReservations?: Pick<
     WorkerEndpointOriginReservations,
+    | "mintForWorker"
     | "assignEndpoint"
     | "cancelEndpointAssignment"
     | "activateEndpointAssignment"
@@ -653,13 +654,38 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
             throw new TakoformHostError("resource_busy", 409);
           }
         } else {
-          if (input.workerEndpointOriginReservationId === undefined) {
-            throw new TakoformHostError("unsupported_capability", 422);
+          // A reservation supplied by the caller is the reseller lane's
+          // authority: it sold a name and held it before the Resource graph
+          // existed. An ordinary organization API key has no such input — the
+          // released provider's `takoform_worker_endpoint` accepts only `name`
+          // and `worker` — so on an installation whose endpoint address is
+          // derived from the Worker anyway, the Host reserves on the caller's
+          // behalf. Without that, no ordinary key could ever create a
+          // WorkerEndpoint at all, and the 14th resource of a Worker graph was
+          // unreachable.
+          let reservationId = input.workerEndpointOriginReservationId;
+          if (reservationId === undefined) {
+            let minted: Awaited<ReturnType<typeof originReservations.mintForWorker>>;
+            try {
+              minted = await originReservations.mintForWorker({
+                organizationId: input.tenantId,
+                space: input.space,
+                workerName: worker.metadata.name,
+                workerResourceUid: worker.metadata.uid,
+                offeringId: offering.id,
+              });
+            } catch (error) {
+              throw endpointReservationHostError(error);
+            }
+            // No derived address on this installation: the reservation really
+            // is the caller's to supply, and there is nothing to mint.
+            if (!minted) throw new TakoformHostError("unsupported_capability", 422);
+            reservationId = minted.reservationId;
           }
           try {
             endpointAssignment = await originReservations.assignEndpoint({
               organizationId: input.tenantId,
-              reservationId: input.workerEndpointOriginReservationId,
+              reservationId,
               space: input.space,
               endpointName: input.name,
               endpointResourceUid: input.resourceUid,

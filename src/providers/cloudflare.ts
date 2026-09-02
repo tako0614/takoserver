@@ -247,6 +247,20 @@ export class CloudflareProvider implements Provider {
         );
         return canonicalPublicOrigin ? { canonicalPublicOrigin } : null;
       },
+      // Only the ordinary-workers backend derives its own address, and it
+      // derives exactly this: `#applyWorkerEndpoint` builds the hostname from
+      // the Worker's own derived script name and the installation's suffix, so
+      // a Host-minted reservation names the address the apply will publish
+      // rather than a second one beside it. The managed backend sells its base
+      // domain, so it answers `null` and keeps requiring a supplied one.
+      hostMintedSubdomain: async ({ tenantRef, space, workerName }) => {
+        if (this.#workerBackend || !this.#workerEndpointSuffix) return null;
+        return await derivedProviderResourceName("tsw", {
+          tenantRef,
+          space,
+          name: workerName,
+        });
+      },
     };
     if (options.runtimeInputs) {
       this.runtimeInputCapabilities = {

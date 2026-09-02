@@ -100,6 +100,17 @@ test("managed Cloudflare reservations are official origins, never workers.dev", 
   );
   expect(reservation?.canonicalPublicOrigin).not.toContain("workers.dev");
 
+  // This backend sells its base domain rather than deriving an address from
+  // the Worker, so it mints nothing on a caller's behalf and the reservation
+  // stays the thing the sponsor supplies.
+  expect(
+    await provider.workerEndpointOriginReservations.hostMintedSubdomain?.({
+      tenantRef: "organization_yurucommu",
+      space: "production",
+      workerName: "server",
+    }),
+  ).toBeNull();
+
   const allocated = await provider.apply({
     operationId: "allocate-worker-yurucommu",
     operationMode: "initial",

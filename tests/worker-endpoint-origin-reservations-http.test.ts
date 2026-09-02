@@ -30,6 +30,9 @@ function fixture() {
       return PROJECTION;
     },
     async release() {},
+    async mintForWorker() {
+      throw new Error("not called");
+    },
     async bind() {
       throw new Error("not called");
     },
