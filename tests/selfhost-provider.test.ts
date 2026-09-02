@@ -2168,6 +2168,58 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
     });
   });
 
+  test("an attachment's absence is read from durable state, not asserted", async () => {
+    const forgotten: string[] = [];
+    const local = provider({
+      events: {
+        async deleteQueue() {},
+        async forgetSchedules(_script, cron) {
+          forgotten.push(cron ?? "*");
+        },
+      },
+    });
+    await publish(local);
+    const applied = await applyCron(local, "0 * * * *");
+    if (applied.phase !== "succeeded") throw new Error("the cron trigger did not attach");
+    if (!local.createNativeReadbackDescriptor || !local.verifyNativeAbsence) {
+      throw new Error("selfhost provider must expose native absence readback");
+    }
+    const descriptor = local.createNativeReadbackDescriptor({
+      offering: offering("WorkerCronTrigger"),
+      nativeId: applied.result.nativeId,
+      identity: identity("hello-cron"),
+      spec: { cron: "0 * * * *" },
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+    });
+    const cronOffering = offering("WorkerCronTrigger");
+    expect(await local.verifyNativeAbsence({ offering: cronOffering, descriptor })).toMatchObject({
+      outcome: "present",
+    });
+
+    expect(
+      (
+        await local.delete({
+          operationId: "op_delete_cron",
+          offering: offering("WorkerCronTrigger"),
+          identity: identity("hello-cron"),
+          nativeId: applied.result.nativeId,
+          spec: {
+            worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+            cron: "0 * * * *",
+          },
+          relations: [relation("/worker", "ModuleWorker", "hello")],
+        })
+      ).phase,
+    ).toBe("succeeded");
+    expect(forgotten).toEqual(["0 * * * *"]);
+    expect(await local.verifyNativeAbsence({ offering: cronOffering, descriptor })).toMatchObject({
+      outcome: "absent",
+    });
+    // And the gate goes with it: nothing delivers to this Worker any more.
+    const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+    expect(config).not.toContain("selfhost-events");
+  });
+
   test("a queue delete drops the messages that queue was holding", async () => {
     const dropped: string[] = [];
     const local = provider({

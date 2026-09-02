@@ -8,6 +8,7 @@ import {
   SELFHOST_WORKER_EVENT_PROTOCOL,
   SELFHOST_WORKER_EVENT_RESPONSE_CONTENT_TYPE,
   SELFHOST_WORKER_EVENT_TOKEN_HEADER,
+  selfhostScheduleAcknowledged,
   selfhostScheduleEvent,
 } from "./providers/selfhost-events.ts";
 import type { WorkerdRuntime } from "./workerd-runtime.ts";
@@ -136,7 +137,9 @@ export function createSelfhostWorkerScheduler(
         body: JSON.stringify(event),
         timeoutMillis: invocationTimeoutMillis,
       });
-      return answer?.status === 200;
+      // The status and the envelope: a 200 carrying anything but this Host's own
+      // acknowledgement is a Worker that did not run the handler.
+      return answer?.status === 200 && selfhostScheduleAcknowledged(answer.body);
     } catch {
       return false;
     }

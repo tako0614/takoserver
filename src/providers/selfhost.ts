@@ -1943,6 +1943,34 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
               input.descriptor,
               kind,
             );
+          // An attachment is durable state now rather than a bare declaration,
+          // so its absence is something this Host can read rather than assert.
+          case "WorkerCronTrigger": {
+            if (!parsed.script) return selfhostUnknown("malformed", false);
+            const cron = optionalSafeString(parsed.data.cron);
+            if (!cron) return selfhostUnknown("malformed", false);
+            const state = await readSelfhostState(selfhostScriptStateRoot(dataRoot), parsed.script);
+            return selfhostAbsence(
+              state.crons.includes(cron) ? "present" : "absent",
+              input.descriptor,
+              kind,
+              id,
+              parsed.data,
+            );
+          }
+          case "QueueConsumer": {
+            if (!parsed.script) return selfhostUnknown("malformed", false);
+            const queueName = optionalSafeString(parsed.data.queueName);
+            if (!queueName) return selfhostUnknown("malformed", false);
+            const state = await readSelfhostState(selfhostScriptStateRoot(dataRoot), parsed.script);
+            return selfhostAbsence(
+              state.consumers.includes(queueName) ? "present" : "absent",
+              input.descriptor,
+              kind,
+              id,
+              parsed.data,
+            );
+          }
           case "SQLiteDatabase":
           case "sql_database":
             return selfhostFileAbsence(
@@ -1958,8 +1986,6 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           case "object_bucket":
           case "EdgeKVNamespace":
           case "AtLeastOnceQueue":
-          case "WorkerCronTrigger":
-          case "QueueConsumer":
             return selfhostAbsence("absent", input.descriptor, kind, id, parsed.data);
           default:
             return selfhostUnknown("unsupported", false);
@@ -2981,6 +3007,9 @@ interface ReadonlyScriptState {
   readonly activeVersion?: string;
   readonly endpointHostname?: string;
   readonly domains: readonly string[];
+  /** Native queue ids this script drains, in whatever order it was written. */
+  readonly consumers: readonly string[];
+  readonly crons: readonly string[];
 }
 
 async function readSelfhostState(root: string, script: string): Promise<ReadonlyScriptState> {
@@ -2991,7 +3020,7 @@ async function readSelfhostState(root: string, script: string): Promise<Readonly
     throw error;
   });
   if (temporary !== null) throw new SelfhostReadbackMalformed();
-  if (bytes === null) return { exists: false, domains: [] };
+  if (bytes === null) return { exists: false, domains: [], consumers: [], crons: [] };
   let parsed: unknown;
   try {
     parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
@@ -3004,12 +3033,23 @@ async function readSelfhostState(root: string, script: string): Promise<Readonly
   const activeVersion = parsed.activeVersion;
   const endpointHostname = parsed.endpointHostname;
   const domains = parsed.domains;
+  const consumers = parsed.consumers ?? [];
+  const crons = parsed.crons ?? [];
   if (
     (activeVersion !== undefined && !safeSegment(activeVersion)) ||
     (endpointHostname !== undefined && !normalizedHostname(endpointHostname)) ||
     domains.some((value) => !normalizedHostname(value)) ||
+    !Array.isArray(consumers) ||
+    !Array.isArray(crons) ||
+    crons.some((value) => !optionalSafeString(value)) ||
+    consumers.some((value) => !isJsonObject(value) || !safeSegment(value.queue)) ||
     Object.keys(parsed).some(
-      (key) => key !== "activeVersion" && key !== "endpointHostname" && key !== "domains",
+      (key) =>
+        key !== "activeVersion" &&
+        key !== "endpointHostname" &&
+        key !== "domains" &&
+        key !== "consumers" &&
+        key !== "crons",
     )
   ) {
     throw new SelfhostReadbackMalformed();
@@ -3019,6 +3059,10 @@ async function readSelfhostState(root: string, script: string): Promise<Readonly
     ...(typeof activeVersion === "string" ? { activeVersion } : {}),
     ...(typeof endpointHostname === "string" ? { endpointHostname } : {}),
     domains: domains.filter((value): value is string => typeof value === "string"),
+    // Only the queue each consumer drains: the limits are the pump's business,
+    // and a readback answers "is this attachment there", not "what is it".
+    consumers: consumers.map((value) => String((value as JsonObject).queue)),
+    crons: crons.filter((value): value is string => typeof value === "string"),
   };
 }
 
