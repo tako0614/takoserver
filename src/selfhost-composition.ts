@@ -11,6 +11,11 @@ import { HOSTED_EDGE_IDENTITY_CLASSES } from "./hosted-edge-supplies.ts";
 import type { Provider, ProviderOffering } from "./provider-port.ts";
 import type { ProviderRuntimeInputLeasePort } from "./provider-runtime-input-port.ts";
 import {
+  canonicalWorkerEndpointOrigin,
+  workerEndpointPublicationDefect,
+  workerEndpointPublicationRemedy,
+} from "./provider-worker-endpoint-origin.ts";
+import {
   createSelfhostProvider,
   type SelfhostArtifacts,
   type SelfhostDataPlaneMaintenance,
@@ -384,5 +389,56 @@ export function selfhostWorkerEndpointScheme(input: {
       `${SELFHOST_TLS_ENVIRONMENT.certificateFile} and ${SELFHOST_TLS_ENVIRONMENT.privateKeyFile} ` +
       `(or ${SELFHOST_TLS_ENVIRONMENT.certificate} and ${SELFHOST_TLS_ENVIRONMENT.privateKey} with ` +
       "the PEM text) to serve https.",
+  };
+}
+
+/**
+ * A script label of the exact shape this provider derives, for asking the
+ * publication rule a question at boot.
+ *
+ * `hostMintedSubdomain` answers `sw-` plus twenty hex bytes, so the longest
+ * name this machine can ever produce is this one. Asking with a real shape is
+ * what lets the boot diagnostic catch a suffix that pushes the address past the
+ * Form's length bound, rather than only the scheme and the port.
+ */
+const SPECIMEN_SCRIPT_LABEL = `sw-${"0".repeat(40)}`;
+
+/**
+ * Whether this machine can mint a `WorkerEndpoint` at all, and what to say.
+ *
+ * Separate from `selfhostWorkerEndpointScheme` because it answers a different
+ * question. That one says what this socket serves, which is always true and
+ * always publishable *to the Worker*. This one asks whether the published
+ * `WorkerEndpoint` Form can carry the resulting address — it cannot carry
+ * plain HTTP, and it cannot carry a port — so a deployment that terminates TLS
+ * somewhere other than 443, and says nothing about it, creates no Worker
+ * endpoint. Everything else on the machine still works, which is why this is a
+ * diagnostic rather than a boot failure.
+ */
+export function selfhostWorkerEndpointPublication(input: {
+  readonly workerEndpointSuffix?: string | undefined;
+  readonly scheme: "https" | "http";
+  readonly port?: number | undefined;
+}): { readonly publishable: boolean; readonly diagnostic?: string } {
+  const suffix = input.workerEndpointSuffix?.trim() || "localhost";
+  const origin = canonicalWorkerEndpointOrigin(
+    SPECIMEN_SCRIPT_LABEL,
+    suffix,
+    input.scheme,
+    input.port,
+  );
+  const defect = origin === null ? "hostname" : workerEndpointPublicationDefect(origin);
+  if (!defect) return { publishable: true };
+  // The specimen label stands back down to `<script>`, so the sentence shows
+  // the exact shape without pretending a particular Worker exists.
+  const address = (origin ?? `${input.scheme}://${SPECIMEN_SCRIPT_LABEL}.${suffix}`).replace(
+    SPECIMEN_SCRIPT_LABEL,
+    "<script>",
+  );
+  return {
+    publishable: false,
+    diagnostic:
+      `Worker endpoints would be published as ${address}. ` +
+      workerEndpointPublicationRemedy(defect),
   };
 }

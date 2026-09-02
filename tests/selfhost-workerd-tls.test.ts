@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import { canonicalWorkerEndpointOrigin } from "../src/provider-worker-endpoint-origin.ts";
 import {
   SELFHOST_TLS_ENVIRONMENT,
+  selfhostWorkerEndpointPublication,
   selfhostWorkerEndpointScheme,
 } from "../src/selfhost-composition.ts";
 import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
@@ -89,6 +90,54 @@ test("a non-loopback suffix with no certificate says plainly that no identity ca
       tlsConfigured: true,
     }),
   ).toEqual({ scheme: "https" });
+});
+
+/**
+ * A machine that cannot mint a Worker endpoint says so at boot.
+ *
+ * The scheme warning above is about what a Worker can establish for *itself*.
+ * This is a different, harder fact: `WorkerEndpoint@0.1.0` publishes
+ * `https://<name>/` and nothing else, so on plain HTTP or on any port but the
+ * scheme's default the resource cannot be created at all. Before this, the only
+ * place that was ever said was the middle of an operator's `tofu apply`, in a
+ * 400 whose text named nothing they had written.
+ */
+test("says at boot when this deployment can mint no Worker endpoint, and how to fix it", () => {
+  // The one shape that works: TLS terminated on the default port, natively or
+  // behind a front end that says so.
+  expect(
+    selfhostWorkerEndpointPublication({
+      workerEndpointSuffix: "workers.example.test",
+      scheme: "https",
+      port: 443,
+    }),
+  ).toEqual({ publishable: true });
+  expect(selfhostWorkerEndpointPublication({ scheme: "https" })).toEqual({ publishable: true });
+
+  const ported = selfhostWorkerEndpointPublication({
+    workerEndpointSuffix: "e2e.selfhost.test",
+    scheme: "https",
+    port: 28_988,
+  });
+  expect(ported.publishable).toBe(false);
+  expect(ported.diagnostic).toContain("https://<script>.e2e.selfhost.test:28988");
+  expect(ported.diagnostic).toContain("TAKOSERVER_WORKERD_PORT=443");
+  expect(ported.diagnostic).toContain("TAKOSERVER_WORKER_ENDPOINT_PORT=443");
+
+  // The loopback development default is not special: `http://*.localhost` is
+  // exactly as unpublishable, and the sentence has to be exactly as clear.
+  const loopback = selfhostWorkerEndpointPublication({ scheme: "http", port: 28_988 });
+  expect(loopback.publishable).toBe(false);
+  expect(loopback.diagnostic).toContain("http://<script>.localhost:28988");
+  expect(loopback.diagnostic).toContain(SELFHOST_TLS_ENVIRONMENT.certificateFile);
+  expect(loopback.diagnostic).toContain("TAKOSERVER_WORKER_ENDPOINT_PORT=443");
+
+  const unnameable = selfhostWorkerEndpointPublication({
+    workerEndpointSuffix: "not_a_label",
+    scheme: "https",
+  });
+  expect(unnameable.publishable).toBe(false);
+  expect(unnameable.diagnostic).toContain("TAKOSERVER_WORKER_ENDPOINT_SUFFIX");
 });
 
 test.skipIf(WORKERD === null)(
