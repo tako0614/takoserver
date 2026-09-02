@@ -241,6 +241,16 @@ test("reads the five-field UTC grammar the Form fixes, and refuses the rest", ()
   expect(next("0 0 1 * 3", noon)).toBe(Date.UTC(2026, 8, 9, 0, 0, 0));
   // Only one restricted constrains the day on its own.
   expect(next("0 0 * * 0", noon)).toBe(Date.UTC(2026, 8, 6, 0, 0, 0));
+  // A step is not a restriction. Vixie cron sets a field's star flag from its
+  // first character, so `*/1` in day-of-week leaves the day to day-of-month
+  // alone: the 1st of each month, not every day.
+  expect(next("0 0 1 * */1", noon)).toBe(Date.UTC(2026, 9, 1, 0, 0, 0));
+  // And the same the other way round: `*/2` in day-of-month restricts nothing,
+  // so this is Mondays -- not Mondays and every other day of the month. From a
+  // Wednesday noon that is the following Monday, never tomorrow.
+  expect(next("0 0 */2 * 1", noon)).toBe(Date.UTC(2026, 8, 7, 0, 0, 0));
+  // A restriction written without a leading star still restricts.
+  expect(next("0 0 1-7/2 * 1", noon)).toBe(Date.UTC(2026, 8, 3, 0, 0, 0));
   // Every field is UTC, so a schedule never shifts with a local timezone.
   expect(next("0 0 * * *", noon)).toBe(Date.UTC(2026, 8, 3, 0, 0, 0));
   // A schedule with no match at all answers rather than looping.

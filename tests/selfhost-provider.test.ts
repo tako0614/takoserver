@@ -1705,6 +1705,50 @@ describe("local namespaces", () => {
     );
   });
 
+  test("a queue recreated under the same name is a different queue", async () => {
+    const local = provider();
+    const queue = offering("AtLeastOnceQueue");
+    const before = await local.apply({
+      operationId: "op_1",
+      offering: queue,
+      identity: kvIdentity("delivery", "uid-before"),
+      spec: { messageRetentionSeconds: 345_600, deliveryDelaySeconds: 0 },
+    });
+    const after = await local.apply({
+      operationId: "op_2",
+      offering: queue,
+      identity: kvIdentity("delivery", "uid-after"),
+      spec: { messageRetentionSeconds: 345_600, deliveryDelaySeconds: 0 },
+    });
+    // A queue is a store now, exactly as a KV namespace is: the messages are
+    // keyed by the derived id, so a name reused after a delete must not name
+    // the incarnation that already has messages in it.
+    expect(before.phase === "succeeded" ? before.result.outputs.queueId : "").not.toBe(
+      after.phase === "succeeded" ? after.result.outputs.queueId : "",
+    );
+  });
+
+  test("an observation reports the queue id its messages are actually under", async () => {
+    const local = provider();
+    const queue = offering("AtLeastOnceQueue");
+    const created = await local.apply({
+      operationId: "op_1",
+      offering: queue,
+      identity: kvIdentity("delivery", "uid-1"),
+      spec: {},
+    });
+    if (created.phase !== "succeeded") throw new Error("queue allocation failed");
+    const observed = await local.observe({
+      offering: queue,
+      nativeId: created.result.nativeId,
+      identity: identity("delivery"),
+      spec: {},
+    });
+    expect(observed.phase === "succeeded" ? observed.result.outputs : {}).toEqual(
+      created.result.outputs,
+    );
+  });
+
   test("an observation reports the namespace id its rows are actually under", async () => {
     const local = provider();
     const kv = offering("EdgeKVNamespace");

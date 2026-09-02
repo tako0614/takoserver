@@ -1921,7 +1921,27 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         };
       }
       case "AtLeastOnceQueue": {
-        const name = await derivedProviderResourceName("tsq", input.identity);
+        // Keyed by the Resource UID as well as its name, for the same reason a
+        // KV namespace is: this is a store now rather than a label, and a
+        // customer who deletes a queue and declares one with the same name has
+        // asked for an empty queue. Without the uid the derived id is the same
+        // one and the old messages come back — to a new consumer, from a
+        // Deployment that never accepted them.
+        const name =
+          selfhostNamespaceName("selfhost-queue", existingNativeId) ??
+          (input.identity.uid
+            ? await derivedProviderResourceIncarnationName("tsq", {
+                tenantRef: input.identity.tenantRef,
+                space: input.identity.space,
+                name: input.identity.name,
+                uid: input.identity.uid,
+              })
+            : null);
+        if (!name) {
+          throw new SelfhostFailure(
+            failed("invalid_spec", "the queue declaration carries no Resource identity"),
+          );
+        }
         return {
           base: `selfhost-queue:${name}`,
           observed: { queueName: name },

@@ -166,9 +166,22 @@ export interface SelfhostVersionBindingStore {
   /** The stored set, or null when this version declared none. */
   read(script: string, versionId: string): Promise<StoredSelfhostVersionBindings | null>;
   /**
-   * Writes the set for one version. A Worker Version is immutable, so a retry
-   * that presents the same bindings adopts the stored record — salt included —
+   * Writes the set for one version.
+   *
+   * A Worker Version is immutable, so a retry that presents the same bindings
+   * adopts the stored record -- salt, plane token, and event token included --
    * rather than minting a generation the runtime would then have to chase.
+   *
+   * "The same bindings" means the record already carries everything a record
+   * carries now. A `@v1` record does not: it predates the handler list, so it
+   * cannot be the record for a set that declares handlers, and adopting it
+   * would leave a Version that can never be given a wrapper or an event token.
+   * That one is rewritten, which is exactly the upgrade path -- it costs a new
+   * salt and a moved digest, and it has no plane token to lose because a `@v1`
+   * record is one with no data plane. A `@v2` record does carry handlers and
+   * does carry a plane token the serving configuration is authenticating with,
+   * so it is adopted rather than rewritten; the event token a `@v2` Version
+   * lacks arrives with the next Version published, which is what the docs say.
    */
   write(
     script: string,
@@ -490,6 +503,15 @@ function normalizeBindings(
   }));
 }
 
+/**
+ * Whether the stored record already IS the record for this set.
+ *
+ * `left.handlers === undefined` is a `@v1` record, and a `@v1` record is not
+ * the record for any set written now: it has no handler list, so it could not
+ * have committed to the one presented here. Answering false rewrites it at
+ * `@v3`, which is how a Version published by an earlier build gains the
+ * handlers and the event token an attachment needs.
+ */
 function sameBindings(
   left: StoredSelfhostVersionBindings,
   right: SelfhostVersionBindingSet,

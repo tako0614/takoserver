@@ -18,7 +18,12 @@
  *
  * When day-of-month and day-of-week are BOTH restricted a day matches if
  * either selects it; when only one is restricted only that one constrains the
- * day. That is the historical crontab rule and the one the Form states.
+ * day. That is the historical crontab rule and the one the Form states, and
+ * "restricted" is decided the way Vixie cron decides it: from the field's FIRST
+ * CHARACTER. `*&#47;2` is therefore unrestricted -- it is a step through every
+ * value of the field, so the field still selects all of them -- while `1-5/2`
+ * and a bare literal are restricted. Reading a step as restriction makes
+ * `0 0 1 * *&#47;1` fire every day instead of on the 1st of each month.
  */
 
 /** Fields, in order, with the inclusive range each accepts. */
@@ -55,7 +60,14 @@ export interface SelfhostCronSchedule {
 
 interface Field {
   readonly values: ReadonlySet<number>;
-  /** Whether the field was written as anything other than a bare `*`. */
+  /**
+   * Whether this field constrains the day, for the two day fields.
+   *
+   * Vixie cron sets a field's star flag from its first character and reads that
+   * flag as "unrestricted", so anything beginning with `*` -- `*` itself and
+   * every `*&#47;step` -- is unrestricted however few values it ends up
+   * selecting.
+   */
   readonly restricted: boolean;
 }
 
@@ -147,7 +159,10 @@ export function parseSelfhostCron(expression: unknown): SelfhostCronSchedule | n
 function parseField(text: string, bounds: (typeof FIELDS)[number]): Field | null {
   if (text.length === 0 || text.length > 128) return null;
   const values = new Set<number>();
-  let restricted = false;
+  // The field's own first character, exactly as the historical implementation
+  // reads it. Deriving this from the terms instead made `*/n` a restriction,
+  // and a restriction in a day field changes which days match.
+  const restricted = !text.startsWith("*");
   for (const term of text.split(",")) {
     const slash = term.indexOf("/");
     const head = slash < 0 ? term : term.slice(0, slash);
@@ -166,7 +181,6 @@ function parseField(text: string, bounds: (typeof FIELDS)[number]): Field | null
         // through; the grammar does not accept it and neither does this.
         if (stepText !== null) return null;
         values.add(single);
-        restricted = true;
         continue;
       }
       const start = wholeNumber(head.slice(0, dash));
@@ -182,7 +196,6 @@ function parseField(text: string, bounds: (typeof FIELDS)[number]): Field | null
       }
       low = start;
       high = end;
-      restricted = true;
     }
     let step = 1;
     if (stepText !== null) {
@@ -190,7 +203,6 @@ function parseField(text: string, bounds: (typeof FIELDS)[number]): Field | null
       const span = high - low + 1;
       if (parsedStep === null || parsedStep < 1 || parsedStep > span) return null;
       step = parsedStep;
-      restricted = true;
     }
     for (let value = low; value <= high; value += step) values.add(value);
   }
