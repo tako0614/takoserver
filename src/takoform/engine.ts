@@ -2456,6 +2456,13 @@ function preconditionFailure(error: unknown): boolean {
   // These failures are emitted before a provider write (validation, missing
   // capability, or a missing local deployment). It is safe to terminalize the
   // planned saga; ambiguous 409/5xx outcomes remain recoverable instead.
+  //
+  // `dependency_in_use` is the one 409 in the list, and it is here because it
+  // is definitive rather than ambiguous: a refusal that names what must be
+  // removed first is one nothing was removed by. A provider that answers it
+  // (a bucket that still holds objects) has proven it mutated nothing, and
+  // treating that as indeterminate sent every retry into delete recovery,
+  // which answered `backend_unavailable` "re-run the same apply" forever.
   return (
     error.status === 400 ||
     error.status === 403 ||
@@ -2465,6 +2472,7 @@ function preconditionFailure(error: unknown): boolean {
     error.code === "unsupported_capability" ||
     error.code === "resource_not_found" ||
     error.code === "form_unknown" ||
-    error.code === "policy_denied"
+    error.code === "policy_denied" ||
+    error.code === "dependency_in_use"
   );
 }

@@ -2333,7 +2333,18 @@ describe("the current ObjectBucket Form on a self-host", () => {
         nativeId: created.result.nativeId,
         identity: { ...identity("media"), uid: "uid-media" },
       }),
-    ).toMatchObject({ phase: "failed", failure: { code: "conflict", retryable: false } });
+    ).toMatchObject({
+      phase: "failed",
+      failure: {
+        // Not `conflict`: that renders as the automatically retryable
+        // `resource_busy`, and waiting never empties a bucket.
+        code: "occupied",
+        retryable: false,
+        message:
+          "the bucket still holds objects, and this Host does not empty a bucket for you; " +
+          "delete its contents and destroy again",
+      },
+    });
     expect(destroyed).toEqual([]);
 
     // An object beside an unfinished upload still refuses: the objects are the
@@ -2347,7 +2358,7 @@ describe("the current ObjectBucket Form on a self-host", () => {
         nativeId: created.result.nativeId,
         identity: { ...identity("media"), uid: "uid-media" },
       }),
-    ).toMatchObject({ phase: "failed", failure: { code: "conflict" } });
+    ).toMatchObject({ phase: "failed", failure: { code: "occupied" } });
     expect(destroyed).toEqual([]);
 
     // An unfinished upload alone does not. Nothing the Binding declares can

@@ -28,6 +28,18 @@ export interface ProviderFailure {
   readonly code:
     | "invalid_spec"
     | "conflict"
+    /**
+     * The target still holds contents this Host will not destroy for the
+     * caller — objects in a bucket, rows a customer wrote.
+     *
+     * Distinct from `conflict`, which is "something else holds this identity"
+     * and renders as the automatically retryable `resource_busy`: waiting does
+     * not empty a bucket, so telling the operator to "wait and re-run the same
+     * apply" was advice that could never work. This is a definitive refusal
+     * about facts the caller then changes, and it renders as
+     * `dependency_in_use`, which the released provider does not auto-retry.
+     */
+    | "occupied"
     | "not_found"
     | "denied"
     | "unavailable"

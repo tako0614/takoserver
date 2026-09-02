@@ -1331,6 +1331,107 @@ describe("durable deferred Takoform operations", () => {
   });
 
   /**
+   * A provider refusal that names what must be removed first is a *result*,
+   * not an indeterminate outcome.
+   *
+   * A non-empty ObjectBucket's delete answered exactly that, and the Host read
+   * it as a mutation whose outcome it could not prove: the planned saga stayed,
+   * the operation was held for repair, and every retry went into delete
+   * recovery, which answered `backend_unavailable` "this is retryable: re-run
+   * the same apply". Re-running never empties a bucket, so a Worker that had
+   * ever accepted one upload could not be torn down at all.
+   */
+  test("settles a refusal that names its cause instead of holding it for delete recovery", async () => {
+    const occupied =
+      "the bucket still holds objects, and this Host does not empty a bucket for you; " +
+      "delete its contents and destroy again";
+    const memory = new InMemoryTakoformResourceDriver();
+    let refusing = true;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      apply: (input) => memory.apply(input),
+      observe: (input) => memory.observe(input),
+      delete: async (input) => {
+        if (refusing) throw new TakoformHostError("dependency_in_use", 409, undefined, occupied);
+        return await memory.delete(input);
+      },
+    };
+    const opened = persistentHarness(undefined, driver).open();
+    const current = await createNow(opened.host, "occupied-bucket");
+    const remove = async () =>
+      await opened.host.handle(
+        request(
+          `${lane}/resources/example.forms.invalid/DeferredThing/occupied-bucket?${new URLSearchParams(
+            {
+              space: "main",
+              group: form.identity.formRef.apiVersion,
+              kind: form.identity.formRef.kind,
+              definitionVersion: form.identity.formRef.definitionVersion,
+              schemaDigest: form.identity.formRef.schemaDigest,
+            },
+          )}`,
+          "primary",
+          {
+            method: "DELETE",
+            headers: {
+              "idempotency-key": "delete-occupied-bucket-0001",
+              "takoform-conformance-probe": "async",
+              "takoform-expected-generation": current.metadata.generation,
+            },
+          },
+        ),
+      );
+
+    const accepted = await remove();
+    expect(accepted?.status).toBe(202);
+    if (!accepted) throw new Error("delete returned no response");
+    const operationId = ((await accepted.json()) as { operation: { id: string } }).operation.id;
+    let settled: Record<string, unknown> | undefined;
+    for (let poll = 0; poll < 8 && !settled?.done; poll += 1) {
+      const polled = await opened.host.handle(
+        request(`${lane}/operations/${operationId}`, "primary"),
+      );
+      settled = (await polled?.json()) as Record<string, unknown>;
+    }
+    // The provider's own sentence, under a code the released provider does not
+    // automatically retry.
+    expect(settled).toMatchObject({
+      done: true,
+      error: { code: "dependency_in_use", message: occupied, retryable: false },
+    });
+
+    // Nothing is held for repair, so nothing ever reaches delete recovery.
+    expect(await opened.host.maintenance?.drainProviderRepairs(8)).toEqual({
+      candidates: 0,
+      acquired: 0,
+      settled: 0,
+      pending: 0,
+    });
+    expect(
+      opened.database.query("SELECT operation_id FROM tf_provider_mutation_sagas").all(),
+    ).toEqual([]);
+
+    // And once the operator has done what the refusal asked, the same destroy
+    // under the same key is a second attempt rather than the stored refusal.
+    refusing = false;
+    const retried = await remove();
+    expect(retried?.status).toBe(202);
+    if (!retried) throw new Error("delete retry returned no response");
+    const retriedId = ((await retried.json()) as { operation: { id: string } }).operation.id;
+    expect(retriedId).not.toBe(operationId);
+    let finished: Record<string, unknown> | undefined;
+    for (let poll = 0; poll < 8 && !finished?.done; poll += 1) {
+      const polled = await opened.host.handle(
+        request(`${lane}/operations/${retriedId}`, "primary"),
+      );
+      finished = (await polled?.json()) as Record<string, unknown>;
+    }
+    expect(finished).toMatchObject({ done: true, result: { deleted: true } });
+    expect(opened.database.query("SELECT name FROM tf_resources").all()).toEqual([]);
+    opened.close();
+  });
+
+  /**
    * Only that one code. Every other settled failure is still a result the same
    * key replays — widening it would also retry a refusal a provider answered
    * *after* it was invoked, and that is a second provider call rather than a
