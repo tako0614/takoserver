@@ -161,22 +161,140 @@ export async function managedWorkerSqliteInstanceName(input: {
 }
 
 /**
- * Takoserver's provider-owned SQLite Durable Object. Runtime calls are RPC
- * methods only; `fetch` is intentionally inert so no public HTTP admin path
- * can reach customer tables or migration history.
+ * The gateway binding that carries the admin secret.
+ *
+ * It is declared on the gateway Worker, which runs this Durable Object class,
+ * and never on a tenant's dispatched Worker — so a tenant cannot read it even
+ * with a raw handle to this namespace, and a Host that has not provisioned it
+ * executes no admin operation at all.
  */
-export class TakoserverManagedWorkerSqlite {
+export const MANAGED_SQLITE_ADMIN_SECRET_BINDING = "TAKOSERVER_MANAGED_SQLITE_ADMIN_SECRET";
+const MANAGED_SQLITE_ADMIN_PROOF_LABEL = "takoserver.managed-sqlite-admin-proof@v1";
+const PROOF = /^[A-Za-z0-9_-]{43}$/u;
+
+/** The admin operations a proof may authorize. A proof names exactly one. */
+export const MANAGED_SQLITE_ADMIN_OPERATIONS = [
+  "initialize",
+  "inspect",
+  "read-migration-ledger",
+  "apply-migration-suffix",
+  "destroy",
+] as const;
+
+export type ManagedWorkerSqliteAdminOperation = (typeof MANAGED_SQLITE_ADMIN_OPERATIONS)[number];
+
+export interface ManagedWorkerSqliteAdminProofInput {
+  readonly secret: string;
+  readonly operation: ManagedWorkerSqliteAdminOperation;
+  readonly authority: ManagedWorkerSqliteAuthority;
+}
+
+/**
+ * Seals one admin operation on one authority tuple.
+ *
+ * Every field of that tuple is derivable by the customer whose Resource it
+ * describes — the provider id, the Resource UID, and a digest over the desired
+ * spec — so the tuple authorizes nothing on its own. What a caller cannot
+ * derive is this HMAC, and the operation name is inside it so an `inspect`
+ * proof is not a `destroy` proof. Fields are length-prefixed for the reason
+ * ADR 0006 gives for the apply commitment: two different tuples must not be
+ * able to hash the same by moving a byte across a boundary.
+ */
+export async function managedWorkerSqliteAdminProof(
+  input: ManagedWorkerSqliteAdminProofInput,
+): Promise<string> {
+  assertToken(input.secret);
+  const parts = [
+    MANAGED_SQLITE_ADMIN_PROOF_LABEL,
+    input.operation,
+    input.authority.providerId,
+    input.authority.resourceUid,
+    input.authority.generation,
+    input.authority.operationId,
+    input.authority.descriptorDigest,
+  ];
+  const encoder = new TextEncoder();
+  const encoded = parts.map((part) => encoder.encode(part));
+  const message = new Uint8Array(encoded.reduce((total, part) => total + 8 + part.byteLength, 0));
+  const view = new DataView(message.buffer);
+  let offset = 0;
+  for (const part of encoded) {
+    view.setBigUint64(offset, BigInt(part.byteLength), false);
+    offset += 8;
+    message.set(part, offset);
+    offset += part.byteLength;
+  }
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(input.secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  return base64Url(new Uint8Array(await crypto.subtle.sign("HMAC", key, message))).slice(0, 43);
+}
+
+/** Compares two proofs without letting the comparison time say how far it got. */
+function sameProof(left: string, right: string): boolean {
+  if (left.length !== right.length) return false;
+  let difference = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    difference |= left.charCodeAt(index) ^ right.charCodeAt(index);
+  }
+  return difference === 0;
+}
+
+/**
+ * The whole behaviour of Takoserver's provider-owned SQLite Durable Object,
+ * with nothing in it that only a Cloudflare isolate can provide.
+ *
+ * The Durable Object itself is `TakoserverManagedWorkerSqlite` in
+ * `cloudflare-managed-worker-sqlite-object.ts`: a class that extends
+ * `DurableObject` from `cloudflare:workers`, which is what makes these methods
+ * reachable as RPC on a real stub, and which nothing outside a Worker can
+ * import. Keeping the behaviour here keeps it exercisable against a faithful
+ * fake storage; the Durable Object adds identity and delegates.
+ *
+ * Runtime calls are RPC methods only; `fetch` on the Durable Object is
+ * intentionally inert so no public HTTP admin path can reach customer tables or
+ * migration history.
+ */
+export class ManagedWorkerSqliteCore {
   readonly #ctx: ManagedWorkerSqliteState;
   readonly #sql: ManagedWorkerSqliteStorage;
+  readonly #adminSecret: string | undefined;
 
   constructor(ctx: ManagedWorkerSqliteState, env: unknown) {
-    void env;
     this.#ctx = ctx;
     this.#sql = ctx.storage.sql;
+    const secret = isRecord(env) ? env[MANAGED_SQLITE_ADMIN_SECRET_BINDING] : undefined;
+    this.#adminSecret = typeof secret === "string" && TOKEN.test(secret) ? secret : undefined;
   }
 
-  fetch(_request?: Request): Response {
-    return new Response(null, { status: 404 });
+  /**
+   * The admin plane is provider-only, and this is what says so.
+   *
+   * Every field of an authority tuple is derivable by the customer whose
+   * Resource it describes, so comparing the tuple alone would let anyone who
+   * could address this namespace claim an unclaimed instance, replay a
+   * migration suffix, or destroy a database. The proof is an HMAC the gateway's
+   * own secret binding computes, and a Host that has not provisioned that
+   * binding executes no admin operation rather than trusting the caller.
+   */
+  async #assertAdminProof(
+    operation: ManagedWorkerSqliteAdminOperation,
+    authority: ManagedWorkerSqliteAuthority,
+    proof: string,
+  ): Promise<void> {
+    const secret = this.#adminSecret;
+    if (secret === undefined) throw new AdminSentinel("backend_unavailable");
+    let expected: string;
+    try {
+      expected = await managedWorkerSqliteAdminProof({ secret, operation, authority });
+    } catch {
+      throw new AdminSentinel("backend_unavailable");
+    }
+    if (!sameProof(expected, proof)) throw new AdminSentinel("invalid_argument");
   }
 
   async edgeSqlExecute(input: unknown): Promise<ManagedWorkerSqlRpcResult<ManagedWorkerSqlResult>> {
@@ -201,6 +319,15 @@ export class TakoserverManagedWorkerSqlite {
         for (const statement of statements) {
           materialized.push(this.#executeSql(statement));
         }
+        // Each statement's own result is bounded as it is read. The envelope
+        // that carries all of them is bounded here, inside the transaction, so
+        // an answer this Durable Object cannot return rolls its writes back
+        // instead of committing them and failing on the way out. The wrapper
+        // refuses the same envelope on the other side of the RPC; this is the
+        // side that owns the data.
+        if (utf8(JSON.stringify({ results: materialized })) > MAX_SQL_RESULT_BYTES) {
+          throw new SqlSentinel(BACKEND_ERROR);
+        }
         results = materialized;
       });
       return success({ results });
@@ -212,9 +339,11 @@ export class TakoserverManagedWorkerSqlite {
   async takoserverSqliteInitialize(
     input: unknown,
   ): Promise<ManagedWorkerSqliteAdminResult<{ readonly state: "active" }>> {
-    const authority = parseAuthority(input);
-    if (!authority) return adminFailure("invalid_argument");
+    const request = parseAdminRequest(input);
+    if (!request) return adminFailure("invalid_argument");
+    const { authority } = request;
     try {
+      await this.#assertAdminProof("initialize", authority, request.proof);
       this.#transactionSync(() => {
         const existing = this.#readControl();
         if (existing !== null) {
@@ -242,9 +371,11 @@ export class TakoserverManagedWorkerSqlite {
   async takoserverSqliteInspect(
     input: unknown,
   ): Promise<ManagedWorkerSqliteAdminResult<ManagedWorkerSqliteInspectResult>> {
-    const authority = parseAuthority(input);
-    if (!authority) return adminFailure("invalid_argument");
+    const request = parseAdminRequest(input);
+    if (!request) return adminFailure("invalid_argument");
+    const { authority } = request;
     try {
+      await this.#assertAdminProof("inspect", authority, request.proof);
       const control = this.#readControl();
       if (control === null) {
         this.#assertNoLegacyControlTables();
@@ -256,18 +387,19 @@ export class TakoserverManagedWorkerSqlite {
         authority: control.authority,
         migrations: control.migrations,
       });
-    } catch {
-      return adminFailure("backend_unavailable");
+    } catch (error) {
+      return adminFailure(error instanceof AdminSentinel ? error.code : "backend_unavailable");
     }
   }
 
   async takoserverSqliteReadMigrationLedger(
     input: unknown,
   ): Promise<ManagedWorkerSqliteAdminResult<readonly ManagedWorkerSqliteMigrationIdentity[]>> {
-    const authority = parseAuthority(input);
-    if (!authority) return adminFailure("invalid_argument");
+    const request = parseAdminRequest(input);
+    if (!request) return adminFailure("invalid_argument");
     try {
-      const control = this.#assertActiveAuthority(authority);
+      await this.#assertAdminProof("read-migration-ledger", request.authority, request.proof);
+      const control = this.#assertActiveAuthority(request.authority);
       return adminSuccess(control.migrations);
     } catch (error) {
       return adminFailure(error instanceof AdminSentinel ? error.code : "backend_unavailable");
@@ -296,6 +428,7 @@ export class TakoserverManagedWorkerSqlite {
       return adminFailure(error instanceof AdminSentinel ? error.code : "invalid_argument");
     }
     try {
+      await this.#assertAdminProof("apply-migration-suffix", parsed.authority, parsed.proof);
       this.#transactionSync(() => {
         const control = this.#assertActiveAuthority(parsed.authority);
         const current = control.migrations;
@@ -345,9 +478,11 @@ export class TakoserverManagedWorkerSqlite {
   async takoserverSqliteDestroy(
     input: unknown,
   ): Promise<ManagedWorkerSqliteAdminResult<{ readonly destroyed: true }>> {
-    const authority = parseAuthority(input);
-    if (!authority) return adminFailure("invalid_argument");
+    const request = parseAdminRequest(input);
+    if (!request) return adminFailure("invalid_argument");
+    const { authority } = request;
     try {
+      await this.#assertAdminProof("destroy", authority, request.proof);
       this.#transactionSync(() => {
         const control = this.#readControl();
         if (control === null) {
@@ -481,8 +616,7 @@ export class TakoserverManagedWorkerSqlite {
   #dropCustomerObjects(): void {
     const objects = this.#sql
       .exec<Record<string, string>>(
-        "SELECT type, name FROM sqlite_schema WHERE name <> ? ORDER BY CASE type WHEN 'trigger' THEN 0 WHEN 'view' THEN 1 WHEN 'index' THEN 2 ELSE 3 END, name",
-        "__cf_kv",
+        "SELECT type, name FROM sqlite_schema ORDER BY CASE type WHEN 'trigger' THEN 0 WHEN 'view' THEN 1 WHEN 'index' THEN 2 ELSE 3 END, name",
       )
       .toArray();
     for (const object of objects) {
@@ -490,9 +624,12 @@ export class TakoserverManagedWorkerSqlite {
       if (typeof name !== "string") continue;
       // SQLite creates indexes such as `sqlite_autoindex_*` (and other
       // `sqlite_*` bookkeeping objects) that cannot be dropped by customer
-      // code. They are not customer-owned objects; all other names are
-      // quoted below, including names containing whitespace or quotes.
-      if (name.startsWith("sqlite_") || name === "__cf_kv") continue;
+      // code, and the runtime keeps its own `_cf_*` tables in the same file —
+      // `_cf_KV` is where this object's control record lives, and dropping it
+      // fails `SQLITE_AUTH` and would take the whole destroy down with it.
+      // Neither is a customer-owned object; all other names are quoted below,
+      // including names containing whitespace or quotes.
+      if (isRuntimeOwnedSqliteObject(name)) continue;
       const type =
         object.type === "table" ||
         object.type === "view" ||
@@ -586,7 +723,7 @@ function validateSql(sql: string): void {
     throw new SqlSentinel(SQL_ERROR);
   }
   if (
-    /\b(?:begin|commit|end|rollback|savepoint|release|attach|detach|vacuum|pragma|create|alter|drop|reindex|replace)\b/iu.test(
+    /\b(?:begin|commit|end|rollback|savepoint|release|attach|detach|vacuum|pragma\w*|create|alter|drop|reindex|replace)\b/iu.test(
       withoutTrailingSemicolon,
     )
   ) {
@@ -613,8 +750,31 @@ function validateMigrationSql(sql: string): void {
   }
 }
 
+/**
+ * The objects in this database file that belong to the runtime rather than to
+ * the customer. `_cf_KV` is the Durable Object's own key-value table — where
+ * this class keeps its control record — and `_cf_METADATA` its bookkeeping;
+ * `__cf_kv` is the name an earlier reading of the runtime used and is kept so
+ * that a database written under it is still recognised. Dropping any of them is
+ * refused by the runtime, and a destroy that tried would fail entirely.
+ */
+function isRuntimeOwnedSqliteObject(name: string): boolean {
+  const lowered = name.toLowerCase();
+  return lowered.startsWith("sqlite_") || lowered.startsWith("_cf_") || lowered === "__cf_kv";
+}
+
+/**
+ * Identifiers no customer statement and no migration may name.
+ *
+ * The runtime authorizes most of these out on its own — `SELECT * FROM _cf_KV`
+ * fails `SQLITE_AUTH` — but a gate that depends on the backend refusing is one
+ * gate, and this is the other. `pragma_*` covers the table-valued functions,
+ * which `PRAGMA`'s own word-boundary denial in `validateSql` does not reach:
+ * `pragma_table_list` is a table name, not the `PRAGMA` keyword, and it does
+ * answer.
+ */
 function containsProtectedIdentifier(sql: string): boolean {
-  return /(?:^|[^A-Za-z0-9_$])(?:__cf_kv|sqlite_schema|sqlite_master|sqlite_temp_schema|sqlite_temp_master|sqlite_sequence)(?=$|[^A-Za-z0-9_$])/iu.test(
+  return /(?:^|[^A-Za-z0-9_$])(?:_cf_[A-Za-z0-9_$]*|__cf_kv|pragma_[A-Za-z0-9_$]*|sqlite_schema|sqlite_master|sqlite_temp_schema|sqlite_temp_master|sqlite_sequence)(?=$|[^A-Za-z0-9_$])/iu.test(
     sql,
   );
 }
@@ -713,14 +873,17 @@ function validControlRecord(value: ManagedWorkerSqliteControlRecord): boolean {
 
 function parseMigrationInput(value: unknown): {
   readonly authority: ManagedWorkerSqliteAuthority;
+  readonly proof: string;
   readonly expectedPrefix: readonly ManagedWorkerSqliteMigrationIdentity[];
   readonly migrations: readonly ManagedWorkerSqliteMigration[];
 } | null {
-  if (!isRecord(value) || !onlyKeys(value, ["authority", "expectedPrefix", "migrations"]))
+  if (!isRecord(value) || !onlyKeys(value, ["authority", "proof", "expectedPrefix", "migrations"]))
     return null;
   const authority = parseAuthority(value.authority);
   if (
     !authority ||
+    typeof value.proof !== "string" ||
+    !PROOF.test(value.proof) ||
     !Array.isArray(value.expectedPrefix) ||
     value.expectedPrefix.length > MAX_SQL_STATEMENTS ||
     !Array.isArray(value.migrations) ||
@@ -734,9 +897,20 @@ function parseMigrationInput(value: unknown): {
     return null;
   return {
     authority,
+    proof: value.proof,
     expectedPrefix: expectedPrefix as ManagedWorkerSqliteMigrationIdentity[],
     migrations: migrations as ManagedWorkerSqliteMigration[],
   };
+}
+
+/** The shape every admin RPC but the migration one takes. */
+function parseAdminRequest(
+  value: unknown,
+): { readonly authority: ManagedWorkerSqliteAuthority; readonly proof: string } | null {
+  if (!isRecord(value) || !onlyKeys(value, ["authority", "proof"])) return null;
+  const authority = parseAuthority(value.authority);
+  if (!authority || typeof value.proof !== "string" || !PROOF.test(value.proof)) return null;
+  return { authority, proof: value.proof };
 }
 
 function parseMigrationIdentity(value: unknown): ManagedWorkerSqliteMigrationIdentity | null {
@@ -826,32 +1000,43 @@ function hasDuplicateMigrationPath(
   return false;
 }
 
+/**
+ * A row leaves this Durable Object over RPC, and Cloudflare's RPC serializer
+ * refuses a null-prototype object — so a projected row must be an ordinary
+ * one. Column names are customer-chosen, so each is defined as an own data
+ * property rather than assigned: `SELECT 1 AS __proto__` would otherwise set
+ * the prototype instead of a column.
+ */
 function projectRow(
   row: Record<string, ArrayBuffer | string | number | null>,
 ): Readonly<Record<string, ManagedWorkerSqlValue>> {
-  const result: Record<string, ManagedWorkerSqlValue> = Object.create(null) as Record<
-    string,
-    ManagedWorkerSqlValue
-  >;
+  const result: Record<string, ManagedWorkerSqlValue> = {};
   const keys = Object.keys(row);
   if (keys.length > MAX_SQL_COLUMNS) throw new SqlSentinel(BACKEND_ERROR);
   for (const key of keys) {
     if (key.length === 0 || utf8(key) > 128) throw new SqlSentinel(BACKEND_ERROR);
     const value = row[key];
+    let projected: ManagedWorkerSqlValue;
     if (value === null) {
-      result[key] = null;
+      projected = null;
     } else if (typeof value === "string") {
       if (utf8(value) > MAX_SQL_VALUE_BYTES) throw new SqlSentinel(BACKEND_ERROR);
-      result[key] = value;
+      projected = value;
     } else if (typeof value === "number") {
       if (!Number.isFinite(value) || Math.abs(value) > Number.MAX_SAFE_INTEGER)
         throw new SqlSentinel(NUMERIC_ERROR);
-      result[key] = value;
+      projected = value;
     } else if (value instanceof ArrayBuffer) {
-      result[key] = { encoding: "base64", data: base64(new Uint8Array(value)) };
+      projected = { encoding: "base64", data: base64(new Uint8Array(value)) };
     } else {
       throw new SqlSentinel(BACKEND_ERROR);
     }
+    Object.defineProperty(result, key, {
+      value: projected,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
   }
   return result;
 }

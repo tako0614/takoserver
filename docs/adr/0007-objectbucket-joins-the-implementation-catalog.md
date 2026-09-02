@@ -2,16 +2,18 @@
 
 **Status:** accepted, 2026-09-02
 
-> **Amended 2026-09-02 by this decision's own second rotation.** Where the body
-> below says a self-host "realizes none" of the ObjectBucket supply and records
-> the Form with an EMPTY operation set, that is no longer true: a self-host now
-> holds object bodies under its data root and their metadata in its control
-> database, and its Provider Pack owns both halves of the
+> **Amended twice on 2026-09-02, and the body below is the first statement of
+> each.** Where it says a self-host "realizes none" of the ObjectBucket supply
+> and records the Form with an EMPTY operation set, that is no longer true: a
+> self-host now holds object bodies under its data root and their metadata in
+> its control database, and its Provider Pack owns both halves of the
 > `module-worker.object-bucket` materialization. The rule is unchanged — an
 > identity capability is admitted with the operations its Form declares exactly
 > where the Host realizes the supply — but the self-host's answer to it moved,
 > and its digests moved with it. See
-> [Second rotation](#second-rotation-the-self-host-realizes-the-supply).
+> [Second rotation](#second-rotation-the-self-host-realizes-the-supply). What
+> the managed Workers-for-Platforms lane turned out to need before anyone
+> composes it is recorded separately, at the end.
 
 ## Decision
 
@@ -52,7 +54,9 @@ They stay installed, unsupported, and without an activation head.
 
 ## What each runtime hands the Worker
 
-Exactly one Cloudflare Worker backend accepts `bucketBindings`.
+Exactly one Cloudflare Worker backend accepts `bucketBindings`. The self-host
+runtime accepts one too, and hands over something different; it is described
+after the two Cloudflare backends.
 
 - The **ordinary-workers backend** — the production path in an operator's own
   Cloudflare account — uploads the tenant's exact bundle bytes with no wrapper.
@@ -89,6 +93,17 @@ it is, the honest statement is: on the ordinary-workers backend the portable
 Binding selects and materializes the bucket, and the runtime shape under the
 declared name is Cloudflare's own. Nothing about bucket name, region,
 endpoint, credential, or supply document reaches the Worker either way.
+
+The **self-host runtime** accepts one as well, and this is where the two
+Cloudflare answers separate for a reason rather than by accident. It publishes
+every Worker Version through a Takoserver-owned entrypoint, so it has the place
+to interpose a facade that the ordinary-workers backend does not — and the
+receipt problem that keeps the managed backend out does not arise, because its
+multipart receipts are rows in the control database rather than isolate memory.
+So `env.MEDIA` there is the exact `edge.objects` facade of ADR 0005, over an
+object plane on the machine itself. The validation below is the same
+validation; only the material differs. See
+[Second rotation](#second-rotation-the-self-host-realizes-the-supply).
 
 The consumer importer added to the Cloudflare runtime-binding materializer
 reverses the note that "an ordinary Worker adapter must not consume this export
@@ -290,3 +305,95 @@ bun scripts/selfhost-form-admission.ts <organizationId> <space> ... --apply
   ordinary-workers backend and the self-host wrapper backend are the two
   runtimes that bind one, and they bind it differently: Cloudflare's own R2
   binding there, the exact `edge.objects` facade here.
+
+## Amendment — 2026-09-02: the managed lane's pre-shipment defects
+
+The section above says what each runtime hands the Worker. An adversarial
+review of the managed (Workers-for-Platforms) backend found that the sentence
+was not the whole truth, and that the lane could not have worked at all. No
+production composition builds it — `src/providers/cloudflare.ts` defaults to
+`ordinary-workers` and only tests construct `CloudflareWfpBackend` — so no
+tenant was affected, and none of the below is a migration. It is what had to be
+true before anyone composes it.
+
+**The wrapper's projected `env` never hid anything.** A binding belongs to the
+script it is declared on, and the runtime hands every one of them to every
+module that script runs — `import { env } from "cloudflare:workers"` included.
+So the internal `__TAKOSERVER_SQLITE_<i>` Durable Object namespace and, if the
+bucket refusal above were ever lifted, the `__TAKOSERVER_OBJECTS_<i>` R2 handle
+were one import away from tenant code, along with every `secret_text` value.
+`tests/cloudflare-managed-worker-wrapper.test.ts` runs the generated wrapper
+under the pinned workerd and shows the raw bucket being written through that
+route. Every managed tenant user Worker is therefore now uploaded with
+`compatibility_flags: ["disallow_importable_env"]`, which empties the importable
+environment while the handler's own `env` argument keeps its bindings; the
+release readback accepts exactly `main_module`, `compatibility_date`,
+`compatibility_flags`, and `bindings`, and refuses a release whose settings do
+not carry the flag. The self-host backend has set the same flag for the same
+reason, and calls it the second lock rather than the first.
+
+**What remains, and why.** On this lane the flag is the only lock. The raw
+handles stay declared on the tenant's own script: moving the data handles behind
+a Takoserver-owned Worker reached over one service binding — with authority
+derived from the dispatch-namespace caller identity rather than from anything
+the tenant supplies — is the structural answer, and it is a larger change than
+this one (a new sibling in the dispatch namespace, its own authority derivation,
+and a second seam for every `edge.*` facade to cross). It is not taken here.
+Until it is, a defect in `disallow_importable_env` itself, or a release uploaded
+without it, is a tenant reading a raw namespace handle. The readback is what
+makes the second of those visible.
+
+**The Durable Object was unreachable.** `TakoserverManagedWorkerSqlite` did not
+extend `DurableObject` from `cloudflare:workers`, so on a real stub it answered
+only `fetch` and every RPC the provider and the wrapper make would have thrown.
+It now extends it, in
+`src/providers/cloudflare-managed-worker-sqlite-object.ts`, and delegates to
+`ManagedWorkerSqliteCore`, which keeps the behaviour testable against a faithful
+fake storage. Running it under the pinned workerd
+(`tests/cloudflare-managed-worker-sqlite-object.test.ts`) found three more
+defects no fake could: a projected row was a null-prototype object, which
+Cloudflare's RPC serializer refuses, so no `SELECT` could ever have returned;
+destroy enumerated `sqlite_schema` and tried to drop the runtime's own `_cf_KV`
+table, which fails `SQLITE_AUTH` and took the whole destroy down with it; and
+the `pragma_*` table-valued functions answered where the `PRAGMA` keyword is
+denied.
+
+**The admin plane trusted the caller.** Every field of a SQLite authority tuple
+— provider id, Resource UID, generation, an operation id derived from the
+descriptor digest, and that digest over the desired spec — is derivable by the
+customer whose Resource it describes. So comparing the tuple authorized nothing:
+anyone who could address the namespace could claim an unclaimed instance, replay
+a migration suffix onto their own database behind the Host's back, or destroy
+it. Each of the five admin RPCs now carries an HMAC over the label
+`takoserver.managed-sqlite-admin-proof@v1`, the operation name, and the
+length-prefixed tuple, under the gateway's own
+`TAKOSERVER_MANAGED_SQLITE_ADMIN_SECRET` binding — a binding declared on the
+gateway Worker, which a tenant's dispatched Worker never holds. A proof names
+one operation, so an `inspect` proof is not a `destroy` proof.
+
+An operator provisions that secret out of band, with the same value the provider
+composition seals with. The deploy surface neither mints nor uploads it, because
+a value that surface does not hold is not a value it can prove; its binding
+closure recognises the secret without requiring it, and still refuses any other
+binding. **Until it is provisioned the Durable Object executes no admin
+operation at all** — which is the honest posture for a lane nothing composes,
+and the thing to fix first for anyone who wants to.
+
+The Durable Object instance name still leaves as the `databaseId` Output. The
+SQLiteDatabase Form declares no outputs, so this is a Host invention and nothing
+in the portable contract requires it — but the ordinary-workers backend emits
+`databaseId` too, as the native D1 id its own binding closure reads, and the two
+backends serving one Form should answer the same question the same way.
+Replacing the managed one would mean minting a second stable identifier with no
+source of truth, and the name is no longer load-bearing: knowing it buys nothing
+now that every admin operation wants a proof and the runtime facade is the only
+other way in.
+
+**The release script name moved.** `compatibility_flags` is part of
+`settingsIdentity`, which is part of the release descriptor digest, which is the
+`tsr-<digest>` script name. So the same desired state now names a different
+release than it did before this change, and `observe()` on a WorkerVersion
+recorded under the old digest would return `conflict`. There are no such
+records: no composition builds this backend, so no receipt exists in any
+environment. The managed lane starts fresh, and no re-key path is provided
+because there is nothing to re-key.

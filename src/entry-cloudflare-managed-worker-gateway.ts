@@ -5,15 +5,25 @@ import {
   type ManagedWorkerDispatchNamespace,
 } from "./providers/cloudflare-managed-worker-gateway.ts";
 
-export { TakoserverManagedWorkerSqlite } from "./providers/cloudflare-managed-worker-sqlite.ts";
+export { TakoserverManagedWorkerSqlite } from "./providers/cloudflare-managed-worker-sqlite-object.ts";
 
-/** Bindings and non-secret identity selected by the owning deploy target. */
+/**
+ * Bindings and non-secret identity selected by the owning deploy target.
+ *
+ * `TAKOSERVER_MANAGED_SQLITE_ADMIN_SECRET` is declared here because it belongs
+ * to this Worker: it is read by the SQLite Durable Object this script exports,
+ * which is handed this same environment, and never by the gateway's own
+ * request paths. An operator provisions it out of band, with the same value the
+ * provider composition seals admin calls with; until they do, the object
+ * refuses every admin operation. A tenant's dispatched Worker never holds it.
+ */
 export interface ManagedWorkerGatewayWorkerEnv {
   readonly STATE_DB: ManagedWorkerD1Database;
   readonly DISPATCHER: ManagedWorkerDispatchNamespace;
   readonly MANAGED_PROVIDER_ID: string;
   readonly TAKOSERVER_MANAGED_WORKER_GATEWAY_ID?: string;
   readonly TAKOSERVER_ENVIRONMENT?: string;
+  readonly TAKOSERVER_MANAGED_SQLITE_ADMIN_SECRET?: string;
 }
 
 const worker = {

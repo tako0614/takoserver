@@ -36,6 +36,7 @@ import {
   TAKOSERVER_MANAGED_WORKER_ROUTE_SCHEMAS,
 } from "./cloudflare-managed-worker-gateway.ts";
 import type {
+  ManagedWorkerSqliteAdminOperation,
   ManagedWorkerSqliteAdminResult,
   ManagedWorkerSqliteAuthority,
   ManagedWorkerSqliteInspectResult,
@@ -62,6 +63,7 @@ import type {
   ArtifactBytes,
   CloudflareManagedScheduleOperatorProof,
   CloudflareManagedScheduleReconciliationStatus,
+  CloudflareManagedSqliteAdminRequest,
   CloudflareManagedSqliteNamespace,
   CloudflareWorkerBackend,
   CloudflareWorkerDeleteInput,
@@ -76,6 +78,20 @@ import {
 } from "./managed-worker-state.ts";
 
 const WORKER_COMPATIBILITY_DATE = "2026-08-19";
+/**
+ * Compatibility flags every managed tenant user Worker is uploaded with.
+ *
+ * A binding belongs to the script it is declared on, and the runtime hands
+ * every one of them to every module that script runs — including through
+ * `import { env } from "cloudflare:workers"`. So the wrapper's projected `env`
+ * never hid the raw `__TAKOSERVER_SQLITE_<i>` Durable Object namespace or the
+ * `__TAKOSERVER_OBJECTS_<i>` R2 handle: it only declined to hand them over.
+ * `disallow_importable_env` makes the importable environment empty while the
+ * handler's own `env` argument keeps its bindings, which is what actually
+ * closes that door. The self-host backend sets the same flag for the same
+ * reason; see `src/workerd-runtime.ts`.
+ */
+const MANAGED_WORKER_COMPATIBILITY_FLAGS = ["disallow_importable_env"] as const;
 const MANAGED_SQLITE_CLASS = "TakoserverManagedWorkerSqlite";
 const MAX_MODULES = 512;
 const MAX_MODULE_BYTES = 32 * 1024 * 1024;
@@ -154,6 +170,7 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
   readonly #inspectRelease: CloudflareWorkersForPlatformsBackendOptions["inspectRelease"];
   readonly #pendingReleaseReadbackQualified: boolean;
   readonly #deriveSqliteInstanceName: CloudflareWorkersForPlatformsBackendOptions["deriveSqliteInstanceName"];
+  readonly #sealSqliteAdminProof: CloudflareWorkersForPlatformsBackendOptions["sealSqliteAdminProof"];
   readonly #sqliteNamespace: CloudflareManagedSqliteNamespace;
 
   constructor(options: CloudflareWfpBackendOptions) {
@@ -187,6 +204,7 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     }
     this.#pendingReleaseReadbackQualified = qualification !== undefined;
     this.#deriveSqliteInstanceName = options.deriveSqliteInstanceName;
+    this.#sealSqliteAdminProof = options.sealSqliteAdminProof;
     this.#sqliteNamespace = options.sqliteNamespace;
   }
 
@@ -462,7 +480,9 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
       }
       const result = await this.#sqliteNamespace
         .getByName(native.name)
-        .takoserverSqliteReadMigrationLedger(authority);
+        .takoserverSqliteReadMigrationLedger(
+          await this.#sealedSqliteRequest("read-migration-ledger", authority),
+        );
       if (!result.ok) return sqliteProviderFailure(result.error);
       if (!Array.isArray(result.value)) {
         return providerValueFailure("provider_error", "the managed SQLite ledger is malformed");
@@ -511,7 +531,7 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
       const result = await this.#sqliteNamespace
         .getByName(native.name)
         .takoserverSqliteApplyMigrationSuffix({
-          authority,
+          ...(await this.#sealedSqliteRequest("apply-migration-suffix", authority)),
           expectedPrefix: input.expectedPrefix,
           migrations: input.migrations,
         });
@@ -1065,6 +1085,7 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     const settingsIdentity = {
       main_module: wrapperModule,
       compatibility_date: this.#compatibilityDate,
+      compatibility_flags: [...MANAGED_WORKER_COMPATIBILITY_FLAGS],
       bindings: canonicalBindingSettings(bindings.metadata),
     };
     const moduleIdentity = await Promise.all(
@@ -2357,8 +2378,10 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     const authority = sqliteAuthority(this.#providerId, resourceUid, descriptorDigest);
     const stub = this.#sqliteNamespace.getByName(instanceName);
     let inspected: Awaited<ReturnType<typeof stub.takoserverSqliteInspect>>;
+    let sealedInspect: CloudflareManagedSqliteAdminRequest;
     try {
-      inspected = await stub.takoserverSqliteInspect(authority);
+      sealedInspect = await this.#sealedSqliteRequest("inspect", authority);
+      inspected = await stub.takoserverSqliteInspect(sealedInspect);
     } catch {
       return failed("unavailable", "the managed SQLite authority is unavailable", true);
     }
@@ -2381,13 +2404,15 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
         return failed("not_found", "the managed SQLite initialization did not occur");
       }
       try {
-        const initialized = await stub.takoserverSqliteInitialize(authority);
+        const initialized = await stub.takoserverSqliteInitialize(
+          await this.#sealedSqliteRequest("initialize", authority),
+        );
         if (!sqliteInitializationMatches(initialized)) {
           return initialized.ok
             ? failed("provider_error", "the managed SQLite initialization readback is malformed")
             : sqliteTicketFailure(initialized.error);
         }
-        inspected = await stub.takoserverSqliteInspect(authority);
+        inspected = await stub.takoserverSqliteInspect(sealedInspect);
       } catch {
         return failed("unavailable", "the managed SQLite initialization is indeterminate", true);
       }
@@ -2435,7 +2460,7 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     try {
       const inspected = await this.#sqliteNamespace
         .getByName(native.name)
-        .takoserverSqliteInspect(authority);
+        .takoserverSqliteInspect(await this.#sealedSqliteRequest("inspect", authority));
       if (!sqliteInspectionMatches(inspected, authority, "active")) {
         return sqliteInspectionMatches(inspected, authority, "destroyed")
           ? failed("not_found", "the managed SQLite Database is absent")
@@ -2480,7 +2505,7 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     try {
       const destroyed = await this.#sqliteNamespace
         .getByName(native.name)
-        .takoserverSqliteDestroy(authority);
+        .takoserverSqliteDestroy(await this.#sealedSqliteRequest("destroy", authority));
       if (!sqliteDestructionMatches(destroyed)) {
         return destroyed.ok
           ? failed("provider_error", "the managed SQLite destroy readback is malformed")
@@ -2506,6 +2531,18 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     return receipt?.kind === "sqlite" && receipt.state === "committed"
       ? sqliteAuthority(this.#providerId, receipt.resourceUid, receipt.descriptorDigest)
       : null;
+  }
+
+  /**
+   * Seals one admin call. The Durable Object refuses an unsealed one, so a
+   * composition whose sealing authority is unavailable fails before it reaches
+   * the namespace rather than after.
+   */
+  async #sealedSqliteRequest(
+    operation: ManagedWorkerSqliteAdminOperation,
+    authority: ManagedWorkerSqliteAuthority,
+  ): Promise<CloudflareManagedSqliteAdminRequest> {
+    return { authority, proof: await this.#sealSqliteAdminProof({ operation, authority }) };
   }
 
   async #observeReceipt(
@@ -3395,6 +3432,7 @@ function releaseSettingsMatch(
   const normalized = {
     main_module: actual.main_module,
     compatibility_date: actual.compatibility_date,
+    compatibility_flags: actual.compatibility_flags,
     bindings: canonicalBindingSettings(
       actualBindings as readonly Readonly<Record<string, unknown>>[],
     ),
@@ -3402,7 +3440,11 @@ function releaseSettingsMatch(
   return (
     canonicalJson(normalized) === canonicalJson(expected) &&
     Object.keys(actual).every(
-      (key) => key === "main_module" || key === "compatibility_date" || key === "bindings",
+      (key) =>
+        key === "main_module" ||
+        key === "compatibility_date" ||
+        key === "compatibility_flags" ||
+        key === "bindings",
     )
   );
 }

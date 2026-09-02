@@ -818,6 +818,7 @@ export const DEPLOY_CONTRACT = {
       covers: [
         "src/providers/cloudflare-managed-worker-gateway.ts",
         "src/providers/cloudflare-managed-worker-sqlite.ts",
+        "src/providers/cloudflare-managed-worker-sqlite-object.ts",
         "src/providers/cloudflare-managed-worker-wrapper.ts",
         "src/entry-cloudflare-managed-worker-gateway.ts",
         "wrangler.managed-worker-gateway.jsonc",

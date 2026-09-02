@@ -13,15 +13,22 @@ import {
   managedWorkerHostRouteKey,
   TAKOSERVER_MANAGED_WORKER_ROUTE_SCHEMAS,
 } from "../src/providers/cloudflare-managed-worker-gateway.ts";
-import type {
-  ManagedWorkerSqliteAuthority,
-  ManagedWorkerSqliteMigrationIdentity,
+import {
+  type ManagedWorkerSqliteAdminOperation,
+  type ManagedWorkerSqliteAuthority,
+  type ManagedWorkerSqliteMigrationIdentity,
+  managedWorkerSqliteAdminProof,
 } from "../src/providers/cloudflare-managed-worker-sqlite.ts";
 import type {
+  CloudflareManagedSqliteAdminRequest,
   CloudflareManagedSqliteNamespace,
   CloudflareManagedSqliteStub,
   CloudflareWorkersForPlatformsBackendOptions,
 } from "../src/providers/cloudflare-worker-backend.ts";
+
+/** Stands in for the gateway's `TAKOSERVER_MANAGED_SQLITE_ADMIN_SECRET`. */
+const TEST_SQLITE_ADMIN_SECRET = "test-managed-sqlite-admin-secret";
+
 import { ManagedWorkerState } from "../src/providers/managed-worker-state.ts";
 
 const released = await buildEdgeForms();
@@ -432,6 +439,38 @@ test("managed Worker Versions use immutable dispatch scripts and exact readback 
   ]);
   expect(calls.every(({ path }) => !path.includes("/workers/scripts/"))).toBe(true);
   expect(JSON.stringify(ticket)).not.toContain("workers.dev");
+  // ADR 0007's managed-lane amendment: the tenant user Worker is uploaded with
+  // `disallow_importable_env`, and the readback refuses a release whose
+  // settings do not carry it, so the raw internal bindings the wrapper holds
+  // cannot be read back out of `cloudflare:workers`.
+  expect(settings?.compatibility_flags).toEqual(["disallow_importable_env"]);
+});
+
+test("a managed release readback without the import fence is refused", async () => {
+  const api = new ManagedReleaseApi();
+  const provider = releaseProvider(api, createEphemeralSql());
+  const input = managedVersionInput("version_no_fence", "release-no-fence", "tsw-no-fence");
+  expect(await provider.apply(input)).toMatchObject({ phase: "succeeded" });
+
+  const held = [...api.scripts.entries()][0];
+  if (!held) throw new Error("managed release was not uploaded");
+  const [scriptName, release] = held;
+  const observeInput = {
+    offering: versionOffering,
+    identity: input.identity,
+    spec: input.spec,
+    nativeId: `version:tsw-no-fence:${scriptName}`,
+    ...(input.relations === undefined ? {} : { relations: input.relations }),
+  };
+  expect(release.settings.compatibility_flags).toEqual(["disallow_importable_env"]);
+  expect(await provider.observe(observeInput)).toMatchObject({ phase: "succeeded" });
+
+  const { compatibility_flags: _dropped, ...withoutFence } = release.settings;
+  api.scripts.set(scriptName, { ...release, settings: withoutFence });
+  expect(await provider.observe(observeInput)).toMatchObject({
+    phase: "failed",
+    failure: { code: "provider_error" },
+  });
 });
 
 test("managed Worker Versions bind SQLite through the gateway's exact exported DO class", async () => {
@@ -759,7 +798,7 @@ test("managed SQLite lifecycle uses one closed direct authority and byte migrati
     operationId: expect.stringMatching(/^sqlite-[0-9a-f]{64}$/u),
     descriptorDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
   });
-  expect(sqlite.receivedWrappedAuthority).toBe(false);
+  expect(sqlite.unsealedCalls).toBe(0);
 
   const migrationSql = new TextEncoder().encode("CREATE TABLE notes (id TEXT PRIMARY KEY)");
   const migrationDigest = `sha256:${hex(
@@ -1880,6 +1919,7 @@ class ManagedReleaseApi {
         settings: {
           main_module: metadata.main_module,
           compatibility_date: metadata.compatibility_date,
+          compatibility_flags: metadata.compatibility_flags,
           bindings,
         },
       });
@@ -1979,32 +2019,60 @@ function recordValue(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+/**
+ * A faithful stand-in for the Durable Object's admin plane: it refuses an
+ * operation whose proof was not sealed for that exact operation and authority,
+ * exactly as `ManagedWorkerSqliteCore` does.
+ */
 class ManagedSqliteFake implements CloudflareManagedSqliteStub {
   authority: ManagedWorkerSqliteAuthority | null = null;
   ledger: ManagedWorkerSqliteMigrationIdentity[] = [];
   lastMigrationBytes: Uint8Array | null = null;
-  receivedWrappedAuthority = false;
+  unsealedCalls = 0;
   initializeCalls = 0;
   inspectFailure: "backend_unavailable" | null = null;
   destroyLosesAck = false;
   destroyed = false;
 
-  async takoserverSqliteInitialize(input: ManagedWorkerSqliteAuthority) {
+  async #sealed(
+    operation: ManagedWorkerSqliteAdminOperation,
+    input: CloudflareManagedSqliteAdminRequest,
+  ): Promise<boolean> {
+    if (
+      Object.keys(input).sort().join(",") !== "authority,proof" ||
+      input.proof !==
+        (await managedWorkerSqliteAdminProof({
+          secret: TEST_SQLITE_ADMIN_SECRET,
+          operation,
+          authority: input.authority,
+        }))
+    ) {
+      this.unsealedCalls += 1;
+      return false;
+    }
+    return true;
+  }
+
+  async takoserverSqliteInitialize(input: CloudflareManagedSqliteAdminRequest) {
     this.initializeCalls += 1;
-    this.receivedWrappedAuthority ||= Reflect.has(input, "authority");
-    if (this.authority && !sameSqliteAuthority(this.authority, input)) {
+    if (!(await this.#sealed("initialize", input))) {
+      return { ok: false as const, error: { code: "invalid_argument" as const } };
+    }
+    if (this.authority && !sameSqliteAuthority(this.authority, input.authority)) {
       return { ok: false as const, error: { code: "conflict" as const } };
     }
-    this.authority = { ...input };
+    this.authority = { ...input.authority };
     return { ok: true as const, value: { state: "active" as const } };
   }
 
-  async takoserverSqliteInspect(input: ManagedWorkerSqliteAuthority) {
-    this.receivedWrappedAuthority ||= Reflect.has(input, "authority");
+  async takoserverSqliteInspect(input: CloudflareManagedSqliteAdminRequest) {
+    if (!(await this.#sealed("inspect", input))) {
+      return { ok: false as const, error: { code: "invalid_argument" as const } };
+    }
     if (this.inspectFailure) {
       return { ok: false as const, error: { code: this.inspectFailure } };
     }
-    if (!this.authority || !sameSqliteAuthority(this.authority, input)) {
+    if (!this.authority || !sameSqliteAuthority(this.authority, input.authority)) {
       return { ok: false as const, error: { code: "not_found" as const } };
     }
     return {
@@ -2017,42 +2085,52 @@ class ManagedSqliteFake implements CloudflareManagedSqliteStub {
     };
   }
 
-  async takoserverSqliteReadMigrationLedger(input: ManagedWorkerSqliteAuthority) {
-    this.receivedWrappedAuthority ||= Reflect.has(input, "authority");
-    if (!this.authority || this.destroyed || !sameSqliteAuthority(this.authority, input)) {
+  async takoserverSqliteReadMigrationLedger(input: CloudflareManagedSqliteAdminRequest) {
+    if (!(await this.#sealed("read-migration-ledger", input))) {
+      return { ok: false as const, error: { code: "invalid_argument" as const } };
+    }
+    if (
+      !this.authority ||
+      this.destroyed ||
+      !sameSqliteAuthority(this.authority, input.authority)
+    ) {
       return { ok: false as const, error: { code: "not_found" as const } };
     }
     return { ok: true as const, value: this.ledger };
   }
 
-  async takoserverSqliteApplyMigrationSuffix(input: {
-    readonly authority: ManagedWorkerSqliteAuthority;
-    readonly expectedPrefix: readonly ManagedWorkerSqliteMigrationIdentity[];
-    readonly migrations: readonly {
-      readonly path: string;
-      readonly digest: `sha256:${string}`;
-      readonly sql: Uint8Array;
-    }[];
-  }) {
+  async takoserverSqliteApplyMigrationSuffix(
+    input: CloudflareManagedSqliteAdminRequest & {
+      readonly expectedPrefix: readonly ManagedWorkerSqliteMigrationIdentity[];
+      readonly migrations: readonly {
+        readonly path: string;
+        readonly digest: `sha256:${string}`;
+        readonly sql: Uint8Array;
+      }[];
+    },
+  ) {
+    const { expectedPrefix, migrations, ...request } = input;
+    if (!(await this.#sealed("apply-migration-suffix", request))) {
+      return { ok: false as const, error: { code: "invalid_argument" as const } };
+    }
     if (
       !this.authority ||
       this.destroyed ||
       !sameSqliteAuthority(this.authority, input.authority) ||
-      JSON.stringify(input.expectedPrefix) !== JSON.stringify(this.ledger)
+      JSON.stringify(expectedPrefix) !== JSON.stringify(this.ledger)
     ) {
       return { ok: false as const, error: { code: "conflict" as const } };
     }
-    this.lastMigrationBytes = input.migrations[0]?.sql ?? null;
-    this.ledger = [
-      ...this.ledger,
-      ...input.migrations.map(({ path, digest }) => ({ path, digest })),
-    ];
+    this.lastMigrationBytes = migrations[0]?.sql ?? null;
+    this.ledger = [...this.ledger, ...migrations.map(({ path, digest }) => ({ path, digest }))];
     return { ok: true as const, value: undefined };
   }
 
-  async takoserverSqliteDestroy(input: ManagedWorkerSqliteAuthority) {
-    this.receivedWrappedAuthority ||= Reflect.has(input, "authority");
-    if (!this.authority || !sameSqliteAuthority(this.authority, input)) {
+  async takoserverSqliteDestroy(input: CloudflareManagedSqliteAdminRequest) {
+    if (!(await this.#sealed("destroy", input))) {
+      return { ok: false as const, error: { code: "invalid_argument" as const } };
+    }
+    if (!this.authority || !sameSqliteAuthority(this.authority, input.authority)) {
       return { ok: false as const, error: { code: "not_found" as const } };
     }
     this.destroyed = true;
@@ -2106,6 +2184,13 @@ function managedBackend(
       : {}),
     async deriveSqliteInstanceName({ resourceUid }) {
       return `sqlite-${resourceUid}`;
+    },
+    sealSqliteAdminProof({ operation, authority }) {
+      return managedWorkerSqliteAdminProof({
+        secret: TEST_SQLITE_ADMIN_SECRET,
+        operation,
+        authority,
+      });
     },
     sqliteNamespace: missingSqliteNamespace,
   };

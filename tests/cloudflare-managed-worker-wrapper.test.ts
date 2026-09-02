@@ -1277,3 +1277,124 @@ test("Scheduled handler failure waits for its background task and fails the invo
     await loaded.dispose();
   }
 });
+
+/**
+ * ADR 0007's managed-lane amendment. A binding belongs to the script it is
+ * declared on, and workerd hands every one of them to every module that script
+ * runs — `import { env } from "cloudflare:workers"` included. So the wrapper's
+ * projected `env` never hid the internal `__TAKOSERVER_OBJECTS_<i>` handle; it
+ * only declined to pass it. `disallow_importable_env`, which
+ * `CloudflareWfpBackend` now uploads on every tenant user Worker, is what
+ * empties the importable environment. This runs the generated wrapper under the
+ * pinned workerd both ways and reads the difference.
+ */
+async function importableEnvUnderFlag(compatibilityFlags: string[]) {
+  const runtime = new Miniflare({
+    workers: [
+      {
+        config: {
+          name: `wrapper-import-fence-${compatibilityFlags.length}`,
+          type: "worker",
+          compatibilityDate: "2026-08-18",
+          compatibilityFlags,
+          manifest: {
+            mainModule: "wrapper.js",
+            modules: {
+              "wrapper.js": {
+                type: "esm",
+                contents: managedWorkerEntrypointSource({
+                  ...EMPTY_WORKER,
+                  bindings: [
+                    { name: "GREETING", type: "plain_text" },
+                    { name: "API_KEY", type: "secret_text" },
+                    {
+                      kind: MANAGED_WORKER_EDGE_OBJECTS_BINDING_KIND,
+                      publicName: "MEDIA",
+                      nativeName: "__TAKOSERVER_OBJECTS_0",
+                    },
+                  ],
+                }),
+              },
+              "index.js": {
+                type: "esm",
+                contents: `import { env as importable } from "cloudflare:workers";
+export default { async fetch(_request, env) {
+  const importableKeys = Reflect.ownKeys(importable ?? {}).sort();
+  const rawBucket = importable?.__TAKOSERVER_OBJECTS_0;
+  let rawPut = "absent";
+  if (rawBucket) {
+    try { await rawBucket.put("raw.txt", "raw"); rawPut = "stored"; }
+    catch (error) { rawPut = error.name; }
+  }
+  return Response.json({
+    importableKeys,
+    rawSecret: importable?.API_KEY ?? null,
+    rawPut,
+    handlerKeys: Reflect.ownKeys(env).sort(),
+    handlerGreeting: env.GREETING,
+    handlerSecret: env.API_KEY,
+    mediaMethods: Reflect.ownKeys(env.MEDIA).sort(),
+  });
+} };`,
+              },
+            },
+          },
+          env: {
+            GREETING: { type: "text", value: "hello" },
+            API_KEY: { type: "text", value: "s3cret" },
+            __TAKOSERVER_OBJECTS_0: {
+              type: "r2",
+              name: `import-fence-${compatibilityFlags.length}`,
+            },
+          },
+          triggers: [],
+        },
+      },
+    ],
+  });
+  try {
+    const response = await runtime.dispatchFetch("https://worker.example/");
+    const text = await response.text();
+    expect({ status: response.status, text }).toMatchObject({ status: 200 });
+    return JSON.parse(text) as Record<string, unknown>;
+  } finally {
+    await runtime.dispose();
+  }
+}
+
+test("disallow_importable_env empties the tenant's importable env and changes nothing else", async () => {
+  const projected = {
+    handlerKeys: ["API_KEY", "GREETING", "MEDIA"],
+    handlerGreeting: "hello",
+    handlerSecret: "s3cret",
+    mediaMethods: [
+      "abortMultipartUpload",
+      "completeMultipartUpload",
+      "createMultipartUpload",
+      "delete",
+      "get",
+      "head",
+      "list",
+      "put",
+      "uploadPart",
+    ],
+  };
+
+  // Without the flag the raw internal R2 handle and the raw secret are both
+  // one import away, and the handle is usable. This is the defect.
+  expect(await importableEnvUnderFlag([])).toEqual({
+    ...projected,
+    importableKeys: ["API_KEY", "GREETING", "__TAKOSERVER_OBJECTS_0"],
+    rawSecret: "s3cret",
+    rawPut: "stored",
+  });
+
+  // With it the importable environment is empty, and the handler env and the
+  // projected facade are byte-for-byte what they were.
+  expect(await importableEnvUnderFlag(["disallow_importable_env"])).toEqual({
+    ...projected,
+    importableKeys: [],
+    rawSecret: null,
+    rawPut: "absent",
+  });
+}, 60_000);

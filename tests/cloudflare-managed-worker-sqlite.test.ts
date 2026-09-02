@@ -1,12 +1,16 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import {
+  MANAGED_SQLITE_ADMIN_SECRET_BINDING,
   MANAGED_SQLITE_CONTROL_KEY,
   MANAGED_SQLITE_CONTROL_SCHEMA,
+  type ManagedWorkerSqliteAdminOperation,
+  type ManagedWorkerSqliteAuthority,
+  ManagedWorkerSqliteCore,
   type ManagedWorkerSqliteState,
   type ManagedWorkerSqliteStorage,
+  managedWorkerSqliteAdminProof,
   managedWorkerSqliteInstanceName,
-  TakoserverManagedWorkerSqlite,
 } from "../src/providers/cloudflare-managed-worker-sqlite.ts";
 
 const AUTHORITY = {
@@ -84,6 +88,21 @@ class BunSqliteState implements ManagedWorkerSqliteState {
   };
 }
 
+/** Stands in for the gateway's `TAKOSERVER_MANAGED_SQLITE_ADMIN_SECRET` binding. */
+const ADMIN_SECRET = "test-managed-sqlite-admin-secret";
+const ADMIN_ENV = { [MANAGED_SQLITE_ADMIN_SECRET_BINDING]: ADMIN_SECRET };
+
+/** Every admin call carries a proof sealed for that exact operation. */
+async function sealed(
+  operation: ManagedWorkerSqliteAdminOperation,
+  authority: ManagedWorkerSqliteAuthority = AUTHORITY,
+) {
+  return {
+    authority,
+    proof: await managedWorkerSqliteAdminProof({ secret: ADMIN_SECRET, operation, authority }),
+  };
+}
+
 async function migration(path: string, sql: string) {
   const bytes = new TextEncoder().encode(sql);
   const digest = `sha256:${[...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))]
@@ -102,8 +121,8 @@ test("SQLite DO names are deterministic and never include the raw resource UID",
 
 test("edge.sql query rolls back all effects after full result materialization", async () => {
   const state = new BunSqliteState();
-  const database = new TakoserverManagedWorkerSqlite(state, {});
-  expect(await database.takoserverSqliteInitialize(AUTHORITY)).toEqual({
+  const database = new ManagedWorkerSqliteCore(state, ADMIN_ENV);
+  expect(await database.takoserverSqliteInitialize(await sealed("initialize"))).toEqual({
     ok: true,
     value: { state: "active" },
   });
@@ -113,7 +132,7 @@ test("edge.sql query rolls back all effects after full result materialization", 
   );
   expect(
     await database.takoserverSqliteApplyMigrationSuffix({
-      authority: AUTHORITY,
+      ...(await sealed("apply-migration-suffix")),
       expectedPrefix: [],
       migrations: [table],
     }),
@@ -137,14 +156,14 @@ test("edge.sql query rolls back all effects after full result materialization", 
 
 test("edge.sql transaction is serializable all-or-none", async () => {
   const state = new BunSqliteState();
-  const database = new TakoserverManagedWorkerSqlite(state, {});
-  await database.takoserverSqliteInitialize(AUTHORITY);
+  const database = new ManagedWorkerSqliteCore(state, ADMIN_ENV);
+  await database.takoserverSqliteInitialize(await sealed("initialize"));
   const table = await migration(
     "002-create.sql",
     "CREATE TABLE events (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
   );
   await database.takoserverSqliteApplyMigrationSuffix({
-    authority: AUTHORITY,
+    ...(await sealed("apply-migration-suffix")),
     expectedPrefix: [],
     migrations: [table],
   });
@@ -163,19 +182,23 @@ test("edge.sql transaction is serializable all-or-none", async () => {
 
 test("control metadata is one hidden sync-KV record and an exact suffix retry is idempotent", async () => {
   const state = new BunSqliteState();
-  const database = new TakoserverManagedWorkerSqlite(state, {});
-  await database.takoserverSqliteInitialize(AUTHORITY);
+  const database = new ManagedWorkerSqliteCore(state, ADMIN_ENV);
+  await database.takoserverSqliteInitialize(await sealed("initialize"));
   const table = await migration(
     "008-retry.sql",
     "CREATE TABLE retry_once (id INTEGER PRIMARY KEY)",
   );
-  const input = { authority: AUTHORITY, expectedPrefix: [], migrations: [table] };
+  const input = {
+    ...(await sealed("apply-migration-suffix")),
+    expectedPrefix: [],
+    migrations: [table],
+  };
   expect(await database.takoserverSqliteApplyMigrationSuffix(input)).toEqual({
     ok: true,
     value: undefined,
   });
   // Recreate the provider object to exercise the durable record after a restart.
-  const restarted = new TakoserverManagedWorkerSqlite(state, {});
+  const restarted = new ManagedWorkerSqliteCore(state, ADMIN_ENV);
   expect(await restarted.takoserverSqliteApplyMigrationSuffix(input)).toEqual({
     ok: true,
     value: undefined,
@@ -183,7 +206,7 @@ test("control metadata is one hidden sync-KV record and an exact suffix retry is
   expect(
     state.database.query("SELECT name FROM sqlite_schema WHERE name = '__cf_kv'").all(),
   ).toEqual([]);
-  expect(await restarted.takoserverSqliteInspect(AUTHORITY)).toEqual({
+  expect(await restarted.takoserverSqliteInspect(await sealed("inspect"))).toEqual({
     ok: true,
     value: {
       state: "active",
@@ -197,12 +220,12 @@ test("control metadata is one hidden sync-KV record and an exact suffix retry is
 
 test("customer SQL and the control KV record commit or roll back together", async () => {
   const state = new BunSqliteState();
-  const database = new TakoserverManagedWorkerSqlite(state, {});
-  await database.takoserverSqliteInitialize(AUTHORITY);
+  const database = new ManagedWorkerSqliteCore(state, ADMIN_ENV);
+  await database.takoserverSqliteInitialize(await sealed("initialize"));
   const first = await migration("009-first.sql", "CREATE TABLE first_row (value TEXT)");
   expect(
     await database.takoserverSqliteApplyMigrationSuffix({
-      authority: AUTHORITY,
+      ...(await sealed("apply-migration-suffix")),
       expectedPrefix: [],
       migrations: [first],
     }),
@@ -211,7 +234,7 @@ test("customer SQL and the control KV record commit or roll back together", asyn
   state.failNextKvPut = true;
   expect(
     await database.takoserverSqliteApplyMigrationSuffix({
-      authority: AUTHORITY,
+      ...(await sealed("apply-migration-suffix")),
       expectedPrefix: [{ path: first.path, digest: first.digest }],
       migrations: [second],
     }),
@@ -219,7 +242,7 @@ test("customer SQL and the control KV record commit or roll back together", asyn
   expect(
     state.database.query("SELECT name FROM sqlite_schema WHERE name = 'rolled_back'").all(),
   ).toEqual([]);
-  expect(await database.takoserverSqliteInspect(AUTHORITY)).toEqual({
+  expect(await database.takoserverSqliteInspect(await sealed("inspect"))).toEqual({
     ok: true,
     value: {
       state: "active",
@@ -231,23 +254,23 @@ test("customer SQL and the control KV record commit or roll back together", asyn
 
 test("destroy is idempotent, leaves a KV tombstone, and closes runtime RPC", async () => {
   const state = new BunSqliteState();
-  const database = new TakoserverManagedWorkerSqlite(state, {});
-  await database.takoserverSqliteInitialize(AUTHORITY);
+  const database = new ManagedWorkerSqliteCore(state, ADMIN_ENV);
+  await database.takoserverSqliteInitialize(await sealed("initialize"));
   const table = await migration("003-create.sql", "CREATE TABLE customer_data (value TEXT)");
   await database.takoserverSqliteApplyMigrationSuffix({
-    authority: AUTHORITY,
+    ...(await sealed("apply-migration-suffix")),
     expectedPrefix: [],
     migrations: [table],
   });
-  expect(await database.takoserverSqliteDestroy(AUTHORITY)).toEqual({
+  expect(await database.takoserverSqliteDestroy(await sealed("destroy"))).toEqual({
     ok: true,
     value: { destroyed: true },
   });
-  expect(await database.takoserverSqliteDestroy(AUTHORITY)).toEqual({
+  expect(await database.takoserverSqliteDestroy(await sealed("destroy"))).toEqual({
     ok: true,
     value: { destroyed: true },
   });
-  expect(await database.takoserverSqliteInspect(AUTHORITY)).toMatchObject({
+  expect(await database.takoserverSqliteInspect(await sealed("inspect"))).toMatchObject({
     ok: true,
     value: { state: "destroyed" },
   });
@@ -261,28 +284,53 @@ test("destroy is idempotent, leaves a KV tombstone, and closes runtime RPC", asy
     ok: false,
     error: { code: "backend_unavailable" },
   });
-  expect(database.fetch(new Request("https://example.test/admin")).status).toBe(404);
+  // `fetch` is inert on the Durable Object rather than on this core, and is
+  // proved there against a real stub — see
+  // `tests/cloudflare-managed-worker-sqlite-object.test.ts`.
 });
 
 test("runtime rejects schema and hidden KV access while former control names remain customer SQL", async () => {
   const state = new BunSqliteState();
-  const database = new TakoserverManagedWorkerSqlite(state, {});
-  await database.takoserverSqliteInitialize(AUTHORITY);
+  const database = new ManagedWorkerSqliteCore(state, ADMIN_ENV);
+  await database.takoserverSqliteInitialize(await sealed("initialize"));
   expect(await database.edgeSqlExecute({ sql: "CREATE TABLE nope (id INTEGER)" })).toEqual({
     ok: false,
     error: { code: "sql_error" },
   });
-  expect(await database.edgeSqlQuery({ sql: "SELECT * FROM __cf_kv" })).toEqual({
-    ok: false,
-    error: { code: "sql_error" },
-  });
+  // The runtime's own key-value table is `_cf_KV`, and `__cf_kv` is the name an
+  // earlier reading used. Both are refused, and so are the `pragma_*`
+  // table-valued functions, which answer where the `PRAGMA` keyword does not.
+  for (const sql of [
+    "SELECT * FROM __cf_kv",
+    "SELECT * FROM _cf_KV",
+    'SELECT * FROM "_cf_kv"',
+    "SELECT * FROM _cf_METADATA",
+    "SELECT name FROM pragma_table_list",
+    "SELECT name FROM pragma_table_info('notes')",
+    "SELECT * FROM pragma_database_list",
+  ]) {
+    expect({ sql, result: await database.edgeSqlQuery({ sql }) }).toEqual({
+      sql,
+      result: { ok: false, error: { code: "sql_error" } },
+    });
+  }
+  // A migration is provider-supplied and may carry DDL, but it may not name
+  // them either.
+  const forbidden = await migration("004-pragma.sql", "CREATE TABLE t AS SELECT * FROM _cf_KV");
+  expect(
+    await database.takoserverSqliteApplyMigrationSuffix({
+      ...(await sealed("apply-migration-suffix")),
+      expectedPrefix: [],
+      migrations: [forbidden],
+    }),
+  ).toEqual({ ok: false, error: { code: "invalid_argument" } });
   const customerTable = await migration(
     "005-former-control-name.sql",
     'CREATE TABLE "_takoform_sqlite_migrations" (value TEXT)',
   );
   expect(
     await database.takoserverSqliteApplyMigrationSuffix({
-      authority: AUTHORITY,
+      ...(await sealed("apply-migration-suffix")),
       expectedPrefix: [],
       migrations: [customerTable],
     }),
@@ -299,7 +347,7 @@ test("runtime rejects schema and hidden KV access while former control names rem
     ok: true,
     value: { rows: [{ value: "customer" }], rowsWritten: 0 },
   });
-  expect(await database.takoserverSqliteInspect(AUTHORITY)).toMatchObject({
+  expect(await database.takoserverSqliteInspect(await sealed("inspect"))).toMatchObject({
     ok: true,
     value: { state: "active", authority: AUTHORITY },
   });
@@ -307,8 +355,8 @@ test("runtime rejects schema and hidden KV access while former control names rem
 
 test("former control-like names never expose or delete KV authority", async () => {
   const state = new BunSqliteState();
-  const database = new TakoserverManagedWorkerSqlite(state, {});
-  await database.takoserverSqliteInitialize(AUTHORITY);
+  const database = new ManagedWorkerSqliteCore(state, ADMIN_ENV);
+  await database.takoserverSqliteInitialize(await sealed("initialize"));
 
   const table = await migration(
     "006-former-identity.sql",
@@ -316,7 +364,7 @@ test("former control-like names never expose or delete KV authority", async () =
   );
   expect(
     await database.takoserverSqliteApplyMigrationSuffix({
-      authority: AUTHORITY,
+      ...(await sealed("apply-migration-suffix")),
       expectedPrefix: [],
       migrations: [table],
     }),
@@ -339,7 +387,7 @@ test("former control-like names never expose or delete KV authority", async () =
     ok: true,
     value: { rowsWritten: 1 },
   });
-  expect(await database.takoserverSqliteInspect(AUTHORITY)).toMatchObject({
+  expect(await database.takoserverSqliteInspect(await sealed("inspect"))).toMatchObject({
     ok: true,
     value: { state: "active", authority: AUTHORITY },
   });
@@ -347,8 +395,8 @@ test("former control-like names never expose or delete KV authority", async () =
 
 test("migration SQL cannot address hidden/system SQLite storage", async () => {
   const state = new BunSqliteState();
-  const database = new TakoserverManagedWorkerSqlite(state, {});
-  await database.takoserverSqliteInitialize(AUTHORITY);
+  const database = new ManagedWorkerSqliteCore(state, ADMIN_ENV);
+  await database.takoserverSqliteInitialize(await sealed("initialize"));
 
   for (const sql of [
     "CREATE TABLE __cf_kv (id INTEGER)",
@@ -356,7 +404,7 @@ test("migration SQL cannot address hidden/system SQLite storage", async () => {
     'CREATE TABLE customer_notes ("sqlite_master" TEXT)',
   ]) {
     const result = await database.takoserverSqliteApplyMigrationSuffix({
-      authority: AUTHORITY,
+      ...(await sealed("apply-migration-suffix")),
       expectedPrefix: [],
       migrations: [await migration(`blocked-${sql.slice(0, 8)}.sql`, sql)],
     });
@@ -366,12 +414,12 @@ test("migration SQL cannot address hidden/system SQLite storage", async () => {
 
 test("missing or malformed control metadata fails closed", async () => {
   const missing = new BunSqliteState();
-  const missingDatabase = new TakoserverManagedWorkerSqlite(missing, {});
+  const missingDatabase = new ManagedWorkerSqliteCore(missing, ADMIN_ENV);
   expect(await missingDatabase.edgeSqlQuery({ sql: "SELECT 1" })).toEqual({
     ok: false,
     error: { code: "backend_unavailable" },
   });
-  expect(await missingDatabase.takoserverSqliteInspect(AUTHORITY)).toEqual({
+  expect(await missingDatabase.takoserverSqliteInspect(await sealed("inspect"))).toEqual({
     ok: false,
     error: { code: "not_found" },
   });
@@ -383,12 +431,12 @@ test("missing or malformed control metadata fails closed", async () => {
     authority: AUTHORITY,
     migrations: [{ path: "not-valid", digest: "sha256:bad" }],
   });
-  const malformedDatabase = new TakoserverManagedWorkerSqlite(malformed, {});
+  const malformedDatabase = new ManagedWorkerSqliteCore(malformed, ADMIN_ENV);
   expect(await malformedDatabase.edgeSqlQuery({ sql: "SELECT 1" })).toEqual({
     ok: false,
     error: { code: "backend_unavailable" },
   });
-  expect(await malformedDatabase.takoserverSqliteInspect(AUTHORITY)).toEqual({
+  expect(await malformedDatabase.takoserverSqliteInspect(await sealed("inspect"))).toEqual({
     ok: false,
     error: { code: "backend_unavailable" },
   });
@@ -397,13 +445,13 @@ test("missing or malformed control metadata fails closed", async () => {
 test("legacy ordinary control names never become authority and block fresh reconciliation", async () => {
   const state = new BunSqliteState();
   state.database.exec('CREATE TABLE "_takoserver_sqlite_identity" (provider_id TEXT)');
-  const database = new TakoserverManagedWorkerSqlite(state, {});
-  expect(await database.takoserverSqliteInitialize(AUTHORITY)).toEqual({
+  const database = new ManagedWorkerSqliteCore(state, ADMIN_ENV);
+  expect(await database.takoserverSqliteInitialize(await sealed("initialize"))).toEqual({
     ok: false,
     error: { code: "backend_unavailable" },
   });
   expect(state.kvValues.has(MANAGED_SQLITE_CONTROL_KEY)).toBe(false);
-  expect(await database.takoserverSqliteInspect(AUTHORITY)).toEqual({
+  expect(await database.takoserverSqliteInspect(await sealed("inspect"))).toEqual({
     ok: false,
     error: { code: "backend_unavailable" },
   });
@@ -411,8 +459,8 @@ test("legacy ordinary control names never become authority and block fresh recon
 
 test("destroy drops customer objects with quoted names", async () => {
   const state = new BunSqliteState();
-  const database = new TakoserverManagedWorkerSqlite(state, {});
-  await database.takoserverSqliteInitialize(AUTHORITY);
+  const database = new ManagedWorkerSqliteCore(state, ADMIN_ENV);
+  await database.takoserverSqliteInitialize(await sealed("initialize"));
   const sql = [
     'CREATE TABLE "odd table""quoted" (value TEXT)',
     'CREATE INDEX "odd index""quoted" ON "odd table""quoted" (value)',
@@ -421,13 +469,13 @@ test("destroy drops customer objects with quoted names", async () => {
   ].join(";\n");
   expect(
     await database.takoserverSqliteApplyMigrationSuffix({
-      authority: AUTHORITY,
+      ...(await sealed("apply-migration-suffix")),
       expectedPrefix: [],
       migrations: [await migration("004-quoted.sql", sql)],
     }),
   ).toEqual({ ok: true, value: undefined });
 
-  expect(await database.takoserverSqliteDestroy(AUTHORITY)).toEqual({
+  expect(await database.takoserverSqliteDestroy(await sealed("destroy"))).toEqual({
     ok: true,
     value: { destroyed: true },
   });
@@ -437,4 +485,131 @@ test("destroy drops customer objects with quoted names", async () => {
     name: string;
   }[];
   expect(leftovers).toEqual([]);
+});
+
+test("a transaction envelope over the result ceiling is refused and rolls its writes back", async () => {
+  const state = new BunSqliteState();
+  const database = new ManagedWorkerSqliteCore(state, ADMIN_ENV);
+  await database.takoserverSqliteInitialize(await sealed("initialize"));
+  const table = await migration(
+    "007-wide.sql",
+    "CREATE TABLE wide (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+  );
+  expect(
+    await database.takoserverSqliteApplyMigrationSuffix({
+      ...(await sealed("apply-migration-suffix")),
+      expectedPrefix: [],
+      migrations: [table],
+    }),
+  ).toEqual({ ok: true, value: undefined });
+  expect(
+    await database.edgeSqlExecute({
+      sql: "INSERT INTO wide (id, body) VALUES (1, ?)",
+      params: ["x".repeat(999_000)],
+    }),
+  ).toMatchObject({ ok: true });
+
+  // Nine ~999 KB results are each far under the 8 MiB per-result ceiling; the
+  // envelope carrying all nine is not. The wrapper refuses the same envelope on
+  // the other side of the RPC — this proves the Durable Object refuses it too,
+  // and that the write in the same transaction did not survive.
+  const selects = Array.from({ length: 9 }, () => ({ sql: "SELECT body FROM wide" }));
+  expect(
+    await database.edgeSqlTransaction({
+      statements: [
+        { sql: "INSERT INTO wide (id, body) VALUES (2, ?)", params: ["second"] },
+        ...selects,
+      ],
+    }),
+  ).toEqual({ ok: false, error: { code: "backend_unavailable" } });
+  expect(await database.edgeSqlQuery({ sql: "SELECT count(*) AS total FROM wide" })).toEqual({
+    ok: true,
+    value: { rows: [{ total: 1 }], rowsWritten: 0 },
+  });
+});
+
+test("the admin plane is provider-only: no proof, wrong operation, and no secret all refuse", async () => {
+  const state = new BunSqliteState();
+  const database = new ManagedWorkerSqliteCore(state, ADMIN_ENV);
+
+  // Every field of an authority tuple is derivable by the customer whose
+  // Resource it describes, so the tuple alone claims nothing.
+  expect(await database.takoserverSqliteInitialize(AUTHORITY)).toEqual({
+    ok: false,
+    error: { code: "invalid_argument" },
+  });
+  expect(
+    await database.takoserverSqliteInitialize({
+      authority: AUTHORITY,
+      proof: "z".repeat(43),
+    }),
+  ).toEqual({ ok: false, error: { code: "invalid_argument" } });
+  // A proof names one operation: an inspect proof does not initialize.
+  expect(await database.takoserverSqliteInitialize(await sealed("inspect"))).toEqual({
+    ok: false,
+    error: { code: "invalid_argument" },
+  });
+  // Nor does a proof over a different authority.
+  expect(
+    await database.takoserverSqliteInitialize({
+      authority: AUTHORITY,
+      proof: (await sealed("initialize", { ...AUTHORITY, resourceUid: "other-uid" })).proof,
+    }),
+  ).toEqual({ ok: false, error: { code: "invalid_argument" } });
+  expect(state.kvValues.get(MANAGED_SQLITE_CONTROL_KEY)).toBeUndefined();
+
+  expect(await database.takoserverSqliteInitialize(await sealed("initialize"))).toEqual({
+    ok: true,
+    value: { state: "active" },
+  });
+  for (const call of [
+    database.takoserverSqliteInspect(AUTHORITY),
+    database.takoserverSqliteReadMigrationLedger(AUTHORITY),
+    database.takoserverSqliteDestroy(await sealed("inspect")),
+  ]) {
+    expect(await call).toEqual({ ok: false, error: { code: "invalid_argument" } });
+  }
+  expect(await database.takoserverSqliteInspect(await sealed("inspect"))).toMatchObject({
+    ok: true,
+    value: { state: "active" },
+  });
+
+  // A Host that never provisioned the gateway secret executes no admin
+  // operation at all rather than trusting what the caller sent.
+  const unconfigured = new ManagedWorkerSqliteCore(new BunSqliteState(), {});
+  expect(await unconfigured.takoserverSqliteInitialize(await sealed("initialize"))).toEqual({
+    ok: false,
+    error: { code: "backend_unavailable" },
+  });
+});
+
+test("an admin proof is bound to the exact operation and authority it seals", async () => {
+  const authority = { ...AUTHORITY, resourceUid: "other-uid" };
+  const first = await managedWorkerSqliteAdminProof({
+    secret: ADMIN_SECRET,
+    operation: "destroy",
+    authority: AUTHORITY,
+  });
+  expect(first).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+  expect(
+    await managedWorkerSqliteAdminProof({
+      secret: ADMIN_SECRET,
+      operation: "destroy",
+      authority: AUTHORITY,
+    }),
+  ).toBe(first);
+  for (const other of [
+    { secret: `${ADMIN_SECRET}-2`, operation: "destroy" as const, authority: AUTHORITY },
+    { secret: ADMIN_SECRET, operation: "inspect" as const, authority },
+    { secret: ADMIN_SECRET, operation: "destroy" as const, authority },
+    // The length prefix is what stops a byte moving across a field boundary
+    // from producing the same proof.
+    {
+      secret: ADMIN_SECRET,
+      operation: "destroy" as const,
+      authority: { ...AUTHORITY, providerId: "cloudflar", resourceUid: "eresource-uid" },
+    },
+  ]) {
+    expect(await managedWorkerSqliteAdminProof(other)).not.toBe(first);
+  }
 });
