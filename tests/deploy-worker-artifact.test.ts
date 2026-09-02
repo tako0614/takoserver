@@ -204,7 +204,9 @@ describe("hermetic Worker bundle identity", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  });
+    // Two real Wrangler builds of the whole Worker: a shared CI runner needs
+    // far more than the default per-test budget for them.
+  }, 60_000);
 
   test("preserves comments that are not repository source labels", () => {
     const source = ["// external explanatory comment", "export default {};", ""].join("\n");

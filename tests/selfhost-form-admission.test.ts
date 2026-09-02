@@ -112,7 +112,9 @@ describe("self-host Form admission", () => {
     } finally {
       fixture.close();
     }
-  });
+    // Two full 17-package admissions with their durable readbacks: a shared CI
+    // disk needs far more than the default per-test budget for this volume.
+  }, 60_000);
 
   test("refuses a verifier whose live identity is not the exact released Core", async () => {
     const fixture = dataRoot();
