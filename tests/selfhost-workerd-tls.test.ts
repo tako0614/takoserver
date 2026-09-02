@@ -28,15 +28,21 @@ const WORKERD = findWorkerd(resolve(import.meta.dir, ".."));
 const HOSTNAME = "tls-probe.localhost";
 
 let root: string;
-let workerd: { kill(): void } | undefined;
+let workerd: { kill(): void; readonly exited: Promise<number> } | undefined;
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "takoserver-selfhost-tls-"));
 });
 
-afterEach(() => {
-  workerd?.kill();
-  workerd = undefined;
+afterEach(async () => {
+  if (workerd) {
+    // Waited out rather than merely signalled: a 150 MB runtime still holding
+    // its socket while the next file starts one of its own is how a suite
+    // becomes flaky.
+    workerd.kill();
+    await workerd.exited;
+    workerd = undefined;
+  }
   if (root) rmSync(root, { recursive: true, force: true });
 });
 
