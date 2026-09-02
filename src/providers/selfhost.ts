@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -482,6 +483,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     versionId: string,
     mainModule: string,
     bindings: StoredSelfhostVersionBindings | null,
+    generation: string,
   ): {
     source: Uint8Array;
     facade: Uint8Array;
@@ -506,7 +508,12 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         failed("invalid_spec", "the Worker bundle claims this Host's entrypoint module name"),
       );
     }
-    const publication = `${script}.${versionId}`;
+    // The generation, not the version: two publications of one Version differ
+    // when its routes do, and a readiness answer has to be attributable to the
+    // exact configuration that asked for it or a stale one passes for it.
+    // Hashed because the generation carries customer hostnames and this string
+    // is compiled into a module the tenant's own isolate loads.
+    const publication = createHash("sha256").update(generation, "utf8").digest("hex");
     let source: string;
     try {
       source = selfhostWorkerEntrypointSource({
@@ -572,30 +579,31 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     const probe = runtime.probe;
     if (!probe) return;
     const deadline = Date.now() + 5_000;
-    let answered = false;
+    let alive = false;
     for (let attempt = 0; ; attempt += 1) {
       const response = await probe(script, SELFHOST_WORKER_READINESS_PATH, {
         method: "POST",
         headers: { [SELFHOST_WORKER_READINESS_HEADER]: SELFHOST_WORKER_READINESS_PROTOCOL },
       }).catch(() => null);
-      const parsed = response ? readinessAnswer(response.body) : null;
-      if (parsed?.publication === publication) {
-        if (response?.status === 200) return;
-        throw new SelfhostFailure(
-          failed(
-            "invalid_spec",
-            "the Worker Version's module does not export every handler it declares",
-          ),
-        );
+      if (response) {
+        alive = true;
+        const parsed = readinessAnswer(response.body);
+        if (parsed?.publication === publication) {
+          if (response.status === 200) return;
+          throw new SelfhostFailure(
+            failed(
+              "invalid_spec",
+              "the Worker Version's module does not export every handler it declares",
+            ),
+          );
+        }
       }
-      // Nothing that speaks this protocol has answered yet: either the runtime
-      // is not in this process at all, or it is not up. Either way there is
-      // nothing to prove, and waiting would turn "I could not ask" into a
-      // refused publication. Once one has answered, a mismatched publication is
-      // a configuration on its way out and worth waiting for.
-      if (!parsed && !answered) return;
-      if (parsed) answered = true;
-      if (Date.now() >= deadline) return;
+      // Nothing has answered on that address and nothing ever did: this
+      // deployment does not run the runtime in this process, so there is
+      // nothing to ask and waiting would turn "I could not ask" into a refused
+      // publication. Once it has answered once, an answer that is not this
+      // publication's is a configuration on its way out, and worth waiting for.
+      if (!alive || Date.now() >= deadline) return;
       await new Promise<void>((wake) => setTimeout(wake, attempt === 0 ? 25 : 100));
     }
   };
@@ -627,7 +635,14 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     // recorded and nothing a later edit of the directory could introduce.
     const bindings = await readVersionBindings(script, state.activeVersion);
     const vars = bindings ? [...bindings.vars, ...bindings.sensitiveVars] : [];
-    const projection = wrapperProjection(script, state.activeVersion, meta.mainModule, bindings);
+    const generation = await runtimeGeneration(script, state);
+    const projection = wrapperProjection(
+      script,
+      state.activeVersion,
+      meta.mainModule,
+      bindings,
+      generation,
+    );
     if (projection) {
       // Written into the workerd script directory, never into the version
       // directory: `materializationDigest` means "the bytes the tenant
@@ -648,7 +663,6 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       modules.set(SELFHOST_WORKER_ENTRYPOINT_MODULE, projection.source);
       modules.set(SELFHOST_WORKER_DATA_SERVICE_MODULE, projection.facade);
     }
-    const generation = await runtimeGeneration(script, state);
     await runtimeOperation(() =>
       runtime.write(
         script,

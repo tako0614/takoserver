@@ -249,7 +249,19 @@ async function reachable(url: string, attempts = 80): Promise<boolean> {
 }
 
 /** Publishes the fixture Worker and boots workerd in front of the real planes. */
-async function boot(tenantModule: string = TENANT_MODULE): Promise<{
+async function boot(
+  tenantModule: string = TENANT_MODULE,
+  /**
+   * Whether workerd watches its configuration while the test publishes.
+   *
+   * Off by default, and deliberately: every reload a watching workerd notices
+   * starts another copy of a 150 MB runtime, inside a suite that runs beside
+   * every other workerd-backed test in this repository. A test that publishes
+   * once and then asks questions does not need it — it starts the runtime after
+   * the publication. A test that publishes *while* the runtime is up asks.
+   */
+  watchConfig = false,
+): Promise<{
   readonly origin: string;
   readonly local: ReturnType<typeof createSelfhostProvider>;
   readonly planeOrigin: string;
@@ -272,28 +284,28 @@ async function boot(tenantModule: string = TENANT_MODULE): Promise<{
   reserved.stop(true);
   expect(Number.isSafeInteger(workerdPort)).toBe(true);
   const origin = `http://127.0.0.1:${workerdPort}`;
-  // Restarted on every reload, exactly as the supervisor does it in the real
-  // entry, so the configuration a probe reaches is always the one just
-  // written rather than whichever one workerd happened to still be serving.
-  const restart = async (): Promise<void> => {
-    // Reaped before the next one starts. Two of these alive at once is two
-    // copies of a 150 MB runtime, and this suite runs beside every other
-    // workerd-backed test in the repository.
-    const previous = workerd;
-    workerd = undefined;
-    previous?.kill();
-    await previous?.exited;
-    workerd = Bun.spawn([WORKERD as string, "serve", join(root, "workers", "workerd.capnp")], {
-      stdout: "ignore",
-      stderr: "ignore",
-    });
+  // Started once, exactly as the supervisor starts it in the real entry: with
+  // `--watch` it notices a rewritten configuration itself, and the readiness
+  // probe waits for the one this publication wrote rather than for whichever
+  // one workerd still served.
+  const start = async (): Promise<void> => {
+    if (workerd) return;
+    workerd = Bun.spawn(
+      [
+        WORKERD as string,
+        "serve",
+        ...(watchConfig ? ["--watch"] : []),
+        join(root, "workers", "workerd.capnp"),
+      ],
+      { stdout: "ignore", stderr: "ignore" },
+    );
     expect(await reachable(`${origin}/`)).toBe(true);
   };
   const runtime = createWorkerdRuntime({
     root,
     port: workerdPort,
     isReady: () => true,
-    onReload: restart,
+    ...(watchConfig ? { onReload: start } : {}),
   });
   const local = createSelfhostProvider({
     offerings: [],
@@ -395,7 +407,7 @@ async function boot(tenantModule: string = TENANT_MODULE): Promise<{
   });
   expect(endpoint.phase).toBe("succeeded");
 
-  expect(await reachable(`${origin}/`)).toBe(true);
+  await start();
   return { origin, local, planeOrigin: `http://${served.address}` };
 }
 
@@ -582,7 +594,7 @@ test.skipIf(WORKERD === null)(
 test.skipIf(WORKERD === null)(
   "publishing a Version whose module lacks a declared handler is refused",
   async () => {
-    const { local } = await boot();
+    const { local } = await boot(TENANT_MODULE, true);
     // The fixture module exports `fetch` and nothing else. Declaring
     // `scheduled` used to publish successfully and fail on the first event the
     // attachment delivered — the wrapper validates its declaration when it
