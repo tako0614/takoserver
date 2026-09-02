@@ -2306,6 +2306,39 @@ describe("the current ObjectBucket Form on a self-host", () => {
     expect(destroyed).toEqual([String(created.result.outputs.bucketName)]);
   });
 
+  test("proves a delete only once the bucket is empty, and never by writing", async () => {
+    const destroyed: string[] = [];
+    const state = { objects: 1, uploads: 0 };
+    const local = provider({ dataPlaneMaintenance: bucketMaintenance(state, destroyed) });
+    const created = await local.apply({
+      operationId: "op_current_bucket_recover",
+      offering: currentBucket,
+      identity: { ...identity("media"), uid: "uid-media" },
+      spec: {},
+    });
+    if (created.phase !== "succeeded") throw new Error("the bucket was not created");
+    const recover = local.recoverDelete;
+    if (!recover) throw new Error("the self-host provider must offer delete recovery");
+    const ask = () =>
+      recover.call(local, {
+        operationId: "op_current_bucket_recover_delete",
+        offering: currentBucket,
+        nativeId: created.result.nativeId,
+        identity: { ...identity("media"), uid: "uid-media" },
+      });
+    expect(await ask()).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    state.objects = 0;
+    expect(await ask()).toMatchObject({
+      phase: "succeeded",
+      result: { observed: { deleted: true } },
+    });
+    // Readback only: recovery never destroys what a delete had not.
+    expect(destroyed).toEqual([]);
+  });
+
   test("proves a bucket present while it holds anything and absent once it does not", async () => {
     const state = { objects: 1, uploads: 0 };
     const local = provider({ dataPlaneMaintenance: bucketMaintenance(state) });

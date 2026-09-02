@@ -2873,6 +2873,17 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           true,
         );
       try {
+        // The current ObjectBucket is the one namespace with residual bytes, so
+        // "is it gone" is a question this Host reads rather than asserts. Empty
+        // is exactly the condition its delete succeeds on, so an empty bucket is
+        // a proven delete and anything still in one is not.
+        if (currentObjectBucket(input.offering)) {
+          const name = selfhostNamespaceName("selfhost-bucket", input.nativeId);
+          if (!name) return failed("not_found", "the bucket identity is malformed");
+          if (!options.dataPlaneMaintenance) return done();
+          const occupancy = await options.dataPlaneMaintenance.objectBucketOccupancy(name);
+          return occupancy.objects === 0 && occupancy.uploads === 0 ? done() : uncertain();
+        }
         switch (dispatchKind(input.offering)) {
           case "ModuleWorker": {
             const script = await scriptOf(input.identity.tenantRef, {
