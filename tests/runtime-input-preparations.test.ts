@@ -65,17 +65,44 @@ function preparationInput(
   };
 }
 
+function executingApply(
+  overrides: {
+    readonly method?: string;
+    readonly path?: string;
+    readonly ifNoneMatch?: string;
+    readonly body?: string;
+  } = {},
+) {
+  return {
+    method: overrides.method ?? "PUT",
+    path: overrides.path ?? APPLY_PATH,
+    ifNoneMatch: overrides.ifNoneMatch ?? "*",
+    body: overrides.body ?? APPLY_BODY,
+  };
+}
+
 function leaseInput(
-  overrides: { readonly operationId?: string; readonly reference?: string } = {},
+  overrides: {
+    readonly operationId?: string;
+    readonly reference?: string;
+    readonly target?: {
+      readonly space: string;
+      readonly workerName: string;
+      readonly workerResourceUid: string;
+      readonly bundleName: string;
+    };
+    readonly publicApply?: ReturnType<typeof executingApply>;
+  } = {},
 ) {
   return {
     organizationId: "org_01",
     operationId: overrides.operationId ?? HOST_OPERATION_ID,
     resourceUid: VERSION_RESOURCE_UID,
     reference: overrides.reference ?? OPERATION_KEY,
-    target: CLAIM_TARGET,
+    target: overrides.target ?? CLAIM_TARGET,
     // Deliberately unsorted: the authority sorts before it fences.
     bindingNames: [...BINDING_NAMES].reverse(),
+    publicApply: overrides.publicApply ?? executingApply(),
   };
 }
 
@@ -216,6 +243,66 @@ test("claims the exact operation key with a commitment-bound preparation identit
   await expect(
     authority.leases.acquire(leaseInput({ operationId: "op_other" })),
   ).rejects.toMatchObject({ code: "conflict", status: 409 });
+});
+
+test("refuses to spend a preparation on any apply but the one it committed to", async () => {
+  const { sql, authority } = await runtimeInputFixture();
+  const prepared = await authority.preparations.prepare(preparationInput());
+
+  // The review's proof-of-concept: another principal in the same organization,
+  // running its own Host operation under the same plan-derived operation key,
+  // aiming the prepared values at a Worker Version of its own choosing. That
+  // apply necessarily differs — a different space or Worker name is a different
+  // path, a different spec is a different body — and nothing else about the old
+  // claim distinguished it.
+  for (const executing of [
+    executingApply({
+      path: "/apis/forms.takoform.com/v1/spaces/other-space/resources/WorkerVersion/attacker-v1",
+    }),
+    executingApply({
+      path: "/apis/forms.takoform.com/v1/spaces/default/resources/WorkerVersion/attacker-worker",
+    }),
+    executingApply({ body: `${APPLY_BODY.slice(0, -1)},"attacker":true}` }),
+    // Shapes this contract cannot authorize at all are the same answer.
+    executingApply({ method: "POST" }),
+    executingApply({ ifNoneMatch: "W/x" }),
+  ]) {
+    await expect(
+      authority.leases.acquire(
+        leaseInput({
+          operationId: "op_attacker",
+          target: { ...CLAIM_TARGET, space: "other-space", workerName: "attacker-worker" },
+          publicApply: executing,
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "apply_commitment_mismatch", status: 409 });
+  }
+
+  // Nothing was claimed, nothing was erased, and no target was recorded: the
+  // handoff is exactly as prepared and still belongs to its own mutation.
+  const [row] = await sql.query(
+    "SELECT state, space, worker_name, host_operation_id FROM worker_runtime_input_preparations WHERE organization_id = ? AND operation_key = ?",
+    ["org_01", OPERATION_KEY],
+  );
+  expect(row).toEqual({
+    state: "prepared",
+    space: null,
+    worker_name: null,
+    host_operation_id: null,
+  });
+  expect(await authority.preparations.read("org_01", OPERATION_KEY)).toEqual(prepared);
+});
+
+test("claims when the executing apply is the exact one the preparation named", async () => {
+  const { authority } = await runtimeInputFixture();
+  const prepared = await authority.preparations.prepare(preparationInput());
+  const lease = await authority.leases.acquire(leaseInput());
+  expect(lease.bindings).toEqual(BINDINGS);
+  expect(lease.preparation.commitment).toBe(prepared.applyCommitment);
+  expect(await authority.preparations.read("org_01", OPERATION_KEY)).toMatchObject({
+    status: "accepted",
+    hostOperationId: HOST_OPERATION_ID,
+  });
 });
 
 test("refuses a claim whose binding-name set is not the sealed one", async () => {

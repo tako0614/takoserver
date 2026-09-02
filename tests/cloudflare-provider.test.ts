@@ -51,6 +51,12 @@ const MODULE_BYTES = new TextEncoder().encode("export default { fetch() {} }");
 const ASSET_BUNDLE = `sha256:${"c".repeat(64)}`;
 
 const SENSITIVE_OPERATION_KEY = `takoform-worker-runtime-v1-${"e".repeat(64)}`;
+const SENSITIVE_PUBLIC_APPLY = {
+  method: "PUT",
+  path: "/apis/forms.takoform.com/v1/resources/edge.forms.takoform.com/WorkerVersion/version",
+  ifNoneMatch: "*",
+  body: '{"apiVersion":"edge.forms.takoform.com","kind":"WorkerVersion"}',
+} as const;
 const SENSITIVE_PREPARATION: ProviderRuntimeInputPreparationIdentity = {
   preparationId: "prep_sensitive",
   operationKey: SENSITIVE_OPERATION_KEY,
@@ -1775,6 +1781,7 @@ describe("released edge Form placement", () => {
     const ticket = await provider.apply({
       operationId: "op-version-sensitive-unsupported",
       operationKey: SENSITIVE_OPERATION_KEY,
+      publicApply: SENSITIVE_PUBLIC_APPLY,
       offering: versionOffering,
       identity: { ...IDENTITY, name: "version" },
       spec: { handlers: ["fetch"], requiredSensitiveVars: ["ENCRYPTION_KEY"] },
@@ -1824,6 +1831,7 @@ describe("released edge Form placement", () => {
             bundleName: "workerbundle",
           },
           bindingNames: ["ENCRYPTION_KEY", "OIDC_CLIENT_SECRET"],
+          publicApply: SENSITIVE_PUBLIC_APPLY,
         });
         return {
           bindings: {
@@ -1871,6 +1879,7 @@ describe("released edge Form placement", () => {
     const ticket = await provider.apply({
       operationId: "op-version-sensitive",
       operationKey: SENSITIVE_OPERATION_KEY,
+      publicApply: SENSITIVE_PUBLIC_APPLY,
       operationMode: "initial",
       offering: versionOffering,
       identity: { ...IDENTITY, uid: "worker-version-uid", name: "version" },
@@ -1952,6 +1961,7 @@ describe("released edge Form placement", () => {
             bundleName: "workerbundle",
           },
           bindingNames: ["ENCRYPTION_KEY"],
+          publicApply: SENSITIVE_PUBLIC_APPLY,
         });
         return {
           bindings: { ENCRYPTION_KEY: "secret-lost-ack-value" },
@@ -2045,6 +2055,7 @@ describe("released edge Form placement", () => {
     const input = {
       operationId: "op-version-sensitive-recovery",
       operationKey: SENSITIVE_OPERATION_KEY,
+      publicApply: SENSITIVE_PUBLIC_APPLY,
       offering: versionOffering,
       identity: { ...IDENTITY, uid: "worker-version-recovery-uid", name: "version" },
       spec: { handlers: ["fetch"], requiredSensitiveVars: ["ENCRYPTION_KEY"] },
@@ -2213,6 +2224,7 @@ describe("released edge Form placement", () => {
       const ticket = await provider.apply({
         operationId,
         operationKey: SENSITIVE_OPERATION_KEY,
+        publicApply: SENSITIVE_PUBLIC_APPLY,
         operationMode: "recovery",
         offering: versionOffering,
         identity: { ...IDENTITY, uid: "worker-version-closure-uid", name: "version" },
@@ -2288,6 +2300,7 @@ describe("released edge Form placement", () => {
       const ticket = await provider.apply({
         operationId: "op-version-sensitive-transport-error",
         operationKey: SENSITIVE_OPERATION_KEY,
+        publicApply: SENSITIVE_PUBLIC_APPLY,
         operationMode: "initial",
         offering: versionOffering,
         identity: { ...IDENTITY, uid: "worker-version-transport-uid", name: "version" },
@@ -2367,6 +2380,7 @@ describe("released edge Form placement", () => {
       const ticket = await provider.apply({
         operationId: "op-version-sensitive-backend-error",
         operationKey: SENSITIVE_OPERATION_KEY,
+        publicApply: SENSITIVE_PUBLIC_APPLY,
         operationMode: "initial",
         offering: versionOffering,
         identity: { ...IDENTITY, uid: "worker-version-backend-uid", name: "version" },
@@ -2441,6 +2455,7 @@ describe("released edge Form placement", () => {
     const ticket = await provider.apply({
       operationId: "op-version-sensitive-invalid-lease",
       operationKey: SENSITIVE_OPERATION_KEY,
+      publicApply: SENSITIVE_PUBLIC_APPLY,
       operationMode: "initial",
       offering: versionOffering,
       identity: { ...IDENTITY, uid: "worker-version-invalid-lease-uid", name: "version" },
@@ -2486,6 +2501,7 @@ describe("released edge Form placement", () => {
             bundleName: "workerbundle",
           },
           bindingNames: ["ENCRYPTION_KEY"],
+          publicApply: SENSITIVE_PUBLIC_APPLY,
         });
         throw new Error("runtime input authority rejected the lease");
       },
@@ -2509,6 +2525,7 @@ describe("released edge Form placement", () => {
     const ticket = await provider.apply({
       operationId: "op-version-sensitive-assets-acquire-rejected",
       operationKey: SENSITIVE_OPERATION_KEY,
+      publicApply: SENSITIVE_PUBLIC_APPLY,
       operationMode: "initial",
       offering: versionOffering,
       identity: {
@@ -2573,6 +2590,7 @@ describe("released edge Form placement", () => {
             bundleName: "workerbundle",
           },
           bindingNames: ["ENCRYPTION_KEY"],
+          publicApply: SENSITIVE_PUBLIC_APPLY,
         });
         return {
           bindings: { ENCRYPTION_KEY: "asset-upload-secret" },
@@ -2629,6 +2647,7 @@ describe("released edge Form placement", () => {
     const ticket = await provider.apply({
       operationId: "op-version-sensitive-assets-upload-failure",
       operationKey: SENSITIVE_OPERATION_KEY,
+      publicApply: SENSITIVE_PUBLIC_APPLY,
       operationMode: "initial",
       offering: versionOffering,
       identity: {

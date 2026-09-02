@@ -21,6 +21,7 @@ import type {
   ProviderRuntimeInputDispatchedLease,
   ProviderRuntimeInputLease,
   ProviderRuntimeInputLeasePort,
+  ProviderRuntimeInputPublicApply,
   ProviderRuntimeInputRecoveryLease,
 } from "../provider-runtime-input-port.ts";
 import {
@@ -707,6 +708,12 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     ) {
       return failed("denied", "required sensitive Worker runtime inputs are unavailable");
     }
+    // The claim's own prerequisite: the exact executing apply, which is what
+    // the authority recomputes the stored commitment against. Recovery never
+    // claims and therefore never needs it.
+    if (requiredSensitive.length > 0 && !recovery && !input.publicApply) {
+      return failed("denied", "required sensitive Worker runtime inputs are unavailable");
+    }
     if (record(input.spec.assets)) {
       // Assets participate in the desired descriptor, but WfP has no
       // provider-authoritative asset hash/readback yet. Initial support stays
@@ -732,6 +739,7 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
           reference: input.operationKey as string,
           target,
           bindingNames: requiredSensitive,
+          publicApply: input.publicApply as ProviderRuntimeInputPublicApply,
         });
       } catch (error) {
         return runtimeInputFailure(error, "acquire");
@@ -3252,6 +3260,15 @@ function runtimeInputFailure(
       "unavailable",
       "the sensitive Worker runtime input outcome is indeterminate",
       true,
+    );
+  }
+  // The handoff exists but it was made for a different mutation. This is a
+  // definitive refusal of this apply, never a retry: the values belong to the
+  // request the preparation named and to no other.
+  if (code === "apply_commitment_mismatch") {
+    return failed(
+      "denied",
+      "the sensitive Worker runtime input handoff does not authorize this apply",
     );
   }
   return code === "conflict"

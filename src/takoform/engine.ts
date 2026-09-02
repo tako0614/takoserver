@@ -54,6 +54,7 @@ import {
   type ParsedResource,
   type ResourcePath,
   requestBodyDigest,
+  requestBodyText,
   requiredExpectedGeneration,
   requiredQuery,
   resourceRequest,
@@ -878,6 +879,11 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
 
     async apply(context, path): Promise<EngineResult> {
       const rawBodyDigest = await requestBodyDigest(context.request);
+      // Read before the original stream is consumed. This is the value-free
+      // identity a sensitive runtime-input claim is fenced against: the
+      // preparation committed to one exact apply, and only the request actually
+      // executing can prove it is that one.
+      const rawBodyText = await requestBodyText(context.request);
       const parsedBody = applyRequest(await jsonBody(context.request));
       const runtime = await runtimeRegistry(context, parsedBody.metadata.space);
       let form = exactInstalledForm(parsedBody.form.formRef, runtime.forms);
@@ -1338,6 +1344,16 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             return await driver.apply({
               operationId: opId,
               operationKey: idempotencyKey(context.request),
+              ...(createIntent
+                ? {
+                    publicApply: {
+                      method: context.request.method,
+                      path: `${context.url.pathname}${context.url.search}`,
+                      ifNoneMatch: "*",
+                      body: rawBodyText,
+                    },
+                  }
+                : {}),
               operationMode,
               ...(execution.providerHandle ? { providerHandle: execution.providerHandle } : {}),
               tenantId: context.tenantId,

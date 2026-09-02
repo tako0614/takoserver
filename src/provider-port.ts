@@ -1,7 +1,10 @@
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import type { TakoformBindingRef, TakoformInterfaceRef } from "./interface-ref.ts";
 import type { JsonObject } from "./ports.ts";
-import type { ProviderRuntimeInputCapabilities } from "./provider-runtime-input-port.ts";
+import type {
+  ProviderRuntimeInputCapabilities,
+  ProviderRuntimeInputPublicApply,
+} from "./provider-runtime-input-port.ts";
 
 /**
  * The one seam between Takoserver and the clouds it provisions on.
@@ -137,6 +140,15 @@ export interface ApplyInput extends ProviderMutationInput {
   readonly runtimeBindings?: readonly ProviderRuntimeBinding[];
   /** Exact private origin authority for a reservation-backed WorkerEndpoint. */
   readonly workerEndpointOriginAssignment?: ProviderWorkerEndpointOriginAssignment;
+  /**
+   * Value-free identity of the ordinary Host apply being executed.
+   *
+   * Present only where the Host can state it exactly, which is the immutable
+   * create a sensitive runtime-input handoff authorizes. An adapter that needs
+   * a lease and does not have this fails closed rather than claiming without
+   * it: the stored commitment is only a fence if something recomputes it.
+   */
+  readonly publicApply?: ProviderRuntimeInputPublicApply;
 }
 
 export interface ProviderRuntimeBinding {

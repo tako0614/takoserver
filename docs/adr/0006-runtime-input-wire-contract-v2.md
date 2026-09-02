@@ -132,3 +132,89 @@ released provider ever wrote one.
   authentication, authorization, or idempotency; the organization is taken only
   from the authenticated API key.
 - A secret value never becomes identity.
+
+## Amendment — 2026-09-02: the lease port carries the executing apply
+
+The "Consequences a reader should expect" section above claimed that the
+executing apply is fenced by the idempotency key and that the internal
+`ProviderRuntimeInputLeasePort` therefore needs no wire field. An adversarial
+review of the implementation showed that this was not true, so the port now
+carries one value-free field and the claim recomputes the commitment.
+
+**What was actually enforced.** `claim` compared the organization, the operation
+key, and the sorted binding-name set. `space`, `worker_name`,
+`worker_resource_uid`, and `bundle_name` were *written from the executing apply*
+rather than compared, and `apply_commitment` was stored and echoed but never
+re-derived. The idempotency fence cited above is the Host's replay record, whose
+key is `tenant \0 principal \0 space \0 operation \0 Idempotency-Key`. It only
+exists after a first apply under that key commits, and it is per-principal and
+per-space, while a preparation is per-organization. So the first apply under an
+operation key was unfenced, and a second credential in the same organization —
+including a scoped tenant-run token, which can spend a preparation it cannot
+create or read — got a fresh replay key and no fence at all. Any principal that
+could mutate resources in the organization and knew the plan-derived operation
+key could have another principal's prepared values installed into a Worker
+Version of its own choosing and then read them from inside that Worker.
+
+**What changed.** `ProviderRuntimeInputAcquireInput` gains
+`publicApply: {method, path, ifNoneMatch, body}`: the value-free identity of the
+ordinary apply this Host is executing, carried from the engine through the
+driver to the adapter. `claim` recomputes
+`runtimeInputPublicApplyCommitment` over it and compares the result with
+`apply_commitment` — before the CAS, and again as one more `AND` inside the same
+CAS that records the target. A mismatch is its own failure, code
+`apply_commitment_mismatch` (409): the preparation is not claimed, no target is
+written, no ciphertext is erased, and the apply fails closed. A request shape
+this contract cannot authorize at all is reported the same way, because it can
+equal no stored commitment.
+
+The body carried here is the ordinary portable Resource the caller would have
+sent with no runtime inputs, so nothing sealed crosses the seam. The engine
+states the apply only for a create (`If-None-Match: *`), which is the only
+mutation a preparation can authorize; an adapter that needs a claim and has no
+executing apply refuses before any provider mutation rather than claiming
+unfenced. Recovery and abandonment take
+`Omit<ProviderRuntimeInputAcquireInput, "publicApply">` — they never claim, and
+their fences are the row's own claim owner, Resource UID, and logical target.
+
+The port is therefore no longer strictly version-agnostic: it carries the
+identity of the request v2's commitment is computed over. That is the price of
+the property the contract already claimed. A commitment nothing recomputes is a
+record, not a fence.
+
+## Amendment — 2026-09-02: three smaller corrections from the same review
+
+- **The canonical public origin is HTTPS-only, and composition proves it.** The
+  Host previously blessed `http://localhost` and `http://127.0.0.1`, which
+  disagreed with both `openapi/takoserver.openapi.json` and the released
+  provider's client-side check — so on a loopback deployment every runtime-input
+  apply failed before a request was sent. Loopback is gone. A deployment without
+  a TLS public origin composes no runtime-input authority, advertises no
+  capability, and refuses the declaration at admission. `RuntimeInputAuthority`
+  also exposes `canonicalPublicOrigin`, and `buildApp` refuses a composition
+  where it differs from the Host's own `publicOrigin`: an anti-misdirection
+  fence configured against an origin the Host is not served at fences nothing.
+
+- **Terminal rows are reclaimed after seven days.** `expireDue` swept only
+  `prepared` and `claimed`, so every successful sensitive create left a row
+  forever. `dispatched`, `consumed`, `revoked`, `expired`, and `indeterminate`
+  rows hold NULL ciphertext and describe a handoff that expired within the hour;
+  the same bounded maintenance tick now deletes them once they are older than
+  seven days. The window is bookkeeping, not safety: what it buys is a readable
+  answer to "was this operation key already spent" for a run from earlier in the
+  week.
+
+- **Removing the reservation coupling opened a release window.** "What this
+  removes" notes that the three `NOT EXISTS` clauses fencing
+  `WorkerEndpointOriginReservation` expiry and release are gone with the column
+  they read. The consequence was not stated: during a sensitive WorkerVersion
+  apply — reservation `bound`, endpoint Resource not yet created — nothing now
+  stops that reservation from being released and its globally unique canonical
+  origin reallocated to another logical Worker. It is an availability window
+  only. No native endpoint exists yet, so the reservation's own release fences
+  (absent endpoint Resource, closed deletion attestation, no live provider
+  deployment) are all satisfied and no origin is taken from something serving;
+  the apply that loses its reservation fails and is retried with a new one. In
+  v2 a preparation has no reservation, so the old coupling is not restorable —
+  the reservation authority would have to fence on the Host operation instead,
+  which is a separate decision and is not made here.

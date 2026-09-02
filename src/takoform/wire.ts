@@ -207,6 +207,24 @@ export async function requestBodyDigest(request: Request): Promise<`sha256:${str
   return await bytesDigest(bytes);
 }
 
+/**
+ * The exact request body bytes, as text.
+ *
+ * Read from a clone so the caller can still parse the original, and decoded
+ * strictly: a body that is not valid UTF-8 could not have produced the
+ * commitment a runtime-input preparation was made against, and silently
+ * substituting U+FFFD would make this Host claim bytes nobody sent.
+ */
+export async function requestBodyText(request: Request): Promise<string> {
+  const bytes = await request.clone().arrayBuffer();
+  if (bytes.byteLength > MAXIMUM_REQUEST_BODY_BYTES) throw new TakoformHostError();
+  try {
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch {
+    throw new TakoformHostError();
+  }
+}
+
 export function idempotencyKey(request: Request): string {
   const key = request.headers.get("idempotency-key");
   if (!key || !IDEMPOTENCY_KEY.test(key)) throw new TakoformHostError();

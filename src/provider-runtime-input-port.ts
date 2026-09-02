@@ -14,6 +14,25 @@ export interface ProviderRuntimeInputTarget {
   readonly bundleName: string;
 }
 
+/**
+ * The value-free identity of the ordinary public apply this Host is executing.
+ *
+ * A preparation commits to exactly one apply — method, path, `If-None-Match`,
+ * and body — but a commitment nothing recomputes is a record, not a fence. This
+ * is what lets the authority derive the executing request's commitment at the
+ * moment of the claim and compare it with the stored one, instead of trusting
+ * that whoever spends the handoff is the mutation it was made for.
+ *
+ * It carries no sealed value: the body is the ordinary portable Resource the
+ * caller would have sent with no runtime inputs at all.
+ */
+export interface ProviderRuntimeInputPublicApply {
+  readonly method: string;
+  readonly path: string;
+  readonly ifNoneMatch: string;
+  readonly body: string;
+}
+
 export interface ProviderRuntimeInputAcquireInput {
   readonly organizationId: string;
   readonly operationId: string;
@@ -22,9 +41,19 @@ export interface ProviderRuntimeInputAcquireInput {
   readonly reference: string;
   readonly target: ProviderRuntimeInputTarget;
   readonly bindingNames: readonly string[];
+  /** The exact apply being executed, recomputed and fenced against the stored commitment. */
+  readonly publicApply: ProviderRuntimeInputPublicApply;
 }
 
-export type ProviderRuntimeInputRecoveryInput = ProviderRuntimeInputAcquireInput;
+/**
+ * Recovery and abandonment are readback-only and reach a handoff whose values
+ * are already gone, so they carry no apply identity: the row's own claim owner,
+ * Resource UID, and logical target are the fences there.
+ */
+export type ProviderRuntimeInputRecoveryInput = Omit<
+  ProviderRuntimeInputAcquireInput,
+  "publicApply"
+>;
 
 /** Value-free identity bound to the exact encrypted preparation. */
 export interface ProviderRuntimeInputPreparationIdentity {

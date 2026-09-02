@@ -27,6 +27,7 @@ import {
   type ProviderRuntimeInputDispatchedLease,
   type ProviderRuntimeInputLease,
   type ProviderRuntimeInputLeasePort,
+  type ProviderRuntimeInputPublicApply,
   type ProviderRuntimeInputRecoveryLease,
   type ProviderRuntimeInputTarget,
 } from "../provider-runtime-input-port.ts";
@@ -427,6 +428,15 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   const leasesAvailable = (input: ApplyInput, target: ProviderRuntimeInputTarget | null): boolean =>
     Boolean(runtimeInputs?.abandon && input.operationKey && input.identity.uid && target);
 
+  /**
+   * The same question for the apply path, plus the one thing only a claim
+   * needs: the exact executing request. Without it the authority cannot
+   * recompute the commitment the preparation was made against, so this Host
+   * refuses before a file exists rather than spending a handoff unfenced.
+   */
+  const claimAvailable = (input: ApplyInput, target: ProviderRuntimeInputTarget | null): boolean =>
+    leasesAvailable(input, target) && Boolean(input.publicApply);
+
   /** The exact logical Worker this version's sensitive values belong to. */
   const sensitiveTarget = (input: ApplyInput): ProviderRuntimeInputTarget | null => {
     const worker = relationResource(input.relations, "/worker", "ModuleWorker");
@@ -508,7 +518,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       return failed("invalid_spec", "the sensitive Worker binding declaration is invalid");
     }
     const runtimeInputTarget = sensitiveTarget(input);
-    if (requiredSensitive.length > 0 && !leasesAvailable(input, runtimeInputTarget)) {
+    if (requiredSensitive.length > 0 && !claimAvailable(input, runtimeInputTarget)) {
       return failed("denied", "required sensitive Worker runtime inputs are unavailable");
     }
     const worker = relationResource(input.relations, "/worker", "ModuleWorker");
@@ -557,6 +567,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           reference: input.operationKey as string,
           target: runtimeInputTarget,
           bindingNames: requiredSensitive,
+          publicApply: input.publicApply as ProviderRuntimeInputPublicApply,
         });
       } catch (error) {
         return runtimeInputFailure(error, "acquire");
@@ -2290,6 +2301,15 @@ function runtimeInputFailure(
       "unavailable",
       "the sensitive Worker runtime input outcome is indeterminate",
       true,
+    );
+  }
+  // The handoff exists but it was made for a different mutation. This is a
+  // definitive refusal of this apply, never a retry: the values belong to the
+  // request the preparation named and to no other.
+  if (code === "apply_commitment_mismatch") {
+    return failed(
+      "denied",
+      "the sensitive Worker runtime input handoff does not authorize this apply",
     );
   }
   return code === "conflict"

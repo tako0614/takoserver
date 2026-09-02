@@ -677,6 +677,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
       const providerInput = {
         operationId: input.operationId,
         operationKey: input.operationKey,
+        ...(input.publicApply ? { publicApply: input.publicApply } : {}),
         ...(input.operationMode ? { operationMode: input.operationMode } : {}),
         offering,
         identity: providerIdentity,

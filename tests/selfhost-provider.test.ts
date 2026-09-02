@@ -779,6 +779,12 @@ describe("publishing a Worker through the Edge Family", () => {
   const sensitiveApply = (extra: Record<string, unknown> = {}) => ({
     operationId: "op_sensitive_version",
     operationKey: SENSITIVE_OPERATION_KEY,
+    publicApply: {
+      method: "PUT",
+      path: "/apis/forms.takoform.com/v1/resources/edge.forms.takoform.com/WorkerVersion/hello-sensitive",
+      ifNoneMatch: "*",
+      body: '{"apiVersion":"edge.forms.takoform.com","kind":"WorkerVersion"}',
+    },
     offering: offering("WorkerVersion"),
     identity: { ...identity("hello-sensitive"), uid: "uid-WorkerVersion-hello-sensitive" },
     spec: {
@@ -804,6 +810,25 @@ describe("publishing a Worker through the Edge Family", () => {
       },
     });
     // Nothing was materialized on the way to saying no.
+    expect(existsSync(join(root, "selfhost", "versions"))).toBe(false);
+  });
+
+  test("refuses a sensitive apply the Host cannot name an executing request for", async () => {
+    const { port, log } = fakeLeases(() => root);
+    const local = provider({ runtimeInputs: port });
+    const { publicApply: _executing, ...unnamed } = sensitiveApply();
+
+    // Without it the authority cannot recompute the commitment the preparation
+    // was made against, so the claim would be unfenced. Refuse before a file
+    // exists rather than spend a handoff on an apply nobody can identify.
+    expect(await local.apply(unnamed)).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "denied",
+        message: "required sensitive Worker runtime inputs are unavailable",
+      },
+    });
+    expect(log.events).toEqual([]);
     expect(existsSync(join(root, "selfhost", "versions"))).toBe(false);
   });
 

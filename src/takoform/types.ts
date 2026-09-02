@@ -1,6 +1,7 @@
 import type { TakoformV1Alpha3FormRef } from "../form-ref.ts";
 import type { TakoformBindingRef, TakoformInterfaceRef } from "../interface-ref.ts";
 import type { JsonObject } from "../ports.ts";
+import type { ProviderRuntimeInputPublicApply } from "../provider-runtime-input-port.ts";
 import type { ResourceDeploymentMutation } from "../resource-deployments.ts";
 
 export type { TakoformBindingRef, TakoformInterfaceRef, TakoformV1Alpha3FormRef };
@@ -267,6 +268,13 @@ export interface TakoformResourceDriver {
     readonly workerEndpointOriginReservationId?: string;
     readonly standardServices?: readonly TakoformStandardServiceProjection[];
     readonly previous?: TakoformStoredResource;
+    /**
+     * Value-free identity of the exact request being executed, stated only for
+     * the immutable create a sensitive runtime-input handoff can authorize.
+     * The driver forwards it so the runtime-input authority can recompute the
+     * commitment a preparation was made against instead of trusting it.
+     */
+    readonly publicApply?: ProviderRuntimeInputPublicApply;
     /** Commit the Deployment realization with the portable Resource. */
     readonly atomicDeploymentCommit?: true;
   }): Promise<TakoformDriverReceipt>;

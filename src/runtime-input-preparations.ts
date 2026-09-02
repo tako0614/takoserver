@@ -3,6 +3,7 @@ import {
   MAX_PROVIDER_RUNTIME_INPUT_BINDINGS,
   type ProviderRuntimeInputLeasePort,
   type ProviderRuntimeInputPreparationIdentity,
+  type ProviderRuntimeInputPublicApply,
 } from "./provider-runtime-input-port.ts";
 
 /**
@@ -148,7 +149,7 @@ export interface RuntimeInputClaimTarget {
   readonly bundleName: string;
 }
 
-export interface RuntimeInputClaimInput {
+export interface RuntimeInputRecoveryInput {
   readonly organizationId: string;
   readonly operationKey: string;
   /** The exact Host operation the claim belongs to. */
@@ -157,6 +158,16 @@ export interface RuntimeInputClaimInput {
   readonly resourceUid: string;
   readonly target: RuntimeInputClaimTarget;
   readonly bindingNames: readonly string[];
+}
+
+export interface RuntimeInputClaimInput extends RuntimeInputRecoveryInput {
+  /**
+   * The exact ordinary apply this Host is executing. Its commitment is
+   * recomputed here and compared with the stored one inside the same CAS that
+   * records the target, so a preparation can only ever be spent by the mutation
+   * it named.
+   */
+  readonly publicApply: ProviderRuntimeInputPublicApply;
 }
 
 export interface RuntimeInputClaim {
@@ -186,7 +197,18 @@ export interface RuntimeInputConsumption extends RuntimeInputClaimIdentity {
 
 export class RuntimeInputPreparationError extends Error {
   constructor(
-    readonly code: "invalid_argument" | "conflict" | "operation_not_found" | "unavailable",
+    readonly code:
+      | "invalid_argument"
+      | "conflict"
+      | "operation_not_found"
+      | "unavailable"
+      /**
+       * The executing apply is not the one this preparation committed to. It is
+       * deliberately its own code: a plain conflict reads as "somebody else got
+       * here first", while this one means the values were addressed to a
+       * different mutation and must never be delivered to this one.
+       */
+      | "apply_commitment_mismatch",
     readonly status: 400 | 404 | 409 | 503,
   ) {
     super(code);
@@ -205,13 +227,13 @@ export interface RuntimeInputPreparations {
   dispatch(input: RuntimeInputClaimIdentity): Promise<{ readonly fence: number }>;
   consume(input: RuntimeInputConsumption): Promise<void>;
   /** Reads only the value-free identity of one exact dispatched handoff. */
-  recover(input: RuntimeInputClaimInput): Promise<RuntimeInputRecoveryIdentity>;
+  recover(input: RuntimeInputRecoveryInput): Promise<RuntimeInputRecoveryIdentity>;
   /** Settles the one dispatched handoff after provider acknowledgement recovery. */
   consumeRecovered(
-    input: RuntimeInputClaimInput & { readonly receiptDigest: `sha256:${string}` },
+    input: RuntimeInputRecoveryInput & { readonly receiptDigest: `sha256:${string}` },
   ): Promise<void>;
   /** Revokes an exact claimed/dispatched handoff after proven provider absence. */
-  abandon(input: RuntimeInputClaimInput): Promise<void>;
+  abandon(input: RuntimeInputRecoveryInput): Promise<void>;
   revoke(organizationId: string, operationKey: string): Promise<void>;
   expireDue(limit: number): Promise<number>;
 }
@@ -276,14 +298,14 @@ export function createRuntimeInputAuthority(
   options: CreateRuntimeInputPreparationsOptions,
 ): RuntimeInputAuthority {
   const internals = createRuntimeInputPreparations(options);
-  const claimInputFor = (input: {
+  const recoveryInputFor = (input: {
     readonly organizationId: string;
     readonly operationId: string;
     readonly resourceUid: string;
     readonly reference: string;
     readonly target: RuntimeInputClaimTarget;
     readonly bindingNames: readonly string[];
-  }): RuntimeInputClaimInput => ({
+  }): RuntimeInputRecoveryInput => ({
     organizationId: input.organizationId,
     operationKey: input.reference,
     claimOwner: input.operationId,
@@ -301,7 +323,10 @@ export function createRuntimeInputAuthority(
     },
     leases: {
       async acquire(input) {
-        const claim = await internals.claim(claimInputFor(input));
+        const claim = await internals.claim({
+          ...recoveryInputFor(input),
+          publicApply: input.publicApply,
+        });
         const preparation = preparationIdentity(claim);
         const identity: RuntimeInputClaimIdentity = {
           organizationId: input.organizationId,
@@ -334,7 +359,7 @@ export function createRuntimeInputAuthority(
         };
       },
       async recover(input) {
-        const claimInput = claimInputFor(input);
+        const claimInput = recoveryInputFor(input);
         const recovered = await internals.recover(claimInput);
         const preparation = preparationIdentity(recovered);
         return {
@@ -354,7 +379,7 @@ export function createRuntimeInputAuthority(
         };
       },
       async abandon(input) {
-        await internals.abandon(claimInputFor(input));
+        await internals.abandon(recoveryInputFor(input));
       },
     },
     maintenance: {
@@ -534,6 +559,11 @@ export function createRuntimeInputPreparations(
 
     async claim(input) {
       const normalized = normalizeClaimInput(input);
+      // The executing apply's own commitment, derived here rather than taken
+      // from the caller. A request this contract cannot authorize at all is not
+      // an argument error at this depth: it simply is not the apply the stored
+      // commitment names.
+      const executing = await executingApplyCommitment(input.publicApply);
       const now = options.clock().getTime();
       let candidate = await readRow(
         options.sql,
@@ -542,6 +572,7 @@ export function createRuntimeInputPreparations(
       );
       if (!candidate) throw new RuntimeInputPreparationError("operation_not_found", 404);
       assertNames(candidate, normalized);
+      assertExecutingApply(candidate, executing);
       if (
         candidate.preparation_id !==
         (await derivePreparationId(normalized.organizationId, normalized.operationKey))
@@ -572,7 +603,7 @@ export function createRuntimeInputPreparations(
                claimed_resource_uid = ?, space = ?, worker_name = ?,
                worker_resource_uid = ?, bundle_name = ?, updated_at = ?
            WHERE organization_id = ? AND operation_key = ? AND state = 'prepared'
-             AND fence = ? AND expires_at > ?
+             AND fence = ? AND expires_at > ? AND apply_commitment = ?
              AND EXISTS (
                SELECT 1 FROM tf_resource_deletion_attestations
                WHERE tenant_id = ? AND resource_uid = ? AND state = 'live'
@@ -591,6 +622,7 @@ export function createRuntimeInputPreparations(
             normalized.operationKey,
             candidate.fence,
             now,
+            executing,
             normalized.organizationId,
             normalized.target.workerResourceUid,
           ],
@@ -601,6 +633,7 @@ export function createRuntimeInputPreparations(
       candidate = await readRow(options.sql, normalized.organizationId, normalized.operationKey);
       if (!candidate) throw new RuntimeInputPreparationError("operation_not_found", 404);
       assertNames(candidate, normalized);
+      assertExecutingApply(candidate, executing);
       if (candidate.state !== "claimed") throw new RuntimeInputPreparationError("conflict", 409);
       assertClaimedTarget(candidate, normalized);
       if (rowExpired(candidate, now)) {
@@ -984,7 +1017,7 @@ async function readByPreparationId(
   return rows.length === 0 ? null : (rows[0] as PreparationRow);
 }
 
-interface NormalizedClaimInput extends RuntimeInputClaimInput {
+interface NormalizedClaimInput extends RuntimeInputRecoveryInput {
   readonly bindingNames: readonly string[];
 }
 
@@ -998,7 +1031,7 @@ function validateClaimIdentity(input: RuntimeInputClaimIdentity): void {
   }
 }
 
-function normalizeClaimInput(input: RuntimeInputClaimInput): NormalizedClaimInput {
+function normalizeClaimInput(input: RuntimeInputRecoveryInput): NormalizedClaimInput {
   validateOpaqueId(input.organizationId);
   validateOperationKey(input.operationKey);
   validateOpaqueId(input.claimOwner);
@@ -1030,6 +1063,49 @@ function assertNames(row: PreparationRow, input: NormalizedClaimInput): void {
     row.binding_names_json !== JSON.stringify(input.bindingNames)
   ) {
     throw new RuntimeInputPreparationError("conflict", 409);
+  }
+}
+
+/**
+ * The commitment of the apply this Host is executing right now.
+ *
+ * A request shape this contract cannot authorize at all — anything but a
+ * `PUT` under `If-None-Match: *` with a non-empty, in-bounds path and body —
+ * cannot equal any stored commitment, so it is reported as the mismatch it is
+ * rather than as an argument error from three layers down.
+ */
+async function executingApplyCommitment(
+  apply: ProviderRuntimeInputPublicApply,
+): Promise<`sha256:${string}`> {
+  if (typeof apply !== "object" || apply === null) {
+    throw new RuntimeInputPreparationError("apply_commitment_mismatch", 409);
+  }
+  try {
+    return await runtimeInputPublicApplyCommitment({
+      method: apply.method,
+      path: apply.path,
+      fences: { ifNoneMatch: apply.ifNoneMatch },
+      body: apply.body,
+    });
+  } catch {
+    throw new RuntimeInputPreparationError("apply_commitment_mismatch", 409);
+  }
+}
+
+/**
+ * The fence the stored commitment was missing.
+ *
+ * Before this, `claim` compared the organization, the operation key, and the
+ * binding-name set, and wrote the target from whatever apply happened to be
+ * executing — so a second principal in the same organization could spend
+ * another one's prepared values into a Worker of its own choosing and then read
+ * them from inside it. Comparing the recomputed commitment is what makes the
+ * module's own claim — "a preparation can never be spent by a different
+ * mutation" — true.
+ */
+function assertExecutingApply(row: PreparationRow, executing: `sha256:${string}`): void {
+  if (row.apply_commitment !== executing) {
+    throw new RuntimeInputPreparationError("apply_commitment_mismatch", 409);
   }
 }
 

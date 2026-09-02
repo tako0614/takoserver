@@ -22,6 +22,7 @@ import type {
   ProviderRuntimeInputDispatchedLease,
   ProviderRuntimeInputLease,
   ProviderRuntimeInputLeasePort,
+  ProviderRuntimeInputPublicApply,
 } from "../provider-runtime-input-port.ts";
 import { MAX_PROVIDER_RUNTIME_INPUT_BINDINGS } from "../provider-runtime-input-port.ts";
 import {
@@ -1000,6 +1001,13 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     ) {
       return failed("denied", "required sensitive Worker runtime inputs are unavailable");
     }
+    // A claim also needs the exact executing apply. Without it the authority
+    // cannot recompute the commitment the preparation named, so an initial
+    // mutation is refused rather than spending a handoff unfenced; recovery,
+    // which never claims, is unaffected.
+    if (requiredSensitive.length > 0 && input.operationMode === "initial" && !input.publicApply) {
+      return failed("denied", "required sensitive Worker runtime inputs are unavailable");
+    }
     if (
       bindings.some(
         (binding) =>
@@ -1117,6 +1125,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
             bundleName: bundleResourceName,
           },
           bindingNames: requiredSensitive,
+          publicApply: input.publicApply as ProviderRuntimeInputPublicApply,
         });
       } catch (error) {
         return runtimeInputFailure(error, "acquire");
@@ -2783,6 +2792,15 @@ function runtimeInputFailure(
       "unavailable",
       "the sensitive Worker runtime input outcome is indeterminate",
       true,
+    );
+  }
+  // The handoff exists but it was made for a different mutation. This is a
+  // definitive refusal of this apply, never a retry: the values belong to the
+  // request the preparation named and to no other.
+  if (code === "apply_commitment_mismatch") {
+    return failed(
+      "denied",
+      "the sensitive Worker runtime input handoff does not authorize this apply",
     );
   }
   if (code === "conflict") {
