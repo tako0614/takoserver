@@ -114,3 +114,66 @@ it always published. The Bun entry takes the port from the workerd socket and
 lets an operator who terminates elsewhere say so with
 `TAKOSERVER_WORKER_ENDPOINT_PORT`. The router still matches on the name alone,
 because a `Host` header's port is not part of the route.
+
+## Amendment — 2026-09-02: publishing a `WorkerEndpoint` also needs an address the Form can carry
+
+The decision above, and the amendment before this one, are about the address an
+installation **serves**. They are unchanged and they remain true: the scheme
+follows the socket, the port follows the socket, the Worker pins exactly what
+its Host advertised, and a request that reaches the runtime carries that same
+authority. What neither said is what a **published** `WorkerEndpoint` may look
+like, and that is not this Host's decision to make.
+
+`WorkerEndpoint@0.1.0` is a released Form. Its `outputSchema.url` is
+`^https://<dotted-name>/$`, and its prose says the same thing in words: *"The
+scheme is https and the path root is `/`… there is no plaintext address and no
+port."* An address is portable output, and the Form is the authority on what
+that output may be.
+
+So the two facts were in conflict and the Host lost twice over. A
+certificate-less self-host derived the `http://` address its socket serves and
+could publish none. A TLS self-host on `28988` derived the ported `https://…:28988`
+address its socket serves — the very repair the previous amendment made — and
+could publish none either. In both cases the refusal arrived from
+`projectReceipt`, after the driver had created the endpoint, after the
+reservation had been activated and after the deletion attestation had been
+opened, while the wire told the operator *"the host mutated nothing"*. Both are
+recorded in the fourth self-host end-to-end run.
+
+**A `WorkerEndpoint` is published only when the installation's address is
+`https` on the default port.** The rule is decided at the reservation, which is
+before anything is minted, assigned or mutated: `planned` refuses a derived
+origin the Form cannot carry with a stable, non-retryable `unsupported_capability`
+422 whose message names the two ways to fix it —
+
+- terminate TLS in workerd on 443 (`TAKOSERVER_WORKERD_TLS_CERT_FILE`,
+  `TAKOSERVER_WORKERD_TLS_KEY_FILE`, `TAKOSERVER_WORKERD_PORT=443`), which needs
+  the capability to bind 443; or
+- put an ordinary 443 front end in front of workerd and declare it with
+  `TAKOSERVER_WORKER_ENDPOINT_PORT=443`, which normalizes the port away.
+
+A deployment that does neither is not broken. It runs Workers, KV, SQL, queues,
+cron and buckets, and it serves them on its own socket at the origin it honestly
+publishes to the Worker. It simply mints no `WorkerEndpoint`, and it says so at
+boot — as a diagnostic, not a boot failure. The loopback development default is
+not an exception: `http://<script>.localhost` is exactly as unpublishable as any
+other plain-HTTP address, and the sentence an operator reads is the same one.
+
+`ProviderWorkerEndpointOriginReservationCapability.publishedScheme` stays, and
+so does the port in the installation's derived origin. They are the fence that
+stops an installation handing this Host an address in a scheme it never said it
+serves, and they are what keeps the Worker's pinned identity and its Host's
+advertised identity the same string. Publication is a second, narrower question
+asked of the same address.
+
+Two consequences worth stating.
+
+- **The refusal is re-attempted, not replayed.** `unsupported_capability` is in
+  `REATTEMPTED_SETTLED_FAILURE_CODES` ([ADR 0008](0008-a-settled-refusal-about-the-host-is-re-attempted.md)),
+  which is exactly right here: the refusal is a statement about this Host, and
+  the operator who reconfigures it re-runs the identical `tofu apply` under the
+  identical plan-derived key.
+- **A conforming Host and a conforming Form now agree before the mutation.**
+  Whichever way this had been resolved, the Host and the Form had to be changed
+  together, and the Form was not consulted. It is now, at the only moment where
+  consulting it is free.

@@ -31,6 +31,7 @@ pack. Relevant variables are:
 | `TAKOSERVER_WORKER_ENDPOINT_SUFFIX` / `TAKOSERVER_SUFFIXES` | Addresses the local provider may issue. |
 | `TAKOSERVER_WORKERD_TLS_CERT_FILE` / `TAKOSERVER_WORKERD_TLS_KEY_FILE` | PEM paths for the Worker socket. Both or neither. |
 | `TAKOSERVER_WORKERD_TLS_CERT` / `TAKOSERVER_WORKERD_TLS_KEY` | The same two halves as PEM text. |
+| `TAKOSERVER_WORKERD_PORT` / `TAKOSERVER_WORKER_ENDPOINT_PORT` | Where Workers are served, and the port a published `WorkerEndpoint` address carries. A `WorkerEndpoint` needs `https` on the default port, so this deployment mints one only with TLS on 443 in workerd or a 443 front end declared with `TAKOSERVER_WORKER_ENDPOINT_PORT=443`. Anything else runs Workers and storage and says at boot that it can publish no endpoint. |
 | `TAKOSERVER_R2_BUCKET` | Optional artifact store shared with the Worker. Requires a Cloudflare account and token source. |
 | `TAKOSERVER_OPERATOR_PUBLIC_JWK` | Public half of the operator key. |
 | `TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK` | Optional login-only operator key; never authorizes funding. |
