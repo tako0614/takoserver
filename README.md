@@ -264,7 +264,14 @@ HTTPS origin at
 and records the same exact sold ModuleWorker Offering and provider placement as
 ordinary Host mutation; an omitted Offering is accepted only when that
 selection has exactly one eligible result. The reservation is value-free and
-does not create a Takoform Resource or call the provider.
+does not create a Takoform Resource or call the provider. A key that reserves
+nothing still gets a `WorkerEndpoint`: where the selected installation derives
+its own endpoint address — a self-host suffix, the ordinary-workers
+`workers.dev` or zone suffix — the Host reserves that derived origin on the
+caller's behalf, in an id namespace the public routes refuse, and lets go of it
+only through the same release fences. An installation that sells its base
+domain instead of deriving one mints nothing and still requires a supplied
+reservation.
 
 The sensitive half of a Worker Version travels separately, over
 `PUT|GET /v1/takoform/worker-runtime-input-preparations/{operationKey}` speaking

@@ -186,3 +186,49 @@ mutable composition state is not an authority.
 - Secret values never enter a public projection, log, provider identity, or
   portable state.
 - Activation does not infer authority from arbitrary URL-like outputs.
+
+## Amendment — 2026-09-02: the Host mints the reservation it can derive
+
+The public control contract above says an organization API key calls the
+reservation routes. Nothing said what happens when it does not, and the answer
+turned out to be: it cannot create a `WorkerEndpoint` at all. The only source
+of `workerEndpointOriginReservationId` on a mutation is a scoped tenant-run
+token minted through the reseller lane, and the released Takoform provider's
+`takoform_worker_endpoint` accepts `name`, `worker`, `space` and timeouts —
+there is no input for a reservation and no code path that makes one. A real
+self-host end-to-end run with a published provider therefore reached
+`unsupported_capability` 422 on the fourteenth resource of a Worker graph, so
+no `launch_url` and no reachable HTTPS endpoint.
+
+Choosing a name is what a reseller lane sells. Where the address is *derived*
+rather than chosen — a self-host's `workerEndpointSuffix`, the ordinary-workers
+backend's `workers.dev` or zone suffix — there is nothing for the caller to
+choose: the hostname follows from the Worker. So on those installations the
+Host reserves on the caller's behalf. Three things make that safe to say:
+
+- **The provider states the label, not the Host.** A new optional capability,
+  `hostMintedSubdomain`, asks the selected installation for the subdomain it
+  would itself give a `WorkerEndpoint` on this exact Worker — the same derived
+  script name its real mutation path uses. An installation that sells its base
+  domain instead of deriving one (the managed Workers-for-Platforms backend)
+  answers `null`, mints nothing, and keeps requiring a supplied reservation.
+  A label this contract cannot hold is a composition defect and fails closed.
+- **A Host-minted reservation is never a caller's.** Its id is derived —
+  `hostmint-` followed by the digest of tenant, Space, Worker name and Worker
+  UID — and the public control routes refuse that prefix outright, so a row in
+  the namespace is always one this Host made and a caller cannot plant one for
+  the Host to adopt. `mintForWorker` releases only rows in that namespace; a
+  caller's reservation that owns the same address stops the mint on the live
+  uniqueness constraint rather than being taken away.
+- **Letting go of one is the same release.** The id names an incarnation, so a
+  destroy followed by a re-apply asks for a different reservation on the same
+  address, and the previous one still owns that address until it is released.
+  Release is this ADR's release, with all four fences: no activation, the
+  retained endpoint Resource absent, its deletion attestation closed, and no
+  provider deployment outside `deleted` or `failed`. While the old endpoint may
+  still be serving, the mint fails rather than reallocating its origin.
+
+Everything else stands. A supplied reservation is still the authority for the
+origin it holds; binding, activation, deactivation, the deletion witness and
+the destroy order are untouched; and the reservation remains value-free and
+still creates no Takoform Resource and calls no provider.
