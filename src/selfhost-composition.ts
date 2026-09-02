@@ -61,6 +61,11 @@ export interface SelfhostCompositionOptions {
    * and admission refuses the declaration before anything is provisioned.
    */
   readonly runtimeInputs?: ProviderRuntimeInputLeasePort;
+  /**
+   * Loopback address of this machine's KV and SQL data planes. Absent means it
+   * serves none, and a Worker Version that binds one is refused at apply.
+   */
+  readonly dataPlaneAddress?: string;
   readonly now: Date;
 }
 
@@ -132,6 +137,7 @@ export function createSelfhostComposition(
     ...(options.workerEndpointSuffix ? { workerEndpointSuffix: options.workerEndpointSuffix } : {}),
     ...(options.suffixes ? { suffixes: options.suffixes } : {}),
     ...(options.runtimeInputs ? { runtimeInputs: options.runtimeInputs } : {}),
+    ...(options.dataPlaneAddress ? { dataPlaneAddress: options.dataPlaneAddress } : {}),
   } satisfies SelfhostProviderOptions);
 
   const supplyContract: SupplyContract = {

@@ -111,6 +111,8 @@ export function createStandaloneProviderComposition(input: {
   readonly suffixes?: readonly string[];
   /** Present only when this deployment has an operator-configured seal key ring. */
   readonly runtimeInputs?: ProviderRuntimeInputLeasePort;
+  /** Loopback address of the KV and SQL data planes, when this entry serves them. */
+  readonly dataPlaneAddress?: string;
   readonly now: Date;
   readonly retiredCloudflare?: Omit<CloudflareProviderOptions, "offerings">;
 }): StandaloneProviderComposition {
@@ -130,6 +132,7 @@ export function createStandaloneProviderComposition(input: {
       ...(input.workerEndpointSuffix ? { workerEndpointSuffix: input.workerEndpointSuffix } : {}),
       ...(input.suffixes ? { suffixes: input.suffixes } : {}),
       ...(input.runtimeInputs ? { runtimeInputs: input.runtimeInputs } : {}),
+      ...(input.dataPlaneAddress ? { dataPlaneAddress: input.dataPlaneAddress } : {}),
       now: input.now,
     });
     return {
@@ -147,6 +150,9 @@ export function createStandaloneProviderComposition(input: {
     throw new TypeError(
       "the retired Cloudflare ObjectBucket drain consumes no runtime-input lease",
     );
+  }
+  if (input.dataPlaneAddress) {
+    throw new TypeError("the retired Cloudflare ObjectBucket drain publishes no Worker Version");
   }
   if (input.workerEndpointSuffix !== undefined || input.suffixes !== undefined) {
     throw new TypeError(

@@ -65,6 +65,19 @@ export interface WorkerdSite {
    * so a script that declares none produces the same bytes it always did.
    */
   readonly vars?: readonly WorkerdBinding[];
+  /**
+   * Modules to declare beside the main one, in order.
+   *
+   * workerd resolves an import against the module registry the configuration
+   * builds, so a module that is on disk but not named here cannot be imported.
+   * Absent renders exactly the single-module configuration it always did.
+   */
+  readonly modules?: readonly string[];
+  /**
+   * Loopback address of this Host's KV and SQL data planes, for a script whose
+   * generated entrypoint calls them. Absent means this script binds neither.
+   */
+  readonly dataPlaneAddress?: string;
 }
 
 /** The seam a provider publishes through: files present, config rewritten. */
@@ -108,9 +121,19 @@ interface Manifest {
   readonly generation?: string;
   readonly assets?: { readonly notFoundHandling: string };
   readonly vars?: readonly WorkerdBinding[];
+  readonly modules?: readonly string[];
+  readonly dataPlaneAddress?: string;
 }
 
 const MANIFEST = "takoserver-site.json";
+/**
+ * The service binding a generated entrypoint reaches the data planes through.
+ *
+ * Kept in step with `SELFHOST_WORKER_DATA_SERVICE_BINDING` by name rather than
+ * by import: this module is the runtime, and it must not depend on the provider
+ * that publishes into it.
+ */
+const DATA_SERVICE_BINDING = "__TAKOSERVER_SELFHOST_DATA";
 /** Where a script's static files live inside its directory. */
 const ASSETS_DIRECTORY = "__assets";
 
@@ -169,6 +192,12 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): WorkerdRun
           ...(site.generation === undefined ? {} : { generation: site.generation }),
           ...(site.assets ? { assets: site.assets } : {}),
           ...(site.vars && site.vars.length > 0 ? { vars: validBindings(site.vars) } : {}),
+          ...(site.modules && site.modules.length > 0
+            ? { modules: validModules(site.modules) }
+            : {}),
+          ...(site.dataPlaneAddress
+            ? { dataPlaneAddress: validDataPlaneAddress(site.dataPlaneAddress) }
+            : {}),
         }),
         "utf8",
       );
@@ -307,6 +336,48 @@ function validBindings(bindings: readonly WorkerdBinding[]): readonly WorkerdBin
 }
 
 /**
+ * Module names this configuration may declare.
+ *
+ * They come from a tenant's own bundle, so they are held to the same rule the
+ * files were written under and to renderability, and a duplicate is refused
+ * rather than silently shadowing the main module.
+ */
+function validModules(modules: readonly string[]): readonly string[] {
+  const seen = new Set<string>();
+  for (const name of modules) {
+    if (
+      typeof name !== "string" ||
+      name.length === 0 ||
+      name.length > 240 ||
+      name.includes("..") ||
+      name.startsWith("/") ||
+      seen.has(name)
+    ) {
+      throw new Error("unusable worker module");
+    }
+    seen.add(name);
+    capnpText(name);
+  }
+  return modules;
+}
+
+/**
+ * The one address a data-plane service may point at.
+ *
+ * Loopback only, and deliberately: the address is written into a generated
+ * `externalServer`, every request a Worker makes on that binding goes to it
+ * whatever URL the Worker wrote, and each of those requests carries the
+ * version's plane token. An address off this machine would be somewhere that
+ * token could be sent.
+ */
+function validDataPlaneAddress(address: string): string {
+  if (!/^(?:127\.0\.0\.1|\[::1\]|localhost):(?:[1-9][0-9]{0,4})$/u.test(address)) {
+    throw new Error("unusable data plane address");
+  }
+  return address;
+}
+
+/**
  * A capnp text literal.
  *
  * This configuration is assembled by concatenating strings, and the values in
@@ -415,6 +486,10 @@ async function readPublished(scriptsRoot: string): Promise<readonly Published[]>
     // tampered manifest and a `renderConfig` that throws for everyone.
     try {
       validBindings(manifest.vars ?? []);
+      validModules(manifest.modules ?? []);
+      if (manifest.dataPlaneAddress !== undefined) {
+        validDataPlaneAddress(manifest.dataPlaneAddress);
+      }
     } catch {
       continue;
     }
@@ -440,6 +515,9 @@ function renderConfig(published: readonly Published[], port: number, scriptsRoot
       // script, and `notFoundHandling` never applies.
       const bindings = [
         ...(entry.manifest.assets ? [`(name = "ASSETS", service = "${entry.name}-assets")`] : []),
+        ...(entry.manifest.dataPlaneAddress
+          ? [`(name = "${DATA_SERVICE_BINDING}", service = "${entry.name}-selfhost-data")`]
+          : []),
         ...validBindings(entry.manifest.vars ?? []).map(
           (binding) =>
             `(name = ${capnpText(binding.name)}, ${binding.kind} = ${capnpText(binding.value)})`,
@@ -447,9 +525,17 @@ function renderConfig(published: readonly Published[], port: number, scriptsRoot
       ];
       const bindingList =
         bindings.length === 0 ? "" : `\n      bindings = [ ${bindings.join(", ")} ],`;
+      // The main module first, then whatever it imports. A generated entrypoint
+      // is only an entrypoint because it is named here.
+      const moduleList = [entry.manifest.mainModule, ...validModules(entry.manifest.modules ?? [])]
+        .map(
+          (name) =>
+            `(name = ${capnpText(name)}, esModule = embed ${capnpText(`${entry.name}/${name}`)})`,
+        )
+        .join(", ");
       return `  ( name = "${entry.name}",
     worker = (
-      modules = [ (name = "${entry.manifest.mainModule}", esModule = embed "${entry.name}/${entry.manifest.mainModule}") ],${bindingList}
+      modules = [ ${moduleList} ],${bindingList}
       compatibilityDate = "2026-01-01",
     )
   ),`;
@@ -486,6 +572,18 @@ function renderConfig(published: readonly Published[], port: number, scriptsRoot
     )
     .join("\n");
 
+  // One per script rather than one shared, so the configuration stays a pure
+  // function of the manifests on disk: a script that binds no data plane
+  // contributes no service, and removing it removes its service with it.
+  const dataServices = published
+    .filter((entry) => entry.manifest.dataPlaneAddress)
+    .map(
+      (entry) => `  ( name = "${entry.name}-selfhost-data",
+    external = ( address = ${capnpText(validDataPlaneAddress(entry.manifest.dataPlaneAddress as string))}, http = () )
+  ),`,
+    )
+    .join("\n");
+
   const routes = published.flatMap((entry) =>
     entry.manifest.hostnames.map((hostname) => ({ hostname, service: entry.name })),
   );
@@ -499,7 +597,7 @@ function renderConfig(published: readonly Published[], port: number, scriptsRoot
 const config :Workerd.Config = (
   services = [
 ${services}
-${assetServices}
+${assetServices}${dataServices === "" ? "" : `\n${dataServices}`}
   ( name = "router",
     worker = (
       modules = [ (name = "router.js", esModule = embed "router.js") ],

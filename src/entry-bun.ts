@@ -17,12 +17,14 @@ import {
 } from "./operator-key.ts";
 import { resolvePayment } from "./payment-setup.ts";
 import { createOpenAiGateway, parseOpenAiModelConfig } from "./providers/openai.ts";
+import { createSelfhostDataPlaneAccess } from "./providers/selfhost.ts";
 import { createProvisionerEndpoint } from "./provisioner-endpoint.ts";
 import {
   createRuntimeInputAuthority,
   runtimeInputCanonicalOriginSupported,
 } from "./runtime-input-preparations.ts";
 import { parseRuntimeInputSealKeyRing } from "./runtime-input-seal-keyring.ts";
+import { createSelfhostDataPlanes } from "./selfhost-data-planes.ts";
 import { ensureSigningKey } from "./signing-key.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import {
@@ -244,6 +246,36 @@ const runtimeInputs = runtimeInputsAvailable
     })
   : undefined;
 
+/**
+ * Where a Worker this machine runs finds its KV namespaces and SQL databases.
+ *
+ * The planes are served by this process, on this process's own port, under a
+ * `.well-known` prefix. What reaches them is not that public origin, though: a
+ * generated Worker entrypoint calls them through a workerd `externalServer`
+ * pointed at the loopback address below, so the traffic never leaves the
+ * machine and never depends on `TAKOSERVER_PUBLIC_ORIGIN` resolving to it.
+ *
+ * `127.0.0.1` and the serving port, therefore — not the public origin, which
+ * on a real deployment is a TLS name in front of a proxy that this process
+ * cannot reach from inside itself, and not `localhost`, which may resolve to
+ * an address the listener is not bound to.
+ *
+ * Retired-drain mode publishes no Worker Version, so it composes no plane and
+ * refuses the address; that keeps the KV table and the SQLite files untouched
+ * on a machine whose only job is proving a historical Deployment is gone.
+ */
+const dataPlaneAddress =
+  providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN ? undefined : `127.0.0.1:${port}`;
+const selfhostDataAccess = createSelfhostDataPlaneAccess(dataRoot);
+const selfhostData = dataPlaneAddress
+  ? createSelfhostDataPlanes({
+      sql,
+      grant: (script, versionId) => selfhostDataAccess.grant(script, versionId),
+      databasePath: (name) => selfhostDataAccess.databasePath(name),
+      clock,
+    })
+  : undefined;
+
 const providerArtifacts = {
   manifest: (tenantRef: string, digest: string) => artifactStore.resolveManifest(tenantRef, digest),
   async blob(digest: string) {
@@ -288,6 +320,7 @@ const providerComposition = createStandaloneProviderComposition({
     ? { suffixes: process.env.TAKOSERVER_SUFFIXES.split(",").map((entry) => entry.trim()) }
     : {}),
   ...(runtimeInputs ? { runtimeInputs: runtimeInputs.leases } : {}),
+  ...(dataPlaneAddress ? { dataPlaneAddress } : {}),
   now: clock(),
   ...(providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
     ? {
@@ -405,6 +438,7 @@ const app = buildApp({
   ...(process.env.TAKOSERVER_CONSOLE_ORIGIN
     ? { consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN }
     : {}),
+  ...(selfhostData ? { selfhostData } : {}),
   forms: currentCandidates.forms,
   bindings: currentCandidates.bindings,
   hostForms: currentCandidates.forms,

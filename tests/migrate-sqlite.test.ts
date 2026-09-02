@@ -13,12 +13,14 @@ const WORKER_ENDPOINT_ORIGIN_RESERVATION_V2 = "0035_worker_endpoint_origin_reser
 const PROVIDER_REPAIR_AND_MANAGED_SCHEDULE_RECONCILIATION =
   "0036_provider_repair_and_managed_schedule_reconciliation.sql";
 const RUNTIME_INPUT_PREPARATION_V2 = "0037_worker_runtime_input_preparation_v2.sql";
+const SELFHOST_EDGE_KV = "0038_selfhost_edge_kv.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
   WORKER_ENDPOINT_ORIGIN_RESERVATION_V2,
   PROVIDER_REPAIR_AND_MANAGED_SCHEDULE_RECONCILIATION,
   RUNTIME_INPUT_PREPARATION_V2,
+  SELFHOST_EDGE_KV,
 ] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
@@ -638,6 +640,7 @@ describe("bringing a local database up to date", () => {
       "0035_worker_endpoint_origin_reservation_v2.sql",
       "0036_provider_repair_and_managed_schedule_reconciliation.sql",
       "0037_worker_runtime_input_preparation_v2.sql",
+      "0038_selfhost_edge_kv.sql",
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -756,6 +759,7 @@ describe("bringing a local database up to date", () => {
       "0035_worker_endpoint_origin_reservation_v2.sql",
       "0036_provider_repair_and_managed_schedule_reconciliation.sql",
       "0037_worker_runtime_input_preparation_v2.sql",
+      "0038_selfhost_edge_kv.sql",
     ]);
     expect(
       database
@@ -1681,6 +1685,7 @@ describe("bringing a local database up to date", () => {
     expect(migrateSqlite(database).applied).toEqual([
       PROVIDER_REPAIR_AND_MANAGED_SCHEDULE_RECONCILIATION,
       RUNTIME_INPUT_PREPARATION_V2,
+      SELFHOST_EDGE_KV,
     ]);
     expect(
       database

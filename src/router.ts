@@ -15,10 +15,25 @@ import type { TakoformHost } from "./takoform/types.ts";
  * or a 404.
  */
 
+/**
+ * The self-hosted KV and SQL data planes, when this deployment runs Workers.
+ *
+ * Declared structurally rather than imported, because the implementation opens
+ * SQLite files and a Cloudflare Worker has no filesystem: a static edge from
+ * here would put a host-only module in the Worker bundle's graph.
+ */
+export type SelfhostDataRoutes = (request: Request, url: URL) => Promise<Response | null>;
+
 export interface CreateRouterOptions {
   readonly control: ControlRoutes;
   readonly sponsorship?: SponsorshipRoutes;
   readonly dataAi?: DataAiRoutes;
+  /**
+   * Offered before anything else. These are a running Worker's storage calls,
+   * they are the hottest path this process serves, and their prefix belongs to
+   * no other surface — so nothing else gets a chance to claim or delay one.
+   */
+  readonly selfhostData?: SelfhostDataRoutes;
   readonly aiAvailable?: boolean;
   readonly takoformHost?: TakoformHost;
   readonly publicOrigin: string;
@@ -97,6 +112,11 @@ function dispatch(options: CreateRouterOptions, origin: string): Router {
   const console = options.consoleOrigin === undefined ? null : httpsOrigin(options.consoleOrigin);
   return async (request) => {
     const url = new URL(request.url);
+
+    if (options.selfhostData) {
+      const served = await options.selfhostData(request, url);
+      if (served) return served;
+    }
 
     if (options.sponsorship) {
       const served = await options.sponsorship(request, url);

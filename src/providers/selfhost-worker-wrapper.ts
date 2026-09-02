@@ -1,0 +1,977 @@
+/**
+ * The entrypoint a self-hosted Worker Version is actually published as.
+ *
+ * workerd has a binding type for a string and one for parsed JSON, and that is
+ * the whole of what a Worker Version's environment could be projected into
+ * until now. It has no SQLite binding at all, and its KV binding is a wire
+ * protocol to a service rather than a facade — so a version that declares
+ * `kvBindings` or `sqliteBindings` cannot be handed to workerd directly and
+ * still receive what the Interface promises.
+ *
+ * So the version is published through a generated module that imports the
+ * tenant's own main module, builds `env` itself, and re-exports the handlers
+ * the version declared. `env.KV` and `env.DB` are the exact `edge.kv@1.0.0`
+ * and `edge.sql@1.0.0` facades the managed Cloudflare backend projects — same
+ * methods, same options, same error names — implemented over this Host's own
+ * data planes. ADR 0005 is explicit that a Worker receives the Binding facade
+ * and never a raw wire envelope or a provider-native client; running on the
+ * operator's own machine does not make that a different contract.
+ *
+ * Two things never reach the tenant. The service binding that addresses the
+ * data planes and the per-version token that authenticates to them are read
+ * from the raw environment, captured in closures, and left out of the projected
+ * object. The service binding is an `externalServer`, so every request on it
+ * goes to this Host's own loopback address regardless of the URL written on it:
+ * even a tenant that could reach the token could not send it anywhere else.
+ *
+ * The intrinsics this module uses are captured at module scope, before the
+ * tenant's module is imported, for the same reason the managed wrapper captures
+ * them: after the first request the tenant's code has run, and a `Headers` or a
+ * `JSON.stringify` it replaced would otherwise be the one this module calls
+ * with a secret in hand.
+ */
+
+/** Closed handler vocabulary of worker.runtime@1.1.0. */
+export const SELFHOST_WORKER_HANDLER_NAMES = ["fetch", "queue", "scheduled"] as const;
+
+export type SelfhostWorkerHandlerName = (typeof SELFHOST_WORKER_HANDLER_NAMES)[number];
+
+export const SELFHOST_WORKER_EDGE_KV_BINDING_KIND = "edge.kv@1.0.0" as const;
+export const SELFHOST_WORKER_EDGE_SQL_BINDING_KIND = "edge.sql@1.0.0" as const;
+
+/** Names reserved for this Host; a public binding may never start with it. */
+export const SELFHOST_WORKER_INTERNAL_BINDING_PREFIX = "__TAKOSERVER_" as const;
+/** The `externalServer` service binding that addresses the Bun data planes. */
+export const SELFHOST_WORKER_DATA_SERVICE_BINDING = "__TAKOSERVER_SELFHOST_DATA" as const;
+/** The per-version bearer token the generated module presents to them. */
+export const SELFHOST_WORKER_DATA_TOKEN_BINDING = "__TAKOSERVER_SELFHOST_DATA_TOKEN" as const;
+
+/** Module name the generated entrypoint is published under. */
+export const SELFHOST_WORKER_ENTRYPOINT_MODULE = "__takoserver-selfhost-entrypoint.js" as const;
+
+export const SELFHOST_DATA_PLANE_PATH_PREFIX = "/.well-known/takoserver/selfhost-data/v1" as const;
+export const SELFHOST_DATA_PLANE_KV_PATH = `${SELFHOST_DATA_PLANE_PATH_PREFIX}/kv` as const;
+export const SELFHOST_DATA_PLANE_SQL_PATH = `${SELFHOST_DATA_PLANE_PATH_PREFIX}/sql` as const;
+export const SELFHOST_DATA_PLANE_PROTOCOL = "takoserver.selfhost-data@v1" as const;
+export const SELFHOST_DATA_PLANE_CONTENT_TYPE =
+  "application/vnd.takoserver.selfhost-data.v1+json" as const;
+
+/**
+ * The origin written on a data-plane request.
+ *
+ * It is never resolved. An `externalServer` binding delivers every `fetch` to
+ * the address in the configuration whatever the URL says, so this exists only
+ * to make the request well-formed and the plane's own logs readable.
+ */
+export const SELFHOST_DATA_PLANE_ORIGIN = "http://takoserver-selfhost-data.invalid" as const;
+
+/** Bytes a plane answer may carry, mirroring the managed facade's SQL ceiling. */
+export const SELFHOST_DATA_PLANE_MAX_RESPONSE_BYTES = 40 * 1024 * 1024;
+
+/** A plain, secret, or JSON value workerd already carries as an env binding. */
+export interface SelfhostWorkerNativeBindingDescriptor {
+  readonly name: string;
+  readonly type: "plain_text" | "json" | "secret_text";
+}
+
+/** A facade this module implements over a data plane, addressed by its name. */
+export interface SelfhostWorkerDataBindingDescriptor {
+  readonly kind:
+    | typeof SELFHOST_WORKER_EDGE_KV_BINDING_KIND
+    | typeof SELFHOST_WORKER_EDGE_SQL_BINDING_KIND;
+  readonly publicName: string;
+}
+
+export type SelfhostWorkerBindingDescriptor =
+  | SelfhostWorkerNativeBindingDescriptor
+  | SelfhostWorkerDataBindingDescriptor;
+
+export interface SelfhostWorkerEntrypointSourceInput {
+  readonly originalMainModule: string;
+  readonly declaredHandlers: readonly SelfhostWorkerHandlerName[];
+  readonly bindings: readonly SelfhostWorkerBindingDescriptor[];
+}
+
+const ARTIFACT_PART_NAME = /^[A-Za-z0-9_.][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_.][A-Za-z0-9._-]*)*$/u;
+const BINDING_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/u;
+const VARIABLE_NAME = /^[A-Za-z][A-Za-z0-9._-]*$/u;
+const NATIVE_BINDING_TYPES = new Set(["plain_text", "json", "secret_text"]);
+const DATA_BINDING_KINDS = new Set<string>([
+  SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
+  SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
+]);
+const HANDLER_NAMES = new Set<string>(SELFHOST_WORKER_HANDLER_NAMES);
+
+/**
+ * Generates the only self-host module allowed to import a tenant's main module.
+ *
+ * The input is a closed object, validated field by field, so no unchecked
+ * string can become an import specifier or a property name in the emitted
+ * source.
+ */
+export function selfhostWorkerEntrypointSource(input: SelfhostWorkerEntrypointSourceInput): string {
+  const normalized = normalizeSourceInput(input);
+  const moduleSpecifier = `./${normalized.originalMainModule}`;
+  const configuration = {
+    declaredHandlers: [...normalized.declaredHandlers].sort(),
+    bindings: normalized.bindings,
+  };
+  const handlers = configuration.declaredHandlers
+    .map((handler) =>
+      handler === "fetch"
+        ? `  async fetch(request, rawEnv, rawContext) {
+    return await invoke("fetch", [request], rawEnv, rawContext);
+  },`
+        : `  async ${handler}(event, rawEnv, rawContext) {
+    return await invoke(${JSON.stringify(handler)}, [event], rawEnv, rawContext);
+  },`,
+    )
+    .join("\n");
+
+  return `const RAW_CONFIGURATION = ${JSON.stringify(configuration)};
+const DATA_SERVICE = ${JSON.stringify(SELFHOST_WORKER_DATA_SERVICE_BINDING)};
+const DATA_TOKEN = ${JSON.stringify(SELFHOST_WORKER_DATA_TOKEN_BINDING)};
+const KV_URL = ${JSON.stringify(`${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_KV_PATH}`)};
+const SQL_URL = ${JSON.stringify(`${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_SQL_PATH}`)};
+const PROTOCOL = ${JSON.stringify(SELFHOST_DATA_PLANE_PROTOCOL)};
+const CONTENT_TYPE = ${JSON.stringify(SELFHOST_DATA_PLANE_CONTENT_TYPE)};
+const MAX_RESPONSE_BYTES = ${SELFHOST_DATA_PLANE_MAX_RESPONSE_BYTES};
+
+// Captured before the tenant module is imported: after its first request its
+// code has run, and anything it replaced on a shared prototype would otherwise
+// be what this module calls while holding the plane token.
+const SafeApply = Reflect.apply;
+const SafeOwnKeys = Reflect.ownKeys;
+const SafeArrayIsArray = Array.isArray;
+const SafeArrayBufferIsView = ArrayBuffer.isView;
+const SafeArrayBufferSlice = ArrayBuffer.prototype.slice;
+const SafeAtob = atob;
+const SafeBtoa = btoa;
+const SafeError = Error;
+const SafeTypeError = TypeError;
+const SafeJSONParse = JSON.parse;
+const SafeJSONStringify = JSON.stringify;
+const SafeMathAbs = Math.abs;
+const SafeMathMin = Math.min;
+const SafeNumberIsFinite = Number.isFinite;
+const SafeNumberIsSafeInteger = Number.isSafeInteger;
+const SafeNumberMaxSafeInteger = Number.MAX_SAFE_INTEGER;
+const SafeObject = Object;
+const SafeObjectCreate = Object.create;
+const SafeObjectFreeze = Object.freeze;
+const SafeObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const SafeObjectGetPrototypeOf = Object.getPrototypeOf;
+const SafeObjectHasOwn = Object.hasOwn;
+const SafeObjectKeys = Object.keys;
+const SafeObjectPrototype = Object.prototype;
+const SafeObjectSetPrototypeOf = Object.setPrototypeOf;
+const SafePromise = Promise;
+const SafePromiseResolve = Promise.resolve;
+const SafePromiseThen = Promise.prototype.then;
+const SafeRegExpTest = RegExp.prototype.test;
+const SafeResponseText = Response.prototype.text;
+const SafeStringFromCharCode = String.fromCharCode;
+const SafeTextDecoder = TextDecoder;
+const SafeTextDecoderDecode = TextDecoder.prototype.decode;
+const SafeTextEncoder = TextEncoder;
+const SafeTextEncoderEncode = TextEncoder.prototype.encode;
+const SafeUint8Array = Uint8Array;
+const SafeUint8ArraySet = Uint8Array.prototype.set;
+const SafeDataViewBufferGet = captureGetter(DataView.prototype, "buffer");
+const SafeDataViewByteLengthGet = captureGetter(DataView.prototype, "byteLength");
+const SafeDataViewByteOffsetGet = captureGetter(DataView.prototype, "byteOffset");
+const SafeTypedArrayBufferGet = captureGetter(Uint8Array.prototype, "buffer");
+const SafeTypedArrayByteLengthGet = captureGetter(Uint8Array.prototype, "byteLength");
+const SafeTypedArrayByteOffsetGet = captureGetter(Uint8Array.prototype, "byteOffset");
+
+const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
+const MAX_KV_KEY_BYTES = 467;
+const MAX_KV_VALUE_BYTES = 26214400;
+const MAX_KV_METADATA_BYTES = 1024;
+const MAX_SQL_BYTES = 100000;
+const MAX_SQL_PARAMETERS = 100;
+const MAX_SQL_STATEMENTS = 100;
+const MAX_SQL_ROWS = 10000;
+const MAX_SQL_COLUMNS = 100;
+const MAX_SQL_COLUMN_NAME_BYTES = 128;
+const MAX_SQL_VALUE_BYTES = 1000000;
+const MAX_SQL_ROW_BYTES = 2000000;
+const MAX_SQL_RESULT_BYTES = 8388608;
+const SQL_ERROR_CODES = ["sql_error", "numeric_out_of_range", "busy", "backend_unavailable"];
+const KV_ERROR_CODES = [
+  "invalid_key",
+  "invalid_value",
+  "invalid_argument",
+  "invalid_cursor",
+  "value_too_large",
+  "metadata_too_large",
+  "backend_unavailable",
+];
+const encoder = new SafeTextEncoder();
+const CONFIGURATION = sealGeneratedConfiguration(RAW_CONFIGURATION);
+let originalPromise;
+
+function captureGetter(prototype, name) {
+  let current = prototype;
+  while (current) {
+    const descriptor = SafeApply(SafeObjectGetOwnPropertyDescriptor, SafeObject, [current, name]);
+    if (descriptor && typeof descriptor.get === "function") return descriptor.get;
+    current = SafeApply(SafeObjectGetPrototypeOf, SafeObject, [current]);
+  }
+  throw new SafeTypeError("self-host Worker intrinsic is unavailable");
+}
+
+export default SafeApply(SafeObjectFreeze, SafeObject, [{
+${handlers}
+}]);
+
+async function invoke(handler, args, rawEnv, rawContext) {
+  const env = projectEnv(rawEnv);
+  const context = createPortableContext(rawContext);
+  const original = await loadOriginal();
+  return await SafeApply(original.handlers[handler], original.target, [...args, env, context]);
+}
+
+function sealGeneratedConfiguration(raw) {
+  const declaredHandlers = internalArray();
+  for (let index = 0; index < raw.declaredHandlers.length; index += 1) {
+    declaredHandlers[index] = raw.declaredHandlers[index];
+  }
+  SafeApply(SafeObjectFreeze, SafeObject, [declaredHandlers]);
+  const bindings = internalArray();
+  for (let index = 0; index < raw.bindings.length; index += 1) {
+    const source = raw.bindings[index];
+    const descriptor = SafeObjectCreate(null);
+    if (SafeObjectHasOwn(source, "kind")) {
+      descriptor.kind = source.kind;
+      descriptor.publicName = source.publicName;
+    } else {
+      descriptor.name = source.name;
+      descriptor.type = source.type;
+    }
+    bindings[index] = SafeApply(SafeObjectFreeze, SafeObject, [descriptor]);
+  }
+  SafeApply(SafeObjectFreeze, SafeObject, [bindings]);
+  const configuration = SafeObjectCreate(null);
+  configuration.declaredHandlers = declaredHandlers;
+  configuration.bindings = bindings;
+  return SafeApply(SafeObjectFreeze, SafeObject, [configuration]);
+}
+
+function internalArray() {
+  return SafeApply(SafeObjectSetPrototypeOf, SafeObject, [[], null]);
+}
+
+function loadOriginal() {
+  if (!originalPromise) {
+    const loading = import(${JSON.stringify(moduleSpecifier)});
+    originalPromise = SafeApply(SafePromiseThen, loading, [validateOriginal]);
+  }
+  return originalPromise;
+}
+
+/**
+ * A declared handler that is not there is a publication that must stop.
+ *
+ * The Version told this Host which events it answers, and the aggregate rules
+ * upstream gate an attachment on that declaration. A module that does not
+ * export one of them would accept the attachment and drop the event.
+ */
+function validateOriginal(loaded) {
+  if (!loaded || (typeof loaded !== "object" && typeof loaded !== "function") || !SafeObjectHasOwn(loaded, "default")) {
+    throw new SafeTypeError("self-host Worker must have a default export");
+  }
+  const original = loaded.default;
+  if (!original || typeof original !== "object" || SafeArrayIsArray(original)) {
+    throw new SafeTypeError("self-host Worker default export must be a plain object");
+  }
+  const prototype = SafeApply(SafeObjectGetPrototypeOf, SafeObject, [original]);
+  if (prototype !== SafeObjectPrototype && prototype !== null) {
+    throw new SafeTypeError("self-host Worker default export must be a plain object");
+  }
+  const handlers = SafeObjectCreate(null);
+  for (let index = 0; index < CONFIGURATION.declaredHandlers.length; index += 1) {
+    const handler = CONFIGURATION.declaredHandlers[index];
+    const descriptor = SafeApply(SafeObjectGetOwnPropertyDescriptor, SafeObject, [original, handler]);
+    if (!descriptor || !SafeObjectHasOwn(descriptor, "value") || typeof descriptor.value !== "function") {
+      throw new SafeTypeError("self-host Worker declared handler is missing");
+    }
+    handlers[handler] = descriptor.value;
+  }
+  return { target: original, handlers };
+}
+
+function projectEnv(rawEnv) {
+  if (!rawEnv || (typeof rawEnv !== "object" && typeof rawEnv !== "function")) {
+    throw portableError("backend_unavailable");
+  }
+  const projected = SafeObjectCreate(null);
+  let call;
+  for (let index = 0; index < CONFIGURATION.bindings.length; index += 1) {
+    const descriptor = CONFIGURATION.bindings[index];
+    if (SafeObjectHasOwn(descriptor, "kind")) {
+      if (!call) call = createPlaneCaller(rawEnv);
+      projected[descriptor.publicName] =
+        descriptor.kind === ${JSON.stringify(SELFHOST_WORKER_EDGE_KV_BINDING_KIND)}
+          ? createKvAdapter(call, descriptor.publicName)
+          : createSqlAdapter(call, descriptor.publicName);
+      continue;
+    }
+    // A text, JSON, or sensitive value is already exactly what the module must
+    // see; workerd has no separate secret binding, and neither does this.
+    projected[descriptor.name] = rawEnv[descriptor.name];
+  }
+  return projected;
+}
+
+function createPortableContext(rawContext) {
+  const portable = SafeObjectCreate(null);
+  const nativeWaitUntil =
+    rawContext && typeof rawContext.waitUntil === "function" ? rawContext.waitUntil : undefined;
+  portable.waitUntil = (value) => {
+    const promise = SafeApply(SafePromiseResolve, SafePromise, [value]);
+    if (nativeWaitUntil) {
+      try { SafeApply(nativeWaitUntil, rawContext, [promise]); } catch {}
+    }
+  };
+  return SafeApply(SafeObjectFreeze, SafeObject, [portable]);
+}
+
+/**
+ * One authenticated caller for every facade on this Worker.
+ *
+ * The service binding is an \`externalServer\`, so the URL below decides nothing:
+ * the request goes to the address in the generated configuration. That is what
+ * makes the token safe to hold here — there is no second destination to send it
+ * to, whatever else in this isolate has been replaced.
+ */
+function createPlaneCaller(rawEnv) {
+  const service = rawEnv[DATA_SERVICE];
+  const send = captureMethod(service, "fetch");
+  const token = rawEnv[DATA_TOKEN];
+  if (typeof token !== "string" || token.length === 0) throw portableError("backend_unavailable");
+  const authorization = "Bearer " + token;
+  return async (url, payload, codes) => {
+    const headers = SafeObjectCreate(null);
+    headers.authorization = authorization;
+    headers["content-type"] = CONTENT_TYPE;
+    const init = SafeObjectCreate(null);
+    init.method = "POST";
+    init.headers = headers;
+    init.body = SafeJSONStringify(payload);
+    let response;
+    try {
+      response = await SafeApply(send, service, [url, init]);
+    } catch {
+      throw portableError("backend_unavailable");
+    }
+    let body;
+    try {
+      body = await SafeApply(SafeResponseText, response, []);
+    } catch {
+      throw portableError("backend_unavailable");
+    }
+    if (typeof body !== "string" || body.length > MAX_RESPONSE_BYTES) {
+      throw portableError("backend_unavailable");
+    }
+    let envelope;
+    try {
+      envelope = SafeJSONParse(body);
+    } catch {
+      throw portableError("backend_unavailable");
+    }
+    if (!isRecord(envelope)) throw portableError("backend_unavailable");
+    if (envelope.ok === true && exactKeys(envelope, ["ok", "value"])) return envelope.value;
+    if (
+      envelope.ok === false &&
+      exactKeys(envelope, ["ok", "error"]) &&
+      isRecord(envelope.error) &&
+      exactKeys(envelope.error, ["code"]) &&
+      includes(codes, envelope.error.code)
+    ) {
+      throw portableError(envelope.error.code);
+    }
+    throw portableError("backend_unavailable");
+  };
+}
+
+function planeRequest(binding, op) {
+  const payload = SafeObjectCreate(null);
+  payload.protocol = PROTOCOL;
+  payload.binding = binding;
+  payload.op = op;
+  return payload;
+}
+
+function createKvAdapter(call, binding) {
+  const portable = SafeObjectCreate(null);
+  portable.get = async (key) => {
+    const found = await kvRead(call, binding, key, "get");
+    return found === null ? null : found.value;
+  };
+  portable.getWithMetadata = async (key) => {
+    const found = await kvRead(call, binding, key, "getWithMetadata");
+    if (found === null) return null;
+    const result = SafeObjectCreate(null);
+    result.value = found.value;
+    if (found.metadata !== undefined) result.metadata = found.metadata;
+    return result;
+  };
+  portable.put = async (key, value, options) => {
+    validateKey(key, MAX_KV_KEY_BYTES);
+    const bytes = runtimeBytes(value, "invalid_value");
+    if (viewByteLength(bytes) > MAX_KV_VALUE_BYTES) throw portableError("value_too_large");
+    const normalized = validateKvPutOptions(options);
+    const payload = planeRequest(binding, "put");
+    payload.key = key;
+    payload.value = encodeBase64(bytes);
+    if (normalized.expirationTtlSeconds !== undefined) {
+      payload.expirationTtlSeconds = normalized.expirationTtlSeconds;
+    }
+    if (normalized.metadata !== undefined) payload.metadata = normalized.metadata;
+    const value_ = await call(KV_URL, payload, KV_ERROR_CODES);
+    if (!isRecord(value_) || !exactKeys(value_, [])) throw portableError("backend_unavailable");
+  };
+  portable.delete = async (key) => {
+    validateKey(key, MAX_KV_KEY_BYTES);
+    const payload = planeRequest(binding, "delete");
+    payload.key = key;
+    const value = await call(KV_URL, payload, KV_ERROR_CODES);
+    if (!isRecord(value) || !exactKeys(value, [])) throw portableError("backend_unavailable");
+  };
+  portable.list = async (options) => {
+    const normalized = validateKvListOptions(options);
+    const payload = planeRequest(binding, "list");
+    if (normalized.prefix !== undefined) payload.prefix = normalized.prefix;
+    if (normalized.cursor !== undefined) payload.cursor = normalized.cursor;
+    if (normalized.limit !== undefined) payload.limit = normalized.limit;
+    const value = await call(KV_URL, payload, KV_ERROR_CODES);
+    if (
+      !isRecord(value) ||
+      !SafeArrayIsArray(value.keys) ||
+      value.keys.length > 1000 ||
+      typeof value.listComplete !== "boolean"
+    ) {
+      throw portableError("backend_unavailable");
+    }
+    const result = SafeObjectCreate(null);
+    result.keys = mapArray(value.keys, (entry) => {
+      if (!isRecord(entry) || !boundedUtf8(entry.name, MAX_KV_KEY_BYTES)) {
+        throw portableError("backend_unavailable");
+      }
+      const key = SafeObjectCreate(null);
+      key.name = entry.name;
+      return key;
+    });
+    result.listComplete = value.listComplete;
+    if (value.cursor !== undefined && value.cursor !== "") {
+      if (!boundedText(value.cursor, 4096)) throw portableError("backend_unavailable");
+      result.cursor = value.cursor;
+    }
+    if (!value.listComplete && result.cursor === undefined) {
+      throw portableError("backend_unavailable");
+    }
+    return result;
+  };
+  return portable;
+}
+
+async function kvRead(call, binding, key, op) {
+  validateKey(key, MAX_KV_KEY_BYTES);
+  const payload = planeRequest(binding, op);
+  payload.key = key;
+  const value = await call(KV_URL, payload, KV_ERROR_CODES);
+  if (!isRecord(value) || typeof value.found !== "boolean") {
+    throw portableError("backend_unavailable");
+  }
+  if (!value.found) return null;
+  if (!isCanonicalBase64(value.value, MAX_KV_VALUE_BYTES)) {
+    throw portableError("backend_unavailable");
+  }
+  const result = SafeObjectCreate(null);
+  result.value = decodeBase64(value.value);
+  if (value.metadata !== undefined) {
+    if (!isRecord(value.metadata)) throw portableError("backend_unavailable");
+    result.metadata = projectStringRecord(value.metadata);
+  }
+  return result;
+}
+
+function createSqlAdapter(call, binding) {
+  const portable = SafeObjectCreate(null);
+  portable.execute = async (sql, params) => {
+    const payload = planeRequest(binding, "execute");
+    payload.statement = sqlInput(sql, params);
+    return projectSqlResult(await call(SQL_URL, payload, SQL_ERROR_CODES));
+  };
+  portable.query = async (sql, params) => {
+    const payload = planeRequest(binding, "query");
+    payload.statement = sqlInput(sql, params);
+    const result = projectSqlResult(await call(SQL_URL, payload, SQL_ERROR_CODES));
+    if (result.rowsWritten !== 0) throw portableError("backend_unavailable");
+    return result;
+  };
+  portable.transaction = async (statements) => {
+    if (!SafeArrayIsArray(statements) || statements.length < 1 || statements.length > MAX_SQL_STATEMENTS) {
+      throw portableError("sql_error");
+    }
+    const normalized = mapArray(statements, normalizeSqlStatement);
+    const payload = planeRequest(binding, "transaction");
+    payload.statements = normalized;
+    const value = await call(SQL_URL, payload, SQL_ERROR_CODES);
+    if (
+      !isRecord(value) ||
+      !exactKeys(value, ["results"]) ||
+      !SafeArrayIsArray(value.results) ||
+      value.results.length !== normalized.length
+    ) {
+      throw portableError("backend_unavailable");
+    }
+    const results = mapArray(value.results, projectSqlResult);
+    const envelope = SafeObjectCreate(null);
+    envelope.results = results;
+    if (utf8Length(SafeJSONStringify(envelope)) > MAX_SQL_RESULT_BYTES) {
+      throw portableError("backend_unavailable");
+    }
+    return results;
+  };
+  return portable;
+}
+
+function sqlInput(sql, params) {
+  if (!boundedUtf8(sql, MAX_SQL_BYTES)) throw portableError("sql_error");
+  const input = SafeObjectCreate(null);
+  input.sql = sql;
+  if (params !== undefined) {
+    if (!SafeArrayIsArray(params) || params.length > MAX_SQL_PARAMETERS) {
+      throw portableError("sql_error");
+    }
+    input.params = mapArray(params, projectSqlValue);
+  }
+  return input;
+}
+
+function normalizeSqlStatement(statement) {
+  if (!isRecord(statement) || !onlyKeys(statement, ["sql", "params"]) || !SafeObjectHasOwn(statement, "sql")) {
+    throw portableError("sql_error");
+  }
+  return sqlInput(statement.sql, statement.params);
+}
+
+function projectSqlResult(value) {
+  if (
+    !isRecord(value) ||
+    !exactKeys(value, ["rows", "rowsWritten"]) ||
+    !SafeArrayIsArray(value.rows) ||
+    value.rows.length > MAX_SQL_ROWS ||
+    !nonNegativeInteger(value.rowsWritten)
+  ) {
+    throw portableError("backend_unavailable");
+  }
+  const result = SafeObjectCreate(null);
+  result.rows = mapArray(value.rows, (row) => {
+    if (!isRecord(row)) throw portableError("backend_unavailable");
+    const keys = SafeObjectKeys(row);
+    if (SafeOwnKeys(row).length !== keys.length || keys.length > MAX_SQL_COLUMNS) {
+      throw portableError("backend_unavailable");
+    }
+    const projected = SafeObjectCreate(null);
+    for (let index = 0; index < keys.length; index += 1) {
+      const key = keys[index];
+      if (utf8Length(key) > MAX_SQL_COLUMN_NAME_BYTES) throw portableError("backend_unavailable");
+      projected[key] = projectSqlValue(row[key], true);
+    }
+    if (utf8Length(SafeJSONStringify(projected)) > MAX_SQL_ROW_BYTES) {
+      throw portableError("backend_unavailable");
+    }
+    return projected;
+  });
+  result.rowsWritten = value.rowsWritten;
+  if (utf8Length(SafeJSONStringify(result)) > MAX_SQL_RESULT_BYTES) {
+    throw portableError("backend_unavailable");
+  }
+  return result;
+}
+
+function projectSqlValue(value, output) {
+  if (value === null) return null;
+  if (typeof value === "number") {
+    if (!SafeNumberIsFinite(value) || SafeMathAbs(value) > SafeNumberMaxSafeInteger) {
+      throw portableError("numeric_out_of_range");
+    }
+    return value;
+  }
+  if (typeof value === "string") {
+    if (utf8Length(value) > MAX_SQL_VALUE_BYTES) {
+      throw portableError(output ? "backend_unavailable" : "sql_error");
+    }
+    return value;
+  }
+  if (
+    isRecord(value) &&
+    exactKeys(value, ["encoding", "data"]) &&
+    value.encoding === "base64" &&
+    isCanonicalBase64(value.data, MAX_SQL_VALUE_BYTES)
+  ) {
+    const projected = SafeObjectCreate(null);
+    projected.encoding = "base64";
+    projected.data = value.data;
+    return projected;
+  }
+  throw portableError(output ? "backend_unavailable" : "sql_error");
+}
+
+function validateKvPutOptions(options) {
+  if (options === undefined) return SafeObjectCreate(null);
+  if (!isRecord(options) || !onlyKeys(options, ["expirationTtlSeconds", "metadata"])) {
+    throw portableError("invalid_value");
+  }
+  const result = SafeObjectCreate(null);
+  if (options.expirationTtlSeconds !== undefined) {
+    if (
+      !SafeNumberIsSafeInteger(options.expirationTtlSeconds) ||
+      options.expirationTtlSeconds < 60 ||
+      options.expirationTtlSeconds > 315360000
+    ) {
+      throw portableError("invalid_value");
+    }
+    result.expirationTtlSeconds = options.expirationTtlSeconds;
+  }
+  if (options.metadata !== undefined) {
+    if (!isRecord(options.metadata)) throw portableError("invalid_value");
+    const metadata = projectStringRecord(options.metadata);
+    if (utf8Length(SafeJSONStringify(metadata)) > MAX_KV_METADATA_BYTES) {
+      throw portableError("metadata_too_large");
+    }
+    result.metadata = metadata;
+  }
+  return result;
+}
+
+function validateKvListOptions(options) {
+  if (options === undefined) return SafeObjectCreate(null);
+  if (!isRecord(options) || !onlyKeys(options, ["prefix", "cursor", "limit"])) {
+    throw portableError("invalid_argument");
+  }
+  const result = SafeObjectCreate(null);
+  if (options.prefix !== undefined) {
+    if (typeof options.prefix !== "string" || utf8Length(options.prefix) > MAX_KV_KEY_BYTES) {
+      throw portableError("invalid_key");
+    }
+    result.prefix = options.prefix;
+  }
+  if (options.cursor !== undefined) {
+    if (!boundedText(options.cursor, 4096)) throw portableError("invalid_cursor");
+    result.cursor = options.cursor;
+  }
+  if (options.limit !== undefined) {
+    if (!SafeNumberIsSafeInteger(options.limit) || options.limit < 1 || options.limit > 1000) {
+      throw portableError("invalid_argument");
+    }
+    result.limit = options.limit;
+  }
+  return result;
+}
+
+function runtimeBytes(value, code) {
+  if (typeof value === "string") return SafeApply(SafeTextEncoderEncode, encoder, [value]);
+  try { return new SafeUint8Array(SafeApply(SafeArrayBufferSlice, value, [0])); } catch {}
+  if (SafeArrayBufferIsView(value)) {
+    let buffer; let byteOffset; let byteLength;
+    try {
+      buffer = SafeApply(SafeTypedArrayBufferGet, value, []);
+      byteOffset = SafeApply(SafeTypedArrayByteOffsetGet, value, []);
+      byteLength = SafeApply(SafeTypedArrayByteLengthGet, value, []);
+    } catch {
+      try {
+        buffer = SafeApply(SafeDataViewBufferGet, value, []);
+        byteOffset = SafeApply(SafeDataViewByteOffsetGet, value, []);
+        byteLength = SafeApply(SafeDataViewByteLengthGet, value, []);
+      } catch { throw portableError(code); }
+    }
+    return new SafeUint8Array(SafeApply(SafeArrayBufferSlice, buffer, [byteOffset, byteOffset + byteLength]));
+  }
+  throw portableError(code);
+}
+
+function encodeBase64(bytes) {
+  let binary = "";
+  const length = viewByteLength(bytes);
+  for (let offset = 0; offset < length; offset += 4096) {
+    const end = SafeMathMin(offset + 4096, length);
+    for (let index = offset; index < end; index += 1) {
+      binary += SafeApply(SafeStringFromCharCode, undefined, [bytes[index]]);
+    }
+  }
+  return SafeBtoa(binary);
+}
+
+function decodeBase64(value) {
+  const binary = SafeAtob(value);
+  const bytes = new SafeUint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return SafeApply(SafeTypedArrayBufferGet, bytes, []);
+}
+
+function isCanonicalBase64(value, maximumBytes) {
+  if (typeof value !== "string" || value.length % 4 !== 0 || !SafeApply(SafeRegExpTest, BASE64_PATTERN, [value])) {
+    return false;
+  }
+  try {
+    const decoded = SafeAtob(value);
+    return decoded.length <= maximumBytes && SafeBtoa(decoded) === value;
+  } catch { return false; }
+}
+
+function projectStringRecord(value) {
+  if (!isRecord(value)) throw portableError("metadata_too_large");
+  const keys = SafeObjectKeys(value);
+  sortStrings(keys);
+  if (SafeOwnKeys(value).length !== keys.length || keys.length > 64) {
+    throw portableError("metadata_too_large");
+  }
+  const result = SafeObjectCreate(null);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    const item = value[key];
+    if (key.length > 256 || typeof item !== "string" || item.length > 8192) {
+      throw portableError("metadata_too_large");
+    }
+    result[key] = item;
+  }
+  return result;
+}
+
+function sortStrings(values) {
+  for (let index = 1; index < values.length; index += 1) {
+    const value = values[index];
+    let destination = index;
+    while (destination > 0 && value < values[destination - 1]) {
+      values[destination] = values[destination - 1];
+      destination -= 1;
+    }
+    values[destination] = value;
+  }
+}
+
+function validateKey(value, maximum) {
+  if (!boundedUtf8(value, maximum)) throw portableError("invalid_key");
+}
+
+function captureMethod(receiver, name) {
+  if (!receiver || (typeof receiver !== "object" && typeof receiver !== "function")) {
+    throw portableError("backend_unavailable");
+  }
+  let method;
+  try { method = receiver[name]; } catch { throw portableError("backend_unavailable"); }
+  if (typeof method !== "function") throw portableError("backend_unavailable");
+  return method;
+}
+
+function portableError(code) {
+  const error = new SafeError(code);
+  error.name = code;
+  return error;
+}
+
+function includes(values, value) {
+  for (let index = 0; index < values.length; index += 1) if (values[index] === value) return true;
+  return false;
+}
+
+function mapArray(values, mapper) {
+  const output = [];
+  for (let index = 0; index < values.length; index += 1) output[index] = mapper(values[index], index);
+  return output;
+}
+
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !SafeArrayIsArray(value);
+}
+
+function exactKeys(value, expected) {
+  const keys = SafeObjectKeys(value);
+  if (SafeOwnKeys(value).length !== keys.length || keys.length !== expected.length) return false;
+  for (let index = 0; index < expected.length; index += 1) {
+    if (!SafeObjectHasOwn(value, expected[index])) return false;
+  }
+  return true;
+}
+
+function onlyKeys(value, allowed) {
+  const keys = SafeObjectKeys(value);
+  if (SafeOwnKeys(value).length !== keys.length) return false;
+  for (let index = 0; index < keys.length; index += 1) {
+    if (!includes(allowed, keys[index])) return false;
+  }
+  return true;
+}
+
+function nonNegativeInteger(value) {
+  return SafeNumberIsSafeInteger(value) && value >= 0;
+}
+
+function boundedText(value, maximum) {
+  return typeof value === "string" && value.length > 0 && value.length <= maximum;
+}
+
+function boundedUtf8(value, maximum) {
+  return typeof value === "string" && value.length > 0 && utf8Length(value) <= maximum;
+}
+
+function utf8Length(value) {
+  return viewByteLength(SafeApply(SafeTextEncoderEncode, encoder, [value]));
+}
+
+function viewByteLength(value) {
+  try { return SafeApply(SafeTypedArrayByteLengthGet, value, []); }
+  catch {
+    try { return SafeApply(SafeDataViewByteLengthGet, value, []); }
+    catch { throw portableError("backend_unavailable"); }
+  }
+}
+`;
+}
+
+function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
+  readonly originalMainModule: string;
+  readonly declaredHandlers: SelfhostWorkerHandlerName[];
+  readonly bindings: SelfhostWorkerBindingDescriptor[];
+} {
+  const fields = dataProperties(input, "input");
+  exactNormalizedKeys(fields, ["originalMainModule", "declaredHandlers", "bindings"], "input");
+  validateArtifactPartName(fields.originalMainModule);
+  if (fields.originalMainModule === SELFHOST_WORKER_ENTRYPOINT_MODULE)
+    invalid("originalMainModule");
+  const declaredHandlersInput = dataArray(fields.declaredHandlers, "declaredHandlers");
+  if (declaredHandlersInput.length < 1) invalid("declaredHandlers");
+  const declaredHandlers: SelfhostWorkerHandlerName[] = [];
+  const handlerSet = new Set<string>();
+  for (const handler of declaredHandlersInput) {
+    if (typeof handler !== "string" || !HANDLER_NAMES.has(handler) || handlerSet.has(handler)) {
+      invalid("declaredHandlers");
+    }
+    handlerSet.add(handler);
+    declaredHandlers.push(handler as SelfhostWorkerHandlerName);
+  }
+  const bindingInputs = dataArray(fields.bindings, "bindings");
+  const bindings: SelfhostWorkerBindingDescriptor[] = [];
+  const publicNames = new Set<string>();
+  let dataBindings = 0;
+  for (const bindingInput of bindingInputs) {
+    const binding = dataProperties(bindingInput, "bindings");
+    if (Object.hasOwn(binding, "kind")) {
+      exactNormalizedKeys(binding, ["kind", "publicName"], "bindings");
+      if (typeof binding.kind !== "string" || !DATA_BINDING_KINDS.has(binding.kind)) {
+        invalid("bindings");
+      }
+      validatePublicName(binding.publicName, publicNames, false);
+      dataBindings += 1;
+      bindings.push({
+        kind: binding.kind as SelfhostWorkerDataBindingDescriptor["kind"],
+        publicName: binding.publicName as string,
+      });
+      continue;
+    }
+    exactNormalizedKeys(binding, ["name", "type"], "bindings");
+    if (typeof binding.type !== "string" || !NATIVE_BINDING_TYPES.has(binding.type)) {
+      invalid("bindings");
+    }
+    validatePublicName(binding.name, publicNames, true);
+    bindings.push({
+      name: binding.name as string,
+      type: binding.type as SelfhostWorkerNativeBindingDescriptor["type"],
+    });
+  }
+  // The wrapper exists to carry a facade. Generating one for a version that
+  // declares none would replace a publication that needs no entrypoint with one
+  // that does, and the byte-identical guarantee for those versions with it.
+  if (dataBindings === 0) invalid("bindings");
+  return { originalMainModule: fields.originalMainModule, declaredHandlers, bindings };
+}
+
+function validateArtifactPartName(value: unknown): asserts value is string {
+  if (
+    typeof value !== "string" ||
+    value.length < 1 ||
+    value.length > 240 ||
+    !ARTIFACT_PART_NAME.test(value) ||
+    value.split("/").some((segment) => segment === "." || segment === "..")
+  ) {
+    invalid("originalMainModule");
+  }
+}
+
+function validatePublicName(value: unknown, seen: Set<string>, variable: boolean): void {
+  if (
+    typeof value !== "string" ||
+    value.length > 64 ||
+    !(variable ? VARIABLE_NAME : BINDING_NAME).test(value) ||
+    value.startsWith(SELFHOST_WORKER_INTERNAL_BINDING_PREFIX) ||
+    seen.has(value)
+  ) {
+    invalid("bindings");
+  }
+  seen.add(value);
+}
+
+function dataProperties(
+  value: unknown,
+  field: string,
+  allowArray = false,
+): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || (!allowArray && Array.isArray(value))) {
+    invalid(field);
+  }
+  let keys: readonly PropertyKey[];
+  try {
+    keys = Reflect.ownKeys(value);
+  } catch {
+    invalid(field);
+  }
+  const properties = Object.create(null) as Record<string, unknown>;
+  for (const key of keys) {
+    if (typeof key !== "string") invalid(field);
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, key);
+    } catch {
+      invalid(field);
+    }
+    if (!descriptor || !Object.hasOwn(descriptor, "value")) invalid(field);
+    properties[key] = descriptor.value;
+  }
+  return properties;
+}
+
+function dataArray(value: unknown, field: string): unknown[] {
+  if (!Array.isArray(value)) invalid(field);
+  const properties = dataProperties(value, field, true);
+  const length = properties.length;
+  if (!Number.isSafeInteger(length) || (length as number) < 0) invalid(field);
+  if (Reflect.ownKeys(properties).length !== (length as number) + 1) invalid(field);
+  const result: unknown[] = [];
+  for (let index = 0; index < (length as number); index += 1) {
+    const key = String(index);
+    if (!Object.hasOwn(properties, key)) invalid(field);
+    result[index] = properties[key];
+  }
+  return result;
+}
+
+function exactNormalizedKeys(
+  value: Record<string, unknown>,
+  expected: readonly string[],
+  field: string,
+): void {
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== expected.length || expected.some((key) => !Object.hasOwn(value, key))) {
+    invalid(field);
+  }
+}
+
+function invalid(field: string): never {
+  throw new TypeError(`self-host Worker wrapper ${field} is invalid`);
+}

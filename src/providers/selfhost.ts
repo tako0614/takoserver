@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { JsonObject } from "../ports.ts";
+import type { JsonObject, JsonValue } from "../ports.ts";
 import {
   type ApplyInput,
   failed,
@@ -45,9 +45,12 @@ import {
 import {
   createSelfhostVersionBindingStore,
   normalizeSelfhostVersionBindingSet,
+  SELFHOST_WORKER_HANDLER_NAMES,
   type SelfhostVersionBinding,
   type SelfhostVersionBindingSet,
   SelfhostVersionBindingStoreError,
+  type SelfhostVersionDataBinding,
+  type SelfhostWorkerHandlerName,
   type StoredSelfhostVersionBindings,
 } from "./selfhost-version-bindings.ts";
 import {
@@ -55,6 +58,14 @@ import {
   SelfhostVersionMaterializationError,
   type SelfhostVersionMaterializationRequest,
 } from "./selfhost-version-materialization.ts";
+import {
+  SELFHOST_WORKER_DATA_TOKEN_BINDING,
+  SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
+  SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
+  SELFHOST_WORKER_ENTRYPOINT_MODULE,
+  SELFHOST_WORKER_INTERNAL_BINDING_PREFIX,
+  selfhostWorkerEntrypointSource,
+} from "./selfhost-worker-wrapper.ts";
 
 /**
  * Provisioning the released Takoform Edge Family on the machine this runs on.
@@ -103,6 +114,9 @@ import {
 
 const MAX_WORKER_VERSION_VARS = 64;
 const WORKER_VERSION_VAR_NAME = /^[A-Za-z][A-Za-z0-9._-]{0,63}$/u;
+/** The Form's own grammar and ceiling for a `kvBindings`/`sqliteBindings` name. */
+const MAX_WORKER_VERSION_DATA_BINDINGS = 64;
+const DATA_BINDING_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/u;
 
 const SQLITE_MIGRATION_LEDGER = "_takoform_sqlite_migrations";
 const SQLITE_MIGRATION_LEDGER_DDL = `CREATE TABLE IF NOT EXISTS ${SQLITE_MIGRATION_LEDGER} (
@@ -161,6 +175,77 @@ export interface SelfhostProviderOptions {
    * declaration with `unsupported_capability` before any mutation happens.
    */
   readonly runtimeInputs?: ProviderRuntimeInputLeasePort;
+  /**
+   * Loopback address of this Host's KV and SQL data planes.
+   *
+   * Absent is a real answer and the fail-closed one. A `kvBindings` or
+   * `sqliteBindings` declaration is refused at apply on a deployment that
+   * serves no plane, rather than published into a Worker whose `env.KV` would
+   * throw on the first request — a broken facade is worse than a refusal,
+   * because the refusal names the machine's missing half and the facade does
+   * not.
+   */
+  readonly dataPlaneAddress?: string;
+}
+
+/** Where this machine keeps one SQLite database. */
+export function selfhostDatabasePath(dataRoot: string, name: string): string {
+  return join(dataRoot, "databases", `${name}.sqlite`);
+}
+
+/** Where it keeps the runtime bindings of one immutable Worker Version. */
+export function selfhostVersionBindingsRoot(dataRoot: string): string {
+  return join(dataRoot, "selfhost", "version-bindings");
+}
+
+/** What one running Worker Version may reach, resolved from its own record. */
+export interface SelfhostVersionDataGrant {
+  readonly secret: string;
+  readonly kv: Readonly<Record<string, string>>;
+  readonly sql: Readonly<Record<string, string>>;
+}
+
+/**
+ * The read-only half of the data-plane seam, for the composition that serves
+ * the planes rather than the provider that publishes into them.
+ *
+ * It is exported from here because the on-disk layout is this module's, not
+ * the entry's: an entry that recomputed the binding root and the database path
+ * would be a second definition of where a Worker's data lives, and the two
+ * would drift the first time either moved.
+ */
+export interface SelfhostDataPlaneAccess {
+  grant(script: string, versionId: string): Promise<SelfhostVersionDataGrant | null>;
+  databasePath(name: string): string;
+}
+
+export function createSelfhostDataPlaneAccess(dataRoot: string): SelfhostDataPlaneAccess {
+  const bindings = createSelfhostVersionBindingStore({
+    root: selfhostVersionBindingsRoot(dataRoot),
+  });
+  return {
+    databasePath: (name) => selfhostDatabasePath(dataRoot, name),
+    async grant(script, versionId) {
+      let stored: StoredSelfhostVersionBindings | null;
+      try {
+        stored = await bindings.read(script, versionId);
+      } catch {
+        // A record this Host cannot read is not a grant it can honour. The
+        // caller answers a presented token the same way it answers an unknown
+        // one, so a corrupt file cannot be told apart from a wrong secret.
+        return null;
+      }
+      const plane = stored?.dataPlane;
+      if (!stored || !plane || !stored.planeToken) return null;
+      const kv: Record<string, string> = {};
+      const sql: Record<string, string> = {};
+      for (const binding of plane.bindings) {
+        if (binding.kind === "edge.kv") kv[binding.name] = binding.target;
+        else sql[binding.name] = binding.target;
+      }
+      return { secret: stored.planeToken, kv, sql };
+    },
+  };
 }
 
 class SelfhostFailure extends Error {
@@ -177,8 +262,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   const endpointSuffix = (options.workerEndpointSuffix ?? "localhost").toLowerCase();
   const versionsRoot = join(dataRoot, "selfhost", "versions");
   const scriptsRoot = join(dataRoot, "selfhost", "scripts");
-  const versionBindingsRoot = join(dataRoot, "selfhost", "version-bindings");
-  const databasesRoot = join(dataRoot, "databases");
+  const versionBindingsRoot = selfhostVersionBindingsRoot(dataRoot);
   const scriptStates = createSelfhostScriptStateStore({ root: scriptsRoot });
   const versionBindings = createSelfhostVersionBindingStore({ root: versionBindingsRoot });
   const runtimeInputs = options.runtimeInputs;
@@ -231,7 +315,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       name: resource.name,
     });
 
-  const databasePath = (name: string): string => join(databasesRoot, `${name}.sqlite`);
+  const databasePath = (name: string): string => selfhostDatabasePath(dataRoot, name);
 
   const scriptStateOperation = async <T>(operation: () => Promise<T>): Promise<T> => {
     try {
@@ -321,6 +405,74 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   const removeScriptState = (script: string): Promise<boolean> =>
     scriptStateOperation(() => scriptStates.remove(script));
 
+  /**
+   * The generated entrypoint one publication needs, or null when it needs none.
+   *
+   * A version that binds no KV namespace and no SQLite database is published
+   * exactly as it was before this Host could generate anything: same main
+   * module, same module list, same bindings, same bytes.
+   */
+  const wrapperProjection = (
+    script: string,
+    versionId: string,
+    mainModule: string,
+    bindings: StoredSelfhostVersionBindings | null,
+  ): { source: Uint8Array; token: SelfhostVersionBinding } | null => {
+    const plane = bindings?.dataPlane;
+    if (!plane || !bindings) return null;
+    if (!options.dataPlaneAddress || !bindings.planeToken) {
+      throw new SelfhostFailure(
+        failed(
+          "provider_error",
+          "the Worker Version binds a data plane this deployment does not serve",
+        ),
+      );
+    }
+    if (mainModule === SELFHOST_WORKER_ENTRYPOINT_MODULE) {
+      throw new SelfhostFailure(
+        failed("invalid_spec", "the Worker bundle claims this Host's entrypoint module name"),
+      );
+    }
+    let source: string;
+    try {
+      source = selfhostWorkerEntrypointSource({
+        originalMainModule: mainModule,
+        declaredHandlers: plane.handlers,
+        bindings: [
+          ...bindings.vars.map((binding) => ({
+            name: binding.name,
+            type: binding.kind === "json" ? ("json" as const) : ("plain_text" as const),
+          })),
+          ...bindings.sensitiveVars.map((binding) => ({
+            name: binding.name,
+            type: "secret_text" as const,
+          })),
+          ...plane.bindings.map((binding) => ({
+            kind:
+              binding.kind === "edge.kv"
+                ? SELFHOST_WORKER_EDGE_KV_BINDING_KIND
+                : SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
+            publicName: binding.name,
+          })),
+        ],
+      });
+    } catch {
+      throw new SelfhostFailure(
+        failed("invalid_spec", "the Worker Version environment cannot be projected"),
+      );
+    }
+    return {
+      source: new TextEncoder().encode(source),
+      // The token names the version it was minted for, so the plane resolves
+      // one record rather than searching every version for a matching secret.
+      token: {
+        name: SELFHOST_WORKER_DATA_TOKEN_BINDING,
+        value: `${script}.${versionId}.${bindings.planeToken}`,
+        kind: "text",
+      },
+    };
+  };
+
   /** Rewrites what workerd serves for one script from durable state alone. */
   const republish = async (script: string): Promise<void> => {
     const { state } = await readScriptState(script);
@@ -348,17 +500,31 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     // recorded and nothing a later edit of the directory could introduce.
     const bindings = await readVersionBindings(script, state.activeVersion);
     const vars = bindings ? [...bindings.vars, ...bindings.sensitiveVars] : [];
+    const projection = wrapperProjection(script, state.activeVersion, meta.mainModule, bindings);
+    if (projection) {
+      // Written into the workerd script directory, never into the version
+      // directory: `materializationDigest` means "the bytes the tenant
+      // committed", and a module this Host generated is not one of them.
+      modules.set(SELFHOST_WORKER_ENTRYPOINT_MODULE, projection.source);
+      vars.push(projection.token);
+    }
     const generation = await runtimeGeneration(script, state);
     await runtimeOperation(() =>
       runtime.write(
         script,
         {
           directory: script,
-          mainModule: meta.mainModule,
+          mainModule: projection ? SELFHOST_WORKER_ENTRYPOINT_MODULE : meta.mainModule,
           hostnames,
           generation,
           ...(meta.assets ? { assets: { notFoundHandling: meta.assets.notFoundHandling } } : {}),
           ...(vars.length > 0 ? { vars } : {}),
+          ...(projection
+            ? {
+                modules: [meta.mainModule],
+                dataPlaneAddress: options.dataPlaneAddress as string,
+              }
+            : {}),
         },
         modules,
         assets,
@@ -484,6 +650,88 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   };
 
   /**
+   * The Worker Version's KV and SQLite bindings, resolved to what they address.
+   *
+   * Every declaration has to line up with a relation this Host itself
+   * provisioned: the related Resource's kind, the native id this provider
+   * minted for it, and the output it published all have to name the same
+   * namespace or database. A relation another provider deployed produces a
+   * native id this parser does not recognize and is refused rather than
+   * guessed at, because "which store is `env.DB`" is not a question to answer
+   * approximately.
+   */
+  const declaredDataBindings = (
+    input: ApplyInput,
+    reserved: ReadonlySet<string>,
+  ): readonly SelfhostVersionDataBinding[] => {
+    const bindings: SelfhostVersionDataBinding[] = [];
+    const names = new Set<string>(reserved);
+    const invalid = (): never => {
+      throw new SelfhostFailure(
+        failed("invalid_spec", "the Worker Version data bindings are invalid"),
+      );
+    };
+    for (const [field, kind, resourceKind, prefix] of [
+      ["kvBindings", "edge.kv", "EdgeKVNamespace", "selfhost-kv"],
+      ["sqliteBindings", "edge.sql", "SQLiteDatabase", "selfhost-sqlite"],
+    ] as const) {
+      const raw = input.spec[field];
+      if (raw === undefined) continue;
+      if (!Array.isArray(raw)) invalid();
+      const declared = raw as readonly JsonValue[];
+      if (declared.length > MAX_WORKER_VERSION_DATA_BINDINGS) invalid();
+      for (let index = 0; index < declared.length; index += 1) {
+        const declaration = isJsonObject(declared[index]) ? (declared[index] as JsonObject) : null;
+        const name = typeof declaration?.name === "string" ? declaration.name : null;
+        const relation = input.relations?.find(
+          (candidate) => candidate.pointer === `/${field}/${index}/resource`,
+        );
+        const target = selfhostNamespaceTarget(relation, prefix, resourceKind, databasePath);
+        if (
+          !name ||
+          name.length > 64 ||
+          !DATA_BINDING_NAME.test(name) ||
+          name.startsWith(SELFHOST_WORKER_INTERNAL_BINDING_PREFIX) ||
+          names.has(name) ||
+          !target
+        ) {
+          invalid();
+        }
+        names.add(name as string);
+        bindings.push({ kind, name: name as string, target: target as string });
+      }
+    }
+    return bindings;
+  };
+
+  /**
+   * The events the version says its module answers.
+   *
+   * Read only when a wrapper is actually generated, because the wrapper is the
+   * only thing on this Host that consumes it: a version with no data binding
+   * publishes exactly as it did before this declaration was looked at.
+   */
+  const declaredHandlers = (spec: JsonObject): readonly SelfhostWorkerHandlerName[] => {
+    const declared = spec.handlers;
+    if (!Array.isArray(declared) || declared.length < 1) {
+      throw new SelfhostFailure(
+        failed("invalid_spec", "the Worker Version declares no event handlers"),
+      );
+    }
+    const handlers = declared.filter(
+      (handler): handler is SelfhostWorkerHandlerName =>
+        typeof handler === "string" &&
+        (SELFHOST_WORKER_HANDLER_NAMES as readonly string[]).includes(handler),
+    );
+    if (handlers.length !== declared.length || new Set(handlers).size !== handlers.length) {
+      throw new SelfhostFailure(
+        failed("invalid_spec", "the Worker Version event handlers are invalid"),
+      );
+    }
+    return [...handlers].sort();
+  };
+
+  /**
    * Records the environment for one immutable version, or removes the record
    * when it declares none — so a version without bindings publishes the exact
    * bytes it published before this Host could project any.
@@ -493,7 +741,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     versionId: string,
     set: SelfhostVersionBindingSet,
   ): Promise<void> => {
-    if (set.vars.length === 0 && set.sensitiveVars.length === 0) {
+    if (set.vars.length === 0 && set.sensitiveVars.length === 0 && !set.dataPlane) {
       await bindingStoreOperation(() => versionBindings.remove(script, versionId));
       return;
     }
@@ -535,6 +783,23 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       name: input.identity.name,
     });
     const vars = declaredVars(input.spec);
+    // Resolved before the lease is acquired, because everything here is a
+    // declarative refusal and a refusal after dispatch would strand the
+    // operation key with its ciphertext already erased.
+    const dataBindings = declaredDataBindings(
+      input,
+      new Set([...vars.map((binding) => binding.name), ...requiredSensitive]),
+    );
+    if (dataBindings.length > 0 && !options.dataPlaneAddress) {
+      return failed(
+        "denied",
+        "this deployment serves no KV or SQLite data plane, so the Worker Version's bindings cannot be projected",
+      );
+    }
+    const dataPlane =
+      dataBindings.length > 0
+        ? { handlers: declaredHandlers(input.spec), bindings: dataBindings }
+        : undefined;
     const assetsSpec =
       typeof input.spec.assets === "object" && input.spec.assets !== null
         ? (input.spec.assets as JsonObject)
@@ -596,7 +861,11 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     // back on every retry.
     let bindingSet: SelfhostVersionBindingSet;
     try {
-      bindingSet = normalizeSelfhostVersionBindingSet({ vars, sensitiveVars });
+      bindingSet = normalizeSelfhostVersionBindingSet({
+        vars,
+        sensitiveVars,
+        ...(dataPlane ? { dataPlane } : {}),
+      });
     } catch (error) {
       if (!(error instanceof SelfhostVersionBindingStoreError)) throw error;
       const aborted = lease ? await abortRuntimeLease(lease) : null;
@@ -648,7 +917,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     if (
       inspected.state !== "present" ||
       inspected.digest !== materialized.materializationDigest ||
-      !sameBindingNames(recorded, vars, requiredSensitive)
+      !sameBindingNames(recorded, vars, requiredSensitive, dataBindings)
     ) {
       return failed("unavailable", "the Worker Version did not settle on this machine", true);
     }
@@ -678,6 +947,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         // identity, and an empty declaration must observe as it always did.
         ...(vars.length > 0 ? { varNames: vars.map((binding) => binding.name) } : {}),
         ...(requiredSensitive.length > 0 ? { sensitiveVarNames: requiredSensitive } : {}),
+        ...(dataBindings.length > 0
+          ? { dataBindingNames: dataBindings.map((binding) => binding.name) }
+          : {}),
       },
       outputs: {
         scriptName: script,
@@ -715,6 +987,23 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       name: input.identity.name,
     });
     const vars = declaredVars(input.spec);
+    // Resolved before the lease is acquired, because everything here is a
+    // declarative refusal and a refusal after dispatch would strand the
+    // operation key with its ciphertext already erased.
+    const dataBindings = declaredDataBindings(
+      input,
+      new Set([...vars.map((binding) => binding.name), ...requiredSensitive]),
+    );
+    if (dataBindings.length > 0 && !options.dataPlaneAddress) {
+      return failed(
+        "denied",
+        "this deployment serves no KV or SQLite data plane, so the Worker Version's bindings cannot be projected",
+      );
+    }
+    const dataPlane =
+      dataBindings.length > 0
+        ? { handlers: declaredHandlers(input.spec), bindings: dataBindings }
+        : undefined;
     const assetsSpec =
       typeof input.spec.assets === "object" && input.spec.assets !== null
         ? (input.spec.assets as JsonObject)
@@ -809,7 +1098,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         "the committed Worker Version materialization conflicts with this recovery",
       );
     }
-    if (!sameBindingNames(recorded, vars, requiredSensitive)) {
+    if (!sameBindingNames(recorded, vars, requiredSensitive, dataBindings)) {
       return failed("not_found", "the Worker Version environment was not recorded");
     }
     if (recoveryLease) {
@@ -836,6 +1125,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         materializationDigest: materialized.digest,
         ...(vars.length > 0 ? { varNames: vars.map((binding) => binding.name) } : {}),
         ...(requiredSensitive.length > 0 ? { sensitiveVarNames: requiredSensitive } : {}),
+        ...(dataBindings.length > 0
+          ? { dataBindingNames: dataBindings.map((binding) => binding.name) }
+          : {}),
       },
       outputs: {
         scriptName: script,
@@ -1942,6 +2234,35 @@ function parseSelfhostNativeId(
   }
 }
 
+/**
+ * The one namespace or database a data binding's relation names, or null.
+ *
+ * Three independent facts have to agree before this returns: the relation
+ * points at the expected Form kind, the deployment's native id was minted by
+ * this provider for that kind, and the deployment's own published output names
+ * the same thing. Any one of them alone can be stale after a reconcile; all
+ * three agreeing is what makes the answer this Host's own.
+ */
+function selfhostNamespaceTarget(
+  relation: ProviderRelation | undefined,
+  prefix: string,
+  resourceKind: string,
+  databasePath: (name: string) => string,
+): string | null {
+  if (!relation || relation.resource.kind !== resourceKind) return null;
+  if (relation.targetUid !== relation.resource.metadata.uid) return null;
+  const nativeId = relation.deployment?.nativeId;
+  if (typeof nativeId !== "string") return null;
+  const parts = nativeId.split(":");
+  const name = parts[0] === prefix && safeSegment(parts[1]) ? (parts[1] as string) : null;
+  if (!name) return null;
+  const outputs = relation.deployment?.outputs;
+  if (resourceKind === "SQLiteDatabase") {
+    return outputs?.engine === "sqlite" && outputs.path === databasePath(name) ? name : null;
+  }
+  return outputs?.namespaceId === name ? name : null;
+}
+
 function selfhostWorkerScript(relations: readonly ProviderRelation[] | undefined): string | null {
   const nativeId = relations?.find((relation) => relation.pointer === "/worker")?.deployment
     ?.nativeId;
@@ -2375,14 +2696,25 @@ function sameBindingNames(
   recorded: StoredSelfhostVersionBindings | null,
   vars: readonly SelfhostVersionBinding[],
   sensitiveNames: readonly string[],
+  dataBindings: readonly SelfhostVersionDataBinding[],
 ): boolean {
   const expectedVars = vars.map((binding) => binding.name).sort();
   const expectedSensitive = [...sensitiveNames].sort();
   const observedVars = (recorded?.vars ?? []).map((binding) => binding.name).sort();
   const observedSensitive = (recorded?.sensitiveVars ?? []).map((binding) => binding.name).sort();
+  // A data binding's target is compared too, not merely its name: an `env.DB`
+  // pointed at a different database is the same environment by name and a
+  // different one by every meaning that matters.
+  const canonicalData = (bindings: readonly SelfhostVersionDataBinding[]): string =>
+    JSON.stringify(
+      [...bindings]
+        .sort((left, right) => (left.name < right.name ? -1 : 1))
+        .map((binding) => [binding.kind, binding.name, binding.target]),
+    );
   return (
     JSON.stringify(expectedVars) === JSON.stringify(observedVars) &&
-    JSON.stringify(expectedSensitive) === JSON.stringify(observedSensitive)
+    JSON.stringify(expectedSensitive) === JSON.stringify(observedSensitive) &&
+    canonicalData(dataBindings) === canonicalData(recorded?.dataPlane?.bindings ?? [])
   );
 }
 
