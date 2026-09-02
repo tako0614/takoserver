@@ -612,8 +612,13 @@ async function readiness(request) {
  * read a list of exports that is complete. The distinction is the marker this
  * wrapper puts on its own refusals; anything else came out of the tenant's
  * module and is reported as the class and message it was, trimmed of control
- * characters and truncated. No binding, environment value, or stack reaches
- * here: only what the module chose to say.
+ * characters and truncated.
+ *
+ * Nothing is read out of the module: no binding, no environment value, no
+ * stack. What crosses is the text the module itself put on the error, which is
+ * the tenant's own text going back to the tenant's own operator — and it is
+ * still bounded and stripped, because a refusal that carries a megabyte of a
+ * stranger's newlines into a Host failure message is a defect of its own.
  */
 function describeLoadFailure(error) {
   const failure = SafeObjectCreate(null);
