@@ -1,6 +1,6 @@
 # Takoserver deploy surfaces
 
-This repository owns one deploy entrypoint and nineteen separate mutation surfaces.
+This repository owns one deploy entrypoint and twenty-two separate mutation surfaces.
 The contract is read-only:
 
 ```sh
@@ -15,7 +15,9 @@ bun run deploy -- <surface> --apply --environment=<integration|rehearsal|product
 ```
 
 The integration JIT credential authority instead accepts exactly one of
-`--issue`, `--status`, or `--revoke` through that same entrypoint.
+`--issue`, `--status`, or `--revoke` through that same entrypoint, and the
+durable organization API key surface accepts exactly one of `--mint`,
+`--status`, or `--revoke`.
 
 One bootstrap exception exists for the already deployed integration Worker whose
 Version predates the `WORKER_VERSION`
@@ -48,13 +50,38 @@ topology retirement surfaces. Secret deletion can create an unannotated direct s
 is never reported as complete and is repaired only through the dedicated
 post-token attribution surface below.
 
-A reviewed closure transition is the separate profile for a live Version whose
-realized closure legitimately predates the current operator-private target
-shape. `takoserver-worker-authority-cutover` accepts
-`--closure-predecessor-version=<uuid>` together with an explicit declaration
-built from the repeatable `--retire-var=NAME`, `--add-var=NAME`,
-`--refresh-var=NAME`, `--add-secret=NAME` and `--rotate-secret=NAME` flags. The
-declaration is
+## The forward transition every Worker surface shares
+
+Every surface that publishes a Cloudflare Worker fences its live Version
+against the exact binding closure the selected commit and the operator-private
+target derive. That fence is right, and it is also how a code advance strands a
+Worker: when the advance itself changes a derived binding — a capability
+manifest gains a Form kind, a service binding appears — the predecessor cannot
+already carry the value the advance introduces, so no publication is admissible
+and that Worker is stuck at the commit before the change. It is not incidental
+to one commit; without a remedy, any future change to a derived closure
+permanently strands whichever Workers are already live.
+
+So there is one mechanism, not one profile per surface. These surfaces accept
+it:
+
+- `takoserver-worker-authority-cutover`
+- `takoserver-form-authority-worker`
+- `takoserver-integration-form-authority-worker`
+- `takoserver-integration-form-authority-operator-worker`
+- `takoserver-form-authority-identity-probe`
+
+Each accepts `--closure-predecessor-version=<uuid>` together with an explicit
+declaration built from the repeatable `--retire-var=NAME`, `--add-var=NAME`,
+`--refresh-var=NAME`, `--add-binding=NAME`, `--add-secret=NAME` and
+`--rotate-secret=NAME` flags. `--add-binding` names a binding that is not plain
+text — a service, D1, R2 or Durable Object binding the current code derives and
+the predecessor lacks. Code-derived values stay code-derived: the declaration
+names the binding, and the value still comes from the selected commit and
+target. Where nothing is declared, every surface stays exactly as strict as it
+is today.
+
+The declaration is
 machine-checked: the profile admits the predecessor only when the authoritative
 current Version is exactly that id, the declaration is non-empty, and it equals
 the entire difference between the predecessor closure and the target closure.
@@ -64,6 +91,11 @@ declaration is what says the current target either no longer derives them or
 derives them differently; every other binding name, type and plain-text value
 and the routing closure stay as strict as the routine path.
 The routine surfaces stay strict too and never accept such a predecessor.
+
+Applying a transition still requires everything the surface required before it:
+the same independent reviewer, the same source qualification, the same single
+upload, and the same post-upload readback — which must show the successor at
+the exact target closure with no declaration outstanding.
 
 `--refresh-var=NAME` covers the difference that changes no binding name at all.
 A corrected target descriptor often changes exactly one value, and without this
@@ -87,6 +119,146 @@ admitted whether or not the declaration names it under `--add-secret`. Naming it
 only decides that its value is read from the secret-input directory and
 re-entered, which is what a rotation is. A secret in that union that the current
 target does not require at all is still refused as inventory drift.
+
+### Exact integration commands
+
+The integration Form-authority lane is behind the current `main` by the two
+differences this mechanism exists for: the operator Space the 2026-08-30 scope
+transition made authoritative, and the capability manifest that gained
+`ObjectBucket`. Settle them in this order. `<sha>` is the exact reviewed commit
+and must equal `HEAD`.
+
+**1. Adopt the live operator Space into the steady descriptor.** The steady
+descriptor still names the Space the transition retired, so read the difference
+and write a candidate:
+
+```sh
+bun run deploy -- takoserver-integration-form-authority-worker --status \
+  --environment=integration --commit=<sha> \
+  --adopt-live=/root/dev/takos/.operator-private/TASK-0042-integration-cutover/takoserver-integration-target.candidate.json
+```
+
+`adoptableFromLive` names `/formAuthority/integrationOperatorScope/space`, and
+`unadoptableFromLive` names the capability manifest with `--refresh-var` as its
+remedy. Inspect the candidate, then move it over the steady descriptor
+yourself; nothing writes it for you.
+
+**2. Advance the route-less integration Form authority Worker.** Its live
+Version `e2c68d9a-3ea3-4155-80e5-6d4da5648b7a` was published from `b10479d2`
+and carries the twelve-kind manifest; `main` derives thirteen:
+
+```sh
+bun run deploy -- takoserver-integration-form-authority-worker --status \
+  --environment=integration --commit=<sha> \
+  --closure-predecessor-version=e2c68d9a-3ea3-4155-80e5-6d4da5648b7a \
+  --refresh-var=TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST
+
+bun run deploy -- takoserver-integration-form-authority-worker --apply \
+  --environment=integration --commit=<sha> \
+  --closure-predecessor-version=e2c68d9a-3ea3-4155-80e5-6d4da5648b7a \
+  --refresh-var=TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST
+```
+
+Status must report `bindingTransitionProfile: declared-delta-predecessor` and
+`ready: true` before the apply; the apply must read back
+`bindingTransitionProfile: none`.
+
+**3. Advance the operator gateway.** The gateway's closure carries no
+capability manifest, so once step 1 has settled the Space it has no difference
+left and the routine invocation publishes it:
+
+```sh
+bun run deploy -- takoserver-integration-form-authority-operator-worker --status \
+  --environment=integration --commit=<sha>
+
+bun run deploy -- takoserver-integration-form-authority-operator-worker --apply \
+  --environment=integration --commit=<sha>
+```
+
+If `--status` still reports `unclassified`, read `descriptorDrift`: the gateway
+surface also inspects the route-less authority it depends on, and that
+dependency must already be at `exact-target` on the same commit. Should the
+gateway itself ever need one, it accepts the same declaration as step 2.
+
+**4. Give the identity probe its `FORM_AUTHORITY` binding.** Commit `5f02c65`
+added a third binding to the probe's closure; live Version
+`67679289-84f5-4082-b3d6-7500b59b542c` has two:
+
+```sh
+bun run deploy -- takoserver-form-authority-identity-probe --status \
+  --environment=integration --commit=<sha> \
+  --closure-predecessor-version=67679289-84f5-4082-b3d6-7500b59b542c \
+  --add-binding=FORM_AUTHORITY
+
+bun run deploy -- takoserver-form-authority-identity-probe --apply \
+  --environment=integration --commit=<sha> \
+  --closure-predecessor-version=67679289-84f5-4082-b3d6-7500b59b542c \
+  --add-binding=FORM_AUTHORITY
+```
+
+That binding names `formAuthority.workerName`, which the probe does not own. If
+that Worker does not exist on the account, `--status` reports
+`formAuthorityWorkerPresent: false` with the remedy and `--apply` refuses
+naming it: deploy `takoserver-form-authority-worker` in this environment first,
+or correct `formAuthority.workerName` in the descriptor. The probe never
+publishes a binding to a script that is not there.
+
+**5. Mint the durable Hosted reservation key.** The Hosted staging release
+needs a `resources:write` organization key that outlives its deploy:
+
+```sh
+bun run deploy -- takoserver-org-api-key --status \
+  --environment=integration --commit=<sha> \
+  --organization=org_takosumi_hosted_staging
+
+bun run deploy -- takoserver-org-api-key --mint \
+  --environment=integration --commit=<sha> \
+  --organization=org_takosumi_hosted_staging \
+  --key-name=takosumi-hosted-reservation \
+  --scope=resources:write \
+  --expires-in-days=90
+```
+
+The secret lands at
+`$TAKOSERVER_ORG_API_KEY_OUTPUT_DIRECTORY/org_takosumi_hosted_staging.takosumi-hosted-reservation.secret`
+and nowhere else; that path is what the Hosted release reads as
+`TAKOSERVER_RESERVATION_API_KEY`. The result prints the exact `--revoke`
+invocation that reverses it.
+
+## Descriptor drift and adopting a live value
+
+A steady target descriptor and the live Worker can legitimately disagree, and
+the live side is sometimes the truth: a scope transition driven from a separate
+descriptor leaves the steady one still naming the retired Space. Until that is
+settled every Form-authority surface refuses, and the refusal used to name only
+the profile that did not match.
+
+`--status` on the Form-authority Worker surfaces and the identity probe now
+reports `descriptorDrift`: one row per inspected Worker, naming its Version and
+every difference between the closure the selected commit publishes and the
+closure the live Version serves — missing, unexpected, wrong type, or a value
+difference with both sides shown. A value longer than 200 bytes is reported as
+a digest and a byte count rather than pasted, so a capability manifest stays a
+comparison.
+
+Each difference is then sorted into `adoptableFromLive` and
+`unadoptableFromLive`. A value is adoptable only when a descriptor field owns
+it: the Form authority Host id, the operator tenant and Space, the gateway
+origin, and the Worker names the descriptor declares. Everything else is
+refused by name with the remedy that fits it — a code-derived value says to
+publish it with `--refresh-var`, a durable data identity says that repointing a
+Host at another database is an explicit reviewed change, and a closure that
+differs in shape rather than value says to declare it with `--add-binding`,
+`--add-var` or `--retire-var`.
+
+`--adopt-live=/absolute/candidate.json` (with `--status` only) writes a
+candidate descriptor with exactly the adoptable values taken from live state.
+It never edits the descriptor: it creates one new `0600` file at a path that
+must not already exist and must stay outside every Git worktree, proves that
+the result still loads as a deploy target, and prints the exact JSON-pointer
+patch it applied. The operator inspects it and moves it into place. A
+scope-transition invocation emits none of this and offers no adoption, because
+that selector owes redaction of both scopes.
 
 Every Worker publication, routine and cutover alike, also composes the selected
 target with the Worker's own startup path before it uploads anything. A target
@@ -120,6 +292,7 @@ no operator input.
 | `takoserver-integration-form-authority-operator-worker` | `--status`, `--apply` | integration only | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-integration-form-authority` | `--status`, `--apply` | integration only | `CLOUDFLARE_API_TOKEN` and `TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-integration-form-authority-deactivation` | `--status`, `--apply` | integration only | `CLOUDFLARE_API_TOKEN` and `TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
+| `takoserver-org-api-key` | `--mint`, `--status`, `--revoke` | integration, rehearsal, production | `TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH` and `TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH` for all three; `TAKOSERVER_ORG_API_KEY_OUTPUT_DIRECTORY` for `--mint` only; `TAKOSERVER_INDEPENDENT_REVIEW` for `--mint` and `--revoke` only. No Cloudflare credential is read. |
 | `takoserver-integration-e2e-credentials` | `--issue`, `--status`, `--revoke` | integration only | `CLOUDFLARE_API_TOKEN`, `TAKOSERVER_INTEGRATION_E2E_API_KEY_PRIVATE_JWK_PATH`, and `TAKOSERVER_INTEGRATION_E2E_OUTPUT_DIRECTORY` for all three; `TAKOSERVER_INDEPENDENT_REVIEW` for `--issue` and `--revoke` only. |
 | `takoserver-site` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both actions. |
 | `takoserver-console` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both actions. |
@@ -355,6 +528,26 @@ The separate authority and irreversible surfaces are:
   metadata. The evidence secret never enters a Provider or runner. Neither
   private JWK nor API-key bytes enter Worker configuration, argv, owner output,
   or diagnostics.
+- `takoserver-org-api-key`: the durable organization API key. It proves the
+  owned `0600` operator Ed25519 private half against the target's declared
+  `operatorIdentity.publicJwk`, signs one 60-second sign-in assertion for the
+  identity named in the operator-private
+  `TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH` descriptor, exchanges it for
+  the same owner session the console uses, and calls the same
+  `POST /v1/organizations/{id}/api-keys` route. The key is therefore recorded
+  exactly where an interactive owner's key is recorded: the console lists it,
+  the console can revoke it, and this surface's own `--status` and `--revoke`
+  read and settle the same rows. Expiry is always declared through
+  `--expires-in-days` and bounded to 730; an unbounded organization API key is
+  refused. `--mint` refuses a second unrevoked key with the same name and an
+  existing secret file for that name before any mutation, writes the one-time
+  secret to a new `0600` file under the exact owned `0700`
+  `TAKOSERVER_ORG_API_KEY_OUTPUT_DIRECTORY`, and then requires the exact minted
+  id, name and expiry to be listed. Every action revokes its proof session and
+  proves that revocation by replay. The surface accepts all three environments;
+  it requires the target to declare `operatorIdentity`, which is an
+  integration-only target field today, so rehearsal and production refuse on
+  the descriptor's own rule until that operator authority is extended.
 - `takoserver-d1-schema`: ordered, forward-only D1 migration apply and exact
   post-lineage/schema-shape readback.
 - `takoserver-signing-key-register`: append-only public Ed25519 JWK registration
@@ -566,6 +759,9 @@ payload or implementation digests; `P` and `I` remain build-derived.
 - `--form-authority-scope-transition=/absolute/operator-private/transition.json`
 - `TAKOSERVER_INTEGRATION_E2E_API_KEY_PRIVATE_JWK_PATH`
 - `TAKOSERVER_INTEGRATION_E2E_OUTPUT_DIRECTORY`
+- `TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH`
+- `TAKOSERVER_ORG_API_KEY_OUTPUT_DIRECTORY`
+- `--adopt-live=/absolute/operator-private/candidate.json`
 
 The Form authority surfaces must read the exhaustive account Worker script,
 domain, subdomain, secret, Version, zone, and Worker-route inventories before
@@ -616,6 +812,44 @@ profile, and scope-redacted boolean/digest summaries; refusal details never
 echo the predecessor, a foreign observed scope, or raw binding JSON. The path
 is never emitted. The selector is accepted only by integration deactivation and
 the two integration Form-authority Worker surfaces.
+
+`TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH` is an owned, link-free
+exact-`0600` strict JSON file of at most 16 KiB holding exactly
+`takoserver.operator-sign-in-identity@v1` with `provider`, `subject`, `email`
+and `displayName`. It is deliberately not a target field: the descriptor
+already pins which key may sign, and the person behind that key is
+operator-private. `TAKOSERVER_ORG_API_KEY_OUTPUT_DIRECTORY` is an owned
+exact-`0700` link-free absolute directory outside every Git worktree; `--mint`
+creates exactly one `0600` `<organization>.<key-name>.secret` file inside it
+and never overwrites one.
+
+### Where each Worker credential comes from
+
+A credential with no minting surface is a credential someone pastes out of a
+browser, so each one says where it comes from.
+
+- `TAKOSERVER_RESERVATION_API_KEY` (Hosted) — a Takoserver organization API key
+  for the named organization, scoped `resources:write`. Minted durably by
+  `takoserver-org-api-key --mint`. The integration JIT pair from
+  `takoserver-integration-e2e-credentials` is a one-hour smoke credential and
+  is never a Worker secret: a release installed with it starts returning `401`
+  an hour later.
+- `TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN` — **operator-supplied, not
+  Takoserver-issued.** Nothing in this repository mints it and nothing should:
+  it is the private bearer the operator chooses for the sponsorship owner API.
+  `takoserver-hosted-token-cutover` is its install and proof surface — it reads
+  the operator's own value from the owned `0600` `TAKOSERVER_HOSTED_TOKEN_PATH`
+  and proves the authenticated sponsorship route answers with a credential
+  signed by the current D1 key. `takoserver-hosted-token-retirement` removes
+  it. Rotation is another `takoserver-hosted-token-cutover` apply with a new
+  value in that file.
+- `TAKOSERVER_SIGNING_KEY` — registered by `takoserver-signing-key-register`,
+  repaired by `takoserver-signing-repair`, rotated by
+  `takoserver-signing-rotation`.
+- `CLOUDFLARE_API_TOKEN` and `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING` (Worker
+  bindings) — operator-supplied, installed and rotated through
+  `takoserver-worker-authority-cutover`'s `--add-secret` / `--rotate-secret`
+  declaration out of `TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY`.
 
 `TAKOSERVER_INTEGRATION_E2E_API_KEY_PRIVATE_JWK_PATH` is a third, dedicated
 operator-private Ed25519 key. The target stores only its public half and the
@@ -696,6 +930,26 @@ exact A direct successor of the selected R, with canonical commit/digest, exact
 attempt. An R that remains current is still
 `token-retired-unattributed-successor`; any unrelated history advance or
 weak/missing script identity fails closed.
+
+For a Worker forward-transition acknowledgement failure on any surface, do not
+retry apply. Run the same surface with `--status` and the same
+`--closure-predecessor-version` and declaration. The Form-authority surfaces
+and the identity probe settle it the same way the public Worker does: the
+pinned predecessor still being current means the upload never landed, and the
+exact successor at the strict target closure means the transition completed.
+A `--status` that reports `unclassified` with a `descriptorDrift` row is the
+readback, not a failure: it names every difference the declaration would have
+to account for.
+
+For a durable organization API key mint or revoke acknowledgement failure, do
+not retry. Run `takoserver-org-api-key --status --organization=<id>`: it lists
+the organization's unrevoked keys. A key listed with the requested name and no
+secret file on disk is a mint whose secret is unrecoverable; revoke it through
+this surface with its exact `--key-id` and mint again. The surface refuses a
+second unrevoked key with the same name and an existing secret file for that
+name before any mutation, so this state cannot be entered twice by accident.
+Its proof session is always revoked and its death proved by replay; a replay
+that does not return `401` is a verification failure, never a retry.
 
 For a Form deactivation acknowledgement failure, do not retry apply. Run the
 deactivation surface with `--status` and require its exact 13-head
