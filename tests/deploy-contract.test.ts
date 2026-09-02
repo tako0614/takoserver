@@ -699,4 +699,113 @@ describe("Takoserver split deploy entrypoint", () => {
       expect(refused.stderr).not.toContain("deploy target descriptor");
     }
   });
+
+  test("declares the reviewed closure transition and parses only its exact selector", async () => {
+    const probe = await deploy(["--contract"]);
+    const contract = JSON.parse(probe.stdout) as {
+      surfaces: { surface: string; obligations: Record<string, string> }[];
+    };
+    const cutover = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-worker-authority-cutover",
+    );
+    expect(cutover?.obligations["closure-transition-selector"]).toContain(
+      "--closure-predecessor-version=<uuid>",
+    );
+    expect(cutover?.obligations["closure-transition-selector"]).toContain("--rotate-secret=NAME");
+    expect(cutover?.obligations["closure-transition-selector"]).toContain(
+      "The routine surfaces stay strict",
+    );
+
+    const sha = "a".repeat(40);
+    const predecessor = "00000000-0000-4000-8000-0000000000a1";
+    for (const environment of ["integration", "rehearsal", "production"] as const) {
+      const accepted = await deploy([
+        "takoserver-worker-authority-cutover",
+        "--status",
+        `--environment=${environment}`,
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+        "--retire-var=TAKOSERVER_STANDARD_SERVICE_SUPPLIES",
+        "--add-var=TAKOSERVER_OBJECT_BUCKET_SUPPLIES",
+        "--add-secret=TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING",
+        "--rotate-secret=CLOUDFLARE_API_TOKEN",
+      ]);
+      expect(accepted.exitCode).toBe(2);
+      expect(accepted.stderr).toContain("deploy target descriptor not found");
+      expect(accepted.stderr).not.toContain("no target was touched");
+    }
+
+    for (const args of [
+      // Routine surfaces never accept the selector.
+      [
+        "takoserver-worker",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+        "--retire-var=TAKOSERVER_STANDARD_SERVICE_SUPPLIES",
+      ],
+      // The declaration must not be empty.
+      [
+        "takoserver-worker-authority-cutover",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+      ],
+      // A delta without the selector is not an invocation.
+      [
+        "takoserver-worker-authority-cutover",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        "--retire-var=TAKOSERVER_STANDARD_SERVICE_SUPPLIES",
+      ],
+      // The three predecessor selectors are mutually exclusive.
+      [
+        "takoserver-worker-authority-cutover",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+        `--legacy-predecessor-version=${predecessor}`,
+        "--add-var=TAKOSERVER_OBJECT_BUCKET_SUPPLIES",
+      ],
+      // A closure transition has no reversal selector.
+      [
+        "takoserver-worker-authority-cutover",
+        "--apply",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+        "--add-var=TAKOSERVER_OBJECT_BUCKET_SUPPLIES",
+        "--reverse",
+      ],
+      // One binding may appear in the declaration only once.
+      [
+        "takoserver-worker-authority-cutover",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+        "--add-secret=CLOUDFLARE_API_TOKEN",
+        "--rotate-secret=CLOUDFLARE_API_TOKEN",
+      ],
+      // Binding names are exact.
+      [
+        "takoserver-worker-authority-cutover",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+        "--add-var=takoserver_object_bucket_supplies",
+      ],
+    ] as const) {
+      const refused = await deploy(args);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
+    }
+  });
 });
