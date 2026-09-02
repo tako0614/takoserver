@@ -398,6 +398,11 @@ export function etag(resource: TakoformStoredResource): HeadersInit {
  * Both lanes answer the same four members because one released client decodes
  * both. See `src/error-envelope.ts`.
  */
-export function failure(code: string, status: number, details?: unknown): Response {
-  return Response.json(errorEnvelope(code, details), { status });
+export function failure(
+  code: string,
+  status: number,
+  details?: unknown,
+  message?: string,
+): Response {
+  return Response.json(errorEnvelope(code, details, undefined, message), { status });
 }
