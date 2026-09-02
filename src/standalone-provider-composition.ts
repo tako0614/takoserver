@@ -112,6 +112,8 @@ export function createStandaloneProviderComposition(input: {
   readonly runtime: WorkerdRuntime;
   readonly artifacts: SelfhostArtifacts;
   readonly workerEndpointSuffix?: string;
+  /** `https` only where this machine's workerd socket terminates TLS. */
+  readonly workerEndpointScheme?: "https" | "http";
   readonly suffixes?: readonly string[];
   /** Present only when this deployment has an operator-configured seal key ring. */
   readonly runtimeInputs?: ProviderRuntimeInputLeasePort;
@@ -138,6 +140,7 @@ export function createStandaloneProviderComposition(input: {
       artifacts: input.artifacts,
       edgeForms: true,
       ...(input.workerEndpointSuffix ? { workerEndpointSuffix: input.workerEndpointSuffix } : {}),
+      ...(input.workerEndpointScheme ? { workerEndpointScheme: input.workerEndpointScheme } : {}),
       ...(input.suffixes ? { suffixes: input.suffixes } : {}),
       ...(input.runtimeInputs ? { runtimeInputs: input.runtimeInputs } : {}),
       ...(input.dataPlaneAddress ? { dataPlaneAddress: input.dataPlaneAddress } : {}),
@@ -164,7 +167,11 @@ export function createStandaloneProviderComposition(input: {
   if (input.dataPlaneAddress) {
     throw new TypeError("the retired Cloudflare ObjectBucket drain publishes no Worker Version");
   }
-  if (input.workerEndpointSuffix !== undefined || input.suffixes !== undefined) {
+  if (
+    input.workerEndpointSuffix !== undefined ||
+    input.workerEndpointScheme !== undefined ||
+    input.suffixes !== undefined
+  ) {
     throw new TypeError(
       "retired Cloudflare ObjectBucket drain cannot be mixed with stable self-host provider settings",
     );

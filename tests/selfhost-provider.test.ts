@@ -152,6 +152,7 @@ interface ProviderCase {
     forgetSchedules(script: string, cron?: string): Promise<void>;
   };
   readonly dataPlaneAddress?: string;
+  readonly workerEndpointScheme?: "https" | "http";
   readonly suffixes?: readonly string[];
   readonly runtime?: WorkerdRuntime;
   readonly missingBlobs?: boolean;
@@ -313,6 +314,7 @@ function provider(options: ProviderCase = {}) {
     dataRoot: root,
     runtime: options.runtime ?? createWorkerdRuntime({ root, isReady: () => true }),
     ...(options.suffixes ? { suffixes: options.suffixes } : {}),
+    ...(options.workerEndpointScheme ? { workerEndpointScheme: options.workerEndpointScheme } : {}),
     ...(options.runtimeInputs ? { runtimeInputs: options.runtimeInputs } : {}),
     ...(options.dataPlaneAddress ? { dataPlaneAddress: options.dataPlaneAddress } : {}),
     ...(options.dataPlaneMaintenance ? { dataPlaneMaintenance: options.dataPlaneMaintenance } : {}),
@@ -664,6 +666,53 @@ describe("publishing a Worker through the Edge Family", () => {
       hostname: `${script}.localhost`,
       url: `https://${script}.localhost/`,
     });
+  });
+
+  /**
+   * A machine whose socket speaks plain HTTP publishes an `http` address.
+   *
+   * The scheme used to be a constant, so this deployment advertised an `https`
+   * endpoint its own workerd socket never served. Nothing answered there, and
+   * the Worker behind it pinned the `http` origin its requests actually arrived
+   * under — its published address and its own identity disagreed.
+   */
+  test("publishes an http endpoint address where the socket terminates no TLS", async () => {
+    const local = provider({ workerEndpointScheme: "http" });
+    const script = await publish(local);
+    const derived = await local.workerEndpointOriginReservations?.derive({
+      tenantRef: "org_demo",
+      requestedSubdomain: script,
+    });
+    expect(derived?.canonicalPublicOrigin).toBe(`http://${script}.localhost`);
+
+    const endpoint = await local.apply({
+      operationId: "op_endpoint_http",
+      offering: offering("WorkerEndpoint"),
+      identity: identity("hello-endpoint"),
+      spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" } },
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+      workerEndpointOriginAssignment: {
+        canonicalPublicOrigin: `http://${script}.localhost`,
+        assignmentDigest: `sha256:${"e".repeat(64)}` as const,
+      },
+    });
+    expect(endpoint.phase === "succeeded" ? endpoint.result.outputs : {}).toEqual({
+      hostname: `${script}.localhost`,
+      url: `http://${script}.localhost/`,
+    });
+
+    // And an https assignment is refused on such a machine rather than
+    // published as an address it cannot serve.
+    expect(
+      await local.apply({
+        operationId: "op_endpoint_http_mismatch",
+        offering: offering("WorkerEndpoint"),
+        identity: identity("hello-endpoint-2"),
+        spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" } },
+        relations: [relation("/worker", "ModuleWorker", "hello")],
+        workerEndpointOriginAssignment: endpointAssignment(`${script}.localhost`),
+      }),
+    ).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
   });
 
   test("the endpoint attachment assigns a stable HTTPS address and routes it", async () => {

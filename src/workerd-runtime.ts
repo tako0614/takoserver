@@ -170,6 +170,21 @@ export interface WorkerdRuntime {
   ): Promise<{ readonly status: number; readonly body: string } | null>;
 }
 
+/**
+ * The certificate this runtime's socket serves, when the operator configured
+ * one.
+ *
+ * Both halves are PEM text — the private key and the leaf-first certificate
+ * chain — and they are rendered into the generated configuration, which is
+ * already written `0600` inside a `0700` directory because it carries every
+ * script's environment. workerd terminates the TLS itself; there is no reverse
+ * proxy in front of it and nothing else to keep in step.
+ */
+export interface WorkerdTlsKeypair {
+  readonly privateKey: string;
+  readonly certificateChain: string;
+}
+
 export interface WorkerdRuntimeOptions {
   /** Directory holding scripts and the generated configuration. */
   readonly root: string;
@@ -182,6 +197,13 @@ export interface WorkerdRuntimeOptions {
   readonly configPath?: string;
   /** Port the router listens on. */
   readonly port?: number;
+  /**
+   * Terminates TLS on that port with this keypair. Absent means the socket is
+   * plain HTTP, which is what the Host must then publish as the endpoint
+   * address: advertising `https` for a socket that speaks `http` gives out an
+   * address nothing answers on.
+   */
+  readonly tls?: WorkerdTlsKeypair;
   /** Called after the config is rewritten, to make workerd read it. */
   readonly onReload?: (configPath: string) => Promise<void>;
   /** Runtime liveness/readiness truth for serving observations. */
@@ -358,15 +380,24 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): WorkerdRun
         return null;
       }
       try {
-        const response = await fetch(`http://127.0.0.1:${port}${path}`, {
-          method: init.method,
-          headers: { ...init.headers, host: hostname },
-          ...(init.body === undefined ? {} : { body: init.body }),
-          // A readiness question is answered by this Host's own module and is
-          // over in milliseconds. An event runs a customer's handler, so the
-          // caller says how long it is willing to wait for one.
-          signal: AbortSignal.timeout(init.timeoutMillis ?? 2_000),
-        });
+        // This Host asking its own runtime, over loopback, by address. Where the
+        // socket terminates TLS the certificate names the endpoint suffix and
+        // not `127.0.0.1`, so verifying it here would refuse every publication
+        // on a correctly configured machine; the connection never leaves this
+        // host and the answer is authenticated by the publication it names.
+        const response = await fetch(
+          `${options.tls ? "https" : "http"}://127.0.0.1:${port}${path}`,
+          {
+            method: init.method,
+            headers: { ...init.headers, host: hostname },
+            ...(init.body === undefined ? {} : { body: init.body }),
+            ...(options.tls ? { tls: { rejectUnauthorized: false } } : {}),
+            // A readiness question is answered by this Host's own module and is
+            // over in milliseconds. An event runs a customer's handler, so the
+            // caller says how long it is willing to wait for one.
+            signal: AbortSignal.timeout(init.timeoutMillis ?? 2_000),
+          },
+        );
         // Bounded because the answer is this Host's own small envelope and the
         // body on the other side of that router is a tenant's Worker.
         const body = (await response.text()).slice(0, 65_536);
@@ -388,7 +419,11 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): WorkerdRun
       await privateDirectory(dirname(configPath));
       // The rendered configuration contains every binding value, sensitive ones
       // included, so it is created `0600` and moved into place atomically.
-      await writePrivate(configPath, renderConfig(published, port, scriptsRoot), "utf8");
+      await writePrivate(
+        configPath,
+        renderConfig(published, port, scriptsRoot, options.tls),
+        "utf8",
+      );
       await options.onReload?.(configPath);
       // A staged manifest is not runtime truth. Only after the reload hook
       // returns successfully do we persist the generation actually activated;
@@ -716,7 +751,12 @@ async function readPublished(scriptsRoot: string): Promise<readonly Published[]>
  * picks by `Host`; anything unclaimed gets a 404 that says so, which is the
  * only honest answer when nobody has asked for that name.
  */
-function renderConfig(published: readonly Published[], port: number, scriptsRoot: string): string {
+function renderConfig(
+  published: readonly Published[],
+  port: number,
+  scriptsRoot: string,
+  tls?: WorkerdTlsKeypair,
+): string {
   const services = published
     .map((entry) => {
       // A script that declared assets is given a binding to them, always. The
@@ -893,9 +933,25 @@ ${bindings}
     )
   ),
   ],
-  sockets = [ ( name = "http", address = "*:${port}", http = (), service = "router" ) ]
+  sockets = [ ${socket(port, tls)} ]
 );
 `;
+}
+
+/**
+ * The one socket the router answers on, and the only place a scheme is decided.
+ *
+ * With a keypair, workerd terminates TLS itself — `https` in workerd's own
+ * schema, with the PEM text inline, which is why the generated configuration is
+ * a `0600` file. Without one the socket is plain HTTP, and the Host publishes
+ * `http://` for it rather than an `https://` address the socket cannot serve.
+ */
+function socket(port: number, tls?: WorkerdTlsKeypair): string {
+  if (!tls) {
+    return `( name = "http", address = "*:${port}", http = (), service = "router" )`;
+  }
+  const keypair = `keypair = ( privateKey = ${capnpText(tls.privateKey)}, certificateChain = ${capnpText(tls.certificateChain)} )`;
+  return `( name = "https", address = "*:${port}", https = ( options = (), tlsOptions = ( ${keypair} ) ), service = "router" )`;
 }
 
 /**

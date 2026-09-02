@@ -29,6 +29,8 @@ pack. Relevant variables are:
 | `TAKOSERVER_DATA_ROOT` / `TAKOSERVER_DB` | Durable local state. |
 | `TAKOSERVER_WORKERD_BINARY` | Optional explicit workerd binary. |
 | `TAKOSERVER_WORKER_ENDPOINT_SUFFIX` / `TAKOSERVER_SUFFIXES` | Addresses the local provider may issue. |
+| `TAKOSERVER_WORKERD_TLS_CERT_FILE` / `TAKOSERVER_WORKERD_TLS_KEY_FILE` | PEM paths for the Worker socket. Both or neither. |
+| `TAKOSERVER_WORKERD_TLS_CERT` / `TAKOSERVER_WORKERD_TLS_KEY` | The same two halves as PEM text. |
 | `TAKOSERVER_R2_BUCKET` | Optional artifact store shared with the Worker. Requires a Cloudflare account and token source. |
 | `TAKOSERVER_OPERATOR_PUBLIC_JWK` | Public half of the operator key. |
 | `TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK` | Optional login-only operator key; never authorizes funding. |

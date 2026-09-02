@@ -152,6 +152,8 @@ Everything lives under one directory, `.takoserver` by default.
 | `TAKOSERVER_DB` | Control database. A file under the data root by default. |
 | `PORT` | Where the API and console API listen. |
 | `TAKOSERVER_WORKERD_PORT` | Where published Workers are served. |
+| `TAKOSERVER_WORKERD_TLS_CERT_FILE` / `TAKOSERVER_WORKERD_TLS_KEY_FILE` | PEM paths. With both, workerd terminates TLS on that port and Worker endpoints are published as `https://`. |
+| `TAKOSERVER_WORKERD_TLS_CERT` / `TAKOSERVER_WORKERD_TLS_KEY` | The same two halves as PEM text, for a deployment that has no file to point at. |
 | `TAKOSERVER_SUFFIXES` | Hostname suffixes this deployment will serve. Empty means any. |
 | `TAKOSERVER_OPERATOR_PUBLIC_JWK` | Public half of the operator key. Generated under the data root if unset. |
 | `TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK` | Optional identity-only operator key. It overrides the login key without granting wallet-funding authority. |
@@ -161,6 +163,14 @@ Everything lives under one directory, `.takoserver` by default.
 | `TAKOSERVER_AI_MODELS` | JSON allowlist mapping public model IDs to upstream IDs, limits, and retail token prices. |
 | `TAKOSERVER_AI_TOKEN_FILE` | Preferred rotatable upstream bearer secret file. |
 | `TAKOSERVER_AI_TOKEN` | Direct upstream bearer secret when a file is not used. |
+
+Without a certificate the Worker socket speaks plain HTTP and endpoints are
+published as `http://`, truthfully — an `https://` address the runtime does not
+serve is one nothing answers on. On the default `localhost` suffix that is
+fine. On any other suffix it is not: a Worker that derives its own public
+identity from the request URL establishes no origin over plain HTTP on a name
+that is not loopback, so federation, signing, and self-addressing cannot work
+there. The process says so at boot rather than leaving it to be discovered.
 
 Nothing in that table is required to start. What is absent is absent rather than
 faked: a deployment with no Stripe key does not serve the route that would begin

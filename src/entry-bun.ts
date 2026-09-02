@@ -28,6 +28,7 @@ import {
   runtimeInputCanonicalOriginSupported,
 } from "./runtime-input-preparations.ts";
 import { parseRuntimeInputSealKeyRing } from "./runtime-input-seal-keyring.ts";
+import { SELFHOST_TLS_ENVIRONMENT, selfhostWorkerEndpointScheme } from "./selfhost-composition.ts";
 import { serveSelfhostDataPlanes } from "./selfhost-data-planes.ts";
 import { createSelfhostQueuePump } from "./selfhost-queue-pump.ts";
 import { createSelfhostWorkerScheduler } from "./selfhost-scheduler.ts";
@@ -162,6 +163,55 @@ const sql = (() => {
 const workerdPort = process.env.TAKOSERVER_WORKERD_PORT
   ? Number(process.env.TAKOSERVER_WORKERD_PORT)
   : 8788;
+
+/**
+ * The certificate this machine's Worker socket serves, if the operator gave it
+ * one.
+ *
+ * Either both halves as PEM file paths, or both as PEM text; one half alone is
+ * a configuration error rather than a silent fallback to plain HTTP, because
+ * the scheme the Host publishes follows this and an operator who thought they
+ * had configured TLS must not be given `http://` addresses instead.
+ */
+const workerdTls = (() => {
+  const read = (path: string, name: string): string => {
+    try {
+      return readFileSync(path, "utf8");
+    } catch {
+      throw new Error(`${name} could not be read: ${path}`);
+    }
+  };
+  const certificateFile = process.env[SELFHOST_TLS_ENVIRONMENT.certificateFile]?.trim();
+  const privateKeyFile = process.env[SELFHOST_TLS_ENVIRONMENT.privateKeyFile]?.trim();
+  const certificate = process.env[SELFHOST_TLS_ENVIRONMENT.certificate]?.trim();
+  const privateKey = process.env[SELFHOST_TLS_ENVIRONMENT.privateKey]?.trim();
+  const certificateChain = certificateFile
+    ? read(certificateFile, SELFHOST_TLS_ENVIRONMENT.certificateFile)
+    : certificate;
+  const key = privateKeyFile
+    ? read(privateKeyFile, SELFHOST_TLS_ENVIRONMENT.privateKeyFile)
+    : privateKey;
+  if (!certificateChain && !key) return undefined;
+  if (!certificateChain || !key) {
+    throw new Error(
+      `a Worker socket certificate needs both halves: set ${SELFHOST_TLS_ENVIRONMENT.certificateFile}` +
+        ` and ${SELFHOST_TLS_ENVIRONMENT.privateKeyFile}, or ${SELFHOST_TLS_ENVIRONMENT.certificate}` +
+        ` and ${SELFHOST_TLS_ENVIRONMENT.privateKey}`,
+    );
+  }
+  return { certificateChain, privateKey: key };
+})();
+
+/**
+ * The scheme Worker endpoints are published under, and the sentence an operator
+ * has to read when it is `http` on a name that is not this machine.
+ */
+const workerEndpoint = selfhostWorkerEndpointScheme({
+  workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX,
+  tlsConfigured: workerdTls !== undefined,
+});
+if (workerEndpoint.warning) process.stderr.write(`${workerEndpoint.warning}\n`);
+
 const workerd = createWorkerdSupervisor({
   binary: process.env.TAKOSERVER_WORKERD_BINARY ?? findWorkerd(process.cwd()),
   spawn: (command) => Bun.spawn(command as string[], { stdout: "inherit", stderr: "inherit" }),
@@ -172,9 +222,15 @@ const workerd = createWorkerdSupervisor({
     // without recording a serving marker before a real liveness check.
     for (let attempt = 0; attempt < 20; attempt += 1) {
       try {
-        const response = await fetch(`http://127.0.0.1:${workerdPort}/`, {
-          signal: AbortSignal.timeout(250),
-        });
+        // By address over loopback, so a certificate naming the endpoint suffix
+        // is not the thing being checked here — that the child is listening is.
+        const response = await fetch(
+          `${workerdTls ? "https" : "http"}://127.0.0.1:${workerdPort}/`,
+          {
+            ...(workerdTls ? { tls: { rejectUnauthorized: false } } : {}),
+            signal: AbortSignal.timeout(250),
+          },
+        );
         return response.status >= 100;
       } catch {
         await new Promise<void>((resolve) => setTimeout(resolve, 50));
@@ -320,6 +376,7 @@ const providerArtifacts = {
 const workerdRuntime = createWorkerdRuntime({
   root: dataRoot,
   port: workerdPort,
+  ...(workerdTls ? { tls: workerdTls } : {}),
   isReady: () => workerd.isReady(),
   async onReload(configPath) {
     // Started on the first publish rather than at boot, so a machine
@@ -373,6 +430,12 @@ const providerComposition = createStandaloneProviderComposition({
   ...(process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX
     ? { workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX }
     : {}),
+  // The scheme is the socket's, so it is composed here rather than defaulted
+  // inside the provider. The drain mode publishes no Worker at all and refuses
+  // every self-host setting, including this one.
+  ...(providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
+    ? {}
+    : { workerEndpointScheme: workerEndpoint.scheme }),
   ...(process.env.TAKOSERVER_SUFFIXES
     ? { suffixes: process.env.TAKOSERVER_SUFFIXES.split(",").map((entry) => entry.trim()) }
     : {}),

@@ -225,6 +225,17 @@ export interface SelfhostProviderOptions {
    * name a self-hosted machine can honestly promise resolves to itself.
    */
   readonly workerEndpointSuffix?: string;
+  /**
+   * Scheme of that address, which is a fact about the socket rather than a
+   * preference.
+   *
+   * `https` only where this machine's workerd socket terminates TLS with an
+   * operator-configured certificate. Without one the socket speaks plain HTTP,
+   * and the Host must publish `http://`: an `https://` endpoint nothing answers
+   * on is worse than an honest `http://` one, and the Worker behind it pins the
+   * origin its own requests arrive under either way.
+   */
+  readonly workerEndpointScheme?: "https" | "http";
   /** Hostname suffixes custom domains may claim. Empty means any. */
   readonly suffixes?: readonly string[];
   /**
@@ -513,6 +524,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   const id = options.id ?? "local";
   const { runtime, artifacts, dataRoot } = options;
   const endpointSuffix = (options.workerEndpointSuffix ?? "localhost").toLowerCase();
+  const endpointScheme = options.workerEndpointScheme ?? "https";
   const versionsRoot = join(dataRoot, "selfhost", "versions");
   const scriptsRoot = join(dataRoot, "selfhost", "scripts");
   const versionBindingsRoot = selfhostVersionBindingsRoot(dataRoot);
@@ -1038,7 +1050,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     try {
       const url = new URL(origin);
       if (
-        url.protocol !== "https:" ||
+        url.protocol !== `${endpointScheme}:` ||
         url.username !== "" ||
         url.password !== "" ||
         url.pathname !== "/" ||
@@ -2248,6 +2260,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         const canonicalPublicOrigin = canonicalWorkerEndpointOrigin(
           requestedSubdomain,
           endpointSuffix,
+          endpointScheme,
         );
         return canonicalPublicOrigin ? { canonicalPublicOrigin } : null;
       },
