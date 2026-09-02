@@ -467,11 +467,11 @@ export async function runFormAuthority(
         `expected=${invocation.transition.predecessorVersionId} actual=${before.history.versionId}`,
       );
     }
+    // An inadmissible declaration never reaches here: the classifier refuses an
+    // apply it cannot place. What is left is a declaration with nothing to do.
     if (before.bindingTransitionProfile !== "declared-delta-predecessor") {
       throw preflightError(
-        before.publicWorkerBindingProfile === "unclassified"
-          ? "declared transition does not account for the whole difference; run --status"
-          : "declared transition is already at the target closure; use the routine invocation",
+        "declared transition is already at the target closure; use the routine invocation",
       );
     }
   }
