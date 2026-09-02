@@ -152,9 +152,15 @@ describe("Form authority identity probe deploy surface", () => {
 function probeState(present: boolean): FormAuthorityIdentityProbeState {
   return {
     async workerScripts() {
+      // The authority Worker the probe's FORM_AUTHORITY binding names is always
+      // present here; its absence is a separate, separately owned refusal.
       return present
-        ? [target.workerName, target.formAuthority.identityProbeWorkerName]
-        : [target.workerName];
+        ? [
+            target.workerName,
+            target.formAuthority.workerName,
+            target.formAuthority.identityProbeWorkerName,
+          ]
+        : [target.workerName, target.formAuthority.workerName];
     },
     async workerDeployments(workerName) {
       return [

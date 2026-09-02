@@ -33,17 +33,17 @@ import {
   workerVersionIdentity,
 } from "./worker-live.ts";
 import {
-  assertExactVersionBindingClosure,
-  exactVersionBindingNames,
-  expectedClosureTransitionPredecessorClosure,
   expectedExactBindingClosure,
-  optionalExactPlainTextBinding,
   parseWorkerDeploymentHistory,
   type WorkerClosureDelta,
   type WorkerDeploymentHistory,
   workerClosureDeltaIsEmpty,
   workerTransitionSecretInventory,
 } from "./worker-state.ts";
+import {
+  assertSurfaceTransitionPredecessor,
+  normalizedWorkerClosureDelta,
+} from "./worker-surface-transition.ts";
 
 /**
  * Operator-private directory holding one `0600` file per declared secret name.
@@ -115,7 +115,7 @@ export async function runWorkerClosureTransition(
   if (!isWorkerVersionId(invocation.closurePredecessorVersionId)) {
     throw preflightError("closure predecessor Version ID must be one exact UUID");
   }
-  const delta = normalizedDelta(invocation.delta);
+  const delta = normalizedWorkerClosureDelta(invocation.delta);
   if (workerClosureDeltaIsEmpty(delta)) {
     throw preflightError(
       "closure transition requires a non-empty declared delta; use the routine surface instead",
@@ -414,7 +414,7 @@ async function appliedClosureTransitionStatus(
     previousVersionId: successor.history.previousVersionId,
     deployedCommit: successor.commit,
     artifactDigest: `sha256:${successor.bundleDigestHex}`,
-    delta: { ...normalizedDelta(invocation.delta) },
+    delta: { ...normalizedWorkerClosureDelta(invocation.delta) },
     appliedMigrations: migrationState.applied,
     pendingMigrations: pending,
     mutationApplied: false,
@@ -451,7 +451,6 @@ async function admitClosurePredecessor(
   } as const;
   const targetClosure = expectedExactBindingClosure(target, bindingInput);
   const targetSecrets = expectedWorkerSecrets(target);
-  assertDeltaNamesTarget(phase, delta, targetClosure, targetSecrets);
   const secrets = workerTransitionSecretInventory(
     phase,
     versionId,
@@ -459,25 +458,15 @@ async function admitClosurePredecessor(
     await state.workerSecrets(target.workerName),
     targetSecrets,
   );
-  assertDeltaAccountsForDifference(
-    phase,
-    versionId,
-    exactVersionBindingNames(phase, versionId, version),
-    targetClosure,
+  // One shared admission for every Worker-publishing surface: the declaration
+  // must describe this target, account for the entire difference, and leave the
+  // rest of the closure exactly as strict as the routine path.
+  assertSurfaceTransitionPredecessor(phase, versionId, version, {
     delta,
-    secrets.carriedStoreSecrets,
-  );
-  assertRefreshedVarsDiffer(phase, versionId, version, targetClosure, delta);
-  assertExactVersionBindingClosure(
-    phase,
-    versionId,
-    version,
-    expectedClosureTransitionPredecessorClosure(target, {
-      delta,
-      carriedStoreSecrets: secrets.carriedStoreSecrets,
-      ...bindingInput,
-    }),
-  );
+    targetClosure,
+    targetSecrets,
+    carriedStoreSecrets: secrets.carriedStoreSecrets,
+  });
   const carriedSecrets = targetSecrets.filter((name) => !delta.addedSecrets.includes(name));
   await assertLiveWorkerRoutingClosure(phase, target, state);
   const after = await currentHistory(phase, target, state);
@@ -492,128 +481,6 @@ async function admitClosurePredecessor(
     );
   }
   return { history, ...identity, carriedSecrets, carriedStoreSecrets: secrets.carriedStoreSecrets };
-}
-
-/** The declared names must be meaningful against the current target closure. */
-function assertDeltaNamesTarget(
-  phase: DeployPhase,
-  delta: WorkerClosureDelta,
-  targetClosure: Readonly<Record<string, unknown>>,
-  targetSecrets: readonly string[],
-): void {
-  const offences: string[] = [];
-  for (const name of delta.retiredVars) {
-    if (name in targetClosure) offences.push(`retired-var-still-in-target:${name}`);
-  }
-  for (const name of delta.addedVars) {
-    const requirement = targetClosure[name];
-    if (!isPlainTextRequirement(requirement)) offences.push(`added-var-not-a-target-var:${name}`);
-  }
-  for (const name of delta.refreshedVars) {
-    const requirement = targetClosure[name];
-    if (!isPlainTextRequirement(requirement)) {
-      offences.push(`refreshed-var-not-a-target-var:${name}`);
-    }
-  }
-  for (const name of delta.addedSecrets) {
-    if (!targetSecrets.includes(name)) offences.push(`added-secret-not-a-target-secret:${name}`);
-  }
-  for (const name of delta.rotatedSecrets) {
-    if (!targetSecrets.includes(name)) offences.push(`rotated-secret-not-a-target-secret:${name}`);
-  }
-  if (offences.length > 0) {
-    throw phaseError(
-      phase,
-      "declared closure delta does not describe the current target closure",
-      JSON.stringify(offences.sort()),
-    );
-  }
-}
-
-/**
- * Refuses before any mutation when the declaration is not exactly the observed
- * difference, and names every unaccounted binding in the refusal.
- */
-function assertDeltaAccountsForDifference(
-  phase: DeployPhase,
-  versionId: string,
-  actualNames: readonly string[],
-  targetClosure: Readonly<Record<string, unknown>>,
-  delta: WorkerClosureDelta,
-  carriedStoreSecrets: readonly string[],
-): void {
-  const actual = new Set(actualNames);
-  // A secret the script-level store already holds is present for the purpose of
-  // "is this binding missing", even when the served Version does not declare it.
-  const held = new Set([...actualNames, ...carriedStoreSecrets]);
-  const expected = new Set(
-    Object.entries(targetClosure)
-      .filter(([, requirement]) => requirement !== null)
-      .map(([name]) => name),
-  );
-  const declaredAdded = new Set([...delta.addedVars, ...delta.addedSecrets]);
-  const declaredRetired = new Set(delta.retiredVars);
-  const undeclaredExtra = [...actual].filter(
-    (name) => !expected.has(name) && !declaredRetired.has(name),
-  );
-  const undeclaredMissing = [...expected].filter(
-    (name) => !held.has(name) && !declaredAdded.has(name),
-  );
-  const retiredNotPresent = [...declaredRetired].filter((name) => !actual.has(name));
-  const refreshedNotPresent = delta.refreshedVars.filter((name) => !actual.has(name));
-  const addedAlreadyPresent = [...declaredAdded].filter((name) => actual.has(name));
-  const rotatedNotPresent = delta.rotatedSecrets.filter((name) => !held.has(name));
-  if (
-    undeclaredExtra.length > 0 ||
-    undeclaredMissing.length > 0 ||
-    retiredNotPresent.length > 0 ||
-    refreshedNotPresent.length > 0 ||
-    addedAlreadyPresent.length > 0 ||
-    rotatedNotPresent.length > 0
-  ) {
-    throw phaseError(
-      phase,
-      `version ${versionId} differs from the target closure outside the declared delta`,
-      JSON.stringify({
-        undeclaredExtraBindings: undeclaredExtra.sort(),
-        undeclaredMissingBindings: undeclaredMissing.sort(),
-        retiredVarsAbsentFromPredecessor: retiredNotPresent.sort(),
-        refreshedVarsAbsentFromPredecessor: [...refreshedNotPresent].sort(),
-        addedBindingsAlreadyPresent: addedAlreadyPresent.sort(),
-        rotatedSecretsAbsentFromPredecessor: [...rotatedNotPresent].sort(),
-      }),
-    );
-  }
-}
-
-/**
- * A refreshed var must actually be wrong on the predecessor.
- *
- * Declaring one that already equals the target value would hide a no-op inside
- * a reviewed transition and let the selector stand in for the routine surface.
- * Only names reach the refusal; the values themselves stay out of diagnostics.
- */
-function assertRefreshedVarsDiffer(
-  phase: DeployPhase,
-  versionId: string,
-  version: unknown,
-  targetClosure: Readonly<Record<string, unknown>>,
-  delta: WorkerClosureDelta,
-): void {
-  const unchanged = delta.refreshedVars.filter((name) => {
-    const requirement = targetClosure[name];
-    if (!isPlainTextRequirement(requirement)) return false;
-    const expected = (requirement as { readonly fields: Readonly<Record<string, string>> }).fields
-      .text;
-    return optionalExactPlainTextBinding(phase, versionId, version, name) === expected;
-  });
-  if (unchanged.length > 0) {
-    throw phaseError(
-      phase,
-      `version ${versionId} already binds a refreshed var with the exact target value`,
-      JSON.stringify([...unchanged].sort()),
-    );
-  }
 }
 
 /**
@@ -638,31 +505,6 @@ function predecessorAuthorityProfile(
           artifactDigest: `sha256:${identity.bundleDigestHex}` as const,
         },
       };
-}
-
-function normalizedDelta(delta: WorkerClosureDelta): WorkerClosureDelta {
-  const names = [
-    ...delta.retiredVars,
-    ...delta.addedVars,
-    ...delta.refreshedVars,
-    ...delta.addedSecrets,
-    ...delta.rotatedSecrets,
-  ];
-  if (new Set(names).size !== names.length) {
-    throw preflightError("closure transition delta names one binding more than once");
-  }
-  for (const name of names) {
-    if (!/^[A-Z][A-Z0-9_]{0,63}$/u.test(name)) {
-      throw preflightError("closure transition delta contains an invalid binding name");
-    }
-  }
-  return {
-    retiredVars: [...delta.retiredVars].sort(),
-    addedVars: [...delta.addedVars].sort(),
-    refreshedVars: [...delta.refreshedVars].sort(),
-    addedSecrets: [...delta.addedSecrets].sort(),
-    rotatedSecrets: [...delta.rotatedSecrets].sort(),
-  };
 }
 
 /**
@@ -754,15 +596,6 @@ function remoteMigrationReader(
       return { local: local.names, applied: remote.applied };
     },
   };
-}
-
-function isPlainTextRequirement(value: unknown): boolean {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    !Array.isArray(value) &&
-    (value as { readonly type?: unknown }).type === "plain_text"
-  );
 }
 
 function phaseError(phase: DeployPhase, message: string, detail?: string) {

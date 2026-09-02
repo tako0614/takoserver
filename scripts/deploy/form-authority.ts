@@ -43,7 +43,13 @@ import {
   wranglerCommand,
 } from "./process.ts";
 import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualification.ts";
-import type { DeployTarget } from "./target.ts";
+import { type DeployTarget, targetPath } from "./target.ts";
+import {
+  type DescriptorBindingMap,
+  planTargetAdoption,
+  type TargetAdoptionPlan,
+  writeAdoptedTargetCandidate,
+} from "./target-adoption.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import {
   inspectLiveWorkerVersion,
@@ -58,6 +64,37 @@ import {
   parseWorkerDeploymentHistory,
   type WorkerDeploymentHistory,
 } from "./worker-state.ts";
+import {
+  type BindingDifference,
+  describeBindingDrift,
+  surfaceTransitionAdmits,
+  type WorkerBindingDrift,
+  type WorkerSurfaceTransition,
+} from "./worker-surface-transition.ts";
+
+/**
+ * Which descriptor field owns each Form-authority binding value.
+ *
+ * Only these can be adopted from live state. Everything else the closure
+ * carries is code-derived, invocation-selected, or durable data identity, and
+ * is refused by name with the remedy that fits it.
+ */
+export const FORM_AUTHORITY_DESCRIPTOR_BINDINGS: DescriptorBindingMap = {
+  TAKOSERVER_FORM_AUTHORITY_HOST_ID: { field: "text", pointer: "/formAuthority/hostId" },
+  TAKOSERVER_FORM_AUTHORITY_OPERATOR_TENANT_ID: {
+    field: "text",
+    pointer: "/formAuthority/integrationOperatorScope/tenantId",
+  },
+  TAKOSERVER_FORM_AUTHORITY_OPERATOR_SPACE: {
+    field: "text",
+    pointer: "/formAuthority/integrationOperatorScope/space",
+  },
+  TAKOSERVER_FORM_AUTHORITY_OPERATOR_ORIGIN: {
+    field: "text",
+    pointer: "/formAuthority/integrationOperatorOrigin",
+  },
+  FORM_AUTHORITY: { field: "service", pointer: "/formAuthority/integrationWorkerName" },
+};
 
 export type FormAuthoritySurface =
   | "takoserver-form-authority-worker"
@@ -72,6 +109,14 @@ export interface FormAuthorityDeployInvocation {
   readonly environment: DeployEnvironment;
   readonly commit: string;
   readonly scopeTransition?: LoadedFormAuthorityScopeTransition;
+  /**
+   * Pinned predecessor Version plus the declared difference between its closure
+   * and the closure this commit would publish. The one way a code-derived
+   * binding change reaches a Worker that is already live.
+   */
+  readonly transition?: WorkerSurfaceTransition;
+  /** `--status` only: absolute path of the candidate descriptor to write. */
+  readonly adoptLivePath?: string;
 }
 
 export type FormAuthorityProcess = (
@@ -106,6 +151,8 @@ export interface FormAuthorityDeployOptions {
   readonly cloudflareEnvironment?: Readonly<Record<string, string>>;
   readonly review?: string;
   readonly fetcher?: (input: string, init?: RequestInit) => Promise<Response>;
+  /** Operator-private descriptor path adoption re-reads; defaults to the selected target path. */
+  readonly targetDescriptorPath?: string;
 }
 
 export interface FormAuthorityCoreVerifierReadbackExpectation {
@@ -145,10 +192,20 @@ interface FormAuthorityInspection {
   readonly history: WorkerDeploymentHistory;
   readonly commit: string;
   readonly authorityArtifactDigest: `sha256:${string}`;
-  readonly publicWorkerBindingProfile: "dynamic-public-rpc" | "legacy-exact-pinned";
-  readonly scopeBindingProfile: "exact-target" | "exact-transition-predecessor";
+  readonly publicWorkerBindingProfile:
+    | "dynamic-public-rpc"
+    | "legacy-exact-pinned"
+    | "unclassified";
+  readonly scopeBindingProfile: "exact-target" | "exact-transition-predecessor" | "unclassified";
+  /**
+   * Whether the live Version is admissible only because the operator declared
+   * the difference. `none` means it already is one of the strict profiles.
+   */
+  readonly bindingTransitionProfile: "none" | "declared-delta-predecessor";
   readonly boundPublicWorkerVersionId: string | null;
   readonly boundPublicWorkerArtifactDigest: `sha256:${string}` | null;
+  /** Every difference between the closure this commit publishes and the live one. */
+  readonly drift: readonly BindingDifference[];
 }
 
 interface PublicWorkerInspection {
@@ -183,6 +240,9 @@ export async function runFormAuthority(
       throw preflightError("Form authority scope transition is integration-only");
     }
     assertLoadedFormAuthorityScopeTransition(invocation.scopeTransition, target);
+  }
+  if (invocation.scopeTransition && invocation.transition) {
+    throw preflightError("one Form authority transition selector at a time");
   }
   const selected = selectTarget(invocation, target);
   const capabilityManifest = publicFormCapabilityManifest();
@@ -260,6 +320,29 @@ export async function runFormAuthority(
   ) {
     throw preflightError("Form authority scope transition refuses absent or bootstrap topology");
   }
+  const drift: readonly WorkerBindingDrift[] = [
+    ...(before === null
+      ? []
+      : [
+          {
+            workerName: selected.workerName,
+            versionId: before.history.versionId,
+            differences: before.drift,
+          },
+        ]),
+    ...(dependencySelected === null || dependencyBefore === null
+      ? []
+      : [
+          {
+            workerName: dependencySelected.workerName,
+            versionId: dependencyBefore.history.versionId,
+            differences: dependencyBefore.drift,
+          },
+        ]),
+  ];
+  // Redaction again: a scope transition never emits scope values, so it never
+  // offers to adopt one either.
+  const adoption = invocation.scopeTransition ? null : adoptLive(invocation, drift, options);
 
   if (invocation.action === "status") {
     return {
@@ -277,6 +360,27 @@ export async function runFormAuthority(
       authorityArtifactDigest: before?.authorityArtifactDigest ?? null,
       publicWorkerBindingProfile: before?.publicWorkerBindingProfile ?? null,
       scopeBindingProfile: before?.scopeBindingProfile ?? null,
+      bindingTransitionProfile: before?.bindingTransitionProfile ?? null,
+      ...(invocation.transition
+        ? {
+            transitionPredecessorVersionId: invocation.transition.predecessorVersionId,
+            transitionDelta: { ...invocation.transition.delta },
+          }
+        : {}),
+      ...(invocation.scopeTransition ? {} : { descriptorDrift: drift }),
+      ...(adoption === null
+        ? {}
+        : {
+            adoptableFromLive: adoption.plan.adopted,
+            unadoptableFromLive: adoption.plan.refused,
+            ...(adoption.candidate === null
+              ? {}
+              : {
+                  adoptedTargetCandidate: adoption.candidate.path,
+                  adoptedTargetCandidateDigest: adoption.candidate.digest,
+                  adoptedTargetCandidatePatch: adoption.candidate.patch,
+                }),
+          }),
       boundPublicWorkerVersionId: before?.boundPublicWorkerVersionId ?? null,
       boundPublicWorkerArtifactDigest: before?.boundPublicWorkerArtifactDigest ?? null,
       workerArtifactDigest: publicBefore.workerArtifactDigest,
@@ -318,24 +422,58 @@ export async function runFormAuthority(
       verificationMode: selected.verificationMode,
       verificationAvailable: selected.verificationAvailable,
       productionEligible: selected.productionEligible,
-      ready:
-        before?.commit === invocation.commit &&
-        (selected.verificationMode !== "released-core" ||
-          statusCoreVerifierReadback?.ready === true) &&
-        publicIdentityReadback.ready &&
-        operatorIdentity !== null &&
-        before.publicWorkerBindingProfile === "dynamic-public-rpc" &&
-        before.scopeBindingProfile === "exact-target" &&
-        publicBefore.commit === invocation.commit &&
-        (dependencySelected === null ||
-          (dependencyBefore?.commit === invocation.commit &&
-            dependencyBefore.publicWorkerBindingProfile === "dynamic-public-rpc" &&
-            dependencyBefore.scopeBindingProfile === "exact-target")),
+      // A declared transition is ready when the pinned predecessor is admitted
+      // and everything it does not name is already exact. The authority's own
+      // commit is deliberately not required to match: advancing it past a
+      // closure-changing commit is precisely what the declaration exists for.
+      ready: invocation.transition
+        ? before?.bindingTransitionProfile === "declared-delta-predecessor" &&
+          publicIdentityReadback.ready &&
+          operatorIdentity !== null &&
+          publicBefore.commit === invocation.commit &&
+          (dependencySelected === null ||
+            (dependencyBefore?.commit === invocation.commit &&
+              dependencyBefore.publicWorkerBindingProfile === "dynamic-public-rpc" &&
+              dependencyBefore.scopeBindingProfile === "exact-target" &&
+              dependencyBefore.bindingTransitionProfile === "none"))
+        : before?.commit === invocation.commit &&
+          (selected.verificationMode !== "released-core" ||
+            statusCoreVerifierReadback?.ready === true) &&
+          publicIdentityReadback.ready &&
+          operatorIdentity !== null &&
+          before.publicWorkerBindingProfile === "dynamic-public-rpc" &&
+          before.scopeBindingProfile === "exact-target" &&
+          publicBefore.commit === invocation.commit &&
+          (dependencySelected === null ||
+            (dependencyBefore?.commit === invocation.commit &&
+              dependencyBefore.publicWorkerBindingProfile === "dynamic-public-rpc" &&
+              dependencyBefore.scopeBindingProfile === "exact-target")),
     };
   }
 
   if (!publicIdentityReadback.ready || operatorIdentity === null) {
     throw preflightError("public Host identity RPC is unavailable or inconsistent");
+  }
+
+  if (invocation.transition) {
+    if (before === null) {
+      throw preflightError(
+        "Form authority forward transition refuses absent or bootstrap topology",
+      );
+    }
+    if (invocation.transition.predecessorVersionId !== before.history.versionId) {
+      throw preflightError(
+        "authoritative current Form authority Version is not the pinned transition predecessor",
+        `expected=${invocation.transition.predecessorVersionId} actual=${before.history.versionId}`,
+      );
+    }
+    if (before.bindingTransitionProfile !== "declared-delta-predecessor") {
+      throw preflightError(
+        before.publicWorkerBindingProfile === "unclassified"
+          ? "declared transition does not account for the whole difference; run --status"
+          : "declared transition is already at the target closure; use the routine invocation",
+      );
+    }
   }
 
   if (invocation.scopeTransition) {
@@ -524,6 +662,7 @@ export async function runFormAuthority(
       (before !== null && after.history.previousVersionId !== before.history.versionId) ||
       after.publicWorkerBindingProfile !== "dynamic-public-rpc" ||
       after.scopeBindingProfile !== "exact-target" ||
+      after.bindingTransitionProfile !== "none" ||
       after.commit !== source.commit ||
       after.authorityArtifactDigest !== authorityArtifactDigest
     ) {
@@ -575,8 +714,15 @@ export async function runFormAuthority(
       implementationPayloadDigest: publicIdentityAfter.identity.implementationPayloadDigest,
       implementationDigest: operatorIdentity.implementationDigest,
       scopeBindingProfile: after.scopeBindingProfile,
+      bindingTransitionProfile: after.bindingTransitionProfile,
       ...(invocation.scopeTransition
         ? { scopeTransitionDigest: invocation.scopeTransition.digest }
+        : {}),
+      ...(invocation.transition
+        ? {
+            transitionPredecessorVersionId: invocation.transition.predecessorVersionId,
+            transitionDelta: { ...invocation.transition.delta },
+          }
         : {}),
       artifactBytes: artifact.bytes,
       artifactFiles: artifact.files,
@@ -867,8 +1013,10 @@ async function classifyPublicWorkerBinding(
     FormAuthorityInspection,
     | "publicWorkerBindingProfile"
     | "scopeBindingProfile"
+    | "bindingTransitionProfile"
     | "boundPublicWorkerVersionId"
     | "boundPublicWorkerArtifactDigest"
+    | "drift"
   >
 > {
   const transition = invocation.scopeTransition;
@@ -879,12 +1027,18 @@ async function classifyPublicWorkerBinding(
     capabilityManifestJson,
     transition?.value.targetScope,
   );
+  // Computed once, whatever the outcome: it is the sentence that turns "no
+  // profile matches" into a difference an operator can act on, and it is the
+  // input `--adopt-live` reads.
+  const drift = describeBindingDrift(phase, authorityVersionId, authorityVersion, targetExpected);
   if (hasExactBindingClosure(phase, authorityVersionId, authorityVersion, targetExpected)) {
     return {
       publicWorkerBindingProfile: "dynamic-public-rpc",
       scopeBindingProfile: "exact-target",
+      bindingTransitionProfile: "none",
       boundPublicWorkerVersionId: null,
       boundPublicWorkerArtifactDigest: null,
+      drift,
     };
   }
 
@@ -900,10 +1054,36 @@ async function classifyPublicWorkerBinding(
       return {
         publicWorkerBindingProfile: "dynamic-public-rpc",
         scopeBindingProfile: "exact-transition-predecessor",
+        bindingTransitionProfile: "none",
         boundPublicWorkerVersionId: null,
         boundPublicWorkerArtifactDigest: null,
+        drift,
       };
     }
+  }
+
+  // The shared forward transition. A code advance that changes this Worker's
+  // derived closure — the capability manifest gaining a Form kind is the live
+  // case — cannot be published while the fence demands the predecessor already
+  // carry the value the advance introduces. The operator pins the Version and
+  // names the difference; the value itself still comes from the code.
+  const declared = invocation.transition;
+  if (
+    declared !== undefined &&
+    declared.predecessorVersionId === authorityVersionId &&
+    surfaceTransitionAdmits(phase, authorityVersionId, authorityVersion, {
+      delta: declared.delta,
+      targetClosure: targetExpected,
+    })
+  ) {
+    return {
+      publicWorkerBindingProfile: "dynamic-public-rpc",
+      scopeBindingProfile: "exact-target",
+      bindingTransitionProfile: "declared-delta-predecessor",
+      boundPublicWorkerVersionId: null,
+      boundPublicWorkerArtifactDigest: null,
+      drift,
+    };
   }
 
   const pinned = await inspectLegacyPinnedPublicWorker(
@@ -928,8 +1108,10 @@ async function classifyPublicWorkerBinding(
         return {
           publicWorkerBindingProfile: "legacy-exact-pinned",
           scopeBindingProfile: "exact-target",
+          bindingTransitionProfile: "none",
           boundPublicWorkerVersionId: pinned.versionId,
           boundPublicWorkerArtifactDigest: pinned.workerArtifactDigest,
+          drift,
         };
       }
       if (!transition) {
@@ -953,19 +1135,44 @@ async function classifyPublicWorkerBinding(
           return {
             publicWorkerBindingProfile: "legacy-exact-pinned",
             scopeBindingProfile: "exact-transition-predecessor",
+            bindingTransitionProfile: "none",
             boundPublicWorkerVersionId: pinned.versionId,
             boundPublicWorkerArtifactDigest: pinned.workerArtifactDigest,
+            drift,
           };
         }
       }
     }
   }
 
-  throw phaseError(
+  // The scope-transition selector owes redaction: neither the predecessor, a
+  // foreign observed scope, nor raw binding JSON may leave it, in success or in
+  // refusal. So that path keeps its exact, detail-free refusal and never
+  // reaches the difference readback below.
+  if (transition) {
+    throw phaseError(
+      phase,
+      "Form authority scope transition binding is neither exact-target nor exact-transition-predecessor",
+    );
+  }
+  // `--status` exists to say what is wrong. Refusing it here is what left the
+  // descriptor drift underneath this refusal unreadable, so status reports the
+  // unclassified Version and its exact differences instead.
+  if (invocation.action === "status") {
+    return {
+      publicWorkerBindingProfile: "unclassified",
+      scopeBindingProfile: "unclassified",
+      bindingTransitionProfile: "none",
+      boundPublicWorkerVersionId: null,
+      boundPublicWorkerArtifactDigest: null,
+      drift,
+    };
+  }
+  throw new DeployError(
     phase,
-    transition
-      ? "Form authority scope transition binding is neither exact-target nor exact-transition-predecessor"
-      : "Form authority binding is neither dynamic public RPC nor an exact legacy public pin",
+    "Form authority binding is neither dynamic public RPC, an exact legacy public pin, nor a " +
+      "declared forward transition; run --status for the exact difference",
+    JSON.stringify(drift),
   );
 }
 
@@ -1393,6 +1600,38 @@ function selectTarget(
     verificationMode: "released-core",
     verificationAvailable: true,
     productionEligible: false,
+  };
+}
+
+interface AdoptionReadback {
+  readonly plan: TargetAdoptionPlan;
+  readonly candidate: ReturnType<typeof writeAdoptedTargetCandidate> | null;
+}
+
+/**
+ * Sorts the observed drift into what the descriptor owns and what it does not,
+ * and — only when the operator names a destination — writes the candidate.
+ *
+ * The plan itself is always computed, so an ordinary `--status` already says
+ * which side of each difference could be the truth. Writing is a separate,
+ * explicitly named act, and it never touches the descriptor.
+ */
+function adoptLive(
+  invocation: FormAuthorityDeployInvocation,
+  drift: readonly WorkerBindingDrift[],
+  options: FormAuthorityDeployOptions,
+): AdoptionReadback | null {
+  if (invocation.action !== "status") return null;
+  const plan = planTargetAdoption(drift, FORM_AUTHORITY_DESCRIPTOR_BINDINGS);
+  if (invocation.adoptLivePath === undefined) return { plan, candidate: null };
+  return {
+    plan,
+    candidate: writeAdoptedTargetCandidate({
+      descriptorPath: options.targetDescriptorPath ?? targetPath(invocation.environment),
+      candidatePath: invocation.adoptLivePath,
+      environment: invocation.environment,
+      plan,
+    }),
   };
 }
 

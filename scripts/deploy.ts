@@ -19,6 +19,7 @@ import { loadTarget, targetPath } from "./deploy/target.ts";
 import { isWorkerVersionId, runWorker } from "./deploy/worker.ts";
 import { runWorkerClosureTransition } from "./deploy/worker-closure-transition.ts";
 import type { WorkerClosureDelta } from "./deploy/worker-state.ts";
+import type { WorkerSurfaceTransition } from "./deploy/worker-surface-transition.ts";
 
 const USAGE = `takoserver deploy
 
@@ -29,10 +30,16 @@ const USAGE = `takoserver deploy
   The authority cutover may add --legacy-predecessor-version=<uuid> for integration bootstrap.
   Hosted-edge authority transition requires the named
   --legacy-host-runtime-predecessor-version=<uuid> selector in integration or production.
-  The reviewed closure transition uses --closure-predecessor-version=<uuid> with an explicit
-  delta of repeatable --retire-var=NAME, --add-var=NAME, --refresh-var=NAME, --add-secret=NAME and
-  --rotate-secret=NAME; --refresh-var publishes a changed value of a var both sides already declare,
+  Every Worker-publishing surface accepts the same reviewed forward transition:
+  --closure-predecessor-version=<uuid> with an explicit delta of repeatable
+  --retire-var=NAME, --add-var=NAME, --refresh-var=NAME, --add-binding=NAME, --add-secret=NAME
+  and --rotate-secret=NAME. --refresh-var publishes a changed value of a var both sides already
+  declare, --add-binding publishes a binding the current code derives and the predecessor lacks,
   and added and rotated secret values come only from TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY.
+  The Form-authority Worker surfaces and the identity probe accept
+  --adopt-live=/absolute/candidate.json with --status: it writes a candidate target descriptor
+  adopting the live value of every descriptor-owned binding that drifted, and never edits the
+  descriptor in place.
   Hosted-edge authority/topology retirement uses --legacy-host-runtime-predecessor-version=<uuid>
   and --reverse; token retirement is forward-only.
   Post-token attribution repair uses both --legacy-host-runtime-predecessor-version=<uuid>
@@ -58,6 +65,7 @@ interface InvocationBase {
   readonly closureDelta?: WorkerClosureDelta;
   readonly unattributedSuccessorVersionId?: string;
   readonly formAuthorityScopeTransitionPath?: string;
+  readonly adoptLivePath?: string;
   readonly reverse?: boolean;
 }
 
@@ -82,8 +90,35 @@ interface ParsedInvocation {
   readonly closureDelta?: WorkerClosureDelta;
   readonly unattributedSuccessorVersionId?: string;
   readonly formAuthorityScopeTransitionPath?: string;
+  readonly adoptLivePath?: string;
   readonly reverse?: boolean;
 }
+
+/**
+ * Every surface that publishes a Cloudflare Worker fences its live Version
+ * against the exact closure the current code and target derive, so every one of
+ * them can be stranded by a code advance that changes that closure. They share
+ * the one declaration that brings a pinned predecessor forward.
+ */
+const TRANSITION_SURFACES: readonly Surface[] = [
+  "takoserver-worker-authority-cutover",
+  "takoserver-form-authority-worker",
+  "takoserver-integration-form-authority-worker",
+  "takoserver-integration-form-authority-operator-worker",
+  "takoserver-form-authority-identity-probe",
+];
+
+/**
+ * Surfaces whose fenced closure carries descriptor-owned identity — the Form
+ * authority Host, operator tenant/Space, gateway origin and Worker names — and
+ * can therefore answer which side of a drift is the truth.
+ */
+const ADOPT_LIVE_SURFACES: readonly Surface[] = [
+  "takoserver-form-authority-worker",
+  "takoserver-integration-form-authority-worker",
+  "takoserver-integration-form-authority-operator-worker",
+  "takoserver-form-authority-identity-probe",
+];
 
 /**
  * The closure transition is the only selector with repeatable operands. Its
@@ -106,10 +141,12 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   const retireVars: string[] = [];
   const addVars: string[] = [];
   const refreshVars: string[] = [];
+  const addBindings: string[] = [];
   const addSecrets: string[] = [];
   const rotateSecrets: string[] = [];
   let unattributedSuccessorVersionId: string | null = null;
   let formAuthorityScopeTransitionPath: string | null = null;
+  let adoptLivePath: string | null = null;
   let reverse = false;
   for (const flag of flags) {
     if (flag === "--status" || flag === "--apply" || flag === "--issue" || flag === "--revoke") {
@@ -182,9 +219,11 @@ function parseInvocation(args: readonly string[]): Invocation | null {
             ? addVars
             : deltaFlag.kind === "refresh-var"
               ? refreshVars
-              : deltaFlag.kind === "add-secret"
-                ? addSecrets
-                : rotateSecrets;
+              : deltaFlag.kind === "add-binding"
+                ? addBindings
+                : deltaFlag.kind === "add-secret"
+                  ? addSecrets
+                  : rotateSecrets;
       list.push(deltaFlag.name);
       continue;
     }
@@ -202,6 +241,13 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       formAuthorityScopeTransitionPath = value;
       continue;
     }
+    if (flag.startsWith("--adopt-live=")) {
+      if (adoptLivePath !== null) return null;
+      const value = flag.slice("--adopt-live=".length);
+      if (!value || !isAbsolute(value)) return null;
+      adoptLivePath = value;
+      continue;
+    }
     if (flag === "--reverse") {
       if (reverse) return null;
       reverse = true;
@@ -214,18 +260,29 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     ...retireVars,
     ...addVars,
     ...refreshVars,
+    ...addBindings,
     ...addSecrets,
     ...rotateSecrets,
   ];
+  const budget = 6 + (adoptLivePath === null ? 0 : 1);
   if (closurePredecessorVersionId === null) {
     // Every other invocation keeps the historical exact flag budget.
-    if (args.length > 6 || closureDeltaNames.length > 0) return null;
+    if (args.length > budget || closureDeltaNames.length > 0) return null;
   } else if (
-    surfaceValue !== "takoserver-worker-authority-cutover" ||
+    !TRANSITION_SURFACES.includes(surfaceValue) ||
     reverse ||
     closureDeltaNames.length === 0 ||
     closureDeltaNames.length > MAX_CLOSURE_DELTA_FLAGS ||
+    args.length > budget + MAX_CLOSURE_DELTA_FLAGS ||
     new Set(closureDeltaNames).size !== closureDeltaNames.length
+  ) {
+    return null;
+  }
+  // The candidate descriptor is a readback product; it never accompanies a
+  // mutation, so the surface can never be asked to adopt and publish at once.
+  if (
+    adoptLivePath !== null &&
+    (!ADOPT_LIVE_SURFACES.includes(surfaceValue) || action !== "status")
   ) {
     return null;
   }
@@ -332,12 +389,14 @@ function parseInvocation(args: readonly string[]): Invocation | null {
             retiredVars: [...retireVars].sort(),
             addedVars: [...addVars].sort(),
             refreshedVars: [...refreshVars].sort(),
+            addedBindings: [...addBindings].sort(),
             addedSecrets: [...addSecrets].sort(),
             rotatedSecrets: [...rotateSecrets].sort(),
           },
         }),
     ...(unattributedSuccessorVersionId === null ? {} : { unattributedSuccessorVersionId }),
     ...(formAuthorityScopeTransitionPath === null ? {} : { formAuthorityScopeTransitionPath }),
+    ...(adoptLivePath === null ? {} : { adoptLivePath }),
     ...(reverse ? { reverse: true } : {}),
   } as Invocation;
 }
@@ -346,6 +405,7 @@ type ClosureDeltaFlagKind =
   | "retire-var"
   | "add-var"
   | "refresh-var"
+  | "add-binding"
   | "add-secret"
   | "rotate-secret";
 
@@ -356,6 +416,7 @@ function closureDeltaFlag(
     "retire-var",
     "add-var",
     "refresh-var",
+    "add-binding",
     "add-secret",
     "rotate-secret",
   ] as const) {
@@ -375,6 +436,14 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
     invocation.formAuthorityScopeTransitionPath === undefined
       ? undefined
       : loadFormAuthorityScopeTransition(invocation.formAuthorityScopeTransitionPath, target);
+  // One declaration, read the same way for every Worker-publishing surface.
+  const surfaceTransition: WorkerSurfaceTransition | undefined =
+    invocation.closurePredecessorVersionId === undefined || invocation.closureDelta === undefined
+      ? undefined
+      : {
+          predecessorVersionId: invocation.closurePredecessorVersionId,
+          delta: invocation.closureDelta,
+        };
   switch (invocation.surface) {
     case "takoserver-worker":
     case "takoserver-worker-authority-cutover":
@@ -534,6 +603,10 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
           environment: invocation.environment,
           commit: invocation.commit,
           ...(scopeTransition === undefined ? {} : { scopeTransition }),
+          ...(surfaceTransition === undefined ? {} : { transition: surfaceTransition }),
+          ...(invocation.adoptLivePath === undefined
+            ? {}
+            : { adoptLivePath: invocation.adoptLivePath }),
         },
         target,
       );
@@ -544,6 +617,10 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
           action: invocation.action,
           environment: invocation.environment,
           commit: invocation.commit,
+          ...(surfaceTransition === undefined ? {} : { transition: surfaceTransition }),
+          ...(invocation.adoptLivePath === undefined
+            ? {}
+            : { adoptLivePath: invocation.adoptLivePath }),
         },
         target,
       );

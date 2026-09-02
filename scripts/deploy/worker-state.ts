@@ -240,6 +240,16 @@ export interface WorkerClosureDelta {
    * correction would be unpublishable by any surface.
    */
   readonly refreshedVars: readonly string[];
+  /**
+   * Non-plain-text bindings the current target declares and the predecessor
+   * lacks.
+   *
+   * A code advance can add a service, D1, R2 or Durable Object binding to a
+   * surface's derived closure. The predecessor cannot have declared it, so
+   * without a name for that difference the advance is unpublishable on every
+   * Worker that is already live.
+   */
+  readonly addedBindings: readonly string[];
   /** Secrets the current target requires and the predecessor does not carry. */
   readonly addedSecrets: readonly string[];
   /** Secrets carried by both sides whose value this one upload replaces. */
@@ -252,62 +262,10 @@ export function workerClosureDeltaIsEmpty(delta: WorkerClosureDelta): boolean {
     delta.retiredVars.length === 0 &&
     delta.addedVars.length === 0 &&
     delta.refreshedVars.length === 0 &&
+    delta.addedBindings.length === 0 &&
     delta.addedSecrets.length === 0 &&
     delta.rotatedSecrets.length === 0
   );
-}
-
-/**
- * Exact binding closure the pinned predecessor of a reviewed closure transition
- * must already serve.
- *
- * It is the current target closure with exactly the declared delta reversed:
- * every declared added var/secret must be absent, and every declared retired
- * var must still be present as an opaque plain-text binding. The retired value
- * is deliberately unconstrained because the current target no longer derives
- * it; every other binding, value, secret name and type stays strict.
- */
-export function expectedClosureTransitionPredecessorClosure(
-  target: DeployTarget,
-  input: {
-    readonly delta: WorkerClosureDelta;
-    /**
-     * Secrets the script-level store holds that the pinned Version does not
-     * declare. They are the one part of this closure read from live state: a
-     * rollback leaves the store ahead of the served Version, and requiring the
-     * Version to declare a secret the Worker already holds would wedge the
-     * only surface that can repair it.
-     */
-    readonly carriedStoreSecrets?: readonly string[];
-    readonly signingKeyId?: string;
-    readonly expectedSecrets?: readonly string[];
-    readonly authorityProfile?: WorkerVersionAuthorityProfile;
-    readonly workerArtifactDigest?: `sha256:${string}`;
-  },
-): ExpectedBindingClosure {
-  const closure: Record<string, ExpectedBinding | null> = {
-    ...expectedExactBindingClosure(target, {
-      ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
-      ...(input.expectedSecrets === undefined ? {} : { expectedSecrets: input.expectedSecrets }),
-      ...(input.authorityProfile === undefined ? {} : { authorityProfile: input.authorityProfile }),
-      ...(input.workerArtifactDigest === undefined
-        ? {}
-        : { workerArtifactDigest: input.workerArtifactDigest }),
-    }),
-  };
-  for (const name of [
-    ...input.delta.addedVars,
-    ...input.delta.addedSecrets,
-    ...(input.carriedStoreSecrets ?? []),
-  ]) {
-    closure[name] = null;
-  }
-  // A refreshed var must still be declared; only its value is unconstrained,
-  // because the whole point of the declaration is that the value is wrong.
-  for (const name of [...input.delta.retiredVars, ...input.delta.refreshedVars]) {
-    closure[name] = { type: "plain_text", fields: {} };
-  }
-  return closure;
 }
 
 /** Exact declared binding names on one immutable Version; unnamed or duplicate fails closed. */
@@ -763,6 +721,21 @@ export function assertVersionBindingClosure(
       );
     }
   }
+}
+
+/**
+ * Bounded reader for one immutable Version's declared binding inventory.
+ *
+ * Exported so the shared transition and drift readers can compare a live
+ * Version against a surface's expected closure without each re-deriving the
+ * provider's envelope shape.
+ */
+export function readVersionBindings(
+  phase: DeployPhase,
+  versionId: string,
+  value: unknown,
+): readonly Record<string, unknown>[] {
+  return versionBindings(phase, versionId, value);
 }
 
 function versionBindings(

@@ -19,15 +19,34 @@ import {
   wranglerCommand,
 } from "./process.ts";
 import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualification.ts";
-import type { DeployTarget } from "./target.ts";
+import { type DeployTarget, targetPath } from "./target.ts";
+import {
+  type DescriptorBindingMap,
+  planTargetAdoption,
+  writeAdoptedTargetCandidate,
+} from "./target-adoption.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import { inspectLiveWorkerVersion } from "./worker-live.ts";
 import {
   assertExactSecretInventory,
   assertExactVersionBindingClosure,
+  type ExpectedBindingClosure,
   parseWorkerDeploymentHistory,
   type WorkerDeploymentHistory,
 } from "./worker-state.ts";
+import {
+  type BindingDifference,
+  describeBindingDrift,
+  surfaceTransitionAdmits,
+  type WorkerBindingDrift,
+  type WorkerSurfaceTransition,
+} from "./worker-surface-transition.ts";
+
+/** Which descriptor field owns each probe binding value; see target-adoption.ts. */
+export const IDENTITY_PROBE_DESCRIPTOR_BINDINGS: DescriptorBindingMap = {
+  TAKOSERVER_FORM_AUTHORITY_HOST_ID: { field: "text", pointer: "/formAuthority/hostId" },
+  FORM_AUTHORITY: { field: "service", pointer: "/formAuthority/workerName" },
+};
 
 const PROBE_PATH = "/v1/public-host-identity";
 const MAX_PROBE_RESPONSE_BYTES = 16 * 1_024;
@@ -37,6 +56,15 @@ export interface FormAuthorityIdentityProbeInvocation {
   readonly action: "status" | "apply";
   readonly environment: DeployEnvironment;
   readonly commit: string;
+  /**
+   * Pinned predecessor Version plus the declared difference between its closure
+   * and the closure this commit publishes. The probe gained a third binding in
+   * one commit; without a name for that difference the live probe can never
+   * follow the code that added it.
+   */
+  readonly transition?: WorkerSurfaceTransition;
+  /** `--status` only: absolute path of the candidate descriptor to write. */
+  readonly adoptLivePath?: string;
 }
 
 export type FormAuthorityIdentityProbeProcess = (
@@ -71,12 +99,17 @@ export interface FormAuthorityIdentityProbeOptions {
   readonly outputDirectory?: string;
   readonly cloudflareEnvironment?: Readonly<Record<string, string>>;
   readonly review?: string;
+  /** Operator-private descriptor path adoption re-reads; defaults to the selected target path. */
+  readonly targetDescriptorPath?: string;
 }
 
 interface ProbeInspection {
   readonly history: WorkerDeploymentHistory;
   readonly commit: string;
   readonly artifactDigest: `sha256:${string}`;
+  /** Whether the live Version is admissible only because a difference was declared. */
+  readonly bindingTransitionProfile: "none" | "declared-delta-predecessor";
+  readonly drift: readonly BindingDifference[];
 }
 
 export interface PublicIdentityProbeExpectation {
@@ -112,25 +145,110 @@ export async function runFormAuthorityIdentityProbe(
     new CloudflareState({ accountId: target.accountId, token: exactToken(environment) });
   const fetcher = options.fetcher ?? fetch;
   const publicBefore = await inspectPublic("preflight", target, state);
-  const before = await inspectProbe("preflight", target, state);
+  const authorityWorkerPresent = await assertBoundAuthorityWorkerExists(
+    "preflight",
+    invocation,
+    target,
+    state,
+  );
+  const before = await inspectProbe(
+    "preflight",
+    target,
+    state,
+    invocation.action,
+    invocation.transition,
+  );
   const readbackBefore =
     before === null
       ? { ready: false, identity: null }
       : await readPublicHostIdentityProbe(target, publicBefore, fetcher);
 
   if (invocation.action === "status") {
-    return probeResult({
-      kind: "takoserver.form-authority-identity-probe-status@v1",
-      invocation,
-      selected,
-      publicWorker: publicBefore,
-      probe: before,
-      readback: readbackBefore,
-      ready:
-        before?.commit === invocation.commit &&
-        publicBefore.commit === invocation.commit &&
-        readbackBefore.ready,
-    });
+    const drift: readonly WorkerBindingDrift[] =
+      before === null
+        ? []
+        : [
+            {
+              workerName: selected.workerName,
+              versionId: before.history.versionId,
+              differences: before.drift,
+            },
+          ];
+    const plan = planTargetAdoption(drift, IDENTITY_PROBE_DESCRIPTOR_BINDINGS);
+    const candidate =
+      invocation.adoptLivePath === undefined
+        ? null
+        : writeAdoptedTargetCandidate({
+            descriptorPath: options.targetDescriptorPath ?? targetPath(invocation.environment),
+            candidatePath: invocation.adoptLivePath,
+            environment: invocation.environment,
+            plan,
+          });
+    return {
+      ...probeResult({
+        kind: "takoserver.form-authority-identity-probe-status@v1",
+        invocation,
+        selected,
+        publicWorker: publicBefore,
+        probe: before,
+        readback: readbackBefore,
+        ready: invocation.transition
+          ? authorityWorkerPresent &&
+            before?.bindingTransitionProfile === "declared-delta-predecessor" &&
+            publicBefore.commit === invocation.commit
+          : authorityWorkerPresent &&
+            before?.commit === invocation.commit &&
+            before.bindingTransitionProfile === "none" &&
+            before.drift.length === 0 &&
+            publicBefore.commit === invocation.commit &&
+            readbackBefore.ready,
+      }),
+      formAuthorityWorkerName: selected.authorityWorkerName,
+      formAuthorityWorkerPresent: authorityWorkerPresent,
+      ...(authorityWorkerPresent
+        ? {}
+        : {
+            formAuthorityWorkerRemedy:
+              `deploy takoserver-form-authority-worker --apply --environment=` +
+              `${invocation.environment} --commit=${invocation.commit} first`,
+          }),
+      bindingTransitionProfile: before?.bindingTransitionProfile ?? null,
+      ...(invocation.transition
+        ? {
+            transitionPredecessorVersionId: invocation.transition.predecessorVersionId,
+            transitionDelta: { ...invocation.transition.delta },
+          }
+        : {}),
+      descriptorDrift: drift,
+      adoptableFromLive: plan.adopted,
+      unadoptableFromLive: plan.refused,
+      ...(candidate === null
+        ? {}
+        : {
+            adoptedTargetCandidate: candidate.path,
+            adoptedTargetCandidateDigest: candidate.digest,
+            adoptedTargetCandidatePatch: candidate.patch,
+          }),
+    };
+  }
+
+  if (invocation.transition) {
+    if (before === null) {
+      throw preflightError(
+        "identity probe forward transition refuses absent or bootstrap topology",
+      );
+    }
+    if (invocation.transition.predecessorVersionId !== before.history.versionId) {
+      throw preflightError(
+        "authoritative current identity probe Version is not the pinned transition predecessor",
+        `expected=${invocation.transition.predecessorVersionId} actual=${before.history.versionId}`,
+      );
+    }
+    if (before.bindingTransitionProfile !== "declared-delta-predecessor") {
+      throw preflightError(
+        "declared transition is already at the target closure; use the routine invocation",
+      );
+    }
   }
 
   const reviewer = exactReviewer(
@@ -178,7 +296,13 @@ export async function runFormAuthorityIdentityProbe(
 
     const publicLast = await inspectPublic("preflight", target, state);
     assertSamePublic("preflight", publicBefore, publicLast);
-    const last = await inspectProbe("preflight", target, state);
+    const last = await inspectProbe(
+      "preflight",
+      target,
+      state,
+      invocation.action,
+      invocation.transition,
+    );
     assertSameProbe("preflight", before, last);
     const upload = await run(
       wranglerCommand([
@@ -202,9 +326,11 @@ export async function runFormAuthorityIdentityProbe(
 
     const publicAfter = await inspectPublic("verification", target, state);
     assertSamePublic("verification", publicBefore, publicAfter);
-    const after = await inspectProbe("verification", target, state);
+    const after = await inspectProbe("verification", target, state, "apply");
     if (
       after === null ||
+      after.bindingTransitionProfile !== "none" ||
+      after.drift.length !== 0 ||
       after.history.versionId === before?.history.versionId ||
       (before !== null && after.history.previousVersionId !== before.history.versionId) ||
       after.commit !== source.commit ||
@@ -234,6 +360,14 @@ export async function runFormAuthorityIdentityProbe(
       artifactBytes: artifact.bytes,
       artifactFiles: artifact.files,
       previousVersionId: before?.history.versionId ?? null,
+      formAuthorityWorkerName: selected.authorityWorkerName,
+      bindingTransitionProfile: after.bindingTransitionProfile,
+      ...(invocation.transition
+        ? {
+            transitionPredecessorVersionId: invocation.transition.predecessorVersionId,
+            transitionDelta: { ...invocation.transition.delta },
+          }
+        : {}),
       rollback: before
         ? `wrangler versions deploy ${before.history.versionId}@100% --yes --name ${selected.workerName}`
         : "forward repair only: no previous identity probe version exists",
@@ -296,6 +430,8 @@ async function inspectProbe(
   phase: DeployPhase,
   target: DeployTarget,
   state: FormAuthorityIdentityProbeState,
+  action: "status" | "apply",
+  transition?: WorkerSurfaceTransition,
 ): Promise<ProbeInspection | null> {
   const selected = requireProbeTarget(target);
   const scripts = await state.workerScripts();
@@ -318,7 +454,36 @@ async function inspectProbe(
   if (history === null) throw phaseError(phase, "identity probe has no served deployment");
   const version = await state.workerVersion(selected.workerName, history.versionId);
   const identity = probeVersionIdentity(phase, version);
-  assertExactVersionBindingClosure(phase, history.versionId, version, {
+  const expected = probeBindingClosure(target);
+  const drift = describeBindingDrift(phase, history.versionId, version, expected);
+  let bindingTransitionProfile: ProbeInspection["bindingTransitionProfile"] = "none";
+  if (drift.length === 0) {
+    assertExactVersionBindingClosure(phase, history.versionId, version, expected);
+  } else if (
+    transition !== undefined &&
+    transition.predecessorVersionId === history.versionId &&
+    surfaceTransitionAdmits(phase, history.versionId, version, {
+      delta: transition.delta,
+      targetClosure: expected,
+    })
+  ) {
+    bindingTransitionProfile = "declared-delta-predecessor";
+  } else if (action === "apply") {
+    // Apply must still fence exactly; this raises the surface's own refusal.
+    assertExactVersionBindingClosure(phase, history.versionId, version, expected);
+  }
+  assertExactSecretInventory(await state.workerSecrets(selected.workerName), [], phase);
+  const subdomain = await state.workerSubdomain(selected.workerName);
+  if (!subdomain.enabled || subdomain.previewsEnabled) {
+    throw phaseError(phase, "identity probe workers.dev topology is not exact");
+  }
+  return { history, ...identity, bindingTransitionProfile, drift };
+}
+
+/** The exact closure one probe Version must serve for the selected target. */
+function probeBindingClosure(target: DeployTarget): ExpectedBindingClosure {
+  const selected = requireProbeTarget(target);
+  return {
     TAKOSERVER_FORM_AUTHORITY_HOST_ID: {
       type: "plain_text",
       fields: { text: selected.hostId },
@@ -334,13 +499,35 @@ async function inspectProbe(
         entrypoint: "FormAuthorityEntrypoint",
       },
     },
-  });
-  assertExactSecretInventory(await state.workerSecrets(selected.workerName), [], phase);
-  const subdomain = await state.workerSubdomain(selected.workerName);
-  if (!subdomain.enabled || subdomain.previewsEnabled) {
-    throw phaseError(phase, "identity probe workers.dev topology is not exact");
-  }
-  return { history, ...identity };
+  };
+}
+
+/**
+ * The probe binds a Worker it does not own.
+ *
+ * `FORM_AUTHORITY` names the released-core authority Worker, whose publication
+ * belongs to `takoserver-form-authority-worker`. Uploading a probe that binds a
+ * script which does not exist would realize a dangling service binding, and a
+ * first deploy is not this surface's to perform. So the absence is named, with
+ * the surface that owns the remedy, rather than published around.
+ */
+async function assertBoundAuthorityWorkerExists(
+  phase: DeployPhase,
+  invocation: FormAuthorityIdentityProbeInvocation,
+  target: DeployTarget,
+  state: FormAuthorityIdentityProbeState,
+): Promise<boolean> {
+  const selected = requireProbeTarget(target);
+  const scripts = await state.workerScripts();
+  if (scripts.includes(selected.authorityWorkerName)) return true;
+  if (invocation.action === "status") return false;
+  throw phaseError(
+    phase,
+    `Worker ${selected.authorityWorkerName} named by the probe's FORM_AUTHORITY binding does not ` +
+      `exist on account ${target.accountId}; deploy it first with \`bun run deploy -- ` +
+      `takoserver-form-authority-worker --apply --environment=${invocation.environment} ` +
+      `--commit=${invocation.commit}\``,
+  );
 }
 
 export async function readPublicHostIdentityProbe(
