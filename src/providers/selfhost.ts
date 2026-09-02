@@ -128,6 +128,14 @@ const MAX_WORKER_VERSION_DATA_BINDINGS = 64;
 const DATA_BINDING_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/u;
 
 const SQLITE_MIGRATION_LEDGER = "_takoform_sqlite_migrations";
+/**
+ * How long a ledger statement waits for a tenant's lock, in milliseconds.
+ *
+ * Kept in step with the data plane's own `busy_timeout` by value: both open the
+ * same file, and one of them failing instantly while the other waits is how a
+ * migration reports a conflict that was never real.
+ */
+const SQLITE_LOCK_WAIT_MS = 5_000;
 const SQLITE_MIGRATION_LEDGER_DDL = `CREATE TABLE IF NOT EXISTS ${SQLITE_MIGRATION_LEDGER} (
   sequence INTEGER PRIMARY KEY NOT NULL CHECK (sequence > 0),
   path TEXT NOT NULL UNIQUE CHECK (length(path) BETWEEN 1 AND 255),
@@ -570,22 +578,23 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         method: "POST",
         headers: { [SELFHOST_WORKER_READINESS_HEADER]: SELFHOST_WORKER_READINESS_PROTOCOL },
       }).catch(() => null);
-      // Nothing is listening and nothing has ever answered: this deployment
-      // does not run the runtime in this process, so there is nothing to prove.
-      if (!response && !answered) return;
-      if (response) {
-        answered = true;
-        const parsed = readinessAnswer(response.body);
-        if (parsed?.publication === publication) {
-          if (response.status === 200) return;
-          throw new SelfhostFailure(
-            failed(
-              "invalid_spec",
-              "the Worker Version's module does not export every handler it declares",
-            ),
-          );
-        }
+      const parsed = response ? readinessAnswer(response.body) : null;
+      if (parsed?.publication === publication) {
+        if (response?.status === 200) return;
+        throw new SelfhostFailure(
+          failed(
+            "invalid_spec",
+            "the Worker Version's module does not export every handler it declares",
+          ),
+        );
       }
+      // Nothing that speaks this protocol has answered yet: either the runtime
+      // is not in this process at all, or it is not up. Either way there is
+      // nothing to prove, and waiting would turn "I could not ask" into a
+      // refused publication. Once one has answered, a mismatched publication is
+      // a configuration on its way out and worth waiting for.
+      if (!parsed && !answered) return;
+      if (parsed) answered = true;
       if (Date.now() >= deadline) return;
       await new Promise<void>((wake) => setTimeout(wake, attempt === 0 ? 25 : 100));
     }
@@ -2153,6 +2162,12 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         if (!existsSync(path)) return { ok: true, value: [] };
         const database = new Database(path);
         try {
+          // A running Worker holds its own handle on this same file, so a
+          // ledger read can arrive while a statement of the tenant's is
+          // writing. SQLite's default is to fail immediately rather than wait,
+          // which would report "the ledger is unreadable" for a lock that was
+          // about to clear.
+          database.exec(`PRAGMA busy_timeout = ${SQLITE_LOCK_WAIT_MS}`);
           const present = database
             .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
             .all(SQLITE_MIGRATION_LEDGER);
@@ -2247,6 +2262,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         await mkdir(dirname(path), { recursive: true });
         const database = new Database(path, { create: true });
         try {
+          // Same reason as the reader, and more pressing: this one takes a
+          // write lock the tenant's own connection may be holding.
+          database.exec(`PRAGMA busy_timeout = ${SQLITE_LOCK_WAIT_MS}`);
           database.exec("BEGIN IMMEDIATE");
           try {
             database.exec(SQLITE_MIGRATION_LEDGER_DDL);

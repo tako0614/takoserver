@@ -396,6 +396,57 @@ async function boot(tenantModule: string = TENANT_MODULE): Promise<{
 const ask = (origin: string, path: string) =>
   fetch(`${origin}${path}`, { headers: { host: HOSTNAME } });
 
+/** Materializes one more Version of the fixture Worker and makes it the live one. */
+async function publishVersion(
+  local: ReturnType<typeof createSelfhostProvider>,
+  name: string,
+  handlers: readonly string[],
+): Promise<{ readonly version: string; readonly deployment: string }> {
+  const version = await local.apply({
+    operationId: `op_version_${name}`,
+    offering: offering("WorkerVersion"),
+    identity: identity(name),
+    spec: {
+      bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+      handlers: [...handlers],
+      worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+      kvBindings: [
+        { name: "KV", resource: { apiVersion: EDGE_API, kind: "EdgeKVNamespace", name: "cache" } },
+      ],
+    },
+    relations: [
+      relation("/worker", "ModuleWorker", "hello"),
+      relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+      deployed(
+        "/kvBindings/0/resource",
+        "EdgeKVNamespace",
+        "cache",
+        `selfhost-kv:${KV_NAMESPACE}:op_kv`,
+        { namespaceId: KV_NAMESPACE },
+      ),
+    ],
+  });
+  const deployment = await local.apply({
+    operationId: `op_deploy_${name}`,
+    offering: offering("WorkerDeployment"),
+    identity: identity("hello-live"),
+    spec: {
+      worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+      versions: [
+        {
+          workerVersion: { apiVersion: EDGE_API, kind: "WorkerVersion", name },
+          weight: 10_000,
+        },
+      ],
+    },
+    relations: [
+      relation("/worker", "ModuleWorker", "hello"),
+      relation("/versions/0/workerVersion", "WorkerVersion", name),
+    ],
+  });
+  return { version: version.phase, deployment: deployment.phase };
+}
+
 test.skipIf(WORKERD === null)(
   "a published Worker reads and writes its KV namespace through the facade",
   async () => {
@@ -517,6 +568,28 @@ test.skipIf(WORKERD === null)(
     expect(await response.json()).toEqual({
       through: { rows: [], rowsWritten: 0 },
       after: { rows: [{ n: 1 }], rowsWritten: 0 },
+    });
+  },
+  30_000,
+);
+
+test.skipIf(WORKERD === null)(
+  "publishing a Version whose module lacks a declared handler is refused",
+  async () => {
+    const { local } = await boot();
+    // The fixture module exports `fetch` and nothing else. Declaring
+    // `scheduled` used to publish successfully and fail on the first event the
+    // attachment delivered — the wrapper validates its declaration when it
+    // first imports the tenant module, and until now that first import was a
+    // customer's request.
+    expect(await publishVersion(local, "hello-v2", ["fetch", "scheduled"])).toEqual({
+      version: "succeeded",
+      deployment: "failed",
+    });
+    // A Version that declares only what it exports still publishes.
+    expect(await publishVersion(local, "hello-v3", ["fetch"])).toEqual({
+      version: "succeeded",
+      deployment: "succeeded",
     });
   },
   30_000,

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEphemeralSql } from "../src/compat.ts";
@@ -398,4 +398,306 @@ test("an operation outside the vocabulary is refused", async () => {
     ok: false,
     error: { code: "backend_unavailable" },
   });
+});
+
+// ---------------------------------------------------------------------------
+// What a statement is allowed to be
+// ---------------------------------------------------------------------------
+
+test("a statement that would leave this database is refused before it is prepared", async () => {
+  const victim = join(root, "victim.sqlite");
+  for (const statement of [
+    { sql: "ATTACH DATABASE ? AS other", params: [victim] },
+    { sql: `ATTACH DATABASE '${victim}' AS other` },
+    { sql: "ATTACH/*sneaky*/DATABASE ? AS other", params: [victim] },
+    { sql: "attach DATABASE ? AS other", params: [victim] },
+    { sql: "DETACH DATABASE other" },
+    { sql: "PRAGMA database_list" },
+    { sql: "PRAGMA writable_schema = ON" },
+    { sql: "VACUUM INTO ?", params: [victim] },
+    { sql: "ANALYZE" },
+    { sql: "EXPLAIN ATTACH DATABASE ? AS other", params: [victim] },
+  ]) {
+    expect((await db({ op: "execute", statement })).envelope).toEqual({
+      ok: false,
+      error: { code: "sql_error" },
+    });
+  }
+  // Nothing was opened, so nothing was created either.
+  expect(existsSync(victim)).toBe(false);
+});
+
+test("the Takoform migration ledger is not a table this binding can name", async () => {
+  // On the managed backend the ledger is Durable Object storage and `edge.sql`
+  // cannot see it. Here it lives in the same file, so the name is reserved —
+  // however it is spelled, and including as a string literal, because SQLite
+  // takes one where an identifier belongs.
+  for (const sql of [
+    "DROP TABLE IF EXISTS _takoform_sqlite_migrations",
+    "DROP TABLE IF EXISTS '_takoform_sqlite_migrations'",
+    'DROP TABLE IF EXISTS "_TAKOFORM_SQLITE_MIGRATIONS"',
+    "DROP TABLE IF EXISTS [_takoform_sqlite_migrations]",
+    "SELECT * FROM _takoform_sqlite_migrations",
+    "CREATE TABLE _takoform_anything (a)",
+    "ALTER TABLE t RENAME TO _takoform_sqlite_migrations",
+  ]) {
+    expect((await db({ op: "execute", statement: { sql } })).envelope).toEqual({
+      ok: false,
+      error: { code: "sql_error" },
+    });
+  }
+});
+
+test("transaction control belongs to the plane, not to the statement", async () => {
+  for (const sql of [
+    "BEGIN",
+    "BEGIN IMMEDIATE",
+    "COMMIT",
+    "END",
+    "ROLLBACK",
+    "SAVEPOINT s",
+    "RELEASE s",
+  ]) {
+    expect((await db({ op: "execute", statement: { sql } })).envelope).toEqual({
+      ok: false,
+      error: { code: "sql_error" },
+    });
+  }
+  // The words are still legal where SQLite means something else by them.
+  await db({ op: "execute", statement: { sql: "CREATE TABLE t (id INTEGER PRIMARY KEY)" } });
+  expect(
+    value(
+      (
+        await db({
+          op: "query",
+          statement: { sql: "SELECT CASE WHEN 1 THEN 'yes' ELSE 'no' END AS answer" },
+        })
+      ).envelope,
+    ),
+  ).toEqual({ rows: [{ answer: "yes" }], rowsWritten: 0 });
+  expect(
+    value(
+      (await db({ op: "execute", statement: { sql: "INSERT OR ROLLBACK INTO t VALUES (1)" } }))
+        .envelope,
+    ),
+  ).toEqual({ rows: [], rowsWritten: 1 });
+});
+
+test("a second statement in one text is refused", async () => {
+  await db({ op: "execute", statement: { sql: "CREATE TABLE t (id INTEGER)" } });
+  expect(
+    (await db({ op: "execute", statement: { sql: "INSERT INTO t VALUES (1); DROP TABLE t" } }))
+      .envelope,
+  ).toEqual({ ok: false, error: { code: "sql_error" } });
+  // A trailing semicolon is punctuation, not a second statement.
+  expect(
+    value(
+      (await db({ op: "execute", statement: { sql: "INSERT INTO t VALUES (2); -- done" } }))
+        .envelope,
+    ),
+  ).toEqual({ rows: [], rowsWritten: 1 });
+});
+
+test("a semicolon inside a value is not a statement boundary", async () => {
+  await db({ op: "execute", statement: { sql: "CREATE TABLE t (body TEXT)" } });
+  expect(
+    value(
+      (await db({ op: "execute", statement: { sql: "INSERT INTO t VALUES ('a; DROP TABLE t')" } }))
+        .envelope,
+    ),
+  ).toEqual({ rows: [], rowsWritten: 1 });
+  expect(
+    value((await db({ op: "query", statement: { sql: "SELECT body FROM t" } })).envelope),
+  ).toEqual({ rows: [{ body: "a; DROP TABLE t" }], rowsWritten: 0 });
+});
+
+// ---------------------------------------------------------------------------
+// Reads, transactions, and ceilings
+// ---------------------------------------------------------------------------
+
+test("a write through query is rolled back rather than committed", async () => {
+  await db({ op: "execute", statement: { sql: "CREATE TABLE t (id INTEGER PRIMARY KEY)" } });
+  await db({ op: "execute", statement: { sql: "INSERT INTO t VALUES (1)" } });
+  // The managed backend runs `query` inside a transaction it always rolls
+  // back, so the two backends must not differ on whether the row survives.
+  expect(value((await db({ op: "query", statement: { sql: "DELETE FROM t" } })).envelope)).toEqual({
+    rows: [],
+    rowsWritten: 0,
+  });
+  expect(
+    value((await db({ op: "query", statement: { sql: "SELECT count(*) AS n FROM t" } })).envelope),
+  ).toEqual({ rows: [{ n: 1 }], rowsWritten: 0 });
+});
+
+test("a transaction whose last statement fails leaves none of the earlier ones", async () => {
+  await db({ op: "execute", statement: { sql: "CREATE TABLE t (id INTEGER PRIMARY KEY)" } });
+  const mixed = await db({
+    op: "transaction",
+    statements: [
+      { sql: "INSERT INTO t VALUES (1)" },
+      { sql: "INSERT INTO t VALUES (2)" },
+      { sql: "INSERT INTO t VALUES (1)" },
+    ],
+  });
+  expect(mixed.envelope).toEqual({ ok: false, error: { code: "sql_error" } });
+  expect(
+    value((await db({ op: "query", statement: { sql: "SELECT count(*) AS n FROM t" } })).envelope),
+  ).toEqual({ rows: [{ n: 0 }], rowsWritten: 0 });
+});
+
+test("a refused statement anywhere in a batch stops the batch before it starts", async () => {
+  await db({ op: "execute", statement: { sql: "CREATE TABLE t (id INTEGER PRIMARY KEY)" } });
+  const mixed = await db({
+    op: "transaction",
+    statements: [
+      { sql: "INSERT INTO t VALUES (1)" },
+      { sql: "COMMIT" },
+      { sql: "INSERT INTO t VALUES (2)" },
+    ],
+  });
+  expect(mixed.envelope).toEqual({ ok: false, error: { code: "sql_error" } });
+  expect(
+    value((await db({ op: "query", statement: { sql: "SELECT count(*) AS n FROM t" } })).envelope),
+  ).toEqual({ rows: [{ n: 0 }], rowsWritten: 0 });
+  // And the connection is still usable: a batch that failed did not leave a
+  // transaction open on the handle every later request shares.
+  expect(
+    value(
+      (
+        await db({
+          op: "transaction",
+          statements: [{ sql: "INSERT INTO t VALUES (3)" }],
+        })
+      ).envelope,
+    ),
+  ).toEqual({ results: [{ rows: [], rowsWritten: 1 }] });
+});
+
+test("a result larger than the ceiling is refused rather than materialised", async () => {
+  const generated =
+    "WITH RECURSIVE wide(i, body) AS (" +
+    "SELECT 1, hex(randomblob(4000)) UNION ALL SELECT i + 1, hex(randomblob(4000)) FROM wide WHERE i < 5000" +
+    ") SELECT i, body FROM wide";
+  const answer = await db({ op: "query", statement: { sql: generated } });
+  expect(answer.envelope).toEqual({ ok: false, error: { code: "sql_error" } });
+});
+
+test("more rows than the ceiling is refused", async () => {
+  await db({ op: "execute", statement: { sql: "CREATE TABLE t (i INTEGER)" } });
+  const answer = await db({
+    op: "query",
+    statement: {
+      sql:
+        "WITH RECURSIVE many(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM many WHERE i < 20000) " +
+        "SELECT i FROM many",
+    },
+  });
+  expect(answer.envelope).toEqual({ ok: false, error: { code: "sql_error" } });
+});
+
+// ---------------------------------------------------------------------------
+// Names, bodies, and files
+// ---------------------------------------------------------------------------
+
+test("a binding named after a prototype property resolves to nothing", async () => {
+  for (const binding of ["__proto__", "constructor", "toString", "valueOf", "hasOwnProperty"]) {
+    expect(
+      (
+        await post(SELFHOST_DATA_PLANE_SQL_PATH, {
+          binding,
+          op: "execute",
+          statement: { sql: "SELECT 1" },
+        })
+      ).envelope,
+    ).toEqual({ ok: false, error: { code: "backend_unavailable" } });
+    expect(
+      (await post(SELFHOST_DATA_PLANE_KV_PATH, { binding, op: "get", key: "k" })).envelope,
+    ).toEqual({
+      ok: false,
+      error: { code: "backend_unavailable" },
+    });
+  }
+  // And no file was opened for one of those names.
+  expect(readdirSync(root)).toEqual([]);
+});
+
+test("a body with no declared length is refused before it is read", async () => {
+  const request = new Request(`${ORIGIN}${SELFHOST_DATA_PLANE_SQL_PATH}`, {
+    method: "POST",
+    headers: { authorization: `Bearer alpha.v1.${ALPHA.secret}` },
+    body: JSON.stringify({ protocol: SELFHOST_DATA_PLANE_PROTOCOL, binding: "DB", op: "execute" }),
+  });
+  const response = await planes.routes(request, new URL(request.url));
+  expect(response?.status).toBe(400);
+});
+
+test("an unauthenticated caller is refused before the body is even measured", async () => {
+  // A body far over the ceiling and a token that is not one. The answer is the
+  // 401, not the 400: nothing about the body was looked at, so an
+  // unauthenticated caller cannot choose how much work this process does.
+  const request = new Request(`${ORIGIN}${SELFHOST_DATA_PLANE_SQL_PATH}`, {
+    method: "POST",
+    headers: {
+      authorization: "Bearer alpha.v1.not-the-right-secret",
+      "content-length": String(1024 * 1024 * 1024),
+    },
+    body: "{}",
+  });
+  const response = await planes.routes(request, new URL(request.url));
+  expect(response?.status).toBe(401);
+});
+
+test("a database file and its directory are private to this process", async () => {
+  await db({ op: "execute", statement: { sql: "CREATE TABLE t (id INTEGER)" } });
+  expect(statSync(join(root, "tsdb-alpha.sqlite")).mode & 0o777).toBe(0o600);
+  expect(statSync(root).mode & 0o077).toBe(0);
+});
+
+test("a listing includes keys outside the basic plane", async () => {
+  // The prefix ceiling is a code point away, not a code unit: incrementing the
+  // trailing low surrogate leaves a bound below every key it should match.
+  await kv({ op: "put", key: "\u{10FFFF}", value: btoa("a") });
+  await kv({ op: "put", key: "\u{10FFFF}z", value: btoa("b") });
+  expect(value((await kv({ op: "list", prefix: "\u{10FFFF}" })).envelope).keys).toEqual([
+    { name: "\u{10FFFF}" },
+    { name: "\u{10FFFF}z" },
+  ]);
+});
+
+// ---------------------------------------------------------------------------
+// Maintenance
+// ---------------------------------------------------------------------------
+
+test("deleting a namespace deletes its rows and leaves every other namespace alone", async () => {
+  await kv({ op: "put", key: "k", value: btoa("alpha") });
+  await kv({ op: "put", key: "k", value: btoa("beta") }, `beta.v1.${BETA.secret}`);
+  await planes.maintenance.deleteKvNamespace("tskv-alpha");
+  expect(value((await kv({ op: "get", key: "k" })).envelope)).toEqual({ found: false });
+  expect(value((await kv({ op: "get", key: "k" }, `beta.v1.${BETA.secret}`)).envelope)).toEqual({
+    found: true,
+    value: btoa("beta"),
+  });
+});
+
+test("the sweep reclaims expired rows and nothing else, in bounded batches", async () => {
+  await kv({ op: "put", key: "keeps", value: btoa("a") });
+  await kv({ op: "put", key: "goes", value: btoa("b"), expirationTtlSeconds: 60 });
+  now = new Date(now.getTime() + 120_000);
+  expect(await planes.maintenance.sweepExpiredKv()).toBe(1);
+  expect(await planes.maintenance.sweepExpiredKv()).toBe(0);
+  expect(value((await kv({ op: "get", key: "keeps" })).envelope)).toEqual({
+    found: true,
+    value: btoa("a"),
+  });
+});
+
+test("forgetting a database drops the handle rather than the file", async () => {
+  await db({ op: "execute", statement: { sql: "CREATE TABLE t (id INTEGER)" } });
+  await db({ op: "execute", statement: { sql: "INSERT INTO t VALUES (1)" } });
+  planes.maintenance.forgetDatabase("tsdb-alpha");
+  // Reopened on the next request, so a database deleted and declared again
+  // under the same name is never served through a handle on the old inode.
+  expect(
+    value((await db({ op: "query", statement: { sql: "SELECT count(*) AS n FROM t" } })).envelope),
+  ).toEqual({ rows: [{ n: 1 }], rowsWritten: 0 });
 });

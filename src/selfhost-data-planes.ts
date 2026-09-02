@@ -466,11 +466,23 @@ async function kvOperation(
       const after = kvCursor(payload.cursor);
       // One row past the limit is what says whether the listing is complete,
       // without a second count over the same range.
+      // The ceiling is absent only when the prefix is made entirely of the last
+      // code point there is, and then every key at or above it already carries
+      // the prefix — there is nothing above to exclude.
+      const ceiling = prefix === "" ? null : prefixCeiling(prefix);
       const rows = await sql.query(
         "SELECT key FROM selfhost_kv_entries WHERE namespace_id = ? AND key > ? " +
-          "AND (? = '' OR (key >= ? AND key < ?)) " +
+          (prefix === "" ? "" : "AND key >= ? ") +
+          (ceiling === null ? "" : "AND key < ? ") +
           "AND (expires_at_ms IS NULL OR expires_at_ms > ?) ORDER BY key LIMIT ?",
-        [namespace, after, prefix, prefix, prefixCeiling(prefix), millis, limit + 1],
+        [
+          namespace,
+          after,
+          ...(prefix === "" ? [] : [prefix]),
+          ...(ceiling === null ? [] : [ceiling]),
+          millis,
+          limit + 1,
+        ],
       );
       const page = rows.slice(0, limit);
       const listComplete = rows.length <= limit;
@@ -533,16 +545,23 @@ function encodeCursor(key: string): string {
  * key containing `%` or `_` would list somebody else's keys. A range does not
  * have that problem, and it uses the primary key.
  */
-function prefixCeiling(prefix: string): string {
-  if (prefix === "") return "";
+function prefixCeiling(prefix: string): string | null {
   // Code points, not code units. A key outside the basic plane ends in a
-  // surrogate pair, and incrementing its low half while dropping one unit
+  // surrogate pair, and incrementing its low half while dropping one code unit
   // leaves a lone high surrogate as the bound — which sorts below the keys the
   // caller asked for, so a matching key simply vanishes from the listing.
   const points = [...prefix];
-  const last = points.pop() as string;
-  const code = last.codePointAt(0) ?? 0;
-  return `${points.join("")}${String.fromCodePoint(code + 1)}`;
+  while (points.length > 0) {
+    const code = (points.pop() as string).codePointAt(0) ?? 0;
+    // U+10FFFF has no successor, so the carry moves left. A prefix that is
+    // nothing but U+10FFFF runs out of places to carry into and has no ceiling.
+    if (code >= 0x10ffff) continue;
+    // The surrogate block is not a code point a well-formed key can contain,
+    // and SQLite compares the UTF-8 those keys are stored as.
+    const next = code + 1 >= 0xd800 && code + 1 <= 0xdfff ? 0xe000 : code + 1;
+    return `${points.join("")}${String.fromCodePoint(next)}`;
+  }
+  return null;
 }
 
 function kvMetadata(value: unknown): string | null {
