@@ -35,7 +35,12 @@ import {
   runCommand,
   wranglerCommand,
 } from "./process.ts";
-import { type DeployEnvironment, qualifySource, sealDirectory } from "./qualification.ts";
+import {
+  type DeployEnvironment,
+  qualifySource,
+  sealDirectory,
+  unsealDirectory,
+} from "./qualification.ts";
 import type { DeployTarget } from "./target.ts";
 
 const RECEIPT_KIND = "takoserver.d1-schema-rehearsal-receipt@v1";
@@ -307,6 +312,7 @@ export async function runD1Schema(
       rollback: "forward repair only: D1 migrations have no down path",
     };
   } finally {
+    unsealDirectory(root);
     if (temporary) rmSync(root, { recursive: true, force: true });
   }
 }

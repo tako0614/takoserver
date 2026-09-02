@@ -1,12 +1,23 @@
 import { describe, expect, test } from "bun:test";
-import { linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import {
   type QualificationProcess,
   qualifySource,
+  removeArtifactTree,
   sealDirectory,
+  unsealDirectory,
 } from "../scripts/deploy/qualification.ts";
 
 const COMMIT = "a".repeat(40);
@@ -102,10 +113,20 @@ describe("sealed link-free artifacts", () => {
       const artifact = sealDirectory(root, ["index.js", "nested/config.json"]);
       expect(artifact.files).toBe(2);
       expect(() => artifact.assertUnchanged()).not.toThrow();
-      writeFileSync(join(root, "index.js"), "two", { mode: 0o600 });
+      expect({
+        root: statSync(root).mode & 0o777,
+        nested: statSync(join(root, "nested")).mode & 0o777,
+        file: statSync(join(root, "index.js")).mode & 0o777,
+      }).toEqual({ root: 0o500, nested: 0o500, file: 0o400 });
+
+      // Sealing removes write permission, so a tamper has to restore it first.
+      // The recorded identity must still catch the changed bytes afterwards.
+      unsealDirectory(root);
+      chmodSync(join(root, "index.js"), 0o600);
+      writeFileSync(join(root, "index.js"), "two");
       expect(() => artifact.assertUnchanged()).toThrow("changed after it was sealed");
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      removeArtifactTree(root);
     }
   });
 

@@ -15,6 +15,7 @@ import {
   qualifySource,
   type SourceQualification,
   sealDirectory,
+  unsealDirectory,
 } from "./qualification.ts";
 
 export const PAGES_PROJECT = "takoserver-website";
@@ -188,6 +189,7 @@ export async function runStaticSite(
       ),
     };
   } finally {
+    unsealDirectory(output);
     if (temporary) rmSync(output, { recursive: true, force: true });
   }
 }

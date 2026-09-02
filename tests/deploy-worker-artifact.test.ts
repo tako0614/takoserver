@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { assertIdentityCapabilitySupplyPartition } from "../scripts/deploy/form-authority-capability.ts";
 import { runCommand } from "../scripts/deploy/process.ts";
+import { removeArtifactTree } from "../scripts/deploy/qualification.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import {
   canonicalizeWorkerBundleSource,
@@ -128,7 +129,7 @@ describe("hermetic Worker bundle identity", () => {
         "TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST",
       );
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      removeArtifactTree(root);
     }
   });
 
@@ -176,7 +177,7 @@ describe("hermetic Worker bundle identity", () => {
       const artifact = prepared.seal();
       artifact.assertUnchanged();
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      removeArtifactTree(root);
     }
   });
 

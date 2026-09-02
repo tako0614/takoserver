@@ -17,7 +17,7 @@ import {
   runCommand,
   wranglerCommand,
 } from "./process.ts";
-import { type DeployEnvironment, qualifySource } from "./qualification.ts";
+import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualification.ts";
 import {
   expectedWorkerSecrets,
   type WorkerConfigOptions,
@@ -353,6 +353,7 @@ export async function runAuthorityTransition(
       },
     };
   } finally {
+    unsealDirectory(root);
     if (temporary) rmSync(root, { recursive: true, force: true });
   }
 }
@@ -883,6 +884,7 @@ async function runTopologyRetirement(
       },
     };
   } finally {
+    unsealDirectory(root);
     if (temporary) rmSync(root, { recursive: true, force: true });
   }
 }
@@ -1241,6 +1243,7 @@ async function runAttributionRepair(
       probe,
     };
   } finally {
+    unsealDirectory(root);
     if (temporary) rmSync(root, { recursive: true, force: true });
   }
 }
@@ -1768,6 +1771,7 @@ async function runTokenRetirement(
       secretRemoved: HOSTED_SPONSORSHIP_SECRET,
     };
   } finally {
+    unsealDirectory(root);
     if (temporary) rmSync(root, { recursive: true, force: true });
   }
 }

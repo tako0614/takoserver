@@ -26,7 +26,7 @@ import {
   requireEnvironment,
   runCommand,
 } from "./process.ts";
-import type { DeployEnvironment } from "./qualification.ts";
+import { type DeployEnvironment, unsealDirectory } from "./qualification.ts";
 import { writeWorkerConfig } from "./realized-config.ts";
 import {
   activePublicJwk,
@@ -201,6 +201,7 @@ export async function runIntegrationE2eCredentials(
       result,
     };
   } finally {
+    unsealDirectory(root);
     if (temporary) rmSync(root, { recursive: true, force: true });
   }
 }
