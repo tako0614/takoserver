@@ -684,6 +684,15 @@ export function createWorkerEndpointOriginReservations(options: {
    * free. A reservation that *did* publish is not reached here: its witness is
    * retained, ADR 0004 keeps it inside both uniqueness constraints, and only
    * the four absence fences let go of it.
+   *
+   * It runs the sweep itself, because this lane's sweep is lazy. Nothing ages a
+   * reservation on a timer: a row past its TTL is still `bound` in the table
+   * until some call reads it through `expire`, and inside a mint the only such
+   * call is `prepare` — which runs *after* this one. So a revival that only
+   * read the row saw `bound`, declined it for not being `expired`, and watched
+   * `prepare` sweep it one statement later and refuse to replay a terminal row.
+   * The state this repair exists for was unreachable from the only caller that
+   * has it.
    */
   const reviveExpiredHostMint = async (input: {
     readonly organizationId: string;
@@ -693,6 +702,7 @@ export function createWorkerEndpointOriginReservations(options: {
     readonly workerResourceUid: string;
   }): Promise<void> => {
     if (!input.reservationId.startsWith(HOST_MINTED_RESERVATION_PREFIX)) return;
+    await expire(input.organizationId, input.reservationId);
     const row = await readRow(options.sql, input.organizationId, input.reservationId);
     if (
       !row ||
