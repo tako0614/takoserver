@@ -124,6 +124,69 @@ export const SELFHOST_WORKER_READINESS_RESULT_SCHEMA =
 /** Header naming the protocol, so an ordinary tenant request cannot be one. */
 export const SELFHOST_WORKER_READINESS_HEADER = "x-takoserver-selfhost-readiness" as const;
 
+export interface SelfhostReadinessFailure {
+  readonly reason: "declaration" | "module";
+  readonly name?: string;
+  readonly message?: string;
+}
+
+/** The readiness envelope, or null for anything that is not exactly one. */
+export function selfhostReadinessAnswer(
+  body: string,
+): { readonly publication: string; readonly failure?: SelfhostReadinessFailure } | null {
+  if (body.length > 8_192) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+  const answer = parsed as Record<string, unknown>;
+  if (
+    answer.schema !== SELFHOST_WORKER_READINESS_RESULT_SCHEMA ||
+    typeof answer.publication !== "string"
+  ) {
+    return null;
+  }
+  const failure = answer.failure;
+  if (typeof failure !== "object" || failure === null || Array.isArray(failure)) {
+    return { publication: answer.publication };
+  }
+  const detail = failure as Record<string, unknown>;
+  if (detail.reason !== "declaration" && detail.reason !== "module") {
+    return { publication: answer.publication };
+  }
+  return {
+    publication: answer.publication,
+    failure: {
+      reason: detail.reason,
+      ...(typeof detail.name === "string" ? { name: detail.name } : {}),
+      ...(typeof detail.message === "string" ? { message: detail.message } : {}),
+    },
+  };
+}
+
+/**
+ * What to tell an operator when the publication's own load probe says no.
+ *
+ * A module that throws while being imported and a module missing a declared
+ * handler are different defects in different files, and the probe could only
+ * say the second. An operator following "does not export every handler it
+ * declares" against a module that exports all of them looks in the wrong
+ * place; the real cause — a missing built-in, a top-level throw — was visible
+ * only by running the runtime by hand.
+ */
+export function selfhostReadinessFailureMessage(
+  failure: SelfhostReadinessFailure | undefined,
+): string {
+  if (failure?.reason !== "module") {
+    return "the Worker Version's module does not export every handler it declares";
+  }
+  const detail = [failure.name ?? "Error", failure.message].filter(Boolean).join(": ");
+  return `the Worker Version's module failed to load: ${detail}`;
+}
+
 export const SELFHOST_DATA_PLANE_PATH_PREFIX = "/.well-known/takoserver/selfhost-data/v1" as const;
 export const SELFHOST_DATA_PLANE_KV_PATH = `${SELFHOST_DATA_PLANE_PATH_PREFIX}/kv` as const;
 export const SELFHOST_DATA_PLANE_SQL_PATH = `${SELFHOST_DATA_PLANE_PATH_PREFIX}/sql` as const;
@@ -403,6 +466,7 @@ const SafeResponseBodyGet = captureGetter(Response.prototype, "body");
 const SafeResponseHeadersGet = captureGetter(Response.prototype, "headers");
 const SafeResponseStatusGet = captureGetter(Response.prototype, "status");
 const SafeStringCharCodeAt = String.prototype.charCodeAt;
+const SafeSymbol = Symbol;
 const SafeURL = URL;
 const SafeHeadersGet = Headers.prototype.get;
 const SafeRequestText = Request.prototype.text;
@@ -528,13 +592,61 @@ async function readiness(request) {
   let status = 200;
   try {
     await loadOriginal();
-  } catch {
+  } catch (error) {
     status = 500;
+    answer.failure = describeLoadFailure(error);
   }
   return new SafeResponse(SafeJSONStringify(answer), {
     status,
     headers: { "content-type": "application/json" },
   });
+}
+
+/**
+ * Why the module did not load, in the two shapes that mean different things.
+ *
+ * A declared handler that is not exported is a defect in the Version's own
+ * declaration. A module that throws while being imported is a defect in the
+ * bundle — a missing built-in, a top-level assertion, an unsupported API — and
+ * naming it "does not export every handler it declares" sends the operator to
+ * read a list of exports that is complete. The distinction is the marker this
+ * wrapper puts on its own refusals; anything else came out of the tenant's
+ * module and is reported as the class and message it was, trimmed of control
+ * characters and truncated. No binding, environment value, or stack reaches
+ * here: only what the module chose to say.
+ */
+function describeLoadFailure(error) {
+  const failure = SafeObjectCreate(null);
+  if (error !== null && typeof error === "object" && SafeObjectHasOwn(error, DECLARATION_MARK)) {
+    failure.reason = "declaration";
+    failure.message = sanitizeFailureText(readFailureField(error, "message"), 200);
+    return failure;
+  }
+  failure.reason = "module";
+  failure.name = sanitizeFailureText(readFailureField(error, "name"), 64) || "Error";
+  failure.message = sanitizeFailureText(readFailureField(error, "message"), 400);
+  return failure;
+}
+
+function readFailureField(error, field) {
+  if (error === null || (typeof error !== "object" && typeof error !== "function")) {
+    return typeof error === "string" && field === "message" ? error : "";
+  }
+  try {
+    const value = error[field];
+    return typeof value === "string" ? value : "";
+  } catch {
+    return "";
+  }
+}
+
+function sanitizeFailureText(value, limit) {
+  let text = "";
+  for (let index = 0; index < value.length && text.length < limit; index += 1) {
+    const code = SafeApply(SafeStringCharCodeAt, value, [index]);
+    text += code < 0x20 || code === 0x7f ? " " : value[index];
+  }
+  return text;
 }
 
 function sealGeneratedConfiguration(raw) {
@@ -573,6 +685,8 @@ function internalArray() {
   return SafeApply(SafeObjectSetPrototypeOf, SafeObject, [[], null]);
 }
 
+const DECLARATION_MARK = SafeSymbol("takoserver-selfhost-declaration-failure");
+
 function loadOriginal() {
   if (!originalPromise) {
     const loading = import(${JSON.stringify(moduleSpecifier)});
@@ -590,26 +704,37 @@ function loadOriginal() {
  */
 function validateOriginal(loaded) {
   if (!loaded || (typeof loaded !== "object" && typeof loaded !== "function") || !SafeObjectHasOwn(loaded, "default")) {
-    throw new SafeTypeError("self-host Worker must have a default export");
+    throw declarationError("self-host Worker must have a default export");
   }
   const original = loaded.default;
   if (!original || typeof original !== "object" || SafeArrayIsArray(original)) {
-    throw new SafeTypeError("self-host Worker default export must be a plain object");
+    throw declarationError("self-host Worker default export must be a plain object");
   }
   const prototype = SafeApply(SafeObjectGetPrototypeOf, SafeObject, [original]);
   if (prototype !== SafeObjectPrototype && prototype !== null) {
-    throw new SafeTypeError("self-host Worker default export must be a plain object");
+    throw declarationError("self-host Worker default export must be a plain object");
   }
   const handlers = SafeObjectCreate(null);
   for (let index = 0; index < CONFIGURATION.declaredHandlers.length; index += 1) {
     const handler = CONFIGURATION.declaredHandlers[index];
     const descriptor = SafeApply(SafeObjectGetOwnPropertyDescriptor, SafeObject, [original, handler]);
     if (!descriptor || !SafeObjectHasOwn(descriptor, "value") || typeof descriptor.value !== "function") {
-      throw new SafeTypeError("self-host Worker declared handler is missing");
+      throw declarationError("self-host Worker declared handler is missing");
     }
     handlers[handler] = descriptor.value;
   }
   return { target: original, handlers };
+}
+
+/**
+ * This wrapper's own refusal, marked so the readiness answer can tell it apart
+ * from anything the tenant's module threw. The marker is a Symbol created in
+ * this module and never handed out, so nothing loaded here can forge one.
+ */
+function declarationError(message) {
+  const error = new SafeTypeError(message);
+  error[DECLARATION_MARK] = true;
+  return error;
 }
 
 function projectEnv(rawEnv) {

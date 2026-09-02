@@ -91,7 +91,8 @@ import {
   SELFHOST_WORKER_READINESS_HEADER,
   SELFHOST_WORKER_READINESS_PATH,
   SELFHOST_WORKER_READINESS_PROTOCOL,
-  SELFHOST_WORKER_READINESS_RESULT_SCHEMA,
+  selfhostReadinessAnswer,
+  selfhostReadinessFailureMessage,
   selfhostWorkerEntrypointSource,
 } from "./selfhost-worker-wrapper.ts";
 
@@ -491,26 +492,6 @@ export function createSelfhostDataPlaneAccess(dataRoot: string): SelfhostDataPla
   };
 }
 
-/** The readiness envelope, or null for anything that is not exactly one. */
-function readinessAnswer(body: string): { readonly publication: string } | null {
-  if (body.length > 8_192) return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    return null;
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
-  const answer = parsed as Record<string, unknown>;
-  if (
-    answer.schema !== SELFHOST_WORKER_READINESS_RESULT_SCHEMA ||
-    typeof answer.publication !== "string"
-  ) {
-    return null;
-  }
-  return { publication: answer.publication };
-}
-
 /** Whether a ticket says "try again", as opposed to "this cannot be served". */
 function retryableTicket(ticket: ProviderTicket): boolean {
   return ticket.phase === "failed" && ticket.failure.retryable === true;
@@ -865,14 +846,11 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       }).catch(() => null);
       if (response) {
         alive = true;
-        const parsed = readinessAnswer(response.body);
+        const parsed = selfhostReadinessAnswer(response.body);
         if (parsed?.publication === publication) {
           if (response.status === 200) return;
           throw new SelfhostFailure(
-            failed(
-              "invalid_spec",
-              "the Worker Version's module does not export every handler it declares",
-            ),
+            failed("invalid_spec", selfhostReadinessFailureMessage(parsed.failure)),
           );
         }
       }
