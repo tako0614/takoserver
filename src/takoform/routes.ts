@@ -881,6 +881,7 @@ function hostErrorResponse(
       error.status,
       redactClaimHolder ? withoutClaimHolder(error.details) : error.details,
       error.publicMessage,
+      error.hostCode,
     );
   }
   // Anything else is a driver or runtime fault. The caller gets an

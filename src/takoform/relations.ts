@@ -10,7 +10,7 @@ import type {
   TakoformInterfaceRef,
   TakoformV1Alpha3FormRef,
 } from "./types.ts";
-import { TakoformHostError } from "./types.ts";
+import { crossResourcePrecondition, TakoformHostError } from "./types.ts";
 
 /** One exact cross-resource reference stored beside the declaring Resource. */
 export interface TakoformStoredRelation {
@@ -157,8 +157,13 @@ export async function resolveRelations(input: {
     };
     const target = await input.store.readResource(address);
     if (!target) {
-      throw new TakoformHostError("resource_not_found", 404, {
-        pointer: instance.concretePointer,
+      // The neighbour this relation names is simply not there yet. The operator
+      // declares it and re-applies under the same plan-derived key, so this
+      // refusal must not be the answer to that second ask.
+      throw crossResourcePrecondition({
+        code: "resource_not_found",
+        status: 404,
+        details: { pointer: instance.concretePointer },
       });
     }
     const targetForm = input.forms.get(formKey(target.form.formRef));
@@ -308,7 +313,20 @@ export function validateDeclaredConstraintRequest(input: {
   }
 }
 
-/** Enforces the installed Definition's portable cross-resource mechanisms. */
+/**
+ * Enforces the installed Definition's portable cross-resource mechanisms.
+ *
+ * Every refusal here is read off *another resource's* live state — a claim
+ * somebody else holds, a pinned target that moved, a cycle the neighbours make
+ * — so every one of them is a `crossResourcePrecondition`. The document that
+ * arrived is not what is wrong, and the operator cures it by changing the
+ * neighbour, which leaves this resource's plan, and therefore the released
+ * provider's idempotency key, byte-identical. The purely document-shaped rules
+ * — `sum`, `orderedPair`, `uniqueBy`, `distinctPair`, and the self-reference
+ * `acyclic` check in `validateDeclaredConstraintRequest` — stay plain
+ * `invalid_argument`, because for those the stored answer really is still the
+ * answer. See [ADR 0008](../../docs/adr/0008-a-settled-refusal-about-the-host-is-re-attempted.md).
+ */
 export async function validateDeclaredConstraints(input: {
   readonly tenantId: string;
   readonly space: string;
@@ -366,7 +384,7 @@ export async function validateDeclaredConstraints(input: {
           holder.holderKind !== input.form.identity.formRef.kind ||
           holder.holderName !== input.resourceName)
       ) {
-        throw new TakoformHostError("invalid_argument", 400, { constraint: "uniquePair" });
+        throw crossResourcePrecondition({ details: { constraint: "uniquePair" } });
       }
       continue;
     }
@@ -419,7 +437,7 @@ export async function validateDeclaredConstraints(input: {
           return holderKey !== undefined && key === canonicalJson(holderKey);
         })
       ) {
-        throw new TakoformHostError("invalid_argument", 400);
+        throw crossResourcePrecondition();
       }
       continue;
     }
@@ -441,7 +459,7 @@ export async function validateDeclaredConstraints(input: {
           holder.holderKind !== input.form.identity.formRef.kind ||
           holder.holderName !== input.resourceName)
       ) {
-        throw new TakoformHostError("invalid_argument", 400, { holder: holder.holderName });
+        throw crossResourcePrecondition({ details: { holder: holder.holderName } });
       }
     }
   }
@@ -503,7 +521,7 @@ async function livePinnedTarget(
     current.metadata.uid !== relation.targetUid ||
     !sameForm(current.form.formRef, relation.targetFormRef)
   ) {
-    throw new TakoformHostError("invalid_argument", 400, { constraint: kind });
+    throw crossResourcePrecondition({ details: { constraint: kind } });
   }
   return current;
 }
@@ -534,7 +552,7 @@ async function validateAcyclicConstraint(
   }
   for (let step = 0; step < MAXIMUM_CONSTRAINT_TRAVERSAL; step += 1) {
     if (seen.has(edge.targetUid)) {
-      throw new TakoformHostError("invalid_argument", 400, { constraint: "acyclic" });
+      throw crossResourcePrecondition({ details: { constraint: "acyclic" } });
     }
     seen.add(edge.targetUid);
     const target = await livePinnedTarget(input, "acyclic", edge);
@@ -549,7 +567,7 @@ async function validateAcyclicConstraint(
     edge = oneRelation("acyclic", reference, targetRelations);
     if (!edge) return;
   }
-  throw new TakoformHostError("invalid_argument", 400, { constraint: "acyclic" });
+  throw crossResourcePrecondition({ details: { constraint: "acyclic" } });
 }
 
 async function validateSameResolvedTargetConstraint(
@@ -598,15 +616,11 @@ async function validateSameResolvedTargetConstraint(
     });
     const through = oneRelation("sameResolvedTarget", constraint.through, memberRelations);
     if (!through) {
-      throw new TakoformHostError("invalid_argument", 400, {
-        constraint: "sameResolvedTarget",
-      });
+      throw crossResourcePrecondition({ details: { constraint: "sameResolvedTarget" } });
     }
     await livePinnedTarget(input, "sameResolvedTarget", through);
     if (through.targetUid !== anchor.targetUid) {
-      throw new TakoformHostError("invalid_argument", 400, {
-        constraint: "sameResolvedTarget",
-      });
+      throw crossResourcePrecondition({ details: { constraint: "sameResolvedTarget" } });
     }
   }
 }

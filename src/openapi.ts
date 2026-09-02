@@ -605,6 +605,13 @@ export const openApiDocument = {
               message: { type: "string", minLength: 1, maxLength: 256 },
               requestId: { type: "string", minLength: 1, maxLength: 128 },
               retryable: { type: "boolean" },
+              hostCode: {
+                description:
+                  "This Host's own finer name for the refusal, when the closed portable code taxonomy cannot carry the distinction. The released provider decodes it alongside the portable code and never acts on it, so it refines a classification rather than replacing one. `cross_resource_precondition` marks a refusal whose truth is held by another resource, which this Host re-attempts rather than replays under the caller's idempotency key.",
+                type: "string",
+                minLength: 1,
+                maxLength: 64,
+              },
               details: {
                 description: "Lane-specific, value-free detail. Never derived from a secret.",
               },

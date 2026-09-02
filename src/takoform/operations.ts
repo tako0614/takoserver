@@ -7,6 +7,7 @@ import type { TakoformHostAuthority } from "./host-authority.ts";
 import { receiptProjectable } from "./receipt-projection.ts";
 import type { DeferredOperationRecord, ResourceAddress, TakoformStore } from "./store.ts";
 import {
+  CROSS_RESOURCE_PRECONDITION,
   TakoformHostError,
   type TakoformStoredResource,
   type TakoformV1Alpha3FormRef,
@@ -348,6 +349,7 @@ export function createDeferredOperations(input: {
         outcome.error.status,
         undefined,
         outcome.error.publicMessage,
+        outcome.error.hostCode,
       );
     }
     const settled = await input.store.readDeferredOperation(
@@ -457,6 +459,7 @@ export function createDeferredOperations(input: {
             operation.id,
             refusal.code,
             refusal.publicMessage ?? diagnosticMessage(refusal.code),
+            refusal.hostCode,
           ),
         });
         return { kind: "settled" };
@@ -502,6 +505,10 @@ export function createDeferredOperations(input: {
           // provider refusal names the cause, and "the deferred mutation was
           // refused" names nothing the operator can act on.
           hostError.publicMessage ?? diagnosticMessage(hostError.code),
+          // And the Host's own classification travels with it: a refusal whose
+          // truth is held by a neighbour is not the answer to the next
+          // identical request once that neighbour changes.
+          hostError.hostCode,
         ),
       });
     }
@@ -748,7 +755,7 @@ function successTerminal(
   });
 }
 
-function failureTerminal(id: string, code: string, message: string): string {
+function failureTerminal(id: string, code: string, message: string, hostCode?: string): string {
   return canonicalJson({
     ...operationDocument(id, true),
     error: {
@@ -756,6 +763,7 @@ function failureTerminal(id: string, code: string, message: string): string {
       message: sanitizedMessage(message) ?? code.replaceAll("_", " "),
       requestId: `req_${id}`,
       retryable: false,
+      ...(hostCode === undefined ? {} : { hostCode }),
     },
   });
 }
@@ -816,6 +824,7 @@ function immediateTerminalResponse(
       deferredFailureStatus(document.error.code),
       undefined,
       typeof document.error.message === "string" ? document.error.message : undefined,
+      typeof document.error.hostCode === "string" ? document.error.hostCode : undefined,
     );
   }
   throw new TakoformHostError("internal_error", 500);
@@ -889,7 +898,7 @@ function isTerminal(operation: DeferredOperationRecord): boolean {
 }
 
 /**
- * Refusals that describe this Host rather than the request, and are therefore
+ * Codes that describe this Host rather than the request, and are therefore
  * re-attempted when the same request is presented again.
  *
  * The split is what the refusal is *about*. `generation_conflict` says the
@@ -906,6 +915,11 @@ function isTerminal(operation: DeferredOperationRecord): boolean {
  * design; handing them the old refusal pins a Host defect to a resource name
  * until the record ages out, and the only escapes measured on a real self-host
  * were renaming the resource or editing the Host's database.
+ *
+ * The code is the classification wherever one code means one thing. Where it
+ * does not — `invalid_argument` answers a malformed document and a missing
+ * neighbour alike — the refusal carries `CROSS_RESOURCE_PRECONDITION` and is
+ * re-attempted on that instead. See `replayRetired`.
  */
 const REATTEMPTED_SETTLED_FAILURE_CODES: ReadonlySet<string> = new Set([
   "backend_unavailable",
@@ -931,14 +945,27 @@ const REATTEMPTED_SETTLED_FAILURE_CODES: ReadonlySet<string> = new Set([
  * answer to the request that just arrived.
  *
  * Two cases retire one. A committed mutation whose Resource no longer exists
- * describes an incarnation that is gone. And a settled failure whose code names
- * something about *this Host* rather than about the request is a statement
+ * describes an incarnation that is gone. And a settled failure that is a
+ * statement about *this Host* rather than about the request is a statement
  * about facts the operator then changes: the released provider recomputes the
  * same plan-derived idempotency key on every run, so `tofu destroy` gets
  * `dependency_in_use` on a parent, deletes the dependents it named, asks again
  * under the same key — and a Host that replayed the refusal would refuse it
  * until the record expired. The same held for `unsupported_capability` after a
  * Host defect was repaired.
+ *
+ * Which of the two a refusal is cannot always be read off the portable code,
+ * because the code taxonomy is closed and released and one of its codes carries
+ * both shapes. `invalid_argument` is "your weights do not sum to 10000" — a
+ * fact about the request that no repair elsewhere changes — and it is equally
+ * "the ModuleWorker you name has no WorkerDeployment", "another resource holds
+ * this hostname", "a second deployment already holds this Worker": facts about
+ * a neighbour, each cured without one byte of this resource's plan moving. So
+ * the site that knows says so, by marking its refusal
+ * `CROSS_RESOURCE_PRECONDITION`, and a marked refusal is re-attempted whatever
+ * its code. Nothing about the wire answer weakens: the code and its `retryable:
+ * false` are unchanged, so the caller still gets a definitive refusal now, and
+ * only the *next* identical request gets a fresh attempt.
  *
  * The rule and its supersession are recorded in
  * [ADR 0008](../../docs/adr/0008-a-settled-refusal-about-the-host-is-re-attempted.md).
@@ -957,15 +984,27 @@ async function replayRetired(
   store: TakoformStore,
 ): Promise<boolean> {
   if (operation.phase === "failed") {
-    const code = terminalErrorCode(operation);
-    return code !== null && REATTEMPTED_SETTLED_FAILURE_CODES.has(code);
+    const refusal = terminalRefusal(operation);
+    if (refusal === null) return false;
+    return (
+      REATTEMPTED_SETTLED_FAILURE_CODES.has(refusal.code) ||
+      refusal.hostCode === CROSS_RESOURCE_PRECONDITION
+    );
   }
   if (!isTerminal(operation) || !operation.committedUid) return false;
   return (await store.resourceByUid(operation.tenantId, operation.committedUid)) === null;
 }
 
-/** The code a settled operation reported, or nothing this Host can act on. */
-function terminalErrorCode(operation: DeferredOperationRecord): string | null {
+/**
+ * What a settled operation refused with, or nothing this Host can act on.
+ *
+ * Both members are read, because the portable code is not always the whole
+ * classification: `invalid_argument` answers a malformed document and a missing
+ * neighbour alike, and only the `hostCode` separates them.
+ */
+function terminalRefusal(
+  operation: DeferredOperationRecord,
+): { readonly code: string; readonly hostCode?: string } | null {
   if (operation.terminalJson === undefined) return null;
   let document: unknown;
   try {
@@ -975,7 +1014,11 @@ function terminalErrorCode(operation: DeferredOperationRecord): string | null {
   }
   if (!isRecord(document)) return null;
   const error = document.error;
-  return isRecord(error) && typeof error.code === "string" ? error.code : null;
+  if (!isRecord(error) || typeof error.code !== "string") return null;
+  return {
+    code: error.code,
+    ...(typeof error.hostCode === "string" ? { hostCode: error.hostCode } : {}),
+  };
 }
 
 function nextIdentifier(prefix: "op" | "uid" | "lease", randomId: () => string): string {

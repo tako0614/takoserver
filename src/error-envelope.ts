@@ -72,6 +72,19 @@ export interface WireErrorEnvelope {
     readonly message: string;
     readonly requestId: string;
     readonly retryable: boolean;
+    /**
+     * The Host's own finer name for this refusal, when the closed portable
+     * taxonomy cannot carry the distinction.
+     *
+     * This is not an extension this Host invented. The released provider's
+     * envelope and terminal-operation decoders both name `hostCode`, and both
+     * decode with `DisallowUnknownFields` — so it is the only member a Host may
+     * add, and anything else would make the whole envelope protocol-invalid.
+     * `takoform`'s `host-api-wire-v1` and `operation-v1` schemas declare it as
+     * a free-form non-empty string, which is exactly what a Host-specific
+     * refinement of a portable code is.
+     */
+    readonly hostCode?: string;
     readonly details?: unknown;
   };
 }
@@ -94,6 +107,7 @@ export function errorEnvelope(
   details?: unknown,
   requestId = `req_${crypto.randomUUID()}`,
   message?: string,
+  hostCode?: string,
 ): WireErrorEnvelope {
   return {
     error: {
@@ -101,6 +115,7 @@ export function errorEnvelope(
       message: sanitizedMessage(message) ?? code.replaceAll("_", " "),
       requestId,
       retryable: AUTOMATICALLY_RETRYABLE_ERROR_CODES.includes(code),
+      ...(hostCode === undefined ? {} : { hostCode }),
       ...(details === undefined ? {} : { details }),
     },
   };
@@ -137,6 +152,10 @@ export function errorEnvelopeResponse(
   details?: unknown,
   init?: ResponseInit,
   message?: string,
+  hostCode?: string,
 ): Response {
-  return Response.json(errorEnvelope(code, details, undefined, message), { ...init, status });
+  return Response.json(errorEnvelope(code, details, undefined, message, hostCode), {
+    ...init,
+    status,
+  });
 }
