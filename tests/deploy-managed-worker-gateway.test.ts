@@ -252,7 +252,7 @@ function gatewayVersion(
   etag: string,
   versionId: string,
   source: string,
-  input: { readonly deployed?: boolean } = {},
+  input: { readonly deployed?: boolean; readonly extraBindings?: readonly unknown[] } = {},
 ): unknown {
   return {
     id: versionId,
@@ -296,6 +296,7 @@ function gatewayVersion(
         text: "gateway",
       },
       { name: "TAKOSERVER_ENVIRONMENT", type: "plain_text", text: environment },
+      ...(input.extraBindings ?? []),
     ],
     resources: {
       script: { etag },
@@ -561,6 +562,90 @@ test("status is read-only while apply requires an independent reviewer", async (
   ).catch((error) => error);
   expect(failure).toMatchObject({ phase: "preflight" });
   expect(failure.message).toContain("TAKOSERVER_INDEPENDENT_REVIEW");
+});
+
+/**
+ * The managed SQLite Durable Object refuses every admin operation without the
+ * gateway's `TAKOSERVER_MANAGED_SQLITE_ADMIN_SECRET`, and an operator
+ * provisions that secret out of band. So the readback must recognise it —
+ * without letting anything else through.
+ */
+test("the gateway closure recognises the provisioned SQLite admin secret and nothing else", async () => {
+  const withSecret = new (class extends ReadyGatewayState {
+    override async workerVersionWithModules(): Promise<unknown> {
+      return gatewayVersion(
+        "integration",
+        "a".repeat(40),
+        createHash("sha256").update(gatewaySource).digest("hex"),
+        "gateway-code-etag",
+        stagedVersionId,
+        gatewaySource,
+        {
+          deployed: true,
+          extraBindings: [{ name: "TAKOSERVER_MANAGED_SQLITE_ADMIN_SECRET", type: "secret_text" }],
+        },
+      );
+    }
+  })([]);
+  expect(
+    await runManagedWorkerGateway(
+      {
+        surface: "takoserver-managed-worker-gateway",
+        action: "status",
+        environment: "integration",
+        commit: "a".repeat(40),
+      },
+      target("integration"),
+      {
+        state: withSecret,
+        routePattern: pattern,
+        gatewayScript,
+        legacyScript,
+        zoneId: "zone",
+        providerId: "provider",
+        dispatchNamespace: "dispatch",
+        gatewayId: "gateway",
+      },
+    ),
+  ).toMatchObject({ workerBindingsExact: true });
+
+  const withStranger = new (class extends ReadyGatewayState {
+    override async workerVersionWithModules(): Promise<unknown> {
+      return gatewayVersion(
+        "integration",
+        "a".repeat(40),
+        createHash("sha256").update(gatewaySource).digest("hex"),
+        "gateway-code-etag",
+        stagedVersionId,
+        gatewaySource,
+        {
+          deployed: true,
+          extraBindings: [{ name: "SOMETHING_ELSE", type: "secret_text" }],
+        },
+      );
+    }
+  })([]);
+  expect(
+    await runManagedWorkerGateway(
+      {
+        surface: "takoserver-managed-worker-gateway",
+        action: "status",
+        environment: "integration",
+        commit: "a".repeat(40),
+      },
+      target("integration"),
+      {
+        state: withStranger,
+        routePattern: pattern,
+        gatewayScript,
+        legacyScript,
+        zoneId: "zone",
+        providerId: "provider",
+        dispatchNamespace: "dispatch",
+        gatewayId: "gateway",
+      },
+    ),
+  ).toMatchObject({ workerStatus: "malformed", workerBindingsExact: false });
 });
 
 test("run surface performs injected integration mutation then exact readback", async () => {

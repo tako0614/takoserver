@@ -161,6 +161,90 @@ export async function managedWorkerSqliteInstanceName(input: {
 }
 
 /**
+ * The gateway binding that carries the admin secret.
+ *
+ * It is declared on the gateway Worker, which runs this Durable Object class,
+ * and never on a tenant's dispatched Worker — so a tenant cannot read it even
+ * with a raw handle to this namespace, and a Host that has not provisioned it
+ * executes no admin operation at all.
+ */
+export const MANAGED_SQLITE_ADMIN_SECRET_BINDING = "TAKOSERVER_MANAGED_SQLITE_ADMIN_SECRET";
+const MANAGED_SQLITE_ADMIN_PROOF_LABEL = "takoserver.managed-sqlite-admin-proof@v1";
+const PROOF = /^[A-Za-z0-9_-]{43}$/u;
+
+/** The admin operations a proof may authorize. A proof names exactly one. */
+export const MANAGED_SQLITE_ADMIN_OPERATIONS = [
+  "initialize",
+  "inspect",
+  "read-migration-ledger",
+  "apply-migration-suffix",
+  "destroy",
+] as const;
+
+export type ManagedWorkerSqliteAdminOperation = (typeof MANAGED_SQLITE_ADMIN_OPERATIONS)[number];
+
+export interface ManagedWorkerSqliteAdminProofInput {
+  readonly secret: string;
+  readonly operation: ManagedWorkerSqliteAdminOperation;
+  readonly authority: ManagedWorkerSqliteAuthority;
+}
+
+/**
+ * Seals one admin operation on one authority tuple.
+ *
+ * Every field of that tuple is derivable by the customer whose Resource it
+ * describes — the provider id, the Resource UID, and a digest over the desired
+ * spec — so the tuple authorizes nothing on its own. What a caller cannot
+ * derive is this HMAC, and the operation name is inside it so an `inspect`
+ * proof is not a `destroy` proof. Fields are length-prefixed for the reason
+ * ADR 0006 gives for the apply commitment: two different tuples must not be
+ * able to hash the same by moving a byte across a boundary.
+ */
+export async function managedWorkerSqliteAdminProof(
+  input: ManagedWorkerSqliteAdminProofInput,
+): Promise<string> {
+  assertToken(input.secret);
+  const parts = [
+    MANAGED_SQLITE_ADMIN_PROOF_LABEL,
+    input.operation,
+    input.authority.providerId,
+    input.authority.resourceUid,
+    input.authority.generation,
+    input.authority.operationId,
+    input.authority.descriptorDigest,
+  ];
+  const encoder = new TextEncoder();
+  const encoded = parts.map((part) => encoder.encode(part));
+  const message = new Uint8Array(encoded.reduce((total, part) => total + 8 + part.byteLength, 0));
+  const view = new DataView(message.buffer);
+  let offset = 0;
+  for (const part of encoded) {
+    view.setBigUint64(offset, BigInt(part.byteLength), false);
+    offset += 8;
+    message.set(part, offset);
+    offset += part.byteLength;
+  }
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(input.secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  return base64Url(new Uint8Array(await crypto.subtle.sign("HMAC", key, message))).slice(0, 43);
+}
+
+/** Compares two proofs without letting the comparison time say how far it got. */
+function sameProof(left: string, right: string): boolean {
+  if (left.length !== right.length) return false;
+  let difference = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    difference |= left.charCodeAt(index) ^ right.charCodeAt(index);
+  }
+  return difference === 0;
+}
+
+/**
  * The whole behaviour of Takoserver's provider-owned SQLite Durable Object,
  * with nothing in it that only a Cloudflare isolate can provide.
  *
@@ -178,11 +262,39 @@ export async function managedWorkerSqliteInstanceName(input: {
 export class ManagedWorkerSqliteCore {
   readonly #ctx: ManagedWorkerSqliteState;
   readonly #sql: ManagedWorkerSqliteStorage;
+  readonly #adminSecret: string | undefined;
 
   constructor(ctx: ManagedWorkerSqliteState, env: unknown) {
-    void env;
     this.#ctx = ctx;
     this.#sql = ctx.storage.sql;
+    const secret = isRecord(env) ? env[MANAGED_SQLITE_ADMIN_SECRET_BINDING] : undefined;
+    this.#adminSecret = typeof secret === "string" && TOKEN.test(secret) ? secret : undefined;
+  }
+
+  /**
+   * The admin plane is provider-only, and this is what says so.
+   *
+   * Every field of an authority tuple is derivable by the customer whose
+   * Resource it describes, so comparing the tuple alone would let anyone who
+   * could address this namespace claim an unclaimed instance, replay a
+   * migration suffix, or destroy a database. The proof is an HMAC the gateway's
+   * own secret binding computes, and a Host that has not provisioned that
+   * binding executes no admin operation rather than trusting the caller.
+   */
+  async #assertAdminProof(
+    operation: ManagedWorkerSqliteAdminOperation,
+    authority: ManagedWorkerSqliteAuthority,
+    proof: string,
+  ): Promise<void> {
+    const secret = this.#adminSecret;
+    if (secret === undefined) throw new AdminSentinel("backend_unavailable");
+    let expected: string;
+    try {
+      expected = await managedWorkerSqliteAdminProof({ secret, operation, authority });
+    } catch {
+      throw new AdminSentinel("backend_unavailable");
+    }
+    if (!sameProof(expected, proof)) throw new AdminSentinel("invalid_argument");
   }
 
   async edgeSqlExecute(input: unknown): Promise<ManagedWorkerSqlRpcResult<ManagedWorkerSqlResult>> {
@@ -227,9 +339,11 @@ export class ManagedWorkerSqliteCore {
   async takoserverSqliteInitialize(
     input: unknown,
   ): Promise<ManagedWorkerSqliteAdminResult<{ readonly state: "active" }>> {
-    const authority = parseAuthority(input);
-    if (!authority) return adminFailure("invalid_argument");
+    const request = parseAdminRequest(input);
+    if (!request) return adminFailure("invalid_argument");
+    const { authority } = request;
     try {
+      await this.#assertAdminProof("initialize", authority, request.proof);
       this.#transactionSync(() => {
         const existing = this.#readControl();
         if (existing !== null) {
@@ -257,9 +371,11 @@ export class ManagedWorkerSqliteCore {
   async takoserverSqliteInspect(
     input: unknown,
   ): Promise<ManagedWorkerSqliteAdminResult<ManagedWorkerSqliteInspectResult>> {
-    const authority = parseAuthority(input);
-    if (!authority) return adminFailure("invalid_argument");
+    const request = parseAdminRequest(input);
+    if (!request) return adminFailure("invalid_argument");
+    const { authority } = request;
     try {
+      await this.#assertAdminProof("inspect", authority, request.proof);
       const control = this.#readControl();
       if (control === null) {
         this.#assertNoLegacyControlTables();
@@ -271,18 +387,19 @@ export class ManagedWorkerSqliteCore {
         authority: control.authority,
         migrations: control.migrations,
       });
-    } catch {
-      return adminFailure("backend_unavailable");
+    } catch (error) {
+      return adminFailure(error instanceof AdminSentinel ? error.code : "backend_unavailable");
     }
   }
 
   async takoserverSqliteReadMigrationLedger(
     input: unknown,
   ): Promise<ManagedWorkerSqliteAdminResult<readonly ManagedWorkerSqliteMigrationIdentity[]>> {
-    const authority = parseAuthority(input);
-    if (!authority) return adminFailure("invalid_argument");
+    const request = parseAdminRequest(input);
+    if (!request) return adminFailure("invalid_argument");
     try {
-      const control = this.#assertActiveAuthority(authority);
+      await this.#assertAdminProof("read-migration-ledger", request.authority, request.proof);
+      const control = this.#assertActiveAuthority(request.authority);
       return adminSuccess(control.migrations);
     } catch (error) {
       return adminFailure(error instanceof AdminSentinel ? error.code : "backend_unavailable");
@@ -311,6 +428,7 @@ export class ManagedWorkerSqliteCore {
       return adminFailure(error instanceof AdminSentinel ? error.code : "invalid_argument");
     }
     try {
+      await this.#assertAdminProof("apply-migration-suffix", parsed.authority, parsed.proof);
       this.#transactionSync(() => {
         const control = this.#assertActiveAuthority(parsed.authority);
         const current = control.migrations;
@@ -360,9 +478,11 @@ export class ManagedWorkerSqliteCore {
   async takoserverSqliteDestroy(
     input: unknown,
   ): Promise<ManagedWorkerSqliteAdminResult<{ readonly destroyed: true }>> {
-    const authority = parseAuthority(input);
-    if (!authority) return adminFailure("invalid_argument");
+    const request = parseAdminRequest(input);
+    if (!request) return adminFailure("invalid_argument");
+    const { authority } = request;
     try {
+      await this.#assertAdminProof("destroy", authority, request.proof);
       this.#transactionSync(() => {
         const control = this.#readControl();
         if (control === null) {
@@ -753,14 +873,17 @@ function validControlRecord(value: ManagedWorkerSqliteControlRecord): boolean {
 
 function parseMigrationInput(value: unknown): {
   readonly authority: ManagedWorkerSqliteAuthority;
+  readonly proof: string;
   readonly expectedPrefix: readonly ManagedWorkerSqliteMigrationIdentity[];
   readonly migrations: readonly ManagedWorkerSqliteMigration[];
 } | null {
-  if (!isRecord(value) || !onlyKeys(value, ["authority", "expectedPrefix", "migrations"]))
+  if (!isRecord(value) || !onlyKeys(value, ["authority", "proof", "expectedPrefix", "migrations"]))
     return null;
   const authority = parseAuthority(value.authority);
   if (
     !authority ||
+    typeof value.proof !== "string" ||
+    !PROOF.test(value.proof) ||
     !Array.isArray(value.expectedPrefix) ||
     value.expectedPrefix.length > MAX_SQL_STATEMENTS ||
     !Array.isArray(value.migrations) ||
@@ -774,9 +897,20 @@ function parseMigrationInput(value: unknown): {
     return null;
   return {
     authority,
+    proof: value.proof,
     expectedPrefix: expectedPrefix as ManagedWorkerSqliteMigrationIdentity[],
     migrations: migrations as ManagedWorkerSqliteMigration[],
   };
+}
+
+/** The shape every admin RPC but the migration one takes. */
+function parseAdminRequest(
+  value: unknown,
+): { readonly authority: ManagedWorkerSqliteAuthority; readonly proof: string } | null {
+  if (!isRecord(value) || !onlyKeys(value, ["authority", "proof"])) return null;
+  const authority = parseAuthority(value.authority);
+  if (!authority || typeof value.proof !== "string" || !PROOF.test(value.proof)) return null;
+  return { authority, proof: value.proof };
 }
 
 function parseMigrationIdentity(value: unknown): ManagedWorkerSqliteMigrationIdentity | null {

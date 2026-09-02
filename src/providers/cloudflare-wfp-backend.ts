@@ -36,6 +36,7 @@ import {
   TAKOSERVER_MANAGED_WORKER_ROUTE_SCHEMAS,
 } from "./cloudflare-managed-worker-gateway.ts";
 import type {
+  ManagedWorkerSqliteAdminOperation,
   ManagedWorkerSqliteAdminResult,
   ManagedWorkerSqliteAuthority,
   ManagedWorkerSqliteInspectResult,
@@ -62,6 +63,7 @@ import type {
   ArtifactBytes,
   CloudflareManagedScheduleOperatorProof,
   CloudflareManagedScheduleReconciliationStatus,
+  CloudflareManagedSqliteAdminRequest,
   CloudflareManagedSqliteNamespace,
   CloudflareWorkerBackend,
   CloudflareWorkerDeleteInput,
@@ -168,6 +170,7 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
   readonly #inspectRelease: CloudflareWorkersForPlatformsBackendOptions["inspectRelease"];
   readonly #pendingReleaseReadbackQualified: boolean;
   readonly #deriveSqliteInstanceName: CloudflareWorkersForPlatformsBackendOptions["deriveSqliteInstanceName"];
+  readonly #sealSqliteAdminProof: CloudflareWorkersForPlatformsBackendOptions["sealSqliteAdminProof"];
   readonly #sqliteNamespace: CloudflareManagedSqliteNamespace;
 
   constructor(options: CloudflareWfpBackendOptions) {
@@ -201,6 +204,7 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     }
     this.#pendingReleaseReadbackQualified = qualification !== undefined;
     this.#deriveSqliteInstanceName = options.deriveSqliteInstanceName;
+    this.#sealSqliteAdminProof = options.sealSqliteAdminProof;
     this.#sqliteNamespace = options.sqliteNamespace;
   }
 
@@ -476,7 +480,9 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
       }
       const result = await this.#sqliteNamespace
         .getByName(native.name)
-        .takoserverSqliteReadMigrationLedger(authority);
+        .takoserverSqliteReadMigrationLedger(
+          await this.#sealedSqliteRequest("read-migration-ledger", authority),
+        );
       if (!result.ok) return sqliteProviderFailure(result.error);
       if (!Array.isArray(result.value)) {
         return providerValueFailure("provider_error", "the managed SQLite ledger is malformed");
@@ -525,7 +531,7 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
       const result = await this.#sqliteNamespace
         .getByName(native.name)
         .takoserverSqliteApplyMigrationSuffix({
-          authority,
+          ...(await this.#sealedSqliteRequest("apply-migration-suffix", authority)),
           expectedPrefix: input.expectedPrefix,
           migrations: input.migrations,
         });
@@ -2372,8 +2378,10 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     const authority = sqliteAuthority(this.#providerId, resourceUid, descriptorDigest);
     const stub = this.#sqliteNamespace.getByName(instanceName);
     let inspected: Awaited<ReturnType<typeof stub.takoserverSqliteInspect>>;
+    let sealedInspect: CloudflareManagedSqliteAdminRequest;
     try {
-      inspected = await stub.takoserverSqliteInspect(authority);
+      sealedInspect = await this.#sealedSqliteRequest("inspect", authority);
+      inspected = await stub.takoserverSqliteInspect(sealedInspect);
     } catch {
       return failed("unavailable", "the managed SQLite authority is unavailable", true);
     }
@@ -2396,13 +2404,15 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
         return failed("not_found", "the managed SQLite initialization did not occur");
       }
       try {
-        const initialized = await stub.takoserverSqliteInitialize(authority);
+        const initialized = await stub.takoserverSqliteInitialize(
+          await this.#sealedSqliteRequest("initialize", authority),
+        );
         if (!sqliteInitializationMatches(initialized)) {
           return initialized.ok
             ? failed("provider_error", "the managed SQLite initialization readback is malformed")
             : sqliteTicketFailure(initialized.error);
         }
-        inspected = await stub.takoserverSqliteInspect(authority);
+        inspected = await stub.takoserverSqliteInspect(sealedInspect);
       } catch {
         return failed("unavailable", "the managed SQLite initialization is indeterminate", true);
       }
@@ -2450,7 +2460,7 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     try {
       const inspected = await this.#sqliteNamespace
         .getByName(native.name)
-        .takoserverSqliteInspect(authority);
+        .takoserverSqliteInspect(await this.#sealedSqliteRequest("inspect", authority));
       if (!sqliteInspectionMatches(inspected, authority, "active")) {
         return sqliteInspectionMatches(inspected, authority, "destroyed")
           ? failed("not_found", "the managed SQLite Database is absent")
@@ -2495,7 +2505,7 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     try {
       const destroyed = await this.#sqliteNamespace
         .getByName(native.name)
-        .takoserverSqliteDestroy(authority);
+        .takoserverSqliteDestroy(await this.#sealedSqliteRequest("destroy", authority));
       if (!sqliteDestructionMatches(destroyed)) {
         return destroyed.ok
           ? failed("provider_error", "the managed SQLite destroy readback is malformed")
@@ -2521,6 +2531,18 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     return receipt?.kind === "sqlite" && receipt.state === "committed"
       ? sqliteAuthority(this.#providerId, receipt.resourceUid, receipt.descriptorDigest)
       : null;
+  }
+
+  /**
+   * Seals one admin call. The Durable Object refuses an unsealed one, so a
+   * composition whose sealing authority is unavailable fails before it reaches
+   * the namespace rather than after.
+   */
+  async #sealedSqliteRequest(
+    operation: ManagedWorkerSqliteAdminOperation,
+    authority: ManagedWorkerSqliteAuthority,
+  ): Promise<CloudflareManagedSqliteAdminRequest> {
+    return { authority, proof: await this.#sealSqliteAdminProof({ operation, authority }) };
   }
 
   async #observeReceipt(

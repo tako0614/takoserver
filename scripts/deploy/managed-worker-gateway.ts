@@ -1086,6 +1086,15 @@ function gatewayBindingClosure(
     },
     TAKOSERVER_ENVIRONMENT: { type: "plain_text", fields: { text: input.target.environment } },
   };
+  // The managed SQLite Durable Object refuses every admin operation without
+  // this secret, and an operator provisions it out of band: the deploy neither
+  // mints it nor uploads it, because a value this surface does not hold is not
+  // a value it can prove. It is therefore recognised rather than required —
+  // present, it must be exactly a secret with this name and nothing else, so a
+  // Version carrying an unexpected binding still fails the closure.
+  const optional: Readonly<Record<string, BindingExpectation>> = {
+    TAKOSERVER_MANAGED_SQLITE_ADMIN_SECRET: { type: "secret_text", fields: {} },
+  };
   const bindings = rawBindings.filter(isRecord);
   if (bindings.length !== rawBindings.length) {
     throw phaseError(phase, "gateway Worker Version contains a malformed binding");
@@ -1093,11 +1102,15 @@ function gatewayBindingClosure(
   const seen = new Set<string>();
   for (const binding of bindings) {
     const name = typeof binding.name === "string" ? binding.name : null;
-    if (name === null || seen.has(name) || !Object.hasOwn(expected, name)) {
+    if (
+      name === null ||
+      seen.has(name) ||
+      !(Object.hasOwn(expected, name) || Object.hasOwn(optional, name))
+    ) {
       throw phaseError(phase, "gateway Worker Version binding closure is not exact");
     }
     seen.add(name);
-    const requirement = expected[name];
+    const requirement = expected[name] ?? optional[name];
     if (!requirement) {
       throw phaseError(phase, "gateway Worker Version binding closure is not exact");
     }
@@ -1115,8 +1128,10 @@ function gatewayBindingClosure(
       }
     }
   }
-  if (seen.size !== Object.keys(expected).length) {
-    throw phaseError(phase, "gateway Worker Version binding closure is incomplete");
+  for (const name of Object.keys(expected)) {
+    if (!seen.has(name)) {
+      throw phaseError(phase, "gateway Worker Version binding closure is incomplete");
+    }
   }
   return true;
 }

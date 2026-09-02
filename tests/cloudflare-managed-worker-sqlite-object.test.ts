@@ -19,8 +19,20 @@ const OBJECT_MODULE = resolve(
   import.meta.dir,
   "../src/providers/cloudflare-managed-worker-sqlite-object.ts",
 );
+const SQLITE_MODULE = resolve(
+  import.meta.dir,
+  "../src/providers/cloudflare-managed-worker-sqlite.ts",
+);
+const ADMIN_SECRET = "test-managed-sqlite-admin-secret";
 
 const WORKER_SOURCE = `export { TakoserverManagedWorkerSqlite } from ${JSON.stringify(OBJECT_MODULE)};
+import { managedWorkerSqliteAdminProof } from ${JSON.stringify(SQLITE_MODULE)};
+
+const SECRET = ${JSON.stringify(ADMIN_SECRET)};
+const seal = async (operation, authority) => ({
+  authority,
+  proof: await managedWorkerSqliteAdminProof({ secret: SECRET, operation, authority }),
+});
 
 const AUTHORITY = {
   providerId: "cloudflare",
@@ -44,11 +56,14 @@ export default {
       [...digestBytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 
     const uninitialized = await stub.edgeSqlExecute({ sql: "SELECT 1" });
-    const missing = await stub.takoserverSqliteInspect(AUTHORITY);
-    const initialized = await stub.takoserverSqliteInitialize(AUTHORITY);
-    const squatted = await stub.takoserverSqliteInitialize(OTHER_AUTHORITY);
+    const unsealed = await stub.takoserverSqliteInitialize(AUTHORITY);
+    const missing = await stub.takoserverSqliteInspect(await seal("inspect", AUTHORITY));
+    const initialized = await stub.takoserverSqliteInitialize(await seal("initialize", AUTHORITY));
+    const squatted = await stub.takoserverSqliteInitialize(
+      await seal("initialize", OTHER_AUTHORITY),
+    );
     const migrated = await stub.takoserverSqliteApplyMigrationSuffix({
-      authority: AUTHORITY,
+      ...(await seal("apply-migration-suffix", AUTHORITY)),
       expectedPrefix: [],
       migrations: [{ path: "001-notes.sql", digest, sql: migrationSql }],
     });
@@ -66,14 +81,17 @@ export default {
     const pragmaRefused = await stub.edgeSqlQuery({
       sql: "SELECT name FROM pragma_table_list",
     });
-    const ledger = await stub.takoserverSqliteReadMigrationLedger(AUTHORITY);
-    const inspected = await stub.takoserverSqliteInspect(AUTHORITY);
+    const ledger = await stub.takoserverSqliteReadMigrationLedger(
+      await seal("read-migration-ledger", AUTHORITY),
+    );
+    const inspected = await stub.takoserverSqliteInspect(await seal("inspect", AUTHORITY));
     const httpStatus = (await stub.fetch(new Request("https://do.invalid/admin"))).status;
-    const destroyed = await stub.takoserverSqliteDestroy(AUTHORITY);
+    const destroyed = await stub.takoserverSqliteDestroy(await seal("destroy", AUTHORITY));
     const afterDestroy = await stub.edgeSqlExecute({ sql: "SELECT 1" });
 
     return Response.json({
       uninitialized,
+      unsealed,
       missing,
       initialized,
       squatted,
@@ -130,6 +148,7 @@ test("the managed SQLite Durable Object answers every RPC method on real workerd
             TakoserverManagedWorkerSqlite: { type: "durable-object", storage: "sqlite" },
           },
           env: {
+            TAKOSERVER_MANAGED_SQLITE_ADMIN_SECRET: { type: "text", value: ADMIN_SECRET },
             SQLITE_DATABASES: {
               type: "durable-object",
               workerName: "managed-sqlite-object-test",
@@ -148,6 +167,9 @@ test("the managed SQLite Durable Object answers every RPC method on real workerd
     expect(JSON.parse(text)).toEqual({
       // Runtime SQL before an authority exists is refused, not answered.
       uninitialized: { ok: false, error: { code: "backend_unavailable" } },
+      // The authority tuple alone claims nothing: the admin plane wants the
+      // proof only the gateway's secret binding can produce.
+      unsealed: { ok: false, error: { code: "invalid_argument" } },
       missing: { ok: false, error: { code: "not_found" } },
       initialized: { ok: true, value: { state: "active" } },
       // A second authority on a claimed instance is a conflict, never a

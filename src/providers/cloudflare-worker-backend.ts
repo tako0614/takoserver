@@ -12,6 +12,7 @@ import type {
   ResourceIdentity,
 } from "../provider-port.ts";
 import type {
+  ManagedWorkerSqliteAdminOperation,
   ManagedWorkerSqliteAdminResult,
   ManagedWorkerSqliteAuthority,
   ManagedWorkerSqliteInspectResult,
@@ -74,27 +75,47 @@ export interface CloudflareWorkersForPlatformsBackendOptions {
     readonly resourceUid: string;
     readonly generation: string;
   }) => Promise<string>;
+  /**
+   * Seals one SQLite admin operation on one authority tuple.
+   *
+   * The tuple itself is derivable by the customer whose Resource it describes,
+   * so it authorizes nothing; this proof is what the Durable Object checks
+   * before it claims, migrates, inspects, or destroys. The secret behind it is
+   * the gateway's `TAKOSERVER_MANAGED_SQLITE_ADMIN_SECRET` binding, which a
+   * tenant Worker never holds.
+   */
+  readonly sealSqliteAdminProof: (input: {
+    readonly operation: ManagedWorkerSqliteAdminOperation;
+    readonly authority: ManagedWorkerSqliteAuthority;
+  }) => Promise<string>;
   /** Provider-only capability for the gateway's external SQLite DO class. */
   readonly sqliteNamespace: CloudflareManagedSqliteNamespace;
 }
 
+/** Every admin call carries the authority tuple and the proof that seals it. */
+export interface CloudflareManagedSqliteAdminRequest {
+  readonly authority: ManagedWorkerSqliteAuthority;
+  readonly proof: string;
+}
+
 export interface CloudflareManagedSqliteStub {
   takoserverSqliteInitialize(
-    input: ManagedWorkerSqliteAuthority,
+    input: CloudflareManagedSqliteAdminRequest,
   ): Promise<ManagedWorkerSqliteAdminResult<{ readonly state: "active" }>>;
   takoserverSqliteInspect(
-    input: ManagedWorkerSqliteAuthority,
+    input: CloudflareManagedSqliteAdminRequest,
   ): Promise<ManagedWorkerSqliteAdminResult<ManagedWorkerSqliteInspectResult>>;
   takoserverSqliteReadMigrationLedger(
-    input: ManagedWorkerSqliteAuthority,
+    input: CloudflareManagedSqliteAdminRequest,
   ): Promise<ManagedWorkerSqliteAdminResult<readonly ManagedWorkerSqliteMigrationIdentity[]>>;
-  takoserverSqliteApplyMigrationSuffix(input: {
-    readonly authority: ManagedWorkerSqliteAuthority;
-    readonly expectedPrefix: readonly ManagedWorkerSqliteMigrationIdentity[];
-    readonly migrations: readonly ManagedWorkerSqliteMigration[];
-  }): Promise<ManagedWorkerSqliteAdminResult<undefined>>;
+  takoserverSqliteApplyMigrationSuffix(
+    input: CloudflareManagedSqliteAdminRequest & {
+      readonly expectedPrefix: readonly ManagedWorkerSqliteMigrationIdentity[];
+      readonly migrations: readonly ManagedWorkerSqliteMigration[];
+    },
+  ): Promise<ManagedWorkerSqliteAdminResult<undefined>>;
   takoserverSqliteDestroy(
-    input: ManagedWorkerSqliteAuthority,
+    input: CloudflareManagedSqliteAdminRequest,
   ): Promise<ManagedWorkerSqliteAdminResult<{ readonly destroyed: true }>>;
 }
 
