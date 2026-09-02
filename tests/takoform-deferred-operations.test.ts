@@ -47,6 +47,31 @@ const claimedForm: InstalledTakoformForm = {
   constraints: [{ kind: "claim", property: "/value" }],
 };
 
+/** A Form that publishes an address, so a receipt can be one it cannot carry. */
+const publishingForm: InstalledTakoformForm = {
+  identity: {
+    formRef: {
+      apiVersion: "example.forms.invalid",
+      kind: "DeferredEndpoint",
+      definitionVersion: "0.1.0",
+      schemaDigest: `sha256:${"c".repeat(64)}`,
+    },
+  },
+  desiredSchema: {
+    type: "object",
+    properties: { value: { type: "string" } },
+    required: ["value"],
+    additionalProperties: false,
+  },
+  outputSchema: {
+    type: "object",
+    properties: { url: { type: "string", pattern: "^https://[a-z.-]+/$" } },
+    required: ["url"],
+    additionalProperties: false,
+  },
+  operations: ["create", "read", "update", "delete"],
+};
+
 /** A Form that holds a relation, so a parent can have a blocking dependent. */
 const dependentForm: InstalledTakoformForm = {
   identity: {
@@ -1570,6 +1595,87 @@ describe("durable deferred Takoform operations", () => {
   });
 
   /**
+   * A held repair that can never settle is not a repair.
+   *
+   * The engine holds every receipt to its Form before it materializes a
+   * Resource. When that refuses, the provider has already acted, so the command
+   * is held for repair — and for this one failure the hold is permanent: the
+   * receipt is durable, the Form is frozen, and nothing an operator does makes
+   * the stored answer publishable. The command owns the caller's plan-derived
+   * replay key while it waits, so every later apply resumed it and read back
+   * the same refusal. A real self-host left a Space unable to create its
+   * endpoint on a Host where every other Space succeeded first time.
+   */
+  test("settles a held command whose receipt its Form can never carry, and re-attempts it", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    let published = "https://ported.invalid:28988/";
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      apply: async (input) => ({
+        ...(await memory.apply(input)),
+        outputs: { url: published },
+      }),
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+    };
+    // The production shape: every provider-backed mutation is a durable
+    // command, settled inline.
+    const opened = persistentHarness(undefined, driver, [publishingForm], {
+      shouldDefer: () => true,
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+    }).open();
+    const desired = {
+      apiVersion: publishingForm.identity.formRef.apiVersion,
+      kind: publishingForm.identity.formRef.kind,
+      form: { formRef: publishingForm.identity.formRef },
+      metadata: { name: "unpublishable", space: "main" },
+      spec: { value: "ported" },
+    };
+    const review = await prepareReviewFor(opened.host, desired);
+    const path = `${lane}/resources/example.forms.invalid/DeferredEndpoint/unpublishable`;
+    const apply = () =>
+      opened.host.handle(
+        request(path, "primary", {
+          method: "PUT",
+          headers: { "idempotency-key": "unpublishable-0001", "if-none-match": "*" },
+          body: JSON.stringify({ ...desired, review }),
+        }),
+      );
+
+    const refused = await apply();
+    expect(refused?.status).toBe(422);
+    expect(await refused?.json()).toMatchObject({
+      error: { code: "unsupported_capability", retryable: false },
+    });
+    // Settled, not held: the command has a terminal answer and its executed
+    // saga is gone, so a fresh attempt plans rather than adopting it.
+    expect(
+      opened.database.query("SELECT phase FROM tf_deferred_operations").all() as {
+        phase: string;
+      }[],
+    ).toEqual([{ phase: "failed" }]);
+    expect(
+      opened.database.query("SELECT count(*) AS rows FROM tf_provider_mutation_sagas").get(),
+    ).toEqual({ rows: 0 });
+    // The refusal is about this Host, so the operation ledger keeps the record
+    // a later repair reads.
+    expect(
+      opened.database.query("SELECT state FROM tf_operations").all() as { state: string }[],
+    ).toEqual([{ state: "failed" }]);
+
+    // The identical apply, under the identical plan-derived key, once the Host
+    // publishes an address the Form can carry.
+    published = "https://repaired.invalid/";
+    const created = await apply();
+    expect(created?.status).toBe(201);
+    expect(await created?.json()).toMatchObject({
+      status: { outputs: { url: "https://repaired.invalid/" } },
+    });
+    opened.close();
+  });
+
+  /**
    * A refusal that mutated nothing leaves nothing behind.
    *
    * A create reserves an incarnation before the provider is asked: a deletion
@@ -1634,6 +1740,12 @@ function persistentHarness(
   clock: () => Date = () => new Date(),
   driver: TakoformResourceDriver = new InMemoryTakoformResourceDriver(),
   forms: readonly InstalledTakoformForm[] = [form],
+  /** The production shape defers every provider-backed mutation inline. */
+  deferred: {
+    readonly shouldDefer?: () => boolean;
+    readonly pollsBeforeCommit?: number;
+    readonly executeOnAccept?: boolean;
+  } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), "takoserver-deferred-operation-"));
   roots.push(root);
@@ -1684,6 +1796,7 @@ function persistentHarness(
           pollsBeforeCommit: 2,
           retryAfterSeconds: 0,
           leaseMilliseconds: 1_000,
+          ...deferred,
         },
         clock,
         randomId: () => `harness-${++ids}`,

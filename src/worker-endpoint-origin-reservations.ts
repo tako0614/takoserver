@@ -652,6 +652,19 @@ export function createWorkerEndpointOriginReservations(options: {
       // this Worker an endpoint for good. What that row has to let go of is
       // its endpoint witness, not itself.
       if (reservationId === input.reservationId) continue;
+      // A superseded row may still be `activated`, and release refuses one
+      // outright — which is right while an endpoint is answering on that
+      // address, and wrong when the endpoint it names was never committed. So
+      // the witness is offered the same in-place clear a live mint gets, under
+      // the same four fences; if it takes, the row is `bound` with nothing
+      // retained and the release below is the ordinary one. If it does not, the
+      // release refuses and the mint fails rather than reallocating an origin
+      // something may still be answering on.
+      await clearSettledHostMintWitness({
+        organizationId: input.organizationId,
+        reservationId,
+        strict: false,
+      });
       await releaseReservation(input.organizationId, reservationId);
     }
   };
@@ -784,7 +797,19 @@ export function createWorkerEndpointOriginReservations(options: {
    * identity and on the incarnation's own state — the endpoint UID, its
    * attestation, its deployments, and no provider effect still open on it —
    * never on a revision, which moves under an apply for reasons that have
-   * nothing to do with whether the endpoint is there.
+   * nothing to do with whether the endpoint is there. A refusal now drops that
+   * record outright rather than leaving it `live`, so an endpoint UID with no
+   * attestation at all reads the same way: nothing was ever committed under it.
+   *
+   * **What "still open" means is the ledger's answer, not the effect row's.** An
+   * effect goes `planned`, then `dispatched`, and its terminal event is written
+   * by the commit — so a create refused *after* dispatch left an `apply` effect
+   * with no terminal event, and the clause read that as a create that might
+   * still land. It could not: the Host itself had refused the command and
+   * recorded that refusal in the operation ledger. An effect whose operation is
+   * recorded there as refused is settled, whatever its own last event says. One
+   * whose operation is still running is not touched — that is a create this
+   * mint would be robbing, and it is exactly what this fence is for.
    *
    * An **activated** row is repaired the same way, and it has to be. A refusal
    * raised after the Host had activated the assignment left exactly that shape
@@ -812,6 +837,15 @@ export function createWorkerEndpointOriginReservations(options: {
   const clearSettledHostMintWitness = async (input: {
     readonly organizationId: string;
     readonly reservationId: string;
+    /**
+     * Whether a witness this could not drop is the answer.
+     *
+     * For the reservation a mint is about to prepare it is: the row cannot take
+     * a new endpoint while it holds one, so refusing here is the refusal. For a
+     * superseded row it is not — the release that follows asks the same
+     * question and gives the refusal that names it.
+     */
+    readonly strict?: boolean;
   }): Promise<void> => {
     if (!input.reservationId.startsWith(HOST_MINTED_RESERVATION_PREFIX)) return;
     const row = await readRow(options.sql, input.organizationId, input.reservationId);
@@ -846,6 +880,11 @@ export function createWorkerEndpointOriginReservations(options: {
                  AND endpoint_deletion.resource_uid = worker_endpoint_origin_reservations.endpoint_resource_uid
                  AND endpoint_deletion.state = 'closed'
              )
+             OR NOT EXISTS (
+               SELECT 1 FROM tf_resource_deletion_attestations AS endpoint_record
+               WHERE endpoint_record.tenant_id = worker_endpoint_origin_reservations.organization_id
+                 AND endpoint_record.resource_uid = worker_endpoint_origin_reservations.endpoint_resource_uid
+             )
              OR (
                EXISTS (
                  SELECT 1 FROM tf_resource_deletion_attestations AS endpoint_reservation
@@ -865,6 +904,18 @@ export function createWorkerEndpointOriginReservations(options: {
                        AND terminal_effect.effect_id = open_effect.effect_id
                        AND terminal_effect.phase IN ('succeeded', 'cancelled')
                    )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM tf_deferred_operations AS refused_command
+                     WHERE refused_command.id = open_effect.effect_id
+                       AND refused_command.tenant_id = open_effect.tenant_id
+                       AND refused_command.phase IN ('failed', 'cancelled')
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM tf_operations AS refused_operation
+                     WHERE refused_operation.id = open_effect.effect_id
+                       AND refused_operation.tenant_id = open_effect.tenant_id
+                       AND refused_operation.state = 'failed'
+                   )
                )
              )
            )
@@ -879,7 +930,7 @@ export function createWorkerEndpointOriginReservations(options: {
     } catch {
       throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
     }
-    if (cleared.changes !== 1) {
+    if (cleared.changes !== 1 && input.strict !== false) {
       throw new WorkerEndpointOriginReservationError("conflict", 409);
     }
   };

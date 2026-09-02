@@ -495,6 +495,23 @@ export interface TakoformStore {
     readonly id: string;
     readonly terminalJson: string;
   }): Promise<"cancelled" | "settled" | "too_late" | "not_found">;
+  /**
+   * Ends a held provider repair whose receipt the Form can never carry.
+   *
+   * The ordinary hold is right where a native object exists and the exact Host
+   * command is the only thing that can reconcile it. This one cannot be
+   * reconciled by anything: the receipt is durable and the Form is frozen, so
+   * the command answers the same refusal for ever and owns the caller's replay
+   * key while it does. It is settled as a refusal about this Host — which
+   * ADR 0008 re-attempts — and the executed saga is dropped with it, because a
+   * fresh attempt on the same target would otherwise adopt it and re-project
+   * the same answer.
+   */
+  retireUnpublishableProviderMutation(input: {
+    readonly operation: DeferredOperationRecord;
+    readonly leaseToken: string;
+    readonly terminalJson: string;
+  }): Promise<boolean>;
   settleDeferredFailure(input: {
     readonly operation: DeferredOperationRecord;
     readonly leaseToken: string;
@@ -2077,6 +2094,56 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       const record = await this.readDeferredOperation(input.tenantId, input.principalId, input.id);
       if (!record) return "not_found";
       return terminalPhase(record.phase) ? "settled" : "too_late";
+    },
+
+    async retireUnpublishableProviderMutation(input) {
+      const timestamp = now();
+      const [settled] = await sql.batch([
+        {
+          sql: `UPDATE tf_deferred_operations
+                SET phase = 'failed', terminal_json = ?, lease_token = NULL, lease_until = NULL,
+                    expires_at = ?, updated_at = ?
+                WHERE id = ? AND tenant_id = ? AND principal_id = ?
+                  AND phase = 'committing' AND lease_token = ? AND expires_at > ?`,
+          params: [
+            input.terminalJson,
+            timestamp + OPERATION_TTL_MILLISECONDS,
+            timestamp,
+            input.operation.id,
+            input.operation.tenantId,
+            input.operation.principalId,
+            input.leaseToken,
+            timestamp,
+          ],
+        },
+        {
+          sql: `DELETE FROM tf_provider_mutation_sagas
+                WHERE operation_id = ? AND tenant_id = ? AND resource_uid = ?
+                  AND phase = 'executed'
+                  AND EXISTS (
+                    SELECT 1 FROM tf_deferred_operations
+                    WHERE id = ? AND tenant_id = ? AND phase = 'failed'
+                  )`,
+          params: [
+            input.operation.id,
+            input.operation.tenantId,
+            input.operation.resourceUid,
+            input.operation.id,
+            input.operation.tenantId,
+          ],
+        },
+      ]);
+      if ((settled?.changes ?? 0) !== 1) return false;
+      // The durable record of the refusal. It outlives the command row that
+      // ADR 0008 retires on the next presentation of the same key, and it is
+      // what a reservation repair reads to know this effect settled.
+      await this.putOperation(input.operation.tenantId, {
+        id: input.operation.id,
+        operation: input.operation.operation,
+        state: "failed",
+        createdAt: input.operation.createdAt,
+      });
+      return true;
     },
 
     async settleDeferredFailure(input) {

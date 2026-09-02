@@ -2352,6 +2352,164 @@ test("repairs a reservation left activated for an endpoint that was never commit
   ).toEqual([{ state: "activated", endpoint_resource_uid: "uid-endpoint-01" }]);
 });
 /**
+ * A database that already holds the wedge has to come back on upgrade.
+ *
+ * The fourth self-host run left one exactly like this. A `WorkerEndpoint`
+ * create reached the provider, activated the reservation and opened the
+ * endpoint's deletion attestation, and only then was the Host's own answer
+ * refused against the Form — so the ledger held an `activated` reservation
+ * naming an endpoint UID no `tf_resources` row would ever carry, its
+ * attestation `live`, and its `apply` effect `dispatched` with no terminal
+ * event. The refusal that produced it cannot happen any more, and the space was
+ * still unable to create that endpoint on a Host rebooted into a configuration
+ * where every other space succeeded on the first attempt: the derived id names
+ * the destroyed Worker incarnation, so the next mint asks for a different
+ * reservation, and release refuses an `activated` row outright.
+ *
+ * The incarnation provably produced nothing — no Resource, no live deployment,
+ * and its one effect belongs to a command this Host itself refused and recorded
+ * — and the address is derived, so the mint that takes it back publishes at the
+ * identical origin. There is nothing to rob and nothing to reallocate.
+ */
+test("repairs a reservation activated on an endpoint incarnation that produced nothing", async () => {
+  const { authority, sql } = fixture();
+  await seedWorker(sql);
+  const wedged = await authority.mintForWorker({
+    organizationId: "org_01",
+    space: TARGET.space,
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-01",
+  });
+  if (!wedged) throw new Error("the fixture installation derives its own address");
+  await seedEndpoint(sql, wedged.canonicalPublicOrigin);
+  const assignment = await authority.assignEndpoint({
+    organizationId: "org_01",
+    reservationId: wedged.reservationId,
+    space: TARGET.space,
+    endpointName: TARGET.endpointName,
+    endpointResourceUid: "uid-endpoint-01",
+    endpointResourceRevision: "1",
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-01",
+    providerPackRef: "fake",
+    providerInstallationRef: "fake.primary",
+  });
+  await authority.activateEndpointAssignment({
+    assignment,
+    providerOutputs: {
+      hostname: new URL(wedged.canonicalPublicOrigin).hostname,
+      url: `${wedged.canonicalPublicOrigin}/`,
+    },
+  });
+
+  // The wedge: the create was refused after activation, so no Resource and no
+  // deployment were ever committed, and the `apply` effect stands dispatched
+  // under a command that has not settled.
+  await sql.run("DELETE FROM tf_resources WHERE tenant_id = 'org_01' AND uid = 'uid-endpoint-01'");
+  await sql.run(
+    "UPDATE tf_resource_deployments SET state = 'deleted' WHERE tenant_id = 'org_01' AND resource_uid = 'uid-endpoint-01'",
+  );
+  await sql.run(
+    "DELETE FROM tf_resource_deployments WHERE tenant_id = 'org_01' AND resource_uid = 'uid-endpoint-01'",
+  );
+  for (const phase of ["planned", "dispatched"]) {
+    await sql.run(
+      `INSERT INTO tf_resource_provider_effects
+         (tenant_id, resource_uid, event_id, effect_id, effect_kind, phase,
+          operation_mode, provider_pack_ref, provider_installation_ref,
+          native_id, target_json, created_at)
+       VALUES ('org_01', 'uid-endpoint-01', ?, 'op_wedged', 'apply', ?, 'initial',
+               NULL, NULL, NULL, NULL, ?)`,
+      [`op_wedged:${phase}`, phase, Date.parse("2026-08-31T12:00:00.000Z")],
+    );
+  }
+  // The Worker was destroyed and re-created, so the next mint derives a
+  // different reservation id for the same address.
+  await sql.run("DELETE FROM tf_resources WHERE tenant_id = 'org_01' AND uid = 'uid-worker-01'");
+  await sql.run(
+    "UPDATE tf_resource_deployments SET state = 'deleted' WHERE tenant_id = 'org_01' AND resource_uid = 'uid-worker-01'",
+  );
+  await seedWorker(sql, {
+    organizationId: "org_01",
+    space: TARGET.space,
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-02",
+  });
+  const target = {
+    organizationId: "org_01",
+    space: TARGET.space,
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-02",
+  } as const;
+
+  // While that command could still land, the address is not free. This is the
+  // fence, and it is the same one that protects a genuinely in-flight create.
+  await expect(authority.mintForWorker(target)).rejects.toMatchObject({
+    code: "conflict",
+    status: 409,
+  });
+  expect(
+    await sql.query(
+      "SELECT state FROM worker_endpoint_origin_reservations WHERE reservation_id = ?",
+      [wedged.reservationId],
+    ),
+  ).toEqual([{ state: "activated" }]);
+
+  // The Host refused that command and said so in its own operation ledger.
+  await sql.run(
+    `INSERT INTO tf_operations (id, tenant_id, operation, state, resource_json, created_at, expires_at)
+     VALUES ('op_wedged', 'org_01', 'apply', 'failed', NULL, '2026-08-31T12:00:00.000Z', ?)`,
+    [Date.parse("2026-09-30T12:00:00.000Z")],
+  );
+
+  const repaired = await authority.mintForWorker(target);
+  expect(repaired).toMatchObject({
+    canonicalPublicOrigin: wedged.canonicalPublicOrigin,
+    status: "bound",
+    binding: { workerResourceUid: "uid-worker-02" },
+  });
+  expect(repaired?.reservationId).not.toBe(wedged.reservationId);
+  expect(
+    await sql.query(
+      `SELECT reservation_id, state, endpoint_resource_uid
+       FROM worker_endpoint_origin_reservations ORDER BY created_at`,
+    ),
+  ).toEqual([
+    { reservation_id: wedged.reservationId, state: "released", endpoint_resource_uid: null },
+    {
+      reservation_id: repaired?.reservationId ?? "",
+      state: "bound",
+      endpoint_resource_uid: null,
+    },
+  ]);
+
+  // And the repaired reservation is a reservation: the endpoint can be made,
+  // at the same derived address.
+  await seedEndpoint(sql, repaired?.canonicalPublicOrigin ?? "", ENDPOINT_FORM, {
+    organizationId: "org_01",
+    space: TARGET.space,
+    endpointName: TARGET.endpointName,
+    endpointResourceUid: "uid-endpoint-02",
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-02",
+  });
+  expect(
+    await authority.assignEndpoint({
+      organizationId: "org_01",
+      reservationId: repaired?.reservationId ?? "",
+      space: TARGET.space,
+      endpointName: TARGET.endpointName,
+      endpointResourceUid: "uid-endpoint-02",
+      endpointResourceRevision: "1",
+      workerName: TARGET.workerName,
+      workerResourceUid: "uid-worker-02",
+      providerPackRef: "fake",
+      providerInstallationRef: "fake.primary",
+    }),
+  ).toMatchObject({ canonicalPublicOrigin: wedged.canonicalPublicOrigin });
+});
+
+/**
  * The sweep that takes the row is the mint's own, so the revival has to run
  * after it.
  *

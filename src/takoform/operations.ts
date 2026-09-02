@@ -4,6 +4,7 @@ import type { Clock, JsonObject } from "../ports.ts";
 import type { EngineContext, EngineMutationCommit, TakoformEngine } from "./engine.ts";
 import { exactInstalledForm, type FormRegistry, sameFormRef } from "./forms.ts";
 import type { TakoformHostAuthority } from "./host-authority.ts";
+import { receiptProjectable } from "./receipt-projection.ts";
 import type { DeferredOperationRecord, ResourceAddress, TakoformStore } from "./store.ts";
 import {
   TakoformHostError,
@@ -427,6 +428,39 @@ export function createDeferredOperations(input: {
             operation.id,
             operation.resourceUid,
           );
+      if (providerReceipt && !carriableReceipt(operation, providerReceipt, input.forms)) {
+        // A hold that can never settle is not a hold. The receipt is durable
+        // and the Form is frozen, so no repair makes this answer publishable;
+        // holding it pinned one Host misconfiguration to a resource name for
+        // the life of the deployment. It is a refusal about this Host, and
+        // ADR 0008 re-attempts those, so the operator who reconfigures the Host
+        // and re-runs the identical apply gets a fresh attempt. The saga goes
+        // with it: adopting it again would re-project the same answer.
+        console.error(
+          canonicalJson({
+            event: "takoform.deferred_operation.unpublishable_receipt",
+            operationId: operation.id,
+            operation: operation.operation,
+            kind: operation.target.kind,
+          }),
+        );
+        const refusal = new TakoformHostError(
+          "unsupported_capability",
+          422,
+          undefined,
+          `the provider's answer for this ${operation.target.kind} is not one ${operation.target.kind}@${operation.target.formRef.definitionVersion} can publish, so this Host cannot record it; repair the Host's configuration and apply again`,
+        );
+        await input.store.retireUnpublishableProviderMutation({
+          operation,
+          leaseToken,
+          terminalJson: failureTerminal(
+            operation.id,
+            refusal.code,
+            refusal.publicMessage ?? diagnosticMessage(refusal.code),
+          ),
+        });
+        return { kind: "settled" };
+      }
       if (providerReceipt || providerPlan) {
         console.error(
           canonicalJson({
@@ -473,6 +507,37 @@ export function createDeferredOperations(input: {
     }
     return { kind: "settled" };
   }
+}
+
+/**
+ * Whether a held provider receipt is one the Form can still carry.
+ *
+ * The engine holds every receipt to its Form before it materializes a Resource:
+ * a driver may only report what its Form declares. When that check refuses, the
+ * mutation has already happened, so the command is held for provider repair —
+ * and for this one failure the hold is permanent. The receipt is durable, the
+ * Form is frozen, and nothing an operator does makes the stored answer
+ * publishable, so every later apply of the same plan-derived key resumed the
+ * same command and read back the same refusal. A real self-host recorded it: a
+ * Worker endpoint created under a Host configured to publish a ported address,
+ * refused by `WorkerEndpoint@0.1.0`, and that Space could not create the
+ * endpoint again on a Host where every other Space succeeded first time.
+ *
+ * A Form this Host cannot resolve is not an answer: the hold stands, which is
+ * the behaviour that was there before.
+ */
+function carriableReceipt(
+  operation: DeferredOperationRecord,
+  receipt: { readonly observed?: JsonObject; readonly outputs?: JsonObject },
+  forms: FormRegistry,
+): boolean {
+  // Only a mutation that materializes a Resource has its receipt held to the
+  // Form. A delete's receipt is provider evidence of a removal and is never
+  // projected onto anything, so asking this of one would call every delete
+  // unpublishable and abandon a real provider repair.
+  if (operation.operation === "delete") return true;
+  const form = exactInstalledForm(operation.target.formRef, forms);
+  return !form || receiptProjectable(form, receipt);
 }
 
 /** First fence is before provider work; the store repeats it in the commit batch. */
