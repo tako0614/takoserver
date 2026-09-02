@@ -79,3 +79,38 @@ answer where the first is not configured.
   one it is given and says what it is serving.
 - No SNI or per-hostname keypair selection. workerd's schema allows for one
   today, and a self-host serves one suffix.
+
+## Amendment — 2026-09-02: the ledger that owns the address has to know both facts
+
+The decision above changed the provider that *derives* a Worker endpoint
+address and nothing that *accepts* one. `canonicalOrigin`,
+`providerOutputOrigin` and `endpointOriginEquals` in
+`src/worker-endpoint-origin-reservations.ts` each still required `https:`
+independently, so a certificate-less self-host derived the `http://` address
+its socket serves and its own reservation authority refused it: the mint
+answered `unsupported_capability` 422 before anything was reserved, and the
+default quickstart could create no `WorkerEndpoint` at all. The boot warning
+said federated identity would not work there; the truth was that no request
+ever reached the Worker to fail.
+
+The scheme is therefore stated by the installation and held to by the ledger.
+`ProviderWorkerEndpointOriginReservationCapability` gains
+`publishedScheme`; absent means `https`, so the managed and ordinary-workers
+lanes are unchanged and an installation that has not said it serves plain HTTP
+cannot hand this Host an `http` address. Downstream, both the provider's `url`
+output and an endpoint's drift check compare against the origin the reservation
+already holds, so they read either web scheme and let that exact comparison be
+the fence — pinning `https` there would only have moved the refusal one step
+later.
+
+**The port is the same fact, one dimension over.** `canonicalWorkerEndpointOrigin`
+refused any port and the socket's port was never part of the address, so a
+self-host on `28988` published a portless origin while every request that
+reached the Worker carried `:28988`: the identity the Worker pinned and the
+identity its Host advertised disagreed, exactly as the scheme once did. The
+published address now carries the port, and `URL` normalizes the scheme's own
+default away — so a deployment behind an ordinary 443 front end publishes what
+it always published. The Bun entry takes the port from the workerd socket and
+lets an operator who terminates elsewhere say so with
+`TAKOSERVER_WORKER_ENDPOINT_PORT`. The router still matches on the name alone,
+because a `Host` header's port is not part of the route.

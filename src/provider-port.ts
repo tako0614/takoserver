@@ -108,6 +108,19 @@ export interface ResourceIdentity {
  * resources do not exist yet and a caller must never invent their names.
  */
 export interface ProviderWorkerEndpointOriginReservationCapability {
+  /**
+   * The scheme every address this installation derives is published under.
+   *
+   * The reservation ledger has to know it, because it is the authority that
+   * accepts or refuses a derived origin and "an origin" is not a shape with one
+   * scheme in it. A managed backend and a TLS-terminating self-host serve
+   * `https` and say so by leaving this absent; a self-host whose operator
+   * configured no certificate serves plain HTTP and says `http`
+   * ([ADR 0009](../docs/adr/0009-a-self-host-publishes-the-scheme-its-socket-serves.md)).
+   * Nothing else may relax the rule: an installation that does not declare
+   * `http` cannot hand this Host an `http` address.
+   */
+  readonly publishedScheme?: "https" | "http";
   derive(input: {
     readonly tenantRef: string;
     readonly requestedSubdomain: string;
