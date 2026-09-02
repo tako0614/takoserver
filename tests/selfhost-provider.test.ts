@@ -6,7 +6,10 @@ import { join } from "node:path";
 import { createEphemeralSql } from "../src/compat.ts";
 import type { ProviderOffering, ProviderRelation } from "../src/provider-port.ts";
 import type { ProviderRuntimeInputLeasePort } from "../src/provider-runtime-input-port.ts";
-import { createSelfhostProvider } from "../src/providers/selfhost.ts";
+import {
+  createSelfhostDataPlaneAccess,
+  createSelfhostProvider,
+} from "../src/providers/selfhost.ts";
 import { createRuntimeInputAuthority } from "../src/runtime-input-preparations.ts";
 import {
   createWorkerdRuntime,
@@ -74,6 +77,41 @@ function relation(
   };
 }
 
+/**
+ * A relation whose Resource this provider has already deployed.
+ *
+ * A data binding resolves through the deployment rather than the declaration —
+ * the native id and the published outputs are what say which namespace or
+ * database `env.KV` and `env.DB` actually address — so a test that omitted it
+ * would be testing a different question.
+ */
+function deployedRelation(
+  pointer: string,
+  kind: string,
+  name: string,
+  nativeId: string,
+  outputs: Record<string, unknown>,
+): ProviderRelation {
+  const base = relation(pointer, kind, name);
+  return {
+    ...base,
+    deployment: {
+      tenantId: "org_demo",
+      id: `dep-${name}`,
+      resourceUid: base.targetUid,
+      offeringId: `selfhost.edge.${kind.toLowerCase()}`,
+      providerPackRef: "local.pack",
+      providerInstallationRef: "local.primary",
+      nativeId,
+      state: "active",
+      observed: {},
+      outputs: outputs as never,
+      createdAt: "2026-09-02T00:00:00.000Z",
+      updatedAt: "2026-09-02T00:00:00.000Z",
+    },
+  };
+}
+
 const identity = (name: string) => ({ tenantRef: "org_demo", space: "default", name });
 
 /** The one materialized version directory under a script, whichever id it got. */
@@ -101,6 +139,7 @@ afterEach(() => {
 
 interface ProviderCase {
   readonly modules?: Record<string, string>;
+  readonly dataPlaneAddress?: string;
   readonly suffixes?: readonly string[];
   readonly runtime?: WorkerdRuntime;
   readonly missingBlobs?: boolean;
@@ -262,6 +301,7 @@ function provider(options: ProviderCase = {}) {
     runtime: options.runtime ?? createWorkerdRuntime({ root, isReady: () => true }),
     ...(options.suffixes ? { suffixes: options.suffixes } : {}),
     ...(options.runtimeInputs ? { runtimeInputs: options.runtimeInputs } : {}),
+    ...(options.dataPlaneAddress ? { dataPlaneAddress: options.dataPlaneAddress } : {}),
     artifacts: {
       async manifest(_tenant, digest) {
         if (digest === "sha256:worker") {
@@ -292,11 +332,46 @@ function provider(options: ProviderCase = {}) {
   });
 }
 
+const KV_NAMESPACE = "tskv-cache-fixture";
+const SQLITE_DATABASE = "tsdb-app-fixture";
+
+/** The two relations a KV+SQL Worker Version binds, as this Host deployed them. */
+function dataRelations(dataRoot: string): readonly ProviderRelation[] {
+  return [
+    deployedRelation(
+      "/kvBindings/0/resource",
+      "EdgeKVNamespace",
+      "cache",
+      `selfhost-kv:${KV_NAMESPACE}:op_kv`,
+      {
+        namespaceId: KV_NAMESPACE,
+      },
+    ),
+    deployedRelation(
+      "/sqliteBindings/0/resource",
+      "SQLiteDatabase",
+      "app",
+      `selfhost-sqlite:${SQLITE_DATABASE}:op_db`,
+      { engine: "sqlite", path: join(dataRoot, "databases", `${SQLITE_DATABASE}.sqlite`) },
+    ),
+  ];
+}
+
+const DATA_BINDING_SPEC = {
+  kvBindings: [
+    { name: "KV", resource: { apiVersion: EDGE_API, kind: "EdgeKVNamespace", name: "cache" } },
+  ],
+  sqliteBindings: [
+    { name: "DB", resource: { apiVersion: EDGE_API, kind: "SQLiteDatabase", name: "app" } },
+  ],
+};
+
 /** Drives the worker → version → deployment chain one apply at a time. */
 async function publish(
   local: ReturnType<typeof provider>,
   assets = false,
   vars?: Record<string, string | number>,
+  dataBindings = false,
 ) {
   const worker = await local.apply({
     operationId: "op_worker",
@@ -316,6 +391,7 @@ async function publish(
       handlers: ["fetch"],
       worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
       ...(vars ? { vars } : {}),
+      ...(dataBindings ? DATA_BINDING_SPEC : {}),
       ...(assets
         ? {
             assets: {
@@ -336,6 +412,7 @@ async function publish(
             }),
           ]
         : []),
+      ...(dataBindings ? dataRelations(root) : []),
     ],
   });
   expect(version.phase).toBe("succeeded");
@@ -1194,6 +1271,294 @@ describe("publishing a Worker through the Edge Family", () => {
     });
     // Recovery is a readback-only seam: no second remove/reload is allowed.
     expect(reloads).toBe(afterDeleteReloads);
+  });
+});
+
+describe("KV and SQLite bindings", () => {
+  const address = "127.0.0.1:8787";
+
+  test("a version binding both is published through a generated entrypoint", async () => {
+    const local = provider({ dataPlaneAddress: address });
+    const script = await publish(local, false, { LANE: "takoform-v1" }, true);
+
+    const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+    // The tenant module is still declared, because the generated one imports
+    // it; workerd resolves imports through the module registry this builds.
+    expect(config).toContain(
+      `modules = [ (name = "__takoserver-selfhost-entrypoint.js", esModule = embed "${script}/__takoserver-selfhost-entrypoint.js"), (name = "index.js", esModule = embed "${script}/index.js") ]`,
+    );
+    expect(config).toContain(
+      `(name = "__TAKOSERVER_SELFHOST_DATA", service = "${script}-selfhost-data")`,
+    );
+    expect(config).toContain(`( name = "${script}-selfhost-data",
+    external = ( address = "${address}", http = () )
+  ),`);
+    expect(config).toContain('(name = "LANE", text = "takoform-v1")');
+
+    const generated = await readFile(
+      join(root, "workers", script, "__takoserver-selfhost-entrypoint.js"),
+      "utf8",
+    );
+    expect(generated).toContain('import("./index.js")');
+    expect(generated).toContain('"kind":"edge.kv@1.0.0","publicName":"KV"');
+    expect(generated).toContain('"kind":"edge.sql@1.0.0","publicName":"DB"');
+  });
+
+  test("the token names the version, is projected once, and stays out of the tenant's env", async () => {
+    const local = provider({ dataPlaneAddress: address });
+    const script = await publish(local, false, undefined, true);
+    const versionId = versionDirectoryName(root, script);
+
+    const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+    const token = config.match(
+      /\(name = "__TAKOSERVER_SELFHOST_DATA_TOKEN", text = "([^"]+)"\)/u,
+    )?.[1];
+    expect(token).toBeDefined();
+    expect(token).toStartWith(`${script}.${versionId}.`);
+
+    // The generated module reads it from the raw environment and never lists it
+    // among the bindings it projects.
+    const generated = await readFile(
+      join(root, "workers", script, "__takoserver-selfhost-entrypoint.js"),
+      "utf8",
+    );
+    expect(generated).not.toContain(token as string);
+    expect(generated).not.toContain('"name":"__TAKOSERVER_SELFHOST_DATA_TOKEN"');
+  });
+
+  test("the plane secret never reaches an observation, an output, or a native id", async () => {
+    const local = provider({ dataPlaneAddress: address });
+    const script = await publish(local, false, undefined, true);
+    const versionId = versionDirectoryName(root, script);
+    const stored = JSON.parse(
+      await readFile(
+        join(root, "selfhost", "version-bindings", script, `${versionId}.json`),
+        "utf8",
+      ),
+    ) as { planeToken: string };
+    expect(typeof stored.planeToken).toBe("string");
+
+    const observed = await local.observe({
+      offering: offering("WorkerVersion"),
+      identity: identity("hello-v1"),
+      nativeId: `selfhost-version:${script}:${versionId}`,
+      spec: { ...DATA_BINDING_SPEC },
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+    });
+    expect(JSON.stringify(observed)).not.toContain(stored.planeToken);
+  });
+
+  test("the generated entrypoint stays outside the immutable version directory", async () => {
+    const local = provider({ dataPlaneAddress: address });
+    const script = await publish(local, false, undefined, true);
+    const versionId = versionDirectoryName(root, script);
+    const versionDirectory = join(root, "selfhost", "versions", script, versionId);
+
+    expect(
+      existsSync(join(versionDirectory, "modules", "__takoserver-selfhost-entrypoint.js")),
+    ).toBe(false);
+    const meta = await readFile(join(versionDirectory, "meta.json"), "utf8");
+    expect(meta).toContain('"mainModule":"index.js"');
+    expect(meta).not.toContain("selfhost-entrypoint");
+    expect(meta).not.toContain("kvBindings");
+
+    // The materialization is still the bytes the tenant committed, so the
+    // recovery seam that recomputes the digest still agrees with it.
+    const recovered = await local.recoverApply?.({
+      operationId: "op_version",
+      offering: offering("WorkerVersion"),
+      identity: identity("hello-v1"),
+      spec: {
+        bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+        handlers: ["fetch"],
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+        ...DATA_BINDING_SPEC,
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", "hello"),
+        relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+        ...dataRelations(root),
+      ],
+    });
+    expect(recovered).toMatchObject({
+      phase: "succeeded",
+      result: { observed: { dataBindingNames: ["KV", "DB"] } },
+    });
+  });
+
+  test("a version that binds neither publishes exactly the bytes it always did", async () => {
+    const withPlane = provider({ dataPlaneAddress: address });
+    const script = await publish(withPlane);
+    const configured = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+
+    rmSync(root, { recursive: true, force: true });
+    root = mkdtempSync(join(tmpdir(), "takoserver-selfhost-"));
+    const withoutPlane = provider();
+    expect(await publish(withoutPlane)).toBe(script);
+    const plain = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+
+    expect(configured.replaceAll(script, "<script>")).toBe(plain.replaceAll(script, "<script>"));
+    expect(plain).not.toContain("selfhost-entrypoint");
+    expect(plain).not.toContain("selfhost-data");
+  });
+
+  test("a deployment with no data plane refuses the declaration rather than half-serving it", async () => {
+    const local = provider();
+    const worker = await local.apply({
+      operationId: "op_worker",
+      offering: offering("ModuleWorker"),
+      identity: identity("hello"),
+      spec: {},
+    });
+    expect(worker.phase).toBe("succeeded");
+    const version = await local.apply({
+      operationId: "op_version",
+      offering: offering("WorkerVersion"),
+      identity: identity("hello-v1"),
+      spec: {
+        bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+        handlers: ["fetch"],
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+        ...DATA_BINDING_SPEC,
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", "hello"),
+        relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+        ...dataRelations(root),
+      ],
+    });
+    expect(version).toMatchObject({
+      phase: "failed",
+      failure: { code: "denied" },
+    });
+    // Nothing was materialized: a refusal must leave no version behind.
+    expect(existsSync(join(root, "selfhost", "versions"))).toBe(false);
+  });
+
+  test("a target this Host did not deploy is refused rather than guessed at", async () => {
+    for (const [label, relations] of [
+      [
+        "a namespace another provider deployed",
+        [
+          deployedRelation(
+            "/kvBindings/0/resource",
+            "EdgeKVNamespace",
+            "cache",
+            "cloudflare-kv:abc123:op",
+            { namespaceId: "abc123" },
+          ),
+        ],
+      ],
+      [
+        "an output that disagrees with the native id",
+        [
+          deployedRelation(
+            "/kvBindings/0/resource",
+            "EdgeKVNamespace",
+            "cache",
+            `selfhost-kv:${KV_NAMESPACE}:op_kv`,
+            { namespaceId: "some-other-namespace" },
+          ),
+        ],
+      ],
+      ["a declaration with no relation at all", []],
+    ] as const) {
+      rmSync(root, { recursive: true, force: true });
+      root = mkdtempSync(join(tmpdir(), "takoserver-selfhost-"));
+      const local = provider({ dataPlaneAddress: address });
+      const version = await local.apply({
+        operationId: "op_version",
+        offering: offering("WorkerVersion"),
+        identity: identity("hello-v1"),
+        spec: {
+          bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+          handlers: ["fetch"],
+          worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+          kvBindings: DATA_BINDING_SPEC.kvBindings,
+        },
+        relations: [
+          relation("/worker", "ModuleWorker", "hello"),
+          relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+          ...relations,
+        ],
+      });
+      expect({ label, ticket: version }).toMatchObject({
+        label,
+        ticket: { phase: "failed", failure: { code: "invalid_spec" } },
+      });
+    }
+  });
+
+  test("a binding name colliding with a var is refused", async () => {
+    const local = provider({ dataPlaneAddress: address });
+    const version = await local.apply({
+      operationId: "op_version",
+      offering: offering("WorkerVersion"),
+      identity: identity("hello-v1"),
+      spec: {
+        bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+        handlers: ["fetch"],
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+        vars: { KV: "not a namespace" },
+        kvBindings: DATA_BINDING_SPEC.kvBindings,
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", "hello"),
+        relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+        ...dataRelations(root),
+      ],
+    });
+    expect(version).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
+  });
+
+  test("republishing after an endpoint attachment keeps the entrypoint and the token", async () => {
+    const local = provider({ dataPlaneAddress: address });
+    const script = await publish(local, false, undefined, true);
+    const before = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+
+    const endpoint = await local.apply({
+      operationId: "op_endpoint",
+      offering: offering("WorkerEndpoint"),
+      identity: identity("hello-endpoint"),
+      spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" } },
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+      workerEndpointOriginAssignment: endpointAssignment(),
+    });
+    expect(endpoint.phase).toBe("succeeded");
+
+    const after = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+    const token = (input: string) =>
+      input.match(/\(name = "__TAKOSERVER_SELFHOST_DATA_TOKEN", text = "([^"]+)"\)/u)?.[1];
+    // A Worker Version is immutable, so a republish must not mint a second
+    // token: the script serving traffic would be authenticating with one this
+    // Host no longer holds.
+    expect(token(after)).toBe(token(before));
+    expect(after).toContain(
+      `(name = "__TAKOSERVER_SELFHOST_DATA", service = "${script}-selfhost-data")`,
+    );
+    expect(after).toContain("reserved.localhost");
+  });
+
+  test("deleting the version revokes the plane grant with it", async () => {
+    const local = provider({ dataPlaneAddress: address });
+    const script = await publish(local, false, undefined, true);
+    const versionId = versionDirectoryName(root, script);
+    const access = createSelfhostDataPlaneAccess(root);
+    expect(await access.grant(script, versionId)).toMatchObject({
+      kv: { KV: KV_NAMESPACE },
+      sql: { DB: SQLITE_DATABASE },
+    });
+
+    const deleted = await local.delete({
+      operationId: "op_delete",
+      offering: offering("WorkerVersion"),
+      identity: identity("hello-v1"),
+      nativeId: `selfhost-version:${script}:${versionId}`,
+      spec: {},
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+    });
+    expect(deleted.phase).toBe("succeeded");
+    expect(await access.grant(script, versionId)).toBeNull();
   });
 });
 

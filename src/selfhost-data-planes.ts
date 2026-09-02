@@ -1,4 +1,6 @@
 import { Database } from "bun:sqlite";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import type { JsonValue, Row, Sql, SqlParam } from "./ports.ts";
 import {
   SELFHOST_DATA_PLANE_KV_PATH,
@@ -108,9 +110,14 @@ export function createSelfhostDataPlanes(
   const database = (name: string): Database => {
     const existing = databases.get(name);
     if (existing) return existing;
+    const path = options.databasePath(name);
     let opened: Database;
     try {
-      opened = new Database(options.databasePath(name), { create: true });
+      // Nothing creates the database root eagerly — a SQLite database on this
+      // Host appears when something writes to it, and this is the something.
+      // `0700` because the file underneath is a tenant's whole dataset.
+      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+      opened = new Database(path, { create: true });
       opened.exec("PRAGMA foreign_keys = ON");
     } catch {
       throw new PlaneError("backend_unavailable");
