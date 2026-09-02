@@ -76,6 +76,20 @@ import {
 } from "./managed-worker-state.ts";
 
 const WORKER_COMPATIBILITY_DATE = "2026-08-19";
+/**
+ * Compatibility flags every managed tenant user Worker is uploaded with.
+ *
+ * A binding belongs to the script it is declared on, and the runtime hands
+ * every one of them to every module that script runs — including through
+ * `import { env } from "cloudflare:workers"`. So the wrapper's projected `env`
+ * never hid the raw `__TAKOSERVER_SQLITE_<i>` Durable Object namespace or the
+ * `__TAKOSERVER_OBJECTS_<i>` R2 handle: it only declined to hand them over.
+ * `disallow_importable_env` makes the importable environment empty while the
+ * handler's own `env` argument keeps its bindings, which is what actually
+ * closes that door. The self-host backend sets the same flag for the same
+ * reason; see `src/workerd-runtime.ts`.
+ */
+const MANAGED_WORKER_COMPATIBILITY_FLAGS = ["disallow_importable_env"] as const;
 const MANAGED_SQLITE_CLASS = "TakoserverManagedWorkerSqlite";
 const MAX_MODULES = 512;
 const MAX_MODULE_BYTES = 32 * 1024 * 1024;
@@ -1065,6 +1079,7 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     const settingsIdentity = {
       main_module: wrapperModule,
       compatibility_date: this.#compatibilityDate,
+      compatibility_flags: [...MANAGED_WORKER_COMPATIBILITY_FLAGS],
       bindings: canonicalBindingSettings(bindings.metadata),
     };
     const moduleIdentity = await Promise.all(
@@ -3395,6 +3410,7 @@ function releaseSettingsMatch(
   const normalized = {
     main_module: actual.main_module,
     compatibility_date: actual.compatibility_date,
+    compatibility_flags: actual.compatibility_flags,
     bindings: canonicalBindingSettings(
       actualBindings as readonly Readonly<Record<string, unknown>>[],
     ),
@@ -3402,7 +3418,11 @@ function releaseSettingsMatch(
   return (
     canonicalJson(normalized) === canonicalJson(expected) &&
     Object.keys(actual).every(
-      (key) => key === "main_module" || key === "compatibility_date" || key === "bindings",
+      (key) =>
+        key === "main_module" ||
+        key === "compatibility_date" ||
+        key === "compatibility_flags" ||
+        key === "bindings",
     )
   );
 }

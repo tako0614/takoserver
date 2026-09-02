@@ -432,6 +432,38 @@ test("managed Worker Versions use immutable dispatch scripts and exact readback 
   ]);
   expect(calls.every(({ path }) => !path.includes("/workers/scripts/"))).toBe(true);
   expect(JSON.stringify(ticket)).not.toContain("workers.dev");
+  // ADR 0007's managed-lane amendment: the tenant user Worker is uploaded with
+  // `disallow_importable_env`, and the readback refuses a release whose
+  // settings do not carry it, so the raw internal bindings the wrapper holds
+  // cannot be read back out of `cloudflare:workers`.
+  expect(settings?.compatibility_flags).toEqual(["disallow_importable_env"]);
+});
+
+test("a managed release readback without the import fence is refused", async () => {
+  const api = new ManagedReleaseApi();
+  const provider = releaseProvider(api, createEphemeralSql());
+  const input = managedVersionInput("version_no_fence", "release-no-fence", "tsw-no-fence");
+  expect(await provider.apply(input)).toMatchObject({ phase: "succeeded" });
+
+  const held = [...api.scripts.entries()][0];
+  if (!held) throw new Error("managed release was not uploaded");
+  const [scriptName, release] = held;
+  const observeInput = {
+    offering: versionOffering,
+    identity: input.identity,
+    spec: input.spec,
+    nativeId: `version:tsw-no-fence:${scriptName}`,
+    ...(input.relations === undefined ? {} : { relations: input.relations }),
+  };
+  expect(release.settings.compatibility_flags).toEqual(["disallow_importable_env"]);
+  expect(await provider.observe(observeInput)).toMatchObject({ phase: "succeeded" });
+
+  const { compatibility_flags: _dropped, ...withoutFence } = release.settings;
+  api.scripts.set(scriptName, { ...release, settings: withoutFence });
+  expect(await provider.observe(observeInput)).toMatchObject({
+    phase: "failed",
+    failure: { code: "provider_error" },
+  });
 });
 
 test("managed Worker Versions bind SQLite through the gateway's exact exported DO class", async () => {
@@ -1880,6 +1912,7 @@ class ManagedReleaseApi {
         settings: {
           main_module: metadata.main_module,
           compatibility_date: metadata.compatibility_date,
+          compatibility_flags: metadata.compatibility_flags,
           bindings,
         },
       });
