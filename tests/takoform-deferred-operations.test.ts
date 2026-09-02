@@ -1181,7 +1181,8 @@ describe("durable deferred Takoform operations", () => {
         },
       ),
     );
-    const operationId = ((await accepted?.json()) as { operation: { id: string } }).operation.id;
+    if (!accepted) throw new Error("delete returned no response");
+    const operationId = ((await accepted.json()) as { operation: { id: string } }).operation.id;
     await opened.host.handle(request(`${lane}/operations/${operationId}`, "primary"));
     await opened.host.handle(request(`${lane}/operations/${operationId}`, "primary"));
     const settling = opened.host.handle(request(`${lane}/operations/${operationId}`, "primary"));
@@ -1279,7 +1280,8 @@ describe("durable deferred Takoform operations", () => {
     // dependent, so it settles as a refusal.
     const accepted = await deleteParent();
     expect(accepted?.status).toBe(202);
-    const operationId = ((await accepted?.json()) as { operation: { id: string } }).operation.id;
+    if (!accepted) throw new Error("delete returned no response");
+    const operationId = ((await accepted.json()) as { operation: { id: string } }).operation.id;
     let settled: Record<string, unknown> | undefined;
     for (let poll = 0; poll < 8 && !settled?.done; poll += 1) {
       const response = await opened.host.handle(
@@ -1314,7 +1316,8 @@ describe("durable deferred Takoform operations", () => {
     // as the answer to a question whose facts have changed.
     const retried = await deleteParent();
     expect(retried?.status).toBe(202);
-    const retriedId = ((await retried?.json()) as { operation: { id: string } }).operation.id;
+    if (!retried) throw new Error("delete retry returned no response");
+    const retriedId = ((await retried.json()) as { operation: { id: string } }).operation.id;
     let deleted: Record<string, unknown> | undefined;
     for (let poll = 0; poll < 8 && !deleted?.done; poll += 1) {
       const response = await opened.host.handle(
