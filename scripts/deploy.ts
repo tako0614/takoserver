@@ -1,4 +1,5 @@
 import { isAbsolute } from "node:path";
+import { API_KEY_SCOPES, type ApiKeyScope } from "../src/auth.ts";
 import { runConsole } from "./deploy/console.ts";
 import { DEPLOY_CONTRACT } from "./deploy/contract.ts";
 import { DeployError, deployFailureAftermath, PHASE_EXIT_CODE } from "./deploy/errors.ts";
@@ -10,6 +11,7 @@ import { runHosted } from "./deploy/hosted.ts";
 import { runOperatorIdentity } from "./deploy/identity.ts";
 import { runIntegrationE2eCredentials } from "./deploy/integration-e2e-credentials.ts";
 import { runManagedWorkerGateway } from "./deploy/managed-worker-gateway.ts";
+import { runOrgApiKey } from "./deploy/org-api-key.ts";
 import type { DeployEnvironment } from "./deploy/qualification.ts";
 import { runRetirement } from "./deploy/retirement.ts";
 import { runD1Schema } from "./deploy/schema.ts";
@@ -27,6 +29,8 @@ const USAGE = `takoserver deploy
   bun run deploy -- <surface> --status --environment=<integration|rehearsal|production> --commit=<sha>
   bun run deploy -- <surface> --apply  --environment=<integration|rehearsal|production> --commit=<sha>
   bun run deploy -- takoserver-integration-e2e-credentials --<issue|status|revoke> --environment=integration --commit=<sha>
+  bun run deploy -- takoserver-org-api-key --<mint|status|revoke> --environment=<env> --commit=<sha>
+    --organization=org_... [--key-name=<name> --scope=<scope> --expires-in-days=<n>] [--key-id=key_...]
   The authority cutover may add --legacy-predecessor-version=<uuid> for integration bootstrap.
   Hosted-edge authority transition requires the named
   --legacy-host-runtime-predecessor-version=<uuid> selector in integration or production.
@@ -54,7 +58,8 @@ deploy-plan flag, ledger, target override or mixed mutation controller.
 
 type Surface = (typeof DEPLOY_CONTRACT.surfaces)[number]["surface"];
 type CredentialSurface = "takoserver-integration-e2e-credentials";
-type StandardSurface = Exclude<Surface, CredentialSurface>;
+type OrgApiKeySurface = "takoserver-org-api-key";
+type StandardSurface = Exclude<Surface, CredentialSurface | OrgApiKeySurface>;
 
 interface InvocationBase {
   readonly environment: DeployEnvironment;
@@ -77,11 +82,20 @@ type Invocation =
   | (InvocationBase & {
       readonly surface: CredentialSurface;
       readonly action: "issue" | "status" | "revoke";
+    })
+  | (InvocationBase & {
+      readonly surface: OrgApiKeySurface;
+      readonly action: "mint" | "status" | "revoke";
+      readonly organizationId: string;
+      readonly keyName?: string;
+      readonly scopes?: readonly ApiKeyScope[];
+      readonly expiresInDays?: number;
+      readonly apiKeyId?: string;
     });
 
 interface ParsedInvocation {
   readonly surface: Surface;
-  readonly action: "status" | "apply" | "issue" | "revoke";
+  readonly action: "status" | "apply" | "issue" | "revoke" | "mint";
   readonly environment: DeployEnvironment;
   readonly commit: string;
   readonly legacyPredecessorVersionId?: string;
@@ -91,8 +105,16 @@ interface ParsedInvocation {
   readonly unattributedSuccessorVersionId?: string;
   readonly formAuthorityScopeTransitionPath?: string;
   readonly adoptLivePath?: string;
+  readonly organizationId?: string;
+  readonly keyName?: string;
+  readonly scopes?: readonly ApiKeyScope[];
+  readonly expiresInDays?: number;
+  readonly apiKeyId?: string;
   readonly reverse?: boolean;
 }
+
+/** The durable organization API key surface is the only one with key operands. */
+const MAX_ORG_API_KEY_FLAGS = 12;
 
 /**
  * Every surface that publishes a Cloudflare Worker fences its live Version
@@ -129,7 +151,8 @@ const MAX_CLOSURE_DELTA_FLAGS = 32;
 const CLOSURE_DELTA_NAME = /^[A-Z][A-Z0-9_]{0,63}$/u;
 
 function parseInvocation(args: readonly string[]): Invocation | null {
-  if (args.length < 4 || args.length > 6 + MAX_CLOSURE_DELTA_FLAGS) return null;
+  if (args.length < 4 || args.length > 7 + Math.max(MAX_CLOSURE_DELTA_FLAGS, MAX_ORG_API_KEY_FLAGS))
+    return null;
   const [surfaceValue, ...flags] = args;
   if (!isSurface(surfaceValue)) return null;
   let action: ParsedInvocation["action"] | null = null;
@@ -147,11 +170,58 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let unattributedSuccessorVersionId: string | null = null;
   let formAuthorityScopeTransitionPath: string | null = null;
   let adoptLivePath: string | null = null;
+  let organizationId: string | null = null;
+  let keyName: string | null = null;
+  const scopes: ApiKeyScope[] = [];
+  let expiresInDays: number | null = null;
+  let apiKeyId: string | null = null;
   let reverse = false;
   for (const flag of flags) {
-    if (flag === "--status" || flag === "--apply" || flag === "--issue" || flag === "--revoke") {
+    if (
+      flag === "--status" ||
+      flag === "--apply" ||
+      flag === "--issue" ||
+      flag === "--revoke" ||
+      flag === "--mint"
+    ) {
       if (action !== null) return null;
       action = flag.slice(2) as ParsedInvocation["action"];
+      continue;
+    }
+    if (flag.startsWith("--organization=")) {
+      if (organizationId !== null) return null;
+      const value = flag.slice("--organization=".length);
+      if (!/^org_[A-Za-z0-9][A-Za-z0-9._:-]{0,123}$/u.test(value)) return null;
+      organizationId = value;
+      continue;
+    }
+    if (flag.startsWith("--key-name=")) {
+      if (keyName !== null) return null;
+      const value = flag.slice("--key-name=".length);
+      if (!/^[a-z0-9][a-z0-9-]{0,63}$/u.test(value)) return null;
+      keyName = value;
+      continue;
+    }
+    if (flag.startsWith("--scope=")) {
+      const value = flag.slice("--scope=".length);
+      if (!API_KEY_SCOPES.includes(value as ApiKeyScope) || scopes.includes(value as ApiKeyScope)) {
+        return null;
+      }
+      scopes.push(value as ApiKeyScope);
+      continue;
+    }
+    if (flag.startsWith("--expires-in-days=")) {
+      if (expiresInDays !== null) return null;
+      const value = flag.slice("--expires-in-days=".length);
+      if (!/^[1-9][0-9]{0,3}$/u.test(value)) return null;
+      expiresInDays = Number(value);
+      continue;
+    }
+    if (flag.startsWith("--key-id=")) {
+      if (apiKeyId !== null) return null;
+      const value = flag.slice("--key-id=".length);
+      if (!/^key_[A-Za-z0-9][A-Za-z0-9._:-]{0,123}$/u.test(value)) return null;
+      apiKeyId = value;
       continue;
     }
     if (flag.startsWith("--environment=")) {
@@ -264,6 +334,49 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     ...addSecrets,
     ...rotateSecrets,
   ];
+  const orgApiKey = surfaceValue === "takoserver-org-api-key";
+  const orgApiKeyOperands =
+    (organizationId === null ? 0 : 1) +
+    (keyName === null ? 0 : 1) +
+    scopes.length +
+    (expiresInDays === null ? 0 : 1) +
+    (apiKeyId === null ? 0 : 1);
+  // Every key operand belongs to exactly one surface, and that surface needs
+  // exactly one of them for each thing it is being asked to name.
+  if (!orgApiKey && orgApiKeyOperands > 0) return null;
+  if (orgApiKey) {
+    if (
+      organizationId === null ||
+      orgApiKeyOperands > MAX_ORG_API_KEY_FLAGS ||
+      closurePredecessorVersionId !== null ||
+      legacyPredecessorVersionId !== null ||
+      legacyHostRuntimePredecessorVersionId !== null ||
+      adoptLivePath !== null ||
+      reverse ||
+      (action !== "mint" && action !== "status" && action !== "revoke")
+    ) {
+      return null;
+    }
+    if (action === "mint" && (keyName === null || scopes.length === 0 || expiresInDays === null)) {
+      return null;
+    }
+    if (action !== "mint" && (keyName !== null || scopes.length > 0 || expiresInDays !== null)) {
+      return null;
+    }
+    if ((action === "revoke") !== (apiKeyId !== null)) return null;
+    return {
+      surface: surfaceValue,
+      action,
+      environment,
+      commit,
+      organizationId,
+      ...(keyName === null ? {} : { keyName }),
+      ...(scopes.length === 0 ? {} : { scopes: [...scopes].sort() }),
+      ...(expiresInDays === null ? {} : { expiresInDays }),
+      ...(apiKeyId === null ? {} : { apiKeyId }),
+    } as Invocation;
+  }
+  if (action === "mint") return null;
   const budget = 6 + (adoptLivePath === null ? 0 : 1);
   if (closurePredecessorVersionId === null) {
     // Every other invocation keeps the historical exact flag budget.
@@ -633,6 +746,23 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
           environment: invocation.environment,
           commit: invocation.commit,
           ...(scopeTransition === undefined ? {} : { scopeTransition }),
+        },
+        target,
+      );
+    case "takoserver-org-api-key":
+      return await runOrgApiKey(
+        {
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
+          organizationId: invocation.organizationId,
+          ...(invocation.keyName === undefined ? {} : { keyName: invocation.keyName }),
+          ...(invocation.scopes === undefined ? {} : { scopes: invocation.scopes }),
+          ...(invocation.expiresInDays === undefined
+            ? {}
+            : { expiresInDays: invocation.expiresInDays }),
+          ...(invocation.apiKeyId === undefined ? {} : { apiKeyId: invocation.apiKeyId }),
         },
         target,
       );
