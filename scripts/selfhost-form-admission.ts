@@ -4,6 +4,7 @@ import { canonicalDigest } from "../src/json.ts";
 import { createFileObjectStore } from "../src/objects-fs.ts";
 import type { ObjectStore, Sql } from "../src/ports.ts";
 import { derivePublicFormImplementationIdentity } from "../src/public-worker-implementation.ts";
+import { SELFHOST_IDENTITY_CAPABILITY_KINDS } from "../src/selfhost-composition.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import {
   readReleasedCoreVerifierIdentity,
@@ -19,10 +20,7 @@ import {
   deriveFormAuthorityIdentity,
   type FormAuthorityEndpointConfiguration,
 } from "../src/takoform/host-admission-endpoint.ts";
-import {
-  YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
-  yurucommuLifecycleCapabilityManifest,
-} from "../src/takoform/implementation-catalog.ts";
+import { yurucommuLifecycleCapabilityManifest } from "../src/takoform/implementation-catalog.ts";
 import { loadPublisherSetClosure } from "../src/takoform/publisher-set-closure.ts";
 import { takoformCoreVerifierArtifactDigest } from "./deploy/form-authority.ts";
 
@@ -98,7 +96,11 @@ export async function runSelfhostFormAdmission(
   // The self-host has no separately sealed Worker payload; its Form
   // implementation identity is the canonical digest of the capability manifest
   // it serves, recorded as provenance on every support and activation event.
-  const capabilities = yurucommuLifecycleCapabilityManifest(YURUCOMMU_IDENTITY_CAPABILITY_KINDS);
+  // Exactly the identity Forms this machine's composition realizes. A self-host
+  // has no `edge.objects` backend, so the current ObjectBucket is recorded as
+  // installed and unsupported with an empty operation set, which is the rule
+  // ADR 0007 states for a Host without that supply.
+  const capabilities = yurucommuLifecycleCapabilityManifest(SELFHOST_IDENTITY_CAPABILITY_KINDS);
   const implementationPayloadDigest = await canonicalDigest({
     kind: "takoserver.selfhost-form-implementation@v1",
     capabilities,

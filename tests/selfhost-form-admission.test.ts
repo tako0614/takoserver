@@ -72,15 +72,27 @@ describe("self-host Form admission", () => {
       expect(forms.filter((form) => form.installed)).toHaveLength(17);
       expect(forms.filter((form) => form.supported)).toHaveLength(IMPLEMENTED);
       expect(forms.filter((form) => form.activationHead.active)).toHaveLength(IMPLEMENTED);
-      // ADR 0007: a self-host admission now supports and activates the exact
-      // current ObjectBucket package. Executing one is still refused by the
-      // self-host provider until it has an EdgeObjects backend.
+      // ADR 0007: a self-host admission installs, supports, and activates the
+      // exact current ObjectBucket package with an EMPTY operation set. That is
+      // the rule for an identity Form whose supply the Host does not realize,
+      // and this machine realizes none: it has no `edge.objects` backend. The
+      // Form is present and nothing about it is executable, which is a
+      // different and more honest statement than claiming five operations and
+      // refusing every one of them at the mutation barrier.
       expect(forms.find((form) => form.formRef.kind === "ObjectBucket")).toMatchObject({
         installed: true,
         supported: true,
-        operations: ["create", "read", "delete", "import", "observe"],
+        operations: [],
         activationHead: { present: true, active: true },
       });
+      // Every other supported Form still carries the operations it declares.
+      expect(forms.find((form) => form.formRef.kind === "EdgeKVNamespace")?.operations).toEqual([
+        "create",
+        "read",
+        "delete",
+        "import",
+        "observe",
+      ]);
       expect(await fixture.sql.query("SELECT count(*) AS c FROM tf_form_install_events")).toEqual([
         { c: 17 },
       ]);
