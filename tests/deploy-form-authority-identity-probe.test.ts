@@ -33,8 +33,13 @@ const target = {
   r2: { bucketName: "takoserver-objects-production" },
   publicOrigin: "https://api.example.test",
   edgeSupplies: {
-    offerings: YURUCOMMU_IDENTITY_CAPABILITY_KINDS.map((formKind) => ({ formKind })),
+    offerings: YURUCOMMU_IDENTITY_CAPABILITY_KINDS.filter(
+      (formKind) => formKind !== "ObjectBucket",
+    ).map((formKind) => ({ formKind })),
   } as unknown as NonNullable<DeployTarget["edgeSupplies"]>,
+  objectBucketSupplies: {
+    supplies: [{ provider: { kind: "cloudflare" } }],
+  } as unknown as NonNullable<DeployTarget["objectBucketSupplies"]>,
   workerEndpointSuffix: "production.example.workers.dev",
   formAuthority: {
     workerName: "takoserver-form-authority-production",

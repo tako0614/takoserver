@@ -21,11 +21,16 @@ import {
   CURRENT_PUBLISHER_REPOSITORY,
 } from "../src/takoform/current-publisher-catalog.ts";
 import { deriveFormAuthorityIdentity } from "../src/takoform/host-admission-endpoint.ts";
-import { YURUCOMMU_IDENTITY_CAPABILITY_KINDS } from "../src/takoform/implementation-catalog.ts";
+import {
+  YURUCOMMU_FORM_VERSIONS,
+  YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
+} from "../src/takoform/implementation-catalog.ts";
 import { createIntegrationFormAuthorityComposition } from "../src/takoform/integration-operator-endpoint.ts";
 
 const COMMIT = "a".repeat(40);
 const NEXT_COMMIT = "d".repeat(40);
+/** Derived so a Form joining the catalog cannot silently leave a count behind. */
+const FORM_COUNT = Object.keys(YURUCOMMU_FORM_VERSIONS).length;
 const NOW = new Date("2026-08-29T02:00:00Z");
 const ARTIFACT = `sha256:${"b".repeat(64)}` as const;
 const PUBLIC_VERSION = "11111111-1111-4111-8111-111111111111";
@@ -79,8 +84,8 @@ describe("signed Form authority operator invocation", () => {
 
     expect(fixture.calls.map(({ action }) => action)).toEqual(["plan", "apply", "readback"]);
     expect(canonicalJson(fixture.calls[1]?.body)).toBe(canonicalJson(fixture.calls[0]?.result));
-    expect((result.readback as { forms: unknown[] }).forms).toHaveLength(12);
-    expect((result.apply as { receipts: unknown[] }).receipts).toHaveLength(38);
+    expect((result.readback as { forms: unknown[] }).forms).toHaveLength(FORM_COUNT);
+    expect((result.apply as { receipts: unknown[] }).receipts).toHaveLength(2 + FORM_COUNT * 3);
     expect(result).toMatchObject({
       kind: "takoserver.integration-form-authority-invocation@v2",
       action: "apply",
@@ -95,7 +100,7 @@ describe("signed Form authority operator invocation", () => {
       productionEligible: false,
       credentialsRedacted: true,
       ready: true,
-      plan: { planDigest: expect.stringMatching(/^sha256:/), commandCount: 38 },
+      plan: { planDigest: expect.stringMatching(/^sha256:/), commandCount: 2 + FORM_COUNT * 3 },
       apply: {
         status: "converged",
         planDigest: expect.stringMatching(/^sha256:/),
@@ -159,7 +164,7 @@ describe("signed Form authority operator invocation", () => {
     expect(secondRequest.evidence?.publisher?.sourceCommit).not.toBe(NEXT_COMMIT);
   });
 
-  test("status is one signed readback and reports the exact 12-form convergence", async () => {
+  test("status is one signed readback and reports the exact 13-form convergence", async () => {
     const fixture = await invocationFixture();
     await runFormAuthorityInvoke(
       {
@@ -188,7 +193,7 @@ describe("signed Form authority operator invocation", () => {
     expect(status).toMatchObject({ action: "status", ready: true, credentialsRedacted: true });
   });
 
-  test("deactivation uses a distinct surface and reports all 12 durable heads inactive", async () => {
+  test("deactivation uses a distinct surface and reports all 13 durable heads inactive", async () => {
     const fixture = await invocationFixture();
     await runFormAuthorityInvoke(
       {
@@ -223,12 +228,12 @@ describe("signed Form authority operator invocation", () => {
       surface: "takoserver-integration-form-authority-deactivation",
       activation: { desiredActive: false },
       ready: true,
-      plan: { commandCount: 12 },
+      plan: { commandCount: FORM_COUNT },
       apply: { status: "converged", nextCommandCount: 0 },
     });
     expect(
       (deactivated.readback as { forms: readonly { activationHead: { active: boolean } }[] }).forms,
-    ).toHaveLength(12);
+    ).toHaveLength(FORM_COUNT);
     expect(
       (
         deactivated.readback as {
@@ -415,7 +420,7 @@ describe("signed Form authority operator invocation", () => {
 
     expect(fixture.calls.map(({ action }) => action)).toEqual(["readback"]);
     expect(status).toMatchObject({ action: "status", ready: false, credentialsRedacted: true });
-    expect((status.readback as { forms: unknown[] }).forms).toHaveLength(12);
+    expect((status.readback as { forms: unknown[] }).forms).toHaveLength(FORM_COUNT);
   });
 
   test("classifies a malformed status readback as a preflight error", async () => {
@@ -723,8 +728,13 @@ async function integrationTarget(): Promise<DeployTarget> {
     r2: { bucketName: "takoserver-objects-integration" },
     publicOrigin: HOST_ID,
     edgeSupplies: {
-      offerings: YURUCOMMU_IDENTITY_CAPABILITY_KINDS.map((formKind) => ({ formKind })),
+      offerings: YURUCOMMU_IDENTITY_CAPABILITY_KINDS.filter(
+        (formKind) => formKind !== "ObjectBucket",
+      ).map((formKind) => ({ formKind })),
     } as unknown as NonNullable<DeployTarget["edgeSupplies"]>,
+    objectBucketSupplies: {
+      supplies: [{ provider: { kind: "cloudflare" } }],
+    } as unknown as NonNullable<DeployTarget["objectBucketSupplies"]>,
     workerEndpointSuffix: "integration.example.workers.dev",
     formAuthority: {
       workerName: "takoserver-form-authority-integration",

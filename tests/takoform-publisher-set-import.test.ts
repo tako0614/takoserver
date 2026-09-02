@@ -52,10 +52,10 @@ const IMPLEMENTED_KINDS = Object.keys(YURUCOMMU_FORM_VERSIONS).sort();
 const RAW_POLICY_DIGEST = await bytesDigest(
   new TextEncoder().encode(TAKOFORM_PUBLISHER_SET_AUTHORITY_CLOSURE.core.publisherPolicy),
 );
+/** ObjectBucket left this list when it joined the catalog; see ADR 0007. */
 const UNIMPLEMENTED_KINDS = [
   "ActorNamespace",
   "DurableWorkflow",
-  "ObjectBucket",
   "StaticAssetBundle",
   "WorkerCustomDomain",
 ];
@@ -220,8 +220,16 @@ describe("exact publisher-set import", () => {
         });
       }
     }
+    // ADR 0007 moved ObjectBucket into the code-owned implementation catalog,
+    // so the exact current package is now installed, supported, and active
+    // with the operations its Form declares — never `update`.
     const objectBucket = readback.forms.find((form) => form.formRef.kind === "ObjectBucket");
-    expect(objectBucket).toMatchObject({ installed: true, supported: false, operations: [] });
+    expect(objectBucket).toMatchObject({
+      installed: true,
+      supported: true,
+      operations: ["create", "read", "delete", "import", "observe"],
+      formRef: { apiVersion: "edge.forms.takoform.com", definitionVersion: "0.1.0" },
+    });
 
     const publishers = await fixture.sql.query(
       "SELECT publisher_key, event_type, source_commit FROM tf_form_publisher_events",

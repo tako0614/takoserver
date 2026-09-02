@@ -226,6 +226,67 @@ export const INTEGRATION_FORM_PACKAGES = [
     ],
   },
   {
+    packageDigest: "sha256:46cd435d838d89de641d38180680e99c8bc7be1a3ae9c123494440d3e6e202ec",
+    formRef: {
+      apiVersion: "edge.forms.takoform.com",
+      kind: "ObjectBucket",
+      definitionVersion: "0.1.0",
+      schemaDigest: "sha256:154e2dcf100b1278f3badb7f7f2f25bba8c6bcf387c75fb6b9abc5ede1cbd557",
+    },
+    manifest: {
+      apiVersion: "packages.forms.takoform.com/v1alpha5",
+      kind: "FormPackage",
+      formRef: {
+        apiVersion: "edge.forms.takoform.com",
+        kind: "ObjectBucket",
+        definitionVersion: "0.1.0",
+        schemaDigest: "sha256:154e2dcf100b1278f3badb7f7f2f25bba8c6bcf387c75fb6b9abc5ede1cbd557",
+      },
+      definitionPath: "definition.json",
+      files: [
+        {
+          path: "definition.json",
+          mediaType: "application/vnd.takoform.form-definition.v1+json",
+          size: 2141,
+          digest: "sha256:08b46ae23f383c3b66edd5316121e834c9c3799679d647bdaf47bc470d9afa4a",
+        },
+        {
+          path: "fixtures/desired.json",
+          mediaType: "application/json",
+          size: 3,
+          digest: "sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+        },
+        {
+          path: "fixtures/negative-unexpected-property.json",
+          mediaType: "application/json",
+          size: 33,
+          digest: "sha256:d10f45f42473405c10b441faafa3d23e863d4160f2ca3a7d0c32874b386f1ae9",
+        },
+      ],
+    },
+    files: [
+      {
+        path: "definition.json",
+        digest: "sha256:08b46ae23f383c3b66edd5316121e834c9c3799679d647bdaf47bc470d9afa4a",
+        mediaType: "application/vnd.takoform.form-definition.v1+json",
+        base64:
+          "ewogICJhcGlWZXJzaW9uIjogImVkZ2UuZm9ybXMudGFrb2Zvcm0uY29tIiwKICAia2luZCI6ICJPYmplY3RCdWNrZXQiLAogICJkZWZpbml0aW9uVmVyc2lvbiI6ICIwLjEuMCIsCiAgInRpdGxlIjogIk9iamVjdCBCdWNrZXQiLAogICJkZXNjcmlwdGlvbiI6ICJGbGF0LW5hbWVzcGFjZSBvYmplY3Qgc3RvcmUgd2l0aCBzdHJvbmcgcmVhZC1hZnRlci13cml0ZSBjb25zaXN0ZW5jeSwgc3RyZWFtaW5nIGJvZGllcywgcmFuZ2VkIGFuZCBjb25kaXRpb25hbCByZWFkcywgYW5kIG11bHRpcGFydCB1cGxvYWQsIGV4YWN0bHkgYXMgZml4ZWQgYnkgdGhlIGVkZ2Uub2JqZWN0cyBJbnRlcmZhY2UuIEFuIG9iamVjdCBib2R5IGlzIGEgYnl0ZSBzdHJlYW0sIG5ldmVyIGEgSlNPTiBzdHJpbmc6IHRoZSBjb250cmFjdCdzIDUgR2lCIGNlaWxpbmcgaXMgb25seSBtZWFuaW5nZnVsIGJlY2F1c2UgYm9kaWVzIG5ldmVyIHRyYXZlbCBpbnNpZGUgYW4gb3BlcmF0aW9uIGRvY3VtZW50IChkZWNpc2lvbiAwMDIwKS4gT3BlcmF0aW5nIHJ1bGVzIHN1Y2ggYXMgQ09SUywgbGlmZWN5Y2xlLCBhbmQgbG9jayBhcmUgc2VwYXJhdGUgcG9saWN5IHJlc291cmNlcywgbmV2ZXIgZGVzaXJlZCBmaWVsZHMgb2YgdGhlIGJ1Y2tldCBpZGVudGl0eS4iLAogICJyb2xlIjogImlkZW50aXR5IiwKICAicmVxdWlyZXNIb3N0QXBpIjogImZvcm1zLnRha29mb3JtLmNvbS92MSIsCiAgImRlc2lyZWRTY2hlbWEiOiB7CiAgICAiJHNjaGVtYSI6ICJodHRwczovL2pzb24tc2NoZW1hLm9yZy9kcmFmdC8yMDIwLTEyL3NjaGVtYSIsCiAgICAiYWRkaXRpb25hbFByb3BlcnRpZXMiOiBmYWxzZSwKICAgICJkZXNjcmlwdGlvbiI6ICJGbGF0LW5hbWVzcGFjZSBvYmplY3Qgc3RvcmUgd2l0aCBzdHJvbmcgcmVhZC1hZnRlci13cml0ZSBjb25zaXN0ZW5jeSwgc3RyZWFtaW5nIGJvZGllcywgcmFuZ2VkIGFuZCBjb25kaXRpb25hbCByZWFkcywgYW5kIG11bHRpcGFydCB1cGxvYWQsIGV4YWN0bHkgYXMgZml4ZWQgYnkgdGhlIGVkZ2Uub2JqZWN0cyBJbnRlcmZhY2UuIEFuIG9iamVjdCBib2R5IGlzIGEgYnl0ZSBzdHJlYW0sIG5ldmVyIGEgSlNPTiBzdHJpbmc6IHRoZSBjb250cmFjdCdzIDUgR2lCIGNlaWxpbmcgaXMgb25seSBtZWFuaW5nZnVsIGJlY2F1c2UgYm9kaWVzIG5ldmVyIHRyYXZlbCBpbnNpZGUgYW4gb3BlcmF0aW9uIGRvY3VtZW50IChkZWNpc2lvbiAwMDIwKS4gT3BlcmF0aW5nIHJ1bGVzIHN1Y2ggYXMgQ09SUywgbGlmZWN5Y2xlLCBhbmQgbG9jayBhcmUgc2VwYXJhdGUgcG9saWN5IHJlc291cmNlcywgbmV2ZXIgZGVzaXJlZCBmaWVsZHMgb2YgdGhlIGJ1Y2tldCBpZGVudGl0eS4iLAogICAgInByb3BlcnRpZXMiOiB7fSwKICAgICJ0aXRsZSI6ICJPYmplY3QgQnVja2V0IGRlc2lyZWQgc3RhdGUiLAogICAgInR5cGUiOiAib2JqZWN0IgogIH0sCiAgImxpZmVjeWNsZUNhcGFiaWxpdGllcyI6IFsKICAgICJjcmVhdGUiLAogICAgInJlYWQiLAogICAgImRlbGV0ZSIsCiAgICAiaW1wb3J0IiwKICAgICJvYnNlcnZlIgogIF0sCiAgInByb3ZpZGVkSW50ZXJmYWNlcyI6IFsKICAgIHsKICAgICAgImFwaVZlcnNpb24iOiAiaW50ZXJmYWNlcy50YWtvZm9ybS5jb20vdjFhbHBoYTEiLAogICAgICAibmFtZSI6ICJlZGdlLm9iamVjdHMiLAogICAgICAidmVyc2lvbiI6ICIxLjAuMCIsCiAgICAgICJzY2hlbWFEaWdlc3QiOiAic2hhMjU2OmI1OGNiMmQ1NGM5M2U0ZDk3YWJlNGZmMzY4NGRkODhjOGE0MDBiNGUzOWVjN2ZlMmYzYmE1NDljNGFjNDQ4YmEiCiAgICB9CiAgXSwKICAiY29uZm9ybWFuY2VGaXh0dXJlcyI6IFsKICAgIHsKICAgICAgIm5hbWUiOiAiY2Fub25pY2FsIiwKICAgICAgImRlc2lyZWRQYXRoIjogImZpeHR1cmVzL2Rlc2lyZWQuanNvbiIKICAgIH0KICBdLAogICJuZWdhdGl2ZUNvbmZvcm1hbmNlRml4dHVyZXMiOiBbCiAgICB7CiAgICAgICJuYW1lIjogInJlamVjdC11bmV4cGVjdGVkLXByb3BlcnR5IiwKICAgICAgInN0YWdlIjogImRlc2lyZWQiLAogICAgICAiaW5wdXRQYXRoIjogImZpeHR1cmVzL25lZ2F0aXZlLXVuZXhwZWN0ZWQtcHJvcGVydHkuanNvbiIsCiAgICAgICJleHBlY3RlZEZhaWx1cmUiOiAic2NoZW1hX3ZhbGlkYXRpb25fZmFpbGVkIgogICAgfQogIF0KfQo=",
+      },
+      {
+        path: "fixtures/desired.json",
+        digest: "sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+        mediaType: "application/json",
+        base64: "e30K",
+      },
+      {
+        path: "fixtures/negative-unexpected-property.json",
+        digest: "sha256:d10f45f42473405c10b441faafa3d23e863d4160f2ca3a7d0c32874b386f1ae9",
+        mediaType: "application/json",
+        base64: "ewogICJ0YWtvZm9ybVVuZXhwZWN0ZWQiOiB0cnVlCn0K",
+      },
+    ],
+  },
+  {
     packageDigest: "sha256:3c6b332cf45df58f7a7db3eea8d03fec2aa4103b5e53c3452335639fa40a6266",
     formRef: {
       apiVersion: "edge.forms.takoform.com",

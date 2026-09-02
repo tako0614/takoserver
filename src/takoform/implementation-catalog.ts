@@ -5,6 +5,7 @@ export const YURUCOMMU_FORM_VERSIONS = {
   AtLeastOnceQueue: "0.1.0",
   EdgeKVNamespace: "0.1.0",
   ModuleWorker: "0.1.0",
+  ObjectBucket: "0.1.0",
   QueueConsumer: "0.1.0",
   SQLiteDatabase: "0.1.0",
   SQLiteMigrationApplication: "0.1.0",
@@ -18,10 +19,16 @@ export const YURUCOMMU_FORM_VERSIONS = {
 
 export type YurucommuFormKind = keyof typeof YURUCOMMU_FORM_VERSIONS;
 
+/**
+ * Identity Forms a Host may support only when the deploy target realizes a
+ * provider supply for each one. `ObjectBucket` joined this set in ADR 0007; a
+ * Host that cannot back it must not appear in the manifest it serves.
+ */
 export const YURUCOMMU_IDENTITY_CAPABILITY_KINDS = [
   "AtLeastOnceQueue",
   "EdgeKVNamespace",
   "ModuleWorker",
+  "ObjectBucket",
   "SQLiteDatabase",
 ] as const;
 
@@ -90,6 +97,7 @@ export function yurucommuLifecycleCapabilityManifest(
       case "AtLeastOnceQueue":
       case "EdgeKVNamespace":
       case "ModuleWorker":
+      case "ObjectBucket":
       case "SQLiteDatabase":
         return supplied.has(kind);
       case "QueueConsumer":

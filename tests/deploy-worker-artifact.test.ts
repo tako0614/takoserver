@@ -48,8 +48,13 @@ describe("hermetic Worker bundle identity", () => {
     const formTarget = {
       ...target,
       edgeSupplies: {
-        offerings: YURUCOMMU_IDENTITY_CAPABILITY_KINDS.map((formKind) => ({ formKind })),
+        offerings: YURUCOMMU_IDENTITY_CAPABILITY_KINDS.filter(
+          (formKind) => formKind !== "ObjectBucket",
+        ).map((formKind) => ({ formKind })),
       } as unknown as NonNullable<DeployTarget["edgeSupplies"]>,
+      objectBucketSupplies: {
+        supplies: [{ provider: { kind: "cloudflare" } }],
+      } as unknown as NonNullable<DeployTarget["objectBucketSupplies"]>,
       workerEndpointSuffix: "integration.example.workers.dev",
       formAuthority: {
         workerName: "takoserver-form-authority-integration",
