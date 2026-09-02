@@ -3,10 +3,13 @@ import { createEphemeralSql } from "../src/compat.ts";
 import type { Sql } from "../src/ports.ts";
 import type { SelfhostEventTarget, SelfhostEventTargets } from "../src/providers/selfhost.ts";
 import {
+  MAX_SELFHOST_EVENT_REQUEST_BYTES,
+  MAX_SELFHOST_QUEUE_MESSAGE_BYTES,
   parseSelfhostQueueDecisions,
   SELFHOST_WORKER_EVENT_PATH,
   SELFHOST_WORKER_EVENT_PROTOCOL,
   SELFHOST_WORKER_EVENT_TOKEN_HEADER,
+  selfhostQueueEvent,
 } from "../src/providers/selfhost-events.ts";
 import { createSelfhostQueuePump } from "../src/selfhost-queue-pump.ts";
 import type { WorkerdRuntime } from "../src/workerd-runtime.ts";
@@ -152,12 +155,21 @@ beforeEach(() => {
 
 async function enqueue(
   count: number,
-  options: { readonly queue?: string; readonly visibleAt?: number } = {},
+  options: {
+    readonly queue?: string;
+    readonly visibleAt?: number;
+    /** Raw body size, for the batches that cannot fit one envelope. */
+    readonly bodyBytes?: number;
+  } = {},
 ): Promise<readonly string[]> {
   const ids: string[] = [];
   for (let index = 0; index < count; index += 1) {
     const id = `m-${options.queue ?? QUEUE}-${index}-${millis}`;
     ids.push(id);
+    const body =
+      options.bodyBytes === undefined
+        ? new TextEncoder().encode(`body-${index}`)
+        : new TextEncoder().encode(`${index}`.padEnd(options.bodyBytes, "x"));
     await sql.run(
       "INSERT INTO selfhost_queue_messages " +
         "(queue_id, message_id, body, enqueued_at_ms, visible_at_ms, expires_at_ms, deliveries) " +
@@ -165,7 +177,7 @@ async function enqueue(
       [
         options.queue ?? QUEUE,
         id,
-        new TextEncoder().encode(`body-${index}`).buffer.slice(0) as ArrayBuffer,
+        body.buffer.slice(0) as ArrayBuffer,
         millis,
         options.visibleAt ?? millis,
         millis + RETENTION.messageRetentionSeconds * 1_000,
@@ -277,8 +289,10 @@ test("retries with the consumer's delay, and with the handler's when it named on
   expect(await rows()).toMatchObject([{ deliveries: 2, visible_at_ms: millis + 5_000 }]);
 });
 
-test("an unanswered delivery is a whole-batch retry, not a settlement", async () => {
+test("a delivery that never reached the Worker spends no redelivery", async () => {
   const runtime = recordingRuntime();
+  // Exactly what a restarting workerd, a refused connection, or a timeout
+  // looks like from here: no answer at all.
   runtime.answer = () => null;
   const pump = createSelfhostQueuePump({
     sql,
@@ -287,11 +301,147 @@ test("an unanswered delivery is a whole-batch retry, not a settlement", async ()
     clock: () => new Date(millis),
   });
   await enqueue(2);
-  expect(await pump.tick()).toBe(2);
+  expect(await pump.tick()).toBe(0);
+  // The lease is released and the count is exactly where it started: downtime
+  // is this Host's problem, and spending the tenant's redeliveries on it is
+  // how a queue empties itself into nothing while the handler never ran.
   expect(await rows()).toMatchObject([
-    { deliveries: 1, visible_at_ms: millis + 60_000 },
-    { deliveries: 1, visible_at_ms: millis + 60_000 },
+    { deliveries: 0, lease_token: null },
+    { deliveries: 0, lease_token: null },
   ]);
+});
+
+test("workerd being down for a whole retry budget still delivers nothing away", async () => {
+  const runtime = recordingRuntime();
+  runtime.answer = () => null;
+  const pump = createSelfhostQueuePump({
+    sql,
+    runtime: runtime.runtime,
+    targets: targets({ consumers: [{ ...CONSUMER, maxRetries: 2, retryDelaySeconds: 0 }] }),
+    clock: () => new Date(millis),
+  });
+  await enqueue(3);
+  for (let pass = 0; pass < 6; pass += 1) {
+    await pump.tick();
+    millis += 120_000;
+  }
+  expect(await rows()).toHaveLength(3);
+  expect((await rows()).every((row) => Number(row.deliveries) === 0)).toBe(true);
+
+  // And once it answers again, the messages are still there to be handled.
+  runtime.answer = (delivery) => acknowledgeEvery(delivery);
+  expect(await pump.tick()).toBe(3);
+  expect(await rows()).toEqual([]);
+});
+
+test("a Worker that answered with a failure spends a redelivery", async () => {
+  const runtime = recordingRuntime();
+  // The wrapper's own answer when the tenant handler threw: a status, and
+  // nothing of the tenant's in it. That is the tenant refusing the batch.
+  runtime.answer = () => ({ status: 500, body: "" });
+  const pump = createSelfhostQueuePump({
+    sql,
+    runtime: runtime.runtime,
+    targets: targets({ consumers: [{ ...CONSUMER, maxRetries: 0 }] }),
+    clock: () => new Date(millis),
+  });
+  await enqueue(1);
+  expect(await pump.tick()).toBe(1);
+  expect(await rows()).toEqual([]);
+});
+
+test("splits a batch too large for one envelope instead of destroying it", async () => {
+  const runtime = recordingRuntime();
+  const pump = createSelfhostQueuePump({
+    sql,
+    runtime: runtime.runtime,
+    targets: targets({
+      consumers: [{ ...CONSUMER, maxBatchSize: 100, maxBatchTimeoutSeconds: 0, maxRetries: 0 }],
+    }),
+    clock: () => new Date(millis),
+  });
+  // 100 x 16 000 bytes is about 2.1 MB once base64 has taken its four bytes
+  // for every three — over the envelope ceiling, and inside every producer cap.
+  await enqueue(100, { bodyBytes: 16_000 });
+  expect(await pump.tick()).toBe(100);
+  expect(runtime.deliveries.length).toBeGreaterThan(1);
+  for (const delivery of runtime.deliveries) {
+    expect(new TextEncoder().encode(JSON.stringify(delivery.event)).byteLength).toBeLessThanOrEqual(
+      MAX_SELFHOST_EVENT_REQUEST_BYTES,
+    );
+  }
+  const delivered = runtime.deliveries.flatMap((delivery) =>
+    (delivery.event.messages ?? []).map((message) => message.messageId),
+  );
+  // Every message went exactly once, on its first delivery.
+  expect(new Set(delivered).size).toBe(100);
+  expect(
+    runtime.deliveries.every((delivery) =>
+      (delivery.event.messages ?? []).every((message) => message.attempts === 1),
+    ),
+  ).toBe(true);
+  expect(await rows()).toEqual([]);
+});
+
+test("a batch too large for one envelope never reaches the dead-letter queue", async () => {
+  const runtime = recordingRuntime();
+  const pump = createSelfhostQueuePump({
+    sql,
+    runtime: runtime.runtime,
+    targets: targets({
+      consumers: [
+        {
+          ...CONSUMER,
+          maxBatchSize: 100,
+          maxBatchTimeoutSeconds: 0,
+          maxRetries: 0,
+          deadLetterQueue: { queue: DLQ, ...RETENTION },
+        },
+      ],
+    }),
+    clock: () => new Date(millis),
+    randomId: (() => {
+      let minted = 0;
+      return () => {
+        minted += 1;
+        return `id-${minted}`;
+      };
+    })(),
+  });
+  await enqueue(20, { bodyBytes: 120_000 });
+  expect(await pump.tick()).toBe(20);
+  expect(await rows()).toEqual([]);
+  expect(
+    await sql.query("SELECT message_id FROM selfhost_queue_messages WHERE queue_id = ?", [DLQ]),
+  ).toEqual([]);
+});
+
+test("one message can never be too large for an envelope, under the producer caps", () => {
+  // The producer refuses a body over MAX_SELFHOST_QUEUE_MESSAGE_BYTES and mints
+  // a message id of at most 128 characters, so this is the largest message that
+  // can ever exist on this machine. Building it must not throw.
+  const raw = new Uint8Array(MAX_SELFHOST_QUEUE_MESSAGE_BYTES);
+  let binary = "";
+  for (let offset = 0; offset < raw.byteLength; offset += 4_096) {
+    binary += String.fromCharCode(...raw.subarray(offset, offset + 4_096));
+  }
+  const event = selfhostQueueEvent({
+    batchId: "b".repeat(64),
+    script: "s".repeat(128),
+    publication: "p".repeat(128),
+    queue: "q".repeat(128),
+    messages: [
+      {
+        messageId: "m".repeat(128),
+        timestampMillis: Number.MAX_SAFE_INTEGER,
+        attempts: 101,
+        body: { encoding: "base64", data: btoa(binary) },
+      },
+    ],
+  });
+  expect(new TextEncoder().encode(JSON.stringify(event)).byteLength).toBeLessThan(
+    MAX_SELFHOST_EVENT_REQUEST_BYTES,
+  );
 });
 
 test("moves a message to the dead-letter queue once its redeliveries are spent", async () => {
@@ -373,7 +523,7 @@ test("never hands a batch to a Worker that declared no queue handler", async () 
   expect(runtime.deliveries).toHaveLength(0);
 });
 
-test("reclaims a message whose retention ran out, and forgets a deleted queue", async () => {
+test("reclaims every message whose retention ran out, not just one page of them", async () => {
   const runtime = recordingRuntime();
   const pump = createSelfhostQueuePump({
     sql,
@@ -385,9 +535,9 @@ test("reclaims a message whose retention ran out, and forgets a deleted queue", 
   await enqueue(1, { queue: DLQ });
   expect(await pump.sweep()).toBe(0);
   millis += RETENTION.messageRetentionSeconds * 1_000 + 1;
+  // A sweep pages until nothing expired is left, so a machine accepting faster
+  // than one page every thirty seconds does not fall behind for ever.
   expect(await pump.sweep()).toBe(2);
-  await enqueue(1);
-  await pump.deleteQueue(QUEUE);
   expect(await rows()).toEqual([]);
 });
 

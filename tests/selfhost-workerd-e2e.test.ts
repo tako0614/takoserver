@@ -731,7 +731,7 @@ async function bootEvents(): Promise<{
     runtime,
     dataPlaneAddress: served.address,
     suffixes: ["localhost"],
-    events: { async deleteQueue() {}, async forgetSchedules() {} },
+    events: { async forgetSchedules() {} },
     artifacts: {
       async manifest(_tenant, digest) {
         return digest === "sha256:worker"

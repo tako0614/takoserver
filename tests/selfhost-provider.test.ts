@@ -141,7 +141,6 @@ afterEach(() => {
 interface ProviderCase {
   readonly modules?: Record<string, string>;
   readonly events?: {
-    deleteQueue(queueId: string): Promise<void>;
     forgetSchedules(script: string, cron?: string): Promise<void>;
   };
   readonly dataPlaneAddress?: string;
@@ -1737,6 +1736,7 @@ describe("local namespaces", () => {
         async deleteKvNamespace(namespaceId) {
           deletedNamespaces.push(namespaceId);
         },
+        async deleteQueue() {},
         forgetDatabase(name) {
           forgotten.push(name);
         },
@@ -2172,7 +2172,6 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
     const forgotten: string[] = [];
     const local = provider({
       events: {
-        async deleteQueue() {},
         async forgetSchedules(_script, cron) {
           forgotten.push(cron ?? "*");
         },
@@ -2222,12 +2221,18 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
 
   test("a queue delete drops the messages that queue was holding", async () => {
     const dropped: string[] = [];
+    // Through the storage seam rather than the pump's: a queue stops existing
+    // whether or not this deployment happens to run one.
     const local = provider({
-      events: {
+      dataPlaneMaintenance: {
+        async deleteKvNamespace() {},
         async deleteQueue(id) {
           dropped.push(id);
         },
-        async forgetSchedules() {},
+        forgetDatabase() {},
+        async sweepExpiredKv() {
+          return 0;
+        },
       },
     });
     const ticket = await local.delete({

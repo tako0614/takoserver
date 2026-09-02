@@ -254,6 +254,14 @@ export function createSelfhostDataPlanes(options: SelfhostDataPlaneOptions): Sel
       ]);
     },
 
+    async deleteQueue(queueId) {
+      // The stored messages are this plane's rows, exactly as a namespace's
+      // entries are, so dropping them belongs to the same housekeeping seam.
+      // It is deliberately not the pump's: a queue stops existing whether or
+      // not this machine happens to be running one.
+      await options.sql.run("DELETE FROM selfhost_queue_messages WHERE queue_id = ?", [queueId]);
+    },
+
     forgetDatabase(name) {
       const opened = databases.get(name);
       if (!opened) return;

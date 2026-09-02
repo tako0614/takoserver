@@ -351,14 +351,12 @@ const workerScheduler =
         targets: eventTargets,
         clock,
       });
-const selfhostEvents =
-  queuePump && workerScheduler
-    ? {
-        deleteQueue: (queueId: string) => queuePump.deleteQueue(queueId),
-        forgetSchedules: (script: string, cron?: string) =>
-          workerScheduler.forgetSchedules(script, cron),
-      }
-    : undefined;
+const selfhostEvents = workerScheduler
+  ? {
+      forgetSchedules: (script: string, cron?: string) =>
+        workerScheduler.forgetSchedules(script, cron),
+    }
+  : undefined;
 
 const providerComposition = createStandaloneProviderComposition({
   mode: providerMode,

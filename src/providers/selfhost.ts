@@ -245,8 +245,6 @@ export interface SelfhostProviderOptions {
  * composed above this provider and this provider must not depend on them.
  */
 export interface SelfhostEventRuntime {
-  /** Drops every stored message of one queue, when the queue stops existing. */
-  deleteQueue(queueId: string): Promise<void>;
   /** Forgets the next-fire state of one script's triggers, or of one trigger. */
   forgetSchedules(script: string, cron?: string): Promise<void>;
 }
@@ -260,6 +258,14 @@ export interface SelfhostEventRuntime {
 export interface SelfhostDataPlaneMaintenance {
   /** Drops every stored entry of one KV namespace. */
   deleteKvNamespace(namespaceId: string): Promise<void>;
+  /**
+   * Drops every stored message of one queue, when the queue stops existing.
+   *
+   * Here rather than on the event runtime because a queue's messages are
+   * storage: they are accepted by this plane and they stop existing with the
+   * Resource, whether or not this deployment happens to run a pump.
+   */
+  deleteQueue(queueId: string): Promise<void>;
   /** Closes and forgets the cached handle on one SQLite database. */
   forgetDatabase(name: string): void;
   /** Reclaims expired KV rows, bounded, for the maintenance tick. */
@@ -2414,7 +2420,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             // rows do: a customer who deleted a queue and declares one with the
             // same name has asked for an empty queue.
             const queueId = selfhostNamespaceName("selfhost-queue", input.nativeId);
-            if (queueId && options.events) await options.events.deleteQueue(queueId);
+            if (queueId && options.dataPlaneMaintenance) {
+              await options.dataPlaneMaintenance.deleteQueue(queueId);
+            }
             return done();
           }
           case "EdgeKVNamespace": {
