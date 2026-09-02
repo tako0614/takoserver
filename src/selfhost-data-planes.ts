@@ -655,7 +655,11 @@ function kvMetadata(value: unknown): string | null {
   if (entries.length > 64) throw new PlaneError("metadata_too_large");
   const projected: Record<string, string> = {};
   for (const [name, item] of entries) {
-    if (name.length > 256 || typeof item !== "string" || item.length > 8_192) {
+    // A value that is not a string is the wrong kind of thing, not too much of
+    // it. Reporting a size refusal for `{m: 1}` sends the caller to shrink
+    // metadata that is already one member long.
+    if (typeof item !== "string") throw new PlaneError("invalid_value");
+    if (name.length > 256 || item.length > 8_192) {
       throw new PlaneError("metadata_too_large");
     }
     projected[name] = item;

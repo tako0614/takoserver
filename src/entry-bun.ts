@@ -584,6 +584,24 @@ if (workerScheduler) {
   }, 5_000);
 }
 
+/**
+ * The runtime is this process's child, and it dies with it.
+ *
+ * `workerd serve --watch` is spawned here and, without this, survives its
+ * parent: it is re-parented to init and keeps the serving port. The next
+ * Takoserver's workerd then fails to bind, Worker serving is silently broken,
+ * and the control plane reports healthy the whole time. A signal handler
+ * replaces the default disposition, so each one ends the process itself after
+ * the child is gone.
+ */
+process.on("exit", () => workerd.stop());
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+  process.on(signal, () => {
+    workerd.stop();
+    process.exit(0);
+  });
+}
+
 Bun.serve({
   port,
   // Longer than the default, because publishing a site means uploading its

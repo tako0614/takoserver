@@ -96,10 +96,12 @@ export async function runSelfhostFormAdmission(
   // The self-host has no separately sealed Worker payload; its Form
   // implementation identity is the canonical digest of the capability manifest
   // it serves, recorded as provenance on every support and activation event.
-  // Exactly the identity Forms this machine's composition realizes. A self-host
-  // has no `edge.objects` backend, so the current ObjectBucket is recorded as
-  // installed and unsupported with an empty operation set, which is the rule
-  // ADR 0007 states for a Host without that supply.
+  // Exactly the identity Forms this machine's composition realizes. That now
+  // includes `ObjectBucket`: a self-host holds object bodies under its data
+  // root and its Provider Pack owns both halves of the
+  // `module-worker.object-bucket` materialization, so the Form is recorded with
+  // the five operations it declares rather than with the empty set ADR 0007
+  // describes for a Host without that supply (see its second rotation).
   const capabilities = yurucommuLifecycleCapabilityManifest(SELFHOST_IDENTITY_CAPABILITY_KINDS);
   const implementationPayloadDigest = await canonicalDigest({
     kind: "takoserver.selfhost-form-implementation@v1",
