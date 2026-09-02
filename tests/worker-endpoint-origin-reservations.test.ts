@@ -2352,24 +2352,21 @@ test("repairs a reservation left activated for an endpoint that was never commit
   ).toEqual([{ state: "activated", endpoint_resource_uid: "uid-endpoint-01" }]);
 });
 /**
- * An apply that stops for a day and is resumed is the same apply.
+ * The sweep that takes the row is the mint's own, so the revival has to run
+ * after it.
  *
- * A Host-minted reservation goes `bound` the moment the Worker is Ready and
- * holds its address until the endpoint is created. When that create is delayed
- * past the mint's 24 h TTL — the operator paused, or an unrelated resource
- * failed and the graph was repaired the next morning — the expiry sweep moved
- * the row to `expired`, `prepare` refused to replay a terminal row, and neither
- * repair step could touch it: one deliberately skips the reservation it is
- * about to prepare, the other wants an endpoint witness that is not there.
- * Because the id is a digest of the Worker identity there is no second id to
- * mint, so that Worker could never be given an endpoint again.
+ * The lane's only sweep is lazy: nothing ages a reservation on a timer, and the
+ * row is moved to `expired` by the next call that reads it through `expire`.
+ * Inside `mintForWorker` the only such call is `prepare`, which runs *after* the
+ * revival — so the revival read a row that was still `bound`, declined it for
+ * not being `expired`, and `prepare` then swept it and refused to replay a
+ * terminal row. The state the revival was written for was unreachable from the
+ * one caller that has it, and the first test to claim otherwise reached it by
+ * asking `read` first, which a driver never does.
  *
- * A reservation that expired without ever publishing an endpoint is a witness
- * to nothing: no address is answering, and the address is a pure function of
- * the same identity that derives the id. So the next mint takes it back, and
- * takes back the same origin.
+ * The mint therefore sweeps its own row before asking whether to take it back.
  */
-test("mints again after its own reservation aged out with no endpoint published", async () => {
+test("takes back its own aged-out reservation through the sweep the mint itself runs", async () => {
   const { authority, sql, advance } = fixture();
   await seedWorker(sql);
   const target = {
@@ -2380,30 +2377,49 @@ test("mints again after its own reservation aged out with no endpoint published"
   } as const;
   const minted = await authority.mintForWorker(target);
   if (!minted) throw new Error("the fixture installation derives its own address");
+  const created = await sql.query(
+    "SELECT created_at, revision FROM worker_endpoint_origin_reservations",
+  );
 
   advance(25 * 60 * 60 * 1_000);
-  // The sweep has taken it, and nothing has ever been published on the origin.
-  expect(await authority.read("org_01", minted.reservationId)).toBeNull();
+  // Nothing has read the row, so nothing has swept it: this is exactly the
+  // state an apply resumed the next morning finds.
   expect(
     await sql.query("SELECT state, endpoint_resource_uid FROM worker_endpoint_origin_reservations"),
-  ).toEqual([{ state: "expired", endpoint_resource_uid: null }]);
+  ).toEqual([{ state: "bound", endpoint_resource_uid: null }]);
 
   const again = await authority.mintForWorker(target);
   expect(again).toMatchObject({
     reservationId: minted.reservationId,
-    // Derived from tenant, Space and Worker, so a fresh mint is the same address.
     canonicalPublicOrigin: minted.canonicalPublicOrigin,
     status: "bound",
     binding: { workerResourceUid: "uid-worker-01", workerResourceRevision: "1" },
   });
-  // One row, live again on a fresh TTL rather than a second reservation.
+  // The same row, taken back — not a second reservation, and not a released one
+  // replaced by a fresh id, which the derived id makes impossible anyway.
   expect(
-    await sql.query("SELECT reservation_id, state FROM worker_endpoint_origin_reservations"),
-  ).toEqual([{ reservation_id: minted.reservationId, state: "bound" }]);
+    await sql.query(
+      "SELECT reservation_id, state, created_at FROM worker_endpoint_origin_reservations",
+    ),
+  ).toEqual([
+    {
+      reservation_id: minted.reservationId,
+      state: "bound",
+      created_at: created[0]?.created_at ?? null,
+    },
+  ]);
+  // Swept, then revived: two writes on top of the row the mint left.
+  expect(
+    Number(
+      (await sql.query("SELECT revision FROM worker_endpoint_origin_reservations"))[0]?.revision,
+    ),
+  ).toBe(Number(created[0]?.revision) + 2);
   expect(
     Date.parse(String((await authority.read("org_01", minted.reservationId))?.expiresAt)),
   ).toBe(Date.parse("2026-09-01T13:00:00.000Z") + 24 * 60 * 60 * 1_000);
-  // And it is still a reservation: the endpoint it was minted for can be made.
+
+  // And it is still a reservation: the endpoint it was minted for can be made,
+  // at the address the mint derived a day earlier.
   await seedEndpoint(sql, minted.canonicalPublicOrigin);
   expect(
     await authority.assignEndpoint({
