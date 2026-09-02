@@ -986,8 +986,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
    * waited out its budget on an answer that named somebody else's publication
    * and refused a Version that was in fact serving — and the failed attempt
    * then wedged the origin reservation behind it. Serializing per script is
-   * what removes the race; the probe's supersession rule is what keeps a
-   * publication from being blamed for one that replaced it anyway.
+   * what removes the race, rather than teaching the probe to tolerate an answer
+   * that is not its own: every publication is still load-probed by the
+   * configuration that asked for it, which is the property the exact match
+   * exists for.
    *
    * Per script rather than globally, because two tenants' Workers have no
    * reason to wait on each other, and the chain entry is dropped once it is the
