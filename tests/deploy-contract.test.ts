@@ -1016,6 +1016,15 @@ describe("Takoserver split deploy entrypoint", () => {
       ],
       // And `--mint` belongs to no other surface.
       ["takoserver-worker", "--mint", "--environment=integration", `--commit=${sha}`],
+      // This surface publishes no Worker, so it carries no closure declaration.
+      [
+        "takoserver-org-api-key",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--organization=${organization}`,
+        "--refresh-var=TAKOSERVER_ENVIRONMENT",
+      ],
       // Key operands belong to no other surface either.
       [
         "takoserver-worker",

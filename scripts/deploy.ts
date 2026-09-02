@@ -348,9 +348,12 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     if (
       organizationId === null ||
       orgApiKeyOperands > MAX_ORG_API_KEY_FLAGS ||
+      closureDeltaNames.length > 0 ||
       closurePredecessorVersionId !== null ||
       legacyPredecessorVersionId !== null ||
       legacyHostRuntimePredecessorVersionId !== null ||
+      unattributedSuccessorVersionId !== null ||
+      formAuthorityScopeTransitionPath !== null ||
       adoptLivePath !== null ||
       reverse ||
       (action !== "mint" && action !== "status" && action !== "revoke")
