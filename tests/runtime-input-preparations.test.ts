@@ -488,7 +488,7 @@ test("erases unreadable sealed material on a same-owner re-claim too", async () 
     ["AAAA", "org_01", OPERATION_KEY],
   );
   await expect(fixture.authority.leases.acquire(leaseInput())).rejects.toMatchObject({
-    code: "unavailable",
+    code: "backend_unavailable",
     status: 503,
   });
   const [row] = await fixture.sql.query(

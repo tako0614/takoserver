@@ -201,7 +201,12 @@ export class RuntimeInputPreparationError extends Error {
       | "invalid_argument"
       | "conflict"
       | "operation_not_found"
-      | "unavailable"
+      /**
+       * Sealing or the durable authority is unavailable. Spelled exactly as the
+       * released provider's closed code table spells it, so this 503 decodes as
+       * a classification rather than as an opaque rejection.
+       */
+      | "backend_unavailable"
       /**
        * The executing apply is not the one this preparation committed to. It is
        * deliberately its own code: a plain conflict reads as "somebody else got
@@ -512,7 +517,7 @@ export function createRuntimeInputPreparations(
         if (raced?.state === "prepared" && raced.expires_at > now) {
           return await adoptExisting(raced, normalized, keys);
         }
-        throw new RuntimeInputPreparationError("unavailable", 503);
+        throw new RuntimeInputPreparationError("backend_unavailable", 503);
       }
       return projection({
         organization_id: normalized.organizationId,
@@ -577,7 +582,7 @@ export function createRuntimeInputPreparations(
         candidate.preparation_id !==
         (await derivePreparationId(normalized.organizationId, normalized.operationKey))
       ) {
-        throw new RuntimeInputPreparationError("unavailable", 503);
+        throw new RuntimeInputPreparationError("backend_unavailable", 503);
       }
       if (rowExpired(candidate, now)) {
         await expireExact(options.sql, candidate, now);
@@ -1143,7 +1148,7 @@ async function readRecoveryRow(sql: Sql, input: NormalizedClaimInput): Promise<P
 
 function recoveryIdentity(row: PreparationRow): RuntimeInputRecoveryIdentity {
   if (!digest.test(row.apply_commitment) || !row.worker_resource_uid || !row.host_operation_id) {
-    throw new RuntimeInputPreparationError("unavailable", 503);
+    throw new RuntimeInputPreparationError("backend_unavailable", 503);
   }
   return {
     operationKey: row.operation_key,
@@ -1232,10 +1237,10 @@ async function decryptClaim(
     !Number.isSafeInteger(row.fence) ||
     row.fence < 1
   ) {
-    throw new RuntimeInputPreparationError("unavailable", 503);
+    throw new RuntimeInputPreparationError("backend_unavailable", 503);
   }
   const key = keys.get(row.seal_key_id);
-  if (!key) throw new RuntimeInputPreparationError("unavailable", 503);
+  if (!key) throw new RuntimeInputPreparationError("backend_unavailable", 503);
   let plaintext: Uint8Array<ArrayBuffer>;
   try {
     plaintext = new Uint8Array(
@@ -1251,7 +1256,7 @@ async function decryptClaim(
       ),
     );
   } catch {
-    throw new RuntimeInputPreparationError("unavailable", 503);
+    throw new RuntimeInputPreparationError("backend_unavailable", 503);
   }
   return {
     operationKey: row.operation_key,
@@ -1273,10 +1278,10 @@ function parseSealedPayload(
   try {
     value = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes));
   } catch {
-    throw new RuntimeInputPreparationError("unavailable", 503);
+    throw new RuntimeInputPreparationError("backend_unavailable", 503);
   }
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new RuntimeInputPreparationError("unavailable", 503);
+    throw new RuntimeInputPreparationError("backend_unavailable", 503);
   }
   const payload = value as Record<string, unknown>;
   if (
@@ -1289,7 +1294,7 @@ function parseSealedPayload(
     payload.values === null ||
     Array.isArray(payload.values)
   ) {
-    throw new RuntimeInputPreparationError("unavailable", 503);
+    throw new RuntimeInputPreparationError("backend_unavailable", 503);
   }
   let parsed: {
     readonly bindings: Readonly<Record<string, string>>;
@@ -1298,10 +1303,10 @@ function parseSealedPayload(
   try {
     parsed = validatedBindings(payload.values as Record<string, unknown>);
   } catch {
-    throw new RuntimeInputPreparationError("unavailable", 503);
+    throw new RuntimeInputPreparationError("backend_unavailable", 503);
   }
   if (JSON.stringify(parsed.names) !== row.binding_names_json) {
-    throw new RuntimeInputPreparationError("unavailable", 503);
+    throw new RuntimeInputPreparationError("backend_unavailable", 503);
   }
   return parsed.bindings;
 }
@@ -1353,10 +1358,10 @@ async function adoptExisting(
     throw new RuntimeInputPreparationError("conflict", 409);
   }
   if (!row.sealed_payload || !row.seal_nonce || !row.seal_key_id) {
-    throw new RuntimeInputPreparationError("unavailable", 503);
+    throw new RuntimeInputPreparationError("backend_unavailable", 503);
   }
   const key = keys.get(row.seal_key_id);
-  if (!key) throw new RuntimeInputPreparationError("unavailable", 503);
+  if (!key) throw new RuntimeInputPreparationError("backend_unavailable", 503);
   let plaintext: ArrayBuffer;
   try {
     plaintext = await crypto.subtle.decrypt(
@@ -1370,7 +1375,7 @@ async function adoptExisting(
       fromBase64Url(row.sealed_payload),
     );
   } catch {
-    throw new RuntimeInputPreparationError("unavailable", 503);
+    throw new RuntimeInputPreparationError("backend_unavailable", 503);
   }
   if (!constantTimeEqual(new Uint8Array(plaintext), encode(canonicalSealedPayload(input)))) {
     throw new RuntimeInputPreparationError("conflict", 409);
@@ -1497,7 +1502,7 @@ function wireStatus(state: PreparationRow["state"]): RuntimeInputPreparationStat
 
 function projection(row: PreparationRow): RuntimeInputPreparationProjection {
   if (!digest.test(row.apply_commitment)) {
-    throw new RuntimeInputPreparationError("unavailable", 503);
+    throw new RuntimeInputPreparationError("backend_unavailable", 503);
   }
   const status = wireStatus(row.state);
   if (!status) throw new RuntimeInputPreparationError("conflict", 409);
@@ -1517,7 +1522,7 @@ function bindingNamesFromRow(row: PreparationRow): readonly string[] {
   try {
     value = JSON.parse(row.binding_names_json);
   } catch {
-    throw new RuntimeInputPreparationError("unavailable", 503);
+    throw new RuntimeInputPreparationError("backend_unavailable", 503);
   }
   if (
     !Array.isArray(value) ||
@@ -1527,7 +1532,7 @@ function bindingNamesFromRow(row: PreparationRow): readonly string[] {
     new Set(value).size !== value.length ||
     JSON.stringify([...value].sort()) !== row.binding_names_json
   ) {
-    throw new RuntimeInputPreparationError("unavailable", 503);
+    throw new RuntimeInputPreparationError("backend_unavailable", 503);
   }
   return value as readonly string[];
 }
@@ -1649,7 +1654,8 @@ function base64Url(bytes: Uint8Array): string {
 }
 
 function fromBase64Url(value: string): Uint8Array<ArrayBuffer> {
-  if (!/^[A-Za-z0-9_-]+$/u.test(value)) throw new RuntimeInputPreparationError("unavailable", 503);
+  if (!/^[A-Za-z0-9_-]+$/u.test(value))
+    throw new RuntimeInputPreparationError("backend_unavailable", 503);
   const padded = value
     .replaceAll("-", "+")
     .replaceAll("_", "/")
@@ -1658,7 +1664,7 @@ function fromBase64Url(value: string): Uint8Array<ArrayBuffer> {
   try {
     decoded = atob(padded);
   } catch {
-    throw new RuntimeInputPreparationError("unavailable", 503);
+    throw new RuntimeInputPreparationError("backend_unavailable", 503);
   }
   return Uint8Array.from(decoded, (character) => character.charCodeAt(0));
 }

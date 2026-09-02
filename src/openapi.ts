@@ -143,14 +143,12 @@ const WORKER_ENDPOINT_ORIGIN_RESERVATION_OPERATIONS = {
       "201": currentReservationResponse(
         "Prepared reservation; an exact replay returns the same closed projection",
       ),
-      "400": { description: "Malformed or open request" },
-      "401": { description: "Organization API key required" },
-      "403": { description: "The key lacks resources:write" },
-      "409": {
-        description: "Replay, requested-subdomain, canonical-origin, or placement conflict",
-      },
-      "422": { description: "No unique eligible ModuleWorker offering or provider capability" },
-      "503": { description: "Placement or reservation authority unavailable" },
+      "400": errorResponse("Malformed or open request"),
+      "401": errorResponse("Organization API key required"),
+      "403": errorResponse("The key lacks resources:write"),
+      "409": errorResponse("Replay, requested-subdomain, canonical-origin, or placement conflict"),
+      "422": errorResponse("No unique eligible ModuleWorker offering or provider capability"),
+      "503": errorResponse("Placement or reservation authority unavailable"),
     },
   },
   get: {
@@ -158,9 +156,9 @@ const WORKER_ENDPOINT_ORIGIN_RESERVATION_OPERATIONS = {
     parameters: [RESERVATION_ID_PARAMETER],
     responses: {
       "200": reservationResponse("Live value-free reservation projection"),
-      "401": { description: "Organization API key required" },
-      "403": { description: "The key lacks resources:write" },
-      "404": { description: "Reservation absent, released, or expired" },
+      "401": errorResponse("Organization API key required"),
+      "403": errorResponse("The key lacks resources:write"),
+      "404": errorResponse("Reservation absent, released, or expired"),
     },
   },
   delete: {
@@ -171,10 +169,10 @@ const WORKER_ENDPOINT_ORIGIN_RESERVATION_OPERATIONS = {
     parameters: [RESERVATION_ID_PARAMETER],
     responses: {
       "204": { description: "Released or already absent/released" },
-      "401": { description: "Organization API key required" },
-      "403": { description: "The key lacks resources:write" },
-      "409": { description: "Still activated, claimed, or fenced by the retained endpoint" },
-      "503": { description: "Reservation authority unavailable" },
+      "401": errorResponse("Organization API key required"),
+      "403": errorResponse("The key lacks resources:write"),
+      "409": errorResponse("Still activated, claimed, or fenced by the retained endpoint"),
+      "503": errorResponse("Reservation authority unavailable"),
     },
   },
 } as const;
@@ -202,11 +200,11 @@ const RUNTIME_INPUT_PREPARATION_OPERATIONS = {
     },
     responses: {
       "200": runtimeInputResponse("Prepared value-free handoff projection"),
-      "400": { description: "Malformed request, wrong Host origin, or wrong operation key" },
-      "401": { description: "Organization API key required" },
-      "403": { description: "The key lacks resources:write" },
-      "409": { description: "The operation key already carries a different or spent handoff" },
-      "503": { description: "Sealing or authority unavailable" },
+      "400": errorResponse("Malformed request, wrong Host origin, or wrong operation key"),
+      "401": errorResponse("Organization API key required"),
+      "403": errorResponse("The key lacks resources:write"),
+      "409": errorResponse("The operation key already carries a different or spent handoff"),
+      "503": errorResponse("Sealing or authority unavailable"),
     },
   },
   get: {
@@ -214,9 +212,9 @@ const RUNTIME_INPUT_PREPARATION_OPERATIONS = {
     parameters: runtimeInputPathParameters(),
     responses: {
       "200": runtimeInputResponse("Value-free lifecycle projection"),
-      "401": { description: "Organization API key required" },
-      "403": { description: "The key lacks resources:write" },
-      "404": { description: "No live handoff exists for this operation key" },
+      "401": errorResponse("Organization API key required"),
+      "403": errorResponse("The key lacks resources:write"),
+      "404": errorResponse("No live handoff exists for this operation key"),
     },
   },
   delete: {
@@ -224,9 +222,9 @@ const RUNTIME_INPUT_PREPARATION_OPERATIONS = {
     parameters: runtimeInputPathParameters(),
     responses: {
       "204": { description: "Revoked or already revoked" },
-      "401": { description: "Organization API key required" },
-      "403": { description: "The key lacks resources:write" },
-      "409": { description: "The handoff is already dispatched or indeterminate" },
+      "401": errorResponse("Organization API key required"),
+      "403": errorResponse("The key lacks resources:write"),
+      "409": errorResponse("The handoff is already dispatched or indeterminate"),
     },
   },
 } as const;
@@ -349,10 +347,10 @@ const PUBLIC_PATHS: Record<string, Record<string, unknown>> = {
             },
           },
         },
-        "400": { description: "Invalid exact address query" },
-        "401": { description: "Authentication required" },
-        "404": { description: "Resource incarnation not found" },
-        "503": { description: "Absence evidence is unavailable" },
+        "400": errorResponse("Invalid exact address query"),
+        "401": errorResponse("Authentication required"),
+        "404": errorResponse("Resource incarnation not found"),
+        "503": errorResponse("Absence evidence is unavailable"),
       },
     },
   },
@@ -498,6 +496,23 @@ function runtimeInputPathParameters() {
   ] as const;
 }
 
+/**
+ * One documented failure.
+ *
+ * Every error on the control lane and the Takoform Host lane is the same
+ * closed envelope, so the document pins its shape rather than leaving the
+ * status with a description and no schema. The released provider decodes an
+ * envelope only when `code`, `message`, `requestId` and `retryable` are all
+ * present; an undocumented shape is how a lane came to answer two members and
+ * make its own 404 unreadable.
+ */
+function errorResponse(description: string) {
+  return {
+    description,
+    content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+  } as const;
+}
+
 function runtimeInputResponse(description: string) {
   return {
     description,
@@ -561,6 +576,29 @@ export const openApiDocument = {
       },
     },
     schemas: {
+      Error: {
+        type: "object",
+        description:
+          "The one wire error envelope. Every failure on every lane of this Host answers with exactly these members.",
+        required: ["error"],
+        additionalProperties: false,
+        properties: {
+          error: {
+            type: "object",
+            required: ["code", "message", "requestId", "retryable"],
+            additionalProperties: false,
+            properties: {
+              code: { type: "string", minLength: 1, maxLength: 64 },
+              message: { type: "string", minLength: 1, maxLength: 256 },
+              requestId: { type: "string", minLength: 1, maxLength: 128 },
+              retryable: { type: "boolean" },
+              details: {
+                description: "Lane-specific, value-free detail. Never derived from a secret.",
+              },
+            },
+          },
+        },
+      },
       WorkerEndpointOriginReservationLegacyTarget: {
         type: "object",
         required: ["space", "workerName", "endpointName"],

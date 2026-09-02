@@ -1,3 +1,4 @@
+import { errorEnvelope } from "../error-envelope.ts";
 import { bytesDigest, canonicalJson } from "../json.ts";
 import type { JsonObject } from "../ports.ts";
 import { parseStrictJson, StrictJsonError } from "../strict-json.ts";
@@ -19,7 +20,6 @@ const NAME = /^[a-z][a-z0-9-]{0,62}$/u;
 const GENERATION = /^[1-9][0-9]{0,18}$/u;
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/u;
 const MAX_COUNTER = 9_223_372_036_854_775_807n;
-const RETRYABLE = ["resource_busy", "backend_unavailable", "rate_limited", "deadline_exceeded"];
 
 export interface ParsedResource {
   readonly apiVersion: string;
@@ -393,20 +393,11 @@ export function etag(resource: TakoformStoredResource): HeadersInit {
 }
 
 /**
- * The one error envelope. `requestId` is always fresh and the message is
- * derived from the code, so a driver's own words never reach the caller.
+ * The one error envelope, shared with the `/v1/*` control lane.
+ *
+ * Both lanes answer the same four members because one released client decodes
+ * both. See `src/error-envelope.ts`.
  */
 export function failure(code: string, status: number, details?: unknown): Response {
-  return Response.json(
-    {
-      error: {
-        code,
-        message: code.replaceAll("_", " "),
-        requestId: `req_${crypto.randomUUID()}`,
-        retryable: RETRYABLE.includes(code),
-        ...(details === undefined ? {} : { details }),
-      },
-    },
-    { status },
-  );
+  return Response.json(errorEnvelope(code, details), { status });
 }
