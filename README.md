@@ -154,6 +154,7 @@ Everything lives under one directory, `.takoserver` by default.
 | `TAKOSERVER_WORKERD_PORT` | Where published Workers are served. |
 | `TAKOSERVER_WORKERD_TLS_CERT_FILE` / `TAKOSERVER_WORKERD_TLS_KEY_FILE` | PEM paths. With both, workerd terminates TLS on that port and Worker endpoints are published as `https://`. |
 | `TAKOSERVER_WORKERD_TLS_CERT` / `TAKOSERVER_WORKERD_TLS_KEY` | The same two halves as PEM text, for a deployment that has no file to point at. |
+| `TAKOSERVER_WORKER_ENDPOINT_PORT` | Port a published Worker address carries. The workerd port by default; set it when something else terminates in front of workerd. The scheme's own default (443, 80) publishes a portless address. |
 | `TAKOSERVER_SUFFIXES` | Hostname suffixes this deployment will serve. Empty means any. |
 | `TAKOSERVER_OPERATOR_PUBLIC_JWK` | Public half of the operator key. Generated under the data root if unset. |
 | `TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK` | Optional identity-only operator key. It overrides the login key without granting wallet-funding authority. |
