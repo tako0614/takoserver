@@ -215,11 +215,14 @@ Host reserves on the caller's behalf. Three things make that safe to say:
   A label this contract cannot hold is a composition defect and fails closed.
 - **A Host-minted reservation is never a caller's.** Its id is derived —
   `hostmint-` followed by the digest of tenant, Space, Worker name and Worker
-  UID — and the public control routes refuse that prefix outright, so a row in
-  the namespace is always one this Host made and a caller cannot plant one for
-  the Host to adopt. `mintForWorker` releases only rows in that namespace; a
-  caller's reservation that owns the same address stops the mint on the live
-  uniqueness constraint rather than being taken away.
+  UID — and the public control routes refuse every *write* to that prefix, so a
+  row in the namespace is always one this Host made and a caller cannot plant
+  one for the Host to adopt. Reading one is allowed: it is the tenant's own
+  derived origin, already scoped to the authenticated organization, and
+  refusing it would leave a tenant unable to see the address their own Worker
+  was given. `mintForWorker` touches only rows in that namespace; a caller's
+  reservation that owns the same address stops the mint on the live uniqueness
+  constraint rather than being taken away.
 - **Letting go of one is the same release.** The id names an incarnation, so a
   destroy followed by a re-apply asks for a different reservation on the same
   address, and the previous one still owns that address until it is released.
@@ -227,6 +230,19 @@ Host reserves on the caller's behalf. Three things make that safe to say:
   retained endpoint Resource absent, its deletion attestation closed, and no
   provider deployment outside `deleted` or `failed`. While the old endpoint may
   still be serving, the mint fails rather than reallocating its origin.
+- **A derived id is minted once, so it is never released to be re-minted.**
+  `prepare` replays an existing reservation and refuses a terminal one, and the
+  id is a digest rather than a choice: releasing the row a mint is about to
+  prepare would refuse that Worker an endpoint permanently. So the two things a
+  reservation must be able to let go of are let go of *in place*. An endpoint
+  that is provably gone — the same four fences — is dropped as a witness while
+  the reservation stays bound, which is what lets an endpoint be destroyed and
+  declared again. And a binding whose Worker revision moved is advanced to the
+  current one under a CAS, after `validateWorker` re-proves that this is still
+  the Ready, current-generation, actively deployed incarnation at this exact
+  placement: a ModuleWorker re-renders whenever a dependent appears or becomes
+  Ready, so a reservation that refused a moved revision would refuse the retry
+  of every apply that made one.
 
 Everything else stands. A supplied reservation is still the authority for the
 origin it holds; binding, activation, deactivation, the deletion witness and

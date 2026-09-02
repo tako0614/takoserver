@@ -1243,6 +1243,110 @@ test("refuses to mint against a Worker that is not the exact Ready incarnation",
 });
 
 /**
+ * Re-creating just the endpoint must not end the Worker's endpoint story.
+ *
+ * A derived reservation id can never be re-minted: `prepare` replays an
+ * existing row and refuses a terminal one, and the id is a digest of the
+ * address, so a released row is the end. Letting go of a settled endpoint
+ * witness therefore has to happen in place — under the same fences a release
+ * uses — rather than by releasing the reservation that is about to be prepared.
+ */
+test("re-creates an endpoint on the same Worker after the previous one is gone", async () => {
+  const { authority, sql } = fixture();
+  await seedWorker(sql);
+  const target = {
+    organizationId: "org_01",
+    space: TARGET.space,
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-01",
+  } as const;
+  const minted = await authority.mintForWorker(target);
+  if (!minted) throw new Error("the fixture installation derives its own address");
+  await seedEndpoint(sql, minted.canonicalPublicOrigin);
+  await authority.assignEndpoint({
+    organizationId: "org_01",
+    reservationId: minted.reservationId,
+    space: TARGET.space,
+    endpointName: TARGET.endpointName,
+    endpointResourceUid: "uid-endpoint-01",
+    endpointResourceRevision: "1",
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-01",
+    providerPackRef: "fake",
+    providerInstallationRef: "fake.primary",
+  });
+
+  // While the endpoint is still there, the witness holds and the mint refuses
+  // rather than pointing a second endpoint at an origin that is answering.
+  await expect(authority.mintForWorker(target)).rejects.toMatchObject({
+    code: "conflict",
+    status: 409,
+  });
+
+  await sql.run("DELETE FROM tf_resources WHERE tenant_id = 'org_01' AND uid = 'uid-endpoint-01'");
+  await sql.run(
+    "UPDATE tf_resource_deployments SET state = 'deleted' WHERE tenant_id = 'org_01' AND resource_uid = 'uid-endpoint-01'",
+  );
+  await sql.run(
+    "UPDATE tf_resource_deletion_attestations SET state = 'closed' WHERE tenant_id = 'org_01' AND resource_uid = 'uid-endpoint-01'",
+  );
+
+  const again = await authority.mintForWorker(target);
+  expect(again).toMatchObject({
+    reservationId: minted.reservationId,
+    canonicalPublicOrigin: minted.canonicalPublicOrigin,
+    status: "bound",
+  });
+  // Still one row, still live: nothing was released, so the address is still
+  // this Worker's and can be minted a third time.
+  expect(
+    await sql.query("SELECT reservation_id, state FROM worker_endpoint_origin_reservations"),
+  ).toEqual([{ reservation_id: minted.reservationId, state: "bound" }]);
+  expect((await authority.mintForWorker(target))?.reservationId).toBe(minted.reservationId);
+});
+
+/**
+ * A ModuleWorker's revision moves on its own — `withDerivedRendering` re-renders
+ * it whenever a dependent appears or becomes Ready — and a binding records the
+ * revision it was made at. Between a failed endpoint apply and its retry that
+ * recorded revision is routinely stale, and refusing on it left the Worker
+ * unable to get an endpoint until the reservation aged out a day later.
+ */
+test("advances its own binding when the Worker re-renders between attempts", async () => {
+  const { authority, sql } = fixture();
+  await seedWorker(sql);
+  const target = {
+    organizationId: "org_01",
+    space: TARGET.space,
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-01",
+  } as const;
+  const minted = await authority.mintForWorker(target);
+  expect(minted?.binding.workerResourceRevision).toBe("1");
+
+  const [row] = await sql.query(
+    "SELECT resource_json FROM tf_resources WHERE tenant_id = 'org_01' AND uid = 'uid-worker-01'",
+  );
+  const resource = JSON.parse(String(row?.resource_json)) as { metadata: { revision: string } };
+  resource.metadata.revision = "2";
+  await sql.run(
+    "UPDATE tf_resources SET revision = '2', resource_json = ? WHERE tenant_id = 'org_01' AND uid = 'uid-worker-01'",
+    [JSON.stringify(resource)],
+  );
+
+  const again = await authority.mintForWorker(target);
+  expect(again).toMatchObject({
+    reservationId: minted?.reservationId as string,
+    status: "bound",
+    binding: { workerResourceUid: "uid-worker-01", workerResourceRevision: "2" },
+  });
+  // The same Worker incarnation throughout: one reservation, advanced.
+  expect(
+    await sql.query("SELECT reservation_id, state FROM worker_endpoint_origin_reservations"),
+  ).toEqual([{ reservation_id: minted?.reservationId as string, state: "bound" }]);
+});
+
+/**
  * A destroy followed by a re-apply asks for the same derived reservation with a
  * new Worker UID. Letting go of the old one is the fenced release of ADR 0004
  * and nothing weaker: while the old endpoint Resource is present, its deletion
