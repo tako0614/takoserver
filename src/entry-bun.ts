@@ -269,6 +269,16 @@ const runtimeInputs = runtimeInputsAvailable
  * composes no address; that keeps the KV table and the SQLite files untouched
  * on a machine whose only job is proving a historical Deployment is gone.
  */
+const configuredDataPlanePort = process.env.TAKOSERVER_DATA_PLANE_PORT;
+if (
+  configuredDataPlanePort !== undefined &&
+  !/^(?:[1-9][0-9]{0,4})$/u.test(configuredDataPlanePort.trim())
+) {
+  // The value ends up inside a generated `externalServer`, so a
+  // not-quite-a-number here becomes a configuration workerd refuses much later
+  // and for a reason that names neither this variable nor this process.
+  throw new Error("TAKOSERVER_DATA_PLANE_PORT must be a port number");
+}
 const selfhostDataAccess = createSelfhostDataPlaneAccess(dataRoot);
 const dataPlanes =
   providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
@@ -278,9 +288,7 @@ const dataPlanes =
         grant: (script, versionId) => selfhostDataAccess.grant(script, versionId),
         databasePath: (name) => selfhostDataAccess.databasePath(name),
         clock,
-        ...(process.env.TAKOSERVER_DATA_PLANE_PORT
-          ? { port: Number(process.env.TAKOSERVER_DATA_PLANE_PORT) }
-          : {}),
+        ...(configuredDataPlanePort ? { port: Number(configuredDataPlanePort.trim()) } : {}),
       });
 
 const providerArtifacts = {

@@ -1432,6 +1432,10 @@ describe("KV and SQLite bindings", () => {
     expect(
       existsSync(join(versionDirectory, "modules", "__takoserver-selfhost-entrypoint.js")),
     ).toBe(false);
+    expect(existsSync(join(versionDirectory, "modules", "__takoserver-selfhost-data.js"))).toBe(
+      false,
+    );
+    expect(readdirSync(join(versionDirectory, "modules"))).toEqual(["index.js"]);
     const meta = await readFile(join(versionDirectory, "meta.json"), "utf8");
     expect(meta).toContain('"mainModule":"index.js"');
     expect(meta).not.toContain("selfhost-entrypoint");

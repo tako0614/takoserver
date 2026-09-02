@@ -276,10 +276,16 @@ async function boot(tenantModule: string = TENANT_MODULE): Promise<{
   // entry, so the configuration a probe reaches is always the one just
   // written rather than whichever one workerd happened to still be serving.
   const restart = async (): Promise<void> => {
-    workerd?.kill();
+    // Reaped before the next one starts. Two of these alive at once is two
+    // copies of a 150 MB runtime, and this suite runs beside every other
+    // workerd-backed test in the repository.
+    const previous = workerd;
+    workerd = undefined;
+    previous?.kill();
+    await previous?.exited;
     workerd = Bun.spawn([WORKERD as string, "serve", join(root, "workers", "workerd.capnp")], {
-      stdout: "pipe",
-      stderr: "pipe",
+      stdout: "ignore",
+      stderr: "ignore",
     });
     expect(await reachable(`${origin}/`)).toBe(true);
   };
