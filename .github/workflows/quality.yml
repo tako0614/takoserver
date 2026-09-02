@@ -27,6 +27,25 @@ jobs:
         with:
           persist-credentials: false
 
+      # The current-publisher catalog tests read the public takoform-forms
+      # corpus from a checkout beside this repository. Runners have no sibling
+      # workspace, so the checkout goes to the runner temporary directory and
+      # the tests are pointed at it through TAKOFORM_FORMS_ROOT. The pinned
+      # commit comes from the catalog source itself, so the two cannot drift.
+      - name: Check out the canonical takoform-forms corpus
+        run: |
+          set -euo pipefail
+          commit="$(sed -n 's/^export const CURRENT_PUBLISHER_COMMIT = "\([0-9a-f]\{40\}\)".*$/\1/p' \
+            src/takoform/current-publisher-catalog.ts)"
+          if [ -z "${commit}" ]; then
+            echo "CURRENT_PUBLISHER_COMMIT is not declared in the catalog source" >&2
+            exit 1
+          fi
+          git clone --quiet https://github.com/tako0614/takoform-forms.git \
+            "${RUNNER_TEMP}/takoform-forms"
+          git -C "${RUNNER_TEMP}/takoform-forms" fetch --quiet origin "${commit}" || true
+          git -C "${RUNNER_TEMP}/takoform-forms" cat-file -e "${commit}^{commit}"
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # pinned: v2.0.2
         with:
@@ -39,4 +58,6 @@ jobs:
         run: bun audit
 
       - name: Run canonical Takoserver checks
+        env:
+          TAKOFORM_FORMS_ROOT: ${{ runner.temp }}/takoform-forms
         run: bun run check
