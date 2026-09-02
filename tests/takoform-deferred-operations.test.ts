@@ -1329,6 +1329,71 @@ describe("durable deferred Takoform operations", () => {
     expect(opened.database.query("SELECT name FROM tf_resources").all()).toEqual([]);
     opened.close();
   });
+
+  /**
+   * Only that one code. Every other settled failure is still a result the same
+   * key replays — widening it would also retry a refusal a provider answered
+   * *after* it was invoked, and that is a second provider call rather than a
+   * second attempt.
+   */
+  test("replays any other settled failure rather than attempting it again", async () => {
+    const opened = persistentHarness().open();
+    const current = await createNow(opened.host, "settled-failure");
+    const remove = async () =>
+      await opened.host.handle(
+        request(
+          `${lane}/resources/example.forms.invalid/DeferredThing/settled-failure?${new URLSearchParams(
+            {
+              space: "main",
+              group: form.identity.formRef.apiVersion,
+              kind: form.identity.formRef.kind,
+              definitionVersion: form.identity.formRef.definitionVersion,
+              schemaDigest: form.identity.formRef.schemaDigest,
+            },
+          )}`,
+          "primary",
+          {
+            method: "DELETE",
+            headers: {
+              "idempotency-key": "delete-settled-failure-0001",
+              "takoform-conformance-probe": "async",
+              "takoform-expected-generation": current.metadata.generation,
+            },
+          },
+        ),
+      );
+
+    const accepted = await remove();
+    expect(accepted?.status).toBe(202);
+    if (!accepted) throw new Error("delete returned no response");
+    const operationId = ((await accepted.json()) as { operation: { id: string } }).operation.id;
+    // The desired state moves under the acceptance, which is a fence a delete
+    // still keeps, so this settles as a failure before any provider is asked.
+    const moved = storedResource("settled-failure", current.metadata.uid);
+    moved.metadata.generation = "9";
+    opened.database
+      .query(
+        "UPDATE tf_resources SET generation = '9', resource_json = ? WHERE name = 'settled-failure'",
+      )
+      .run(JSON.stringify(moved));
+    let settled: Record<string, unknown> | undefined;
+    for (let poll = 0; poll < 8 && !settled?.done; poll += 1) {
+      const polled = await opened.host.handle(
+        request(`${lane}/operations/${operationId}`, "primary"),
+      );
+      settled = (await polled?.json()) as Record<string, unknown>;
+    }
+    expect(settled).toMatchObject({ done: true, error: { code: "generation_conflict" } });
+
+    const replayed = await remove();
+    expect(replayed?.status).toBe(202);
+    if (!replayed) throw new Error("delete replay returned no response");
+    // The same durable operation, not a fresh attempt.
+    expect(((await replayed.json()) as { operation: { id: string } }).operation.id).toBe(
+      operationId,
+    );
+    opened.close();
+  });
 });
 
 function persistentHarness(

@@ -809,23 +809,41 @@ function isTerminal(operation: DeferredOperationRecord): boolean {
  * answer to the request that just arrived.
  *
  * Two cases retire one. A committed mutation whose Resource no longer exists
- * describes an incarnation that is gone. And a **settled failure** is not a
- * result at all: the released provider recomputes the same plan-derived
- * idempotency key on every run, so replaying a refusal the caller has already
- * acted on strands the resource. `tofu destroy` gets `dependency_in_use` on a
- * parent, deletes the dependents the refusal named, and asks again under the
- * same key — and would be handed the same refusal forever. A settled failure is
- * also known not to have crossed the provider boundary: an operation whose
- * provider mutation was planned or receipted is held for repair rather than
- * settled, so retiring one replays nothing.
+ * describes an incarnation that is gone. And a settled `dependency_in_use` is
+ * not a result at all, it is a statement about facts the caller then changes:
+ * the released provider recomputes the same plan-derived idempotency key on
+ * every run, so `tofu destroy` gets that refusal on a parent, deletes the
+ * dependents it named, asks again under the same key — and would be handed the
+ * same refusal until the record aged out.
+ *
+ * Only that one code, and deliberately. The engine raises it before it accepts
+ * a provider mutation saga at all, so retiring one is provably retiring
+ * something that never reached a provider. Widening this to every settled
+ * failure would also retire a refusal a provider answered *after* it was
+ * invoked — a precondition failure deletes its saga row on the way out — and a
+ * retry there is a second provider call, not a second attempt.
  */
 async function replayRetired(
   operation: DeferredOperationRecord,
   store: TakoformStore,
 ): Promise<boolean> {
-  if (operation.phase === "failed") return true;
+  if (operation.phase === "failed") return terminalErrorCode(operation) === "dependency_in_use";
   if (!isTerminal(operation) || !operation.committedUid) return false;
   return (await store.resourceByUid(operation.tenantId, operation.committedUid)) === null;
+}
+
+/** The code a settled operation reported, or nothing this Host can act on. */
+function terminalErrorCode(operation: DeferredOperationRecord): string | null {
+  if (operation.terminalJson === undefined) return null;
+  let document: unknown;
+  try {
+    document = JSON.parse(operation.terminalJson);
+  } catch {
+    return null;
+  }
+  if (!isRecord(document)) return null;
+  const error = document.error;
+  return isRecord(error) && typeof error.code === "string" ? error.code : null;
 }
 
 function nextIdentifier(prefix: "op" | "uid" | "lease", randomId: () => string): string {
