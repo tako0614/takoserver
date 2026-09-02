@@ -37,9 +37,13 @@ import {
  * would not answer.
  */
 
+/** Where this Host's readiness probe reaches a published script. */
+const PROBE_HOSTNAME = "sw-test.selfhost-internal.invalid";
+
 const KV_ONLY: SelfhostWorkerEntrypointSourceInput = {
   originalMainModule: "index.js",
   publication: "sw1.v1",
+  probeHostname: PROBE_HOSTNAME,
   declaredHandlers: ["fetch"],
   bindings: [{ kind: SELFHOST_WORKER_EDGE_KV_BINDING_KIND, publicName: "KV" }],
 };
@@ -125,6 +129,7 @@ test("projects the declared facades and nothing else onto the tenant environment
     {
       originalMainModule: "index.js",
       publication: "sw1.v1",
+      probeHostname: PROBE_HOSTNAME,
       declaredHandlers: ["fetch"],
       bindings: [
         { kind: SELFHOST_WORKER_EDGE_KV_BINDING_KIND, publicName: "KV" },
@@ -165,6 +170,7 @@ test("the edge.sql facade offers exactly execute, query, and transaction", async
     {
       originalMainModule: "index.js",
       publication: "sw1.v1",
+      probeHostname: PROBE_HOSTNAME,
       declaredHandlers: ["fetch"],
       bindings: [{ kind: SELFHOST_WORKER_EDGE_SQL_BINDING_KIND, publicName: "DB" }],
     },
@@ -233,6 +239,7 @@ test("a SQL statement travels to the SQL plane and its rows come back projected"
     {
       originalMainModule: "index.js",
       publication: "sw1.v1",
+      probeHostname: PROBE_HOSTNAME,
       declaredHandlers: ["fetch"],
       bindings: [{ kind: SELFHOST_WORKER_EDGE_SQL_BINDING_KIND, publicName: "DB" }],
     },
@@ -267,6 +274,7 @@ test("a plane refusal reaches the tenant under the closed error vocabulary", asy
     {
       originalMainModule: "index.js",
       publication: "sw1.v1",
+      probeHostname: PROBE_HOSTNAME,
       declaredHandlers: ["fetch"],
       bindings: [{ kind: SELFHOST_WORKER_EDGE_SQL_BINDING_KIND, publicName: "DB" }],
     },
@@ -294,6 +302,7 @@ test("a code the plane is not allowed to return becomes backend_unavailable", as
     {
       originalMainModule: "index.js",
       publication: "sw1.v1",
+      probeHostname: PROBE_HOSTNAME,
       declaredHandlers: ["fetch"],
       bindings: [{ kind: SELFHOST_WORKER_EDGE_SQL_BINDING_KIND, publicName: "DB" }],
     },
@@ -384,7 +393,7 @@ test("the readiness route reports a declared handler the tenant module lacks", a
   );
   try {
     const answered = await generated.worker.fetch(
-      new Request(`https://worker.example${SELFHOST_WORKER_READINESS_PATH}`, {
+      new Request(`https://${PROBE_HOSTNAME}${SELFHOST_WORKER_READINESS_PATH}`, {
         method: "POST",
         headers: { [SELFHOST_WORKER_READINESS_HEADER]: SELFHOST_WORKER_READINESS_PROTOCOL },
       }),
@@ -399,7 +408,7 @@ test("the readiness route reports a declared handler the tenant module lacks", a
       schema: SELFHOST_WORKER_READINESS_RESULT_SCHEMA,
       publication: "sw1.v1",
       handlers: ["fetch", "scheduled"],
-      failure: { reason: "declaration", message: "self-host Worker declared handler is missing" },
+      failure: { reason: "declaration", message: "declared handler scheduled is not exported" },
     });
   } finally {
     await generated.dispose();
@@ -424,7 +433,7 @@ test("the readiness route distinguishes an import-time failure from a missing ex
   );
   try {
     const answered = await generated.worker.fetch(
-      new Request(`https://worker.example${SELFHOST_WORKER_READINESS_PATH}`, {
+      new Request(`https://${PROBE_HOSTNAME}${SELFHOST_WORKER_READINESS_PATH}`, {
         method: "POST",
         headers: { [SELFHOST_WORKER_READINESS_HEADER]: SELFHOST_WORKER_READINESS_PROTOCOL },
       }),
@@ -460,7 +469,7 @@ test("a declared handler the tenant module does not export refuses the publicati
   try {
     await expect(
       generated.worker.fetch(new Request("https://worker.example/"), rawEnv(service), context),
-    ).rejects.toThrow("declared handler is missing");
+    ).rejects.toThrow("declared handler scheduled is not exported");
   } finally {
     await generated.dispose();
   }
@@ -472,7 +481,7 @@ test("a module with no default export refuses the publication", async () => {
   try {
     await expect(
       generated.worker.fetch(new Request("https://worker.example/"), rawEnv(service), context),
-    ).rejects.toThrow("must have a default export");
+    ).rejects.toThrow("the module has no default export");
   } finally {
     await generated.dispose();
   }
@@ -516,6 +525,7 @@ test("a version with no facade generates no entrypoint at all", () => {
     selfhostWorkerEntrypointSource({
       originalMainModule: "index.js",
       publication: "sw1.v1",
+      probeHostname: PROBE_HOSTNAME,
       declaredHandlers: ["fetch"],
       bindings: [{ name: "LANE", type: "plain_text" }],
     }),
@@ -598,6 +608,7 @@ function objectPlane(
 const OBJECTS_ONLY: SelfhostWorkerEntrypointSourceInput = {
   originalMainModule: "index.js",
   publication: "sw1.v1",
+  probeHostname: PROBE_HOSTNAME,
   declaredHandlers: ["fetch"],
   bindings: [{ kind: SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND, publicName: "MEDIA" }],
 };
@@ -945,9 +956,14 @@ test("the Host reports an import-time failure as one, and a missing export as on
   );
 
   const declaration = selfhostReadinessAnswer(
-    envelope({ reason: "declaration", message: "self-host Worker declared handler is missing" }),
+    envelope({ reason: "declaration", message: "declared handler queue is not exported" }),
   );
   expect(selfhostReadinessFailureMessage(declaration?.failure)).toBe(
+    "the Worker Version's module is not what it declares: declared handler queue is not exported",
+  );
+  // Only a declaration refusal with nothing to add falls back to the general
+  // sentence, so the other three defects never wear the handler list's words.
+  expect(selfhostReadinessFailureMessage({ reason: "declaration" })).toBe(
     "the Worker Version's module does not export every handler it declares",
   );
 
@@ -962,4 +978,132 @@ test("the Host reports an import-time failure as one, and a missing export as on
   // failure at all rather than as a third meaning.
   expect(selfhostReadinessAnswer(envelope({ reason: "whatever" }))?.failure).toBeUndefined();
   expect(selfhostReadinessAnswer('{"schema":"other"}')).toBeNull();
+});
+
+/**
+ * The route lives on the tenant's default `fetch`, and every hostname the
+ * publication claims — customer custom domains included — reaches that same
+ * service. So the refusal is public, and what the module said about it must not
+ * be: a module specifier or a source path is the bundle's business and the
+ * operator's, not something to hand to anyone who can reach the address.
+ */
+test("answers the readiness detail to this Host's probe and to nobody else", async () => {
+  const { service } = plane([]);
+  const generated = await loadGenerated(
+    `throw new TypeError('No such module "node:path". imported from "/srv/app/index.js"');\n` +
+      `export default { async fetch() { return new Response("ok"); } };`,
+    KV_ONLY,
+  );
+  const ask = async (hostname: string) =>
+    await generated.worker.fetch(
+      new Request(`https://${hostname}${SELFHOST_WORKER_READINESS_PATH}`, {
+        method: "POST",
+        headers: { [SELFHOST_WORKER_READINESS_HEADER]: SELFHOST_WORKER_READINESS_PROTOCOL },
+      }),
+      rawEnv(service),
+      context,
+    );
+  try {
+    for (const hostname of [
+      "worker.example",
+      "www.customer.test",
+      "sw-other.selfhost-internal.invalid",
+    ]) {
+      const public_ = await ask(hostname);
+      // Still an honest refusal, and still attributable to this publication.
+      expect(public_.status).toBe(500);
+      const body = (await public_.text()) as string;
+      expect(JSON.parse(body)).toEqual({
+        schema: SELFHOST_WORKER_READINESS_RESULT_SCHEMA,
+        publication: "sw1.v1",
+        handlers: ["fetch"],
+      });
+      expect(body).not.toContain("node:path");
+      expect(body).not.toContain("/srv/app");
+    }
+    const probed = await ask(PROBE_HOSTNAME);
+    expect(((await probed.json()) as { failure: { message: string } }).failure.message).toContain(
+      "node:path",
+    );
+  } finally {
+    await generated.dispose();
+  }
+});
+
+/**
+ * Everything the failure report touches came out of the tenant's module, so a
+ * Proxy trap or a getter can throw while it is being read. A refusal this Host
+ * cannot describe is still a refusal: it must not become "the runtime did not
+ * answer at all", which the Host waits out and reports as retryable, burning
+ * the whole probe deadline on every attempt.
+ */
+test("a tenant cannot make the readiness route reject", async () => {
+  const { service } = plane([]);
+  const generated = await loadGenerated(
+    `throw new Proxy({}, { getOwnPropertyDescriptor() { throw new RangeError("trap"); },\n` +
+      `  get() { throw new RangeError("trap"); } });\n` +
+      `export default { async fetch() { return new Response("ok"); } };`,
+    KV_ONLY,
+  );
+  try {
+    const answered = await generated.worker.fetch(
+      new Request(`https://${PROBE_HOSTNAME}${SELFHOST_WORKER_READINESS_PATH}`, {
+        method: "POST",
+        headers: { [SELFHOST_WORKER_READINESS_HEADER]: SELFHOST_WORKER_READINESS_PROTOCOL },
+      }),
+      rawEnv(service),
+      context,
+    );
+    expect(answered.status).toBe(500);
+    expect(await answered.json()).toEqual({
+      schema: SELFHOST_WORKER_READINESS_RESULT_SCHEMA,
+      publication: "sw1.v1",
+      handlers: ["fetch"],
+      // Reported as the module's, undescribed — never as a declaration defect,
+      // which the tenant has no way to claim.
+      failure: { reason: "module", name: "Error", message: "" },
+    });
+  } finally {
+    await generated.dispose();
+  }
+});
+
+/**
+ * A metadata member that is not a string is the wrong kind of thing, not too
+ * much of it. The facade is where a Worker meets this rule, so the facade is
+ * where the code has to be right — the plane behind it never sees the call.
+ */
+test("the KV facade refuses metadata by kind and by size, each as itself", async () => {
+  const { service } = plane([]);
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       const said = {};
+       const record = async (name, run) => {
+         try { await run(); said[name] = null; }
+         catch (error) { said[name] = error.name; }
+       };
+       await record("number", () => env.KV.put("k", "v", { metadata: { m: 1 } }));
+       await record("nested", () => env.KV.put("k", "v", { metadata: { m: { deep: true } } }));
+       await record("notARecord", () => env.KV.put("k", "v", { metadata: "no" }));
+       await record("longValue", () =>
+         env.KV.put("k", "v", { metadata: { m: "x".repeat(8193) } }));
+       return Response.json(said);
+     } };`,
+    KV_ONLY,
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(await response.json()).toEqual({
+      number: "invalid_value",
+      nested: "invalid_value",
+      notARecord: "invalid_value",
+      longValue: "metadata_too_large",
+    });
+  } finally {
+    await generated.dispose();
+  }
 });

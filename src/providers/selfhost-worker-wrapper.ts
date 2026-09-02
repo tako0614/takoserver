@@ -180,11 +180,18 @@ export function selfhostReadinessAnswer(
 export function selfhostReadinessFailureMessage(
   failure: SelfhostReadinessFailure | undefined,
 ): string {
-  if (failure?.reason !== "module") {
-    return "the Worker Version's module does not export every handler it declares";
+  if (failure?.reason === "module") {
+    const detail = [failure.name ?? "Error", failure.message].filter(Boolean).join(": ");
+    return `the Worker Version's module failed to load: ${detail}`;
   }
-  const detail = [failure.name ?? "Error", failure.message].filter(Boolean).join(": ");
-  return `the Worker Version's module failed to load: ${detail}`;
+  // "does not export every handler it declares" is one of four things the
+  // wrapper can mean, and the other three are about the default export rather
+  // than the handler list. Collapsing them here would re-create the
+  // mis-direction one level down: an operator told the handler list is wrong
+  // reads a list that is right.
+  return failure?.message
+    ? `the Worker Version's module is not what it declares: ${failure.message}`
+    : "the Worker Version's module does not export every handler it declares";
 }
 
 export const SELFHOST_DATA_PLANE_PATH_PREFIX = "/.well-known/takoserver/selfhost-data/v1" as const;
@@ -274,6 +281,17 @@ export interface SelfhostWorkerEntrypointSourceInput {
    */
   readonly publication: string;
   /**
+   * The one hostname this Host's readiness probe arrives on.
+   *
+   * The route lives on the tenant's default `fetch`, and the runtime maps every
+   * hostname the publication claims — customer custom domains included — to
+   * that same service. So the route answers on the public internet, and what it
+   * says has to depend on how the request got here. The probe's own address is
+   * the only fact about a request the isolate can check that tenant code does
+   * not supply, so the failure detail is answered on it and nowhere else.
+   */
+  readonly probeHostname: string;
+  /**
    * Whether this publication exports the event entrypoint.
    *
    * True when the Worker has a Queue Consumer or a Cron Trigger attached, which
@@ -300,6 +318,8 @@ export interface SelfhostWorkerEntrypointSourceInput {
 
 const ARTIFACT_PART_NAME = /^[A-Za-z0-9_.][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_.][A-Za-z0-9._-]*)*$/u;
 const PUBLICATION = /^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/u;
+const PROBE_HOSTNAME =
+  /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/u;
 const BINDING_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/u;
 const VARIABLE_NAME = /^[A-Za-z][A-Za-z0-9._-]*$/u;
 const NATIVE_BINDING_TYPES = new Set(["plain_text", "json", "secret_text"]);
@@ -332,7 +352,7 @@ export function selfhostWorkerEntrypointSource(input: SelfhostWorkerEntrypointSo
   // not with a runtime error about a missing entrypoint.
   const handlers = [
     `  async fetch(request, rawEnv, rawContext) {
-    const answered = await readiness(request);
+    const answered = await safeReadiness(request);
     if (answered) return answered;
 ${
   configuration.declaredHandlers.includes("fetch")
@@ -397,6 +417,7 @@ const READINESS_PROTOCOL = ${JSON.stringify(SELFHOST_WORKER_READINESS_PROTOCOL)}
 const READINESS_RESULT_SCHEMA = ${JSON.stringify(SELFHOST_WORKER_READINESS_RESULT_SCHEMA)};
 const READINESS_HEADER = ${JSON.stringify(SELFHOST_WORKER_READINESS_HEADER)};
 const PUBLICATION = ${JSON.stringify(normalized.publication)};
+const PROBE_HOSTNAME = ${JSON.stringify(normalized.probeHostname)};
 const KV_URL = ${JSON.stringify(`${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_KV_PATH}`)};
 const SQL_URL = ${JSON.stringify(`${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_SQL_PATH}`)};
 const PROTOCOL = ${JSON.stringify(SELFHOST_DATA_PLANE_PROTOCOL)};
@@ -474,6 +495,7 @@ const SafeRequestUrlGet = captureGetter(Request.prototype, "url");
 const SafeRequestMethodGet = captureGetter(Request.prototype, "method");
 const SafeRequestHeadersGet = captureGetter(Request.prototype, "headers");
 const SafeURLPathnameGet = captureGetter(URL.prototype, "pathname");
+const SafeURLHostnameGet = captureGetter(URL.prototype, "hostname");
 const SafeStringFromCharCode = String.fromCharCode;
 const SafeTextDecoder = TextDecoder;
 const SafeTextDecoderDecode = TextDecoder.prototype.decode;
@@ -573,7 +595,32 @@ function statusResponse(status) {
  * still a refusal rather than a dropped event. Nothing about the tenant crosses
  * the seam: a module that throws is a 500 and a status, never a message.
  */
+/**
+ * The readiness route can never take the tenant's request down with it.
+ *
+ * Everything it touches on a failure came out of the tenant's module, so a
+ * refusal it cannot describe answers 500 with no detail rather than rejecting
+ * the handler — which the Host reads as "the runtime did not answer at all",
+ * waits out the deadline for, and reports as retryable.
+ */
+async function safeReadiness(request) {
+  try {
+    return await readiness(request);
+  } catch {
+    const answer = SafeObjectCreate(null);
+    answer.schema = READINESS_RESULT_SCHEMA;
+    answer.publication = PUBLICATION;
+    answer.handlers = CONFIGURATION.declaredHandlers;
+    answer.failure = unknownLoadFailure();
+    return new SafeResponse(SafeJSONStringify(answer), {
+      status: 500,
+      headers: { "content-type": "application/json" },
+    });
+  }
+}
+
 async function readiness(request) {
+  let asked = false;
   try {
     const url = new SafeURL(SafeApply(SafeRequestUrlGet, request, []));
     if (SafeApply(SafeURLPathnameGet, url, []) !== READINESS_PATH) return undefined;
@@ -582,6 +629,11 @@ async function readiness(request) {
     if (SafeApply(SafeHeadersGet, headers, [READINESS_HEADER]) !== READINESS_PROTOCOL) {
       return undefined;
     }
+    // Whether this Host asked, as opposed to the internet. Every hostname the
+    // publication claims reaches this same service, so the route answers
+    // publicly; only the probe's own address distinguishes the Host's question,
+    // and it is the one thing about a request that tenant code cannot supply.
+    asked = SafeApply(SafeURLHostnameGet, url, []) === PROBE_HOSTNAME;
   } catch {
     return undefined;
   }
@@ -594,7 +646,20 @@ async function readiness(request) {
     await loadOriginal();
   } catch (error) {
     status = 500;
-    answer.failure = describeLoadFailure(error);
+    // Reading anything off a tenant-thrown value is tenant code: a Proxy trap
+    // or a getter can throw here. A refusal this Host cannot describe is still
+    // a refusal, and it must not become "the runtime did not answer", which is
+    // retryable and costs the whole probe deadline on every attempt.
+    // The refusal is public; what the module said about it is not. A module
+    // specifier or a source path is the bundle's business and the operator's,
+    // not something to hand to anyone who can reach the Worker's address.
+    if (asked) {
+      try {
+        answer.failure = describeLoadFailure(error);
+      } catch {
+        answer.failure = unknownLoadFailure();
+      }
+    }
   }
   return new SafeResponse(SafeJSONStringify(answer), {
     status,
@@ -630,6 +695,14 @@ function describeLoadFailure(error) {
   failure.reason = "module";
   failure.name = sanitizeFailureText(readFailureField(error, "name"), 64) || "Error";
   failure.message = sanitizeFailureText(readFailureField(error, "message"), 400);
+  return failure;
+}
+
+function unknownLoadFailure() {
+  const failure = SafeObjectCreate(null);
+  failure.reason = "module";
+  failure.name = "Error";
+  failure.message = "";
   return failure;
 }
 
@@ -709,22 +782,25 @@ function loadOriginal() {
  */
 function validateOriginal(loaded) {
   if (!loaded || (typeof loaded !== "object" && typeof loaded !== "function") || !SafeObjectHasOwn(loaded, "default")) {
-    throw declarationError("self-host Worker must have a default export");
+    throw declarationError("the module has no default export");
   }
   const original = loaded.default;
   if (!original || typeof original !== "object" || SafeArrayIsArray(original)) {
-    throw declarationError("self-host Worker default export must be a plain object");
+    throw declarationError("the default export is not a plain object");
   }
   const prototype = SafeApply(SafeObjectGetPrototypeOf, SafeObject, [original]);
   if (prototype !== SafeObjectPrototype && prototype !== null) {
-    throw declarationError("self-host Worker default export must be a plain object");
+    throw declarationError("the default export is not a plain object");
   }
   const handlers = SafeObjectCreate(null);
   for (let index = 0; index < CONFIGURATION.declaredHandlers.length; index += 1) {
     const handler = CONFIGURATION.declaredHandlers[index];
     const descriptor = SafeApply(SafeObjectGetOwnPropertyDescriptor, SafeObject, [original, handler]);
-    if (!descriptor || !SafeObjectHasOwn(descriptor, "value") || typeof descriptor.value !== "function") {
-      throw declarationError("self-host Worker declared handler is missing");
+    if (!descriptor) {
+      throw declarationError("declared handler " + handler + " is not exported");
+    }
+    if (!SafeObjectHasOwn(descriptor, "value") || typeof descriptor.value !== "function") {
+      throw declarationError("declared handler " + handler + " is not a function");
     }
     handlers[handler] = descriptor.value;
   }
@@ -2301,18 +2377,21 @@ function isCanonicalBase64(value, maximumBytes) {
   } catch { return false; }
 }
 
+// Metadata that is the wrong kind of thing is invalid_value; only too much of
+// it is metadata_too_large. Answering a size refusal to a one-member record
+// whose value is a number sends the caller to shrink what is already small.
 function projectStringRecord(value) {
-  if (!isRecord(value)) throw portableError("metadata_too_large");
+  if (!isRecord(value)) throw portableError("invalid_value");
   const keys = SafeObjectKeys(value);
   sortStrings(keys);
-  if (SafeOwnKeys(value).length !== keys.length || keys.length > 64) {
-    throw portableError("metadata_too_large");
-  }
+  if (SafeOwnKeys(value).length !== keys.length) throw portableError("invalid_value");
+  if (keys.length > 64) throw portableError("metadata_too_large");
   const result = SafeObjectCreate(null);
   for (let index = 0; index < keys.length; index += 1) {
     const key = keys[index];
     const item = value[key];
-    if (key.length > 256 || typeof item !== "string" || item.length > 8192) {
+    if (typeof item !== "string") throw portableError("invalid_value");
+    if (key.length > 256 || item.length > 8192) {
       throw portableError("metadata_too_large");
     }
     result[key] = item;
@@ -2416,6 +2495,7 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
   readonly declaredHandlers: SelfhostWorkerHandlerName[];
   readonly bindings: SelfhostWorkerBindingDescriptor[];
   readonly publication: string;
+  readonly probeHostname: string;
   readonly events: boolean;
   readonly services: string[];
 } {
@@ -2429,6 +2509,7 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
       "declaredHandlers",
       "bindings",
       "publication",
+      "probeHostname",
       ...(Object.hasOwn(fields, "events") ? ["events"] : []),
       ...(Object.hasOwn(fields, "services") ? ["services"] : []),
     ],
@@ -2440,6 +2521,13 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
     invalid("originalMainModule");
   if (typeof fields.publication !== "string" || !PUBLICATION.test(fields.publication)) {
     invalid("publication");
+  }
+  if (
+    typeof fields.probeHostname !== "string" ||
+    fields.probeHostname.length > 255 ||
+    !PROBE_HOSTNAME.test(fields.probeHostname)
+  ) {
+    invalid("probeHostname");
   }
   const declaredHandlersInput = dataArray(fields.declaredHandlers, "declaredHandlers");
   if (declaredHandlersInput.length < 1) invalid("declaredHandlers");
@@ -2513,6 +2601,7 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
     declaredHandlers,
     bindings,
     publication: fields.publication,
+    probeHostname: fields.probeHostname,
     events,
     services,
   };
