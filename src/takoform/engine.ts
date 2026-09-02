@@ -296,6 +296,16 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
     readonly onContention?: () => void;
     readonly onDispatch?: () => void | Promise<void>;
     readonly onReceiptReady?: () => void;
+    /**
+     * The attempt ended having provably mutated nothing.
+     *
+     * Raised only where the saga itself is terminalized as a precondition
+     * failure: the plan is deleted, so no recovery will ever resume it, and the
+     * refusal's whole meaning is that the provider did not act. That is the one
+     * fact the caller's effect ledger needs in order to close its own record of
+     * the attempt rather than leaving it open for a repair that will not come.
+     */
+    readonly onProvablyIdle?: () => void;
     readonly prepare?: () => Promise<void>;
     readonly settleDefinitiveImportConflict?: (leaseToken: string) => Promise<boolean>;
     readonly execute: (
@@ -402,7 +412,8 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           resourceUid: input.resourceUid,
           leaseToken,
         });
-        if (!settledPrecondition) input.onContention?.();
+        if (settledPrecondition) input.onProvablyIdle?.();
+        else input.onContention?.();
       }
       if (!settledPrecondition) {
         const released = await store.releaseProviderMutationExecution({
@@ -415,6 +426,43 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       }
       throw error;
     }
+  };
+
+  /**
+   * Closes the Host's own record of an attempt that provably mutated nothing.
+   *
+   * A create reserves an incarnation — a deletion attestation opened `live`,
+   * then a `planned` and, once the saga is marked, a `dispatched` effect — all
+   * before the provider is asked. A refusal that follows commits no Resource,
+   * so the record described an incarnation that never existed: the attestation
+   * could never be closed by a deletion that never happened, and the `apply`
+   * effect stayed open for a repair that was never coming. Every later question
+   * of the form "is this endpoint provably gone" reads exactly those two rows,
+   * so one refusal's residue made the next repair impossible — which is how a
+   * space came to be unable to create its endpoint again on a Host that had
+   * been repaired.
+   *
+   * The effect is terminalized first, because that is a statement this Host can
+   * always make truthfully once the saga is settled: the mutation did not
+   * happen. Dropping the record then needs the stronger proof that the
+   * incarnation produced nothing at all, and if that does not hold the settled
+   * effect is still there for the repair to read.
+   */
+  const settleIdleAttempt = async (
+    tenantId: string,
+    resourceUid: string,
+    effectId: string,
+    kind: "apply" | "import",
+  ): Promise<void> => {
+    await store.recordResourceEffect({
+      tenantId,
+      resourceUid,
+      effectId,
+      kind,
+      phase: "cancelled",
+      operationMode: "initial",
+    });
+    await store.releaseUncommittedResourceIncarnation({ tenantId, resourceUid, effectId });
   };
 
   const requireExecutable = async (
@@ -1297,6 +1345,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       let persisted = false;
       let providerSettled = false;
       let providerDispatched = false;
+      let providerProvablyIdle = false;
       let releaseClaimsOnFailure = true;
       try {
         let preparedDriverRelations: readonly TakoformDriverRelation[] = [];
@@ -1310,6 +1359,9 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           },
           onReceiptReady: () => {
             releaseClaimsOnFailure = false;
+          },
+          onProvablyIdle: () => {
+            providerProvablyIdle = true;
           },
           onDispatch: async () => {
             if (
@@ -1454,20 +1506,15 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         if (!persisted && !providerSettled && releaseClaimsOnFailure) {
           await store.releaseResourceClaims(claimOwnerId);
           if (!providerDispatched) {
-            await store.recordResourceEffect({
-              tenantId: context.tenantId,
-              resourceUid: uid,
-              effectId: opId,
-              kind: "apply",
-              phase: "cancelled",
-              operationMode: "initial",
-            });
             await store.abandonProviderMutationPlan({
               tenantId: context.tenantId,
               operationId: opId,
               replayKey,
               resourceUid: uid,
             });
+          }
+          if (!providerDispatched || providerProvablyIdle) {
+            await settleIdleAttempt(context.tenantId, uid, opId, "apply");
           }
         }
         throw error;
@@ -1817,6 +1864,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       let persisted = false;
       let providerSettled = false;
       let providerDispatched = false;
+      let providerProvablyIdle = false;
       let releaseClaimsOnFailure = true;
       try {
         let preparedDriverRelations: readonly TakoformDriverRelation[] = [];
@@ -1966,20 +2014,15 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         if (!persisted && !providerSettled && releaseClaimsOnFailure) {
           await store.releaseResourceClaims(claimOwnerId);
           if (!providerDispatched) {
-            await store.recordResourceEffect({
-              tenantId: context.tenantId,
-              resourceUid: uid,
-              effectId: importId,
-              kind: "import",
-              phase: "cancelled",
-              operationMode: "initial",
-            });
             await store.abandonProviderMutationPlan({
               tenantId: context.tenantId,
               operationId: importId,
               replayKey,
               resourceUid: uid,
             });
+          }
+          if (!providerDispatched || providerProvablyIdle) {
+            await settleIdleAttempt(context.tenantId, uid, importId, "import");
           }
         }
         throw error;

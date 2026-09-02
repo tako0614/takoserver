@@ -1568,6 +1568,66 @@ describe("durable deferred Takoform operations", () => {
     );
     opened.close();
   });
+
+  /**
+   * A refusal that mutated nothing leaves nothing behind.
+   *
+   * A create reserves an incarnation before the provider is asked: a deletion
+   * attestation opened `live`, a `planned` effect, and — once the saga is
+   * marked — a `dispatched` one. A refusal raised inside the driver after that
+   * marker commits no Resource, so the record described an incarnation that
+   * never existed. The attestation could not be closed by a deletion that never
+   * happened and the `apply` effect had no terminal event, so both stood for
+   * good; a real self-host ended every refused `WorkerEndpoint` create with
+   * exactly that pair, and it is the pair every later "is this endpoint
+   * provably gone" question reads.
+   */
+  test("leaves no attestation and no open effect when a create is refused before the provider acts", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    let refuse = true;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      apply: async (input) => {
+        // The shape a self-host's endpoint mint refuses with: a statement about
+        // this Host, raised after the Host marked its own dispatch and before
+        // anything native was touched.
+        if (refuse) throw new TakoformHostError("unsupported_capability", 422);
+        return await memory.apply(input);
+      },
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+    };
+    const opened = persistentHarness(undefined, driver).open();
+    const desired = desiredResource("refused-create", "nothing-was-mutated");
+    const review = await prepareReview(opened.host, desired);
+    const path = `${lane}/resources/example.forms.invalid/DeferredThing/refused-create`;
+    const apply = () =>
+      opened.host.handle(
+        request(path, "primary", {
+          method: "PUT",
+          headers: { "idempotency-key": "refused-create-0001", "if-none-match": "*" },
+          body: JSON.stringify({ ...desired, review }),
+        }),
+      );
+
+    expect((await apply())?.status).toBe(422);
+    const ledger = () => ({
+      attestations: opened.database
+        .query("SELECT count(*) AS rows FROM tf_resource_deletion_attestations")
+        .get() as { rows: number },
+      effects: opened.database
+        .query("SELECT count(*) AS rows FROM tf_resource_provider_effects")
+        .get() as { rows: number },
+    });
+    expect(ledger()).toEqual({ attestations: { rows: 0 }, effects: { rows: 0 } });
+
+    // And the same request is still a request: the refusal was about this Host,
+    // so once it stops refusing the identical apply creates the Resource.
+    refuse = false;
+    expect((await apply())?.status).toBe(201);
+    expect(ledger()).toEqual({ attestations: { rows: 1 }, effects: { rows: 3 } });
+    opened.close();
+  });
 });
 
 function persistentHarness(
