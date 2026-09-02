@@ -1879,6 +1879,9 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           onReceiptReady: () => {
             releaseClaimsOnFailure = false;
           },
+          onProvablyIdle: () => {
+            providerProvablyIdle = true;
+          },
           onDispatch: async () => {
             if (
               !(await store.recordResourceEffect({
