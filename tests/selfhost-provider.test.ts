@@ -140,6 +140,10 @@ afterEach(() => {
 
 interface ProviderCase {
   readonly modules?: Record<string, string>;
+  readonly events?: {
+    deleteQueue(queueId: string): Promise<void>;
+    forgetSchedules(script: string, cron?: string): Promise<void>;
+  };
   readonly dataPlaneAddress?: string;
   readonly suffixes?: readonly string[];
   readonly runtime?: WorkerdRuntime;
@@ -305,6 +309,7 @@ function provider(options: ProviderCase = {}) {
     ...(options.runtimeInputs ? { runtimeInputs: options.runtimeInputs } : {}),
     ...(options.dataPlaneAddress ? { dataPlaneAddress: options.dataPlaneAddress } : {}),
     ...(options.dataPlaneMaintenance ? { dataPlaneMaintenance: options.dataPlaneMaintenance } : {}),
+    ...(options.events ? { events: options.events } : {}),
     artifacts: {
       async manifest(_tenant, digest) {
         if (digest === "sha256:worker") {
@@ -1936,5 +1941,251 @@ describe("the SQLite migration ledger", () => {
       ok: true,
       value: [{ path: first.path, digest: first.digest }],
     });
+  });
+});
+
+/**
+ * A Queue Consumer and a Cron Trigger are declarations until something on the
+ * machine moves the message or fires the minute. The ticket has to say which of
+ * those is true, because an observation that lies is worse than a missing
+ * feature: an operator reading `delivering: true` on a machine with no pump has
+ * no way left to find out.
+ */
+describe("attaching a Queue Consumer and a Cron Trigger", () => {
+  const QUEUE_ID = "tsq-attachment-fixture";
+  const DLQ_ID = "tsq-attachment-fixture-dlq";
+  const EVENTS = {
+    async deleteQueue() {},
+    async forgetSchedules() {},
+  };
+
+  function queueRelation(pointer: string, name: string, id: string): ProviderRelation {
+    return {
+      ...deployedRelation(pointer, "AtLeastOnceQueue", name, `selfhost-queue:${id}:op_q`, {
+        queueId: id,
+        queueName: id,
+      }),
+      resource: {
+        ...relation(pointer, "AtLeastOnceQueue", name, {
+          messageRetentionSeconds: 345_600,
+          deliveryDelaySeconds: 0,
+        }).resource,
+      },
+    };
+  }
+
+  const consumerSpec = {
+    worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+    queue: { apiVersion: EDGE_API, kind: "AtLeastOnceQueue", name: "delivery" },
+    maxBatchSize: 10,
+    maxBatchTimeoutSeconds: 1,
+    maxRetries: 3,
+    retryDelaySeconds: 60,
+    maxConcurrency: 4,
+  };
+
+  const applyConsumer = (
+    local: ReturnType<typeof provider>,
+    spec: Record<string, unknown> = {},
+    relations: readonly ProviderRelation[] = [],
+  ) =>
+    local.apply({
+      operationId: "op_consumer",
+      offering: offering("QueueConsumer"),
+      identity: identity("hello-consumer"),
+      spec: { ...consumerSpec, ...spec },
+      relations: [
+        relation("/worker", "ModuleWorker", "hello"),
+        queueRelation("/queue", "delivery", QUEUE_ID),
+        ...relations,
+      ],
+    });
+
+  const applyCron = (local: ReturnType<typeof provider>, cron: string) =>
+    local.apply({
+      operationId: "op_cron",
+      offering: offering("WorkerCronTrigger"),
+      identity: identity("hello-cron"),
+      spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" }, cron },
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+    });
+
+  test("says it is delivering and scheduled only when this machine runs both", async () => {
+    const configured = provider({ events: EVENTS });
+    await publish(configured);
+    expect(await applyConsumer(configured)).toMatchObject({
+      phase: "succeeded",
+      result: { observed: { queueName: QUEUE_ID, delivering: true } },
+    });
+    expect(await applyCron(configured, "0 * * * *")).toMatchObject({
+      phase: "succeeded",
+      result: { observed: { cron: "0 * * * *", scheduled: true } },
+    });
+
+    rmSync(root, { recursive: true, force: true });
+    root = mkdtempSync(join(tmpdir(), "takoserver-selfhost-"));
+    const bare = provider();
+    await publish(bare);
+    // Still recorded, still republished — the declaration is desired state
+    // either way — and honestly reported as moving nothing.
+    expect(await applyConsumer(bare)).toMatchObject({
+      phase: "succeeded",
+      result: { observed: { delivering: false } },
+    });
+    expect(await applyCron(bare, "0 * * * *")).toMatchObject({
+      phase: "succeeded",
+      result: { observed: { scheduled: false } },
+    });
+  });
+
+  test("refuses a cron expression this Host could record and never fire", async () => {
+    const local = provider({ events: EVENTS });
+    await publish(local);
+    expect(await applyCron(local, "0 * * *")).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec" },
+    });
+    expect(await applyCron(local, "0 * * * MON")).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec" },
+    });
+  });
+
+  test("refuses a Consumer whose queue this provider did not deploy", async () => {
+    const local = provider({ events: EVENTS });
+    await publish(local);
+    const ticket = await local.apply({
+      operationId: "op_consumer",
+      offering: offering("QueueConsumer"),
+      identity: identity("hello-consumer"),
+      spec: consumerSpec,
+      relations: [
+        relation("/worker", "ModuleWorker", "hello"),
+        // Declared but never deployed here: the native id and the published
+        // output are what say which queue this is, and there are neither.
+        relation("/queue", "AtLeastOnceQueue", "delivery", {
+          messageRetentionSeconds: 345_600,
+        }),
+      ],
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", message: "the Queue Consumer is incomplete" },
+    });
+  });
+
+  test("refuses a Consumer whose declared dead-letter queue is not resolvable", async () => {
+    const local = provider({ events: EVENTS });
+    await publish(local);
+    expect(
+      await applyConsumer(local, {
+        deadLetterQueue: { apiVersion: EDGE_API, kind: "AtLeastOnceQueue", name: "dlq" },
+      }),
+    ).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec" },
+    });
+    expect(
+      await applyConsumer(
+        local,
+        { deadLetterQueue: { apiVersion: EDGE_API, kind: "AtLeastOnceQueue", name: "dlq" } },
+        [queueRelation("/deadLetterQueue", "dlq", DLQ_ID)],
+      ),
+    ).toMatchObject({ phase: "succeeded" });
+  });
+
+  test("refuses a limit outside the range its Form fixes", async () => {
+    const local = provider({ events: EVENTS });
+    await publish(local);
+    expect(await applyConsumer(local, { maxBatchSize: 101 })).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", message: "the Queue Consumer limits are invalid" },
+    });
+    expect(await applyConsumer(local, { maxConcurrency: undefined })).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec" },
+    });
+  });
+
+  test("puts the event gate in front of the Worker only once something is attached", async () => {
+    const local = provider({ events: EVENTS });
+    const script = await publish(local);
+    const before = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+    expect(before).not.toContain("selfhost-events");
+
+    expect((await applyCron(local, "0 * * * *")).phase).toBe("succeeded");
+    const after = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+    // A Host-owned service holding the token, and a route that reaches it
+    // rather than the script.
+    expect(after).toContain(`( name = "${script}-selfhost-events"`);
+    expect(after).toContain(`entrypoint = "takoserverSelfhostEvents"`);
+    expect(after).toContain(`${script}.selfhost-events.invalid\\":\\"${script}-selfhost-events`);
+    // The token is on the gate and on nothing else.
+    const tenantService = after.slice(
+      after.indexOf(`( name = "${script}",`),
+      after.indexOf(`( name = "${script}-selfhost-events"`),
+    );
+    expect(tenantService).not.toContain("__TAKOSERVER_SELFHOST_EVENT_TOKEN");
+  });
+
+  test("a Worker Version binding a queue on a machine with no plane is refused", async () => {
+    const local = provider();
+    const worker = await local.apply({
+      operationId: "op_worker",
+      offering: offering("ModuleWorker"),
+      identity: identity("hello"),
+      spec: {},
+    });
+    expect(worker.phase).toBe("succeeded");
+    const ticket = await local.apply({
+      operationId: "op_version_queue",
+      offering: offering("WorkerVersion"),
+      identity: identity("hello-v1"),
+      spec: {
+        bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+        handlers: ["fetch", "queue"],
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+        queueProducerBindings: [
+          {
+            name: "QUEUE",
+            resource: { apiVersion: EDGE_API, kind: "AtLeastOnceQueue", name: "delivery" },
+          },
+        ],
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", "hello"),
+        relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+        queueRelation("/queueProducerBindings/0/resource", "delivery", QUEUE_ID),
+      ],
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "denied",
+        message:
+          "this deployment serves no data plane, so the Worker Version's bindings cannot be projected",
+      },
+    });
+  });
+
+  test("a queue delete drops the messages that queue was holding", async () => {
+    const dropped: string[] = [];
+    const local = provider({
+      events: {
+        async deleteQueue(id) {
+          dropped.push(id);
+        },
+        async forgetSchedules() {},
+      },
+    });
+    const ticket = await local.delete({
+      operationId: "op_delete_queue",
+      offering: offering("AtLeastOnceQueue"),
+      identity: identity("delivery"),
+      nativeId: `selfhost-queue:${QUEUE_ID}:op_q`,
+      spec: {},
+    });
+    expect(ticket.phase).toBe("succeeded");
+    expect(dropped).toEqual([QUEUE_ID]);
   });
 });

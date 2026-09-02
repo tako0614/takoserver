@@ -7,6 +7,7 @@ import type { Sql } from "../src/ports.ts";
 import {
   SELFHOST_DATA_PLANE_KV_PATH,
   SELFHOST_DATA_PLANE_PROTOCOL,
+  SELFHOST_DATA_PLANE_QUEUE_PATH,
   SELFHOST_DATA_PLANE_SQL_PATH,
 } from "../src/providers/selfhost-worker-wrapper.ts";
 import {
@@ -90,6 +91,9 @@ const kv = (body: Record<string, unknown>, token?: string) =>
   post(SELFHOST_DATA_PLANE_KV_PATH, { binding: "KV", ...body }, token);
 const db = (body: Record<string, unknown>, token?: string) =>
   post(SELFHOST_DATA_PLANE_SQL_PATH, { binding: "DB", ...body }, token);
+const queue = (body: Record<string, unknown>, token?: string) =>
+  post(SELFHOST_DATA_PLANE_QUEUE_PATH, { binding: "DELIVERY", ...body }, token);
+const encode = (text: string) => btoa(text);
 
 function value(envelope: Record<string, unknown>): Record<string, unknown> {
   expect(envelope.ok).toBe(true);
@@ -703,4 +707,100 @@ test("forgetting a database drops the handle rather than the file", async () => 
   expect(
     value((await db({ op: "query", statement: { sql: "SELECT count(*) AS n FROM t" } })).envelope),
   ).toEqual({ rows: [{ n: 1 }], rowsWritten: 0 });
+});
+
+// ---------------------------------------------------------------------------
+// Queue producer
+// ---------------------------------------------------------------------------
+
+const messages = () =>
+  sql.query(
+    "SELECT queue_id, message_id, visible_at_ms, expires_at_ms, deliveries " +
+      "FROM selfhost_queue_messages ORDER BY message_id",
+    [],
+  );
+
+test("accepting a message decides its whole future at the moment it is accepted", async () => {
+  const accepted = value((await queue({ op: "send", body: encode("one") })).envelope);
+  expect(String(accepted.messageId)).toMatch(/^[0-9a-f-]{36}$/u);
+  expect(await messages()).toMatchObject([
+    {
+      queue_id: "tsq-alpha",
+      // Deliverable now, because this queue's own delay is none, and kept for
+      // exactly the retention it promised — both as absolute instants, so a
+      // restart does not restart the clock with the process.
+      visible_at_ms: now.getTime(),
+      expires_at_ms: now.getTime() + 345_600 * 1_000,
+      deliveries: 0,
+    },
+  ]);
+});
+
+test("a send may delay past the queue's own default, inside the Interface's range", async () => {
+  value((await queue({ op: "send", body: encode("later"), delaySeconds: 30 })).envelope);
+  expect(await messages()).toMatchObject([{ visible_at_ms: now.getTime() + 30_000 }]);
+  expect((await queue({ op: "send", body: encode("no"), delaySeconds: 43_201 })).envelope).toEqual({
+    ok: false,
+    error: { code: "invalid_argument" },
+  });
+  expect((await queue({ op: "send", body: encode("no"), delaySeconds: -1 })).envelope).toEqual({
+    ok: false,
+    error: { code: "invalid_argument" },
+  });
+});
+
+test("a batch is accepted whole or not at all", async () => {
+  const accepted = value(
+    (
+      await queue({
+        op: "sendBatch",
+        messages: [{ body: encode("one") }, { body: encode("two"), delaySeconds: 5 }],
+      })
+    ).envelope,
+  );
+  expect((accepted.messageIds as readonly string[]).length).toBe(2);
+  expect(await messages()).toHaveLength(2);
+
+  // One bad message refuses the batch, and leaves nothing behind.
+  expect(
+    (
+      await queue({
+        op: "sendBatch",
+        messages: [{ body: encode("fine") }, { body: "not base64!" }],
+      })
+    ).envelope,
+  ).toEqual({ ok: false, error: { code: "invalid_body" } });
+  expect(await messages()).toHaveLength(2);
+});
+
+test("refuses a body that is not bytes, one that is too large, and a batch that is", async () => {
+  expect((await queue({ op: "send", body: 7 })).envelope).toEqual({
+    ok: false,
+    error: { code: "invalid_body" },
+  });
+  expect((await queue({ op: "send", body: encode("x".repeat(127_001)) })).envelope).toEqual({
+    ok: false,
+    error: { code: "message_too_large" },
+  });
+  expect(
+    (
+      await queue({
+        op: "sendBatch",
+        messages: Array.from({ length: 101 }, () => ({ body: encode("x") })),
+      })
+    ).envelope,
+  ).toEqual({ ok: false, error: { code: "batch_too_large" } });
+});
+
+test("a queue binding the version never declared is not a queue this token can name", async () => {
+  const answer = await post(
+    SELFHOST_DATA_PLANE_QUEUE_PATH,
+    { binding: "OTHER", op: "send", body: encode("x") },
+    `alpha.v1.${ALPHA.secret}`,
+  );
+  expect(answer.status).toBe(404);
+  expect(answer.envelope).toEqual({ ok: false, error: { code: "backend_unavailable" } });
+  // And one tenant's binding name never reaches another tenant's queue.
+  value((await queue({ op: "send", body: encode("mine") }, `beta.v1.${BETA.secret}`)).envelope);
+  expect((await messages())[0]?.queue_id).toBe("tsq-beta");
 });

@@ -60,10 +60,11 @@ file is read at the moment of each call, so a rotation does not need a restart.
 
 ## Worker storage on this machine
 
-A Worker Version that declares `kvBindings` or `sqliteBindings` needs a backend,
-and a machine standing on its own has to be one. Two small HTTP services provide
-it: KV entries live in the control database under migration 0038, and each
-`SQLiteDatabase` is a file under `<data root>/databases`.
+A Worker Version that declares `kvBindings`, `queueProducerBindings`, or
+`sqliteBindings` needs a backend, and a machine standing on its own has to be
+one. Three small HTTP services provide it: KV entries and queue messages live in
+the control database under migrations 0038 and 0039, and each `SQLiteDatabase`
+is a file under `<data root>/databases`.
 
 They are served on their own listener, bound to `127.0.0.1`, never on `PORT`.
 What authenticates there is a bearer token minted per Worker Version, and a
@@ -83,6 +84,12 @@ services for one script:
 | `<script>-selfhost-data` | A Takoserver-owned facade module, no tenant code | The Version's plane token and a service binding to the origin below |
 | `<script>-selfhost-data-origin` | Nothing; an `externalServer` | The loopback address of the planes |
 
+A Worker with a Queue Consumer or a Cron Trigger attached gets one more:
+
+| Service | What it runs | What it holds |
+|---|---|---|
+| `<script>-selfhost-events` | A Takoserver-owned gate module, no tenant code | The Version's event token, and a service binding naming the script's `takoserverSelfhostEvents` entrypoint |
+
 The split is the isolation. A binding belongs to the service it is declared on,
 and workerd hands every one of them to every module that service runs —
 including through `import { env } from "cloudflare:workers"` — so a value left
@@ -93,7 +100,7 @@ service binding that leaked into tenant code reaches those two routes and
 nothing else on this machine. `disallow_importable_env` is set on the tenant's
 service as well, which is the second lock rather than the first.
 
-Publishing also asks the published pair, over the workerd router, whether the
+Publishing also asks the published services, over the workerd router, whether the
 tenant's module exports every handler the Version declared. A module that does
 not is refused there rather than accepted and drained of its first event. The
 probe is best effort: when no runtime answers — a composition that serves
@@ -134,14 +141,88 @@ permits 25 MiB, values cross this seam base64-encoded, and base64 is 4 bytes per
 and the same response cap, so the largest permitted value fits with room to
 spare.
 
-### What is not here yet
+## Queues and cron on this machine
 
-`queue` and `scheduled` handlers a Version declares are re-exported by the
-generated entrypoint, but this Host renders no queue producer, no consumer, and
-no cron trigger — nothing invokes them. When something does, note that the
-self-host wrapper would hand workerd's raw event to the tenant while the managed
-wrapper projects a portable batch with `ack`/`retry`; closing that gap is part
-of making the events real, not a separate fix.
+workerd has no queue trigger and no scheduler: its configuration has services,
+sockets, and flags, and nothing that says "at this minute". So the Bun process
+is both. A message a Worker sends through `env.QUEUE` becomes a row in the
+control database, and a `WorkerCronTrigger` becomes a next-fire instant beside
+it; two loops in the process — one every second for queues, one every five for
+schedules — decide when either is due and invoke the Worker over HTTP.
+
+The event itself is the managed backend's envelope, unchanged:
+`takoserver.managed-worker-event@v1`, posted to
+`/.well-known/takoserver/managed-worker-events/v1` with the same content types.
+A Worker's `queue` handler therefore receives the same portable batch here as on
+Cloudflare — `acknowledge` / `retry` / `acknowledgeAll` / `retryAll`, bodies as
+`{encoding: "base64", data}` — and `scheduled` the same `{cron, scheduledTime}`.
+Two things differ and are named rather than hidden: `logicalWorkerId` and
+`deploymentId` are the workerd script name and the exact Worker Version, which
+are the only such identities this Host has; and where the managed wrapper trusts
+`ctx.props` that only a dispatch namespace can set, this one trusts a gate.
+
+That gate is the reason the delivery cannot be forged. workerd's router forwards
+by `Host`, and anything that can reach the runtime's port can name a hostname —
+so an event hostname that reached the script itself would let any such caller
+invoke another tenant's `queue` handler. Instead `<script>.selfhost-events.invalid`
+reaches `<script>-selfhost-events`, a Takoserver-owned service running one
+constant module, which compares a per-Version token in constant time and rewrites
+the request into a fixed method, URL, and header set before forwarding it to the
+script's `takoserverSelfhostEvents` export. That export is a *named* entrypoint:
+the router hands customer traffic to the default one, so a request to the event
+path at the Worker's own hostname reaches `fetch`, which does not know what an
+event is. The token is declared on the gate and nowhere else, exactly as the
+plane token is declared on the data facade.
+
+### What a Consumer's numbers mean here
+
+- `maxBatchSize` and `maxBatchTimeoutSeconds`: a batch leaves as soon as it is
+  full, or as soon as its oldest due message has waited the timeout.
+- `maxConcurrency`: at most that many batches are in flight for one consumer at
+  a time. It is a ceiling on this machine, not a promise of parallelism.
+- `maxRetries` counts REDELIVERIES: a message is delivered at most
+  `1 + maxRetries` times. One that exhausts them moves to `deadLetterQueue` as a
+  NEW message there — new identity, new acceptance instant, its own count
+  starting again — or is dropped when none is declared.
+- `retryDelaySeconds` applies when the handler did not name a delay of its own.
+- `deliveryDelaySeconds` and `messageRetentionSeconds` are applied when the
+  message is accepted, as absolute instants, so a restart does not restart the
+  clock with the process. They are read from the queue Resource the *publishing*
+  Version pinned: raising a queue's retention reaches a Worker on its next
+  published Version rather than immediately.
+- A batch owns its messages under a lease. A process that dies between dispatch
+  and settlement leaves rows whose lease expires and which the next pass takes
+  again, so a handler may see a message twice. At-least-once is the contract.
+
+### What a Cron Trigger's schedule means here
+
+Five UTC fields, exactly the Form's grammar: minute, hour, day-of-month, month,
+day-of-week, each a comma-separated list of `*`, a literal, `low-high`,
+`*/step`, or `low-high/step`. Names and a step on a bare literal are refused, and
+so is an expression this Host cannot read — at apply, rather than by recording a
+trigger that would never fire.
+
+**A missed run is not made up.** A match is fired only while the minute it
+belongs to is still the current one; a machine that was down, or whose previous
+invocation was still running, steps over the match and records the next future
+one. A restart after an outage therefore produces one next fire and never a
+backlog. Within that, delivery is at-least-once: a process that died after
+dispatch and before releasing its lease leaves the fire recorded but
+unacknowledged, so a `scheduled` handler must be idempotent.
+
+A trigger seen for the first time is due at its next future match, never at a
+past one: attaching `0 * * * *` at 12:30 asks for 13:00.
+
+### When this deployment runs neither
+
+The retired ObjectBucket drain mode composes no pump and no scheduler. A Queue
+Consumer and a Cron Trigger applied there are still recorded and still
+republished — the declaration is desired state either way — and the ticket says
+`delivering: false` and `scheduled: false`, which is the truth on that machine.
+
+A Worker Version published before this Host recorded event handlers has neither
+a handler list nor an event token, so attaching a Consumer or a Trigger to it is
+refused rather than half-served; publishing a new Version is what changes that.
 
 ## Retired Cloudflare ObjectBucket drain
 
