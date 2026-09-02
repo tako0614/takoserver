@@ -44,6 +44,7 @@ import {
 } from "./selfhost-script-state.ts";
 import {
   createSelfhostVersionBindingStore,
+  normalizeSelfhostVersionBindingSet,
   type SelfhostVersionBinding,
   type SelfhostVersionBindingSet,
   SelfhostVersionBindingStoreError,
@@ -580,6 +581,28 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       }
     }
 
+    const sensitiveVars: readonly SelfhostVersionBinding[] = lease
+      ? requiredSensitive.map((name) => ({
+          name,
+          value: lease.bindings[name] as string,
+          kind: "text" as const,
+        }))
+      : [];
+    // Everything the environment can be refused for without touching a disk —
+    // shape, grammar, ordering, and a `vars` name colliding with a sensitive one
+    // — is decided here, while the lease can still be aborted. A declarative
+    // refusal after dispatch would strand the operation key: the ciphertext is
+    // gone, the handoff is not replaceable, and the same plan-derived key comes
+    // back on every retry.
+    let bindingSet: SelfhostVersionBindingSet;
+    try {
+      bindingSet = normalizeSelfhostVersionBindingSet({ vars, sensitiveVars });
+    } catch (error) {
+      if (!(error instanceof SelfhostVersionBindingStoreError)) throw error;
+      const aborted = lease ? await abortRuntimeLease(lease) : null;
+      return aborted ?? failed("invalid_spec", "the Worker Version environment is invalid");
+    }
+
     let materialized: Awaited<ReturnType<typeof versionMaterializer.materialize>>;
     try {
       materialized = await versionMaterializer.materialize({
@@ -609,15 +632,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         return runtimeInputFailure(error, "dispatch");
       }
     }
-    const sensitiveVars: readonly SelfhostVersionBinding[] = lease
-      ? requiredSensitive.map((name) => ({
-          name,
-          value: lease.bindings[name] as string,
-          kind: "text" as const,
-        }))
-      : [];
     try {
-      await writeVersionBindings(script, versionId, { vars, sensitiveVars });
+      await writeVersionBindings(script, versionId, bindingSet);
     } catch (error) {
       if (dispatched && error instanceof SelfhostFailure) {
         return failed("unavailable", "the Worker Version environment did not settle", true);
@@ -759,10 +775,14 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     const materialized = await inspectVersion(script, versionId);
     const recorded = await readVersionBindings(script, versionId);
     // Proven absence, and the only shape of it this Host can prove: no file on
-    // this machine holds these values. Revoking the handoff is what lets the
-    // ordinary retry prepare the same operation key again instead of deadlocking
-    // against a dispatched lease it can never claim.
-    const absent = materialized.state === "absent" && recorded === null;
+    // this machine holds these values. The binding record is the only place they
+    // ever land here — the version directory is materialized before dispatch and
+    // never carries a value — so its absence is the proof, whether or not that
+    // directory exists. Requiring both is what used to strand a handoff whose
+    // write failed after dispatch: the directory was there, `abandon` was
+    // skipped, and the plan-derived operation key could never be prepared again.
+    // Revoking the handoff is what lets the ordinary retry re-prepare it.
+    const absent = recorded === null;
     if (absent && requiredSensitive.length > 0 && runtimeInputTarget) {
       try {
         await (runtimeInputs as ProviderRuntimeInputLeasePort).abandon?.({

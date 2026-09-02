@@ -3,9 +3,11 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } 
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createEphemeralSql } from "../src/compat.ts";
 import type { ProviderOffering, ProviderRelation } from "../src/provider-port.ts";
 import type { ProviderRuntimeInputLeasePort } from "../src/provider-runtime-input-port.ts";
 import { createSelfhostProvider } from "../src/providers/selfhost.ts";
+import { createRuntimeInputAuthority } from "../src/runtime-input-preparations.ts";
 import {
   createWorkerdRuntime,
   type WorkerdRuntime,
@@ -848,6 +850,28 @@ describe("publishing a Worker through the Edge Family", () => {
     expect(bindingFiles(root)).toEqual([]);
   });
 
+  test("refuses a colliding environment before the one-shot lease is spent", async () => {
+    const { port, log } = fakeLeases(() => root);
+    const local = provider({ runtimeInputs: port });
+
+    // A `vars` name that collides with a sensitive one. The Host refuses this at
+    // admission, so reaching the provider with it means something upstream is
+    // wrong — and the answer must still be a refusal the lease survives, not a
+    // dispatched handoff nothing can clear.
+    expect(
+      await local.apply(
+        sensitiveApply({
+          spec: { ...sensitiveApply().spec, vars: { ENCRYPTION_KEY: "collides" } },
+        }),
+      ),
+    ).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", message: "the Worker Version environment is invalid" },
+    });
+    expect(log.events).toEqual(["acquire", "abort"]);
+    expect(existsSync(join(root, "selfhost", "versions"))).toBe(false);
+  });
+
   test("dispatches before the values touch disk and settles only after readback", async () => {
     const { port, log } = fakeLeases(() => root);
     const local = provider({ runtimeInputs: port });
@@ -941,6 +965,133 @@ describe("publishing a Worker through the Edge Family", () => {
     expect(log.events).not.toContain("dispatch");
     expect(log.events.at(-1)).toMatch(/^settle:sha256:[0-9a-f]{64}$/u);
     expect(JSON.stringify(recovered)).not.toContain(SECRET_VALUE);
+  });
+
+  /**
+   * The whole one-shot lifecycle against the real authority rather than a fake
+   * port, because the property under test is what the durable row does: a write
+   * that fails *after* dispatch must still end in a handoff the ordinary retry
+   * can prepare again under the same plan-derived operation key.
+   */
+  const sealedLane = async () => {
+    const sql = createEphemeralSql();
+    const now = Date.parse("2026-09-02T09:00:00.000Z");
+    const formRef = {
+      apiVersion: EDGE_API,
+      kind: "ModuleWorker",
+      definitionVersion: "0.1.0",
+      schemaDigest: `sha256:${"a".repeat(64)}`,
+    };
+    const resource = {
+      apiVersion: EDGE_API,
+      kind: "ModuleWorker",
+      form: { formRef },
+      metadata: {
+        name: "hello",
+        space: "default",
+        uid: "uid-ModuleWorker-hello",
+        generation: "1",
+        revision: "1",
+      },
+      spec: {},
+    };
+    await sql.run(
+      `INSERT INTO tf_resources
+         (tenant_id, space, api_version, kind, name, uid, generation, revision,
+          resource_json, updated_at)
+       VALUES ('org_demo', 'default', ?, 'ModuleWorker', 'hello', 'uid-ModuleWorker-hello',
+               '1', '1', ?, ?)`,
+      [EDGE_API, JSON.stringify(resource), now],
+    );
+    await sql.run(
+      `INSERT INTO tf_resource_deployments
+         (tenant_id, id, resource_uid, offering_id, provider_pack_ref,
+          provider_installation_ref, native_id, native_claimed, state,
+          observed_json, outputs_json, created_at, updated_at)
+       VALUES ('org_demo', 'dep-hello', 'uid-ModuleWorker-hello', 'selfhost.edge.moduleworker',
+               'local', 'local.primary', 'selfhost-worker:hello', 0, 'active', '{}', '{}', ?, ?)`,
+      [now, now],
+    );
+    await sql.run(
+      `INSERT INTO tf_resource_deletion_attestations
+         (tenant_id, resource_uid, space, api_version, kind, name, form_ref_json,
+          state, closure_fence, effects_json, evidence_json, evidence_ref,
+          evidence_effect_digest, evidence_checked_at, evidence_status, created_at, updated_at)
+       VALUES ('org_demo', 'uid-ModuleWorker-hello', 'default', ?, 'ModuleWorker', 'hello', ?,
+               'live', 1, '[]', NULL, NULL, NULL, NULL, NULL, ?, ?)`,
+      [EDGE_API, JSON.stringify(formRef), now, now],
+    );
+    const authority = createRuntimeInputAuthority({
+      sql,
+      sealKeys: {
+        current: {
+          keyId: "selfhost-test-key",
+          key: await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
+            "encrypt",
+            "decrypt",
+          ]),
+        },
+      },
+      canonicalPublicOrigin: "https://api.takoserver.test",
+      clock: () => new Date(now),
+    });
+    const executing = sensitiveApply().publicApply;
+    const prepare = async () =>
+      await authority.preparations.prepare({
+        organizationId: "org_demo",
+        operationKey: SENSITIVE_OPERATION_KEY,
+        canonicalPublicOrigin: "https://api.takoserver.test",
+        publicApply: {
+          method: executing.method,
+          path: executing.path,
+          fences: { ifNoneMatch: executing.ifNoneMatch },
+          body: executing.body,
+        },
+        bindings: { ENCRYPTION_KEY: SECRET_VALUE },
+      });
+    return { authority, prepare, local: provider({ runtimeInputs: authority.leases }) };
+  };
+
+  test("a write that fails after dispatch is recovered, abandoned, and prepared again", async () => {
+    const { authority, prepare, local } = await sealedLane();
+    expect((await prepare()).status).toBe("prepared");
+
+    // A transient I/O failure that can only be discovered by writing: the store's
+    // own root is not a directory, so every path under it fails with ENOTDIR.
+    await mkdir(join(root, "selfhost"), { recursive: true });
+    await writeFile(join(root, "selfhost", "version-bindings"), "not a directory");
+
+    expect(await local.apply(sensitiveApply())).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "unavailable",
+        message: "the Worker Version environment did not settle",
+        retryable: true,
+      },
+    });
+    // The ciphertext is gone and the version directory exists, which is exactly
+    // the state that used to be unrecoverable.
+    expect(await authority.preparations.read("org_demo", SENSITIVE_OPERATION_KEY)).toMatchObject({
+      status: "dispatched",
+    });
+    await expect(prepare()).rejects.toMatchObject({ code: "conflict", status: 409 });
+
+    rmSync(join(root, "selfhost", "version-bindings"));
+    if (!local.recoverApply) throw new Error("the selfhost provider is missing apply recovery");
+    expect(await local.recoverApply(sensitiveApply({ operationMode: "recovery" }))).toMatchObject({
+      phase: "failed",
+      failure: { code: "not_found", message: "the Worker Version environment was not recorded" },
+    });
+    // Abandoned on proven absence, so the plan-derived key is not burned.
+    expect(await authority.preparations.read("org_demo", SENSITIVE_OPERATION_KEY)).toBeNull();
+
+    expect((await prepare()).status).toBe("prepared");
+    const retried = await local.apply(sensitiveApply());
+    expect(retried.phase).toBe("succeeded");
+    expect(await authority.preparations.read("org_demo", SENSITIVE_OPERATION_KEY)).toMatchObject({
+      status: "consumed",
+    });
+    expect(JSON.stringify(retried)).not.toContain(SECRET_VALUE);
   });
 
   test("recovery abandons a handoff whose values provably never landed", async () => {

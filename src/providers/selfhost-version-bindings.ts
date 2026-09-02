@@ -224,6 +224,20 @@ async function locked<T>(key: string, operation: () => Promise<T>): Promise<T> {
   }
 }
 
+/**
+ * The purely declarative half of `write`: shape, grammar, ordering, and the
+ * rule that a `vars` name and a sensitive name cannot collide.
+ *
+ * It is exported because the caller must be able to run it *before* it spends a
+ * one-shot runtime-input lease. A refusal that needs no disk is a refusal that
+ * must not happen after the ciphertext has been erased.
+ */
+export function normalizeSelfhostVersionBindingSet(
+  set: SelfhostVersionBindingSet,
+): SelfhostVersionBindingSet {
+  return normalizeSet(set);
+}
+
 function normalizeSet(set: SelfhostVersionBindingSet): SelfhostVersionBindingSet {
   const vars = normalizeBindings(set.vars);
   const sensitiveVars = normalizeBindings(set.sensitiveVars);
