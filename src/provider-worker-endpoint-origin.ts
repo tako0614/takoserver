@@ -48,16 +48,30 @@ async function derivedName(prefix: string, parts: readonly string[]): Promise<st
   return `${prefix}-${hex}`;
 }
 
-/** Exact HTTPS origin later emitted by WorkerEndpoint for this native script. */
-export function canonicalWorkerEndpointOrigin(script: string, suffix: string): string | null {
+/**
+ * Exact origin later emitted by WorkerEndpoint for this native script.
+ *
+ * The scheme is an input rather than a constant because it is a fact about the
+ * runtime that serves the address, not a preference. A managed backend and a
+ * TLS-terminating self-host serve `https`; a self-host whose operator has
+ * configured no certificate serves plain HTTP, and publishing `https://` for it
+ * handed out an address nothing answers on — the Worker itself then pinned the
+ * `http` origin its own requests arrived under, so its federated identity and
+ * the address its Host advertised disagreed.
+ */
+export function canonicalWorkerEndpointOrigin(
+  script: string,
+  suffix: string,
+  scheme: "https" | "http" = "https",
+): string | null {
   const hostname = `${script}.${suffix}`.toLowerCase().replace(/\.$/u, "");
   let parsed: URL;
   try {
-    parsed = new URL(`https://${hostname}/`);
+    parsed = new URL(`${scheme}://${hostname}/`);
   } catch {
     return null;
   }
-  return parsed.protocol === "https:" &&
+  return parsed.protocol === `${scheme}:` &&
     parsed.username === "" &&
     parsed.password === "" &&
     parsed.port === "" &&

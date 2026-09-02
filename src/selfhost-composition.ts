@@ -95,6 +95,8 @@ export interface SelfhostCompositionOptions {
   /** Whether the released Edge Family is offered. On by default upstream. */
   readonly edgeForms: boolean;
   readonly workerEndpointSuffix?: string;
+  /** `https` only where this machine's workerd socket terminates TLS. */
+  readonly workerEndpointScheme?: "https" | "http";
   readonly suffixes?: readonly string[];
   /**
    * The one-shot seam for `requiredSensitiveVars`. Absent means this machine
@@ -184,6 +186,7 @@ export function createSelfhostComposition(
     runtime: options.runtime,
     artifacts: options.artifacts,
     ...(options.workerEndpointSuffix ? { workerEndpointSuffix: options.workerEndpointSuffix } : {}),
+    ...(options.workerEndpointScheme ? { workerEndpointScheme: options.workerEndpointScheme } : {}),
     ...(options.suffixes ? { suffixes: options.suffixes } : {}),
     ...(options.runtimeInputs ? { runtimeInputs: options.runtimeInputs } : {}),
     ...(options.dataPlaneAddress ? { dataPlaneAddress: options.dataPlaneAddress } : {}),
@@ -310,3 +313,71 @@ const SELFHOST_EDGE_RELATION_KINDS = new Set([
   "WorkerCronTrigger",
   "QueueConsumer",
 ]);
+
+/**
+ * Environment variables an operator sets to give this machine's Worker socket a
+ * certificate. Named here so the entry, the docs, and the diagnostic agree.
+ *
+ * [ADR 0009](../docs/adr/0009-a-self-host-publishes-the-scheme-its-socket-serves.md).
+ */
+export const SELFHOST_TLS_ENVIRONMENT = {
+  certificateFile: "TAKOSERVER_WORKERD_TLS_CERT_FILE",
+  privateKeyFile: "TAKOSERVER_WORKERD_TLS_KEY_FILE",
+  certificate: "TAKOSERVER_WORKERD_TLS_CERT",
+  privateKey: "TAKOSERVER_WORKERD_TLS_KEY",
+} as const;
+
+/**
+ * Whether a Worker endpoint suffix names this machine and nothing else.
+ *
+ * The same tree `yurucommu-core`'s public-origin rule treats as loopback, and
+ * for the same reason: `localhost` and everything under it can only ever be the
+ * machine asking, so plain HTTP there is not a downgrade.
+ */
+function loopbackSuffix(suffix: string): boolean {
+  const name = suffix.toLowerCase().replace(/\.$/u, "");
+  return (
+    name === "localhost" ||
+    name.endsWith(".localhost") ||
+    name === "127.0.0.1" ||
+    name === "::1" ||
+    name === "[::1]"
+  );
+}
+
+/**
+ * The scheme this machine publishes Worker endpoints under, and what an
+ * operator has to be told about it.
+ *
+ * The scheme follows the socket and nothing else. With a certificate, workerd
+ * terminates TLS and the address is `https://`. Without one the socket speaks
+ * plain HTTP and the address is `http://` — truthfully, because an `https://`
+ * address the runtime cannot serve is one nothing answers on.
+ *
+ * The warning exists because the consequence is not local. A Worker that
+ * establishes its own public identity from the request URL — the rule
+ * `yurucommu-core` applies — accepts plain HTTP only on the loopback tree. On
+ * any other suffix, an untrusted `http` origin establishes nothing at all, and
+ * the instance cannot federate, sign, or address itself. That is a sentence an
+ * operator must read at boot rather than discover from a Worker that serves
+ * `/healthz` and nothing that needs an identity.
+ */
+export function selfhostWorkerEndpointScheme(input: {
+  readonly workerEndpointSuffix?: string | undefined;
+  readonly tlsConfigured: boolean;
+}): { readonly scheme: "https" | "http"; readonly warning?: string } {
+  if (input.tlsConfigured) return { scheme: "https" };
+  const suffix = input.workerEndpointSuffix?.trim() || "localhost";
+  if (loopbackSuffix(suffix)) return { scheme: "http" };
+  return {
+    scheme: "http",
+    warning:
+      `Worker endpoints are published as http://<script>.${suffix} because no TLS ` +
+      "certificate is configured for the Worker socket. That suffix is not loopback, so a " +
+      "Worker that derives its public identity from the request URL will establish no origin " +
+      "at all: federated identity, signing, and self-addressing cannot work there. Configure " +
+      `${SELFHOST_TLS_ENVIRONMENT.certificateFile} and ${SELFHOST_TLS_ENVIRONMENT.privateKeyFile} ` +
+      `(or ${SELFHOST_TLS_ENVIRONMENT.certificate} and ${SELFHOST_TLS_ENVIRONMENT.privateKey} with ` +
+      "the PEM text) to serve https.",
+  };
+}
