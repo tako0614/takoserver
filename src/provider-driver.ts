@@ -738,6 +738,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
         ...(previous ? { previous } : {}),
       } satisfies import("./provider-port.ts").ApplyInput;
       let providerBoundaryEntered = false;
+      let endpointActivated = false;
       const work = async () => {
         providerBoundaryEntered = true;
         const ticket = await settle(
@@ -764,6 +765,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
               assignment: endpointAssignment,
               providerOutputs: ticket.result.outputs,
             });
+            endpointActivated = true;
           } catch (error) {
             throw endpointReservationHostError(error);
           }
@@ -781,11 +783,28 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
             ? resultOf(await work())
             : await charged(input.tenantId, input.operationId, priceMinor, work);
       } catch (error) {
-        if (endpointAssignment && !providerBoundaryEntered) {
+        // An assignment that was never activated is let go of, whether or not
+        // the provider was entered. Keeping it after a failed create is what
+        // made a lost readiness race permanent: the reservation stayed bound to
+        // an endpoint UID whose Resource was never committed, its deletion
+        // attestation could therefore never close, and every later apply — with
+        // a fresh UID, as a re-created resource always has — was refused
+        // `resource_busy` 409 until the reservation aged out a day later.
+        //
+        // Letting go of it reallocates nothing. The reservation stays `bound`
+        // and still owns its canonical origin under the live uniqueness
+        // constraint; only the endpoint witness is dropped, and a recovery that
+        // resumes this operation re-assigns the same endpoint before the
+        // provider is called again.
+        if (endpointAssignment && !endpointActivated) {
           try {
             await originReservations?.cancelEndpointAssignment(endpointAssignment);
           } catch (cancelError) {
-            throw endpointReservationHostError(cancelError);
+            // Before dispatch the cancel failure is the only thing that went
+            // wrong, so it is the answer. After dispatch the provider's own
+            // refusal is what the operator has to read, and a witness this
+            // could not drop is repaired by the next mint.
+            if (!providerBoundaryEntered) throw endpointReservationHostError(cancelError);
           }
         }
         throw error;

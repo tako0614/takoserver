@@ -1629,6 +1629,38 @@ test("reclaims its own superseded reservation only through the release fences", 
   ]);
 });
 
+/** The stable WorkerEndpoint Form, as an installed definition the driver takes. */
+function endpointFormDefinition() {
+  const definition = STABLE_PRODUCTION_TAKOFORM_CATALOG.forms.find(
+    (candidate) => candidate.identity.formRef.kind === "WorkerEndpoint",
+  );
+  if (!definition) throw new Error("WorkerEndpoint Form missing");
+  return definition;
+}
+
+/** The `/worker` relation a `takoform_worker_endpoint` create carries. */
+function workerRelation() {
+  return {
+    pointer: "/worker",
+    relation: "/worker",
+    targetUid: "uid-worker-01",
+    resource: {
+      apiVersion: FORM.apiVersion,
+      kind: "ModuleWorker",
+      form: { formRef: FORM },
+      metadata: {
+        name: TARGET.workerName,
+        space: TARGET.space,
+        uid: "uid-worker-01",
+        generation: "1",
+        revision: "1",
+      },
+      spec: {},
+      status: { observedGeneration: "1", conditions: [] },
+    },
+  } as const;
+}
+
 async function seedWorker(
   sql: ReturnType<typeof createReservationV2Sql>,
   identity: {
@@ -1999,6 +2031,171 @@ test("creates a WorkerEndpoint with no reservation on the placement the Worker i
       endpoint_resource_uid: "uid-endpoint-01",
     },
   ]);
+});
+
+/**
+ * A create that fails after the provider was entered gives the origin back.
+ *
+ * It did not. The driver cancelled an endpoint assignment only when the
+ * provider had *not* been entered, so a `WorkerEndpoint` whose provider refused
+ * — a lost readiness race, on a real self-host — left the reservation bound to
+ * an endpoint UID whose Resource was never committed. Its deletion attestation
+ * was opened `live` by the incarnation reservation and could never close,
+ * because a Resource that never existed is never deleted; so the witness stood,
+ * and every later apply, which re-creates the endpoint under a fresh UID,
+ * answered `resource_busy` 409. Five consecutive applies in three independent
+ * Spaces, with no escape but a different Worker name or surgery on the row.
+ */
+test("re-binds after a WorkerEndpoint create the provider refused", async () => {
+  let refuse = true;
+  const harness = fixture({
+    offerings: [sold(), soldEndpointOffering()],
+    technical: [technical(), technicalEndpointOffering()],
+    hostMintedSubdomain: "sw-community",
+    apply: async (applyInput) => {
+      if (refuse) {
+        refuse = false;
+        return {
+          phase: "failed",
+          failure: {
+            code: "unavailable",
+            message: "the Worker runtime did not confirm this publication is the one it serves",
+            retryable: true,
+          },
+        };
+      }
+      const origin = applyInput.workerEndpointOriginAssignment?.canonicalPublicOrigin ?? "";
+      return succeeded({
+        nativeId: `endpoint:${applyInput.identity.uid}`,
+        observed: { assigned: true },
+        outputs: { hostname: new URL(origin).hostname, url: `${origin}/` },
+      });
+    },
+  });
+  await seedWorker(harness.sql);
+  const driver = createProviderDriver({
+    providers: [harness.provider],
+    catalog: harness.catalog,
+    ledger: createLedger(harness.sql, harness.clock),
+    deployments: createResourceDeploymentStore(harness.sql, harness.clock),
+    originReservations: harness.authority,
+  });
+  const create = (uid: string) =>
+    driver.apply({
+      operationId: `op-endpoint-${uid}`,
+      operationKey: `key-endpoint-${uid}`,
+      tenantId: "org_01",
+      resourceUid: uid,
+      form: endpointFormDefinition(),
+      name: TARGET.endpointName,
+      space: TARGET.space,
+      spec: {
+        worker: { apiVersion: FORM.apiVersion, kind: "ModuleWorker", name: TARGET.workerName },
+      },
+      relations: [workerRelation()],
+    });
+
+  await expect(create("uid-endpoint-01")).rejects.toMatchObject({
+    name: "ProviderMutationRecoveryError",
+    providerOutcome: "indeterminate",
+  });
+  // Bound, and free to take another endpoint: the origin was not reallocated,
+  // only the witness for an endpoint that was never made was let go of.
+  expect(
+    await harness.sql.query(
+      `SELECT state, bound_endpoint_name, endpoint_resource_uid
+       FROM worker_endpoint_origin_reservations`,
+    ),
+  ).toEqual([{ state: "bound", bound_endpoint_name: null, endpoint_resource_uid: null }]);
+
+  // The retry is a new incarnation, exactly as a re-created resource is.
+  const receipt = await create("uid-endpoint-02");
+  expect(receipt.outputs).toEqual({
+    hostname: "sw-community.org_01.workers.test",
+    url: "https://sw-community.org_01.workers.test/",
+  });
+  expect(
+    await harness.sql.query(
+      "SELECT state, endpoint_resource_uid FROM worker_endpoint_origin_reservations",
+    ),
+  ).toEqual([{ state: "activated", endpoint_resource_uid: "uid-endpoint-02" }]);
+});
+
+/**
+ * And a witness that can never close is repaired rather than waited out.
+ *
+ * If the Host dies between the refusal and the release above, the row is left
+ * exactly as the defect left it. `live` with no Resource row is an incarnation
+ * that was reserved and never committed, so the next mint drops it — but only
+ * while nothing is still working on that incarnation, which is what keeps a
+ * create that is genuinely in flight from having its origin taken.
+ */
+test("drops a witness for an endpoint incarnation that was never committed", async () => {
+  const { authority, sql } = fixture();
+  await seedWorker(sql);
+  const target = {
+    organizationId: "org_01",
+    space: TARGET.space,
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-01",
+  } as const;
+  const minted = await authority.mintForWorker(target);
+  if (!minted) throw new Error("the fixture installation derives its own address");
+  // What a create that never committed leaves: the incarnation reservation, and
+  // nothing else.
+  await sql.run(
+    `INSERT INTO tf_resource_deletion_attestations
+       (tenant_id, resource_uid, space, api_version, kind, name, form_ref_json,
+        state, closure_fence, effects_json, evidence_json, evidence_ref,
+        evidence_effect_digest, evidence_checked_at, evidence_status, created_at, updated_at)
+     VALUES ('org_01', 'uid-endpoint-phantom', ?, ?, 'WorkerEndpoint', ?, ?, 'live', 1, '[]',
+             NULL, NULL, NULL, NULL, NULL, 0, 0)`,
+    [TARGET.space, ENDPOINT_FORM.apiVersion, TARGET.endpointName, JSON.stringify(ENDPOINT_FORM)],
+  );
+  await authority.assignEndpoint({
+    organizationId: "org_01",
+    reservationId: minted.reservationId,
+    space: TARGET.space,
+    endpointName: TARGET.endpointName,
+    endpointResourceUid: "uid-endpoint-phantom",
+    endpointResourceRevision: "1",
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-01",
+    providerPackRef: "fake",
+    providerInstallationRef: "fake.primary",
+  });
+
+  // While a provider effect is still open on that incarnation, the create may
+  // yet land and the origin stays where it is.
+  await sql.run(
+    `INSERT INTO tf_resource_provider_effects
+       (tenant_id, resource_uid, event_id, effect_id, effect_kind, phase,
+        operation_mode, provider_pack_ref, provider_installation_ref,
+        native_id, target_json, created_at)
+     VALUES ('org_01', 'uid-endpoint-phantom', 'op-phantom:planned', 'op-phantom',
+             'apply', 'planned', 'initial', NULL, NULL, NULL, '{}', 0)`,
+  );
+  await expect(authority.mintForWorker(target)).rejects.toMatchObject({
+    code: "conflict",
+    status: 409,
+  });
+
+  await sql.run(
+    `INSERT INTO tf_resource_provider_effects
+       (tenant_id, resource_uid, event_id, effect_id, effect_kind, phase,
+        operation_mode, provider_pack_ref, provider_installation_ref,
+        native_id, target_json, created_at)
+     VALUES ('org_01', 'uid-endpoint-phantom', 'op-phantom:cancelled', 'op-phantom',
+             'apply', 'cancelled', 'initial', NULL, NULL, NULL, '{}', 0)`,
+  );
+  expect(await authority.mintForWorker(target)).toMatchObject({
+    reservationId: minted.reservationId,
+    canonicalPublicOrigin: minted.canonicalPublicOrigin,
+    status: "bound",
+  });
+  expect(
+    await sql.query("SELECT state, endpoint_resource_uid FROM worker_endpoint_origin_reservations"),
+  ).toEqual([{ state: "bound", endpoint_resource_uid: null }]);
 });
 
 /**
