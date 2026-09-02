@@ -4,17 +4,17 @@
 
 ## Repository
 
-- Scope: Public OSS Takoserver cloud control plane, Takoform Host, resource graph, provider SDK, direct service, and reseller contracts.
+- Scope: Public OSS Takoserver cloud control plane and independent Takoform Host for Host-owned supply procured, resold, or self-operated by the Takoserver operator; no tenant BYOC.
 - Repository kind: `product`
 - Direct sibling dependencies: なし
 - Repository gate: `bun run check`
-- Canonical docs: [README.md](README.md), [docs/adr/0002-separate-resource-meaning-from-supply.md](docs/adr/0002-separate-resource-meaning-from-supply.md), [docs/provisioner.md](docs/provisioner.md), [openapi/takoserver.openapi.json](openapi/takoserver.openapi.json)
+- Canonical docs: [README.md](README.md), [CONTEXT.md](CONTEXT.md), [docs/adr/0002-separate-resource-meaning-from-supply.md](docs/adr/0002-separate-resource-meaning-from-supply.md), [docs/provisioner.md](docs/provisioner.md), [openapi/takoserver.openapi.json](openapi/takoserver.openapi.json)
 
 ## Ownership
 
-- Owns: Takoserver direct Console and API-key account plane / Prepaid wallet, append-only funding/usage ledger, multi-Offering catalog, and logical Resource lifecycle / Takoform Host, ResourceDeployment, Attachment, Migration, Provider Pack, meter, and self-host models / Public AI and S3 data planes plus publishable provider adapters / Short-lived scoped reseller execution grants and public API/OpenAPI/SDK/CLI artifacts
-- Does not own: Takosumi OSS Run, state, output, audit, or ProviderConnection authority / Takosumi Hosted customer accounts, Marketplace, Stripe, or support / Signed Supply Contracts, negotiated prices, production provider accounts, credentials, and operator-only capacity policy / Takosumi Accounts or the archived takosumi-cloud repository
-- Hazards: Portable Form identity must come from released Takoform packages; never mint a provider-shaped Form locally. / Provider capability does not imply resale authority; production Offerings require private Supply Contract composition. / Reseller requests carry only an opaque tenantRef and a short-lived audience-bound grant. / Do not import Takosumi or Hosted source, account IDs, sessions, or private operator state.
+- Owns: Independent Host, Host-owned supply, execution and capacity lifecycle, provider credentials, and reseller contracts / Takoform Host lanes and Offering, Resource, Deployment, Attachment, and Migration lifecycles / Established standard service APIs and data planes offered directly without redefining their protocols / Workers for Platforms dispatch namespace, user Worker, dispatcher, and route authority for managed Cloudflare customer ModuleWorkers / Organizations, API keys, prepaid wallet, Stripe settlement, and the console / Reseller lane quotes, reservations, capture, release, and provision tokens / Public AI and S3 data planes plus publishable provider adapters and Provider Packs / Public API, OpenAPI, SDK, and CLI artifacts
+- Does not own: Tenant/customer vendor accounts, provider credentials, or BYOC execution / Takosumi OSS Run, state, output, audit, or ProviderConnection authority / Takosumi Hosted customer accounts, Marketplace, retail Stripe, or support / Takosumi Accounts or the retired takosumi-cloud historical identity (reintroduction prohibited) / Signed Supply Contracts, negotiated prices, production provider accounts, realized credentials, and operator-only capacity policy composed in takoserver-private
+- Hazards: Do not import Takosumi or Hosted source, account IDs, sessions, or private operator state. / A self-host operator credential is Host-owned supply; never add customer provider credential onboarding or account selection. / Managed Cloudflare customer ModuleWorkers require Workers for Platforms; ordinary account Workers are only product components or development surfaces. / Keep parent provider credentials behind non-public Provisioner authority rather than the public customer API Worker. / Shipped Form definitions are frozen by schemaDigest pins; add a definitionVersion instead of editing one. / Reseller customers cross the wire only as opaque tenantRef values and single-use provision tokens. / Portable Form identity must come from released Takoform packages; never mint a provider-shaped Form locally. / Provider capability does not imply resale authority; production Offerings require private Supply Contract composition.
 
 ## Required workflow
 
