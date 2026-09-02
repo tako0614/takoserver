@@ -71,6 +71,12 @@ it:
 - `takoserver-integration-form-authority-operator-worker`
 - `takoserver-form-authority-identity-probe`
 
+No other surface needs it: `takoserver-worker` shares the public Worker's
+closure and its declaration is `takoserver-worker-authority-cutover`;
+`takoserver-console` and `takoserver-site` fence no binding closure at all; and
+`takoserver-managed-worker-gateway` already reports an inexact predecessor as
+drift and publishes past it rather than refusing.
+
 Each accepts `--closure-predecessor-version=<uuid>` together with an explicit
 declaration built from the repeatable `--retire-var=NAME`, `--add-var=NAME`,
 `--refresh-var=NAME`, `--add-binding=NAME`, `--add-secret=NAME` and
