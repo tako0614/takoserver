@@ -7,7 +7,7 @@ import type { ProviderPack } from "./provider-pack.ts";
 import type { Provider } from "./provider-port.ts";
 import type { ProviderRuntimeInputLeasePort } from "./provider-runtime-input-port.ts";
 import { CloudflareProvider, type CloudflareProviderOptions } from "./providers/cloudflare.ts";
-import type { SelfhostArtifacts } from "./providers/selfhost.ts";
+import type { SelfhostArtifacts, SelfhostDataPlaneMaintenance } from "./providers/selfhost.ts";
 import { createSelfhostComposition } from "./selfhost-composition.ts";
 import type { InstalledTakoformForm } from "./takoform/types.ts";
 import type { WorkerdRuntime } from "./workerd-runtime.ts";
@@ -113,6 +113,8 @@ export function createStandaloneProviderComposition(input: {
   readonly runtimeInputs?: ProviderRuntimeInputLeasePort;
   /** Loopback address of the KV and SQL data planes, when this entry serves them. */
   readonly dataPlaneAddress?: string;
+  /** The housekeeping half of those planes, composed with the address or not at all. */
+  readonly dataPlaneMaintenance?: SelfhostDataPlaneMaintenance;
   readonly now: Date;
   readonly retiredCloudflare?: Omit<CloudflareProviderOptions, "offerings">;
 }): StandaloneProviderComposition {
@@ -133,6 +135,7 @@ export function createStandaloneProviderComposition(input: {
       ...(input.suffixes ? { suffixes: input.suffixes } : {}),
       ...(input.runtimeInputs ? { runtimeInputs: input.runtimeInputs } : {}),
       ...(input.dataPlaneAddress ? { dataPlaneAddress: input.dataPlaneAddress } : {}),
+      ...(input.dataPlaneMaintenance ? { dataPlaneMaintenance: input.dataPlaneMaintenance } : {}),
       now: input.now,
     });
     return {

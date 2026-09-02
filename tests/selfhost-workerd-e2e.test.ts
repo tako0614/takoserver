@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createEphemeralSql } from "../src/compat.ts";
@@ -8,7 +8,7 @@ import {
   createSelfhostDataPlaneAccess,
   createSelfhostProvider,
 } from "../src/providers/selfhost.ts";
-import { createSelfhostDataPlanes } from "../src/selfhost-data-planes.ts";
+import { serveSelfhostDataPlanes } from "../src/selfhost-data-planes.ts";
 import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
 import { findWorkerd } from "../src/workerd-supervisor.ts";
 
@@ -80,6 +80,61 @@ const TENANT_MODULE = `export default {
         return Response.json({ refused: error.name, rows: after.rows });
       }
       return Response.json({ refused: "none" });
+    }
+    if (url.pathname === "/smuggle") {
+      // The exposure this lane was built wrong for: a binding belongs to the
+      // service it is declared on, and workerd hands every one of them to
+      // every module that service runs. Reading the projected env never
+      // showed that; this does.
+      let importable = null;
+      try {
+        const module = await import("cloudflare:workers");
+        importable = {
+          keys: Object.keys(module.env ?? {}).sort(),
+          token: (module.env ?? {}).__TAKOSERVER_SELFHOST_DATA_TOKEN ?? null,
+          service: typeof (module.env ?? {}).__TAKOSERVER_SELFHOST_DATA,
+        };
+      } catch (error) {
+        importable = { error: String(error && error.name) };
+      }
+      return Response.json({
+        importable,
+        handlerToken: env.__TAKOSERVER_SELFHOST_DATA_TOKEN ?? null,
+        handlerService: typeof env.__TAKOSERVER_SELFHOST_DATA,
+      });
+    }
+    if (url.pathname === "/attach") {
+      const attempts = {};
+      for (const [name, sql, params] of [
+        ["attachLiteral", "ATTACH DATABASE '" + url.searchParams.get("victim") + "' AS victim", []],
+        ["attachParam", "ATTACH DATABASE ? AS victim", [url.searchParams.get("victim")]],
+        ["attachControl", "ATTACH DATABASE ? AS control", [url.searchParams.get("control")]],
+        ["databaseList", "PRAGMA database_list", []],
+        ["vacuumInto", "VACUUM INTO ?", [url.searchParams.get("spill")]],
+        ["dropLedger", "DROP TABLE IF EXISTS _takoform_sqlite_migrations", []],
+        ["selectLedger", "SELECT * FROM _takoform_sqlite_migrations", []],
+        ["multiStatement", "SELECT 1; ATTACH DATABASE ? AS victim", [url.searchParams.get("victim")]],
+        ["begin", "BEGIN IMMEDIATE", []],
+        ["commit", "COMMIT", []],
+        ["savepoint", "SAVEPOINT s1", []],
+        ["analyze", "ANALYZE", []],
+        ["detach", "DETACH DATABASE victim", []],
+      ]) {
+        try {
+          await env.DB.execute(sql, params);
+          attempts[name] = "allowed";
+        } catch (error) {
+          attempts[name] = error.name;
+        }
+      }
+      return Response.json(attempts);
+    }
+    if (url.pathname === "/query-writes") {
+      await env.DB.execute("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)");
+      await env.DB.execute("INSERT OR REPLACE INTO notes (id, body) VALUES (7, 'seven')");
+      const through = await env.DB.query("DELETE FROM notes WHERE id = 7");
+      const after = await env.DB.query("SELECT count(*) AS n FROM notes WHERE id = 7");
+      return Response.json({ through, after });
     }
     return Response.json({ lane: env.LANE, secret: typeof env.__TAKOSERVER_SELFHOST_DATA });
   },
@@ -166,7 +221,7 @@ function deployed(
 const identity = (name: string) => ({ tenantRef: "org_demo", space: "default", name });
 
 let root: string;
-let planeServer: ReturnType<typeof Bun.serve> | undefined;
+let planeServer: { stop(closeActive?: boolean): void } | undefined;
 let workerd: ReturnType<typeof Bun.spawn> | undefined;
 
 beforeEach(() => {
@@ -194,25 +249,20 @@ async function reachable(url: string, attempts = 80): Promise<boolean> {
 }
 
 /** Publishes the fixture Worker and boots workerd in front of the real planes. */
-async function boot(): Promise<{ readonly origin: string }> {
+async function boot(tenantModule: string = TENANT_MODULE): Promise<{
+  readonly origin: string;
+  readonly local: ReturnType<typeof createSelfhostProvider>;
+  readonly planeOrigin: string;
+}> {
   const sql = createEphemeralSql();
   const access = createSelfhostDataPlaneAccess(root);
-  const planes = createSelfhostDataPlanes({
+  const served = serveSelfhostDataPlanes({
     sql,
     grant: (script, versionId) => access.grant(script, versionId),
     databasePath: (name) => access.databasePath(name),
   });
-  planeServer = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    async fetch(request) {
-      const url = new URL(request.url);
-      return (
-        (await planes(request, url)) ?? new Response("not a data plane request", { status: 404 })
-      );
-    },
-  });
-  const dataPlaneAddress = `127.0.0.1:${planeServer.port}`;
+  planeServer = served;
+  const dataPlaneAddress = served.address;
 
   // workerd binds a socket named in its configuration, so the port has to be
   // chosen before it starts. Asking the kernel for a free one and handing it
@@ -221,7 +271,24 @@ async function boot(): Promise<{ readonly origin: string }> {
   const workerdPort = Number(reserved.port);
   reserved.stop(true);
   expect(Number.isSafeInteger(workerdPort)).toBe(true);
-  const runtime = createWorkerdRuntime({ root, port: workerdPort, isReady: () => true });
+  const origin = `http://127.0.0.1:${workerdPort}`;
+  // Restarted on every reload, exactly as the supervisor does it in the real
+  // entry, so the configuration a probe reaches is always the one just
+  // written rather than whichever one workerd happened to still be serving.
+  const restart = async (): Promise<void> => {
+    workerd?.kill();
+    workerd = Bun.spawn([WORKERD as string, "serve", join(root, "workers", "workerd.capnp")], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(await reachable(`${origin}/`)).toBe(true);
+  };
+  const runtime = createWorkerdRuntime({
+    root,
+    port: workerdPort,
+    isReady: () => true,
+    onReload: restart,
+  });
   const local = createSelfhostProvider({
     offerings: [],
     dataRoot: root,
@@ -239,7 +306,7 @@ async function boot(): Promise<{ readonly origin: string }> {
           : null;
       },
       async blob(digest) {
-        return digest === "sha256:index.js" ? new TextEncoder().encode(TENANT_MODULE) : null;
+        return digest === "sha256:index.js" ? new TextEncoder().encode(tenantModule) : null;
       },
     },
   });
@@ -322,13 +389,8 @@ async function boot(): Promise<{ readonly origin: string }> {
   });
   expect(endpoint.phase).toBe("succeeded");
 
-  workerd = Bun.spawn([WORKERD as string, "serve", join(root, "workers", "workerd.capnp")], {
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const origin = `http://127.0.0.1:${workerdPort}`;
   expect(await reachable(`${origin}/`)).toBe(true);
-  return { origin };
+  return { origin, local, planeOrigin: `http://${served.address}` };
 }
 
 const ask = (origin: string, path: string) =>
@@ -387,6 +449,75 @@ test.skipIf(WORKERD === null)(
     const { origin } = await boot();
     const response = await ask(origin, "/");
     expect(await response.json()).toEqual({ lane: "takoform-v1", secret: "undefined" });
+  },
+  30_000,
+);
+
+test.skipIf(WORKERD === null)(
+  "a tenant importing cloudflare:workers finds no token and no data binding",
+  async () => {
+    const { origin } = await boot();
+    const response = await ask(origin, "/smuggle");
+    // `import { env } from "cloudflare:workers"` is the raw environment of the
+    // service, not the projected object — so leaving a binding out of the
+    // projection never hid it. Two things make this empty: the token and the
+    // plane address are declared on a separate Host-owned service, and
+    // `disallow_importable_env` is set on this one.
+    expect(await response.json()).toEqual({
+      importable: { keys: [], token: null, service: "undefined" },
+      handlerToken: null,
+      handlerService: "undefined",
+    });
+  },
+  30_000,
+);
+
+test.skipIf(WORKERD === null)(
+  "the SQL binding refuses every statement that would leave its own database",
+  async () => {
+    const { origin } = await boot();
+    const victim = join(root, "databases", "tsdb-someone-else.sqlite");
+    const control = join(root, "control.sqlite");
+    const spill = join(root, "spilled.sqlite");
+    const asked = new URL(`${origin}/attach`);
+    asked.searchParams.set("victim", victim);
+    asked.searchParams.set("control", control);
+    asked.searchParams.set("spill", spill);
+    const response = await fetch(asked, { headers: { host: HOSTNAME } });
+    // Every one of these is a way out of the one database this binding names:
+    // ATTACH opens another tenant's file and this Host's control database,
+    // VACUUM INTO writes a file anywhere this process can, PRAGMA reads the
+    // paths back, and the migration ledger lives in the same file.
+    expect(await response.json()).toEqual({
+      attachLiteral: "sql_error",
+      attachParam: "sql_error",
+      attachControl: "sql_error",
+      databaseList: "sql_error",
+      vacuumInto: "sql_error",
+      dropLedger: "sql_error",
+      selectLedger: "sql_error",
+      multiStatement: "sql_error",
+      begin: "sql_error",
+      commit: "sql_error",
+      savepoint: "sql_error",
+      analyze: "sql_error",
+      detach: "sql_error",
+    });
+    expect(existsSync(victim)).toBe(false);
+    expect(existsSync(spill)).toBe(false);
+  },
+  30_000,
+);
+
+test.skipIf(WORKERD === null)(
+  "a write smuggled through query is rolled back, exactly as the managed backend does it",
+  async () => {
+    const { origin } = await boot();
+    const response = await ask(origin, "/query-writes");
+    expect(await response.json()).toEqual({
+      through: { rows: [], rowsWritten: 0 },
+      after: { rows: [{ n: 1 }], rowsWritten: 0 },
+    });
   },
   30_000,
 );

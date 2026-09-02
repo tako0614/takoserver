@@ -17,18 +17,26 @@
  * and never a raw wire envelope or a provider-native client; running on the
  * operator's own machine does not make that a different contract.
  *
- * Two things never reach the tenant. The service binding that addresses the
- * data planes and the per-version token that authenticates to them are read
- * from the raw environment, captured in closures, and left out of the projected
- * object. The service binding is an `externalServer`, so every request on it
- * goes to this Host's own loopback address regardless of the URL written on it:
- * even a tenant that could reach the token could not send it anywhere else.
+ * No secret is on this service. The per-version plane token and the plane's
+ * `externalServer` live on a separate workerd service of this Host's own
+ * (`selfhost-data-service.ts`), and the only thing this module is given is a
+ * plain service binding to it. That is a structural claim rather than a
+ * projection one: a binding belongs to the service it is declared on, and
+ * workerd hands every binding of a service to every module that service runs —
+ * `import { env } from "cloudflare:workers"` included. Leaving a value out of
+ * the projected object never hid it. Leaving it off the service does.
+ *
+ * The service binding this module does hold reaches exactly two routes, and the
+ * facade behind it rewrites every request completely, so a leak of the binding
+ * into tenant code buys a KV call and a SQL call against the same Version's own
+ * grant — not an address, not a token, and not a path anywhere else on this
+ * machine. `disallow_importable_env` is set on this service besides, so
+ * `cloudflare:workers` hands the tenant an empty environment.
  *
  * The intrinsics this module uses are captured at module scope, before the
  * tenant's module is imported, for the same reason the managed wrapper captures
  * them: after the first request the tenant's code has run, and a `Headers` or a
- * `JSON.stringify` it replaced would otherwise be the one this module calls
- * with a secret in hand.
+ * `JSON.stringify` it replaced would otherwise be the one this module calls.
  */
 
 /** Closed handler vocabulary of worker.runtime@1.1.0. */
@@ -41,13 +49,42 @@ export const SELFHOST_WORKER_EDGE_SQL_BINDING_KIND = "edge.sql@1.0.0" as const;
 
 /** Names reserved for this Host; a public binding may never start with it. */
 export const SELFHOST_WORKER_INTERNAL_BINDING_PREFIX = "__TAKOSERVER_" as const;
-/** The `externalServer` service binding that addresses the Bun data planes. */
+/**
+ * The plain service binding the tenant's service holds.
+ *
+ * It carries no secret and names no address: it addresses the Host-owned
+ * facade service, which is where the token and the `externalServer` live.
+ */
 export const SELFHOST_WORKER_DATA_SERVICE_BINDING = "__TAKOSERVER_SELFHOST_DATA" as const;
-/** The per-version bearer token the generated module presents to them. */
+/**
+ * The per-version bearer token, declared on the facade service only.
+ *
+ * Never on the tenant's service. `disallow_importable_env` is defence in depth
+ * behind that, not the reason it is safe.
+ */
 export const SELFHOST_WORKER_DATA_TOKEN_BINDING = "__TAKOSERVER_SELFHOST_DATA_TOKEN" as const;
 
 /** Module name the generated entrypoint is published under. */
 export const SELFHOST_WORKER_ENTRYPOINT_MODULE = "__takoserver-selfhost-entrypoint.js" as const;
+
+/**
+ * Where this Host asks a published pair whether the tenant module really loads.
+ *
+ * The wrapper validates the declared handlers when it first imports the tenant
+ * module, and until this existed that first import was a customer's request:
+ * a version declaring a handler its module does not export was published, and
+ * the attachment it enabled dropped the event. So the publication asks first,
+ * through the workerd router, and the answer names the publication that gave
+ * it — a stale configuration cannot pass for the new one.
+ */
+export const SELFHOST_WORKER_READINESS_PATH =
+  "/.well-known/takoserver/selfhost-worker-readiness/v1" as const;
+export const SELFHOST_WORKER_READINESS_PROTOCOL =
+  "takoserver.selfhost-worker-readiness@v1" as const;
+export const SELFHOST_WORKER_READINESS_RESULT_SCHEMA =
+  "takoserver.selfhost-worker-readiness-result@v1" as const;
+/** Header naming the protocol, so an ordinary tenant request cannot be one. */
+export const SELFHOST_WORKER_READINESS_HEADER = "x-takoserver-selfhost-readiness" as const;
 
 export const SELFHOST_DATA_PLANE_PATH_PREFIX = "/.well-known/takoserver/selfhost-data/v1" as const;
 export const SELFHOST_DATA_PLANE_KV_PATH = `${SELFHOST_DATA_PLANE_PATH_PREFIX}/kv` as const;
@@ -90,9 +127,15 @@ export interface SelfhostWorkerEntrypointSourceInput {
   readonly originalMainModule: string;
   readonly declaredHandlers: readonly SelfhostWorkerHandlerName[];
   readonly bindings: readonly SelfhostWorkerBindingDescriptor[];
+  /**
+   * Which publication this module is. Echoed by the readiness route so a probe
+   * can tell the configuration it asked for from the one workerd still served.
+   */
+  readonly publication: string;
 }
 
 const ARTIFACT_PART_NAME = /^[A-Za-z0-9_.][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_.][A-Za-z0-9._-]*)*$/u;
+const PUBLICATION = /^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/u;
 const BINDING_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/u;
 const VARIABLE_NAME = /^[A-Za-z][A-Za-z0-9._-]*$/u;
 const NATIVE_BINDING_TYPES = new Set(["plain_text", "json", "secret_text"]);
@@ -116,21 +159,36 @@ export function selfhostWorkerEntrypointSource(input: SelfhostWorkerEntrypointSo
     declaredHandlers: [...normalized.declaredHandlers].sort(),
     bindings: normalized.bindings,
   };
-  const handlers = configuration.declaredHandlers
-    .map((handler) =>
-      handler === "fetch"
-        ? `  async fetch(request, rawEnv, rawContext) {
-    return await invoke("fetch", [request], rawEnv, rawContext);
-  },`
-        : `  async ${handler}(event, rawEnv, rawContext) {
+  // `fetch` is always exported, whether or not the version declared it. The
+  // readiness route lives on it, and a version that declares only `queue` must
+  // answer an HTTP request the same way the managed wrapper does — with a 404,
+  // not with a runtime error about a missing entrypoint.
+  const handlers = [
+    `  async fetch(request, rawEnv, rawContext) {
+    const answered = await readiness(request);
+    if (answered) return answered;
+${
+  configuration.declaredHandlers.includes("fetch")
+    ? `    return await invoke("fetch", [request], rawEnv, rawContext);`
+    : `    return statusResponse(404);`
+}
+  },`,
+    ...configuration.declaredHandlers
+      .filter((handler) => handler !== "fetch")
+      .map(
+        (handler) => `  async ${handler}(event, rawEnv, rawContext) {
     return await invoke(${JSON.stringify(handler)}, [event], rawEnv, rawContext);
   },`,
-    )
-    .join("\n");
+      ),
+  ].join("\n");
 
   return `const RAW_CONFIGURATION = ${JSON.stringify(configuration)};
 const DATA_SERVICE = ${JSON.stringify(SELFHOST_WORKER_DATA_SERVICE_BINDING)};
-const DATA_TOKEN = ${JSON.stringify(SELFHOST_WORKER_DATA_TOKEN_BINDING)};
+const READINESS_PATH = ${JSON.stringify(SELFHOST_WORKER_READINESS_PATH)};
+const READINESS_PROTOCOL = ${JSON.stringify(SELFHOST_WORKER_READINESS_PROTOCOL)};
+const READINESS_RESULT_SCHEMA = ${JSON.stringify(SELFHOST_WORKER_READINESS_RESULT_SCHEMA)};
+const READINESS_HEADER = ${JSON.stringify(SELFHOST_WORKER_READINESS_HEADER)};
+const PUBLICATION = ${JSON.stringify(normalized.publication)};
 const KV_URL = ${JSON.stringify(`${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_KV_PATH}`)};
 const SQL_URL = ${JSON.stringify(`${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_SQL_PATH}`)};
 const PROTOCOL = ${JSON.stringify(SELFHOST_DATA_PLANE_PROTOCOL)};
@@ -169,7 +227,14 @@ const SafePromise = Promise;
 const SafePromiseResolve = Promise.resolve;
 const SafePromiseThen = Promise.prototype.then;
 const SafeRegExpTest = RegExp.prototype.test;
+const SafeResponse = Response;
 const SafeResponseText = Response.prototype.text;
+const SafeURL = URL;
+const SafeHeadersGet = Headers.prototype.get;
+const SafeRequestUrlGet = captureGetter(Request.prototype, "url");
+const SafeRequestMethodGet = captureGetter(Request.prototype, "method");
+const SafeRequestHeadersGet = captureGetter(Request.prototype, "headers");
+const SafeURLPathnameGet = captureGetter(URL.prototype, "pathname");
 const SafeStringFromCharCode = String.fromCharCode;
 const SafeTextDecoder = TextDecoder;
 const SafeTextDecoderDecode = TextDecoder.prototype.decode;
@@ -230,6 +295,46 @@ async function invoke(handler, args, rawEnv, rawContext) {
   const context = createPortableContext(rawContext);
   const original = await loadOriginal();
   return await SafeApply(original.handlers[handler], original.target, [...args, env, context]);
+}
+
+function statusResponse(status) {
+  return new SafeResponse(null, { status });
+}
+
+/**
+ * The publication's own answer to "does the tenant module really load".
+ *
+ * It imports the module and validates the declared handlers — the same work the
+ * first customer request would have done, moved to a moment where failing is
+ * still a refusal rather than a dropped event. Nothing about the tenant crosses
+ * the seam: a module that throws is a 500 and a status, never a message.
+ */
+async function readiness(request) {
+  try {
+    const url = new SafeURL(SafeApply(SafeRequestUrlGet, request, []));
+    if (SafeApply(SafeURLPathnameGet, url, []) !== READINESS_PATH) return undefined;
+    if (SafeApply(SafeRequestMethodGet, request, []) !== "POST") return undefined;
+    const headers = SafeApply(SafeRequestHeadersGet, request, []);
+    if (SafeApply(SafeHeadersGet, headers, [READINESS_HEADER]) !== READINESS_PROTOCOL) {
+      return undefined;
+    }
+  } catch {
+    return undefined;
+  }
+  const answer = SafeObjectCreate(null);
+  answer.schema = READINESS_RESULT_SCHEMA;
+  answer.publication = PUBLICATION;
+  answer.handlers = CONFIGURATION.declaredHandlers;
+  let status = 200;
+  try {
+    await loadOriginal();
+  } catch {
+    status = 500;
+  }
+  return new SafeResponse(SafeJSONStringify(answer), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
 }
 
 function sealGeneratedConfiguration(raw) {
@@ -338,22 +443,18 @@ function createPortableContext(rawContext) {
 }
 
 /**
- * One authenticated caller for every facade on this Worker.
+ * One caller for every facade on this Worker.
  *
- * The service binding is an \`externalServer\`, so the URL below decides nothing:
- * the request goes to the address in the generated configuration. That is what
- * makes the token safe to hold here — there is no second destination to send it
- * to, whatever else in this isolate has been replaced.
+ * There is no credential here to protect, and that is the point: the service
+ * binding addresses this Host's own facade service, which holds the token and
+ * the plane address and rewrites every request it is handed. This module can
+ * name one of two paths and a JSON body; it cannot name a destination.
  */
 function createPlaneCaller(rawEnv) {
   const service = rawEnv[DATA_SERVICE];
   const send = captureMethod(service, "fetch");
-  const token = rawEnv[DATA_TOKEN];
-  if (typeof token !== "string" || token.length === 0) throw portableError("backend_unavailable");
-  const authorization = "Bearer " + token;
   return async (url, payload, codes) => {
     const headers = SafeObjectCreate(null);
-    headers.authorization = authorization;
     headers["content-type"] = CONTENT_TYPE;
     const init = SafeObjectCreate(null);
     init.method = "POST";
@@ -839,12 +940,20 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
   readonly originalMainModule: string;
   readonly declaredHandlers: SelfhostWorkerHandlerName[];
   readonly bindings: SelfhostWorkerBindingDescriptor[];
+  readonly publication: string;
 } {
   const fields = dataProperties(input, "input");
-  exactNormalizedKeys(fields, ["originalMainModule", "declaredHandlers", "bindings"], "input");
+  exactNormalizedKeys(
+    fields,
+    ["originalMainModule", "declaredHandlers", "bindings", "publication"],
+    "input",
+  );
   validateArtifactPartName(fields.originalMainModule);
   if (fields.originalMainModule === SELFHOST_WORKER_ENTRYPOINT_MODULE)
     invalid("originalMainModule");
+  if (typeof fields.publication !== "string" || !PUBLICATION.test(fields.publication)) {
+    invalid("publication");
+  }
   const declaredHandlersInput = dataArray(fields.declaredHandlers, "declaredHandlers");
   if (declaredHandlersInput.length < 1) invalid("declaredHandlers");
   const declaredHandlers: SelfhostWorkerHandlerName[] = [];
@@ -889,7 +998,12 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
   // declares none would replace a publication that needs no entrypoint with one
   // that does, and the byte-identical guarantee for those versions with it.
   if (dataBindings === 0) invalid("bindings");
-  return { originalMainModule: fields.originalMainModule, declaredHandlers, bindings };
+  return {
+    originalMainModule: fields.originalMainModule,
+    declaredHandlers,
+    bindings,
+    publication: fields.publication,
+  };
 }
 
 function validateArtifactPartName(value: unknown): asserts value is string {

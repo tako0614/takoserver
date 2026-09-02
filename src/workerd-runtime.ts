@@ -74,10 +74,26 @@ export interface WorkerdSite {
    */
   readonly modules?: readonly string[];
   /**
-   * Loopback address of this Host's KV and SQL data planes, for a script whose
-   * generated entrypoint calls them. Absent means this script binds neither.
+   * The Host-owned facade service this script's generated entrypoint calls.
+   *
+   * Absent means this script binds no KV namespace and no SQLite database, and
+   * renders exactly the configuration it always did. Present renders a second
+   * service beside the script — its own module, its own bindings — and gives
+   * the script a plain service binding to it. The token and the loopback
+   * address are declared there and never on the script, because workerd hands
+   * every binding of a service to every module that service runs.
    */
-  readonly dataPlaneAddress?: string;
+  readonly dataPlane?: WorkerdDataPlane;
+}
+
+/** The facade service one script's entrypoint reaches its storage through. */
+export interface WorkerdDataPlane {
+  /** Loopback address of this Host's KV and SQL planes. */
+  readonly address: string;
+  /** Module inside the script's directory that implements the facade. */
+  readonly module: string;
+  /** Bindings for the facade service alone; this is where the token lives. */
+  readonly vars: readonly WorkerdBinding[];
 }
 
 /** The seam a provider publishes through: files present, config rewritten. */
@@ -95,6 +111,18 @@ export interface WorkerdRuntime {
   reload(): Promise<void>;
   /** Whether the requested generation is actually activated, for `observe`. */
   has(name: string, generation?: string): Promise<boolean>;
+  /**
+   * Asks one published script a question over the router this runtime serves.
+   *
+   * `null` means the runtime did not answer at all — it is not running, or it
+   * is restarting on the configuration just written — which is a different
+   * thing from a script that answered badly and must never be read as one.
+   */
+  probe?(
+    name: string,
+    path: string,
+    init: { readonly method: string; readonly headers: Readonly<Record<string, string>> },
+  ): Promise<{ readonly status: number; readonly body: string } | null>;
 }
 
 export interface WorkerdRuntimeOptions {
@@ -122,18 +150,40 @@ interface Manifest {
   readonly assets?: { readonly notFoundHandling: string };
   readonly vars?: readonly WorkerdBinding[];
   readonly modules?: readonly string[];
-  readonly dataPlaneAddress?: string;
+  readonly dataPlane?: WorkerdDataPlane;
 }
 
 const MANIFEST = "takoserver-site.json";
 /**
- * The service binding a generated entrypoint reaches the data planes through.
+ * The service binding a generated entrypoint reaches its facade through, and
+ * the one the facade reaches the Bun planes through.
  *
- * Kept in step with `SELFHOST_WORKER_DATA_SERVICE_BINDING` by name rather than
- * by import: this module is the runtime, and it must not depend on the provider
- * that publishes into it.
+ * Kept in step with the provider's own constants by name rather than by import:
+ * this module is the runtime, and it must not depend on the provider that
+ * publishes into it.
  */
 const DATA_SERVICE_BINDING = "__TAKOSERVER_SELFHOST_DATA";
+const DATA_PLANE_BINDING = "__TAKOSERVER_SELFHOST_DATA_PLANE";
+/**
+ * Compatibility flags for a script published through a generated entrypoint.
+ *
+ * `disallow_importable_env` makes `import { env } from "cloudflare:workers"`
+ * yield an empty object while the handler's own `env` argument keeps its
+ * bindings. The facade service is what actually keeps the token away from
+ * tenant code; this is the second lock on the same door, and it also stops a
+ * tenant module reading the service binding the entrypoint holds.
+ */
+const DATA_PLANE_COMPATIBILITY_FLAGS = ["disallow_importable_env"] as const;
+/**
+ * The hostname this Host asks a generated entrypoint its own questions on.
+ *
+ * A script is reachable through the router by `Host` and by nothing else, so a
+ * publication that has not been given a customer hostname yet would be
+ * unreachable — including to the readiness probe that decides whether it may be
+ * published at all. `.invalid` can never be delegated, and the route is written
+ * after the customer routes so a claimed custom domain cannot capture it.
+ */
+const INTERNAL_ROUTE_SUFFIX = ".selfhost-internal.invalid";
 /** Where a script's static files live inside its directory. */
 const ASSETS_DIRECTORY = "__assets";
 
@@ -195,9 +245,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): WorkerdRun
           ...(site.modules && site.modules.length > 0
             ? { modules: validModules(site.modules) }
             : {}),
-          ...(site.dataPlaneAddress
-            ? { dataPlaneAddress: validDataPlaneAddress(site.dataPlaneAddress) }
-            : {}),
+          ...(site.dataPlane ? { dataPlane: validDataPlane(site.dataPlane) } : {}),
         }),
         "utf8",
       );
@@ -224,6 +272,28 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): WorkerdRun
         return false;
       }
       return true;
+    },
+
+    async probe(name, path, init) {
+      let hostname: string;
+      try {
+        hostname = internalHostname(name);
+      } catch {
+        return null;
+      }
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+          method: init.method,
+          headers: { ...init.headers, host: hostname },
+          signal: AbortSignal.timeout(2_000),
+        });
+        // Bounded because the answer is this Host's own small envelope and the
+        // body on the other side of that router is a tenant's Worker.
+        const body = (await response.text()).slice(0, 65_536);
+        return { status: response.status, body };
+      } catch {
+        return null;
+      }
     },
 
     async reload() {
@@ -365,16 +435,47 @@ function validModules(modules: readonly string[]): readonly string[] {
  * The one address a data-plane service may point at.
  *
  * Loopback only, and deliberately: the address is written into a generated
- * `externalServer`, every request a Worker makes on that binding goes to it
- * whatever URL the Worker wrote, and each of those requests carries the
+ * `externalServer`, every request the facade service makes on that binding goes
+ * to it whatever URL was written, and each of those requests carries the
  * version's plane token. An address off this machine would be somewhere that
  * token could be sent.
+ *
+ * Two literal addresses, not a name. `localhost` is a resolver answer rather
+ * than an address: it may be `::1` where the listener is on `127.0.0.1`, it may
+ * be several addresses, and on a machine whose `hosts` file somebody edited it
+ * may be neither. A port is a port — `0` is not one, and neither is `99999`.
  */
 function validDataPlaneAddress(address: string): string {
-  if (!/^(?:127\.0\.0\.1|\[::1\]|localhost):(?:[1-9][0-9]{0,4})$/u.test(address)) {
+  const separator = address.lastIndexOf(":");
+  const host = separator < 0 ? "" : address.slice(0, separator);
+  const port = separator < 0 ? "" : address.slice(separator + 1);
+  const number = /^[1-9][0-9]{0,4}$/u.test(port) ? Number(port) : 0;
+  if ((host !== "127.0.0.1" && host !== "[::1]") || number < 1 || number > 65_535) {
     throw new Error("unusable data plane address");
   }
   return address;
+}
+
+/** The facade service one script publishes beside itself, checked whole. */
+function validDataPlane(plane: WorkerdDataPlane): WorkerdDataPlane {
+  if (typeof plane !== "object" || plane === null) throw new Error("unusable data plane");
+  validDataPlaneAddress(plane.address);
+  validModules([plane.module]);
+  validBindings(plane.vars ?? []);
+  return plane;
+}
+
+/**
+ * The hostname the router answers this Host's own questions about a script on.
+ *
+ * Derived from the script name rather than stored, so it cannot drift from the
+ * service it names and no manifest can claim somebody else's.
+ */
+export function internalHostname(script: string): string {
+  if (!/^[a-z0-9][a-z0-9_-]{0,127}$/u.test(script)) {
+    throw new Error(`unusable script name: ${script}`);
+  }
+  return `${script}${INTERNAL_ROUTE_SUFFIX}`;
 }
 
 /**
@@ -487,9 +588,8 @@ async function readPublished(scriptsRoot: string): Promise<readonly Published[]>
     try {
       validBindings(manifest.vars ?? []);
       validModules(manifest.modules ?? []);
-      if (manifest.dataPlaneAddress !== undefined) {
-        validDataPlaneAddress(manifest.dataPlaneAddress);
-      }
+      if (manifest.dataPlane !== undefined) validDataPlane(manifest.dataPlane);
+      internalHostname(entry.name);
     } catch {
       continue;
     }
@@ -515,7 +615,7 @@ function renderConfig(published: readonly Published[], port: number, scriptsRoot
       // script, and `notFoundHandling` never applies.
       const bindings = [
         ...(entry.manifest.assets ? [`(name = "ASSETS", service = "${entry.name}-assets")`] : []),
-        ...(entry.manifest.dataPlaneAddress
+        ...(entry.manifest.dataPlane
           ? [`(name = "${DATA_SERVICE_BINDING}", service = "${entry.name}-selfhost-data")`]
           : []),
         ...validBindings(entry.manifest.vars ?? []).map(
@@ -533,10 +633,15 @@ function renderConfig(published: readonly Published[], port: number, scriptsRoot
             `(name = ${capnpText(name)}, esModule = embed ${capnpText(`${entry.name}/${name}`)})`,
         )
         .join(", ");
+      // Rendered only for a script published through a generated entrypoint, so
+      // a script that binds no data plane produces the bytes it always did.
+      const flagList = entry.manifest.dataPlane
+        ? `\n      compatibilityFlags = [ ${DATA_PLANE_COMPATIBILITY_FLAGS.map((flag) => capnpText(flag)).join(", ")} ],`
+        : "";
       return `  ( name = "${entry.name}",
     worker = (
       modules = [ ${moduleList} ],${bindingList}
-      compatibilityDate = "2026-01-01",
+      compatibilityDate = "2026-01-01",${flagList}
     )
   ),`;
     })
@@ -572,21 +677,48 @@ function renderConfig(published: readonly Published[], port: number, scriptsRoot
     )
     .join("\n");
 
-  // One per script rather than one shared, so the configuration stays a pure
-  // function of the manifests on disk: a script that binds no data plane
-  // contributes no service, and removing it removes its service with it.
+  // One pair per script rather than one shared, so the configuration stays a
+  // pure function of the manifests on disk: a script that binds no data plane
+  // contributes neither service, and removing it removes both with it.
+  //
+  // The token is declared here and only here. The script's own service holds a
+  // binding to this one and nothing else, so tenant code — by `env`, by
+  // `cloudflare:workers`, or by any other route into its own isolate — has
+  // nothing to find.
   const dataServices = published
-    .filter((entry) => entry.manifest.dataPlaneAddress)
-    .map(
-      (entry) => `  ( name = "${entry.name}-selfhost-data",
-    external = ( address = ${capnpText(validDataPlaneAddress(entry.manifest.dataPlaneAddress as string))}, http = () )
-  ),`,
+    .filter((entry) => entry.manifest.dataPlane)
+    .map((entry) => {
+      const plane = validDataPlane(entry.manifest.dataPlane as WorkerdDataPlane);
+      const facadeBindings = [
+        `(name = "${DATA_PLANE_BINDING}", service = "${entry.name}-selfhost-data-origin")`,
+        ...validBindings(plane.vars).map(
+          (binding) =>
+            `(name = ${capnpText(binding.name)}, ${binding.kind} = ${capnpText(binding.value)})`,
+        ),
+      ].join(", ");
+      return `  ( name = "${entry.name}-selfhost-data",
+    worker = (
+      modules = [ (name = ${capnpText(plane.module)}, esModule = embed ${capnpText(`${entry.name}/${plane.module}`)}) ],
+      bindings = [ ${facadeBindings} ],
+      compatibilityDate = "2026-01-01",
     )
+  ),
+  ( name = "${entry.name}-selfhost-data-origin",
+    external = ( address = ${capnpText(plane.address)}, http = () )
+  ),`;
+    })
     .join("\n");
 
-  const routes = published.flatMap((entry) =>
-    entry.manifest.hostnames.map((hostname) => ({ hostname, service: entry.name })),
-  );
+  const routes = [
+    ...published.flatMap((entry) =>
+      entry.manifest.hostnames.map((hostname) => ({ hostname, service: entry.name })),
+    ),
+    // Last, so a customer domain that happens to claim one of these names
+    // cannot capture this Host's own probe for another script.
+    ...published
+      .filter((entry) => entry.manifest.dataPlane)
+      .map((entry) => ({ hostname: internalHostname(entry.name), service: entry.name })),
+  ];
   const routeTable = JSON.stringify(Object.fromEntries(routes.map((r) => [r.hostname, r.service])));
   const bindings = published
     .map((entry) => `      (name = "${entry.name}", service = "${entry.name}"),`)

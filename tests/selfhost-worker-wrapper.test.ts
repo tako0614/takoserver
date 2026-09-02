@@ -11,6 +11,10 @@ import {
   SELFHOST_WORKER_DATA_TOKEN_BINDING,
   SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
   SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
+  SELFHOST_WORKER_READINESS_HEADER,
+  SELFHOST_WORKER_READINESS_PATH,
+  SELFHOST_WORKER_READINESS_PROTOCOL,
+  SELFHOST_WORKER_READINESS_RESULT_SCHEMA,
   type SelfhostWorkerEntrypointSourceInput,
   selfhostWorkerEntrypointSource,
 } from "../src/providers/selfhost-worker-wrapper.ts";
@@ -26,6 +30,7 @@ import {
 
 const KV_ONLY: SelfhostWorkerEntrypointSourceInput = {
   originalMainModule: "index.js",
+  publication: "sw1.v1",
   declaredHandlers: ["fetch"],
   bindings: [{ kind: SELFHOST_WORKER_EDGE_KV_BINDING_KIND, publicName: "KV" }],
 };
@@ -91,11 +96,11 @@ function rawEnv(
   service: { fetch(url: string, init: RequestInit): Promise<Response> },
   extra: Record<string, unknown> = {},
 ): Record<string, unknown> {
-  return {
-    [SELFHOST_WORKER_DATA_SERVICE_BINDING]: service,
-    [SELFHOST_WORKER_DATA_TOKEN_BINDING]: "sw1.v1.secret-token-value",
-    ...extra,
-  };
+  // No token: the generated entrypoint's service binding addresses this Host's
+  // own facade service, and the facade is what holds the credential. A raw
+  // environment carrying one here would be testing a topology that no longer
+  // exists.
+  return { [SELFHOST_WORKER_DATA_SERVICE_BINDING]: service, ...extra };
 }
 
 const context = { waitUntil() {} };
@@ -110,6 +115,7 @@ test("projects the declared facades and nothing else onto the tenant environment
      } };`,
     {
       originalMainModule: "index.js",
+      publication: "sw1.v1",
       declaredHandlers: ["fetch"],
       bindings: [
         { kind: SELFHOST_WORKER_EDGE_KV_BINDING_KIND, publicName: "KV" },
@@ -149,6 +155,7 @@ test("the edge.sql facade offers exactly execute, query, and transaction", async
      } };`,
     {
       originalMainModule: "index.js",
+      publication: "sw1.v1",
       declaredHandlers: ["fetch"],
       bindings: [{ kind: SELFHOST_WORKER_EDGE_SQL_BINDING_KIND, publicName: "DB" }],
     },
@@ -189,7 +196,8 @@ test("a KV put and get travel as one authenticated request each", async () => {
     expect(await response.json()).toEqual({ value: "stored", metadata: { kind: "session" } });
     expect(calls).toHaveLength(2);
     expect(calls[0]?.url).toEndWith(SELFHOST_DATA_PLANE_KV_PATH);
-    expect(calls[0]?.authorization).toBe("Bearer sw1.v1.secret-token-value");
+    // The entrypoint has no credential to present and does not invent one.
+    expect(calls[0]?.authorization).toBeNull();
     expect(calls[0]?.body).toEqual({
       protocol: SELFHOST_DATA_PLANE_PROTOCOL,
       binding: "KV",
@@ -215,6 +223,7 @@ test("a SQL statement travels to the SQL plane and its rows come back projected"
      } };`,
     {
       originalMainModule: "index.js",
+      publication: "sw1.v1",
       declaredHandlers: ["fetch"],
       bindings: [{ kind: SELFHOST_WORKER_EDGE_SQL_BINDING_KIND, publicName: "DB" }],
     },
@@ -248,6 +257,7 @@ test("a plane refusal reaches the tenant under the closed error vocabulary", asy
      } };`,
     {
       originalMainModule: "index.js",
+      publication: "sw1.v1",
       declaredHandlers: ["fetch"],
       bindings: [{ kind: SELFHOST_WORKER_EDGE_SQL_BINDING_KIND, publicName: "DB" }],
     },
@@ -274,6 +284,7 @@ test("a code the plane is not allowed to return becomes backend_unavailable", as
      } };`,
     {
       originalMainModule: "index.js",
+      publication: "sw1.v1",
       declaredHandlers: ["fetch"],
       bindings: [{ kind: SELFHOST_WORKER_EDGE_SQL_BINDING_KIND, publicName: "DB" }],
     },
@@ -290,7 +301,7 @@ test("a code the plane is not allowed to return becomes backend_unavailable", as
   }
 });
 
-test("only the declared handlers are exported", async () => {
+test("only the declared handlers are exported, and fetch always is", async () => {
   const generated = await loadGenerated(
     `export default { async fetch() { return new Response("ok"); },
        async queue() {}, async scheduled() {} };`,
@@ -298,6 +309,88 @@ test("only the declared handlers are exported", async () => {
   );
   try {
     expect(Object.keys(generated.worker).sort()).toEqual(["fetch", "queue"]);
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("a version that declares no fetch handler answers an HTTP request with 404", async () => {
+  const { service } = plane([]);
+  const generated = await loadGenerated(`export default { async queue() {} };`, {
+    ...KV_ONLY,
+    declaredHandlers: ["queue"],
+  });
+  try {
+    // Exactly what the managed wrapper answers, and for the same reason: the
+    // event that arrived is not one this Version said it handles.
+    expect(Object.keys(generated.worker).sort()).toEqual(["fetch", "queue"]);
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(response.status).toBe(404);
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("the readiness route loads the tenant module and names its own publication", async () => {
+  const { service } = plane([]);
+  const generated = await loadGenerated(
+    `export default { async fetch() { return new Response("tenant"); } };`,
+  );
+  try {
+    const answered = await generated.worker.fetch(
+      new Request(`https://worker.example${SELFHOST_WORKER_READINESS_PATH}`, {
+        method: "POST",
+        headers: { [SELFHOST_WORKER_READINESS_HEADER]: SELFHOST_WORKER_READINESS_PROTOCOL },
+      }),
+      rawEnv(service),
+      context,
+    );
+    expect(answered.status).toBe(200);
+    expect(await answered.json()).toEqual({
+      schema: SELFHOST_WORKER_READINESS_RESULT_SCHEMA,
+      publication: "sw1.v1",
+      handlers: ["fetch"],
+    });
+    // Without the protocol header the same path is an ordinary tenant request.
+    const tenant = await generated.worker.fetch(
+      new Request(`https://worker.example${SELFHOST_WORKER_READINESS_PATH}`, { method: "POST" }),
+      rawEnv(service),
+      context,
+    );
+    expect(await tenant.text()).toBe("tenant");
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("the readiness route reports a declared handler the tenant module lacks", async () => {
+  const { service } = plane([]);
+  const generated = await loadGenerated(
+    `export default { async fetch() { return new Response("ok"); } };`,
+    { ...KV_ONLY, declaredHandlers: ["fetch", "scheduled"] },
+  );
+  try {
+    const answered = await generated.worker.fetch(
+      new Request(`https://worker.example${SELFHOST_WORKER_READINESS_PATH}`, {
+        method: "POST",
+        headers: { [SELFHOST_WORKER_READINESS_HEADER]: SELFHOST_WORKER_READINESS_PROTOCOL },
+      }),
+      rawEnv(service),
+      context,
+    );
+    expect(answered.status).toBe(500);
+    // The publication is named even on the refusal, so a prober can tell this
+    // answer from a stale configuration's. Nothing about the tenant's own
+    // failure crosses.
+    expect(await answered.json()).toEqual({
+      schema: SELFHOST_WORKER_READINESS_RESULT_SCHEMA,
+      publication: "sw1.v1",
+      handlers: ["fetch", "scheduled"],
+    });
   } finally {
     await generated.dispose();
   }
@@ -367,6 +460,7 @@ test("a version with no facade generates no entrypoint at all", () => {
   expect(() =>
     selfhostWorkerEntrypointSource({
       originalMainModule: "index.js",
+      publication: "sw1.v1",
       declaredHandlers: ["fetch"],
       bindings: [{ name: "LANE", type: "plain_text" }],
     }),

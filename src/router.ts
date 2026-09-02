@@ -13,27 +13,18 @@ import type { TakoformHost } from "./takoform/types.ts";
  * a whole path prefix and answers `null` for anything outside it; the control
  * plane then claims `/v1`; everything else is either a documented public page
  * or a 404.
- */
-
-/**
- * The self-hosted KV and SQL data planes, when this deployment runs Workers.
  *
- * Declared structurally rather than imported, because the implementation opens
- * SQLite files and a Cloudflare Worker has no filesystem: a static edge from
- * here would put a host-only module in the Worker bundle's graph.
+ * A self-hosted deployment's KV and SQL data planes are deliberately not here.
+ * They authenticate a bearer token minted per Worker Version and are meant to
+ * be reachable only from a workerd service on the same machine, so they are
+ * served on their own loopback listener. A route here would make that token an
+ * internet-facing credential for arbitrary SQL on this Host.
  */
-export type SelfhostDataRoutes = (request: Request, url: URL) => Promise<Response | null>;
 
 export interface CreateRouterOptions {
   readonly control: ControlRoutes;
   readonly sponsorship?: SponsorshipRoutes;
   readonly dataAi?: DataAiRoutes;
-  /**
-   * Offered before anything else. These are a running Worker's storage calls,
-   * they are the hottest path this process serves, and their prefix belongs to
-   * no other surface — so nothing else gets a chance to claim or delay one.
-   */
-  readonly selfhostData?: SelfhostDataRoutes;
   readonly aiAvailable?: boolean;
   readonly takoformHost?: TakoformHost;
   readonly publicOrigin: string;
@@ -112,11 +103,6 @@ function dispatch(options: CreateRouterOptions, origin: string): Router {
   const console = options.consoleOrigin === undefined ? null : httpsOrigin(options.consoleOrigin);
   return async (request) => {
     const url = new URL(request.url);
-
-    if (options.selfhostData) {
-      const served = await options.selfhostData(request, url);
-      if (served) return served;
-    }
 
     if (options.sponsorship) {
       const served = await options.sponsorship(request, url);

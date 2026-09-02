@@ -32,7 +32,7 @@ import {
   createResourceMigrationService,
   createResourceMigrationStore,
 } from "./resource-migrations.ts";
-import { createRouter, type Router, type SelfhostDataRoutes } from "./router.ts";
+import { createRouter, type Router } from "./router.ts";
 import type { RuntimeInputAuthority } from "./runtime-input-preparations.ts";
 import { createSponsorshipRoutes } from "./sponsorship-api.ts";
 import {
@@ -102,13 +102,6 @@ export interface AppPorts {
   readonly originReservations?: WorkerEndpointOriginReservations;
   /** Where this deployment's console is served, if it has one. */
   readonly consoleOrigin?: string;
-  /**
-   * The KV and SQL planes a self-hosted deployment's own Workers call.
-   *
-   * Absent on a Cloudflare deployment, which has neither files to keep them in
-   * nor Workers of its own to serve.
-   */
-  readonly selfhostData?: SelfhostDataRoutes;
   /** Private Hosted-to-Takoserver sponsorship bearer; absent disables the seam. */
   readonly sponsorshipServiceToken?: string;
   readonly forms: readonly InstalledTakoformForm[];
@@ -615,7 +608,6 @@ export function buildApp(ports: AppPorts): App {
 
   const router = createRouter({
     control,
-    ...(ports.selfhostData ? { selfhostData: ports.selfhostData } : {}),
     ...(sponsorship ? { sponsorship } : {}),
     dataAi,
     aiAvailable: ports.ai !== undefined,

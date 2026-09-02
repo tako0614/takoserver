@@ -1,7 +1,8 @@
 import { Database } from "bun:sqlite";
-import { mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 import type { JsonValue, Row, Sql, SqlParam } from "./ports.ts";
+import type { SelfhostDataPlaneMaintenance } from "./providers/selfhost.ts";
 import {
   SELFHOST_DATA_PLANE_KV_PATH,
   SELFHOST_DATA_PLANE_PROTOCOL,
@@ -27,6 +28,21 @@ import {
  *
  * The token is compared in constant time and never appears in a response, a
  * log line, or an error. A wrong one is answered exactly like a missing one.
+ *
+ * These planes are served on a listener of their own, bound to `127.0.0.1`, and
+ * never on the public one. The token is a bearer credential and the public
+ * origin is on the internet: mounting a route that accepts it there makes it an
+ * internet-facing credential for arbitrary SQL, whatever the comment above the
+ * route says about loopback. The workerd `externalServer` in front points at
+ * this listener, so the traffic that should reach it still does and nothing
+ * else can.
+ *
+ * The SQL half executes what a tenant writes, so it decides what a statement is
+ * allowed to be before it prepares one. `ATTACH` is the reason: SQLite will
+ * happily open a second file, and every other tenant's database — and this
+ * Host's own control database — is a path away. The gate is a parse rather than
+ * a pattern, because a bound parameter, a comment, and a quoted identifier are
+ * all ways of writing the same statement.
  */
 
 /** The one path prefix these planes answer under. */
@@ -60,6 +76,12 @@ export interface SelfhostDataPlaneOptions {
 
 export type SelfhostDataPlaneRoutes = (request: Request, url: URL) => Promise<Response | null>;
 
+/** The planes plus the housekeeping the rest of this machine drives them with. */
+export interface SelfhostDataPlanes {
+  readonly routes: SelfhostDataPlaneRoutes;
+  readonly maintenance: SelfhostDataPlaneMaintenance;
+}
+
 const MAX_REQUEST_BYTES = 40 * 1024 * 1024;
 const MAX_KV_KEY_BYTES = 467;
 const MAX_KV_VALUE_BYTES = 26_214_400;
@@ -70,7 +92,22 @@ const MAX_SQL_STATEMENTS = 100;
 const MAX_SQL_ROWS = 10_000;
 const MAX_SQL_COLUMNS = 100;
 const MAX_SQL_VALUE_BYTES = 1_000_000;
+/** The managed Durable Object's own ceilings, enforced here for the same reason. */
+const MAX_SQL_ROW_BYTES = 2_000_000;
+const MAX_SQL_RESULT_BYTES = 8_388_608;
 const DEFAULT_LIST_LIMIT = 1_000;
+/**
+ * How long a statement waits for a lock before it is `busy`.
+ *
+ * Two handles are open on a tenant's database at once whenever the Takoform
+ * migration ledger is read or applied, and SQLite's default is to fail
+ * immediately rather than wait. A Worker seeing `busy` because a migration was
+ * mid-flight is a failure the operator cannot act on and the tenant cannot see
+ * the cause of.
+ */
+const SQLITE_BUSY_TIMEOUT_MS = 5_000;
+/** Rows one maintenance pass reclaims, so a sweep never becomes the workload. */
+const KV_SWEEP_BATCH = 1_000;
 const SCRIPT_NAME = /^[a-z0-9][a-z0-9_-]{0,127}$/u;
 const VERSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const TOKEN_SECRET = /^[A-Za-z0-9_-]{16,128}$/u;
@@ -94,9 +131,7 @@ class PlaneError extends Error {
   }
 }
 
-export function createSelfhostDataPlanes(
-  options: SelfhostDataPlaneOptions,
-): SelfhostDataPlaneRoutes {
+export function createSelfhostDataPlanes(options: SelfhostDataPlaneOptions): SelfhostDataPlanes {
   const now = options.clock ?? (() => new Date());
   const databases = new Map<string, Database>();
 
@@ -105,37 +140,58 @@ export function createSelfhostDataPlanes(
    *
    * A Worker's SQL binding is a hot path, and reopening the file per statement
    * would both cost more than the statement and drop the connection-scoped
-   * `total_changes()` counter the write count is derived from.
+   * `total_changes()` counter the write count is derived from. A handle is only
+   * safe to keep while the file it names is the file the Host means, so
+   * `forgetDatabase` is what a Resource lifecycle calls when that stops being
+   * true.
    */
   const database = (name: string): Database => {
     const existing = databases.get(name);
     if (existing) return existing;
     const path = options.databasePath(name);
-    let opened: Database;
+    let opened: Database | undefined;
     try {
       // Nothing creates the database root eagerly — a SQLite database on this
       // Host appears when something writes to it, and this is the something.
-      // `0700` because the file underneath is a tenant's whole dataset.
-      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+      // The directory holds tenants' whole datasets, so it is tightened and
+      // then re-read rather than created hopefully: `mkdir(mode)` does nothing
+      // to a directory an earlier build or an operator's `mkdir -p` made.
+      privateDirectory(dirname(path));
       opened = new Database(path, { create: true });
+      // `create: true` makes a `0644` file. The bytes under it are one
+      // tenant's, so the mode is corrected and then proved.
+      chmodSync(path, 0o600);
+      if ((statSync(path).mode & 0o077) !== 0) {
+        throw new Error("refusing to open a group- or world-accessible database");
+      }
+      opened.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
       opened.exec("PRAGMA foreign_keys = ON");
     } catch {
+      try {
+        opened?.close();
+      } catch {}
       throw new PlaneError("backend_unavailable");
     }
     databases.set(name, opened);
     return opened;
   };
 
-  return async (request, url) => {
+  const routes: SelfhostDataPlaneRoutes = async (request, url) => {
     const kv = url.pathname === SELFHOST_DATA_PLANE_KV_PATH;
     const sql = url.pathname === SELFHOST_DATA_PLANE_SQL_PATH;
     if (!kv && !sql) return null;
     if (request.method !== "POST") return refusal("backend_unavailable", 405);
 
+    // Before the body, deliberately. Reading and parsing up to the request
+    // ceiling for a caller that turns out to hold no token is work an
+    // unauthenticated caller chose for this process; the header is enough to
+    // decide, and it costs one record read.
+    const grant = await authorize(request, options.grant);
+    if (!grant) return refusal("backend_unavailable", 401);
+
     let body: unknown;
     try {
-      const raw = await boundedText(request);
-      body = JSON.parse(raw);
+      body = JSON.parse(await boundedText(request));
     } catch {
       return refusal("backend_unavailable", 400);
     }
@@ -147,19 +203,18 @@ export function createSelfhostDataPlanes(
     const op = text(payload.op, 32);
     if (!binding || !op) return refusal("backend_unavailable", 400);
 
-    const grant = await authorize(request, options.grant);
-    if (!grant) return refusal("backend_unavailable", 401);
-
     try {
       if (kv) {
-        const namespace = grant.kv[binding];
-        // A name the Version did not declare is not a 403 to be probed: it is
-        // simply not a binding this deployment has.
-        if (namespace === undefined) return refusal("backend_unavailable", 404);
+        // `hasOwn`, not a truthiness test: `__proto__` and `constructor` are
+        // properties of every ordinary object, so a lookup that walks the
+        // prototype chain answers binding names no record ever carried — and
+        // answers them the same way for every tenant on the machine.
+        if (!Object.hasOwn(grant.kv, binding)) return refusal("backend_unavailable", 404);
+        const namespace = grant.kv[binding] as string;
         return answer(await kvOperation(options.sql, now, namespace, op, payload));
       }
-      const name = grant.sql[binding];
-      if (name === undefined) return refusal("backend_unavailable", 404);
+      if (!Object.hasOwn(grant.sql, binding)) return refusal("backend_unavailable", 404);
+      const name = grant.sql[binding] as string;
       return answer(sqlOperation(database(name), op, payload));
     } catch (error) {
       // Nothing but the closed vocabulary crosses this seam. A SQLite message
@@ -167,6 +222,101 @@ export function createSelfhostDataPlanes(
       return refusal(error instanceof PlaneError ? error.code : "backend_unavailable", 200);
     }
   };
+
+  const maintenance: SelfhostDataPlaneMaintenance = {
+    async deleteKvNamespace(namespaceId) {
+      // A namespace id is derived from the Resource's own uid, so this can
+      // never reach a live namespace's rows: the id a recreated namespace gets
+      // is a different one.
+      await options.sql.run("DELETE FROM selfhost_kv_entries WHERE namespace_id = ?", [
+        namespaceId,
+      ]);
+    },
+
+    forgetDatabase(name) {
+      const opened = databases.get(name);
+      if (!opened) return;
+      databases.delete(name);
+      try {
+        opened.close();
+      } catch {}
+    },
+
+    async sweepExpiredKv(limit = KV_SWEEP_BATCH) {
+      // Bounded, because this runs on the same tick as settlement and a
+      // namespace with a million dead rows must not become that tick.
+      const rows = await options.sql.query(
+        "SELECT namespace_id, key FROM selfhost_kv_entries " +
+          "WHERE expires_at_ms IS NOT NULL AND expires_at_ms <= ? LIMIT ?",
+        [now().getTime(), Math.max(1, Math.min(limit, KV_SWEEP_BATCH))],
+      );
+      for (const row of rows) {
+        await options.sql.run(
+          "DELETE FROM selfhost_kv_entries WHERE namespace_id = ? AND key = ?",
+          [String(row.namespace_id), String(row.key)],
+        );
+      }
+      return rows.length;
+    },
+  };
+
+  return { routes, maintenance };
+}
+
+/**
+ * The planes on a listener of their own.
+ *
+ * `127.0.0.1` is the whole point: what authenticates here is a bearer token
+ * minted per Worker Version, and the only thing that should ever present one is
+ * a workerd service on this machine. A port of `0` asks the kernel for a free
+ * one, which the caller then records and writes into the generated
+ * `externalServer` — no configuration, no collision, and nothing published.
+ */
+export function serveSelfhostDataPlanes(
+  options: SelfhostDataPlaneOptions & { readonly port?: number },
+): {
+  readonly address: string;
+  readonly port: number;
+  readonly maintenance: SelfhostDataPlaneMaintenance;
+  stop(closeActive?: boolean): void;
+} {
+  const planes = createSelfhostDataPlanes(options);
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: options.port ?? 0,
+    async fetch(request) {
+      const url = new URL(request.url);
+      return (
+        (await planes.routes(request, url)) ??
+        new Response("not a data plane request\n", { status: 404 })
+      );
+    },
+  });
+  return {
+    address: `127.0.0.1:${server.port}`,
+    port: Number(server.port),
+    maintenance: planes.maintenance,
+    stop: (closeActive) => server.stop(closeActive),
+  };
+}
+
+/**
+ * A directory this process is willing to keep a tenant's dataset in.
+ *
+ * `mkdir(mode)` does nothing to a directory that already exists, so a
+ * `databases/` made by an earlier build — or by an operator's `mkdir -p` — keeps
+ * whatever mode it was made with. The mode is therefore tightened and re-read,
+ * exactly as the workerd runtime does for the directories holding its rendered
+ * bindings.
+ */
+function privateDirectory(path: string): void {
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  try {
+    chmodSync(path, 0o700);
+  } catch {}
+  if ((statSync(path).mode & 0o077) !== 0) {
+    throw new Error(`refusing to open a database under a group- or world-accessible directory`);
+  }
 }
 
 /**
@@ -215,13 +365,22 @@ function constantTimeEqual(left: string, right: string): boolean {
   return difference === 0;
 }
 
+/**
+ * The body, or a refusal before a byte of it is read.
+ *
+ * A declared length is required rather than merely respected. Without one the
+ * only ceiling is the server's own, the caller decides how long this process
+ * spends reading, and the check that follows happens after the bytes have
+ * already crossed. Everything that legitimately reaches this plane is a fixed
+ * JSON envelope a workerd service sent, and workerd declares its length.
+ */
 async function boundedText(request: Request): Promise<string> {
   const declared = request.headers.get("content-length");
-  if (declared !== null && (!/^\d+$/u.test(declared) || Number(declared) > MAX_REQUEST_BYTES)) {
+  if (declared === null || !/^\d+$/u.test(declared) || Number(declared) > MAX_REQUEST_BYTES) {
     throw new PlaneError("backend_unavailable");
   }
   const raw = await request.text();
-  if (raw.length > MAX_REQUEST_BYTES) throw new PlaneError("backend_unavailable");
+  if (utf8Length(raw) > Number(declared)) throw new PlaneError("backend_unavailable");
   return raw;
 }
 
@@ -376,8 +535,14 @@ function encodeCursor(key: string): string {
  */
 function prefixCeiling(prefix: string): string {
   if (prefix === "") return "";
-  const code = prefix.codePointAt(prefix.length - 1) ?? 0;
-  return `${prefix.slice(0, -1)}${String.fromCodePoint(code + 1)}`;
+  // Code points, not code units. A key outside the basic plane ends in a
+  // surrogate pair, and incrementing its low half while dropping one unit
+  // leaves a lone high surrogate as the bound — which sorts below the keys the
+  // caller asked for, so a matching key simply vanishes from the listing.
+  const points = [...prefix];
+  const last = points.pop() as string;
+  const code = last.codePointAt(0) ?? 0;
+  return `${points.join("")}${String.fromCodePoint(code + 1)}`;
 }
 
 function kvMetadata(value: unknown): string | null {
@@ -414,27 +579,54 @@ function sqlOperation(
   op: string,
   payload: Readonly<Record<string, unknown>>,
 ): Record<string, unknown> {
+  // A connection is shared by every request this Version makes, and a
+  // transaction left open on it would make every later write invisible to
+  // anything else and lost on a restart. Nothing here opens one it does not
+  // close, so an open one means a process that died mid-request.
+  if (database.inTransaction) rollback(database);
   switch (op) {
     case "execute":
-    case "query":
       return executeStatement(database, planeStatement(payload.statement));
+
+    // `query` is a read, and the facade in front of it says so. The managed
+    // backend runs it inside a transaction it always rolls back, so a write
+    // smuggled through `query` is executed and then undone rather than
+    // committed and then complained about. Same here, for the same reason: the
+    // two backends must not differ on whether a row survives.
+    case "query": {
+      const statement = planeStatement(payload.statement);
+      exec(database, "BEGIN");
+      try {
+        const result = executeStatement(database, statement);
+        return { rows: result.rows, rowsWritten: 0 };
+      } finally {
+        rollback(database);
+      }
+    }
 
     case "transaction": {
       const declared = payload.statements;
       if (!Array.isArray(declared) || declared.length < 1 || declared.length > MAX_SQL_STATEMENTS) {
         throw new PlaneError("sql_error");
       }
+      // Every statement is admitted before any of them runs, so a batch whose
+      // last statement is refused never half-executes.
       const statements = declared.map(planeStatement);
       // All or none, exactly as `createSqliteSql` does it and exactly what D1's
       // implicit batch transaction gives: a caller that used a batch to keep
       // two rows in step must not get one of them.
-      exec(database, "BEGIN IMMEDIATE");
+      try {
+        exec(database, "BEGIN IMMEDIATE");
+      } catch (error) {
+        rollback(database);
+        throw error;
+      }
       try {
         const results = statements.map((statement) => executeStatement(database, statement));
         exec(database, "COMMIT");
         return { results };
       } catch (error) {
-        exec(database, "ROLLBACK");
+        rollback(database);
         throw error instanceof PlaneError ? error : sqlFailure(error);
       }
     }
@@ -453,6 +645,19 @@ function exec(database: Database, statement: string): void {
 }
 
 /**
+ * Undo whatever is open, without ever replacing the failure that got us here.
+ *
+ * A rollback that throws is a connection this process no longer understands,
+ * and the honest answer to the caller is still the error their statement
+ * produced.
+ */
+function rollback(database: Database): void {
+  try {
+    if (database.inTransaction) database.exec("ROLLBACK");
+  } catch {}
+}
+
+/**
  * One statement, with the row count the facade reports.
  *
  * The count is a `total_changes()` delta rather than `changes()`, because
@@ -462,24 +667,45 @@ function exec(database: Database, statement: string): void {
  */
 function executeStatement(database: Database, statement: PlaneStatement): Record<string, unknown> {
   const before = totalChanges(database);
-  let rows: Row[];
+  const rows: Record<string, JsonValue>[] = [];
+  let resultBytes = 0;
+  let prepared: ReturnType<Database["prepare"]>;
   try {
-    rows = database.query(statement.sql).all(...statement.params) as Row[];
+    prepared = database.prepare(statement.sql);
   } catch (error) {
     throw sqlFailure(error);
   }
-  const rowsWritten = totalChanges(database) - before;
-  if (rows.length > MAX_SQL_ROWS) throw new PlaneError("sql_error");
-  return {
-    rows: rows.map((row) => {
-      const keys = Object.keys(row);
+  try {
+    // Row by row, and refused before the next one is read. `.all()` builds the
+    // whole answer first, so a recursive CTE the tenant wrote decides how much
+    // of this machine's memory it gets — and this is the process serving the
+    // control plane and every other tenant. The managed Durable Object bounds
+    // the same three things at the same numbers.
+    for (const raw of prepared.iterate(...statement.params) as Iterable<Row>) {
+      if (rows.length >= MAX_SQL_ROWS) throw new PlaneError("sql_error");
+      const keys = Object.keys(raw);
       if (keys.length > MAX_SQL_COLUMNS) throw new PlaneError("sql_error");
       const projected: Record<string, JsonValue> = {};
-      for (const key of keys) projected[key] = wireValue(row[key]);
-      return projected;
-    }),
-    rowsWritten: rowsWritten < 0 ? 0 : rowsWritten,
-  };
+      for (const key of keys) projected[key] = wireValue(raw[key]);
+      const bytes = utf8Length(JSON.stringify(projected));
+      if (bytes > MAX_SQL_ROW_BYTES) throw new PlaneError("sql_error");
+      resultBytes += bytes;
+      if (resultBytes > MAX_SQL_RESULT_BYTES) throw new PlaneError("sql_error");
+      rows.push(projected);
+    }
+  } catch (error) {
+    throw error instanceof PlaneError ? error : sqlFailure(error);
+  } finally {
+    try {
+      prepared.finalize();
+    } catch {}
+  }
+  const rowsWritten = totalChanges(database) - before;
+  return { rows, rowsWritten: rowsWritten < 0 ? 0 : rowsWritten };
+}
+
+function utf8Length(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
 }
 
 function totalChanges(database: Database): number {
@@ -490,15 +716,178 @@ function totalChanges(database: Database): number {
 function planeStatement(value: unknown): PlaneStatement {
   const statement = record(value);
   const sql = statement?.sql;
-  if (typeof sql !== "string" || new TextEncoder().encode(sql).byteLength > MAX_SQL_BYTES) {
+  if (typeof sql !== "string" || utf8Length(sql) > MAX_SQL_BYTES) {
     throw new PlaneError("sql_error");
   }
+  admitStatement(sql);
   const declared = statement?.params;
   if (declared === undefined) return { sql, params: [] };
   if (!Array.isArray(declared) || declared.length > MAX_SQL_PARAMETERS) {
     throw new PlaneError("sql_error");
   }
   return { sql, params: declared.map(boundValue) };
+}
+
+// ---------------------------------------------------------------------------
+// What a statement is allowed to be
+// ---------------------------------------------------------------------------
+
+/**
+ * Statements this plane never runs, wherever they appear.
+ *
+ * `ATTACH` is the one that matters: it opens a second database file, and every
+ * other tenant's dataset and this Host's own `control.sqlite` are a path away —
+ * the name can be a bound parameter, so parameterisation is no defence. The
+ * other four are the same shape of problem: `VACUUM INTO` writes a file
+ * anywhere this process can write, and `PRAGMA` reaches
+ * `writable_schema`, `journal_mode`, and the list of attached files. None of
+ * them is a keyword SQLite accepts as a bare identifier, so refusing the word
+ * outright cannot break a legitimate statement.
+ */
+const REFUSED_ANYWHERE = new Set(["attach", "detach", "vacuum", "pragma", "analyze"]);
+
+/**
+ * Statements this plane never runs *as a statement*.
+ *
+ * Transaction control belongs to the plane, not to the caller. A tenant
+ * `COMMIT` inside a batch ends the transaction the batch's own guarantee is
+ * made of, and a tenant `BEGIN` leaves one open on a connection every later
+ * request shares. These words are legal elsewhere — `END` closes a `CASE`,
+ * `ROLLBACK` names a conflict resolution — so only the leading one is refused.
+ */
+const REFUSED_LEADING = new Set([
+  "begin",
+  "commit",
+  "end",
+  "rollback",
+  "savepoint",
+  "release",
+  ...REFUSED_ANYWHERE,
+]);
+
+/**
+ * The prefix the Takoform SQLite migration ledger lives under.
+ *
+ * On the managed backend that ledger is Durable Object storage and `edge.sql`
+ * cannot see it. Here it is a table in the same file the tenant has full write
+ * access to, so a tenant could drop it, rewrite it, or add rows to it and make
+ * this Host re-apply or skip a migration. Names, quoted or bare, are refused —
+ * and so are string literals, because SQLite accepts one where an identifier
+ * belongs.
+ */
+const RESERVED_IDENTIFIER_PREFIX = "_takoform_";
+
+const WORD_START = /[A-Za-z_\u0080-\uffff]/u;
+const WORD_PART = /[A-Za-z0-9_$\u0080-\uffff]/u;
+
+/**
+ * One statement, and one this plane is willing to run.
+ *
+ * This is a parse rather than a pattern because every cheap check has a
+ * counterexample: a comment hides a keyword, a quoted identifier hides a name,
+ * a string literal contains a semicolon. It reads the text once, tracking only
+ * what it needs to know which characters are code.
+ */
+function admitStatement(sql: string): void {
+  let index = 0;
+  let seenContent = false;
+  let terminated = false;
+  const words: string[] = [];
+  const refuse = (): never => {
+    throw new PlaneError("sql_error");
+  };
+  const content = (): void => {
+    // Anything at all after a statement's own `;` is a second statement, and
+    // this plane answers one. A batch is what `transaction` is for.
+    if (terminated) refuse();
+    seenContent = true;
+  };
+  while (index < sql.length) {
+    const character = sql[index] as string;
+    if (character === "-" && sql[index + 1] === "-") {
+      index += 2;
+      while (index < sql.length && sql[index] !== "\n") index += 1;
+      continue;
+    }
+    if (character === "/" && sql[index + 1] === "*") {
+      const end = sql.indexOf("*/", index + 2);
+      if (end < 0) refuse();
+      index = end + 2;
+      continue;
+    }
+    if (character === " " || character === "\t" || character === "\n" || character === "\r") {
+      index += 1;
+      continue;
+    }
+    if (character === ";") {
+      if (!seenContent || terminated) refuse();
+      terminated = true;
+      index += 1;
+      continue;
+    }
+    if (character === "'" || character === '"' || character === "`") {
+      content();
+      const closed = closingQuote(sql, index, character);
+      // A literal is refused by content only when it names this Host's own
+      // ledger: SQLite will take `DROP TABLE '_takoform_x'` as an identifier.
+      if (reserved(sql.slice(index + 1, closed - 1).replaceAll(character + character, character))) {
+        refuse();
+      }
+      index = closed;
+      continue;
+    }
+    if (character === "[") {
+      content();
+      const closed = sql.indexOf("]", index + 1);
+      if (closed < 0) refuse();
+      if (reserved(sql.slice(index + 1, closed))) refuse();
+      index = closed + 1;
+      continue;
+    }
+    if (WORD_START.test(character)) {
+      content();
+      let end = index + 1;
+      while (end < sql.length && WORD_PART.test(sql[end] as string)) end += 1;
+      const word = sql.slice(index, end);
+      if (reserved(word) || REFUSED_ANYWHERE.has(word.toLowerCase())) refuse();
+      words.push(word.toLowerCase());
+      index = end;
+      continue;
+    }
+    content();
+    index += 1;
+  }
+  if (!seenContent) refuse();
+  // `EXPLAIN` and `EXPLAIN QUERY PLAN` prefix a statement rather than being
+  // one, so the word that decides is the one after them.
+  let leading = 0;
+  if (words[leading] === "explain") {
+    leading += 1;
+    if (words[leading] === "query" && words[leading + 1] === "plan") leading += 2;
+  }
+  const first = words[leading];
+  if (first === undefined || REFUSED_LEADING.has(first)) refuse();
+}
+
+function reserved(identifier: string): boolean {
+  return identifier.toLowerCase().startsWith(RESERVED_IDENTIFIER_PREFIX);
+}
+
+/** Index just past the closing quote, or a refusal for an unterminated one. */
+function closingQuote(sql: string, start: number, quote: string): number {
+  let index = start + 1;
+  while (index < sql.length) {
+    if (sql[index] !== quote) {
+      index += 1;
+      continue;
+    }
+    if (sql[index + 1] === quote) {
+      index += 2;
+      continue;
+    }
+    return index + 1;
+  }
+  throw new PlaneError("sql_error");
 }
 
 function boundValue(value: unknown): string | number | null | Uint8Array {

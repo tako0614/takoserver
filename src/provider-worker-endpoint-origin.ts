@@ -10,9 +10,37 @@ export async function derivedProviderResourceName(
   prefix: string,
   identity: Pick<ResourceIdentity, "tenantRef" | "space" | "name">,
 ): Promise<string> {
-  const bytes = new TextEncoder().encode(
-    `${identity.tenantRef}\0${identity.space}\0${identity.name}`,
-  );
+  return await derivedName(prefix, [identity.tenantRef, identity.space, identity.name]);
+}
+
+/**
+ * Stable provider-native name for one *incarnation* of a logical Resource.
+ *
+ * Where `derivedProviderResourceName` answers "which Resource is this", this
+ * answers "which one of them" — the Resource UID is part of the digest, so a
+ * Resource deleted and declared again under the same name is a different native
+ * object. That is what a store needs: a customer who deletes a namespace and
+ * creates one with the same name has asked for an empty namespace, and on
+ * Cloudflare they get one.
+ */
+export async function derivedProviderResourceIncarnationName(
+  prefix: string,
+  identity: Pick<ResourceIdentity, "tenantRef" | "space" | "name"> & { readonly uid: string },
+): Promise<string> {
+  return await derivedName(prefix, [
+    identity.tenantRef,
+    identity.space,
+    identity.name,
+    identity.uid,
+  ]);
+}
+
+async function derivedName(prefix: string, parts: readonly string[]): Promise<string> {
+  // NUL-separated, exactly as it always was: it is the one byte a tenantRef, a
+  // space, a name, and a uid cannot contain, so no two different tuples join
+  // into the same string. Changing this separator would rename every native
+  // object on every deployment.
+  const bytes = new TextEncoder().encode(parts.join("\u0000"));
   const digest = new Uint8Array(
     await crypto.subtle.digest("SHA-256", bytes as unknown as BufferSource),
   );

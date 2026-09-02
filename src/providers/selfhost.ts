@@ -33,9 +33,14 @@ import {
 } from "../provider-runtime-input-port.ts";
 import {
   canonicalWorkerEndpointOrigin,
+  derivedProviderResourceIncarnationName,
   derivedProviderResourceName,
 } from "../provider-worker-endpoint-origin.ts";
 import type { WorkerdRuntime } from "../workerd-runtime.ts";
+import {
+  SELFHOST_WORKER_DATA_SERVICE_MODULE,
+  selfhostDataServiceSource,
+} from "./selfhost-data-service.ts";
 import {
   createSelfhostScriptStateStore,
   type SelfhostScriptState,
@@ -64,6 +69,10 @@ import {
   SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
   SELFHOST_WORKER_ENTRYPOINT_MODULE,
   SELFHOST_WORKER_INTERNAL_BINDING_PREFIX,
+  SELFHOST_WORKER_READINESS_HEADER,
+  SELFHOST_WORKER_READINESS_PATH,
+  SELFHOST_WORKER_READINESS_PROTOCOL,
+  SELFHOST_WORKER_READINESS_RESULT_SCHEMA,
   selfhostWorkerEntrypointSource,
 } from "./selfhost-worker-wrapper.ts";
 
@@ -186,6 +195,30 @@ export interface SelfhostProviderOptions {
    * not.
    */
   readonly dataPlaneAddress?: string;
+  /**
+   * The housekeeping half of the data planes, when this deployment serves them.
+   *
+   * A lifecycle delete is the only thing that knows a namespace or a database
+   * has stopped meaning what it meant, and the planes are the only thing
+   * holding the rows and the open handle. Absent means this provider does not
+   * serve storage, and there is nothing to reclaim.
+   */
+  readonly dataPlaneMaintenance?: SelfhostDataPlaneMaintenance;
+}
+
+/**
+ * What a Resource lifecycle asks of the running planes.
+ *
+ * Declared here rather than imported, because the planes are composed above
+ * this provider and this provider must not depend on them.
+ */
+export interface SelfhostDataPlaneMaintenance {
+  /** Drops every stored entry of one KV namespace. */
+  deleteKvNamespace(namespaceId: string): Promise<void>;
+  /** Closes and forgets the cached handle on one SQLite database. */
+  forgetDatabase(name: string): void;
+  /** Reclaims expired KV rows, bounded, for the maintenance tick. */
+  sweepExpiredKv(limit?: number): Promise<number>;
 }
 
 /** Where this machine keeps one SQLite database. */
@@ -237,8 +270,12 @@ export function createSelfhostDataPlaneAccess(dataRoot: string): SelfhostDataPla
       }
       const plane = stored?.dataPlane;
       if (!stored || !plane || !stored.planeToken) return null;
-      const kv: Record<string, string> = {};
-      const sql: Record<string, string> = {};
+      // Null prototypes, because these are looked up by a name a tenant chose.
+      // On an ordinary object `__proto__` and `constructor` are answers, and a
+      // Worker binding under one of those names would resolve to a namespace no
+      // record declared — the same one for every Version on the machine.
+      const kv: Record<string, string> = Object.create(null) as Record<string, string>;
+      const sql: Record<string, string> = Object.create(null) as Record<string, string>;
       for (const binding of plane.bindings) {
         if (binding.kind === "edge.kv") kv[binding.name] = binding.target;
         else sql[binding.name] = binding.target;
@@ -246,6 +283,26 @@ export function createSelfhostDataPlaneAccess(dataRoot: string): SelfhostDataPla
       return { secret: stored.planeToken, kv, sql };
     },
   };
+}
+
+/** The readiness envelope, or null for anything that is not exactly one. */
+function readinessAnswer(body: string): { readonly publication: string } | null {
+  if (body.length > 8_192) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+  const answer = parsed as Record<string, unknown>;
+  if (
+    answer.schema !== SELFHOST_WORKER_READINESS_RESULT_SCHEMA ||
+    typeof answer.publication !== "string"
+  ) {
+    return null;
+  }
+  return { publication: answer.publication };
 }
 
 class SelfhostFailure extends Error {
@@ -417,7 +474,12 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     versionId: string,
     mainModule: string,
     bindings: StoredSelfhostVersionBindings | null,
-  ): { source: Uint8Array; token: SelfhostVersionBinding } | null => {
+  ): {
+    source: Uint8Array;
+    facade: Uint8Array;
+    publication: string;
+    token: SelfhostVersionBinding;
+  } | null => {
     const plane = bindings?.dataPlane;
     if (!plane || !bindings) return null;
     if (!options.dataPlaneAddress || !bindings.planeToken) {
@@ -428,14 +490,19 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         ),
       );
     }
-    if (mainModule === SELFHOST_WORKER_ENTRYPOINT_MODULE) {
+    if (
+      mainModule === SELFHOST_WORKER_ENTRYPOINT_MODULE ||
+      mainModule === SELFHOST_WORKER_DATA_SERVICE_MODULE
+    ) {
       throw new SelfhostFailure(
         failed("invalid_spec", "the Worker bundle claims this Host's entrypoint module name"),
       );
     }
+    const publication = `${script}.${versionId}`;
     let source: string;
     try {
       source = selfhostWorkerEntrypointSource({
+        publication,
         originalMainModule: mainModule,
         declaredHandlers: plane.handlers,
         bindings: [
@@ -463,14 +530,65 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     }
     return {
       source: new TextEncoder().encode(source),
+      facade: new TextEncoder().encode(selfhostDataServiceSource()),
+      publication,
       // The token names the version it was minted for, so the plane resolves
       // one record rather than searching every version for a matching secret.
+      // It is declared on the facade service and nowhere else.
       token: {
         name: SELFHOST_WORKER_DATA_TOKEN_BINDING,
         value: `${script}.${versionId}.${bindings.planeToken}`,
         kind: "text",
       },
     };
+  };
+
+  /**
+   * Whether the pair this Host just published actually loads what it declared.
+   *
+   * The wrapper validates the declared handlers when it first imports the
+   * tenant module. Without this, that first import is a customer request, and a
+   * Version declaring a handler its module does not export is published — the
+   * attachment upstream is gated on the declaration, so the event is accepted
+   * and dropped. So the publication asks, over the router this runtime serves,
+   * and refuses on a definite bad answer.
+   *
+   * A runtime that does not answer is not a bad answer. workerd may be
+   * restarting on the configuration just written, or not running at all on a
+   * machine whose serving half is composed separately, and turning "I could not
+   * ask" into "your Worker is broken" would refuse valid publications. The
+   * answer carries the publication it came from, so a stale configuration is
+   * told apart from the one being published rather than believed.
+   */
+  const probeReadiness = async (script: string, publication: string): Promise<void> => {
+    const probe = runtime.probe;
+    if (!probe) return;
+    const deadline = Date.now() + 5_000;
+    let answered = false;
+    for (let attempt = 0; ; attempt += 1) {
+      const response = await probe(script, SELFHOST_WORKER_READINESS_PATH, {
+        method: "POST",
+        headers: { [SELFHOST_WORKER_READINESS_HEADER]: SELFHOST_WORKER_READINESS_PROTOCOL },
+      }).catch(() => null);
+      // Nothing is listening and nothing has ever answered: this deployment
+      // does not run the runtime in this process, so there is nothing to prove.
+      if (!response && !answered) return;
+      if (response) {
+        answered = true;
+        const parsed = readinessAnswer(response.body);
+        if (parsed?.publication === publication) {
+          if (response.status === 200) return;
+          throw new SelfhostFailure(
+            failed(
+              "invalid_spec",
+              "the Worker Version's module does not export every handler it declares",
+            ),
+          );
+        }
+      }
+      if (Date.now() >= deadline) return;
+      await new Promise<void>((wake) => setTimeout(wake, attempt === 0 ? 25 : 100));
+    }
   };
 
   /** Rewrites what workerd serves for one script from durable state alone. */
@@ -505,8 +623,21 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       // Written into the workerd script directory, never into the version
       // directory: `materializationDigest` means "the bytes the tenant
       // committed", and a module this Host generated is not one of them.
+      //
+      // A tenant module under either generated name would be overwritten here
+      // and silently replaced, so the publication stops instead.
+      for (const generated of [
+        SELFHOST_WORKER_ENTRYPOINT_MODULE,
+        SELFHOST_WORKER_DATA_SERVICE_MODULE,
+      ]) {
+        if (modules.has(generated)) {
+          throw new SelfhostFailure(
+            failed("invalid_spec", "the Worker bundle claims this Host's entrypoint module name"),
+          );
+        }
+      }
       modules.set(SELFHOST_WORKER_ENTRYPOINT_MODULE, projection.source);
-      vars.push(projection.token);
+      modules.set(SELFHOST_WORKER_DATA_SERVICE_MODULE, projection.facade);
     }
     const generation = await runtimeGeneration(script, state);
     await runtimeOperation(() =>
@@ -522,7 +653,13 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           ...(projection
             ? {
                 modules: [meta.mainModule],
-                dataPlaneAddress: options.dataPlaneAddress as string,
+                // The token rides on the facade service's own binding list, so
+                // it is never a binding of the service that runs tenant code.
+                dataPlane: {
+                  address: options.dataPlaneAddress as string,
+                  module: SELFHOST_WORKER_DATA_SERVICE_MODULE,
+                  vars: [projection.token],
+                },
               }
             : {}),
         },
@@ -531,6 +668,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       ),
     );
     await runtimeOperation(() => runtime.reload());
+    if (projection) await probeReadiness(script, projection.publication);
   };
 
   const endpointAddress = (
@@ -1291,6 +1429,15 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   const namespaceResult = async (
     kind: string,
     input: { identity: ResourceIdentity },
+    /**
+     * The native id this Resource already has, when it has one.
+     *
+     * A namespace's stored rows are keyed by the name inside it, so the name of
+     * an existing namespace is read back rather than recomputed: recomputing is
+     * how an observation of a namespace made by an earlier build would report a
+     * different id than the one its rows are under.
+     */
+    existingNativeId?: string,
   ): Promise<{ base: string; observed: JsonObject; outputs: JsonObject }> => {
     switch (kind) {
       case "ObjectBucket":
@@ -1303,7 +1450,26 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         };
       }
       case "EdgeKVNamespace": {
-        const name = await derivedProviderResourceName("tskv", input.identity);
+        // Keyed by the Resource UID as well as its name, because this is now a
+        // store rather than an allocated label: a customer who deletes a
+        // namespace and declares one with the same name has asked for an empty
+        // namespace, and on Cloudflare that is what they get. Without the uid
+        // the derived id is the same one and the old rows come back.
+        const name =
+          selfhostNamespaceName("selfhost-kv", existingNativeId) ??
+          (input.identity.uid
+            ? await derivedProviderResourceIncarnationName("tskv", {
+                tenantRef: input.identity.tenantRef,
+                space: input.identity.space,
+                name: input.identity.name,
+                uid: input.identity.uid,
+              })
+            : null);
+        if (!name) {
+          throw new SelfhostFailure(
+            failed("invalid_spec", "the KV namespace declaration carries no Resource identity"),
+          );
+        }
         return {
           base: `selfhost-kv:${name}`,
           observed: { name },
@@ -1545,7 +1711,11 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             // Namespaces have nothing mutable in their backend, so an update
             // confirms rather than changes. Saying so beats pretending work
             // happened.
-            const made = await namespaceResult(dispatchKind(input.offering), input);
+            const made = await namespaceResult(
+              dispatchKind(input.offering),
+              input,
+              input.previous?.nativeId,
+            );
             return succeeded({
               nativeId: nativeId(input, made.base),
               observed: made.observed,
@@ -1698,7 +1868,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
               outputs: {},
             });
           default: {
-            const made = await namespaceResult(dispatchKind(input.offering), input);
+            const made = await namespaceResult(dispatchKind(input.offering), input, input.nativeId);
             return succeeded({
               nativeId: input.nativeId,
               observed: made.observed,
@@ -1808,11 +1978,32 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             }
             return done();
           }
+          case "EdgeKVNamespace": {
+            // The rows go with the namespace. Leaving them was defensible while
+            // `EdgeKVNamespace` was a name with nothing behind it; now that it
+            // is a store, leaving them means a customer who deleted a namespace
+            // still has their data on this machine — and, before the id
+            // included the Resource UID, still served from it.
+            const namespaceId = selfhostNamespaceName("selfhost-kv", input.nativeId);
+            if (namespaceId && options.dataPlaneMaintenance) {
+              await options.dataPlaneMaintenance.deleteKvNamespace(namespaceId);
+            }
+            return done();
+          }
+          case "SQLiteDatabase":
+          case "sql_database": {
+            // The file stays — removing durable bytes inside an apply is not
+            // this seam's job — but the open handle must not: it names an inode
+            // this Host no longer means, and a database declared again under
+            // the same name would be served through it.
+            const name = selfhostNamespaceName("selfhost-sqlite", input.nativeId);
+            if (name) options.dataPlaneMaintenance?.forgetDatabase(name);
+            return done();
+          }
           default:
-            // Namespaces, cron declarations, consumers, databases: the
-            // lifecycle delete removes the declaration. Removing stored bytes
-            // too is a reconciliation step, done deliberately and not inside
-            // an apply.
+            // Cron declarations, consumers, buckets, queues: the lifecycle
+            // delete removes the declaration. Removing stored bytes too is a
+            // reconciliation step, done deliberately and not inside an apply.
             return done();
         }
       } catch (error) {
@@ -2263,6 +2454,13 @@ function selfhostNamespaceTarget(
   return outputs?.namespaceId === name ? name : null;
 }
 
+/** The namespace or database name inside one of this provider's native ids. */
+function selfhostNamespaceName(prefix: string, nativeId: string | undefined): string | null {
+  if (typeof nativeId !== "string") return null;
+  const parts = nativeId.split(":");
+  return parts[0] === prefix && safeSegment(parts[1]) ? (parts[1] as string) : null;
+}
+
 function selfhostWorkerScript(relations: readonly ProviderRelation[] | undefined): string | null {
   const nativeId = relations?.find((relation) => relation.pointer === "/worker")?.deployment
     ?.nativeId;
@@ -2595,7 +2793,13 @@ function sensitiveBindingNames(value: unknown): readonly string[] | null {
     names.length !== value.length ||
     names.length > MAX_PROVIDER_RUNTIME_INPUT_BINDINGS ||
     new Set(names).size !== names.length ||
-    names.some((name) => !/^[A-Z_][A-Z0-9_]{0,127}$/u.test(name))
+    names.some((name) => !/^[A-Z_][A-Z0-9_]{0,127}$/u.test(name)) ||
+    // The one declaration whose grammar admits this Host's own prefix. `vars`
+    // names must start with a letter and data-binding names are checked
+    // explicitly, so without this the reserved namespace is not reserved: a
+    // tenant could name a sensitive var after the data service binding and
+    // shadow it.
+    names.some((name) => name.startsWith(SELFHOST_WORKER_INTERNAL_BINDING_PREFIX))
   ) {
     return null;
   }

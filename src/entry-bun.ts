@@ -24,7 +24,7 @@ import {
   runtimeInputCanonicalOriginSupported,
 } from "./runtime-input-preparations.ts";
 import { parseRuntimeInputSealKeyRing } from "./runtime-input-seal-keyring.ts";
-import { createSelfhostDataPlanes } from "./selfhost-data-planes.ts";
+import { serveSelfhostDataPlanes } from "./selfhost-data-planes.ts";
 import { ensureSigningKey } from "./signing-key.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import {
@@ -249,32 +249,39 @@ const runtimeInputs = runtimeInputsAvailable
 /**
  * Where a Worker this machine runs finds its KV namespaces and SQL databases.
  *
- * The planes are served by this process, on this process's own port, under a
- * `.well-known` prefix. What reaches them is not that public origin, though: a
- * generated Worker entrypoint calls them through a workerd `externalServer`
- * pointed at the loopback address below, so the traffic never leaves the
- * machine and never depends on `TAKOSERVER_PUBLIC_ORIGIN` resolving to it.
+ * On a listener of their own, bound to `127.0.0.1`, and never on the public
+ * one. What authenticates here is a bearer token minted per Worker Version, and
+ * the only thing that should ever hold one is a workerd service on this
+ * machine; a route on the public origin would make that token an
+ * internet-facing credential for arbitrary SQL, however loopback-only the
+ * intent was. A generated Worker entrypoint reaches this listener through a
+ * workerd `externalServer` addressed below, so nothing legitimate loses a path
+ * and nothing else gains one.
  *
- * `127.0.0.1` and the serving port, therefore — not the public origin, which
- * on a real deployment is a TLS name in front of a proxy that this process
- * cannot reach from inside itself, and not `localhost`, which may resolve to
- * an address the listener is not bound to.
+ * `127.0.0.1` and the port this listener actually got — not the public origin,
+ * which on a real deployment is a TLS name in front of a proxy this process
+ * cannot reach from inside itself, and not `localhost`, which may resolve to an
+ * address the listener is not bound to. `TAKOSERVER_DATA_PLANE_PORT` fixes the
+ * port for an operator who needs one; without it the kernel picks a free one
+ * and this process records what it got.
  *
- * Retired-drain mode publishes no Worker Version, so it composes no plane and
- * refuses the address; that keeps the KV table and the SQLite files untouched
+ * Retired-drain mode publishes no Worker Version, so it serves no plane and
+ * composes no address; that keeps the KV table and the SQLite files untouched
  * on a machine whose only job is proving a historical Deployment is gone.
  */
-const dataPlaneAddress =
-  providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN ? undefined : `127.0.0.1:${port}`;
 const selfhostDataAccess = createSelfhostDataPlaneAccess(dataRoot);
-const selfhostData = dataPlaneAddress
-  ? createSelfhostDataPlanes({
-      sql,
-      grant: (script, versionId) => selfhostDataAccess.grant(script, versionId),
-      databasePath: (name) => selfhostDataAccess.databasePath(name),
-      clock,
-    })
-  : undefined;
+const dataPlanes =
+  providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
+    ? undefined
+    : serveSelfhostDataPlanes({
+        sql,
+        grant: (script, versionId) => selfhostDataAccess.grant(script, versionId),
+        databasePath: (name) => selfhostDataAccess.databasePath(name),
+        clock,
+        ...(process.env.TAKOSERVER_DATA_PLANE_PORT
+          ? { port: Number(process.env.TAKOSERVER_DATA_PLANE_PORT) }
+          : {}),
+      });
 
 const providerArtifacts = {
   manifest: (tenantRef: string, digest: string) => artifactStore.resolveManifest(tenantRef, digest),
@@ -320,7 +327,9 @@ const providerComposition = createStandaloneProviderComposition({
     ? { suffixes: process.env.TAKOSERVER_SUFFIXES.split(",").map((entry) => entry.trim()) }
     : {}),
   ...(runtimeInputs ? { runtimeInputs: runtimeInputs.leases } : {}),
-  ...(dataPlaneAddress ? { dataPlaneAddress } : {}),
+  ...(dataPlanes
+    ? { dataPlaneAddress: dataPlanes.address, dataPlaneMaintenance: dataPlanes.maintenance }
+    : {}),
   now: clock(),
   ...(providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
     ? {
@@ -438,7 +447,6 @@ const app = buildApp({
   ...(process.env.TAKOSERVER_CONSOLE_ORIGIN
     ? { consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN }
     : {}),
-  ...(selfhostData ? { selfhostData } : {}),
   forms: currentCandidates.forms,
   bindings: currentCandidates.bindings,
   hostForms: currentCandidates.forms,
@@ -460,6 +468,13 @@ setInterval(() => {
   ticking = true;
   app
     .tick()
+    // Expired KV rows are reclaimed on the same pass. A `get` reclaims the row
+    // it reads and a `list` skips it, so a key nobody asks for again would
+    // otherwise be stored until the file was deleted — and the expiry index
+    // that exists for exactly this would only cost writes.
+    .then(async () => {
+      if (dataPlanes) await dataPlanes.maintenance.sweepExpiredKv();
+    })
     .catch((error: unknown) => console.error("tick failed", error))
     .finally(() => {
       ticking = false;
@@ -475,6 +490,11 @@ Bun.serve({
     return (await provision(request)) ?? (await app.fetch(request));
   },
 });
+if (dataPlanes) {
+  // Recorded, because an operator debugging a Worker's storage needs to know
+  // which port to look at and the kernel usually chose it.
+  console.log(`self-host data planes listening on ${dataPlanes.address} (loopback only)`);
+}
 console.log(
   `takoserver listening on :${port} as ${publicOrigin} ` +
     // Named from what is actually configured. A banner that says Cloudflare on

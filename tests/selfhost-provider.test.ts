@@ -1290,10 +1290,16 @@ describe("KV and SQLite bindings", () => {
     expect(config).toContain(
       `(name = "__TAKOSERVER_SELFHOST_DATA", service = "${script}-selfhost-data")`,
     );
+    // The service the tenant binds is a Worker of this Host's own, and the one
+    // that names the loopback address sits behind it.
     expect(config).toContain(`( name = "${script}-selfhost-data",
+    worker = (
+      modules = [ (name = "__takoserver-selfhost-data.js", esModule = embed "${script}/__takoserver-selfhost-data.js") ],`);
+    expect(config).toContain(`( name = "${script}-selfhost-data-origin",
     external = ( address = "${address}", http = () )
   ),`);
     expect(config).toContain('(name = "LANE", text = "takoform-v1")');
+    expect(config).toContain('compatibilityFlags = [ "disallow_importable_env" ]');
 
     const generated = await readFile(
       join(root, "workers", script, "__takoserver-selfhost-entrypoint.js"),
@@ -1304,7 +1310,7 @@ describe("KV and SQLite bindings", () => {
     expect(generated).toContain('"kind":"edge.sql@1.0.0","publicName":"DB"');
   });
 
-  test("the token names the version, is projected once, and stays out of the tenant's env", async () => {
+  test("the token names the version and is a binding of the facade service alone", async () => {
     const local = provider({ dataPlaneAddress: address });
     const script = await publish(local, false, undefined, true);
     const versionId = versionDirectoryName(root, script);
@@ -1316,14 +1322,55 @@ describe("KV and SQLite bindings", () => {
     expect(token).toBeDefined();
     expect(token).toStartWith(`${script}.${versionId}.`);
 
-    // The generated module reads it from the raw environment and never lists it
-    // among the bindings it projects.
+    // Exactly one service declares it, and it is not the one that runs tenant
+    // code. A binding belongs to its service, and workerd hands every binding
+    // of a service to every module that service runs — including through
+    // `cloudflare:workers` — so keeping the token off this service is the whole
+    // isolation claim.
+    const services = config
+      .split(/^ {2}\( name = /mu)
+      .filter((section) => section.includes("__TAKOSERVER_SELFHOST_DATA_TOKEN"));
+    expect(services).toHaveLength(1);
+    expect(services[0]).toStartWith(`"${script}-selfhost-data"`);
+
+    const tenantService = config
+      .split(/^ {2}\( name = /mu)
+      .find((section) => section.startsWith(`"${script}"`)) as string;
+    expect(tenantService).not.toContain(token as string);
+    expect(tenantService).not.toContain("__TAKOSERVER_SELFHOST_DATA_TOKEN");
+
+    // The generated modules carry no credential of their own either.
     const generated = await readFile(
       join(root, "workers", script, "__takoserver-selfhost-entrypoint.js"),
       "utf8",
     );
+    const facade = await readFile(
+      join(root, "workers", script, "__takoserver-selfhost-data.js"),
+      "utf8",
+    );
     expect(generated).not.toContain(token as string);
-    expect(generated).not.toContain('"name":"__TAKOSERVER_SELFHOST_DATA_TOKEN"');
+    expect(generated).not.toContain("__TAKOSERVER_SELFHOST_DATA_TOKEN");
+    expect(facade).not.toContain(token as string);
+  });
+
+  test("the facade service is the only route out, and it names both its own", async () => {
+    const local = provider({ dataPlaneAddress: address });
+    const script = await publish(local, false, undefined, true);
+    const facade = await readFile(
+      join(root, "workers", script, "__takoserver-selfhost-data.js"),
+      "utf8",
+    );
+    // Two destinations, both constants of this Host's, and nothing a caller
+    // writes on a request reaches either.
+    expect(facade).toContain(
+      'const KV_URL = "http://takoserver-selfhost-data.invalid/.well-known/takoserver/selfhost-data/v1/kv"',
+    );
+    expect(facade).toContain(
+      'const SQL_URL = "http://takoserver-selfhost-data.invalid/.well-known/takoserver/selfhost-data/v1/sql"',
+    );
+    expect(facade).toContain(
+      'if (target === null || request.method !== "POST") return refuse(404)',
+    );
   });
 
   test("the plane secret never reaches an observation, an output, or a native id", async () => {
@@ -1563,19 +1610,23 @@ describe("KV and SQLite bindings", () => {
 });
 
 describe("local namespaces", () => {
+  // A namespace now stores bytes, so its native name is derived from the
+  // Resource UID as well as its name. The Host sends one on every apply.
+  const kvIdentity = (name: string, uid: string) => ({ ...identity(name), uid });
+
   test("a create mints an incarnation-unique native identity", async () => {
     const local = provider();
     const kv = offering("EdgeKVNamespace");
     const first = await local.apply({
       operationId: "op_1",
       offering: kv,
-      identity: identity("cache"),
+      identity: kvIdentity("cache", "uid-1"),
       spec: {},
     });
     const second = await local.apply({
       operationId: "op_2",
       offering: kv,
-      identity: identity("cache"),
+      identity: kvIdentity("cache", "uid-1"),
       spec: {},
     });
     const firstId = first.phase === "succeeded" ? first.result.nativeId : "";
@@ -1589,11 +1640,56 @@ describe("local namespaces", () => {
     const updated = await local.apply({
       operationId: "op_3",
       offering: kv,
-      identity: identity("cache"),
+      identity: kvIdentity("cache", "uid-1"),
       spec: {},
       previous: { nativeId: firstId, spec: {} },
     });
     expect(updated.phase === "succeeded" ? updated.result.nativeId : "").toBe(firstId);
+  });
+
+  test("a namespace recreated under the same name is a different namespace", async () => {
+    const local = provider();
+    const kv = offering("EdgeKVNamespace");
+    const before = await local.apply({
+      operationId: "op_1",
+      offering: kv,
+      identity: kvIdentity("cache", "uid-before"),
+      spec: {},
+    });
+    const after = await local.apply({
+      operationId: "op_2",
+      offering: kv,
+      identity: kvIdentity("cache", "uid-after"),
+      spec: {},
+    });
+    // Cloudflare gives a recreated namespace an empty one. So does this: the
+    // rows are keyed by the derived id, and the id names the incarnation.
+    expect(before.phase === "succeeded" ? before.result.outputs.namespaceId : "").not.toBe(
+      after.phase === "succeeded" ? after.result.outputs.namespaceId : "",
+    );
+  });
+
+  test("an observation reports the namespace id its rows are actually under", async () => {
+    const local = provider();
+    const kv = offering("EdgeKVNamespace");
+    const created = await local.apply({
+      operationId: "op_1",
+      offering: kv,
+      identity: kvIdentity("cache", "uid-1"),
+      spec: {},
+    });
+    if (created.phase !== "succeeded") throw new Error("namespace allocation failed");
+    // Observation carries no Resource UID, so a recomputed name would be a
+    // different one than the rows are stored under.
+    const observed = await local.observe({
+      offering: kv,
+      nativeId: created.result.nativeId,
+      identity: identity("cache"),
+      spec: {},
+    });
+    expect(observed.phase === "succeeded" ? observed.result.outputs : {}).toEqual(
+      created.result.outputs,
+    );
   });
 
   test("the bucket keeps its pre-Edge readable name", async () => {

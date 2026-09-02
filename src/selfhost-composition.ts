@@ -12,6 +12,7 @@ import type { ProviderRuntimeInputLeasePort } from "./provider-runtime-input-por
 import {
   createSelfhostProvider,
   type SelfhostArtifacts,
+  type SelfhostDataPlaneMaintenance,
   type SelfhostProviderOptions,
 } from "./providers/selfhost.ts";
 import type { InstalledTakoformForm } from "./takoform/types.ts";
@@ -66,6 +67,8 @@ export interface SelfhostCompositionOptions {
    * serves none, and a Worker Version that binds one is refused at apply.
    */
   readonly dataPlaneAddress?: string;
+  /** The housekeeping half of those planes: reclaiming rows and handles. */
+  readonly dataPlaneMaintenance?: SelfhostDataPlaneMaintenance;
   readonly now: Date;
 }
 
@@ -138,6 +141,7 @@ export function createSelfhostComposition(
     ...(options.suffixes ? { suffixes: options.suffixes } : {}),
     ...(options.runtimeInputs ? { runtimeInputs: options.runtimeInputs } : {}),
     ...(options.dataPlaneAddress ? { dataPlaneAddress: options.dataPlaneAddress } : {}),
+    ...(options.dataPlaneMaintenance ? { dataPlaneMaintenance: options.dataPlaneMaintenance } : {}),
   } satisfies SelfhostProviderOptions);
 
   const supplyContract: SupplyContract = {
