@@ -47,6 +47,37 @@ const claimedForm: InstalledTakoformForm = {
   constraints: [{ kind: "claim", property: "/value" }],
 };
 
+/** A Form that holds a relation, so a parent can have a blocking dependent. */
+const dependentForm: InstalledTakoformForm = {
+  identity: {
+    formRef: {
+      apiVersion: "example.forms.invalid",
+      kind: "DeferredDependent",
+      definitionVersion: "1.0.0",
+      schemaDigest: `sha256:${"e".repeat(64)}`,
+    },
+  },
+  desiredSchema: {
+    type: "object",
+    required: ["parent"],
+    additionalProperties: false,
+    properties: {
+      parent: {
+        type: "object",
+        required: ["apiVersion", "kind", "name"],
+        additionalProperties: false,
+        "x-takoform-target-formrefs": [{ ...form.identity.formRef }],
+        properties: {
+          apiVersion: { const: form.identity.formRef.apiVersion },
+          kind: { const: form.identity.formRef.kind },
+          name: { type: "string" },
+        },
+      },
+    },
+  },
+  operations: ["create", "read", "delete"],
+};
+
 const roots: string[] = [];
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -1029,7 +1060,19 @@ describe("durable deferred Takoform operations", () => {
     opened.close();
   });
 
-  test("holds an executed delete receipt until its exact logical revision is repaired", async () => {
+  /**
+   * The revision is not the delete fence, and pinning it wedged a real
+   * teardown.
+   *
+   * A deferred `ModuleWorker` delete was accepted at revision 2; deleting the
+   * Worker's dependents re-rendered the parent and the live revision became 3.
+   * Every retry replayed the same durable record under the provider's
+   * deterministic delete idempotency key and answered 412 forever. The released
+   * provider states the rule on every resource page and sends no `If-Match` on
+   * a delete, so the Host now honours it: incarnation and generation fence a
+   * delete, and a revision that moved under it does not.
+   */
+  test("commits a delete whose logical revision moved while the provider ran", async () => {
     const providerEntered = deferred();
     const releaseProvider = deferred();
     const memory = new InMemoryTakoformResourceDriver();
@@ -1090,28 +1133,7 @@ describe("durable deferred Takoform operations", () => {
       .run(JSON.stringify(concurrent));
     releaseProvider.resolve();
 
-    const repairRequired = await settling;
-    expect(await repairRequired?.json()).toMatchObject({
-      done: false,
-      id: operationId,
-    });
-    expect(providerDeleteCalls).toBe(1);
-    expect(
-      opened.database.query("SELECT revision FROM tf_resources WHERE name = 'delete-fence'").get(),
-    ).toEqual({ revision: "91" });
-
-    opened.database
-      .query(
-        `UPDATE tf_resources SET revision = ?, resource_json = ?
-         WHERE tenant_id = 'tenant-a' AND space = 'main'
-           AND api_version = 'example.forms.invalid' AND kind = 'DeferredThing'
-           AND name = 'delete-fence'`,
-      )
-      .run(current.metadata.revision, JSON.stringify(current));
-    const repaired = await opened.host.handle(
-      request(`${lane}/operations/${operationId}`, "primary"),
-    );
-    expect(await repaired?.json()).toMatchObject({
+    expect(await (await settling)?.json()).toMatchObject({
       done: true,
       result: { deleted: true },
     });
@@ -1119,6 +1141,189 @@ describe("durable deferred Takoform operations", () => {
     expect(
       opened.database.query("SELECT name FROM tf_resources WHERE name = 'delete-fence'").all(),
     ).toEqual([]);
+    opened.close();
+  });
+
+  test("still refuses a delete whose generation moved while the provider ran", async () => {
+    const providerEntered = deferred();
+    const releaseProvider = deferred();
+    const memory = new InMemoryTakoformResourceDriver();
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      apply: (input) => memory.apply(input),
+      observe: (input) => memory.observe(input),
+      delete: async (input) => {
+        providerEntered.resolve();
+        await releaseProvider.promise;
+        return await memory.delete(input);
+      },
+    };
+    const opened = persistentHarness(undefined, driver).open();
+    const current = await createNow(opened.host, "generation-fence");
+    const query = new URLSearchParams({
+      space: "main",
+      group: form.identity.formRef.apiVersion,
+      kind: form.identity.formRef.kind,
+      definitionVersion: form.identity.formRef.definitionVersion,
+      schemaDigest: form.identity.formRef.schemaDigest,
+    });
+    const accepted = await opened.host.handle(
+      request(
+        `${lane}/resources/example.forms.invalid/DeferredThing/generation-fence?${query}`,
+        "primary",
+        {
+          method: "DELETE",
+          headers: {
+            "idempotency-key": "generation-fence-0001",
+            "takoform-conformance-probe": "async",
+            "takoform-expected-generation": current.metadata.generation,
+          },
+        },
+      ),
+    );
+    const operationId = ((await accepted?.json()) as { operation: { id: string } }).operation.id;
+    await opened.host.handle(request(`${lane}/operations/${operationId}`, "primary"));
+    await opened.host.handle(request(`${lane}/operations/${operationId}`, "primary"));
+    const settling = opened.host.handle(request(`${lane}/operations/${operationId}`, "primary"));
+    await providerEntered.promise;
+
+    // A different desired state, not a re-render: the caller asked to delete
+    // something that is no longer what is there.
+    const concurrent = storedResource("generation-fence", current.metadata.uid);
+    concurrent.metadata.generation = "2";
+    concurrent.metadata.revision = "2";
+    opened.database
+      .query(
+        `UPDATE tf_resources SET generation = '2', revision = '2', resource_json = ?
+         WHERE tenant_id = 'tenant-a' AND space = 'main'
+           AND api_version = 'example.forms.invalid' AND kind = 'DeferredThing'
+           AND name = 'generation-fence'`,
+      )
+      .run(JSON.stringify(concurrent));
+    releaseProvider.resolve();
+
+    expect(await (await settling)?.json()).toMatchObject({ done: false, id: operationId });
+    expect(
+      opened.database
+        .query("SELECT generation FROM tf_resources WHERE name = 'generation-fence'")
+        .get(),
+    ).toEqual({ generation: "2" });
+    opened.close();
+  });
+
+  /**
+   * The teardown sequence the self-host end-to-end run could not complete.
+   *
+   * `tofu destroy` deletes a parent whose dependents are still present, gets a
+   * refusal, removes the dependents, and asks again — under the *same*
+   * plan-derived idempotency key, because the provider derives a delete key
+   * from ref/name/space/uid/generation and none of those moved. Every step of
+   * that must be able to happen twice.
+   */
+  test("a refused delete can be retried under the same key once its dependents are gone", async () => {
+    const opened = persistentHarness(undefined, undefined, [form, dependentForm]).open();
+    const parent = await createNow(opened.host, "parent");
+    const child = {
+      apiVersion: dependentForm.identity.formRef.apiVersion,
+      kind: dependentForm.identity.formRef.kind,
+      form: { formRef: dependentForm.identity.formRef },
+      metadata: { name: "child", space: "main" },
+      spec: {
+        parent: {
+          apiVersion: form.identity.formRef.apiVersion,
+          kind: form.identity.formRef.kind,
+          name: "parent",
+        },
+      },
+    };
+    const created = await opened.host.handle(
+      request(`${lane}/resources/example.forms.invalid/DeferredDependent/child`, "primary", {
+        method: "PUT",
+        headers: {
+          "idempotency-key": "create-child-0001",
+          "if-none-match": "*",
+        },
+        body: JSON.stringify({ ...child, review: await prepareReviewFor(opened.host, child) }),
+      }),
+    );
+    expect(created?.status).toBe(201);
+
+    // The deferred lane, which is what a Host answering 202 puts the provider
+    // through: the refusal is recorded against the durable acceptance, and the
+    // retry arrives on the same replay key.
+    const deleteParent = async () =>
+      await opened.host.handle(
+        request(
+          `${lane}/resources/example.forms.invalid/DeferredThing/parent?${new URLSearchParams({
+            space: "main",
+            group: form.identity.formRef.apiVersion,
+            kind: form.identity.formRef.kind,
+            definitionVersion: form.identity.formRef.definitionVersion,
+            schemaDigest: form.identity.formRef.schemaDigest,
+          })}`,
+          "primary",
+          {
+            method: "DELETE",
+            headers: {
+              // The provider's key: derived from the address and generation,
+              // which a refused delete leaves exactly where they were.
+              "idempotency-key": "delete-parent-0001",
+              "takoform-conformance-probe": "async",
+              "takoform-expected-generation": parent.metadata.generation,
+            },
+          },
+        ),
+      );
+
+    // The provider polls until the operation settles; the parent still has a
+    // dependent, so it settles as a refusal.
+    const accepted = await deleteParent();
+    expect(accepted?.status).toBe(202);
+    const operationId = ((await accepted?.json()) as { operation: { id: string } }).operation.id;
+    let settled: Record<string, unknown> | undefined;
+    for (let poll = 0; poll < 8 && !settled?.done; poll += 1) {
+      const response = await opened.host.handle(
+        request(`${lane}/operations/${operationId}`, "primary"),
+      );
+      settled = (await response?.json()) as Record<string, unknown>;
+    }
+    expect(settled).toMatchObject({ done: true, error: { code: "dependency_in_use" } });
+
+    const childDeleted = await opened.host.handle(
+      request(
+        `${lane}/resources/example.forms.invalid/DeferredDependent/child?${new URLSearchParams({
+          space: "main",
+          group: dependentForm.identity.formRef.apiVersion,
+          kind: dependentForm.identity.formRef.kind,
+          definitionVersion: dependentForm.identity.formRef.definitionVersion,
+          schemaDigest: dependentForm.identity.formRef.schemaDigest,
+        })}`,
+        "primary",
+        {
+          method: "DELETE",
+          headers: {
+            "idempotency-key": "delete-child-0001",
+            "takoform-expected-generation": "1",
+          },
+        },
+      ),
+    );
+    expect(childDeleted?.status).toBe(204);
+
+    // The same plan-derived key again. A settled refusal must not be replayed
+    // as the answer to a question whose facts have changed.
+    const retried = await deleteParent();
+    expect(retried?.status).toBe(202);
+    const retriedId = ((await retried?.json()) as { operation: { id: string } }).operation.id;
+    let deleted: Record<string, unknown> | undefined;
+    for (let poll = 0; poll < 8 && !deleted?.done; poll += 1) {
+      const response = await opened.host.handle(
+        request(`${lane}/operations/${retriedId}`, "primary"),
+      );
+      deleted = (await response?.json()) as Record<string, unknown>;
+    }
+    expect(deleted).toMatchObject({ done: true, result: { deleted: true } });
+    expect(opened.database.query("SELECT name FROM tf_resources").all()).toEqual([]);
     opened.close();
   });
 });

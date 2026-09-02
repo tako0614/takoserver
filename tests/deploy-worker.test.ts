@@ -229,6 +229,7 @@ describe("split Takoserver Worker surfaces", () => {
   test("classifies every executable public Form P/I owner as authority", () => {
     const expected = [
       "src/entry-public-form-runtime-payload.ts",
+      "src/error-envelope.ts",
       "src/form-ref.ts",
       "src/generated/takoform-stable-v1-catalog.ts",
       "src/json.ts",

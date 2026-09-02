@@ -2,7 +2,12 @@ import { canonicalDigest, canonicalJson } from "../json.ts";
 import type { Clock, JsonObject, Row, Sql, SqlParam, SqlStatement } from "../ports.ts";
 import { SqlError } from "../ports.ts";
 import type { TakoformAuthorityFence } from "./host-authority.ts";
-import { OPERATION_TTL_MILLISECONDS, REPLAY_TTL_MILLISECONDS, SWEEP_ROW_LIMIT } from "./limits.ts";
+import {
+  OPERATION_TTL_MILLISECONDS,
+  PROVIDER_REPAIR_HOLD_TTL_MILLISECONDS,
+  REPLAY_TTL_MILLISECONDS,
+  SWEEP_ROW_LIMIT,
+} from "./limits.ts";
 import type { TakoformStoredRelation } from "./relations.ts";
 import {
   type TakoformDriverReceipt,
@@ -558,6 +563,32 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
     return rows[0] ? deferredOperation(rows[0]) : null;
   };
 
+  /**
+   * Whether this deferred operation's accepted revision is still a fence.
+   *
+   * For an apply or an import it is: an update must not land on a Resource that
+   * moved under it. For a **delete** it is not, and the released provider's own
+   * documentation says so on every resource page — *"`revision` … is deliberately
+   * NOT the delete fence: a teardown removes dependents first and would otherwise
+   * be refused by a revision it moved itself."* `DeleteResource` accordingly sends
+   * `takoform-expected-generation` and no `If-Match`.
+   *
+   * Pinning it anyway is what wedged a real teardown. A deferred `ModuleWorker`
+   * delete was accepted at revision 2; deleting the Worker's dependents made
+   * `withDerivedRendering` re-render the parent (its `Ready` condition became
+   * "has no active WorkerDeployment") and the live revision became 3. Every
+   * retry replayed the same durable record under the provider's deterministic
+   * delete idempotency key and answered 412 forever, so `tofu destroy` could
+   * never finish and six resources leaked. Incarnation (`uid`), `generation` and
+   * the exact Form ref remain the fences, and they are the ones that describe
+   * what the caller asked to delete.
+   */
+  function deleteFencesRevision(operation: {
+    readonly operation: "apply" | "import" | "delete";
+  }): boolean {
+    return operation.operation !== "delete";
+  }
+
   const commitFenceError = async (
     operation: DeferredOperationRecord,
     leaseToken: string,
@@ -600,7 +631,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
     if (row.generation !== operation.acceptedGeneration) {
       return new TakoformHostError("generation_conflict", 412);
     }
-    if (row.revision !== operation.acceptedRevision) {
+    if (deleteFencesRevision(operation) && row.revision !== operation.acceptedRevision) {
       return new TakoformHostError("revision_conflict", 412);
     }
     return new TakoformHostError("resource_busy", 409);
@@ -1712,14 +1743,34 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       }
     },
 
+    /**
+     * Holds a command whose provider mutation may have crossed the boundary.
+     *
+     * An apply or an import is held without an end: its provider evidence is a
+     * native object that exists, and the exact Host command is the only thing
+     * that can reconcile it. A **delete** is bounded. The same row owns the
+     * caller's replay key, so a delete acceptance that can never settle refuses
+     * every later attempt at the same delete for the life of the deployment —
+     * which is how the end-to-end teardown came to be permanently wedged. The
+     * window runs from acceptance rather than from the last repair attempt, so
+     * the repair loop re-entering the hold cannot push it out forever, and the
+     * dispatched saga row keeps its own non-expiring provider evidence either
+     * way.
+     */
     async holdDeferredProviderRepair(input) {
+      const accepted = Date.parse(input.operation.createdAt);
+      const expiresAt =
+        input.operation.operation === "delete"
+          ? (Number.isFinite(accepted) ? accepted : now()) + PROVIDER_REPAIR_HOLD_TTL_MILLISECONDS
+          : 253_402_300_799_999;
       const held = await sql.run(
         `UPDATE tf_deferred_operations
          SET lease_token = NULL, lease_until = NULL,
-             expires_at = 253402300799999, updated_at = ?
+             expires_at = ?, updated_at = ?
          WHERE id = ? AND tenant_id = ? AND principal_id = ?
            AND phase = 'committing' AND lease_token = ?`,
         [
+          expiresAt,
           now(),
           input.operation.id,
           input.operation.tenantId,
@@ -1998,6 +2049,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         WHERE id = ? AND tenant_id = ? AND principal_id = ?
           AND phase = 'committing' AND lease_token = ? AND expires_at > ?
       )`;
+      // A delete is fenced by incarnation and generation, never by revision.
+      // See `deleteFencesRevision`.
+      const fencesRevision = deleteFencesRevision(operation);
       const resourceFence =
         operation.acceptedUid === undefined
           ? `NOT EXISTS (
@@ -2007,7 +2061,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           : `EXISTS (
               SELECT 1 FROM tf_resources
               WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
-                AND uid = ? AND generation = ? AND revision = ?
+                AND uid = ? AND generation = ?${fencesRevision ? " AND revision = ?" : ""}
                 AND json_extract(resource_json, '$.form.formRef.apiVersion') = ?
                 AND json_extract(resource_json, '$.form.formRef.kind') = ?
                 AND json_extract(resource_json, '$.form.formRef.definitionVersion') = ?
@@ -2020,7 +2074,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
               ...targetKey,
               operation.acceptedUid,
               operation.acceptedGeneration ?? "",
-              operation.acceptedRevision ?? "",
+              ...(fencesRevision ? [operation.acceptedRevision ?? ""] : []),
               target.formRef.apiVersion,
               target.formRef.kind,
               target.formRef.definitionVersion,
@@ -2146,12 +2200,12 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         statements.push({
           sql: `DELETE FROM tf_resources
                 WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
-                  AND uid = ? AND generation = ? AND revision = ?`,
+                  AND uid = ? AND generation = ?${fencesRevision ? " AND revision = ?" : ""}`,
           params: [
             ...targetKey,
             operation.acceptedUid ?? "",
             operation.acceptedGeneration ?? "",
-            operation.acceptedRevision ?? "",
+            ...(fencesRevision ? [operation.acceptedRevision ?? ""] : []),
           ],
         });
       }

@@ -30,6 +30,19 @@ export const SWEEP_ROW_LIMIT = 64;
 /** How long a settled operation remains readable by its id. */
 export const OPERATION_TTL_MILLISECONDS = 7 * 24 * 60 * 60_000;
 
+/**
+ * How long a deferred operation held for provider repair stays authoritative.
+ *
+ * A held command is repair authority — its provider mutation may have crossed
+ * the boundary — so it must outlive an ordinary operation by a wide margin.
+ * It must not outlive everything. The hold owns the caller's replay key, so an
+ * acceptance that can never settle would refuse every later attempt at the same
+ * mutation for the life of the deployment; a month is long enough for an
+ * operator to repair one and short enough that a stale acceptance cannot wedge
+ * a Resource forever.
+ */
+export const PROVIDER_REPAIR_HOLD_TTL_MILLISECONDS = 30 * 24 * 60 * 60_000;
+
 /** Long enough for one provider call; expired reservations are recoverable. */
 export const RESOURCE_CLAIM_RESERVATION_TTL_MILLISECONDS = 5 * 60_000;
 
