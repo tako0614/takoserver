@@ -470,7 +470,16 @@ test("managed Worker Versions bind SQLite through the gateway's exact exported D
   });
 });
 
-test("managed Worker Versions expose edge.objects through a private R2 binding", async () => {
+/**
+ * ADR 0007. The managed wrapper can project the `edge.objects` facade over an
+ * internal R2 binding — `tests/cloudflare-managed-worker-wrapper.test.ts`
+ * exercises that facade against a real R2 — but its multipart validation
+ * receipts live in isolate memory, and an eviction between
+ * `createMultipartUpload` and `completeMultipartUpload` is ordinary. So this
+ * backend refuses the Binding by name rather than binding a bucket whose
+ * in-flight uploads it cannot honestly carry.
+ */
+test("managed Worker Versions refuse an ObjectBucket the wrapper cannot keep restart-safe", async () => {
   const api = new ManagedReleaseApi();
   const provider = releaseProvider(api, createEphemeralSql());
   const input = managedVersionInput(
@@ -520,40 +529,37 @@ test("managed Worker Versions expose edge.objects through a private R2 binding",
     ],
   });
 
-  expect(ticket).toMatchObject({ phase: "succeeded" });
+  expect(ticket).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
+  if (ticket.phase !== "failed") throw new Error("expected failure");
+  expect(ticket.failure.retryable).toBe(false);
+  expect(ticket.failure.message).toContain("multipart upload ledger");
+  // Refused before the release closure is built: nothing was uploaded, and the
+  // bucket name never reached the ticket.
+  expect(api.scripts.size).toBe(0);
   expect(JSON.stringify(ticket)).not.toContain(bucketName);
-  const release = [...api.scripts.values()][0];
-  if (!release) throw new Error("managed release was not uploaded");
-  expect(release.settings.bindings).toContainEqual({
-    type: "r2_bucket",
-    name: "__TAKOSERVER_OBJECTS_0",
-    bucket_name: bucketName,
-  });
-  expect(release.settings.bindings).not.toContainEqual(
-    expect.objectContaining({ name: "MEDIA", type: "r2_bucket" }),
-  );
 
-  const invalid = managedVersionInput(
-    "version_objects_invalid",
-    "release-objects-invalid",
-    "tsw-objects-invalid",
+  // A materialized Binding the Version never declared is refused on the same
+  // terms; the managed backend has no path that reaches a bucket at all.
+  const undeclared = managedVersionInput(
+    "version_objects_undeclared",
+    "release-objects-undeclared",
+    "tsw-objects-undeclared",
   );
   expect(
     await provider.apply({
-      ...invalid,
-      spec: { ...invalid.spec, bucketBindings: [{ name: "MEDIA" }] },
-      relations: [...(invalid.relations ?? []), bucket],
+      ...undeclared,
+      relations: [...(undeclared.relations ?? []), bucket],
       runtimeBindings: [
         {
           name: "MEDIA",
           targetUid: "bucket_binding",
           bindingRef,
-          material: { kind: "untrusted.r2", bucketName },
+          material: { kind: "takoserver.cloudflare-r2.edge-objects@v1", bucketName },
         },
       ],
     }),
-  ).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
-  expect(api.scripts.size).toBe(1);
+  ).toMatchObject({ phase: "failed", failure: { code: "invalid_spec", retryable: false } });
+  expect(api.scripts.size).toBe(0);
 });
 
 test("release readiness failure cleans the exact artifact and permits a fresh operation", async () => {
