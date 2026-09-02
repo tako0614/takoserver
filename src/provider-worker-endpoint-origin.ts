@@ -58,23 +58,35 @@ async function derivedName(prefix: string, parts: readonly string[]): Promise<st
  * handed out an address nothing answers on — the Worker itself then pinned the
  * `http` origin its own requests arrived under, so its federated identity and
  * the address its Host advertised disagreed.
+ *
+ * The port is an input for exactly the same reason. An address is a scheme, a
+ * name *and* a port, and a self-host whose runtime socket is not on the
+ * scheme's default published a portless address the Worker never saw: the
+ * request URL inside the Worker carried `:28988`, so the identity it pinned and
+ * the identity its Host advertised disagreed again, one dimension over. The
+ * port is normalized away when it is the scheme's default, so a deployment
+ * behind an ordinary 443 front end publishes exactly what it published before.
  */
 export function canonicalWorkerEndpointOrigin(
   script: string,
   suffix: string,
   scheme: "https" | "http" = "https",
+  port?: number,
 ): string | null {
   const hostname = `${script}.${suffix}`.toLowerCase().replace(/\.$/u, "");
+  if (port !== undefined && (!Number.isSafeInteger(port) || port < 1 || port > 65_535)) {
+    return null;
+  }
+  const authority = port === undefined ? hostname : `${hostname}:${port}`;
   let parsed: URL;
   try {
-    parsed = new URL(`${scheme}://${hostname}/`);
+    parsed = new URL(`${scheme}://${authority}/`);
   } catch {
     return null;
   }
   return parsed.protocol === `${scheme}:` &&
     parsed.username === "" &&
     parsed.password === "" &&
-    parsed.port === "" &&
     parsed.pathname === "/" &&
     parsed.search === "" &&
     parsed.hash === "" &&

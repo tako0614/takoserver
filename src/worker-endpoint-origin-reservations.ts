@@ -344,7 +344,13 @@ export function createWorkerEndpointOriginReservations(options: {
     } catch {
       throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
     }
-    if (!derived || !canonicalOrigin(derived.canonicalPublicOrigin)) {
+    // The installation states which scheme it serves; this ledger holds it to
+    // that one and to nothing else. An installation that declares nothing is
+    // https, so the managed and ordinary-workers lanes are unchanged.
+    if (
+      !derived ||
+      !canonicalOrigin(derived.canonicalPublicOrigin, capability.publishedScheme ?? "https")
+    ) {
       throw new WorkerEndpointOriginReservationError("unsupported_capability", 422);
     }
     return {
@@ -2049,12 +2055,20 @@ async function assertExactAssignment(
   }
 }
 
+/**
+ * The origin a provider's own `url` output names, or nothing this can compare.
+ *
+ * Both web schemes are read here because the answer is only ever compared with
+ * the origin the reservation already holds, and that one was accepted under the
+ * scheme its installation declared. Pinning `https` here refused the address a
+ * certificate-less self-host had just been reserved one step earlier.
+ */
 function providerOutputOrigin(outputs: JsonObject): string | null {
   if (typeof outputs.url !== "string" || outputs.url.length > 2_048) return null;
   try {
     const url = new URL(outputs.url);
     if (
-      url.protocol !== "https:" ||
+      (url.protocol !== "https:" && url.protocol !== "http:") ||
       url.username !== "" ||
       url.password !== "" ||
       url.pathname !== "/" ||
@@ -2180,11 +2194,14 @@ function endpointOriginEquals(snapshot: ResourceWithRelations, expected: string)
   } catch {
     return false;
   }
+  // Scheme and port are both settled by the last line: `expected` is the origin
+  // this reservation owns, accepted under the scheme its installation declared,
+  // and an origin comparison is exact about both. Requiring `https` and no port
+  // here as well refused the address the same authority had just minted.
   return (
-    parsed.protocol === "https:" &&
+    (parsed.protocol === "https:" || parsed.protocol === "http:") &&
     parsed.username === "" &&
     parsed.password === "" &&
-    parsed.port === "" &&
     parsed.pathname === "/" &&
     parsed.search === "" &&
     parsed.hash === "" &&
@@ -2304,7 +2321,27 @@ function ttl(value: number): number {
   return value;
 }
 
-function canonicalOrigin(value: string): boolean {
+/**
+ * Whether a derived address is one this ledger can own.
+ *
+ * With a `scheme`, that exact one: the scheme is a fact about the runtime that
+ * serves the address ([ADR 0009](../docs/adr/0009-a-self-host-publishes-the-scheme-its-socket-serves.md)),
+ * so the caller takes it from the installation that derived the address and
+ * never from a request. Hard-coding `https` here is what made a
+ * certificate-less self-host unable to create a `WorkerEndpoint` at all: the
+ * provider derived the `http://` address its socket serves, this function
+ * refused it, and the mint answered `unsupported_capability` 422 before
+ * anything was reserved.
+ *
+ * Without one, either web scheme — which is what reading a durable row needs,
+ * since the row was written under whichever scheme its own installation
+ * declared and placement drift is fenced by re-deriving the address, not by
+ * re-guessing its scheme here.
+ *
+ * A port is allowed, and `URL` normalizes the scheme's default away — so a
+ * portless address stays portless and `…:28988` is held exactly as derived.
+ */
+function canonicalOrigin(value: string, scheme?: "https" | "http"): boolean {
   let parsed: URL;
   try {
     parsed = new URL(value);
@@ -2312,10 +2349,11 @@ function canonicalOrigin(value: string): boolean {
     return false;
   }
   return (
-    parsed.protocol === "https:" &&
+    (scheme === undefined
+      ? parsed.protocol === "https:" || parsed.protocol === "http:"
+      : parsed.protocol === `${scheme}:`) &&
     parsed.username === "" &&
     parsed.password === "" &&
-    parsed.port === "" &&
     parsed.pathname === "/" &&
     parsed.search === "" &&
     parsed.hash === "" &&

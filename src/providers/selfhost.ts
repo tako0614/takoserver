@@ -236,6 +236,17 @@ export interface SelfhostProviderOptions {
    * origin its own requests arrive under either way.
    */
   readonly workerEndpointScheme?: "https" | "http";
+  /**
+   * Port of that address, which is a fact about the socket for the same reason.
+   *
+   * The workerd socket this machine serves Workers on. Absent, or the scheme's
+   * own default, publishes a portless address — which is what a deployment
+   * behind an ordinary 443 front end wants. Anything else is carried into the
+   * published origin, because a Worker that derives its identity from the
+   * request URL sees `…:28988` and would otherwise disagree with the address
+   * its own Host advertised.
+   */
+  readonly workerEndpointPort?: number;
   /** Hostname suffixes custom domains may claim. Empty means any. */
   readonly suffixes?: readonly string[];
   /**
@@ -525,6 +536,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   const { runtime, artifacts, dataRoot } = options;
   const endpointSuffix = (options.workerEndpointSuffix ?? "localhost").toLowerCase();
   const endpointScheme = options.workerEndpointScheme ?? "https";
+  const endpointPort = options.workerEndpointPort;
   const versionsRoot = join(dataRoot, "selfhost", "versions");
   const scriptsRoot = join(dataRoot, "selfhost", "scripts");
   const versionBindingsRoot = selfhostVersionBindingsRoot(dataRoot);
@@ -2256,11 +2268,17 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       ? { runtimeInputCapabilities: { maximumBindings: MAX_PROVIDER_RUNTIME_INPUT_BINDINGS } }
       : {}),
     workerEndpointOriginReservations: {
+      // What the socket serves, told to the ledger that has to accept the
+      // address derived from it. Without this the reservation authority held
+      // every derived origin to `https` and a certificate-less self-host could
+      // create no WorkerEndpoint at all.
+      publishedScheme: endpointScheme,
       derive: async ({ requestedSubdomain }) => {
         const canonicalPublicOrigin = canonicalWorkerEndpointOrigin(
           requestedSubdomain,
           endpointSuffix,
           endpointScheme,
+          endpointPort,
         );
         return canonicalPublicOrigin ? { canonicalPublicOrigin } : null;
       },

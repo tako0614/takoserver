@@ -113,6 +113,21 @@ const CANONICAL_HTTPS_ORIGIN_SCHEMA = {
   pattern: "^https://[^/]+$",
   maxLength: 2_048,
 } as const;
+/**
+ * The address a Worker endpoint is published at.
+ *
+ * `http` belongs here and not in the schema above: the scheme of a published
+ * Worker address is a fact about the runtime socket that serves it, and a
+ * certificate-less self-host serves plain HTTP
+ * (ADR 0009). This Host's *own* canonical public origin, which the
+ * runtime-input route fences against, remains HTTPS-only.
+ */
+const PUBLISHED_WORKER_ORIGIN_SCHEMA = {
+  type: "string",
+  format: "uri",
+  pattern: "^https?://[^/]+$",
+  maxLength: 2_048,
+} as const;
 const REQUESTED_SUBDOMAIN_SCHEMA = {
   type: "string",
   minLength: 1,
@@ -686,7 +701,7 @@ export const openApiDocument = {
           format: { const: "takoserver.worker-endpoint-origin-reservation.v2" },
           reservationId: IDENTIFIER_SCHEMA,
           requestedSubdomain: REQUESTED_SUBDOMAIN_SCHEMA,
-          canonicalPublicOrigin: CANONICAL_HTTPS_ORIGIN_SCHEMA,
+          canonicalPublicOrigin: PUBLISHED_WORKER_ORIGIN_SCHEMA,
           revision: { type: "string", pattern: "^[1-9][0-9]*$" },
           expiresAt: { type: "string", format: "date-time" },
           status: { type: "string", enum: ["prepared", "bound", "activated"] },
@@ -708,7 +723,7 @@ export const openApiDocument = {
         properties: {
           format: { const: "takoserver.worker-endpoint-origin-reservation.v1" },
           reservationId: IDENTIFIER_SCHEMA,
-          canonicalPublicOrigin: CANONICAL_HTTPS_ORIGIN_SCHEMA,
+          canonicalPublicOrigin: PUBLISHED_WORKER_ORIGIN_SCHEMA,
           revision: { type: "string", pattern: "^[1-9][0-9]*$" },
           expiresAt: { type: "string", format: "date-time" },
           target: { $ref: "#/components/schemas/WorkerEndpointOriginReservationLegacyTarget" },

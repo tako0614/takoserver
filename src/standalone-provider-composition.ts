@@ -114,6 +114,8 @@ export function createStandaloneProviderComposition(input: {
   readonly workerEndpointSuffix?: string;
   /** `https` only where this machine's workerd socket terminates TLS. */
   readonly workerEndpointScheme?: "https" | "http";
+  /** The workerd socket's port, carried into the address when it is not the scheme's default. */
+  readonly workerEndpointPort?: number;
   readonly suffixes?: readonly string[];
   /** Present only when this deployment has an operator-configured seal key ring. */
   readonly runtimeInputs?: ProviderRuntimeInputLeasePort;
@@ -141,6 +143,9 @@ export function createStandaloneProviderComposition(input: {
       edgeForms: true,
       ...(input.workerEndpointSuffix ? { workerEndpointSuffix: input.workerEndpointSuffix } : {}),
       ...(input.workerEndpointScheme ? { workerEndpointScheme: input.workerEndpointScheme } : {}),
+      ...(input.workerEndpointPort === undefined
+        ? {}
+        : { workerEndpointPort: input.workerEndpointPort }),
       ...(input.suffixes ? { suffixes: input.suffixes } : {}),
       ...(input.runtimeInputs ? { runtimeInputs: input.runtimeInputs } : {}),
       ...(input.dataPlaneAddress ? { dataPlaneAddress: input.dataPlaneAddress } : {}),
@@ -170,6 +175,7 @@ export function createStandaloneProviderComposition(input: {
   if (
     input.workerEndpointSuffix !== undefined ||
     input.workerEndpointScheme !== undefined ||
+    input.workerEndpointPort !== undefined ||
     input.suffixes !== undefined
   ) {
     throw new TypeError(

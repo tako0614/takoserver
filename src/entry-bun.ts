@@ -165,6 +165,27 @@ const workerdPort = process.env.TAKOSERVER_WORKERD_PORT
   : 8788;
 
 /**
+ * The port a published Worker endpoint address carries.
+ *
+ * The socket's own port by default, because that is the one this machine can
+ * promise answers: a self-host on `28988` published a portless address while
+ * every request that reached the Worker carried `:28988`, so the identity the
+ * Worker pinned and the identity its Host advertised disagreed. A deployment
+ * that puts an ordinary front end on 443 in front of workerd says so here, and
+ * the scheme's default is normalized away rather than published.
+ */
+const workerEndpointPort = process.env.TAKOSERVER_WORKER_ENDPOINT_PORT
+  ? Number(process.env.TAKOSERVER_WORKER_ENDPOINT_PORT)
+  : workerdPort;
+if (
+  !Number.isSafeInteger(workerEndpointPort) ||
+  workerEndpointPort < 1 ||
+  workerEndpointPort > 65_535
+) {
+  throw new Error("TAKOSERVER_WORKER_ENDPOINT_PORT must be a TCP port between 1 and 65535");
+}
+
+/**
  * The certificate this machine's Worker socket serves, if the operator gave it
  * one.
  *
@@ -435,7 +456,7 @@ const providerComposition = createStandaloneProviderComposition({
   // every self-host setting, including this one.
   ...(providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
     ? {}
-    : { workerEndpointScheme: workerEndpoint.scheme }),
+    : { workerEndpointScheme: workerEndpoint.scheme, workerEndpointPort }),
   ...(process.env.TAKOSERVER_SUFFIXES
     ? { suffixes: process.env.TAKOSERVER_SUFFIXES.split(",").map((entry) => entry.trim()) }
     : {}),

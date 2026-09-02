@@ -153,6 +153,7 @@ interface ProviderCase {
   };
   readonly dataPlaneAddress?: string;
   readonly workerEndpointScheme?: "https" | "http";
+  readonly workerEndpointPort?: number;
   readonly suffixes?: readonly string[];
   readonly runtime?: WorkerdRuntime;
   readonly missingBlobs?: boolean;
@@ -315,6 +316,9 @@ function provider(options: ProviderCase = {}) {
     runtime: options.runtime ?? createWorkerdRuntime({ root, isReady: () => true }),
     ...(options.suffixes ? { suffixes: options.suffixes } : {}),
     ...(options.workerEndpointScheme ? { workerEndpointScheme: options.workerEndpointScheme } : {}),
+    ...(options.workerEndpointPort === undefined
+      ? {}
+      : { workerEndpointPort: options.workerEndpointPort }),
     ...(options.runtimeInputs ? { runtimeInputs: options.runtimeInputs } : {}),
     ...(options.dataPlaneAddress ? { dataPlaneAddress: options.dataPlaneAddress } : {}),
     ...(options.dataPlaneMaintenance ? { dataPlaneMaintenance: options.dataPlaneMaintenance } : {}),
@@ -713,6 +717,67 @@ describe("publishing a Worker through the Edge Family", () => {
         workerEndpointOriginAssignment: endpointAssignment(`${script}.localhost`),
       }),
     ).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
+  });
+
+  /**
+   * An address is a scheme, a name *and* a port.
+   *
+   * A self-host whose workerd socket is not on the scheme's default published a
+   * portless address, so the Worker pinned the `…:28988` origin its own
+   * requests genuinely arrived on while its Host advertised one without it —
+   * the same disagreement the scheme fix closed, one dimension over. The
+   * scheme's own default is still normalized away, so a deployment behind an
+   * ordinary 443 front end publishes exactly what it published before.
+   */
+  test("publishes the port its socket listens on, and only when it is not the default", async () => {
+    const ported = provider({ workerEndpointScheme: "https", workerEndpointPort: 28_988 });
+    const script = await publish(ported);
+    expect(
+      (
+        await ported.workerEndpointOriginReservations?.derive({
+          tenantRef: "org_demo",
+          requestedSubdomain: script,
+        })
+      )?.canonicalPublicOrigin,
+    ).toBe(`https://${script}.localhost:28988`);
+
+    // And it is the address this deployment then accepts and serves on.
+    const endpoint = await ported.apply({
+      operationId: "op_endpoint_ported",
+      offering: offering("WorkerEndpoint"),
+      identity: identity("hello-endpoint"),
+      spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" } },
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+      workerEndpointOriginAssignment: {
+        canonicalPublicOrigin: `https://${script}.localhost:28988`,
+        assignmentDigest: `sha256:${"e".repeat(64)}` as const,
+      },
+    });
+    expect(endpoint.phase === "succeeded" ? endpoint.result.outputs : {}).toEqual({
+      // The router matches on the name, so the route is the bare hostname while
+      // the published address carries the port a client has to dial.
+      hostname: `${script}.localhost`,
+      url: `https://${script}.localhost:28988/`,
+    });
+
+    const fronted = provider({ workerEndpointScheme: "https", workerEndpointPort: 443 });
+    expect(
+      (
+        await fronted.workerEndpointOriginReservations?.derive({
+          tenantRef: "org_demo",
+          requestedSubdomain: script,
+        })
+      )?.canonicalPublicOrigin,
+    ).toBe(`https://${script}.localhost`);
+    const plain = provider({ workerEndpointScheme: "http", workerEndpointPort: 80 });
+    expect(
+      (
+        await plain.workerEndpointOriginReservations?.derive({
+          tenantRef: "org_demo",
+          requestedSubdomain: script,
+        })
+      )?.canonicalPublicOrigin,
+    ).toBe(`http://${script}.localhost`);
   });
 
   test("the endpoint attachment assigns a stable HTTPS address and routes it", async () => {

@@ -282,7 +282,7 @@
           "canonicalPublicOrigin": {
             "type": "string",
             "format": "uri",
-            "pattern": "^https://[^/]+$",
+            "pattern": "^https?://[^/]+$",
             "maxLength": 2048
           },
           "revision": {
@@ -330,7 +330,7 @@
           "canonicalPublicOrigin": {
             "type": "string",
             "format": "uri",
-            "pattern": "^https://[^/]+$",
+            "pattern": "^https?://[^/]+$",
             "maxLength": 2048
           },
           "revision": {

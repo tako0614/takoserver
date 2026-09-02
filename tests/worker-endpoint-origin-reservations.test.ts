@@ -170,6 +170,8 @@ function fixture(
     readonly offerings?: readonly Offering[];
     readonly technical?: readonly ProviderOffering[];
     readonly fixedOrigin?: string;
+    /** What the installation says its own runtime serves. Absent is `https`. */
+    readonly publishedScheme?: "https" | "http";
     /** `false` removes the capability; a string is the label it derives. */
     readonly hostMintedSubdomain?: string | false;
     readonly sql?: ReturnType<typeof createReservationV2Sql>;
@@ -184,6 +186,7 @@ function fixture(
   const provider = Object.assign(base, {
     ...(input.apply ? { apply: input.apply } : {}),
     workerEndpointOriginReservations: {
+      ...(input.publishedScheme ? { publishedScheme: input.publishedScheme } : {}),
       async derive({
         tenantRef,
         requestedSubdomain,
@@ -296,6 +299,154 @@ test("reserves one exact future Worker endpoint origin without manufacturing a R
       worker_resource_uid: null,
       bound_endpoint_name: null,
       endpoint_resource_uid: null,
+    },
+  ]);
+});
+
+/**
+ * The scheme of a published address is a fact about the socket that serves it,
+ * and this ledger is the authority that accepts one.
+ *
+ * It held every derived origin to `https` while ADR 0009 made a
+ * certificate-less self-host derive `http://<script>.<suffix>`, so the default
+ * self-host quickstart could create no `WorkerEndpoint` at all: the mint
+ * answered `unsupported_capability` 422 before anything was reserved, and the
+ * Worker had no published address to serve on. The installation states what it
+ * serves; nothing else may relax the rule.
+ */
+test("reserves the scheme and port the installation says its own socket serves", async () => {
+  const plain = fixture({
+    publishedScheme: "http",
+    fixedOrigin: "http://sw-community.localhost:28988",
+  });
+  const reserved = await plain.authority.prepare({
+    organizationId: "org_01",
+    reservationId: "reservation_01",
+    requestedSubdomain: REQUESTED_SUBDOMAIN,
+    expiresInSeconds: 600,
+  });
+  expect(reserved).toMatchObject({
+    canonicalPublicOrigin: "http://sw-community.localhost:28988",
+    status: "prepared",
+  });
+  expect(
+    await plain.sql.query(
+      "SELECT canonical_public_origin FROM worker_endpoint_origin_reservations",
+    ),
+  ).toEqual([{ canonical_public_origin: "http://sw-community.localhost:28988" }]);
+
+  // The managed and ordinary-workers lanes declare nothing and stay https-only:
+  // an installation that has not said it serves plain HTTP cannot hand this
+  // ledger an `http` address, whatever it derives.
+  const managed = fixture({ fixedOrigin: "http://sw-community.localhost" });
+  await expect(
+    managed.authority.prepare({
+      organizationId: "org_01",
+      reservationId: "reservation_01",
+      requestedSubdomain: REQUESTED_SUBDOMAIN,
+      expiresInSeconds: 600,
+    }),
+  ).rejects.toMatchObject({ code: "unsupported_capability", status: 422 });
+
+  // And the declaration is exact in the other direction too.
+  const mismatched = fixture({
+    publishedScheme: "http",
+    fixedOrigin: "https://sw-community.localhost",
+  });
+  await expect(
+    mismatched.authority.prepare({
+      organizationId: "org_01",
+      reservationId: "reservation_01",
+      requestedSubdomain: REQUESTED_SUBDOMAIN,
+      expiresInSeconds: 600,
+    }),
+  ).rejects.toMatchObject({ code: "unsupported_capability", status: 422 });
+});
+
+/**
+ * The whole certificate-less lane, end to end: mint, assign, apply, activate.
+ *
+ * `canonicalOrigin`, `providerOutputOrigin` and `endpointOriginEquals` each
+ * required `https:` independently, so repairing one alone would only have moved
+ * the 422 one step later.
+ */
+test("creates a WorkerEndpoint on a self-host whose socket speaks plain HTTP", async () => {
+  const origin = "http://sw-community.localhost:28988";
+  const harness = fixture({
+    offerings: [sold(), soldEndpointOffering()],
+    technical: [technical(), technicalEndpointOffering()],
+    publishedScheme: "http",
+    fixedOrigin: origin,
+    hostMintedSubdomain: "sw-community",
+    apply: async (applyInput) =>
+      succeeded({
+        nativeId: `endpoint:${applyInput.identity.uid}`,
+        observed: { assigned: true },
+        outputs: {
+          hostname: new URL(applyInput.workerEndpointOriginAssignment?.canonicalPublicOrigin ?? "")
+            .hostname,
+          url: `${applyInput.workerEndpointOriginAssignment?.canonicalPublicOrigin}/`,
+        },
+      }),
+  });
+  await seedWorker(harness.sql);
+  const endpointForm = STABLE_PRODUCTION_TAKOFORM_CATALOG.forms.find(
+    (candidate) => candidate.identity.formRef.kind === "WorkerEndpoint",
+  );
+  if (!endpointForm) throw new Error("WorkerEndpoint Form missing");
+  const driver = createProviderDriver({
+    providers: [harness.provider],
+    catalog: harness.catalog,
+    ledger: createLedger(harness.sql, harness.clock),
+    deployments: createResourceDeploymentStore(harness.sql, harness.clock),
+    originReservations: harness.authority,
+  });
+
+  const receipt = await driver.apply({
+    operationId: "op-endpoint-http",
+    operationKey: "key-endpoint-http",
+    tenantId: "org_01",
+    resourceUid: "uid-endpoint-01",
+    form: endpointForm,
+    name: TARGET.endpointName,
+    space: TARGET.space,
+    spec: {
+      worker: { apiVersion: FORM.apiVersion, kind: "ModuleWorker", name: TARGET.workerName },
+    },
+    relations: [
+      {
+        pointer: "/worker",
+        relation: "/worker",
+        targetUid: "uid-worker-01",
+        resource: {
+          apiVersion: FORM.apiVersion,
+          kind: "ModuleWorker",
+          form: { formRef: FORM },
+          metadata: {
+            name: TARGET.workerName,
+            space: TARGET.space,
+            uid: "uid-worker-01",
+            generation: "1",
+            revision: "1",
+          },
+          spec: {},
+          status: { observedGeneration: "1", conditions: [] },
+        },
+      },
+    ],
+  });
+
+  expect(receipt.outputs).toEqual({ hostname: "sw-community.localhost", url: `${origin}/` });
+  expect(
+    await harness.sql.query(
+      `SELECT canonical_public_origin, state, endpoint_resource_uid
+       FROM worker_endpoint_origin_reservations`,
+    ),
+  ).toEqual([
+    {
+      canonical_public_origin: origin,
+      state: "activated",
+      endpoint_resource_uid: "uid-endpoint-01",
     },
   ]);
 });
@@ -421,14 +572,34 @@ test("fails closed when durable origin state is corrupted", async () => {
     requestedSubdomain: REQUESTED_SUBDOMAIN,
     expiresInSeconds: 600,
   });
+  // Not a web origin at all, and an origin with something after it: both are
+  // shapes this ledger can never have written. `http` is no longer one of them
+  // — a certificate-less self-host publishes the scheme its socket serves
+  // (ADR 0009), and a row holding that address is a row, not corruption.
+  for (const corrupt of [
+    "ftp://community-public.workers.test",
+    "https://community-public.workers.test/",
+    "https://operator@community-public.workers.test",
+  ]) {
+    await sql.run(
+      `UPDATE worker_endpoint_origin_reservations
+       SET canonical_public_origin = ?
+       WHERE organization_id = 'org_01' AND reservation_id = 'reservation_01'`,
+      [corrupt],
+    );
+    await expect(authority.read("org_01", "reservation_01")).rejects.toMatchObject({
+      code: "backend_unavailable",
+      status: 503,
+    });
+  }
+
   await sql.run(
     `UPDATE worker_endpoint_origin_reservations
-     SET canonical_public_origin = 'http://community-public.workers.test'
+     SET canonical_public_origin = 'http://community-public.workers.test:28988'
      WHERE organization_id = 'org_01' AND reservation_id = 'reservation_01'`,
   );
-  await expect(authority.read("org_01", "reservation_01")).rejects.toMatchObject({
-    code: "backend_unavailable",
-    status: 503,
+  expect(await authority.read("org_01", "reservation_01")).toMatchObject({
+    canonicalPublicOrigin: "http://community-public.workers.test:28988",
   });
 });
 

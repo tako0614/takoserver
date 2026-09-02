@@ -97,6 +97,8 @@ export interface SelfhostCompositionOptions {
   readonly workerEndpointSuffix?: string;
   /** `https` only where this machine's workerd socket terminates TLS. */
   readonly workerEndpointScheme?: "https" | "http";
+  /** The workerd socket's port, carried into the address when it is not the scheme's default. */
+  readonly workerEndpointPort?: number;
   readonly suffixes?: readonly string[];
   /**
    * The one-shot seam for `requiredSensitiveVars`. Absent means this machine
@@ -187,6 +189,9 @@ export function createSelfhostComposition(
     artifacts: options.artifacts,
     ...(options.workerEndpointSuffix ? { workerEndpointSuffix: options.workerEndpointSuffix } : {}),
     ...(options.workerEndpointScheme ? { workerEndpointScheme: options.workerEndpointScheme } : {}),
+    ...(options.workerEndpointPort === undefined
+      ? {}
+      : { workerEndpointPort: options.workerEndpointPort }),
     ...(options.suffixes ? { suffixes: options.suffixes } : {}),
     ...(options.runtimeInputs ? { runtimeInputs: options.runtimeInputs } : {}),
     ...(options.dataPlaneAddress ? { dataPlaneAddress: options.dataPlaneAddress } : {}),
