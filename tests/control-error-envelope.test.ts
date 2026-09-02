@@ -236,12 +236,14 @@ test("the provider's exact private-PUT/public-apply/private-GET sequence complet
   const control = createControlRoutes({
     accounts: {
       async authenticate(authorization: string | null) {
-        if (authorization !== "Bearer organization-key") return null;
+        if (authorization !== "Bearer organization-key" && authorization !== "Bearer reader-key") {
+          return null;
+        }
         return {
           hostPrincipalId: "api-key-principal",
           principalId: "principal_01",
           organizationId: ORGANIZATION_ID,
-          scopes: ["resources:write"],
+          scopes: authorization === "Bearer reader-key" ? ["resources:read"] : ["resources:write"],
           kind: "api_key",
         } as const;
       },
@@ -268,12 +270,15 @@ test("the provider's exact private-PUT/public-apply/private-GET sequence complet
       readonly body?: string;
       readonly idempotencyKey?: string;
       readonly ifNoneMatch?: string;
+      readonly authorization?: string | null;
     } = {},
   ): Promise<Response> => {
+    const authorization =
+      options.authorization === undefined ? "Bearer organization-key" : options.authorization;
     const request = new Request(`${HOST_ORIGIN}${path}`, {
       method,
       headers: {
-        authorization: "Bearer organization-key",
+        ...(authorization === null ? {} : { authorization }),
         ...(options.body === undefined ? {} : { "content-type": "application/json" }),
         ...(options.idempotencyKey ? { "idempotency-key": options.idempotencyKey } : {}),
         ...(options.ifNoneMatch ? { "if-none-match": options.ifNoneMatch } : {}),
@@ -358,6 +363,59 @@ test("the provider's exact private-PUT/public-apply/private-GET sequence complet
     [OPERATION_KEY],
   );
   expect(JSON.stringify(rows)).not.toContain("placeholder-encryption-value");
+
+  // 5. Every refusal this route can answer, on the route itself, in the shape
+  //    the released provider decodes. A `conflict` is deliberately not in the
+  //    provider's closed code table: it reads as an opaque rejection, which is
+  //    the correct outcome for a spent handoff and is never auto-retried.
+  const refusals: readonly [string, Response][] = [
+    ["unauthenticated", await call("GET", privatePath, { authorization: null })],
+    ["permission_denied", await call("GET", privatePath, { authorization: "Bearer reader-key" })],
+    [
+      "operation_not_found",
+      await call("GET", `/v1/takoform/worker-runtime-input-preparations/${"z".repeat(40)}`, {
+        idempotencyKey: "z".repeat(40),
+      }),
+    ],
+    [
+      "invalid_argument",
+      await call("PUT", privatePath, { idempotencyKey: "a-different-operation-key", body: "{}" }),
+    ],
+    [
+      "conflict",
+      await call("PUT", privatePath, {
+        idempotencyKey: OPERATION_KEY,
+        body: JSON.stringify({
+          format: "takoserver.worker-runtime-input-preparation@v2",
+          canonicalPublicOrigin: HOST_ORIGIN,
+          publicApply: {
+            method: "PUT",
+            path: publicPath,
+            fences: { ifNoneMatch: "*" },
+            body: '{"different":"apply"}',
+          },
+          bindings: { ENCRYPTION_KEY: "placeholder-encryption-value" },
+        }),
+      }),
+    ],
+  ];
+  const seen: Record<string, { status: number; decodes: boolean }> = {};
+  for (const [expected, response] of refusals) {
+    const body = (await response.json()) as { error: Record<string, unknown> };
+    expect(Object.keys(body.error).sort()).toEqual(["code", "message", "requestId", "retryable"]);
+    expect(body.error.code).toBe(expected);
+    seen[expected] = {
+      status: response.status,
+      decodes: providerDecodes(response.status, body) !== "protocol_invalid",
+    };
+  }
+  expect(seen).toEqual({
+    unauthenticated: { status: 401, decodes: true },
+    permission_denied: { status: 403, decodes: true },
+    operation_not_found: { status: 404, decodes: true },
+    invalid_argument: { status: 400, decodes: true },
+    conflict: { status: 409, decodes: false },
+  });
 });
 
 async function seedWorkerLifecycle(
