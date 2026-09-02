@@ -165,13 +165,43 @@ Everything lives under one directory, `.takoserver` by default.
 | `TAKOSERVER_AI_TOKEN_FILE` | Preferred rotatable upstream bearer secret file. |
 | `TAKOSERVER_AI_TOKEN` | Direct upstream bearer secret when a file is not used. |
 
-Without a certificate the Worker socket speaks plain HTTP and endpoints are
-published as `http://`, truthfully — an `https://` address the runtime does not
-serve is one nothing answers on. On the default `localhost` suffix that is
-fine. On any other suffix it is not: a Worker that derives its own public
-identity from the request URL establishes no origin over plain HTTP on a name
-that is not loopback, so federation, signing, and self-addressing cannot work
-there. The process says so at boot rather than leaving it to be discovered.
+Without a certificate the Worker socket speaks plain HTTP and the origin this
+Host hands a Worker is `http://`, truthfully — an `https://` address the runtime
+does not serve is one nothing answers on. On the default `localhost` suffix that
+is fine for the Worker's own identity. On any other suffix it is not: a Worker
+that derives its public identity from the request URL establishes no origin over
+plain HTTP on a name that is not loopback, so federation, signing, and
+self-addressing cannot work there. The process says so at boot rather than
+leaving it to be discovered.
+
+### Publishing a `WorkerEndpoint` needs TLS on 443
+
+A `WorkerEndpoint` is a published, portable address, and the released
+`WorkerEndpoint` Form states what one may look like: `https://` plus a dotted
+name plus `/`. There is no plaintext address and no port. So this deployment can
+create a `WorkerEndpoint` only when the address it would publish is that shape,
+which means terminating TLS on the default port in one of two ways:
+
+- **In workerd.** Set `TAKOSERVER_WORKERD_TLS_CERT_FILE` and
+  `TAKOSERVER_WORKERD_TLS_KEY_FILE` (or the two `_CERT` / `_KEY` PEM-text
+  variables) and `TAKOSERVER_WORKERD_PORT=443`. Binding 443 needs the capability
+  to do so.
+- **Behind a front end.** Terminate TLS on 443 in front of this machine, leave
+  workerd on whatever port it has, and say so with
+  `TAKOSERVER_WORKER_ENDPOINT_PORT=443`. The port then normalizes away and the
+  published address is the portless one the front end really answers on.
+
+Any other configuration — plain HTTP, or a port that is not the scheme's
+default — still runs Workers, KV, SQL, queues, cron and buckets, and still
+serves them on its own socket. It simply cannot mint a `WorkerEndpoint`, and it
+says which of the two remedies to apply: at boot, and again in the refusal a
+`takoform_worker_endpoint` create answers with. The loopback development default
+is included: `http://<script>.localhost` is exactly as unpublishable as any
+other plain-HTTP address.
+
+A restarted deployment brings its published Workers back by itself. The runtime
+is started at boot for whatever this machine had already published, before the
+API begins answering; a machine that has published nothing starts no runtime.
 
 Nothing in that table is required to start. What is absent is absent rather than
 faked: a deployment with no Stripe key does not serve the route that would begin
