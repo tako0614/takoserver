@@ -21,11 +21,11 @@ export const WORKER_ENDPOINT_ORIGIN_ASSIGNMENT_FORMAT =
 /**
  * The reservation-id namespace this Host mints in, and no caller may write to.
  *
- * A Host-minted reservation is derived, not requested: one per organization,
- * Space and logical Worker, exactly the uniqueness ADR 0004 already states. The
- * prefix is the fence — the public control route refuses it, so a reservation
- * in this namespace is always one this Host made, and `mintForWorker` never
- * adopts a row a caller wrote.
+ * A Host-minted reservation is derived, not requested, and the live-uniqueness
+ * ADR 0004 states is unchanged: one live reservation per organization, Space
+ * and logical Worker. The prefix is the fence — the public control route
+ * refuses it, so a reservation in this namespace is always one this Host made,
+ * and `mintForWorker` never adopts, or releases, a row a caller wrote.
  */
 export const HOST_MINTED_RESERVATION_PREFIX = "hostmint-";
 /** Long enough to outlive an apply, short enough that an abandoned one ages out. */
@@ -516,9 +516,10 @@ export function createWorkerEndpointOriginReservations(options: {
    * Frees a Host-minted reservation that describes a Worker incarnation which
    * is gone.
    *
-   * The id is derived from the address, not the incarnation, so a destroy
-   * followed by a re-apply asks for the same reservation with a new Worker UID.
-   * Release is the one fenced way to let go of it: ADR 0004 requires the
+   * The id names a Worker incarnation, so a destroy followed by a re-apply
+   * asks for a different reservation on the same address — and the previous
+   * one still owns that address until it is let go of.
+   * Release is the one fenced way to do that: ADR 0004 requires the
    * retained endpoint Resource to be absent, its deletion attestation closed,
    * and no provider deployment outside `deleted`/`failed`. If those do not
    * hold, the old endpoint may still be serving on that origin and the mint
@@ -585,7 +586,7 @@ export function createWorkerEndpointOriginReservations(options: {
     return boundProjection(row);
   };
 
-  return {
+  const authority: WorkerEndpointOriginReservations = {
     async prepare(input) {
       normalizeIdentity(input.organizationId, input.reservationId);
       validateRequestedSubdomain(input.requestedSubdomain);
@@ -1030,14 +1031,14 @@ export function createWorkerEndpointOriginReservations(options: {
         requestedSubdomain: subdomain,
         reservationId,
       });
-      await this.prepare({
+      await authority.prepare({
         organizationId: input.organizationId,
         reservationId,
         requestedSubdomain: subdomain,
         ...(input.offeringId ? { offeringId: input.offeringId } : {}),
         expiresInSeconds: HOST_MINTED_TTL_SECONDS,
       });
-      return await this.bind({
+      return await authority.bind({
         organizationId: input.organizationId,
         reservationId,
         space: input.space,
@@ -1328,6 +1329,8 @@ export function createWorkerEndpointOriginReservations(options: {
       }
     },
   };
+
+  return authority;
 }
 
 interface PlannedPlacement {
