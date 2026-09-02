@@ -624,8 +624,11 @@ async function invokeQueue(event, rawEnv, rawContext) {
   const env = projectEnv(rawEnv);
   const context = createPortableContext(rawContext);
   const original = await loadOriginal();
-  const messages = internalArray();
-  const messageIds = internalArray();
+  // Plain arrays, deliberately: this batch is handed to tenant code, and a
+  // null-prototype array is not iterable — a for-of over batch.messages, which
+  // is how every consumer is written, would throw.
+  const messages = [];
+  const messageIds = [];
   const decisions = new SafeMap();
   const seen = new SafeMap();
   for (let index = 0; index < event.messages.length; index += 1) {
@@ -789,7 +792,7 @@ function createQueueAdapter(call, binding) {
     if (!SafeArrayIsArray(messages) || messages.length < 1 || messages.length > MAX_QUEUE_MESSAGES) {
       throw portableError("batch_too_large");
     }
-    const entries = internalArray();
+    const entries = [];
     for (let index = 0; index < messages.length; index += 1) {
       const message = messages[index];
       if (!isRecord(message) || !onlyKeys(message, ["body", "delaySeconds"]) || !SafeObjectHasOwn(message, "body")) {

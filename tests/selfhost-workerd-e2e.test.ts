@@ -6,9 +6,12 @@ import { createEphemeralSql } from "../src/compat.ts";
 import type { ProviderOffering, ProviderRelation } from "../src/provider-port.ts";
 import {
   createSelfhostDataPlaneAccess,
+  createSelfhostEventTargets,
   createSelfhostProvider,
 } from "../src/providers/selfhost.ts";
 import { serveSelfhostDataPlanes } from "../src/selfhost-data-planes.ts";
+import { createSelfhostQueuePump } from "../src/selfhost-queue-pump.ts";
+import { createSelfhostWorkerScheduler } from "../src/selfhost-scheduler.ts";
 import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
 import { findWorkerd } from "../src/workerd-supervisor.ts";
 
@@ -197,8 +200,9 @@ function deployed(
   name: string,
   nativeId: string,
   outputs: Record<string, unknown>,
+  spec: Record<string, unknown> = {},
 ): ProviderRelation {
-  const base = relation(pointer, kind, name);
+  const base = relation(pointer, kind, name, spec);
   return {
     ...base,
     deployment: {
@@ -611,4 +615,360 @@ test.skipIf(WORKERD === null)(
     });
   },
   30_000,
+);
+
+/**
+ * The event half of the same lane, with the same nothing simulated.
+ *
+ * A real Worker sends a message through `env.QUEUE`, a real Bun pump takes it
+ * out of SQLite and posts it through the workerd router, and the same Worker's
+ * `queue` handler acknowledges it. Nothing here can be proved without workerd:
+ * that a service binding naming a *named* entrypoint resolves, that the batch
+ * the tenant receives is iterable and settles the way the managed wrapper's
+ * does, that the gate refuses a caller without the token, and that the token is
+ * nowhere tenant code can reach.
+ */
+const EVENT_MODULE = `const seen = [];
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname === "/send") {
+      const id = await env.QUEUE.send(JSON.stringify({ note: "one" }));
+      const ids = await env.QUEUE.sendBatch([
+        { body: JSON.stringify({ note: "two" }) },
+        { body: JSON.stringify({ note: "three" }) },
+      ]);
+      return Response.json({ id, ids });
+    }
+    if (url.pathname === "/seen") {
+      const stored = await env.KV.get("seen");
+      const fired = await env.KV.get("fired");
+      return Response.json({
+        seen: stored === null ? null : JSON.parse(new TextDecoder().decode(stored)),
+        fired: fired === null ? null : new TextDecoder().decode(fired),
+      });
+    }
+    if (url.pathname === "/reach") {
+      // The token is declared on a service this isolate holds no binding to,
+      // and the entrypoint that consumes it is not the one the router calls.
+      let importable = null;
+      try {
+        const module = await import("cloudflare:workers");
+        importable = Object.keys(module.env ?? {}).sort();
+      } catch (error) {
+        importable = [String(error && error.name)];
+      }
+      return Response.json({
+        importable,
+        handlerKeys: Object.keys(env).sort(),
+        token: env.__TAKOSERVER_SELFHOST_EVENT_TOKEN ?? null,
+        target: typeof env.__TAKOSERVER_SELFHOST_EVENT_TARGET,
+      });
+    }
+    return Response.json({ ok: true });
+  },
+  async queue(batch, env) {
+    // for-of, which is how every consumer is written: the batch this Host
+    // projects has to be an ordinary iterable array.
+    for (const message of batch.messages) {
+      seen.push({
+        queue: batch.queue,
+        attempts: message.attempts,
+        note: JSON.parse(atob(message.body.data)).note,
+      });
+      message.acknowledge();
+    }
+    await env.KV.put("seen", JSON.stringify(seen));
+  },
+  async scheduled(controller, env) {
+    await env.KV.put("fired", controller.cron + "@" + String(controller.scheduledTime));
+  },
+};
+`;
+
+const QUEUE_ID = "tsq-e2e-delivery";
+const DLQ_ID = "tsq-e2e-delivery-dlq";
+const CRON = "* * * * *";
+
+function queueRelation(pointer: string, name: string, id: string): ProviderRelation {
+  return deployed(
+    pointer,
+    "AtLeastOnceQueue",
+    name,
+    `selfhost-queue:${id}:op_queue`,
+    { queueId: id, queueName: id },
+    { messageRetentionSeconds: 345_600, deliveryDelaySeconds: 0 },
+  );
+}
+
+/** Publishes a Worker that produces, consumes, and is scheduled, then boots it. */
+async function bootEvents(): Promise<{
+  readonly origin: string;
+  readonly script: string;
+  readonly workerdPort: number;
+  readonly sql: ReturnType<typeof createEphemeralSql>;
+  readonly runtime: ReturnType<typeof createWorkerdRuntime>;
+  readonly targets: ReturnType<typeof createSelfhostEventTargets>;
+}> {
+  const sql = createEphemeralSql();
+  const access = createSelfhostDataPlaneAccess(root);
+  const served = serveSelfhostDataPlanes({
+    sql,
+    grant: (script, versionId) => access.grant(script, versionId),
+    databasePath: (name) => access.databasePath(name),
+  });
+  planeServer = served;
+
+  const reserved = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+  const workerdPort = Number(reserved.port);
+  reserved.stop(true);
+  const origin = `http://127.0.0.1:${workerdPort}`;
+  const runtime = createWorkerdRuntime({ root, port: workerdPort, isReady: () => true });
+  const local = createSelfhostProvider({
+    offerings: [],
+    dataRoot: root,
+    runtime,
+    dataPlaneAddress: served.address,
+    suffixes: ["localhost"],
+    events: { async deleteQueue() {}, async forgetSchedules() {} },
+    artifacts: {
+      async manifest(_tenant, digest) {
+        return digest === "sha256:worker"
+          ? {
+              kind: "WorkerBundle",
+              mainModule: "index.js",
+              modules: [{ name: "index.js", digest: "sha256:index.js" }],
+            }
+          : null;
+      },
+      async blob(digest) {
+        return digest === "sha256:index.js" ? new TextEncoder().encode(EVENT_MODULE) : null;
+      },
+    },
+  });
+
+  const worker = await local.apply({
+    operationId: "op_worker",
+    offering: offering("ModuleWorker"),
+    identity: identity("hello"),
+    spec: {},
+  });
+  expect(worker.phase).toBe("succeeded");
+  const script = worker.phase === "succeeded" ? String(worker.result.outputs.scriptName) : "";
+
+  const version = await local.apply({
+    operationId: "op_version",
+    offering: offering("WorkerVersion"),
+    identity: identity("hello-v1"),
+    spec: {
+      bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+      handlers: ["fetch", "queue", "scheduled"],
+      worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+      kvBindings: [
+        { name: "KV", resource: { apiVersion: EDGE_API, kind: "EdgeKVNamespace", name: "cache" } },
+      ],
+      queueProducerBindings: [
+        {
+          name: "QUEUE",
+          resource: { apiVersion: EDGE_API, kind: "AtLeastOnceQueue", name: "delivery" },
+        },
+      ],
+    },
+    relations: [
+      relation("/worker", "ModuleWorker", "hello"),
+      relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+      deployed(
+        "/kvBindings/0/resource",
+        "EdgeKVNamespace",
+        "cache",
+        `selfhost-kv:${KV_NAMESPACE}:op_kv`,
+        { namespaceId: KV_NAMESPACE },
+      ),
+      queueRelation("/queueProducerBindings/0/resource", "delivery", QUEUE_ID),
+    ],
+  });
+  expect(version.phase).toBe("succeeded");
+
+  const deployment = await local.apply({
+    operationId: "op_deploy",
+    offering: offering("WorkerDeployment"),
+    identity: identity("hello-live"),
+    spec: {
+      worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+      versions: [
+        {
+          workerVersion: { apiVersion: EDGE_API, kind: "WorkerVersion", name: "hello-v1" },
+          weight: 10_000,
+        },
+      ],
+    },
+    relations: [
+      relation("/worker", "ModuleWorker", "hello"),
+      relation("/versions/0/workerVersion", "WorkerVersion", "hello-v1"),
+    ],
+  });
+  expect(deployment.phase).toBe("succeeded");
+
+  const endpoint = await local.apply({
+    operationId: "op_endpoint",
+    offering: offering("WorkerEndpoint"),
+    identity: identity("hello-endpoint"),
+    spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" } },
+    relations: [relation("/worker", "ModuleWorker", "hello")],
+    workerEndpointOriginAssignment: {
+      canonicalPublicOrigin: `https://${HOSTNAME}`,
+      assignmentDigest: `sha256:${"e".repeat(64)}`,
+    },
+  });
+  expect(endpoint.phase).toBe("succeeded");
+
+  const consumer = await local.apply({
+    operationId: "op_consumer",
+    offering: offering("QueueConsumer"),
+    identity: identity("hello-consumer"),
+    spec: {
+      worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+      queue: { apiVersion: EDGE_API, kind: "AtLeastOnceQueue", name: "delivery" },
+      deadLetterQueue: { apiVersion: EDGE_API, kind: "AtLeastOnceQueue", name: "delivery-dlq" },
+      maxBatchSize: 10,
+      maxBatchTimeoutSeconds: 0,
+      maxRetries: 3,
+      retryDelaySeconds: 60,
+      maxConcurrency: 4,
+    },
+    relations: [
+      relation("/worker", "ModuleWorker", "hello"),
+      queueRelation("/queue", "delivery", QUEUE_ID),
+      queueRelation("/deadLetterQueue", "delivery-dlq", DLQ_ID),
+    ],
+  });
+  expect(consumer).toMatchObject({
+    phase: "succeeded",
+    result: { observed: { delivering: true } },
+  });
+
+  const trigger = await local.apply({
+    operationId: "op_cron",
+    offering: offering("WorkerCronTrigger"),
+    identity: identity("hello-cron"),
+    spec: {
+      worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+      cron: CRON,
+    },
+    relations: [relation("/worker", "ModuleWorker", "hello")],
+  });
+  expect(trigger).toMatchObject({
+    phase: "succeeded",
+    result: { observed: { scheduled: true } },
+  });
+
+  workerd = Bun.spawn([WORKERD as string, "serve", join(root, "workers", "workerd.capnp")], {
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  expect(await reachable(`${origin}/`)).toBe(true);
+
+  return { origin, script, workerdPort, sql, runtime, targets: createSelfhostEventTargets(root) };
+}
+
+test.skipIf(WORKERD === null)(
+  "a Worker sends into its own queue, the pump delivers the batch, and the handler acks",
+  async () => {
+    const { origin, sql, runtime, targets } = await bootEvents();
+    const pump = createSelfhostQueuePump({ sql, runtime, targets });
+    const sent = await ask(origin, "/send");
+    expect(sent.status).toBe(200);
+    const accepted = (await sent.json()) as { id: string; ids: readonly string[] };
+    expect(accepted.id).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(accepted.ids).toHaveLength(2);
+
+    // One pass takes every due message, hands it to the same Worker's `queue`
+    // handler as a portable batch, and settles what came back.
+    expect(await pump.tick()).toBe(3);
+    const observed = (await (await ask(origin, "/seen")).json()) as {
+      seen: readonly { queue: string; attempts: number; note: string }[];
+    };
+    expect(observed.seen.map((entry) => entry.note).sort()).toEqual(["one", "three", "two"]);
+    expect(observed.seen.every((entry) => entry.attempts === 1)).toBe(true);
+    expect(observed.seen.every((entry) => entry.queue === QUEUE_ID)).toBe(true);
+    // Acknowledged means gone: a second pass has nothing left to deliver.
+    expect(await pump.tick()).toBe(0);
+    expect(await sql.query("SELECT message_id FROM selfhost_queue_messages", [])).toEqual([]);
+  },
+  60_000,
+);
+
+test.skipIf(WORKERD === null)(
+  "the scheduler fires the Worker's scheduled handler inside the minute it matched",
+  async () => {
+    const { origin, sql, runtime, targets } = await bootEvents();
+    let millis = Date.UTC(2026, 8, 2, 12, 0, 30);
+    const scheduler = createSelfhostWorkerScheduler({
+      sql,
+      runtime,
+      targets,
+      clock: () => new Date(millis),
+    });
+    // The first pass only seeds the next fire: a trigger attached at 12:00:30
+    // is not owed the 12:00 that happened before it existed.
+    expect(await scheduler.tick()).toBe(0);
+    expect((await (await ask(origin, "/seen")).json()).fired).toBeNull();
+
+    millis = Date.UTC(2026, 8, 2, 12, 1, 10);
+    expect(await scheduler.tick()).toBe(1);
+    expect((await (await ask(origin, "/seen")).json()).fired).toBe(
+      `${CRON}@${Date.UTC(2026, 8, 2, 12, 1, 0)}`,
+    );
+  },
+  60_000,
+);
+
+test.skipIf(WORKERD === null)(
+  "the event token is not readable from tenant code, and the gate refuses without it",
+  async () => {
+    const { origin, script, workerdPort } = await bootEvents();
+    const reach = await ask(origin, "/reach");
+    expect(await reach.json()).toEqual({
+      // `disallow_importable_env` empties this, and the token and the gate's
+      // service binding were never on this service to begin with.
+      importable: [],
+      handlerKeys: ["KV", "QUEUE"],
+      token: null,
+      target: "undefined",
+    });
+
+    const event = JSON.stringify({
+      protocol: "takoserver.managed-worker-event@v1",
+      kind: "schedule",
+      logicalWorkerId: script,
+      deploymentId: "forged",
+      cron: CRON,
+      scheduledTime: 0,
+    });
+    const eventPath = "/.well-known/takoserver/managed-worker-events/v1";
+    const headers = {
+      "content-type": "application/vnd.takoserver.managed-worker-event.v1+json",
+      "x-takoserver-managed-worker-event": "takoserver.managed-worker-event@v1",
+    };
+    // Anything that can reach the runtime's port can name a hostname, so the
+    // gate is what stands between that and a forged delivery.
+    const forged = await fetch(`http://127.0.0.1:${workerdPort}${eventPath}`, {
+      method: "POST",
+      headers: { ...headers, host: `${script}.selfhost-events.invalid` },
+      body: event,
+    });
+    expect(forged.status).toBe(404);
+
+    // And the customer-facing hostname does not know what an event is: the
+    // event entrypoint is a named export the router never addresses.
+    const direct = await fetch(`http://127.0.0.1:${workerdPort}${eventPath}`, {
+      method: "POST",
+      headers: { ...headers, host: HOSTNAME },
+      body: event,
+    });
+    expect(await direct.json()).toEqual({ ok: true });
+    expect((await (await ask(origin, "/seen")).json()).fired).toBeNull();
+  },
+  60_000,
 );
