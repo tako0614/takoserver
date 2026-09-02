@@ -236,3 +236,203 @@ function publicVersion() {
     },
   };
 }
+
+describe("Form authority identity probe forward transition", () => {
+  const FORM_AUTHORITY_DELTA = {
+    retiredVars: [],
+    addedVars: [],
+    refreshedVars: [],
+    addedBindings: ["FORM_AUTHORITY"],
+    addedSecrets: [],
+    rotatedSecrets: [],
+  } as const;
+
+  /** The live wedge: the probe predates the commit that added its third binding. */
+  function twoBindingProbeState(input: {
+    readonly isUploaded?: () => boolean;
+    readonly authorityWorkerPresent?: boolean;
+  }): FormAuthorityIdentityProbeState {
+    const isUploaded = input.isUploaded ?? (() => false);
+    const present = input.authorityWorkerPresent !== false;
+    const base = probeState(true);
+    return {
+      ...base,
+      async workerScripts() {
+        return [
+          target.workerName,
+          ...(present ? [target.formAuthority.workerName] : []),
+          target.formAuthority.identityProbeWorkerName,
+        ];
+      },
+      async workerVersion(workerName, versionId) {
+        const value = (await base.workerVersion(workerName, versionId)) as {
+          resources: { bindings: { name: string }[] };
+        };
+        if (workerName === target.workerName || isUploaded()) return value;
+        return {
+          ...value,
+          resources: {
+            bindings: value.resources.bindings.filter(({ name }) => name !== "FORM_AUTHORITY"),
+          },
+        };
+      },
+    };
+  }
+
+  test("status names the missing FORM_AUTHORITY binding instead of refusing opaquely", async () => {
+    const status = await runFormAuthorityIdentityProbe(
+      {
+        surface: "takoserver-form-authority-identity-probe",
+        action: "status",
+        environment: "production",
+        commit: COMMIT,
+      },
+      target,
+      { state: twoBindingProbeState({}), fetcher: readyFetcher() },
+    );
+    expect(status).toMatchObject({
+      bindingTransitionProfile: "none",
+      formAuthorityWorkerPresent: true,
+      ready: false,
+    });
+    expect(status.descriptorDrift).toEqual([
+      {
+        workerName: target.formAuthority.identityProbeWorkerName,
+        versionId: PROBE_VERSION,
+        differences: [{ binding: "FORM_AUTHORITY", difference: "missing", target: "service" }],
+      },
+    ]);
+    // A binding that is absent is a closure change, not a value to adopt.
+    expect(status.adoptableFromLive).toEqual([]);
+    expect(status.unadoptableFromLive).toEqual([
+      {
+        worker: target.formAuthority.identityProbeWorkerName,
+        binding: "FORM_AUTHORITY",
+        reason: expect.stringContaining("--add-binding"),
+      },
+    ]);
+  });
+
+  test("admits the added service binding only through the declaration", async () => {
+    const admitted = await runFormAuthorityIdentityProbe(
+      {
+        surface: "takoserver-form-authority-identity-probe",
+        action: "status",
+        environment: "production",
+        commit: COMMIT,
+        transition: {
+          predecessorVersionId: PROBE_VERSION,
+          delta: { ...FORM_AUTHORITY_DELTA },
+        },
+      },
+      target,
+      { state: twoBindingProbeState({}), fetcher: readyFetcher() },
+    );
+    expect(admitted).toMatchObject({
+      bindingTransitionProfile: "declared-delta-predecessor",
+      transitionPredecessorVersionId: PROBE_VERSION,
+      ready: true,
+    });
+
+    // Declaring it as a plain-text var does not describe the target closure.
+    const misdeclared = await runFormAuthorityIdentityProbe(
+      {
+        surface: "takoserver-form-authority-identity-probe",
+        action: "status",
+        environment: "production",
+        commit: COMMIT,
+        transition: {
+          predecessorVersionId: PROBE_VERSION,
+          delta: { ...FORM_AUTHORITY_DELTA, addedBindings: [], addedVars: ["FORM_AUTHORITY"] },
+        },
+      },
+      target,
+      { state: twoBindingProbeState({}), fetcher: readyFetcher() },
+    );
+    expect(misdeclared).toMatchObject({ bindingTransitionProfile: "none", ready: false });
+  });
+
+  test("refuses the undeclared apply and publishes the declared one exactly once", async () => {
+    const undeclared = await runFormAuthorityIdentityProbe(
+      {
+        surface: "takoserver-form-authority-identity-probe",
+        action: "apply",
+        environment: "production",
+        commit: COMMIT,
+      },
+      target,
+      {
+        state: twoBindingProbeState({}),
+        fetcher: readyFetcher(),
+        review: "independent-reviewer",
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        async run() {
+          throw new Error("no command may run before the closure fence");
+        },
+      },
+    ).catch((error: unknown) => error);
+    expect(undeclared).toBeInstanceOf(Error);
+    expect((undeclared as Error).message).toContain("does not declare the FORM_AUTHORITY binding");
+  });
+
+  test("refuses to bind a Form authority Worker that does not exist on the account", async () => {
+    const status = await runFormAuthorityIdentityProbe(
+      {
+        surface: "takoserver-form-authority-identity-probe",
+        action: "status",
+        environment: "production",
+        commit: COMMIT,
+      },
+      target,
+      {
+        state: twoBindingProbeState({ authorityWorkerPresent: false }),
+        fetcher: readyFetcher(),
+      },
+    );
+    expect(status).toMatchObject({
+      formAuthorityWorkerName: target.formAuthority.workerName,
+      formAuthorityWorkerPresent: false,
+      ready: false,
+    });
+    expect(status.formAuthorityWorkerRemedy).toContain("takoserver-form-authority-worker");
+
+    const refusal = await runFormAuthorityIdentityProbe(
+      {
+        surface: "takoserver-form-authority-identity-probe",
+        action: "apply",
+        environment: "production",
+        commit: COMMIT,
+        transition: { predecessorVersionId: PROBE_VERSION, delta: { ...FORM_AUTHORITY_DELTA } },
+      },
+      target,
+      {
+        state: twoBindingProbeState({ authorityWorkerPresent: false }),
+        fetcher: readyFetcher(),
+        review: "independent-reviewer",
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        async run() {
+          throw new Error("no command may run before the missing Worker is named");
+        },
+      },
+    ).catch((error: unknown) => error);
+    expect(refusal).toBeInstanceOf(Error);
+    expect((refusal as Error).message).toContain(target.formAuthority.workerName);
+    expect((refusal as Error).message).toContain("takoserver-form-authority-worker --apply");
+  });
+});
+
+function readyFetcher(): (input: string, init?: RequestInit) => Promise<Response> {
+  return async () => {
+    const semantic = await derivePublicFormImplementationIdentity({
+      implementationPayloadDigest: PAYLOAD_DIGEST,
+      capabilities: publicFormCapabilityManifest(),
+    });
+    return Response.json({
+      kind: "takoserver.public-host-identity@v2",
+      hostId: target.formAuthority.hostId,
+      workerVersionId: PUBLIC_VERSION,
+      workerArtifactDigest: OUTER_DIGEST,
+      ...semantic,
+    });
+  };
+}

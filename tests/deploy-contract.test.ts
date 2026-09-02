@@ -44,6 +44,7 @@ const SURFACES = [
   ["takoserver-worker-retirement-attribution-repair", []],
   ["takoserver-integration-operator-identity", ["authority"]],
   ["takoserver-managed-worker-gateway", ["authority"]],
+  ["takoserver-org-api-key", ["authority"]],
 ] as const;
 
 describe("Takoserver split deploy entrypoint", () => {
@@ -820,6 +821,208 @@ describe("Takoserver split deploy entrypoint", () => {
         `--commit=${sha}`,
         `--closure-predecessor-version=${predecessor}`,
         "--refresh-var=TAKOSERVER_EDGE_SUPPLIES",
+      ],
+    ] as const) {
+      const refused = await deploy(args);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
+    }
+  });
+
+  test("offers the same forward transition to every Worker-publishing surface", async () => {
+    const sha = "a".repeat(40);
+    const predecessor = "00000000-0000-4000-8000-0000000000a1";
+    for (const [surface, environment] of [
+      ["takoserver-form-authority-identity-probe", "production"],
+      ["takoserver-form-authority-worker", "production"],
+      ["takoserver-integration-form-authority-worker", "integration"],
+      ["takoserver-integration-form-authority-operator-worker", "integration"],
+    ] as const) {
+      const accepted = await deploy([
+        surface,
+        "--status",
+        `--environment=${environment}`,
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+        "--refresh-var=TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST",
+        "--add-binding=FORM_AUTHORITY",
+      ]);
+      expect(accepted.exitCode).toBe(2);
+      expect(accepted.stderr).toContain("deploy target descriptor not found");
+      expect(accepted.stderr).not.toContain("no target was touched");
+
+      // The candidate descriptor is a readback product; it never accompanies a mutation.
+      const adopt = await deploy([
+        surface,
+        "--status",
+        `--environment=${environment}`,
+        `--commit=${sha}`,
+        "--adopt-live=/tmp/takoserver-adopt-candidate.json",
+      ]);
+      expect(adopt.exitCode).toBe(2);
+      expect(adopt.stderr).toContain("deploy target descriptor not found");
+    }
+
+    for (const args of [
+      // `--adopt-live` never accompanies an apply.
+      [
+        "takoserver-integration-form-authority-worker",
+        "--apply",
+        "--environment=integration",
+        `--commit=${sha}`,
+        "--adopt-live=/tmp/takoserver-adopt-candidate.json",
+      ],
+      // Nor a surface with no descriptor-owned identity in its closure.
+      [
+        "takoserver-worker",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        "--adopt-live=/tmp/takoserver-adopt-candidate.json",
+      ],
+      // The candidate path is absolute.
+      [
+        "takoserver-integration-form-authority-worker",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        "--adopt-live=candidate.json",
+      ],
+      // A signed-invocation surface publishes no Worker and takes no declaration.
+      [
+        "takoserver-integration-form-authority",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+        "--add-binding=FORM_AUTHORITY",
+      ],
+      // An added binding is still one exact binding name.
+      [
+        "takoserver-form-authority-identity-probe",
+        "--status",
+        "--environment=production",
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+        "--add-binding=form_authority",
+      ],
+    ] as const) {
+      const refused = await deploy(args);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
+    }
+  });
+
+  test("parses only the exact durable organization API key operands", async () => {
+    const probe = await deploy(["--contract"]);
+    const contract = JSON.parse(probe.stdout) as {
+      surfaces: { surface: string; requiresEnv: string[]; obligations: Record<string, string> }[];
+    };
+    const surface = contract.surfaces.find(({ surface }) => surface === "takoserver-org-api-key");
+    expect(surface?.requiresEnv).toEqual([
+      "TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH",
+      "TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH",
+      "TAKOSERVER_ORG_API_KEY_OUTPUT_DIRECTORY",
+      "TAKOSERVER_INDEPENDENT_REVIEW",
+    ]);
+    expect(surface?.obligations["post-conditions"]).toContain("an unbounded organization API key");
+    expect(surface?.obligations.reversal).toContain("--revoke");
+
+    const sha = "a".repeat(40);
+    const organization = "org_takosumi_hosted_staging";
+    const keyId = `key_${"1".repeat(40)}`;
+    for (const [environment, args] of [
+      ["integration", ["--status", `--organization=${organization}`]],
+      [
+        "rehearsal",
+        [
+          "--mint",
+          `--organization=${organization}`,
+          "--key-name=takosumi-hosted-reservation",
+          "--scope=resources:write",
+          "--scope=resources:read",
+          "--expires-in-days=90",
+        ],
+      ],
+      ["production", ["--revoke", `--organization=${organization}`, `--key-id=${keyId}`]],
+    ] as const) {
+      const accepted = await deploy([
+        "takoserver-org-api-key",
+        `--environment=${environment}`,
+        `--commit=${sha}`,
+        ...args,
+      ]);
+      expect(accepted.exitCode).toBe(2);
+      expect(accepted.stderr).toContain("deploy target descriptor not found");
+      expect(accepted.stderr).not.toContain("no target was touched");
+    }
+
+    for (const args of [
+      // Every action names the organization.
+      ["takoserver-org-api-key", "--status", "--environment=integration", `--commit=${sha}`],
+      // A mint declares name, scope and a bounded expiry.
+      [
+        "takoserver-org-api-key",
+        "--mint",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--organization=${organization}`,
+        "--key-name=takosumi-hosted-reservation",
+        "--scope=resources:write",
+      ],
+      // An unbounded expiry is not expressible.
+      [
+        "takoserver-org-api-key",
+        "--mint",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--organization=${organization}`,
+        "--key-name=takosumi-hosted-reservation",
+        "--scope=resources:write",
+        "--expires-in-days=0",
+      ],
+      // An unknown scope is refused before a target is opened.
+      [
+        "takoserver-org-api-key",
+        "--mint",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--organization=${organization}`,
+        "--key-name=takosumi-hosted-reservation",
+        "--scope=resources:everything",
+        "--expires-in-days=90",
+      ],
+      // Revoke names one exact key id and nothing a mint would name.
+      [
+        "takoserver-org-api-key",
+        "--revoke",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--organization=${organization}`,
+        "--key-name=takosumi-hosted-reservation",
+        `--key-id=${keyId}`,
+      ],
+      // `--apply` is not one of this surface's actions.
+      [
+        "takoserver-org-api-key",
+        "--apply",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--organization=${organization}`,
+      ],
+      // And `--mint` belongs to no other surface.
+      ["takoserver-worker", "--mint", "--environment=integration", `--commit=${sha}`],
+      // Key operands belong to no other surface either.
+      [
+        "takoserver-worker",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--organization=${organization}`,
       ],
     ] as const) {
       const refused = await deploy(args);

@@ -16,7 +16,11 @@ import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
 import { canonicalJson } from "../src/json.ts";
 import { derivePublicFormImplementationIdentity } from "../src/public-worker-implementation.ts";
-import { YURUCOMMU_IDENTITY_CAPABILITY_KINDS } from "../src/takoform/implementation-catalog.ts";
+import {
+  YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
+  yurucommuLifecycleCapabilityManifest,
+} from "../src/takoform/implementation-catalog.ts";
+import { edgeSuppliesFixture, objectBucketSuppliesFixture } from "./helpers/hosted-supply-fixtures.ts";
 
 const COMMIT = "a".repeat(40);
 const PREVIOUS_COMMIT = "b".repeat(40);
@@ -2219,6 +2223,262 @@ describe("route-less Form authority deploy surfaces", () => {
           { state },
         ),
       ).rejects.toThrow(/custom domain|topology|foreign/u);
+    }
+  });
+});
+
+describe("Form authority forward transition and descriptor drift", () => {
+  // The exact live predecessor shape: the manifest of the commit before
+  // ObjectBucket joined the Host's identity capability kinds.
+  const STALE_MANIFEST_JSON = canonicalJson(
+    yurucommuLifecycleCapabilityManifest(
+      YURUCOMMU_IDENTITY_CAPABILITY_KINDS.filter((kind) => kind !== "ObjectBucket"),
+    ),
+  );
+  const MANIFEST_DELTA = {
+    retiredVars: [],
+    addedVars: [],
+    refreshedVars: ["TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST"],
+    addedBindings: [],
+    addedSecrets: [],
+    rotatedSecrets: [],
+  } as const;
+
+  /**
+   * The live wedge: the served authority Version carries the manifest of an
+   * older commit, and the commit being deployed is the one that changed it.
+   */
+  function manifestAdvanceState(input: {
+    readonly isUploaded?: () => boolean;
+    readonly scope?: { readonly tenantId: string; readonly space: string };
+  }): FormAuthorityDeployState {
+    const isUploaded = input.isUploaded ?? (() => false);
+    const current = stateSequence({ isUploaded });
+    return {
+      ...current,
+      async workerVersion(workerName, versionId) {
+        if (workerName !== target.formAuthority.integrationWorkerName) {
+          return await current.workerVersion(workerName, versionId);
+        }
+        const scope = input.scope ?? target.formAuthority.integrationOperatorScope;
+        if (isUploaded()) return dynamicVersion(COMMIT, BUNDLE_DIGEST, scope);
+        const stale = JSON.parse(
+          JSON.stringify(dynamicVersion(PREVIOUS_COMMIT, PREVIOUS_DIGEST, scope)),
+        ) as { resources: { bindings: { name: string; text?: string }[] } };
+        stale.resources.bindings = stale.resources.bindings.map((binding) =>
+          binding.name === "TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST"
+            ? { ...binding, text: STALE_MANIFEST_JSON }
+            : binding,
+        );
+        return stale;
+      },
+    };
+  }
+
+  test("status names the capability-manifest advance instead of refusing opaquely", async () => {
+    const status = await runFormAuthority(
+      {
+        surface: "takoserver-integration-form-authority-worker",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      target,
+      { state: manifestAdvanceState({}) },
+    );
+    expect(status).toMatchObject({
+      publicWorkerBindingProfile: "unclassified",
+      scopeBindingProfile: "unclassified",
+      bindingTransitionProfile: "none",
+      ready: false,
+    });
+    expect(status.descriptorDrift).toEqual([
+      {
+        workerName: target.formAuthority.integrationWorkerName,
+        versionId: PREVIOUS_AUTHORITY_VERSION_ID,
+        differences: [
+          {
+            binding: "TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST",
+            difference: "value",
+            field: "text",
+            target: expect.stringContaining("sha256:"),
+            live: expect.stringContaining("sha256:"),
+          },
+        ],
+      },
+    ]);
+    // A code-derived value is never adopted from live state.
+    expect(status.adoptableFromLive).toEqual([]);
+    expect(status.unadoptableFromLive).toEqual([
+      {
+        worker: target.formAuthority.integrationWorkerName,
+        binding: "TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST",
+        reason: expect.stringContaining("--refresh-var"),
+      },
+    ]);
+  });
+
+  test("admits the manifest advance only through the declaration", async () => {
+    const admitted = await runFormAuthority(
+      {
+        surface: "takoserver-integration-form-authority-worker",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+        transition: {
+          predecessorVersionId: PREVIOUS_AUTHORITY_VERSION_ID,
+          delta: { ...MANIFEST_DELTA },
+        },
+      },
+      target,
+      { state: manifestAdvanceState({}) },
+    );
+    expect(admitted).toMatchObject({
+      publicWorkerBindingProfile: "dynamic-public-rpc",
+      scopeBindingProfile: "exact-target",
+      bindingTransitionProfile: "declared-delta-predecessor",
+      transitionPredecessorVersionId: PREVIOUS_AUTHORITY_VERSION_ID,
+      ready: true,
+    });
+
+    // Naming a different binding leaves the manifest unaccounted for.
+    const misdeclared = await runFormAuthority(
+      {
+        surface: "takoserver-integration-form-authority-worker",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+        transition: {
+          predecessorVersionId: PREVIOUS_AUTHORITY_VERSION_ID,
+          delta: { ...MANIFEST_DELTA, refreshedVars: ["TAKOSERVER_FORM_AUTHORITY_HOST_ID"] },
+        },
+      },
+      target,
+      { state: manifestAdvanceState({}) },
+    );
+    expect(misdeclared).toMatchObject({ bindingTransitionProfile: "none", ready: false });
+  });
+
+  test("publishes the manifest advance once and refuses the same apply without the declaration", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-manifest-"));
+    let uploaded = false;
+    try {
+      const process = fakeProcess({
+        onUpload() {
+          uploaded = true;
+        },
+      });
+      const result = await runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          transition: {
+            predecessorVersionId: PREVIOUS_AUTHORITY_VERSION_ID,
+            delta: { ...MANIFEST_DELTA },
+          },
+        },
+        target,
+        {
+          run: process.run,
+          state: manifestAdvanceState({ isUploaded: () => uploaded }),
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          review: "independent-reviewer",
+        },
+      );
+      expect(result).toMatchObject({
+        kind: "takoserver.form-authority-worker-apply@v1",
+        bindingTransitionProfile: "none",
+        transitionPredecessorVersionId: PREVIOUS_AUTHORITY_VERSION_ID,
+        previousVersionId: PREVIOUS_AUTHORITY_VERSION_ID,
+        versionId: CURRENT_AUTHORITY_VERSION_ID,
+      });
+      expect(process.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+
+      // The same advance without the declaration touches nothing.
+      const undeclared = fakeProcess();
+      const refusal = await runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target,
+        {
+          run: undeclared.run,
+          state: manifestAdvanceState({}),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          review: "independent-reviewer",
+        },
+      ).catch((error: unknown) => error);
+      expect(refusal).toBeInstanceOf(Error);
+      expect((refusal as Error).message).toContain("declared forward transition");
+      expect(undeclared.calls.some((call) => call.includes("--no-bundle"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("reports a drifted operator Space and writes a candidate descriptor for it", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-adopt-"));
+    const outside = mkdtempSync(join(tmpdir(), "takoserver-adopt-candidate-"));
+    try {
+      // The descriptor on disk is a real one: the candidate must still load as
+      // a deploy target, so the fixture cannot take the cast-shaped shortcut.
+      const descriptor = {
+        ...target,
+        edgeSupplies: edgeSuppliesFixture(),
+        objectBucketSupplies: objectBucketSuppliesFixture(),
+      } satisfies DeployTarget;
+      const descriptorPath = join(root, "integration.json");
+      const descriptorBytes = `${JSON.stringify(descriptor, null, 2)}\n`;
+      writeFileSync(descriptorPath, descriptorBytes, { mode: 0o600 });
+      const liveScope = {
+        tenantId: target.formAuthority.integrationOperatorScope.tenantId,
+        space: "space-yurucommu-adopted",
+      } as const;
+      const candidatePath = join(outside, "integration.candidate.json");
+      const status = await runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-worker",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          adoptLivePath: candidatePath,
+        },
+        target,
+        {
+          state: manifestAdvanceState({ scope: liveScope }),
+          targetDescriptorPath: descriptorPath,
+        },
+      );
+      expect(status.adoptableFromLive).toEqual([
+        {
+          worker: target.formAuthority.integrationWorkerName,
+          binding: "TAKOSERVER_FORM_AUTHORITY_OPERATOR_SPACE",
+          field: "text",
+          pointer: "/formAuthority/integrationOperatorScope/space",
+          target: target.formAuthority.integrationOperatorScope.space,
+          live: liveScope.space,
+        },
+      ]);
+      expect(status.adoptedTargetCandidate).toBe(candidatePath);
+      expect(status.adoptedTargetCandidatePatch).toEqual([
+        { pointer: "/formAuthority/integrationOperatorScope/space", value: liveScope.space },
+      ]);
+      // The operator's own descriptor is never edited.
+      expect(readFileSync(descriptorPath, "utf8")).toBe(descriptorBytes);
+      const candidate = JSON.parse(readFileSync(candidatePath, "utf8")) as typeof target;
+      expect(candidate.formAuthority.integrationOperatorScope.space).toBe(liveScope.space);
+      expect(candidate.formAuthority.integrationOperatorScope.tenantId).toBe(
+        target.formAuthority.integrationOperatorScope.tenantId,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
     }
   });
 });

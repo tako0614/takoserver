@@ -41,6 +41,12 @@ const hostedTokenInput =
   "`TAKOSERVER_HOSTED_TOKEN_PATH` is required for `--apply` only; `--status` does not read it.";
 const operatorPrivateJwkInput =
   "`TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH` is required for `--apply` only; `--status` does not read it and this surface is integration-only.";
+const orgApiKeyInput =
+  "Input contract: `TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH` and " +
+  "`TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH` are required for each `--mint`, `--status` and " +
+  "`--revoke` action; `TAKOSERVER_ORG_API_KEY_OUTPUT_DIRECTORY` for `--mint` only; " +
+  "`TAKOSERVER_INDEPENDENT_REVIEW` for `--mint` and `--revoke` only. No Cloudflare credential is " +
+  "read: this surface acts through the Host's own published organization API, not through the provider.";
 const closureSecretDirectoryInput =
   "`TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY` is required for `--apply` only, and only when the declared closure delta names an added or rotated secret; `--status` never reads it.";
 
@@ -900,6 +906,59 @@ export const DEPLOY_CONTRACT = {
           "and requires exact status readback. The surface does not mutate live production from tests or " +
           "from a guessed Cloudflare identifier." +
           inputContract(applyReviewInput),
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-org-api-key",
+      target: "https:environment-selected-durable-organization-api-key",
+      covers: [
+        "scripts/deploy.ts",
+        "scripts/deploy/org-api-key.ts",
+        "scripts/deploy/identity.ts",
+        "scripts/deploy/target.ts",
+        "src/auth.ts",
+        "src/control.ts",
+        "src/operator-key.ts",
+      ],
+      requiresScripts: ["deploy"],
+      requiresTools: ["bun"],
+      requiresEnv: [
+        "TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH",
+        "TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH",
+        "TAKOSERVER_ORG_API_KEY_OUTPUT_DIRECTORY",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+      ],
+      triggers: ["authority"],
+      obligations: {
+        provenance:
+          `${exactSource} The owned 0600 Ed25519 private half must prove the target's declared ` +
+          "operator public JWK before it signs one 60-second sign-in assertion, and the public " +
+          "product probe must identify this target's Host before any credential moves. The key is " +
+          "minted through the Host's own organization API, so it is recorded exactly where an " +
+          "interactive owner's key is recorded and the console lists and revokes it unchanged.",
+        "post-conditions":
+          "`--mint` writes the one-time secret to a new owner-only 0600 file under the exact " +
+          "`TAKOSERVER_ORG_API_KEY_OUTPUT_DIRECTORY`, then re-reads the organization's unrevoked keys " +
+          "and requires the exact minted id, name and expiry to be listed. Expiry is always declared " +
+          "and bounded; an unbounded organization API key is refused. `--status` is a value-free " +
+          "readback of every unrevoked key. `--revoke` requires the exact key id and proves absence " +
+          "from a fresh readback. Every action revokes its proof session and proves that revocation " +
+          "by replay.",
+        reversal:
+          "A minted key is reversed by this surface's own `--revoke` with the printed key id, which " +
+          "the result names. Revocation itself is forward-only: a revoked key is never restored.",
+        "failure-handling":
+          `${highRiskFailure} A second unrevoked key with the same name is refused before any ` +
+          "mutation, and so is an existing secret file for that name, because a duplicate would " +
+          "leave two keys the operator cannot tell apart with a secret for only one. A lost mint or " +
+          "revoke acknowledgement is indeterminate and is never retried: `--status` lists the " +
+          "organization's live keys, and a key listed without a secret file on disk is revoked " +
+          "through this surface before minting again. Secret bytes never enter argv, the child " +
+          "environment, success output or diagnostics. The surface requires the target to declare " +
+          "`operatorIdentity`; a target without that operator authority is refused by name in every " +
+          "environment." +
+          orgApiKeyInput,
         "independent-review": review,
       },
     },
