@@ -685,11 +685,20 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     scriptStateOperation(() => scriptStates.remove(script));
 
   /**
-   * The generated entrypoint one publication needs, or null when it needs none.
+   * The generated entrypoint one publication needs, or null when it cannot have
+   * one.
    *
-   * A version that binds no namespace, queue, or database and receives no event
-   * is published exactly as it was before this Host could generate anything:
-   * same main module, same module list, same bindings, same bytes.
+   * Every publication this Host can wrap is wrapped, because the entrypoint is
+   * also the load probe: it imports the tenant module and answers whether it
+   * loaded. A Worker with no bindings and no events used to be published as-is,
+   * which meant it was never asked — an unloadable module deployed, reported
+   * `Ready=True`, and failed with a 500 on the first real request instead.
+   *
+   * The one publication that still cannot be wrapped is a Version recorded
+   * before this Host kept a handler list: the wrapper has to re-export exactly
+   * what the Version declared, and that declaration is not recoverable from the
+   * materialized bundle. Where nothing else needs a wrapper such a Version is
+   * published as it always was; where something does, it is refused.
    */
   const wrapperProjection = (
     script: string,
@@ -716,7 +725,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     eventToken: SelfhostVersionBinding | null;
   } | null => {
     const plane = bindings?.dataPlane;
-    if (!bindings || (!plane && !events)) return null;
+    if (!bindings) return null;
+    if (!bindings.handlers && !plane && !events) return null;
     if (plane && (!options.dataPlaneAddress || !bindings.planeToken)) {
       throw new SelfhostFailure(
         failed(
@@ -980,6 +990,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           ...(vars.length > 0 ? { vars } : {}),
           ...(projection
             ? {
+                generatedEntrypoint: true,
                 modules: [meta.mainModule],
                 // The token rides on the facade service's own binding list, so
                 // it is never a binding of the service that runs tenant code.

@@ -520,16 +520,27 @@ test("two bindings under one name are refused at generation", () => {
   ).toThrow("bindings is invalid");
 });
 
-test("a version with no facade generates no entrypoint at all", () => {
-  expect(() =>
-    selfhostWorkerEntrypointSource({
-      originalMainModule: "index.js",
-      publication: "sw1.v1",
-      probeHostname: PROBE_HOSTNAME,
-      declaredHandlers: ["fetch"],
-      bindings: [{ name: "LANE", type: "plain_text" }],
-    }),
-  ).toThrow("bindings is invalid");
+/**
+ * A version with no facade still gets an entrypoint, because the entrypoint is
+ * the load probe.
+ *
+ * It used to be refused here, on the reasoning that a wrapper exists to carry a
+ * facade or to receive an event. That left the simplest kind of Worker — no
+ * bindings, no events — published unwrapped and therefore never asked whether
+ * its module loads: an unloadable one deployed, reported `Ready=True`, and
+ * failed with a 500 on the first real request.
+ */
+test("a version with no facade still generates the entrypoint that probes it", () => {
+  const source = selfhostWorkerEntrypointSource({
+    originalMainModule: "index.js",
+    publication: "sw1.v1",
+    probeHostname: PROBE_HOSTNAME,
+    declaredHandlers: ["fetch"],
+    bindings: [{ name: "LANE", type: "plain_text" }],
+  });
+  expect(source).toContain('import("./index.js")');
+  expect(source).toContain(SELFHOST_WORKER_READINESS_PATH);
+  expect(source).toContain('"LANE"');
 });
 
 test("a main module that escapes its own directory is refused at generation", () => {

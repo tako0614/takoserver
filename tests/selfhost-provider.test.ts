@@ -8,6 +8,7 @@ import type {
   ProviderOffering,
   ProviderRelation,
   ProviderRuntimeBinding,
+  ProviderTicket,
 } from "../src/provider-port.ts";
 import type { ProviderRuntimeInputLeasePort } from "../src/provider-runtime-input-port.ts";
 import { EDGE_OBJECTS_BINDING_REF } from "../src/providers/cloudflare-runtime-bindings.ts";
@@ -17,6 +18,7 @@ import {
   type SelfhostDataPlaneMaintenance,
 } from "../src/providers/selfhost.ts";
 import { SELFHOST_EDGE_OBJECTS_MATERIAL_KIND } from "../src/providers/selfhost-runtime-bindings.ts";
+import { SELFHOST_WORKER_READINESS_PATH } from "../src/providers/selfhost-worker-wrapper.ts";
 import { createRuntimeInputAuthority } from "../src/runtime-input-preparations.ts";
 import {
   createWorkerdRuntime,
@@ -379,13 +381,25 @@ const DATA_BINDING_SPEC = {
   ],
 };
 
-/** Drives the worker → version → deployment chain one apply at a time. */
+/** Drives the chain and asserts it published, answering the script name. */
 async function publish(
   local: ReturnType<typeof provider>,
   assets = false,
   vars?: Record<string, string | number>,
   dataBindings = false,
-) {
+): Promise<string> {
+  const { script, deployment } = await publishChain(local, assets, vars, dataBindings);
+  expect(deployment.phase).toBe("succeeded");
+  return script;
+}
+
+/** Drives the worker → version → deployment chain one apply at a time. */
+async function publishChain(
+  local: ReturnType<typeof provider>,
+  assets = false,
+  vars?: Record<string, string | number>,
+  dataBindings = false,
+): Promise<{ readonly script: string; readonly deployment: ProviderTicket }> {
   const worker = await local.apply({
     operationId: "op_worker",
     offering: offering("ModuleWorker"),
@@ -448,11 +462,60 @@ async function publish(
       relation("/versions/0/workerVersion", "WorkerVersion", "hello-v1"),
     ],
   });
-  expect(deployment.phase).toBe("succeeded");
-  return script;
+  return { script, deployment };
 }
 
 describe("publishing a Worker through the Edge Family", () => {
+  /**
+   * Every publication is load-probed, including the simplest kind of Worker.
+   *
+   * The generated entrypoint is what answers this Host's readiness question,
+   * and it used to be written only for a Version that bound a facade or
+   * received an event. A Worker with neither was therefore published without
+   * ever being asked whether its module loads: an unloadable one — a missing
+   * built-in, a top-level throw — deployed, reported `Ready=True`, and failed
+   * with a 500 on the first real request instead.
+   */
+  test("asks a Worker with no bindings at all whether its module loads", async () => {
+    const asked: string[] = [];
+    const local = provider({
+      runtime: {
+        async write() {},
+        async remove() {},
+        async reload() {},
+        async has() {
+          return true;
+        },
+        async probe(name, path) {
+          asked.push(`${name} ${path}`);
+          // Nothing answered at all: this deployment does not run the runtime
+          // in this process, which is not a bad answer and never refuses a
+          // valid publication.
+          return null;
+        },
+      },
+    });
+
+    const script = await publish(local);
+    expect(asked).toEqual([`${script} ${SELFHOST_WORKER_READINESS_PATH}`]);
+  });
+
+  test("refuses a bundle that carries a module under this Host's generated name", async () => {
+    const local = provider({
+      modules: {
+        "index.js": "export default {}",
+        "__takoserver-selfhost-entrypoint.js": "export default {}",
+      },
+    });
+    expect((await publishChain(local)).deployment).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "invalid_spec",
+        message: "the Worker bundle claims this Host's entrypoint module name",
+      },
+    });
+  });
+
   test("a deployment publishes the version's modules into workerd", async () => {
     const local = provider();
     const script = await publish(local);
@@ -1518,7 +1581,7 @@ describe("KV and SQLite bindings", () => {
     });
   });
 
-  test("a version that binds neither publishes exactly the bytes it always did", async () => {
+  test("a version that binds neither renders the same whether or not a plane is served", async () => {
     const withPlane = provider({ dataPlaneAddress: address });
     const script = await publish(withPlane);
     const configured = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
@@ -1530,7 +1593,10 @@ describe("KV and SQLite bindings", () => {
     const plain = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
 
     expect(configured.replaceAll(script, "<script>")).toBe(plain.replaceAll(script, "<script>"));
-    expect(plain).not.toContain("selfhost-entrypoint");
+    // The generated entrypoint is there either way, because it is the load
+    // probe rather than the facade. The facade service is what a Version that
+    // binds nothing does not get.
+    expect(plain).toContain("selfhost-entrypoint");
     expect(plain).not.toContain("selfhost-data");
   });
 
@@ -2165,13 +2231,14 @@ describe("bucketBindings on a self-host Worker Version", () => {
     });
   });
 
-  test("renders a version without bucket bindings byte-for-byte as it always did", async () => {
+  test("renders a version without bucket bindings with no facade and no object binding", async () => {
     const withoutBuckets = provider({ dataPlaneAddress: address });
     await publish(withoutBuckets, false, undefined, false);
     const plain = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
-    // A plain Version carries no generated entrypoint and no facade service at
-    // all, which is the whole of the byte-identity claim.
-    expect(plain).not.toContain("selfhost-entrypoint");
+    // The entrypoint is the load probe and is always there. What a Version
+    // that binds no bucket does not get is the facade service or any trace of
+    // the object Binding.
+    expect(plain).toContain("selfhost-entrypoint");
     expect(plain).not.toContain("selfhost-data");
     expect(plain).not.toContain("edge.objects");
   });
@@ -2755,25 +2822,29 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
   });
 
   test("an attachment the publication definitely refused does not stay behind", async () => {
-    // A bundle carrying a module under this Host's own generated name. It
-    // publishes fine while nothing is attached, because a Version with no
-    // binding gets no generated entrypoint at all; the attachment is what asks
-    // for one, and asking is what the publication refuses.
-    const local = provider({
-      events: EVENTS,
-      modules: {
-        "index.js": "export default {}",
-        "__takoserver-selfhost-entrypoint.js": "export default {}",
-      },
-    });
+    const local = provider({ events: EVENTS });
     const script = await publish(local);
+    // A materialized tree the republish definitely refuses, present only while
+    // the attachment is attempted. What the attachment must not do is leave
+    // itself recorded behind a refusal.
+    const strayModule = join(
+      root,
+      "selfhost",
+      "versions",
+      script,
+      versionDirectoryName(root, script),
+      "modules",
+      "stray.js",
+    );
+    await writeFile(strayModule, "export default {}");
     expect(await applyCron(local, "0 * * * *")).toMatchObject({
       phase: "failed",
       failure: {
-        code: "invalid_spec",
-        message: "the Worker bundle claims this Host's entrypoint module name",
+        code: "provider_error",
+        message: "the active Worker Version is not materialized on this machine",
       },
     });
+    rmSync(strayModule);
     // Rolled back, so a later republish of the script is not the same refusal
     // for ever. Before this, one refused attach wedged every domain, endpoint,
     // and deployment change the Worker would ever see.
