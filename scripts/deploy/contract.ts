@@ -259,7 +259,7 @@ export const DEPLOY_CONTRACT = {
       triggers: ["authority"],
       obligations: {
         provenance:
-          `${exactSource} Integration only. The generated exact 12-package unsigned fixture corpus, ` +
+          `${exactSource} Integration only. The generated exact 13-package unsigned fixture corpus, ` +
           "route-less bundle, target D1/R2 bindings, public identity RPC, and canonical capability manifest are sealed before one upload.",
         "post-conditions":
           "Authoritative Worker history and exact binding closure identify the uploaded integration fixture; " +
@@ -353,7 +353,7 @@ export const DEPLOY_CONTRACT = {
           "must identify that commit before the owned 0600 Ed25519 key signs any request.",
         "post-conditions":
           "Status performs one signed authoritative readback. Apply obtains one signed canonical plan, " +
-          "passes that exact plan digest once to apply, and finishes with a separately signed readback of the exact 12 Space-scoped non-production fixtures.",
+          "passes that exact plan digest once to apply, and finishes with a separately signed readback of the exact 13 Space-scoped non-production fixtures.",
         reversal:
           "Authority events are repaired forward: an acknowledged partial apply preserves every sanitized " +
           "action receipt and its next-plan digest for an explicit later readback/replan.",
@@ -396,7 +396,7 @@ export const DEPLOY_CONTRACT = {
         "post-conditions":
           "Status performs one signed authoritative readback. Apply obtains one signed canonical " +
           "deactivation plan, passes that exact plan digest once to apply, and finishes with a " +
-          "separately signed readback proving every exact 12 Space-scoped fixture is absent or inactive. " +
+          "separately signed readback proving every exact 13 Space-scoped fixture is absent or inactive. " +
           "With a transition descriptor, both gateway and route-less authority must have a verified dynamic or legacy exact identity profile and " +
           "exact-transition-predecessor and only predecessor desiredActive:false is signed. Success projects " +
           "only the transition digest, binding profile, and scope-redacted boolean/digest readback summary.",

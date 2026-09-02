@@ -63,7 +63,7 @@ file is read at the moment of each call, so a rotation does not need a restart.
 A Worker Version that declares `kvBindings`, `queueProducerBindings`, or
 `sqliteBindings` needs a backend, and a machine standing on its own has to be
 one. Three small HTTP services provide it: KV entries and queue messages live in
-the control database under migrations 0038 and 0039, and each `SQLiteDatabase`
+the control database under migrations 0038 and 0040, and each `SQLiteDatabase`
 is a file under `<data root>/databases`.
 
 They are served on their own listener, bound to `127.0.0.1`, never on `PORT`.

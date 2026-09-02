@@ -172,7 +172,7 @@ The separate authority and irreversible surfaces are:
   facts only; Takoserver Host retains admission policy and private handle
   issuance. Deploying the shell does not grant Form mutation authority.
 - `takoserver-integration-form-authority-worker`: integration only. It packages
-  the exact generated 12-Form unsigned fixture corpus, hard-refuses any other
+  the exact generated 13-Form unsigned fixture corpus, hard-refuses any other
   environment before binding reads, and remains permanently non-production.
   Its default export has a non-operational `fetch` handler that always returns
   `404` only to satisfy Cloudflare’s module registration requirement; its named
@@ -228,7 +228,7 @@ The separate authority and irreversible surfaces are:
   separately owned from normal activation. It always signs
   `activation.desiredActive: false`, emits only inactive activation successors,
   never loads Form packages or invokes package verification, and has no free
-  mode, repair, or reverse flag. Status/apply/status proves all exact 12
+  mode, repair, or reverse flag. Status/apply/status proves all exact 13
   durable activation heads are absent or inactive. It uses the same v2 signed
   request/plan/apply/readback protocol and the same no-retry/credential
   redaction rules. With the named transition descriptor it requires both live
@@ -558,7 +558,7 @@ attempt. An R that remains current is still
 weak/missing script identity fails closed.
 
 For a Form deactivation acknowledgement failure, do not retry apply. Run the
-deactivation surface with `--status` and require its exact 12-head
+deactivation surface with `--status` and require its exact 13-head
 absent-or-inactive proof before any fresh decision. A Worker rollback cannot
 reverse the append-only activation event; use the normal activation surface
 for explicit reactivation. When a transition descriptor selected the

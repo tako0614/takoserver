@@ -985,6 +985,24 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     runtimeInputCommitment?: `sha256:${string}`,
     secretValues?: Readonly<Record<string, string>>,
   ): Promise<ManagedReleaseClosure | ProviderTicket> {
+    // ADR 0007. The managed backend projects the `edge.objects` facade over an
+    // internal R2 binding, and that facade keeps its multipart validation
+    // receipts in isolate memory. An eviction between `createMultipartUpload`
+    // and `completeMultipartUpload` is ordinary, not exceptional, so this
+    // backend cannot honestly claim a restart-safe ObjectBucket runtime. The
+    // ordinary-workers backend has no such problem — a native R2 binding keeps
+    // its multipart state provider-side — so the refusal is this backend's, by
+    // name, rather than a structural accident of nobody configuring it.
+    if (
+      (Array.isArray(input.spec.bucketBindings) && input.spec.bucketBindings.length > 0) ||
+      (input.runtimeBindings?.length ?? 0) > 0
+    ) {
+      return failed(
+        "invalid_spec",
+        "the managed Worker backend does not bind an ObjectBucket: its multipart upload ledger " +
+          "is in-isolate and an eviction would lose an upload in flight",
+      );
+    }
     const worker = relationDeployment(input.relations, "/worker", "worker");
     const workerResource = relationResource(input.relations, "/worker", "ModuleWorker");
     const bundleResource = relationResource(input.relations, "/bundle", "WorkerBundle");
@@ -1197,6 +1215,12 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
       });
     }
 
+    // Unreachable while `#prepareRelease` refuses `bucketBindings` by name.
+    // Kept exact because the facade it feeds is complete and tested against a
+    // real R2 (`tests/cloudflare-managed-worker-wrapper.test.ts`); the one
+    // thing missing is a durable multipart receipt backend, and the day that
+    // exists this is the shape the managed path takes. The refusal above is the
+    // single gate, and this remains a structural backstop behind it.
     const bucketDeclarations = Array.isArray(input.spec.bucketBindings)
       ? input.spec.bucketBindings
       : [];

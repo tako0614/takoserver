@@ -268,13 +268,13 @@ the deploy command exits nonzero as a verification failure. A lost apply
 acknowledgement is indeterminate and is never retried or hidden behind an
 automatic readback; the operator runs status before making an explicit fresh
 apply decision. Plan and readback requests are bounded at 30 seconds. Apply is
-bounded at 55 seconds, inside the assertion lifetime, so the exact 12-Form
+bounded at 55 seconds, inside the assertion lifetime, so the exact 13-Form
 fixture can finish without turning an ordinary full convergence into a false
 lost acknowledgement.
 
 Deactivation is an explicit status/apply/status sequence: inspect status,
 apply once, then run status again. Its ready proof requires the exact generated
-12 Forms to each have a durable activation head that is either absent or
+13 Forms to each have a durable activation head that is either absent or
 inactive, plus a zero-command next plan. The v2 readback exposes each head as
 `activationHead` with `present`, `active`, `implementationDigest`, and
 `eventDigest`; it never hides a stale active head behind installed or effective
@@ -312,11 +312,35 @@ apply, and readback always cover all 17 packages; `apply` loads every package
 from the embedded closure and sends the whole raw set to Core in one request,
 also on retry after a refused or partial apply. Support and activation are the
 intersection of the package set with the code-owned implementation catalog:
-`ActorNamespace`, `DurableWorkflow`, `ObjectBucket`, `StaticAssetBundle`, and
+`ActorNamespace`, `DurableWorkflow`, `StaticAssetBundle`, and
 `WorkerCustomDomain` are installed durable packages with empty executable
 operations, never supported, never activated, and not offered by any
 Takoserver supply. Readback exposes them as `installed: true`,
 `supported: false`, and an absent activation head.
+
+`ObjectBucket` left that list in
+[ADR 0007](adr/0007-objectbucket-joins-the-implementation-catalog.md). The exact
+current package at definition version `0.1.0` is now supported and activated
+with the operations its Form declares — `create`, `read`, `delete`, `import`,
+`observe`, never `update` — on any Host that realizes an ObjectBucket supply.
+It is an identity capability, so a Host without that supply installs, supports,
+and activates it with an EMPTY operation set: the Form is known there and none
+of it executes. That is what a self-host does, because its composition builds
+no ObjectBucket Offering at all — the machine has no `edge.objects` backend —
+so `scripts/selfhost-form-admission.ts` records only the identity Forms that
+composition offers. The two Hosts therefore no longer share one capability
+digest: the public Worker's is
+`sha256:a5bc1508638fb1c47182d4ee68be5eedb7acc050394bd3507b532a78daacc024` and a
+self-host's is
+`sha256:0d471b6ebe2bf43c60ba2b8a000cd8aa2293c0cc9b4b4a048b9abc1d75a13669`. Both
+rotated, so both require explicit reconvergence in every advertised
+environment.
+Reconvergence is an append-only support and activation event through the
+existing admission chain — the operator surface in an environment that has one,
+`scripts/selfhost-form-admission.ts` on a self-host — never an in-place edit of
+a durable head. ADR 0007 carries the exact predecessor and successor digests
+for both Hosts, and the operator commands for the environments that have an
+ingress.
 
 Production currently has no operator ingress: the route-less production Worker
 can be deployed, its Container identity can be read back through the probe,
@@ -430,14 +454,14 @@ Worker-version rollback alone never reverses an append-only activation event.
 The integration fixture contains exactly these identities projected from the
 released-Core-verified public publisher set:
 
-- `AtLeastOnceQueue`, `EdgeKVNamespace`, `ModuleWorker`, `QueueConsumer`,
-  `SQLiteDatabase`, `SQLiteMigrationApplication`, `SQLiteMigrationSet`,
-  `WorkerBundle`, `WorkerCronTrigger`, and `WorkerEndpoint` at definition version
-  `0.1.0`;
+- `AtLeastOnceQueue`, `EdgeKVNamespace`, `ModuleWorker`, `ObjectBucket`,
+  `QueueConsumer`, `SQLiteDatabase`, `SQLiteMigrationApplication`,
+  `SQLiteMigrationSet`, `WorkerBundle`, `WorkerCronTrigger`, and
+  `WorkerEndpoint` at definition version `0.1.0`;
 - `WorkerDeployment` at definition version `0.2.0` and `WorkerVersion` at
   definition version `0.3.0`.
 
-`ActorNamespace`, `DurableWorkflow`, `ObjectBucket`, `StaticAssetBundle`, and
+`ActorNamespace`, `DurableWorkflow`, `StaticAssetBundle`, and
 `WorkerCustomDomain` are excluded. The owning current-catalog importer derives
 package, schema, and payload digests directly from the verified source checkout;
 literals in the operator do not confer trust. The portable gate then rechecks

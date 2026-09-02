@@ -26,9 +26,13 @@ import {
  * the version declared. `env.KV` and `env.DB` are the exact `edge.kv@1.0.0`
  * and `edge.sql@1.0.0` facades the managed Cloudflare backend projects — same
  * methods, same options, same error names — implemented over this Host's own
- * data planes. ADR 0005 is explicit that a Worker receives the Binding facade
- * and never a raw wire envelope or a provider-native client; running on the
- * operator's own machine does not make that a different contract.
+ * data planes. ADR 0005 asks for the Binding facade rather than a raw wire
+ * envelope or a provider-native client, and running on the operator's own
+ * machine does not make that a different contract for the Bindings a wrapper
+ * host projects. It is not a claim about every backend: an ordinary-workers
+ * Worker carries native Cloudflare bindings, which is the divergence
+ * [ADR 0007](../../docs/adr/0007-objectbucket-joins-the-implementation-catalog.md)
+ * records for `bucketBindings`.
  *
  * No secret is on this service. The per-version plane token and the plane's
  * `externalServer` live on a separate workerd service of this Host's own

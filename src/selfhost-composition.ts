@@ -16,6 +16,10 @@ import {
   type SelfhostEventRuntime,
   type SelfhostProviderOptions,
 } from "./providers/selfhost.ts";
+import {
+  YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
+  type YurucommuIdentityCapabilityKind,
+} from "./takoform/implementation-catalog.ts";
 import type { InstalledTakoformForm } from "./takoform/types.ts";
 import type { WorkerdRuntime } from "./workerd-runtime.ts";
 
@@ -33,6 +37,19 @@ import type { WorkerdRuntime } from "./workerd-runtime.ts";
  * Deployments can be observed and deleted. `edgeForms: false` narrows both
  * surfaces to the retained ObjectBucket drain capability.
  */
+
+/**
+ * The identity Forms a self-host composition can actually offer.
+ *
+ * Derived from the one rule the composition below applies — a stable identity
+ * Form becomes an Offering only when `HOSTED_EDGE_IDENTITY_CLASSES` names it —
+ * rather than restated as a second list that could drift from it. The current
+ * ObjectBucket is deliberately outside: this machine has no `edge.objects`
+ * backend, so it has no Offering for one, and a Host must not advertise an
+ * operation whose only possible answer is a refusal (ADR 0007).
+ */
+export const SELFHOST_IDENTITY_CAPABILITY_KINDS: readonly YurucommuIdentityCapabilityKind[] =
+  YURUCOMMU_IDENTITY_CAPABILITY_KINDS.filter((kind) => kind in HOSTED_EDGE_IDENTITY_CLASSES);
 
 const SUPPLY_CONTRACT_REF = "local.ownership-contract";
 const PROVIDER_INSTALLATION_REF = "local.primary";

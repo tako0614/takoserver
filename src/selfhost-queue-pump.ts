@@ -121,7 +121,7 @@ const QUEUE_MESSAGE_FIXED_BYTES =
   1;
 
 export interface SelfhostQueuePumpOptions {
-  /** Control storage; the messages live here under migration 0039. */
+  /** Control storage; the messages live here under migration 0040. */
   readonly sql: Sql;
   /** The runtime the event is delivered through, by its own event hostname. */
   readonly runtime: WorkerdRuntime;

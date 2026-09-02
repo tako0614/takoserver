@@ -14,7 +14,8 @@ const PROVIDER_REPAIR_AND_MANAGED_SCHEDULE_RECONCILIATION =
   "0036_provider_repair_and_managed_schedule_reconciliation.sql";
 const RUNTIME_INPUT_PREPARATION_V2 = "0037_worker_runtime_input_preparation_v2.sql";
 const SELFHOST_EDGE_KV = "0038_selfhost_edge_kv.sql";
-const SELFHOST_QUEUES_AND_SCHEDULES = "0039_selfhost_queues_and_schedules.sql";
+const LIVE_NATIVE_CLAIM_ACROSS_TENANTS = "0039_takoform_live_native_claim_across_tenants.sql";
+const SELFHOST_QUEUES_AND_SCHEDULES = "0040_selfhost_queues_and_schedules.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
@@ -22,6 +23,7 @@ const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   PROVIDER_REPAIR_AND_MANAGED_SCHEDULE_RECONCILIATION,
   RUNTIME_INPUT_PREPARATION_V2,
   SELFHOST_EDGE_KV,
+  LIVE_NATIVE_CLAIM_ACROSS_TENANTS,
   SELFHOST_QUEUES_AND_SCHEDULES,
 ] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
@@ -295,6 +297,72 @@ describe("bringing a local database up to date", () => {
     expect(createHash("sha256").update(MODIFIED_ARTIFACT_LIFECYCLE_SQL).digest("hex")).toBe(
       "9894eb347b8544875e3ebaef9802e9f2ab2680ff819a05b8fca4085d1c6688a7",
     );
+  });
+
+  /**
+   * One provider installation is one account, so one native object has one
+   * live claim in it. The migration states that; a database where two tenants
+   * already share one has to be resolved by hand rather than converged.
+   */
+  describe("live native claim uniqueness across tenants", () => {
+    const LIVE_CLAIM = (tenant: string, id: string) =>
+      `INSERT INTO tf_resource_deployments
+         (tenant_id, id, resource_uid, offering_id, provider_pack_ref,
+          provider_installation_ref, native_id, native_claimed, state,
+          observed_json, outputs_json, created_at, updated_at)
+       VALUES ('${tenant}', '${id}', 'uid_${id}', 'offering.test', 'cloudflare',
+               'installation.test', 'r2:ts-shared', 0, 'active', '{}', '{}', 1, 1)`;
+
+    function upTo(exclusive: string): Database {
+      const database = new Database(":memory:");
+      database.exec(`
+        CREATE TABLE applied_migrations (
+          name TEXT PRIMARY KEY NOT NULL,
+          applied_at TEXT NOT NULL
+        );
+      `);
+      for (const migration of MIGRATIONS) {
+        if (migration.name === exclusive) break;
+        database.exec(migration.sql);
+        database.exec(
+          `INSERT INTO applied_migrations (name, applied_at) VALUES ('${migration.name}', 'x')`,
+        );
+      }
+      return database;
+    }
+
+    test("refuses to converge a database where two tenants share a live claim", () => {
+      const database = upTo(LIVE_NATIVE_CLAIM_ACROSS_TENANTS);
+      database.exec(LIVE_CLAIM("tenant_a", "dep_a"));
+      database.exec(LIVE_CLAIM("tenant_b", "dep_b"));
+
+      expect(() => migrateSqlite(database)).toThrow(
+        /takoform_live_native_claim_shared_across_tenants/u,
+      );
+      // Forward only: the refusal leaves the database on its previous version.
+      expect(
+        database
+          .query(
+            `SELECT COUNT(*) AS count FROM applied_migrations WHERE name = '${LIVE_NATIVE_CLAIM_ACROSS_TENANTS}'`,
+          )
+          .get(),
+      ).toEqual({ count: 0 });
+      expect(database.query("SELECT COUNT(*) AS count FROM tf_resource_deployments").get()).toEqual(
+        { count: 2 },
+      );
+    });
+
+    test("converges a database whose live claims are already distinct, then holds them", () => {
+      const database = upTo(LIVE_NATIVE_CLAIM_ACROSS_TENANTS);
+      database.exec(LIVE_CLAIM("tenant_a", "dep_a"));
+      // Everything from this migration to the head, because `upTo` seeded the
+      // database at the version just before it.
+      expect(migrateSqlite(database).applied).toEqual([
+        LIVE_NATIVE_CLAIM_ACROSS_TENANTS,
+        SELFHOST_QUEUES_AND_SCHEDULES,
+      ]);
+      expect(() => database.exec(LIVE_CLAIM("tenant_b", "dep_b"))).toThrow(/UNIQUE|constraint/iu);
+    });
   });
 
   test("converges fresh, original 0031, and modified 0031 lineages without losing rows", () => {
@@ -643,7 +711,8 @@ describe("bringing a local database up to date", () => {
       "0036_provider_repair_and_managed_schedule_reconciliation.sql",
       "0037_worker_runtime_input_preparation_v2.sql",
       "0038_selfhost_edge_kv.sql",
-      "0039_selfhost_queues_and_schedules.sql",
+      "0039_takoform_live_native_claim_across_tenants.sql",
+      "0040_selfhost_queues_and_schedules.sql",
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -763,7 +832,8 @@ describe("bringing a local database up to date", () => {
       "0036_provider_repair_and_managed_schedule_reconciliation.sql",
       "0037_worker_runtime_input_preparation_v2.sql",
       "0038_selfhost_edge_kv.sql",
-      "0039_selfhost_queues_and_schedules.sql",
+      "0039_takoform_live_native_claim_across_tenants.sql",
+      "0040_selfhost_queues_and_schedules.sql",
     ]);
     expect(
       database
@@ -1690,6 +1760,7 @@ describe("bringing a local database up to date", () => {
       PROVIDER_REPAIR_AND_MANAGED_SCHEDULE_RECONCILIATION,
       RUNTIME_INPUT_PREPARATION_V2,
       SELFHOST_EDGE_KV,
+      LIVE_NATIVE_CLAIM_ACROSS_TENANTS,
       SELFHOST_QUEUES_AND_SCHEDULES,
     ]);
     expect(

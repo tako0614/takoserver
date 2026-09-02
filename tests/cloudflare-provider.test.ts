@@ -1,17 +1,30 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { buildEdgeForms, edgeProviderOffering } from "../src/edge-forms.ts";
+import {
+  buildEdgeForms,
+  edgeProviderOffering,
+  objectBucketProviderOffering,
+} from "../src/edge-forms.ts";
 import type { JsonObject } from "../src/ports.ts";
-import type { ProviderOffering, ProviderRelation } from "../src/provider-port.ts";
+import type {
+  ProviderOffering,
+  ProviderRelation,
+  ProviderRuntimeBinding,
+} from "../src/provider-port.ts";
 import type {
   ProviderRuntimeInputLeasePort,
   ProviderRuntimeInputPreparationIdentity,
   ProviderRuntimeInputRecoveryInput,
 } from "../src/provider-runtime-input-port.ts";
 import {
+  derivedProviderResourceIncarnationName,
+  derivedProviderResourceName,
+} from "../src/provider-worker-endpoint-origin.ts";
+import {
   type ArtifactBytes,
   CloudflareProvider,
   type CloudflareZone,
 } from "../src/providers/cloudflare.ts";
+import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
 
 const FORM_REF = {
   apiVersion: "edge.forms.takoform.com/v1beta1",
@@ -592,6 +605,458 @@ describe("Cloudflare provider", () => {
       failure: { code: "unavailable", retryable: true },
     });
     expect(posts).toBe(1);
+  });
+});
+
+/**
+ * The current versionless ObjectBucket Form, which ADR 0007 admitted. Its
+ * technical offering keeps the legacy `object_bucket` provider kind, so this
+ * proves the ordinary-workers backend reaches the R2 lifecycle through the
+ * exact current identity rather than through the retained v1beta1 one.
+ */
+describe("current ObjectBucket Form on the ordinary-workers backend", () => {
+  const form = currentTakoformCandidates().forms.find(
+    (candidate) => candidate.identity.formRef.kind === "ObjectBucket",
+  );
+  if (!form) throw new Error("current ObjectBucket Form missing");
+  const offering = objectBucketProviderOffering(form, {
+    id: "storage.object.standard",
+    displayName: "Object bucket",
+    regions: ["global"],
+  });
+
+  // A Resource UID: the current Form derives its bucket from the incarnation,
+  // so destroying a bucket and declaring one with the same name gets an empty
+  // one rather than the old bytes.
+  const MEDIA = { ...IDENTITY, name: "media", uid: "res_media_1" } as const;
+
+  function bucketProvider(status = 200, body: unknown = { success: true, errors: [], result: {} }) {
+    return scriptedBucketProvider(() => ({ status, body }));
+  }
+
+  function scriptedBucketProvider(
+    script: (call: { method: string; path: string; index: number }) => {
+      status: number;
+      body: unknown;
+    },
+  ) {
+    const calls: Call[] = [];
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [offering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        const index = calls.length;
+        calls.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body: await request.clone().text(),
+        });
+        const { status, body } = script({
+          method: request.method,
+          path: new URL(request.url).pathname,
+          index,
+        });
+        return new Response(JSON.stringify(body), {
+          status,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    return { provider, calls };
+  }
+
+  /** The exact name this Host derives for one Resource incarnation. */
+  async function derivedBucket(identity: {
+    tenantRef: string;
+    space: string;
+    name: string;
+    uid: string;
+  }): Promise<string> {
+    return await derivedProviderResourceIncarnationName("ts", identity);
+  }
+
+  test("names the offering by the exact current FormRef", () => {
+    expect(offering.form).toEqual({
+      apiVersion: "edge.forms.takoform.com",
+      kind: "ObjectBucket",
+      definitionVersion: "0.1.0",
+      schemaDigest: "sha256:154e2dcf100b1278f3badb7f7f2f25bba8c6bcf387c75fb6b9abc5ede1cbd557",
+    });
+    expect(offering.providedInterfaces.map(({ name }) => name)).toEqual(["edge.objects"]);
+    // The Form declares no update, so the offering never claims one.
+    expect(offering.capabilities).toEqual(["create", "delete", "import", "observe"]);
+  });
+
+  test("creates a bucket under a derived name and reports no tenant name", async () => {
+    const { provider, calls } = bucketProvider();
+    const ticket = await provider.apply({
+      operationId: "op-current-bucket",
+      offering,
+      identity: MEDIA,
+      spec: {},
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: `r2:${await derivedBucket(MEDIA)}` },
+    });
+    // The address alone is not the name: a second incarnation of the same
+    // address is a different bucket, exactly as the self-host KV store does.
+    expect(await derivedBucket(MEDIA)).not.toBe(
+      await derivedBucket({ ...MEDIA, uid: "res_media_2" }),
+    );
+    expect(calls).toHaveLength(1);
+    expect(new URL(calls[0]?.url ?? "").pathname).toBe("/client/v4/accounts/acct_1/r2/buckets");
+    expect(calls[0]?.body).not.toContain("media");
+    expect(calls[0]?.body).not.toContain("org_acme");
+  });
+
+  test("observes and deletes by the derived native identity only", async () => {
+    const { provider, calls } = bucketProvider();
+    const created = await provider.apply({
+      operationId: "op-current-bucket-observe",
+      offering,
+      identity: MEDIA,
+      spec: {},
+    });
+    if (created.phase !== "succeeded") throw new Error("expected success");
+    const nativeId = created.result.nativeId;
+    const name = nativeId.slice("r2:".length);
+
+    const observed = await provider.observe({
+      offering,
+      nativeId,
+      identity: MEDIA,
+      spec: {},
+    });
+    expect(observed).toMatchObject({ phase: "succeeded", result: { nativeId } });
+
+    const deleted = await provider.delete({
+      operationId: "op-current-bucket-delete",
+      offering,
+      nativeId,
+      identity: MEDIA,
+    });
+    expect(deleted).toMatchObject({
+      phase: "succeeded",
+      result: { observed: { deleted: true } },
+    });
+    expect(calls.map((call) => `${call.method} ${new URL(call.url).pathname}`)).toEqual([
+      "POST /client/v4/accounts/acct_1/r2/buckets",
+      `GET /client/v4/accounts/acct_1/r2/buckets/${name}`,
+      `DELETE /client/v4/accounts/acct_1/r2/buckets/${name}`,
+    ]);
+  });
+
+  test("treats an already-absent bucket as a completed delete", async () => {
+    const { provider } = bucketProvider(404, {
+      success: false,
+      errors: [{ code: 10006, message: "bucket not found" }],
+    });
+    const deleted = await provider.delete({
+      operationId: "op-current-bucket-delete-absent",
+      offering,
+      nativeId: `r2:ts-${"c".repeat(40)}`,
+      identity: MEDIA,
+    });
+    expect(deleted).toMatchObject({
+      phase: "succeeded",
+      result: { observed: { deleted: true } },
+    });
+  });
+
+  test("refuses a create whose derived bucket already exists, and says how to repair it", async () => {
+    const { provider, calls } = scriptedBucketProvider(({ method }) =>
+      method === "POST"
+        ? { status: 400, body: { success: false, errors: [{ message: "already exists" }] } }
+        : { status: 200, body: { success: true, errors: [], result: {} } },
+    );
+    const ticket = await provider.apply({
+      operationId: "op-current-bucket-conflict",
+      offering,
+      identity: MEDIA,
+      spec: {},
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "conflict", retryable: false },
+    });
+    if (ticket.phase !== "failed") throw new Error("expected failure");
+    expect(ticket.failure.message).toContain("import it onto this Resource");
+    // Exactly one readback proves the claim; nothing was mutated twice.
+    expect(calls.map((call) => call.method)).toEqual(["POST", "GET"]);
+  });
+
+  test("keeps a create refusal that is not an existing bucket as the backend classified it", async () => {
+    const { provider } = scriptedBucketProvider(({ method }) =>
+      method === "POST"
+        ? { status: 400, body: { success: false, errors: [{ message: "bad location" }] } }
+        : { status: 404, body: { success: false, errors: [] } },
+    );
+    const ticket = await provider.apply({
+      operationId: "op-current-bucket-invalid",
+      offering,
+      identity: MEDIA,
+      spec: {},
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", retryable: false },
+    });
+  });
+
+  test("refuses to destroy a bucket R2 still reports as present", async () => {
+    const name = await derivedBucket(MEDIA);
+    const { provider, calls } = scriptedBucketProvider(({ method }) =>
+      method === "DELETE"
+        ? { status: 400, body: { success: false, errors: [{ message: "bucket not empty" }] } }
+        : { status: 200, body: { success: true, errors: [], result: {} } },
+    );
+    const ticket = await provider.delete({
+      operationId: "op-current-bucket-not-empty",
+      offering,
+      nativeId: `r2:${name}`,
+      identity: MEDIA,
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "conflict", retryable: false },
+    });
+    if (ticket.phase !== "failed") throw new Error("expected failure");
+    expect(ticket.failure.message).toContain("empty it and destroy again");
+    expect(calls.map((call) => call.method)).toEqual(["DELETE", "GET"]);
+  });
+
+  test("names the exact repair when a create acknowledgement was lost", async () => {
+    const { provider, calls } = bucketProvider();
+    const ticket = await provider.apply({
+      operationId: "op-current-bucket-lost",
+      operationMode: "recovery",
+      offering,
+      identity: MEDIA,
+      spec: {},
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    if (ticket.phase !== "failed") throw new Error("expected failure");
+    expect(ticket.failure.message).toContain(
+      "import the bucket this Host derives for this Resource address",
+    );
+    expect(calls).toEqual([]);
+  });
+
+  test("refuses a create with no Resource incarnation to derive a bucket from", async () => {
+    const { provider, calls } = bucketProvider();
+    const ticket = await provider.apply({
+      operationId: "op-current-bucket-no-uid",
+      offering,
+      identity: { ...IDENTITY, name: "media" },
+      spec: {},
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", retryable: false },
+    });
+    expect(calls).toEqual([]);
+  });
+});
+
+/**
+ * Import is the one lifecycle whose native address comes from the caller. The
+ * account credential this adapter holds reaches every object in the operator's
+ * Cloudflare account, so adoption is fenced to the object this Host derives for
+ * the exact Resource address being imported onto.
+ */
+describe("import fence on the ordinary-workers backend", () => {
+  const bucketForm = currentTakoformCandidates().forms.find(
+    (candidate) => candidate.identity.formRef.kind === "ObjectBucket",
+  );
+  const workerForm = currentTakoformCandidates().forms.find(
+    (candidate) => candidate.identity.formRef.kind === "ModuleWorker",
+  );
+  if (!bucketForm || !workerForm) throw new Error("current Form missing");
+  const bucketOffering = objectBucketProviderOffering(bucketForm, {
+    id: "storage.object.standard",
+    displayName: "Object bucket",
+    regions: ["global"],
+  });
+  const workerOffering = edgeProviderOffering(workerForm, {
+    id: "compute.edge.standard",
+    regions: ["global"],
+  });
+  const VICTIM = {
+    tenantRef: "org_victim",
+    space: "default",
+    name: "media",
+    uid: "res_v",
+  } as const;
+  const ATTACKER = {
+    tenantRef: "org_attacker",
+    space: "default",
+    name: "media",
+    uid: "res_a",
+  } as const;
+
+  function fenceProvider() {
+    const calls: Call[] = [];
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [bucketOffering, workerOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        calls.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body: await request.clone().text(),
+        });
+        return new Response(JSON.stringify({ success: true, errors: [], result: {} }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    return { provider, calls };
+  }
+
+  test("refuses the control plane's own bucket before any API call", async () => {
+    const { provider, calls } = fenceProvider();
+    const ticket = await provider.adopt({
+      operationId: "op-import-control-plane",
+      offering: bucketOffering,
+      nativeId: "r2:takoserver-objects-production",
+      identity: ATTACKER,
+      spec: {},
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", retryable: false },
+    });
+    expect(calls).toEqual([]);
+  });
+
+  test("refuses another tenant's derived bucket name before any API call", async () => {
+    const { provider, calls } = fenceProvider();
+    const victimBucket = await derivedProviderResourceIncarnationName("ts", VICTIM);
+    const ticket = await provider.adopt({
+      operationId: "op-import-cross-tenant",
+      offering: bucketOffering,
+      nativeId: `r2:${victimBucket}`,
+      identity: ATTACKER,
+      spec: {},
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", retryable: false },
+    });
+    expect(calls).toEqual([]);
+  });
+
+  test("adopts the bucket this Host minted for this exact address", async () => {
+    const { provider, calls } = fenceProvider();
+    const own = await derivedProviderResourceIncarnationName("ts", ATTACKER);
+    const ticket = await provider.adopt({
+      operationId: "op-import-own",
+      offering: bucketOffering,
+      nativeId: `r2:${own}`,
+      identity: ATTACKER,
+      spec: {},
+    });
+    expect(ticket).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: `r2:${own}` },
+    });
+    expect(calls.map((call) => `${call.method} ${new URL(call.url).pathname}`)).toEqual([
+      `GET /client/v4/accounts/acct_1/r2/buckets/${own}`,
+    ]);
+  });
+
+  test("refuses a native identity of the wrong Cloudflare kind", async () => {
+    const { provider, calls } = fenceProvider();
+    const own = await derivedProviderResourceIncarnationName("ts", ATTACKER);
+    const ticket = await provider.adopt({
+      operationId: "op-import-wrong-kind",
+      offering: bucketOffering,
+      nativeId: `kv:${own}`,
+      identity: ATTACKER,
+      spec: {},
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", retryable: false },
+    });
+    expect(calls).toEqual([]);
+  });
+
+  test("fences every kind, not only R2: a foreign script is refused and this Host's own is not", async () => {
+    const { provider, calls } = fenceProvider();
+    const foreign = await provider.adopt({
+      operationId: "op-import-foreign-script",
+      offering: workerOffering,
+      nativeId: "worker:takoserver-production",
+      identity: ATTACKER,
+      spec: {},
+    });
+    expect(foreign).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", retryable: false },
+    });
+    const own = await derivedProviderResourceName("tsw", ATTACKER);
+    const mine = await provider.adopt({
+      operationId: "op-import-own-script",
+      offering: workerOffering,
+      nativeId: `worker:${own}`,
+      identity: ATTACKER,
+      spec: {},
+    });
+    expect(mine).toMatchObject({ phase: "succeeded", result: { nativeId: `worker:${own}` } });
+    // ModuleWorker observation is answered from the native identity itself.
+    expect(calls).toEqual([]);
+  });
+
+  test("refuses a kind whose native name Cloudflare assigns, because none can be recomputed", async () => {
+    const { provider, calls } = fenceProvider();
+    const kvForm = currentTakoformCandidates().forms.find(
+      (candidate) => candidate.identity.formRef.kind === "EdgeKVNamespace",
+    );
+    if (!kvForm) throw new Error("current EdgeKVNamespace Form missing");
+    const ticket = await provider.adopt({
+      operationId: "op-import-kv",
+      offering: edgeProviderOffering(kvForm, { id: "storage.kv.standard", regions: ["global"] }),
+      nativeId: "kv:0123456789abcdef0123456789abcdef",
+      identity: ATTACKER,
+      spec: {},
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", retryable: false },
+    });
+    expect(calls).toEqual([]);
+  });
+
+  test("fences adoption recovery on the same derivation", async () => {
+    const { provider, calls } = fenceProvider();
+    const victimBucket = await derivedProviderResourceIncarnationName("ts", VICTIM);
+    const ticket = await provider.recoverAdopt({
+      operationId: "op-import-recover",
+      offering: bucketOffering,
+      nativeId: `r2:${victimBucket}`,
+      identity: ATTACKER,
+      spec: {},
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", retryable: false },
+    });
+    expect(calls).toEqual([]);
   });
 });
 
@@ -1636,63 +2101,94 @@ describe("released edge Form placement", () => {
     }
   });
 
-  test("refuses a portable object Binding without the managed Worker adapter", async () => {
-    const workerOffering = technical("ModuleWorker");
-    const versionOffering = technical("WorkerVersion");
-    const calls: Call[] = [];
-    const provider = new CloudflareProvider({
-      accountId: "acct_1",
-      offerings: [workerOffering, versionOffering],
-      artifacts,
-      authorize: () => "Bearer secret-account-token",
-      apiOrigin: "https://api.cloudflare.test/client/v4",
-      async fetch(request) {
-        const url = new URL(request.url);
-        calls.push({
-          method: request.method,
-          url: request.url,
-          authorization: request.headers.get("authorization"),
-          body: await request.clone().text(),
-        });
-        if (request.method === "GET" && url.pathname.endsWith("/versions")) {
+  /**
+   * ADR 0007: the ordinary-workers backend consumes the materialized
+   * edge.objects capability and projects Cloudflare's native R2 binding under
+   * the declared name. Everything a caller controls is validated against the
+   * Provider Pack's result before the first Cloudflare call.
+   */
+  describe("portable object Bindings on the ordinary-workers backend", () => {
+    const BUCKET_NAME = `ts-${"a".repeat(40)}`;
+    const OBJECT_BUCKET_BINDING = {
+      apiVersion: "bindings.takoform.com/v1alpha2",
+      name: "module-worker.object-bucket",
+      version: "1.1.0",
+      schemaDigest: "sha256:ff8661459b73a8d229e0915c698afad2aa297b5db90fe5e1693d346a7ae3adfb",
+    } as const;
+    const MEDIA_DECLARATION = {
+      bucketBindings: [
+        {
+          name: "MEDIA",
+          resource: {
+            apiVersion: "edge.forms.takoform.com",
+            kind: "ObjectBucket",
+            name: "media",
+          },
+        },
+      ],
+    } as const;
+
+    function objectsProvider() {
+      const workerOffering = technical("ModuleWorker");
+      const versionOffering = technical("WorkerVersion");
+      const calls: Call[] = [];
+      const provider = new CloudflareProvider({
+        accountId: "acct_1",
+        offerings: [workerOffering, versionOffering],
+        artifacts,
+        authorize: () => "Bearer secret-account-token",
+        apiOrigin: "https://api.cloudflare.test/client/v4",
+        async fetch(request) {
+          calls.push({
+            method: request.method,
+            url: request.url,
+            authorization: request.headers.get("authorization"),
+            body: await request.clone().text(),
+          });
           return Response.json({
             success: true,
             errors: [],
-            result: { items: [] },
-            result_info: { page: 1, per_page: 100 },
+            result: { id: "version-objects" },
           });
-        }
-        return Response.json({
-          success: true,
-          errors: [],
-          result: { id: "version-objects" },
-        });
-      },
-    });
-    const bucketName = `ts-${"a".repeat(40)}`;
-    const ticket = await provider.apply({
-      operationId: "op-version-objects",
-      operationMode: "initial",
-      offering: versionOffering,
-      identity: { ...IDENTITY, name: "version" },
-      spec: { handlers: ["fetch"], requiredSensitiveVars: [] },
-      runtimeBindings: [
-        {
-          name: "MEDIA",
-          targetUid: "bucket-uid",
-          bindingRef: {
-            apiVersion: "bindings.takoform.com/v1alpha2",
-            name: "module-worker.object-bucket",
-            version: "1.1.0",
-            schemaDigest: "sha256:ff8661459b73a8d229e0915c698afad2aa297b5db90fe5e1693d346a7ae3adfb",
-          },
-          material: { kind: "takoserver.cloudflare-r2.edge-objects@v1", bucketName },
         },
-      ],
-      relations: [
+      });
+      return { provider, calls, workerOffering, versionOffering };
+    }
+
+    function runtimeBinding(overrides: Record<string, unknown> = {}) {
+      return {
+        name: "MEDIA",
+        targetUid: "bucket-uid",
+        bindingRef: OBJECT_BUCKET_BINDING,
+        material: {
+          kind: "takoserver.cloudflare-r2.edge-objects@v1",
+          bucketName: BUCKET_NAME,
+        },
+        ...overrides,
+      } as ProviderRuntimeBinding;
+    }
+
+    const ACTIVE_BUCKET = {
+      nativeId: `r2:${BUCKET_NAME}`,
+      offeringId: "storage.object.standard",
+      providerPackRef: "cloudflare",
+      outputs: { protocol: "s3", bucketName: BUCKET_NAME },
+    } as const;
+
+    function bucketRelation(deployment: Parameters<typeof related>[2] = ACTIVE_BUCKET) {
+      return related(
+        "/bucketBindings/0/resource",
+        stored("ObjectBucket", "bucket-uid", {}),
+        deployment,
+        OBJECT_BUCKET_BINDING,
+      );
+    }
+
+    function workerRelations(workerOfferingId: string) {
+      return [
         related("/worker", stored("ModuleWorker", "worker-uid", {}), {
           nativeId: "worker:script-name",
-          offeringId: workerOffering.id,
+          offeringId: workerOfferingId,
           providerPackRef: "cloudflare",
           outputs: { scriptName: "script-name" },
         }),
@@ -1702,15 +2198,157 @@ describe("released edge Form placement", () => {
             manifestDigest: `sha256:${"d".repeat(64)}`,
           }),
         ),
-      ],
+      ];
+    }
+
+    test("projects the declared name as a native R2 binding", async () => {
+      const { provider, calls, workerOffering, versionOffering } = objectsProvider();
+      const ticket = await provider.apply({
+        operationId: "op-version-objects",
+        operationMode: "initial",
+        offering: versionOffering,
+        identity: { ...IDENTITY, name: "version" },
+        spec: { handlers: ["fetch"], requiredSensitiveVars: [], ...MEDIA_DECLARATION },
+        runtimeBindings: [runtimeBinding()],
+        relations: [...workerRelations(workerOffering.id), bucketRelation()],
+      });
+
+      expect(ticket).toMatchObject({
+        phase: "succeeded",
+        result: { nativeId: "version:script-name:version-objects" },
+      });
+      const upload = calls[0]?.body ?? "";
+      expect(upload).toContain(
+        `{"type":"r2_bucket","name":"MEDIA","bucket_name":"${BUCKET_NAME}"}`,
+      );
+      // The bucket's public Resource name is never a provider address.
+      expect(upload).not.toContain('"media"');
+      // Nothing about the bucket reaches the ticket the Host records.
+      expect(JSON.stringify(ticket)).not.toContain(BUCKET_NAME);
     });
 
-    expect(ticket).toMatchObject({
-      phase: "failed",
-      failure: { code: "invalid_spec" },
-    });
-    expect(calls).toEqual([]);
-    expect(JSON.stringify(ticket)).not.toContain(bucketName);
+    const refusals = [
+      {
+        label: "a declaration the Provider Pack did not materialize",
+        spec: MEDIA_DECLARATION as Record<string, unknown>,
+        runtimeBindings: [] as ProviderRuntimeBinding[],
+        relations: () => [bucketRelation()],
+      },
+      {
+        label: "a materialized Binding the version never declared",
+        spec: {},
+        runtimeBindings: [runtimeBinding()],
+        relations: () => [bucketRelation()],
+      },
+      {
+        label: "a declaration name that disagrees with the Binding name",
+        spec: {
+          bucketBindings: [
+            {
+              name: "ASSETS",
+              resource: {
+                apiVersion: "edge.forms.takoform.com",
+                kind: "ObjectBucket",
+                name: "media",
+              },
+            },
+          ],
+        },
+        runtimeBindings: [runtimeBinding()],
+        relations: () => [bucketRelation()],
+      },
+      {
+        label: "a Binding whose target uid is not the relation's",
+        spec: MEDIA_DECLARATION as Record<string, unknown>,
+        runtimeBindings: [runtimeBinding({ targetUid: "other-uid" })],
+        relations: () => [bucketRelation()],
+      },
+      {
+        label: "a foreign Binding identity",
+        spec: MEDIA_DECLARATION as Record<string, unknown>,
+        runtimeBindings: [
+          runtimeBinding({
+            bindingRef: { ...OBJECT_BUCKET_BINDING, schemaDigest: `sha256:${"f".repeat(64)}` },
+          }),
+        ],
+        relations: () => [bucketRelation()],
+      },
+      {
+        label: "a material this provider did not derive",
+        spec: MEDIA_DECLARATION as Record<string, unknown>,
+        runtimeBindings: [runtimeBinding({ material: { kind: "other@v1", bucketName: "media" } })],
+        relations: () => [bucketRelation()],
+      },
+      {
+        label: "a bucket realized under another provider installation",
+        spec: MEDIA_DECLARATION as Record<string, unknown>,
+        runtimeBindings: [runtimeBinding()],
+        relations: () => [
+          bucketRelation({ ...ACTIVE_BUCKET, providerInstallationRef: "cloudflare.secondary" }),
+        ],
+      },
+      {
+        label: "a bucket Deployment that is not active",
+        spec: MEDIA_DECLARATION as Record<string, unknown>,
+        runtimeBindings: [runtimeBinding()],
+        relations: () => [bucketRelation({ ...ACTIVE_BUCKET, state: "draining" })],
+      },
+      {
+        // Cloudflare accepts a metadata list carrying one name twice and keeps
+        // whichever it prefers, so two declarations under one name are refused
+        // here rather than resolved by the backend's taste.
+        label: "a var that shares its name with the bucket Binding",
+        spec: { vars: { MEDIA: "plain" }, ...MEDIA_DECLARATION },
+        runtimeBindings: [runtimeBinding()],
+        relations: () => [bucketRelation()],
+      },
+      {
+        label: "a KV Binding that shares its name with a var",
+        spec: {
+          vars: { CACHE: "plain" },
+          kvBindings: [
+            {
+              name: "CACHE",
+              resource: {
+                apiVersion: "edge.forms.takoform.com",
+                kind: "EdgeKVNamespace",
+                name: "cache",
+              },
+            },
+          ],
+          ...MEDIA_DECLARATION,
+        },
+        runtimeBindings: [runtimeBinding()],
+        relations: () => [
+          bucketRelation(),
+          related("/kvBindings/0/resource", stored("EdgeKVNamespace", "kv-uid", {}), {
+            nativeId: "kv:kv-id",
+            offeringId: "storage.kv.standard",
+            providerPackRef: "cloudflare",
+            outputs: { namespaceId: "kv-id" },
+          }),
+        ],
+      },
+    ];
+
+    for (const [index, scenario] of refusals.entries()) {
+      test(`refuses ${scenario.label} before any Cloudflare call`, async () => {
+        const { provider, calls, workerOffering, versionOffering } = objectsProvider();
+        const ticket = await provider.apply({
+          operationId: `op-version-objects-refusal-${index}`,
+          operationMode: "initial",
+          offering: versionOffering,
+          identity: { ...IDENTITY, name: "version" },
+          spec: { handlers: ["fetch"], requiredSensitiveVars: [], ...scenario.spec },
+          runtimeBindings: scenario.runtimeBindings,
+          relations: [...workerRelations(workerOffering.id), ...scenario.relations()],
+        });
+
+        expect(ticket).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
+        expect(calls).toEqual([]);
+        expect(JSON.stringify(ticket)).not.toContain(BUCKET_NAME);
+      });
+    }
   });
 
   test("provisions a fetch-only Worker Version without secret bindings", async () => {
@@ -2984,13 +3622,17 @@ describe("released edge Form placement", () => {
       offeringId: string;
       providerPackRef: string;
       outputs: JsonObject;
+      providerInstallationRef?: string;
+      state?: NonNullable<ProviderRelation["deployment"]>["state"];
     },
+    bindingRef?: ProviderRelation["bindingRef"],
   ): ProviderRelation {
     return {
       pointer,
       relation: pointer.replace(/\/\d+/gu, "/*"),
       targetUid: resource.metadata.uid,
       resource,
+      ...(bindingRef ? { bindingRef } : {}),
       ...(deployment
         ? {
             deployment: {
@@ -2999,9 +3641,9 @@ describe("released edge Form placement", () => {
               resourceUid: resource.metadata.uid,
               offeringId: deployment.offeringId,
               providerPackRef: deployment.providerPackRef,
-              providerInstallationRef: "cloudflare.primary",
+              providerInstallationRef: deployment.providerInstallationRef ?? "cloudflare.primary",
               nativeId: deployment.nativeId,
-              state: "active",
+              state: deployment.state ?? "active",
               observed: {},
               outputs: deployment.outputs,
               createdAt: "2026-08-19T00:00:00.000Z",

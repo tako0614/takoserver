@@ -1846,6 +1846,92 @@ describe("local namespaces", () => {
   });
 });
 
+/**
+ * ADR 0007 let a Host support and activate the current ObjectBucket Form, and
+ * a self-host admission does exactly that. This machine still has no
+ * `edge.objects` backend, so the mutation barrier is where the truth is told.
+ * Slice D2 replaces the refusal with a backend, not the refusal's reason.
+ */
+describe("the current ObjectBucket Form on a self-host", () => {
+  const currentBucket: ProviderOffering = {
+    id: "storage.object.stable-v1.standard",
+    kind: "takoform.ObjectBucket",
+    displayName: "Object bucket",
+    form: {
+      apiVersion: "edge.forms.takoform.com",
+      kind: "ObjectBucket",
+      definitionVersion: "0.1.0",
+      schemaDigest: "sha256:154e2dcf100b1278f3badb7f7f2f25bba8c6bcf387c75fb6b9abc5ede1cbd557",
+    },
+    providedInterfaces: [],
+    bindingRefs: [],
+    capabilities: ["create", "delete", "import", "observe"],
+  };
+  const retainedBucket = offering("ObjectBucket");
+
+  test("refuses to create one, and records nothing", async () => {
+    const local = provider();
+    const ticket = await local.apply({
+      operationId: "op_current_bucket",
+      offering: currentBucket,
+      identity: { ...identity("media"), uid: "uid-media" },
+      spec: {},
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "denied",
+        retryable: false,
+        message: "this Host has no object-storage backend for the current ObjectBucket Form",
+      },
+    });
+    expect(existsSync(join(root, "selfhost"))).toBe(false);
+  });
+
+  test("refuses to import one rather than adopting a bucket it cannot back", async () => {
+    const local = provider();
+    const adopt = local.adopt;
+    if (!adopt) throw new Error("the self-host provider must offer import");
+    const ticket = await adopt.call(local, {
+      operationId: "op_current_bucket_adopt",
+      offering: currentBucket,
+      nativeId: "local-bucket:whatever",
+      identity: identity("media"),
+      spec: {},
+    });
+    expect(ticket).toMatchObject({ phase: "failed", failure: { code: "denied" } });
+  });
+
+  test("keeps the retained v1beta1 drain working", async () => {
+    const local = provider();
+    const created = await local.apply({
+      operationId: "op_retained_bucket",
+      offering: retainedBucket,
+      identity: identity("legacy"),
+      spec: {},
+    });
+    expect(created).toMatchObject({
+      phase: "succeeded",
+      result: { outputs: { protocol: "s3" } },
+    });
+    if (created.phase !== "succeeded") throw new Error("expected success");
+    const observed = await local.observe({
+      offering: retainedBucket,
+      nativeId: created.result.nativeId,
+      identity: identity("legacy"),
+      spec: {},
+    });
+    expect(observed).toMatchObject({ phase: "succeeded" });
+    const deleted = await local.delete({
+      operationId: "op_retained_bucket_delete",
+      offering: retainedBucket,
+      nativeId: created.result.nativeId,
+      identity: identity("legacy"),
+    });
+    expect(deleted).toMatchObject({ phase: "succeeded", result: { observed: { deleted: true } } });
+  });
+});
+
 describe("read-only native absence verification", () => {
   test("reads worker Version state, then proves it absent after parent deletion", async () => {
     const runtime = flakyRuntime();

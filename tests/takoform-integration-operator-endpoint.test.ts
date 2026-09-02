@@ -33,11 +33,20 @@ import { createIntegrationFormAuthorityComposition } from "../src/takoform/integ
 import { loadPublisherSetClosure } from "../src/takoform/publisher-set-closure.ts";
 
 const digest = (hex: string) => `sha256:${hex.repeat(64)}` as const;
+/**
+ * A distinct bundle digest per fixture package, for any corpus size. Cycling a
+ * single hex character was unique only while the corpus stayed under sixteen
+ * packages, and it also collided with the fixed digests above.
+ */
+const packageBundleDigest = (index: number): `sha256:${string}` =>
+  `sha256:${index.toString(16).padStart(64, "b")}`;
 const PUBLIC_VERSION_ID = "00000000-0000-4000-8000-000000000001";
 const DRIFTED_PUBLIC_VERSION_ID = "00000000-0000-4000-8000-000000000002";
 const CAPABILITIES = yurucommuLifecycleCapabilityManifest(YURUCOMMU_IDENTITY_CAPABILITY_KINDS);
 const TEST_IMPLEMENTATION_DIGEST = digest("9");
 const TEST_IMPLEMENTATION_PAYLOAD_DIGEST = digest("8");
+/** Derived so a Form joining the catalog cannot silently leave a count behind. */
+const FORM_COUNT = Object.keys(YURUCOMMU_FORM_VERSIONS).length;
 
 async function buildConfiguration(
   input: Omit<
@@ -87,7 +96,7 @@ function trustEvidence(): FormAuthorityVerificationEvidence {
     packageBundleDigests: INTEGRATION_FORM_PACKAGES.map((pkg, index) => ({
       formRef: structuredClone(pkg.formRef),
       packageDigest: pkg.packageDigest,
-      bundleDigest: digest((index + 4).toString(16)),
+      bundleDigest: packageBundleDigest(index),
     })),
   };
 }
@@ -440,16 +449,16 @@ describe("integration Form authority bridge", () => {
     expect(reads).toEqual(["environment"]);
   });
 
-  test("installs and Space-activates only the exact 12 Yurucommu Forms", async () => {
+  test("installs and Space-activates only the exact 13 Yurucommu Forms", async () => {
     const fixture = await integrationFixture();
     const plan = await fixture.endpoint.plan(fixture.request);
-    expect(plan.packages).toHaveLength(12);
+    expect(plan.packages).toHaveLength(FORM_COUNT);
     expect(
       Object.fromEntries(
         plan.packages.map(({ formRef }) => [formRef.kind, formRef.definitionVersion]),
       ),
     ).toEqual(YURUCOMMU_FORM_VERSIONS);
-    expect(plan.commands).toHaveLength(2 + 12 * 3);
+    expect(plan.commands).toHaveLength(2 + FORM_COUNT * 3);
     expect(
       plan.commands
         .filter((command) => command.kind === "SetActivation")
@@ -463,7 +472,7 @@ describe("integration Form authority bridge", () => {
 
     const applied = await fixture.endpoint.apply(plan);
     expect(applied.status).toBe("converged");
-    expect(applied.readback.forms).toHaveLength(12);
+    expect(applied.readback.forms).toHaveLength(FORM_COUNT);
     expect(
       applied.readback.forms.every(
         (form) =>
@@ -492,8 +501,13 @@ describe("integration Form authority bridge", () => {
         return report.signature?.bundleDigest;
       }),
     );
-    expect(installReports).toHaveLength(12);
-    expect(bundleDigests.size).toBe(12);
+    expect(installReports).toHaveLength(FORM_COUNT);
+    expect(bundleDigests.size).toBe(FORM_COUNT);
+    // The generator itself stays distinct past the current corpus, so this
+    // count keeps meaning what it says as packages are added.
+    expect(new Set(Array.from({ length: 64 }, (_, index) => packageBundleDigest(index))).size).toBe(
+      64,
+    );
     expect(applied.nextPlan.commands).toEqual([]);
   });
 
@@ -555,13 +569,13 @@ describe("integration Form authority bridge", () => {
     ).toBe(true);
     expect(
       (await sql.query("SELECT COUNT(*) AS count FROM tf_form_install_events"))[0]?.count,
-    ).toBe(12);
+    ).toBe(FORM_COUNT);
     expect(
       (await sql.query("SELECT COUNT(*) AS count FROM tf_form_activation_events"))[0]?.count,
-    ).toBe(12);
+    ).toBe(FORM_COUNT);
     expect(
       (await sql.query("SELECT COUNT(*) AS count FROM tf_form_support_events"))[0]?.count,
-    ).toBe(12);
+    ).toBe(FORM_COUNT);
   });
 
   test("keeps semantic support across outer artifact changes but reconverges capabilities", async () => {
@@ -613,10 +627,14 @@ describe("integration Form authority bridge", () => {
             (form) => !form.installed && !form.supported && form.activationHead.active,
           ),
         ).toBe(true);
-        expect(plan.commands).toHaveLength(36);
-        expect(plan.commands.filter(({ kind }) => kind === "ReplacePackage")).toHaveLength(12);
-        expect(plan.commands.filter(({ kind }) => kind === "SetSupport")).toHaveLength(12);
-        expect(plan.commands.filter(({ kind }) => kind === "SetActivation")).toHaveLength(12);
+        expect(plan.commands).toHaveLength(FORM_COUNT * 3);
+        expect(plan.commands.filter(({ kind }) => kind === "ReplacePackage")).toHaveLength(
+          FORM_COUNT,
+        );
+        expect(plan.commands.filter(({ kind }) => kind === "SetSupport")).toHaveLength(FORM_COUNT);
+        expect(plan.commands.filter(({ kind }) => kind === "SetActivation")).toHaveLength(
+          FORM_COUNT,
+        );
         const applied = await changed.endpoint.apply(plan);
         expect(applied.status).toBe("converged");
         expect(applied.nextPlan.commands).toEqual([]);
@@ -710,13 +728,13 @@ describe("integration Form authority bridge", () => {
     };
 
     const plan = await advanced.endpoint.plan(request);
-    expect(plan.commands).toHaveLength(2 + 12);
+    expect(plan.commands).toHaveLength(2 + FORM_COUNT);
     expect(plan.commands.slice(0, 2).map((command) => command.kind)).toEqual([
       "AllowPublisher",
       "AppendCheckpoint",
     ]);
     expect(plan.commands.slice(2).map((command) => command.kind)).toEqual(
-      Array.from({ length: 12 }, () => "ReplacePackage"),
+      Array.from({ length: FORM_COUNT }, () => "ReplacePackage"),
     );
 
     failReplacementAt = 3;
@@ -728,9 +746,9 @@ describe("integration Form authority bridge", () => {
       "ReplacePackage",
       "ReplacePackage",
     ]);
-    expect(partial.nextPlan.commands).toHaveLength(10);
+    expect(partial.nextPlan.commands).toHaveLength(FORM_COUNT - 2);
     expect(partial.nextPlan.commands.map((command) => command.kind)).toEqual(
-      Array.from({ length: 10 }, () => "ReplacePackage"),
+      Array.from({ length: FORM_COUNT - 2 }, () => "ReplacePackage"),
     );
 
     const applied = await advanced.endpoint.apply(partial.nextPlan);
@@ -753,13 +771,13 @@ describe("integration Form authority bridge", () => {
     ).toBe(2);
     expect(
       (await sql.query("SELECT COUNT(*) AS count FROM tf_form_install_events"))[0]?.count,
-    ).toBe(24);
+    ).toBe(FORM_COUNT * 2);
     expect(
       (await sql.query("SELECT COUNT(*) AS count FROM tf_form_support_events"))[0]?.count,
-    ).toBe(12);
+    ).toBe(FORM_COUNT);
     expect(
       (await sql.query("SELECT COUNT(*) AS count FROM tf_form_activation_events"))[0]?.count,
-    ).toBe(12);
+    ).toBe(FORM_COUNT);
   });
 
   test("converges exact-existing R2 package bytes only after readback and replan", async () => {

@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { assertIdentityCapabilitySupplyPartition } from "../scripts/deploy/form-authority-capability.ts";
 import { runCommand } from "../scripts/deploy/process.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import {
@@ -48,8 +49,13 @@ describe("hermetic Worker bundle identity", () => {
     const formTarget = {
       ...target,
       edgeSupplies: {
-        offerings: YURUCOMMU_IDENTITY_CAPABILITY_KINDS.map((formKind) => ({ formKind })),
+        offerings: YURUCOMMU_IDENTITY_CAPABILITY_KINDS.filter(
+          (formKind) => formKind !== "ObjectBucket",
+        ).map((formKind) => ({ formKind })),
       } as unknown as NonNullable<DeployTarget["edgeSupplies"]>,
+      objectBucketSupplies: {
+        supplies: [{ provider: { kind: "cloudflare" } }],
+      } as unknown as NonNullable<DeployTarget["objectBucketSupplies"]>,
       workerEndpointSuffix: "integration.example.workers.dev",
       formAuthority: {
         workerName: "takoserver-form-authority-integration",
@@ -202,5 +208,28 @@ describe("hermetic Worker bundle identity", () => {
   test("preserves comments that are not repository source labels", () => {
     const source = ["// external explanatory comment", "export default {};", ""].join("\n");
     expect(canonicalizeWorkerBundleSource(source, "/tmp/build/index.js")).toBe(source);
+  });
+});
+
+describe("deploy supply partition", () => {
+  test("covers exactly the code-owned identity capabilities", () => {
+    expect(() => assertIdentityCapabilitySupplyPartition()).not.toThrow();
+  });
+
+  test("refuses a capability the partition does not place, rather than guessing a supply", () => {
+    expect(() =>
+      assertIdentityCapabilitySupplyPartition([
+        ...YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
+        "DurableWorkflow",
+      ]),
+    ).toThrow(/DurableWorkflow/u);
+  });
+
+  test("refuses a partition entry the code-owned set no longer names", () => {
+    expect(() =>
+      assertIdentityCapabilitySupplyPartition(
+        YURUCOMMU_IDENTITY_CAPABILITY_KINDS.filter((kind) => kind !== "ObjectBucket"),
+      ),
+    ).toThrow(/ObjectBucket/u);
   });
 });

@@ -99,10 +99,15 @@ import {
  *
  * What each Form honestly is here:
  *
- * - **ObjectBucket / EdgeKVNamespace / AtLeastOnceQueue** are namespaces. The
- *   data planes key their contents by resource uid, so creating one is
- *   agreeing that a name exists — the same promise Cloudflare charges per
- *   bucket for, with less machinery.
+ * - **EdgeKVNamespace / AtLeastOnceQueue** are namespaces. The data planes key
+ *   their contents by resource uid, so creating one is agreeing that a name
+ *   exists — the same promise Cloudflare charges per bucket for, with less
+ *   machinery. The retained v1beta1 **ObjectBucket** is the same shape, kept
+ *   only so already-recorded Deployments can be observed and deleted.
+ * - The current **ObjectBucket** is refused at apply and import with `denied`.
+ *   A Host may support and activate the Form (ADR 0007), but this machine has
+ *   no `edge.objects` backend, and recording a namespace for storage that does
+ *   not exist would be a lie a Worker Version later binds to.
  * - **SQLiteDatabase** is a file under the data root. It appears when
  *   something writes to it, and the migration ledger below executes real SQL
  *   against it.
@@ -1978,6 +1983,22 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     return offering.kind;
   };
 
+  /**
+   * The current ObjectBucket Form, as opposed to the retained v1beta1 drain.
+   *
+   * A self-host admission activates this Form with an empty operation set
+   * (ADR 0007), so nothing should reach here at all. This is the barrier behind
+   * that: a composition assembled by hand could still offer the Form, and
+   * reporting a `local-bucket:` namespace for it would record a Deployment for
+   * storage that does not exist, which a later Worker Version would bind
+   * nothing to. The v1beta1 identity keeps its observe/delete drain.
+   */
+  const currentObjectBucket = (offering: ProviderOffering): boolean =>
+    offering.form.kind === "ObjectBucket" && offering.form.apiVersion === "edge.forms.takoform.com";
+
+  const objectBucketUnsupported = (): ProviderTicket =>
+    failed("denied", "this Host has no object-storage backend for the current ObjectBucket Form");
+
   return {
     id,
     offerings: structuredClone(options.offerings) as ProviderOffering[],
@@ -2181,6 +2202,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     },
 
     async apply(input): Promise<ProviderTicket> {
+      if (currentObjectBucket(input.offering)) return objectBucketUnsupported();
       try {
         switch (dispatchKind(input.offering)) {
           case "ModuleWorker":
@@ -2686,6 +2708,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     },
 
     async adopt(input): Promise<ProviderTicket> {
+      // Import is the other way a Deployment for this Form could appear, and
+      // this machine still cannot back one.
+      if (currentObjectBucket(input.offering)) return objectBucketUnsupported();
       if (input.operationMode === "recovery" && !input.providerHandle) {
         return failed("unavailable", "provider mutation recovery requires an opaque handle", true);
       }

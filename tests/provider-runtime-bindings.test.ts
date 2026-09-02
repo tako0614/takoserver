@@ -14,6 +14,7 @@ import {
   canMaterializeAcrossProviderPacks,
   materializeProviderRuntimeBindings,
 } from "../src/provider-runtime-bindings.ts";
+import { CloudflareProvider } from "../src/providers/cloudflare.ts";
 import {
   CLOUDFLARE_R2_EDGE_OBJECTS_MATERIAL_KIND,
   EDGE_OBJECTS_BINDING_REF,
@@ -252,30 +253,96 @@ describe("provider-private runtime Binding materialization", () => {
     ).rejects.toMatchObject({ code: "unsupported_capability", status: 422 });
   });
 
-  test("Cloudflare exports R2 privately but advertises no importer before durable receipts exist", async () => {
+  test("Cloudflare exports and imports R2 on one route (ADR 0007)", async () => {
     const cloudflare = pack("cloudflare", createCloudflareRuntimeBindingMaterializer("cloudflare"));
     const materializer = cloudflare.runtimeBindingMaterializer;
-
-    expect(materializer?.exporter?.routes).toEqual([
+    const expected = [
       {
         bindingRef: EDGE_OBJECTS_BINDING_REF,
         materialKind: CLOUDFLARE_R2_EDGE_OBJECTS_MATERIAL_KIND,
       },
-    ]);
-    expect(materializer?.importer).toBeUndefined();
+    ];
+
+    expect(materializer?.exporter?.routes).toEqual(expected);
+    expect(materializer?.importer?.routes).toEqual(expected);
     expect(
       canMaterializeAcrossProviderPacks({
         bindingRef: EDGE_OBJECTS_BINDING_REF,
         consumerPack: cloudflare,
         targetPack: cloudflare,
       }),
-    ).toBe(false);
+    ).toBe(true);
+    const bindings = await materializeProviderRuntimeBindings({
+      ...baseInput,
+      consumerPack: cloudflare,
+      packs: new Map([[cloudflare.id, cloudflare]]),
+      relations: [relation()],
+    });
+    expect(bindings).toEqual([
+      {
+        name: "OBJECTS",
+        targetUid: "uid-bucket",
+        bindingRef: EDGE_OBJECTS_BINDING_REF,
+        material: {
+          kind: CLOUDFLARE_R2_EDGE_OBJECTS_MATERIAL_KIND,
+          bucketName: `ts-${"a".repeat(40)}`,
+        },
+      },
+    ]);
+  });
+
+  test("refuses to import an edge.objects capability this Cloudflare pack did not export", async () => {
+    const cloudflare = pack("cloudflare", createCloudflareRuntimeBindingMaterializer("cloudflare"));
+    // A foreign pack that claims the same Binding and material kind still
+    // cannot mint the private export token, so the import returns null and the
+    // driver refuses before any provider mutation.
+    const forger = pack("forger", {
+      id: "forger-runtime-bindings",
+      exporter: {
+        routes: [
+          {
+            bindingRef: EDGE_OBJECTS_BINDING_REF,
+            materialKind: CLOUDFLARE_R2_EDGE_OBJECTS_MATERIAL_KIND,
+          },
+        ],
+        async exportTarget() {
+          return Object.freeze({
+            providerPackRef: "cloudflare",
+            bucketName: `ts-${"a".repeat(40)}`,
+          });
+        },
+      },
+    });
+    await expect(
+      materializeProviderRuntimeBindings({
+        ...baseInput,
+        consumerPack: cloudflare,
+        packs: new Map([
+          [cloudflare.id, cloudflare],
+          [forger.id, forger],
+        ]),
+        relations: [relation("forger")],
+      }),
+    ).rejects.toMatchObject({ code: "unsupported_capability", status: 422 });
+  });
+
+  test("refuses to export a bucket Deployment whose native identity disagrees", async () => {
+    const cloudflare = pack("cloudflare", createCloudflareRuntimeBindingMaterializer("cloudflare"));
+    const drifted = relation();
     await expect(
       materializeProviderRuntimeBindings({
         ...baseInput,
         consumerPack: cloudflare,
         packs: new Map([[cloudflare.id, cloudflare]]),
-        relations: [relation()],
+        relations: [
+          {
+            ...drifted,
+            deployment: {
+              ...(drifted.deployment as NonNullable<ProviderRelation["deployment"]>),
+              nativeId: `r2:ts-${"b".repeat(40)}`,
+            },
+          },
+        ],
       }),
     ).rejects.toMatchObject({ code: "unsupported_capability", status: 422 });
   });
@@ -409,5 +476,166 @@ describe("provider-private runtime Binding materialization", () => {
     ).rejects.toMatchObject({ code: "unsupported_capability", status: 422 });
     expect(remoteCalls).toBe(0);
     expect(await deployments.active("org-remote", "uid-version")).toBeNull();
+  });
+
+  /**
+   * The whole chain in one place: a Host relation with a Binding, an already
+   * realized bucket Deployment, the Cloudflare pack materializing it, and the
+   * ordinary-workers backend turning it into the upload. Each half is unit
+   * tested elsewhere; this proves they meet.
+   */
+  test("materializes a Cloudflare bucket relation into the Worker Version upload", async () => {
+    const sql = createEphemeralSql();
+    const clock = () => new Date("2026-09-01T00:00:00.000Z");
+    const deployments = createResourceDeploymentStore(sql, clock);
+    const forms = stableProductionTakoformCatalog().forms;
+    const worker = forms.find((form) => form.identity.formRef.kind === "ModuleWorker");
+    const version = forms.find((form) => form.identity.formRef.kind === "WorkerVersion");
+    const bundleForm = forms.find((form) => form.identity.formRef.kind === "WorkerBundle");
+    const bucket = forms.find((form) => form.identity.formRef.kind === "ObjectBucket");
+    if (!worker || !version || !bundleForm || !bucket) {
+      throw new Error("stable runtime Binding fixtures missing");
+    }
+    const bucketName = `ts-${"a".repeat(40)}`;
+    const manifestDigest = `sha256:${"d".repeat(64)}`;
+    const moduleDigest = `sha256:${"e".repeat(64)}`;
+    const uploads: string[] = [];
+    const cloudflare = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [edgeProviderOffering(version, { id: "cloudflare.edge.stable-v1.workerversion" })],
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      artifacts: {
+        async manifest(_tenant, digest) {
+          return digest === manifestDigest
+            ? {
+                kind: "WorkerBundle" as const,
+                mainModule: "index.js",
+                modules: [
+                  {
+                    name: "index.js",
+                    mediaType: "application/javascript+module",
+                    digest: moduleDigest,
+                  },
+                ],
+              }
+            : null;
+        },
+        async blob(digest) {
+          return digest === moduleDigest ? new TextEncoder().encode("export default {}") : null;
+        },
+      },
+      async fetch(request) {
+        uploads.push(await request.clone().text());
+        return Response.json({ success: true, errors: [], result: { id: "version-chain" } });
+      },
+    });
+    const cloudflarePack = createProviderPack({
+      id: cloudflare.id,
+      providerType: "cloudflare",
+      provisioners: [cloudflare],
+      attachmentFactories: [],
+      transferEndpoints: [],
+      credentialIssuers: [],
+      meterSources: [],
+      costEstimators: [],
+      runtimeBindingMaterializer: createCloudflareRuntimeBindingMaterializer(cloudflare.id),
+    });
+    for (const entry of [
+      {
+        id: "dep-worker",
+        resourceUid: "uid-worker",
+        offeringId: "cloudflare.edge.stable-v1.moduleworker",
+        nativeId: "worker:script-name",
+        outputs: { scriptName: "script-name" },
+      },
+      {
+        id: "dep-bucket",
+        resourceUid: "uid-bucket",
+        offeringId: "storage.object.standard",
+        nativeId: `r2:${bucketName}`,
+        outputs: { protocol: "s3", bucketName },
+      },
+    ]) {
+      await deployments.create({
+        tenantId: "org-chain",
+        providerPackRef: cloudflare.id,
+        providerInstallationRef: "cloudflare.primary",
+        state: "active",
+        observed: {},
+        ...entry,
+      });
+    }
+    const resource = (form: typeof worker, name: string, uid: string, spec = {}) => ({
+      apiVersion: form.identity.formRef.apiVersion,
+      kind: form.identity.formRef.kind,
+      form: form.identity,
+      metadata: { name, space: "default", uid, generation: "1", revision: "1" },
+      spec,
+      status: { observedGeneration: "1", conditions: [] },
+    });
+    const driver = createProviderDriver({
+      providers: [cloudflare],
+      providerPacks: [cloudflarePack],
+      catalog: createCatalog([]),
+      ledger: createLedger(sql, clock),
+      deployments,
+    });
+
+    const applied = await driver.apply({
+      operationId: "op-chain-version",
+      operationKey: "key-chain-version",
+      operationMode: "initial",
+      tenantId: "org-chain",
+      resourceUid: "uid-version",
+      form: version,
+      name: "version",
+      space: "default",
+      spec: {
+        handlers: ["fetch"],
+        bucketBindings: [
+          {
+            name: "MEDIA",
+            resource: {
+              apiVersion: bucket.identity.formRef.apiVersion,
+              kind: bucket.identity.formRef.kind,
+              name: "media",
+            },
+          },
+        ],
+      },
+      relations: [
+        {
+          pointer: "/worker",
+          relation: "/worker",
+          targetUid: "uid-worker",
+          resource: resource(worker, "worker", "uid-worker"),
+        },
+        {
+          pointer: "/bundle",
+          relation: "/bundle",
+          targetUid: "uid-bundle",
+          resource: resource(bundleForm, "bundle", "uid-bundle", { manifestDigest }),
+        },
+        {
+          pointer: "/bucketBindings/0/resource",
+          relation: "/bucketBindings/*/resource",
+          targetUid: "uid-bucket",
+          resource: resource(bucket, "media", "uid-bucket"),
+          bindingRef: EDGE_OBJECTS_BINDING_REF,
+        },
+      ],
+    });
+
+    expect(uploads).toHaveLength(1);
+    expect(uploads[0]).toContain(
+      `{"type":"r2_bucket","name":"MEDIA","bucket_name":"${bucketName}"}`,
+    );
+    expect(await deployments.active("org-chain", "uid-version")).toMatchObject({
+      state: "active",
+      nativeId: "version:script-name:version-chain",
+    });
+    // The receipt the Host records names no provider bucket.
+    expect(JSON.stringify(applied)).not.toContain(bucketName);
   });
 });

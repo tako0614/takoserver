@@ -56,7 +56,7 @@ const DEFAULT_INVOCATION_TIMEOUT_MILLIS = 60_000;
 const MATCH_TOLERANCE_MILLIS = 60_000;
 
 export interface SelfhostWorkerSchedulerOptions {
-  /** Control storage; the next-fire state lives here under migration 0039. */
+  /** Control storage; the next-fire state lives here under migration 0040. */
   readonly sql: Sql;
   readonly runtime: WorkerdRuntime;
   readonly targets: SelfhostEventTargets;
