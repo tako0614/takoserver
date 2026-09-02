@@ -130,7 +130,40 @@ export function planTargetAdoption(
       });
     }
   }
-  return { adopted: sortAdopted(adopted), refused: sortRefused(refused) };
+  return { adopted: sortAdopted(dedupe(adopted, refused)), refused: sortRefused(refused) };
+}
+
+/**
+ * Two Workers can carry the same descriptor value, and a gateway is inspected
+ * alongside the authority it depends on. Agreeing observations collapse to one
+ * patch; disagreeing ones are not a value to adopt at all, because the
+ * descriptor cannot hold both and nothing here may choose between them.
+ */
+function dedupe(
+  adopted: readonly AdoptedValue[],
+  refused: RefusedAdoption[],
+): readonly AdoptedValue[] {
+  const byPointer = new Map<string, AdoptedValue[]>();
+  for (const value of adopted) {
+    byPointer.set(value.pointer, [...(byPointer.get(value.pointer) ?? []), value]);
+  }
+  const kept: AdoptedValue[] = [];
+  for (const [pointer, values] of byPointer) {
+    const first = values[0];
+    if (first === undefined) continue;
+    if (values.every((value) => value.live === first.live)) {
+      kept.push(first);
+      continue;
+    }
+    for (const value of values) {
+      refused.push({
+        worker: value.worker,
+        binding: value.binding,
+        reason: `live Workers disagree about ${pointer}, so neither observation is the truth`,
+      });
+    }
+  }
+  return kept;
 }
 
 export interface WrittenTargetCandidate {

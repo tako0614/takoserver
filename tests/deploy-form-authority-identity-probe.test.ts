@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { publicFormCapabilityManifest } from "../scripts/deploy/form-authority.ts";
@@ -436,3 +437,243 @@ function readyFetcher(): (input: string, init?: RequestInit) => Promise<Response
     });
   };
 }
+
+describe("Form authority identity probe forward transition apply", () => {
+  const PUBLIC_BUNDLE = "export default { async fetch() { return new Response('public'); } };\n";
+  const PROBE_BUNDLE = "export default { async fetch() { return new Response('probe'); } };\n";
+  const PUBLIC_DIGEST = `sha256:${createHash("sha256")
+    .update(PUBLIC_BUNDLE)
+    .digest("hex")}` as const;
+  const PROBE_SUCCESSOR = "44444444-4444-4444-8444-444444444444";
+  const APPLY_COMMIT = "b".repeat(40);
+
+  const applyTarget = {
+    ...target,
+    environment: "integration",
+    workerName: "takoserver-api-integration",
+    publicOrigin: "https://api.integration.example.test",
+    workerEndpointSuffix: "integration.example.workers.dev",
+    formAuthority: {
+      ...target.formAuthority,
+      identityProbeOrigin:
+        "https://takoserver-form-identity-production.integration.example.workers.dev",
+    },
+  } satisfies DeployTarget;
+
+  function probeVersion(bindings: readonly string[], commit: string, digest: `sha256:${string}`) {
+    const all = [
+      {
+        name: "TAKOSERVER_FORM_AUTHORITY_HOST_ID",
+        type: "plain_text",
+        text: applyTarget.formAuthority.hostId,
+      },
+      {
+        name: "PUBLIC_HOST_IDENTITY",
+        type: "service",
+        service: applyTarget.workerName,
+        entrypoint: "PublicHostIdentityEntrypoint",
+      },
+      {
+        name: "FORM_AUTHORITY",
+        type: "service",
+        service: applyTarget.formAuthority.workerName,
+        entrypoint: "FormAuthorityEntrypoint",
+      },
+    ];
+    return {
+      annotations: {
+        "workers/message": `form-authority-identity-probe:${commit}:${digest}`,
+        "workers/triggered_by": "version_upload",
+      },
+      resources: { bindings: all.filter(({ name }) => bindings.includes(name)) },
+    };
+  }
+
+  function applyState(isUploaded: () => boolean): FormAuthorityIdentityProbeState {
+    const expected = expectedExactBindingClosure(applyTarget, {
+      workerArtifactDigest: PUBLIC_DIGEST,
+    });
+    return {
+      async workerScripts() {
+        return [
+          applyTarget.workerName,
+          applyTarget.formAuthority.workerName,
+          applyTarget.formAuthority.identityProbeWorkerName,
+        ];
+      },
+      async workerDeployments(workerName) {
+        if (workerName === applyTarget.workerName) {
+          return [
+            {
+              id: "public-deployment",
+              created_on: "2026-09-02T00:00:00Z",
+              versions: [{ version_id: PUBLIC_VERSION, percentage: 100 }],
+            },
+          ];
+        }
+        return isUploaded()
+          ? [
+              {
+                id: "probe-successor",
+                created_on: "2026-09-02T02:00:00Z",
+                versions: [{ version_id: PROBE_SUCCESSOR, percentage: 100 }],
+              },
+              {
+                id: "probe-predecessor",
+                created_on: "2026-09-02T01:00:00Z",
+                versions: [{ version_id: PROBE_VERSION, percentage: 100 }],
+              },
+            ]
+          : [
+              {
+                id: "probe-predecessor",
+                created_on: "2026-09-02T01:00:00Z",
+                versions: [{ version_id: PROBE_VERSION, percentage: 100 }],
+              },
+            ];
+      },
+      async workerVersion(workerName, versionId) {
+        if (workerName === applyTarget.workerName) {
+          return {
+            annotations: {
+              "workers/message": `takoserver-worker:${APPLY_COMMIT}:${PUBLIC_DIGEST.slice(
+                "sha256:".length,
+              )}`,
+              "workers/triggered_by": "version_upload",
+            },
+            resources: {
+              bindings: Object.entries(expected).flatMap(([name, requirement]) =>
+                requirement === null
+                  ? []
+                  : [{ name, type: requirement.type, ...requirement.fields }],
+              ),
+            },
+          };
+        }
+        return versionId === PROBE_SUCCESSOR
+          ? probeVersion(
+              ["TAKOSERVER_FORM_AUTHORITY_HOST_ID", "PUBLIC_HOST_IDENTITY", "FORM_AUTHORITY"],
+              APPLY_COMMIT,
+              uploadedProbeDigest ?? PUBLIC_DIGEST,
+            )
+          : probeVersion(
+              ["TAKOSERVER_FORM_AUTHORITY_HOST_ID", "PUBLIC_HOST_IDENTITY"],
+              APPLY_COMMIT,
+              PUBLIC_DIGEST,
+            );
+      },
+      async workerSecrets(workerName) {
+        return workerName === applyTarget.workerName
+          ? expectedWorkerSecrets(applyTarget).map((name) => ({ name, type: "secret_text" }))
+          : [];
+      },
+      async workerDomains() {
+        return [{ hostname: "api.integration.example.test", service: applyTarget.workerName }];
+      },
+      async workerSubdomain() {
+        return { enabled: true, previewsEnabled: false };
+      },
+      async workerRoutes() {
+        return [];
+      },
+    };
+  }
+
+  let uploadedProbeDigest: `sha256:${string}` | null = null;
+
+  test("publishes the added binding through the declaration in exactly one upload", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-probe-transition-"));
+    let uploaded = false;
+    uploadedProbeDigest = null;
+    const calls: string[][] = [];
+    try {
+      const run = async (command: readonly string[]) => {
+        calls.push([...command]);
+        const key = command.join(" ");
+        if (key === "git rev-parse HEAD") return ok(`${APPLY_COMMIT}\n`);
+        if (key === "git branch --show-current") return ok("fix/probe-transition\n");
+        if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
+        if (key === "bun run check") return ok("green\n");
+        if (command.includes("--dry-run")) {
+          const out = command[command.indexOf("--outdir") + 1];
+          if (!out) throw new Error("dry-run outdir missing");
+          mkdirSync(out, { recursive: true });
+          const publicBuild = out.includes("public-worker-proof");
+          writeFileSync(join(out, "worker.js"), publicBuild ? PUBLIC_BUNDLE : PROBE_BUNDLE);
+          writeFileSync(join(out, "worker.js.map"), "{}\n");
+          return ok("built\n");
+        }
+        if (command.includes("--no-bundle")) {
+          const message = command[command.indexOf("--message") + 1] ?? "";
+          uploadedProbeDigest = message.slice(
+            message.indexOf(":sha256:") + 1,
+          ) as `sha256:${string}`;
+          uploaded = true;
+          return ok("uploaded\n");
+        }
+        throw new Error(`unexpected command: ${key}`);
+      };
+      const result = await runFormAuthorityIdentityProbe(
+        {
+          surface: "takoserver-form-authority-identity-probe",
+          action: "apply",
+          environment: "integration",
+          commit: APPLY_COMMIT,
+          transition: {
+            predecessorVersionId: PROBE_VERSION,
+            delta: {
+              retiredVars: [],
+              addedVars: [],
+              refreshedVars: [],
+              addedBindings: ["FORM_AUTHORITY"],
+              addedSecrets: [],
+              rotatedSecrets: [],
+            },
+          },
+        },
+        applyTarget,
+        {
+          run,
+          state: applyState(() => uploaded),
+          fetcher: applyFetcher(),
+          review: "independent-reviewer",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          outputDirectory: root,
+        },
+      );
+      expect(result).toMatchObject({
+        kind: "takoserver.form-authority-identity-probe-apply@v1",
+        bindingTransitionProfile: "none",
+        transitionPredecessorVersionId: PROBE_VERSION,
+        previousVersionId: PROBE_VERSION,
+        versionId: PROBE_SUCCESSOR,
+        formAuthorityWorkerName: applyTarget.formAuthority.workerName,
+        ready: true,
+      });
+      expect(calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+    } finally {
+      uploadedProbeDigest = null;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  function applyFetcher(): (input: string, init?: RequestInit) => Promise<Response> {
+    return async () => {
+      const semantic = await derivePublicFormImplementationIdentity({
+        implementationPayloadDigest: PAYLOAD_DIGEST,
+        capabilities: publicFormCapabilityManifest(),
+      });
+      return Response.json({
+        kind: "takoserver.public-host-identity@v2",
+        hostId: applyTarget.formAuthority.hostId,
+        workerVersionId: PUBLIC_VERSION,
+        workerArtifactDigest: PUBLIC_DIGEST,
+        ...semantic,
+      });
+    };
+  }
+
+  function ok(stdout: string) {
+    return { exitCode: 0, stdout, stderr: "" };
+  }
+});
