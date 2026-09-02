@@ -239,3 +239,36 @@ the release readback refuses a release whose settings do not carry it. See
 [ADR 0007](0007-objectbucket-joins-the-implementation-catalog.md)'s managed-lane
 amendment for what that closes and what remains. Nothing about this contract's
 wire shape, sealing, erase-before-mutation, or one-shot settlement changes.
+
+## Amendment — 2026-09-02: a spent handoff is spent on something, and outlives it
+
+"A handoff that was dispatched or consumed is never replaceable: its values
+already reached a provider" was written for the object those values configured.
+Nothing said what happens once that object is *gone*, and the answer was that
+`tofu destroy` followed by `tofu apply` silently built nothing.
+
+The released provider derives its operation key from the plan, so the second
+apply presents the same key. The preparation answered `consumed` with the
+previous run's `hostOperationId`; the provider polled that settled operation,
+OpenTofu printed `Creation complete` for a `WorkerVersion` this Host had not
+made, and the next resource failed `resource_not_found` 404, with every later
+refresh reporting the Version "has been deleted". The only escape was rotating a
+`runtime_input_nonce` no operator was told was load-bearing, and a Yurucommu
+instance could not be rebuilt in place after a teardown.
+
+A spent handoff is bound to the incarnation it produced. When that incarnation
+is provably gone — no `tf_resources` row and a deletion attestation that is
+`closed`, which is written in the same commit that removes the row — the
+handoff is retired and the operation key may be prepared again. `GET` reports
+absence for it, which is what the contract already says about a key that carries
+no live authority. This is
+[ADR 0008](0008-a-settled-refusal-about-the-host-is-re-attempted.md)'s rule for
+the operation ledger — a committed mutation is replayed under its key and
+retired once the Resource it committed no longer exists — applied to the route
+that bypassed it.
+
+One-shot is unchanged. While the incarnation exists the key is still refused;
+an incarnation still being created has neither proof, so nothing in flight is
+ever retired; and the apply commitment stays fenced where it was, in the claim
+CAS, because a retired handoff is replaced by a fresh preparation with a fresh
+commitment that `claim` re-derives.

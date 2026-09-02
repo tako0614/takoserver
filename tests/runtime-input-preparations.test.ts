@@ -477,6 +477,83 @@ test("reclaims a terminal, value-free row only after its retention window", asyn
   ).toHaveLength(0);
 });
 
+/**
+ * A `destroy` followed by an `apply` builds the graph again.
+ *
+ * It silently built nothing. The released provider derives its operation key
+ * from the plan, so the second `apply` asked for the same key, and a `consumed`
+ * handoff was never replaceable — "its values already reached a provider, and
+ * the object they configured may exist". The object did not exist: the destroy
+ * had removed it. So the preparation answered `consumed` with the previous
+ * run's `hostOperationId`, the provider polled that settled operation and
+ * printed "Creation complete" for a Worker Version this Host had not made, and
+ * the next resource failed `resource_not_found` 404 — with `tofu` then
+ * reporting the Version "has been deleted" on every later refresh. The only
+ * escape was rotating a `runtime_input_nonce` nobody was told was load-bearing.
+ *
+ * `replayRetired` already states the rule for the operation ledger: a committed
+ * mutation is replayed under its key and retired once the Resource it committed
+ * is gone. This is the same rule on the route that bypassed it.
+ */
+test("prepares the same operation key again once the Version it produced is destroyed", async () => {
+  const fixture = await runtimeInputFixture();
+  const spend = async (operationId: string) => {
+    await fixture.authority.preparations.prepare(preparationInput());
+    const lease = await fixture.authority.leases.acquire(leaseInput({ operationId }));
+    const dispatched = await lease.dispatch();
+    await dispatched.settle(`sha256:${"5".repeat(64)}`);
+  };
+  await spend(HOST_OPERATION_ID);
+  expect(await fixture.authority.preparations.read("org_01", OPERATION_KEY)).toMatchObject({
+    status: "consumed",
+  });
+
+  // While the Version it configured is there, the handoff is still spent and
+  // the key is still refused: nothing here weakens one-shot.
+  await seedWorkerVersion(fixture.sql, "org_01", "live", true);
+  await expect(fixture.authority.preparations.prepare(preparationInput())).rejects.toMatchObject({
+    code: "conflict",
+    status: 409,
+  });
+  expect(await fixture.authority.preparations.read("org_01", OPERATION_KEY)).toMatchObject({
+    status: "consumed",
+  });
+
+  // `tofu destroy`: the row goes in the same commit that closes the record.
+  await fixture.sql.run("DELETE FROM tf_resources WHERE tenant_id = 'org_01' AND uid = ?", [
+    VERSION_RESOURCE_UID,
+  ]);
+  await fixture.sql.run(
+    "UPDATE tf_resource_deletion_attestations SET state = 'closed' WHERE tenant_id = 'org_01' AND resource_uid = ?",
+    [VERSION_RESOURCE_UID],
+  );
+
+  // Absence is the honest answer, so the caller prepares rather than polling a
+  // settled success for something that is gone.
+  expect(await fixture.authority.preparations.read("org_01", OPERATION_KEY)).toBeNull();
+  expect(await fixture.authority.preparations.prepare(preparationInput())).toMatchObject({
+    status: "prepared",
+    operationKey: OPERATION_KEY,
+  });
+  // One row, and it names no operation: the previous run's is not inherited.
+  const rows = await fixture.sql.query(
+    "SELECT state, host_operation_id FROM worker_runtime_input_preparations WHERE organization_id = 'org_01'",
+  );
+  expect(rows).toEqual([{ state: "prepared", host_operation_id: null }]);
+
+  // And it spends afresh, under this run's own Host operation.
+  const lease = await fixture.authority.leases.acquire(
+    leaseInput({ operationId: "op_worker_version_02" }),
+  );
+  const dispatched = await lease.dispatch();
+  await dispatched.settle(`sha256:${"6".repeat(64)}`);
+  expect(
+    await fixture.sql.query(
+      "SELECT state, host_operation_id FROM worker_runtime_input_preparations WHERE organization_id = 'org_01'",
+    ),
+  ).toEqual([{ state: "consumed", host_operation_id: "op_worker_version_02" }]);
+});
+
 test("erases unreadable sealed material on a same-owner re-claim too", async () => {
   const fixture = await runtimeInputFixture();
   await fixture.authority.preparations.prepare(preparationInput());
@@ -803,6 +880,54 @@ test("refuses a composition whose runtime-input origin is not this Host's own", 
   );
   expect(() => buildApp({ ...ports, publicOrigin: HOST_ORIGIN })).not.toThrow();
 });
+
+/** The Worker Version a spent handoff configured, in the state a caller sees. */
+async function seedWorkerVersion(
+  sql: ReturnType<typeof createEphemeralSql>,
+  organizationId: string,
+  attestation: "live" | "closed",
+  present: boolean,
+): Promise<void> {
+  const formRef = { ...WORKER_FORM_REF, kind: "WorkerVersion" };
+  const now = Date.parse(PREPARATION_TIME);
+  if (present) {
+    await sql.run(
+      `INSERT INTO tf_resources
+         (tenant_id, space, api_version, kind, name, uid, generation, revision,
+          resource_json, updated_at)
+       VALUES (?, 'default', 'edge.forms.takoform.com', 'WorkerVersion', 'app-v1', ?,
+               '1', '1', ?, ?)`,
+      [
+        organizationId,
+        VERSION_RESOURCE_UID,
+        JSON.stringify({
+          apiVersion: formRef.apiVersion,
+          kind: "WorkerVersion",
+          form: { formRef },
+          metadata: {
+            name: "app-v1",
+            space: "default",
+            uid: VERSION_RESOURCE_UID,
+            generation: "1",
+            revision: "1",
+          },
+          spec: {},
+          status: { observedGeneration: "1", conditions: [] },
+        }),
+        now,
+      ],
+    );
+  }
+  await sql.run(
+    `INSERT INTO tf_resource_deletion_attestations
+       (tenant_id, resource_uid, space, api_version, kind, name, form_ref_json,
+        state, closure_fence, effects_json, evidence_json, evidence_ref,
+        evidence_effect_digest, evidence_checked_at, evidence_status, created_at, updated_at)
+     VALUES (?, ?, 'default', 'edge.forms.takoform.com', 'WorkerVersion', 'app-v1', ?,
+             ?, 1, '[]', NULL, NULL, NULL, NULL, NULL, ?, ?)`,
+    [organizationId, VERSION_RESOURCE_UID, JSON.stringify(formRef), attestation, now, now],
+  );
+}
 
 async function seedWorkerLifecycle(
   sql: ReturnType<typeof createEphemeralSql>,
