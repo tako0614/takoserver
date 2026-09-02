@@ -21,6 +21,26 @@ import { TakoformHostError } from "./takoform/types.ts";
  * selected consumer pack must import that same identity. Both calls are
  * read-only materialization of an existing realization; mutation, credential
  * issuance, and public endpoint projection do not belong at this seam.
+ *
+ * **A relation the selected pack realizes itself needs no materialization.**
+ * This seam exists to carry an opaque capability *between* Provider Packs; a
+ * pack that deployed both halves already knows where its own KV namespace,
+ * SQLite database and queue live and reads them straight off the relation. So
+ * a same-pack relation for which no route resolves is skipped, not refused —
+ * which is exactly the rule the driver's own post-loop check assumes, since it
+ * demands a materialized Binding only for a *cross-pack* relation.
+ *
+ * Refusing it instead is what made a self-host unable to bind KV, SQL or a
+ * queue producer at all: the self-host and Cloudflare packs publish a
+ * materializer route for `module-worker.object-bucket` and for nothing else,
+ * so every other `bindingRefs`-carrying declaration on a Worker Version died
+ * with `unsupported_capability` before the adapter was ever called.
+ *
+ * Nothing about the bucket contract loosens. A cross-pack relation with no
+ * complete route still fails closed here, and each Worker backend independently
+ * requires one materialized runtime Binding per `bucketBindings` declaration,
+ * in order, with the exact Binding identity (ADR 0007) — so a pack that
+ * published half a route still cannot publish a Worker.
  */
 export async function materializeProviderRuntimeBindings(input: {
   readonly tenantId: string;
@@ -44,7 +64,19 @@ export async function materializeProviderRuntimeBindings(input: {
     });
     const exporter = targetPack?.runtimeBindingMaterializer?.exporter;
     const importer = input.consumerPack?.runtimeBindingMaterializer?.importer;
-    if (deployment?.state !== "active" || !route || !exporter || !importer) unsupported();
+    if (!route) {
+      // Same pack: the consumer realizes this target itself, so there is
+      // nothing to carry across a pack boundary. Cross pack: still refused.
+      if (
+        deployment &&
+        input.consumerPack &&
+        deployment.providerPackRef === input.consumerPack.id
+      ) {
+        continue;
+      }
+      unsupported();
+    }
+    if (deployment?.state !== "active" || !exporter || !importer) unsupported();
     const name = bindingName(input.sourceSpec, relation.pointer);
     if (!name || names.has(name)) unsupported();
     const exactRelation = relation as ProviderRelation & {

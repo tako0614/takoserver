@@ -20,9 +20,26 @@ import {
   EDGE_OBJECTS_BINDING_REF,
 } from "../src/providers/cloudflare-runtime-bindings.ts";
 import { createRemoteProvider } from "../src/providers/remote.ts";
+import { createSelfhostRuntimeBindingMaterializer } from "../src/selfhost-runtime-binding-materializer.ts";
 import { stableProductionTakoformCatalog } from "../src/takoform/stable-production-catalog.ts";
 
 const TEST_MATERIAL_KIND = "test.target-object-capability@v1";
+/** The three Bindings no Provider Pack publishes a materializer route for. */
+const EDGE_KV_BINDING_REF = {
+  name: "module-worker.edge-kv",
+  version: "1.0.0",
+  schemaDigest: "sha256:ca7ea8945f6f0f51949a152bee2a340e5926709f2238bb0cfc8b4d84cb006471",
+} as const;
+const SQLITE_BINDING_REF = {
+  name: "module-worker.sqlite",
+  version: "1.0.0",
+  schemaDigest: "sha256:e5793c9601ceb2fce80938282a5c7eb1e249026bd7bde70083c0e93746eae4dc",
+} as const;
+const QUEUE_PRODUCER_BINDING_REF = {
+  name: "module-worker.queue-producer",
+  version: "1.0.0",
+  schemaDigest: "sha256:141f7413ff4dced8e379d9726100f66b584e76135156fb5a74a54e7b83edba1d",
+} as const;
 const sourceSpec = {
   bucketBindings: [
     {
@@ -204,7 +221,7 @@ describe("provider-private runtime Binding materialization", () => {
     expect(bindings[0]?.material).toEqual({ kind: "private-test" });
   });
 
-  test("rejects material-kind mismatch and same-pack directional omission with 422", async () => {
+  test("rejects a cross-pack material-kind mismatch and a cross-pack half-route with 422", async () => {
     const exporterOnly = pack("target", {
       id: "target-runtime-bindings",
       exporter: {
@@ -243,12 +260,14 @@ describe("provider-private runtime Binding materialization", () => {
       }),
     ).rejects.toMatchObject({ code: "unsupported_capability", status: 422 });
 
+    // A pack that publishes only an export half cannot consume another pack's
+    // target either. Same identity, no importer route, different pack: refused.
     await expect(
       materializeProviderRuntimeBindings({
         ...baseInput,
         consumerPack: exporterOnly,
         packs: new Map([[exporterOnly.id, exporterOnly]]),
-        relations: [relation("target")],
+        relations: [relation("elsewhere")],
       }),
     ).rejects.toMatchObject({ code: "unsupported_capability", status: 422 });
   });
@@ -347,19 +366,169 @@ describe("provider-private runtime Binding materialization", () => {
     ).rejects.toMatchObject({ code: "unsupported_capability", status: 422 });
   });
 
-  test("a remote-style pack without sideband materializer routes fails before provider mutation", async () => {
+  test("a pack with no materializer refuses another pack's target before provider mutation", async () => {
     const remote = pack("remote");
     await expect(
       materializeProviderRuntimeBindings({
         ...baseInput,
         consumerPack: remote,
         packs: new Map([[remote.id, remote]]),
-        relations: [relation("remote")],
+        relations: [relation("elsewhere")],
       }),
     ).rejects.toMatchObject({ code: "unsupported_capability", status: 422 });
   });
 
-  test("the Provider driver returns 422 before a remote provisioner RPC when sideband is absent", async () => {
+  /**
+   * The rule the driver's own post-loop check already assumed, and the one
+   * defect 2 of the self-host end-to-end run turned into a 422.
+   *
+   * A Provider Pack that deployed both halves of a relation resolves it itself
+   * — the self-host adapter reads `env.KV`, `env.DB` and a queue producer
+   * straight off `input.relations` and never looks at `runtimeBindings`. There
+   * is nothing to carry across a pack boundary, so there is nothing to refuse.
+   */
+  test("passes a same-pack relation this pack materializes nothing for", async () => {
+    const bucketOnly = pack("local", {
+      id: "local-runtime-bindings",
+      exporter: {
+        routes: [route()],
+        async exportTarget() {
+          return Object.freeze({ opaque: "local-target-capability" });
+        },
+      },
+      importer: {
+        routes: [route()],
+        async importBinding() {
+          return { kind: "private-test" };
+        },
+      },
+    });
+    const dataBinding = (
+      name: string,
+      field: string,
+      binding: { readonly name: string; readonly version: string; readonly schemaDigest: string },
+    ): ProviderRelation => ({
+      ...relation("local"),
+      pointer: `/${field}/0/resource`,
+      relation: `/${field}/*/resource`,
+      targetUid: `uid-${name}`,
+      bindingRef: {
+        apiVersion: "bindings.takoform.com/v1alpha2",
+        name: binding.name,
+        version: binding.version,
+        schemaDigest: binding.schemaDigest as `sha256:${string}`,
+      },
+    });
+
+    const bindings = await materializeProviderRuntimeBindings({
+      ...baseInput,
+      sourceSpec: {
+        ...sourceSpec,
+        kvBindings: [{ name: "KV", resource: { name: "kv" } }],
+        sqliteBindings: [{ name: "DB", resource: { name: "db" } }],
+        queueProducerBindings: [{ name: "QUEUE", resource: { name: "queue" } }],
+      },
+      consumerPack: bucketOnly,
+      packs: new Map([[bucketOnly.id, bucketOnly]]),
+      relations: [
+        relation("local"),
+        dataBinding("kv", "kvBindings", EDGE_KV_BINDING_REF),
+        dataBinding("db", "sqliteBindings", SQLITE_BINDING_REF),
+        dataBinding("queue", "queueProducerBindings", QUEUE_PRODUCER_BINDING_REF),
+      ],
+    });
+
+    // Exactly one Binding crossed the seam: the one this pack publishes a
+    // route for. The other three are the adapter's own business.
+    expect(bindings).toEqual([
+      {
+        name: "OBJECTS",
+        targetUid: "uid-bucket",
+        bindingRef: EDGE_OBJECTS_BINDING_REF,
+        material: { kind: "private-test" },
+      },
+    ]);
+
+    // And the same three relations, deployed by a different pack, still fail
+    // closed: nothing about the bucket contract loosened.
+    for (const field of ["kvBindings", "sqliteBindings", "queueProducerBindings"] as const) {
+      const foreign = {
+        kvBindings: dataBinding("kv", "kvBindings", EDGE_KV_BINDING_REF),
+        sqliteBindings: dataBinding("db", "sqliteBindings", SQLITE_BINDING_REF),
+        queueProducerBindings: dataBinding(
+          "queue",
+          "queueProducerBindings",
+          QUEUE_PRODUCER_BINDING_REF,
+        ),
+      }[field];
+      await expect(
+        materializeProviderRuntimeBindings({
+          ...baseInput,
+          sourceSpec: { [field]: [{ name: "X", resource: { name: "x" } }] },
+          consumerPack: bucketOnly,
+          packs: new Map([[bucketOnly.id, bucketOnly]]),
+          relations: [
+            {
+              ...foreign,
+              deployment: {
+                ...(foreign.deployment as NonNullable<ProviderRelation["deployment"]>),
+                providerPackRef: "elsewhere",
+              },
+            },
+          ],
+        }),
+      ).rejects.toMatchObject({ code: "unsupported_capability", status: 422 });
+    }
+  });
+
+  /**
+   * The self-host pack itself, not a stand-in: the real materializer publishes
+   * one route, and that is exactly what a Worker Version declaring all four
+   * binding kinds needs it to publish.
+   */
+  test("the self-host pack materializes its bucket and passes its own data bindings", async () => {
+    const local = pack("local", createSelfhostRuntimeBindingMaterializer("local"));
+    const bucketId = `tsb-${"a".repeat(40)}`;
+    const bucketRelation: ProviderRelation = {
+      ...relation("local"),
+      bindingRef: EDGE_OBJECTS_BINDING_REF,
+      deployment: {
+        ...(relation("local").deployment as NonNullable<ProviderRelation["deployment"]>),
+        nativeId: `selfhost-bucket:${bucketId}`,
+        outputs: { bucketName: bucketId },
+      },
+    };
+    const kvRelation: ProviderRelation = {
+      ...relation("local"),
+      pointer: "/kvBindings/0/resource",
+      relation: "/kvBindings/*/resource",
+      targetUid: "uid-kv",
+      bindingRef: {
+        apiVersion: "bindings.takoform.com/v1alpha2",
+        name: EDGE_KV_BINDING_REF.name,
+        version: EDGE_KV_BINDING_REF.version,
+        schemaDigest: EDGE_KV_BINDING_REF.schemaDigest as `sha256:${string}`,
+      },
+    };
+
+    const bindings = await materializeProviderRuntimeBindings({
+      ...baseInput,
+      sourceSpec: { ...sourceSpec, kvBindings: [{ name: "KV", resource: { name: "kv" } }] },
+      consumerPack: local,
+      packs: new Map([[local.id, local]]),
+      relations: [bucketRelation, kvRelation],
+    });
+    expect(bindings).toEqual([
+      {
+        name: "OBJECTS",
+        targetUid: "uid-bucket",
+        bindingRef: EDGE_OBJECTS_BINDING_REF,
+        material: { kind: "takoserver.selfhost.edge-objects@v1", bucketId },
+      },
+    ]);
+  });
+
+  test("the Provider driver returns 422 before a remote provisioner RPC for a cross-pack binding", async () => {
     const sql = createEphemeralSql();
     const clock = () => new Date("2026-09-01T00:00:00.000Z");
     const deployments = createResourceDeploymentStore(sql, clock);
@@ -402,14 +571,17 @@ describe("provider-private runtime Binding materialization", () => {
       observed: {},
       outputs: {},
     });
+    // The bucket belongs to a different Provider Pack, which is the case the
+    // seam exists for: the consumer must import an opaque capability the
+    // target pack exported, and neither pack publishes a route for it.
     await deployments.create({
       tenantId: "org-remote",
       id: "dep-bucket",
       resourceUid: "uid-bucket",
-      offeringId: "remote.object-bucket",
-      providerPackRef: remote.id,
-      providerInstallationRef: "remote.primary",
-      nativeId: "bucket:remote",
+      offeringId: "elsewhere.object-bucket",
+      providerPackRef: "elsewhere",
+      providerInstallationRef: "elsewhere.primary",
+      nativeId: "bucket:elsewhere",
       state: "active",
       observed: {},
       outputs: {},
@@ -476,6 +648,126 @@ describe("provider-private runtime Binding materialization", () => {
     ).rejects.toMatchObject({ code: "unsupported_capability", status: 422 });
     expect(remoteCalls).toBe(0);
     expect(await deployments.active("org-remote", "uid-version")).toBeNull();
+  });
+
+  /**
+   * The seam the self-host end-to-end run could not cross.
+   *
+   * A Worker Version declaring a KV namespace its own Provider Pack deployed
+   * reached `unsupported_capability` before the adapter was called, because the
+   * pack publishes a materializer route for the object bucket and for nothing
+   * else. There is nothing to materialize here: the adapter resolves the
+   * namespace from the relation. The driver must therefore call it.
+   */
+  test("the Provider driver calls the adapter for a same-pack data binding", async () => {
+    const sql = createEphemeralSql();
+    const clock = () => new Date("2026-09-01T00:00:00.000Z");
+    const deployments = createResourceDeploymentStore(sql, clock);
+    const forms = stableProductionTakoformCatalog().forms;
+    const worker = forms.find((form) => form.identity.formRef.kind === "ModuleWorker");
+    const version = forms.find((form) => form.identity.formRef.kind === "WorkerVersion");
+    const namespace = forms.find((form) => form.identity.formRef.kind === "EdgeKVNamespace");
+    if (!worker || !version || !namespace) throw new Error("stable Binding fixtures missing");
+    let remoteCalls = 0;
+    const remote = createRemoteProvider({
+      id: "remote",
+      origin: "https://provisioner.test",
+      offerings: [edgeProviderOffering(version, { id: "remote.worker-version" })],
+      authorize: () => "Bearer provider-private",
+      async fetch() {
+        remoteCalls += 1;
+        return Response.json({ ticket: { phase: "failed", failure: { code: "invalid_spec" } } });
+      },
+    });
+    const remotePack = createProviderPack({
+      id: remote.id,
+      providerType: "remote",
+      provisioners: [remote],
+      attachmentFactories: [],
+      transferEndpoints: [],
+      credentialIssuers: [],
+      meterSources: [],
+      costEstimators: [],
+    });
+    for (const [id, uid, offeringId] of [
+      ["dep-worker", "uid-worker", "remote.module-worker"],
+      ["dep-kv", "uid-kv", "remote.edge-kv"],
+    ] as const) {
+      await deployments.create({
+        tenantId: "org-remote",
+        id,
+        resourceUid: uid,
+        offeringId,
+        providerPackRef: remote.id,
+        providerInstallationRef: "remote.primary",
+        nativeId: `native:${uid}`,
+        state: "active",
+        observed: {},
+        outputs: {},
+      });
+    }
+    const resource = (form: typeof worker, name: string, uid: string) => ({
+      apiVersion: form.identity.formRef.apiVersion,
+      kind: form.identity.formRef.kind,
+      form: form.identity,
+      metadata: { name, space: "default", uid, generation: "1", revision: "1" },
+      spec: {},
+      status: { observedGeneration: "1", conditions: [] },
+    });
+    const driver = createProviderDriver({
+      providers: [remote],
+      providerPacks: [remotePack],
+      catalog: createCatalog([]),
+      ledger: createLedger(sql, clock),
+      deployments,
+    });
+
+    // The adapter is reached and answers for itself. What matters is that the
+    // refusal is the provider's own, not a 422 from the materialization seam.
+    await expect(
+      driver.apply({
+        operationId: "op-remote-kv-version",
+        operationKey: "key-remote-kv-version",
+        tenantId: "org-remote",
+        resourceUid: "uid-version",
+        form: version,
+        name: "version",
+        space: "default",
+        spec: {
+          kvBindings: [
+            {
+              name: "KV",
+              resource: {
+                apiVersion: namespace.identity.formRef.apiVersion,
+                kind: namespace.identity.formRef.kind,
+                name: "store",
+              },
+            },
+          ],
+        },
+        relations: [
+          {
+            pointer: "/worker",
+            relation: "/worker",
+            targetUid: "uid-worker",
+            resource: resource(worker, "worker", "uid-worker"),
+          },
+          {
+            pointer: "/kvBindings/0/resource",
+            relation: "/kvBindings/*/resource",
+            targetUid: "uid-kv",
+            resource: resource(namespace, "store", "uid-kv"),
+            bindingRef: {
+              apiVersion: "bindings.takoform.com/v1alpha2",
+              name: EDGE_KV_BINDING_REF.name,
+              version: EDGE_KV_BINDING_REF.version,
+              schemaDigest: EDGE_KV_BINDING_REF.schemaDigest as `sha256:${string}`,
+            },
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: "invalid_argument" });
+    expect(remoteCalls).toBe(1);
   });
 
   /**
