@@ -423,9 +423,10 @@ const workerdRuntime = createWorkerdRuntime({
   ...(workerdTls ? { tls: workerdTls } : {}),
   isReady: () => workerd.isReady(),
   async onReload(configPath) {
-    // Started on the first publish rather than at boot, so a machine
-    // that never runs a Worker never runs a runtime for one. After
-    // that it watches the file itself: one tenant's deploy must not
+    // Started on the first publish rather than unconditionally, so a machine
+    // that never runs a Worker never runs a runtime for one. A machine that
+    // *has* published one starts it at boot instead — see the restore below.
+    // After that it watches the file itself: one tenant's deploy must not
     // bounce every other tenant's in-flight requests.
     await workerd.ensure(configPath);
   },
@@ -707,6 +708,40 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
     workerd.stop();
     process.exit(0);
   });
+}
+
+/**
+ * Bring the runtime back for the Workers this machine already published.
+ *
+ * `workerd` used to be started only by a publication, so a self-host that was
+ * restarted served nothing at all while its control plane reported healthy and
+ * `tofu plan` answered "No changes. Your infrastructure matches the
+ * configuration": every resource was observed Ready and no request could reach
+ * any Worker. A read or a refresh did not revive it either; only a fresh
+ * publication did, so surviving a reboot meant re-applying by hand.
+ *
+ * The configuration is re-rendered from the durable manifests rather than
+ * trusted as it stands, so a machine that was published by an older build comes
+ * back on this build's router. It runs before the listener opens, so this Host
+ * does not answer anything — readiness included — until the Workers it says it
+ * is serving are actually being served.
+ *
+ * A machine that has published nothing starts nothing, and a runtime that
+ * cannot be started is reported rather than fatal: the control plane is how an
+ * operator would diagnose it, and `has()` already fails closed, so nothing is
+ * observed Ready on a runtime that is not running.
+ */
+try {
+  const restored = await workerdRuntime.restore();
+  if (restored.length > 0) {
+    console.log(`restored ${restored.length} published Worker(s): ${restored.join(", ")}`);
+  }
+} catch (error) {
+  process.stderr.write(
+    `the Worker runtime could not be restored at boot: ${
+      error instanceof Error ? error.message : "unknown error"
+    }. Published Workers will not answer until the next publication.\n`,
+  );
 }
 
 Bun.serve({
