@@ -268,11 +268,14 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       const organizationId = await organizationWriter(request);
       const reservationId = segment(originReservation[1]);
       // The Host mints its own reservations for a caller that has no
-      // reservation input, in a namespace no caller may write to. Without this
-      // fence the derived id is guessable from an address the tenant already
-      // knows, and a row a caller planted would be adopted as one this Host
-      // made.
-      if (reservationId.startsWith(HOST_MINTED_RESERVATION_PREFIX)) {
+      // reservation input, in a namespace no caller may *write* to. Without
+      // that fence the derived id is computable from an address the tenant
+      // already knows, and a row a caller planted would be adopted as one this
+      // Host made. Reading one is a different question: it is the tenant's own
+      // derived origin, already scoped to the authenticated organization, and
+      // refusing it would leave a tenant unable to see the address their own
+      // Worker was given.
+      if (request.method !== "GET" && reservationId.startsWith(HOST_MINTED_RESERVATION_PREFIX)) {
         controlError("not_found", 404);
       }
       const headers = { "cache-control": "private, no-store", "x-content-type-options": "nosniff" };

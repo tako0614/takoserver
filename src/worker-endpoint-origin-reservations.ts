@@ -549,10 +549,144 @@ export function createWorkerEndpointOriginReservations(options: {
       // uniqueness constraint rather than taking it away.
       if (!reservationId.startsWith(HOST_MINTED_RESERVATION_PREFIX)) continue;
       if (String(row.state) === "released") continue;
-      const superseded =
-        reservationId !== input.reservationId || row.endpoint_resource_uid !== null;
-      if (!superseded) continue;
+      // And never the one about to be prepared. Its id is derived, so a
+      // released row can never be re-minted: releasing it here would refuse
+      // this Worker an endpoint for good. What that row has to let go of is
+      // its endpoint witness, not itself.
+      if (reservationId === input.reservationId) continue;
       await releaseReservation(input.organizationId, reservationId);
+    }
+  };
+
+  /**
+   * Lets a Host-minted reservation let go of an endpoint that is provably gone.
+   *
+   * Deactivation retains the endpoint UID as a deletion witness, and while it
+   * is retained the reservation cannot take a new endpoint. For a caller's
+   * reservation the answer is to release it and reserve again; for a derived
+   * one there is no "again" — the id is a digest of the address, so a released
+   * row ends that Worker's endpoint story permanently. So the witness is
+   * dropped in place, under exactly the fences release uses: the endpoint
+   * Resource absent, its deletion attestation closed, and no provider
+   * deployment outside `deleted` or `failed`. While any of those is unmet the
+   * old endpoint may still be serving, the witness stays, and the apply is
+   * refused rather than pointed at an origin somebody else answers on.
+   */
+  const clearSettledHostMintWitness = async (input: {
+    readonly organizationId: string;
+    readonly reservationId: string;
+  }): Promise<void> => {
+    if (!input.reservationId.startsWith(HOST_MINTED_RESERVATION_PREFIX)) return;
+    const row = await readRow(options.sql, input.organizationId, input.reservationId);
+    if (!row || row.state !== "bound" || row.endpoint_resource_uid === null) return;
+    let cleared: SqlWrite;
+    try {
+      cleared = await options.sql.run(
+        `UPDATE worker_endpoint_origin_reservations
+         SET bound_endpoint_name = NULL, endpoint_resource_uid = NULL,
+             endpoint_resource_revision = NULL, revision = revision + 1, updated_at = ?
+         WHERE organization_id = ? AND reservation_id = ? AND revision = ?
+           AND state = 'bound' AND endpoint_resource_uid IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM tf_resources AS endpoint_resource
+             WHERE endpoint_resource.tenant_id = worker_endpoint_origin_reservations.organization_id
+               AND endpoint_resource.uid = worker_endpoint_origin_reservations.endpoint_resource_uid
+           )
+           AND EXISTS (
+             SELECT 1 FROM tf_resource_deletion_attestations AS endpoint_deletion
+             WHERE endpoint_deletion.tenant_id = worker_endpoint_origin_reservations.organization_id
+               AND endpoint_deletion.resource_uid = worker_endpoint_origin_reservations.endpoint_resource_uid
+               AND endpoint_deletion.state = 'closed'
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM tf_resource_deployments AS endpoint_deployment
+             WHERE endpoint_deployment.tenant_id = worker_endpoint_origin_reservations.organization_id
+               AND endpoint_deployment.resource_uid = worker_endpoint_origin_reservations.endpoint_resource_uid
+               AND endpoint_deployment.state NOT IN ('deleted', 'failed')
+           )`,
+        [now(), input.organizationId, input.reservationId, row.revision],
+      );
+    } catch {
+      throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
+    }
+    if (cleared.changes !== 1) {
+      throw new WorkerEndpointOriginReservationError("conflict", 409);
+    }
+  };
+
+  /**
+   * Advances a Host-minted reservation to the Worker's current revision.
+   *
+   * A binding records the revision it was made at, and `bind` and
+   * `assignEndpoint` both re-prove it. A ModuleWorker's revision moves on its
+   * own — `withDerivedRendering` re-renders it whenever a dependent appears or
+   * becomes Ready — so between a failed endpoint apply and its retry the
+   * recorded revision is routinely stale, and every later attempt was refused
+   * until the reservation aged out a day later.
+   *
+   * The reservation is still bound to the same Worker incarnation, which is
+   * what it is a reservation *of*. `validateWorker` re-proves that incarnation
+   * is the Ready, current-generation, actively deployed one at this exact
+   * placement, and the CAS re-proves the revision it is moving to, so this
+   * advances a binding rather than inventing one. Nothing here touches a
+   * reservation a caller made: those keep the exact-replay semantics they had.
+   */
+  const advanceHostMintToCurrentRevision = async (input: {
+    readonly organizationId: string;
+    readonly reservationId: string;
+    readonly space: string;
+    readonly workerName: string;
+    readonly workerResourceUid: string;
+  }): Promise<void> => {
+    if (!input.reservationId.startsWith(HOST_MINTED_RESERVATION_PREFIX)) return;
+    const row = await readRow(options.sql, input.organizationId, input.reservationId);
+    if (
+      !row ||
+      row.state !== "bound" ||
+      row.endpoint_resource_uid !== null ||
+      row.bound_space !== input.space ||
+      row.bound_worker_name !== input.workerName ||
+      row.worker_resource_uid !== input.workerResourceUid
+    ) {
+      return;
+    }
+    await assertPlacement(row);
+    const { snapshot } = await validateWorker(row, input);
+    if (row.worker_resource_revision === snapshot.listing.revision) return;
+    let advanced: SqlWrite;
+    try {
+      advanced = await options.sql.run(
+        `UPDATE worker_endpoint_origin_reservations
+         SET worker_resource_revision = ?, revision = revision + 1, updated_at = ?
+         WHERE organization_id = ? AND reservation_id = ? AND revision = ?
+           AND state = 'bound' AND endpoint_resource_uid IS NULL
+           AND bound_space = ? AND bound_worker_name = ? AND worker_resource_uid = ?
+           AND EXISTS (
+             SELECT 1 FROM tf_resources
+             WHERE tenant_id = ? AND uid = ? AND space = ? AND name = ?
+               AND kind = 'ModuleWorker' AND revision = ?
+           )`,
+        [
+          snapshot.listing.revision,
+          now(),
+          input.organizationId,
+          input.reservationId,
+          row.revision,
+          input.space,
+          input.workerName,
+          input.workerResourceUid,
+          input.organizationId,
+          input.workerResourceUid,
+          input.space,
+          input.workerName,
+          snapshot.listing.revision,
+        ],
+      );
+    } catch {
+      throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
+    }
+    if (advanced.changes !== 1) {
+      throw new WorkerEndpointOriginReservationError("conflict", 409);
     }
   };
 
@@ -1026,10 +1160,25 @@ export function createWorkerEndpointOriginReservations(options: {
         throw new WorkerEndpointOriginReservationError("unsupported_capability", 422);
       }
       const reservationId = await hostMintedReservationId(input);
+      // In this order: let go of a *different* derived reservation on this
+      // address, then let this one let go of an endpoint that is gone, then
+      // bring its binding up to the Worker's current revision. Only after all
+      // three is the row in a state `prepare` and `bind` will replay.
       await releaseSupersededHostMint({
         organizationId: input.organizationId,
         requestedSubdomain: subdomain,
         reservationId,
+      });
+      await clearSettledHostMintWitness({
+        organizationId: input.organizationId,
+        reservationId,
+      });
+      await advanceHostMintToCurrentRevision({
+        organizationId: input.organizationId,
+        reservationId,
+        space: input.space,
+        workerName: input.workerName,
+        workerResourceUid: input.workerResourceUid,
       });
       await authority.prepare({
         organizationId: input.organizationId,
@@ -1994,14 +2143,14 @@ function sameForm(left: TakoformV1Alpha3FormRef, right: TakoformV1Alpha3FormRef)
 }
 
 /**
- * The one Host-minted reservation id for a Worker *incarnation*.
+ * The one Host-minted reservation id for a Worker incarnation.
  *
- * A retry of the same apply asks for the same reservation, and a Worker
- * destroyed and declared again asks for a different one — the reservations are
- * separate rows describing separate lives of one address, which is what lets
- * the released one stay as history while the new one is prepared. The address
- * itself is what stays unique, and the release fences are the only way it is
- * ever handed on.
+ * A retry of the same apply asks for the same reservation — that is the whole
+ * point of deriving it — and a Worker destroyed and declared again asks for a
+ * different one. Because the id can never be re-minted once its row is
+ * terminal, nothing in this lane may release a row it is about to prepare: a
+ * reservation whose endpoint went away is advanced in place, and only a
+ * *different* reservation on the same address is released.
  */
 async function hostMintedReservationId(target: {
   readonly organizationId: string;

@@ -195,3 +195,67 @@ test("HTTP activation accepts only the endpoint UID and never a restated worker 
   expect(restated.status).toBe(400);
   expect(activationCalls).toHaveLength(1);
 });
+
+/**
+ * A Host-minted reservation is one no caller may write to, and one every
+ * caller may read.
+ *
+ * Writing is what the fence is for: the id is derived from an address the
+ * tenant knows, so a row a caller planted at that id would be adopted as one
+ * this Host made. Reading it is the tenant's own derived origin, already scoped
+ * to the authenticated organization — and refusing that would leave a tenant
+ * unable to see the address their own Worker was given.
+ */
+test("the Host-minted namespace refuses every write and answers a read", async () => {
+  const { fetch, prepareCalls, activationCalls } = fixture();
+  const minted = "hostmint-0000000000000000000000000000000000000000";
+  const call = (method: string, suffix = "", body?: unknown) =>
+    fetch(
+      new Request(
+        `https://api.example.test/v1/worker-endpoint-origin-reservations/${minted}${suffix}`,
+        {
+          method,
+          headers: {
+            authorization: "Bearer organization-key",
+            ...(body === undefined ? {} : { "content-type": "application/json" }),
+          },
+          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        },
+      ),
+    );
+
+  for (const [method, suffix, body] of [
+    [
+      "PUT",
+      "",
+      {
+        format: WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT,
+        requestedSubdomain: "community-public",
+        expiresInSeconds: 600,
+      },
+    ],
+    ["DELETE", "", undefined],
+    [
+      "PUT",
+      "/activation",
+      {
+        format: WORKER_ENDPOINT_ORIGIN_RESERVATION_ACTIVATION_FORMAT,
+        endpointResourceUid: "uid-endpoint-01",
+      },
+    ],
+    [
+      "DELETE",
+      "/activation",
+      {
+        format: WORKER_ENDPOINT_ORIGIN_RESERVATION_ACTIVATION_FORMAT,
+        endpointResourceUid: "uid-endpoint-01",
+      },
+    ],
+  ] as const) {
+    expect((await call(method, suffix, body)).status).toBe(404);
+  }
+  expect(prepareCalls).toEqual([]);
+  expect(activationCalls).toEqual([]);
+
+  expect((await call("GET")).status).toBe(200);
+});

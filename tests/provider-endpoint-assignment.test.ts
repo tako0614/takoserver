@@ -190,11 +190,9 @@ async function fixture(input: {
   let cancelCalls = 0;
   let activateCalls = 0;
   let deactivateCalls = 0;
-  let mintCalls = 0;
   const originReservations = {
     async mintForWorker() {
       events.push("reservation.mint");
-      mintCalls += 1;
       return input.hostMintsReservation === false
         ? null
         : ({
