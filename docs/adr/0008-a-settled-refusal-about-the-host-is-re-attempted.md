@@ -78,3 +78,43 @@ a re-run of a refused apply is supposed to be.
   it only stops standing in the way of a caller that asks again.
 - A cancelled operation stays cancelled. Cancellation is an explicit terminal
   decision, not a refusal about anything.
+
+## Amendment — 2026-09-02: a hold that can never settle is not a hold
+
+The rule above turns on a settled failure, and it says the store rather than the
+code list holds the safety property: an operation whose provider mutation
+produced a receipt is not settled at all, because the mutation is real and the
+exact Host command is the only thing that can reconcile it.
+
+One failure escapes that reasoning. The engine holds every receipt to its Form
+before it materializes a Resource — a driver may only report what its Form
+declares — and when *that* is what refuses, the receipt is durable and the Form
+is frozen. No repair makes the stored answer publishable. The command is held
+anyway, it owns the caller's plan-derived replay key while it waits, and every
+later apply of the same graph resumes it and reads back the identical refusal.
+The fourth self-host run created one and the fifth proved it survives a reboot
+into a repaired configuration: that Space could not create its endpoint on a
+Host where every other Space succeeded on the first attempt.
+
+**A receipt its Form can never carry settles the command as
+`unsupported_capability`.** That is the honest code — this Host cannot record
+that answer — and it is in the set above, so the operator who repairs the Host
+and re-runs the identical apply gets a fresh attempt rather than the stored
+refusal. The executed saga is dropped with the command, because a fresh attempt
+on the same target would otherwise adopt it and project the same answer again.
+A delete is untouched: its receipt is provider evidence of a removal and is
+never projected onto a Form, so asking this of one would abandon a real repair.
+
+**And a refusal that provably mutated nothing leaves nothing behind.** A create
+reserves an incarnation before the provider is asked — a deletion attestation
+opened `live`, a `planned` effect, and, once the saga is marked, a `dispatched`
+one. A refusal after that marker commits no Resource, so the record described an
+incarnation that never existed: no deletion could close the attestation and the
+effect had no terminal event. The saga already knows the fact that settles it —
+a precondition failure deletes the plan, so no recovery will resume it and the
+refusal's whole meaning is that the provider did not act — and the apply and
+import paths now terminalize their own effect and drop the reserved incarnation
+under proof that it produced nothing: no Resource row, no provider deployment
+outside `deleted`/`failed`, the attestation still `live`, and every effect on the
+uid belonging to that one command with none of them `succeeded`. A refusal that
+may have mutated something keeps its record, which is what a repair reads.
