@@ -47,6 +47,28 @@ The immutable provider-v2.1.1 v1beta1 ObjectBucket package remains usable only
 to observe, delete, and prove absence for already-recorded Deployments. It is
 not authorable, sellable, or relabelled as the current versionless family.
 
+## Amendment — 2026-09-02: refusing to empty a bucket is a definitive refusal
+
+Deleting an `ObjectBucket` that still holds objects is refused, and that
+refusal names what the operator must do. It is a *result*, not an unproven
+outcome: the Host read nothing but occupancy and removed nothing, so a retry is
+a second attempt rather than a second mutation.
+
+The Host said so badly. The provider answered `conflict`, which renders as
+`resource_busy` — a code inside the released provider's automatic retry table,
+whose repair line is "wait and re-run the same apply" — and the Host then
+treated a 409 after dispatch as indeterminate, held the operation for repair,
+and sent every later attempt into delete recovery, which answered
+`backend_unavailable` and the same advice. Waiting never empties a bucket, so a
+deployment that had accepted one upload could not be torn down at all.
+
+A bucket that still holds objects therefore fails `occupied`, a provider
+failure code distinct from `conflict`, and it renders as `dependency_in_use`:
+outside the provider's retry table, and carrying the Host's own sentence.
+Because the refusal is definitive, the planned provider saga is terminalized
+rather than held, so `recoverDelete` is never entered for it and the same
+`tofu destroy`, re-run after the objects are gone, succeeds.
+
 ## Consequences
 
 - Resource desired, observed, output, and discovery contain no provider

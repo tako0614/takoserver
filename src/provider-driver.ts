@@ -1539,6 +1539,12 @@ export function failureToWire(code: string): [string, number] {
       return ["invalid_argument", 400];
     case "conflict":
       return ["resource_busy", 409];
+    case "occupied":
+      // Not `resource_busy`: that is in the released provider's automatic
+      // retry table and its repair line says to wait and re-run, which never
+      // empties a bucket. `dependency_in_use` is outside that table and its
+      // repair line is the true one — remove what the message names first.
+      return ["dependency_in_use", 409];
     case "not_found":
       return ["resource_not_found", 404];
     case "denied":

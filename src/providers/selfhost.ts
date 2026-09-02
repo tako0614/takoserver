@@ -2208,8 +2208,13 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     if (!name || !options.dataPlaneMaintenance) return done();
     const occupancy = await options.dataPlaneMaintenance.objectBucketOccupancy(name);
     if (occupancy.objects > 0) {
+      // `occupied`, not `conflict`. A conflict renders as the automatically
+      // retryable `resource_busy`, whose repair line tells the operator to
+      // wait and re-run — and waiting never empties a bucket. This renders as
+      // `dependency_in_use`: outside the released provider's retry table, and
+      // asking for exactly what has to happen.
       return failed(
-        "conflict",
+        "occupied",
         "the bucket still holds objects, and this Host does not empty a bucket for you; " +
           "delete its contents and destroy again",
       );
