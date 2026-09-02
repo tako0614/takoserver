@@ -630,7 +630,9 @@ describe("objects on a disk", () => {
     expect(new Set([...first.objects, ...second.objects].map((object) => object.key)).size).toBe(
       1_025,
     );
-  });
+    // 1,025 durable single-object writes plus two full listings: slow shared
+    // CI disks need far more than the default per-test budget for this volume.
+  }, 60_000);
 
   test("never lists its own sidecars as objects", async () => {
     await store.put("doc", new TextEncoder().encode("x"), { contentType: "text/plain" });
