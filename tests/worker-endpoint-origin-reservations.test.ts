@@ -2351,6 +2351,140 @@ test("repairs a reservation left activated for an endpoint that was never commit
     ),
   ).toEqual([{ state: "activated", endpoint_resource_uid: "uid-endpoint-01" }]);
 });
+/**
+ * An apply that stops for a day and is resumed is the same apply.
+ *
+ * A Host-minted reservation goes `bound` the moment the Worker is Ready and
+ * holds its address until the endpoint is created. When that create is delayed
+ * past the mint's 24 h TTL — the operator paused, or an unrelated resource
+ * failed and the graph was repaired the next morning — the expiry sweep moved
+ * the row to `expired`, `prepare` refused to replay a terminal row, and neither
+ * repair step could touch it: one deliberately skips the reservation it is
+ * about to prepare, the other wants an endpoint witness that is not there.
+ * Because the id is a digest of the Worker identity there is no second id to
+ * mint, so that Worker could never be given an endpoint again.
+ *
+ * A reservation that expired without ever publishing an endpoint is a witness
+ * to nothing: no address is answering, and the address is a pure function of
+ * the same identity that derives the id. So the next mint takes it back, and
+ * takes back the same origin.
+ */
+test("mints again after its own reservation aged out with no endpoint published", async () => {
+  const { authority, sql, advance } = fixture();
+  await seedWorker(sql);
+  const target = {
+    organizationId: "org_01",
+    space: TARGET.space,
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-01",
+  } as const;
+  const minted = await authority.mintForWorker(target);
+  if (!minted) throw new Error("the fixture installation derives its own address");
+
+  advance(25 * 60 * 60 * 1_000);
+  // The sweep has taken it, and nothing has ever been published on the origin.
+  expect(await authority.read("org_01", minted.reservationId)).toBeNull();
+  expect(
+    await sql.query("SELECT state, endpoint_resource_uid FROM worker_endpoint_origin_reservations"),
+  ).toEqual([{ state: "expired", endpoint_resource_uid: null }]);
+
+  const again = await authority.mintForWorker(target);
+  expect(again).toMatchObject({
+    reservationId: minted.reservationId,
+    // Derived from tenant, Space and Worker, so a fresh mint is the same address.
+    canonicalPublicOrigin: minted.canonicalPublicOrigin,
+    status: "bound",
+    binding: { workerResourceUid: "uid-worker-01", workerResourceRevision: "1" },
+  });
+  // One row, live again on a fresh TTL rather than a second reservation.
+  expect(
+    await sql.query("SELECT reservation_id, state FROM worker_endpoint_origin_reservations"),
+  ).toEqual([{ reservation_id: minted.reservationId, state: "bound" }]);
+  expect(
+    Date.parse(String((await authority.read("org_01", minted.reservationId))?.expiresAt)),
+  ).toBe(Date.parse("2026-09-01T13:00:00.000Z") + 24 * 60 * 60 * 1_000);
+  // And it is still a reservation: the endpoint it was minted for can be made.
+  await seedEndpoint(sql, minted.canonicalPublicOrigin);
+  expect(
+    await authority.assignEndpoint({
+      organizationId: "org_01",
+      reservationId: minted.reservationId,
+      space: TARGET.space,
+      endpointName: TARGET.endpointName,
+      endpointResourceUid: "uid-endpoint-01",
+      endpointResourceRevision: "1",
+      workerName: TARGET.workerName,
+      workerResourceUid: "uid-worker-01",
+      providerPackRef: "fake",
+      providerInstallationRef: "fake.primary",
+    }),
+  ).toMatchObject({ canonicalPublicOrigin: minted.canonicalPublicOrigin });
+});
+
+/**
+ * Expiry is not a licence to reallocate an address something is answering on.
+ *
+ * A reservation that *did* publish keeps the endpoint UID as a deletion
+ * witness, and ADR 0004 keeps an expired row holding one inside both uniqueness
+ * constraints. So the day-old row is taken back only on the same proof a
+ * release needs: the endpoint Resource absent, its deletion attestation
+ * settled, and no provider deployment outside `deleted`/`failed`.
+ */
+test("keeps an aged-out reservation that published an endpoint until that endpoint is gone", async () => {
+  const { authority, sql, advance } = fixture();
+  await seedWorker(sql);
+  const target = {
+    organizationId: "org_01",
+    space: TARGET.space,
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-01",
+  } as const;
+  const minted = await authority.mintForWorker(target);
+  if (!minted) throw new Error("the fixture installation derives its own address");
+  await seedEndpoint(sql, minted.canonicalPublicOrigin);
+  await authority.assignEndpoint({
+    organizationId: "org_01",
+    reservationId: minted.reservationId,
+    space: TARGET.space,
+    endpointName: TARGET.endpointName,
+    endpointResourceUid: "uid-endpoint-01",
+    endpointResourceRevision: "1",
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-01",
+    providerPackRef: "fake",
+    providerInstallationRef: "fake.primary",
+  });
+
+  advance(25 * 60 * 60 * 1_000);
+  expect(await authority.read("org_01", minted.reservationId)).toBeNull();
+  expect(
+    await sql.query("SELECT state, endpoint_resource_uid FROM worker_endpoint_origin_reservations"),
+  ).toEqual([{ state: "expired", endpoint_resource_uid: "uid-endpoint-01" }]);
+  // The endpoint is still there, so the origin is still spoken for.
+  await expect(authority.mintForWorker(target)).rejects.toMatchObject({
+    code: "conflict",
+    status: 409,
+  });
+  expect(
+    await sql.query("SELECT state, endpoint_resource_uid FROM worker_endpoint_origin_reservations"),
+  ).toEqual([{ state: "expired", endpoint_resource_uid: "uid-endpoint-01" }]);
+
+  await sql.run("DELETE FROM tf_resources WHERE tenant_id = 'org_01' AND uid = 'uid-endpoint-01'");
+  await sql.run(
+    "UPDATE tf_resource_deployments SET state = 'deleted' WHERE tenant_id = 'org_01' AND resource_uid = 'uid-endpoint-01'",
+  );
+  await sql.run(
+    "UPDATE tf_resource_deletion_attestations SET state = 'closed' WHERE tenant_id = 'org_01' AND resource_uid = 'uid-endpoint-01'",
+  );
+  expect(await authority.mintForWorker(target)).toMatchObject({
+    reservationId: minted.reservationId,
+    canonicalPublicOrigin: minted.canonicalPublicOrigin,
+    status: "bound",
+  });
+  expect(
+    await sql.query("SELECT state, endpoint_resource_uid FROM worker_endpoint_origin_reservations"),
+  ).toEqual([{ state: "bound", endpoint_resource_uid: null }]);
+});
 
 /**
  * A Worker's readiness is derived, and the condition on its row is a cache.

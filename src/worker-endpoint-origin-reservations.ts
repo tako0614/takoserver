@@ -657,6 +657,100 @@ export function createWorkerEndpointOriginReservations(options: {
   };
 
   /**
+   * Takes back a Host-minted reservation that aged out without ever publishing.
+   *
+   * A mint is `bound` from the moment the Worker is Ready and holds its address
+   * until the endpoint Resource is created. Nothing bounds how long that takes:
+   * an operator pauses, an unrelated resource in the same graph fails, and the
+   * apply is resumed the next morning. Past the 24 h TTL the sweep moves the
+   * row to `expired`, and from there the lane had no way back — `prepare`
+   * refuses to replay a terminal row, the superseded-release deliberately skips
+   * the reservation it is about to prepare, and the witness clear wants an
+   * endpoint that is not there. Since the id is a digest of the Worker
+   * identity, there was no second id to mint: that Worker could never be given
+   * an endpoint again.
+   *
+   * An expired reservation with no endpoint witness is a witness to nothing.
+   * Nothing was published, so no address is answering, and the address is a
+   * pure function of the same tenant/Space/Worker identity that derives the id
+   * (ADR 0004) — so re-deriving it yields the same origin and `prepare` replays
+   * it exactly. The row is therefore handed back to the state it was swept
+   * from, on a fresh TTL, and the mint continues.
+   *
+   * Fenced the way the witness clear is: on identity and on incarnation state —
+   * the Host-minted namespace, `expired`, no endpoint witness at all, and the
+   * bound Worker being this exact one — never on a revision, which moves under
+   * an apply for reasons that have nothing to do with whether the address is
+   * free. A reservation that *did* publish is not reached here: its witness is
+   * retained, ADR 0004 keeps it inside both uniqueness constraints, and only
+   * the four absence fences let go of it.
+   */
+  const reviveExpiredHostMint = async (input: {
+    readonly organizationId: string;
+    readonly reservationId: string;
+    readonly space: string;
+    readonly workerName: string;
+    readonly workerResourceUid: string;
+  }): Promise<void> => {
+    if (!input.reservationId.startsWith(HOST_MINTED_RESERVATION_PREFIX)) return;
+    const row = await readRow(options.sql, input.organizationId, input.reservationId);
+    if (
+      !row ||
+      row.state !== "expired" ||
+      row.reservation_format !== WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT ||
+      row.endpoint_resource_uid !== null ||
+      // A bound row names the Worker it is a reservation *of*; one swept before
+      // it bound names none yet. Neither is ever another Worker's.
+      (row.worker_resource_uid !== null &&
+        (row.bound_space !== input.space ||
+          row.bound_worker_name !== input.workerName ||
+          row.worker_resource_uid !== input.workerResourceUid))
+    ) {
+      return;
+    }
+    const timestamp = now();
+    let revived: SqlWrite;
+    try {
+      revived = await options.sql.run(
+        `UPDATE worker_endpoint_origin_reservations
+         SET state = CASE WHEN worker_resource_uid IS NULL THEN 'prepared' ELSE 'bound' END,
+             expires_at = ? + requested_ttl_seconds * 1000,
+             revision = revision + 1, updated_at = ?
+         WHERE organization_id = ? AND reservation_id = ? AND revision = ?
+           AND state = 'expired' AND endpoint_resource_uid IS NULL`,
+        [timestamp, timestamp, input.organizationId, input.reservationId, row.revision],
+      );
+    } catch {
+      // Coming back makes the row live for the uniqueness constraints again.
+      // Something else holding the address or the logical Worker is a
+      // reservation this lane does not take away — most likely a caller's.
+      if (
+        (row.requested_subdomain !== null &&
+          (await liveCollision(
+            options.sql,
+            row.requested_subdomain,
+            row.canonical_public_origin,
+          ))) ||
+        (row.bound_space !== null &&
+          row.bound_worker_name !== null &&
+          (await liveWorkerCollision(
+            options.sql,
+            input.organizationId,
+            row.bound_space,
+            row.bound_worker_name,
+            input.reservationId,
+          )))
+      ) {
+        throw new WorkerEndpointOriginReservationError("conflict", 409);
+      }
+      throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
+    }
+    if (revived.changes !== 1) {
+      throw new WorkerEndpointOriginReservationError("conflict", 409);
+    }
+  };
+
+  /**
    * Lets a Host-minted reservation let go of an endpoint that is provably gone.
    *
    * Deactivation retains the endpoint UID as a deletion witness, and while it
@@ -697,6 +791,13 @@ export function createWorkerEndpointOriginReservations(options: {
    * happening right now: a row handed back with a spent clock would be expired
    * by `prepare`'s own sweep one statement later and refuse the mint it was
    * just repaired for.
+   *
+   * An **expired** row is repaired the same way, and for the same reason. A
+   * deactivated reservation is swept like any other once its TTL runs out, and
+   * ADR 0004 keeps it inside both uniqueness constraints while it still holds
+   * the witness — so waiting does not free the address, and `prepare` refuses a
+   * terminal row. The fences are the ones that matter here: whether that
+   * endpoint is provably gone, never how long the row has been sitting there.
    */
   const clearSettledHostMintWitness = async (input: {
     readonly organizationId: string;
@@ -706,7 +807,7 @@ export function createWorkerEndpointOriginReservations(options: {
     const row = await readRow(options.sql, input.organizationId, input.reservationId);
     if (
       !row ||
-      (row.state !== "bound" && row.state !== "activated") ||
+      (row.state !== "bound" && row.state !== "activated" && row.state !== "expired") ||
       row.endpoint_resource_uid === null
     ) {
       return;
@@ -721,7 +822,8 @@ export function createWorkerEndpointOriginReservations(options: {
              bound_endpoint_name = NULL, endpoint_resource_uid = NULL,
              endpoint_resource_revision = NULL, revision = revision + 1, updated_at = ?
          WHERE organization_id = ? AND reservation_id = ? AND revision = ?
-           AND state IN ('bound', 'activated') AND endpoint_resource_uid IS NOT NULL
+           AND state IN ('bound', 'activated', 'expired')
+           AND endpoint_resource_uid IS NOT NULL
            AND NOT EXISTS (
              SELECT 1 FROM tf_resources AS endpoint_resource
              WHERE endpoint_resource.tenant_id = worker_endpoint_origin_reservations.organization_id
@@ -1355,13 +1457,23 @@ export function createWorkerEndpointOriginReservations(options: {
       }
       const reservationId = await hostMintedReservationId(input);
       // In this order: let go of a *different* derived reservation on this
-      // address, then let this one let go of an endpoint that is gone, then
-      // bring its binding up to the Worker's current revision. Only after all
-      // three is the row in a state `prepare` and `bind` will replay.
+      // address, then take this one back if it aged out with nothing published,
+      // then let it let go of an endpoint that is gone, then bring its binding
+      // up to the Worker's current revision. Only after all four is the row in
+      // a state `prepare` and `bind` will replay. The revive follows the
+      // release because coming back re-enters the uniqueness constraints, and
+      // it precedes the witness clear because that one wants a live row.
       await releaseSupersededHostMint({
         organizationId: input.organizationId,
         requestedSubdomain: subdomain,
         reservationId,
+      });
+      await reviveExpiredHostMint({
+        organizationId: input.organizationId,
+        reservationId,
+        space: input.space,
+        workerName: input.workerName,
+        workerResourceUid: input.workerResourceUid,
       });
       await clearSettledHostMintWitness({
         organizationId: input.organizationId,
@@ -2433,9 +2545,10 @@ function sameForm(left: TakoformV1Alpha3FormRef, right: TakoformV1Alpha3FormRef)
  * A retry of the same apply asks for the same reservation — that is the whole
  * point of deriving it — and a Worker destroyed and declared again asks for a
  * different one. Because the id can never be re-minted once its row is
- * terminal, nothing in this lane may release a row it is about to prepare: a
- * reservation whose endpoint went away is advanced in place, and only a
- * *different* reservation on the same address is released.
+ * *released*, nothing in this lane may release a row it is about to prepare: a
+ * reservation whose endpoint went away is advanced in place, one the sweep took
+ * while it held no endpoint is revived in place, and only a *different*
+ * reservation on the same address is released.
  */
 async function hostMintedReservationId(target: {
   readonly organizationId: string;

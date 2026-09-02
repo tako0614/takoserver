@@ -272,3 +272,55 @@ Everything else stands. A supplied reservation is still the authority for the
 origin it holds; binding, activation, deactivation, the deletion witness and
 the destroy order are untouched; and the reservation remains value-free and
 still creates no Takoform Resource and calls no provider.
+
+## Amendment — 2026-09-02: expiry ends a hold, not a Worker's address
+
+A reservation's TTL exists so an abandoned hold ages out and stops owning an
+address nobody is going to use. For a *supplied* reservation that is the whole
+story: the caller chose the id, and after the sweep they choose another one and
+reserve again.
+
+A Host-minted reservation has no "again". Its id is a digest of tenant, Space,
+Worker name and Worker UID, so the sweep and the derivation disagreed about what
+they were doing to the same row. A mint goes `bound` the moment the Worker is
+Ready and holds the address until the `WorkerEndpoint` Resource is created, and
+nothing bounds how long that takes — an operator pauses, an unrelated resource
+in the graph fails and the apply is resumed the next morning. Past 24 hours the
+sweep moved the row to `expired`; `prepare` then refused to replay a terminal
+row, the superseded-release deliberately skips the reservation it is about to
+prepare, and the in-place witness clear wanted an endpoint witness that was
+never there. So a Worker whose endpoint create was delayed by a day could never
+be given an endpoint again, on any later apply, by any means short of deleting
+rows from the Host's database.
+
+**An expired Host-minted reservation that never published an endpoint is taken
+back by the next mint.** It is a witness to nothing: no `WorkerEndpoint` was
+created, so no address is answering, and the address is a pure function of the
+same identity that derives the id — re-deriving it yields the same origin, which
+is why `prepare` replays the revived row exactly rather than reserving a second
+one. The row returns to the state the sweep took it from, `bound` or `prepared`,
+on a fresh TTL.
+
+The fences are the ones the in-place witness clear already uses, and they are
+about identity and incarnation state, never about a revision:
+
+- the Host-minted namespace, so a caller's reservation is never revived by this
+  lane any more than it is released by it;
+- `expired`, and no endpoint witness retained at all;
+- the bound Worker, when the row got as far as binding, being this exact
+  tenant, Space, Worker name and Worker UID; and
+- coming back inside the live uniqueness constraints without displacing
+  anything — a live reservation already holding that address or that logical
+  Worker refuses the mint rather than losing its hold.
+
+**Expiry is otherwise unchanged, and it never reallocates a published address.**
+A reservation that did publish retains the endpoint UID as a deletion witness,
+and this ADR already keeps such a row inside both uniqueness constraints after
+it expires. That row is not revived; it is repaired by the same in-place clear
+as a live one, which now accepts an `expired` row for exactly this reason —
+waiting does not free the address, so the question was never how long the row
+has been sitting there. It is still the four absence fences that answer it: the
+endpoint Resource absent, its deletion attestation settled, and no provider
+deployment outside `deleted` or `failed`. While any of those is unmet the mint
+is refused, the same way it is for a live reservation whose endpoint is still
+serving.
