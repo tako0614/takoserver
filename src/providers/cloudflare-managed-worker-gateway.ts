@@ -611,11 +611,6 @@ async function dispatchQueue(
     settleRetry(batch.messages);
     return;
   }
-  if (batch.messages.length > MAX_QUEUE_MESSAGES) {
-    settleRetry(batch.messages);
-    return;
-  }
-  let route: ManagedWorkerQueueRoute;
   let routeRead: ManagedWorkerRouteReadFor<"queue">;
   try {
     routeRead = await readStateRoute(state, "queue", managedWorkerQueueRouteKey(batch.queue));
@@ -627,25 +622,61 @@ async function dispatchQueue(
     settleRetry(batch.messages);
     return;
   }
-  route = routeRead.value;
+  const route = routeRead.value;
   const release = await safeRelease(state, route.logicalWorkerId);
   if (!release) {
     settleRetry(batch.messages);
     return;
   }
-  let event: ManagedWorkerQueueEvent;
-  try {
-    event = queueEvent(batch, route.logicalWorkerId, release.deploymentId);
-  } catch {
-    settleRetry(batch.messages);
+  // Queues hands this gateway the batch; it cannot ask for a smaller one. What
+  // it can do is take the batch apart. A batch over the message ceiling, or one
+  // whose bodies do not fit the 2 MiB envelope, used to be settled with a
+  // whole-batch `retry()` — so a consumer with a large `maxBatchSize` and large
+  // bodies retried itself into the dead-letter queue without the Worker ever
+  // being invoked. Each chunk below is an envelope this gateway can actually
+  // send, and each is settled on its own answer.
+  const chunks = splitQueueBatch(batch, route.logicalWorkerId, release.deploymentId);
+  let settlementError: unknown;
+  for (const chunk of chunks) {
+    try {
+      await dispatchQueueChunk(chunk, route, release, dispatcher, identity);
+    } catch (error) {
+      settlementError ??= error;
+    }
+  }
+  if (settlementError !== undefined) {
+    throw settlementError instanceof Error
+      ? settlementError
+      : new Error("managed Worker Queue settlement failed");
+  }
+}
+
+interface ManagedWorkerQueueChunk {
+  readonly event: ManagedWorkerQueueEvent | null;
+  readonly messages: readonly ManagedWorkerMessage[];
+}
+
+async function dispatchQueueChunk(
+  chunk: ManagedWorkerQueueChunk,
+  route: ManagedWorkerQueueRoute,
+  release: ManagedWorkerReleaseRoute,
+  dispatcher: ManagedWorkerDispatchNamespace,
+  identity: ManagedWorkerGatewayIdentity,
+): Promise<void> {
+  const event = chunk.event;
+  // One message larger than the whole envelope is undeliverable by any split.
+  // It is left unsettled here, which is what a redelivery and, eventually, the
+  // dead-letter queue are for; the messages beside it are unaffected.
+  if (!event) {
+    settleRetry(chunk.messages);
     return;
   }
   const selected = selectRelease(
     release.releases,
-    `queue|${batch.queue}|${event.messages.map(({ messageId }) => messageId).join("|")}`,
+    `queue|${event.queue}|${event.messages.map(({ messageId }) => messageId).join("|")}`,
   );
   if (!selected) {
-    settleRetry(batch.messages);
+    settleRetry(chunk.messages);
     return;
   }
   let response: Response;
@@ -660,11 +691,11 @@ async function dispatchQueue(
     };
     response = await dispatcher.get(selected.scriptName, props).fetch(eventRequest(event));
   } catch {
-    settleRetry(batch.messages);
+    settleRetry(chunk.messages);
     return;
   }
   if (!response.ok) {
-    settleRetry(batch.messages);
+    settleRetry(chunk.messages);
     return;
   }
   const decisions = await readQueueDecisions(
@@ -672,12 +703,12 @@ async function dispatchQueue(
     event.messages.map(({ messageId }) => messageId),
   );
   if (!decisions) {
-    settleRetry(batch.messages);
+    settleRetry(chunk.messages);
     return;
   }
   const byId = new Map(decisions.map((decision) => [decision.messageId, decision]));
   let settlementError: unknown;
-  for (const message of batch.messages) {
+  for (const message of chunk.messages) {
     try {
       const decision = byId.get(message.id);
       if (!decision || decision.outcome === "retry") {
@@ -695,6 +726,93 @@ async function dispatchQueue(
   if (settlementError !== undefined) {
     throw new Error("managed Worker Queue settlement failed");
   }
+}
+
+/**
+ * Cuts one native batch into envelopes this gateway can send.
+ *
+ * A chunk holds at most `MAX_QUEUE_MESSAGES` messages and serializes to at most
+ * `MAX_EVENT_REQUEST_BYTES`. The sizes are measured on the projected message
+ * objects rather than by re-serializing the whole event per candidate, and the
+ * envelope's own overhead is measured with the longest batch id any chunk can
+ * be given — so a chunk is never packed to a size the final `queueEvent` call
+ * would refuse. A message this Host cannot project, or one that alone exceeds
+ * the envelope, becomes its own chunk with no event.
+ */
+function splitQueueBatch(
+  batch: ManagedWorkerMessageBatch,
+  logicalWorkerId: string,
+  deploymentId: string,
+): readonly ManagedWorkerQueueChunk[] {
+  const projected = batch.messages.map((message) => {
+    try {
+      const value = queueEventMessage(message);
+      return { message, value, bytes: utf8Length(JSON.stringify(value)) };
+    } catch {
+      return { message, value: null, bytes: Number.POSITIVE_INFINITY };
+    }
+  });
+  const maximumChunks = Math.max(
+    1,
+    Math.ceil(batch.messages.length / MAX_QUEUE_MESSAGES),
+    batch.messages.length,
+  );
+  const idSuffixBytes = `-${maximumChunks}`.length;
+  let overhead: number;
+  try {
+    overhead =
+      utf8Length(
+        JSON.stringify(
+          queueEnvelope(batch.batchId, batch.queue, logicalWorkerId, deploymentId, []),
+        ),
+      ) + idSuffixBytes;
+  } catch {
+    return [{ event: null, messages: batch.messages }];
+  }
+  const groups: { message: ManagedWorkerMessage; value: ManagedWorkerQueueMessage | null }[][] = [];
+  let current: { message: ManagedWorkerMessage; value: ManagedWorkerQueueMessage | null }[] = [];
+  let currentBytes = 0;
+  for (const entry of projected) {
+    if (entry.value === null || overhead + entry.bytes > MAX_EVENT_REQUEST_BYTES) {
+      if (current.length > 0) groups.push(current);
+      current = [];
+      currentBytes = 0;
+      groups.push([{ message: entry.message, value: null }]);
+      continue;
+    }
+    const separator = current.length === 0 ? 0 : 1;
+    if (
+      current.length === MAX_QUEUE_MESSAGES ||
+      overhead + currentBytes + separator + entry.bytes > MAX_EVENT_REQUEST_BYTES
+    ) {
+      if (current.length > 0) groups.push(current);
+      current = [];
+      currentBytes = 0;
+    }
+    currentBytes += (current.length === 0 ? 0 : 1) + entry.bytes;
+    current.push({ message: entry.message, value: entry.value });
+  }
+  if (current.length > 0) groups.push(current);
+  return groups.map((group, index) => {
+    const messages = group.map(({ message }) => message);
+    const values = group.map(({ value }) => value);
+    if (values.some((value) => value === null)) return { event: null, messages };
+    const batchId = groups.length === 1 ? batch.batchId : `${batch.batchId}-${index + 1}`;
+    try {
+      return {
+        event: queueEnvelope(
+          batchId,
+          batch.queue,
+          logicalWorkerId,
+          deploymentId,
+          values as readonly ManagedWorkerQueueMessage[],
+        ),
+        messages,
+      };
+    } catch {
+      return { event: null, messages };
+    }
+  });
 }
 
 async function dispatchSchedule(
@@ -773,46 +891,55 @@ async function dispatchSchedule(
   if (firstError !== undefined) throw firstError;
 }
 
-function queueEvent(
-  batch: ManagedWorkerMessageBatch,
+function queueEventMessage(message: ManagedWorkerMessage): ManagedWorkerQueueMessage {
+  if (
+    !isRouteToken(message.id) ||
+    !Number.isSafeInteger(message.attempts) ||
+    message.attempts < 1 ||
+    message.attempts > 101 ||
+    !(message.timestamp instanceof Date) ||
+    !Number.isFinite(message.timestamp.getTime())
+  ) {
+    throw new TypeError("managed Worker Queue message is invalid");
+  }
+  return {
+    messageId: message.id,
+    timestampMillis: message.timestamp.getTime(),
+    attempts: message.attempts,
+    body: encodeQueueBody(message.body),
+  };
+}
+
+function queueEnvelope(
+  batchId: string,
+  queue: string,
   logicalWorkerId: string,
   deploymentId: string,
+  messages: readonly ManagedWorkerQueueMessage[],
 ): ManagedWorkerQueueEvent {
-  if (!isRouteToken(batch.batchId)) {
+  if (!isRouteToken(batchId)) {
     throw new TypeError("managed Worker Queue batch id is invalid");
   }
-  const messages = batch.messages.map((message) => {
-    if (
-      !isRouteToken(message.id) ||
-      !Number.isSafeInteger(message.attempts) ||
-      message.attempts < 1 ||
-      message.attempts > 101 ||
-      !(message.timestamp instanceof Date) ||
-      !Number.isFinite(message.timestamp.getTime())
-    ) {
-      throw new TypeError("managed Worker Queue message is invalid");
-    }
-    const body = encodeQueueBody(message.body);
-    return {
-      messageId: message.id,
-      timestampMillis: message.timestamp.getTime(),
-      attempts: message.attempts,
-      body,
-    };
-  });
+  if (messages.length > MAX_QUEUE_MESSAGES) {
+    throw new TypeError("managed Worker Queue event holds too many messages");
+  }
   const event: ManagedWorkerQueueEvent = {
     protocol: TAKOSERVER_MANAGED_WORKER_EVENT_PROTOCOL,
     kind: "queue",
-    batchId: batch.batchId,
+    batchId,
     logicalWorkerId: routeToken(logicalWorkerId, "logicalWorkerId"),
     deploymentId: routeToken(deploymentId, "deploymentId"),
-    queue: batch.queue,
+    queue,
     messages,
   };
-  const size = textEncoder.encode(JSON.stringify(event)).byteLength;
-  if (size > MAX_EVENT_REQUEST_BYTES)
+  if (utf8Length(JSON.stringify(event)) > MAX_EVENT_REQUEST_BYTES) {
     throw new TypeError("managed Worker Queue event is too large");
+  }
   return event;
+}
+
+function utf8Length(value: string): number {
+  return textEncoder.encode(value).byteLength;
 }
 
 function encodeQueueBody(value: unknown): ManagedWorkerQueueBody {

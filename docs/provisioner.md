@@ -265,16 +265,25 @@ refused rather than half-served — before anything durable moves, so a refused
 attachment leaves no attachment behind. Publishing a new Version is what changes
 that.
 
-### Known gap: the managed backend's batch ceiling
+### How the managed backend does the same thing
 
 The managed Cloudflare backend projects the same envelope with the same 2 MiB
-ceiling, and its gateway settles a batch it could not build the same way this one
-used to: as a whole-batch `retry()`, which counts. It is not fixed here, because
-only a self-hosted Host owns the queue the batch came out of and can take a
-smaller one; on Cloudflare the batch is handed over by Queues and the gateway
-cannot ask for a different one. Until that is addressed there, a managed consumer
-with a large `maxBatchSize` and bodies near the producer's 127 000-byte ceiling
-retries itself into the dead-letter queue without the Worker ever being invoked.
+ceiling, and it used to settle a batch it could not build as a whole-batch
+`retry()`, which counts — so a managed consumer with a large `maxBatchSize` and
+bodies near the producer's 127 000-byte ceiling retried itself into the
+dead-letter queue without the Worker ever being invoked. The gateway cannot ask
+Queues for a smaller batch the way this Host can take one; what it can do is cut
+the batch it was handed. It now delivers the messages in envelope-sized chunks —
+at most a hundred messages, at most 2 MiB serialized — and settles each chunk on
+its own answer, so a batch that is too large by count or by bytes reaches the
+Worker rather than the dead-letter queue.
+
+One case remains, and it is the one no split can reach: a single message whose
+own encoded body does not fit an envelope. It is left unsettled — costing a
+redelivery and, eventually, the dead-letter queue, which is where an
+undeliverable message belongs — and every message beside it in the same batch is
+delivered normally. Takoserver's own producer facade caps a message at 127 000
+bytes, so this is a message some other producer put on the queue.
 
 ## Retired Cloudflare ObjectBucket drain
 

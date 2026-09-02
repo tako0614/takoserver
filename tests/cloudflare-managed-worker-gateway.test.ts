@@ -49,6 +49,7 @@ class RecordingDispatcher implements ManagedWorkerDispatchNamespace {
     scriptName: string;
     props: Readonly<Record<string, unknown>> | undefined;
     request: Request;
+    body?: unknown;
   }[] = [];
   readonly responses = new Map<string, Response | (() => Response)>();
   failing = false;
@@ -57,7 +58,8 @@ class RecordingDispatcher implements ManagedWorkerDispatchNamespace {
     return {
       fetch: async (request: Request) => {
         if (this.failing) throw new Error("dispatcher unavailable");
-        this.calls.push({ scriptName, props, request });
+        const body = request.body === null ? undefined : await request.clone().json();
+        this.calls.push({ scriptName, props, request, body });
         const response = this.responses.get(scriptName);
         return typeof response === "function" ? response() : (response ?? new Response("ok"));
       },
@@ -704,4 +706,95 @@ test("wrapper waitUntil rejection is diagnostics-only and successful queue retur
     await rm(customerPath, { force: true });
     await rm(wrapperPath, { force: true });
   }
+});
+
+/**
+ * Queues hands the gateway the batch, so the gateway cannot ask for a smaller
+ * one. It used to settle a batch it could not encode with a whole-batch
+ * `retry()`, which spent a redelivery each time: a consumer with large bodies
+ * retried itself into the dead-letter queue without the Worker ever running.
+ * Now the batch is cut into envelopes that fit and each is settled on its own
+ * answer.
+ */
+test("an oversized Queue batch is split into envelopes rather than retried whole", async () => {
+  const state = new MemoryState();
+  const dispatcher = new RecordingDispatcher();
+  putStandardQueue(state);
+  // Bodies cross this seam base64-encoded, four bytes per three: three 600 KiB
+  // bodies are 2.34 MiB on the wire and do not fit one 2 MiB envelope; two do.
+  const messages = [
+    fakeMessage("m1", 1, "a".repeat(600 * 1024)),
+    fakeMessage("m2", 1, "b".repeat(600 * 1024)),
+    fakeMessage("m3", 1, "c".repeat(600 * 1024)),
+  ];
+  dispatcher.responses.set("customer-script-a", () => {
+    const event = dispatcher.calls[dispatcher.calls.length - 1]?.body as {
+      readonly messages: readonly { readonly messageId: string }[];
+    };
+    return Response.json({
+      protocol: TAKOSERVER_MANAGED_WORKER_EVENT_PROTOCOL,
+      kind: "queue",
+      decisions: event.messages.map(({ messageId }) => ({ messageId, outcome: "ack" })),
+    });
+  });
+  await gateway(state, dispatcher).queue({ batchId: "batch-1", queue: "events", messages });
+
+  expect(messages.map(messageState)).toEqual(["ack", "ack", "ack"]);
+  const events = dispatcher.calls.map(
+    ({ body }) => body as { readonly batchId: string; readonly messages: readonly unknown[] },
+  );
+  expect(events.map(({ batchId }) => batchId)).toEqual(["batch-1-1", "batch-1-2"]);
+  expect(events.map(({ messages: sent }) => sent.length)).toEqual([2, 1]);
+});
+
+test("more than one native batch of messages is delivered, never refused for its count", async () => {
+  const state = new MemoryState();
+  const dispatcher = new RecordingDispatcher();
+  putStandardQueue(state);
+  const messages = Array.from({ length: 150 }, (_unused, index) =>
+    fakeMessage(`m${index}`, 1, "small"),
+  );
+  dispatcher.responses.set("customer-script-a", () => {
+    const event = dispatcher.calls[dispatcher.calls.length - 1]?.body as {
+      readonly messages: readonly { readonly messageId: string }[];
+    };
+    return Response.json({
+      protocol: TAKOSERVER_MANAGED_WORKER_EVENT_PROTOCOL,
+      kind: "queue",
+      decisions: event.messages.map(({ messageId }) => ({ messageId, outcome: "ack" })),
+    });
+  });
+  await gateway(state, dispatcher).queue({ batchId: "batch-1", queue: "events", messages });
+  expect(new Set(messages.map(messageState))).toEqual(new Set(["ack"]));
+  expect(
+    dispatcher.calls.map(
+      ({ body }) => (body as { readonly messages: readonly unknown[] }).messages.length,
+    ),
+  ).toEqual([100, 50]);
+});
+
+test("one message larger than the envelope is left alone and its neighbours still run", async () => {
+  const state = new MemoryState();
+  const dispatcher = new RecordingDispatcher();
+  putStandardQueue(state);
+  const messages = [
+    fakeMessage("small-before", 1, "before"),
+    fakeMessage("undeliverable", 1, "x".repeat(3 * 1024 * 1024)),
+    fakeMessage("small-after", 1, "after"),
+  ];
+  dispatcher.responses.set("customer-script-a", () => {
+    const event = dispatcher.calls[dispatcher.calls.length - 1]?.body as {
+      readonly messages: readonly { readonly messageId: string }[];
+    };
+    return Response.json({
+      protocol: TAKOSERVER_MANAGED_WORKER_EVENT_PROTOCOL,
+      kind: "queue",
+      decisions: event.messages.map(({ messageId }) => ({ messageId, outcome: "ack" })),
+    });
+  });
+  await gateway(state, dispatcher).queue({ batchId: "batch-1", queue: "events", messages });
+  // No split can make this one deliverable; a redelivery and, eventually, the
+  // dead-letter queue are what it is for. Everything beside it is delivered.
+  expect(messages.map(messageState)).toEqual(["ack", "retry", "ack"]);
+  expect(dispatcher.calls).toHaveLength(2);
 });
