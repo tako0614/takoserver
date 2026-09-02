@@ -100,6 +100,31 @@ export interface ProviderWorkerEndpointOriginReservationCapability {
     readonly tenantRef: string;
     readonly requestedSubdomain: string;
   }): Promise<{ readonly canonicalPublicOrigin: string } | null>;
+  /**
+   * The subdomain this installation gives a WorkerEndpoint on this exact
+   * Worker, when its own offering derives the hostname instead of taking one
+   * from the caller.
+   *
+   * A reseller lane chooses the label: it sells a name, holds it before the
+   * Resource graph exists, and the reservation is the authority for it. An
+   * ordinary organization API key has no such input — the released provider's
+   * `takoform_worker_endpoint` accepts only `name` and `worker` — and on a Host
+   * whose endpoint address is derived anyway (the self-host suffix, the
+   * ordinary-workers `workers.dev`/zone suffix) there is no name to choose:
+   * the address follows from the Worker. So the Host mints the reservation
+   * itself, from this, and the WorkerEndpoint apply consumes it exactly as if
+   * a reseller had supplied one.
+   *
+   * Absent, or `null`, means this installation has no such rule and every
+   * reservation must be requested explicitly. The managed
+   * (Workers-for-Platforms) backend answers that way: its base domain is sold
+   * rather than derived.
+   */
+  hostMintedSubdomain?(input: {
+    readonly tenantRef: string;
+    readonly space: string;
+    readonly workerName: string;
+  }): Promise<string | null>;
 }
 
 /**

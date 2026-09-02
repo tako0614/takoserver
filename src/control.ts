@@ -34,6 +34,7 @@ import { TakoformHostError } from "./takoform/types.ts";
 import { TakosIdIdentityError } from "./takos-id-identity.ts";
 import { TokenError, type TokenService } from "./token.ts";
 import {
+  HOST_MINTED_RESERVATION_PREFIX,
   WORKER_ENDPOINT_ORIGIN_RESERVATION_ACTIVATION_FORMAT,
   WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT,
   WorkerEndpointOriginReservationError,
@@ -235,6 +236,9 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       if (!originReservations) controlError("not_found", 404);
       const organizationId = await organizationWriter(request);
       const reservationId = segment(originReservationActivation[1]);
+      if (reservationId.startsWith(HOST_MINTED_RESERVATION_PREFIX)) {
+        controlError("not_found", 404);
+      }
       const headers = { "cache-control": "private, no-store", "x-content-type-options": "nosniff" };
       if (request.method === "PUT" || request.method === "DELETE") {
         const body = await jsonObject(request);
@@ -263,6 +267,14 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       if (!originReservations) controlError("not_found", 404);
       const organizationId = await organizationWriter(request);
       const reservationId = segment(originReservation[1]);
+      // The Host mints its own reservations for a caller that has no
+      // reservation input, in a namespace no caller may write to. Without this
+      // fence the derived id is guessable from an address the tenant already
+      // knows, and a row a caller planted would be adopted as one this Host
+      // made.
+      if (reservationId.startsWith(HOST_MINTED_RESERVATION_PREFIX)) {
+        controlError("not_found", 404);
+      }
       const headers = { "cache-control": "private, no-store", "x-content-type-options": "nosniff" };
       if (request.method === "PUT") {
         const body = await jsonObject(request);

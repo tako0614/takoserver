@@ -121,6 +121,8 @@ async function fixture(input: {
   readonly recoverDelete?: Provider["recoverDelete"];
   readonly activationFails?: boolean;
   readonly assignmentAckLost?: boolean;
+  /** Whether this installation derives its own endpoint address. */
+  readonly hostMintsReservation?: boolean;
 }) {
   const sql = createEphemeralSql();
   const deployments = createResourceDeploymentStore(sql, clock);
@@ -188,7 +190,33 @@ async function fixture(input: {
   let cancelCalls = 0;
   let activateCalls = 0;
   let deactivateCalls = 0;
+  let mintCalls = 0;
   const originReservations = {
+    async mintForWorker() {
+      events.push("reservation.mint");
+      mintCalls += 1;
+      return input.hostMintsReservation === false
+        ? null
+        : ({
+            organizationId: tenantId,
+            reservationId: "hostmint-minted",
+            canonicalPublicOrigin: exactAssignment.canonicalPublicOrigin,
+            revision: "1",
+            expiresAtEpochMilliseconds: Date.now() + 3_600_000,
+            requestedSubdomain: "community",
+            binding: {
+              space: "default",
+              workerName: "community",
+              workerResourceUid: workerUid,
+              workerResourceRevision: "1",
+            },
+            status: "bound",
+            providerPackRef: "fake",
+            providerInstallationRef: "fake.primary",
+            offeringId: "fake.endpoint",
+            offeringDigest: `sha256:${"a".repeat(64)}`,
+          } as const);
+    },
     async assignEndpoint() {
       events.push("reservation.assign");
       assignCalls += 1;
@@ -271,13 +299,44 @@ async function fixture(input: {
   };
 }
 
-test("WorkerEndpoint create requires a private reservation before provider dispatch", async () => {
+/**
+ * The reservation an ordinary organization API key never had.
+ *
+ * The reservation id is minted only through the reseller lane's scoped run
+ * token, and the released provider's `takoform_worker_endpoint` has no input
+ * for one, so an ordinary key could never create a WorkerEndpoint: the 14th
+ * resource of a Worker graph was unreachable and `launch_url` never resolved.
+ * On an installation whose endpoint address is derived from the Worker anyway,
+ * the Host reserves on the caller's behalf and the apply consumes it exactly
+ * as if a reseller had supplied one.
+ */
+test("an ordinary key gets a Host-minted reservation when the address is derived", async () => {
   const context = await fixture({});
+  await context.driver.apply(context.applyInput);
+  expect(context.events).toEqual([
+    "reservation.mint",
+    "reservation.assign",
+    "provider.apply",
+    "reservation.activate",
+  ]);
+});
+
+test("WorkerEndpoint create is refused where no address is derived and none was supplied", async () => {
+  const context = await fixture({ hostMintsReservation: false });
   await expect(context.driver.apply(context.applyInput)).rejects.toMatchObject({
     code: "unsupported_capability",
     status: 422,
   });
-  expect(context.events).toEqual([]);
+  expect(context.events).toEqual(["reservation.mint"]);
+});
+
+test("a supplied reservation is used as it is, and nothing is minted beside it", async () => {
+  const context = await fixture({});
+  await context.driver.apply({
+    ...context.applyInput,
+    workerEndpointOriginReservationId: "reservation-01",
+  });
+  expect(context.events).toEqual(["reservation.assign", "provider.apply", "reservation.activate"]);
 });
 
 test("a priced pre-dispatch refusal exact-cancels the assigned endpoint", async () => {

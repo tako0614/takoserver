@@ -2228,6 +2228,12 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         );
         return canonicalPublicOrigin ? { canonicalPublicOrigin } : null;
       },
+      // The script name, which is the same label `applyWorkerEndpoint` writes
+      // as the script's `endpointHostname` and the router already answers on.
+      // Deriving it from anywhere else would hand a Worker an address this
+      // machine does not route to.
+      hostMintedSubdomain: async ({ tenantRef, space, workerName }) =>
+        await scriptOf(tenantRef, { space, name: workerName }),
     },
 
     /** Capture a pure, redacted descriptor for post-delete readback. */

@@ -560,6 +560,49 @@ describe("publishing a Worker through the Edge Family", () => {
     expect(await readFile(statePath, "utf8")).toBe('{"activeVersion":"v-truncated","domains":[');
   });
 
+  /**
+   * The address an ordinary organization API key gets.
+   *
+   * The released provider's `takoform_worker_endpoint` accepts only `name` and
+   * `worker`, so an ordinary key supplies no reservation at all and the Host
+   * mints one from this. What the installation derives has to be the address
+   * it will actually serve on — the Worker's own script name under this
+   * deployment's suffix — or the endpoint publishes a hostname the router
+   * never answers.
+   */
+  test("derives the Host-minted endpoint subdomain as the script this machine routes", async () => {
+    const local = provider();
+    const script = await publish(local);
+    const derive = local.workerEndpointOriginReservations?.hostMintedSubdomain;
+    if (!derive) throw new Error("the self-host provider mints no endpoint subdomain");
+    const subdomain = await derive({
+      tenantRef: "org_demo",
+      space: "default",
+      workerName: "hello",
+    });
+    expect(subdomain).toBe(script);
+
+    const derived = await local.workerEndpointOriginReservations?.derive({
+      tenantRef: "org_demo",
+      requestedSubdomain: subdomain as string,
+    });
+    expect(derived?.canonicalPublicOrigin).toBe(`https://${script}.localhost`);
+
+    // And it is an address this deployment accepts and publishes.
+    const endpoint = await local.apply({
+      operationId: "op_endpoint_hostmint",
+      offering: offering("WorkerEndpoint"),
+      identity: identity("hello-endpoint"),
+      spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" } },
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+      workerEndpointOriginAssignment: endpointAssignment(`${script}.localhost`),
+    });
+    expect(endpoint.phase === "succeeded" ? endpoint.result.outputs : {}).toEqual({
+      hostname: `${script}.localhost`,
+      url: `https://${script}.localhost/`,
+    });
+  });
+
   test("the endpoint attachment assigns a stable HTTPS address and routes it", async () => {
     const local = provider();
     const script = await publish(local);

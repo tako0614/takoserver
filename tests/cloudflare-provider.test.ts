@@ -3412,6 +3412,85 @@ describe("released edge Form placement", () => {
     expect(batch.batch?.[3]?.params?.[0]).toBe(2);
   });
 
+  /**
+   * The address an ordinary organization API key gets on this backend.
+   *
+   * `#applyWorkerEndpoint` publishes `<derived script name>.<suffix>` and takes
+   * nothing from the caller, so the reservation the Host mints has to name the
+   * same hostname the apply will publish rather than a second one beside it.
+   * The managed backend sells its base domain instead of deriving one, so it
+   * mints nothing and keeps requiring a supplied reservation.
+   */
+  test("derives the Host-minted endpoint subdomain as the script the endpoint publishes", async () => {
+    const endpointOffering = technical("WorkerEndpoint");
+    const calls: Call[] = [];
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [endpointOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      workerEndpointSuffix: "tenant.workers.dev",
+      async fetch(request) {
+        calls.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body: await request.clone().text(),
+        });
+        return Response.json({ success: true, errors: [], result: { enabled: true } });
+      },
+    });
+
+    const subdomain = await provider.workerEndpointOriginReservations.hostMintedSubdomain?.({
+      tenantRef: IDENTITY.tenantRef,
+      space: IDENTITY.space,
+      workerName: "worker",
+    });
+    expect(subdomain).toMatch(/^tsw-[0-9a-f]{40}$/u);
+    expect(
+      await provider.workerEndpointOriginReservations.derive({
+        tenantRef: IDENTITY.tenantRef,
+        requestedSubdomain: subdomain as string,
+      }),
+    ).toEqual({ canonicalPublicOrigin: `https://${subdomain}.tenant.workers.dev` });
+
+    const applied = await provider.apply({
+      operationId: "op-endpoint-hostmint",
+      offering: endpointOffering,
+      identity: { ...IDENTITY, name: "public" },
+      spec: {
+        worker: {
+          apiVersion: "edge.forms.takoform.com",
+          kind: "ModuleWorker",
+          name: "worker",
+        },
+      },
+      relations: [
+        related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+          nativeId: `worker:${subdomain}`,
+          offeringId: "cloudflare.module-worker",
+          providerPackRef: "cloudflare",
+          outputs: { scriptName: subdomain as string },
+        }),
+      ],
+      workerEndpointOriginAssignment: {
+        canonicalPublicOrigin: `https://${subdomain}.tenant.workers.dev`,
+        assignmentDigest: `sha256:${"e".repeat(64)}`,
+      },
+    });
+    // The hostname the apply publishes is the one the reservation named.
+    expect(applied).toMatchObject({
+      phase: "succeeded",
+      result: {
+        outputs: {
+          hostname: `${subdomain}.tenant.workers.dev`,
+          url: `https://${subdomain}.tenant.workers.dev/`,
+        },
+      },
+    });
+  });
+
   test("observes and removes every composed provider object without guessing identity", async () => {
     const offerings = [
       technical("WorkerVersion"),

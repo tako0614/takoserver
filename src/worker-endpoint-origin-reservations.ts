@@ -5,6 +5,7 @@ import { canonicalDigest } from "./json.ts";
 import type { Clock, JsonObject, Row, Sql, SqlWrite } from "./ports.ts";
 import { createSoldProviderPlacementSelector } from "./provider-placement.ts";
 import type { Provider } from "./provider-port.ts";
+import { derivedProviderResourceIncarnationName } from "./provider-worker-endpoint-origin.ts";
 import type { ResourceDeployment, ResourceDeploymentStore } from "./resource-deployments.ts";
 import type { ResourceWithRelations, TakoformStore } from "./takoform/store.ts";
 
@@ -16,6 +17,19 @@ export const WORKER_ENDPOINT_ORIGIN_RESERVATION_ACTIVATION_FORMAT =
   "takoserver.worker-endpoint-origin-reservation-activation.v2" as const;
 export const WORKER_ENDPOINT_ORIGIN_ASSIGNMENT_FORMAT =
   "takoserver.worker-endpoint-origin-assignment.v1" as const;
+
+/**
+ * The reservation-id namespace this Host mints in, and no caller may write to.
+ *
+ * A Host-minted reservation is derived, not requested: one per organization,
+ * Space and logical Worker, exactly the uniqueness ADR 0004 already states. The
+ * prefix is the fence — the public control route refuses it, so a reservation
+ * in this namespace is always one this Host made, and `mintForWorker` never
+ * adopts a row a caller wrote.
+ */
+export const HOST_MINTED_RESERVATION_PREFIX = "hostmint-";
+/** Long enough to outlive an apply, short enough that an abandoned one ages out. */
+const HOST_MINTED_TTL_SECONDS = 24 * 60 * 60;
 
 const MINIMUM_TTL_SECONDS = 60;
 const MAXIMUM_TTL_SECONDS = 24 * 60 * 60;
@@ -180,6 +194,22 @@ export interface WorkerEndpointOriginReservations {
     readonly reservationId: string;
     readonly endpointResourceUid: string;
   }): Promise<WorkerEndpointOriginReservationProjection>;
+  /**
+   * Reserves this Host's own derived origin for one exact Ready ModuleWorker,
+   * on behalf of a caller that has no reservation input at all.
+   *
+   * `null` means the selected installation does not derive its own endpoint
+   * address, so there is nothing to mint and the caller must supply one. The
+   * returned reservation is `bound` to the exact Worker and is ready for
+   * `assignEndpoint`.
+   */
+  mintForWorker(input: {
+    readonly organizationId: string;
+    readonly space: string;
+    readonly workerName: string;
+    readonly workerResourceUid: string;
+    readonly offeringId?: string;
+  }): Promise<BoundWorkerEndpointOriginReservation | null>;
   /** CAS-pins a future endpoint before the Provider mutation boundary. */
   assignEndpoint(input: {
     readonly organizationId: string;
@@ -422,6 +452,109 @@ export function createWorkerEndpointOriginReservations(options: {
     return { snapshot, deployment };
   };
 
+  /**
+   * Lets go of a reservation, under the four fences ADR 0004 states.
+   *
+   * Named rather than inline because the Host-minted lane needs it too: a
+   * reservation this Host derived for a logical Worker is reclaimed by the
+   * same rule a caller's explicit DELETE goes through, never by a shortcut.
+   */
+  const releaseReservation = async (
+    organizationId: string,
+    reservationId: string,
+  ): Promise<void> => {
+    normalizeIdentity(organizationId, reservationId);
+    await expire(organizationId, reservationId);
+    const row = await readRow(options.sql, organizationId, reservationId);
+    if (!row || row.state === "released") return;
+    if (row.state === "activated") {
+      throw new WorkerEndpointOriginReservationError("conflict", 409);
+    }
+    const timestamp = now();
+    let released: SqlWrite;
+    try {
+      released = await options.sql.run(
+        `UPDATE worker_endpoint_origin_reservations
+         SET state = 'released', revision = revision + 1,
+             released_at = ?, updated_at = ?
+         WHERE organization_id = ? AND reservation_id = ? AND revision = ?
+           AND state IN ('prepared', 'bound', 'expired')
+           AND (
+             endpoint_resource_uid IS NULL OR (
+               NOT EXISTS (
+                 SELECT 1 FROM tf_resources AS endpoint_resource
+                 WHERE endpoint_resource.tenant_id = worker_endpoint_origin_reservations.organization_id
+                   AND endpoint_resource.uid = worker_endpoint_origin_reservations.endpoint_resource_uid
+               )
+               AND EXISTS (
+                 SELECT 1 FROM tf_resource_deletion_attestations AS endpoint_deletion
+                 WHERE endpoint_deletion.tenant_id = worker_endpoint_origin_reservations.organization_id
+                   AND endpoint_deletion.resource_uid = worker_endpoint_origin_reservations.endpoint_resource_uid
+                   AND endpoint_deletion.state = 'closed'
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM tf_resource_deployments AS endpoint_deployment
+                 WHERE endpoint_deployment.tenant_id = worker_endpoint_origin_reservations.organization_id
+                   AND endpoint_deployment.resource_uid = worker_endpoint_origin_reservations.endpoint_resource_uid
+                   AND endpoint_deployment.state NOT IN ('deleted', 'failed')
+               )
+             )
+           )`,
+        [timestamp, timestamp, organizationId, reservationId, row.revision],
+      );
+    } catch {
+      throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
+    }
+    if (released.changes !== 1) {
+      const current = await readRow(options.sql, organizationId, reservationId);
+      if (!current || current.state === "released") return;
+      throw new WorkerEndpointOriginReservationError("conflict", 409);
+    }
+  };
+
+  /**
+   * Frees a Host-minted reservation that describes a Worker incarnation which
+   * is gone.
+   *
+   * The id is derived from the address, not the incarnation, so a destroy
+   * followed by a re-apply asks for the same reservation with a new Worker UID.
+   * Release is the one fenced way to let go of it: ADR 0004 requires the
+   * retained endpoint Resource to be absent, its deletion attestation closed,
+   * and no provider deployment outside `deleted`/`failed`. If those do not
+   * hold, the old endpoint may still be serving on that origin and the mint
+   * fails rather than reallocating it.
+   */
+  const releaseSupersededHostMint = async (input: {
+    readonly organizationId: string;
+    readonly requestedSubdomain: string;
+    readonly reservationId: string;
+  }): Promise<void> => {
+    let rows: readonly Row[];
+    try {
+      rows = await options.sql.query(
+        `SELECT reservation_id, state, endpoint_resource_uid
+         FROM worker_endpoint_origin_reservations
+         WHERE organization_id = ? AND requested_subdomain = ?
+         LIMIT 8`,
+        [input.organizationId, input.requestedSubdomain],
+      );
+    } catch {
+      throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
+    }
+    for (const row of rows) {
+      const reservationId = String(row.reservation_id);
+      // Never a reservation a caller made. One that owns this address is the
+      // caller's authority over it, and the mint below fails on the live
+      // uniqueness constraint rather than taking it away.
+      if (!reservationId.startsWith(HOST_MINTED_RESERVATION_PREFIX)) continue;
+      if (String(row.state) === "released") continue;
+      const superseded =
+        reservationId !== input.reservationId || row.endpoint_resource_uid !== null;
+      if (!superseded) continue;
+      await releaseReservation(input.organizationId, reservationId);
+    }
+  };
+
   const inspectBound = async (input: {
     readonly organizationId: string;
     readonly reservationId: string;
@@ -529,55 +662,7 @@ export function createWorkerEndpointOriginReservations(options: {
       return row ? publicProjection(row) : null;
     },
 
-    async release(organizationId, reservationId) {
-      normalizeIdentity(organizationId, reservationId);
-      await expire(organizationId, reservationId);
-      const row = await readRow(options.sql, organizationId, reservationId);
-      if (!row || row.state === "released") return;
-      if (row.state === "activated") {
-        throw new WorkerEndpointOriginReservationError("conflict", 409);
-      }
-      const timestamp = now();
-      let released: SqlWrite;
-      try {
-        released = await options.sql.run(
-          `UPDATE worker_endpoint_origin_reservations
-           SET state = 'released', revision = revision + 1,
-               released_at = ?, updated_at = ?
-           WHERE organization_id = ? AND reservation_id = ? AND revision = ?
-             AND state IN ('prepared', 'bound', 'expired')
-             AND (
-               endpoint_resource_uid IS NULL OR (
-                 NOT EXISTS (
-                   SELECT 1 FROM tf_resources AS endpoint_resource
-                   WHERE endpoint_resource.tenant_id = worker_endpoint_origin_reservations.organization_id
-                     AND endpoint_resource.uid = worker_endpoint_origin_reservations.endpoint_resource_uid
-                 )
-                 AND EXISTS (
-                   SELECT 1 FROM tf_resource_deletion_attestations AS endpoint_deletion
-                   WHERE endpoint_deletion.tenant_id = worker_endpoint_origin_reservations.organization_id
-                     AND endpoint_deletion.resource_uid = worker_endpoint_origin_reservations.endpoint_resource_uid
-                     AND endpoint_deletion.state = 'closed'
-                 )
-                 AND NOT EXISTS (
-                   SELECT 1 FROM tf_resource_deployments AS endpoint_deployment
-                   WHERE endpoint_deployment.tenant_id = worker_endpoint_origin_reservations.organization_id
-                     AND endpoint_deployment.resource_uid = worker_endpoint_origin_reservations.endpoint_resource_uid
-                     AND endpoint_deployment.state NOT IN ('deleted', 'failed')
-                 )
-               )
-             )`,
-          [timestamp, timestamp, organizationId, reservationId, row.revision],
-        );
-      } catch {
-        throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
-      }
-      if (released.changes !== 1) {
-        const current = await readRow(options.sql, organizationId, reservationId);
-        if (!current || current.state === "released") return;
-        throw new WorkerEndpointOriginReservationError("conflict", 409);
-      }
-    },
+    release: releaseReservation,
 
     async bind(input) {
       normalizeIdentity(input.organizationId, input.reservationId);
@@ -912,6 +997,53 @@ export function createWorkerEndpointOriginReservations(options: {
         throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
       }
       return publicProjection(current);
+    },
+
+    async mintForWorker(input) {
+      normalizeIdentity(input.organizationId, input.workerResourceUid);
+      validateTargetName(input.space);
+      validateTargetName(input.workerName);
+      if (input.offeringId !== undefined) validateOpaque(input.offeringId);
+      const selection = await selectedPlacement(input.offeringId);
+      const derive = selection.provider.workerEndpointOriginReservations?.hostMintedSubdomain;
+      if (!derive) return null;
+      let subdomain: string | null;
+      try {
+        subdomain = await derive({
+          tenantRef: input.organizationId,
+          space: input.space,
+          workerName: input.workerName,
+        });
+      } catch {
+        throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
+      }
+      if (subdomain === null) return null;
+      if (!requestedSubdomain.test(subdomain)) {
+        // The installation derived a label this contract cannot hold. That is
+        // a composition defect, not a caller error, and it must not become a
+        // reservation on some other origin.
+        throw new WorkerEndpointOriginReservationError("unsupported_capability", 422);
+      }
+      const reservationId = await hostMintedReservationId(input);
+      await releaseSupersededHostMint({
+        organizationId: input.organizationId,
+        requestedSubdomain: subdomain,
+        reservationId,
+      });
+      await this.prepare({
+        organizationId: input.organizationId,
+        reservationId,
+        requestedSubdomain: subdomain,
+        ...(input.offeringId ? { offeringId: input.offeringId } : {}),
+        expiresInSeconds: HOST_MINTED_TTL_SECONDS,
+      });
+      return await this.bind({
+        organizationId: input.organizationId,
+        reservationId,
+        space: input.space,
+        workerName: input.workerName,
+        workerResourceUid: input.workerResourceUid,
+      });
     },
 
     async assignEndpoint(input) {
@@ -1856,6 +1988,30 @@ function sameForm(left: TakoformV1Alpha3FormRef, right: TakoformV1Alpha3FormRef)
     left.definitionVersion === right.definitionVersion &&
     left.schemaDigest === right.schemaDigest
   );
+}
+
+/**
+ * The one Host-minted reservation id for a Worker *incarnation*.
+ *
+ * A retry of the same apply asks for the same reservation, and a Worker
+ * destroyed and declared again asks for a different one — the reservations are
+ * separate rows describing separate lives of one address, which is what lets
+ * the released one stay as history while the new one is prepared. The address
+ * itself is what stays unique, and the release fences are the only way it is
+ * ever handed on.
+ */
+async function hostMintedReservationId(target: {
+  readonly organizationId: string;
+  readonly space: string;
+  readonly workerName: string;
+  readonly workerResourceUid: string;
+}): Promise<string> {
+  return await derivedProviderResourceIncarnationName("hostmint", {
+    tenantRef: target.organizationId,
+    space: target.space,
+    name: target.workerName,
+    uid: target.workerResourceUid,
+  });
 }
 
 function normalizeIdentity(organizationId: string, reservationId: string): void {

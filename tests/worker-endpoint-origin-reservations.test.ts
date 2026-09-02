@@ -145,6 +145,8 @@ function fixture(
     readonly offerings?: readonly Offering[];
     readonly technical?: readonly ProviderOffering[];
     readonly fixedOrigin?: string;
+    /** `false` removes the capability; a string is the label it derives. */
+    readonly hostMintedSubdomain?: string | false;
     readonly sql?: ReturnType<typeof createReservationV2Sql>;
   } = {},
 ) {
@@ -167,6 +169,24 @@ function fixture(
             input.fixedOrigin ?? `https://${requestedSubdomain}.${tenantRef}.workers.test`,
         };
       },
+      // An installation whose endpoint address is derived from the Worker, the
+      // way the self-host suffix and the ordinary-workers suffix are.
+      ...(input.hostMintedSubdomain === false
+        ? {}
+        : {
+            async hostMintedSubdomain({
+              space,
+              workerName,
+            }: {
+              tenantRef: string;
+              space: string;
+              workerName: string;
+            }) {
+              return typeof input.hostMintedSubdomain === "string"
+                ? input.hostMintedSubdomain
+                : `sw-${space}-${workerName}`;
+            },
+          }),
     },
   }) satisfies Provider;
   const authority = createWorkerEndpointOriginReservations({
@@ -1132,6 +1152,174 @@ test("migrates a durable v1 row for read and drain lifecycle without reopening i
     status: "bound",
     requestedSubdomain: "current-public",
   });
+});
+
+/**
+ * The reservation an ordinary organization API key never had.
+ *
+ * The reseller lane sells a name and holds it before the Resource graph
+ * exists, and the reservation is the authority for it. An ordinary key has no
+ * such input — the released provider's `takoform_worker_endpoint` accepts only
+ * `name` and `worker` — so on an installation whose endpoint address is derived
+ * from the Worker anyway, this Host reserves on the caller's behalf.
+ */
+test("mints one bound reservation for a Ready Worker on an installation that derives its address", async () => {
+  const { authority, sql } = fixture();
+  await seedWorker(sql);
+  const target = {
+    organizationId: "org_01",
+    space: TARGET.space,
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-01",
+  } as const;
+
+  const minted = await authority.mintForWorker(target);
+  expect(minted).toMatchObject({
+    organizationId: "org_01",
+    status: "bound",
+    canonicalPublicOrigin: `https://sw-${TARGET.space}-${TARGET.workerName}.org_01.workers.test`,
+    binding: {
+      space: TARGET.space,
+      workerName: TARGET.workerName,
+      workerResourceUid: "uid-worker-01",
+      workerResourceRevision: "1",
+    },
+  });
+  // Derived from the exact Worker incarnation, so a retry of the same apply
+  // asks for the same reservation rather than a second origin.
+  expect(minted?.reservationId).toMatch(/^hostmint-[0-9a-f]{40}$/u);
+  expect((await authority.mintForWorker(target))?.reservationId).toBe(
+    minted?.reservationId as string,
+  );
+  expect(
+    await sql.query("SELECT reservation_id FROM worker_endpoint_origin_reservations"),
+  ).toHaveLength(1);
+
+  // One reservation per organization, Space and logical Worker: a second
+  // Worker in the same Space gets its own, and its own origin.
+  await seedWorker(sql, {
+    organizationId: "org_01",
+    space: TARGET.space,
+    workerName: "other",
+    workerResourceUid: "uid-worker-02",
+  });
+  const second = await authority.mintForWorker({
+    organizationId: "org_01",
+    space: TARGET.space,
+    workerName: "other",
+    workerResourceUid: "uid-worker-02",
+  });
+  expect(second?.reservationId).not.toBe(minted?.reservationId);
+  expect(second?.canonicalPublicOrigin).not.toBe(minted?.canonicalPublicOrigin);
+});
+
+test("mints nothing where the installation does not derive its own endpoint address", async () => {
+  const { authority, sql } = fixture({ hostMintedSubdomain: false });
+  await seedWorker(sql);
+  expect(
+    await authority.mintForWorker({
+      organizationId: "org_01",
+      space: TARGET.space,
+      workerName: TARGET.workerName,
+      workerResourceUid: "uid-worker-01",
+    }),
+  ).toBeNull();
+  expect(await sql.query("SELECT reservation_id FROM worker_endpoint_origin_reservations")).toEqual(
+    [],
+  );
+});
+
+test("refuses to mint against a Worker that is not the exact Ready incarnation", async () => {
+  const { authority, sql } = fixture();
+  await seedWorker(sql);
+  await expect(
+    authority.mintForWorker({
+      organizationId: "org_01",
+      space: TARGET.space,
+      workerName: TARGET.workerName,
+      workerResourceUid: "uid-worker-missing",
+    }),
+  ).rejects.toMatchObject({ code: "conflict", status: 409 });
+});
+
+/**
+ * A destroy followed by a re-apply asks for the same derived reservation with a
+ * new Worker UID. Letting go of the old one is the fenced release of ADR 0004
+ * and nothing weaker: while the old endpoint Resource is present, its deletion
+ * attestation open, or a provider deployment still live, the origin stays where
+ * it is and the mint fails rather than reallocating an address that may still
+ * be serving.
+ */
+test("reclaims its own superseded reservation only through the release fences", async () => {
+  const { authority, sql } = fixture();
+  await seedWorker(sql);
+  const minted = await authority.mintForWorker({
+    organizationId: "org_01",
+    space: TARGET.space,
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-01",
+  });
+  if (!minted) throw new Error("the fixture installation derives its own address");
+  await seedEndpoint(sql, minted.canonicalPublicOrigin);
+  await authority.assignEndpoint({
+    organizationId: "org_01",
+    reservationId: minted.reservationId,
+    space: TARGET.space,
+    endpointName: TARGET.endpointName,
+    endpointResourceUid: "uid-endpoint-01",
+    endpointResourceRevision: "1",
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-01",
+    providerPackRef: "fake",
+    providerInstallationRef: "fake.primary",
+  });
+
+  // The Worker was destroyed and declared again: same address, new incarnation.
+  await sql.run("DELETE FROM tf_resources WHERE tenant_id = 'org_01' AND uid = 'uid-worker-01'");
+  await seedWorker(sql, {
+    organizationId: "org_01",
+    space: TARGET.space,
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-03",
+  });
+  const remint = {
+    organizationId: "org_01",
+    space: TARGET.space,
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-03",
+  } as const;
+
+  // The old endpoint is still present, so the origin is not free.
+  await expect(authority.mintForWorker(remint)).rejects.toMatchObject({
+    code: "conflict",
+    status: 409,
+  });
+
+  await sql.run("DELETE FROM tf_resources WHERE tenant_id = 'org_01' AND uid = 'uid-endpoint-01'");
+  await sql.run(
+    "UPDATE tf_resource_deployments SET state = 'deleted' WHERE tenant_id = 'org_01' AND resource_uid = 'uid-endpoint-01'",
+  );
+  await sql.run(
+    "UPDATE tf_resource_deletion_attestations SET state = 'closed' WHERE tenant_id = 'org_01' AND resource_uid = 'uid-endpoint-01'",
+  );
+
+  const reminted = await authority.mintForWorker(remint);
+  expect(reminted).toMatchObject({
+    canonicalPublicOrigin: minted.canonicalPublicOrigin,
+    binding: { workerResourceUid: "uid-worker-03" },
+    status: "bound",
+  });
+  // A different reservation: the old one stays as history of the address's
+  // previous life, released rather than rewritten.
+  expect(reminted?.reservationId).not.toBe(minted.reservationId);
+  expect(
+    await sql.query(
+      "SELECT reservation_id, state FROM worker_endpoint_origin_reservations ORDER BY created_at",
+    ),
+  ).toEqual([
+    { reservation_id: minted.reservationId, state: "released" },
+    { reservation_id: reminted?.reservationId as string, state: "bound" },
+  ]);
 });
 
 async function seedWorker(
