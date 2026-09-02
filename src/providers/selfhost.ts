@@ -23,6 +23,14 @@ import {
   succeeded,
 } from "../provider-port.ts";
 import {
+  MAX_PROVIDER_RUNTIME_INPUT_BINDINGS,
+  type ProviderRuntimeInputDispatchedLease,
+  type ProviderRuntimeInputLease,
+  type ProviderRuntimeInputLeasePort,
+  type ProviderRuntimeInputRecoveryLease,
+  type ProviderRuntimeInputTarget,
+} from "../provider-runtime-input-port.ts";
+import {
   canonicalWorkerEndpointOrigin,
   derivedProviderResourceName,
 } from "../provider-worker-endpoint-origin.ts";
@@ -81,6 +89,14 @@ import {
  * environment bindings, kept in a `0600` record beside — never inside — the
  * immutable version directory, whose digest means "the bytes the tenant
  * committed" and must not move because a variable did.
+ *
+ * `requiredSensitiveVars` travel the same last mile, because workerd has no
+ * separate notion of a secret: what makes them sensitive here is the file mode
+ * and the rule that no value reaches an observation, an output, a native id, or
+ * a log line. They arrive through the one-shot lease port, which this provider
+ * only has when the operator configured a seal key ring — so a machine with
+ * nowhere to keep a secret at rest advertises no capability and the declaration
+ * is refused at admission rather than half-executed.
  */
 
 const MAX_WORKER_VERSION_VARS = 64;
@@ -134,6 +150,15 @@ export interface SelfhostProviderOptions {
   readonly workerEndpointSuffix?: string;
   /** Hostname suffixes custom domains may claim. Empty means any. */
   readonly suffixes?: readonly string[];
+  /**
+   * The one value-bearing seam for `requiredSensitiveVars`.
+   *
+   * Absent is a real answer, and the fail-closed one: an operator who has not
+   * configured a seal key ring has nowhere to keep a secret at rest, so this
+   * provider advertises no runtime-input capability and admission refuses the
+   * declaration with `unsupported_capability` before any mutation happens.
+   */
+  readonly runtimeInputs?: ProviderRuntimeInputLeasePort;
 }
 
 class SelfhostFailure extends Error {
@@ -154,6 +179,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   const databasesRoot = join(dataRoot, "databases");
   const scriptStates = createSelfhostScriptStateStore({ root: scriptsRoot });
   const versionBindings = createSelfhostVersionBindingStore({ root: versionBindingsRoot });
+  const runtimeInputs = options.runtimeInputs;
   const versionMaterializer = createSelfhostVersionMaterializer({
     root: versionsRoot,
     artifacts,
@@ -390,6 +416,31 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     input.previous?.nativeId ?? `${base}:${input.operationId}`;
 
   /**
+   * Whether this machine can actually take a sensitive declaration.
+   *
+   * Every part has to be there: a lease port, the operation key both halves of
+   * the handoff are addressed by, a way to revoke one whose values never
+   * landed, the Resource UID the claim is fenced to, and the exact logical
+   * target. Missing any of them is `denied` before a file exists, not a failure
+   * after one does.
+   */
+  const leasesAvailable = (input: ApplyInput, target: ProviderRuntimeInputTarget | null): boolean =>
+    Boolean(runtimeInputs?.abandon && input.operationKey && input.identity.uid && target);
+
+  /** The exact logical Worker this version's sensitive values belong to. */
+  const sensitiveTarget = (input: ApplyInput): ProviderRuntimeInputTarget | null => {
+    const worker = relationResource(input.relations, "/worker", "ModuleWorker");
+    const bundle = relationResource(input.relations, "/bundle", "WorkerBundle");
+    if (!worker || !bundle) return null;
+    return {
+      space: input.identity.space,
+      workerName: worker.metadata.name,
+      workerResourceUid: worker.metadata.uid,
+      bundleName: bundle.metadata.name,
+    };
+  };
+
+  /**
    * The Worker Version's own non-secret environment.
    *
    * A string becomes a `text` binding and anything else a `json` one, which is
@@ -452,15 +503,13 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
 
   const applyWorkerVersion = async (input: ApplyInput): Promise<ProviderTicket> => {
     if (input.previous) return failed("invalid_spec", "Worker Versions are immutable");
-    const requiredSensitive = input.spec.requiredSensitiveVars ?? [];
-    if (
-      !Array.isArray(requiredSensitive) ||
-      requiredSensitive.some((name) => typeof name !== "string")
-    ) {
+    const requiredSensitive = sensitiveBindingNames(input.spec.requiredSensitiveVars);
+    if (!requiredSensitive) {
       return failed("invalid_spec", "the sensitive Worker binding declaration is invalid");
     }
-    if (requiredSensitive.length > 0) {
-      return failed("denied", "sensitive Worker bindings are unsupported by this Host");
+    const runtimeInputTarget = sensitiveTarget(input);
+    if (requiredSensitive.length > 0 && !leasesAvailable(input, runtimeInputTarget)) {
+      return failed("denied", "required sensitive Worker runtime inputs are unavailable");
     }
     const worker = relationResource(input.relations, "/worker", "ModuleWorker");
     const bundle = relationResource(input.relations, "/bundle", "WorkerBundle");
@@ -496,6 +545,30 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       };
     }
 
+    // The lease is claimed before anything is materialized, so a Worker Version
+    // whose secrets this Host cannot obtain leaves nothing behind on disk.
+    let lease: ProviderRuntimeInputLease | undefined;
+    if (requiredSensitive.length > 0 && runtimeInputTarget) {
+      try {
+        lease = await (runtimeInputs as ProviderRuntimeInputLeasePort).acquire({
+          organizationId: input.identity.tenantRef,
+          operationId: input.operationId,
+          resourceUid: input.identity.uid as string,
+          reference: input.operationKey as string,
+          target: runtimeInputTarget,
+          bindingNames: requiredSensitive,
+        });
+      } catch (error) {
+        return runtimeInputFailure(error, "acquire");
+      }
+      if (!exactRuntimeInputBindings(lease.bindings, requiredSensitive)) {
+        const aborted = await abortRuntimeLease(lease);
+        return (
+          aborted ?? failed("denied", "required sensitive Worker runtime inputs are unavailable")
+        );
+      }
+    }
+
     let materialized: Awaited<ReturnType<typeof versionMaterializer.materialize>>;
     try {
       materialized = await versionMaterializer.materialize({
@@ -506,12 +579,67 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         ...(assetsInput ? { assets: assetsInput } : {}),
       });
     } catch (error) {
+      const aborted = lease ? await abortRuntimeLease(lease) : null;
+      if (aborted) return aborted;
       if (error instanceof SelfhostVersionMaterializationError) {
         return failed(error.code, materializationMessage(error), error.code === "unavailable");
       }
       throw error;
     }
-    await writeVersionBindings(script, versionId, { vars, sensitiveVars: [] });
+
+    // On this Host the "provider request" is the write itself: the values reach
+    // a durable file and nothing else. Dispatch therefore happens immediately
+    // before that write and after everything that could still refuse.
+    let dispatched: ProviderRuntimeInputDispatchedLease | undefined;
+    if (lease) {
+      try {
+        dispatched = await lease.dispatch();
+      } catch (error) {
+        return runtimeInputFailure(error, "dispatch");
+      }
+    }
+    const sensitiveVars: readonly SelfhostVersionBinding[] = lease
+      ? requiredSensitive.map((name) => ({
+          name,
+          value: lease.bindings[name] as string,
+          kind: "text" as const,
+        }))
+      : [];
+    try {
+      await writeVersionBindings(script, versionId, { vars, sensitiveVars });
+    } catch (error) {
+      if (dispatched && error instanceof SelfhostFailure) {
+        return failed("unavailable", "the Worker Version environment did not settle", true);
+      }
+      throw error;
+    }
+
+    // Authoritative readback: what this machine will actually serve, re-read
+    // from disk rather than assumed from what was just written.
+    const recorded = await readVersionBindings(script, versionId);
+    const inspected = await inspectVersion(script, versionId);
+    if (
+      inspected.state !== "present" ||
+      inspected.digest !== materialized.materializationDigest ||
+      !sameBindingNames(recorded, vars, requiredSensitive)
+    ) {
+      return failed("unavailable", "the Worker Version did not settle on this machine", true);
+    }
+    if (dispatched) {
+      try {
+        await dispatched.settle(
+          await versionRuntimeInputReceiptDigest({
+            script,
+            versionId,
+            materializationDigest: inspected.digest,
+            bindingsDigest: recorded?.digest ?? null,
+            bindingNames: requiredSensitive,
+          }),
+        );
+      } catch (error) {
+        return runtimeInputFailure(error, "settle");
+      }
+    }
 
     return succeeded({
       nativeId: nativeId(input, `selfhost-version:${script}:${versionId}`),
@@ -522,6 +650,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         // Names only, and only when there are any: an environment is not
         // identity, and an empty declaration must observe as it always did.
         ...(vars.length > 0 ? { varNames: vars.map((binding) => binding.name) } : {}),
+        ...(requiredSensitive.length > 0 ? { sensitiveVarNames: requiredSensitive } : {}),
       },
       outputs: {
         scriptName: script,
@@ -538,15 +667,13 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
    */
   const recoverWorkerVersionApply = async (input: ApplyInput): Promise<ProviderTicket> => {
     if (input.previous) return failed("invalid_spec", "Worker Versions are immutable");
-    const requiredSensitive = input.spec.requiredSensitiveVars ?? [];
-    if (
-      !Array.isArray(requiredSensitive) ||
-      requiredSensitive.some((name) => typeof name !== "string")
-    ) {
+    const requiredSensitive = sensitiveBindingNames(input.spec.requiredSensitiveVars);
+    if (!requiredSensitive) {
       return failed("invalid_spec", "the sensitive Worker binding declaration is invalid");
     }
-    if (requiredSensitive.length > 0) {
-      return failed("denied", "sensitive Worker bindings are unsupported by this Host");
+    const runtimeInputTarget = sensitiveTarget(input);
+    if (requiredSensitive.length > 0 && !leasesAvailable(input, runtimeInputTarget)) {
+      return failed("denied", "required sensitive Worker runtime inputs are unavailable");
     }
     const worker = relationResource(input.relations, "/worker", "ModuleWorker");
     const bundle = relationResource(input.relations, "/bundle", "WorkerBundle");
@@ -596,7 +723,49 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       }
       throw error;
     }
+    // Readback-only from here down. Recovery never materializes, never writes a
+    // binding, and never asks for the values again: a dispatched handoff has
+    // already erased its ciphertext, and a second dispatch is not a thing this
+    // seam can do.
+    let recoveryLease: ProviderRuntimeInputRecoveryLease | undefined;
+    if (requiredSensitive.length > 0 && runtimeInputTarget) {
+      try {
+        recoveryLease = await (runtimeInputs as ProviderRuntimeInputLeasePort).recover({
+          organizationId: input.identity.tenantRef,
+          operationId: input.operationId,
+          resourceUid: input.identity.uid as string,
+          reference: input.operationKey as string,
+          target: runtimeInputTarget,
+          bindingNames: requiredSensitive,
+        });
+      } catch (error) {
+        return runtimeInputFailure(error, "recover");
+      }
+      if (!sameStrings(recoveryLease.bindingNames, requiredSensitive)) {
+        return failed("denied", "required sensitive Worker runtime inputs are unavailable");
+      }
+    }
     const materialized = await inspectVersion(script, versionId);
+    const recorded = await readVersionBindings(script, versionId);
+    // Proven absence, and the only shape of it this Host can prove: no file on
+    // this machine holds these values. Revoking the handoff is what lets the
+    // ordinary retry prepare the same operation key again instead of deadlocking
+    // against a dispatched lease it can never claim.
+    const absent = materialized.state === "absent" && recorded === null;
+    if (absent && requiredSensitive.length > 0 && runtimeInputTarget) {
+      try {
+        await (runtimeInputs as ProviderRuntimeInputLeasePort).abandon?.({
+          organizationId: input.identity.tenantRef,
+          operationId: input.operationId,
+          resourceUid: input.identity.uid as string,
+          reference: input.operationKey as string,
+          target: runtimeInputTarget,
+          bindingNames: requiredSensitive,
+        });
+      } catch (error) {
+        return runtimeInputFailure(error, "abort");
+      }
+    }
     if (materialized.state === "absent") {
       return failed("not_found", "the Worker Version is not materialized");
     }
@@ -609,12 +778,23 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         "the committed Worker Version materialization conflicts with this recovery",
       );
     }
-    // Recovery is readback-only: an environment this Host never recorded is not
-    // written here, it is reported as an apply that did not complete, and the
-    // ordinary retry of an immutable create is what finishes the job.
-    const recorded = await readVersionBindings(script, versionId);
-    if (!sameBindingNames(recorded, vars, [])) {
+    if (!sameBindingNames(recorded, vars, requiredSensitive)) {
       return failed("not_found", "the Worker Version environment was not recorded");
+    }
+    if (recoveryLease) {
+      try {
+        await recoveryLease.settle(
+          await versionRuntimeInputReceiptDigest({
+            script,
+            versionId,
+            materializationDigest: materialized.digest,
+            bindingsDigest: recorded?.digest ?? null,
+            bindingNames: requiredSensitive,
+          }),
+        );
+      } catch (error) {
+        return runtimeInputFailure(error, "settle");
+      }
     }
     return succeeded({
       nativeId: nativeId(input, `selfhost-version:${script}:${versionId}`),
@@ -624,6 +804,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         materialized: true,
         materializationDigest: materialized.digest,
         ...(vars.length > 0 ? { varNames: vars.map((binding) => binding.name) } : {}),
+        ...(requiredSensitive.length > 0 ? { sensitiveVarNames: requiredSensitive } : {}),
       },
       outputs: {
         scriptName: script,
@@ -847,6 +1028,12 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   return {
     id,
     offerings: structuredClone(options.offerings) as ProviderOffering[],
+    // Derived from the lease port's presence, never from a config flag. A
+    // machine that advertised a non-zero ceiling without somewhere to seal a
+    // value would turn a clean 422 at admission into a failure at apply.
+    ...(runtimeInputs
+      ? { runtimeInputCapabilities: { maximumBindings: MAX_PROVIDER_RUNTIME_INPUT_BINDINGS } }
+      : {}),
     workerEndpointOriginReservations: {
       derive: async ({ requestedSubdomain }) => {
         const canonicalPublicOrigin = canonicalWorkerEndpointOrigin(
@@ -2040,6 +2227,102 @@ function errorCode(error: unknown): string | undefined {
   return typeof error === "object" && error !== null && "code" in error
     ? String(error.code)
     : undefined;
+}
+
+/**
+ * The closed sensitive declaration, sorted, or null when it is not one.
+ *
+ * The grammar is the superset of the Form's own and the runtime-input
+ * authority's, so a name either arrives from both or from neither.
+ */
+function sensitiveBindingNames(value: unknown): readonly string[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return null;
+  const names = value.filter((entry): entry is string => typeof entry === "string");
+  if (
+    names.length !== value.length ||
+    names.length > MAX_PROVIDER_RUNTIME_INPUT_BINDINGS ||
+    new Set(names).size !== names.length ||
+    names.some((name) => !/^[A-Z_][A-Z0-9_]{0,127}$/u.test(name))
+  ) {
+    return null;
+  }
+  return [...names].sort();
+}
+
+function exactRuntimeInputBindings(
+  bindings: Readonly<Record<string, string>>,
+  expectedNames: readonly string[],
+): boolean {
+  return (
+    sameStrings(Object.keys(bindings), expectedNames) &&
+    expectedNames.every((name) => typeof bindings[name] === "string" && bindings[name].length > 0)
+  );
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return JSON.stringify([...left].sort()) === JSON.stringify([...right].sort());
+}
+
+async function abortRuntimeLease(lease: ProviderRuntimeInputLease): Promise<ProviderTicket | null> {
+  try {
+    await lease.abort();
+    return null;
+  } catch (error) {
+    return runtimeInputFailure(error, "abort");
+  }
+}
+
+/**
+ * A closed provider outcome for a lease that did not go the way it had to.
+ *
+ * Nothing about the failure escapes beyond its phase: the message never names
+ * a binding, and never carries a Host diagnostic that might quote one.
+ */
+function runtimeInputFailure(
+  error: unknown,
+  phase: "acquire" | "abort" | "dispatch" | "recover" | "settle",
+): ProviderTicket {
+  const code =
+    typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
+  if (phase !== "acquire" || code === "unavailable") {
+    return failed(
+      "unavailable",
+      "the sensitive Worker runtime input outcome is indeterminate",
+      true,
+    );
+  }
+  return code === "conflict"
+    ? failed("conflict", "the sensitive Worker runtime input lease conflicts")
+    : failed("denied", "required sensitive Worker runtime inputs are unavailable");
+}
+
+/**
+ * The authoritative receipt for one settled handoff.
+ *
+ * Every field is something this machine read back after the write, and none of
+ * them is a value: names, the materialization digest, and the salted commitment
+ * to the binding record.
+ */
+async function versionRuntimeInputReceiptDigest(input: {
+  readonly script: string;
+  readonly versionId: string;
+  readonly materializationDigest: string;
+  readonly bindingsDigest: string | null;
+  readonly bindingNames: readonly string[];
+}): Promise<`sha256:${string}`> {
+  const canonical = JSON.stringify({
+    format: "takoserver.selfhost-worker-version-runtime-input-receipt@v1",
+    script: input.script,
+    versionId: input.versionId,
+    materializationDigest: input.materializationDigest,
+    bindingsDigest: input.bindingsDigest,
+    bindingNames: [...input.bindingNames].sort(),
+  });
+  const bytes = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical)),
+  );
+  return `sha256:${[...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 }
 
 /**

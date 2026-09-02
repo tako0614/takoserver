@@ -5,6 +5,7 @@ import {
 import { type EdgeFormBundle, edgeProviderOffering } from "./edge-forms.ts";
 import type { ProviderPack } from "./provider-pack.ts";
 import type { Provider } from "./provider-port.ts";
+import type { ProviderRuntimeInputLeasePort } from "./provider-runtime-input-port.ts";
 import { CloudflareProvider, type CloudflareProviderOptions } from "./providers/cloudflare.ts";
 import type { SelfhostArtifacts } from "./providers/selfhost.ts";
 import { createSelfhostComposition } from "./selfhost-composition.ts";
@@ -108,6 +109,8 @@ export function createStandaloneProviderComposition(input: {
   readonly artifacts: SelfhostArtifacts;
   readonly workerEndpointSuffix?: string;
   readonly suffixes?: readonly string[];
+  /** Present only when this deployment has an operator-configured seal key ring. */
+  readonly runtimeInputs?: ProviderRuntimeInputLeasePort;
   readonly now: Date;
   readonly retiredCloudflare?: Omit<CloudflareProviderOptions, "offerings">;
 }): StandaloneProviderComposition {
@@ -126,6 +129,7 @@ export function createStandaloneProviderComposition(input: {
       edgeForms: true,
       ...(input.workerEndpointSuffix ? { workerEndpointSuffix: input.workerEndpointSuffix } : {}),
       ...(input.suffixes ? { suffixes: input.suffixes } : {}),
+      ...(input.runtimeInputs ? { runtimeInputs: input.runtimeInputs } : {}),
       now: input.now,
     });
     return {
@@ -138,6 +142,11 @@ export function createStandaloneProviderComposition(input: {
 
   if (!input.retiredCloudflare) {
     throw new TypeError("retired Cloudflare ObjectBucket drain configuration is required");
+  }
+  if (input.runtimeInputs) {
+    throw new TypeError(
+      "the retired Cloudflare ObjectBucket drain consumes no runtime-input lease",
+    );
   }
   if (input.workerEndpointSuffix !== undefined || input.suffixes !== undefined) {
     throw new TypeError(

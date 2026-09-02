@@ -18,6 +18,8 @@ import {
 import { resolvePayment } from "./payment-setup.ts";
 import { createOpenAiGateway, parseOpenAiModelConfig } from "./providers/openai.ts";
 import { createProvisionerEndpoint } from "./provisioner-endpoint.ts";
+import { createRuntimeInputAuthority } from "./runtime-input-preparations.ts";
+import { parseRuntimeInputSealKeyRing } from "./runtime-input-seal-keyring.ts";
 import { ensureSigningKey } from "./signing-key.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import {
@@ -197,6 +199,28 @@ const artifactStore = createTakoformArtifacts({
   clock,
   randomId: () => crypto.randomUUID(),
 });
+/**
+ * The sealed path a sensitive Worker var travels on this machine.
+ *
+ * Constructed only when the operator has configured a key ring, because
+ * everything downstream is derived from its presence: without one the self-host
+ * provider advertises no runtime-input capability, admission refuses a
+ * `requiredSensitiveVars` declaration with `unsupported_capability`, and the
+ * private preparation route is not served at all. Generating a key here and
+ * keeping it beside the ciphertext would not be encryption at rest; it would be
+ * a lock with its key taped to it.
+ */
+const runtimeInputs = process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING
+  ? createRuntimeInputAuthority({
+      sql,
+      sealKeys: await parseRuntimeInputSealKeyRing(
+        process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING,
+      ),
+      canonicalPublicOrigin: publicOrigin,
+      clock,
+    })
+  : undefined;
+
 const providerArtifacts = {
   manifest: (tenantRef: string, digest: string) => artifactStore.resolveManifest(tenantRef, digest),
   async blob(digest: string) {
@@ -239,6 +263,9 @@ const providerComposition = createStandaloneProviderComposition({
     : {}),
   ...(process.env.TAKOSERVER_SUFFIXES
     ? { suffixes: process.env.TAKOSERVER_SUFFIXES.split(",").map((entry) => entry.trim()) }
+    : {}),
+  ...(runtimeInputs && providerMode !== RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
+    ? { runtimeInputs: runtimeInputs.leases }
     : {}),
   now: clock(),
   ...(providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
@@ -366,6 +393,7 @@ const app = buildApp({
   offerings,
   artifacts: artifactStore,
   workerModuleInspector: createJavaScriptWorkerModuleInspector(),
+  ...(runtimeInputs ? { runtimeInputs } : {}),
   clock,
 });
 

@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProviderOffering, ProviderRelation } from "../src/provider-port.ts";
+import type { ProviderRuntimeInputLeasePort } from "../src/provider-runtime-input-port.ts";
 import { createSelfhostProvider } from "../src/providers/selfhost.ts";
 import {
   createWorkerdRuntime,
@@ -101,6 +102,108 @@ interface ProviderCase {
   readonly suffixes?: readonly string[];
   readonly runtime?: WorkerdRuntime;
   readonly missingBlobs?: boolean;
+  readonly runtimeInputs?: ProviderRuntimeInputLeasePort;
+}
+
+const SECRET_VALUE = "placeholder-encryption-value";
+const SENSITIVE_OPERATION_KEY = `takoform-worker-runtime-v1-${"a".repeat(64)}`;
+
+interface LeaseLog {
+  readonly events: string[];
+  bindings: Record<string, string>;
+  settleFails: boolean;
+  recoveredNames: readonly string[];
+  /** Files under the data root at the moment `dispatch` was called. */
+  filesAtDispatch: readonly string[];
+}
+
+/**
+ * A lease port that records exactly what the provider did with it, so the
+ * ordering the contract requires — claim, dispatch immediately before the write,
+ * settle only after readback — is observable rather than asserted from the code.
+ */
+function fakeLeases(dataRoot: () => string): {
+  readonly port: ProviderRuntimeInputLeasePort;
+  readonly log: LeaseLog;
+} {
+  const log: LeaseLog = {
+    events: [],
+    bindings: { ENCRYPTION_KEY: SECRET_VALUE },
+    settleFails: false,
+    recoveredNames: ["ENCRYPTION_KEY"],
+    filesAtDispatch: [],
+  };
+  const preparation = {
+    preparationId: "prep-selfhost",
+    operationKey: SENSITIVE_OPERATION_KEY,
+    workerResourceUid: "uid-ModuleWorker-hello",
+    canonicalPublicOrigin: "https://api.takoserver.test",
+    commitment: `sha256:${"b".repeat(64)}` as const,
+  };
+  return {
+    log,
+    port: {
+      async acquire() {
+        log.events.push("acquire");
+        return {
+          bindings: log.bindings,
+          preparation,
+          async abort() {
+            log.events.push("abort");
+          },
+          async dispatch() {
+            log.events.push("dispatch");
+            log.filesAtDispatch = bindingFiles(dataRoot());
+            return {
+              async settle(digest) {
+                if (log.settleFails) {
+                  log.events.push("settle-failed");
+                  throw Object.assign(new Error("settle failed"), { code: "unavailable" });
+                }
+                log.events.push(`settle:${digest}`);
+              },
+            };
+          },
+        };
+      },
+      async recover() {
+        log.events.push("recover");
+        return {
+          preparation,
+          bindingNames: log.recoveredNames,
+          async settle(digest) {
+            if (log.settleFails) {
+              log.events.push("settle-failed");
+              throw Object.assign(new Error("settle failed"), { code: "unavailable" });
+            }
+            log.events.push(`settle:${digest}`);
+          },
+        };
+      },
+      async abandon() {
+        log.events.push("abandon");
+      },
+    },
+  };
+}
+
+/** Every file under the data root that carries the value, with its mode. */
+function carriers(dataRoot: string): readonly (readonly [string, number])[] {
+  const found: (readonly [string, number])[] = [];
+  for (const entry of readdirSync(dataRoot, { recursive: true })) {
+    const path = join(dataRoot, String(entry));
+    const stats = statSync(path);
+    if (!stats.isFile()) continue;
+    if (!readFileSync(path, "utf8").includes(SECRET_VALUE)) continue;
+    found.push([String(entry), stats.mode & 0o777] as const);
+  }
+  return found;
+}
+
+function bindingFiles(dataRoot: string): readonly string[] {
+  const bindings = join(dataRoot, "selfhost", "version-bindings");
+  if (!existsSync(bindings)) return [];
+  return readdirSync(bindings, { recursive: true }).map(String);
 }
 
 interface FlakyRuntimeState {
@@ -156,6 +259,7 @@ function provider(options: ProviderCase = {}) {
     dataRoot: root,
     runtime: options.runtime ?? createWorkerdRuntime({ root, isReady: () => true }),
     ...(options.suffixes ? { suffixes: options.suffixes } : {}),
+    ...(options.runtimeInputs ? { runtimeInputs: options.runtimeInputs } : {}),
     artifacts: {
       async manifest(_tenant, digest) {
         if (digest === "sha256:worker") {
@@ -671,30 +775,176 @@ describe("publishing a Worker through the Edge Family", () => {
     expect(ticket).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
   });
 
-  test("refuses unsupported sensitive Worker bindings", async () => {
+  /** The sensitive apply, as the Host drives it: an exact operation and UID. */
+  const sensitiveApply = (extra: Record<string, unknown> = {}) => ({
+    operationId: "op_sensitive_version",
+    operationKey: SENSITIVE_OPERATION_KEY,
+    offering: offering("WorkerVersion"),
+    identity: { ...identity("hello-sensitive"), uid: "uid-WorkerVersion-hello-sensitive" },
+    spec: {
+      bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+      handlers: ["fetch"],
+      requiredSensitiveVars: ["ENCRYPTION_KEY"],
+      worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+    },
+    relations: [
+      relation("/worker", "ModuleWorker", "hello"),
+      relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+    ],
+    ...extra,
+  });
+
+  test("an unconfigured machine still refuses sensitive Worker bindings", async () => {
     const local = provider();
-    const ticket = await local.apply({
-      operationId: "op_sensitive_version",
-      offering: offering("WorkerVersion"),
-      identity: identity("hello-sensitive"),
-      spec: {
-        bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
-        handlers: ["fetch"],
-        requiredSensitiveVars: ["ENCRYPTION_KEY"],
-        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
-      },
-      relations: [
-        relation("/worker", "ModuleWorker", "hello"),
-        relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
-      ],
-    });
-    expect(ticket).toMatchObject({
+    expect(await local.apply(sensitiveApply())).toMatchObject({
       phase: "failed",
       failure: {
         code: "denied",
-        message: "sensitive Worker bindings are unsupported by this Host",
+        message: "required sensitive Worker runtime inputs are unavailable",
       },
     });
+    // Nothing was materialized on the way to saying no.
+    expect(existsSync(join(root, "selfhost", "versions"))).toBe(false);
+  });
+
+  test("refuses and aborts when the lease does not carry the exact declared names", async () => {
+    const { port, log } = fakeLeases(() => root);
+    log.bindings = { ENCRYPTION_KEY: SECRET_VALUE, EXTRA: "unexpected" };
+    const local = provider({ runtimeInputs: port });
+
+    expect(await local.apply(sensitiveApply())).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "denied",
+        message: "required sensitive Worker runtime inputs are unavailable",
+      },
+    });
+    expect(log.events).toEqual(["acquire", "abort"]);
+    expect(bindingFiles(root)).toEqual([]);
+  });
+
+  test("dispatches before the values touch disk and settles only after readback", async () => {
+    const { port, log } = fakeLeases(() => root);
+    const local = provider({ runtimeInputs: port });
+
+    const ticket = await local.apply(sensitiveApply());
+    expect(ticket.phase).toBe("succeeded");
+    expect(log.events[0]).toBe("acquire");
+    expect(log.events[1]).toBe("dispatch");
+    // The dispatch CAS runs before this machine's own mutation: at that moment
+    // no file on it holds the value.
+    expect(log.filesAtDispatch).toEqual([]);
+    expect(log.events[2]).toMatch(/^settle:sha256:[0-9a-f]{64}$/u);
+    expect(bindingFiles(root).length).toBeGreaterThan(0);
+
+    // Deploying it projects the value into what workerd actually runs.
+    await local.apply({
+      operationId: "op_worker",
+      offering: offering("ModuleWorker"),
+      identity: identity("hello"),
+      spec: {},
+    });
+    const deployment = await local.apply({
+      operationId: "op_deploy_sensitive",
+      offering: offering("WorkerDeployment"),
+      identity: identity("hello-live"),
+      spec: {
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+        versions: [
+          {
+            workerVersion: {
+              apiVersion: EDGE_API,
+              kind: "WorkerVersion",
+              name: "hello-sensitive",
+            },
+            weight: 10_000,
+          },
+        ],
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", "hello"),
+        relation("/versions/0/workerVersion", "WorkerVersion", "hello-sensitive"),
+      ],
+    });
+    expect(deployment.phase).toBe("succeeded");
+    const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+    expect(config).toContain(`(name = "ENCRYPTION_KEY", text = "${SECRET_VALUE}")`);
+
+    // Leak fence: the value is in the two 0600 files that must carry it, and
+    // in nothing the Host records, returns, or leaves world-readable.
+    expect(JSON.stringify(ticket)).not.toContain(SECRET_VALUE);
+    if (ticket.phase !== "succeeded") throw new Error("unreachable");
+    expect(JSON.stringify(ticket.result.observed)).toContain("ENCRYPTION_KEY");
+    expect(ticket.result.nativeId).not.toContain(SECRET_VALUE);
+    expect(log.events.join(" ")).not.toContain(SECRET_VALUE);
+    const holders = carriers(root);
+    // The generated config, the script manifest it was rendered from, and the
+    // version's own binding record — and nothing else on the machine.
+    expect(holders.length).toBe(3);
+    for (const [path, mode] of holders) {
+      expect(mode).toBe(0o600);
+      expect(path).toMatch(/workerd\.capnp$|takoserver-site\.json$|version-bindings\//u);
+    }
+  });
+
+  test("reports an unsettled receipt as retryable rather than as a completed apply", async () => {
+    const { port, log } = fakeLeases(() => root);
+    log.settleFails = true;
+    const local = provider({ runtimeInputs: port });
+
+    expect(await local.apply(sensitiveApply())).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "unavailable",
+        message: "the sensitive Worker runtime input outcome is indeterminate",
+        retryable: true,
+      },
+    });
+    expect(log.events).toEqual(["acquire", "dispatch", "settle-failed"]);
+  });
+
+  test("recovery settles from readback and never dispatches a second time", async () => {
+    const { port, log } = fakeLeases(() => root);
+    const local = provider({ runtimeInputs: port });
+    expect((await local.apply(sensitiveApply())).phase).toBe("succeeded");
+    log.events.length = 0;
+
+    if (!local.recoverApply) throw new Error("the selfhost provider is missing apply recovery");
+    const recovered = await local.recoverApply(sensitiveApply({ operationMode: "recovery" }));
+    expect(recovered.phase).toBe("succeeded");
+    expect(log.events[0]).toBe("recover");
+    expect(log.events).not.toContain("dispatch");
+    expect(log.events.at(-1)).toMatch(/^settle:sha256:[0-9a-f]{64}$/u);
+    expect(JSON.stringify(recovered)).not.toContain(SECRET_VALUE);
+  });
+
+  test("recovery abandons a handoff whose values provably never landed", async () => {
+    const { port, log } = fakeLeases(() => root);
+    const local = provider({ runtimeInputs: port });
+
+    if (!local.recoverApply) throw new Error("the selfhost provider is missing apply recovery");
+    const recovered = await local.recoverApply(sensitiveApply({ operationMode: "recovery" }));
+    expect(recovered).toMatchObject({
+      phase: "failed",
+      failure: { code: "not_found", message: "the Worker Version is not materialized" },
+    });
+    expect(log.events).toEqual(["recover", "abandon"]);
+  });
+
+  test("recovery refuses a handoff whose recovered names are not the declared ones", async () => {
+    const { port, log } = fakeLeases(() => root);
+    log.recoveredNames = ["ENCRYPTION_KEY", "SOMETHING_ELSE"];
+    const local = provider({ runtimeInputs: port });
+
+    if (!local.recoverApply) throw new Error("the selfhost provider is missing apply recovery");
+    expect(await local.recoverApply(sensitiveApply({ operationMode: "recovery" }))).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "denied",
+        message: "required sensitive Worker runtime inputs are unavailable",
+      },
+    });
+    expect(log.events).toEqual(["recover"]);
   });
 
   test("a version that declares a site carries its files to the runtime", async () => {

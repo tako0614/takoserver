@@ -8,6 +8,7 @@ import {
 import { type EdgeFormBundle, edgeProviderOffering } from "./edge-forms.ts";
 import { HOSTED_EDGE_IDENTITY_CLASSES } from "./hosted-edge-supplies.ts";
 import type { Provider, ProviderOffering } from "./provider-port.ts";
+import type { ProviderRuntimeInputLeasePort } from "./provider-runtime-input-port.ts";
 import {
   createSelfhostProvider,
   type SelfhostArtifacts,
@@ -54,6 +55,12 @@ export interface SelfhostCompositionOptions {
   readonly edgeForms: boolean;
   readonly workerEndpointSuffix?: string;
   readonly suffixes?: readonly string[];
+  /**
+   * The one-shot seam for `requiredSensitiveVars`. Absent means this machine
+   * has no sealed path for a secret, so the provider advertises no capability
+   * and admission refuses the declaration before anything is provisioned.
+   */
+  readonly runtimeInputs?: ProviderRuntimeInputLeasePort;
   readonly now: Date;
 }
 
@@ -124,6 +131,7 @@ export function createSelfhostComposition(
     artifacts: options.artifacts,
     ...(options.workerEndpointSuffix ? { workerEndpointSuffix: options.workerEndpointSuffix } : {}),
     ...(options.suffixes ? { suffixes: options.suffixes } : {}),
+    ...(options.runtimeInputs ? { runtimeInputs: options.runtimeInputs } : {}),
   } satisfies SelfhostProviderOptions);
 
   const supplyContract: SupplyContract = {

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { buildEdgeForms } from "../src/edge-forms.ts";
-import { createProviderFormAvailability } from "../src/provider-driver.ts";
+import { createProviderDriver, createProviderFormAvailability } from "../src/provider-driver.ts";
+import type { ProviderRuntimeInputLeasePort } from "../src/provider-runtime-input-port.ts";
 import { createSelfhostComposition } from "../src/selfhost-composition.ts";
 import { stableProductionTakoformCatalog } from "../src/takoform/stable-production-catalog.ts";
 import type { WorkerdRuntime } from "../src/workerd-runtime.ts";
@@ -21,7 +22,17 @@ const runtime: WorkerdRuntime = {
   },
 };
 
-async function compose(edgeForms: boolean) {
+const leases: ProviderRuntimeInputLeasePort = {
+  async acquire(): Promise<never> {
+    throw new Error("the capability probe must not acquire");
+  },
+  async recover(): Promise<never> {
+    throw new Error("the capability probe must not recover");
+  },
+  async abandon() {},
+};
+
+async function compose(edgeForms: boolean, runtimeInputs?: ProviderRuntimeInputLeasePort) {
   return createSelfhostComposition({
     edge: await buildEdgeForms(),
     stableForms: stableProductionTakoformCatalog().forms,
@@ -36,6 +47,7 @@ async function compose(edgeForms: boolean) {
       },
     },
     edgeForms,
+    ...(runtimeInputs ? { runtimeInputs } : {}),
     now: new Date("2026-06-01T00:00:00.000Z"),
   });
 }
@@ -135,6 +147,44 @@ describe("the self-host catalog", () => {
       "WorkerEndpoint",
       "WorkerVersion",
     ]);
+  });
+
+  test("advertises a runtime-input ceiling only when a sealed lease port exists", async () => {
+    const unconfigured = await compose(true);
+    expect(unconfigured.provider.runtimeInputCapabilities).toBeUndefined();
+
+    const configured = await compose(true, leases);
+    expect(configured.provider.runtimeInputCapabilities).toEqual({ maximumBindings: 64 });
+  });
+
+  test("projects that ceiling into the WorkerVersion support profile the provider reads", async () => {
+    const workerVersion = stableProductionTakoformCatalog().forms.find(
+      (form) =>
+        form.identity.formRef.apiVersion === "edge.forms.takoform.com" &&
+        form.identity.formRef.kind === "WorkerVersion",
+    );
+    if (!workerVersion) throw new Error("the stable WorkerVersion Form is missing");
+
+    for (const [runtimeInputs, expected] of [
+      [undefined, 0],
+      [leases, 64],
+    ] as const) {
+      const composition = await compose(true, runtimeInputs);
+      const driver = createProviderDriver({
+        providers: [composition.provider],
+        catalog: {
+          list: () => composition.offerings,
+          async digest() {
+            return `sha256:${"a".repeat(64)}` as const;
+          },
+          findOffering: () => undefined,
+          offeringsFor: () => [],
+        } as never,
+        deployments: {} as never,
+        ledger: {} as never,
+      });
+      expect(driver.runtimeInputPolicy?.guaranteedMaximum(workerVersion)).toBe(expected);
+    }
   });
 
   test("keeps the legacy storage-only variant drain-only too", async () => {

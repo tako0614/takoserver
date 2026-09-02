@@ -271,8 +271,16 @@ relation, provider placement, and canonical output. Deactivation retains the
 endpoint UID as a deletion witness: the endpoint and its provider deployment
 must be closed before the reservation can be released and its origin reused.
 TTL expiry does not unlock an origin while that deletion witness is retained.
-Self-host remains fail-closed without the runtime-input authority and provider
-capability.
+A self-hosted machine takes the same path when its operator configures
+`TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING`, and only then: the capability is
+derived from the lease port's presence, so a machine with nowhere to seal a
+value advertises a ceiling of zero and admission refuses the declaration with
+`unsupported_capability` before anything is provisioned. Nothing is
+auto-generated in its place — a key kept beside the ciphertext it protects is
+not encryption at rest. workerd has no secret binding type, so a delivered value
+is projected as an ordinary environment binding into a `0600` configuration
+under a `0700` directory, recorded in a `0600` file beside — never inside — the
+immutable version directory, and never written anywhere else.
 The declaration's names remain in the Worker Version spec; values do not enter
 portable state. Realization places the other non-secret values in Worker vars.
 AI uses the native Workers AI binding, so it does not copy an account API token
