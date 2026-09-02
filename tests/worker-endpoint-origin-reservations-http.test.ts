@@ -5,6 +5,7 @@ import { createRouter } from "../src/router.ts";
 import {
   WORKER_ENDPOINT_ORIGIN_RESERVATION_ACTIVATION_FORMAT,
   WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT,
+  WorkerEndpointOriginReservationError,
   type WorkerEndpointOriginReservations,
 } from "../src/worker-endpoint-origin-reservations.ts";
 
@@ -18,12 +19,13 @@ const PROJECTION = {
   status: "prepared",
 } as const;
 
-function fixture() {
+function fixture(prepareRefusal?: WorkerEndpointOriginReservationError) {
   const prepareCalls: unknown[] = [];
   const activationCalls: unknown[] = [];
   const originReservations: WorkerEndpointOriginReservations = {
     async prepare(input) {
       prepareCalls.push(input);
+      if (prepareRefusal) throw prepareRefusal;
       return PROJECTION;
     },
     async read() {
@@ -261,4 +263,33 @@ test("the Host-minted namespace refuses every write and answers a read", async (
   expect(activationCalls).toEqual([]);
 
   expect((await call("GET")).status).toBe(200);
+});
+
+/**
+ * The reseller reading this route gets the same sentence as everybody else.
+ *
+ * A reservation refused because *this deployment* cannot publish the address it
+ * would derive is the caller's to act on but not the caller's to have caused,
+ * and `unsupported_capability` alone says which of those two it is and nothing
+ * about which knob to turn. The boot diagnostic and the Takoform Host lane both
+ * name the remedies; so does this.
+ */
+test("a reservation refused by this deployment's own configuration says which knob to turn", async () => {
+  const remedy =
+    "no Worker endpoint can be published here: this deployment's address is plain HTTP, " +
+    "and WorkerEndpoint@0.1.0 admits only https on the default port.";
+  const { fetch } = fixture(
+    new WorkerEndpointOriginReservationError("unsupported_capability", 422, remedy),
+  );
+  const response = await fetch(
+    request({
+      format: WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT,
+      requestedSubdomain: "community-public",
+      expiresInSeconds: 600,
+    }),
+  );
+  expect(response.status).toBe(422);
+  expect(await response.json()).toMatchObject({
+    error: { code: "unsupported_capability", message: remedy, retryable: false },
+  });
 });
