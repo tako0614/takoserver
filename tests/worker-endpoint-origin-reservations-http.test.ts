@@ -53,6 +53,9 @@ function fixture() {
     async cancelEndpointAssignment() {
       throw new Error("not called");
     },
+    async releaseEndpointAssignment() {
+      throw new Error("not called");
+    },
     async activateEndpointAssignment() {
       throw new Error("not called");
     },

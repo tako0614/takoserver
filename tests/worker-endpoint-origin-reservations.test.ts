@@ -2242,6 +2242,117 @@ test("drops a witness for an endpoint incarnation that was never committed", asy
 });
 
 /**
+ * The exact wedge a post-activation refusal used to leave, healed on upgrade.
+ *
+ * A real self-host run finished with `hostmint-…  state=activated`, a `live`
+ * deletion attestation for `uid_c3f8c40a…`, no `tf_resources` row for it and no
+ * open provider effect — while the wire had told the operator "the host mutated
+ * nothing". That space could then never create the endpoint again: the
+ * reservation id is derived from organization + space + Worker, and the address
+ * of an activated reservation is immutable, so rebooting into a configuration
+ * where every other space succeeded on the first attempt changed nothing.
+ *
+ * The refusal that produced it cannot happen any more, but a database that
+ * already holds one has to come back, so the next mint repairs it under exactly
+ * the fences a release goes through.
+ */
+test("repairs a reservation left activated for an endpoint that was never committed", async () => {
+  const { authority, sql, advance } = fixture();
+  await seedWorker(sql);
+  const target = {
+    organizationId: "org_01",
+    space: TARGET.space,
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-01",
+  } as const;
+  const minted = await authority.mintForWorker(target);
+  if (!minted) throw new Error("the fixture installation derives its own address");
+  await sql.run(
+    `INSERT INTO tf_resource_deletion_attestations
+       (tenant_id, resource_uid, space, api_version, kind, name, form_ref_json,
+        state, closure_fence, effects_json, evidence_json, evidence_ref,
+        evidence_effect_digest, evidence_checked_at, evidence_status, created_at, updated_at)
+     VALUES ('org_01', 'uid-endpoint-wedged', ?, ?, 'WorkerEndpoint', ?, ?, 'live', 1, '[]',
+             NULL, NULL, NULL, NULL, NULL, 0, 0)`,
+    [TARGET.space, ENDPOINT_FORM.apiVersion, TARGET.endpointName, JSON.stringify(ENDPOINT_FORM)],
+  );
+  const assignment = await authority.assignEndpoint({
+    organizationId: "org_01",
+    reservationId: minted.reservationId,
+    space: TARGET.space,
+    endpointName: TARGET.endpointName,
+    endpointResourceUid: "uid-endpoint-wedged",
+    endpointResourceRevision: "1",
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-01",
+    providerPackRef: "fake",
+    providerInstallationRef: "fake.primary",
+  });
+  await authority.activateEndpointAssignment({
+    assignment,
+    providerOutputs: {
+      hostname: new URL(minted.canonicalPublicOrigin).hostname,
+      url: `${minted.canonicalPublicOrigin}/`,
+    },
+  });
+  expect(await sql.query("SELECT state FROM worker_endpoint_origin_reservations")).toEqual([
+    { state: "activated" },
+  ]);
+
+  // A day later — long past the mint's own TTL, which is how an operator meets
+  // this shape: after a restart, on the next apply.
+  advance(25 * 60 * 60 * 1_000);
+  expect(await authority.mintForWorker(target)).toMatchObject({
+    reservationId: minted.reservationId,
+    canonicalPublicOrigin: minted.canonicalPublicOrigin,
+    status: "bound",
+  });
+  expect(
+    await sql.query("SELECT state, endpoint_resource_uid FROM worker_endpoint_origin_reservations"),
+  ).toEqual([{ state: "bound", endpoint_resource_uid: null }]);
+
+  // And the same repair is refused while the endpoint may still be there: an
+  // activated reservation for an endpoint that *is* committed stays activated.
+  const live = fixture();
+  await seedWorker(live.sql);
+  const liveMint = await live.authority.mintForWorker(target);
+  if (!liveMint) throw new Error("the fixture installation derives its own address");
+  await seedEndpoint(live.sql, liveMint.canonicalPublicOrigin);
+  const liveAssignment = await live.authority.assignEndpoint({
+    organizationId: "org_01",
+    reservationId: liveMint.reservationId,
+    space: TARGET.space,
+    endpointName: TARGET.endpointName,
+    endpointResourceUid: "uid-endpoint-01",
+    endpointResourceRevision: "1",
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-01",
+    providerPackRef: "fake",
+    providerInstallationRef: "fake.primary",
+  });
+  await live.authority.activateEndpointAssignment({
+    assignment: liveAssignment,
+    providerOutputs: {
+      hostname: new URL(liveMint.canonicalPublicOrigin).hostname,
+      url: `${liveMint.canonicalPublicOrigin}/`,
+    },
+  });
+  await expect(live.authority.mintForWorker(target)).rejects.toMatchObject({
+    code: "conflict",
+    status: 409,
+  });
+  await expect(live.authority.releaseEndpointAssignment(liveAssignment)).rejects.toMatchObject({
+    code: "conflict",
+    status: 409,
+  });
+  expect(
+    await live.sql.query(
+      "SELECT state, endpoint_resource_uid FROM worker_endpoint_origin_reservations",
+    ),
+  ).toEqual([{ state: "activated", endpoint_resource_uid: "uid-endpoint-01" }]);
+});
+
+/**
  * A Worker's readiness is derived, and the condition on its row is a cache.
  *
  * Nothing re-renders a ModuleWorker when a *dependent* is created, so through a

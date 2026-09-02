@@ -259,6 +259,7 @@ describe("split Takoserver Worker surfaces", () => {
       "src/takoform/forms.ts",
       "src/takoform/implementation-catalog.ts",
       "src/takoform/limits.ts",
+      "src/takoform/receipt-projection.ts",
       "src/takoform/relations.ts",
       "src/takoform/schema.ts",
       "src/takoform/sqlite-migrations.ts",

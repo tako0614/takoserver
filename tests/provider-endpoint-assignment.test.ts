@@ -121,6 +121,8 @@ async function fixture(input: {
   readonly recoverDelete?: Provider["recoverDelete"];
   readonly activationFails?: boolean;
   readonly assignmentAckLost?: boolean;
+  /** Fails the wallet capture, which is the one step after activation. */
+  readonly captureFails?: boolean;
   /** Whether this installation derives its own endpoint address. */
   readonly hostMintsReservation?: boolean;
 }) {
@@ -188,6 +190,7 @@ async function fixture(input: {
   let assignmentLookup: WorkerEndpointOriginAssignment | null = exactAssignment;
   let assignCalls = 0;
   let cancelCalls = 0;
+  let releaseCalls = 0;
   let activateCalls = 0;
   let deactivateCalls = 0;
   const originReservations = {
@@ -231,6 +234,11 @@ async function fixture(input: {
       events.push("reservation.cancel");
       cancelCalls += 1;
     },
+    async releaseEndpointAssignment(value: WorkerEndpointOriginAssignment) {
+      expect(value).toEqual(exactAssignment);
+      events.push("reservation.release");
+      releaseCalls += 1;
+    },
     async activateEndpointAssignment(value: {
       readonly assignment: WorkerEndpointOriginAssignment;
       readonly providerOutputs: Readonly<Record<string, unknown>>;
@@ -265,10 +273,26 @@ async function fixture(input: {
     observed: {},
     outputs: { scriptName: "community" },
   });
+  const ledger = createLedger(sql, clock);
+  if (input.captureFails) {
+    await ledger.fund({
+      organizationId: tenantId,
+      fundingRef: "funding-endpoint-release",
+      amountMinor: 5_000,
+    });
+  }
   const driver = createProviderDriver({
     providers: [provider],
     catalog: createCatalog(input.priced ? [soldEndpoint(endpointOffering)] : []),
-    ledger: createLedger(sql, clock),
+    ledger: input.captureFails
+      ? {
+          ...ledger,
+          async capture() {
+            events.push("ledger.capture-failed");
+            throw new Error("wallet capture failed");
+          },
+        }
+      : ledger,
     deployments,
     originReservations,
   });
@@ -290,7 +314,7 @@ async function fixture(input: {
     applyInput,
     events,
     providerInputs,
-    calls: () => ({ assignCalls, cancelCalls, activateCalls, deactivateCalls }),
+    calls: () => ({ assignCalls, cancelCalls, releaseCalls, activateCalls, deactivateCalls }),
     setAssignmentLookup(value: WorkerEndpointOriginAssignment | null) {
       assignmentLookup = value;
     },
@@ -349,6 +373,7 @@ test("a priced pre-dispatch refusal exact-cancels the assigned endpoint", async 
   expect(context.calls()).toEqual({
     assignCalls: 1,
     cancelCalls: 1,
+    releaseCalls: 0,
     activateCalls: 0,
     deactivateCalls: 0,
   });
@@ -387,6 +412,7 @@ test("releases an assignment the provider never got activated, and gates the rec
   expect(context.calls()).toEqual({
     assignCalls: 1,
     cancelCalls: 1,
+    releaseCalls: 0,
     activateCalls: 1,
     deactivateCalls: 0,
   });
@@ -395,6 +421,77 @@ test("releases an assignment the provider never got activated, and gates the rec
     assignmentDigest: `sha256:${"e".repeat(64)}`,
   });
   expect(context.providerInputs[0]).not.toHaveProperty("workerEndpointOriginReservationId");
+});
+
+/**
+ * A receipt the Form cannot publish is refused before anything is activated.
+ *
+ * This is the exact shape a real self-host run left behind. The driver returned
+ * outputs the released `WorkerEndpoint` Form refuses, the engine's own
+ * projection check raised `invalid_argument` 400 — after the reservation had
+ * been activated and the endpoint's deletion attestation opened — and the wire
+ * told the operator "the host mutated nothing" while the ledger held an
+ * activated reservation for an endpoint no `tf_resources` row would ever name.
+ * That space could then never create the endpoint again: the reservation id is
+ * derived from the Worker and an activated address is immutable.
+ */
+test("refuses a receipt its Form cannot publish before the assignment is activated", async () => {
+  const context = await fixture({
+    apply: async () =>
+      succeeded({
+        nativeId: `endpoint:${endpointUid}`,
+        observed: { assigned: true },
+        // `WorkerEndpoint@0.1.0` publishes `^https://<dotted-name>/$`.
+        outputs: { hostname: "reserved.endpoint.test", url: "http://reserved.endpoint.test/" },
+      }),
+  });
+  await expect(
+    context.driver.apply({
+      ...context.applyInput,
+      workerEndpointOriginReservationId: "reservation-01",
+    }),
+  ).rejects.toMatchObject({ code: "invalid_argument", status: 400 });
+  expect(context.events).toEqual(["reservation.assign", "provider.apply", "reservation.cancel"]);
+  expect(context.calls()).toEqual({
+    assignCalls: 1,
+    cancelCalls: 1,
+    releaseCalls: 0,
+    activateCalls: 0,
+    deactivateCalls: 0,
+  });
+});
+
+/**
+ * And when a refusal really does land after activation, it is given back.
+ *
+ * `cancelEndpointAssignment` pins the reservation revision it was handed, which
+ * activation has already moved, so it could never reach an activated
+ * assignment: the only path that existed did nothing at all. The wallet capture
+ * is the one step this driver takes after activating, so it is the one that
+ * proves the release.
+ */
+test("gives back an assignment whose mutation failed after it was activated", async () => {
+  const context = await fixture({ priced: true, captureFails: true });
+  await expect(
+    context.driver.apply({
+      ...context.applyInput,
+      workerEndpointOriginReservationId: "reservation-01",
+    }),
+  ).rejects.toThrow("wallet capture failed");
+  expect(context.events).toEqual([
+    "reservation.assign",
+    "provider.apply",
+    "reservation.activate",
+    "ledger.capture-failed",
+    "reservation.release",
+  ]);
+  expect(context.calls()).toEqual({
+    assignCalls: 1,
+    cancelCalls: 0,
+    releaseCalls: 1,
+    activateCalls: 1,
+    deactivateCalls: 0,
+  });
 });
 
 test("WorkerEndpoint updates re-resolve the durable assignment instead of a logical hostname", async () => {
@@ -438,6 +535,7 @@ test("recovery convergence resumes the exact assignment after process death befo
   expect(context.calls()).toEqual({
     assignCalls: 2,
     cancelCalls: 0,
+    releaseCalls: 0,
     activateCalls: 1,
     deactivateCalls: 0,
   });
