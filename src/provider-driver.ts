@@ -23,6 +23,7 @@ import {
 } from "./provider-runtime-bindings.ts";
 import type { ResourceDeployment, ResourceDeploymentStore } from "./resource-deployments.ts";
 import { validateMaximumRuntimeInputBindings } from "./takoform/forms.ts";
+import { receiptProjectable } from "./takoform/receipt-projection.ts";
 import type { TakoformStore } from "./takoform/store.ts";
 import type {
   InstalledTakoformForm,
@@ -87,6 +88,7 @@ export interface CreateProviderDriverOptions {
     | "mintForWorker"
     | "assignEndpoint"
     | "cancelEndpointAssignment"
+    | "releaseEndpointAssignment"
     | "activateEndpointAssignment"
     | "endpointAssignment"
     | "deactivateEndpointAssignment"
@@ -738,7 +740,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
         ...(previous ? { previous } : {}),
       } satisfies import("./provider-port.ts").ApplyInput;
       let providerBoundaryEntered = false;
-      let endpointActivated = false;
+      let activatedAssignment: WorkerEndpointOriginAssignment | null = null;
       const work = async () => {
         providerBoundaryEntered = true;
         const ticket = await settle(
@@ -760,12 +762,23 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
           Boolean(input.providerHandle),
         );
         if (endpointAssignment && ticket.phase === "succeeded") {
+          // Asked here, before anything is activated, because this is the last
+          // moment at which the answer is free. The engine holds every receipt
+          // to its Form before it materializes a Resource; when that check ran
+          // there and failed, the reservation had already been activated and
+          // the endpoint's deletion attestation opened, the wire still said
+          // "the host mutated nothing", and the space could never create that
+          // endpoint again. One rule, asked at the point where refusing it
+          // costs nothing.
+          if (!receiptProjectable(input.form, receiptOf(ticket.result))) {
+            throw new TakoformHostError();
+          }
           try {
-            await originReservations?.activateEndpointAssignment({
-              assignment: endpointAssignment,
-              providerOutputs: ticket.result.outputs,
-            });
-            endpointActivated = true;
+            activatedAssignment =
+              (await originReservations?.activateEndpointAssignment({
+                assignment: endpointAssignment,
+                providerOutputs: ticket.result.outputs,
+              })) ?? null;
           } catch (error) {
             throw endpointReservationHostError(error);
           }
@@ -796,9 +809,22 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
         // constraint; only the endpoint witness is dropped, and a recovery that
         // resumes this operation re-assigns the same endpoint before the
         // provider is called again.
-        if (endpointAssignment && !endpointActivated) {
+        // An activated assignment is let go of too, and through its own seam:
+        // `cancelEndpointAssignment` pins the revision it was handed, which
+        // activation has already moved, so it could never reach one. That is
+        // how a refusal raised after activation left a reservation pinned to an
+        // endpoint UID no Resource would ever name — permanently, because the
+        // reservation id is derived from the Worker and an activated address is
+        // immutable.
+        const activated: WorkerEndpointOriginAssignment | null = activatedAssignment;
+        const letGo = activated
+          ? () => originReservations?.releaseEndpointAssignment(activated)
+          : endpointAssignment
+            ? () => originReservations?.cancelEndpointAssignment(endpointAssignment)
+            : null;
+        if (letGo) {
           try {
-            await originReservations?.cancelEndpointAssignment(endpointAssignment);
+            await letGo();
           } catch (cancelError) {
             // Before dispatch the cancel failure is the only thing that went
             // wrong, so it is the answer. After dispatch the provider's own

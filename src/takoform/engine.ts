@@ -12,6 +12,7 @@ import {
   PROVIDER_MUTATION_EXECUTION_LEASE_MILLISECONDS,
   RESOURCE_CLAIM_RESERVATION_TTL_MILLISECONDS,
 } from "./limits.ts";
+import { receiptProjectable } from "./receipt-projection.ts";
 import {
   declaredResourceClaims,
   relationDrift,
@@ -20,7 +21,7 @@ import {
   validateDeclaredConstraintRequest,
   validateDeclaredConstraints,
 } from "./relations.ts";
-import { materializeDefaults, validateDesired, validateSchemaValue } from "./schema.ts";
+import { materializeDefaults, validateDesired } from "./schema.ts";
 import { applySqliteMigrationApplication, sqliteMigrationCondition } from "./sqlite-migrations.ts";
 import { resolveStandardServiceSlots } from "./standard-services.ts";
 import type {
@@ -2382,22 +2383,7 @@ function projectReceipt(
   readonly outputs?: JsonObject;
   readonly conditions?: TakoformStoredResource["status"]["conditions"];
 } {
-  if (form.observedSchema && !receipt.observed) throw new TakoformHostError();
-  if (form.outputSchema && !receipt.outputs) throw new TakoformHostError();
-  if (
-    form.observedSchema &&
-    receipt.observed &&
-    validateSchemaValue(form.observedSchema, receipt.observed, "").length > 0
-  ) {
-    throw new TakoformHostError();
-  }
-  if (
-    form.outputSchema &&
-    receipt.outputs &&
-    validateSchemaValue(form.outputSchema, receipt.outputs, "").length > 0
-  ) {
-    throw new TakoformHostError();
-  }
+  if (!receiptProjectable(form, receipt)) throw new TakoformHostError();
   if (receipt.conditions && !validConditions(receipt.conditions)) {
     throw new TakoformHostError();
   }

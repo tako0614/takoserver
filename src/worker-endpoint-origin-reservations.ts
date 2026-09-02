@@ -245,6 +245,20 @@ export interface WorkerEndpointOriginReservations {
   }): Promise<WorkerEndpointOriginAssignment>;
   /** Clears only an exact assignment proven not to have crossed the Provider boundary. */
   cancelEndpointAssignment(assignment: WorkerEndpointOriginAssignment): Promise<void>;
+  /**
+   * Lets go of an exact assignment whose mutation failed *after* activation.
+   *
+   * `cancelEndpointAssignment` is the pre-dispatch one and pins the revision it
+   * was handed, which activation has already moved. This one takes the
+   * activated assignment, deactivates and drops the witness in a single CAS,
+   * and is fenced on the endpoint incarnation itself rather than on a revision:
+   * the exact assignment identity, no `tf_resources` row for that endpoint UID,
+   * and no provider Deployment outside `deleted`/`failed`. Without it, a
+   * refusal raised after the endpoint was activated left the reservation
+   * pinned to an address it could never publish, and that space could never
+   * create the endpoint again.
+   */
+  releaseEndpointAssignment(assignment: WorkerEndpointOriginAssignment): Promise<void>;
   /** Activates exact provider output before a Ready Host commit is allowed. */
   activateEndpointAssignment(input: {
     readonly assignment: WorkerEndpointOriginAssignment;
@@ -667,6 +681,22 @@ export function createWorkerEndpointOriginReservations(options: {
    * attestation, its deployments, and no provider effect still open on it —
    * never on a revision, which moves under an apply for reasons that have
    * nothing to do with whether the endpoint is there.
+   *
+   * An **activated** row is repaired the same way, and it has to be. A refusal
+   * raised after the Host had activated the assignment left exactly that shape
+   * behind — reservation `activated`, deletion attestation `live`, no
+   * `tf_resources` row, no open provider effect — and the release path could
+   * not touch it, so the space could never create that endpoint again even
+   * after the Host was rebooted into a configuration where every other space
+   * succeeded on the first attempt. The refusal that produced it cannot happen
+   * any more, but a database that already holds one has to come back on
+   * upgrade, so the same fences let go of an activated witness and hand the row
+   * back as `bound`.
+   *
+   * The expiry is restarted with it, because the only caller is a mint that is
+   * happening right now: a row handed back with a spent clock would be expired
+   * by `prepare`'s own sweep one statement later and refuse the mint it was
+   * just repaired for.
    */
   const clearSettledHostMintWitness = async (input: {
     readonly organizationId: string;
@@ -674,15 +704,24 @@ export function createWorkerEndpointOriginReservations(options: {
   }): Promise<void> => {
     if (!input.reservationId.startsWith(HOST_MINTED_RESERVATION_PREFIX)) return;
     const row = await readRow(options.sql, input.organizationId, input.reservationId);
-    if (!row || row.state !== "bound" || row.endpoint_resource_uid === null) return;
+    if (
+      !row ||
+      (row.state !== "bound" && row.state !== "activated") ||
+      row.endpoint_resource_uid === null
+    ) {
+      return;
+    }
+    const timestamp = now();
     let cleared: SqlWrite;
     try {
       cleared = await options.sql.run(
         `UPDATE worker_endpoint_origin_reservations
-         SET bound_endpoint_name = NULL, endpoint_resource_uid = NULL,
+         SET state = 'bound',
+             expires_at = ? + requested_ttl_seconds * 1000,
+             bound_endpoint_name = NULL, endpoint_resource_uid = NULL,
              endpoint_resource_revision = NULL, revision = revision + 1, updated_at = ?
          WHERE organization_id = ? AND reservation_id = ? AND revision = ?
-           AND state = 'bound' AND endpoint_resource_uid IS NOT NULL
+           AND state IN ('bound', 'activated') AND endpoint_resource_uid IS NOT NULL
            AND NOT EXISTS (
              SELECT 1 FROM tf_resources AS endpoint_resource
              WHERE endpoint_resource.tenant_id = worker_endpoint_origin_reservations.organization_id
@@ -723,7 +762,7 @@ export function createWorkerEndpointOriginReservations(options: {
                AND endpoint_deployment.resource_uid = worker_endpoint_origin_reservations.endpoint_resource_uid
                AND endpoint_deployment.state NOT IN ('deleted', 'failed')
            )`,
-        [now(), input.organizationId, input.reservationId, row.revision],
+        [timestamp, timestamp, input.organizationId, input.reservationId, row.revision],
       );
     } catch {
       throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
@@ -1489,6 +1528,80 @@ export function createWorkerEndpointOriginReservations(options: {
         throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
       }
       if (cancelled.changes !== 1) {
+        const current = await readRow(
+          options.sql,
+          assignment.organizationId,
+          assignment.reservationId,
+        );
+        if (
+          current?.endpoint_resource_uid === null &&
+          (current.state === "bound" || current.state === "expired")
+        ) {
+          return;
+        }
+        throw new WorkerEndpointOriginReservationError("conflict", 409);
+      }
+    },
+
+    async releaseEndpointAssignment(assignment) {
+      normalizeIdentity(assignment.organizationId, assignment.reservationId);
+      const row = await readRow(options.sql, assignment.organizationId, assignment.reservationId);
+      if (!row) throw new WorkerEndpointOriginReservationError("not_found", 404);
+      if (
+        row.endpoint_resource_uid === null &&
+        (row.state === "bound" || row.state === "expired")
+      ) {
+        return;
+      }
+      // Identity first, and the whole of it: organization, reservation, origin,
+      // assignment digest, the endpoint's own name/UID/revision, the Worker
+      // incarnation and revision, and the placement. Nothing here is fenced on
+      // the reservation revision, which activation itself moved.
+      await assertExactAssignment(row, assignment);
+      if (row.state !== "activated" && row.state !== "bound" && row.state !== "expired") {
+        throw new WorkerEndpointOriginReservationError("conflict", 409);
+      }
+      let released: SqlWrite;
+      try {
+        released = await options.sql.run(
+          `UPDATE worker_endpoint_origin_reservations
+           SET state = CASE
+                         WHEN state = 'activated' AND expires_at <= ? THEN 'expired'
+                         WHEN state = 'activated' THEN 'bound'
+                         ELSE state
+                       END,
+               bound_endpoint_name = NULL, endpoint_resource_uid = NULL,
+               endpoint_resource_revision = NULL, revision = revision + 1, updated_at = ?
+           WHERE organization_id = ? AND reservation_id = ? AND revision = ?
+             AND state IN ('activated', 'bound', 'expired')
+             AND bound_endpoint_name = ? AND endpoint_resource_uid = ?
+             AND endpoint_resource_revision = ?
+             AND NOT EXISTS (
+               SELECT 1 FROM tf_resources AS endpoint_resource
+               WHERE endpoint_resource.tenant_id = worker_endpoint_origin_reservations.organization_id
+                 AND endpoint_resource.uid = worker_endpoint_origin_reservations.endpoint_resource_uid
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM tf_resource_deployments AS endpoint_deployment
+               WHERE endpoint_deployment.tenant_id = worker_endpoint_origin_reservations.organization_id
+                 AND endpoint_deployment.resource_uid = worker_endpoint_origin_reservations.endpoint_resource_uid
+                 AND endpoint_deployment.state NOT IN ('deleted', 'failed')
+             )`,
+          [
+            now(),
+            now(),
+            assignment.organizationId,
+            assignment.reservationId,
+            row.revision,
+            assignment.endpoint.name,
+            assignment.endpoint.uid,
+            assignment.endpoint.revision,
+          ],
+        );
+      } catch {
+        throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
+      }
+      if (released.changes !== 1) {
         const current = await readRow(
           options.sql,
           assignment.organizationId,
