@@ -178,3 +178,62 @@ test("tightens a scripts tree an older tree left group- or world-readable", asyn
   expect((await stat(join(root, "workers"))).mode & 0o777).toBe(0o700);
   expect((await stat(join(root, "workers", "site"))).mode & 0o777).toBe(0o700);
 });
+
+/**
+ * A restarted self-host brings its own Workers back.
+ *
+ * `workerd` was started by a publication and by nothing else, so a machine that
+ * restarted served nothing at all — while its control plane reported healthy
+ * and `tofu plan` answered "No changes. Your infrastructure matches the
+ * configuration". Every resource was observed Ready and no request could reach
+ * any Worker; a read or a refresh did not revive it, only a fresh publication
+ * did. So the boot asks the durable manifests what this machine had published
+ * and renders the configuration again for them.
+ */
+test("restores the runtime from what a previous process published", async () => {
+  const published = createWorkerdRuntime({ root, isReady: () => true });
+  await published.write(
+    "site",
+    {
+      directory: "site",
+      mainModule: "index.js",
+      hostnames: ["site.localhost"],
+      generation: "gen-1",
+    },
+    MODULES,
+  );
+  await published.reload();
+  const before = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+
+  // The next process: a new runtime over the same data directory, told nothing.
+  const reloaded: string[] = [];
+  const restarted = createWorkerdRuntime({
+    root,
+    isReady: () => true,
+    onReload: async (configPath) => {
+      reloaded.push(configPath);
+    },
+  });
+  expect(await restarted.restore()).toEqual(["site"]);
+  // The runtime was actually started, against the configuration this build
+  // renders rather than whichever one happened to be on disk.
+  expect(reloaded).toEqual([join(root, "workers", "workerd.capnp")]);
+  expect(await readFile(join(root, "workers", "workerd.capnp"), "utf8")).toBe(before);
+  expect(await restarted.has("site", "gen-1")).toBe(true);
+});
+
+test("starts nothing on a machine that has published no Worker", async () => {
+  const reloaded: string[] = [];
+  const runtime = createWorkerdRuntime({
+    root,
+    isReady: () => true,
+    onReload: async (configPath) => {
+      reloaded.push(configPath);
+    },
+  });
+  expect(await runtime.restore()).toEqual([]);
+  // No configuration, and above all no runtime: a machine that never runs a
+  // Worker must not be given a workerd to run one in.
+  expect(reloaded).toEqual([]);
+  await expect(readFile(join(root, "workers", "workerd.capnp"), "utf8")).rejects.toThrow();
+});

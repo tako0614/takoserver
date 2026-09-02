@@ -171,6 +171,27 @@ export interface WorkerdRuntime {
 }
 
 /**
+ * The runtime as its own process holds it, which is one capability more.
+ *
+ * `WorkerdRuntime` is the seam a *provider* publishes through, and a provider
+ * never restarts a machine. A composition root does, and it is the only thing
+ * that knows this process has just started with a data directory that may
+ * already hold published Workers.
+ */
+export interface HostedWorkerdRuntime extends WorkerdRuntime {
+  /**
+   * Brings the runtime back up for whatever is already published.
+   *
+   * Answers the names it restored, or nothing when this machine has published
+   * no Worker — which is the case a boot must not start a runtime for. The
+   * configuration is re-rendered from the durable manifests rather than trusted
+   * as it stands, so a machine whose configuration was written by an older
+   * build comes back on this one's router.
+   */
+  restore(): Promise<readonly string[]>;
+}
+
+/**
  * The certificate this runtime's socket serves, when the operator configured
  * one.
  *
@@ -283,7 +304,7 @@ export const WORKERD_ASSETS_BINDING = "ASSETS";
 /** Where a script's static files live inside its directory. */
 const ASSETS_DIRECTORY = "__assets";
 
-export function createWorkerdRuntime(options: WorkerdRuntimeOptions): WorkerdRuntime {
+export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWorkerdRuntime {
   const scriptsRoot = join(options.root, "workers");
   const configPath = options.configPath ?? join(scriptsRoot, "workerd.capnp");
   const port = options.port ?? 8788;
@@ -294,6 +315,37 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): WorkerdRun
       throw new Error(`unusable script name: ${name}`);
     }
     return join(scriptsRoot, name);
+  };
+
+  /**
+   * Rewrites everything derived from the durable manifests, then makes workerd
+   * read it.
+   *
+   * Named because two callers need exactly this and must not diverge: a publish,
+   * and a boot bringing an already-published machine back up. A boot that
+   * re-rendered by some other route would be the second place the router, the
+   * asset shim and the socket are decided.
+   */
+  const render = async (published: readonly Published[]): Promise<void> => {
+    await privateDirectory(scriptsRoot);
+    for (const entry of published) await privateDirectory(join(scriptsRoot, entry.name));
+    // Written before the config that embeds it, every time, so a router
+    // improvement reaches a deployment on its next reload rather than
+    // whenever somebody remembers.
+    await writeFile(join(scriptsRoot, "router.js"), ROUTER_SOURCE, "utf8");
+    await writeFile(join(scriptsRoot, "assets.js"), ASSETS_SOURCE, "utf8");
+    await privateDirectory(dirname(configPath));
+    // The rendered configuration contains every binding value, sensitive ones
+    // included, so it is created `0600` and moved into place atomically.
+    await writePrivate(configPath, renderConfig(published, port, scriptsRoot, options.tls), "utf8");
+    await options.onReload?.(configPath);
+    // A staged manifest is not runtime truth. Only after the reload hook
+    // returns successfully do we persist the generation actually activated;
+    // a failed reload therefore leaves the previous marker intact.
+    await writeActivation(
+      activationPath,
+      Object.fromEntries(published.map((entry) => [entry.name, entry.manifest.generation ?? null])),
+    );
   };
 
   return {
@@ -407,33 +459,20 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): WorkerdRun
       }
     },
 
-    async reload() {
+    async restore() {
+      // The one question a boot has to ask before starting anything: is there a
+      // Worker on this machine at all. Rendering an empty configuration and
+      // starting a runtime for it would give every machine a workerd it never
+      // asked for, which is exactly what deferring the start to the first
+      // publish was avoiding.
       const published = await readPublished(scriptsRoot);
-      await privateDirectory(scriptsRoot);
-      for (const entry of published) await privateDirectory(join(scriptsRoot, entry.name));
-      // Written before the config that embeds it, every time, so a router
-      // improvement reaches a deployment on its next reload rather than
-      // whenever somebody remembers.
-      await writeFile(join(scriptsRoot, "router.js"), ROUTER_SOURCE, "utf8");
-      await writeFile(join(scriptsRoot, "assets.js"), ASSETS_SOURCE, "utf8");
-      await privateDirectory(dirname(configPath));
-      // The rendered configuration contains every binding value, sensitive ones
-      // included, so it is created `0600` and moved into place atomically.
-      await writePrivate(
-        configPath,
-        renderConfig(published, port, scriptsRoot, options.tls),
-        "utf8",
-      );
-      await options.onReload?.(configPath);
-      // A staged manifest is not runtime truth. Only after the reload hook
-      // returns successfully do we persist the generation actually activated;
-      // a failed reload therefore leaves the previous marker intact.
-      await writeActivation(
-        activationPath,
-        Object.fromEntries(
-          published.map((entry) => [entry.name, entry.manifest.generation ?? null]),
-        ),
-      );
+      if (published.length === 0) return [];
+      await render(published);
+      return published.map((entry) => entry.name);
+    },
+
+    async reload() {
+      await render(await readPublished(scriptsRoot));
     },
   };
 }
