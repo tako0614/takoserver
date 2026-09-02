@@ -9,6 +9,7 @@ import {
   type IdentityProviderDescriptor,
 } from "./auth.ts";
 import type { Catalog } from "./catalog.ts";
+import { errorEnvelope } from "./error-envelope.ts";
 import { GoogleIdentityError } from "./google-identity.ts";
 import { type FundingSettlementVerifier, type Ledger, LedgerError } from "./ledger.ts";
 import { OperatorAssertionError } from "./operator-credentials.ts";
@@ -1074,10 +1075,16 @@ function controlError(code: string, status: number): never {
 /**
  * Maps every failure the control plane can raise onto one envelope. Codes are
  * ours; the messages are derived from them, so no internal text escapes.
+ *
+ * The envelope is the same four-member one the stable Takoform Host lane
+ * answers with, because one released client reads both: the private
+ * runtime-input route's `operation_not_found` 404 is how the provider learns a
+ * handoff does not exist yet, and an envelope missing `requestId` or
+ * `retryable` is protocol-invalid to it rather than a classification.
  */
 export function controlErrorResponse(error: unknown): Response {
   const { code, status } = classify(error);
-  return Response.json({ error: { code, message: code.replaceAll("_", " ") } }, { status });
+  return Response.json(errorEnvelope(code), { status });
 }
 
 function classify(error: unknown): { code: string; status: number } {
