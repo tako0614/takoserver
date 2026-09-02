@@ -1571,7 +1571,17 @@ function objectBodySource(value, maximum, declaredLength, intrinsicTooLargeError
   } else if (isReadableStream(value)) {
     body = value;
   } else {
-    objectBindingTypeError();
+    // Naming the argument and what it accepts, because "invalid arguments" on
+    // a five-argument facade sends the caller to read the whole call. The three
+    // accepted shapes are the ones the Binding declares (ADR 0005); an
+    // ArrayBufferView is deliberately not one of them, and saying so is the
+    // difference between a caller wrapping their bytes and a caller guessing.
+    objectBindingTypeError(
+      SafeArrayBufferIsView(value)
+        ? "body must be a string, an ArrayBuffer, or a byte ReadableStream; " +
+            "pass the view's own buffer slice"
+        : "body must be a string, an ArrayBuffer, or a byte ReadableStream",
+    );
   }
   if (declaredLength !== undefined) objectContentLength(declaredLength);
   const length = declaredLength === undefined ? known : declaredLength;
@@ -1819,8 +1829,12 @@ function exactObjectArgumentCount(actual, maximum) {
   if (actual > maximum) objectBindingTypeError();
 }
 
-function objectBindingTypeError() {
-  throw new SafeTypeError("invalid module-worker.object-bucket arguments");
+function objectBindingTypeError(detail) {
+  throw new SafeTypeError(
+    typeof detail === "string"
+      ? "invalid module-worker.object-bucket arguments: " + detail
+      : "invalid module-worker.object-bucket arguments",
+  );
 }
 
 function hasControlCharacters(value) {

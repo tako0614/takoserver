@@ -216,6 +216,25 @@ test("a ttl below the facade's floor is refused", async () => {
   expect(answer.envelope).toEqual({ ok: false, error: { code: "invalid_value" } });
 });
 
+/**
+ * A metadata member that is not a string is the wrong kind of thing, not too
+ * much of it. `metadata_too_large` on `{m: 1}` sends the caller to shrink
+ * metadata that is one member long.
+ */
+test("metadata refuses a non-string member by kind and an oversized one by size", async () => {
+  expect(
+    (await kv({ op: "put", key: "k", value: btoa("v"), metadata: { m: 1 } })).envelope,
+  ).toEqual({ ok: false, error: { code: "invalid_value" } });
+  expect(
+    (await kv({ op: "put", key: "k", value: btoa("v"), metadata: { m: "x".repeat(8_193) } }))
+      .envelope,
+  ).toEqual({ ok: false, error: { code: "metadata_too_large" } });
+  expect((await kv({ op: "put", key: "k", value: btoa("v"), metadata: "no" })).envelope).toEqual({
+    ok: false,
+    error: { code: "invalid_value" },
+  });
+});
+
 test("a delete makes the entry absent and is not an error when it already was", async () => {
   await kv({ op: "put", key: "k", value: btoa("v") });
   expect(value((await kv({ op: "delete", key: "k" })).envelope)).toEqual({});

@@ -742,6 +742,47 @@ test("the facade holds the exact edge.objects ceilings and error vocabulary", as
   }
 });
 
+/**
+ * "invalid arguments" on a five-argument facade sends the caller to read the
+ * whole call. A `Uint8Array` is the shape a caller reaches for first, and R2
+ * accepts one; this Binding declares three body shapes (ADR 0005) and does not,
+ * so the refusal has to say which argument and which three.
+ */
+test("a body the Binding does not accept names the argument and what it accepts", async () => {
+  const { service } = objectPlane([]);
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       const said = {};
+       const record = async (name, run) => {
+         try { await run(); said[name] = null; }
+         catch (error) { said[name] = error.message; }
+       };
+       await record("view", () => env.MEDIA.put("k", new Uint8Array([1, 2, 3])));
+       await record("number", () => env.MEDIA.put("k", 7));
+       return Response.json(said);
+     } };`,
+    OBJECTS_ONLY,
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    const said = (await response.json()) as Record<string, string>;
+    expect(said.view).toBe(
+      "invalid module-worker.object-bucket arguments: body must be a string, an ArrayBuffer, " +
+        "or a byte ReadableStream; pass the view's own buffer slice",
+    );
+    expect(said.number).toBe(
+      "invalid module-worker.object-bucket arguments: body must be a string, an ArrayBuffer, " +
+        "or a byte ReadableStream",
+    );
+  } finally {
+    await generated.dispose();
+  }
+});
+
 test("a multipart complete is refused against the receipts this isolate holds", async () => {
   const { service } = objectPlane([
     { ok: true, value: { uploadId: "upload-1" } },
