@@ -1487,6 +1487,90 @@ async function seedWorker(
       nativeId: `worker:${identity.workerResourceUid}`,
     },
   });
+  await seedServingDeployment(sql, identity);
+}
+
+/**
+ * The Version and Deployment that make a Worker actually serve `fetch`.
+ *
+ * The reservation authority derives readiness rather than reading the cached
+ * `Ready` condition on the Worker's row — that condition is refreshed only when
+ * something reads the Worker, so through a whole first apply it still says the
+ * Worker has no deployment. A seed that set the condition and nothing else
+ * would therefore be testing a cache this code no longer consults.
+ */
+async function seedServingDeployment(
+  sql: ReturnType<typeof createReservationV2Sql>,
+  identity: {
+    readonly organizationId: string;
+    readonly space: string;
+    readonly workerName: string;
+    readonly workerResourceUid: string;
+  },
+): Promise<void> {
+  const timestamp = Date.parse("2026-08-31T12:00:00.000Z");
+  const versionName = `${identity.workerResourceUid}-version`;
+  const versionUid = `uid-version-${identity.workerResourceUid}`;
+  const write = async (
+    kind: "WorkerVersion" | "WorkerDeployment",
+    name: string,
+    uid: string,
+    spec: Record<string, unknown>,
+    relations: readonly Record<string, unknown>[],
+  ): Promise<void> => {
+    const formRef = { ...FORM, kind };
+    await sql.run(
+      `INSERT INTO tf_resources
+         (tenant_id, space, api_version, kind, name, uid, generation, revision,
+          resource_json, relations_json, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, '1', '1', ?, ?, ?)`,
+      [
+        identity.organizationId,
+        identity.space,
+        FORM.apiVersion,
+        kind,
+        name,
+        uid,
+        JSON.stringify({
+          apiVersion: FORM.apiVersion,
+          kind,
+          form: { formRef },
+          metadata: { name, space: identity.space, uid, generation: "1", revision: "1" },
+          spec,
+          status: { observedGeneration: "1", conditions: [] },
+        }),
+        JSON.stringify(relations),
+        timestamp,
+      ],
+    );
+  };
+  await write("WorkerVersion", versionName, versionUid, { handlers: ["fetch"] }, []);
+  await write(
+    "WorkerDeployment",
+    `${identity.workerResourceUid}-deployment`,
+    `uid-deployment-${identity.workerResourceUid}`,
+    {},
+    [
+      {
+        pointer: "/worker",
+        relation: "/worker",
+        targetApiVersion: FORM.apiVersion,
+        targetKind: "ModuleWorker",
+        targetName: identity.workerName,
+        targetUid: identity.workerResourceUid,
+        targetFormRef: FORM,
+      },
+      {
+        pointer: "/versions/0/workerVersion",
+        relation: "/versions/*/workerVersion",
+        targetApiVersion: FORM.apiVersion,
+        targetKind: "WorkerVersion",
+        targetName: versionName,
+        targetUid: versionUid,
+        targetFormRef: { ...FORM, kind: "WorkerVersion" },
+      },
+    ],
+  );
 }
 
 async function seedEndpoint(
@@ -1745,3 +1829,66 @@ test("creates a WorkerEndpoint with no reservation on the placement the Worker i
     },
   ]);
 });
+
+/**
+ * A Worker's readiness is derived, and the condition on its row is a cache.
+ *
+ * Nothing re-renders a ModuleWorker when a *dependent* is created, so through a
+ * whole first `tofu apply` the row still says what it said when it was made:
+ * "has no active WorkerDeployment". The deployment lands, the endpoint is
+ * created a moment later, and a reservation that read the cache refused a
+ * Worker that had been serving for a second — `resource_busy` 409 once, then
+ * the identical apply succeeded, because the second run's refresh read the
+ * Worker and re-rendered it.
+ */
+test("binds a Worker that is serving now, whatever its cached Ready condition still says", async () => {
+  const { authority, sql } = fixture();
+  await seedWorker(sql);
+  await setWorkerCondition(sql, "uid-worker-01", {
+    type: "Ready",
+    status: "False",
+    reason: "Provisioning",
+    lastTransitionTime: "2026-08-31T12:00:00.000Z",
+  });
+
+  const minted = await authority.mintForWorker({
+    organizationId: "org_01",
+    space: TARGET.space,
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-01",
+  });
+  expect(minted).toMatchObject({ status: "bound" });
+});
+
+test("refuses a Worker that is not serving, whatever its cached Ready condition claims", async () => {
+  const { authority, sql } = fixture();
+  await seedWorker(sql);
+  // The cache says Ready. The deployment that made it so is gone, so the
+  // Worker serves nothing and there is no address to reserve for it.
+  await sql.run("DELETE FROM tf_resources WHERE kind = 'WorkerDeployment'");
+
+  await expect(
+    authority.mintForWorker({
+      organizationId: "org_01",
+      space: TARGET.space,
+      workerName: TARGET.workerName,
+      workerResourceUid: "uid-worker-01",
+    }),
+  ).rejects.toMatchObject({ code: "conflict", status: 409 });
+});
+
+async function setWorkerCondition(
+  sql: ReturnType<typeof createReservationV2Sql>,
+  uid: string,
+  condition: Record<string, string>,
+): Promise<void> {
+  const rows = await sql.query("SELECT resource_json FROM tf_resources WHERE uid = ?", [uid]);
+  const raw = rows[0]?.resource_json;
+  if (typeof raw !== "string") throw new Error(`no resource row for ${uid}`);
+  const resource = JSON.parse(raw) as { status: { conditions: unknown[] } };
+  resource.status.conditions = [condition];
+  await sql.run("UPDATE tf_resources SET resource_json = ? WHERE uid = ?", [
+    JSON.stringify(resource),
+    uid,
+  ]);
+}
