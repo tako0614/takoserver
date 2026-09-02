@@ -8,6 +8,7 @@ import type { Provider } from "./provider-port.ts";
 import { derivedProviderResourceIncarnationName } from "./provider-worker-endpoint-origin.ts";
 import type { ResourceDeployment, ResourceDeploymentStore } from "./resource-deployments.ts";
 import type { ResourceWithRelations, TakoformStore } from "./takoform/store.ts";
+import { workerServiceCondition } from "./takoform/worker-aggregate.ts";
 
 export const WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT =
   "takoserver.worker-endpoint-origin-reservation.v2" as const;
@@ -285,7 +286,15 @@ export function createWorkerEndpointOriginReservations(options: {
   readonly clock: Clock;
   readonly catalog: Catalog;
   readonly providers: readonly Provider[];
-  readonly resources: Pick<TakoformStore, "resourceWithRelationsByUid">;
+  /**
+   * `resourcesByRelation` and `readResource` are here because a Worker's
+   * readiness is *derived*, and this authority derives it rather than reading
+   * the cached condition on the row. See `workerReady`.
+   */
+  readonly resources: Pick<
+    TakoformStore,
+    "resourceWithRelationsByUid" | "resourcesByRelation" | "readResource"
+  >;
   readonly deployments: Pick<ResourceDeploymentStore, "active">;
 }): WorkerEndpointOriginReservations {
   const placements = createSoldProviderPlacementSelector({
@@ -413,6 +422,39 @@ export function createWorkerEndpointOriginReservations(options: {
     }
   };
 
+  /**
+   * Whether this ModuleWorker is serving *now*, derived rather than read.
+   *
+   * A ModuleWorker's `Ready` condition is a projection of its WorkerDeployment
+   * graph that the Host refreshes lazily — on a read of the Worker, or on its
+   * own apply. Nothing re-renders it when a *dependent* is created, so through
+   * the whole of a first `tofu apply` the row still says "has no active
+   * WorkerDeployment" from the moment it was created: the deployment lands, the
+   * endpoint is created a moment later, and the reservation refused a Worker
+   * that had been serving for a second. The apply failed `resource_busy` 409
+   * once, and the next run — which reads the Worker during refresh, and so
+   * re-renders it — succeeded with no change at all.
+   *
+   * So readiness is asked of the same authority the engine's own attachment
+   * rule asks, and the stored condition is left as what it is: a cache.
+   */
+  const workerReady = async (
+    organizationId: string,
+    snapshot: ResourceWithRelations,
+  ): Promise<boolean> => {
+    let condition: Awaited<ReturnType<typeof workerServiceCondition>>;
+    try {
+      condition = await workerServiceCondition({
+        tenantId: organizationId,
+        resource: snapshot.listing.resource,
+        store: options.resources,
+      });
+    } catch {
+      throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
+    }
+    return condition?.status === "True";
+  };
+
   const validateWorker = async (
     row: ReservationRow,
     identity: {
@@ -434,8 +476,9 @@ export function createWorkerEndpointOriginReservations(options: {
       snapshot.listing.uid !== identity.workerResourceUid ||
       snapshot.listing.space !== identity.space ||
       snapshot.listing.name !== identity.workerName ||
-      !readyCurrent(snapshot, "ModuleWorker") ||
-      !sameForm(snapshot.listing.resource.form.formRef, MODULE_WORKER_FORM_REF)
+      !currentIncarnation(snapshot, "ModuleWorker") ||
+      !sameForm(snapshot.listing.resource.form.formRef, MODULE_WORKER_FORM_REF) ||
+      !(await workerReady(row.organization_id, snapshot))
     ) {
       throw new WorkerEndpointOriginReservationError("conflict", 409);
     }
@@ -2095,7 +2138,7 @@ async function liveIncarnation(
   return rows.length === 1;
 }
 
-function readyCurrent(snapshot: ResourceWithRelations, kind: string): boolean {
+function currentIncarnation(snapshot: ResourceWithRelations, kind: string): boolean {
   const { listing } = snapshot;
   const resource = listing.resource;
   return (
@@ -2108,8 +2151,14 @@ function readyCurrent(snapshot: ResourceWithRelations, kind: string): boolean {
     resource.metadata.generation === listing.generation &&
     resource.metadata.revision === listing.revision &&
     resource.status.observedGeneration === resource.metadata.generation &&
-    canonicalRevision(listing.revision) &&
-    resource.status.conditions.some(
+    canonicalRevision(listing.revision)
+  );
+}
+
+function readyCurrent(snapshot: ResourceWithRelations, kind: string): boolean {
+  return (
+    currentIncarnation(snapshot, kind) &&
+    snapshot.listing.resource.status.conditions.some(
       (condition) => condition.type === "Ready" && condition.status === "True",
     )
   );

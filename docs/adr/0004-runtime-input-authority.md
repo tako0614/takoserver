@@ -257,6 +257,17 @@ Host reserves on the caller's behalf. Three things make that safe to say:
   ModuleWorker Offering, which is a fact about the catalog rather than about
   this Worker.
 
+- **Readiness is derived, and the condition on the row is a cache.** Binding
+  records the exact *Ready*, current-generation ModuleWorker, and it asks the
+  same authority the engine's attachment rule asks rather than reading the
+  `Ready` condition stored on the Worker. Nothing re-renders a ModuleWorker when
+  a dependent is created, so through a whole first `tofu apply` the row still
+  says "has no active WorkerDeployment" from the moment it was made: the
+  deployment lands, the endpoint is created a moment later, and a reservation
+  reading the cache refused a Worker that had been serving for a second. The
+  apply failed `resource_busy` 409 once and the identical re-run succeeded,
+  because a refresh reads the Worker and re-renders it.
+
 Everything else stands. A supplied reservation is still the authority for the
 origin it holds; binding, activation, deactivation, the deletion witness and
 the destroy order are untouched; and the reservation remains value-free and
