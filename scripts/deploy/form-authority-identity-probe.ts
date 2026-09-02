@@ -18,7 +18,7 @@ import {
   runCommand,
   wranglerCommand,
 } from "./process.ts";
-import { type DeployEnvironment, qualifySource } from "./qualification.ts";
+import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualification.ts";
 import type { DeployTarget } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import { inspectLiveWorkerVersion } from "./worker-live.ts";
@@ -239,6 +239,7 @@ export async function runFormAuthorityIdentityProbe(
         : "forward repair only: no previous identity probe version exists",
     };
   } finally {
+    unsealDirectory(root);
     if (temporary) rmSync(root, { recursive: true, force: true });
   }
 }

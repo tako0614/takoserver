@@ -19,7 +19,7 @@ import {
   runCommand,
   wranglerCommand,
 } from "./process.ts";
-import { type DeployEnvironment, qualifySource } from "./qualification.ts";
+import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualification.ts";
 import { writeWorkerConfig } from "./realized-config.ts";
 import { runAuthorityTransition } from "./retirement.ts";
 import {
@@ -527,6 +527,7 @@ export async function runWorker(
     };
   } finally {
     await publicationLease?.release();
+    unsealDirectory(root);
     if (temporary) rmSync(root, { recursive: true, force: true });
   }
 }

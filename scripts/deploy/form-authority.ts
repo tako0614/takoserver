@@ -42,7 +42,7 @@ import {
   runCommand,
   wranglerCommand,
 } from "./process.ts";
-import { type DeployEnvironment, qualifySource } from "./qualification.ts";
+import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualification.ts";
 import type { DeployTarget } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import {
@@ -601,6 +601,7 @@ export async function runFormAuthority(
         : "forward repair only: no previous Form authority Worker version exists",
     };
   } finally {
+    unsealDirectory(root);
     if (temporary) rmSync(root, { recursive: true, force: true });
   }
 }

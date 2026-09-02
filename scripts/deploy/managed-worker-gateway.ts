@@ -10,7 +10,7 @@ import {
   requireEnvironment,
   runCommand,
 } from "./process.ts";
-import { type DeployEnvironment, qualifySource } from "./qualification.ts";
+import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualification.ts";
 import type { DeployTarget } from "./target.ts";
 import { prepareWorkerArtifact, type WorkerArtifactProcess } from "./worker-artifact.ts";
 import { parseWorkerDeploymentHistory } from "./worker-state.ts";
@@ -500,6 +500,7 @@ export async function runManagedWorkerGateway(
         throw preflightError(plan.reason);
       }
     } finally {
+      unsealDirectory(root);
       if (temporary) rmSync(root, { recursive: true, force: true });
     }
   }
@@ -729,6 +730,7 @@ async function rollbackGatewayWorker(input: {
       previousVersionId: restoredHistory.previousVersionId,
     };
   } finally {
+    unsealDirectory(root);
     if (temporary) rmSync(root, { recursive: true, force: true });
   }
 }

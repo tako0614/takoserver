@@ -27,7 +27,7 @@ import {
   runCommand,
   wranglerCommand,
 } from "./process.ts";
-import { type DeployEnvironment, qualifySource } from "./qualification.ts";
+import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualification.ts";
 import { expectedWorkerSecrets } from "./realized-config.ts";
 import type { DeployTarget } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
@@ -225,6 +225,7 @@ export async function runOperatorIdentity(
         "revoke every session and API key issued through this identity before a separately reviewed identity removal",
     };
   } finally {
+    unsealDirectory(root);
     if (temporary) rmSync(root, { recursive: true, force: true });
   }
 }

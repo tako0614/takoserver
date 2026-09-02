@@ -13,7 +13,7 @@ import {
   runCommand,
   wranglerCommand,
 } from "./process.ts";
-import { type DeployEnvironment, qualifySource } from "./qualification.ts";
+import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualification.ts";
 import { expectedWorkerSecrets, writeWorkerConfig } from "./realized-config.ts";
 import {
   activeHostedTokenCutoverPublicJwk,
@@ -142,6 +142,7 @@ export async function runHosted(
       inspection.live,
     );
   } finally {
+    unsealDirectory(root);
     if (temporary) rmSync(root, { recursive: true, force: true });
   }
 }

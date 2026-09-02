@@ -1,5 +1,13 @@
 import { createHash } from "node:crypto";
-import { chmodSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import {
+  chmodSync,
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { relative, resolve, sep } from "node:path";
 import { preflightError } from "./errors.ts";
 import { type CommandResult, runCommand } from "./process.ts";
@@ -178,6 +186,52 @@ export function sealDirectory(
       }
     },
   };
+}
+
+/**
+ * Restores the owner's write permission across one artifact tree, releasing
+ * what `sealDirectory` removed.
+ *
+ * The seal exists between building an artifact and reading the published bytes
+ * back: directories lose their write bit so no entry can be added or removed,
+ * and files lose theirs so no byte can be rewritten. Once that operation is
+ * over the tree is ordinary build output again, and an operator who is not
+ * root can otherwise neither delete it nor build into the same output
+ * directory a second time. Only the owner write bit is restored, so a 0600
+ * receipt stays 0600; symbolic links are never followed, so nothing outside
+ * the tree is touched; and a tree that is already gone is not an error.
+ */
+export function unsealDirectory(root: string): void {
+  for (const name of unsealEntry(root)) unsealDirectory(resolve(root, name));
+}
+
+/**
+ * Releases the seal on one entry and answers the child names left to visit.
+ *
+ * Releasing is best effort. It runs while an operation is unwinding, so an
+ * entry that has already been removed, sits on a read-only filesystem, or
+ * belongs to someone else must never replace the outcome that operation
+ * produced.
+ */
+function unsealEntry(path: string): readonly string[] {
+  try {
+    const status = lstatSync(path);
+    if (status.isSymbolicLink()) return [];
+    if (!status.isDirectory()) {
+      if (status.isFile()) chmodSync(path, status.mode | 0o200);
+      return [];
+    }
+    chmodSync(path, status.mode | 0o700);
+    return readdirSync(path);
+  } catch {
+    return [];
+  }
+}
+
+/** Unseals one artifact tree and then removes it. */
+export function removeArtifactTree(root: string): void {
+  unsealDirectory(root);
+  rmSync(root, { recursive: true, force: true });
 }
 
 function identity(root: string): ArtifactIdentity {

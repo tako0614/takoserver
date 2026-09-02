@@ -11,7 +11,12 @@ import {
   runCommand,
   wranglerCommand,
 } from "./process.ts";
-import { type DeployEnvironment, qualifySource, sealDirectory } from "./qualification.ts";
+import {
+  type DeployEnvironment,
+  qualifySource,
+  sealDirectory,
+  unsealDirectory,
+} from "./qualification.ts";
 import type { DeployTarget } from "./target.ts";
 import { parseWorkerDeploymentHistory } from "./worker-state.ts";
 
@@ -169,6 +174,7 @@ export async function runConsole(
         : "forward repair only: no previous Console version exists",
     };
   } finally {
+    unsealDirectory(root);
     if (temporary) rmSync(root, { recursive: true, force: true });
   }
 }
