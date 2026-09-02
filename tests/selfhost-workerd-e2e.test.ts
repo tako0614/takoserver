@@ -4,12 +4,15 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createEphemeralSql } from "../src/compat.ts";
 import type { ProviderOffering, ProviderRelation } from "../src/provider-port.ts";
+import { EDGE_OBJECTS_BINDING_REF } from "../src/providers/cloudflare-runtime-bindings.ts";
 import {
   createSelfhostDataPlaneAccess,
   createSelfhostEventTargets,
   createSelfhostProvider,
 } from "../src/providers/selfhost.ts";
+import { SELFHOST_EDGE_OBJECTS_MATERIAL_KIND } from "../src/providers/selfhost-runtime-bindings.ts";
 import { serveSelfhostDataPlanes } from "../src/selfhost-data-planes.ts";
+import { createSelfhostObjectStore } from "../src/selfhost-object-store.ts";
 import { createSelfhostQueuePump } from "../src/selfhost-queue-pump.ts";
 import { createSelfhostWorkerScheduler } from "../src/selfhost-scheduler.ts";
 import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
@@ -1242,6 +1245,337 @@ test.skipIf(WORKERD === null)(
         message: "the Worker Version's module does not export every handler it declares",
       },
     });
+  },
+  60_000,
+);
+
+// ---------------------------------------------------------------------------
+// Objects
+// ---------------------------------------------------------------------------
+
+/**
+ * The bucket lane, with nothing simulated.
+ *
+ * What only a real runtime can answer here is whether an object body actually
+ * streams: the tenant's `put` hands a stream to a service binding, the facade
+ * forwards it to an `externalServer` without reading it, and the plane writes
+ * it to a file as it arrives. A unit test can prove each hop; only workerd can
+ * prove the three of them compose.
+ */
+const BUCKET_ID = `tsb-${"e".repeat(40)}`;
+const OTHER_BUCKET_ID = `tsb-${"d".repeat(40)}`;
+
+const OBJECT_MODULE = `export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname === "/objects") {
+      const written = await env.MEDIA.put("photos/one.txt", "hello objects", {
+        contentType: "text/plain",
+      });
+      await env.MEDIA.put("photos/two.txt", "second");
+      await env.MEDIA.put("notes/readme.txt", "notes");
+      const head = await env.MEDIA.head("photos/one.txt");
+      const whole = await env.MEDIA.get("photos/one.txt");
+      const wholeText = await new Response(whole.body).text();
+      const ranged = await env.MEDIA.get("photos/one.txt", { range: { offset: 6, length: 7 } });
+      const rangedText = await new Response(ranged.body).text();
+      const listed = await env.MEDIA.list({ prefix: "photos/" });
+      const folders = await env.MEDIA.list({ delimiter: "/" });
+      await env.MEDIA.delete("photos/two.txt");
+      const gone = await env.MEDIA.head("photos/two.txt");
+      let refused = null;
+      try {
+        await env.MEDIA.put("photos/one.txt", "clash", { ifNoneMatch: "*" });
+      } catch (error) { refused = error.name; }
+      return Response.json({
+        size: written.size,
+        etagMatches: head.etag === written.etag,
+        contentType: head.contentType,
+        wholeText,
+        partial: ranged.partial,
+        range: ranged.range,
+        rangedText,
+        keys: listed.objects.map((object) => object.key),
+        prefixes: folders.prefixes,
+        deleted: gone === null,
+        refused,
+      });
+    }
+    if (url.pathname === "/multipart") {
+      const created = await env.MEDIA.createMultipartUpload("film.bin", {
+        contentType: "application/octet-stream",
+      });
+      const block = new Uint8Array(5 * 1024 * 1024);
+      block.fill(65);
+      const one = await env.MEDIA.uploadPart("film.bin", created.uploadId, 1, block.buffer);
+      const two = await env.MEDIA.uploadPart("film.bin", created.uploadId, 2, "TAIL");
+      const completed = await env.MEDIA.completeMultipartUpload("film.bin", created.uploadId, [
+        { etag: one.etag, partNumber: 1 },
+        { etag: two.etag, partNumber: 2 },
+      ]);
+      const tail = await env.MEDIA.get("film.bin", {
+        range: { offset: completed.size - 4, length: 4 },
+      });
+      const tailText = await new Response(tail.body).text();
+      let spent = null;
+      try {
+        await env.MEDIA.abortMultipartUpload("film.bin", created.uploadId);
+      } catch (error) { spent = error.name; }
+      return Response.json({ size: completed.size, tailText, spent });
+    }
+    if (url.pathname === "/objects-isolation") {
+      const escaped = "../" + url.searchParams.get("other") + "/stolen";
+      const written = await env.MEDIA.put(escaped, "nope");
+      const listed = await env.MEDIA.list({});
+      let direct = null;
+      try {
+        const response = await fetch(url.searchParams.get("plane"), { method: "POST" });
+        direct = "status:" + response.status;
+      } catch (error) { direct = String(error && error.name); }
+      let importable;
+      try {
+        const module = await import("cloudflare:workers");
+        importable = Object.keys(module.env ?? {}).sort();
+      } catch (error) { importable = ["threw:" + String(error && error.name)]; }
+      return Response.json({
+        escapedSize: written.size,
+        keys: listed.objects.map((object) => object.key),
+        other: typeof env.OTHER,
+        dataService: typeof env.__TAKOSERVER_SELFHOST_DATA,
+        token: env.__TAKOSERVER_SELFHOST_DATA_TOKEN ?? null,
+        importable,
+        direct,
+      });
+    }
+    return Response.json({ lane: "objects" });
+  },
+};
+`;
+
+/** Publishes a Worker that binds one bucket, and boots workerd in front of it. */
+async function bootObjects(): Promise<{
+  readonly origin: string;
+  readonly planeOrigin: string;
+  readonly store: ReturnType<typeof createSelfhostObjectStore>;
+}> {
+  const sql = createEphemeralSql();
+  const access = createSelfhostDataPlaneAccess(root);
+  const objectRoot = join(root, "selfhost", "objects");
+  const served = serveSelfhostDataPlanes({
+    sql,
+    grant: (script, versionId) => access.grant(script, versionId),
+    databasePath: (name) => access.databasePath(name),
+    objectRoot,
+  });
+  planeServer = served;
+
+  const reserved = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+  const workerdPort = Number(reserved.port);
+  reserved.stop(true);
+  const origin = `http://127.0.0.1:${workerdPort}`;
+  const runtime = createWorkerdRuntime({ root, port: workerdPort, isReady: () => true });
+  const local = createSelfhostProvider({
+    offerings: [],
+    dataRoot: root,
+    runtime,
+    dataPlaneAddress: served.address,
+    suffixes: ["localhost"],
+    artifacts: {
+      async manifest(_tenant, digest) {
+        return digest === "sha256:worker"
+          ? {
+              kind: "WorkerBundle",
+              mainModule: "index.js",
+              modules: [{ name: "index.js", digest: "sha256:index.js" }],
+            }
+          : null;
+      },
+      async blob(digest) {
+        return digest === "sha256:index.js" ? new TextEncoder().encode(OBJECT_MODULE) : null;
+      },
+    },
+  });
+
+  const worker = await local.apply({
+    operationId: "op_worker",
+    offering: offering("ModuleWorker"),
+    identity: identity("hello"),
+    spec: {},
+  });
+  expect(worker.phase).toBe("succeeded");
+  const script = worker.phase === "succeeded" ? String(worker.result.outputs.scriptName) : "";
+
+  const bucket = deployed(
+    "/bucketBindings/0/resource",
+    "ObjectBucket",
+    "media",
+    `selfhost-bucket:${BUCKET_ID}`,
+    { bucketName: BUCKET_ID },
+  );
+  const version = await local.apply({
+    operationId: "op_version",
+    offering: offering("WorkerVersion"),
+    identity: identity("hello-v1"),
+    spec: {
+      bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+      handlers: ["fetch"],
+      worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+      bucketBindings: [
+        { name: "MEDIA", resource: { apiVersion: EDGE_API, kind: "ObjectBucket", name: "media" } },
+      ],
+    },
+    relations: [
+      deployed("/worker", "ModuleWorker", "hello", `selfhost-worker:${script}`, {
+        scriptName: script,
+      }),
+      relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+      { ...bucket, bindingRef: EDGE_OBJECTS_BINDING_REF },
+    ],
+    // Exactly what the Provider Pack's own importer produces for this relation.
+    runtimeBindings: [
+      {
+        name: "MEDIA",
+        targetUid: bucket.targetUid,
+        bindingRef: EDGE_OBJECTS_BINDING_REF,
+        material: { kind: SELFHOST_EDGE_OBJECTS_MATERIAL_KIND, bucketId: BUCKET_ID },
+      },
+    ],
+  });
+  if (version.phase !== "succeeded") {
+    throw new Error(`version apply failed: ${JSON.stringify(version)}`);
+  }
+
+  const deployment = await local.apply({
+    operationId: "op_deploy",
+    offering: offering("WorkerDeployment"),
+    identity: identity("hello-live"),
+    spec: {
+      worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+      versions: [
+        {
+          workerVersion: { apiVersion: EDGE_API, kind: "WorkerVersion", name: "hello-v1" },
+          weight: 10_000,
+        },
+      ],
+    },
+    relations: [
+      relation("/worker", "ModuleWorker", "hello"),
+      relation("/versions/0/workerVersion", "WorkerVersion", "hello-v1"),
+    ],
+  });
+  expect(deployment.phase).toBe("succeeded");
+
+  const endpoint = await local.apply({
+    operationId: "op_endpoint",
+    offering: offering("WorkerEndpoint"),
+    identity: identity("hello-endpoint"),
+    spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" } },
+    relations: [relation("/worker", "ModuleWorker", "hello")],
+    workerEndpointOriginAssignment: {
+      canonicalPublicOrigin: `https://${HOSTNAME}`,
+      assignmentDigest: `sha256:${"e".repeat(64)}`,
+    },
+  });
+  expect(endpoint.phase).toBe("succeeded");
+
+  workerd = Bun.spawn([WORKERD as string, "serve", join(root, "workers", "workerd.capnp")], {
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  expect(await reachable(`${origin}/`)).toBe(true);
+  return {
+    origin,
+    planeOrigin: `http://${served.address}`,
+    store: createSelfhostObjectStore({ sql, root: objectRoot }),
+  };
+}
+
+test.skipIf(WORKERD === null)(
+  "a published Worker puts, ranged-gets, lists, and deletes through env.MEDIA",
+  async () => {
+    const { origin, store } = await bootObjects();
+    const response = await ask(origin, "/objects");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      size: 13,
+      etagMatches: true,
+      contentType: "text/plain",
+      wholeText: "hello objects",
+      partial: true,
+      range: { offset: 6, length: 7 },
+      rangedText: "objects",
+      keys: ["photos/one.txt", "photos/two.txt"],
+      prefixes: ["notes/", "photos/"],
+      deleted: true,
+      refused: "precondition_failed",
+    });
+    // The bytes really are on this machine, in this bucket, and nowhere else.
+    const listed = await store.list(BUCKET_ID);
+    expect(listed.objects.map((object) => object.key)).toEqual([
+      "notes/readme.txt",
+      "photos/one.txt",
+    ]);
+  },
+  60_000,
+);
+
+test.skipIf(WORKERD === null)(
+  "a multipart upload streams five megabytes through the facade and completes",
+  async () => {
+    const { origin, store } = await bootObjects();
+    const response = await ask(origin, "/multipart");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      size: 5 * 1024 * 1024 + 4,
+      tailText: "TAIL",
+      spent: "upload_not_found",
+    });
+    expect((await store.head(BUCKET_ID, "film.bin"))?.size).toBe(5 * 1024 * 1024 + 4);
+    // The receipts were rows, so nothing about the upload is still owed.
+    expect(await store.occupancy(BUCKET_ID)).toEqual({ objects: 1, uploads: 0 });
+  },
+  60_000,
+);
+
+test.skipIf(WORKERD === null)(
+  "a tenant cannot reach another bucket, the plane, or its own token",
+  async () => {
+    const { origin, planeOrigin, store } = await bootObjects();
+    // Somebody else's bucket, with something in it worth taking.
+    await store.put(OTHER_BUCKET_ID, "secret", new Blob(["not yours"]).stream(), {
+      contentLength: 9,
+    });
+
+    const asked = new URL(`${origin}/objects-isolation`);
+    asked.searchParams.set("other", OTHER_BUCKET_ID);
+    asked.searchParams.set(
+      "plane",
+      `${planeOrigin}/.well-known/takoserver/selfhost-data/v1/objects`,
+    );
+    const response = await fetch(asked, { headers: { host: HOSTNAME } });
+    const body = (await response.json()) as Record<string, unknown>;
+
+    // A key that looks like a path is a key. It landed inside this Version's
+    // own bucket, under a name this Host minted, and touched nothing else.
+    expect(body.escapedSize).toBe(4);
+    expect(body.keys).toEqual([`../${OTHER_BUCKET_ID}/stolen`]);
+    expect((await store.list(OTHER_BUCKET_ID)).objects.map((object) => object.key)).toEqual([
+      "secret",
+    ]);
+    expect(await new Response((await store.get(OTHER_BUCKET_ID, "secret"))?.body).text()).toBe(
+      "not yours",
+    );
+
+    // A binding this Version never declared is absent rather than resolvable,
+    // and the plane token is on a service this one holds no binding to.
+    expect(body.other).toBe("undefined");
+    expect(body.dataService).toBe("undefined");
+    expect(body.token).toBeNull();
+    expect(body.importable).toEqual([]);
+    // And the planes are not reachable by address from tenant code at all:
+    // workerd's default outbound network refuses loopback, so the attempt
+    // throws rather than reaching a status of any kind.
+    expect(String(body.direct)).not.toContain("status:");
   },
   60_000,
 );
