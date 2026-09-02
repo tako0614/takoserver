@@ -1089,7 +1089,14 @@ function controlError(code: string, status: number): never {
 
 /**
  * Maps every failure the control plane can raise onto one envelope. Codes are
- * ours; the messages are derived from them, so no internal text escapes.
+ * ours; the message is derived from the code unless this Host composed one
+ * itself, so no internal, provider, or caller-supplied text escapes.
+ *
+ * The one composed message is a reservation refusal about *this deployment's*
+ * configuration — an address the published `WorkerEndpoint` Form cannot carry.
+ * The code alone says something about the Host is wrong and nothing about which
+ * knob to turn, and the reseller reading this route deserves the same sentence
+ * the boot diagnostic and the Takoform Host lane give.
  *
  * The envelope is the same four-member one the stable Takoform Host lane
  * answers with, because one released client reads both: the private
@@ -1099,7 +1106,9 @@ function controlError(code: string, status: number): never {
  */
 export function controlErrorResponse(error: unknown): Response {
   const { code, status } = classify(error);
-  return Response.json(errorEnvelope(code), { status });
+  const message =
+    error instanceof WorkerEndpointOriginReservationError ? error.publicMessage : undefined;
+  return Response.json(errorEnvelope(code, undefined, undefined, message), { status });
 }
 
 function classify(error: unknown): { code: string; status: number } {
