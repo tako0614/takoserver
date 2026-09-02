@@ -1955,9 +1955,18 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
   const QUEUE_ID = "tsq-attachment-fixture";
   const DLQ_ID = "tsq-attachment-fixture-dlq";
   const EVENTS = {
-    async deleteQueue() {},
     async forgetSchedules() {},
   };
+
+  /** Where one Version's durable binding record lives on this machine. */
+  const recordPath = (script: string) =>
+    join(
+      root,
+      "selfhost",
+      "version-bindings",
+      script,
+      `${versionDirectoryName(root, script)}.json`,
+    );
 
   function queueRelation(pointer: string, name: string, id: string): ProviderRelation {
     return {
@@ -2036,6 +2045,89 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
       phase: "succeeded",
       result: { observed: { scheduled: false } },
     });
+  });
+
+  test("refuses an attachment to a Version it could never deliver to", async () => {
+    const local = provider({ events: EVENTS });
+    const script = await publish(local);
+    // Exactly what an upgraded machine has: a Version published before this
+    // Host recorded handlers and minted an event token. Earlier builds removed
+    // the record entirely for a Version that declared no binding.
+    rmSync(recordPath(script), { force: true });
+
+    expect(await applyCron(local, "0 * * * *")).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "invalid_spec",
+        message:
+          "the active Worker Version predates event delivery on this Host; publish a new Version",
+      },
+    });
+    // Refused BEFORE the durable state moved: nothing was attached, so nothing
+    // is left claiming a delivery that can never happen.
+    const state = JSON.parse(
+      readFileSync(join(root, "selfhost", "scripts", `${script}.json`), "utf8"),
+    ) as { crons?: readonly string[]; consumers?: readonly unknown[] };
+    expect(state.crons ?? []).toEqual([]);
+    expect(state.consumers ?? []).toEqual([]);
+    // And the script is not wedged: a later republish of it still succeeds.
+    expect(
+      (
+        await local.apply({
+          operationId: "op_domain",
+          offering: offering("WorkerCustomDomain"),
+          identity: identity("hello-domain"),
+          spec: {
+            worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+            hostname: "attached.localhost",
+          },
+          relations: [relation("/worker", "ModuleWorker", "hello")],
+        })
+      ).phase,
+    ).toBe("succeeded");
+  });
+
+  test("an attachment the publication definitely refused does not stay behind", async () => {
+    // A bundle carrying a module under this Host's own generated name. It
+    // publishes fine while nothing is attached, because a Version with no
+    // binding gets no generated entrypoint at all; the attachment is what asks
+    // for one, and asking is what the publication refuses.
+    const local = provider({
+      events: EVENTS,
+      modules: {
+        "index.js": "export default {}",
+        "__takoserver-selfhost-entrypoint.js": "export default {}",
+      },
+    });
+    const script = await publish(local);
+    expect(await applyCron(local, "0 * * * *")).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "invalid_spec",
+        message: "the Worker bundle claims this Host's entrypoint module name",
+      },
+    });
+    // Rolled back, so a later republish of the script is not the same refusal
+    // for ever. Before this, one refused attach wedged every domain, endpoint,
+    // and deployment change the Worker would ever see.
+    const state = JSON.parse(
+      readFileSync(join(root, "selfhost", "scripts", `${script}.json`), "utf8"),
+    ) as { crons?: readonly string[] };
+    expect(state.crons ?? []).toEqual([]);
+    expect(
+      (
+        await local.apply({
+          operationId: "op_domain",
+          offering: offering("WorkerCustomDomain"),
+          identity: identity("hello-domain"),
+          spec: {
+            worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+            hostname: "attached.localhost",
+          },
+          relations: [relation("/worker", "ModuleWorker", "hello")],
+        })
+      ).phase,
+    ).toBe("succeeded");
   });
 
   test("refuses a cron expression this Host could record and never fire", async () => {

@@ -465,6 +465,11 @@ function readinessAnswer(body: string): { readonly publication: string } | null 
   return { publication: answer.publication };
 }
 
+/** Whether a ticket says "try again", as opposed to "this cannot be served". */
+function retryableTicket(ticket: ProviderTicket): boolean {
+  return ticket.phase === "failed" && ticket.failure.retryable === true;
+}
+
 class SelfhostFailure extends Error {
   readonly ticket: ProviderTicket;
   constructor(ticket: ProviderTicket) {
@@ -590,22 +595,29 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   ): Promise<StoredSelfhostVersionBindings | null> =>
     bindingStoreOperation(() => versionBindings.read(script, versionId));
 
-  // Runtime activation is identified by the complete desired route set and the
-  // exact environment, not merely by the active version. An endpoint/domain
-  // write can stage a new manifest while reload still serves the previous route
-  // table, and a version whose bindings were written after its first publish
-  // would otherwise report a stale environment as serving. A version that
-  // declares no binding contributes nothing, so its generation is byte-for-byte
-  // what it was before bindings existed.
+  // Runtime activation is identified by the complete desired route set, the
+  // exact environment, and everything attached to the script, not merely by the
+  // active version. An endpoint/domain write can stage a new manifest while
+  // reload still serves the previous route table; a version whose bindings were
+  // written after its first publish would otherwise report a stale environment
+  // as serving; and an attachment is what puts the event gate in front of the
+  // Worker, so a script whose gate was rendered and one whose republish failed
+  // have to be different generations. A version that declares no binding and a
+  // script with nothing attached contribute nothing, so their generation is
+  // byte-for-byte what it was before either existed.
   const runtimeGeneration = async (script: string, state: SelfhostScriptState): Promise<string> => {
     const bindings = state.activeVersion
       ? await readVersionBindings(script, state.activeVersion)
       : null;
+    const consumers = state.consumers ?? [];
+    const crons = state.crons ?? [];
     return JSON.stringify({
       activeVersion: state.activeVersion ?? null,
       endpointHostname: state.endpointHostname ?? null,
       domains: state.domains,
       ...(bindings ? { bindingsDigest: bindings.digest } : {}),
+      ...(consumers.length > 0 ? { consumers } : {}),
+      ...(crons.length > 0 ? { crons } : {}),
     });
   };
 
@@ -819,6 +831,27 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   /** Whether anything is attached to this script that delivers it an event. */
   const receivesEvents = (state: SelfhostScriptState): boolean =>
     (state.consumers ?? []).length > 0 || (state.crons ?? []).length > 0;
+
+  /**
+   * Whether an event attached to this script would actually reach it.
+   *
+   * The same three facts `createSelfhostEventTargets` reads before it hands a
+   * script to the pump or the scheduler: this deployment runs them at all, the
+   * script has an active Version, and that Version's record carries the handler
+   * list and the event token the gate needs. Deriving `delivering` and
+   * `scheduled` from anywhere else is how a ticket comes to claim delivery for
+   * an attachment that can never fire.
+   */
+  const eventsDeliverable = async (
+    script: string,
+    state: SelfhostScriptState,
+  ): Promise<boolean> => {
+    if (!options.events || !state.activeVersion) return false;
+    // A record this Host cannot read is not one it can deliver through, and an
+    // observation is not the place to turn that into a failure.
+    const stored = await readVersionBindings(script, state.activeVersion).catch(() => null);
+    return Boolean(stored?.eventToken && stored.handlers);
+  };
 
   /** Rewrites what workerd serves for one script from durable state alone. */
   const republish = async (script: string): Promise<void> => {
@@ -1732,13 +1765,42 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   ): Promise<void> => {
     const current = await readScriptState(script);
     const next = change(current.state);
-    if (JSON.stringify(next) !== JSON.stringify(current.state)) {
-      await writeScriptState(script, current, next);
+    // Read the active Version's record BEFORE anything durable moves. A Version
+    // published before this Host recorded handlers has neither a handler list
+    // nor an event token, so nothing would ever be delivered to it — and
+    // committing the attachment first meant that discovery happened inside
+    // `republish`, with the attachment already written and every later
+    // republish of the script failing on it.
+    if (receivesEvents(next) && next.activeVersion) {
+      const bindings = await readVersionBindings(script, next.activeVersion);
+      if (!bindings?.handlers || !bindings.eventToken) {
+        throw new SelfhostFailure(
+          failed(
+            "invalid_spec",
+            "the active Worker Version predates event delivery on this Host; publish a new Version",
+          ),
+        );
+      }
     }
-    // Always, even when the desired state was already this: a committed
-    // attachment is not proof that the runtime accepted the gate it needs, and
-    // the publication is what puts that gate in front of the Worker.
-    if (next.activeVersion) await republish(script);
+    const moved = JSON.stringify(next) !== JSON.stringify(current.state);
+    if (moved) await writeScriptState(script, current, next);
+    if (!next.activeVersion) return;
+    try {
+      // Always, even when the desired state was already this: a committed
+      // attachment is not proof that the runtime accepted the gate it needs,
+      // and the publication is what puts that gate in front of the Worker.
+      await republish(script);
+    } catch (error) {
+      // A definite refusal means this declaration cannot be served at all, so
+      // the attachment must not stay behind refusing every later republish of
+      // the script. A retryable failure is the opposite: the desired state is
+      // right and the next reconcile is what makes it true, so it stays.
+      if (moved && error instanceof SelfhostFailure && !retryableTicket(error.ticket)) {
+        const written = await readScriptState(script);
+        await writeScriptState(script, written, current.state).catch(() => undefined);
+      }
+      throw error;
+    }
   };
 
   const applyWorkerCronTrigger = async (input: ApplyInput): Promise<ProviderTicket> => {
@@ -1758,9 +1820,14 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       ...state,
       crons: [...new Set([...(state.crons ?? []), cron])].sort(),
     }));
+    const { state } = await readScriptState(script);
     return succeeded({
       nativeId: nativeId(input, `selfhost-cron:${script}`),
-      observed: { cron, scriptName: script, scheduled: Boolean(options.events) },
+      observed: {
+        cron,
+        scriptName: script,
+        scheduled: await eventsDeliverable(script, state),
+      },
       outputs: {},
     });
   };
@@ -1791,12 +1858,13 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         attachment,
       ].sort((left, right) => (left.queue < right.queue ? -1 : 1)),
     }));
+    const { state } = await readScriptState(script);
     return succeeded({
       nativeId: nativeId(input, `selfhost-consumer:${queue.queue}:${script}`),
       observed: {
         queueName: queue.queue,
         scriptName: script,
-        delivering: Boolean(options.events),
+        delivering: await eventsDeliverable(script, state),
       },
       outputs: {},
     });
@@ -2269,8 +2337,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
               observed: {
                 cron,
                 scriptName: script,
-                // Attached and, if this deployment runs a scheduler, firing.
-                scheduled: Boolean(options.events) && Boolean(state.activeVersion),
+                // Attached and, if anything on this machine would fire it, firing.
+                scheduled: await eventsDeliverable(script, state),
               },
               outputs: {},
             });
@@ -2291,7 +2359,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
               observed: {
                 queueName: queue.queue,
                 scriptName: script,
-                delivering: Boolean(options.events) && Boolean(state.activeVersion),
+                delivering: await eventsDeliverable(script, state),
               },
               outputs: {},
             });

@@ -176,18 +176,27 @@ export function createSelfhostWorkerScheduler(
           // The claim and the advance are one statement, fenced on the exact
           // instant this pass read: two passes cannot both own the minute, and
           // a lease that is still live is what makes the second one skip.
+          const lease = millis + leaseMillis;
           const claim = await sql.run(
             "UPDATE selfhost_worker_schedules SET running_until_ms = ?, next_fire_at_ms = ? " +
               "WHERE script = ? AND cron = ? AND next_fire_at_ms = ? " +
               "AND (running_until_ms IS NULL OR running_until_ms <= ?)",
-            [millis + leaseMillis, next, target.script, cron, state.nextFireAtMillis, millis],
+            [lease, next, target.script, cron, state.nextFireAtMillis, millis],
           );
           if (claim.changes !== 1) continue;
           const acknowledged = await invoke(target, cron, state.nextFireAtMillis);
+          // Fenced on the exact lease this pass wrote, because the CAS above is
+          // the only thing enforcing single flight and a release that did not
+          // match it would clear a lease another pass had taken. And
+          // `last_fired_at_ms` records a fire, so an invocation that was not
+          // acknowledged does not get to write one.
           await sql.run(
-            "UPDATE selfhost_worker_schedules SET running_until_ms = NULL, last_fired_at_ms = ? " +
-              "WHERE script = ? AND cron = ?",
-            [state.nextFireAtMillis, target.script, cron],
+            "UPDATE selfhost_worker_schedules SET running_until_ms = NULL" +
+              (acknowledged ? ", last_fired_at_ms = ?" : "") +
+              " WHERE script = ? AND cron = ? AND running_until_ms = ?",
+            acknowledged
+              ? [state.nextFireAtMillis, target.script, cron, lease]
+              : [target.script, cron, lease],
           );
           // A failed invocation is a failed invocation, not a retry: the Form
           // says a match is not retried within its minute.
