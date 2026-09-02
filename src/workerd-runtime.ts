@@ -266,6 +266,12 @@ function validBindings(bindings: readonly WorkerdBinding[]): readonly WorkerdBin
     }
     if (seen.has(binding.name)) throw new Error("unusable worker binding");
     seen.add(binding.name);
+    // Renderability is part of validity. A value capnp Text cannot carry is
+    // refused here, where every caller already fails closed, rather than in
+    // `renderConfig`, which runs once for the whole machine and would take
+    // every other script down with the broken one.
+    capnpText(binding.name);
+    capnpText(binding.value);
   }
   return bindings;
 }
@@ -373,9 +379,12 @@ async function readPublished(scriptsRoot: string): Promise<readonly Published[]>
     }
     // A manifest whose bindings cannot be rendered is not a script this process
     // will serve. Skipping it keeps one broken directory from taking every
-    // other customer's site down with it on the next reload.
+    // other customer's site down with it on the next reload. Renderability is
+    // proved here, not merely name validity: `capnpText` refuses a NUL or a
+    // lone surrogate, and it is the only thing that stands between a torn or
+    // tampered manifest and a `renderConfig` that throws for everyone.
     try {
-      if (manifest.vars !== undefined) validBindings(manifest.vars);
+      validBindings(manifest.vars ?? []);
     } catch {
       continue;
     }
