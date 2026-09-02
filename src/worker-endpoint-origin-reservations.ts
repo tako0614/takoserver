@@ -5,7 +5,11 @@ import { canonicalDigest } from "./json.ts";
 import type { Clock, JsonObject, Row, Sql, SqlWrite } from "./ports.ts";
 import { createSoldProviderPlacementSelector } from "./provider-placement.ts";
 import type { Provider } from "./provider-port.ts";
-import { derivedProviderResourceIncarnationName } from "./provider-worker-endpoint-origin.ts";
+import {
+  derivedProviderResourceIncarnationName,
+  workerEndpointPublicationDefect,
+  workerEndpointPublicationRemedy,
+} from "./provider-worker-endpoint-origin.ts";
 import type { ResourceDeployment, ResourceDeploymentStore } from "./resource-deployments.ts";
 import type { ResourceWithRelations, TakoformStore } from "./takoform/store.ts";
 import { workerServiceCondition } from "./takoform/worker-aggregate.ts";
@@ -152,6 +156,14 @@ export class WorkerEndpointOriginReservationError extends Error {
       | "unsupported_capability"
       | "backend_unavailable",
     readonly status: 400 | 404 | 409 | 422 | 503,
+    /**
+     * One sanitized sentence the caller reads instead of the code-derived one.
+     *
+     * A refusal about *this deployment's configuration* is the caller's to act
+     * on but not the caller's to have caused, so the code alone tells them
+     * nothing they can use. Only text this module composes reaches here.
+     */
+    readonly publicMessage?: string,
   ) {
     super(code);
     this.name = "WorkerEndpointOriginReservationError";
@@ -352,6 +364,22 @@ export function createWorkerEndpointOriginReservations(options: {
       !canonicalOrigin(derived.canonicalPublicOrigin, capability.publishedScheme ?? "https")
     ) {
       throw new WorkerEndpointOriginReservationError("unsupported_capability", 422);
+    }
+    // And whether the published Form can carry it at all, decided here because
+    // here is before any mutation. `WorkerEndpoint@0.1.0` publishes
+    // `^https://<dotted-name>/$`, so an address that is honest about a
+    // plain-HTTP socket or a non-default port is one no receipt could ever
+    // project — and discovering that after the provider had created the
+    // endpoint is what left a space wedged with an activated reservation and no
+    // Resource. The installation still serves that address; it simply cannot
+    // publish it as a WorkerEndpoint.
+    const defect = workerEndpointPublicationDefect(derived.canonicalPublicOrigin);
+    if (defect) {
+      throw new WorkerEndpointOriginReservationError(
+        "unsupported_capability",
+        422,
+        workerEndpointPublicationRemedy(defect),
+      );
     }
     return {
       canonicalPublicOrigin: derived.canonicalPublicOrigin,

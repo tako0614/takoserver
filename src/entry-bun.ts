@@ -28,7 +28,11 @@ import {
   runtimeInputCanonicalOriginSupported,
 } from "./runtime-input-preparations.ts";
 import { parseRuntimeInputSealKeyRing } from "./runtime-input-seal-keyring.ts";
-import { SELFHOST_TLS_ENVIRONMENT, selfhostWorkerEndpointScheme } from "./selfhost-composition.ts";
+import {
+  SELFHOST_TLS_ENVIRONMENT,
+  selfhostWorkerEndpointPublication,
+  selfhostWorkerEndpointScheme,
+} from "./selfhost-composition.ts";
 import { serveSelfhostDataPlanes } from "./selfhost-data-planes.ts";
 import { createSelfhostQueuePump } from "./selfhost-queue-pump.ts";
 import { createSelfhostWorkerScheduler } from "./selfhost-scheduler.ts";
@@ -232,6 +236,25 @@ const workerEndpoint = selfhostWorkerEndpointScheme({
   tlsConfigured: workerdTls !== undefined,
 });
 if (workerEndpoint.warning) process.stderr.write(`${workerEndpoint.warning}\n`);
+
+/**
+ * Whether this machine can mint a Worker endpoint at all, said at boot.
+ *
+ * `WorkerEndpoint@0.1.0` publishes `https://<name>/` and nothing else, so a
+ * deployment on plain HTTP or on a port that is not the scheme's default can
+ * create no endpoint — and the only place that was discovered before was the
+ * middle of somebody's `tofu apply`. It is a diagnostic and not a boot failure
+ * because everything else on the machine works: Workers run, storage answers,
+ * queues drain, cron fires, and the runtime serves on its own socket.
+ */
+const workerEndpointPublication = selfhostWorkerEndpointPublication({
+  workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX,
+  scheme: workerEndpoint.scheme,
+  port: workerEndpointPort,
+});
+if (workerEndpointPublication.diagnostic) {
+  process.stderr.write(`${workerEndpointPublication.diagnostic}\n`);
+}
 
 const workerd = createWorkerdSupervisor({
   binary: process.env.TAKOSERVER_WORKERD_BINARY ?? findWorkerd(process.cwd()),

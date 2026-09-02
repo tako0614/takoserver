@@ -94,3 +94,90 @@ export function canonicalWorkerEndpointOrigin(
     ? parsed.origin
     : null;
 }
+
+/**
+ * The hostname grammar `WorkerEndpoint@0.1.0` publishes, verbatim.
+ *
+ * Copied from `vendor/takoform/v2.1.1/forms/worker-endpoint/definition.json`
+ * (`outputSchema.properties.hostname.pattern`, and the tail of `url.pattern`,
+ * which are the same grammar). It is here rather than read from the Form
+ * because this rule has to run before a Form is resolved — at the moment an
+ * address is reserved, which is long before any receipt is projected.
+ */
+const FORM_PUBLISHABLE_HOSTNAME =
+  /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/u;
+/** `hostname.maxLength` and `url.maxLength` from the same Form. */
+const FORM_PUBLISHABLE_HOSTNAME_LENGTH = 253;
+const FORM_PUBLISHABLE_URL_LENGTH = 264;
+
+/** Why an origin cannot be published as a `WorkerEndpoint` address. */
+export type WorkerEndpointPublicationDefect = "scheme" | "port" | "hostname";
+
+/**
+ * Whether an origin can be published as a `WorkerEndpoint` address at all.
+ *
+ * `WorkerEndpoint@0.1.0` is a released Form and its `url` output is
+ * `^https://<dotted-name>/$`. Its prose says the same thing in words — *"the
+ * scheme is https … there is no plaintext address and no port"* — so an
+ * address that is honest about a plain-HTTP socket, or about a socket that is
+ * not on 443, is an address this Form cannot carry. The Form is the authority
+ * on what a `WorkerEndpoint` address may look like, so the Host's job is to
+ * refuse to *reserve* such an address rather than to mint one and discover the
+ * refusal after the provider has already mutated.
+ *
+ * This is deliberately separate from the scheme an installation *serves*
+ * ([ADR 0009](../docs/adr/0009-a-self-host-publishes-the-scheme-its-socket-serves.md)).
+ * A self-host on plain HTTP still serves its Workers on its own socket, and the
+ * origin it hands them is still the true one; what it cannot do is publish that
+ * origin as a `WorkerEndpoint`.
+ */
+export function workerEndpointPublicationDefect(
+  origin: string,
+): WorkerEndpointPublicationDefect | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(origin);
+  } catch {
+    return "hostname";
+  }
+  if (parsed.protocol !== "https:") return "scheme";
+  // `URL` has already normalized the scheme's own default away, so a port that
+  // survives here is one a consumer would have to dial.
+  if (parsed.port !== "") return "port";
+  if (
+    parsed.hostname.length > FORM_PUBLISHABLE_HOSTNAME_LENGTH ||
+    !FORM_PUBLISHABLE_HOSTNAME.test(parsed.hostname) ||
+    `https://${parsed.hostname}/`.length > FORM_PUBLISHABLE_URL_LENGTH
+  ) {
+    return "hostname";
+  }
+  return null;
+}
+
+/**
+ * The one sentence an operator reads about an address that cannot be published.
+ *
+ * Shared by the boot diagnostic and by the wire refusal on purpose: an operator
+ * who reads it at start-up and an operator who reads it out of `tofu apply`
+ * must be told the same two things to do, and two copies of a sentence drift.
+ * It carries no address, so that it fits inside the envelope's bounded message
+ * with both remedies intact; the boot diagnostic, which has no such bound,
+ * names the address in front of it.
+ */
+export function workerEndpointPublicationRemedy(defect: WorkerEndpointPublicationDefect): string {
+  if (defect === "hostname") {
+    return (
+      "no Worker endpoint can be published here: this deployment's address is not a dotted " +
+      "DNS name WorkerEndpoint@0.1.0 can carry. Set TAKOSERVER_WORKER_ENDPOINT_SUFFIX to a " +
+      "name this machine answers on."
+    );
+  }
+  const cause = defect === "scheme" ? "is plain HTTP" : "carries a port";
+  return (
+    `no Worker endpoint can be published here: this deployment's address ${cause}, and ` +
+    "WorkerEndpoint@0.1.0 admits only https on the default port. Either terminate TLS in " +
+    "workerd on 443 (TAKOSERVER_WORKERD_TLS_CERT_FILE, TAKOSERVER_WORKERD_TLS_KEY_FILE, " +
+    "TAKOSERVER_WORKERD_PORT=443), or run a 443 front end and set " +
+    "TAKOSERVER_WORKER_ENDPOINT_PORT=443. Workers and storage run either way."
+  );
+}

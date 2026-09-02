@@ -1538,17 +1538,21 @@ function endpointReservationHostError(error: unknown): TakoformHostError {
   if (!(error instanceof WorkerEndpointOriginReservationError)) {
     return new TakoformHostError("backend_unavailable", 503);
   }
+  // A reservation refusal that names this deployment's own configuration
+  // carries its sentence across: the code alone tells an operator that
+  // something about the Host is wrong and nothing about which knob to turn.
+  const detail = error.publicMessage;
   switch (error.code) {
     case "invalid_argument":
-      return new TakoformHostError("invalid_argument", 400);
+      return new TakoformHostError("invalid_argument", 400, undefined, detail);
     case "not_found":
-      return new TakoformHostError("resource_not_found", 404);
+      return new TakoformHostError("resource_not_found", 404, undefined, detail);
     case "conflict":
-      return new TakoformHostError("resource_busy", 409);
+      return new TakoformHostError("resource_busy", 409, undefined, detail);
     case "unsupported_capability":
-      return new TakoformHostError("unsupported_capability", 422);
+      return new TakoformHostError("unsupported_capability", 422, undefined, detail);
     case "backend_unavailable":
-      return new TakoformHostError("backend_unavailable", 503);
+      return new TakoformHostError("backend_unavailable", 503, undefined, detail);
   }
 }
 

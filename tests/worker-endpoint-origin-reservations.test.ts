@@ -69,7 +69,7 @@ test("connects the narrow runtime binding authority exactly once and fails close
     organizationId: "org_01",
     reservationId: "reservation_01",
     requestedSubdomain: REQUESTED_SUBDOMAIN,
-    canonicalPublicOrigin: "https://community-public.org_01.workers.test",
+    canonicalPublicOrigin: "https://community-public.org-01.workers.test",
     revision: "2",
     expiresAtEpochMilliseconds: Date.parse("2026-08-31T12:10:00.000Z"),
     binding: {
@@ -197,7 +197,11 @@ function fixture(
         deriveCalls.push({ tenantRef, requestedSubdomain });
         return {
           canonicalPublicOrigin:
-            input.fixedOrigin ?? `https://${requestedSubdomain}.${tenantRef}.workers.test`,
+            input.fixedOrigin ??
+            // A real installation derives a DNS label; `org_01` is not one, and
+            // the reservation authority now holds a derived address to the
+            // grammar `WorkerEndpoint@0.1.0` publishes.
+            `https://${requestedSubdomain}.${tenantRef.replaceAll("_", "-")}.workers.test`,
         };
       },
       // An installation whose endpoint address is derived from the Worker, the
@@ -255,7 +259,7 @@ test("reserves one exact future Worker endpoint origin without manufacturing a R
     format: "takoserver.worker-endpoint-origin-reservation.v2",
     reservationId: "reservation_01",
     requestedSubdomain: REQUESTED_SUBDOMAIN,
-    canonicalPublicOrigin: "https://community-public.org_01.workers.test",
+    canonicalPublicOrigin: "https://community-public.org-01.workers.test",
     revision: "1",
     expiresAt: "2026-08-31T12:10:00.000Z",
     status: "prepared",
@@ -304,37 +308,72 @@ test("reserves one exact future Worker endpoint origin without manufacturing a R
 });
 
 /**
+ * An address the published Form cannot carry is refused before anything exists.
+ *
+ * `WorkerEndpoint@0.1.0` publishes `^https://<dotted-name>/$` — no plaintext
+ * address and no port — so a self-host on plain HTTP, or on a socket that is
+ * not on 443, can create no `WorkerEndpoint` at all. That was discovered in the
+ * middle of an apply: the Host minted, assigned, mutated, activated and
+ * attested the endpoint, and only then refused its own driver's outputs against
+ * the Form, leaving the space wedged. The rule therefore lives at the mint,
+ * which is before any of that, and the refusal says which two things fix it.
+ */
+test("refuses an address the published WorkerEndpoint Form cannot carry, before it reserves one", async () => {
+  const unpublishable = [
+    // A certificate-less self-host: honest about its socket, unpublishable.
+    { publishedScheme: "http" as const, origin: "http://sw-community.localhost:28988" },
+    // The same host with the port normalized away. The scheme alone is enough.
+    { publishedScheme: "http" as const, origin: "http://sw-community.localhost" },
+    // TLS in workerd, but not on 443: the O-7 repair, which the Form forbids.
+    { origin: "https://sw-community.e2e.selfhost.test:28988" },
+    // And a suffix no DNS name can be made of.
+    { origin: "https://sw-community.not_a_label" },
+  ];
+  for (const [index, entry] of unpublishable.entries()) {
+    const harness = fixture({
+      ...(entry.publishedScheme ? { publishedScheme: entry.publishedScheme } : {}),
+      fixedOrigin: entry.origin,
+    });
+    const refusal = harness.authority.prepare({
+      organizationId: "org_01",
+      reservationId: `reservation_0${index}`,
+      requestedSubdomain: REQUESTED_SUBDOMAIN,
+      expiresInSeconds: 600,
+    });
+    await expect(refusal).rejects.toMatchObject({
+      code: "unsupported_capability",
+      status: 422,
+    });
+    await refusal.catch((error: unknown) => {
+      const message = (error as { publicMessage?: string }).publicMessage ?? "";
+      // Both remedies, named, in the sentence the operator actually reads.
+      if (entry.origin.endsWith("not_a_label")) {
+        expect(message).toContain("TAKOSERVER_WORKER_ENDPOINT_SUFFIX");
+        return;
+      }
+      expect(message).toContain("TAKOSERVER_WORKERD_TLS_CERT_FILE");
+      expect(message).toContain("TAKOSERVER_WORKERD_PORT=443");
+      expect(message).toContain("TAKOSERVER_WORKER_ENDPOINT_PORT=443");
+      // And it fits the wire, remedies included, rather than being truncated.
+      expect(message.length).toBeLessThanOrEqual(400);
+    });
+    // Nothing was reserved, so nothing has to be let go of.
+    expect(
+      await harness.sql.query("SELECT reservation_id FROM worker_endpoint_origin_reservations"),
+    ).toEqual([]);
+  }
+});
+
+/**
  * The scheme of a published address is a fact about the socket that serves it,
  * and this ledger is the authority that accepts one.
  *
- * It held every derived origin to `https` while ADR 0009 made a
- * certificate-less self-host derive `http://<script>.<suffix>`, so the default
- * self-host quickstart could create no `WorkerEndpoint` at all: the mint
- * answered `unsupported_capability` 422 before anything was reserved, and the
- * Worker had no published address to serve on. The installation states what it
- * serves; nothing else may relax the rule.
+ * This fence is separate from the publication rule above and still load-bearing:
+ * it is what stops an installation handing this Host an address in a scheme it
+ * never said it serves. The publication rule then decides whether the address
+ * can be published at all.
  */
-test("reserves the scheme and port the installation says its own socket serves", async () => {
-  const plain = fixture({
-    publishedScheme: "http",
-    fixedOrigin: "http://sw-community.localhost:28988",
-  });
-  const reserved = await plain.authority.prepare({
-    organizationId: "org_01",
-    reservationId: "reservation_01",
-    requestedSubdomain: REQUESTED_SUBDOMAIN,
-    expiresInSeconds: 600,
-  });
-  expect(reserved).toMatchObject({
-    canonicalPublicOrigin: "http://sw-community.localhost:28988",
-    status: "prepared",
-  });
-  expect(
-    await plain.sql.query(
-      "SELECT canonical_public_origin FROM worker_endpoint_origin_reservations",
-    ),
-  ).toEqual([{ canonical_public_origin: "http://sw-community.localhost:28988" }]);
-
+test("holds a derived address to the scheme the installation says it serves", async () => {
   // The managed and ordinary-workers lanes declare nothing and stay https-only:
   // an installation that has not said it serves plain HTTP cannot hand this
   // ledger an `http` address, whatever it derives.
@@ -364,18 +403,19 @@ test("reserves the scheme and port the installation says its own socket serves",
 });
 
 /**
- * The whole certificate-less lane, end to end: mint, assign, apply, activate.
+ * The whole publishable lane, end to end: mint, assign, apply, activate.
  *
- * `canonicalOrigin`, `providerOutputOrigin` and `endpointOriginEquals` each
- * required `https:` independently, so repairing one alone would only have moved
- * the 422 one step later.
+ * The address is `https` with the port normalized away — a self-host that
+ * terminates TLS on 443, natively or behind a front end that says so with
+ * `TAKOSERVER_WORKER_ENDPOINT_PORT=443`. That is the one shape
+ * `WorkerEndpoint@0.1.0` can carry, and it has to work with no `-target`
+ * staging and no shim.
  */
-test("creates a WorkerEndpoint on a self-host whose socket speaks plain HTTP", async () => {
-  const origin = "http://sw-community.localhost:28988";
+test("creates a WorkerEndpoint on a self-host that terminates TLS on the default port", async () => {
+  const origin = "https://sw-community.e2e.selfhost.test";
   const harness = fixture({
     offerings: [sold(), soldEndpointOffering()],
     technical: [technical(), technicalEndpointOffering()],
-    publishedScheme: "http",
     fixedOrigin: origin,
     hostMintedSubdomain: "sw-community",
     apply: async (applyInput) =>
@@ -436,7 +476,10 @@ test("creates a WorkerEndpoint on a self-host whose socket speaks plain HTTP", a
     ],
   });
 
-  expect(receipt.outputs).toEqual({ hostname: "sw-community.localhost", url: `${origin}/` });
+  expect(receipt.outputs).toEqual({
+    hostname: "sw-community.e2e.selfhost.test",
+    url: `${origin}/`,
+  });
   expect(
     await harness.sql.query(
       `SELECT canonical_public_origin, state, endpoint_resource_uid
@@ -619,7 +662,7 @@ test("expiry cannot release an origin retained by a deactivated endpoint", async
     workerName: TARGET.workerName,
     workerResourceUid: "uid-worker-01",
   });
-  await seedEndpoint(sql, "https://community-public.org_01.workers.test");
+  await seedEndpoint(sql, "https://community-public.org-01.workers.test");
   await authority.activate({
     organizationId: "org_01",
     reservationId: "reservation_01",
@@ -765,7 +808,7 @@ test("CAS-assigns exactly one endpoint, replays it, and fences placement drift",
   });
   expect(winner.value).toMatchObject({
     format: "takoserver.worker-endpoint-origin-assignment.v1",
-    canonicalPublicOrigin: "https://community-public.org_01.workers.test",
+    canonicalPublicOrigin: "https://community-public.org-01.workers.test",
     endpoint: {
       space: TARGET.space,
       name: claims[winnerIndex]?.endpointName,
@@ -818,8 +861,8 @@ test("cancels only an unchanged pre-dispatch assignment and activates exact prov
     authority.activateEndpointAssignment({
       assignment: first,
       providerOutputs: {
-        hostname: "wrong.org_01.workers.test",
-        url: "https://wrong.org_01.workers.test/",
+        hostname: "wrong.org-01.workers.test",
+        url: "https://wrong.org-01.workers.test/",
       },
     }),
   ).rejects.toMatchObject({ code: "conflict", status: 409 });
@@ -850,8 +893,8 @@ test("cancels only an unchanged pre-dispatch assignment and activates exact prov
   const activated = await authority.activateEndpointAssignment({
     assignment: reassigned,
     providerOutputs: {
-      hostname: "community-public.org_01.workers.test",
-      url: "https://community-public.org_01.workers.test/",
+      hostname: "community-public.org-01.workers.test",
+      url: "https://community-public.org-01.workers.test/",
     },
   });
   expect(activated.assignmentDigest).toBe(reassigned.assignmentDigest);
@@ -927,7 +970,7 @@ test("binds and activates only authoritative post-Plan identities unrelated to t
     workerResourceRevision: "1",
   });
 
-  const origin = "https://friendly-public-name.org_01.workers.test";
+  const origin = "https://friendly-public-name.org-01.workers.test";
   await seedEndpoint(sql, origin, ENDPOINT_FORM, endpoint);
   await expect(
     authority.activate({
@@ -1049,7 +1092,7 @@ test("activates only the stable WorkerEndpoint Form before deletion starts", asy
   });
   await seedEndpoint(
     wrongForm.sql,
-    "https://community-public.org_01.workers.test",
+    "https://community-public.org-01.workers.test",
     nonCanonicalEndpointForm,
   );
   await expect(
@@ -1075,7 +1118,7 @@ test("activates only the stable WorkerEndpoint Form before deletion starts", asy
     workerName: TARGET.workerName,
     workerResourceUid: "uid-worker-01",
   });
-  await seedEndpoint(deleting.sql, "https://community-public.org_01.workers.test");
+  await seedEndpoint(deleting.sql, "https://community-public.org-01.workers.test");
   await deleting.sql.run(
     "UPDATE tf_resource_deletion_attestations SET state = 'pending' WHERE tenant_id = 'org_01' AND resource_uid = 'uid-endpoint-01'",
   );
@@ -1119,8 +1162,8 @@ test("activates only the exact Ready endpoint and retains its deletion witness o
          resource_json = json_set(
            resource_json,
            '$.metadata.revision', '2',
-           '$.status.outputs.hostname', 'community-public.org_01.workers.test',
-           '$.status.outputs.url', 'https://community-public.org_01.workers.test/'
+           '$.status.outputs.hostname', 'community-public.org-01.workers.test',
+           '$.status.outputs.url', 'https://community-public.org-01.workers.test/'
          ),
          updated_at = updated_at + 1
      WHERE tenant_id = 'org_01' AND uid = 'uid-endpoint-01'`,
@@ -1162,7 +1205,7 @@ test("activates only the exact Ready endpoint and retains its deletion witness o
       endpointResourceUid: "uid-endpoint-01",
     }),
   ).toEqual(deactivated);
-  await seedEndpoint(sql, "https://community-public.org_01.workers.test", ENDPOINT_FORM, {
+  await seedEndpoint(sql, "https://community-public.org-01.workers.test", ENDPOINT_FORM, {
     organizationId: "org_01",
     space: TARGET.space,
     endpointName: "replacement",
@@ -1380,7 +1423,7 @@ test("mints one bound reservation for a Ready Worker on an installation that der
   expect(minted).toMatchObject({
     organizationId: "org_01",
     status: "bound",
-    canonicalPublicOrigin: `https://sw-${TARGET.space}-${TARGET.workerName}.org_01.workers.test`,
+    canonicalPublicOrigin: `https://sw-${TARGET.space}-${TARGET.workerName}.org-01.workers.test`,
     binding: {
       space: TARGET.space,
       workerName: TARGET.workerName,
@@ -2007,9 +2050,9 @@ test("creates a WorkerEndpoint with no reservation on the placement the Worker i
     ],
   });
 
-  const origin = "https://sw-community.org_01.workers.test";
+  const origin = "https://sw-community.org-01.workers.test";
   expect(receipt.outputs).toEqual({
-    hostname: "sw-community.org_01.workers.test",
+    hostname: "sw-community.org-01.workers.test",
     url: `${origin}/`,
   });
   expect(applied).toHaveLength(1);
@@ -2111,8 +2154,8 @@ test("re-binds after a WorkerEndpoint create the provider refused", async () => 
   // The retry is a new incarnation, exactly as a re-created resource is.
   const receipt = await create("uid-endpoint-02");
   expect(receipt.outputs).toEqual({
-    hostname: "sw-community.org_01.workers.test",
-    url: "https://sw-community.org_01.workers.test/",
+    hostname: "sw-community.org-01.workers.test",
+    url: "https://sw-community.org-01.workers.test/",
   });
   expect(
     await harness.sql.query(
