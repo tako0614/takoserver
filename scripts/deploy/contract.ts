@@ -69,6 +69,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy.ts",
         "scripts/deploy/worker.ts",
         "scripts/deploy/worker-authority-paths.ts",
+        "scripts/deploy/worker-composition.ts",
         "scripts/deploy/wrangler-state.ts",
         "scripts/deploy/qualification.ts",
       ],
@@ -98,7 +99,11 @@ export const DEPLOY_CONTRACT = {
           "The immediately previous Cloudflare Worker version is printed as the provider-history rollback target.",
         "failure-handling":
           `${routineFailure} The surface refuses pending migrations and any configuration, secret, ` +
-          "signing or Hosted topology drift before upload. A diff that changes authentication, " +
+          "signing or Hosted topology drift before upload. It also composes the selected target with " +
+          "the Worker's own startup path before any upload and refuses with that composition's exact " +
+          "words, so a target that parses and yet cannot serve is a pre-mutation refusal rather than a " +
+          "failed public probe over a Host that is already down. A plain-text value difference names " +
+          "--refresh-var as its remedy. A diff that changes authentication, " +
           "authorization or the deploy mechanism is refused and routed to the authority cutover surface. " +
           "Wrangler JSON framing, the upload-to-deploy predecessor re-fence, publication identities and " +
           "final public smoke are strict; any drift or readback mismatch fails closed. The host-local " +
@@ -123,6 +128,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/worker.ts",
         "scripts/deploy/worker-authority-paths.ts",
         "scripts/deploy/worker-closure-transition.ts",
+        "scripts/deploy/worker-composition.ts",
         "scripts/deploy/realized-config.ts",
         "scripts/deploy/target.ts",
         "scripts/deploy/worker-live.ts",
@@ -158,7 +164,8 @@ export const DEPLOY_CONTRACT = {
           "path that may carry the observed legacy service binding and Hosted secret into a " +
           "candidate; ordinary target realization remains free of both retired fields. " +
           "The named --closure-predecessor-version profile refuses before any mutation and names " +
-          "every binding its declared delta does not account for." +
+          "every binding its declared delta does not account for. The selected target is composed " +
+          "with the Worker's own startup path before any upload and its refusal is reported verbatim." +
           inputContract(applyReviewInput, closureSecretDirectoryInput),
         "production-selector":
           "Production accepts this transition only with the exact pinned predecessor Version ID, " +
@@ -166,15 +173,22 @@ export const DEPLOY_CONTRACT = {
           "cannot bypass the selector or carry the retired edge.",
         "closure-transition-selector":
           "`--closure-predecessor-version=<uuid>` plus the repeatable `--retire-var=NAME`, " +
-          "`--add-var=NAME`, `--add-secret=NAME` and `--rotate-secret=NAME` declaration is the only " +
+          "`--add-var=NAME`, `--refresh-var=NAME`, `--add-secret=NAME` and `--rotate-secret=NAME` " +
+          "declaration is the only " +
           "path that brings a live Version forward when the operator-private target descriptor " +
           "legitimately changed shape. It is admitted only when the authoritative current Version " +
           "is exactly the pinned id, the declared delta is non-empty, and that declaration equals " +
-          "the entire difference between the predecessor closure and the target closure. One upload " +
+          "the entire difference between the predecessor closure and the target closure. " +
+          "`--refresh-var` covers the difference that changes no binding name at all: the " +
+          "predecessor must declare that var with a value different from the one the target derives, " +
+          "and the upload publishes the target's value. The secret inventory is the union of what " +
+          "the pinned Version declares and what the script-level secret store holds, so a secret a " +
+          "rollback left in the store is carried whether or not the declaration names it; naming it " +
+          "under `--add-secret` only decides that its value is re-entered. One upload " +
           "then realizes the complete current closure: target plain-text vars exactly as the routine " +
           "surface produces them, every required secret, added and rotated values supplied only " +
           "through the owned 0700 secret-input directory as one ephemeral sealed Wrangler secrets " +
-          "file, and every other live secret carried without being re-entered. The routine surfaces " +
+          "file, and every other held secret carried without being re-entered. The routine surfaces " +
           "stay strict and never accept this predecessor.",
         "independent-review": review,
       },

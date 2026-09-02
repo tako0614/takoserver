@@ -22,6 +22,7 @@ import {
 import type { DeployTarget } from "./target.ts";
 import { probeProduct, type WorkerMigrationReader } from "./worker.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
+import { assertTargetComposes } from "./worker-composition.ts";
 import {
   assertLiveWorkerRoutingClosure,
   inspectLiveWorkerVersion,
@@ -32,15 +33,16 @@ import {
   workerVersionIdentity,
 } from "./worker-live.ts";
 import {
-  assertExactSecretInventory,
   assertExactVersionBindingClosure,
   exactVersionBindingNames,
   expectedClosureTransitionPredecessorClosure,
   expectedExactBindingClosure,
+  optionalExactPlainTextBinding,
   parseWorkerDeploymentHistory,
   type WorkerClosureDelta,
   type WorkerDeploymentHistory,
   workerClosureDeltaIsEmpty,
+  workerTransitionSecretInventory,
 } from "./worker-state.ts";
 
 /**
@@ -82,8 +84,10 @@ interface ClosurePredecessor {
   readonly history: WorkerDeploymentHistory;
   readonly commit: string;
   readonly bundleDigestHex: string;
-  /** Secrets already on the pinned Version that this upload carries unchanged. */
+  /** Secrets already held that this upload carries unchanged. */
   readonly carriedSecrets: readonly string[];
+  /** Held by the script-level store while the served Version does not declare them. */
+  readonly carriedStoreSecrets: readonly string[];
 }
 
 /**
@@ -132,6 +136,9 @@ export async function runWorkerClosureTransition(
     (options.state !== undefined && invocation.action === "status"
       ? {}
       : cloudflareChildEnvironment());
+  // A transition exists to publish a corrected target. Prove that the
+  // correction composes before it can be uploaded.
+  await assertTargetComposes("preflight", target);
   const temporary = options.outputDirectory === undefined;
   const root =
     options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-worker-closure-transition-"));
@@ -181,6 +188,7 @@ export async function runWorkerClosureTransition(
         artifactDigest: `sha256:${before.bundleDigestHex}`,
         delta: { ...delta },
         carriedSecrets: before.carriedSecrets,
+        carriedStoreSecrets: before.carriedStoreSecrets,
         secretInputsRequired: [...delta.addedSecrets, ...delta.rotatedSecrets].sort(),
         appliedMigrations: migrationState.applied,
         pendingMigrations: pending,
@@ -273,7 +281,8 @@ export async function runWorkerClosureTransition(
     if (
       requalified.commit !== before.commit ||
       requalified.bundleDigestHex !== before.bundleDigestHex ||
-      JSON.stringify(requalified.carriedSecrets) !== JSON.stringify(before.carriedSecrets)
+      JSON.stringify(requalified.carriedSecrets) !== JSON.stringify(before.carriedSecrets) ||
+      JSON.stringify(requalified.carriedStoreSecrets) !== JSON.stringify(before.carriedStoreSecrets)
     ) {
       throw preflightError("pinned closure predecessor identity changed before the upload");
     }
@@ -347,6 +356,7 @@ export async function runWorkerClosureTransition(
       closurePredecessorVersionId: selector,
       delta: { ...delta },
       carriedSecrets: before.carriedSecrets,
+      carriedStoreSecrets: before.carriedStoreSecrets,
       artifactDigest: artifact.digest,
       artifactBytes: artifact.bytes,
       artifactFiles: artifact.files,
@@ -414,8 +424,11 @@ async function appliedClosureTransitionStatus(
 
 /**
  * Proves the pinned Version is exactly the target closure with the declared
- * delta reversed. Every other binding name, type and plain-text value, the
- * secret inventory and the routing closure stay as strict as the routine path.
+ * delta reversed. Every other binding name, type and plain-text value and the
+ * routing closure stay as strict as the routine path. The secret inventory is
+ * the union of what the Version declares and what the script-level store holds,
+ * because a rollback leaves the store ahead of the Version and a required
+ * secret the Worker already holds is carried rather than demanded again.
  */
 async function admitClosurePredecessor(
   phase: DeployPhase,
@@ -439,21 +452,33 @@ async function admitClosurePredecessor(
   const targetClosure = expectedExactBindingClosure(target, bindingInput);
   const targetSecrets = expectedWorkerSecrets(target);
   assertDeltaNamesTarget(phase, delta, targetClosure, targetSecrets);
+  const secrets = workerTransitionSecretInventory(
+    phase,
+    versionId,
+    version,
+    await state.workerSecrets(target.workerName),
+    targetSecrets,
+  );
   assertDeltaAccountsForDifference(
     phase,
     versionId,
     exactVersionBindingNames(phase, versionId, version),
     targetClosure,
     delta,
+    secrets.carriedStoreSecrets,
   );
+  assertRefreshedVarsDiffer(phase, versionId, version, targetClosure, delta);
   assertExactVersionBindingClosure(
     phase,
     versionId,
     version,
-    expectedClosureTransitionPredecessorClosure(target, { delta, ...bindingInput }),
+    expectedClosureTransitionPredecessorClosure(target, {
+      delta,
+      carriedStoreSecrets: secrets.carriedStoreSecrets,
+      ...bindingInput,
+    }),
   );
   const carriedSecrets = targetSecrets.filter((name) => !delta.addedSecrets.includes(name));
-  assertExactSecretInventory(await state.workerSecrets(target.workerName), carriedSecrets, phase);
   await assertLiveWorkerRoutingClosure(phase, target, state);
   const after = await currentHistory(phase, target, state);
   if (
@@ -466,7 +491,7 @@ async function admitClosurePredecessor(
       "authoritative Worker deployment history changed during closure transition inspection",
     );
   }
-  return { history, ...identity, carriedSecrets };
+  return { history, ...identity, carriedSecrets, carriedStoreSecrets: secrets.carriedStoreSecrets };
 }
 
 /** The declared names must be meaningful against the current target closure. */
@@ -483,6 +508,12 @@ function assertDeltaNamesTarget(
   for (const name of delta.addedVars) {
     const requirement = targetClosure[name];
     if (!isPlainTextRequirement(requirement)) offences.push(`added-var-not-a-target-var:${name}`);
+  }
+  for (const name of delta.refreshedVars) {
+    const requirement = targetClosure[name];
+    if (!isPlainTextRequirement(requirement)) {
+      offences.push(`refreshed-var-not-a-target-var:${name}`);
+    }
   }
   for (const name of delta.addedSecrets) {
     if (!targetSecrets.includes(name)) offences.push(`added-secret-not-a-target-secret:${name}`);
@@ -509,8 +540,12 @@ function assertDeltaAccountsForDifference(
   actualNames: readonly string[],
   targetClosure: Readonly<Record<string, unknown>>,
   delta: WorkerClosureDelta,
+  carriedStoreSecrets: readonly string[],
 ): void {
   const actual = new Set(actualNames);
+  // A secret the script-level store already holds is present for the purpose of
+  // "is this binding missing", even when the served Version does not declare it.
+  const held = new Set([...actualNames, ...carriedStoreSecrets]);
   const expected = new Set(
     Object.entries(targetClosure)
       .filter(([, requirement]) => requirement !== null)
@@ -522,15 +557,17 @@ function assertDeltaAccountsForDifference(
     (name) => !expected.has(name) && !declaredRetired.has(name),
   );
   const undeclaredMissing = [...expected].filter(
-    (name) => !actual.has(name) && !declaredAdded.has(name),
+    (name) => !held.has(name) && !declaredAdded.has(name),
   );
   const retiredNotPresent = [...declaredRetired].filter((name) => !actual.has(name));
+  const refreshedNotPresent = delta.refreshedVars.filter((name) => !actual.has(name));
   const addedAlreadyPresent = [...declaredAdded].filter((name) => actual.has(name));
-  const rotatedNotPresent = delta.rotatedSecrets.filter((name) => !actual.has(name));
+  const rotatedNotPresent = delta.rotatedSecrets.filter((name) => !held.has(name));
   if (
     undeclaredExtra.length > 0 ||
     undeclaredMissing.length > 0 ||
     retiredNotPresent.length > 0 ||
+    refreshedNotPresent.length > 0 ||
     addedAlreadyPresent.length > 0 ||
     rotatedNotPresent.length > 0
   ) {
@@ -541,9 +578,40 @@ function assertDeltaAccountsForDifference(
         undeclaredExtraBindings: undeclaredExtra.sort(),
         undeclaredMissingBindings: undeclaredMissing.sort(),
         retiredVarsAbsentFromPredecessor: retiredNotPresent.sort(),
+        refreshedVarsAbsentFromPredecessor: [...refreshedNotPresent].sort(),
         addedBindingsAlreadyPresent: addedAlreadyPresent.sort(),
         rotatedSecretsAbsentFromPredecessor: [...rotatedNotPresent].sort(),
       }),
+    );
+  }
+}
+
+/**
+ * A refreshed var must actually be wrong on the predecessor.
+ *
+ * Declaring one that already equals the target value would hide a no-op inside
+ * a reviewed transition and let the selector stand in for the routine surface.
+ * Only names reach the refusal; the values themselves stay out of diagnostics.
+ */
+function assertRefreshedVarsDiffer(
+  phase: DeployPhase,
+  versionId: string,
+  version: unknown,
+  targetClosure: Readonly<Record<string, unknown>>,
+  delta: WorkerClosureDelta,
+): void {
+  const unchanged = delta.refreshedVars.filter((name) => {
+    const requirement = targetClosure[name];
+    if (!isPlainTextRequirement(requirement)) return false;
+    const expected = (requirement as { readonly fields: Readonly<Record<string, string>> }).fields
+      .text;
+    return optionalExactPlainTextBinding(phase, versionId, version, name) === expected;
+  });
+  if (unchanged.length > 0) {
+    throw phaseError(
+      phase,
+      `version ${versionId} already binds a refreshed var with the exact target value`,
+      JSON.stringify([...unchanged].sort()),
     );
   }
 }
@@ -576,6 +644,7 @@ function normalizedDelta(delta: WorkerClosureDelta): WorkerClosureDelta {
   const names = [
     ...delta.retiredVars,
     ...delta.addedVars,
+    ...delta.refreshedVars,
     ...delta.addedSecrets,
     ...delta.rotatedSecrets,
   ];
@@ -590,6 +659,7 @@ function normalizedDelta(delta: WorkerClosureDelta): WorkerClosureDelta {
   return {
     retiredVars: [...delta.retiredVars].sort(),
     addedVars: [...delta.addedVars].sort(),
+    refreshedVars: [...delta.refreshedVars].sort(),
     addedSecrets: [...delta.addedSecrets].sort(),
     rotatedSecrets: [...delta.rotatedSecrets].sort(),
   };

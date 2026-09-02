@@ -996,12 +996,14 @@ describe("integration-only exact-organization API-key authority", () => {
         throw new Error("R2 must not be composed");
       },
     } as unknown as Parameters<typeof worker.fetch>[1];
-    await expect(
-      worker.fetch(
-        new Request(`${ORIGIN}/v1/integration/e2e-credentials/status`),
-        startupEnvironment,
-      ),
-    ).rejects.toThrow("must not reuse the runtime signing key");
+    // A startup refusal is answered, not thrown, and it still refuses before
+    // any storage binding is composed.
+    const refusal = await worker.fetch(
+      new Request(`${ORIGIN}/v1/integration/e2e-credentials/status`),
+      startupEnvironment,
+    );
+    expect(refusal.status).toBe(503);
+    expect(await refusal.text()).toContain("must not reuse the runtime signing key");
     expect(storageBindingReads).toBe(0);
   });
 });

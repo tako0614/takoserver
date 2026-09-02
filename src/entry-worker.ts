@@ -1,6 +1,7 @@
 import { type App, buildApp } from "./app.ts";
 import { createCatalog } from "./catalog.ts";
 import { buildEdgeForms } from "./edge-forms.ts";
+import { errorEnvelopeResponse } from "./error-envelope.ts";
 import { resolveIdentity } from "./identity-setup.ts";
 import {
   INTEGRATION_E2E_ORGANIZATION_ID,
@@ -195,13 +196,86 @@ export function workerCredentials(
 let cached: { readonly env: WorkerEnv; readonly app: App } | null = null;
 
 /**
+ * Bounded classification of a startup refusal.
+ *
+ * The Worker composes itself lazily, per request, so a target whose realized
+ * configuration cannot compose used to surface as a bare provider exception
+ * page with no readable cause. The classes below are the vocabulary the entry
+ * answers with instead: an operator reading `/healthz`, `/.well-known/takoserver`
+ * or any other route learns which half of startup refused.
+ */
+export type WorkerStartupFailureReason =
+  | "public-origin"
+  | "supply-composition"
+  | "runtime-configuration"
+  | "unavailable";
+
+/** One classified startup refusal, carrying the exact cause it wraps. */
+export class WorkerStartupError extends Error {
+  readonly reason: WorkerStartupFailureReason;
+  /** The product's own refusal sentence, when the cause produced one. */
+  readonly refusal: string | undefined;
+
+  constructor(reason: WorkerStartupFailureReason, cause: unknown) {
+    const refusal = startupRefusal(cause);
+    super(refusal ?? `Worker startup refused: ${reason}`, { cause });
+    this.name = "WorkerStartupError";
+    this.reason = reason;
+    this.refusal = refusal;
+  }
+}
+
+/**
+ * Only the product's own refusal vocabulary reaches a caller.
+ *
+ * Every composition and configuration refusal in this graph is a `TypeError`
+ * whose message is an authored sentence over non-secret descriptors. Anything
+ * else is reported as an unreadable failure rather than echoed, because its
+ * text is not a value this Host has declared safe to publish.
+ */
+function startupRefusal(cause: unknown): string | undefined {
+  return cause instanceof TypeError ? cause.message : undefined;
+}
+
+/** Runs one startup stage and attributes its refusal to that stage. */
+function startupStage<T>(reason: WorkerStartupFailureReason, body: () => T): T {
+  try {
+    return body();
+  } catch (error) {
+    throw error instanceof WorkerStartupError ? error : new WorkerStartupError(reason, error);
+  }
+}
+
+/**
+ * The readable answer a Worker that cannot start still owes every caller.
+ *
+ * It is the ordinary wire envelope at `503 backend_unavailable`, so a client
+ * that already decodes this Host's errors reads it without a special case, and
+ * `details.reason` names the class. No response is cached: the next request
+ * recomposes, so a repaired configuration serves as soon as it lands.
+ */
+export function workerStartupFailureResponse(error: unknown): Response {
+  const startup = error instanceof WorkerStartupError ? error : null;
+  const reason: WorkerStartupFailureReason =
+    startup?.reason ?? (error instanceof TypeError ? "runtime-configuration" : "unavailable");
+  const refusal = startup ? startup.refusal : startupRefusal(error);
+  return errorEnvelopeResponse(
+    "backend_unavailable",
+    503,
+    { reason },
+    { headers: { "cache-control": "no-store" } },
+    refusal,
+  );
+}
+
+/**
  * The official Worker has one operator-owned public address. It is injected by
  * the owning deploy target; deriving it from the request host would let an
  * alias or service binding silently become the product's advertised identity.
  */
 export function requirePublicOrigin(env: { readonly PUBLIC_ORIGIN?: string | undefined }): string {
   const origin = env.PUBLIC_ORIGIN?.trim();
-  if (!origin) throw new Error("PUBLIC_ORIGIN is required for the official Worker");
+  if (!origin) throw new TypeError("PUBLIC_ORIGIN is required for the official Worker");
   return origin;
 }
 
@@ -379,20 +453,22 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     randomId,
   });
   const dataServices = createWorkerDataServices(env);
-  const deployment = createWorkerProductionComposition({
-    env,
-    forms: currentCandidates.forms,
-    retainedForms: edge.forms,
-    artifacts: {
-      manifest: (tenantRef, digest) => artifacts.resolveManifest(tenantRef, digest),
-      async blob(digest) {
-        const stored = await objects.get(`art/${digest.slice("sha256:".length)}`);
-        return stored ? new Uint8Array(await new Response(stored.body).arrayBuffer()) : null;
+  const deployment = startupStage("supply-composition", () =>
+    createWorkerProductionComposition({
+      env,
+      forms: currentCandidates.forms,
+      retainedForms: edge.forms,
+      artifacts: {
+        manifest: (tenantRef, digest) => artifacts.resolveManifest(tenantRef, digest),
+        async blob(digest) {
+          const stored = await objects.get(`art/${digest.slice("sha256:".length)}`);
+          return stored ? new Uint8Array(await new Response(stored.body).arrayBuffer()) : null;
+        },
       },
-    },
-    ...(runtimeInputs ? { runtimeInputs: runtimeInputs.leases } : {}),
-    now: new Date(),
-  });
+      ...(runtimeInputs ? { runtimeInputs: runtimeInputs.leases } : {}),
+      now: new Date(),
+    }),
+  );
   const originReservations = createWorkerEndpointOriginReservations({
     sql,
     clock,
@@ -440,9 +516,22 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
 }
 
 export default {
+  /**
+   * Startup is lazy and per request, and only its success is cached, so a
+   * startup refusal is answered rather than thrown: `/healthz`,
+   * `/.well-known/takoserver` and every other route report the readable 503
+   * reason class instead of a bare provider exception page.
+   */
   async fetch(request: Request, env: WorkerEnv): Promise<Response> {
-    const origin = requirePublicOrigin(env);
-    const app = await appFor(env, origin);
+    let app: App;
+    try {
+      app = await appFor(
+        env,
+        startupStage("public-origin", () => requirePublicOrigin(env)),
+      );
+    } catch (error) {
+      return workerStartupFailureResponse(error);
+    }
     return await app.fetch(request);
   },
 
