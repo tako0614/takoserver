@@ -17,6 +17,8 @@ import { runSigning } from "./deploy/signing.ts";
 import { runStaticSite } from "./deploy/static.ts";
 import { loadTarget, targetPath } from "./deploy/target.ts";
 import { isWorkerVersionId, runWorker } from "./deploy/worker.ts";
+import { runWorkerClosureTransition } from "./deploy/worker-closure-transition.ts";
+import type { WorkerClosureDelta } from "./deploy/worker-state.ts";
 
 const USAGE = `takoserver deploy
 
@@ -27,6 +29,9 @@ const USAGE = `takoserver deploy
   The authority cutover may add --legacy-predecessor-version=<uuid> for integration bootstrap.
   Hosted-edge authority transition requires the named
   --legacy-host-runtime-predecessor-version=<uuid> selector in integration or production.
+  The reviewed closure transition uses --closure-predecessor-version=<uuid> with an explicit
+  delta of repeatable --retire-var=NAME, --add-var=NAME, --add-secret=NAME and --rotate-secret=NAME;
+  added and rotated secret values come only from TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY.
   Hosted-edge authority/topology retirement uses --legacy-host-runtime-predecessor-version=<uuid>
   and --reverse; token retirement is forward-only.
   Post-token attribution repair uses both --legacy-host-runtime-predecessor-version=<uuid>
@@ -48,6 +53,8 @@ interface InvocationBase {
   readonly commit: string;
   readonly legacyPredecessorVersionId?: string;
   readonly legacyHostRuntimePredecessorVersionId?: string;
+  readonly closurePredecessorVersionId?: string;
+  readonly closureDelta?: WorkerClosureDelta;
   readonly unattributedSuccessorVersionId?: string;
   readonly formAuthorityScopeTransitionPath?: string;
   readonly reverse?: boolean;
@@ -70,13 +77,23 @@ interface ParsedInvocation {
   readonly commit: string;
   readonly legacyPredecessorVersionId?: string;
   readonly legacyHostRuntimePredecessorVersionId?: string;
+  readonly closurePredecessorVersionId?: string;
+  readonly closureDelta?: WorkerClosureDelta;
   readonly unattributedSuccessorVersionId?: string;
   readonly formAuthorityScopeTransitionPath?: string;
   readonly reverse?: boolean;
 }
 
+/**
+ * The closure transition is the only selector with repeatable operands. Its
+ * declaration stays bounded so an invocation can never grow into an unreviewed
+ * bulk rewrite of the realized closure.
+ */
+const MAX_CLOSURE_DELTA_FLAGS = 32;
+const CLOSURE_DELTA_NAME = /^[A-Z][A-Z0-9_]{0,63}$/u;
+
 function parseInvocation(args: readonly string[]): Invocation | null {
-  if (args.length < 4 || args.length > 6) return null;
+  if (args.length < 4 || args.length > 6 + MAX_CLOSURE_DELTA_FLAGS) return null;
   const [surfaceValue, ...flags] = args;
   if (!isSurface(surfaceValue)) return null;
   let action: ParsedInvocation["action"] | null = null;
@@ -84,6 +101,11 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let commit: string | null = null;
   let legacyPredecessorVersionId: string | null = null;
   let legacyHostRuntimePredecessorVersionId: string | null = null;
+  let closurePredecessorVersionId: string | null = null;
+  const retireVars: string[] = [];
+  const addVars: string[] = [];
+  const addSecrets: string[] = [];
+  const rotateSecrets: string[] = [];
   let unattributedSuccessorVersionId: string | null = null;
   let formAuthorityScopeTransitionPath: string | null = null;
   let reverse = false;
@@ -110,19 +132,56 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       continue;
     }
     if (flag.startsWith("--legacy-predecessor-version=")) {
-      if (legacyPredecessorVersionId !== null || legacyHostRuntimePredecessorVersionId !== null)
+      if (
+        legacyPredecessorVersionId !== null ||
+        legacyHostRuntimePredecessorVersionId !== null ||
+        closurePredecessorVersionId !== null
+      ) {
         return null;
+      }
       const value = flag.slice("--legacy-predecessor-version=".length);
       if (!isWorkerVersionId(value)) return null;
       legacyPredecessorVersionId = value;
       continue;
     }
     if (flag.startsWith("--legacy-host-runtime-predecessor-version=")) {
-      if (legacyHostRuntimePredecessorVersionId !== null || legacyPredecessorVersionId !== null)
+      if (
+        legacyHostRuntimePredecessorVersionId !== null ||
+        legacyPredecessorVersionId !== null ||
+        closurePredecessorVersionId !== null
+      ) {
         return null;
+      }
       const value = flag.slice("--legacy-host-runtime-predecessor-version=".length);
       if (!isWorkerVersionId(value)) return null;
       legacyHostRuntimePredecessorVersionId = value;
+      continue;
+    }
+    if (flag.startsWith("--closure-predecessor-version=")) {
+      if (
+        closurePredecessorVersionId !== null ||
+        legacyPredecessorVersionId !== null ||
+        legacyHostRuntimePredecessorVersionId !== null
+      ) {
+        return null;
+      }
+      const value = flag.slice("--closure-predecessor-version=".length);
+      if (!isWorkerVersionId(value)) return null;
+      closurePredecessorVersionId = value;
+      continue;
+    }
+    const deltaFlag = closureDeltaFlag(flag);
+    if (deltaFlag !== null) {
+      if (!CLOSURE_DELTA_NAME.test(deltaFlag.name)) return null;
+      const list =
+        deltaFlag.kind === "retire-var"
+          ? retireVars
+          : deltaFlag.kind === "add-var"
+            ? addVars
+            : deltaFlag.kind === "add-secret"
+              ? addSecrets
+              : rotateSecrets;
+      list.push(deltaFlag.name);
       continue;
     }
     if (flag.startsWith("--unattributed-successor-version=")) {
@@ -147,6 +206,19 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     return null;
   }
   if (!action || !environment || !commit) return null;
+  const closureDeltaNames = [...retireVars, ...addVars, ...addSecrets, ...rotateSecrets];
+  if (closurePredecessorVersionId === null) {
+    // Every other invocation keeps the historical exact flag budget.
+    if (args.length > 6 || closureDeltaNames.length > 0) return null;
+  } else if (
+    surfaceValue !== "takoserver-worker-authority-cutover" ||
+    reverse ||
+    closureDeltaNames.length === 0 ||
+    closureDeltaNames.length > MAX_CLOSURE_DELTA_FLAGS ||
+    new Set(closureDeltaNames).size !== closureDeltaNames.length
+  ) {
+    return null;
+  }
   if (
     (surfaceValue === "takoserver-integration-e2e-credentials" && action === "apply") ||
     (surfaceValue !== "takoserver-integration-e2e-credentials" &&
@@ -242,10 +314,33 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     ...(legacyHostRuntimePredecessorVersionId === null
       ? {}
       : { legacyHostRuntimePredecessorVersionId }),
+    ...(closurePredecessorVersionId === null
+      ? {}
+      : {
+          closurePredecessorVersionId,
+          closureDelta: {
+            retiredVars: [...retireVars].sort(),
+            addedVars: [...addVars].sort(),
+            addedSecrets: [...addSecrets].sort(),
+            rotatedSecrets: [...rotateSecrets].sort(),
+          },
+        }),
     ...(unattributedSuccessorVersionId === null ? {} : { unattributedSuccessorVersionId }),
     ...(formAuthorityScopeTransitionPath === null ? {} : { formAuthorityScopeTransitionPath }),
     ...(reverse ? { reverse: true } : {}),
   } as Invocation;
+}
+
+type ClosureDeltaFlagKind = "retire-var" | "add-var" | "add-secret" | "rotate-secret";
+
+function closureDeltaFlag(
+  flag: string,
+): { readonly kind: ClosureDeltaFlagKind; readonly name: string } | null {
+  for (const kind of ["retire-var", "add-var", "add-secret", "rotate-secret"] as const) {
+    const prefix = `--${kind}=`;
+    if (flag.startsWith(prefix)) return { kind, name: flag.slice(prefix.length) };
+  }
+  return null;
 }
 
 function isSurface(value: string | undefined): value is Surface {
@@ -261,6 +356,23 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
   switch (invocation.surface) {
     case "takoserver-worker":
     case "takoserver-worker-authority-cutover":
+      if (
+        invocation.surface === "takoserver-worker-authority-cutover" &&
+        invocation.closurePredecessorVersionId !== undefined &&
+        invocation.closureDelta !== undefined
+      ) {
+        return await runWorkerClosureTransition(
+          {
+            surface: invocation.surface,
+            action: invocation.action,
+            environment: invocation.environment,
+            commit: invocation.commit,
+            closurePredecessorVersionId: invocation.closurePredecessorVersionId,
+            delta: invocation.closureDelta,
+          },
+          target,
+        );
+      }
       if (
         invocation.surface === "takoserver-worker-authority-cutover" &&
         invocation.legacyHostRuntimePredecessorVersionId !== undefined

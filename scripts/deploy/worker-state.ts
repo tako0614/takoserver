@@ -217,6 +217,107 @@ export function expectedLegacyPreVersionMetadataBindingClosure(
   };
 }
 
+/**
+ * One reviewed, explicitly declared difference between a pinned predecessor
+ * Version and the current realized target closure.
+ *
+ * Every name is declared by the operator on the command line. Nothing here is
+ * inferred from live state: the declaration is what makes the difference
+ * reviewable, and an undeclared difference is a refusal rather than a repair.
+ */
+export interface WorkerClosureDelta {
+  /** Plain-text bindings the current target no longer derives. */
+  readonly retiredVars: readonly string[];
+  /** Plain-text bindings the current target derives and the predecessor lacks. */
+  readonly addedVars: readonly string[];
+  /** Secrets the current target requires and the predecessor does not carry. */
+  readonly addedSecrets: readonly string[];
+  /** Secrets carried by both sides whose value this one upload replaces. */
+  readonly rotatedSecrets: readonly string[];
+}
+
+/** A selector without any declared change is an ordinary publication, not a transition. */
+export function workerClosureDeltaIsEmpty(delta: WorkerClosureDelta): boolean {
+  return (
+    delta.retiredVars.length === 0 &&
+    delta.addedVars.length === 0 &&
+    delta.addedSecrets.length === 0 &&
+    delta.rotatedSecrets.length === 0
+  );
+}
+
+/**
+ * Exact binding closure the pinned predecessor of a reviewed closure transition
+ * must already serve.
+ *
+ * It is the current target closure with exactly the declared delta reversed:
+ * every declared added var/secret must be absent, and every declared retired
+ * var must still be present as an opaque plain-text binding. The retired value
+ * is deliberately unconstrained because the current target no longer derives
+ * it; every other binding, value, secret name and type stays strict.
+ */
+export function expectedClosureTransitionPredecessorClosure(
+  target: DeployTarget,
+  input: {
+    readonly delta: WorkerClosureDelta;
+    readonly signingKeyId?: string;
+    readonly expectedSecrets?: readonly string[];
+    readonly authorityProfile?: WorkerVersionAuthorityProfile;
+    readonly workerArtifactDigest?: `sha256:${string}`;
+  },
+): ExpectedBindingClosure {
+  const closure: Record<string, ExpectedBinding | null> = {
+    ...expectedExactBindingClosure(target, {
+      ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
+      ...(input.expectedSecrets === undefined ? {} : { expectedSecrets: input.expectedSecrets }),
+      ...(input.authorityProfile === undefined ? {} : { authorityProfile: input.authorityProfile }),
+      ...(input.workerArtifactDigest === undefined
+        ? {}
+        : { workerArtifactDigest: input.workerArtifactDigest }),
+    }),
+  };
+  for (const name of [...input.delta.addedVars, ...input.delta.addedSecrets]) {
+    closure[name] = null;
+  }
+  for (const name of input.delta.retiredVars) {
+    closure[name] = { type: "plain_text", fields: {} };
+  }
+  return closure;
+}
+
+/** Exact declared binding names on one immutable Version; unnamed or duplicate fails closed. */
+export function exactVersionBindingNames(
+  phase: DeployPhase,
+  versionId: string,
+  version: unknown,
+): readonly string[] {
+  const bindings = versionBindings(phase, versionId, version);
+  const names = bindings.map((binding) => {
+    const name =
+      typeof binding.name === "string"
+        ? binding.name
+        : typeof binding.binding === "string"
+          ? binding.binding
+          : null;
+    if (name === null) {
+      throw new DeployError(
+        phase,
+        `version ${versionId} contains an unnamed binding`,
+        bindingInventoryDetail(bindings),
+      );
+    }
+    return name;
+  });
+  if (new Set(names).size !== names.length) {
+    throw new DeployError(
+      phase,
+      `version ${versionId} declares a duplicate binding name`,
+      bindingInventoryDetail(bindings),
+    );
+  }
+  return names;
+}
+
 /** Exact binding closure used by the reviewed Hosted-edge retirement surfaces. */
 export function expectedTransitionBindingClosure(
   target: DeployTarget,
