@@ -24,6 +24,7 @@ import {
 import {
   createSelfhostObjectStore,
   prefixCeiling,
+  SELFHOST_OBJECT_RECONCILE_BATCH,
   SelfhostObjectError,
   type SelfhostObjectStore,
 } from "./selfhost-object-store.ts";
@@ -137,6 +138,8 @@ const DEFAULT_LIST_LIMIT = 1_000;
 const SQLITE_BUSY_TIMEOUT_MS = 5_000;
 /** Rows one maintenance pass reclaims, so a sweep never becomes the workload. */
 const KV_SWEEP_BATCH = 1_000;
+/** Abandoned uploads one pass reclaims; each one is a directory to remove. */
+const UPLOAD_SWEEP_BATCH = 64;
 const SCRIPT_NAME = /^[a-z0-9][a-z0-9_-]{0,127}$/u;
 const VERSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const TOKEN_SECRET = /^[A-Za-z0-9_-]{16,128}$/u;
@@ -330,6 +333,22 @@ export function createSelfhostDataPlanes(options: SelfhostDataPlaneOptions): Sel
       // a bucket id is derived from the Resource incarnation, so this can never
       // reach a live bucket's objects.
       await objectStore.destroy(bucketId);
+    },
+
+    async sweepExpiredObjectUploads(limit = UPLOAD_SWEEP_BATCH) {
+      // Bounded for the same reason the KV sweep is: this runs on the
+      // settlement tick, and a machine that accumulated ten thousand abandoned
+      // uploads must not become that tick.
+      return await objectStore.sweepExpiredUploads({
+        limit: Math.max(1, Math.min(limit, UPLOAD_SWEEP_BATCH)),
+      });
+    },
+
+    async reconcileOrphanObjectFiles(limit = SELFHOST_OBJECT_RECONCILE_BATCH) {
+      const swept = await objectStore.reconcileOrphanFiles({
+        limit: Math.max(1, Math.min(limit, SELFHOST_OBJECT_RECONCILE_BATCH)),
+      });
+      return swept.reclaimed;
     },
 
     async sweepExpiredKv(limit = KV_SWEEP_BATCH) {

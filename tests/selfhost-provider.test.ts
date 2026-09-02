@@ -1797,6 +1797,12 @@ describe("local namespaces", () => {
         async sweepExpiredKv() {
           return 0;
         },
+        async sweepExpiredObjectUploads() {
+          return 0;
+        },
+        async reconcileOrphanObjectFiles() {
+          return 0;
+        },
       },
     });
     const created = await local.apply({
@@ -2163,6 +2169,12 @@ describe("the current ObjectBucket Form on a self-host", () => {
     async sweepExpiredKv() {
       return 0;
     },
+    async sweepExpiredObjectUploads() {
+      return 0;
+    },
+    async reconcileOrphanObjectFiles() {
+      return 0;
+    },
   });
 
   test("creates one under the incarnation this Host derives", async () => {
@@ -2259,7 +2271,7 @@ describe("the current ObjectBucket Form on a self-host", () => {
     ).toMatchObject({ phase: "succeeded", result: { nativeId: derived.result.nativeId } });
   });
 
-  test("refuses to destroy a bucket that still holds anything", async () => {
+  test("refuses to destroy a bucket that still holds objects, but not one mid-upload", async () => {
     const destroyed: string[] = [];
     const state = { objects: 2, uploads: 0 };
     const local = provider({ dataPlaneMaintenance: bucketMaintenance(state, destroyed) });
@@ -2281,29 +2293,36 @@ describe("the current ObjectBucket Form on a self-host", () => {
     ).toMatchObject({ phase: "failed", failure: { code: "conflict", retryable: false } });
     expect(destroyed).toEqual([]);
 
-    // An unfinished multipart upload counts too: it is storage the customer
-    // started and nobody else may finish or discard.
-    state.objects = 0;
+    // An object beside an unfinished upload still refuses: the objects are the
+    // customer's storage, and this Host does not empty one for them.
+    state.objects = 1;
     state.uploads = 1;
     expect(
       await local.delete({
-        operationId: "op_current_bucket_delete_uploads",
+        operationId: "op_current_bucket_delete_mixed",
         offering: currentBucket,
         nativeId: created.result.nativeId,
         identity: { ...identity("media"), uid: "uid-media" },
       }),
     ).toMatchObject({ phase: "failed", failure: { code: "conflict" } });
+    expect(destroyed).toEqual([]);
 
-    state.uploads = 0;
+    // An unfinished upload alone does not. Nothing the Binding declares can
+    // list one, and the upload id that could abort it lived in an isolate that
+    // is gone — so refusing on it would make a bucket the customer can see is
+    // empty permanently undeletable. The destroy takes it with everything else.
+    state.objects = 0;
+    state.uploads = 1;
     expect(
       await local.delete({
-        operationId: "op_current_bucket_delete_empty",
+        operationId: "op_current_bucket_delete_abandoned",
         offering: currentBucket,
         nativeId: created.result.nativeId,
         identity: { ...identity("media"), uid: "uid-media" },
       }),
     ).toMatchObject({ phase: "succeeded", result: { observed: { deleted: true } } });
     expect(destroyed).toEqual([String(created.result.outputs.bucketName)]);
+    expect(state).toEqual({ objects: 0, uploads: 0 });
   });
 
   test("proves a delete only once the bucket is empty, and never by writing", async () => {
@@ -2921,6 +2940,12 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
         },
         async deleteObjectBucket() {},
         async sweepExpiredKv() {
+          return 0;
+        },
+        async sweepExpiredObjectUploads() {
+          return 0;
+        },
+        async reconcileOrphanObjectFiles() {
           return 0;
         },
       },

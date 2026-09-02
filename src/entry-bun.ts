@@ -524,7 +524,20 @@ setInterval(() => {
     // otherwise be stored until the file was deleted — and the expiry index
     // that exists for exactly this would only cost writes.
     .then(async () => {
-      if (dataPlanes) await dataPlanes.maintenance.sweepExpiredKv();
+      if (dataPlanes) {
+        await dataPlanes.maintenance.sweepExpiredKv();
+        // A multipart upload nobody can finish any more, for a reason no other
+        // sweep covers: the upload id lived in the isolate that started it, no
+        // operation the Binding declares enumerates open uploads, and durable
+        // receipts are exactly what would otherwise keep an abandoned one for
+        // the life of the machine.
+        await dataPlanes.maintenance.sweepExpiredObjectUploads();
+        // And the files no row names: a crash between publishing a body and
+        // writing the row that names it leaves bytes nothing can ever reach.
+        // Bounded and resumable, so a bucket holding a million objects costs a
+        // batch a tick rather than a tick.
+        await dataPlanes.maintenance.reconcileOrphanObjectFiles();
+      }
       // A message nobody asked for again is reclaimed on the same pass, for the
       // same reason: retention is a promise about how long it is kept, not
       // about when somebody notices.

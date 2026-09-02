@@ -223,13 +223,26 @@ bun scripts/selfhost-form-admission.ts <organizationId> <space> ... --apply
 name from the Resource INCARNATION — tenant, Space, name, and Resource UID —
 for the reason stated under [Naming and import](#naming-and-import): a customer
 who destroys a bucket and declares one with the same name has asked for an
-empty bucket. `delete` refuses a bucket that still holds an object or an
-unfinished multipart upload, as a named non-retryable failure proven by one
-readback; the Form declares no field that could ask this Host to empty one, and
-emptying a customer's storage is not a decision a lifecycle delete may take.
-`import` is fenced to the exact incarnation this Host itself derives for the
-Resource address being imported onto, so another tenant's bucket and a name
-this Host never minted are both refused before anything is read.
+empty bucket. `delete` refuses a bucket that still holds an object, as a named
+non-retryable failure proven by one readback; the Form declares no field that
+could ask this Host to empty one, and emptying a customer's storage is not a
+decision a lifecycle delete may take. `import` is fenced to the exact
+incarnation this Host itself derives for the Resource address being imported
+onto, so another tenant's bucket and a name this Host never minted are both
+refused before anything is read.
+
+An unfinished multipart upload is not one of those objects, and the delete drops
+it rather than refusing on it. Durability is what lets this Host serve
+`bucketBindings` where the managed wrapper may not — and durability is also what
+would have turned a lost upload id into a permanent lifecycle deadlock, because
+the id lives only in the isolate that minted it and the Form's Binding declares
+no operation that enumerates open uploads. A refusal there would tell a customer
+to empty a bucket that every operation they hold reports as empty. So the
+destroy takes the receipts and their part files with everything else, and the
+maintenance tick expires uploads older than seven days on buckets nobody is
+destroying. The absence readback still counts an upload as presence: a completed
+destroy leaves neither, so both being zero is what proves the destroy ran, and
+that is a different question from what the delete must refuse.
 
 ### Deploy-target obligation
 

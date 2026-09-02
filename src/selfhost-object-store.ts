@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { createHash, randomBytes } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { chmod, mkdir, open, rename, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, open, readdir, rename, rm, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { Sql } from "./ports.ts";
 
@@ -53,6 +53,33 @@ export const MAX_SELFHOST_OBJECT_SINGLE_PUT_BYTES = 314_572_800;
 export const MAX_SELFHOST_OBJECT_PARTS = 10_000;
 export const MIN_SELFHOST_OBJECT_NON_FINAL_PART_BYTES = 5_242_880;
 export const MAX_SELFHOST_OBJECT_LIST_LIMIT = 1_000;
+
+/**
+ * How long an unfinished multipart upload is kept.
+ *
+ * A tenant that calls `createMultipartUpload` and is then evicted, throws, or
+ * is redeployed has lost the only handle to that upload: the id lived in its
+ * isolate, and the Binding declares no operation that enumerates open uploads.
+ * Durable receipts are what let this Host serve `bucketBindings` at all
+ * (ADR 0007), and without a bound they are also what would keep an abandoned
+ * upload — and the part files under it — for the life of the machine. Seven
+ * days is far past any legitimate upload and is measured from the create, not
+ * from the last part, exactly as R2 measures it.
+ */
+export const SELFHOST_OBJECT_UPLOAD_LIFETIME_MS = 7 * 24 * 60 * 60 * 1_000;
+
+/**
+ * How old a file must be before reconciliation is willing to call it an orphan.
+ *
+ * A body is renamed into place before the row that names it is written, and a
+ * put stages into `tmp/` before either. Both windows are milliseconds wide, so
+ * an hour is not a tolerance — it is the margin that keeps a sweep from ever
+ * racing a write in flight.
+ */
+export const SELFHOST_OBJECT_ORPHAN_MIN_AGE_MS = 60 * 60 * 1_000;
+
+/** Files one reconciliation pass will look at, so a tick stays a tick. */
+export const SELFHOST_OBJECT_RECONCILE_BATCH = 512;
 
 /** The bucket ids this store will open a directory for, and nothing else. */
 const BUCKET_ID = /^tsb-[0-9a-f]{40}$/u;
@@ -171,6 +198,29 @@ export interface SelfhostObjectStore {
   occupancy(bucketId: string): Promise<SelfhostObjectBucketOccupancy>;
   /** Drops every row and every file of one bucket incarnation. */
   destroy(bucketId: string): Promise<void>;
+  /**
+   * Reclaims multipart uploads nobody can finish any more.
+   *
+   * Bounded, because it runs on the same tick as settlement. Returns how many
+   * uploads it dropped.
+   */
+  sweepExpiredUploads(options?: {
+    readonly before?: number;
+    readonly limit?: number;
+  }): Promise<number>;
+  /**
+   * Reclaims files no row names.
+   *
+   * A crash between `publish()` and the row write leaves a body under `o/`
+   * that nothing can ever reach, and a crash inside `stage()` leaves a file
+   * under `tmp/`. Neither is visible to any operation the Binding declares, so
+   * only this reclaims them short of destroying the bucket. One pass looks at a
+   * bounded number of files and resumes where the last one stopped.
+   */
+  reconcileOrphanFiles(options?: {
+    readonly before?: number;
+    readonly limit?: number;
+  }): Promise<{ readonly examined: number; readonly reclaimed: number }>;
 }
 
 export interface SelfhostObjectStoreOptions {
@@ -189,6 +239,11 @@ export function createSelfhostObjectStore(
   const now = options.clock ?? (() => new Date());
   const identifier = options.identifier ?? (() => randomBytes(16).toString("hex"));
   const sql = options.sql;
+
+  // Where the last reconciliation pass stopped. In memory rather than durable:
+  // losing it on a restart costs one extra pass over files nobody is asking
+  // for, and a restart is exactly when the orphans it looks for are made.
+  let reconcileCursor: { bucket: string; shard: string } = { bucket: "", shard: "" };
 
   const bucketDirectory = (bucketId: string): string => {
     validBucket(bucketId);
@@ -599,16 +654,30 @@ export function createSelfhostObjectStore(
             partPath(bucketId, uploadId, part.partNumber),
             fsConstants.O_RDONLY,
           );
+          // The receipt is checked against the bytes, not just against the row.
+          // `uploadPart` renames a new file over the deterministic part path,
+          // so a part replaced while this complete was running would otherwise
+          // be assembled into an object whose multipart etag names bytes it no
+          // longer contains — and a same-size replacement would pass the total.
+          const digest = createHash("sha256");
+          let copied = 0;
           try {
             for (let offset = 0; ; ) {
               const buffer = new Uint8Array(READ_CHUNK_BYTES);
               const read = await source.read(buffer, 0, buffer.byteLength, offset);
               if (read.bytesRead === 0) break;
               offset += read.bytesRead;
-              await handle.write(buffer.subarray(0, read.bytesRead));
+              copied += read.bytesRead;
+              const chunk = buffer.subarray(0, read.bytesRead);
+              digest.update(chunk);
+              await handle.write(chunk);
             }
           } finally {
             await source.close().catch(() => undefined);
+          }
+          const known = recorded.get(part.partNumber);
+          if (!known || copied !== known.size || digest.digest("hex") !== known.etag) {
+            throw new SelfhostObjectError("invalid_part");
           }
         }
         await handle.sync();
@@ -685,7 +754,105 @@ export function createSelfhostObjectStore(
       await run(sql, "DELETE FROM selfhost_objects WHERE bucket_id = ?", [bucketId]);
       await rm(directory, { recursive: true, force: true }).catch(() => undefined);
     },
+
+    async sweepExpiredUploads(options = {}) {
+      const before = options.before ?? now().getTime() - SELFHOST_OBJECT_UPLOAD_LIFETIME_MS;
+      const limit = Math.max(1, Math.min(options.limit ?? 64, 256));
+      const rows = await query(
+        sql,
+        "SELECT bucket_id, upload_id FROM selfhost_object_uploads " +
+          "WHERE created_at_ms <= ? ORDER BY created_at_ms LIMIT ?",
+        [before, limit],
+      );
+      let dropped = 0;
+      for (const row of rows) {
+        const bucketId = String(row.bucket_id);
+        const uploadId = String(row.upload_id);
+        if (!BUCKET_ID.test(bucketId) || !UPLOAD_ID.test(uploadId)) continue;
+        // The rows first: a part file with no receipt is unreachable, while a
+        // receipt whose files this pass failed to remove would be a complete
+        // that cannot be validated.
+        await dropUpload(sql, bucketId, uploadId);
+        await rm(join(bucketDirectory(bucketId), "u", uploadId), {
+          recursive: true,
+          force: true,
+        }).catch(() => undefined);
+        dropped += 1;
+      }
+      return dropped;
+    },
+
+    async reconcileOrphanFiles(options = {}) {
+      const before = options.before ?? now().getTime() - SELFHOST_OBJECT_ORPHAN_MIN_AGE_MS;
+      const limit = Math.max(
+        1,
+        Math.min(options.limit ?? SELFHOST_OBJECT_RECONCILE_BATCH, SELFHOST_OBJECT_RECONCILE_BATCH),
+      );
+      let examined = 0;
+      let reclaimed = 0;
+      const buckets = (await readdir(root).catch(() => []))
+        .filter((entry) => BUCKET_ID.test(entry))
+        .sort();
+      // The pass resumes where the last one stopped rather than restarting, and
+      // running off the end resets to the top — so a machine holding far more
+      // files than one batch still reaches all of them, a batch per tick.
+      let resumeBucket = reconcileCursor.bucket;
+      let resumeShard = reconcileCursor.shard;
+      for (const bucketId of buckets) {
+        if (bucketId < resumeBucket) continue;
+        const shards = ["tmp", ...(await shardNames(join(root, bucketId, "o")))];
+        for (const shard of shards) {
+          if (bucketId === resumeBucket && shard < resumeShard) continue;
+          const directory =
+            shard === "tmp" ? join(root, bucketId, "tmp") : join(root, bucketId, "o", shard);
+          for (const name of await shardEntries(directory)) {
+            if (examined >= limit) {
+              reconcileCursor = { bucket: bucketId, shard };
+              return { examined, reclaimed };
+            }
+            examined += 1;
+            const path = join(directory, name);
+            const modified = (await stat(path).catch(() => null))?.mtimeMs;
+            if (modified === undefined || modified > before) continue;
+            if (shard === "tmp") {
+              // Nothing reads a staged file but the call that wrote it, and
+              // that call finished or died an hour ago.
+              await rm(path, { force: true }).catch(() => undefined);
+              reclaimed += 1;
+              continue;
+            }
+            // The question migration 0041's second index exists for: which
+            // files does this bucket still own.
+            if (!STORAGE_ID.test(name) || name.slice(0, 2) !== shard) continue;
+            const rows = await query(
+              sql,
+              "SELECT 1 AS present FROM selfhost_objects WHERE bucket_id = ? AND storage_id = ? " +
+                "LIMIT 1",
+              [bucketId, name],
+            );
+            if (rows.length > 0) continue;
+            await rm(path, { force: true }).catch(() => undefined);
+            reclaimed += 1;
+          }
+          resumeShard = "";
+        }
+        resumeBucket = "";
+      }
+      reconcileCursor = { bucket: "", shard: "" };
+      return { examined, reclaimed };
+    },
   };
+}
+
+/** Sorted shard directories of one bucket, or none when it has no bodies yet. */
+async function shardNames(path: string): Promise<readonly string[]> {
+  return (await readdir(path).catch(() => []))
+    .filter((entry) => /^[0-9a-f]{2}$/u.test(entry))
+    .sort();
+}
+
+async function shardEntries(path: string): Promise<readonly string[]> {
+  return (await readdir(path).catch(() => [])).sort();
 }
 
 /**

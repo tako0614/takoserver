@@ -1070,6 +1070,47 @@ test("the plane bounds contentType and etag exactly as the facade does", async (
   expect(await tooWide.json()).toEqual({ ok: false, error: { code: "backend_unavailable" } });
 });
 
+test("the maintenance tick reclaims abandoned uploads and files no row names", async () => {
+  // Both are storage nothing on this machine can reach again: the uploadId
+  // lived in an isolate that is gone, and a body whose row never landed is not
+  // named by anything. Neither is visible to any operation the Binding
+  // declares, so the tick is the only thing that reclaims them.
+  const created = await objectValue({ op: "createMultipartUpload", key: "abandoned" });
+  await objectValue(
+    {
+      op: "uploadPart",
+      key: "abandoned",
+      uploadId: created.uploadId,
+      partNumber: 1,
+      contentLength: 4,
+    },
+    "half",
+  );
+  await objectValue({ op: "put", key: "orphaned", contentLength: 6 }, "orphan");
+  const rows = await sql.query("SELECT storage_id FROM selfhost_objects WHERE key = ?", [
+    "orphaned",
+  ]);
+  const storageId = String((rows[0] as Record<string, unknown>).storage_id);
+  await sql.run("DELETE FROM selfhost_objects WHERE key = ?", ["orphaned"]);
+  const orphan = join(root, "objects", ALPHA.objects?.MEDIA as string, "o", storageId.slice(0, 2));
+
+  // A fresh upload survives the tick; one past its lifetime does not.
+  expect(await planes.maintenance.sweepExpiredObjectUploads()).toBe(0);
+  now = new Date(now.getTime() + 8 * 24 * 60 * 60 * 1_000);
+  expect(await planes.maintenance.sweepExpiredObjectUploads()).toBe(1);
+  expect(await planes.maintenance.sweepExpiredObjectUploads()).toBe(0);
+  const spent = await objects({
+    op: "abortMultipartUpload",
+    key: "abandoned",
+    uploadId: created.uploadId,
+  });
+  expect(await spent.json()).toEqual({ ok: false, error: { code: "upload_not_found" } });
+
+  expect(await planes.maintenance.reconcileOrphanObjectFiles()).toBe(1);
+  expect(readdirSync(orphan)).toEqual([]);
+  expect(await planes.maintenance.reconcileOrphanObjectFiles()).toBe(0);
+});
+
 test("the object route refuses an unauthenticated caller before it reads a byte", async () => {
   const request = new Request(`${ORIGIN}${SELFHOST_DATA_PLANE_OBJECTS_PATH}`, {
     method: "POST",

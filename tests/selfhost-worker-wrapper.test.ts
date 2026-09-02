@@ -813,6 +813,9 @@ test("a tenant that forges Symbol.hasInstance cannot move what counts as a strea
        });
        const body = new Blob(["streamed"]).stream();
        await record("stream", () => env.MEDIA.put("k", body, { contentLength: 8 }));
+       // A tenant's isolate is its own; this one shares a realm with the rest
+       // of the suite, so it puts the global back.
+       delete ReadableStream[Symbol.hasInstance];
        return Response.json(attempts);
      } };`,
     OBJECTS_ONLY,
@@ -831,7 +834,9 @@ test("a tenant that forges Symbol.hasInstance cannot move what counts as a strea
     });
     // Nothing but the two legitimate bodies ever left the isolate.
     expect(calls.map((call) => call.body)).toEqual(["ok", "streamed"]);
+    expect(new Blob([]).stream() instanceof ReadableStream).toBe(true);
   } finally {
+    delete (ReadableStream as unknown as Record<symbol, unknown>)[Symbol.hasInstance];
     await generated.dispose();
   }
 });

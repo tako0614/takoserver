@@ -164,11 +164,38 @@ between this runtime and the managed one: a restart between
 `createMultipartUpload` and `completeMultipartUpload` costs nothing here, so the
 part sizes and etags a complete is validated against survive it.
 
-**Destroying a bucket that still holds anything is refused.** The Form's desired
-state is empty, so nothing in it could ask this Host to empty one, and emptying
-a customer's storage is not a decision a lifecycle delete may take. An object or
-an unfinished multipart upload is enough; the refusal is named, non-retryable,
-and proven by one readback.
+**Destroying a bucket that still holds an object is refused.** The Form's
+desired state is empty, so nothing in it could ask this Host to empty one, and
+emptying a customer's storage is not a decision a lifecycle delete may take. The
+refusal is named, non-retryable, and proven by one readback.
+
+An unfinished multipart upload is not one of those objects and does not refuse
+the destroy. It is bytes a customer began writing and never finished, no
+operation on the Binding lists one, and the upload id that could abort it lived
+in the isolate that minted it — so a Worker evicted between
+`createMultipartUpload` and `completeMultipartUpload` would otherwise have made
+its own bucket permanently undeletable, and the refusal would have told the
+customer to empty a bucket every operation they hold reports as empty. The
+destroy takes those receipts and their part files with everything else.
+
+**Uploads nobody finished expire after seven days**, measured from the create
+rather than from the last part, exactly as R2 measures it. The maintenance tick
+drops a bounded batch of them and removes their staged parts, beside the KV
+expiry sweep. The same tick reconciles files against rows: a crash between
+writing a body and writing the row that names it leaves bytes nothing can reach,
+as does a crash inside a staged write, and both are removed once they are older
+than an hour and no row names them. The pass looks at a bounded number of files
+and resumes where the last one stopped, so a bucket holding a million objects
+costs a batch per tick rather than the tick.
+
+**There is no per-tenant or per-bucket quota here.** `edge.objects` bounds one
+object at 5 GiB, one single `put` at 300 MiB, and one upload at 10 000 parts,
+but nothing bounds how many objects a Worker Version writes or how many bytes
+accumulate across open multipart uploads before a complete. What bounds them is
+the operator's disk. A machine serving `bucketBindings` for tenants it does not
+control needs a filesystem quota, a separate volume for `<data root>`, or both;
+this Host reports a full disk as `backend_unavailable` and removes what it had
+staged, but it never refuses a write on the customer's behalf.
 
 ### Ceilings
 

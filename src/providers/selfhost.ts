@@ -300,7 +300,8 @@ export interface SelfhostDataPlaneMaintenance {
    * Read-only, and the one question a lifecycle delete has to ask before it
    * removes a bucket: this Host does not destroy objects a customer never
    * asked it to, so a bucket that still holds any is refused rather than
-   * emptied.
+   * emptied. An unfinished multipart upload is counted here but is not one of
+   * those objects — see `deleteObjectBucket`.
    */
   objectBucketOccupancy(bucketId: string): Promise<{
     readonly objects: number;
@@ -310,6 +311,10 @@ export interface SelfhostDataPlaneMaintenance {
   deleteObjectBucket(bucketId: string): Promise<void>;
   /** Reclaims expired KV rows, bounded, for the maintenance tick. */
   sweepExpiredKv(limit?: number): Promise<number>;
+  /** Reclaims multipart uploads past their lifetime, bounded, on the same tick. */
+  sweepExpiredObjectUploads(limit?: number): Promise<number>;
+  /** Reclaims object files no row names, bounded, on the same tick. */
+  reconcileOrphanObjectFiles(limit?: number): Promise<number>;
 }
 
 /** Where this machine keeps one SQLite database. */
@@ -2194,10 +2199,19 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
    * Destroying one is refusing to destroy a customer's objects for them.
    *
    * The Form declares no field that could ask for it — its desired state is
-   * empty — so a bucket that still holds an object or an unfinished multipart
-   * upload is a named, non-retryable refusal proven by one readback, exactly as
-   * R2 refuses. A machine that serves no object plane has nothing to read and
-   * nothing to hold, so its delete is the declaration transition alone.
+   * empty — so a bucket that still holds an object is a named, non-retryable
+   * refusal proven by one readback, exactly as R2 refuses. A machine that
+   * serves no object plane has nothing to read and nothing to hold, so its
+   * delete is the declaration transition alone.
+   *
+   * An unfinished multipart upload is not one of those objects and does not
+   * refuse the delete. It is bytes the customer began writing and never
+   * finished, no operation the Binding declares can list one, and the upload id
+   * that could abort it lived in an isolate that is gone — so refusing on it
+   * would make a lost id a permanent lifecycle deadlock on the customer's own
+   * bucket. The destroy drops those rows and their part files with everything
+   * else, and the maintenance tick reclaims abandoned uploads on buckets nobody
+   * is destroying.
    */
   const deleteObjectBucket = async (input: {
     readonly nativeId: string;
@@ -2208,11 +2222,11 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       succeeded({ nativeId: input.nativeId, observed: { deleted: true }, outputs: {} });
     if (!name || !options.dataPlaneMaintenance) return done();
     const occupancy = await options.dataPlaneMaintenance.objectBucketOccupancy(name);
-    if (occupancy.objects > 0 || occupancy.uploads > 0) {
+    if (occupancy.objects > 0) {
       return failed(
         "conflict",
-        "the bucket still holds objects or unfinished multipart uploads, and this Host does " +
-          "not empty a bucket for you; delete its contents and destroy again",
+        "the bucket still holds objects, and this Host does not empty a bucket for you; " +
+          "delete its contents and destroy again",
       );
     }
     await options.dataPlaneMaintenance.deleteObjectBucket(name);
@@ -2348,8 +2362,12 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           // The current ObjectBucket is the one namespace here with durable
           // bytes behind it, so its absence is something this Host reads rather
           // than asserts: a bucket still holding an object or an unfinished
-          // upload is present, and that is exactly the condition its delete
-          // refuses on. The retained v1beta1 drain never held anything locally.
+          // upload is present, because both are state a destroy would have
+          // removed. That is no longer the same condition the delete refuses
+          // on — the delete refuses on objects and drops uploads — and the two
+          // questions are different ones: "must this Host keep the customer's
+          // bytes" and "is the native bucket gone". The retained v1beta1 drain
+          // never held anything locally.
           case "ObjectBucket":
           case "object_bucket": {
             const bucketName = optionalSafeString(parsed.data.bucketName);
@@ -2874,9 +2892,11 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         );
       try {
         // The current ObjectBucket is the one namespace with residual bytes, so
-        // "is it gone" is a question this Host reads rather than asserts. Empty
-        // is exactly the condition its delete succeeds on, so an empty bucket is
-        // a proven delete and anything still in one is not.
+        // "is it gone" is a question this Host reads rather than asserts. A
+        // completed destroy leaves no object and no upload receipt, so both
+        // being zero is what proves the delete ran; an unfinished upload still
+        // standing means it did not, even though the delete would not have
+        // refused on one.
         if (currentObjectBucket(input.offering)) {
           const name = selfhostNamespaceName("selfhost-bucket", input.nativeId);
           if (!name) return failed("not_found", "the bucket identity is malformed");

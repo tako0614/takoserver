@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, statSync } from "node:fs";
-import { readdir } from "node:fs/promises";
+import { mkdir, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEphemeralSql } from "../src/compat.ts";
@@ -8,6 +8,7 @@ import type { Sql } from "../src/ports.ts";
 import {
   createSelfhostObjectStore,
   MIN_SELFHOST_OBJECT_NON_FINAL_PART_BYTES,
+  SELFHOST_OBJECT_UPLOAD_LIFETIME_MS,
   SelfhostObjectError,
   type SelfhostObjectStore,
 } from "../src/selfhost-object-store.ts";
@@ -445,6 +446,151 @@ describe("the self-host object store", () => {
     expect((await store.list(BUCKET_A)).objects).toEqual([]);
     expect(await readdir(root)).toEqual([BUCKET_B]);
     expect((await store.head(BUCKET_B, "elsewhere"))?.size).toBe(4);
+  });
+
+  test("reclaims an abandoned multipart upload and its part files", async () => {
+    // The deadlock this exists for: the uploadId lived in the isolate that
+    // called createMultipartUpload, no operation the Binding declares
+    // enumerates open uploads, and durable receipts are exactly what would
+    // otherwise keep this one for the life of the machine.
+    const abandoned = await store.createMultipartUpload(BUCKET_A, "lost", {});
+    await store.uploadPart(BUCKET_A, "lost", abandoned.uploadId, 1, bytes("half"), {
+      contentLength: 4,
+    });
+    expect((await store.occupancy(BUCKET_A)).uploads).toBe(1);
+    expect(await readdir(join(root, BUCKET_A, "u"))).toEqual([abandoned.uploadId]);
+
+    // A fresh upload is not expired: the bound is measured from the create.
+    expect(await store.sweepExpiredUploads()).toBe(0);
+    expect((await store.occupancy(BUCKET_A)).uploads).toBe(1);
+
+    const clock = Date.parse("2026-09-02T00:00:00.000Z");
+    expect(await store.sweepExpiredUploads({ before: clock - 1 })).toBe(0);
+    expect(await store.sweepExpiredUploads({ before: clock })).toBe(1);
+    expect((await store.occupancy(BUCKET_A)).uploads).toBe(0);
+    expect(await readdir(join(root, BUCKET_A, "u"))).toEqual([]);
+    expect(
+      await failure(
+        store.uploadPart(BUCKET_A, "lost", abandoned.uploadId, 1, bytes("x"), {
+          contentLength: 1,
+        }),
+      ),
+    ).toBe("upload_not_found");
+    expect(SELFHOST_OBJECT_UPLOAD_LIFETIME_MS).toBe(7 * 24 * 60 * 60 * 1_000);
+
+    // And the sweep is not a ceiling on the feature: a new upload still
+    // completes exactly as it did.
+    const fresh = await store.createMultipartUpload(BUCKET_A, "found", {});
+    const part = await store.uploadPart(BUCKET_A, "found", fresh.uploadId, 1, bytes("kept"), {
+      contentLength: 4,
+    });
+    const completed = await store.completeMultipartUpload(BUCKET_A, "found", fresh.uploadId, [
+      { etag: part.etag, partNumber: 1 },
+    ]);
+    expect(completed.size).toBe(4);
+    expect(await text((await store.get(BUCKET_A, "found"))?.body as never)).toBe("kept");
+  });
+
+  test("reclaims a body no row names and a staged file nobody finished", async () => {
+    await put("kept", "kept bytes");
+    await put("orphaned", "orphan bytes");
+    const rows = await sql.query("SELECT storage_id FROM selfhost_objects WHERE key = ?", [
+      "orphaned",
+    ]);
+    const storageId = String((rows[0] as Record<string, unknown>).storage_id);
+    // The crash this exists for: the body was renamed into place and the row
+    // that would have named it never landed.
+    await sql.run("DELETE FROM selfhost_objects WHERE key = ?", ["orphaned"]);
+    // And a stage() that died before it published anything.
+    const staged = join(root, BUCKET_A, "tmp", "abandoned");
+    await mkdir(join(root, BUCKET_A, "tmp"), { recursive: true, mode: 0o700 });
+    await writeFile(staged, "half a body", { mode: 0o600 });
+
+    const orphan = join(root, BUCKET_A, "o", storageId.slice(0, 2), storageId);
+    expect(statSync(orphan).size).toBe(12);
+
+    // Nothing is old enough yet: the bound is what keeps a sweep from racing a
+    // write that is still in flight.
+    expect(await store.reconcileOrphanFiles({ before: 0 })).toEqual({
+      examined: 3,
+      reclaimed: 0,
+    });
+    expect(statSync(orphan).size).toBe(12);
+
+    const reconciled = await store.reconcileOrphanFiles({ before: Date.now() + 60_000 });
+    expect(reconciled).toEqual({ examined: 3, reclaimed: 2 });
+    expect(() => statSync(orphan)).toThrow();
+    expect(() => statSync(staged)).toThrow();
+    // The object a row still names is untouched.
+    expect(await text((await store.get(BUCKET_A, "kept"))?.body as never)).toBe("kept bytes");
+    expect(await store.reconcileOrphanFiles({ before: Date.now() + 60_000 })).toEqual({
+      examined: 1,
+      reclaimed: 0,
+    });
+  });
+
+  test("reconciles a bounded batch and resumes where it stopped", async () => {
+    for (let index = 0; index < 6; index += 1) await put(`k${index}`, `body ${index}`);
+    await sql.run("DELETE FROM selfhost_objects WHERE bucket_id = ?", [BUCKET_A]);
+    const before = Date.now() + 60_000;
+    let reclaimed = 0;
+    // Two files a pass: a bucket holding a million bodies costs a batch a tick
+    // rather than the tick.
+    for (let pass = 0; pass < 3; pass += 1) {
+      const result = await store.reconcileOrphanFiles({ before, limit: 2 });
+      expect(result.examined).toBe(2);
+      reclaimed += result.reclaimed;
+    }
+    expect(reclaimed).toBe(6);
+    const files = await readdir(join(root, BUCKET_A, "o"), { recursive: true });
+    expect(files.filter((entry) => /[0-9a-f]{32}$/u.test(entry))).toEqual([]);
+  });
+
+  test("refuses a complete whose part file no longer holds the bytes it recorded", async () => {
+    const created = await store.createMultipartUpload(BUCKET_A, "swapped", {});
+    const size = MIN_SELFHOST_OBJECT_NON_FINAL_PART_BYTES;
+    const one = await store.uploadPart(
+      BUCKET_A,
+      "swapped",
+      created.uploadId,
+      1,
+      filler(size, "x"),
+      {
+        contentLength: size,
+      },
+    );
+    const two = await store.uploadPart(BUCKET_A, "swapped", created.uploadId, 2, bytes("tail"), {
+      contentLength: 4,
+    });
+    // The interleaving a lock on the row would not catch: uploadPart renames a
+    // new file over the deterministic part path, so a same-size replacement
+    // passes both the recorded size and the assembled total. The bytes are
+    // what the receipt is checked against.
+    await writeFile(join(root, BUCKET_A, "u", created.uploadId, "2"), "TAIL", { mode: 0o600 });
+    expect(
+      await failure(
+        store.completeMultipartUpload(BUCKET_A, "swapped", created.uploadId, [
+          { etag: one.etag, partNumber: 1 },
+          { etag: two.etag, partNumber: 2 },
+        ]),
+      ),
+    ).toBe("invalid_part");
+    // Nothing was published, and the upload is still there to complete once the
+    // parts and their receipts agree again.
+    expect(await store.head(BUCKET_A, "swapped")).toBeNull();
+    const replaced = await store.uploadPart(
+      BUCKET_A,
+      "swapped",
+      created.uploadId,
+      2,
+      bytes("TAIL"),
+      { contentLength: 4 },
+    );
+    const completed = await store.completeMultipartUpload(BUCKET_A, "swapped", created.uploadId, [
+      { etag: one.etag, partNumber: 1 },
+      { etag: replaced.etag, partNumber: 2 },
+    ]);
+    expect(completed.size).toBe(size + 4);
   });
 
   test("replaces a body without disturbing a reader that already opened one", async () => {
