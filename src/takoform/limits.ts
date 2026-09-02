@@ -31,15 +31,18 @@ export const SWEEP_ROW_LIMIT = 64;
 export const OPERATION_TTL_MILLISECONDS = 7 * 24 * 60 * 60_000;
 
 /**
- * How long a deferred operation held for provider repair stays authoritative.
+ * How long a deferred *delete* held for provider repair stays authoritative.
  *
  * A held command is repair authority — its provider mutation may have crossed
- * the boundary — so it must outlive an ordinary operation by a wide margin.
- * It must not outlive everything. The hold owns the caller's replay key, so an
- * acceptance that can never settle would refuse every later attempt at the same
- * mutation for the life of the deployment; a month is long enough for an
- * operator to repair one and short enough that a stale acceptance cannot wedge
- * a Resource forever.
+ * the boundary — so it outlives an ordinary operation by a wide margin, and an
+ * apply or an import is held without an end because the native object it may
+ * have made is still there. A delete is different: the hold also owns the
+ * caller's replay key, so an acceptance that can never settle refuses every
+ * later attempt at the same delete for the life of the deployment, which is how
+ * a teardown came to be permanently wedged. A month is long enough for an
+ * operator to repair one and short enough that a stale acceptance cannot hold a
+ * Resource forever. Measured from acceptance, so re-entering the hold cannot
+ * push it out.
  */
 export const PROVIDER_REPAIR_HOLD_TTL_MILLISECONDS = 30 * 24 * 60 * 60_000;
 
