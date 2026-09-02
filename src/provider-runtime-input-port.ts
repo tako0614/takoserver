@@ -18,7 +18,7 @@ export interface ProviderRuntimeInputAcquireInput {
   readonly organizationId: string;
   readonly operationId: string;
   readonly resourceUid: string;
-  /** Exact Takoserver-issued handoff reference used as this Host operation's idempotency key. */
+  /** Exact operation key this Host mutation was addressed by, and the handoff with it. */
   readonly reference: string;
   readonly target: ProviderRuntimeInputTarget;
   readonly bindingNames: readonly string[];
@@ -29,11 +29,15 @@ export type ProviderRuntimeInputRecoveryInput = ProviderRuntimeInputAcquireInput
 /** Value-free identity bound to the exact encrypted preparation. */
 export interface ProviderRuntimeInputPreparationIdentity {
   readonly preparationId: string;
-  readonly materialSetId: string;
-  readonly originReservationId: string;
+  /** The exact operation key both the private handoff and the public apply carry. */
+  readonly operationKey: string;
   readonly workerResourceUid: string;
+  /** The Host origin the caller addressed; not the future Worker's origin. */
   readonly canonicalPublicOrigin: string;
-  /** Plan-known commitment; no plaintext binding name or value is embedded in it. */
+  /**
+   * Commitment to the exact public apply this handoff authorizes. No plaintext
+   * binding name or value is embedded in it.
+   */
   readonly commitment: `sha256:${string}`;
 }
 

@@ -317,14 +317,8 @@ export function createWorkerEndpointOriginReservations(options: {
         `UPDATE worker_endpoint_origin_reservations
          SET state = 'expired', revision = revision + 1, updated_at = ?
          WHERE organization_id = ? AND reservation_id = ?
-           AND state IN ('prepared', 'bound') AND expires_at <= ?
-           AND NOT EXISTS (
-             SELECT 1 FROM worker_runtime_input_preparations AS preparation
-             WHERE preparation.organization_id = worker_endpoint_origin_reservations.organization_id
-               AND preparation.origin_reservation_id = worker_endpoint_origin_reservations.reservation_id
-               AND preparation.state = 'claimed' AND preparation.claim_expires_at > ?
-           )`,
-        [timestamp, organizationId, reservationId, timestamp, timestamp],
+           AND state IN ('prepared', 'bound') AND expires_at <= ?`,
+        [timestamp, organizationId, reservationId, timestamp],
       );
     } catch {
       throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
@@ -341,14 +335,8 @@ export function createWorkerEndpointOriginReservations(options: {
         `UPDATE worker_endpoint_origin_reservations
          SET state = 'expired', revision = revision + 1, updated_at = ?
          WHERE state IN ('prepared', 'bound') AND expires_at <= ?
-           AND (requested_subdomain = ? OR canonical_public_origin = ?)
-           AND NOT EXISTS (
-             SELECT 1 FROM worker_runtime_input_preparations AS preparation
-             WHERE preparation.organization_id = worker_endpoint_origin_reservations.organization_id
-               AND preparation.origin_reservation_id = worker_endpoint_origin_reservations.reservation_id
-               AND preparation.state = 'claimed' AND preparation.claim_expires_at > ?
-           )`,
-        [timestamp, timestamp, requestedSubdomain, canonicalPublicOrigin, timestamp],
+           AND (requested_subdomain = ? OR canonical_public_origin = ?)`,
+        [timestamp, timestamp, requestedSubdomain, canonicalPublicOrigin],
       );
     } catch {
       throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
@@ -558,12 +546,6 @@ export function createWorkerEndpointOriginReservations(options: {
                released_at = ?, updated_at = ?
            WHERE organization_id = ? AND reservation_id = ? AND revision = ?
              AND state IN ('prepared', 'bound', 'expired')
-             AND NOT EXISTS (
-               SELECT 1 FROM worker_runtime_input_preparations AS preparation
-               WHERE preparation.organization_id = worker_endpoint_origin_reservations.organization_id
-                 AND preparation.origin_reservation_id = worker_endpoint_origin_reservations.reservation_id
-                 AND preparation.state = 'claimed' AND preparation.claim_expires_at > ?
-             )
              AND (
                endpoint_resource_uid IS NULL OR (
                  NOT EXISTS (
@@ -585,7 +567,7 @@ export function createWorkerEndpointOriginReservations(options: {
                  )
                )
              )`,
-          [timestamp, timestamp, organizationId, reservationId, row.revision, timestamp],
+          [timestamp, timestamp, organizationId, reservationId, row.revision],
         );
       } catch {
         throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);

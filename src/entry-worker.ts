@@ -368,9 +368,8 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     ? createRuntimeInputAuthority({
         sql,
         sealKeys: await parseRuntimeInputSealKeyRing(env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING),
-        originReservations: originReservationBinding.port,
+        canonicalPublicOrigin: origin,
         clock,
-        randomId,
       })
     : undefined;
   const artifacts = createTakoformArtifacts({

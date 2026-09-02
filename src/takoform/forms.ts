@@ -291,7 +291,11 @@ export function formSupportProfile(
       configuredArtifactFileLimit;
   }
   if (workerVersion) {
-    limits[stableProfile ? "/requiredSensitiveVars" : "requiredSensitiveVars"] =
+    // `maximum<Field>` is the profile schema's own ceiling grammar, and it is
+    // the exact key a client reads back for a collection field. Publishing the
+    // bare field name instead left the ceiling unread, so a plan could declare
+    // more sensitive vars than the Host would accept and only find out at apply.
+    limits[stableProfile ? "/maximumRequiredSensitiveVars" : "maximumRequiredSensitiveVars"] =
       maximumRuntimeInputBindings;
   }
   return {

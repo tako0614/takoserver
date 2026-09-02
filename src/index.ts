@@ -168,15 +168,16 @@ export {
 export { createRouter, type Router } from "./router.ts";
 export {
   createRuntimeInputAuthority,
-  deriveRuntimeInputReference,
-  RUNTIME_INPUT_PREFLIGHT_FORMAT,
   RUNTIME_INPUT_PREPARATION_FORMAT,
+  RUNTIME_INPUT_PUBLIC_APPLY_COMMITMENT_LABEL,
   type RuntimeInputAuthority,
-  type RuntimeInputPreflightDocument,
+  type RuntimeInputClaimTarget,
   RuntimeInputPreparationError,
   type RuntimeInputPreparationInput,
   type RuntimeInputPreparationProjection,
-  type RuntimeInputPreparationTarget,
+  type RuntimeInputPreparationStatus,
+  type RuntimeInputPublicApply,
+  runtimeInputPublicApplyCommitment,
 } from "./runtime-input-preparations.ts";
 export { createSponsorshipRoutes, type SponsorshipRoutes } from "./sponsorship-api.ts";
 export { createD1Sql } from "./sql-d1.ts";

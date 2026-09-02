@@ -101,6 +101,12 @@ const RESOURCE_NAME_SCHEMA = {
   maxLength: 128,
   pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
 } as const;
+const OPERATION_KEY_SCHEMA = {
+  type: "string",
+  minLength: 8,
+  maxLength: 128,
+  pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$",
+} as const;
 const CANONICAL_HTTPS_ORIGIN_SCHEMA = {
   type: "string",
   format: "uri",
@@ -195,11 +201,11 @@ const RUNTIME_INPUT_PREPARATION_OPERATIONS = {
       },
     },
     responses: {
-      "201": runtimeInputResponse("Prepared value-free handoff projection"),
-      "400": { description: "Malformed request or invalid preflight reference" },
+      "200": runtimeInputResponse("Prepared value-free handoff projection"),
+      "400": { description: "Malformed request, wrong Host origin, or wrong operation key" },
       "401": { description: "Organization API key required" },
-      "403": { description: "The key lacks resources:write or belongs to another organization" },
-      "409": { description: "Replay, reservation, worker revision, or placement conflict" },
+      "403": { description: "The key lacks resources:write" },
+      "409": { description: "The operation key already carries a different or spent handoff" },
       "503": { description: "Sealing or authority unavailable" },
     },
   },
@@ -209,8 +215,8 @@ const RUNTIME_INPUT_PREPARATION_OPERATIONS = {
     responses: {
       "200": runtimeInputResponse("Value-free lifecycle projection"),
       "401": { description: "Organization API key required" },
-      "403": { description: "The key lacks resources:write or belongs to another organization" },
-      "404": { description: "Preparation not found" },
+      "403": { description: "The key lacks resources:write" },
+      "404": { description: "No live handoff exists for this operation key" },
     },
   },
   delete: {
@@ -219,7 +225,7 @@ const RUNTIME_INPUT_PREPARATION_OPERATIONS = {
     responses: {
       "204": { description: "Revoked or already revoked" },
       "401": { description: "Organization API key required" },
-      "403": { description: "The key lacks resources:write or belongs to another organization" },
+      "403": { description: "The key lacks resources:write" },
       "409": { description: "The handoff is already dispatched or indeterminate" },
     },
   },
@@ -275,7 +281,7 @@ const PUBLIC_PATHS: Record<string, Record<string, unknown>> = {
     WORKER_ENDPOINT_ORIGIN_RESERVATION_OPERATIONS,
   "/v1/worker-endpoint-origin-reservations/{reservationId}/activation":
     WORKER_ENDPOINT_ORIGIN_ACTIVATION_OPERATIONS,
-  "/v1/organizations/{organizationId}/worker-runtime-input-preparations/{operationId}":
+  "/v1/takoform/worker-runtime-input-preparations/{operationKey}":
     RUNTIME_INPUT_PREPARATION_OPERATIONS,
   "/v1/organizations/{organizationId}/resources": operation(
     "get",
@@ -477,16 +483,17 @@ function reservationActivationOperation(summary: string) {
 function runtimeInputPathParameters() {
   return [
     {
-      name: "organizationId",
+      name: "operationKey",
       in: "path",
       required: true,
-      schema: IDENTIFIER_SCHEMA,
+      schema: OPERATION_KEY_SCHEMA,
     },
     {
-      name: "operationId",
-      in: "path",
+      name: "Idempotency-Key",
+      in: "header",
       required: true,
-      schema: IDENTIFIER_SCHEMA,
+      description: "Must equal the operation key in the path.",
+      schema: OPERATION_KEY_SCHEMA,
     },
   ] as const;
 }
@@ -689,38 +696,32 @@ export const openApiDocument = {
           endpointResourceUid: IDENTIFIER_SCHEMA,
         },
       },
-      WorkerRuntimeInputPreparationTarget: {
+      WorkerRuntimeInputPublicApply: {
         type: "object",
-        required: ["space", "workerName", "workerResourceUid", "bundleName", "originReservationId"],
+        description:
+          "The exact ordinary public apply this handoff authorizes. The host commits to it as the length-prefixed SHA-256 of [label, method, path, ifNoneMatch, body].",
+        required: ["method", "path", "fences", "body"],
         additionalProperties: false,
         properties: {
-          space: RESOURCE_NAME_SCHEMA,
-          workerName: RESOURCE_NAME_SCHEMA,
-          workerResourceUid: IDENTIFIER_SCHEMA,
-          bundleName: RESOURCE_NAME_SCHEMA,
-          originReservationId: IDENTIFIER_SCHEMA,
+          method: { const: "PUT" },
+          path: { type: "string", minLength: 1, maxLength: 8_192, pattern: "^/" },
+          fences: {
+            type: "object",
+            required: ["ifNoneMatch"],
+            additionalProperties: false,
+            properties: { ifNoneMatch: { const: "*" } },
+          },
+          body: { type: "string", minLength: 1, maxLength: 1_048_576 },
         },
       },
       WorkerRuntimeInputPreparationRequest: {
         type: "object",
-        required: [
-          "format",
-          "materialSetId",
-          "materialSetNonce",
-          "runtimeInputReference",
-          "target",
-          "bindings",
-        ],
+        required: ["format", "canonicalPublicOrigin", "publicApply", "bindings"],
         additionalProperties: false,
         properties: {
-          format: { const: "takoserver.worker-runtime-input-preparation@v1" },
-          materialSetId: IDENTIFIER_SCHEMA,
-          materialSetNonce: IDENTIFIER_SCHEMA,
-          runtimeInputReference: {
-            type: "string",
-            pattern: "^rip1\\.prep-[0-9a-f]{32}\\.[0-9a-f]{64}$",
-          },
-          target: { $ref: "#/components/schemas/WorkerRuntimeInputPreparationTarget" },
+          format: { const: "takoserver.worker-runtime-input-preparation@v2" },
+          canonicalPublicOrigin: CANONICAL_HTTPS_ORIGIN_SCHEMA,
+          publicApply: { $ref: "#/components/schemas/WorkerRuntimeInputPublicApply" },
           bindings: {
             type: "object",
             minProperties: 1,
@@ -734,38 +735,21 @@ export const openApiDocument = {
         type: "object",
         required: [
           "format",
-          "operationId",
-          "preparationId",
-          "runtimeInputReference",
           "status",
-          "expiresAt",
-          "target",
+          "operationKey",
+          "applyCommitment",
           "canonicalPublicOrigin",
           "bindingNames",
         ],
         additionalProperties: false,
         properties: {
-          format: { const: "takoserver.worker-runtime-input-preparation@v1" },
-          operationId: IDENTIFIER_SCHEMA,
-          preparationId: { type: "string", pattern: "^prep-[0-9a-f]{32}$" },
-          runtimeInputReference: {
-            type: "string",
-            pattern: "^rip1\\.prep-[0-9a-f]{32}\\.[0-9a-f]{64}$",
-          },
+          format: { const: "takoserver.worker-runtime-input-preparation@v2" },
           status: {
             type: "string",
-            enum: [
-              "prepared",
-              "claimed",
-              "dispatched",
-              "consumed",
-              "revoked",
-              "expired",
-              "indeterminate",
-            ],
+            enum: ["prepared", "accepted", "dispatched", "consumed"],
           },
-          expiresAt: { type: "string", format: "date-time" },
-          target: { $ref: "#/components/schemas/WorkerRuntimeInputPreparationTarget" },
+          operationKey: OPERATION_KEY_SCHEMA,
+          applyCommitment: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
           canonicalPublicOrigin: CANONICAL_HTTPS_ORIGIN_SCHEMA,
           bindingNames: {
             type: "array",
@@ -773,6 +757,11 @@ export const openApiDocument = {
             maxItems: 64,
             uniqueItems: true,
             items: { type: "string", pattern: "^[A-Z_][A-Z0-9_]{0,127}$" },
+          },
+          hostOperationId: {
+            type: "string",
+            description: "Present exactly when the handoff has been claimed by a Host operation.",
+            pattern: "^op_[A-Za-z0-9][A-Za-z0-9._-]{0,124}$",
           },
         },
       },

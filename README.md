@@ -251,16 +251,20 @@ ordinary Host mutation; an omitted Offering is accepted only when that
 selection has exactly one eligible result. The reservation is value-free and
 does not create a Takoform Resource or call the provider.
 
-A preflight client computes a plan-known `rip1` reference from a non-secret
-nonce, the reservation's logical endpoint identity and canonical origin, and
-the exact sorted bindings. Runtime-input `PUT` supplies that reference plus the
-actual ModuleWorker UID; Takoserver recomputes it, atomically binds the live
-reservation and exact Ready worker revision/placement, and seals the material.
-It never accepts a caller-supplied origin. The provider lease claims that exact
+The sensitive half of a Worker Version travels separately, over
+`PUT|GET /v1/takoform/worker-runtime-input-preparations/{operationKey}` speaking
+`takoserver.worker-runtime-input-preparation@v2`. The operation key is the exact
+`Idempotency-Key` the ordinary public apply will carry, so one key names both
+halves of the same mutation. The private request states this Host's own
+canonical public origin and commits to the exact public apply it authorizes —
+method, path, `If-None-Match: *`, and body — and Takoserver recomputes that
+commitment and echoes it back, so a caller can prove the Host bound the values
+to the request it meant. Replaying the key with a different apply or different
+values is a conflict, not an overwrite. The provider lease claims that exact
 identity before any asset or Worker Version mutation, erases ciphertext in the
-dispatch CAS, and settles only after provider readback. Dispatch revision-fences
-the worker and reservation again. Post-dispatch recovery is value-free and
-reservation-independent.
+dispatch CAS, and settles only after provider readback. `GET` is the value-free
+recovery read: it never returns a value and never asks the caller to send the
+secrets a second time.
 
 Activation later proves the released, Ready `WorkerEndpoint`, its exact worker
 relation, provider placement, and canonical output. Deactivation retains the
@@ -282,7 +286,9 @@ using a demo backend.
 See [docs/adr/0001-provision-from-the-worker.md](docs/adr/0001-provision-from-the-worker.md)
 for why the deployed Worker holds the account credential, and what that costs.
 The reservation and RuntimeInputAuthority boundary is recorded in
-[docs/adr/0004-runtime-input-authority.md](docs/adr/0004-runtime-input-authority.md).
+[docs/adr/0004-runtime-input-authority.md](docs/adr/0004-runtime-input-authority.md),
+and the runtime-input wire contract this Host now speaks in
+[docs/adr/0006-runtime-input-wire-contract-v2.md](docs/adr/0006-runtime-input-wire-contract-v2.md).
 
 ## Resource and supply model
 

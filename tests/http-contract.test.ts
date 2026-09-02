@@ -77,7 +77,7 @@ const PUBLIC_PATHS = [
   "/v1/organizations/{organizationId}/api-keys/{apiKeyId}",
   "/v1/organizations/{organizationId}/operations",
   "/v1/organizations/{organizationId}/resources",
-  "/v1/organizations/{organizationId}/worker-runtime-input-preparations/{operationId}",
+  "/v1/takoform/worker-runtime-input-preparations/{operationKey}",
   "/v1/worker-endpoint-origin-reservations/{reservationId}",
   "/v1/worker-endpoint-origin-reservations/{reservationId}/activation",
   "/v1/organizations/{organizationId}/resources/{resourceUid}",
@@ -258,13 +258,12 @@ describe("published API description", () => {
     );
 
     expect(schemas.WorkerRuntimeInputPreparationRequest.additionalProperties).toBe(false);
-    expect(schemas.WorkerRuntimeInputPreparationRequest.required).toContain("materialSetNonce");
+    expect(schemas.WorkerRuntimeInputPreparationRequest.required).toContain("publicApply");
     expect(schemas.WorkerRuntimeInputPreparationRequest.required).toContain(
-      "runtimeInputReference",
-    );
-    expect(JSON.stringify(schemas.WorkerRuntimeInputPreparationRequest)).not.toContain(
       "canonicalPublicOrigin",
     );
+    // No secret value ever appears in the projection the caller reads back.
+    expect(JSON.stringify(schemas.WorkerRuntimeInputPreparation)).not.toContain("bindings");
   });
 
   test("mentions no other product and leaks no upstream identity vocabulary", () => {

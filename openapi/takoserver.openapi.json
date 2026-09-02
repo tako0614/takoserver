@@ -349,44 +349,42 @@
           }
         }
       },
-      "WorkerRuntimeInputPreparationTarget": {
+      "WorkerRuntimeInputPublicApply": {
         "type": "object",
+        "description": "The exact ordinary public apply this handoff authorizes. The host commits to it as the length-prefixed SHA-256 of [label, method, path, ifNoneMatch, body].",
         "required": [
-          "space",
-          "workerName",
-          "workerResourceUid",
-          "bundleName",
-          "originReservationId"
+          "method",
+          "path",
+          "fences",
+          "body"
         ],
         "additionalProperties": false,
         "properties": {
-          "space": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 128,
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+          "method": {
+            "const": "PUT"
           },
-          "workerName": {
+          "path": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 128,
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+            "maxLength": 8192,
+            "pattern": "^/"
           },
-          "workerResourceUid": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 128
+          "fences": {
+            "type": "object",
+            "required": [
+              "ifNoneMatch"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "ifNoneMatch": {
+                "const": "*"
+              }
+            }
           },
-          "bundleName": {
+          "body": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 128,
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
-          },
-          "originReservationId": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 128
+            "maxLength": 1048576
           }
         }
       },
@@ -394,33 +392,23 @@
         "type": "object",
         "required": [
           "format",
-          "materialSetId",
-          "materialSetNonce",
-          "runtimeInputReference",
-          "target",
+          "canonicalPublicOrigin",
+          "publicApply",
           "bindings"
         ],
         "additionalProperties": false,
         "properties": {
           "format": {
-            "const": "takoserver.worker-runtime-input-preparation@v1"
+            "const": "takoserver.worker-runtime-input-preparation@v2"
           },
-          "materialSetId": {
+          "canonicalPublicOrigin": {
             "type": "string",
-            "minLength": 1,
-            "maxLength": 128
+            "format": "uri",
+            "pattern": "^https://[^/]+$",
+            "maxLength": 2048
           },
-          "materialSetNonce": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 128
-          },
-          "runtimeInputReference": {
-            "type": "string",
-            "pattern": "^rip1\\.prep-[0-9a-f]{32}\\.[0-9a-f]{64}$"
-          },
-          "target": {
-            "$ref": "#/components/schemas/WorkerRuntimeInputPreparationTarget"
+          "publicApply": {
+            "$ref": "#/components/schemas/WorkerRuntimeInputPublicApply"
           },
           "bindings": {
             "type": "object",
@@ -441,51 +429,35 @@
         "type": "object",
         "required": [
           "format",
-          "operationId",
-          "preparationId",
-          "runtimeInputReference",
           "status",
-          "expiresAt",
-          "target",
+          "operationKey",
+          "applyCommitment",
           "canonicalPublicOrigin",
           "bindingNames"
         ],
         "additionalProperties": false,
         "properties": {
           "format": {
-            "const": "takoserver.worker-runtime-input-preparation@v1"
-          },
-          "operationId": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 128
-          },
-          "preparationId": {
-            "type": "string",
-            "pattern": "^prep-[0-9a-f]{32}$"
-          },
-          "runtimeInputReference": {
-            "type": "string",
-            "pattern": "^rip1\\.prep-[0-9a-f]{32}\\.[0-9a-f]{64}$"
+            "const": "takoserver.worker-runtime-input-preparation@v2"
           },
           "status": {
             "type": "string",
             "enum": [
               "prepared",
-              "claimed",
+              "accepted",
               "dispatched",
-              "consumed",
-              "revoked",
-              "expired",
-              "indeterminate"
+              "consumed"
             ]
           },
-          "expiresAt": {
+          "operationKey": {
             "type": "string",
-            "format": "date-time"
+            "minLength": 8,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
           },
-          "target": {
-            "$ref": "#/components/schemas/WorkerRuntimeInputPreparationTarget"
+          "applyCommitment": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
           },
           "canonicalPublicOrigin": {
             "type": "string",
@@ -502,6 +474,11 @@
               "type": "string",
               "pattern": "^[A-Z_][A-Z0-9_]{0,127}$"
             }
+          },
+          "hostOperationId": {
+            "type": "string",
+            "description": "Present exactly when the handoff has been claimed by a Host operation.",
+            "pattern": "^op_[A-Za-z0-9][A-Za-z0-9._-]{0,124}$"
           }
         }
       }
@@ -904,28 +881,31 @@
         }
       }
     },
-    "/v1/organizations/{organizationId}/worker-runtime-input-preparations/{operationId}": {
+    "/v1/takoform/worker-runtime-input-preparations/{operationKey}": {
       "put": {
         "summary": "Prepare one encrypted Worker runtime-input handoff",
         "parameters": [
           {
-            "name": "organizationId",
+            "name": "operationKey",
             "in": "path",
             "required": true,
             "schema": {
               "type": "string",
-              "minLength": 1,
-              "maxLength": 128
+              "minLength": 8,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
             }
           },
           {
-            "name": "operationId",
-            "in": "path",
+            "name": "Idempotency-Key",
+            "in": "header",
             "required": true,
+            "description": "Must equal the operation key in the path.",
             "schema": {
               "type": "string",
-              "minLength": 1,
-              "maxLength": 128
+              "minLength": 8,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
             }
           }
         ],
@@ -940,7 +920,7 @@
           }
         },
         "responses": {
-          "201": {
+          "200": {
             "description": "Prepared value-free handoff projection",
             "content": {
               "application/json": {
@@ -951,16 +931,16 @@
             }
           },
           "400": {
-            "description": "Malformed request or invalid preflight reference"
+            "description": "Malformed request, wrong Host origin, or wrong operation key"
           },
           "401": {
             "description": "Organization API key required"
           },
           "403": {
-            "description": "The key lacks resources:write or belongs to another organization"
+            "description": "The key lacks resources:write"
           },
           "409": {
-            "description": "Replay, reservation, worker revision, or placement conflict"
+            "description": "The operation key already carries a different or spent handoff"
           },
           "503": {
             "description": "Sealing or authority unavailable"
@@ -971,23 +951,26 @@
         "summary": "Read a Worker runtime-input handoff without secret values",
         "parameters": [
           {
-            "name": "organizationId",
+            "name": "operationKey",
             "in": "path",
             "required": true,
             "schema": {
               "type": "string",
-              "minLength": 1,
-              "maxLength": 128
+              "minLength": 8,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
             }
           },
           {
-            "name": "operationId",
-            "in": "path",
+            "name": "Idempotency-Key",
+            "in": "header",
             "required": true,
+            "description": "Must equal the operation key in the path.",
             "schema": {
               "type": "string",
-              "minLength": 1,
-              "maxLength": 128
+              "minLength": 8,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
             }
           }
         ],
@@ -1006,10 +989,10 @@
             "description": "Organization API key required"
           },
           "403": {
-            "description": "The key lacks resources:write or belongs to another organization"
+            "description": "The key lacks resources:write"
           },
           "404": {
-            "description": "Preparation not found"
+            "description": "No live handoff exists for this operation key"
           }
         }
       },
@@ -1017,23 +1000,26 @@
         "summary": "Revoke one undispatched Worker runtime-input handoff",
         "parameters": [
           {
-            "name": "organizationId",
+            "name": "operationKey",
             "in": "path",
             "required": true,
             "schema": {
               "type": "string",
-              "minLength": 1,
-              "maxLength": 128
+              "minLength": 8,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
             }
           },
           {
-            "name": "operationId",
-            "in": "path",
+            "name": "Idempotency-Key",
+            "in": "header",
             "required": true,
+            "description": "Must equal the operation key in the path.",
             "schema": {
               "type": "string",
-              "minLength": 1,
-              "maxLength": 128
+              "minLength": 8,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
             }
           }
         ],
@@ -1045,7 +1031,7 @@
             "description": "Organization API key required"
           },
           "403": {
-            "description": "The key lacks resources:write or belongs to another organization"
+            "description": "The key lacks resources:write"
           },
           "409": {
             "description": "The handoff is already dispatched or indeterminate"

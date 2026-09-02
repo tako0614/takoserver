@@ -62,7 +62,7 @@ describe("independent Takoserver Host boundary", () => {
     expect(support?.status).toBe(200);
     expect(await support?.json()).toMatchObject({
       limits: {
-        "/requiredSensitiveVars": 0,
+        "/maximumRequiredSensitiveVars": 0,
       },
     });
 

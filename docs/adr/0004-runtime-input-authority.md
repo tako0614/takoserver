@@ -1,6 +1,9 @@
 # ADR 0004 — Worker origin reservation and one-shot runtime-input authority
 
-**Status:** accepted, 2026-08-31
+**Status:** accepted, 2026-08-31. The runtime-input wire contract and the
+composition consequence below are superseded by
+[ADR 0006](0006-runtime-input-wire-contract-v2.md); the reservation authority
+stands.
 
 ## Decision
 

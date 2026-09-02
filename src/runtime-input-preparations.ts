@@ -4,23 +4,49 @@ import {
   type ProviderRuntimeInputLeasePort,
   type ProviderRuntimeInputPreparationIdentity,
 } from "./provider-runtime-input-port.ts";
-import type {
-  BoundWorkerEndpointOriginReservation,
-  WorkerEndpointOriginReservations,
-} from "./worker-endpoint-origin-reservations.ts";
+
+/**
+ * The one-shot Worker runtime-input handoff, wire contract v2.
+ *
+ * A provider that must deliver `requiredSensitiveVars` sends the values once,
+ * privately, addressed by the exact operation key it will also use as the
+ * public apply's `Idempotency-Key`. The same request commits to the exact
+ * public apply it authorizes — method, path, `If-None-Match`, and body — so a
+ * preparation can never be spent by a different mutation, and the caller can
+ * prove the Host echoed the commitment it computed itself.
+ *
+ * Everything else about the handoff is value-free. The durable row holds only
+ * sealed ciphertext, binding names, the commitment, and the identity of the
+ * operation that claimed it; the projection returned to the caller holds no
+ * values at all, so a lost acknowledgement is recovered by reading rather than
+ * by sending the secrets a second time.
+ */
 
 export const RUNTIME_INPUT_PREPARATION_FORMAT =
-  "takoserver.worker-runtime-input-preparation@v1" as const;
+  "takoserver.worker-runtime-input-preparation@v2" as const;
 
-const SEALED_PAYLOAD_FORMAT = "takoserver.worker-runtime-input-sealed-payload@v1" as const;
-const AAD_FORMAT = "takoserver.worker-runtime-input-aad@v1" as const;
-export const RUNTIME_INPUT_PREFLIGHT_FORMAT =
-  "takoserver.worker-runtime-input-preflight.v1" as const;
-const RUNTIME_INPUT_REFERENCE_PREFIX = "rip1";
+/**
+ * Label of the cross-implementation public-apply commitment. The framing is
+ * length-prefixed on purpose: concatenating a path and a body without one lets
+ * two different requests hash the same.
+ */
+export const RUNTIME_INPUT_PUBLIC_APPLY_COMMITMENT_LABEL =
+  "takoserver.worker-runtime-input-public-apply@v1" as const;
+
+const SEALED_PAYLOAD_FORMAT = "takoserver.worker-runtime-input-sealed-payload@v2" as const;
+const AAD_FORMAT = "takoserver.worker-runtime-input-aad@v2" as const;
+const PREPARATION_ID_FORMAT = "takoserver.worker-runtime-input-preparation-id@v2" as const;
+const RECEIPT_FORMAT = "takoserver.worker-runtime-input-receipt@v2" as const;
+
 const PREPARATION_TTL_MILLISECONDS = 60 * 60 * 1_000;
 const CLAIM_TTL_MILLISECONDS = 15 * 60 * 1_000;
 const MAX_VALUE_BYTES = 32 * 1_024;
+const MAX_PUBLIC_APPLY_PATH_BYTES = 8 * 1_024;
+const MAX_PUBLIC_APPLY_BODY_BYTES = 1 * 1_024 * 1_024;
+
 const opaqueId = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+/** Exactly the grammar the stable Host requires of a mutation Idempotency-Key. */
+const operationKeyPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/u;
 const bindingName = /^[A-Z_][A-Z0-9_]{0,127}$/u;
 const digest = /^sha256:[0-9a-f]{64}$/u;
 
@@ -29,170 +55,106 @@ export interface RuntimeInputSealKey {
   readonly key: CryptoKey;
 }
 
-export interface RuntimeInputPreparationTarget {
-  readonly space: string;
-  readonly workerName: string;
-  readonly workerResourceUid: string;
-  readonly bundleName: string;
-  readonly originReservationId: string;
+/** The exact ordinary public apply one preparation authorizes. */
+export interface RuntimeInputPublicApply {
+  readonly method: string;
+  readonly path: string;
+  readonly fences: { readonly ifNoneMatch: string };
+  readonly body: string;
 }
 
 export interface RuntimeInputPreparationInput {
   readonly organizationId: string;
-  readonly operationId: string;
-  readonly materialSetId: string;
-  readonly materialSetNonce: string;
-  /** Plan-known commitment recomputed from the reservation and exact values. */
-  readonly runtimeInputReference: string;
-  readonly target: RuntimeInputPreparationTarget;
+  readonly operationKey: string;
+  /** This Host's own canonical public origin, as the caller addressed it. */
+  readonly canonicalPublicOrigin: string;
+  readonly publicApply: RuntimeInputPublicApply;
   readonly bindings: Readonly<Record<string, string>>;
 }
 
-export interface RuntimeInputPreflightDocument {
-  readonly format: typeof RUNTIME_INPUT_PREFLIGHT_FORMAT;
-  readonly materialSetNonce: string;
-  readonly target: {
-    readonly space: string;
-    readonly workerName: string;
-    readonly bundleName: string;
-    readonly endpointName: string;
-    readonly originReservationId: string;
-    readonly canonicalPublicOrigin: string;
-  };
-  readonly bindings: Readonly<Record<string, string>>;
-}
-
-/** Cross-language plan-time reference derivation shared by preflight clients. */
-export async function deriveRuntimeInputReference(input: RuntimeInputPreflightDocument): Promise<{
-  readonly preparationId: string;
-  readonly commitment: `sha256:${string}`;
-  readonly runtimeInputReference: string;
-}> {
-  if (input.format !== RUNTIME_INPUT_PREFLIGHT_FORMAT) {
-    throw new RuntimeInputPreparationError("invalid_argument", 400);
-  }
-  validateOpaqueId(input.materialSetNonce);
-  for (const value of Object.values(input.target)) validateBoundedText(value, 2_048);
-  validateCanonicalOrigin(input.target.canonicalPublicOrigin);
-  const names = Object.keys(input.bindings).sort();
-  if (
-    names.length === 0 ||
-    names.length > MAX_PROVIDER_RUNTIME_INPUT_BINDINGS ||
-    names.some((name) => !bindingName.test(name))
-  ) {
-    throw new RuntimeInputPreparationError("invalid_argument", 400);
-  }
-  const bindings: Record<string, string> = {};
-  for (const name of names) {
-    const value = input.bindings[name];
-    if (
-      typeof value !== "string" ||
-      value.length === 0 ||
-      hasUnpairedSurrogate(value) ||
-      encode(value).byteLength > MAX_VALUE_BYTES
-    ) {
-      throw new RuntimeInputPreparationError("invalid_argument", 400);
-    }
-    bindings[name] = value;
-  }
-  const canonical = crossLanguageJson({
-    format: RUNTIME_INPUT_PREFLIGHT_FORMAT,
-    materialSetNonce: input.materialSetNonce,
-    target: {
-      space: input.target.space,
-      workerName: input.target.workerName,
-      bundleName: input.target.bundleName,
-      endpointName: input.target.endpointName,
-      originReservationId: input.target.originReservationId,
-      canonicalPublicOrigin: input.target.canonicalPublicOrigin,
-    },
-    bindings,
-  });
-  const bytes = new Uint8Array(
-    await crypto.subtle.digest("SHA-256", encode(canonical) as unknown as BufferSource),
-  );
-  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-  const preparationId = `prep-${hex.slice(0, 32)}`;
-  const commitment = `sha256:${hex}` as const;
-  return {
-    preparationId,
-    commitment,
-    runtimeInputReference: runtimeInputReferenceValue(preparationId, commitment),
-  };
-}
-
-/**
- * Go's encoding/json always escapes the two ECMAScript line-separator scalars
- * even with HTML escaping disabled. Preserve that exact wire behavior so a
- * provider-computed plan reference and the server commitment are byte-equal.
- */
-function crossLanguageJson(value: unknown): string {
-  return JSON.stringify(value).replaceAll("\u2028", "\\u2028").replaceAll("\u2029", "\\u2029");
-}
-
-function hasUnpairedSurrogate(value: string): boolean {
-  for (let index = 0; index < value.length; index += 1) {
-    const codeUnit = value.charCodeAt(index);
-    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
-      if (index + 1 >= value.length) return true;
-      const next = value.charCodeAt(index + 1);
-      if (next < 0xdc00 || next > 0xdfff) return true;
-      index += 1;
-    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
-      return true;
-    }
-  }
-  return false;
-}
+export type RuntimeInputPreparationStatus = "prepared" | "accepted" | "dispatched" | "consumed";
 
 export interface RuntimeInputPreparationProjection {
   readonly format: typeof RUNTIME_INPUT_PREPARATION_FORMAT;
-  readonly operationId: string;
-  readonly preparationId: string;
-  /** Opaque value the caller must reuse as the exact Host mutation idempotency key. */
-  readonly runtimeInputReference: string;
-  readonly status:
-    | "prepared"
-    | "claimed"
-    | "dispatched"
-    | "consumed"
-    | "revoked"
-    | "expired"
-    | "indeterminate";
-  readonly expiresAt: string;
-  readonly target: RuntimeInputPreparationTarget;
+  readonly status: RuntimeInputPreparationStatus;
+  readonly operationKey: string;
+  readonly applyCommitment: `sha256:${string}`;
   readonly canonicalPublicOrigin: string;
   readonly bindingNames: readonly string[];
+  /** Present exactly when the handoff has been claimed by a Host operation. */
+  readonly hostOperationId?: string;
+}
+
+/**
+ * The cross-implementation commitment to one exact public apply request.
+ *
+ * Each field in `[label, method, path, ifNoneMatch, body]` is UTF-8 preceded by
+ * its unsigned 64-bit big-endian byte length; the SHA-256 is lowercase hex.
+ * This is byte-for-byte the framing the released Takoform provider computes, so
+ * the two sides compare one string instead of trusting each other's
+ * canonicalization.
+ */
+export async function runtimeInputPublicApplyCommitment(
+  apply: RuntimeInputPublicApply,
+): Promise<`sha256:${string}`> {
+  if (apply.method !== "PUT") throw new RuntimeInputPreparationError("invalid_argument", 400);
+  if (apply.fences?.ifNoneMatch !== "*") {
+    throw new RuntimeInputPreparationError("invalid_argument", 400);
+  }
+  const path = utf8(apply.path, MAX_PUBLIC_APPLY_PATH_BYTES);
+  if (path.byteLength < 1 || !apply.path.startsWith("/")) {
+    throw new RuntimeInputPreparationError("invalid_argument", 400);
+  }
+  const body = utf8(apply.body, MAX_PUBLIC_APPLY_BODY_BYTES);
+  if (body.byteLength < 1) throw new RuntimeInputPreparationError("invalid_argument", 400);
+  const fields = [
+    encode(RUNTIME_INPUT_PUBLIC_APPLY_COMMITMENT_LABEL),
+    encode(apply.method),
+    path,
+    encode(apply.fences.ifNoneMatch),
+    body,
+  ];
+  let total = 0;
+  for (const field of fields) total += 8 + field.byteLength;
+  const framed = new Uint8Array(total);
+  const view = new DataView(framed.buffer);
+  let offset = 0;
+  for (const field of fields) {
+    view.setBigUint64(offset, BigInt(field.byteLength), false);
+    offset += 8;
+    framed.set(field, offset);
+    offset += field.byteLength;
+  }
+  return await sha256(framed);
+}
+
+export interface RuntimeInputClaimTarget {
+  readonly space: string;
+  readonly workerName: string;
+  /** Exact ModuleWorker incarnation re-read at the provider mutation barrier. */
+  readonly workerResourceUid: string;
+  readonly bundleName: string;
 }
 
 export interface RuntimeInputClaimInput {
   readonly organizationId: string;
-  readonly preparationId: string;
-  readonly preparationCommitment: `sha256:${string}`;
+  readonly operationKey: string;
+  /** The exact Host operation the claim belongs to. */
   readonly claimOwner: string;
+  /** The WorkerVersion Resource being created by that operation. */
   readonly resourceUid: string;
-  readonly target: Pick<
-    RuntimeInputPreparationTarget,
-    "space" | "workerName" | "workerResourceUid" | "bundleName"
-  >;
+  readonly target: RuntimeInputClaimTarget;
   readonly bindingNames: readonly string[];
 }
 
 export interface RuntimeInputClaim {
-  readonly operationId: string;
+  readonly operationKey: string;
   readonly preparationId: string;
-  readonly preparationCommitment: `sha256:${string}`;
-  readonly fence: number;
-  readonly materialSetId: string;
+  readonly applyCommitment: `sha256:${string}`;
   readonly canonicalPublicOrigin: string;
-  readonly originReservationId: string;
   readonly workerResourceUid: string;
-  readonly workerResourceRevision: string;
-  readonly originReservationRevision: string;
-  readonly providerPackRef: string;
-  readonly providerInstallationRef: string;
-  readonly offeringId: string;
-  readonly offeringDigest: `sha256:${string}`;
+  readonly hostOperationId: string;
+  readonly fence: number;
   readonly bindings: Readonly<Record<string, string>>;
 }
 
@@ -206,29 +168,13 @@ export interface RuntimeInputClaimIdentity {
   readonly fence: number;
 }
 
-export type RuntimeInputDispatchIdentity = RuntimeInputClaimIdentity;
-
 export interface RuntimeInputConsumption extends RuntimeInputClaimIdentity {
-  readonly receiptDigest: `sha256:${string}`;
-}
-
-export interface RuntimeInputRecoveredConsumption {
-  readonly organizationId: string;
-  readonly preparationId: string;
-  readonly preparationCommitment: `sha256:${string}`;
-  readonly claimOwner: string;
-  readonly resourceUid: string;
-  readonly target: Pick<
-    RuntimeInputPreparationTarget,
-    "space" | "workerName" | "workerResourceUid" | "bundleName"
-  >;
-  readonly bindingNames: readonly string[];
   readonly receiptDigest: `sha256:${string}`;
 }
 
 export class RuntimeInputPreparationError extends Error {
   constructor(
-    readonly code: "invalid_argument" | "conflict" | "not_found" | "unavailable",
+    readonly code: "invalid_argument" | "conflict" | "operation_not_found" | "unavailable",
     readonly status: 400 | 404 | 409 | 503,
   ) {
     super(code);
@@ -237,26 +183,24 @@ export class RuntimeInputPreparationError extends Error {
 }
 
 export interface RuntimeInputPreparations {
-  prepare(input: BoundRuntimeInputPreparationInput): Promise<RuntimeInputPreparationProjection>;
+  prepare(input: RuntimeInputPreparationInput): Promise<RuntimeInputPreparationProjection>;
   read(
     organizationId: string,
-    operationId: string,
+    operationKey: string,
   ): Promise<RuntimeInputPreparationProjection | null>;
   claim(input: RuntimeInputClaimInput): Promise<RuntimeInputClaim>;
-  /** Value-free exact-reference validation performed before an external authority lookup. */
-  inspect(input: RuntimeInputClaimInput): Promise<RuntimeInputRecoveryIdentity>;
   abort(input: RuntimeInputClaimIdentity): Promise<void>;
-  dispatch(input: RuntimeInputDispatchIdentity): Promise<{ readonly fence: number }>;
+  dispatch(input: RuntimeInputClaimIdentity): Promise<{ readonly fence: number }>;
   consume(input: RuntimeInputConsumption): Promise<void>;
   /** Reads only the value-free identity of one exact dispatched handoff. */
-  recover(
-    input: Omit<RuntimeInputRecoveredConsumption, "receiptDigest">,
-  ): Promise<RuntimeInputRecoveryIdentity>;
+  recover(input: RuntimeInputClaimInput): Promise<RuntimeInputRecoveryIdentity>;
   /** Settles the one dispatched handoff after provider acknowledgement recovery. */
-  consumeRecovered(input: RuntimeInputRecoveredConsumption): Promise<void>;
+  consumeRecovered(
+    input: RuntimeInputClaimInput & { readonly receiptDigest: `sha256:${string}` },
+  ): Promise<void>;
   /** Revokes an exact claimed/dispatched handoff after proven provider absence. */
-  abandon(input: Omit<RuntimeInputRecoveredConsumption, "receiptDigest">): Promise<void>;
-  revoke(organizationId: string, operationId: string): Promise<void>;
+  abandon(input: RuntimeInputClaimInput): Promise<void>;
+  revoke(organizationId: string, operationKey: string): Promise<void>;
   expireDue(limit: number): Promise<number>;
 }
 
@@ -266,9 +210,9 @@ export interface RuntimeInputAuthority {
     prepare(input: RuntimeInputPreparationInput): Promise<RuntimeInputPreparationProjection>;
     read(
       organizationId: string,
-      operationId: string,
+      operationKey: string,
     ): Promise<RuntimeInputPreparationProjection | null>;
-    revoke(organizationId: string, operationId: string): Promise<void>;
+    revoke(organizationId: string, operationKey: string): Promise<void>;
   };
   /** Provider-neutral one-shot lease seam used by concrete provider adapters. */
   readonly leases: ProviderRuntimeInputLeasePort;
@@ -278,150 +222,69 @@ export interface RuntimeInputAuthority {
   };
 }
 
+export interface CreateRuntimeInputPreparationsOptions {
+  readonly sql: Sql;
+  readonly sealKeys: {
+    readonly current: RuntimeInputSealKey;
+    readonly previous?: readonly RuntimeInputSealKey[];
+  };
+  readonly clock: Clock;
+  /**
+   * This deployment's own canonical public origin. A preparation addressed to a
+   * different origin is refused before anything is sealed: the caller is either
+   * misconfigured or talking to a Host it did not mean to trust.
+   */
+  readonly canonicalPublicOrigin: string;
+  readonly randomBytes?: (length: number) => Uint8Array;
+}
+
 export function createRuntimeInputAuthority(
-  options: Parameters<typeof createRuntimeInputPreparations>[0] & {
-    readonly originReservations: Pick<WorkerEndpointOriginReservations, "bind" | "inspectBound">;
-  },
+  options: CreateRuntimeInputPreparationsOptions,
 ): RuntimeInputAuthority {
   const internals = createRuntimeInputPreparations(options);
-  const assertReservation = async (
-    organizationId: string,
-    target: RuntimeInputPreparationTarget,
-    expected?: RuntimeInputRecoveryIdentity,
-  ): Promise<BoundWorkerEndpointOriginReservation> => {
-    let reservation: BoundWorkerEndpointOriginReservation;
-    try {
-      reservation = await options.originReservations.inspectBound({
-        organizationId,
-        reservationId: target.originReservationId,
-        space: target.space,
-        workerName: target.workerName,
-        workerResourceUid: target.workerResourceUid,
-      });
-    } catch (error) {
-      if (error instanceof RuntimeInputPreparationError) throw error;
-      if (
-        typeof error === "object" &&
-        error !== null &&
-        "status" in error &&
-        (error.status === 404 || error.status === 409)
-      ) {
-        throw new RuntimeInputPreparationError("conflict", 409);
-      }
-      throw new RuntimeInputPreparationError("unavailable", 503);
-    }
-    if (
-      expected &&
-      (expected.originReservationId !== reservation.reservationId ||
-        expected.canonicalPublicOrigin !== reservation.canonicalPublicOrigin ||
-        expected.workerResourceUid !== reservation.binding.workerResourceUid ||
-        expected.workerResourceRevision !== reservation.binding.workerResourceRevision ||
-        expected.originReservationRevision !== reservation.revision ||
-        expected.providerPackRef !== reservation.providerPackRef ||
-        expected.providerInstallationRef !== reservation.providerInstallationRef ||
-        expected.offeringId !== reservation.offeringId ||
-        expected.offeringDigest !== reservation.offeringDigest)
-    ) {
-      throw new RuntimeInputPreparationError("conflict", 409);
-    }
-    return reservation;
-  };
-  const inspect = async (
-    input: Parameters<RuntimeInputPreparations["inspect"]>[0],
-  ): Promise<RuntimeInputRecoveryIdentity> => {
-    const inspected = await internals.inspect(input);
-    await assertReservation(
-      input.organizationId,
-      {
-        ...input.target,
-        workerResourceUid: inspected.workerResourceUid,
-        originReservationId: inspected.originReservationId,
-      },
-      inspected,
-    );
-    return inspected;
-  };
+  const claimInputFor = (input: {
+    readonly organizationId: string;
+    readonly operationId: string;
+    readonly resourceUid: string;
+    readonly reference: string;
+    readonly target: RuntimeInputClaimTarget;
+    readonly bindingNames: readonly string[];
+  }): RuntimeInputClaimInput => ({
+    organizationId: input.organizationId,
+    operationKey: input.reference,
+    claimOwner: input.operationId,
+    resourceUid: input.resourceUid,
+    target: input.target,
+    bindingNames: input.bindingNames,
+  });
+
   return {
     preparations: {
-      prepare: async (input) => {
-        let reservation: BoundWorkerEndpointOriginReservation;
-        try {
-          reservation = await options.originReservations.bind({
-            organizationId: input.organizationId,
-            reservationId: input.target.originReservationId,
-            space: input.target.space,
-            workerName: input.target.workerName,
-            workerResourceUid: input.target.workerResourceUid,
-          });
-        } catch (error) {
-          if (error instanceof RuntimeInputPreparationError) throw error;
-          if (
-            typeof error === "object" &&
-            error !== null &&
-            "status" in error &&
-            (error.status === 404 || error.status === 409)
-          ) {
-            throw new RuntimeInputPreparationError("conflict", 409);
-          }
-          throw new RuntimeInputPreparationError("unavailable", 503);
-        }
-        return await internals.prepare({ ...input, reservation });
-      },
-      read: (organizationId, operationId) => internals.read(organizationId, operationId),
-      revoke: (organizationId, operationId) => internals.revoke(organizationId, operationId),
+      prepare: (input) => internals.prepare(input),
+      read: (organizationId, operationKey) => internals.read(organizationId, operationKey),
+      revoke: (organizationId, operationKey) => internals.revoke(organizationId, operationKey),
     },
     leases: {
       async acquire(input) {
-        const reference = runtimeInputReference(input.reference);
-        const claimInput = {
+        const claim = await internals.claim(claimInputFor(input));
+        const preparation = preparationIdentity(claim);
+        const identity: RuntimeInputClaimIdentity = {
           organizationId: input.organizationId,
-          preparationId: reference.preparationId,
-          preparationCommitment: reference.commitment,
+          preparationId: claim.preparationId,
           claimOwner: input.operationId,
           resourceUid: input.resourceUid,
-          target: input.target,
-          bindingNames: input.bindingNames,
+          fence: claim.fence,
         };
-        await inspect(claimInput);
-        const claim = await internals.claim(claimInput);
-        const preparation = preparationIdentity(claim);
         return {
           bindings: claim.bindings,
           preparation,
-          abort: async () =>
-            await internals.abort({
-              organizationId: input.organizationId,
-              preparationId: claim.preparationId,
-              claimOwner: input.operationId,
-              resourceUid: input.resourceUid,
-              fence: claim.fence,
-            }),
+          abort: async () => await internals.abort(identity),
           async dispatch() {
-            await assertReservation(
-              input.organizationId,
-              {
-                space: input.target.space,
-                workerName: input.target.workerName,
-                workerResourceUid: claim.workerResourceUid,
-                bundleName: input.target.bundleName,
-                originReservationId: claim.originReservationId,
-              },
-              claim,
-            );
-            const dispatched = await internals.dispatch({
-              organizationId: input.organizationId,
-              preparationId: claim.preparationId,
-              claimOwner: input.operationId,
-              resourceUid: input.resourceUid,
-              fence: claim.fence,
-            });
+            const dispatched = await internals.dispatch(identity);
             return {
               settle: async (providerReceiptDigest) =>
                 await internals.consume({
-                  organizationId: input.organizationId,
-                  preparationId: claim.preparationId,
-                  claimOwner: input.operationId,
-                  resourceUid: input.resourceUid,
+                  ...identity,
                   fence: dispatched.fence,
                   receiptDigest: await runtimeInputReceiptDigest({
                     preparation,
@@ -436,34 +299,17 @@ export function createRuntimeInputAuthority(
         };
       },
       async recover(input) {
-        const reference = runtimeInputReference(input.reference);
-        const recoveryInput = {
-          organizationId: input.organizationId,
-          preparationId: reference.preparationId,
-          preparationCommitment: reference.commitment,
-          claimOwner: input.operationId,
-          resourceUid: input.resourceUid,
-          target: input.target,
-          bindingNames: input.bindingNames,
-        };
-        const recovered = await internals.recover(recoveryInput);
-        if (recovered.preparationCommitment !== reference.commitment) {
-          throw new RuntimeInputPreparationError("conflict", 409);
-        }
+        const claimInput = claimInputFor(input);
+        const recovered = await internals.recover(claimInput);
+        const preparation = preparationIdentity(recovered);
         return {
-          preparation: preparationIdentity(recovered),
+          preparation,
           bindingNames: [...input.bindingNames].sort(),
           settle: async (providerReceiptDigest) =>
             await internals.consumeRecovered({
-              organizationId: input.organizationId,
-              preparationId: reference.preparationId,
-              preparationCommitment: reference.commitment,
-              claimOwner: input.operationId,
-              resourceUid: input.resourceUid,
-              target: input.target,
-              bindingNames: input.bindingNames,
+              ...claimInput,
               receiptDigest: await runtimeInputReceiptDigest({
-                preparation: preparationIdentity(recovered),
+                preparation,
                 organizationId: input.organizationId,
                 operationId: input.operationId,
                 resourceUid: input.resourceUid,
@@ -473,16 +319,7 @@ export function createRuntimeInputAuthority(
         };
       },
       async abandon(input) {
-        const reference = runtimeInputReference(input.reference);
-        await internals.abandon({
-          organizationId: input.organizationId,
-          preparationId: reference.preparationId,
-          preparationCommitment: reference.commitment,
-          claimOwner: input.operationId,
-          resourceUid: input.resourceUid,
-          target: input.target,
-          bindingNames: input.bindingNames,
-        });
+        await internals.abandon(claimInputFor(input));
       },
     },
     maintenance: {
@@ -491,22 +328,17 @@ export function createRuntimeInputAuthority(
   };
 }
 
-export function createRuntimeInputPreparations(options: {
-  readonly sql: Sql;
-  readonly sealKeys: {
-    readonly current: RuntimeInputSealKey;
-    readonly previous?: readonly RuntimeInputSealKey[];
-  };
-  readonly clock: Clock;
-  readonly randomId: () => string;
-  readonly randomBytes?: (length: number) => Uint8Array;
-}): RuntimeInputPreparations {
+export function createRuntimeInputPreparations(
+  options: CreateRuntimeInputPreparationsOptions,
+): RuntimeInputPreparations {
   const keys = new Map<string, CryptoKey>();
   for (const candidate of [options.sealKeys.current, ...(options.sealKeys.previous ?? [])]) {
     validateSealKey(candidate);
     if (keys.has(candidate.keyId)) throw new TypeError("runtime input seal key ids must be unique");
     keys.set(candidate.keyId, candidate.key);
   }
+  const hostOrigin = options.canonicalPublicOrigin;
+  validateBareOrigin(hostOrigin);
   const randomBytes =
     options.randomBytes ??
     ((length: number) => {
@@ -515,204 +347,153 @@ export function createRuntimeInputPreparations(options: {
       return value;
     });
 
+  const seal = async (
+    normalized: NormalizedPreparation,
+    preparationId: string,
+  ): Promise<{ readonly ciphertext: string; readonly nonce: string; readonly keyId: string }> => {
+    const key = options.sealKeys.current;
+    const nonce = Uint8Array.from(randomBytes(12));
+    if (nonce.byteLength !== 12) {
+      throw new TypeError("runtime input nonce source must return 12 bytes");
+    }
+    const ciphertext = await crypto.subtle.encrypt(
+      {
+        name: "AES-GCM",
+        iv: nonce,
+        additionalData: encode(canonicalAad(normalized, preparationId, key.keyId)),
+        tagLength: 128,
+      },
+      key.key,
+      encode(canonicalSealedPayload(normalized)),
+    );
+    return {
+      ciphertext: base64Url(new Uint8Array(ciphertext)),
+      nonce: base64Url(nonce),
+      keyId: key.keyId,
+    };
+  };
+
   return {
     async prepare(input) {
-      const normalized = normalizeInput(input);
-      const reference = await computeBoundRuntimeInputReference(normalized);
-      if (input.runtimeInputReference !== reference.value) {
-        throw new RuntimeInputPreparationError("invalid_argument", 400);
-      }
+      const normalized = await normalizePreparation(input, hostOrigin);
+      const preparationId = await derivePreparationId(
+        normalized.organizationId,
+        normalized.operationKey,
+      );
+      const now = options.clock().getTime();
       const existing = await readRow(
         options.sql,
         normalized.organizationId,
-        normalized.operationId,
+        normalized.operationKey,
       );
-      if (existing) return await adoptExisting(existing, normalized, keys, options.clock);
+      if (existing) {
+        if (existing.state === "prepared" && existing.expires_at > now) {
+          return await adoptExisting(existing, normalized, keys);
+        }
+        if (!replaceablePreparation(existing, now)) {
+          throw new RuntimeInputPreparationError("conflict", 409);
+        }
+        await discardReplaceable(options.sql, existing);
+      }
 
-      const preparationId = reference.preparationId;
-      const preparationCommitment = reference.commitment;
-      const createdAt = options.clock().getTime();
-      const expiresAt =
-        normalized.reservation.status === "activated"
-          ? createdAt + PREPARATION_TTL_MILLISECONDS
-          : Math.min(
-              createdAt + PREPARATION_TTL_MILLISECONDS,
-              normalized.reservation.expiresAtEpochMilliseconds,
-            );
-      if (expiresAt <= createdAt) throw new RuntimeInputPreparationError("conflict", 409);
-      const key = options.sealKeys.current;
-      const nonce = Uint8Array.from(randomBytes(12));
-      if (nonce.byteLength !== 12)
-        throw new TypeError("runtime input nonce source must return 12 bytes");
-      const plaintext = canonicalSealedPayload(normalized);
-      const aad = canonicalAad(normalized, preparationId, key.keyId);
-      const ciphertext = await crypto.subtle.encrypt(
-        { name: "AES-GCM", iv: nonce, additionalData: encode(aad), tagLength: 128 },
-        key.key,
-        encode(plaintext),
-      );
-
+      const sealed = await seal(normalized, preparationId);
+      const expiresAt = now + PREPARATION_TTL_MILLISECONDS;
       try {
         const inserted = await options.sql.run(
           `INSERT INTO worker_runtime_input_preparations
-             (organization_id, operation_id, preparation_id, preparation_commitment,
-              material_set_id, material_set_nonce,
-              space, worker_name, endpoint_name, worker_resource_uid, worker_resource_revision, bundle_name,
-              origin_reservation_id, origin_reservation_revision, canonical_public_origin,
-              provider_pack_ref, provider_installation_ref, offering_id, offering_digest,
-              binding_names_json,
+             (organization_id, operation_key, preparation_id, apply_commitment,
+              canonical_public_origin, binding_names_json,
               sealed_payload, seal_nonce, seal_key_id,
-              state, fence, claim_owner, claim_expires_at,
-              claimed_resource_uid, dispatched_operation_id, consumed_receipt_digest,
-              expires_at, created_at, updated_at, consumed_at, revoked_at)
-           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                  'prepared', 1, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, NULL, NULL
-           WHERE EXISTS (
-             SELECT 1 FROM worker_endpoint_origin_reservations
-             WHERE organization_id = ? AND reservation_id = ?
-               AND revision = ? AND state IN ('bound', 'activated')
-               AND (state = 'activated' OR expires_at > ?)
-               AND canonical_public_origin = ? AND worker_resource_uid = ?
-               AND worker_resource_revision = ? AND provider_pack_ref = ?
-               AND provider_installation_ref = ? AND offering_id = ? AND offering_digest = ?
-           ) AND EXISTS (
-             SELECT 1 FROM tf_resources
-             WHERE tenant_id = ? AND uid = ? AND space = ? AND name = ? AND kind = 'ModuleWorker'
-               AND revision = ?
-           ) AND EXISTS (
-             SELECT 1 FROM tf_resource_deployments
-             WHERE tenant_id = ? AND resource_uid = ? AND state = 'active'
-               AND offering_id = ? AND provider_pack_ref = ? AND provider_installation_ref = ?
-           ) AND EXISTS (
-             SELECT 1 FROM tf_resource_deletion_attestations
-             WHERE tenant_id = ? AND resource_uid = ? AND state = 'live'
-           )`,
+              state, fence, host_operation_id, claim_owner, claim_expires_at,
+              claimed_resource_uid, space, worker_name, worker_resource_uid, bundle_name,
+              consumed_receipt_digest, expires_at, created_at, updated_at, consumed_at, revoked_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', 1,
+                   NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, NULL, NULL)`,
           [
             normalized.organizationId,
-            normalized.operationId,
+            normalized.operationKey,
             preparationId,
-            preparationCommitment,
-            normalized.materialSetId,
-            normalized.materialSetNonce,
-            normalized.target.space,
-            normalized.target.workerName,
-            normalized.reservation.binding.endpointName,
-            normalized.target.workerResourceUid,
-            normalized.reservation.binding.workerResourceRevision,
-            normalized.target.bundleName,
-            normalized.target.originReservationId,
-            Number(normalized.reservation.revision),
+            normalized.applyCommitment,
             normalized.canonicalPublicOrigin,
-            normalized.reservation.providerPackRef,
-            normalized.reservation.providerInstallationRef,
-            normalized.reservation.offeringId,
-            normalized.reservation.offeringDigest,
             JSON.stringify(normalized.bindingNames),
-            base64Url(new Uint8Array(ciphertext)),
-            base64Url(nonce),
-            key.keyId,
+            sealed.ciphertext,
+            sealed.nonce,
+            sealed.keyId,
             expiresAt,
-            createdAt,
-            createdAt,
-            normalized.organizationId,
-            normalized.target.originReservationId,
-            Number(normalized.reservation.revision),
-            createdAt,
-            normalized.canonicalPublicOrigin,
-            normalized.target.workerResourceUid,
-            normalized.reservation.binding.workerResourceRevision,
-            normalized.reservation.providerPackRef,
-            normalized.reservation.providerInstallationRef,
-            normalized.reservation.offeringId,
-            normalized.reservation.offeringDigest,
-            normalized.organizationId,
-            normalized.target.workerResourceUid,
-            normalized.target.space,
-            normalized.target.workerName,
-            normalized.reservation.binding.workerResourceRevision,
-            normalized.organizationId,
-            normalized.target.workerResourceUid,
-            normalized.reservation.offeringId,
-            normalized.reservation.providerPackRef,
-            normalized.reservation.providerInstallationRef,
-            normalized.organizationId,
-            normalized.target.workerResourceUid,
+            now,
+            now,
           ],
         );
-        if (inserted.changes !== 1) {
-          throw new RuntimeInputPreparationError("conflict", 409);
+        if (inserted.changes !== 1) throw new RuntimeInputPreparationError("conflict", 409);
+      } catch (error) {
+        if (error instanceof RuntimeInputPreparationError) throw error;
+        const raced = await readRow(
+          options.sql,
+          normalized.organizationId,
+          normalized.operationKey,
+        );
+        if (raced?.state === "prepared" && raced.expires_at > now) {
+          return await adoptExisting(raced, normalized, keys);
         }
-      } catch {
-        const raced = await readRow(options.sql, normalized.organizationId, normalized.operationId);
-        if (raced) return await adoptExisting(raced, normalized, keys, options.clock);
         throw new RuntimeInputPreparationError("unavailable", 503);
       }
-
       return projection({
         organization_id: normalized.organizationId,
-        operation_id: normalized.operationId,
+        operation_key: normalized.operationKey,
         preparation_id: preparationId,
-        preparation_commitment: preparationCommitment,
-        material_set_id: normalized.materialSetId,
-        material_set_nonce: normalized.materialSetNonce,
-        space: normalized.target.space,
-        worker_name: normalized.target.workerName,
-        endpoint_name: normalized.reservation.binding.endpointName,
-        worker_resource_uid: normalized.target.workerResourceUid,
-        worker_resource_revision: normalized.reservation.binding.workerResourceRevision,
-        bundle_name: normalized.target.bundleName,
-        origin_reservation_id: normalized.target.originReservationId,
-        origin_reservation_revision: Number(normalized.reservation.revision),
+        apply_commitment: normalized.applyCommitment,
         canonical_public_origin: normalized.canonicalPublicOrigin,
-        provider_pack_ref: normalized.reservation.providerPackRef,
-        provider_installation_ref: normalized.reservation.providerInstallationRef,
-        offering_id: normalized.reservation.offeringId,
-        offering_digest: normalized.reservation.offeringDigest,
         binding_names_json: JSON.stringify(normalized.bindingNames),
-        sealed_payload: base64Url(new Uint8Array(ciphertext)),
-        seal_nonce: base64Url(nonce),
-        seal_key_id: key.keyId,
+        sealed_payload: sealed.ciphertext,
+        seal_nonce: sealed.nonce,
+        seal_key_id: sealed.keyId,
         state: "prepared",
         fence: 1,
+        host_operation_id: null,
         claim_owner: null,
         claim_expires_at: null,
         claimed_resource_uid: null,
-        dispatched_operation_id: null,
+        space: null,
+        worker_name: null,
+        worker_resource_uid: null,
+        bundle_name: null,
         consumed_receipt_digest: null,
         expires_at: expiresAt,
       });
     },
 
-    async read(organizationId, operationId) {
+    async read(organizationId, operationKey) {
       validateOpaqueId(organizationId);
-      validateOpaqueId(operationId);
-      let row = await readRow(options.sql, organizationId, operationId);
+      validateOperationKey(operationKey);
+      const row = await readRow(options.sql, organizationId, operationKey);
       if (!row) return null;
       const now = options.clock().getTime();
       if (rowExpired(row, now)) {
         await expireExact(options.sql, row, now);
-        row = await readRow(options.sql, organizationId, operationId);
-        if (!row || rowExpired(row, now)) {
-          throw new RuntimeInputPreparationError("unavailable", 503);
-        }
+        return null;
       }
+      // Revoked, expired, and indeterminate handoffs carry no live authority
+      // and no material. Reporting them as a fifth wire status would invent a
+      // vocabulary the contract does not have; absence is the honest answer,
+      // and it is also what lets a retry prepare the same operation key again.
+      if (!wireStatus(row.state)) return null;
       return projection(row);
     },
 
     async claim(input) {
       const normalized = normalizeClaimInput(input);
       const now = options.clock().getTime();
-      let candidate = await readByPreparationId(
+      let candidate = await readRow(
         options.sql,
         normalized.organizationId,
-        normalized.preparationId,
+        normalized.operationKey,
       );
-      if (!candidate) throw new RuntimeInputPreparationError("not_found", 404);
-      assertClaimMatches(candidate, normalized);
-      if (candidate.preparation_commitment !== normalized.preparationCommitment) {
-        throw new RuntimeInputPreparationError("conflict", 409);
-      }
-      if (candidate.preparation_commitment !== validatedReferenceCommitment(candidate)) {
+      if (!candidate) throw new RuntimeInputPreparationError("operation_not_found", 404);
+      assertNames(candidate, normalized);
+      if (
+        candidate.preparation_id !==
+        (await derivePreparationId(normalized.organizationId, normalized.operationKey))
+      ) {
         throw new RuntimeInputPreparationError("unavailable", 503);
       }
       if (rowExpired(candidate, now)) {
@@ -720,12 +501,7 @@ export function createRuntimeInputPreparations(options: {
         throw new RuntimeInputPreparationError("conflict", 409);
       }
       if (candidate.state === "claimed") {
-        if (
-          candidate.claim_owner !== normalized.claimOwner ||
-          candidate.claimed_resource_uid !== normalized.resourceUid
-        ) {
-          throw new RuntimeInputPreparationError("conflict", 409);
-        }
+        assertClaimedTarget(candidate, normalized);
         return await decryptClaim(candidate, keys);
       }
       if (candidate.state !== "prepared") {
@@ -735,61 +511,42 @@ export function createRuntimeInputPreparations(options: {
       try {
         await options.sql.run(
           `UPDATE worker_runtime_input_preparations
-           SET state = 'claimed', fence = fence + 1, claim_owner = ?, claim_expires_at = ?,
-               claimed_resource_uid = ?, updated_at = ?
-           WHERE organization_id = ? AND preparation_id = ? AND state = 'prepared'
+           SET state = 'claimed', fence = fence + 1,
+               host_operation_id = ?, claim_owner = ?, claim_expires_at = ?,
+               claimed_resource_uid = ?, space = ?, worker_name = ?,
+               worker_resource_uid = ?, bundle_name = ?, updated_at = ?
+           WHERE organization_id = ? AND operation_key = ? AND state = 'prepared'
              AND fence = ? AND expires_at > ?
              AND EXISTS (
                SELECT 1 FROM tf_resource_deletion_attestations
-               WHERE tenant_id = ?
-                 AND resource_uid = worker_runtime_input_preparations.worker_resource_uid
-                 AND state = 'live'
-             )
-             AND EXISTS (
-               SELECT 1 FROM worker_endpoint_origin_reservations AS reservation
-               WHERE reservation.organization_id = ?
-                 AND reservation.reservation_id = worker_runtime_input_preparations.origin_reservation_id
-                 AND reservation.revision = worker_runtime_input_preparations.origin_reservation_revision
-                 AND reservation.state IN ('bound', 'activated')
-                 AND (reservation.state = 'activated' OR reservation.expires_at > ?)
-                 AND reservation.worker_resource_uid = worker_runtime_input_preparations.worker_resource_uid
-                 AND reservation.worker_resource_revision = worker_runtime_input_preparations.worker_resource_revision
-                 AND reservation.provider_pack_ref = worker_runtime_input_preparations.provider_pack_ref
-                 AND reservation.provider_installation_ref = worker_runtime_input_preparations.provider_installation_ref
-                 AND reservation.offering_id = worker_runtime_input_preparations.offering_id
-                 AND reservation.offering_digest = worker_runtime_input_preparations.offering_digest
+               WHERE tenant_id = ? AND resource_uid = ? AND state = 'live'
              )`,
           [
             normalized.claimOwner,
+            normalized.claimOwner,
             claimExpiresAt,
             normalized.resourceUid,
+            normalized.target.space,
+            normalized.target.workerName,
+            normalized.target.workerResourceUid,
+            normalized.target.bundleName,
             now,
             normalized.organizationId,
-            normalized.preparationId,
+            normalized.operationKey,
             candidate.fence,
             now,
             normalized.organizationId,
-            normalized.organizationId,
-            now,
+            normalized.target.workerResourceUid,
           ],
         );
       } catch {
         // An acknowledgement loss is resolved from the exact claim identity below.
       }
-      candidate = await readByPreparationId(
-        options.sql,
-        normalized.organizationId,
-        normalized.preparationId,
-      );
-      if (!candidate) throw new RuntimeInputPreparationError("not_found", 404);
-      assertClaimMatches(candidate, normalized);
-      if (
-        candidate.state !== "claimed" ||
-        candidate.claim_owner !== normalized.claimOwner ||
-        candidate.claimed_resource_uid !== normalized.resourceUid
-      ) {
-        throw new RuntimeInputPreparationError("conflict", 409);
-      }
+      candidate = await readRow(options.sql, normalized.organizationId, normalized.operationKey);
+      if (!candidate) throw new RuntimeInputPreparationError("operation_not_found", 404);
+      assertNames(candidate, normalized);
+      if (candidate.state !== "claimed") throw new RuntimeInputPreparationError("conflict", 409);
+      assertClaimedTarget(candidate, normalized);
       if (rowExpired(candidate, now)) {
         await expireExact(options.sql, candidate, now);
         throw new RuntimeInputPreparationError("conflict", 409);
@@ -802,27 +559,6 @@ export function createRuntimeInputPreparations(options: {
       }
     },
 
-    async inspect(input) {
-      const normalized = normalizeClaimInput(input);
-      const row = await readByPreparationId(
-        options.sql,
-        normalized.organizationId,
-        normalized.preparationId,
-      );
-      if (!row) throw new RuntimeInputPreparationError("not_found", 404);
-      assertClaimMatches(row, normalized);
-      if (row.preparation_commitment !== normalized.preparationCommitment) {
-        throw new RuntimeInputPreparationError("conflict", 409);
-      }
-      if (row.preparation_commitment !== validatedReferenceCommitment(row)) {
-        throw new RuntimeInputPreparationError("unavailable", 503);
-      }
-      if (rowExpired(row, options.clock().getTime())) {
-        throw new RuntimeInputPreparationError("conflict", 409);
-      }
-      return recoveryIdentity(row);
-    },
-
     async abort(input) {
       validateClaimIdentity(input);
       const now = options.clock().getTime();
@@ -830,7 +566,8 @@ export function createRuntimeInputPreparations(options: {
         const result = await options.sql.run(
           `UPDATE worker_runtime_input_preparations
            SET state = 'revoked', sealed_payload = NULL, seal_nonce = NULL, seal_key_id = NULL,
-               fence = fence + 1, updated_at = ?, revoked_at = ?
+               fence = fence + 1, claim_owner = NULL, claim_expires_at = NULL,
+               updated_at = ?, revoked_at = ?
            WHERE organization_id = ? AND preparation_id = ? AND state = 'claimed'
              AND fence = ? AND claim_owner = ? AND claimed_resource_uid = ?`,
           [
@@ -848,11 +585,11 @@ export function createRuntimeInputPreparations(options: {
         // Exact readback below distinguishes a committed abort from failure.
       }
       const row = await readByPreparationId(options.sql, input.organizationId, input.preparationId);
-      if (!row) throw new RuntimeInputPreparationError("not_found", 404);
+      if (!row) throw new RuntimeInputPreparationError("operation_not_found", 404);
       if (
         row.state === "revoked" &&
         row.fence === input.fence + 1 &&
-        row.claim_owner === input.claimOwner &&
+        row.host_operation_id === input.claimOwner &&
         row.claimed_resource_uid === input.resourceUid &&
         row.sealed_payload === null &&
         row.seal_nonce === null &&
@@ -870,8 +607,7 @@ export function createRuntimeInputPreparations(options: {
         const result = await options.sql.run(
           `UPDATE worker_runtime_input_preparations
            SET state = 'dispatched', sealed_payload = NULL, seal_nonce = NULL, seal_key_id = NULL,
-               fence = fence + 1, claim_owner = NULL, claim_expires_at = NULL,
-               dispatched_operation_id = ?, updated_at = ?
+               fence = fence + 1, claim_owner = NULL, claim_expires_at = NULL, updated_at = ?
            WHERE organization_id = ? AND preparation_id = ? AND state = 'claimed'
              AND fence = ? AND claim_owner = ? AND claimed_resource_uid = ?
              AND claim_expires_at > ?
@@ -881,21 +617,6 @@ export function createRuntimeInputPreparations(options: {
                  AND resource_uid = worker_runtime_input_preparations.worker_resource_uid
                  AND state = 'live'
              )
-             AND EXISTS (
-               SELECT 1 FROM worker_endpoint_origin_reservations AS reservation
-               WHERE reservation.organization_id = ?
-                 AND reservation.reservation_id = worker_runtime_input_preparations.origin_reservation_id
-                 AND reservation.revision = worker_runtime_input_preparations.origin_reservation_revision
-                 AND reservation.state IN ('bound', 'activated')
-                 AND (reservation.state = 'activated' OR reservation.expires_at > ?)
-                 AND reservation.canonical_public_origin = worker_runtime_input_preparations.canonical_public_origin
-                 AND reservation.worker_resource_uid = worker_runtime_input_preparations.worker_resource_uid
-                 AND reservation.worker_resource_revision = worker_runtime_input_preparations.worker_resource_revision
-                 AND reservation.provider_pack_ref = worker_runtime_input_preparations.provider_pack_ref
-                 AND reservation.provider_installation_ref = worker_runtime_input_preparations.provider_installation_ref
-                 AND reservation.offering_id = worker_runtime_input_preparations.offering_id
-                 AND reservation.offering_digest = worker_runtime_input_preparations.offering_digest
-             )
              AND (
                SELECT COUNT(*) FROM tf_resources AS worker_resource
                WHERE worker_resource.tenant_id = ?
@@ -903,19 +624,14 @@ export function createRuntimeInputPreparations(options: {
                  AND worker_resource.space = worker_runtime_input_preparations.space
                  AND worker_resource.name = worker_runtime_input_preparations.worker_name
                  AND worker_resource.kind = 'ModuleWorker'
-                 AND worker_resource.revision = worker_runtime_input_preparations.worker_resource_revision
              ) = 1
              AND EXISTS (
                SELECT 1 FROM tf_resource_deployments AS deployment
                WHERE deployment.tenant_id = ?
                  AND deployment.resource_uid = worker_runtime_input_preparations.worker_resource_uid
                  AND deployment.state = 'active'
-                 AND deployment.offering_id = worker_runtime_input_preparations.offering_id
-                 AND deployment.provider_pack_ref = worker_runtime_input_preparations.provider_pack_ref
-                 AND deployment.provider_installation_ref = worker_runtime_input_preparations.provider_installation_ref
              )`,
           [
-            input.claimOwner,
             now,
             input.organizationId,
             input.preparationId,
@@ -925,8 +641,6 @@ export function createRuntimeInputPreparations(options: {
             now,
             input.organizationId,
             input.organizationId,
-            now,
-            input.organizationId,
             input.organizationId,
           ],
         );
@@ -935,12 +649,12 @@ export function createRuntimeInputPreparations(options: {
         // Exact readback below settles an acknowledgement loss without redispatching.
       }
       const row = await readByPreparationId(options.sql, input.organizationId, input.preparationId);
-      if (!row) throw new RuntimeInputPreparationError("not_found", 404);
+      if (!row) throw new RuntimeInputPreparationError("operation_not_found", 404);
       if (
         row.state === "dispatched" &&
         row.fence === input.fence + 1 &&
         row.claimed_resource_uid === input.resourceUid &&
-        row.dispatched_operation_id === input.claimOwner
+        row.host_operation_id === input.claimOwner
       ) {
         return { fence: row.fence };
       }
@@ -955,13 +669,11 @@ export function createRuntimeInputPreparations(options: {
     },
 
     async recover(input) {
-      const normalized = normalizeRecoveredInput(input);
-      const row = await readRecoveryRow(options.sql, normalized);
-      return recoveryIdentity(row);
+      return recoveryIdentity(await readRecoveryRow(options.sql, normalizeClaimInput(input)));
     },
 
     async consumeRecovered(input) {
-      const normalized = normalizeRecoveredInput(input);
+      const normalized = normalizeClaimInput(input);
       if (!digest.test(input.receiptDigest)) {
         throw new RuntimeInputPreparationError("invalid_argument", 400);
       }
@@ -971,24 +683,27 @@ export function createRuntimeInputPreparations(options: {
         throw new RuntimeInputPreparationError("conflict", 409);
       }
       await consumeDispatched(options.sql, options.clock, {
-        ...input,
+        organizationId: normalized.organizationId,
+        preparationId: row.preparation_id,
+        claimOwner: normalized.claimOwner,
+        resourceUid: normalized.resourceUid,
         fence: row.fence,
+        receiptDigest: input.receiptDigest,
       });
     },
 
     async abandon(input) {
-      const normalized = normalizeRecoveredInput(input);
-      const row = await readByPreparationId(
-        options.sql,
-        normalized.organizationId,
-        normalized.preparationId,
-      );
-      if (!row) throw new RuntimeInputPreparationError("not_found", 404);
-      assertClaimMatches(row, normalized);
-      if (
-        row.preparation_commitment !== normalized.preparationCommitment ||
-        row.preparation_commitment !== validatedReferenceCommitment(row)
-      ) {
+      const normalized = normalizeClaimInput(input);
+      const row = await readRow(options.sql, normalized.organizationId, normalized.operationKey);
+      if (!row) throw new RuntimeInputPreparationError("operation_not_found", 404);
+      assertNames(row, normalized);
+      if (row.state === "revoked") {
+        if (
+          row.host_operation_id === normalized.claimOwner &&
+          row.claimed_resource_uid === normalized.resourceUid
+        ) {
+          return;
+        }
         throw new RuntimeInputPreparationError("conflict", 409);
       }
       const exactClaimed =
@@ -997,17 +712,8 @@ export function createRuntimeInputPreparations(options: {
         row.claimed_resource_uid === normalized.resourceUid;
       const exactDispatched =
         row.state === "dispatched" &&
-        row.dispatched_operation_id === normalized.claimOwner &&
+        row.host_operation_id === normalized.claimOwner &&
         row.claimed_resource_uid === normalized.resourceUid;
-      if (row.state === "revoked") {
-        if (
-          row.dispatched_operation_id === normalized.claimOwner &&
-          row.claimed_resource_uid === normalized.resourceUid
-        ) {
-          return;
-        }
-        throw new RuntimeInputPreparationError("conflict", 409);
-      }
       if (!exactClaimed && !exactDispatched) {
         throw new RuntimeInputPreparationError("conflict", 409);
       }
@@ -1016,22 +722,17 @@ export function createRuntimeInputPreparations(options: {
         `UPDATE worker_runtime_input_preparations
          SET state = 'revoked', sealed_payload = NULL, seal_nonce = NULL, seal_key_id = NULL,
              fence = fence + 1, claim_owner = NULL, claim_expires_at = NULL,
-             dispatched_operation_id = ?, updated_at = ?, revoked_at = ?
+             updated_at = ?, revoked_at = ?
          WHERE organization_id = ? AND preparation_id = ? AND fence = ?
-           AND claimed_resource_uid = ?
-           AND (
-             (state = 'claimed' AND claim_owner = ?)
-             OR (state = 'dispatched' AND dispatched_operation_id = ?)
-           )`,
+           AND claimed_resource_uid = ? AND host_operation_id = ?
+           AND state IN ('claimed', 'dispatched')`,
         [
-          normalized.claimOwner,
           now,
           now,
           normalized.organizationId,
-          normalized.preparationId,
+          row.preparation_id,
           row.fence,
           normalized.resourceUid,
-          normalized.claimOwner,
           normalized.claimOwner,
         ],
       );
@@ -1039,11 +740,11 @@ export function createRuntimeInputPreparations(options: {
       const observed = await readByPreparationId(
         options.sql,
         normalized.organizationId,
-        normalized.preparationId,
+        row.preparation_id,
       );
       if (
         observed?.state === "revoked" &&
-        observed.dispatched_operation_id === normalized.claimOwner &&
+        observed.host_operation_id === normalized.claimOwner &&
         observed.claimed_resource_uid === normalized.resourceUid
       ) {
         return;
@@ -1051,19 +752,20 @@ export function createRuntimeInputPreparations(options: {
       throw new RuntimeInputPreparationError("conflict", 409);
     },
 
-    async revoke(organizationId, operationId) {
+    async revoke(organizationId, operationKey) {
       validateOpaqueId(organizationId);
-      validateOpaqueId(operationId);
+      validateOperationKey(operationKey);
       const now = options.clock().getTime();
       const result = await options.sql.run(
         `UPDATE worker_runtime_input_preparations
          SET state = 'revoked', sealed_payload = NULL, seal_nonce = NULL, seal_key_id = NULL,
-             fence = fence + 1, updated_at = ?, revoked_at = ?
-         WHERE organization_id = ? AND operation_id = ? AND state IN ('prepared', 'claimed')`,
-        [now, now, organizationId, operationId],
+             fence = fence + 1, claim_owner = NULL, claim_expires_at = NULL,
+             updated_at = ?, revoked_at = ?
+         WHERE organization_id = ? AND operation_key = ? AND state IN ('prepared', 'claimed')`,
+        [now, now, organizationId, operationKey],
       );
       if (result.changes === 1) return;
-      const row = await readRow(options.sql, organizationId, operationId);
+      const row = await readRow(options.sql, organizationId, operationKey);
       if (!row || row.state === "revoked" || row.state === "expired" || row.state === "consumed") {
         return;
       }
@@ -1078,7 +780,7 @@ export function createRuntimeInputPreparations(options: {
       const result = await options.sql.run(
         `UPDATE worker_runtime_input_preparations
          SET state = 'expired', sealed_payload = NULL, seal_nonce = NULL, seal_key_id = NULL,
-             fence = fence + 1, updated_at = ?
+             fence = fence + 1, claim_owner = NULL, claim_expires_at = NULL, updated_at = ?
          WHERE rowid IN (
            SELECT rowid FROM worker_runtime_input_preparations
            WHERE (state = 'prepared' AND expires_at <= ?)
@@ -1108,12 +810,10 @@ async function consumeDispatched(
       `UPDATE worker_runtime_input_preparations
        SET state = 'consumed', sealed_payload = NULL, seal_nonce = NULL, seal_key_id = NULL,
            fence = fence + 1, claim_owner = NULL, claim_expires_at = NULL,
-           dispatched_operation_id = ?, consumed_receipt_digest = ?,
-           consumed_at = ?, updated_at = ?
+           consumed_receipt_digest = ?, consumed_at = ?, updated_at = ?
        WHERE organization_id = ? AND preparation_id = ? AND state = 'dispatched'
-         AND fence = ? AND dispatched_operation_id = ? AND claimed_resource_uid = ?`,
+         AND fence = ? AND host_operation_id = ? AND claimed_resource_uid = ?`,
       [
-        input.claimOwner,
         input.receiptDigest,
         now,
         now,
@@ -1129,11 +829,11 @@ async function consumeDispatched(
     // Exact readback below distinguishes a committed transition from failure.
   }
   const row = await readByPreparationId(sql, input.organizationId, input.preparationId);
-  if (!row) throw new RuntimeInputPreparationError("not_found", 404);
+  if (!row) throw new RuntimeInputPreparationError("operation_not_found", 404);
   if (
     row.state === "consumed" &&
     row.claimed_resource_uid === input.resourceUid &&
-    row.dispatched_operation_id === input.claimOwner &&
+    row.host_operation_id === input.claimOwner &&
     row.consumed_receipt_digest === input.receiptDigest
   ) {
     return;
@@ -1141,75 +841,63 @@ async function consumeDispatched(
   throw new RuntimeInputPreparationError("conflict", 409);
 }
 
-interface BoundRuntimeInputPreparationInput extends RuntimeInputPreparationInput {
-  readonly reservation: BoundWorkerEndpointOriginReservation;
-}
-
-interface RuntimeInputBoundReservation extends BoundWorkerEndpointOriginReservation {
-  readonly binding: BoundWorkerEndpointOriginReservation["binding"] & {
-    readonly endpointName: string;
-  };
-}
-
-interface NormalizedInput extends Omit<BoundRuntimeInputPreparationInput, "reservation"> {
-  readonly reservation: RuntimeInputBoundReservation;
+interface NormalizedPreparation {
+  readonly organizationId: string;
+  readonly operationKey: string;
   readonly canonicalPublicOrigin: string;
+  readonly applyCommitment: `sha256:${string}`;
   readonly bindingNames: readonly string[];
   readonly bindings: Readonly<Record<string, string>>;
 }
 
 type PreparationRow = Row & {
   readonly organization_id: string;
-  readonly operation_id: string;
+  readonly operation_key: string;
   readonly preparation_id: string;
-  readonly preparation_commitment: `sha256:${string}`;
-  readonly material_set_id: string;
-  readonly material_set_nonce: string;
-  readonly space: string;
-  readonly worker_name: string;
-  readonly endpoint_name: string;
-  readonly worker_resource_uid: string;
-  readonly worker_resource_revision: string;
-  readonly bundle_name: string;
-  readonly origin_reservation_id: string;
-  readonly origin_reservation_revision: number;
+  readonly apply_commitment: `sha256:${string}`;
   readonly canonical_public_origin: string;
-  readonly provider_pack_ref: string;
-  readonly provider_installation_ref: string;
-  readonly offering_id: string;
-  readonly offering_digest: `sha256:${string}`;
   readonly binding_names_json: string;
   readonly sealed_payload: string | null;
   readonly seal_nonce: string | null;
   readonly seal_key_id: string | null;
-  readonly state: RuntimeInputPreparationProjection["status"];
+  readonly state:
+    | "prepared"
+    | "claimed"
+    | "dispatched"
+    | "consumed"
+    | "revoked"
+    | "expired"
+    | "indeterminate";
   readonly fence: number;
+  readonly host_operation_id: string | null;
   readonly claim_owner: string | null;
   readonly claim_expires_at: number | null;
   readonly claimed_resource_uid: string | null;
-  readonly dispatched_operation_id: string | null;
+  readonly space: string | null;
+  readonly worker_name: string | null;
+  readonly worker_resource_uid: string | null;
+  readonly bundle_name: string | null;
   readonly consumed_receipt_digest: string | null;
   readonly expires_at: number;
 };
 
+const ROW_COLUMNS = `organization_id, operation_key, preparation_id, apply_commitment,
+            canonical_public_origin, binding_names_json,
+            sealed_payload, seal_nonce, seal_key_id, state, fence,
+            host_operation_id, claim_owner, claim_expires_at, claimed_resource_uid,
+            space, worker_name, worker_resource_uid, bundle_name,
+            consumed_receipt_digest, expires_at`;
+
 async function readRow(
   sql: Sql,
   organizationId: string,
-  operationId: string,
+  operationKey: string,
 ): Promise<PreparationRow | null> {
   const rows = await sql.query(
-    `SELECT organization_id, operation_id, preparation_id, preparation_commitment,
-            material_set_id, material_set_nonce,
-            space, worker_name, endpoint_name, worker_resource_uid, worker_resource_revision,
-            bundle_name, origin_reservation_id, origin_reservation_revision,
-            canonical_public_origin, provider_pack_ref, provider_installation_ref,
-            offering_id, offering_digest, binding_names_json,
-            sealed_payload, seal_nonce, seal_key_id, state, fence,
-            claim_owner, claim_expires_at, claimed_resource_uid,
-            dispatched_operation_id, consumed_receipt_digest, expires_at
+    `SELECT ${ROW_COLUMNS}
      FROM worker_runtime_input_preparations
-     WHERE organization_id = ? AND operation_id = ?`,
-    [organizationId, operationId],
+     WHERE organization_id = ? AND operation_key = ?`,
+    [organizationId, operationKey],
   );
   return rows.length === 0 ? null : (rows[0] as PreparationRow);
 }
@@ -1220,15 +908,7 @@ async function readByPreparationId(
   preparationId: string,
 ): Promise<PreparationRow | null> {
   const rows = await sql.query(
-    `SELECT organization_id, operation_id, preparation_id, preparation_commitment,
-            material_set_id, material_set_nonce,
-            space, worker_name, endpoint_name, worker_resource_uid, worker_resource_revision,
-            bundle_name, origin_reservation_id, origin_reservation_revision,
-            canonical_public_origin, provider_pack_ref, provider_installation_ref,
-            offering_id, offering_digest, binding_names_json,
-            sealed_payload, seal_nonce, seal_key_id, state, fence,
-            claim_owner, claim_expires_at, claimed_resource_uid,
-            dispatched_operation_id, consumed_receipt_digest, expires_at
+    `SELECT ${ROW_COLUMNS}
      FROM worker_runtime_input_preparations
      WHERE organization_id = ? AND preparation_id = ?`,
     [organizationId, preparationId],
@@ -1252,96 +932,83 @@ function validateClaimIdentity(input: RuntimeInputClaimIdentity): void {
 
 function normalizeClaimInput(input: RuntimeInputClaimInput): NormalizedClaimInput {
   validateOpaqueId(input.organizationId);
-  validateOpaqueId(input.preparationId);
+  validateOperationKey(input.operationKey);
   validateOpaqueId(input.claimOwner);
   validateOpaqueId(input.resourceUid);
-  if (!digest.test(input.preparationCommitment)) {
-    throw new RuntimeInputPreparationError("invalid_argument", 400);
-  }
-  validateBoundedText(input.target.space, 255);
-  validateBoundedText(input.target.workerName, 255);
-  validateBoundedText(input.target.bundleName, 255);
-  const bindingNames = [...input.bindingNames].sort();
+  validateBoundedText(input.target.space, 128);
+  validateBoundedText(input.target.workerName, 128);
+  validateBoundedText(input.target.bundleName, 128);
+  validateOpaqueId(input.target.workerResourceUid);
+  return { ...input, bindingNames: validatedBindingNames(input.bindingNames) };
+}
+
+function validatedBindingNames(names: readonly string[]): readonly string[] {
+  const sorted = [...names].sort();
   if (
-    bindingNames.length === 0 ||
-    bindingNames.length > MAX_PROVIDER_RUNTIME_INPUT_BINDINGS ||
-    new Set(bindingNames).size !== bindingNames.length ||
-    bindingNames.some((name) => !bindingName.test(name))
+    sorted.length === 0 ||
+    sorted.length > MAX_PROVIDER_RUNTIME_INPUT_BINDINGS ||
+    new Set(sorted).size !== sorted.length ||
+    sorted.some((name) => !bindingName.test(name))
   ) {
     throw new RuntimeInputPreparationError("invalid_argument", 400);
   }
-  return { ...input, bindingNames };
+  return sorted;
 }
 
-function assertClaimMatches(row: PreparationRow, input: NormalizedClaimInput): void {
+function assertNames(row: PreparationRow, input: NormalizedClaimInput): void {
   if (
     row.organization_id !== input.organizationId ||
-    row.preparation_id !== input.preparationId ||
-    row.space !== input.target.space ||
-    row.worker_name !== input.target.workerName ||
-    row.worker_resource_uid !== input.target.workerResourceUid ||
-    row.bundle_name !== input.target.bundleName ||
+    row.operation_key !== input.operationKey ||
     row.binding_names_json !== JSON.stringify(input.bindingNames)
   ) {
     throw new RuntimeInputPreparationError("conflict", 409);
   }
 }
 
-type NormalizedRecoveredInput = Omit<RuntimeInputRecoveredConsumption, "receiptDigest"> & {
-  readonly bindingNames: readonly string[];
-};
-
-function normalizeRecoveredInput(
-  input: Omit<RuntimeInputRecoveredConsumption, "receiptDigest">,
-): NormalizedRecoveredInput {
-  const normalized = normalizeClaimInput({
-    organizationId: input.organizationId,
-    preparationId: input.preparationId,
-    preparationCommitment: input.preparationCommitment,
-    claimOwner: input.claimOwner,
-    resourceUid: input.resourceUid,
-    target: input.target,
-    bindingNames: input.bindingNames,
-  });
-  return { ...input, bindingNames: normalized.bindingNames };
-}
-
-async function readRecoveryRow(sql: Sql, input: NormalizedRecoveredInput): Promise<PreparationRow> {
-  const row = await readByPreparationId(sql, input.organizationId, input.preparationId);
-  if (!row) throw new RuntimeInputPreparationError("not_found", 404);
-  assertClaimMatches(row, input);
-  if (row.preparation_commitment !== input.preparationCommitment) {
-    throw new RuntimeInputPreparationError("conflict", 409);
-  }
+function assertClaimedTarget(row: PreparationRow, input: NormalizedClaimInput): void {
   if (
-    (row.state !== "dispatched" && row.state !== "consumed") ||
-    row.dispatched_operation_id !== input.claimOwner ||
-    row.claimed_resource_uid !== input.resourceUid
+    row.claim_owner !== input.claimOwner ||
+    row.host_operation_id !== input.claimOwner ||
+    row.claimed_resource_uid !== input.resourceUid ||
+    row.space !== input.target.space ||
+    row.worker_name !== input.target.workerName ||
+    row.worker_resource_uid !== input.target.workerResourceUid ||
+    row.bundle_name !== input.target.bundleName
   ) {
     throw new RuntimeInputPreparationError("conflict", 409);
   }
-  if (row.preparation_commitment !== validatedReferenceCommitment(row)) {
-    throw new RuntimeInputPreparationError("unavailable", 503);
+}
+
+async function readRecoveryRow(sql: Sql, input: NormalizedClaimInput): Promise<PreparationRow> {
+  const row = await readRow(sql, input.organizationId, input.operationKey);
+  if (!row) throw new RuntimeInputPreparationError("operation_not_found", 404);
+  assertNames(row, input);
+  if (
+    (row.state !== "dispatched" && row.state !== "consumed") ||
+    row.host_operation_id !== input.claimOwner ||
+    row.claimed_resource_uid !== input.resourceUid ||
+    row.space !== input.target.space ||
+    row.worker_name !== input.target.workerName ||
+    row.worker_resource_uid !== input.target.workerResourceUid ||
+    row.bundle_name !== input.target.bundleName
+  ) {
+    throw new RuntimeInputPreparationError("conflict", 409);
   }
   return row;
 }
 
 function recoveryIdentity(row: PreparationRow): RuntimeInputRecoveryIdentity {
+  if (!digest.test(row.apply_commitment) || !row.worker_resource_uid || !row.host_operation_id) {
+    throw new RuntimeInputPreparationError("unavailable", 503);
+  }
   return {
-    operationId: row.operation_id,
+    operationKey: row.operation_key,
     preparationId: row.preparation_id,
-    preparationCommitment: row.preparation_commitment,
-    fence: row.fence,
-    materialSetId: row.material_set_id,
+    applyCommitment: row.apply_commitment,
     canonicalPublicOrigin: row.canonical_public_origin,
-    originReservationId: row.origin_reservation_id,
     workerResourceUid: row.worker_resource_uid,
-    workerResourceRevision: row.worker_resource_revision,
-    originReservationRevision: String(row.origin_reservation_revision),
-    providerPackRef: row.provider_pack_ref,
-    providerInstallationRef: row.provider_installation_ref,
-    offeringId: row.offering_id,
-    offeringDigest: row.offering_digest,
+    hostOperationId: row.host_operation_id,
+    fence: row.fence,
   };
 }
 
@@ -1350,11 +1017,10 @@ function preparationIdentity(
 ): ProviderRuntimeInputPreparationIdentity {
   return {
     preparationId: claim.preparationId,
-    materialSetId: claim.materialSetId,
-    originReservationId: claim.originReservationId,
+    operationKey: claim.operationKey,
     workerResourceUid: claim.workerResourceUid,
     canonicalPublicOrigin: claim.canonicalPublicOrigin,
-    commitment: claim.preparationCommitment,
+    commitment: claim.applyCommitment,
   };
 }
 
@@ -1365,21 +1031,46 @@ function rowExpired(row: PreparationRow, now: number): boolean {
   );
 }
 
+/**
+ * A handoff that never left this Host may be prepared again under the same
+ * operation key: a Terraform retry recomputes the same plan-derived key, and
+ * refusing it would strand the resource behind an aborted lease. A dispatched
+ * or consumed handoff is never replaceable — its values already reached a
+ * provider, and the object they configured may exist.
+ */
+function replaceablePreparation(row: PreparationRow, now: number): boolean {
+  if (row.state === "revoked" || row.state === "expired" || row.state === "indeterminate") {
+    return true;
+  }
+  return (row.state === "prepared" || row.state === "claimed") && rowExpired(row, now);
+}
+
+async function discardReplaceable(sql: Sql, row: PreparationRow): Promise<void> {
+  const removed = await sql.run(
+    `DELETE FROM worker_runtime_input_preparations
+     WHERE organization_id = ? AND operation_key = ? AND fence = ?
+       AND state NOT IN ('dispatched', 'consumed')`,
+    [row.organization_id, row.operation_key, row.fence],
+  );
+  if (removed.changes !== 1) throw new RuntimeInputPreparationError("conflict", 409);
+}
+
 async function expireExact(sql: Sql, row: PreparationRow, now: number): Promise<void> {
+  if (row.state !== "prepared" && row.state !== "claimed") return;
   const expiryColumn = row.state === "claimed" ? "claim_expires_at" : "expires_at";
   const expiryValue = row.state === "claimed" ? row.claim_expires_at : row.expires_at;
-  if ((row.state !== "prepared" && row.state !== "claimed") || expiryValue === null) return;
+  if (expiryValue === null) return;
   try {
     await sql.run(
       `UPDATE worker_runtime_input_preparations
        SET state = 'expired', sealed_payload = NULL, seal_nonce = NULL, seal_key_id = NULL,
-           fence = fence + 1, updated_at = ?
+           fence = fence + 1, claim_owner = NULL, claim_expires_at = NULL, updated_at = ?
        WHERE organization_id = ? AND preparation_id = ? AND state = ? AND fence = ?
          AND ${expiryColumn} = ?`,
       [now, row.organization_id, row.preparation_id, row.state, row.fence, expiryValue],
     );
   } catch {
-    // Exact callers re-read or fail closed; scheduler retries this bounded cleanup.
+    // Exact callers re-read or fail closed; the scheduler retries this cleanup.
   }
 }
 
@@ -1392,6 +1083,8 @@ async function decryptClaim(
     !row.sealed_payload ||
     !row.seal_nonce ||
     !row.seal_key_id ||
+    !row.host_operation_id ||
+    !row.worker_resource_uid ||
     !Number.isSafeInteger(row.fence) ||
     row.fence < 1
   ) {
@@ -1416,38 +1109,22 @@ async function decryptClaim(
   } catch {
     throw new RuntimeInputPreparationError("unavailable", 503);
   }
-  const normalized = parseSealedPayload(row, plaintext);
-  if (!constantTimeEqual(plaintext, encode(canonicalSealedPayload(normalized)))) {
-    throw new RuntimeInputPreparationError("unavailable", 503);
-  }
-  const reference = await computeBoundRuntimeInputReference(normalized);
-  if (
-    row.preparation_commitment !== reference.commitment ||
-    row.preparation_id !== reference.preparationId ||
-    normalized.runtimeInputReference !== reference.value
-  ) {
-    throw new RuntimeInputPreparationError("unavailable", 503);
-  }
   return {
-    operationId: row.operation_id,
+    operationKey: row.operation_key,
     preparationId: row.preparation_id,
-    preparationCommitment: row.preparation_commitment,
-    fence: row.fence,
-    materialSetId: row.material_set_id,
+    applyCommitment: row.apply_commitment,
     canonicalPublicOrigin: row.canonical_public_origin,
-    originReservationId: row.origin_reservation_id,
     workerResourceUid: row.worker_resource_uid,
-    workerResourceRevision: row.worker_resource_revision,
-    originReservationRevision: String(row.origin_reservation_revision),
-    providerPackRef: row.provider_pack_ref,
-    providerInstallationRef: row.provider_installation_ref,
-    offeringId: row.offering_id,
-    offeringDigest: row.offering_digest,
-    bindings: { ...normalized.bindings },
+    hostOperationId: row.host_operation_id,
+    fence: row.fence,
+    bindings: parseSealedPayload(row, plaintext),
   };
 }
 
-function parseSealedPayload(row: PreparationRow, bytes: Uint8Array): NormalizedInput {
+function parseSealedPayload(
+  row: PreparationRow,
+  bytes: Uint8Array,
+): Readonly<Record<string, string>> {
   let value: unknown;
   try {
     value = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes));
@@ -1459,10 +1136,10 @@ function parseSealedPayload(row: PreparationRow, bytes: Uint8Array): NormalizedI
   }
   const payload = value as Record<string, unknown>;
   if (
-    Object.keys(payload).sort().join("\0") !==
-      ["canonicalPublicOrigin", "format", "materialSetId", "values"].sort().join("\0") ||
+    Object.keys(payload).sort().join(",") !==
+      "applyCommitment,canonicalPublicOrigin,format,values" ||
     payload.format !== SEALED_PAYLOAD_FORMAT ||
-    payload.materialSetId !== row.material_set_id ||
+    payload.applyCommitment !== row.apply_commitment ||
     payload.canonicalPublicOrigin !== row.canonical_public_origin ||
     typeof payload.values !== "object" ||
     payload.values === null ||
@@ -1470,69 +1147,30 @@ function parseSealedPayload(row: PreparationRow, bytes: Uint8Array): NormalizedI
   ) {
     throw new RuntimeInputPreparationError("unavailable", 503);
   }
-  let normalized: NormalizedInput;
+  let parsed: {
+    readonly bindings: Readonly<Record<string, string>>;
+    readonly names: readonly string[];
+  };
   try {
-    normalized = normalizeInput({
-      organizationId: row.organization_id,
-      operationId: row.operation_id,
-      materialSetId: row.material_set_id,
-      materialSetNonce: row.material_set_nonce,
-      runtimeInputReference: runtimeInputReferenceValue(
-        row.preparation_id,
-        row.preparation_commitment,
-      ),
-      target: {
-        space: row.space,
-        workerName: row.worker_name,
-        workerResourceUid: row.worker_resource_uid,
-        bundleName: row.bundle_name,
-        originReservationId: row.origin_reservation_id,
-      },
-      bindings: payload.values as Readonly<Record<string, string>>,
-      reservation: {
-        organizationId: row.organization_id,
-        reservationId: row.origin_reservation_id,
-        canonicalPublicOrigin: row.canonical_public_origin,
-        revision: String(row.origin_reservation_revision),
-        expiresAtEpochMilliseconds: row.expires_at,
-        binding: {
-          space: row.space,
-          workerName: row.worker_name,
-          workerResourceUid: row.worker_resource_uid,
-          workerResourceRevision: row.worker_resource_revision,
-          endpointName: row.endpoint_name,
-        },
-        status: "bound",
-        providerPackRef: row.provider_pack_ref,
-        providerInstallationRef: row.provider_installation_ref,
-        offeringId: row.offering_id,
-        offeringDigest: row.offering_digest,
-      },
-    });
+    parsed = validatedBindings(payload.values as Record<string, unknown>);
   } catch {
     throw new RuntimeInputPreparationError("unavailable", 503);
   }
-  if (JSON.stringify(normalized.bindingNames) !== row.binding_names_json) {
+  if (JSON.stringify(parsed.names) !== row.binding_names_json) {
     throw new RuntimeInputPreparationError("unavailable", 503);
   }
-  return normalized;
+  return parsed.bindings;
 }
 
 function canonicalAadFromRow(row: PreparationRow): string {
   return JSON.stringify({
     format: AAD_FORMAT,
     organizationId: row.organization_id,
-    operationId: row.operation_id,
+    operationKey: row.operation_key,
     preparationId: row.preparation_id,
     keyId: row.seal_key_id,
-    target: {
-      space: row.space,
-      workerName: row.worker_name,
-      workerResourceUid: row.worker_resource_uid,
-      bundleName: row.bundle_name,
-      originReservationId: row.origin_reservation_id,
-    },
     canonicalPublicOrigin: row.canonical_public_origin,
+    applyCommitment: row.apply_commitment,
     bindingNames: bindingNamesFromRow(row),
   });
 }
@@ -1543,50 +1181,30 @@ async function markClaimIndeterminate(sql: Sql, row: PreparationRow, now: number
       `UPDATE worker_runtime_input_preparations
        SET state = 'indeterminate', sealed_payload = NULL, seal_nonce = NULL, seal_key_id = NULL,
            fence = fence + 1, claim_owner = NULL, claim_expires_at = NULL, updated_at = ?
-       WHERE organization_id = ? AND operation_id = ? AND state = 'claimed' AND fence = ?`,
-      [now, row.organization_id, row.operation_id, row.fence],
+       WHERE organization_id = ? AND preparation_id = ? AND state = 'claimed' AND fence = ?`,
+      [now, row.organization_id, row.preparation_id, row.fence],
     );
   } catch {
     // Best effort only: the caller still fails closed and no second claim is issued.
   }
 }
 
+/**
+ * A replay of the one private PUT. The stored ciphertext is opened and compared
+ * against the resubmitted values, so a second request that reuses an operation
+ * key with different secrets is a conflict rather than a silent overwrite.
+ */
 async function adoptExisting(
   row: PreparationRow,
-  input: NormalizedInput,
+  input: NormalizedPreparation,
   keys: ReadonlyMap<string, CryptoKey>,
-  clock: Clock,
 ): Promise<RuntimeInputPreparationProjection> {
-  if (row.state !== "prepared" || row.expires_at <= clock().getTime()) {
-    throw new RuntimeInputPreparationError("conflict", 409);
-  }
   if (
     row.organization_id !== input.organizationId ||
-    row.operation_id !== input.operationId ||
-    row.material_set_id !== input.materialSetId ||
-    row.material_set_nonce !== input.materialSetNonce ||
-    row.space !== input.target.space ||
-    row.worker_name !== input.target.workerName ||
-    row.endpoint_name !== input.reservation.binding.endpointName ||
-    row.worker_resource_uid !== input.target.workerResourceUid ||
-    row.worker_resource_revision !== input.reservation.binding.workerResourceRevision ||
-    row.bundle_name !== input.target.bundleName ||
-    row.origin_reservation_id !== input.target.originReservationId ||
-    row.origin_reservation_revision !== Number(input.reservation.revision) ||
+    row.operation_key !== input.operationKey ||
     row.canonical_public_origin !== input.canonicalPublicOrigin ||
-    row.provider_pack_ref !== input.reservation.providerPackRef ||
-    row.provider_installation_ref !== input.reservation.providerInstallationRef ||
-    row.offering_id !== input.reservation.offeringId ||
-    row.offering_digest !== input.reservation.offeringDigest ||
+    row.apply_commitment !== input.applyCommitment ||
     row.binding_names_json !== JSON.stringify(input.bindingNames)
-  ) {
-    throw new RuntimeInputPreparationError("conflict", 409);
-  }
-  const reference = await computeBoundRuntimeInputReference(input);
-  if (
-    row.preparation_commitment !== reference.commitment ||
-    row.preparation_id !== reference.preparationId ||
-    input.runtimeInputReference !== reference.value
   ) {
     throw new RuntimeInputPreparationError("conflict", 409);
   }
@@ -1616,121 +1234,81 @@ async function adoptExisting(
   return projection(row);
 }
 
-function normalizeInput(input: BoundRuntimeInputPreparationInput): NormalizedInput {
+async function normalizePreparation(
+  input: RuntimeInputPreparationInput,
+  hostOrigin: string,
+): Promise<NormalizedPreparation> {
   validateOpaqueId(input.organizationId);
-  validateOpaqueId(input.operationId);
-  validateOpaqueId(input.materialSetId);
-  validateOpaqueId(input.materialSetNonce);
-  runtimeInputReference(input.runtimeInputReference);
-  for (const value of Object.values(input.target)) validateBoundedText(value, 255);
-  const reservation = input.reservation;
-  if (
-    reservation.organizationId !== input.organizationId ||
-    reservation.reservationId !== input.target.originReservationId ||
-    reservation.binding.space !== input.target.space ||
-    reservation.binding.workerName !== input.target.workerName ||
-    reservation.binding.workerResourceUid !== input.target.workerResourceUid ||
-    reservation.binding.endpointName === undefined ||
-    (reservation.status !== "bound" && reservation.status !== "activated") ||
-    !Number.isSafeInteger(Number(reservation.revision)) ||
-    Number(reservation.revision) < 1 ||
-    !digest.test(reservation.offeringDigest)
-  ) {
-    throw new RuntimeInputPreparationError("conflict", 409);
-  }
-  validateCanonicalOrigin(reservation.canonicalPublicOrigin);
-  for (const value of [
-    reservation.binding.endpointName,
-    reservation.binding.workerResourceRevision,
-    reservation.providerPackRef,
-    reservation.providerInstallationRef,
-    reservation.offeringId,
-  ]) {
-    validateBoundedText(value, 255);
-  }
-  const bindingNames = Object.keys(input.bindings).sort();
-  if (bindingNames.length === 0 || bindingNames.length > MAX_PROVIDER_RUNTIME_INPUT_BINDINGS) {
+  validateOperationKey(input.operationKey);
+  if (input.canonicalPublicOrigin !== hostOrigin) {
     throw new RuntimeInputPreparationError("invalid_argument", 400);
   }
-  const bindings: Record<string, string> = {};
-  for (const name of bindingNames) {
-    if (!bindingName.test(name)) throw new RuntimeInputPreparationError("invalid_argument", 400);
-    const value = input.bindings[name];
-    if (
-      typeof value !== "string" ||
-      value.length === 0 ||
-      encode(value).byteLength > MAX_VALUE_BYTES
-    ) {
-      throw new RuntimeInputPreparationError("invalid_argument", 400);
-    }
-    bindings[name] = value;
-  }
-  const normalizedReservation: RuntimeInputBoundReservation = {
-    ...reservation,
-    binding: {
-      ...reservation.binding,
-      endpointName: reservation.binding.endpointName,
-    },
-  };
+  const applyCommitment = await runtimeInputPublicApplyCommitment(input.publicApply);
+  const { bindings, names } = validatedBindings(input.bindings);
   return {
-    ...input,
-    reservation: normalizedReservation,
-    canonicalPublicOrigin: reservation.canonicalPublicOrigin,
+    organizationId: input.organizationId,
+    operationKey: input.operationKey,
+    canonicalPublicOrigin: input.canonicalPublicOrigin,
+    applyCommitment,
+    bindingNames: names,
     bindings,
-    bindingNames,
   };
 }
 
-function canonicalSealedPayload(input: NormalizedInput): string {
+function validatedBindings(value: Record<string, unknown>): {
+  readonly bindings: Readonly<Record<string, string>>;
+  readonly names: readonly string[];
+} {
+  const names = validatedBindingNames(Object.keys(value));
+  const bindings: Record<string, string> = {};
+  for (const name of names) {
+    const item = value[name];
+    // NUL is refused rather than stored: the provider will not send one, and a
+    // value carrying it cannot be projected into a runtime binding intact.
+    if (typeof item !== "string" || item.includes("\u0000") || hasUnpairedSurrogate(item)) {
+      throw new RuntimeInputPreparationError("invalid_argument", 400);
+    }
+    const bytes = encode(item);
+    if (bytes.byteLength < 1 || bytes.byteLength > MAX_VALUE_BYTES) {
+      throw new RuntimeInputPreparationError("invalid_argument", 400);
+    }
+    bindings[name] = item;
+  }
+  return { bindings, names };
+}
+
+function canonicalSealedPayload(input: NormalizedPreparation): string {
   return JSON.stringify({
     format: SEALED_PAYLOAD_FORMAT,
-    materialSetId: input.materialSetId,
+    applyCommitment: input.applyCommitment,
     canonicalPublicOrigin: input.canonicalPublicOrigin,
     values: input.bindings,
   });
 }
 
-async function computeBoundRuntimeInputReference(input: NormalizedInput): Promise<{
-  readonly preparationId: string;
-  readonly commitment: `sha256:${string}`;
-  readonly value: string;
-}> {
-  const derived = await deriveRuntimeInputReference({
-    format: RUNTIME_INPUT_PREFLIGHT_FORMAT,
-    materialSetNonce: input.materialSetNonce,
-    target: {
-      space: input.target.space,
-      workerName: input.target.workerName,
-      bundleName: input.target.bundleName,
-      endpointName: input.reservation.binding.endpointName,
-      originReservationId: input.target.originReservationId,
-      canonicalPublicOrigin: input.canonicalPublicOrigin,
-    },
-    bindings: input.bindings,
+function canonicalAad(input: NormalizedPreparation, preparationId: string, keyId: string): string {
+  return JSON.stringify({
+    format: AAD_FORMAT,
+    organizationId: input.organizationId,
+    operationKey: input.operationKey,
+    preparationId,
+    keyId,
+    canonicalPublicOrigin: input.canonicalPublicOrigin,
+    applyCommitment: input.applyCommitment,
+    bindingNames: input.bindingNames,
   });
-  return {
-    preparationId: derived.preparationId,
-    commitment: derived.commitment,
-    value: derived.runtimeInputReference,
-  };
 }
 
 /**
- * Validate the durable plan-time reference commitment without pretending it
- * can be recomputed after the secret values have been erased. Worker/resource
- * and material-set identity are fenced by their dedicated columns instead of
- * being overloaded into this commitment.
+ * The durable handle is derived rather than taken from the caller: an operation
+ * key is chosen by a provider and is not this Host's internal identity for the
+ * sealed row.
  */
-function validatedReferenceCommitment(row: PreparationRow): `sha256:${string}` {
-  bindingNamesFromRow(row);
-  if (
-    !digest.test(row.preparation_commitment) ||
-    row.preparation_id !==
-      `prep-${row.preparation_commitment.slice("sha256:".length, "sha256:".length + 32)}`
-  ) {
-    throw new RuntimeInputPreparationError("unavailable", 503);
-  }
-  return row.preparation_commitment;
+async function derivePreparationId(organizationId: string, operationKey: string): Promise<string> {
+  const commitment = await sha256(
+    encode(JSON.stringify({ format: PREPARATION_ID_FORMAT, organizationId, operationKey })),
+  );
+  return `prep-${commitment.slice("sha256:".length, "sha256:".length + 32)}`;
 }
 
 async function runtimeInputReceiptDigest(input: {
@@ -1743,76 +1321,50 @@ async function runtimeInputReceiptDigest(input: {
   if (!digest.test(input.providerReceiptDigest)) {
     throw new RuntimeInputPreparationError("invalid_argument", 400);
   }
-  const canonical = JSON.stringify({
-    format: "takoserver.worker-runtime-input-receipt@v1",
-    preparationId: input.preparation.preparationId,
-    preparationCommitment: input.preparation.commitment,
-    organizationId: input.organizationId,
-    operationId: input.operationId,
-    resourceUid: input.resourceUid,
-    providerReceiptDigest: input.providerReceiptDigest,
-  });
-  const bytes = new Uint8Array(
-    await crypto.subtle.digest("SHA-256", encode(canonical) as unknown as BufferSource),
+  return await sha256(
+    encode(
+      JSON.stringify({
+        format: RECEIPT_FORMAT,
+        preparationId: input.preparation.preparationId,
+        applyCommitment: input.preparation.commitment,
+        organizationId: input.organizationId,
+        operationId: input.operationId,
+        resourceUid: input.resourceUid,
+        providerReceiptDigest: input.providerReceiptDigest,
+      }),
+    ),
   );
-  return `sha256:${[...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 }
 
-function runtimeInputReferenceValue(preparationId: string, commitment: `sha256:${string}`): string {
-  return `${RUNTIME_INPUT_REFERENCE_PREFIX}.${preparationId}.${commitment.slice("sha256:".length)}`;
-}
-
-function runtimeInputReference(value: string): {
-  readonly preparationId: string;
-  readonly commitment: `sha256:${string}`;
-} {
-  const match = /^rip1\.([A-Za-z0-9_-]{3,42})\.([0-9a-f]{64})$/u.exec(value);
-  if (!match?.[1] || !match[2]) {
-    throw new RuntimeInputPreparationError("invalid_argument", 400);
+function wireStatus(state: PreparationRow["state"]): RuntimeInputPreparationStatus | null {
+  switch (state) {
+    case "prepared":
+      return "prepared";
+    case "claimed":
+      return "accepted";
+    case "dispatched":
+      return "dispatched";
+    case "consumed":
+      return "consumed";
+    default:
+      return null;
   }
-  if (match[1] !== `prep-${match[2].slice(0, 32)}`) {
-    throw new RuntimeInputPreparationError("invalid_argument", 400);
-  }
-  return { preparationId: match[1], commitment: `sha256:${match[2]}` };
-}
-
-function canonicalAad(input: NormalizedInput, preparationId: string, keyId: string): string {
-  return JSON.stringify({
-    format: AAD_FORMAT,
-    organizationId: input.organizationId,
-    operationId: input.operationId,
-    preparationId,
-    keyId,
-    target: input.target,
-    canonicalPublicOrigin: input.canonicalPublicOrigin,
-    bindingNames: input.bindingNames,
-  });
 }
 
 function projection(row: PreparationRow): RuntimeInputPreparationProjection {
-  if (!digest.test(row.preparation_commitment)) {
+  if (!digest.test(row.apply_commitment)) {
     throw new RuntimeInputPreparationError("unavailable", 503);
   }
-  const names = bindingNamesFromRow(row);
+  const status = wireStatus(row.state);
+  if (!status) throw new RuntimeInputPreparationError("conflict", 409);
   return {
     format: RUNTIME_INPUT_PREPARATION_FORMAT,
-    operationId: row.operation_id,
-    preparationId: row.preparation_id,
-    runtimeInputReference: runtimeInputReferenceValue(
-      row.preparation_id,
-      row.preparation_commitment,
-    ),
-    status: row.state,
-    expiresAt: new Date(row.expires_at).toISOString(),
-    target: {
-      space: row.space,
-      workerName: row.worker_name,
-      workerResourceUid: row.worker_resource_uid,
-      bundleName: row.bundle_name,
-      originReservationId: row.origin_reservation_id,
-    },
+    status,
+    operationKey: row.operation_key,
+    applyCommitment: row.apply_commitment,
     canonicalPublicOrigin: row.canonical_public_origin,
-    bindingNames: names,
+    bindingNames: bindingNamesFromRow(row),
+    ...(row.host_operation_id ? { hostOperationId: row.host_operation_id } : {}),
   };
 }
 
@@ -1858,7 +1410,15 @@ function validateSealKey(candidate: RuntimeInputSealKey): void {
 }
 
 function validateOpaqueId(value: string): void {
-  if (!opaqueId.test(value)) throw new RuntimeInputPreparationError("invalid_argument", 400);
+  if (typeof value !== "string" || !opaqueId.test(value)) {
+    throw new RuntimeInputPreparationError("invalid_argument", 400);
+  }
+}
+
+function validateOperationKey(value: string): void {
+  if (typeof value !== "string" || !operationKeyPattern.test(value)) {
+    throw new RuntimeInputPreparationError("invalid_argument", 400);
+  }
 }
 
 function validateBoundedText(value: string, maximum: number): void {
@@ -1867,15 +1427,21 @@ function validateBoundedText(value: string, maximum: number): void {
   }
 }
 
-function validateCanonicalOrigin(value: string): void {
+/**
+ * A bare origin this deployment can honestly be addressed as. HTTPS everywhere
+ * except loopback, which is the one name a machine developing against itself
+ * can produce without inventing a certificate.
+ */
+function validateBareOrigin(value: string): void {
   let parsed: URL;
   try {
     parsed = new URL(value);
   } catch {
-    throw new RuntimeInputPreparationError("invalid_argument", 400);
+    throw new TypeError("canonical public origin must be a bare origin");
   }
+  const loopback = parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
   if (
-    parsed.protocol !== "https:" ||
+    (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback)) ||
     parsed.origin !== value ||
     parsed.username !== "" ||
     parsed.password !== "" ||
@@ -1883,8 +1449,43 @@ function validateCanonicalOrigin(value: string): void {
     parsed.search !== "" ||
     parsed.hash !== ""
   ) {
+    throw new TypeError("canonical public origin must be a bare origin");
+  }
+}
+
+function utf8(value: unknown, maximum: number): Uint8Array<ArrayBuffer> {
+  if (typeof value !== "string" || hasUnpairedSurrogate(value)) {
     throw new RuntimeInputPreparationError("invalid_argument", 400);
   }
+  const bytes = encode(value);
+  if (bytes.byteLength > maximum) throw new RuntimeInputPreparationError("invalid_argument", 400);
+  return bytes;
+}
+
+/**
+ * A lone UTF-16 surrogate encodes as U+FFFD, which would make this Host commit
+ * to bytes the caller never sent. Refuse instead of silently substituting.
+ */
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      if (index + 1 >= value.length) return true;
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      index += 1;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function sha256(bytes: Uint8Array): Promise<`sha256:${string}`> {
+  const hashed = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", bytes as unknown as BufferSource),
+  );
+  return `sha256:${[...hashed].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 }
 
 function encode(value: string): Uint8Array<ArrayBuffer> {

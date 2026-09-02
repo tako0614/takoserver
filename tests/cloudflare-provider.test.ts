@@ -50,15 +50,14 @@ const MODULE_BYTES = new TextEncoder().encode("export default { fetch() {} }");
 
 const ASSET_BUNDLE = `sha256:${"c".repeat(64)}`;
 
+const SENSITIVE_OPERATION_KEY = `takoform-worker-runtime-v1-${"e".repeat(64)}`;
 const SENSITIVE_PREPARATION: ProviderRuntimeInputPreparationIdentity = {
   preparationId: "prep_sensitive",
-  materialSetId: "material_sensitive",
-  originReservationId: "origin-reservation-id",
+  operationKey: SENSITIVE_OPERATION_KEY,
   workerResourceUid: "worker-uid",
-  canonicalPublicOrigin: "https://version.example.test",
+  canonicalPublicOrigin: "https://api.takoserver.test",
   commitment: `sha256:${"b".repeat(64)}`,
 };
-const SENSITIVE_OPERATION_KEY = `rip1.prep_sensitive.${SENSITIVE_PREPARATION.commitment.slice("sha256:".length)}`;
 
 const artifacts: ArtifactBytes = {
   async manifest(_tenantRef, digest) {

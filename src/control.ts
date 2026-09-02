@@ -51,6 +51,13 @@ import {
  */
 
 const MAX_BODY_BYTES = 64 * 1_024;
+/**
+ * The runtime-input handoff carries the exact public apply body it authorizes
+ * plus every sensitive value, so it is the one control route whose request is
+ * measured in megabytes rather than kilobytes. The per-field ceilings below it
+ * are the real contract; this is only the outer refusal.
+ */
+const MAX_RUNTIME_INPUT_BODY_BYTES = 4 * 1_024 * 1_024;
 
 /**
  * The read side of what a tenant declared.
@@ -649,67 +656,54 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       });
     }
 
+    // The private half of the runtime-input handoff. The organization is taken
+    // only from the authenticated key, and the operation key in the path is the
+    // same one the public apply will carry as its Idempotency-Key, so the two
+    // requests name one operation without the caller restating who they are.
     const runtimeInputPreparation =
-      /^\/v1\/organizations\/([^/]+)\/worker-runtime-input-preparations\/([^/]+)$/u.exec(
-        url.pathname,
-      );
+      /^\/v1\/takoform\/worker-runtime-input-preparations\/([^/]+)$/u.exec(url.pathname);
     if (runtimeInputPreparation) {
-      if (!runtimeInputs) controlError("not_found", 404);
-      const organizationId = segment(runtimeInputPreparation[1]);
-      const operationId = segment(runtimeInputPreparation[2]);
-      const authorizedOrganizationId = await organizationWriter(request);
-      if (authorizedOrganizationId !== organizationId) {
-        throw new AuthError("permission_denied");
+      if (!runtimeInputs) controlError("operation_not_found", 404);
+      const operationKey = segment(runtimeInputPreparation[1]);
+      const organizationId = await organizationWriter(request);
+      if (request.headers.get("idempotency-key") !== operationKey) {
+        controlError("invalid_argument", 400);
       }
       const headers = {
         "cache-control": "private, no-store",
         "x-content-type-options": "nosniff",
       };
       if (request.method === "PUT") {
-        const body = await jsonObject(request);
-        exactKeys(body, [
-          "format",
-          "materialSetId",
-          "materialSetNonce",
-          "runtimeInputReference",
-          "target",
-          "bindings",
-        ]);
+        const body = await jsonObject(request, MAX_RUNTIME_INPUT_BODY_BYTES);
+        exactKeys(body, ["format", "canonicalPublicOrigin", "publicApply", "bindings"]);
         if (body.format !== RUNTIME_INPUT_PREPARATION_FORMAT) {
           controlError("invalid_argument", 400);
         }
-        const target = record(body.target);
-        exactKeys(target, [
-          "space",
-          "workerName",
-          "workerResourceUid",
-          "bundleName",
-          "originReservationId",
-        ]);
+        const publicApply = record(body.publicApply);
+        exactKeys(publicApply, ["method", "path", "fences", "body"]);
+        const fences = record(publicApply.fences);
+        exactKeys(fences, ["ifNoneMatch"]);
         const prepared = await runtimeInputs.prepare({
           organizationId,
-          operationId,
-          materialSetId: text(body.materialSetId),
-          materialSetNonce: text(body.materialSetNonce),
-          runtimeInputReference: text(body.runtimeInputReference),
-          target: {
-            space: text(target.space),
-            workerName: text(target.workerName),
-            workerResourceUid: text(target.workerResourceUid),
-            bundleName: text(target.bundleName),
-            originReservationId: text(target.originReservationId),
+          operationKey,
+          canonicalPublicOrigin: bounded(body.canonicalPublicOrigin, 2_048),
+          publicApply: {
+            method: bounded(publicApply.method, 16),
+            path: bounded(publicApply.path, 8 * 1_024),
+            fences: { ifNoneMatch: bounded(fences.ifNoneMatch, 16) },
+            body: bounded(publicApply.body, 1_024 * 1_024),
           },
           bindings: stringRecord(body.bindings),
         });
-        return Response.json(prepared, { status: 201, headers });
+        return Response.json(prepared, { headers });
       }
       if (request.method === "GET") {
-        const prepared = await runtimeInputs.read(organizationId, operationId);
-        if (!prepared) controlError("not_found", 404);
+        const prepared = await runtimeInputs.read(organizationId, operationKey);
+        if (!prepared) controlError("operation_not_found", 404);
         return Response.json(prepared, { headers });
       }
       if (request.method === "DELETE") {
-        await runtimeInputs.revoke(organizationId, operationId);
+        await runtimeInputs.revoke(organizationId, operationKey);
         return new Response(null, { status: 204, headers });
       }
     }
@@ -1188,16 +1182,19 @@ function organizationOf(actor: Actor): string {
   return actor.organizationId;
 }
 
-async function jsonObject(request: Request): Promise<Record<string, unknown>> {
+async function jsonObject(
+  request: Request,
+  limit: number = MAX_BODY_BYTES,
+): Promise<Record<string, unknown>> {
   if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
     controlError("invalid_argument", 400);
   }
   const bytes = new Uint8Array(await request.arrayBuffer());
-  if (bytes.byteLength === 0 || bytes.byteLength > MAX_BODY_BYTES) {
+  if (bytes.byteLength === 0 || bytes.byteLength > limit) {
     controlError("invalid_argument", 400);
   }
   try {
-    const parsed = parseStrictJson(bytes, MAX_BODY_BYTES);
+    const parsed = parseStrictJson(bytes, limit);
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
       controlError("invalid_argument", 400);
     }
