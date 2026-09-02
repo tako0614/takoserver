@@ -196,6 +196,16 @@ export function buildApp(ports: AppPorts): App {
       "integration E2E credential authority does not match the active Worker Version",
     );
   }
+  // The runtime-input `canonicalPublicOrigin` is an anti-misdirection fence:
+  // it is the origin a caller must have addressed for its values to be sealed
+  // here. An authority configured against any other origin fences nothing, so
+  // the two independent inputs are proved equal at composition rather than
+  // assumed equal by convention.
+  if (ports.runtimeInputs && ports.runtimeInputs.canonicalPublicOrigin !== ports.publicOrigin) {
+    throw new TypeError(
+      "runtime input authority origin does not match this deployment's public origin",
+    );
+  }
   const clock = ports.clock ?? (() => new Date());
   const randomId = ports.randomId ?? (() => crypto.randomUUID().replaceAll("-", ""));
   const artifactReconciler = createTakoformArtifactReconciler({

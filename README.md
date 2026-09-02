@@ -272,10 +272,17 @@ endpoint UID as a deletion witness: the endpoint and its provider deployment
 must be closed before the reservation can be released and its origin reused.
 TTL expiry does not unlock an origin while that deletion witness is retained.
 A self-hosted machine takes the same path when its operator configures
-`TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING`, and only then: the capability is
+`TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING` **and** serves the deployment at an
+`https` bare `TAKOSERVER_PUBLIC_ORIGIN`, and only then: the capability is
 derived from the lease port's presence, so a machine with nowhere to seal a
 value advertises a ceiling of zero and admission refuses the declaration with
-`unsupported_capability` before anything is provisioned. Nothing is
+`unsupported_capability` before anything is provisioned. The canonical public
+origin is HTTPS-only on both sides — the released Takoform provider refuses any
+other scheme before it sends a value, and `openapi/takoserver.openapi.json`
+documents the same — so the default `http://localhost:8787` development origin
+carries no sensitive runtime inputs; the entry point says so on startup and
+composes no preparation route. The retired-ObjectBucket drain mode composes no
+lease port either, and therefore also serves no preparation route. Nothing is
 auto-generated in its place — a key kept beside the ciphertext it protects is
 not encryption at rest. workerd has no secret binding type, so a delivered value
 is projected as an ordinary environment binding into a `0600` configuration

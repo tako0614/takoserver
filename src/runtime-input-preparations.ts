@@ -205,6 +205,13 @@ export interface RuntimeInputPreparations {
 }
 
 export interface RuntimeInputAuthority {
+  /**
+   * The exact origin this authority refuses a preparation for. It is exposed so
+   * the composition that owns the Host's public identity can prove the two are
+   * the same value: an anti-misdirection fence configured against an origin the
+   * Host is not served at fences nothing.
+   */
+  readonly canonicalPublicOrigin: string;
   /** Closed control-plane surface used only by authenticated HTTP routes. */
   readonly preparations: {
     prepare(input: RuntimeInputPreparationInput): Promise<RuntimeInputPreparationProjection>;
@@ -238,6 +245,21 @@ export interface CreateRuntimeInputPreparationsOptions {
   readonly randomBytes?: (length: number) => Uint8Array;
 }
 
+/**
+ * Whether this deployment's public origin can carry the sensitive runtime-input
+ * contract at all. A composition asks before it constructs the authority, so an
+ * operator without a TLS origin gets a Host that honestly advertises no
+ * capability instead of one that fails at the first apply.
+ */
+export function runtimeInputCanonicalOriginSupported(value: string): boolean {
+  try {
+    validateBareOrigin(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function createRuntimeInputAuthority(
   options: CreateRuntimeInputPreparationsOptions,
 ): RuntimeInputAuthority {
@@ -259,6 +281,7 @@ export function createRuntimeInputAuthority(
   });
 
   return {
+    canonicalPublicOrigin: options.canonicalPublicOrigin,
     preparations: {
       prepare: (input) => internals.prepare(input),
       read: (organizationId, operationKey) => internals.read(organizationId, operationKey),
@@ -1428,9 +1451,16 @@ function validateBoundedText(value: string, maximum: number): void {
 }
 
 /**
- * A bare origin this deployment can honestly be addressed as. HTTPS everywhere
- * except loopback, which is the one name a machine developing against itself
- * can produce without inventing a certificate.
+ * A bare origin this deployment can honestly be addressed as, and the published
+ * schema's rule: HTTPS only, loopback included.
+ *
+ * The released Takoform provider refuses any other scheme client-side before it
+ * sends a single value, and `openapi/takoserver.openapi.json` documents the
+ * same. A Host that blessed `http://localhost` would advertise a capability no
+ * released client can use, so the one deployment shape that cannot have a TLS
+ * origin simply has no sensitive runtime inputs: the authority is not
+ * constructed, the provider advertises no capability, and admission refuses the
+ * declaration with `unsupported_capability`.
  */
 function validateBareOrigin(value: string): void {
   let parsed: URL;
@@ -1439,9 +1469,8 @@ function validateBareOrigin(value: string): void {
   } catch {
     throw new TypeError("canonical public origin must be a bare origin");
   }
-  const loopback = parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
   if (
-    (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback)) ||
+    parsed.protocol !== "https:" ||
     parsed.origin !== value ||
     parsed.username !== "" ||
     parsed.password !== "" ||

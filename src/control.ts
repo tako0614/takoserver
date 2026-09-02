@@ -663,9 +663,13 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     const runtimeInputPreparation =
       /^\/v1\/takoform\/worker-runtime-input-preparations\/([^/]+)$/u.exec(url.pathname);
     if (runtimeInputPreparation) {
+      // Authentication first, deliberately. Answering 404 before the caller has
+      // proved anything would make this route an unauthenticated oracle for
+      // "this deployment is configured to hold sealed secrets", which is a fact
+      // about the operator rather than about the requested operation.
+      const organizationId = await organizationWriter(request);
       if (!runtimeInputs) controlError("operation_not_found", 404);
       const operationKey = segment(runtimeInputPreparation[1]);
-      const organizationId = await organizationWriter(request);
       if (request.headers.get("idempotency-key") !== operationKey) {
         controlError("invalid_argument", 400);
       }

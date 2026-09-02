@@ -583,7 +583,7 @@ test("serves the private v2 route to one resources writer, shaped as the provide
   expect(durable).toEqual({ state: "revoked", sealed_payload: null });
 });
 
-test("does not mount the preparation route without an explicit runtime-input service", async () => {
+test("hides whether a runtime-input service is composed until the caller authenticates", async () => {
   const app = buildApp({
     sql: createEphemeralSql(),
     objects: createMemoryObjectStore(),
@@ -610,7 +610,64 @@ test("does not mount the preparation route without an explicit runtime-input ser
       headers: { "idempotency-key": OPERATION_KEY },
     }),
   );
-  expect(response.status).toBe(404);
+  // Exactly what a deployment that *does* hold a seal key ring answers the same
+  // unauthenticated request with, so the response is not an oracle for whether
+  // this machine keeps sealed secrets at rest.
+  expect(response.status).toBe(401);
+  expect(await response.json()).toMatchObject({ error: { code: "unauthenticated" } });
+});
+
+test("refuses a canonical public origin the released provider would not speak", async () => {
+  const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
+    "encrypt",
+    "decrypt",
+  ]);
+  const authority = (canonicalPublicOrigin: string) =>
+    createRuntimeInputAuthority({
+      sql: createEphemeralSql(),
+      sealKeys: { current: { keyId: "runtime-input-test-key", key } },
+      canonicalPublicOrigin,
+      clock: () => new Date(PREPARATION_TIME),
+    });
+  // HTTPS only, loopback included: the released client rejects every other
+  // scheme before it sends a value, and the published schema says the same.
+  for (const invalid of [
+    "http://localhost:8787",
+    "http://127.0.0.1:8787",
+    "https://api.takoserver.test/",
+    "https://user:pass@api.takoserver.test",
+    "not-an-origin",
+  ]) {
+    expect(() => authority(invalid)).toThrow("canonical public origin must be a bare origin");
+  }
+  expect(authority(HOST_ORIGIN).canonicalPublicOrigin).toBe(HOST_ORIGIN);
+});
+
+test("refuses a composition whose runtime-input origin is not this Host's own", async () => {
+  const { authority } = await runtimeInputFixture();
+  const ports = {
+    sql: createEphemeralSql(),
+    objects: createMemoryObjectStore(),
+    identity: {
+      async verify() {
+        throw new Error("identity must not be reached");
+      },
+    },
+    settlement: {
+      async verify() {
+        throw new Error("settlement must not be reached");
+      },
+    },
+    forms: [],
+    hostForms: [],
+    driver: new InMemoryTakoformResourceDriver(),
+    offerings: [],
+    runtimeInputs: authority,
+  };
+  expect(() => buildApp({ ...ports, publicOrigin: "https://api.elsewhere.test" })).toThrow(
+    "runtime input authority origin does not match this deployment's public origin",
+  );
+  expect(() => buildApp({ ...ports, publicOrigin: HOST_ORIGIN })).not.toThrow();
 });
 
 async function seedWorkerLifecycle(

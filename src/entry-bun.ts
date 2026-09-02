@@ -18,7 +18,10 @@ import {
 import { resolvePayment } from "./payment-setup.ts";
 import { createOpenAiGateway, parseOpenAiModelConfig } from "./providers/openai.ts";
 import { createProvisionerEndpoint } from "./provisioner-endpoint.ts";
-import { createRuntimeInputAuthority } from "./runtime-input-preparations.ts";
+import {
+  createRuntimeInputAuthority,
+  runtimeInputCanonicalOriginSupported,
+} from "./runtime-input-preparations.ts";
 import { parseRuntimeInputSealKeyRing } from "./runtime-input-seal-keyring.ts";
 import { ensureSigningKey } from "./signing-key.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
@@ -209,12 +212,32 @@ const artifactStore = createTakoformArtifacts({
  * private preparation route is not served at all. Generating a key here and
  * keeping it beside the ciphertext would not be encryption at rest; it would be
  * a lock with its key taped to it.
+ *
+ * Two more conditions have to hold, and both are refusals rather than
+ * workarounds. `TAKOSERVER_PUBLIC_ORIGIN` must be an `https` bare origin,
+ * because the released Takoform provider refuses any other scheme before it
+ * sends a value and this Host's own published schema says the same — a Host
+ * that accepted `http://localhost:8787` would advertise a capability no client
+ * can use. And the retired-ObjectBucket drain mode composes no lease port, so
+ * a preparation made there could never be delivered and would simply expire
+ * with secrets sealed on disk for an hour.
  */
-const runtimeInputs = process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING
+const runtimeInputsAvailable =
+  Boolean(process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING) &&
+  runtimeInputCanonicalOriginSupported(publicOrigin) &&
+  providerMode !== RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN;
+if (process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING && !runtimeInputsAvailable) {
+  console.warn(
+    runtimeInputCanonicalOriginSupported(publicOrigin)
+      ? "sensitive Worker runtime inputs are disabled: the retired ObjectBucket drain mode composes no lease port"
+      : `sensitive Worker runtime inputs are disabled: TAKOSERVER_PUBLIC_ORIGIN must be an https bare origin (got ${publicOrigin})`,
+  );
+}
+const runtimeInputs = runtimeInputsAvailable
   ? createRuntimeInputAuthority({
       sql,
       sealKeys: await parseRuntimeInputSealKeyRing(
-        process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING,
+        process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING as string,
       ),
       canonicalPublicOrigin: publicOrigin,
       clock,
@@ -264,9 +287,7 @@ const providerComposition = createStandaloneProviderComposition({
   ...(process.env.TAKOSERVER_SUFFIXES
     ? { suffixes: process.env.TAKOSERVER_SUFFIXES.split(",").map((entry) => entry.trim()) }
     : {}),
-  ...(runtimeInputs && providerMode !== RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
-    ? { runtimeInputs: runtimeInputs.leases }
-    : {}),
+  ...(runtimeInputs ? { runtimeInputs: runtimeInputs.leases } : {}),
   now: clock(),
   ...(providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
     ? {
