@@ -174,6 +174,16 @@ path at the Worker's own hostname reaches `fetch`, which does not know what an
 event is. The token is declared on the gate and nowhere else, exactly as the
 plane token is declared on the data facade.
 
+The token is therefore the whole defence, and it is worth saying so plainly:
+workerd binds one socket for everything it serves, so the event hostname is
+reachable from wherever that port is reachable — the same interface a customer's
+own traffic arrives on. Anything that can address the port can name
+`<script>.selfhost-events.invalid`; what it cannot do is present the 32 random
+bytes the gate compares, and every refusal is the same bare `404`. There is no
+rate limit, because guessing 32 bytes is not a thing a rate limit is needed for.
+Put the runtime's port where the provisioning endpoint goes — behind a tunnel or
+on a private interface — and this is one lock rather than the only one.
+
 ### What a Consumer's numbers mean here
 
 - `maxBatchSize` and `maxBatchTimeoutSeconds`: a batch leaves as soon as it is
@@ -194,6 +204,29 @@ plane token is declared on the data facade.
   and settlement leaves rows whose lease expires and which the next pass takes
   again, so a handler may see a message twice. At-least-once is the contract.
 
+**A redelivery is only ever spent by an answer the Worker gave.** A workerd that
+is restarting, a refused connection, a delivery that ran out of time, and a reply
+that is not this protocol are all this Host failing to ask: the lease is
+released, the delivery count is put back where it was, and the consumer is left
+alone for a doubling wait of at most a minute before being asked again. So a
+machine whose runtime is down for a while empties nothing. What does spend a
+redelivery is the tenant's own answer — its decisions, or the wrapper's status
+for a handler that threw.
+
+**A batch is also bounded by bytes.** The event envelope has a 2 MiB ceiling,
+so a pass takes messages until the next one would not fit and sends what it has;
+the batch is then full in the same sense a `maxBatchSize` batch is, and does not
+wait for `maxBatchTimeoutSeconds`. A `maxBatchSize` of 100 with large bodies
+therefore arrives as several batches rather than one, which is the only reading
+under which nothing is lost. A batch this Host could not send at all is split,
+never settled: it costs no redelivery and reaches no dead-letter queue.
+
+**Retention is swept, not merely promised.** Expired messages are reclaimed on
+the thirty-second maintenance tick, in pages, until nothing expired is left or
+the pass has reclaimed a hundred thousand rows. A queue accepting faster than one
+page a tick does not accumulate rows for ever; a queue nobody drains still cannot
+turn the sweep into the workload.
+
 ### What a Cron Trigger's schedule means here
 
 Five UTC fields, exactly the Form's grammar: minute, hour, day-of-month, month,
@@ -201,6 +234,12 @@ day-of-week, each a comma-separated list of `*`, a literal, `low-high`,
 `*/step`, or `low-high/step`. Names and a step on a bare literal are refused, and
 so is an expression this Host cannot read — at apply, rather than by recording a
 trigger that would never fire.
+
+When day-of-month and day-of-week are both *restricted* a day matches if either
+selects it; when only one is, only that one constrains the day. Restricted is
+decided from the field's first character, which is the historical rule: `*/2` in
+a day field restricts nothing, so `0 0 */2 * 1` is Mondays and `0 0 1 * */1` is
+the 1st of each month.
 
 **A missed run is not made up.** A match is fired only while the minute it
 belongs to is still the current one; a machine that was down, or whose previous
@@ -222,7 +261,20 @@ republished — the declaration is desired state either way — and the ticket s
 
 A Worker Version published before this Host recorded event handlers has neither
 a handler list nor an event token, so attaching a Consumer or a Trigger to it is
-refused rather than half-served; publishing a new Version is what changes that.
+refused rather than half-served — before anything durable moves, so a refused
+attachment leaves no attachment behind. Publishing a new Version is what changes
+that.
+
+### Known gap: the managed backend's batch ceiling
+
+The managed Cloudflare backend projects the same envelope with the same 2 MiB
+ceiling, and its gateway settles a batch it could not build the same way this one
+used to: as a whole-batch `retry()`, which counts. It is not fixed here, because
+only a self-hosted Host owns the queue the batch came out of and can take a
+smaller one; on Cloudflare the batch is handed over by Queues and the gateway
+cannot ask for a different one. Until that is addressed there, a managed consumer
+with a large `maxBatchSize` and bodies near the producer's 127 000-byte ceiling
+retries itself into the dead-letter queue without the Worker ever being invoked.
 
 ## Retired Cloudflare ObjectBucket drain
 
