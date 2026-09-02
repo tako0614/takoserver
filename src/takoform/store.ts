@@ -335,6 +335,28 @@ export interface TakoformStore {
     readonly address: ResourceAddress;
     readonly formRef: TakoformV1Alpha3FormRef;
   }): Promise<boolean>;
+  /**
+   * Drops the record of an incarnation that was reserved and never committed.
+   *
+   * `reserveResourceIncarnation` opens a deletion attestation `live` before the
+   * Resource exists, and a create that is refused commits nothing — so the
+   * record described an incarnation that never existed, a deletion that never
+   * happened could never close it, and the `apply` effect it carried stayed
+   * open for good. Everything that later asks "is this endpoint provably gone"
+   * reads exactly those two rows, so the residue of one refusal made the next
+   * repair impossible.
+   *
+   * Fenced on the incarnation having produced nothing: no Resource row, no
+   * provider deployment outside `deleted`/`failed`, the attestation still
+   * `live`, and every effect on the uid belonging to this one operation with
+   * none of them `succeeded`. A refusal that may have mutated something keeps
+   * its record, which is what a repair reads.
+   */
+  releaseUncommittedResourceIncarnation(input: {
+    readonly tenantId: string;
+    readonly resourceUid: string;
+    readonly effectId: string;
+  }): Promise<boolean>;
   /** Append one provider/migration effect event; duplicate events are idempotent. */
   recordResourceEffect(input: {
     readonly tenantId: string;
@@ -1075,6 +1097,58 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         canonicalJson(row.formRef) === canonicalJson(input.formRef) &&
         row.state === "live"
       );
+    },
+
+    async releaseUncommittedResourceIncarnation(input): Promise<boolean> {
+      const producedNothing = `
+        NOT EXISTS (
+          SELECT 1 FROM tf_resources
+          WHERE tenant_id = ? AND uid = ?
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM tf_resource_deployments
+          WHERE tenant_id = ? AND resource_uid = ? AND state NOT IN ('deleted', 'failed')
+        )
+        AND EXISTS (
+          SELECT 1 FROM tf_resource_deletion_attestations
+          WHERE tenant_id = ? AND resource_uid = ? AND state = 'live'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM tf_resource_provider_effects
+          WHERE tenant_id = ? AND resource_uid = ?
+            AND (effect_id <> ? OR phase = 'succeeded')
+        )`;
+      const fence = (uid: string, effectId: string): readonly SqlParam[] => [
+        input.tenantId,
+        uid,
+        input.tenantId,
+        uid,
+        input.tenantId,
+        uid,
+        input.tenantId,
+        uid,
+        effectId,
+      ];
+      const [, dropped] = await sql.batch([
+        {
+          sql: `DELETE FROM tf_resource_provider_effects
+                WHERE tenant_id = ? AND resource_uid = ? AND effect_id = ?
+                  AND ${producedNothing}`,
+          params: [
+            input.tenantId,
+            input.resourceUid,
+            input.effectId,
+            ...fence(input.resourceUid, input.effectId),
+          ],
+        },
+        {
+          sql: `DELETE FROM tf_resource_deletion_attestations
+                WHERE tenant_id = ? AND resource_uid = ? AND state = 'live'
+                  AND ${producedNothing}`,
+          params: [input.tenantId, input.resourceUid, ...fence(input.resourceUid, input.effectId)],
+        },
+      ]);
+      return (dropped?.changes ?? 0) === 1;
     },
 
     async recordResourceEffect(input): Promise<boolean> {

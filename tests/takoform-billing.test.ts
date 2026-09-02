@@ -885,13 +885,23 @@ describe("Takoform apply on a real backend", () => {
     );
     expect(failedApply.status).not.toBe(201);
     expect(provider.sideEffectCount).toBe(0);
+    // The attempt provably mutated nothing, so the incarnation it reserved is
+    // not left on record: an attestation that no deletion can close and an
+    // `apply` effect with no terminal event are what a later repair reads as
+    // "this may still be there".
     expect(
       await sql.query(
         `SELECT phase FROM tf_resource_provider_effects
          WHERE tenant_id = ? AND effect_kind = 'apply'`,
         [organizationId],
       ),
-    ).toEqual([{ phase: "planned" }, { phase: "cancelled" }]);
+    ).toEqual([]);
+    expect(
+      await sql.query(
+        "SELECT resource_uid FROM tf_resource_deletion_attestations WHERE tenant_id = ?",
+        [organizationId],
+      ),
+    ).toEqual([]);
     expect(
       await sql.query("SELECT operation_id FROM tf_provider_mutation_sagas WHERE tenant_id = ?", [
         organizationId,
