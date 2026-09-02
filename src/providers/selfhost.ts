@@ -1545,11 +1545,12 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   /**
    * The current ObjectBucket Form, as opposed to the retained v1beta1 drain.
    *
-   * A Host may now support and activate it (ADR 0007), but this machine has no
-   * `edge.objects` backend, so the honest answer at the mutation barrier is a
-   * refusal. Reporting a `local-bucket:` namespace instead would record a
-   * Deployment for storage that does not exist, and a later Worker Version
-   * would bind nothing. The v1beta1 identity keeps its observe/delete drain.
+   * A self-host admission activates this Form with an empty operation set
+   * (ADR 0007), so nothing should reach here at all. This is the barrier behind
+   * that: a composition assembled by hand could still offer the Form, and
+   * reporting a `local-bucket:` namespace for it would record a Deployment for
+   * storage that does not exist, which a later Worker Version would bind
+   * nothing to. The v1beta1 identity keeps its observe/delete drain.
    */
   const currentObjectBucket = (offering: ProviderOffering): boolean =>
     offering.form.kind === "ObjectBucket" && offering.form.apiVersion === "edge.forms.takoform.com";

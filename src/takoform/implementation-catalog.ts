@@ -20,9 +20,10 @@ export const YURUCOMMU_FORM_VERSIONS = {
 export type YurucommuFormKind = keyof typeof YURUCOMMU_FORM_VERSIONS;
 
 /**
- * Identity Forms a Host may support only when the deploy target realizes a
- * provider supply for each one. `ObjectBucket` joined this set in ADR 0007; a
- * Host that cannot back it must not appear in the manifest it serves.
+ * Identity Forms a Host may execute only where it realizes a provider supply
+ * for each one. `ObjectBucket` joined this set in ADR 0007; a Host that cannot
+ * back one leaves that kind out of the manifest it serves, and then serves an
+ * empty operation set for the Form rather than an operation it would refuse.
  */
 export const YURUCOMMU_IDENTITY_CAPABILITY_KINDS = [
   "AtLeastOnceQueue",
