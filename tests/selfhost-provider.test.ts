@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -18,7 +19,10 @@ import {
   type SelfhostDataPlaneMaintenance,
 } from "../src/providers/selfhost.ts";
 import { SELFHOST_EDGE_OBJECTS_MATERIAL_KIND } from "../src/providers/selfhost-runtime-bindings.ts";
-import { SELFHOST_WORKER_READINESS_PATH } from "../src/providers/selfhost-worker-wrapper.ts";
+import {
+  SELFHOST_WORKER_READINESS_PATH,
+  SELFHOST_WORKER_READINESS_RESULT_SCHEMA,
+} from "../src/providers/selfhost-worker-wrapper.ts";
 import { createRuntimeInputAuthority } from "../src/runtime-input-preparations.ts";
 import {
   createWorkerdRuntime,
@@ -260,6 +264,60 @@ function bindingFiles(dataRoot: string): readonly string[] {
   const bindings = join(dataRoot, "selfhost", "version-bindings");
   if (!existsSync(bindings)) return [];
   return readdirSync(bindings, { recursive: true }).map(String);
+}
+
+/**
+ * A runtime that behaves the way workerd does: one live configuration at a
+ * time, and a readiness answer that names whichever publication is live.
+ *
+ * `flakyRuntime` answers `has()` and nothing else, so it cannot show a
+ * publication being answered about a configuration that replaced it. This one
+ * can. Each step yields, because a race between two publications is a race
+ * between their `await` points and a synchronous fake has none.
+ */
+function servingRuntime(): {
+  readonly runtime: WorkerdRuntime;
+  readonly state: { readonly log: string[] };
+} {
+  const staged = new Map<string, string>();
+  const live = new Map<string, string>();
+  const log: string[] = [];
+  const yieldTurn = () => new Promise<void>((wake) => setTimeout(wake, 0));
+  return {
+    state: { log },
+    runtime: {
+      async write(name, site) {
+        log.push("write");
+        await yieldTurn();
+        staged.set(name, String(site.generation ?? ""));
+      },
+      async remove(name) {
+        staged.delete(name);
+        live.delete(name);
+      },
+      async reload() {
+        log.push("reload");
+        await yieldTurn();
+        for (const [name, generation] of staged) live.set(name, generation);
+      },
+      async has(name, generation) {
+        return generation === undefined ? live.has(name) : live.get(name) === generation;
+      },
+      async probe(name) {
+        log.push("probe");
+        await yieldTurn();
+        const generation = live.get(name);
+        if (generation === undefined) return null;
+        return {
+          status: 200,
+          body: JSON.stringify({
+            schema: SELFHOST_WORKER_READINESS_RESULT_SCHEMA,
+            publication: createHash("sha256").update(generation, "utf8").digest("hex"),
+          }),
+        };
+      },
+    },
+  };
 }
 
 interface FlakyRuntimeState {
@@ -504,6 +562,65 @@ describe("publishing a Worker through the Edge Family", () => {
 
     const script = await publish(local);
     expect(asked).toEqual([`${script} ${SELFHOST_WORKER_READINESS_PATH}`]);
+  });
+
+  /**
+   * A publication is not defeated by another publication of the same Worker.
+   *
+   * One `tofu apply` creates the `WorkerEndpoint`, the `QueueConsumer` and the
+   * `WorkerCronTrigger` together, and all three republish the same script.
+   * Read-state, render, write, reload, ask-the-runtime was not exclusive, so
+   * the reloads interleaved: the endpoint asked about a configuration another
+   * publication had already replaced, waited out a five-second guess on an
+   * answer naming somebody else's publication, and refused with `unavailable` —
+   * a Version that was in fact serving. On a real self-host the failed attempt
+   * then left the origin reservation bound to an endpoint that never existed,
+   * so every later apply answered `resource_busy` 409 forever.
+   */
+  test("does not let one publication of a Worker answer for another", async () => {
+    const runtime = servingRuntime();
+    const local = provider({ runtime: runtime.runtime, events: { async forgetSchedules() {} } });
+    const script = await publish(local);
+    const cron = () =>
+      local.apply({
+        operationId: "op_cron_race",
+        offering: offering("WorkerCronTrigger"),
+        identity: identity("hello-cron"),
+        spec: {
+          worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+          cron: "0 * * * *",
+        },
+        relations: [relation("/worker", "ModuleWorker", "hello")],
+      });
+    expect(await cron()).toMatchObject({ phase: "succeeded" });
+
+    // The shape the real apply makes: the endpoint attaches its hostname while
+    // a second publication of the same script — a re-applied attachment, which
+    // republishes whether or not its desired state moved — runs beside it.
+    runtime.state.log.length = 0;
+    const [endpoint, replayed] = await Promise.all([
+      local.apply({
+        operationId: "op_endpoint_race",
+        offering: offering("WorkerEndpoint"),
+        identity: identity("hello-endpoint"),
+        spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" } },
+        relations: [relation("/worker", "ModuleWorker", "hello")],
+        workerEndpointOriginAssignment: endpointAssignment(`${script}.localhost`),
+      }),
+      cron(),
+    ]);
+
+    expect(endpoint).toMatchObject({ phase: "succeeded" });
+    expect(replayed).toMatchObject({ phase: "succeeded" });
+    expect(endpoint.phase === "succeeded" ? endpoint.result.outputs : {}).toEqual({
+      hostname: `${script}.localhost`,
+      url: `https://${script}.localhost/`,
+    });
+
+    // And every probe asked about the configuration the runtime had just been
+    // given: one publication at a time, so nothing is ever published without
+    // its own load probe being the one that answered.
+    expect(runtime.state.log).toEqual(["write", "reload", "probe", "write", "reload", "probe"]);
   });
 
   test("refuses a bundle that carries a module under this Host's generated name", async () => {

@@ -173,13 +173,24 @@ const SQLITE_MIGRATION_LEDGER = "_takoform_sqlite_migrations";
  */
 const SQLITE_LOCK_WAIT_MS = 5_000;
 /**
- * How long a publication waits for the runtime to confirm it is the one served.
+ * How long a publication waits for the runtime to confirm it is the one served,
+ * with nothing moving.
  *
  * Long enough for workerd to notice a rewritten configuration and reload on it,
- * short enough that an apply is still an apply. Reaching the end of it is a
- * refusal, not a pass.
+ * short enough that an apply is still an apply. It is measured from the last
+ * time the runtime answered with a *different* publication than it had before:
+ * a runtime that is still working through configurations is making progress,
+ * and a fixed budget spent waiting for one that is stuck is the honest bound.
+ * Reaching the end of it is a refusal, not a pass.
  */
-const READINESS_DEADLINE_MILLIS = 5_000;
+const READINESS_IDLE_DEADLINE_MILLIS = 5_000;
+/**
+ * The end of the wait however much progress the runtime keeps making.
+ *
+ * The idle bound above is the one that normally fires. This exists so a runtime
+ * that never settles cannot hold an apply open forever.
+ */
+const READINESS_CEILING_MILLIS = 60_000;
 const SQLITE_MIGRATION_LEDGER_DDL = `CREATE TABLE IF NOT EXISTS ${SQLITE_MIGRATION_LEDGER} (
   sequence INTEGER PRIMARY KEY NOT NULL CHECK (sequence > 0),
   path TEXT NOT NULL UNIQUE CHECK (length(path) BETWEEN 1 AND 255),
@@ -874,12 +885,30 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
    * answer that is not this publication's readiness answer means the check did
    * not happen. Waiting out the deadline and returning would publish exactly
    * the Version this exists to refuse, so the deadline fails closed.
+   *
+   * What defeated it was another publication of the same script. A `tofu apply`
+   * creates the endpoint, the queue consumer and the cron trigger at once, and
+   * all three republish; interleaved, each reload replaced the configuration
+   * the other had just asked about, so the endpoint's probe waited out a
+   * five-second guess on an answer naming somebody else's publication and
+   * refused a Version that was in fact serving. Publications of one script are
+   * now serialized (`republish`), which removes the race rather than tolerating
+   * it — a probe always asks about the configuration the runtime was last given
+   * for this script.
+   *
+   * What is left to bound is a runtime that never gets there, and the bound is
+   * derived from what the runtime is doing rather than guessed: the budget is
+   * spent only while the answer stays the same. A runtime still working through
+   * configurations is making progress and is given the budget again, under a
+   * ceiling so it cannot hold an apply open forever.
    */
   const probeReadiness = async (script: string, publication: string): Promise<void> => {
     const probe = runtime.probe;
     if (!probe) return;
-    const deadline = Date.now() + READINESS_DEADLINE_MILLIS;
+    const ceiling = Date.now() + READINESS_CEILING_MILLIS;
+    let idleDeadline = Date.now() + READINESS_IDLE_DEADLINE_MILLIS;
     let alive = false;
+    let observed: string | null = null;
     for (let attempt = 0; ; attempt += 1) {
       const response = await probe(script, SELFHOST_WORKER_READINESS_PATH, {
         method: "POST",
@@ -894,12 +923,18 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             failed("invalid_spec", selfhostReadinessFailureMessage(parsed.failure)),
           );
         }
+        if (parsed && parsed.publication !== observed) {
+          // The runtime moved. It has not reached this publication, but it is
+          // not stuck on one either, so the idle budget starts again.
+          observed = parsed.publication;
+          idleDeadline = Date.now() + READINESS_IDLE_DEADLINE_MILLIS;
+        }
       }
       // Nothing has answered on that address and nothing ever did: this
       // deployment does not run the runtime in this process, so there is
       // nothing to ask and waiting would be waiting for nobody.
       if (!alive) return;
-      if (Date.now() >= deadline) {
+      if (Date.now() >= idleDeadline || Date.now() >= ceiling) {
         // Retryable: the runtime is up but has not reached this configuration,
         // which is a reconcile away rather than a defect in the declaration.
         throw new SelfhostFailure(
@@ -939,8 +974,46 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     return Boolean(stored?.eventToken && stored.handlers);
   };
 
+  /**
+   * One publication of a script at a time, on this machine.
+   *
+   * A publication is read-state, render, write, reload, then ask the runtime
+   * whether the configuration it is serving is this one. Nothing made those
+   * five steps exclusive, and a single `tofu apply` runs several of them at
+   * once: the `WorkerEndpoint`, the `QueueConsumer` and the `WorkerCronTrigger`
+   * all republish the same script. Interleaved, each reload replaced the
+   * configuration the other had just asked about, so the endpoint's probe
+   * waited out its budget on an answer that named somebody else's publication
+   * and refused a Version that was in fact serving — and the failed attempt
+   * then wedged the origin reservation behind it. Serializing per script is
+   * what removes the race; the probe's supersession rule is what keeps a
+   * publication from being blamed for one that replaced it anyway.
+   *
+   * Per script rather than globally, because two tenants' Workers have no
+   * reason to wait on each other, and the chain entry is dropped once it is the
+   * tail and settled so a long-lived Host does not accumulate one per script it
+   * ever published.
+   */
+  const publications = new Map<string, Promise<void>>();
+  const republish = (script: string): Promise<void> => {
+    const queued = publications.get(script) ?? Promise.resolve();
+    const next = queued.then(
+      () => publishScript(script),
+      () => publishScript(script),
+    );
+    const settled = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    publications.set(script, settled);
+    void settled.then(() => {
+      if (publications.get(script) === settled) publications.delete(script);
+    });
+    return next;
+  };
+
   /** Rewrites what workerd serves for one script from durable state alone. */
-  const republish = async (script: string): Promise<void> => {
+  const publishScript = async (script: string): Promise<void> => {
     const { state } = await readScriptState(script);
     if (!state.activeVersion) {
       await runtimeOperation(() => runtime.remove(script));
