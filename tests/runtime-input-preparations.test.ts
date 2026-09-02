@@ -368,6 +368,53 @@ test("sweeps an expired claim but leaves a dispatched handoff untouched", async 
   });
 });
 
+test("reclaims a terminal, value-free row only after its retention window", async () => {
+  const fixture = await runtimeInputFixture();
+  await fixture.authority.preparations.prepare(preparationInput());
+  const lease = await fixture.authority.leases.acquire(leaseInput());
+  const dispatched = await lease.dispatch();
+  await dispatched.settle(`sha256:${"4".repeat(64)}`);
+
+  // A consumed handoff is still the answer to "was this key already spent"
+  // for as long as an operator might be looking at the run that spent it.
+  fixture.setNow("2026-09-07T17:59:00Z");
+  expect(await fixture.authority.maintenance.expireDue(64)).toBe(0);
+  expect(await fixture.authority.preparations.read("org_01", OPERATION_KEY)).toMatchObject({
+    status: "consumed",
+  });
+
+  fixture.setNow("2026-09-07T18:00:01Z");
+  expect(await fixture.authority.maintenance.expireDue(64)).toBe(1);
+  expect(
+    await fixture.sql.query("SELECT operation_key FROM worker_runtime_input_preparations", []),
+  ).toHaveLength(0);
+});
+
+test("erases unreadable sealed material on a same-owner re-claim too", async () => {
+  const fixture = await runtimeInputFixture();
+  await fixture.authority.preparations.prepare(preparationInput());
+  await fixture.authority.leases.acquire(leaseInput());
+  // Disk-level damage to a row that is already claimed. The first branch a
+  // retry of the same Host operation takes is the re-claim one.
+  await fixture.sql.run(
+    "UPDATE worker_runtime_input_preparations SET sealed_payload = ? WHERE organization_id = ? AND operation_key = ?",
+    ["AAAA", "org_01", OPERATION_KEY],
+  );
+  await expect(fixture.authority.leases.acquire(leaseInput())).rejects.toMatchObject({
+    code: "unavailable",
+    status: 503,
+  });
+  const [row] = await fixture.sql.query(
+    "SELECT state, sealed_payload FROM worker_runtime_input_preparations WHERE organization_id = ? AND operation_key = ?",
+    ["org_01", OPERATION_KEY],
+  );
+  expect(row).toEqual({ state: "indeterminate", sealed_payload: null });
+  // Indeterminate is replaceable, so the same plan-derived key is not stranded.
+  expect(await fixture.authority.preparations.prepare(preparationInput())).toMatchObject({
+    status: "prepared",
+  });
+});
+
 test("expires an unclaimed preparation and erases its ciphertext on read", async () => {
   const fixture = await runtimeInputFixture();
   await fixture.authority.preparations.prepare(preparationInput());

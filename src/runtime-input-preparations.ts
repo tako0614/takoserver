@@ -40,6 +40,18 @@ const RECEIPT_FORMAT = "takoserver.worker-runtime-input-receipt@v2" as const;
 
 const PREPARATION_TTL_MILLISECONDS = 60 * 60 * 1_000;
 const CLAIM_TTL_MILLISECONDS = 15 * 60 * 1_000;
+/**
+ * How long a terminal, value-free row is kept before the maintenance tick
+ * removes it.
+ *
+ * Seven days, and the number is a bookkeeping choice rather than a safety one:
+ * every state this reclaims already holds NULL ciphertext, and the handoff it
+ * describes expired within the hour. What the row still buys after that is a
+ * readable answer to "was this operation key already spent" for an operator
+ * looking at a run from earlier in the week. Keeping it forever would make a
+ * table that only grows out of one successful create each.
+ */
+const TERMINAL_RETENTION_MILLISECONDS = 7 * 24 * 60 * 60 * 1_000;
 const MAX_VALUE_BYTES = 32 * 1_024;
 const MAX_PUBLIC_APPLY_PATH_BYTES = 8 * 1_024;
 const MAX_PUBLIC_APPLY_BODY_BYTES = 1 * 1_024 * 1_024;
@@ -396,6 +408,23 @@ export function createRuntimeInputPreparations(
     };
   };
 
+  /**
+   * Opens one claimed row's material, and erases it if it cannot be opened.
+   *
+   * Corrupt or unopenable ciphertext fails closed either way; marking the row
+   * indeterminate is what stops a second caller from finding the same
+   * unreadable bytes still sitting there, and is what lets the operation key be
+   * prepared again instead of waiting out the claim TTL.
+   */
+  const openClaim = async (row: PreparationRow, now: number): Promise<RuntimeInputClaim> => {
+    try {
+      return await decryptClaim(row, keys);
+    } catch (error) {
+      await markClaimIndeterminate(options.sql, row, now);
+      throw error;
+    }
+  };
+
   return {
     async prepare(input) {
       const normalized = await normalizePreparation(input, hostOrigin);
@@ -525,7 +554,11 @@ export function createRuntimeInputPreparations(
       }
       if (candidate.state === "claimed") {
         assertClaimedTarget(candidate, normalized);
-        return await decryptClaim(candidate, keys);
+        // The same wrapper the fresh-claim path uses. Unreadable sealed
+        // material is a durable fact about the row, not about which branch
+        // noticed it: erasing it here too keeps a re-claim from leaving
+        // ciphertext nobody can open sitting until the claim TTL runs out.
+        return await openClaim(candidate, now);
       }
       if (candidate.state !== "prepared") {
         throw new RuntimeInputPreparationError("conflict", 409);
@@ -574,12 +607,7 @@ export function createRuntimeInputPreparations(
         await expireExact(options.sql, candidate, now);
         throw new RuntimeInputPreparationError("conflict", 409);
       }
-      try {
-        return await decryptClaim(candidate, keys);
-      } catch (error) {
-        await markClaimIndeterminate(options.sql, candidate, now);
-        throw error;
-      }
+      return await openClaim(candidate, now);
     },
 
     async abort(input) {
@@ -813,7 +841,24 @@ export function createRuntimeInputPreparations(
          )`,
         [now, now, now, limit],
       );
-      return result.changes;
+      // Terminal rows carry no material and no live authority, but they used to
+      // be kept forever: one row per successful sensitive create, never
+      // reclaimed. The `sealed_payload IS NULL` predicate is redundant against
+      // the table's own CHECK and is stated anyway, because this statement
+      // deletes rather than transitions.
+      const reclaimed = await options.sql.run(
+        `DELETE FROM worker_runtime_input_preparations
+         WHERE rowid IN (
+           SELECT rowid FROM worker_runtime_input_preparations
+           WHERE state IN ('dispatched', 'consumed', 'revoked', 'expired', 'indeterminate')
+             AND sealed_payload IS NULL
+             AND updated_at <= ?
+           ORDER BY updated_at, rowid
+           LIMIT ?
+         )`,
+        [now - TERMINAL_RETENTION_MILLISECONDS, limit],
+      );
+      return result.changes + reclaimed.changes;
     },
   };
 }
