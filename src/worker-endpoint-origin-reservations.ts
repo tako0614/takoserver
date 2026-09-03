@@ -11,6 +11,7 @@ import {
   workerEndpointPublicationRemedy,
 } from "./provider-worker-endpoint-origin.ts";
 import type { ResourceDeployment, ResourceDeploymentStore } from "./resource-deployments.ts";
+import { isSpaceId } from "./takoform/space-id.ts";
 import type { ResourceWithRelations, TakoformStore } from "./takoform/store.ts";
 import { workerServiceCondition } from "./takoform/worker-aggregate.ts";
 
@@ -1055,7 +1056,7 @@ export function createWorkerEndpointOriginReservations(options: {
     readonly workerResourceUid: string;
   }): Promise<BoundWorkerEndpointOriginReservation> => {
     normalizeIdentity(input.organizationId, input.reservationId);
-    validateTargetName(input.space);
+    validateSpace(input.space);
     validateTargetName(input.workerName);
     validateOpaque(input.workerResourceUid);
     const row = await liveRow(input.organizationId, input.reservationId);
@@ -1158,7 +1159,7 @@ export function createWorkerEndpointOriginReservations(options: {
 
     async bind(input) {
       normalizeIdentity(input.organizationId, input.reservationId);
-      validateTargetName(input.space);
+      validateSpace(input.space);
       validateTargetName(input.workerName);
       validateOpaque(input.workerResourceUid);
       const row = await liveRow(input.organizationId, input.reservationId);
@@ -1493,7 +1494,7 @@ export function createWorkerEndpointOriginReservations(options: {
 
     async mintForWorker(input) {
       normalizeIdentity(input.organizationId, input.workerResourceUid);
-      validateTargetName(input.space);
+      validateSpace(input.space);
       validateTargetName(input.workerName);
       const offeringId = await hostMintedWorkerOfferingId(input);
       const selection = await selectedPlacement(offeringId);
@@ -1565,7 +1566,7 @@ export function createWorkerEndpointOriginReservations(options: {
 
     async assignEndpoint(input) {
       normalizeIdentity(input.organizationId, input.reservationId);
-      validateTargetName(input.space);
+      validateSpace(input.space);
       validateTargetName(input.endpointName);
       validateTargetName(input.workerName);
       validateOpaque(input.endpointResourceUid);
@@ -2021,7 +2022,7 @@ function reservationRow(row: Row): ReservationRow {
   const legacyShape =
     reservationFormat === LEGACY_WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT &&
     requested === null &&
-    validResourceName(legacySpace) &&
+    validSpace(legacySpace) &&
     validResourceName(legacyWorkerName) &&
     validResourceName(legacyEndpointName);
   const currentShape =
@@ -2037,7 +2038,7 @@ function reservationRow(row: Row): ReservationRow {
     workerResourceUid === null &&
     workerResourceRevision === null;
   const boundWorker =
-    validResourceName(boundSpace) &&
+    validSpace(boundSpace) &&
     validResourceName(boundWorkerName) &&
     validOpaque(workerResourceUid) &&
     workerResourceRevision !== null &&
@@ -2640,6 +2641,17 @@ function validateTargetName(value: string): void {
   if (!resourceName.test(value)) {
     throw new WorkerEndpointOriginReservationError("invalid_argument", 400);
   }
+}
+
+/** A Space is the stable Host API identifier, not a Resource metadata.name. */
+function validateSpace(value: string): void {
+  if (!isSpaceId(value)) {
+    throw new WorkerEndpointOriginReservationError("invalid_argument", 400);
+  }
+}
+
+function validSpace(value: string | null): value is string {
+  return isSpaceId(value);
 }
 
 function validateOpaque(value: string): void {

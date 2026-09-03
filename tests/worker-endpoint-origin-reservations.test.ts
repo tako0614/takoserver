@@ -35,6 +35,7 @@ const ENDPOINT_FORM = (() => {
 })();
 
 const TARGET = { space: "default", workerName: "community", endpointName: "public" } as const;
+const TAKOSUMI_TENANT_SPACE = "tenant:tsh_2IS0Th3vfHv-B1kAAJfyNKHM79GJ0SxuZdRM147QfvI";
 const REQUESTED_SUBDOMAIN = "community-public";
 const RESERVATION_V2_MIGRATION_NAME = "0035_worker_endpoint_origin_reservation_v2.sql";
 const RESERVATION_V2_MIGRATION = readFileSync(
@@ -1459,6 +1460,102 @@ test("mints one bound reservation for a Ready Worker on an installation that der
   expect(second?.canonicalPublicOrigin).not.toBe(minted?.canonicalPublicOrigin);
 });
 
+/**
+ * A Space is an opaque Host API identifier, not a Resource metadata.name.
+ * Takosumi's real tenant-scoped Spaces contain `:`, so applying the Resource
+ * name grammar here made the first WorkerEndpoint in an otherwise healthy
+ * fifteen-Resource graph fail before the provider mutation boundary.
+ */
+test("mints a WorkerEndpoint reservation in the tenant-scoped Space used by Takosumi", async () => {
+  const space = TAKOSUMI_TENANT_SPACE;
+  const { authority, sql } = fixture({ hostMintedSubdomain: "sw-community" });
+  await seedWorker(sql, {
+    organizationId: "org_01",
+    space,
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-01",
+  });
+
+  const minted = await authority.mintForWorker({
+    organizationId: "org_01",
+    space,
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-01",
+  });
+  expect(minted).toMatchObject({
+    status: "bound",
+    binding: { space },
+  });
+});
+
+/** The reservation ledger must carry every Space the stable Host wire admits. */
+test("preserves a maximum-length Unicode Host API Space in a reservation", async () => {
+  const space = `tenant:${"界".repeat(248)}`;
+  expect([...space]).toHaveLength(255);
+  const { authority, sql } = fixture({ hostMintedSubdomain: "sw-community" });
+  await seedWorker(sql, {
+    organizationId: "org_01",
+    space,
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-01",
+  });
+
+  const minted = await authority.mintForWorker({
+    organizationId: "org_01",
+    space,
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-01",
+  });
+  expect(minted?.binding?.space).toBe(space);
+  expect(
+    await sql.query(
+      "SELECT bound_space FROM worker_endpoint_origin_reservations WHERE organization_id = ?",
+      ["org_01"],
+    ),
+  ).toEqual([{ bound_space: space }]);
+});
+
+test("rejects only non-Host Spaces at every reservation command boundary", async () => {
+  const { authority } = fixture({ hostMintedSubdomain: "sw-community" });
+  const invalidSpaces = [
+    "",
+    " leading",
+    "trailing ",
+    "tenant/child",
+    "tenant:\u0000child",
+    "界".repeat(256),
+  ];
+  for (const space of invalidSpaces) {
+    const worker = {
+      organizationId: "org_01",
+      space,
+      workerName: TARGET.workerName,
+      workerResourceUid: "uid-worker-01",
+    } as const;
+    await expect(authority.mintForWorker(worker)).rejects.toMatchObject({
+      code: "invalid_argument",
+      status: 400,
+    });
+    await expect(
+      authority.inspectBound({ ...worker, reservationId: "reservation_01" }),
+    ).rejects.toMatchObject({ code: "invalid_argument", status: 400 });
+    await expect(
+      authority.bind({ ...worker, reservationId: "reservation_01" }),
+    ).rejects.toMatchObject({ code: "invalid_argument", status: 400 });
+    await expect(
+      authority.assignEndpoint({
+        ...worker,
+        reservationId: "reservation_01",
+        endpointName: TARGET.endpointName,
+        endpointResourceUid: "uid-endpoint-01",
+        endpointResourceRevision: "1",
+        providerPackRef: "fake",
+        providerInstallationRef: "fake.primary",
+      }),
+    ).rejects.toMatchObject({ code: "invalid_argument", status: 400 });
+  }
+});
+
 test("mints nothing where the installation does not derive its own endpoint address", async () => {
   const { authority, sql } = fixture({ hostMintedSubdomain: false });
   await seedWorker(sql);
@@ -1682,7 +1779,7 @@ function endpointFormDefinition() {
 }
 
 /** The `/worker` relation a `takoform_worker_endpoint` create carries. */
-function workerRelation() {
+function workerRelation(space: string = TARGET.space) {
   return {
     pointer: "/worker",
     relation: "/worker",
@@ -1693,7 +1790,7 @@ function workerRelation() {
       form: { formRef: FORM },
       metadata: {
         name: TARGET.workerName,
-        space: TARGET.space,
+        space,
         uid: "uid-worker-01",
         generation: "1",
         revision: "1",
@@ -1987,94 +2084,84 @@ async function seedResource(
  * one looked it up in the ModuleWorker candidate list, never matched, and
  * refused every self-host WorkerEndpoint with `unsupported_capability` 422.
  */
-test("creates a WorkerEndpoint with no reservation on the placement the Worker itself holds", async () => {
-  const applied: ApplyInput[] = [];
-  const harness = fixture({
-    offerings: [sold(), soldEndpointOffering()],
-    technical: [technical(), technicalEndpointOffering()],
-    hostMintedSubdomain: "sw-community",
-    apply: async (applyInput) => {
-      applied.push(applyInput);
-      const origin = applyInput.workerEndpointOriginAssignment?.canonicalPublicOrigin ?? "";
-      return succeeded({
-        nativeId: `endpoint:${applyInput.identity.uid}`,
-        observed: { assigned: true },
-        outputs: { hostname: new URL(origin).hostname, url: `${origin}/` },
-      });
-    },
-  });
-  await seedWorker(harness.sql);
-  const endpointForm = STABLE_PRODUCTION_TAKOFORM_CATALOG.forms.find(
-    (candidate) => candidate.identity.formRef.kind === "WorkerEndpoint",
-  );
-  if (!endpointForm) throw new Error("WorkerEndpoint Form missing");
-  const driver = createProviderDriver({
-    providers: [harness.provider],
-    catalog: harness.catalog,
-    ledger: createLedger(harness.sql, harness.clock),
-    deployments: createResourceDeploymentStore(harness.sql, harness.clock),
-    originReservations: harness.authority,
-  });
-
-  const receipt = await driver.apply({
-    operationId: "op-endpoint-hostmint",
-    operationKey: "key-endpoint-hostmint",
-    tenantId: "org_01",
-    resourceUid: "uid-endpoint-01",
-    form: endpointForm,
-    name: TARGET.endpointName,
-    space: TARGET.space,
-    spec: {
-      worker: { apiVersion: FORM.apiVersion, kind: "ModuleWorker", name: TARGET.workerName },
-    },
-    relations: [
-      {
-        pointer: "/worker",
-        relation: "/worker",
-        targetUid: "uid-worker-01",
-        resource: {
-          apiVersion: FORM.apiVersion,
-          kind: "ModuleWorker",
-          form: { formRef: FORM },
-          metadata: {
-            name: TARGET.workerName,
-            space: TARGET.space,
-            uid: "uid-worker-01",
-            generation: "1",
-            revision: "1",
-          },
-          spec: {},
-          status: { observedGeneration: "1", conditions: [] },
-        },
+for (const { label, space } of [
+  { label: "ordinary", space: TARGET.space },
+  { label: "Takosumi tenant-scoped", space: TAKOSUMI_TENANT_SPACE },
+] as const) {
+  test(`creates a WorkerEndpoint with no reservation in the ${label} Space`, async () => {
+    const applied: ApplyInput[] = [];
+    const harness = fixture({
+      offerings: [sold(), soldEndpointOffering()],
+      technical: [technical(), technicalEndpointOffering()],
+      hostMintedSubdomain: "sw-community",
+      apply: async (applyInput) => {
+        applied.push(applyInput);
+        const origin = applyInput.workerEndpointOriginAssignment?.canonicalPublicOrigin ?? "";
+        return succeeded({
+          nativeId: `endpoint:${applyInput.identity.uid}`,
+          observed: { assigned: true },
+          outputs: { hostname: new URL(origin).hostname, url: `${origin}/` },
+        });
       },
-    ],
-  });
+    });
+    await seedWorker(harness.sql, {
+      organizationId: "org_01",
+      space,
+      workerName: TARGET.workerName,
+      workerResourceUid: "uid-worker-01",
+    });
+    const endpointForm = STABLE_PRODUCTION_TAKOFORM_CATALOG.forms.find(
+      (candidate) => candidate.identity.formRef.kind === "WorkerEndpoint",
+    );
+    if (!endpointForm) throw new Error("WorkerEndpoint Form missing");
+    const driver = createProviderDriver({
+      providers: [harness.provider],
+      catalog: harness.catalog,
+      ledger: createLedger(harness.sql, harness.clock),
+      deployments: createResourceDeploymentStore(harness.sql, harness.clock),
+      originReservations: harness.authority,
+    });
 
-  const origin = "https://sw-community.org-01.workers.test";
-  expect(receipt.outputs).toEqual({
-    hostname: "sw-community.org-01.workers.test",
-    url: `${origin}/`,
-  });
-  expect(applied).toHaveLength(1);
-  expect(applied[0]?.workerEndpointOriginAssignment?.canonicalPublicOrigin).toBe(origin);
+    const receipt = await driver.apply({
+      operationId: "op-endpoint-hostmint",
+      operationKey: "key-endpoint-hostmint",
+      tenantId: "org_01",
+      resourceUid: "uid-endpoint-01",
+      form: endpointForm,
+      name: TARGET.endpointName,
+      space,
+      spec: {
+        worker: { apiVersion: FORM.apiVersion, kind: "ModuleWorker", name: TARGET.workerName },
+      },
+      relations: [workerRelation(space)],
+    });
 
-  // The reservation this Host made for the caller: a derived id in the
-  // Host-minted namespace, on the ModuleWorker's own Offering, activated by
-  // the endpoint the provider just created.
-  expect(
-    await harness.sql.query(
-      `SELECT reservation_id, offering_id, state, endpoint_resource_uid
+    const origin = "https://sw-community.org-01.workers.test";
+    expect(receipt.outputs).toEqual({
+      hostname: "sw-community.org-01.workers.test",
+      url: `${origin}/`,
+    });
+    expect(applied).toHaveLength(1);
+    expect(applied[0]?.workerEndpointOriginAssignment?.canonicalPublicOrigin).toBe(origin);
+
+    // The reservation this Host made for the caller: a derived id in the
+    // Host-minted namespace, on the ModuleWorker's own Offering, activated by
+    // the endpoint the provider just created.
+    expect(
+      await harness.sql.query(
+        `SELECT reservation_id, offering_id, state, endpoint_resource_uid
        FROM worker_endpoint_origin_reservations`,
-    ),
-  ).toEqual([
-    {
-      reservation_id: expect.stringMatching(/^hostmint-[0-9a-f]{40}$/u),
-      offering_id: "worker.module.test",
-      state: "activated",
-      endpoint_resource_uid: "uid-endpoint-01",
-    },
-  ]);
-});
+      ),
+    ).toEqual([
+      {
+        reservation_id: expect.stringMatching(/^hostmint-[0-9a-f]{40}$/u),
+        offering_id: "worker.module.test",
+        state: "activated",
+        endpoint_resource_uid: "uid-endpoint-01",
+      },
+    ]);
+  });
+}
 
 /**
  * A create that fails after the provider was entered gives the origin back.

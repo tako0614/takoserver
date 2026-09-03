@@ -17,6 +17,8 @@ import {
 } from "../src/route-table.ts";
 import type { WorkerEndpointOriginReservations } from "../src/worker-endpoint-origin-reservations.ts";
 
+const TAKOSUMI_TENANT_SPACE = "tenant:tsh_2IS0Th3vfHv-B1kAAJfyNKHM79GJ0SxuZdRM147QfvI";
+
 const identity: ExternalIdentityVerifier = {
   async verify() {
     return { providerSubject: "subject", email: "owner@example.com", displayName: "Owner" };
@@ -285,6 +287,48 @@ describe("published API description", () => {
       "workerResourceUid",
       "workerResourceRevision",
     ]);
+    const spaceSchema = {
+      type: "string",
+      description:
+        "Opaque stable Host Space identifier: 1-255 Unicode code points, with no slash, C0/C1 control, or boundary whitespace.",
+      minLength: 1,
+      maxLength: 255,
+      pattern:
+        "^(?![\\u0009-\\u000d\\u0020\\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff])(?![\\s\\S]*[/\\u0000-\\u001f\\u007f-\\u009f])(?![\\s\\S]*[\\u0009-\\u000d\\u0020\\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]$)[\\s\\S]+$",
+    } as const;
+    expect(schemas.WorkerEndpointOriginReservationBinding.properties.space).toEqual(spaceSchema);
+    expect(schemas.WorkerEndpointOriginReservationLegacyTarget.properties.space).toEqual(
+      spaceSchema,
+    );
+    const spacePattern = new RegExp(spaceSchema.pattern, "u");
+    for (const valid of [TAKOSUMI_TENANT_SPACE, "内 部", `tenant:${"界".repeat(248)}`]) {
+      expect(spacePattern.test(valid)).toBe(true);
+    }
+    for (const invalid of ["", " leading", "trailing ", "tenant/child", "tenant:\u0000child"]) {
+      expect(spacePattern.test(invalid)).toBe(false);
+    }
+    const resourceList = openApiDocument.paths["/v1/organizations/{organizationId}/resources"] as {
+      get: {
+        parameters: readonly {
+          name: string;
+          in: string;
+          required: boolean;
+          schema: unknown;
+        }[];
+      };
+    };
+    expect(resourceList.get.parameters).toContainEqual({
+      name: "space",
+      in: "query",
+      required: false,
+      schema: spaceSchema,
+    });
+    const nativeResidual = openApiDocument.paths[
+      "/v1/organizations/{organizationId}/resources/{resourceUid}/native-residual"
+    ] as { get: { parameters: readonly { name: string; schema: unknown }[] } };
+    expect(
+      nativeResidual.get.parameters.find((parameter) => parameter.name === "space")?.schema,
+    ).toEqual(spaceSchema);
     expect(schemas.WorkerEndpointOriginReservationBinding.oneOf).toEqual([
       {
         not: {
