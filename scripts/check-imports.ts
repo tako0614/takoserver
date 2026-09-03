@@ -32,9 +32,16 @@ for (const name of Object.keys({ ...manifest.dependencies, ...manifest.devDepend
 //
 // Each layer names the layers it may import from. Domain code never reaches for
 // an adapter — it receives ports instead — and only the composition root is
-// allowed to know which implementations exist. Files that match no layer are
-// pre-redesign modules; they are exempt until the milestone that deletes them,
-// so the rule tightens on its own as the rewrite lands.
+// allowed to know which implementations exist.
+//
+// Every module under `src` must match exactly one layer. An unmatched file used
+// to be silently exempt as "pre-redesign", which meant the rule could be
+// escaped by adding a module rather than by classifying one — the gate answered
+// "no violation" for a file it had never looked at. A module the architecture
+// has no name for is now a violation, so the only way past this gate is to say
+// where the module belongs. Ambient declaration files (`*.d.ts`) declare types
+// for code elsewhere and are not modules in the graph, so they are skipped
+// before the classification, not exempted after it.
 // ---------------------------------------------------------------------------
 
 interface Layer {
@@ -65,7 +72,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "domain",
     match:
-      /^src\/(?:token|auth|ledger|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|provider-metering|provider-placement|provider-runtime-bindings|resource-deployments|resource-migrations|runtime-input-preparations|worker-endpoint-origin-reservations|attachments|reconcile|metering|edge-forms|ai-requests|operator-credentials|integration-e2e-credential-authority|form-authority-operator-proof|google-identity|takos-id-identity|identity-setup|stripe-settlement|signing-key|operator-key)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$|host-admission-endpoint\.ts$|integration-operator-endpoint\.ts$)/u,
+      /^src\/(?:token|auth|ledger|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|provider-metering|provider-placement|provider-runtime-bindings|resource-deployments|resource-migrations|runtime-input-preparations|worker-endpoint-origin-reservations|attachments|reconcile|metering|edge-forms|ai-requests|operator-credentials|integration-e2e-credential-authority|form-authority-operator-proof|google-identity|takos-id-identity|identity-setup|stripe-settlement|signing-key|operator-key|runtime-grants|takoform-released-provider)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$|host-admission-endpoint\.ts$|integration-operator-endpoint\.ts$)/u,
     may: ["core", "domain", "release-data"],
   },
   {
@@ -79,7 +86,7 @@ const LAYERS: readonly Layer[] = [
     // `payment-setup` builds the shape the routes layer asks for, which makes
     // it composition rather than domain: it is allowed to know both halves.
     match:
-      /^src\/(?:app|cloudflare-runtime-binding-materializer|deployment-composition|form-authority-(?:identity-probe|public-identity|worker-composition)|integration-form-authority-gateway|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|public-form-(?:implementation-build|runtime)|public-worker-implementation|runtime-input-seal-keyring|selfhost-composition|selfhost-data-planes|selfhost-object-store|selfhost-queue-pump|selfhost-runtime-binding-materializer|selfhost-scheduler|standalone-provider-composition|worker-data-services|worker-(?:production|stable-local)-composition)\.ts$|^src\/takoform\/(?:host-admission-endpoint|integration-operator-endpoint)\.ts$/u,
+      /^src\/(?:app|compat|cloudflare-runtime-binding-materializer|deployment-composition|form-authority-(?:identity-probe|public-identity|worker-composition)|integration-form-authority-gateway|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|public-form-(?:implementation-build|runtime)|public-worker-implementation|runtime-input-seal-keyring|selfhost-composition|selfhost-data-planes|selfhost-object-store|selfhost-queue-pump|selfhost-runtime-binding-materializer|selfhost-scheduler|standalone-provider-composition|worker-data-services|worker-(?:production|stable-local)-composition)\.ts$|^src\/takoform\/(?:host-admission-endpoint|integration-operator-endpoint)\.ts$/u,
     may: ["core", "adapter", "domain", "routes", "app", "release-data"],
   },
   // An entry chooses concrete implementations — that is its whole job. What it
@@ -93,6 +100,14 @@ const LAYERS: readonly Layer[] = [
     // composition roots and the host-only graph checks below still apply.
     may: ["core", "adapter", "domain", "routes", "app", "entry"],
   },
+  // The published package surface re-exports the product for an embedder. It
+  // states no policy of its own, so it may name anything a consumer is allowed
+  // to construct — but it stays below `entry`, which owns a running process.
+  {
+    name: "package-surface",
+    match: /^src\/index\.ts$/u,
+    may: ["core", "adapter", "domain", "routes", "app", "package-surface"],
+  },
 ];
 
 function layerOf(path: string): Layer | undefined {
@@ -100,13 +115,19 @@ function layerOf(path: string): Layer | undefined {
 }
 
 for (const path of walk("src")) {
-  if (!path.endsWith(".ts")) continue;
+  if (!path.endsWith(".ts") || path.endsWith(".d.ts")) continue;
   const layer = layerOf(path);
-  if (!layer) continue;
+  if (!layer) {
+    violations.push(
+      `${path} matches no declared layer; classify it in scripts/check-imports.ts ` +
+        `before the import graph can be checked for it`,
+    );
+    continue;
+  }
   for (const target of localImportsOf(path)) {
     const targetLayer = layerOf(target);
     if (!targetLayer) {
-      violations.push(`${path} (${layer.name}) imports pre-redesign module ${target}`);
+      violations.push(`${path} (${layer.name}) imports unclassified module ${target}`);
       continue;
     }
     if (!layer.may.includes(targetLayer.name)) {
