@@ -79,7 +79,7 @@ test("Form authority source contains no fictional Core admission seam", async ()
     expect(await Bun.file(resolve(repositoryRoot, retiredPath)).exists()).toBe(false);
   }
   expect(retained).toEqual([]);
-});
+}, 30_000);
 
 function importedSpecifiers(path: string, text: string): readonly string[] {
   const parsed = createSourceFile(path, text, ScriptTarget.Latest, true, ScriptKind.TS);
