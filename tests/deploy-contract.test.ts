@@ -43,6 +43,7 @@ const SURFACES = [
   ["takoserver-host-runtime-topology-retirement", ["irreversible", "authority"]],
   ["takoserver-hosted-token-retirement", ["irreversible", "authority"]],
   ["takoserver-worker-retirement-attribution-repair", []],
+  ["takoserver-operator-identity", ["authority"]],
   ["takoserver-integration-operator-identity", ["authority"]],
   ["takoserver-managed-worker-gateway", ["authority"]],
   ["takoserver-org-api-key", ["authority"]],
@@ -99,6 +100,20 @@ describe("Takoserver split deploy entrypoint", () => {
       ({ surface }) => surface === "takoserver-d1-schema-rehearsal-baseline",
     );
     const schema = contract.surfaces.find(({ surface }) => surface === "takoserver-d1-schema");
+    const operatorIdentity = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-operator-identity",
+    );
+    expect(operatorIdentity?.requiresEnv).toEqual([
+      "CLOUDFLARE_API_TOKEN",
+      "TAKOSERVER_INDEPENDENT_REVIEW",
+      "TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH",
+      "TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH",
+    ]);
+    expect(operatorIdentity?.obligations.provenance).toContain("--organization=<org_...>");
+    expect(operatorIdentity?.obligations.reversal).toContain("non-executable");
+    expect(operatorIdentity?.obligations.reversal).toContain("freshly qualified");
+    expect(operatorIdentity?.obligations["post-conditions"]).toContain("owner");
+    expect(operatorIdentity?.obligations["failure-handling"]).toContain("--status");
     expect(routineWorker?.requiresTools).toContain("flock");
     expect(routineWorker?.obligations.provenance).toContain("explicit `CLOUDFLARE_API_TOKEN`");
     expect(routineWorker?.obligations.provenance).not.toContain("stored OAuth profile");
@@ -574,13 +589,56 @@ describe("Takoserver split deploy entrypoint", () => {
     }
   });
 
-  test("parses the operator identity surface only for integration", async () => {
+  test("parses the canonical operator identity surface for every environment", async () => {
+    const sha = "a".repeat(40);
+    for (const environment of ["integration", "rehearsal", "production"] as const) {
+      const accepted = await deploy([
+        "takoserver-operator-identity",
+        "--status",
+        `--environment=${environment}`,
+        `--commit=${sha}`,
+        "--organization=org_operator_owner",
+      ]);
+      expect(accepted.exitCode).toBe(2);
+      expect(accepted.stderr).toContain("deploy target descriptor not found");
+      expect(accepted.stderr).not.toContain("no target was touched");
+    }
+
+    for (const args of [
+      ["takoserver-operator-identity", "--status", "--environment=integration", `--commit=${sha}`],
+      [
+        "takoserver-operator-identity",
+        "--status",
+        "--environment=production",
+        `--commit=${sha}`,
+        "--organization=org_operator_owner",
+        "--key-name=unexpected",
+      ],
+      [
+        "takoserver-operator-identity",
+        "--status",
+        "--environment=production",
+        `--commit=${sha}`,
+        "--organization=org_operator_owner",
+        "--scope=resources:read",
+      ],
+    ] as const) {
+      const refused = await deploy([...args]);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
+    }
+  });
+
+  test("keeps the legacy operator identity spelling integration-only", async () => {
     const sha = "a".repeat(40);
     const accepted = await deploy([
       "takoserver-integration-operator-identity",
       "--status",
       "--environment=integration",
       `--commit=${sha}`,
+      "--organization=org_operator_owner",
     ]);
     expect(accepted.exitCode).toBe(2);
     expect(accepted.stderr).toContain("deploy target descriptor not found");
@@ -592,6 +650,7 @@ describe("Takoserver split deploy entrypoint", () => {
         "--status",
         `--environment=${environment}`,
         `--commit=${sha}`,
+        "--organization=org_operator_owner",
       ]);
       expect(refused.exitCode).toBe(2);
       expect(refused.stdout).toBe("");

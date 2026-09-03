@@ -90,18 +90,21 @@ async function owned(identity?: Record<string, unknown>): Promise<Owned> {
   };
 }
 
-function targetFor(input: Owned): DeployTarget {
+function targetFor(
+  input: Owned,
+  environment: "integration" | "rehearsal" | "production" = "integration",
+): DeployTarget {
   return {
     kind: "takoserver.deploy-target@v2",
-    environment: "integration",
+    environment,
     accountId: "a".repeat(32),
-    workerName: "takoserver-api-integration",
+    workerName: `takoserver-api-${environment}`,
     d1: {
-      databaseName: "takoserver-runtime-integration",
+      databaseName: `takoserver-runtime-${environment}`,
       databaseId: "00000000-0000-4000-8000-000000000000",
     },
-    r2: { bucketName: "takoserver-objects-integration" },
-    publicOrigin: ORIGIN,
+    r2: { bucketName: `takoserver-objects-${environment}` },
+    publicOrigin: `https://api.${environment}.example.test`,
     edgeSupplies: {
       offerings: YURUCOMMU_IDENTITY_CAPABILITY_KINDS.map((formKind) => ({ formKind })),
     } as unknown as NonNullable<DeployTarget["edgeSupplies"]>,
@@ -522,23 +525,29 @@ describe("durable organization API key surface", () => {
     }
   });
 
-  test("refuses a target that declares no operator authority", async () => {
+  test("refuses a target that declares no operator authority through the canonical surface", async () => {
     const input = await owned();
     try {
-      const { operatorIdentity: _absent, ...withoutIdentity } = targetFor(input);
-      const refusal = await runOrgApiKey(
-        {
-          surface: "takoserver-org-api-key",
-          action: "status",
-          environment: "integration",
-          commit: COMMIT,
-          organizationId: ORGANIZATION,
-        },
-        withoutIdentity as DeployTarget,
-        optionsFor(input, host()),
-      ).catch((error: unknown) => error);
-      expect(refusal).toBeInstanceOf(DeployError);
-      expect((refusal as DeployError).message).toContain("operatorIdentity");
+      for (const environment of ["integration", "rehearsal", "production"] as const) {
+        const { operatorIdentity: _absent, ...withoutIdentity } = targetFor(input, environment);
+        const refusal = await runOrgApiKey(
+          {
+            surface: "takoserver-org-api-key",
+            action: "status",
+            environment,
+            commit: COMMIT,
+            organizationId: ORGANIZATION,
+          },
+          withoutIdentity as DeployTarget,
+          optionsFor(input, host()),
+        ).catch((error: unknown) => error);
+        expect(refusal).toBeInstanceOf(DeployError);
+        expect((refusal as DeployError).message).toContain("operatorIdentity");
+        expect((refusal as DeployError).detail).toContain("takoserver-operator-identity");
+        expect((refusal as DeployError).detail).not.toContain(
+          "takoserver-integration-operator-identity",
+        );
+      }
     } finally {
       rmSync(input.root, { recursive: true, force: true });
     }

@@ -33,6 +33,10 @@ const USAGE = `takoserver deploy
   bun run deploy -- --contract
   bun run deploy -- <surface> --status --environment=<integration|rehearsal|production> --commit=<sha>
   bun run deploy -- <surface> --apply  --environment=<integration|rehearsal|production> --commit=<sha>
+  bun run deploy -- takoserver-operator-identity --<status|apply> --environment=<integration|rehearsal|production> --commit=<sha>
+    --organization=org_...
+  bun run deploy -- takoserver-integration-operator-identity --<status|apply> --environment=integration --commit=<sha>
+    --organization=org_... (legacy spelling; integration only)
   bun run deploy -- takoserver-integration-e2e-credentials --<issue|status|revoke> --environment=integration --commit=<sha>
   bun run deploy -- takoserver-org-api-key --<mint|status|revoke> --environment=<env> --commit=<sha>
     --organization=org_... [--key-name=<name> --scope=<scope> --expires-in-days=<n>] [--key-id=key_...]
@@ -76,6 +80,7 @@ type StandardSurface = Exclude<Surface, CredentialSurface | OrgApiKeySurface>;
 interface InvocationBase {
   readonly environment: DeployEnvironment;
   readonly commit: string;
+  readonly organizationId?: string;
   readonly legacyPredecessorVersionId?: string;
   readonly legacyHostRuntimePredecessorVersionId?: string;
   readonly closurePredecessorVersionId?: string;
@@ -375,6 +380,9 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     ...rotateSecrets,
   ];
   const orgApiKey = surfaceValue === "takoserver-org-api-key";
+  const operatorIdentity =
+    surfaceValue === "takoserver-operator-identity" ||
+    surfaceValue === "takoserver-integration-operator-identity";
   const orgApiKeyOperands =
     (organizationId === null ? 0 : 1) +
     (keyName === null ? 0 : 1) +
@@ -383,7 +391,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     (apiKeyId === null ? 0 : 1);
   // Every key operand belongs to exactly one surface, and that surface needs
   // exactly one of them for each thing it is being asked to name.
-  if (!orgApiKey && orgApiKeyOperands > 0) return null;
+  if (!orgApiKey && !operatorIdentity && orgApiKeyOperands > 0) return null;
   if (orgApiKey) {
     if (
       organizationId === null ||
@@ -420,6 +428,42 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       ...(scopes.length === 0 ? {} : { scopes: [...scopes].sort() }),
       ...(expiresInDays === null ? {} : { expiresInDays }),
       ...(apiKeyId === null ? {} : { apiKeyId }),
+    } as Invocation;
+  }
+  if (operatorIdentity) {
+    if (
+      organizationId === null ||
+      keyName !== null ||
+      scopes.length > 0 ||
+      expiresInDays !== null ||
+      apiKeyId !== null ||
+      closureDeltaNames.length > 0 ||
+      closurePredecessorVersionId !== null ||
+      legacyPredecessorVersionId !== null ||
+      legacyHostRuntimePredecessorVersionId !== null ||
+      unattributedSuccessorVersionId !== null ||
+      formAuthorityScopeTransitionPath !== null ||
+      adoptLivePath !== null ||
+      bootstrapVerifierBridge ||
+      bootstrapProbePredecessorVersionId !== null ||
+      throughMigration !== null ||
+      reverse ||
+      (action !== "status" && action !== "apply")
+    ) {
+      return null;
+    }
+    if (
+      surfaceValue === "takoserver-integration-operator-identity" &&
+      environment !== "integration"
+    ) {
+      return null;
+    }
+    return {
+      surface: surfaceValue,
+      action,
+      environment,
+      commit,
+      organizationId,
     } as Invocation;
   }
   if (action === "mint") return null;
@@ -489,8 +533,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     return null;
   }
   if (
-    (surfaceValue === "takoserver-integration-operator-identity" ||
-      surfaceValue === "takoserver-integration-form-authority-worker" ||
+    (surfaceValue === "takoserver-integration-form-authority-worker" ||
       surfaceValue === "takoserver-integration-form-authority-operator-worker" ||
       surfaceValue === "takoserver-integration-form-authority" ||
       surfaceValue === "takoserver-integration-form-authority-deactivation" ||
@@ -782,6 +825,7 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
         },
         target,
       );
+    case "takoserver-operator-identity":
     case "takoserver-integration-operator-identity":
       return await runOperatorIdentity(
         {
@@ -789,6 +833,9 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
           action: invocation.action,
           environment: invocation.environment,
           commit: invocation.commit,
+          ...(invocation.organizationId === undefined
+            ? {}
+            : { organizationId: invocation.organizationId }),
         },
         target,
       );

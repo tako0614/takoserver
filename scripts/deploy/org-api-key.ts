@@ -107,7 +107,8 @@ export async function runOrgApiKey(
     throw preflightError(
       "selected target declares no operatorIdentity, so no operator authority can mint a key here",
       "Declare `operatorIdentity.publicJwk` in the operator-private descriptor and publish it " +
-        "through takoserver-integration-operator-identity first.",
+        "through takoserver-operator-identity first; the legacy integration spelling is not a " +
+        "rehearsal or production remediation.",
     );
   }
   const request = assertActionShape(invocation);

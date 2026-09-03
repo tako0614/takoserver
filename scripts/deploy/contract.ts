@@ -40,7 +40,7 @@ const signingNextPrivateJwkInput =
 const hostedTokenInput =
   "`TAKOSERVER_HOSTED_TOKEN_PATH` is required for `--apply` only; `--status` does not read it.";
 const operatorPrivateJwkInput =
-  "`TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH` is required for `--apply` only; `--status` does not read it and this surface is integration-only.";
+  "`TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH` and `TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH` are required for `--apply` only; `--status` does not read either file. Every action also requires one exact `--organization=<org_...>` selector.";
 const orgApiKeyInput =
   "Input contract: `TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH` and " +
   "`TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH` are required for each `--mint`, `--status` and " +
@@ -885,11 +885,12 @@ export const DEPLOY_CONTRACT = {
       },
     },
     {
-      surface: "takoserver-integration-operator-identity",
-      target: "cloudflare-worker:integration-takoserver-operator-identity",
+      surface: "takoserver-operator-identity",
+      target: "cloudflare-worker:environment-selected-takoserver-operator-identity",
       covers: [
         "scripts/deploy.ts",
         "scripts/deploy/identity.ts",
+        "scripts/deploy/operator-authority.ts",
         "scripts/deploy/target.ts",
         "scripts/deploy/realized-config.ts",
       ],
@@ -899,11 +900,58 @@ export const DEPLOY_CONTRACT = {
         "CLOUDFLARE_API_TOKEN",
         "TAKOSERVER_INDEPENDENT_REVIEW",
         "TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH",
+        "TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH",
       ],
       triggers: ["authority"],
       obligations: {
         provenance:
-          "Integration only. The selected commit must already be the served Worker commit. The " +
+          `${exactSource} The canonical environment-neutral operator identity surface requires one ` +
+          "exact `--organization=<org_...>` selector. The selected commit must already be the served " +
+          "Worker commit. The owner gate rebuilds it once, requires the exact served bundle digest, and " +
+          "proves the owned 0600 private JWK against the target's exact public Ed25519 JWK.",
+        "post-conditions":
+          "One immutable Worker Version adds only OPERATOR_IDENTITY_PUBLIC_JWK. Code, every other variable " +
+          "and binding, secrets, domains, D1, R2 and Hosted topology remain exact; a short-lived redacted " +
+          "operator assertion for the selected organization must prove the real owner, create a session " +
+          "whose redacted bearer succeeds at /v1/me, is then revoked, and fails a replay. Production " +
+          "status never presents provider-only configuration as owner-ready.",
+        reversal:
+          "Rollback evidence names the exact predecessor but is explicitly non-executable. Any recovery " +
+          "requires a freshly qualified product-owned exact-target status/qualification operation; this " +
+          "surface emits no provider rollback command and never treats prior evidence as authorization.",
+        "failure-handling":
+          `${highRiskFailure} Unrelated configuration or Version advance is refused rather than attributed. ` +
+          "An upload acknowledgement failure is settled by the same canonical surface's fresh " +
+          "`--status` with the exact organization selector; it is never retried blindly. Owner-proof " +
+          "failure in production may roll back only after the successor history is freshly re-read and " +
+          "the exact predecessor is still authoritative; otherwise rollback is refused as indeterminate." +
+          inputContract(applyReviewInput, operatorPrivateJwkInput),
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-integration-operator-identity",
+      target: "cloudflare-worker:integration-takoserver-operator-identity",
+      covers: [
+        "scripts/deploy.ts",
+        "scripts/deploy/identity.ts",
+        "scripts/deploy/operator-authority.ts",
+        "scripts/deploy/target.ts",
+        "scripts/deploy/realized-config.ts",
+      ],
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+        "TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH",
+        "TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH",
+      ],
+      triggers: ["authority"],
+      obligations: {
+        provenance:
+          "Integration-only legacy spelling of the canonical operator identity surface. The selected " +
+          "commit must already be the served Worker commit. The " +
           "owner gate rebuilds it once, requires the exact served bundle digest, and proves the " +
           "owned 0600 private JWK against the target's exact public Ed25519 JWK.",
         "post-conditions":
@@ -912,8 +960,11 @@ export const DEPLOY_CONTRACT = {
           "redacted operator assertion must create a session whose redacted bearer succeeds at /v1/me, " +
           "is then revoked, and fails a replay.",
         reversal:
-          "Before removing this identity, revoke every session and API key issued through it. " +
-          "Identity removal is a separate reviewed configuration transition; this surface never deletes it.",
+          "Rollback evidence names the exact predecessor but is explicitly non-executable. Any recovery " +
+          "requires a freshly qualified product-owned exact-target status/qualification operation; this " +
+          "surface emits no provider rollback command. Before removing this identity, revoke every " +
+          "session and API key issued through it. Identity removal is a separate reviewed configuration " +
+          "transition; this surface never deletes it.",
         "failure-handling":
           highRiskFailure + inputContract(applyReviewInput, operatorPrivateJwkInput),
         "independent-review": review,
