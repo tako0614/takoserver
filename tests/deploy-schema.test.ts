@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -125,8 +126,8 @@ describe("forward-only D1 schema surface", () => {
     try {
       const fixture = processFixture("rehearsal");
       const result = await runD1Schema(
-        { action: "status", environment: "rehearsal", commit: COMMIT },
-        target,
+        { action: "status", environment: "integration", commit: COMMIT },
+        { ...target, environment: "integration" },
         {
           run: fixture.run,
           reader: readerSequence([PRE]),
@@ -136,7 +137,8 @@ describe("forward-only D1 schema surface", () => {
         },
       );
       expect(result).toMatchObject({
-        kind: "takoserver.d1-schema-status@v2",
+        kind: "takoserver.d1-schema-status@v3",
+        evidenceClass: "integration-only",
         appliedMigrations: ["0001_first.sql"],
         pendingMigrations: ["0002_second.sql"],
         schemaShapeDigest: PRE.shapeDigest,
@@ -159,7 +161,12 @@ describe("forward-only D1 schema surface", () => {
         1,
       );
       const result = await runD1Schema(
-        { action: "status", environment: "rehearsal", commit: COMMIT },
+        {
+          action: "status",
+          environment: "rehearsal",
+          commit: COMMIT,
+          throughMigration: "0036",
+        },
         target,
         {
           reader,
@@ -168,9 +175,11 @@ describe("forward-only D1 schema surface", () => {
         },
       );
       expect(result).toMatchObject({
-        providerRepairPreflight: {
-          status: "operator_reconciliation_required",
-          unmatchedDispatchedSagaCount: 1,
+        dataPreflights: {
+          providerRepair: {
+            status: "operator_reconciliation_required",
+            unmatchedDispatchedSagaCount: 1,
+          },
         },
       });
       expect(reader.preflightReads()).toBe(1);
@@ -192,7 +201,12 @@ describe("forward-only D1 schema surface", () => {
       );
       const fixture = processFixture("rehearsal");
       const failure = await runD1Schema(
-        { action: "apply", environment: "rehearsal", commit: COMMIT },
+        {
+          action: "apply",
+          environment: "rehearsal",
+          commit: COMMIT,
+          throughMigration: "0036",
+        },
         target,
         {
           reader,
@@ -204,7 +218,7 @@ describe("forward-only D1 schema surface", () => {
         },
       ).catch((error) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(failure.message).toContain("provider-specific operator reconciliation");
+      expect(failure.message).toContain("data preflights require operator repair");
       expect(fixture.calls).toHaveLength(0);
       expect(reader.preflightReads()).toBe(1);
     } finally {
@@ -218,8 +232,8 @@ describe("forward-only D1 schema surface", () => {
       const fixture = processFixture("rehearsal");
       const current = { ...POST, applied: ["0001_first.sql", "0002_second.sql"] };
       const failure = await runD1Schema(
-        { action: "apply", environment: "rehearsal", commit: COMMIT },
-        target,
+        { action: "apply", environment: "integration", commit: COMMIT },
+        { ...target, environment: "integration" },
         {
           run: fixture.run,
           reader: readerSequence([current]),
@@ -231,25 +245,25 @@ describe("forward-only D1 schema surface", () => {
         },
       ).catch((error) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(failure.message).toContain("no pending D1 migration");
+      expect(failure.message).toContain("selected D1 migration wave is already complete");
       expect(fixture.calls.some((call) => call.includes("apply"))).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("rehearsal applies the exact sealed suffix once, reads it back, and writes a 0600 receipt", async () => {
+  test("integration no-selector applies the suffix but cannot emit production rehearsal evidence", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-rehearsal-"));
     try {
       chmodSync(root, 0o700);
       const fixture = processFixture("rehearsal");
       const receiptPath = join(root, "receipt.json");
       const result = await runD1Schema(
-        { action: "apply", environment: "rehearsal", commit: COMMIT },
-        target,
+        { action: "apply", environment: "integration", commit: COMMIT },
+        { ...target, environment: "integration" },
         {
           run: fixture.run,
-          reader: readerSequence([PRE, PRE, POST]),
+          reader: readerSequence([PRE, PRE, PRE, POST]),
           migrationDirectory: migrations(root),
           outputDirectory: join(root, "work"),
           receiptPath,
@@ -258,9 +272,11 @@ describe("forward-only D1 schema surface", () => {
         },
       );
       expect(result).toMatchObject({
-        kind: "takoserver.d1-schema-apply@v2",
+        kind: "takoserver.d1-schema-apply@v3",
+        evidenceClass: "integration-only",
         pendingMigrations: ["0002_second.sql"],
         postShapeDigest: POST.shapeDigest,
+        rehearsalReceipt: "not-emitted-integration-evidence-is-never-production-acceptable",
         rollback: "forward repair only: D1 migrations have no down path",
       });
       expect(
@@ -271,15 +287,7 @@ describe("forward-only D1 schema surface", () => {
       );
       expect(applies).toHaveLength(1);
       expect(applies[0]).toContain(target.d1.databaseName);
-      const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
-      expect(receipt).toMatchObject({
-        kind: "takoserver.d1-schema-rehearsal-receipt@v1",
-        commit: COMMIT,
-        pendingMigrations: ["0002_second.sql"],
-        preShapeDigest: PRE.shapeDigest,
-        postShapeDigest: POST.shapeDigest,
-      });
-      expect(Bun.file(receiptPath).size).toBeGreaterThan(0);
+      expect(existsSync(receiptPath)).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -289,27 +297,46 @@ describe("forward-only D1 schema surface", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-production-"));
     try {
       chmodSync(root, 0o700);
-      const migrationDirectory = migrations(root);
       const rehearsal = processFixture("rehearsal");
       const receiptPath = join(root, "receipt.json");
-      await runD1Schema({ action: "apply", environment: "rehearsal", commit: COMMIT }, target, {
-        run: rehearsal.run,
-        reader: readerSequence([PRE, PRE, POST]),
-        migrationDirectory,
-        outputDirectory: join(root, "rehearsal-work"),
-        receiptPath,
-        review: "reviewer@example.test",
-        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
-      });
+      const pre = {
+        ...PRE,
+        applied: MIGRATIONS.slice(0, 22).map(({ name }) => name),
+      };
+      const post = {
+        ...POST,
+        applied: MIGRATIONS.slice(0, 28).map(({ name }) => name),
+      };
+      await runD1Schema(
+        {
+          action: "apply",
+          environment: "rehearsal",
+          commit: COMMIT,
+          throughMigration: "0028",
+        },
+        target,
+        {
+          run: rehearsal.run,
+          reader: readerSequence([pre, pre, pre, post]),
+          outputDirectory: join(root, "rehearsal-work"),
+          receiptPath,
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
       const productionTarget = { ...target, environment: "production" as const };
       const production = processFixture("production");
       const result = await runD1Schema(
-        { action: "apply", environment: "production", commit: COMMIT },
+        {
+          action: "apply",
+          environment: "production",
+          commit: COMMIT,
+          throughMigration: "0028",
+        },
         productionTarget,
         {
           run: production.run,
-          reader: readerSequence([PRE, PRE, POST]),
-          migrationDirectory,
+          reader: readerSequence([pre, pre, pre, post]),
           outputDirectory: join(root, "production-work"),
           receiptPath,
           review: "second-reviewer@example.test",
@@ -318,34 +345,46 @@ describe("forward-only D1 schema surface", () => {
       );
       expect(result).toMatchObject({
         environment: "production",
-        postShapeDigest: POST.shapeDigest,
+        postShapeDigest: post.shapeDigest,
       });
       expect(
         production.calls.filter((call) => call.includes("migrations") && call.includes("apply")),
       ).toHaveLength(1);
 
-      const malformed = JSON.parse(readFileSync(receiptPath, "utf8"));
-      malformed.preShapeDigest = `sha256:${"9".repeat(64)}`;
-      writeFileSync(join(root, "bad-receipt.json"), `${JSON.stringify(malformed)}\n`, {
-        mode: 0o600,
-      });
-      const refusedProcess = processFixture("production");
-      const refused = await runD1Schema(
-        { action: "apply", environment: "production", commit: COMMIT },
-        productionTarget,
-        {
-          run: refusedProcess.run,
-          reader: readerSequence([PRE, PRE]),
-          migrationDirectory,
-          outputDirectory: join(root, "refused-work"),
-          receiptPath: join(root, "bad-receipt.json"),
-          review: "second-reviewer@example.test",
-          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
-        },
-      ).catch((error) => error);
-      expect(refused).toBeInstanceOf(DeployError);
-      expect(refused.message).toContain("rehearsal receipt");
-      expect(refusedProcess.calls.some((call) => call.includes("apply"))).toBe(false);
+      const exactReceipt = JSON.parse(readFileSync(receiptPath, "utf8"));
+      for (const [index, field] of [
+        "preShapeDigest",
+        "fromMigration",
+        "throughMigration",
+        "migrationDigest",
+        "throughPrefixDigest",
+      ].entries()) {
+        const malformed = structuredClone(exactReceipt);
+        malformed[field] = `drift-${field}`;
+        const badReceiptPath = join(root, `bad-receipt-${index}.json`);
+        writeFileSync(badReceiptPath, `${JSON.stringify(malformed)}\n`, { mode: 0o600 });
+        const refusedProcess = processFixture("production");
+        const refused = await runD1Schema(
+          {
+            action: "apply",
+            environment: "production",
+            commit: COMMIT,
+            throughMigration: "0028",
+          },
+          productionTarget,
+          {
+            run: refusedProcess.run,
+            reader: readerSequence([pre, pre]),
+            outputDirectory: join(root, `refused-work-${index}`),
+            receiptPath: badReceiptPath,
+            review: "second-reviewer@example.test",
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          },
+        ).catch((error) => error);
+        expect(refused).toBeInstanceOf(DeployError);
+        expect(refused.message).toContain("rehearsal receipt");
+        expect(refusedProcess.calls.some((call) => call.includes("apply"))).toBe(false);
+      }
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

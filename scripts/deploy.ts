@@ -14,7 +14,12 @@ import { runManagedWorkerGateway } from "./deploy/managed-worker-gateway.ts";
 import { runOrgApiKey } from "./deploy/org-api-key.ts";
 import type { DeployEnvironment } from "./deploy/qualification.ts";
 import { runRetirement } from "./deploy/retirement.ts";
-import { runD1Schema } from "./deploy/schema.ts";
+import {
+  runD1Schema,
+  runD1SchemaRehearsalBaseline,
+  SCHEMA_WAVE_BOUNDARIES,
+  type SchemaWaveBoundary,
+} from "./deploy/schema.ts";
 import { runSigning } from "./deploy/signing.ts";
 import { runStaticSite } from "./deploy/static.ts";
 import { loadTarget, targetPath } from "./deploy/target.ts";
@@ -31,6 +36,9 @@ const USAGE = `takoserver deploy
   bun run deploy -- takoserver-integration-e2e-credentials --<issue|status|revoke> --environment=integration --commit=<sha>
   bun run deploy -- takoserver-org-api-key --<mint|status|revoke> --environment=<env> --commit=<sha>
     --organization=org_... [--key-name=<name> --scope=<scope> --expires-in-days=<n>] [--key-id=key_...]
+  Rehearsal and production D1 schema status/apply require one fixed next-wave selector:
+    --through-migration=<0028|0033|0036|0042>
+  takoserver-d1-schema-rehearsal-baseline is fixed empty -> 0022, rehearsal-only, and accepts no selector.
   The authority cutover may add --legacy-predecessor-version=<uuid> for integration bootstrap.
   Hosted-edge authority transition requires the named
   --legacy-host-runtime-predecessor-version=<uuid> selector in integration or production.
@@ -77,6 +85,7 @@ interface InvocationBase {
   readonly adoptLivePath?: string;
   readonly bootstrapVerifierBridge?: boolean;
   readonly bootstrapProbePredecessorVersionId?: string;
+  readonly throughMigration?: SchemaWaveBoundary;
   readonly reverse?: boolean;
 }
 
@@ -113,6 +122,7 @@ interface ParsedInvocation {
   readonly adoptLivePath?: string;
   readonly bootstrapVerifierBridge?: boolean;
   readonly bootstrapProbePredecessorVersionId?: string;
+  readonly throughMigration?: SchemaWaveBoundary;
   readonly organizationId?: string;
   readonly keyName?: string;
   readonly scopes?: readonly ApiKeyScope[];
@@ -180,6 +190,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let adoptLivePath: string | null = null;
   let bootstrapVerifierBridge = false;
   let bootstrapProbePredecessorVersionId: string | null = null;
+  let throughMigration: SchemaWaveBoundary | null = null;
   let organizationId: string | null = null;
   let keyName: string | null = null;
   const scopes: ApiKeyScope[] = [];
@@ -340,6 +351,13 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       bootstrapProbePredecessorVersionId = value;
       continue;
     }
+    if (flag.startsWith("--through-migration=")) {
+      if (throughMigration !== null) return null;
+      const value = flag.slice("--through-migration=".length);
+      if (!SCHEMA_WAVE_BOUNDARIES.includes(value as SchemaWaveBoundary)) return null;
+      throughMigration = value as SchemaWaveBoundary;
+      continue;
+    }
     if (flag === "--reverse") {
       if (reverse) return null;
       reverse = true;
@@ -379,6 +397,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       adoptLivePath !== null ||
       bootstrapVerifierBridge ||
       bootstrapProbePredecessorVersionId !== null ||
+      throughMigration !== null ||
       reverse ||
       (action !== "mint" && action !== "status" && action !== "revoke")
     ) {
@@ -420,6 +439,26 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   }
   // The candidate descriptor is a readback product; it never accompanies a
   // mutation, so the surface can never be asked to adopt and publish at once.
+  if (
+    surfaceValue === "takoserver-d1-schema-rehearsal-baseline" &&
+    (environment !== "rehearsal" || throughMigration !== null)
+  ) {
+    return null;
+  }
+  if (
+    surfaceValue === "takoserver-d1-schema" &&
+    ((environment === "integration" && throughMigration !== null) ||
+      (environment !== "integration" && throughMigration === null))
+  ) {
+    return null;
+  }
+  if (
+    surfaceValue !== "takoserver-d1-schema" &&
+    surfaceValue !== "takoserver-d1-schema-rehearsal-baseline" &&
+    throughMigration !== null
+  ) {
+    return null;
+  }
   if (
     adoptLivePath !== null &&
     (!ADOPT_LIVE_SURFACES.includes(surfaceValue) || action !== "status")
@@ -555,6 +594,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     ...(adoptLivePath === null ? {} : { adoptLivePath }),
     ...(bootstrapVerifierBridge ? { bootstrapVerifierBridge: true } : {}),
     ...(bootstrapProbePredecessorVersionId === null ? {} : { bootstrapProbePredecessorVersionId }),
+    ...(throughMigration === null ? {} : { throughMigration }),
     ...(reverse ? { reverse: true } : {}),
   } as Invocation;
 }
@@ -654,8 +694,20 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
       return await runStaticSite(invocation, { accountId: target.accountId });
     case "takoserver-console":
       return await runConsole(invocation, target);
+    case "takoserver-d1-schema-rehearsal-baseline":
+      return await runD1SchemaRehearsalBaseline(invocation, target);
     case "takoserver-d1-schema":
-      return await runD1Schema(invocation, target);
+      return await runD1Schema(
+        {
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
+          ...(invocation.throughMigration === undefined
+            ? {}
+            : { throughMigration: invocation.throughMigration }),
+        },
+        target,
+      );
     case "takoserver-signing-key-register":
     case "takoserver-signing-repair":
     case "takoserver-signing-rotation":
