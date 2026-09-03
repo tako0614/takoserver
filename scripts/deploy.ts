@@ -51,6 +51,10 @@ const USAGE = `takoserver deploy
   Integration Form-authority scope retirement uses the operator-private
   --form-authority-scope-transition=/absolute/file.json selector only on deactivation,
   the route-less authority Worker and its operator gateway.
+  takoserver-form-authority-worker --apply accepts --bootstrap-verifier-bridge only where that
+  Worker has no Version at all, together with
+  --bootstrap-probe-predecessor-version=<uuid>. The pinned identity-probe Version must already be
+  the exact predecessor missing only FORM_AUTHORITY; it is checked again at the mutation fence.
 
 The target descriptor is selected only by the exact environment. There is no
 deploy-plan flag, ledger, target override or mixed mutation controller.
@@ -71,6 +75,8 @@ interface InvocationBase {
   readonly unattributedSuccessorVersionId?: string;
   readonly formAuthorityScopeTransitionPath?: string;
   readonly adoptLivePath?: string;
+  readonly bootstrapVerifierBridge?: boolean;
+  readonly bootstrapProbePredecessorVersionId?: string;
   readonly reverse?: boolean;
 }
 
@@ -105,6 +111,8 @@ interface ParsedInvocation {
   readonly unattributedSuccessorVersionId?: string;
   readonly formAuthorityScopeTransitionPath?: string;
   readonly adoptLivePath?: string;
+  readonly bootstrapVerifierBridge?: boolean;
+  readonly bootstrapProbePredecessorVersionId?: string;
   readonly organizationId?: string;
   readonly keyName?: string;
   readonly scopes?: readonly ApiKeyScope[];
@@ -170,6 +178,8 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let unattributedSuccessorVersionId: string | null = null;
   let formAuthorityScopeTransitionPath: string | null = null;
   let adoptLivePath: string | null = null;
+  let bootstrapVerifierBridge = false;
+  let bootstrapProbePredecessorVersionId: string | null = null;
   let organizationId: string | null = null;
   let keyName: string | null = null;
   const scopes: ApiKeyScope[] = [];
@@ -318,6 +328,18 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       adoptLivePath = value;
       continue;
     }
+    if (flag === "--bootstrap-verifier-bridge") {
+      if (bootstrapVerifierBridge) return null;
+      bootstrapVerifierBridge = true;
+      continue;
+    }
+    if (flag.startsWith("--bootstrap-probe-predecessor-version=")) {
+      if (bootstrapProbePredecessorVersionId !== null) return null;
+      const value = flag.slice("--bootstrap-probe-predecessor-version=".length);
+      if (!isWorkerVersionId(value)) return null;
+      bootstrapProbePredecessorVersionId = value;
+      continue;
+    }
     if (flag === "--reverse") {
       if (reverse) return null;
       reverse = true;
@@ -355,6 +377,8 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       unattributedSuccessorVersionId !== null ||
       formAuthorityScopeTransitionPath !== null ||
       adoptLivePath !== null ||
+      bootstrapVerifierBridge ||
+      bootstrapProbePredecessorVersionId !== null ||
       reverse ||
       (action !== "mint" && action !== "status" && action !== "revoke")
     ) {
@@ -380,7 +404,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     } as Invocation;
   }
   if (action === "mint") return null;
-  const budget = 6 + (adoptLivePath === null ? 0 : 1);
+  const budget = 6 + (adoptLivePath === null ? 0 : 1) + (bootstrapVerifierBridge ? 1 : 0);
   if (closurePredecessorVersionId === null) {
     // Every other invocation keeps the historical exact flag budget.
     if (args.length > budget || closureDeltaNames.length > 0) return null;
@@ -399,6 +423,22 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   if (
     adoptLivePath !== null &&
     (!ADOPT_LIVE_SURFACES.includes(surfaceValue) || action !== "status")
+  ) {
+    return null;
+  }
+  // The bootstrap deferral belongs to exactly one surface's one mutating
+  // action. Its own Worker has no predecessor, but the identity probe must have
+  // one explicitly pinned predecessor which is inspected by that surface's
+  // strict one-binding transition classifier.
+  if (
+    bootstrapVerifierBridge !== (bootstrapProbePredecessorVersionId !== null) ||
+    (bootstrapVerifierBridge &&
+      (surfaceValue !== "takoserver-form-authority-worker" ||
+        action !== "apply" ||
+        closurePredecessorVersionId !== null ||
+        formAuthorityScopeTransitionPath !== null ||
+        adoptLivePath !== null ||
+        reverse))
   ) {
     return null;
   }
@@ -513,6 +553,8 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     ...(unattributedSuccessorVersionId === null ? {} : { unattributedSuccessorVersionId }),
     ...(formAuthorityScopeTransitionPath === null ? {} : { formAuthorityScopeTransitionPath }),
     ...(adoptLivePath === null ? {} : { adoptLivePath }),
+    ...(bootstrapVerifierBridge ? { bootstrapVerifierBridge: true } : {}),
+    ...(bootstrapProbePredecessorVersionId === null ? {} : { bootstrapProbePredecessorVersionId }),
     ...(reverse ? { reverse: true } : {}),
   } as Invocation;
 }
@@ -723,6 +765,14 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
           ...(invocation.adoptLivePath === undefined
             ? {}
             : { adoptLivePath: invocation.adoptLivePath }),
+          ...(invocation.bootstrapVerifierBridge === undefined
+            ? {}
+            : { bootstrapVerifierBridge: invocation.bootstrapVerifierBridge }),
+          ...(invocation.bootstrapProbePredecessorVersionId === undefined
+            ? {}
+            : {
+                bootstrapProbePredecessorVersionId: invocation.bootstrapProbePredecessorVersionId,
+              }),
         },
         target,
       );

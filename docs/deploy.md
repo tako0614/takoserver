@@ -186,7 +186,52 @@ surface also inspects the route-less authority it depends on, and that
 dependency must already be at `exact-target` on the same commit. Should the
 gateway itself ever need one, it accepts the same declaration as step 2.
 
-**4. Give the identity probe its `FORM_AUTHORITY` binding.** Commit `5f02c65`
+**4a. Publish the released-Core authority Worker, if it has none.** The probe's
+`FORM_AUTHORITY` binding names `formAuthority.workerName`, and
+`takoserver-form-authority-worker`'s own apply post-condition reads
+`GET <identityProbeOrigin>/v1/core-verifier-identity` — a route the probe serves
+only through that same binding. Each surface therefore needed the other to have
+gone first. The order is declared rather than deadlocked, and only where that
+Worker has no Version at all:
+
+```sh
+bun run deploy -- takoserver-form-authority-identity-probe --status \
+  --environment=integration --commit=<sha>
+
+bun run deploy -- takoserver-form-authority-worker --status \
+  --environment=integration --commit=<sha>
+
+bun run deploy -- takoserver-form-authority-worker --apply \
+  --environment=integration --commit=<sha> \
+  --bootstrap-verifier-bridge \
+  --bootstrap-probe-predecessor-version=<probe-version-id-from-the-first-status>
+```
+
+`--status` reports `versionId: null`, `coreVerifierRpcReady: false` and
+`coreVerifierBridgeRemedy` naming the whole remaining sequence. The apply
+does not guess that the probe can make the next transition. Before qualification
+and again at the final mutation fence, it runs the probe surface's own strict
+transition inspection. The exact pinned Version must still be current, have a
+canonical commit and artifact identity, and differ from the target closure only
+by the missing `FORM_AUTHORITY` binding. Extra closure, a different current
+Version, or drift appearing after the owner gate refuses the authority apply
+with zero uploads.
+
+The successful apply publishes the first Version with the readback deferred and
+returns `verifierBridgePending: true`, `verifierBridgeNextStep`, and the admitted
+`bootstrapProbePredecessorVersionId`, `bootstrapProbePredecessorCommit`, and
+`bootstrapProbeArtifactDigest`. It is a first upload, so there is no Version to
+roll back to and no surface deletes a Worker: its `rollback` names the forward
+repair — steps 4b and 4c — instead.
+
+Skip 4a where the Worker already exists. `--bootstrap-verifier-bridge` is
+refused there by name, and it never accompanies `--closure-predecessor-version`,
+`--form-authority-scope-transition` or `--adopt-live`: a first upload has no
+authority predecessor to pin and no live value to adopt. It does require the
+separate `--bootstrap-probe-predecessor-version`; that immutable probe Version
+is the predecessor step 4b must use.
+
+**4b. Give the identity probe its `FORM_AUTHORITY` binding.** Commit `5f02c65`
 added a third binding to the probe's closure; live Version
 `67679289-84f5-4082-b3d6-7500b59b542c` has two:
 
@@ -205,9 +250,21 @@ bun run deploy -- takoserver-form-authority-identity-probe --apply \
 That binding names `formAuthority.workerName`, which the probe does not own. If
 that Worker does not exist on the account, `--status` reports
 `formAuthorityWorkerPresent: false` with the remedy and `--apply` refuses
-naming it: deploy `takoserver-form-authority-worker` in this environment first,
-or correct `formAuthority.workerName` in the descriptor. The probe never
-publishes a binding to a script that is not there.
+naming it: run step 4a first, or correct `formAuthority.workerName` in the
+descriptor. The probe never publishes a binding to a script that is not there.
+
+**4c. Prove the bridge live.** Nothing calls the lane converged until the
+readback the bootstrap deferred actually answers:
+
+```sh
+bun run deploy -- takoserver-form-authority-worker --status \
+  --environment=integration --commit=<sha>
+```
+
+It reports `coreVerifierRpcReady: true`, `coreVerifierAuthorityWorkerVersionId`
+equal to the Version step 4a published, and `ready: true`. Every later apply of
+this surface reads that same bridge as its own post-condition; the deferral
+applies to the first upload alone.
 
 **5. Mint the durable Hosted reservation key.** The Hosted staging release
 needs a `resources:write` organization key that outlives its deploy:
@@ -230,6 +287,33 @@ The secret lands at
 and nowhere else; that path is what the Hosted release reads as
 `TAKOSERVER_RESERVATION_API_KEY`. The result prints the exact `--revoke`
 invocation that reverses it.
+
+Only the organization's owner principal may mint, so
+`TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH` must name that exact principal —
+its `provider` and `subject`, not merely an assertion-capable pair.
+`org_takosumi_hosted_staging`'s owner is a `github` principal, so its identity
+file reads:
+
+```json
+{
+  "kind": "takoserver.operator-sign-in-identity@v1",
+  "provider": "github",
+  "subject": "task0037-staging-operator",
+  "email": "<the owner's address>",
+  "displayName": "<the owner's name>"
+}
+```
+
+The preflight names a mismatch rather than leaving one to be read out of a
+status code:
+
+- a `provider` no operator assertion can vouch for is refused before any
+  request leaves, listing the providers that work (`google`, `github`);
+- a Host that registers no operator-assertion verifier for the named provider
+  is refused by that name — it answers `400 invalid`, never a 500, and the
+  remedy is to advance the Host or name an owner it already verifies;
+- an assertion-capable identity that is simply not the owner is told so, with
+  the organization named, instead of arriving as a malformed readback.
 
 ## Descriptor drift and adopting a live value
 
@@ -455,7 +539,17 @@ The separate authority and irreversible surfaces are:
   only after actively calling that RPC bridge and matching Host id, served
   Version, outer artifact `A`, payload `P`, capability, and semantic `I`.
 - `takoserver-form-authority-worker`: one reviewed route-less service-binding
-  RPC Worker upload. Exact D1/R2 and identity bindings are read back with no
+  RPC Worker upload. Its Core-verifier post-condition reads the identity probe's
+  `FORM_AUTHORITY` bridge, which cannot exist before this Worker does, so a
+  first upload is declared with `--apply --bootstrap-verifier-bridge` and an
+  exact `--bootstrap-probe-predecessor-version`. The probe surface's strict
+  transition classifier proves before qualification and at the final mutation
+  fence that this Version is current and lacks only `FORM_AUTHORITY`; no probe
+  drift can be crossed by the irreversible first upload. The deferred bridge is
+  verified by the `--status` that follows the probe's binding transition. That
+  deferral is admitted only where this Worker has no Version at all; every later
+  apply reads the live bridge as its own post-condition. Exact D1/R2 and identity
+  bindings are read back with no
   secret or public-domain, zone-route, workers.dev, or preview ownership. The
   default export has a non-operational `fetch` handler that always returns
   `404` only to satisfy Cloudflare’s module registration requirement; the named
@@ -551,7 +645,10 @@ The separate authority and irreversible surfaces are:
   identity named in the operator-private
   `TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH` descriptor, exchanges it for
   the same owner session the console uses, and calls the same
-  `POST /v1/organizations/{id}/api-keys` route. The key is therefore recorded
+  `POST /v1/organizations/{id}/api-keys` route. That identity must name the
+  organization's own owner principal, and its provider must be one an operator
+  assertion can vouch for — `google` or `github`; the preflight names either
+  mismatch before anything is minted. The key is therefore recorded
   exactly where an interactive owner's key is recorded: the console lists it,
   the console can revoke it, and this surface's own `--status` and `--revoke`
   read and settle the same rows. Expiry is always declared through

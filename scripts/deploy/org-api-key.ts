@@ -10,6 +10,11 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { API_KEY_SCOPES, type ApiKeyScope } from "../../src/auth.ts";
+import {
+  isOperatorProvider,
+  OPERATOR_PROVIDERS,
+  type OperatorProvider,
+} from "../../src/operator-credentials.ts";
 import { signOperatorAssertion } from "../../src/operator-key.ts";
 import { mutationError, preflightError, verificationError } from "./errors.ts";
 import { provePrivateMatchesPublic, readPrivateJwk } from "./identity.ts";
@@ -90,7 +95,7 @@ export interface OrgApiKeyOptions {
 }
 
 interface OperatorSignInIdentity {
-  readonly provider: "google" | "github";
+  readonly provider: OperatorProvider;
   readonly subject: string;
   readonly email: string;
   readonly displayName: string;
@@ -165,6 +170,7 @@ export async function runOrgApiKey(
       session,
       invocation.organizationId,
       fetcher,
+      identity,
     );
 
     if (invocation.action === "status") {
@@ -401,6 +407,18 @@ async function openOperatorSession(
   }
   const body = (await response.json().catch(() => null)) as unknown;
   const sessionToken = isRecord(body) ? body.sessionToken : undefined;
+  // A Host that registers no operator-assertion verifier for this provider
+  // refuses the exchange itself rather than the assertion in it. Saying only
+  // "no usable session" sent the last operator looking at their key, their
+  // clock and their identity file; the cause was that the organization's owner
+  // signs in under a provider the deployed Host does not wire at all.
+  if (response.status === 400 && errorCode(body) === "invalid") {
+    throw preflightError(
+      `Host ${origin} verifies no operator assertion for provider ${identity.provider}`,
+      `Advance the Host to a commit that registers ${identity.provider}:operator-assertion, or ` +
+        `point ${OPERATOR_IDENTITY_ENV} at an owner principal whose provider it already verifies.`,
+    );
+  }
   if (
     response.status !== 200 ||
     typeof sessionToken !== "string" ||
@@ -460,6 +478,7 @@ async function listApiKeys(
   sessionToken: string,
   organizationId: string,
   fetcher: (input: string, init?: RequestInit) => Promise<Response>,
+  identity?: OperatorSignInIdentity,
 ): Promise<readonly LiveApiKey[]> {
   let response: Response;
   try {
@@ -475,6 +494,17 @@ async function listApiKeys(
     throw preflightError("organization API key readback transport failed");
   }
   const body = (await response.json().catch(() => null)) as unknown;
+  // Only the owner may list, so a refusal here means the session that opened
+  // is somebody else. The operator identity file names which principal the
+  // assertion vouches for, and that is the thing to correct.
+  if (response.status === 403 && identity) {
+    throw preflightError(
+      `the operator identity signed in as a ${identity.provider} principal that does not own ` +
+        organizationId,
+      `Point ${OPERATOR_IDENTITY_ENV} at the organization's owner principal — its provider and ` +
+        "subject must be the pair that owns the organization, not merely an assertion-capable one.",
+    );
+  }
   if (response.status !== 200 || !isRecord(body) || !Array.isArray(body.apiKeys)) {
     throw preflightError(
       "organization API key readback was refused or malformed",
@@ -637,13 +667,26 @@ function readOperatorSignInIdentity(path: string): OperatorSignInIdentity {
     !isRecord(value) ||
     JSON.stringify(Object.keys(value).sort()) !== JSON.stringify([...IDENTITY_KEYS].sort()) ||
     value.kind !== IDENTITY_KIND ||
-    (value.provider !== "google" && value.provider !== "github") ||
+    typeof value.provider !== "string" ||
     !boundedText(value.subject) ||
     !boundedText(value.email) ||
     !boundedText(value.displayName)
   ) {
     throw preflightError(
       `operator sign-in identity must be exactly ${IDENTITY_KIND} with provider, subject, email and displayName`,
+    );
+  }
+  // The organization's owner principal is the only account that may mint, and
+  // it is reachable only through a provider an operator assertion can vouch
+  // for. Naming one outside that set is refused here, by name, rather than
+  // becoming a sign-in the Host cannot verify.
+  if (!isOperatorProvider(value.provider)) {
+    throw preflightError(
+      `operator sign-in identity names provider ${value.provider}, which no operator assertion ` +
+        "can vouch for; the organization's owner principal must sign in under one of " +
+        `${OPERATOR_PROVIDERS.join(", ")}`,
+      "Re-seed the organization's owner principal under an assertion-capable provider, or point " +
+        `${OPERATOR_IDENTITY_ENV} at the owner this Host can verify.`,
     );
   }
   return {
@@ -706,4 +749,10 @@ function exactReviewer(value: string): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** The refusal code inside a Host error envelope, when it carries one. */
+function errorCode(body: unknown): string | null {
+  if (!isRecord(body) || !isRecord(body.error)) return null;
+  return typeof body.error.code === "string" ? body.error.code : null;
 }

@@ -657,6 +657,89 @@ describe("Form authority identity probe forward transition apply", () => {
     }
   });
 
+  test("rechecks the Form authority Worker at the mutation fence before uploading", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-probe-authority-fence-"));
+    let uploaded = false;
+    uploadedProbeDigest = null;
+    let workerScriptsCalls = 0;
+    const calls: string[][] = [];
+    const baseState = applyState(() => uploaded);
+    const state: FormAuthorityIdentityProbeState = {
+      ...baseState,
+      async workerScripts() {
+        workerScriptsCalls += 1;
+        const scripts = await baseState.workerScripts();
+        // The first three reads cover initial authority validation and both
+        // final qualification snapshots. The fourth read is the mutation
+        // fence: the bound authority Worker disappears before publication.
+        return workerScriptsCalls >= 4
+          ? scripts.filter((name) => name !== applyTarget.formAuthority.workerName)
+          : scripts;
+      },
+    };
+    try {
+      const refusal = await runFormAuthorityIdentityProbe(
+        {
+          surface: "takoserver-form-authority-identity-probe",
+          action: "apply",
+          environment: "integration",
+          commit: APPLY_COMMIT,
+          transition: {
+            predecessorVersionId: PROBE_VERSION,
+            delta: {
+              retiredVars: [],
+              addedVars: [],
+              refreshedVars: [],
+              addedBindings: ["FORM_AUTHORITY"],
+              addedSecrets: [],
+              rotatedSecrets: [],
+            },
+          },
+        },
+        applyTarget,
+        {
+          run: async (command: readonly string[]) => {
+            calls.push([...command]);
+            const key = command.join(" ");
+            if (key === "git rev-parse HEAD") return ok(`${APPLY_COMMIT}\n`);
+            if (key === "git branch --show-current") return ok("fix/probe-transition\n");
+            if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
+            if (key === "bun run check") return ok("green\n");
+            if (command.includes("--dry-run")) {
+              const out = command[command.indexOf("--outdir") + 1];
+              if (!out) throw new Error("dry-run outdir missing");
+              mkdirSync(out, { recursive: true });
+              const publicBuild = out.includes("public-worker-proof");
+              writeFileSync(join(out, "worker.js"), publicBuild ? PUBLIC_BUNDLE : PROBE_BUNDLE);
+              writeFileSync(join(out, "worker.js.map"), "{}\n");
+              return ok("built\n");
+            }
+            if (command.includes("--no-bundle")) {
+              uploadedProbeDigest = "sha256:unexpected" as `sha256:${string}`;
+              uploaded = true;
+              return ok("uploaded\n");
+            }
+            throw new Error(`unexpected command: ${key}`);
+          },
+          state,
+          fetcher: applyFetcher(),
+          review: "independent-reviewer",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          outputDirectory: root,
+        },
+      ).catch((error: unknown) => error);
+
+      expect(refusal).toBeInstanceOf(Error);
+      expect(calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
+      expect(workerScriptsCalls).toBeGreaterThanOrEqual(4);
+      expect((refusal as Error).message).toContain(applyTarget.formAuthority.workerName);
+      expect((refusal as Error).message).toContain("does not exist on account");
+    } finally {
+      uploadedProbeDigest = null;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   function applyFetcher(): (input: string, init?: RequestInit) => Promise<Response> {
     return async () => {
       const semantic = await derivePublicFormImplementationIdentity({

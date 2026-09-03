@@ -1,6 +1,10 @@
-import type { ExternalIdentityVerifier, IdentityProviderDescriptor } from "./auth.ts";
+import {
+  AuthError,
+  type ExternalIdentityVerifier,
+  type IdentityProviderDescriptor,
+} from "./auth.ts";
 import { createGoogleIdentity } from "./google-identity.ts";
-import { createOperatorIdentity } from "./operator-credentials.ts";
+import { createOperatorIdentity, OPERATOR_PROVIDERS } from "./operator-credentials.ts";
 import type { Clock } from "./ports.ts";
 import { createTakosIdIdentity } from "./takos-id-identity.ts";
 
@@ -80,13 +84,18 @@ export function resolveIdentity(options: IdentitySetupOptions): IdentitySetup {
   }
 
   if (options.operatorPublicKeyJwk) {
-    byProviderMethod.set(
-      "google:operator-assertion",
-      createOperatorIdentity({
-        publicKeyJwk: options.operatorPublicKeyJwk,
-        ...(options.clock ? { clock: options.clock } : {}),
-      }),
-    );
+    const operator = createOperatorIdentity({
+      publicKeyJwk: options.operatorPublicKeyJwk,
+      ...(options.clock ? { clock: options.clock } : {}),
+    });
+    // One registration per provider an operator assertion may vouch for, read
+    // from the single declaration of that set rather than written out here.
+    // The assertion itself names its provider and is refused when it does not
+    // match the one the caller asked for, so registering the whole set widens
+    // which accounts can be reached, not what any one assertion can claim.
+    for (const provider of OPERATOR_PROVIDERS) {
+      byProviderMethod.set(`${provider}:operator-assertion`, operator);
+    }
     // Advertised only when there is no real provider, because it is not
     // sign-in — it is the operator vouching by signature, and it asks a person
     // to paste a token they had to generate elsewhere. Once Google is
@@ -96,11 +105,13 @@ export function resolveIdentity(options: IdentitySetupOptions): IdentitySetup {
     // deliberate: it is how the operator gets in when the identity provider is
     // misconfigured, which is exactly when nobody can sign in the normal way.
     if (!options.googleClientId && !options.takosId) {
-      providers.push({
-        id: "google",
-        displayName: "Operator assertion",
-        method: "operator-assertion",
-      });
+      for (const provider of OPERATOR_PROVIDERS) {
+        providers.push({
+          id: provider,
+          displayName: "Operator assertion",
+          method: "operator-assertion",
+        });
+      }
     }
   }
 
@@ -113,7 +124,12 @@ export function resolveIdentity(options: IdentitySetupOptions): IdentitySetup {
         const method = input.method ?? fallback;
         const verifier =
           method === undefined ? undefined : byProviderMethod.get(`${input.provider}:${method}`);
-        if (!verifier) throw new Error("no identity provider is configured for that method");
+        // A provider or method this deployment does not verify is something
+        // the caller can correct. Thrown as an AuthError so it lands as a
+        // stable 4xx: an unhandled throw here reached the router's
+        // catch-all and answered `internal_error` with status 500, which
+        // reads as an outage and tells nobody what to fix.
+        if (!verifier) throw new AuthError("invalid");
         return await verifier.verify(input);
       },
     },

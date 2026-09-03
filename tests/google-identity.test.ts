@@ -168,12 +168,60 @@ describe("identity setup", () => {
     ).rejects.toBeInstanceOf(Error);
   });
 
-  test("names the operator path as what it is", async () => {
+  test("names the operator path as what it is, once per provider it verifies", async () => {
     const { resolveIdentity } = await import("../src/identity-setup.ts");
+    const { OPERATOR_PROVIDERS } = await import("../src/operator-credentials.ts");
     const setup = resolveIdentity({ operatorPublicKeyJwk: OPERATOR_JWK });
-    expect(setup.providers).toEqual([
-      { id: "google", displayName: "Operator assertion", method: "operator-assertion" },
-    ]);
+    expect(setup.providers).toEqual(
+      OPERATOR_PROVIDERS.map((id) => ({
+        id,
+        displayName: "Operator assertion",
+        method: "operator-assertion",
+      })),
+    );
+  });
+
+  /**
+   * The set the identity plane registers is the set it advertises, and both
+   * come from one declaration.
+   *
+   * They did not. `OPERATOR_PROVIDERS` named `google` and `github`, nothing
+   * read it, and only `google:operator-assertion` was registered — so an
+   * organization owned by a `github` principal had no reachable way in, and
+   * asking for one answered an unhandled 500.
+   */
+  test("verifies an operator assertion for every provider it declares", async () => {
+    const { resolveIdentity } = await import("../src/identity-setup.ts");
+    const { OperatorAssertionError, OPERATOR_PROVIDERS } = await import(
+      "../src/operator-credentials.ts"
+    );
+    const setup = resolveIdentity({ operatorPublicKeyJwk: OPERATOR_JWK });
+    for (const provider of OPERATOR_PROVIDERS) {
+      // Reaching the operator verifier at all is the claim: the assertion is
+      // deliberately not a real one, so it must be refused as an assertion.
+      await expect(
+        setup.verifier.verify({
+          provider,
+          assertion: "not-an-assertion",
+          method: "operator-assertion",
+        }),
+      ).rejects.toBeInstanceOf(OperatorAssertionError);
+    }
+  });
+
+  test("refuses a provider it registers nothing for as the caller's error", async () => {
+    const { resolveIdentity } = await import("../src/identity-setup.ts");
+    const { AuthError } = await import("../src/auth.ts");
+    const setup = resolveIdentity({ operatorPublicKeyJwk: OPERATOR_JWK });
+    // `takos-id` is a real provider of this product and no operator assertion
+    // can vouch for it. That is a 4xx about the request, never a 500.
+    const refusal = setup.verifier.verify({
+      provider: "takos-id",
+      assertion: "not-an-assertion",
+      method: "operator-assertion",
+    });
+    await expect(refusal).rejects.toBeInstanceOf(AuthError);
+    await expect(refusal).rejects.toMatchObject({ code: "invalid" });
   });
 
   test("offers only Google once Google is configured", async () => {
