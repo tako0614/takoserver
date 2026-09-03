@@ -9,6 +9,13 @@ import {
   openApiDocument,
   openApiPaths,
 } from "../src/index.ts";
+import {
+  ROUTES,
+  TAKOFORM_LANES,
+  TAKOFORM_ROUTES,
+  takoformRoutePattern,
+} from "../src/route-table.ts";
+import type { WorkerEndpointOriginReservations } from "../src/worker-endpoint-origin-reservations.ts";
 
 const identity: ExternalIdentityVerifier = {
   async verify() {
@@ -36,85 +43,170 @@ function handler(publicOrigin = "https://api.takoserver.com") {
   }).fetch;
 }
 
-/** The one stable Takoform Host lane; Form family groups are versionless. */
-const TAKOFORM_SUFFIXES = [
-  "/forms",
-  "/form-definitions/{group}/{kind}",
-  "/support/forms",
-  "/support/forms/{group}/{kind}/{definitionVersion}",
-  "/support/interfaces/{name}/{version}",
-  "/support/bindings/{name}/{version}",
-  "/resources/validate",
-  "/resources/prepare",
-  "/resources/{group}/{kind}/{name}",
-  "/resources/{group}/{kind}/{name}/observe",
-  "/resources/{group}/{kind}/{name}/import",
-  "/operations/{operationId}",
-  "/operations/{operationId}/cancel",
-  "/artifacts/uploads",
-  "/artifacts/uploads/{uploadId}",
-  "/artifacts/uploads/{uploadId}/commit",
-  "/artifacts/uploads/{uploadId}/blobs/{digest}",
-  "/artifacts/{digest}",
-  "/artifacts/blobs/{digest}",
+const SPONSORSHIP_SERVICE_TOKEN = "sponsorship-service-token";
+
+/**
+ * The reservation authority is an optional port, so a composition without one
+ * answers its routes `not_found` — which would make the reachability check
+ * below unable to tell an absent capability from an unknown route. The stub
+ * only has to make the routes mountable.
+ */
+const RESERVATION_PROJECTION = {
+  format: "takoserver.worker-endpoint-origin-reservation.v2",
+  reservationId: "reservation_01",
+  requestedSubdomain: "probe",
+  canonicalPublicOrigin: "https://probe.workers.test",
+  revision: "1",
+  expiresAt: "2026-08-31T12:10:00.000Z",
+  status: "prepared",
+} as const;
+
+function reservationStub(): WorkerEndpointOriginReservations {
+  const refuse = () => {
+    throw new Error("not reached by a surface probe");
+  };
+  return {
+    async prepare() {
+      return RESERVATION_PROJECTION;
+    },
+    async read() {
+      return RESERVATION_PROJECTION;
+    },
+    async release() {},
+    async activate() {
+      return RESERVATION_PROJECTION;
+    },
+    async deactivate() {
+      return RESERVATION_PROJECTION;
+    },
+    mintForWorker: refuse,
+    bind: refuse,
+    inspectBound: refuse,
+    assignEndpoint: refuse,
+    cancelEndpointAssignment: refuse,
+    releaseEndpointAssignment: refuse,
+  } as unknown as WorkerEndpointOriginReservations;
+}
+
+/** The whole surface composed, so no route is missing merely for want of a port. */
+function completeHandler() {
+  return buildApp({
+    sql: createEphemeralSql(),
+    objects: createMemoryObjectStore(),
+    identity,
+    settlement,
+    publicOrigin: "https://api.takoserver.com",
+    forms: [],
+    hostForms: [],
+    driver: new InMemoryTakoformResourceDriver(),
+    offerings: [],
+    originReservations: reservationStub(),
+    sponsorshipServiceToken: SPONSORSHIP_SERVICE_TOKEN,
+  }).fetch;
+}
+
+const PATH_SAMPLES: Readonly<Record<string, string>> = {
+  organizationId: "org_probe",
+  resourceUid: "uid_probe",
+  migrationId: "mig_probe",
+  attachmentId: "att_probe",
+  apiKeyId: "key_probe",
+  reservationId: "reservation_probe",
+  operationKey: "opkey_probe1234",
+  operationId: "op_probe",
+  tenantRef: "tenant_probe",
+  group: "edge.forms.takoform.com",
+  kind: "ModuleWorker",
+  name: "probe",
+  definitionVersion: "1.0.0",
+  version: "v1",
+  uploadId: "upload_probe",
+  digest: `sha256:${"a".repeat(64)}`,
+};
+
+function concretePath(pattern: string): string {
+  return pattern.replaceAll(/\{(\w+)\}/gu, (_match, parameter: string) => {
+    const sample = PATH_SAMPLES[parameter];
+    if (sample === undefined) throw new Error(`no sample for path parameter ${parameter}`);
+    return sample;
+  });
+}
+
+/** Every route the table declares, including the private seams and both lanes. */
+const DECLARED_ROUTES = [
+  ...ROUTES,
+  ...TAKOFORM_LANES.flatMap((lane) =>
+    TAKOFORM_ROUTES.map((route) => ({
+      ...route,
+      pattern: takoformRoutePattern(lane, route.pattern),
+    })),
+  ),
 ];
 
-const PUBLIC_PATHS = [
-  "/",
-  "/.well-known/takoform/v1",
-  "/.well-known/takoserver",
-  "/openapi.json",
-  "/v1/catalog",
-  "/v1/forms",
-  "/v1/identity/providers",
-  "/v1/me",
-  "/v1/ai/models",
-  "/v1/ai/chat/completions",
-  "/v1/organizations",
-  "/v1/organizations/{organizationId}/attachments",
-  "/v1/organizations/{organizationId}/attachments/{attachmentId}",
-  "/v1/organizations/{organizationId}/api-keys",
-  "/v1/organizations/{organizationId}/api-keys/{apiKeyId}",
-  "/v1/organizations/{organizationId}/operations",
-  "/v1/organizations/{organizationId}/resources",
-  "/v1/takoform/worker-runtime-input-preparations/{operationKey}",
-  "/v1/worker-endpoint-origin-reservations/{reservationId}",
-  "/v1/worker-endpoint-origin-reservations/{reservationId}/activation",
-  "/v1/organizations/{organizationId}/resources/{resourceUid}",
-  "/v1/organizations/{organizationId}/resources/{resourceUid}/native-residual",
-  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations",
-  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}",
-  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/cancel",
-  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/cutover",
-  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/execute",
-  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/rollback",
-  "/v1/organizations/{organizationId}/wallet",
-  "/v1/organizations/{organizationId}/wallet/checkout",
-  "/v1/organizations/{organizationId}/wallet/funding",
-  "/v1/reseller/quotes",
-  "/v1/reseller/reservations",
-  "/v1/reseller/reservations/{reservationId}/capture",
-  "/v1/reseller/reservations/{reservationId}/provision-tokens",
-  "/v1/reseller/reservations/{reservationId}/release",
-  "/v1/reseller/reservations/{reservationId}/takoform-run-tokens",
-  "/v1/reseller/reservations/{reservationId}/usage-statement",
-  "/v1/sessions",
-];
+/** Every path the document is expected to publish, derived from the same table. */
+const DOCUMENTED_PATTERNS = [
+  ...new Set(
+    DECLARED_ROUTES.filter((route) => !("internal" in route && route.internal)).map(
+      (route) => route.pattern,
+    ),
+  ),
+].sort();
 
 describe("published API description", () => {
-  test("declares exactly the one literal stable Host surface", () => {
-    const expected = [
-      ...PUBLIC_PATHS,
-      ...TAKOFORM_SUFFIXES.map((suffix) => `/apis/forms.takoform.com/v1${suffix}`),
-    ].sort();
-    expect(openApiPaths()).toEqual(expected);
-    expect(TAKOFORM_SUFFIXES.length + PUBLIC_PATHS.length).toBe(openApiPaths().length);
+  test("publishes exactly the paths the route table declares", () => {
+    // Derived, not transcribed. The list this used to compare against was a
+    // second hand-written copy of the document, so the two could only ever
+    // agree — including about a route neither of them mentioned.
+    expect(openApiPaths()).toEqual(DOCUMENTED_PATTERNS);
     expect(JSON.stringify(openApiDocument)).not.toMatch(
       /forms\.takoform\.com\/(?:v1alpha3|v1beta1|v1beta4)/u,
     );
     expect(JSON.stringify(openApiDocument)).not.toMatch(
       /s3-credentials|takoserver\.s3-connection|support\/standard-services/u,
     );
+  });
+
+  test("publishes the Console sign-out the surface has always served", () => {
+    // `DELETE /v1/session` is called by `console/src/api.ts`. It was absent
+    // from the document for as long as the document was written by hand.
+    expect(openApiPaths()).toContain("/v1/session");
+  });
+
+  test("keeps the private sponsorship seam out of the published document", () => {
+    const internal = ROUTES.filter((route) => route.internal);
+    expect(internal.length).toBeGreaterThan(0);
+    for (const route of internal) {
+      expect(openApiPaths()).not.toContain(route.pattern);
+    }
+    expect(JSON.stringify(openApiDocument)).not.toMatch(/sponsorship/u);
+  });
+
+  test("every route the table declares is one the dispatcher knows", async () => {
+    // The check the two hand-written lists could not make: go to the built
+    // application and confirm each declared route resolves to a handler. An
+    // unknown path is answered by `router.ts` with the code `not_found`; a
+    // known one answers its own refusal (401, 403, 400) or succeeds.
+    const fetch = completeHandler();
+    const unknown: string[] = [];
+    for (const route of DECLARED_ROUTES) {
+      const response = await fetch(
+        new Request(`https://api.takoserver.com${concretePath(route.pattern)}`, {
+          method: route.method.toUpperCase(),
+          headers:
+            "internal" in route && route.internal
+              ? { authorization: `Bearer ${SPONSORSHIP_SERVICE_TOKEN}` }
+              : {},
+        }),
+      );
+      const body = (await response
+        .clone()
+        .json()
+        .catch(() => null)) as { error?: { code?: string } } | null;
+      if (body?.error?.code === "not_found") {
+        unknown.push(`${route.method.toUpperCase()} ${route.pattern}`);
+      }
+    }
+    expect(unknown).toEqual([]);
   });
 
   test("names one server and one bearer scheme", () => {
