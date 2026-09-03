@@ -154,6 +154,7 @@ export function workerCredentials(
     | "TAKOSERVER_STRIPE_CHECKOUT_ENABLED"
     | "TAKOSERVER_CONSOLE_ORIGIN"
   >,
+  operatorAudience: string,
 ) {
   const operatorKeys = operatorCredentialKeys(env);
   const identity = resolveIdentity({
@@ -167,6 +168,7 @@ export function workerCredentials(
       : {}),
     googleClientId: env.GOOGLE_CLIENT_ID,
     operatorPublicKeyJwk: operatorKeys.identity,
+    operatorAudience,
   });
   const payment = resolvePayment({
     stripeSecretKey:
@@ -432,7 +434,7 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
   const edge = await buildEdgeForms();
   const currentCandidates = currentTakoformCandidates();
   const implementationIdentity = resolvePublicWorkerImplementationIdentity(env);
-  const { identity, identityProviders, settlement, checkout } = workerCredentials(env);
+  const { identity, identityProviders, settlement, checkout } = workerCredentials(env, origin);
   const sql = createD1Sql(env.STATE_DB);
   const objects = createR2ObjectStore(env.OBJECTS);
   const clock = () => new Date();

@@ -151,6 +151,7 @@ describe("the assertion a first run prints", () => {
       privateJwk: store.files.get("/data/operator-key.jwk") ?? "",
       claims: {
         purpose: "sign-in",
+        aud: "http://localhost:8787",
         provider: "google",
         subject: "operator",
         email: "operator@localhost",
@@ -162,9 +163,14 @@ describe("the assertion a first run prints", () => {
 
     const identity = createOperatorIdentity({
       publicKeyJwk,
+      audience: "http://localhost:8787",
       clock: () => new Date(now * 1_000),
     });
-    const verified = await identity.verify({ provider: "google", assertion });
+    const verified = await identity.verify({
+      provider: "google",
+      assertion,
+      audience: "http://localhost:8787",
+    });
 
     expect(verified.providerSubject).toBe("operator");
     expect(verified.email).toBe("operator@localhost");
@@ -186,6 +192,7 @@ describe("the assertion a first run prints", () => {
       privateJwk: store.files.get("/data/operator-key.jwk") ?? "",
       claims: {
         purpose: "sign-in",
+        aud: "http://localhost:8787",
         provider: "google",
         subject: "operator",
         email: "operator@localhost",
@@ -197,8 +204,15 @@ describe("the assertion a first run prints", () => {
 
     const identity = createOperatorIdentity({
       publicKeyJwk,
+      audience: "http://localhost:8787",
       clock: () => new Date((issued + 601) * 1_000),
     });
-    await expect(identity.verify({ provider: "google", assertion })).rejects.toThrow();
+    await expect(
+      identity.verify({
+        provider: "google",
+        assertion,
+        audience: "http://localhost:8787",
+      }),
+    ).rejects.toThrow();
   });
 });

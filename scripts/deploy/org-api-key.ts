@@ -1,23 +1,16 @@
-import {
-  closeSync,
-  constants,
-  existsSync,
-  fstatSync,
-  lstatSync,
-  openSync,
-  readFileSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, lstatSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { API_KEY_SCOPES, type ApiKeyScope } from "../../src/auth.ts";
-import {
-  isOperatorProvider,
-  OPERATOR_PROVIDERS,
-  type OperatorProvider,
-} from "../../src/operator-credentials.ts";
-import { signOperatorAssertion } from "../../src/operator-key.ts";
 import { mutationError, preflightError, verificationError } from "./errors.ts";
-import { provePrivateMatchesPublic, readPrivateJwk } from "./identity.ts";
+import {
+  OPERATOR_IDENTITY_ENV,
+  OPERATOR_PRIVATE_JWK_ENV,
+  type OperatorAuthoritySession,
+  provePrivateMatchesPublic,
+  readOperatorSignInIdentity,
+  readPrivateJwk,
+  withOperatorOwnerSession,
+} from "./operator-authority.ts";
 import { type CommandResult, requireEnvironment, runCommand } from "./process.ts";
 import { type DeployEnvironment, qualifySource } from "./qualification.ts";
 import type { DeployTarget } from "./target.ts";
@@ -46,8 +39,7 @@ import { probeProduct } from "./worker.ts";
  * reason it existed.
  */
 
-export const OPERATOR_PRIVATE_JWK_ENV = "TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH";
-export const OPERATOR_IDENTITY_ENV = "TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH";
+export { OPERATOR_IDENTITY_ENV, OPERATOR_PRIVATE_JWK_ENV } from "./operator-authority.ts";
 export const OUTPUT_DIRECTORY_ENV = "TAKOSERVER_ORG_API_KEY_OUTPUT_DIRECTORY";
 
 /** Long enough for a release to live on, short enough to be re-decided. */
@@ -57,10 +49,6 @@ const ORGANIZATION_ID = /^org_[A-Za-z0-9][A-Za-z0-9._:-]{0,123}$/u;
 /** Also the secret file name, so it stays a plain lowercase path segment. */
 const KEY_NAME = /^[a-z0-9][a-z0-9-]{0,63}$/u;
 const API_KEY_ID = /^key_[A-Za-z0-9][A-Za-z0-9._:-]{0,123}$/u;
-const IDENTITY_KIND = "takoserver.operator-sign-in-identity@v1";
-const IDENTITY_KEYS = ["kind", "provider", "subject", "email", "displayName"] as const;
-const MAX_IDENTITY_BYTES = 16_384;
-const PROOF_LIFETIME_SECONDS = 60;
 const SECONDS_PER_DAY = 86_400;
 
 export type OrgApiKeyAction = "mint" | "status" | "revoke";
@@ -94,13 +82,6 @@ export interface OrgApiKeyOptions {
   readonly now?: () => Date;
 }
 
-interface OperatorSignInIdentity {
-  readonly provider: OperatorProvider;
-  readonly subject: string;
-  readonly email: string;
-  readonly displayName: string;
-}
-
 interface LiveApiKey {
   readonly id: string;
   readonly organizationId: string;
@@ -126,7 +107,8 @@ export async function runOrgApiKey(
     throw preflightError(
       "selected target declares no operatorIdentity, so no operator authority can mint a key here",
       "Declare `operatorIdentity.publicJwk` in the operator-private descriptor and publish it " +
-        "through takoserver-integration-operator-identity first.",
+        "through takoserver-operator-identity first; the legacy integration spelling is not a " +
+        "rehearsal or production remediation.",
     );
   }
   const request = assertActionShape(invocation);
@@ -157,59 +139,108 @@ export async function runOrgApiKey(
   // The Host must be the product this target names before any credential moves.
   const probe = await probeProduct(target.publicOrigin, fetcher);
 
-  const session = await openOperatorSession(
-    target.publicOrigin,
-    privateJwk,
-    identity,
-    now,
-    fetcher,
-  );
-  try {
-    const before = await listApiKeys(
-      target.publicOrigin,
-      session,
-      invocation.organizationId,
-      fetcher,
+  const authority = await withOperatorOwnerSession(
+    {
+      origin: target.publicOrigin,
+      organizationId: invocation.organizationId,
+      privateInput: privateJwk,
       identity,
-    );
+      fetcher,
+      now,
+      phase: "preflight",
+      cleanupPhase: invocation.action === "status" ? "preflight" : "verification",
+    },
+    async (session) => {
+      const before = await listApiKeys(session, invocation.organizationId);
 
-    if (invocation.action === "status") {
-      return {
-        kind: "takoserver.org-api-key-status@v1",
-        surface: invocation.surface,
-        action: invocation.action,
-        environment: invocation.environment,
-        selectedCommit: source.commit,
-        dirty: source.dirty,
+      if (invocation.action === "status") {
+        return {
+          kind: "takoserver.org-api-key-status@v1",
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          selectedCommit: source.commit,
+          dirty: source.dirty,
+          organizationId: invocation.organizationId,
+          probe,
+          apiKeys: before,
+          secretsRedacted: true,
+          mutationApplied: false,
+          ready: true,
+        };
+      }
+
+      if (invocation.action === "revoke") {
+        const apiKeyId = request.apiKeyId;
+        const revoked = await revokeApiKey(session, invocation.organizationId, apiKeyId);
+        const after = await listApiKeys(session, invocation.organizationId);
+        if (after.some((key) => key.id === apiKeyId)) {
+          throw verificationError("revoked organization API key is still listed as unrevoked");
+        }
+        return {
+          kind: "takoserver.org-api-key-revoke@v1",
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: source.commit,
+          dirty: source.dirty,
+          remoteRef: source.remoteRef,
+          reviewer,
+          organizationId: invocation.organizationId,
+          apiKeyId,
+          revokedKeyName: revoked.name,
+          apiKeys: after,
+          secretsRedacted: true,
+          mutationApplied: true,
+          reversal:
+            "forward only: a revoked key is never restored; mint a new key and re-install it",
+        };
+      }
+
+      const keyName = request.keyName;
+      const scopes = request.scopes;
+      const expiresInSeconds = request.expiresInDays * SECONDS_PER_DAY;
+      const secretPath = join(
+        outputDirectory as string,
+        `${invocation.organizationId}.${keyName}.secret`,
+      );
+      if (existsSync(secretPath)) {
+        throw preflightError(
+          "an organization API key secret file with this name already exists",
+          "Revoke the key it holds through this surface and remove the file before minting again.",
+        );
+      }
+      // A duplicate live name would leave two keys the operator cannot tell
+      // apart, and only one of them would have a secret on disk.
+      const conflict = before.find((key) => key.name === keyName);
+      if (conflict) {
+        throw preflightError(
+          `organization ${invocation.organizationId} already has an unrevoked API key named ${keyName}`,
+          JSON.stringify({ apiKeyId: conflict.id, expiresAt: conflict.expiresAt }),
+        );
+      }
+      const minted = await mintApiKey(session, {
         organizationId: invocation.organizationId,
-        probe,
-        apiKeys: before,
-        secretsRedacted: true,
-        mutationApplied: false,
-        ready: true,
-      };
-    }
-
-    if (invocation.action === "revoke") {
-      const apiKeyId = request.apiKeyId;
-      const revoked = await revokeApiKey(
-        target.publicOrigin,
-        session,
-        invocation.organizationId,
-        apiKeyId,
-        fetcher,
-      );
-      const after = await listApiKeys(
-        target.publicOrigin,
-        session,
-        invocation.organizationId,
-        fetcher,
-      );
-      if (after.some((key) => key.id === apiKeyId)) {
-        throw verificationError("revoked organization API key is still listed as unrevoked");
+        name: keyName,
+        scopes,
+        expiresInSeconds,
+      });
+      // The secret exists in exactly two places from here: this file and the
+      // Host's digest. It never enters stdout, argv or a diagnostic.
+      writeFileSync(secretPath, minted.secret, { mode: 0o600, flag: "wx" });
+      const after = await listApiKeys(session, invocation.organizationId);
+      const readback = after.find((key) => key.id === minted.apiKey.id);
+      if (
+        !readback ||
+        readback.name !== keyName ||
+        readback.expiresAt !== minted.apiKey.expiresAt
+      ) {
+        throw verificationError(
+          "minted organization API key is not listed with its exact identity",
+        );
       }
       return {
-        kind: "takoserver.org-api-key-revoke@v1",
+        kind: "takoserver.org-api-key-mint@v1",
         surface: invocation.surface,
         action: invocation.action,
         environment: invocation.environment,
@@ -218,85 +249,24 @@ export async function runOrgApiKey(
         remoteRef: source.remoteRef,
         reviewer,
         organizationId: invocation.organizationId,
-        apiKeyId,
-        revokedKeyName: revoked.name,
-        apiKeys: after,
+        apiKeyId: readback.id,
+        keyName,
+        scopes: readback.scopes,
+        createdAt: readback.createdAt,
+        expiresAt: readback.expiresAt,
+        expiresInDays: request.expiresInDays,
+        secretPath,
         secretsRedacted: true,
+        probe,
         mutationApplied: true,
-        reversal: "forward only: a revoked key is never restored; mint a new key and re-install it",
+        reversal:
+          `bun run deploy -- takoserver-org-api-key --revoke --environment=${invocation.environment} ` +
+          `--commit=${source.commit} --organization=${invocation.organizationId} ` +
+          `--key-id=${readback.id}`,
       };
-    }
-
-    const keyName = request.keyName;
-    const scopes = request.scopes;
-    const expiresInSeconds = request.expiresInDays * SECONDS_PER_DAY;
-    const secretPath = join(
-      outputDirectory as string,
-      `${invocation.organizationId}.${keyName}.secret`,
-    );
-    if (existsSync(secretPath)) {
-      throw preflightError(
-        "an organization API key secret file with this name already exists",
-        "Revoke the key it holds through this surface and remove the file before minting again.",
-      );
-    }
-    // A duplicate live name would leave two keys the operator cannot tell
-    // apart, and only one of them would have a secret on disk.
-    const conflict = before.find((key) => key.name === keyName);
-    if (conflict) {
-      throw preflightError(
-        `organization ${invocation.organizationId} already has an unrevoked API key named ${keyName}`,
-        JSON.stringify({ apiKeyId: conflict.id, expiresAt: conflict.expiresAt }),
-      );
-    }
-    const minted = await mintApiKey(target.publicOrigin, session, {
-      organizationId: invocation.organizationId,
-      name: keyName,
-      scopes,
-      expiresInSeconds,
-      fetcher,
-    });
-    // The secret exists in exactly two places from here: this file and the
-    // Host's digest. It never enters stdout, argv or a diagnostic.
-    writeFileSync(secretPath, minted.secret, { mode: 0o600, flag: "wx" });
-    const after = await listApiKeys(
-      target.publicOrigin,
-      session,
-      invocation.organizationId,
-      fetcher,
-    );
-    const readback = after.find((key) => key.id === minted.apiKey.id);
-    if (!readback || readback.name !== keyName || readback.expiresAt !== minted.apiKey.expiresAt) {
-      throw verificationError("minted organization API key is not listed with its exact identity");
-    }
-    return {
-      kind: "takoserver.org-api-key-mint@v1",
-      surface: invocation.surface,
-      action: invocation.action,
-      environment: invocation.environment,
-      commit: source.commit,
-      dirty: source.dirty,
-      remoteRef: source.remoteRef,
-      reviewer,
-      organizationId: invocation.organizationId,
-      apiKeyId: readback.id,
-      keyName,
-      scopes: readback.scopes,
-      createdAt: readback.createdAt,
-      expiresAt: readback.expiresAt,
-      expiresInDays: request.expiresInDays,
-      secretPath,
-      secretsRedacted: true,
-      probe,
-      mutationApplied: true,
-      reversal:
-        `bun run deploy -- takoserver-org-api-key --revoke --environment=${invocation.environment} ` +
-        `--commit=${source.commit} --organization=${invocation.organizationId} ` +
-        `--key-id=${readback.id}`,
-    };
-  } finally {
-    await closeOperatorSession(target.publicOrigin, session, fetcher);
-  }
+    },
+  );
+  return authority.value;
 }
 
 interface ActionShape {
@@ -362,149 +332,20 @@ function assertActionShape(invocation: OrgApiKeyInvocation): ActionShape {
   return { keyName: "", scopes: [], expiresInDays: 0, apiKeyId: "" };
 }
 
-async function openOperatorSession(
-  origin: string,
-  privateJwk: ReturnType<typeof readPrivateJwk>,
-  identity: OperatorSignInIdentity,
-  now: () => Date,
-  fetcher: (input: string, init?: RequestInit) => Promise<Response>,
-): Promise<string> {
-  const nowSeconds = Math.floor(now().getTime() / 1_000);
-  if (!Number.isSafeInteger(nowSeconds)) {
-    throw preflightError("organization API key proof clock is invalid");
-  }
-  let assertion: string;
-  try {
-    assertion = await signOperatorAssertion({
-      privateJwk: JSON.stringify(privateJwk.jwk),
-      claims: {
-        purpose: "sign-in",
-        provider: identity.provider,
-        subject: identity.subject,
-        email: identity.email,
-        displayName: identity.displayName,
-      },
-      nowSeconds,
-      lifetimeSeconds: PROOF_LIFETIME_SECONDS,
-    });
-  } catch {
-    throw preflightError("organization API key assertion signing failed; private key redacted");
-  }
-  let response: Response;
-  try {
-    response = await fetcher(`${origin}/v1/sessions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "cache-control": "no-store" },
-      body: JSON.stringify({
-        provider: identity.provider,
-        method: "operator-assertion",
-        assertion,
-      }),
-      redirect: "error",
-    });
-  } catch {
-    throw preflightError("organization API key session transport failed; credentials redacted");
-  }
-  const body = (await response.json().catch(() => null)) as unknown;
-  const sessionToken = isRecord(body) ? body.sessionToken : undefined;
-  // A Host that registers no operator-assertion verifier for this provider
-  // refuses the exchange itself rather than the assertion in it. Saying only
-  // "no usable session" sent the last operator looking at their key, their
-  // clock and their identity file; the cause was that the organization's owner
-  // signs in under a provider the deployed Host does not wire at all.
-  if (response.status === 400 && errorCode(body) === "invalid") {
-    throw preflightError(
-      `Host ${origin} verifies no operator assertion for provider ${identity.provider}`,
-      `Advance the Host to a commit that registers ${identity.provider}:operator-assertion, or ` +
-        `point ${OPERATOR_IDENTITY_ENV} at an owner principal whose provider it already verifies.`,
-    );
-  }
-  if (
-    response.status !== 200 ||
-    typeof sessionToken !== "string" ||
-    sessionToken.length < 1 ||
-    sessionToken.length > 16_384
-  ) {
-    throw preflightError(
-      "operator sign-in did not return a usable redacted session",
-      `status=${response.status}`,
-    );
-  }
-  return sessionToken;
-}
-
-/**
- * The proof session is always revoked, and its death is proved by replay.
- *
- * A lost `DELETE` acknowledgement is settled by the read-only replay rather
- * than by a retry, exactly as the operator-identity surface settles its own.
- */
-async function closeOperatorSession(
-  origin: string,
-  sessionToken: string,
-  fetcher: (input: string, init?: RequestInit) => Promise<Response>,
-): Promise<void> {
-  try {
-    await fetcher(`${origin}/v1/session`, {
-      method: "DELETE",
-      headers: { authorization: `Bearer ${sessionToken}`, "cache-control": "no-store" },
-      redirect: "error",
-    });
-  } catch {
-    // The replay below is the authority for an acknowledgement that may be lost.
-  }
-  let replay: Response;
-  try {
-    replay = await fetcher(`${origin}/v1/me`, {
-      method: "GET",
-      headers: { authorization: `Bearer ${sessionToken}`, "cache-control": "no-store" },
-      redirect: "error",
-    });
-  } catch {
-    throw verificationError(
-      "organization API key proof session revocation replay failed; session state is indeterminate",
-    );
-  }
-  if (replay.status !== 401) {
-    throw verificationError(
-      "organization API key proof session remains usable after revocation",
-      `replay_status=${replay.status}`,
-    );
-  }
-}
-
 async function listApiKeys(
-  origin: string,
-  sessionToken: string,
+  session: OperatorAuthoritySession,
   organizationId: string,
-  fetcher: (input: string, init?: RequestInit) => Promise<Response>,
-  identity?: OperatorSignInIdentity,
 ): Promise<readonly LiveApiKey[]> {
   let response: Response;
   try {
-    response = await fetcher(
-      `${origin}/v1/organizations/${encodeURIComponent(organizationId)}/api-keys`,
-      {
-        method: "GET",
-        headers: { authorization: `Bearer ${sessionToken}`, "cache-control": "no-store" },
-        redirect: "error",
-      },
+    response = await session.request(
+      `/v1/organizations/${encodeURIComponent(organizationId)}/api-keys`,
+      { method: "GET" },
     );
   } catch {
     throw preflightError("organization API key readback transport failed");
   }
   const body = (await response.json().catch(() => null)) as unknown;
-  // Only the owner may list, so a refusal here means the session that opened
-  // is somebody else. The operator identity file names which principal the
-  // assertion vouches for, and that is the thing to correct.
-  if (response.status === 403 && identity) {
-    throw preflightError(
-      `the operator identity signed in as a ${identity.provider} principal that does not own ` +
-        organizationId,
-      `Point ${OPERATOR_IDENTITY_ENV} at the organization's owner principal — its provider and ` +
-        "subject must be the pair that owns the organization, not merely an assertion-capable one.",
-    );
-  }
   if (response.status !== 200 || !isRecord(body) || !Array.isArray(body.apiKeys)) {
     throw preflightError(
       "organization API key readback was refused or malformed",
@@ -515,26 +356,22 @@ async function listApiKeys(
 }
 
 async function mintApiKey(
-  origin: string,
-  sessionToken: string,
+  session: OperatorAuthoritySession,
   input: {
     readonly organizationId: string;
     readonly name: string;
     readonly scopes: readonly ApiKeyScope[];
     readonly expiresInSeconds: number;
-    readonly fetcher: (input: string, init?: RequestInit) => Promise<Response>;
   },
 ): Promise<{ readonly apiKey: LiveApiKey; readonly secret: string }> {
   let response: Response;
   try {
-    response = await input.fetcher(
-      `${origin}/v1/organizations/${encodeURIComponent(input.organizationId)}/api-keys`,
+    response = await session.request(
+      `/v1/organizations/${encodeURIComponent(input.organizationId)}/api-keys`,
       {
         method: "POST",
         headers: {
-          authorization: `Bearer ${sessionToken}`,
           "content-type": "application/json",
-          "cache-control": "no-store",
         },
         body: JSON.stringify({
           name: input.name,
@@ -566,21 +403,17 @@ async function mintApiKey(
 }
 
 async function revokeApiKey(
-  origin: string,
-  sessionToken: string,
+  session: OperatorAuthoritySession,
   organizationId: string,
   apiKeyId: string,
-  fetcher: (input: string, init?: RequestInit) => Promise<Response>,
 ): Promise<LiveApiKey> {
   let response: Response;
   try {
-    response = await fetcher(
-      `${origin}/v1/organizations/${encodeURIComponent(organizationId)}/api-keys/` +
+    response = await session.request(
+      `/v1/organizations/${encodeURIComponent(organizationId)}/api-keys/` +
         encodeURIComponent(apiKeyId),
       {
         method: "DELETE",
-        headers: { authorization: `Bearer ${sessionToken}`, "cache-control": "no-store" },
-        redirect: "error",
       },
     );
   } catch {
@@ -626,90 +459,6 @@ function exactApiKey(value: unknown, organizationId: string): LiveApiKey {
   };
 }
 
-/**
- * The operator names the identity their key vouches for.
- *
- * It is deliberately not a target field: the descriptor already pins which key
- * may sign, and the person behind that key is operator-private.
- */
-function readOperatorSignInIdentity(path: string): OperatorSignInIdentity {
-  if (!isAbsolute(path)) throw preflightError(`${OPERATOR_IDENTITY_ENV} must be one absolute path`);
-  let descriptor: number | null = null;
-  let raw: string;
-  try {
-    descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-    const status = fstatSync(descriptor);
-    if (
-      !status.isFile() ||
-      status.nlink !== 1 ||
-      (typeof process.getuid === "function" && status.uid !== process.getuid()) ||
-      (status.mode & 0o777) !== 0o600 ||
-      status.size < 1 ||
-      status.size > MAX_IDENTITY_BYTES
-    ) {
-      throw new Error("unsafe");
-    }
-    raw = readFileSync(descriptor, "utf8");
-  } catch {
-    throw preflightError(
-      "operator sign-in identity must be an owned 0600 link-free regular file of at most 16 KiB",
-    );
-  } finally {
-    if (descriptor !== null) closeSync(descriptor);
-  }
-  let value: unknown;
-  try {
-    value = JSON.parse(raw);
-  } catch {
-    throw preflightError("operator sign-in identity is not valid JSON");
-  }
-  if (
-    !isRecord(value) ||
-    JSON.stringify(Object.keys(value).sort()) !== JSON.stringify([...IDENTITY_KEYS].sort()) ||
-    value.kind !== IDENTITY_KIND ||
-    typeof value.provider !== "string" ||
-    !boundedText(value.subject) ||
-    !boundedText(value.email) ||
-    !boundedText(value.displayName)
-  ) {
-    throw preflightError(
-      `operator sign-in identity must be exactly ${IDENTITY_KIND} with provider, subject, email and displayName`,
-    );
-  }
-  // The organization's owner principal is the only account that may mint, and
-  // it is reachable only through a provider an operator assertion can vouch
-  // for. Naming one outside that set is refused here, by name, rather than
-  // becoming a sign-in the Host cannot verify.
-  if (!isOperatorProvider(value.provider)) {
-    throw preflightError(
-      `operator sign-in identity names provider ${value.provider}, which no operator assertion ` +
-        "can vouch for; the organization's owner principal must sign in under one of " +
-        `${OPERATOR_PROVIDERS.join(", ")}`,
-      "Re-seed the organization's owner principal under an assertion-capable provider, or point " +
-        `${OPERATOR_IDENTITY_ENV} at the owner this Host can verify.`,
-    );
-  }
-  return {
-    provider: value.provider,
-    subject: value.subject as string,
-    email: value.email as string,
-    displayName: value.displayName as string,
-  };
-}
-
-function boundedText(value: unknown): boolean {
-  return (
-    typeof value === "string" &&
-    value.length > 0 &&
-    value.length <= 256 &&
-    value.trim() === value &&
-    ![...value].some((character) => {
-      const code = character.codePointAt(0);
-      return code !== undefined && (code <= 31 || code === 127);
-    })
-  );
-}
-
 function ownedSecretDirectory(path: string): string {
   if (!isAbsolute(path)) throw preflightError(`${OUTPUT_DIRECTORY_ENV} must be one absolute path`);
   const normalized = resolve(path);
@@ -749,10 +498,4 @@ function exactReviewer(value: string): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/** The refusal code inside a Host error envelope, when it carries one. */
-function errorCode(body: unknown): string | null {
-  if (!isRecord(body) || !isRecord(body.error)) return null;
-  return typeof body.error.code === "string" ? body.error.code : null;
 }

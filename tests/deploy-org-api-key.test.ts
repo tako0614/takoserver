@@ -90,18 +90,21 @@ async function owned(identity?: Record<string, unknown>): Promise<Owned> {
   };
 }
 
-function targetFor(input: Owned): DeployTarget {
+function targetFor(
+  input: Owned,
+  environment: "integration" | "rehearsal" | "production" = "integration",
+): DeployTarget {
   return {
     kind: "takoserver.deploy-target@v2",
-    environment: "integration",
+    environment,
     accountId: "a".repeat(32),
-    workerName: "takoserver-api-integration",
+    workerName: `takoserver-api-${environment}`,
     d1: {
-      databaseName: "takoserver-runtime-integration",
+      databaseName: `takoserver-runtime-${environment}`,
       databaseId: "00000000-0000-4000-8000-000000000000",
     },
-    r2: { bucketName: "takoserver-objects-integration" },
-    publicOrigin: ORIGIN,
+    r2: { bucketName: `takoserver-objects-${environment}` },
+    publicOrigin: `https://api.${environment}.example.test`,
     edgeSupplies: {
       offerings: YURUCOMMU_IDENTITY_CAPABILITY_KINDS.map((formKind) => ({ formKind })),
     } as unknown as NonNullable<DeployTarget["edgeSupplies"]>,
@@ -127,6 +130,7 @@ function host(
     readonly ownerGateRefuses?: boolean;
   } = {},
 ): Host {
+  let signedPrincipal: Record<string, unknown> | null = null;
   const state: Host = {
     calls: [],
     keys: new Map(),
@@ -144,21 +148,50 @@ function host(
         });
       }
       if (path === "/openapi.json") return Response.json({ servers: [{ url: ORIGIN }] });
-      if (method === "POST" && path === "/v1/sessions") {
-        const posted = JSON.parse(String(init?.body)) as { provider: string };
+      if (method === "POST" && (path === "/v1/operator-owner-proof" || path === "/v1/sessions")) {
+        const posted = JSON.parse(String(init?.body)) as { provider: string; assertion: string };
         // Exactly the Host's own answer: a provider it registers nothing for
         // is the caller's error, and the assertion is never even read.
         if (!(input.assertionProviders ?? ["google", "github"]).includes(posted.provider)) {
           return Response.json({ error: { code: "invalid" } }, { status: 400 });
         }
+        const [payload] = posted.assertion.split(".");
+        const claims = JSON.parse(Buffer.from(payload ?? "", "base64url").toString("utf8")) as {
+          subject: string;
+          email: string;
+          displayName: string;
+          aud: string;
+        };
+        if (claims.aud !== ORIGIN) {
+          return Response.json({ error: { code: "unauthenticated" } }, { status: 401 });
+        }
+        signedPrincipal = {
+          id: "prn_operator",
+          provider: posted.provider,
+          providerSubject: claims.subject,
+          email: claims.email,
+          displayName: claims.displayName,
+        };
+        if (path === "/v1/operator-owner-proof") {
+          if (input.ownerGateRefuses) {
+            return Response.json({ error: { code: "not_found" } }, { status: 404 });
+          }
+          return Response.json({
+            principal: signedPrincipal,
+            organization: {
+              id: ORGANIZATION,
+              name: "Takosumi Hosted staging",
+              ownerPrincipalId: "prn_operator",
+              createdAt: "2026-06-18T11:00:00.000Z",
+            },
+          });
+        }
         return Response.json({
-          principal: { id: "prn_operator" },
+          principal: signedPrincipal,
           sessionToken: SESSION,
         });
       }
-      const authorized = init?.headers
-        ? (init.headers as Record<string, string>).authorization === `Bearer ${SESSION}`
-        : false;
+      const authorized = new Headers(init?.headers).get("authorization") === `Bearer ${SESSION}`;
       if (method === "DELETE" && path === "/v1/session") {
         state.sessionRevoked = true;
         return new Response(null, { status: 204 });
@@ -166,7 +199,17 @@ function host(
       if (path === "/v1/me") {
         return state.sessionRevoked || !authorized
           ? Response.json({ error: { code: "unauthenticated" } }, { status: 401 })
-          : Response.json({ principal: { id: "prn_operator" }, organizations: [] });
+          : Response.json({
+              principal: signedPrincipal,
+              organizations: [
+                {
+                  id: ORGANIZATION,
+                  name: "Takosumi Hosted staging",
+                  ownerPrincipalId: input.ownerGateRefuses ? "prn_somebody_else" : "prn_operator",
+                  createdAt: "2026-06-18T11:00:00.000Z",
+                },
+              ],
+            });
       }
       if (!authorized || state.sessionRevoked) {
         return Response.json({ error: { code: "unauthenticated" } }, { status: 401 });
@@ -282,7 +325,18 @@ describe("durable organization API key surface", () => {
       // the proof session is dead before the surface returns.
       expect([...live.keys.values()]).toHaveLength(1);
       expect(live.sessionRevoked).toBe(true);
-      expect(live.calls).toContain("DELETE /v1/session");
+      expect(live.calls).toEqual([
+        "GET /.well-known/takoserver",
+        "GET /openapi.json",
+        "POST /v1/operator-owner-proof",
+        "POST /v1/sessions",
+        "GET /v1/me",
+        `GET /v1/organizations/${ORGANIZATION}/api-keys`,
+        `POST /v1/organizations/${ORGANIZATION}/api-keys`,
+        `GET /v1/organizations/${ORGANIZATION}/api-keys`,
+        "DELETE /v1/session",
+        "GET /v1/me",
+      ]);
     } finally {
       rmSync(input.root, { recursive: true, force: true });
     }
@@ -471,23 +525,29 @@ describe("durable organization API key surface", () => {
     }
   });
 
-  test("refuses a target that declares no operator authority", async () => {
+  test("refuses a target that declares no operator authority through the canonical surface", async () => {
     const input = await owned();
     try {
-      const { operatorIdentity: _absent, ...withoutIdentity } = targetFor(input);
-      const refusal = await runOrgApiKey(
-        {
-          surface: "takoserver-org-api-key",
-          action: "status",
-          environment: "integration",
-          commit: COMMIT,
-          organizationId: ORGANIZATION,
-        },
-        withoutIdentity as DeployTarget,
-        optionsFor(input, host()),
-      ).catch((error: unknown) => error);
-      expect(refusal).toBeInstanceOf(DeployError);
-      expect((refusal as DeployError).message).toContain("operatorIdentity");
+      for (const environment of ["integration", "rehearsal", "production"] as const) {
+        const { operatorIdentity: _absent, ...withoutIdentity } = targetFor(input, environment);
+        const refusal = await runOrgApiKey(
+          {
+            surface: "takoserver-org-api-key",
+            action: "status",
+            environment,
+            commit: COMMIT,
+            organizationId: ORGANIZATION,
+          },
+          withoutIdentity as DeployTarget,
+          optionsFor(input, host()),
+        ).catch((error: unknown) => error);
+        expect(refusal).toBeInstanceOf(DeployError);
+        expect((refusal as DeployError).message).toContain("operatorIdentity");
+        expect((refusal as DeployError).detail).toContain("takoserver-operator-identity");
+        expect((refusal as DeployError).detail).not.toContain(
+          "takoserver-integration-operator-identity",
+        );
+      }
     } finally {
       rmSync(input.root, { recursive: true, force: true });
     }
@@ -598,7 +658,12 @@ describe("durable organization API key surface", () => {
       expect(refusal).toBeInstanceOf(DeployError);
       expect((refusal as DeployError).message).toContain("does not own");
       expect((refusal as DeployError).message).toContain(ORGANIZATION);
-      expect(live.sessionRevoked).toBe(true);
+      expect(live.sessionRevoked).toBe(false);
+      expect(live.calls).toEqual([
+        "GET /.well-known/takoserver",
+        "GET /openapi.json",
+        "POST /v1/operator-owner-proof",
+      ]);
     } finally {
       rmSync(input.root, { recursive: true, force: true });
     }

@@ -95,13 +95,13 @@ export interface DeployTarget {
     readonly hostId: string;
   };
   /**
-   * Public half of the integration operator's identity-only proof key.
+   * Public half of this deployment operator's identity-only proof key.
    *
    * This is deliberately target data rather than a Worker secret: the Worker
    * verifies an offline login assertion and never receives the private half.
-   * It does not enable the legacy wallet-funding verifier. Only
-   * the dedicated integration authority surface may bridge its absence to the
-   * exact value declared here.
+   * It does not enable the legacy wallet-funding verifier. Only the dedicated
+   * operator-identity authority surface may change the exact value declared
+   * here.
    */
   readonly operatorIdentity?: {
     readonly publicJwk: {
@@ -180,15 +180,18 @@ export function loadTarget(path: string, environment: DeployEnvironment): Deploy
   } catch {
     throw preflightError(`deploy target descriptor is not valid JSON: ${path}`);
   }
-  return validateTarget(parsed, path, environment);
+  return parseDeployTarget(parsed, path, environment);
 }
 
-function validateTarget(
+/** Pure validation of one already-decoded operator-private target descriptor. */
+export function parseDeployTarget(
   value: unknown,
-  path: string,
+  source: string,
   environment: DeployEnvironment,
 ): DeployTarget {
-  if (!isRecord(value)) throw preflightError(`deploy target descriptor must be an object: ${path}`);
+  if (!isRecord(value)) {
+    throw preflightError(`deploy target descriptor must be an object: ${source}`);
+  }
   assertExactKeys(
     value,
     ["kind", "environment", "accountId", "workerName", "d1", "r2", "publicOrigin", "signing"],
@@ -292,9 +295,6 @@ function validateTarget(
   }
   if (target.takosId && target.googleClientId) {
     throw preflightError("deploy target cannot configure both `takosId` and `googleClientId`");
-  }
-  if (target.operatorIdentity && environment !== "integration") {
-    throw preflightError("deploy target `operatorIdentity` is integration-only");
   }
   if (target.integrationE2eCredentialAuthority && environment !== "integration") {
     throw preflightError("deploy target `integrationE2eCredentialAuthority` is integration-only");

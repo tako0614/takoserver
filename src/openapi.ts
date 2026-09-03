@@ -210,6 +210,10 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
   identityProviders: described("Identity providers accepted for sign-in", {
     security: [],
   }),
+  proveOperatorOrganizationOwner: described(
+    "Prove an operator assertion names an existing exact Organization owner without creating durable state",
+    { security: [] },
+  ),
   createSession: described("Exchange an external assertion for a session", {
     security: [],
   }),

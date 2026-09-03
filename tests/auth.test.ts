@@ -43,6 +43,79 @@ async function ownerWithOrganization() {
 }
 
 describe("accounts", () => {
+  test("proves only an existing exact organization owner without creating durable rows", async () => {
+    const { principal, organization } = await ownerWithOrganization();
+    const countsBefore = {
+      principals: Number((await sql.query("SELECT COUNT(*) AS count FROM principals"))[0]?.count),
+      sessions: Number(
+        (await sql.query("SELECT COUNT(*) AS count FROM auth_tokens WHERE kind = 'session'"))[0]
+          ?.count,
+      ),
+      apiKeys: Number(
+        (await sql.query("SELECT COUNT(*) AS count FROM auth_tokens WHERE kind = 'api_key'"))[0]
+          ?.count,
+      ),
+    };
+
+    await expect(
+      accounts.proveExistingOwner({
+        provider: "google",
+        assertion: "owner",
+        organizationId: organization.id,
+        audience: "https://api.example.test",
+        method: "operator-assertion",
+      }),
+    ).resolves.toEqual({ principal, organization });
+
+    await expect(
+      accounts.proveExistingOwner({
+        provider: "github",
+        assertion: "unknown",
+        organizationId: organization.id,
+        audience: "https://api.example.test",
+        method: "operator-assertion",
+      }),
+    ).rejects.toMatchObject({ code: "not_found" });
+
+    expect(Number((await sql.query("SELECT COUNT(*) AS count FROM principals"))[0]?.count)).toBe(
+      countsBefore.principals,
+    );
+    expect(
+      Number(
+        (await sql.query("SELECT COUNT(*) AS count FROM auth_tokens WHERE kind = 'session'"))[0]
+          ?.count,
+      ),
+    ).toBe(countsBefore.sessions);
+    expect(
+      Number(
+        (await sql.query("SELECT COUNT(*) AS count FROM auth_tokens WHERE kind = 'api_key'"))[0]
+          ?.count,
+      ),
+    ).toBe(countsBefore.apiKeys);
+  });
+
+  test("refuses stale owner membership when the Organization names another principal", async () => {
+    const { actor, organization } = await ownerWithOrganization();
+    const successor = await accounts.signIn({ provider: "github", assertion: "successor" });
+    await sql.run("UPDATE orgs SET owner_principal_id = ? WHERE id = ?", [
+      successor.principal.id,
+      organization.id,
+    ]);
+
+    await expect(
+      accounts.proveExistingOwner({
+        provider: "google",
+        assertion: "owner",
+        organizationId: organization.id,
+        audience: "https://api.example.test",
+        method: "operator-assertion",
+      }),
+    ).rejects.toMatchObject({ code: "not_found" });
+    await expect(accounts.requireOwner(actor, organization.id)).rejects.toMatchObject({
+      code: "not_found",
+    });
+  });
+
   test("returns the same principal for a repeated sign-in", async () => {
     const first = await accounts.signIn({
       provider: "google",

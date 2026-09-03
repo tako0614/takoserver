@@ -1,6 +1,6 @@
 # Takoserver deploy surfaces
 
-This repository owns one deploy entrypoint and twenty-three separate mutation surfaces.
+This repository owns one deploy entrypoint and twenty-four separate mutation surfaces.
 The contract is read-only:
 
 ```sh
@@ -36,6 +36,13 @@ The integration JIT credential authority instead accepts exactly one of
 `--issue`, `--status`, or `--revoke` through that same entrypoint, and the
 durable organization API key surface accepts exactly one of `--mint`,
 `--status`, or `--revoke`.
+
+The canonical `takoserver-operator-identity` surface accepts `--status` or
+`--apply` in integration, rehearsal, and production. Every invocation names
+one exact `--organization=org_...` so status and owner proof are tied to the
+same organization. The former `takoserver-integration-operator-identity`
+spelling remains only as an integration compatibility alias; it is refused in
+rehearsal and production.
 
 One bootstrap exception exists for the already deployed integration Worker whose
 Version predates the `WORKER_VERSION`
@@ -413,7 +420,8 @@ no operator input.
 | `takoserver-host-runtime-topology-retirement` | `--status`, `--apply` | integration, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-hosted-token-retirement` | `--status`, `--apply` | integration, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-worker-retirement-attribution-repair` | `--status`, `--apply` | integration, production | `CLOUDFLARE_API_TOKEN` for both actions. |
-| `takoserver-integration-operator-identity` | `--status`, `--apply` | integration only | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH` for `--apply` only. |
+| `takoserver-operator-identity` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW`, `TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH`, and `TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH` for `--apply` only; every action requires `--organization=org_...`. |
+| `takoserver-integration-operator-identity` | `--status`, `--apply` | integration only | Legacy spelling of the canonical surface; same inputs and required `--organization=org_...`, refused in rehearsal and production. |
 
 ## Surfaces
 
@@ -678,9 +686,9 @@ The separate authority and irreversible surfaces are:
   `TAKOSERVER_ORG_API_KEY_OUTPUT_DIRECTORY`, and then requires the exact minted
   id, name and expiry to be listed. Every action revokes its proof session and
   proves that revocation by replay. The surface accepts all three environments;
-  it requires the target to declare `operatorIdentity`, which is an
-  integration-only target field today, so rehearsal and production refuse on
-  the descriptor's own rule until that operator authority is extended.
+  it requires the target to declare `operatorIdentity`, an environment-neutral
+  authority used by integration, rehearsal, and production; the same exact
+  owner proof applies in every environment.
 - `takoserver-d1-schema-rehearsal-baseline`: rehearsal-only exact empty-to-0022
   bootstrap for the selected disposable D1. It seals only that fixed prefix,
   rechecks the empty lineage and canonical empty shape at the final fence, and
@@ -817,15 +825,21 @@ The separate authority and irreversible surfaces are:
   identity, and the existing public probe. This is a forward repair surface;
   it has no `--reverse` or secret mutation and an upload acknowledgement loss is
   settled only by status recognizing that exact A successor.
-- `takoserver-integration-operator-identity`: integration only. It rebuilds the
-  already served commit once, requires the exact served bundle digest, and
-  uploads one immutable Worker Version that adds only the target's canonical
-  public Ed25519 `OPERATOR_IDENTITY_PUBLIC_JWK` variable. Every other variable, binding,
-  secret name/type, domain, D1/R2 identity, and Hosted topology must remain
-  exact. It never writes a credential to D1 and never enables the separate
-  wallet-funding authority retained by the legacy `OPERATOR_PUBLIC_JWK`.
-  A live Worker carrying that legacy funding binding is refused as unrelated
-  authority; replacing or removing it requires its own reviewed transition.
+- `takoserver-operator-identity`: environment-neutral operator identity
+  authority. Every invocation names one exact `--organization=org_...`; it
+  rebuilds the already served commit once, requires the exact served bundle
+  digest, and uploads one immutable Worker Version that adds only the target's
+  canonical public Ed25519 `OPERATOR_IDENTITY_PUBLIC_JWK` variable. Every other
+  variable, binding, secret name/type, domain, D1/R2 identity, and Hosted
+  topology must remain exact. Its owner proof uses the selected organization,
+  revokes the short-lived session, and proves replay failure. Production status
+  never treats provider-only configuration as owner-ready. The former
+  `takoserver-integration-operator-identity` spelling remains an integration-
+  only compatibility alias.
+  It never writes a credential to D1 and never enables the separate wallet-
+  funding authority retained by the legacy `OPERATOR_PUBLIC_JWK`. A live Worker
+  carrying that legacy funding binding is refused as unrelated authority;
+  replacing or removing it requires its own reviewed transition.
 
 The intended forward order is schema, public-key registration, any required
 authority-sensitive Worker code, signing repair or explicit rotation, Hosted
@@ -865,12 +879,16 @@ used. Rollback is an explicit normal reactivation append, never a
 Worker-version rollback. The exact descriptor schema and command order are in
 [form-authority.md](form-authority.md).
 
-The operator-identity surface is deliberately outside that production order.
-Its invocation parser accepts only `--environment=integration`; rehearsal and
-production are refused before a target descriptor is opened. Its status path
-is read-only and reports the desired public-JWK digest, whether that exact
-variable is already configured, the served Version, and readiness without
-reading the private key or requiring review evidence.
+The canonical operator-identity surface is available in that production order
+when an environment's operator authority needs to be configured. Its parser
+requires one exact `--organization=org_...` and accepts integration, rehearsal,
+or production. The legacy integration spelling is refused outside integration.
+Its status path is read-only and reports the desired public-JWK digest, whether
+that exact variable is already configured, the served Version, owner-proof
+readiness, and a non-executable rollback evidence record. Status never reads
+the private key or requires review evidence. Any recovery named by that record
+requires a freshly qualified product-owned exact-target status/qualification
+operation; no provider rollback command is emitted.
 
 ## Source, artifacts, and readback
 
@@ -926,6 +944,7 @@ payload or implementation digests; `P` and `I` remain build-derived.
 - `TAKOSERVER_SIGNING_NEXT_PRIVATE_JWK_PATH`
 - `TAKOSERVER_HOSTED_TOKEN_PATH`
 - `TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH`
+- `TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH` (operator identity owner proof)
 - `TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY`
 - `TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH`
 - `--form-authority-scope-transition=/absolute/operator-private/transition.json`
@@ -934,6 +953,7 @@ payload or implementation digests; `P` and `I` remain build-derived.
 - `TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH`
 - `TAKOSERVER_ORG_API_KEY_OUTPUT_DIRECTORY`
 - `--adopt-live=/absolute/operator-private/candidate.json`
+- `--organization=org_...` (required by `takoserver-operator-identity` and its legacy integration alias)
 
 For a D1 rehearsal apply, the lane creates a no-overwrite
 `<TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH>.attempt` file after the final mutation
@@ -1097,11 +1117,18 @@ request without a redeploy. The routine and cutover surfaces compose the target
 before uploading, so this state should be reachable only through a change made
 outside them.
 
-For an operator-identity upload acknowledgement failure, do not retry apply.
-Run the same surface with `--status`: an exact configured digest means the
+For a canonical operator-identity upload acknowledgement failure, do not retry
+apply. Run the same surface with `--status --environment=<env>
+--commit=<sha> --organization=<id>`: an exact configured digest means the
 single-variable Version is current, while absence means the selected
 predecessor remains current. Any unrelated configuration or Version advance is
-refused rather than attributed to the interrupted attempt.
+refused rather than attributed to the interrupted attempt. In production,
+status is never owner-ready without a fresh owner qualification. A rollback
+record is evidence only (`executable=false`); recovery requires a freshly
+qualified product-owned exact-target status/qualification operation, and no
+provider rollback command is emitted. The legacy
+`takoserver-integration-operator-identity` spelling may be used for this
+readback only when `--environment=integration`.
 
 For an integration credential issue failure, never replay the secret-bearing
 issue. Run the credential surface with `--status`; it validates the sealed pair
