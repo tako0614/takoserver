@@ -24,6 +24,7 @@ import {
 } from "./runtime-input-preparations.ts";
 import { parseStrictJson, StrictJsonError } from "./strict-json.ts";
 import { formSupportProfile } from "./takoform/forms.ts";
+import { isSpaceId } from "./takoform/space-id.ts";
 import type { OperationListing, ResourceListing } from "./takoform/store.ts";
 import type {
   InstalledTakoformForm,
@@ -663,7 +664,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       const cursor = url.searchParams.get("cursor");
       const page = await inventory.listResources(organizationId, {
         limit: pageSize(url),
-        ...(space === null ? {} : { space: segment(space) }),
+        ...(space === null ? {} : { space: spaceIdentifier(space) }),
         ...(cursor === null ? {} : { cursor }),
       });
       return Response.json({
@@ -754,7 +755,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       const evidence = await nativeResidual.verify({
         tenantId: organizationId,
         resourceUid,
-        space: text(requiredQuery(url, "space")),
+        space: spaceIdentifier(requiredQuery(url, "space")),
         name: resourceName(requiredQuery(url, "name")),
       });
       return Response.json({ residual: evidence }, { headers: { "cache-control": "no-store" } });
@@ -1345,6 +1346,11 @@ function stringRecord(value: unknown): Readonly<Record<string, string>> {
 
 function segment(value: string | undefined): string {
   if (!value || value.includes("%") || value.length > 128) controlError("invalid_argument", 400);
+  return value;
+}
+
+function spaceIdentifier(value: unknown): string {
+  if (!isSpaceId(value)) controlError("invalid_argument", 400);
   return value;
 }
 

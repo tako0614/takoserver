@@ -17,6 +17,8 @@ const SELFHOST_EDGE_KV = "0038_selfhost_edge_kv.sql";
 const LIVE_NATIVE_CLAIM_ACROSS_TENANTS = "0039_takoform_live_native_claim_across_tenants.sql";
 const SELFHOST_QUEUES_AND_SCHEDULES = "0040_selfhost_queues_and_schedules.sql";
 const SELFHOST_OBJECT_BUCKETS = "0041_selfhost_object_buckets.sql";
+const WORKER_ENDPOINT_ORIGIN_RESERVATION_SPACE_ID =
+  "0042_worker_endpoint_origin_reservation_space_id.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
@@ -27,6 +29,7 @@ const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   LIVE_NATIVE_CLAIM_ACROSS_TENANTS,
   SELFHOST_QUEUES_AND_SCHEDULES,
   SELFHOST_OBJECT_BUCKETS,
+  WORKER_ENDPOINT_ORIGIN_RESERVATION_SPACE_ID,
 ] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
@@ -260,6 +263,47 @@ function canonicalSqliteSchema(database: Database): readonly Record<string, unkn
   }));
 }
 
+function sqliteTableSql(database: Database, table: string): string {
+  const row = database
+    .query("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?")
+    .get(table) as { sql: unknown } | null;
+  if (!row || typeof row.sql !== "string") {
+    throw new Error(`missing SQLite table schema for ${table}`);
+  }
+  return row.sql;
+}
+
+function sqliteIndexes(database: Database, table: string): readonly Record<string, unknown>[] {
+  return database
+    .query(
+      `SELECT name, sql FROM sqlite_schema
+       WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL
+       ORDER BY name`,
+    )
+    .all(table) as Record<string, unknown>[];
+}
+
+function normalizeSqliteSql(sql: string): string {
+  return sql
+    .replace(/["`]/g, "")
+    .replace(/\s+/gu, " ")
+    .replace(/\s*,\s*/gu, ",")
+    .trim();
+}
+
+function expectWidenedTableSchema(
+  before: string,
+  after: string,
+  replacements: readonly (readonly [string, string])[],
+): void {
+  let expected = before;
+  for (const [narrow, wide] of replacements) {
+    expect(expected).toContain(narrow);
+    expected = expected.replace(narrow, wide);
+  }
+  expect(normalizeSqliteSql(after)).toBe(normalizeSqliteSql(expected));
+}
+
 function artifactRoots(database: Database): readonly Record<string, unknown>[] {
   return database
     .query(
@@ -363,9 +407,198 @@ describe("bringing a local database up to date", () => {
         LIVE_NATIVE_CLAIM_ACROSS_TENANTS,
         SELFHOST_QUEUES_AND_SCHEDULES,
         SELFHOST_OBJECT_BUCKETS,
+        WORKER_ENDPOINT_ORIGIN_RESERVATION_SPACE_ID,
       ]);
       expect(() => database.exec(LIVE_CLAIM("tenant_b", "dep_b"))).toThrow(/UNIQUE|constraint/iu);
     });
+  });
+
+  test("widens every persisted Space contract without changing rows, checks, or indexes", () => {
+    const migrationIndex = MIGRATIONS.findIndex(
+      (migration) => migration.name === WORKER_ENDPOINT_ORIGIN_RESERVATION_SPACE_ID,
+    );
+    expect(migrationIndex).toBeGreaterThan(0);
+    const database = new Database(":memory:");
+    for (const migration of MIGRATIONS.slice(0, migrationIndex)) {
+      database.exec(migration.sql);
+    }
+    const offeringDigest = `sha256:${"a".repeat(64)}`;
+    database.exec(`
+      INSERT INTO worker_endpoint_origin_reservations
+        (organization_id, reservation_id, reservation_format,
+         legacy_space, legacy_worker_name, legacy_endpoint_name, requested_subdomain,
+         canonical_public_origin, provider_pack_ref, provider_installation_ref,
+         offering_id, offering_digest, requested_ttl_seconds, expires_at,
+         state, revision, bound_space, bound_worker_name,
+         worker_resource_uid, worker_resource_revision, bound_endpoint_name,
+         endpoint_resource_uid, endpoint_resource_revision,
+         created_at, updated_at, released_at)
+      VALUES
+        ('org_01', 'reservation_legacy',
+         'takoserver.worker-endpoint-origin-reservation.v1',
+         'legacy-space', 'legacy-worker', 'legacy-endpoint', NULL,
+         'https://legacy.example.test', 'pack', 'installation',
+         'offering', '${offeringDigest}', 600, 1000,
+         'activated', 3, 'legacy-space', 'legacy-worker',
+         'uid-legacy-worker', '2', 'legacy-endpoint',
+         'uid-legacy-endpoint', '4', 1, 2, NULL),
+        ('org_01', 'reservation_current',
+         'takoserver.worker-endpoint-origin-reservation.v2',
+         NULL, NULL, NULL, 'current',
+         'https://current.example.test', 'pack', 'installation',
+         'offering', '${offeringDigest}', 600, 1000,
+         'released', 4, 'tenant:fixture', 'current-worker',
+         'uid-current-worker', '1', 'current-endpoint',
+         'uid-current-endpoint', '3', 1, 3, 3);
+
+      INSERT INTO tf_provider_mutation_sagas
+        (operation_id, replay_key, tenant_id, fingerprint, resource_uid,
+         target_space, target_api_version, target_kind, target_name,
+         accepted_uid, accepted_generation, accepted_revision, phase,
+         receipt_json, created_at, updated_at, expires_at, authority_head_digest,
+         execution_lease_token, execution_lease_until, execution_started_at,
+         provider_handle, provider_outcome)
+      VALUES
+        ('operation_planned', 'replay_planned', 'tenant_saga', 'fp-planned',
+         'uid-planned', 'space-planned', 'edge.forms.takoform.com/v1beta1',
+         'WorkerBundle', 'worker-planned', NULL, NULL, NULL, 'planned', NULL,
+         10, 20, 100, 'sha256:${"b".repeat(64)}', 'lease-planned', 30, 20,
+         'handle-planned', 'indeterminate'),
+        ('operation_executed', 'replay_executed', 'tenant_saga', 'fp-executed',
+         'uid-executed', 'space-executed', 'edge.forms.takoform.com/v1beta1',
+         'WorkerBundle', 'worker-executed', 'uid-accepted', '7', 'revision-7',
+         'executed', '{"ok":true}', 30, 40, NULL,
+         'sha256:${"c".repeat(64)}', 'lease-executed', 50, 40,
+         'handle-executed', 'running');
+
+      INSERT INTO worker_runtime_input_preparations
+        (organization_id, operation_key, preparation_id, apply_commitment,
+         canonical_public_origin, binding_names_json, sealed_payload, seal_nonce,
+         seal_key_id, state, fence, host_operation_id, claim_owner,
+         claim_expires_at, claimed_resource_uid, space, worker_name,
+         worker_resource_uid, bundle_name, consumed_receipt_digest, expires_at,
+         created_at, updated_at, consumed_at, revoked_at)
+      VALUES
+        ('org_runtime', 'operation-key-claimed', 'prep-claimed',
+         'sha256:${"d".repeat(64)}', 'https://claimed.example.test',
+         '{"TOKEN":"secret"}', 'sealed-payload', 'seal-nonce', 'seal-key',
+         'claimed', 2, 'host-op-claimed', 'claim-owner', 50,
+         'uid-runtime-claimed', 'space-claimed', 'worker-claimed',
+         'uid-runtime-claimed', 'bundle-claimed', NULL, 100, 1, 2,
+         NULL, NULL),
+        ('org_runtime', 'operation-key-consumed', 'prep-consumed',
+         'sha256:${"e".repeat(64)}', 'https://consumed.example.test',
+         '{"TOKEN":"consumed"}', NULL, NULL, NULL,
+         'consumed', 3, 'host-op-consumed', 'claim-owner-consumed', 60,
+         'uid-runtime-consumed', 'space-consumed', 'worker-consumed',
+         'uid-runtime-consumed', 'bundle-consumed', 'receipt-consumed', 200, 3, 4,
+         5, NULL);
+    `);
+    const tableNames = [
+      "worker_endpoint_origin_reservations",
+      "tf_provider_mutation_sagas",
+      "worker_runtime_input_preparations",
+    ] as const;
+    const tableBefore = new Map(
+      tableNames.map((table) => [table, sqliteTableSql(database, table)]),
+    );
+    const rowsBefore = new Map(
+      tableNames.map((table) => [table, database.query(`SELECT * FROM ${table}`).all()]),
+    );
+    const indexesBefore = new Map(
+      tableNames.map((table) => [table, sqliteIndexes(database, table)]),
+    );
+
+    // Read the migration file directly so this focused test also exercises an
+    // unpublished migration before generated db-schema.ts is refreshed.
+    const migrationSql = readFileSync(
+      new URL(
+        "../migrations/0042_worker_endpoint_origin_reservation_space_id.sql",
+        import.meta.url,
+      ),
+      "utf8",
+    );
+    database.exec(migrationSql);
+
+    for (const table of tableNames) {
+      const expectedRows = rowsBefore.get(table);
+      const expectedIndexes = indexesBefore.get(table);
+      if (!expectedRows || !expectedIndexes) throw new TypeError(`missing fixture for ${table}`);
+      expect(database.query(`SELECT * FROM ${table}`).all()).toEqual(expectedRows);
+      expect(sqliteIndexes(database, table)).toEqual(expectedIndexes);
+      expect(
+        database.query(`SELECT name FROM sqlite_schema WHERE name LIKE '%_forward_space_id'`).all(),
+      ).toEqual([]);
+    }
+    expectWidenedTableSchema(
+      tableBefore.get("worker_endpoint_origin_reservations") ?? "",
+      sqliteTableSql(database, "worker_endpoint_origin_reservations"),
+      [
+        [
+          "CHECK (legacy_space IS NULL OR length(legacy_space) BETWEEN 1 AND 128)",
+          "CHECK (legacy_space IS NULL OR length(legacy_space) BETWEEN 1 AND 255)",
+        ],
+        [
+          "CHECK (bound_space IS NULL OR length(bound_space) BETWEEN 1 AND 128)",
+          "CHECK (bound_space IS NULL OR length(bound_space) BETWEEN 1 AND 255)",
+        ],
+      ],
+    );
+    expectWidenedTableSchema(
+      tableBefore.get("tf_provider_mutation_sagas") ?? "",
+      sqliteTableSql(database, "tf_provider_mutation_sagas"),
+      [
+        [
+          "CHECK (length(target_space) BETWEEN 1 AND 128)",
+          "CHECK (length(target_space) BETWEEN 1 AND 255)",
+        ],
+      ],
+    );
+    expectWidenedTableSchema(
+      tableBefore.get("worker_runtime_input_preparations") ?? "",
+      sqliteTableSql(database, "worker_runtime_input_preparations"),
+      [
+        [
+          "CHECK (space IS NULL OR length(space) BETWEEN 1 AND 128)",
+          "CHECK (space IS NULL OR length(space) BETWEEN 1 AND 255)",
+        ],
+      ],
+    );
+
+    // SQLite length(TEXT) counts Unicode code points. An astral character is
+    // one code point even though JavaScript UTF-16 uses two code units.
+    const maximumSpace = `tenant:${"😀".repeat(248)}`;
+    expect([...maximumSpace]).toHaveLength(255);
+    const oversizedSpace = `${maximumSpace}x`;
+    const widenedColumns = [
+      ["worker_endpoint_origin_reservations", "legacy_space", "reservation_legacy"],
+      ["worker_endpoint_origin_reservations", "bound_space", "reservation_current"],
+      ["tf_provider_mutation_sagas", "target_space", "operation_planned"],
+      ["tf_provider_mutation_sagas", "target_space", "operation_executed"],
+      ["worker_runtime_input_preparations", "space", "operation-key-claimed"],
+      ["worker_runtime_input_preparations", "space", "operation-key-consumed"],
+    ] as const;
+    for (const [table, column, key] of widenedColumns) {
+      const keyColumn =
+        table === "worker_endpoint_origin_reservations"
+          ? "reservation_id"
+          : table === "tf_provider_mutation_sagas"
+            ? "operation_id"
+            : "operation_key";
+      database
+        .query(`UPDATE ${table} SET ${column} = ? WHERE ${keyColumn} = ?`)
+        .run(maximumSpace, key);
+      expect(
+        database
+          .query(`SELECT length(${column}) AS space_length FROM ${table} WHERE ${keyColumn} = ?`)
+          .get(key),
+      ).toEqual({ space_length: 255 });
+      expect(() =>
+        database
+          .query(`UPDATE ${table} SET ${column} = ? WHERE ${keyColumn} = ?`)
+          .run(oversizedSpace, key),
+      ).toThrow(/CHECK constraint/iu);
+    }
   });
 
   test("converges fresh, original 0031, and modified 0031 lineages without losing rows", () => {
@@ -717,6 +950,7 @@ describe("bringing a local database up to date", () => {
       "0039_takoform_live_native_claim_across_tenants.sql",
       "0040_selfhost_queues_and_schedules.sql",
       "0041_selfhost_object_buckets.sql",
+      "0042_worker_endpoint_origin_reservation_space_id.sql",
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -839,6 +1073,7 @@ describe("bringing a local database up to date", () => {
       "0039_takoform_live_native_claim_across_tenants.sql",
       "0040_selfhost_queues_and_schedules.sql",
       "0041_selfhost_object_buckets.sql",
+      "0042_worker_endpoint_origin_reservation_space_id.sql",
     ]);
     expect(
       database
@@ -1768,6 +2003,7 @@ describe("bringing a local database up to date", () => {
       LIVE_NATIVE_CLAIM_ACROSS_TENANTS,
       SELFHOST_QUEUES_AND_SCHEDULES,
       SELFHOST_OBJECT_BUCKETS,
+      WORKER_ENDPOINT_ORIGIN_RESERVATION_SPACE_ID,
     ]);
     expect(
       database

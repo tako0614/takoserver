@@ -4,6 +4,7 @@ import type { JsonObject } from "../ports.ts";
 import { parseStrictJson, StrictJsonError } from "../strict-json.ts";
 import { DIGEST, isFormGroup, isFormVersion, isKind, validateFormRef } from "./forms.ts";
 import { MAXIMUM_REQUEST_BODY_BYTES } from "./limits.ts";
+import { isSpaceId } from "./space-id.ts";
 import { TakoformHostError, type TakoformStoredResource } from "./types.ts";
 
 /**
@@ -297,20 +298,7 @@ export function exactQuery(url: URL, expected: readonly string[]): void {
 }
 
 export function spaceId(value: string): string {
-  const points = [...value];
-  const white = /^[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]$/u;
-  if (
-    points.length === 0 ||
-    points.length > 255 ||
-    white.test(points[0] ?? "") ||
-    white.test(points.at(-1) ?? "") ||
-    points.some((point) => {
-      const code = point.codePointAt(0) ?? 0;
-      return point === "/" || code <= 0x1f || (code >= 0x7f && code <= 0x9f);
-    })
-  ) {
-    throw new TakoformHostError();
-  }
+  if (!isSpaceId(value)) throw new TakoformHostError();
   return value;
 }
 

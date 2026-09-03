@@ -1,4 +1,5 @@
 import { ROUTES, TAKOFORM_LANES, TAKOFORM_ROUTES, takoformRoutePattern } from "./route-table.ts";
+import { SPACE_ID_MAX_CODE_POINTS, SPACE_ID_PATTERN_SOURCE } from "./takoform/space-id.ts";
 
 /**
  * The published API description.
@@ -47,6 +48,14 @@ const RESOURCE_NAME_SCHEMA = {
   minLength: 1,
   maxLength: 128,
   pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+} as const;
+const SPACE_ID_SCHEMA = {
+  type: "string",
+  description:
+    "Opaque stable Host Space identifier: 1-255 Unicode code points, with no slash, C0/C1 control, or boundary whitespace.",
+  minLength: 1,
+  maxLength: SPACE_ID_MAX_CODE_POINTS,
+  pattern: SPACE_ID_PATTERN_SOURCE,
 } as const;
 const OPERATION_KEY_SCHEMA = {
   type: "string",
@@ -246,7 +255,16 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
   prepareWorkerRuntimeInput: RUNTIME_INPUT_PREPARATION_OPERATIONS.put,
   readWorkerRuntimeInput: RUNTIME_INPUT_PREPARATION_OPERATIONS.get,
   revokeWorkerRuntimeInput: RUNTIME_INPUT_PREPARATION_OPERATIONS.delete,
-  listOrganizationResources: described("List the organization's Takoform resources"),
+  listOrganizationResources: described("List the organization's Takoform resources", {
+    parameters: [
+      {
+        name: "space",
+        in: "query",
+        required: false,
+        schema: SPACE_ID_SCHEMA,
+      },
+    ],
+  }),
   readOrganizationResource: described("Read one exact organization Takoform resource"),
   readNativeResidual: {
     summary: "Prove provider-native absence after a Resource delete",
@@ -255,7 +273,7 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
         name: "space",
         in: "query",
         required: true,
-        schema: { type: "string", minLength: 1, maxLength: 255 },
+        schema: SPACE_ID_SCHEMA,
       },
       {
         name: "name",
@@ -558,7 +576,7 @@ export const openApiDocument = {
         required: ["space", "workerName", "endpointName"],
         additionalProperties: false,
         properties: {
-          space: RESOURCE_NAME_SCHEMA,
+          space: SPACE_ID_SCHEMA,
           workerName: RESOURCE_NAME_SCHEMA,
           endpointName: RESOURCE_NAME_SCHEMA,
         },
@@ -593,7 +611,7 @@ export const openApiDocument = {
           },
         ],
         properties: {
-          space: RESOURCE_NAME_SCHEMA,
+          space: SPACE_ID_SCHEMA,
           workerName: RESOURCE_NAME_SCHEMA,
           workerResourceUid: IDENTIFIER_SCHEMA,
           workerResourceRevision: { type: "string", pattern: "^[1-9][0-9]*$" },

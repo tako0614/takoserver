@@ -5,6 +5,7 @@ import {
   type ProviderRuntimeInputPreparationIdentity,
   type ProviderRuntimeInputPublicApply,
 } from "./provider-runtime-input-port.ts";
+import { isSpaceId } from "./takoform/space-id.ts";
 
 /**
  * The one-shot Worker runtime-input handoff, wire contract v2.
@@ -1049,7 +1050,9 @@ function normalizeClaimInput(input: RuntimeInputRecoveryInput): NormalizedClaimI
   validateOperationKey(input.operationKey);
   validateOpaqueId(input.claimOwner);
   validateOpaqueId(input.resourceUid);
-  validateBoundedText(input.target.space, 128);
+  if (!isSpaceId(input.target.space)) {
+    throw new RuntimeInputPreparationError("invalid_argument", 400);
+  }
   validateBoundedText(input.target.workerName, 128);
   validateBoundedText(input.target.bundleName, 128);
   validateOpaqueId(input.target.workerResourceUid);

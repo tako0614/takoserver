@@ -259,6 +259,7 @@ describe("split Takoserver Worker surfaces", () => {
       "src/runtime-input-seal-keyring.ts",
       "src/stripe-settlement.ts",
       "src/takoform/limits.ts",
+      "src/takoform/space-id.ts",
       "src/takoform/store.ts",
       "src/takoform/types.ts",
     ]);
@@ -346,6 +347,7 @@ describe("split Takoserver Worker surfaces", () => {
       "src/takoform/receipt-projection.ts",
       "src/takoform/relations.ts",
       "src/takoform/schema.ts",
+      "src/takoform/space-id.ts",
       "src/takoform/sqlite-migrations.ts",
       "src/takoform/standard-services.ts",
       "src/takoform/types.ts",

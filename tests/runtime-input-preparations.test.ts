@@ -106,14 +106,16 @@ function leaseInput(
   };
 }
 
-async function runtimeInputFixture(options: { readonly initialTime?: string } = {}) {
+async function runtimeInputFixture(
+  options: { readonly initialTime?: string; readonly space?: string } = {},
+) {
   const sql = createEphemeralSql();
   const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
     "encrypt",
     "decrypt",
   ]);
   let now = new Date(options.initialTime ?? PREPARATION_TIME);
-  await seedWorkerLifecycle(sql, "org_01", now.getTime());
+  await seedWorkerLifecycle(sql, "org_01", now.getTime(), options.space);
   const authority = createRuntimeInputAuthority({
     sql,
     sealKeys: { current: { keyId: "runtime-input-test-key", key } },
@@ -243,6 +245,48 @@ test("claims the exact operation key with a commitment-bound preparation identit
   await expect(
     authority.leases.acquire(leaseInput({ operationId: "op_other" })),
   ).rejects.toMatchObject({ code: "conflict", status: 409 });
+});
+
+test("claims a Worker in every stable Host Space the durable handoff can name", async () => {
+  const space = "😀".repeat(255);
+  expect([...space]).toHaveLength(255);
+  expect(space).toHaveLength(510);
+  const path = `/apis/forms.takoform.com/v1/spaces/${encodeURIComponent(space)}/resources/WorkerVersion/app-v1`;
+  const { authority } = await runtimeInputFixture({ space });
+  await authority.preparations.prepare(preparationInput({ path }));
+
+  const lease = await authority.leases.acquire(
+    leaseInput({
+      target: { ...CLAIM_TARGET, space },
+      publicApply: executingApply({ path }),
+    }),
+  );
+  expect(lease.bindings).toEqual(BINDINGS);
+});
+
+test("rejects non-Host Spaces before a runtime-input claim is recorded", async () => {
+  const { sql, authority } = await runtimeInputFixture();
+  await authority.preparations.prepare(preparationInput());
+  for (const space of [
+    "",
+    "x".repeat(256),
+    "😀".repeat(256),
+    "tenant/child",
+    "tenant:\u0000child",
+    "tenant:\u0085child",
+    " leading",
+    "trailing ",
+  ]) {
+    await expect(
+      authority.leases.acquire(leaseInput({ target: { ...CLAIM_TARGET, space } })),
+    ).rejects.toMatchObject({ code: "invalid_argument", status: 400 });
+  }
+  expect(
+    await sql.query(
+      "SELECT state, space FROM worker_runtime_input_preparations WHERE operation_key = ?",
+      [OPERATION_KEY],
+    ),
+  ).toEqual([{ state: "prepared", space: null }]);
 });
 
 test("refuses to spend a preparation on any apply but the one it committed to", async () => {
@@ -933,6 +977,7 @@ async function seedWorkerLifecycle(
   sql: ReturnType<typeof createEphemeralSql>,
   organizationId: string,
   now: number,
+  space: string = CLAIM_TARGET.space,
 ): Promise<void> {
   const resource = {
     apiVersion: WORKER_FORM_REF.apiVersion,
@@ -940,7 +985,7 @@ async function seedWorkerLifecycle(
     form: { formRef: WORKER_FORM_REF },
     metadata: {
       name: CLAIM_TARGET.workerName,
-      space: CLAIM_TARGET.space,
+      space,
       uid: WORKER_RESOURCE_UID,
       generation: "1",
       revision: "1",
@@ -962,9 +1007,9 @@ async function seedWorkerLifecycle(
     `INSERT INTO tf_resources
        (tenant_id, space, api_version, kind, name, uid, generation, revision,
         resource_json, updated_at)
-     VALUES (?, 'default', 'edge.forms.takoform.com', 'ModuleWorker', 'yurucommu', ?,
+     VALUES (?, ?, 'edge.forms.takoform.com', 'ModuleWorker', 'yurucommu', ?,
              '1', '1', ?, ?)`,
-    [organizationId, WORKER_RESOURCE_UID, JSON.stringify(resource), now],
+    [organizationId, space, WORKER_RESOURCE_UID, JSON.stringify(resource), now],
   );
   await sql.run(
     `INSERT INTO tf_resource_deployments
@@ -980,8 +1025,8 @@ async function seedWorkerLifecycle(
        (tenant_id, resource_uid, space, api_version, kind, name, form_ref_json,
         state, closure_fence, effects_json, evidence_json, evidence_ref,
         evidence_effect_digest, evidence_checked_at, evidence_status, created_at, updated_at)
-     VALUES (?, ?, 'default', 'edge.forms.takoform.com', 'ModuleWorker', 'yurucommu', ?,
+     VALUES (?, ?, ?, 'edge.forms.takoform.com', 'ModuleWorker', 'yurucommu', ?,
              'live', 1, '[]', NULL, NULL, NULL, NULL, NULL, ?, ?)`,
-    [organizationId, WORKER_RESOURCE_UID, JSON.stringify(WORKER_FORM_REF), now, now],
+    [organizationId, WORKER_RESOURCE_UID, space, JSON.stringify(WORKER_FORM_REF), now, now],
   );
 }
