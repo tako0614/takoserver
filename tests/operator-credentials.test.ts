@@ -1,8 +1,16 @@
 import { beforeEach, describe, expect, test } from "bun:test";
+import { resolveIdentity } from "../src/identity-setup.ts";
+import {
+  buildApp,
+  createEphemeralSql,
+  createMemoryObjectStore,
+  InMemoryTakoformResourceDriver,
+} from "../src/index.ts";
 import { base64UrlEncode } from "../src/json.ts";
 import {
   createOperatorIdentity,
   createOperatorSettlement,
+  OPERATOR_PROVIDERS,
   OperatorAssertionError,
 } from "../src/operator-credentials.ts";
 
@@ -138,5 +146,103 @@ describe("operator funding", () => {
         settlement.verify({ organizationId: "org_a", settlementProof }),
       ).rejects.toBeInstanceOf(OperatorAssertionError);
     }
+  });
+});
+
+/**
+ * Signing in as the account that actually owns the organization.
+ *
+ * `org_takosumi_hosted_staging`'s sole owner principal is a `github` one, and
+ * the durable organization API key surface could not reach it: the Worker
+ * registered `google:operator-assertion` alone, so `github` fell through to the
+ * router's catch-all as an unhandled 500 and `google` landed on a principal
+ * that owns nothing. Both halves are settled here over real HTTP.
+ */
+describe("operator sign-in over HTTP", () => {
+  const ORIGIN = "https://api.takoserver.test";
+
+  function newApp() {
+    const setup = resolveIdentity({ operatorPublicKeyJwk: publicKeyJwk, clock });
+    return buildApp({
+      sql: createEphemeralSql(),
+      objects: createMemoryObjectStore(),
+      identity: setup.verifier,
+      identityProviders: setup.providers,
+      settlement: createOperatorSettlement({ publicKeyJwk, clock }),
+      publicOrigin: ORIGIN,
+      forms: [],
+      hostForms: [],
+      driver: new InMemoryTakoformResourceDriver(),
+      offerings: [],
+    });
+  }
+
+  async function call(
+    app: ReturnType<typeof newApp>,
+    method: string,
+    path: string,
+    body?: unknown,
+    headers: Record<string, string> = {},
+  ): Promise<{ readonly status: number; readonly body: Record<string, unknown> }> {
+    const response = await app.fetch(
+      new Request(`${ORIGIN}${path}`, {
+        method,
+        headers: body === undefined ? headers : { ...headers, "content-type": "application/json" },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      }),
+    );
+    const text = await response.text();
+    return { status: response.status, body: text ? JSON.parse(text) : {} };
+  }
+
+  test("mints an organization key for a GitHub-owned organization", async () => {
+    const app = newApp();
+    const session = await call(app, "POST", "/v1/sessions", {
+      provider: "github",
+      method: "operator-assertion",
+      assertion: await assert({ ...SIGN_IN, provider: "github", subject: "staging-operator" }),
+    });
+    expect(session.status).toBe(200);
+    expect(session.body.principal).toMatchObject({
+      provider: "github",
+      providerSubject: "staging-operator",
+    });
+    const owner = { authorization: `Bearer ${String(session.body.sessionToken)}` };
+
+    const organization = await call(app, "POST", "/v1/organizations", { name: "Hosted" }, owner);
+    expect(organization.status).toBe(201);
+    const organizationId = String((organization.body.organization as { id: string }).id);
+
+    const key = await call(
+      app,
+      "POST",
+      `/v1/organizations/${organizationId}/api-keys`,
+      { name: "reservation", scopes: ["resources:write"], expiresInSeconds: 3_600 },
+      owner,
+    );
+    expect(key.status).toBe(201);
+    expect(typeof key.body.secret).toBe("string");
+  });
+
+  test("advertises exactly the providers it will verify an assertion for", async () => {
+    const providers = await call(newApp(), "GET", "/v1/identity/providers");
+    expect(providers.status).toBe(200);
+    expect(providers.body.providers).toEqual(
+      OPERATOR_PROVIDERS.map((id) => ({
+        id,
+        displayName: "Operator assertion",
+        method: "operator-assertion",
+      })),
+    );
+  });
+
+  test("refuses an unregistered provider with a stable 4xx rather than a 500", async () => {
+    const refused = await call(newApp(), "POST", "/v1/sessions", {
+      provider: "takos-id",
+      method: "operator-assertion",
+      assertion: await assert({ ...SIGN_IN, provider: "takos-id" }),
+    });
+    expect(refused.status).toBe(400);
+    expect(refused.body).toMatchObject({ error: { code: "invalid" } });
   });
 });

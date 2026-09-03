@@ -45,7 +45,7 @@ interface Owned {
   readonly publicJwk: { readonly kty: "OKP"; readonly crv: "Ed25519"; readonly x: string };
 }
 
-async function owned(): Promise<Owned> {
+async function owned(identity?: Record<string, unknown>): Promise<Owned> {
   const root = mkdtempSync(join(tmpdir(), "takoserver-org-api-key-"));
   const pair = (await crypto.subtle.generateKey("Ed25519", true, [
     "sign",
@@ -74,7 +74,9 @@ async function owned(): Promise<Owned> {
   );
   chmodSync(privateJwkPath, 0o600);
   const operatorIdentityPath = join(root, "operator-identity.json");
-  writeFileSync(operatorIdentityPath, `${JSON.stringify(IDENTITY, null, 2)}\n`, { mode: 0o600 });
+  writeFileSync(operatorIdentityPath, `${JSON.stringify(identity ?? IDENTITY, null, 2)}\n`, {
+    mode: 0o600,
+  });
   chmodSync(operatorIdentityPath, 0o600);
   const outputDirectory = join(root, "secrets");
   mkdirSync(outputDirectory, { recursive: true, mode: 0o700 });
@@ -116,7 +118,15 @@ interface Host {
   sessionRevoked: boolean;
 }
 
-function host(input: { readonly existing?: Record<string, unknown> } = {}): Host {
+function host(
+  input: {
+    readonly existing?: Record<string, unknown>;
+    /** Providers this Host registers an operator-assertion verifier for. */
+    readonly assertionProviders?: readonly string[];
+    /** The signed-in principal owns nothing, exactly as the owner gate answers. */
+    readonly ownerGateRefuses?: boolean;
+  } = {},
+): Host {
   const state: Host = {
     calls: [],
     keys: new Map(),
@@ -135,6 +145,12 @@ function host(input: { readonly existing?: Record<string, unknown> } = {}): Host
       }
       if (path === "/openapi.json") return Response.json({ servers: [{ url: ORIGIN }] });
       if (method === "POST" && path === "/v1/sessions") {
+        const posted = JSON.parse(String(init?.body)) as { provider: string };
+        // Exactly the Host's own answer: a provider it registers nothing for
+        // is the caller's error, and the assertion is never even read.
+        if (!(input.assertionProviders ?? ["google", "github"]).includes(posted.provider)) {
+          return Response.json({ error: { code: "invalid" } }, { status: 400 });
+        }
         return Response.json({
           principal: { id: "prn_operator" },
           sessionToken: SESSION,
@@ -156,6 +172,9 @@ function host(input: { readonly existing?: Record<string, unknown> } = {}): Host
         return Response.json({ error: { code: "unauthenticated" } }, { status: 401 });
       }
       const collection = `/v1/organizations/${ORGANIZATION}/api-keys`;
+      if (input.ownerGateRefuses && path === collection) {
+        return Response.json({ error: { code: "permission_denied" } }, { status: 403 });
+      }
       if (method === "GET" && path === collection) {
         return Response.json({ apiKeys: [...state.keys.values()] });
       }
@@ -469,6 +488,117 @@ describe("durable organization API key surface", () => {
       ).catch((error: unknown) => error);
       expect(refusal).toBeInstanceOf(DeployError);
       expect((refusal as DeployError).message).toContain("operatorIdentity");
+    } finally {
+      rmSync(input.root, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * The organization's owner decides which provider must sign in.
+   *
+   * `org_takosumi_hosted_staging`'s only owner is a `github` principal, and the
+   * surface refused with "operator sign-in did not return a usable redacted
+   * session, status=500" — a sentence about nothing anyone could act on. The
+   * provider is now named on both sides: before a request leaves, when the
+   * identity file names a provider no assertion can vouch for, and on the wire,
+   * when the Host verifies none for the provider it does name.
+   */
+  test("mints for a GitHub-owned organization", async () => {
+    const input = await owned({ ...IDENTITY, provider: "github", subject: "staging-operator" });
+    try {
+      const live = host();
+      const result = await runOrgApiKey(
+        {
+          surface: "takoserver-org-api-key",
+          action: "mint",
+          environment: "integration",
+          commit: COMMIT,
+          organizationId: ORGANIZATION,
+          keyName: "takosumi-hosted-reservation",
+          scopes: ["resources:write"],
+          expiresInDays: 90,
+        },
+        targetFor(input),
+        optionsFor(input, live, "independent-reviewer"),
+      );
+      expect(result).toMatchObject({ kind: "takoserver.org-api-key-mint@v1", apiKeyId: KEY_ID });
+      expect(live.keys.size).toBe(1);
+      expect(live.sessionRevoked).toBe(true);
+    } finally {
+      rmSync(input.root, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses an identity naming a provider no operator assertion can vouch for", async () => {
+    const input = await owned({ ...IDENTITY, provider: "takos-id" });
+    try {
+      const live = host();
+      const refusal = await runOrgApiKey(
+        {
+          surface: "takoserver-org-api-key",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          organizationId: ORGANIZATION,
+        },
+        targetFor(input),
+        optionsFor(input, live),
+      ).catch((error: unknown) => error);
+      expect(refusal).toBeInstanceOf(DeployError);
+      expect((refusal as DeployError).phase).toBe("preflight");
+      expect((refusal as DeployError).message).toContain("takos-id");
+      expect((refusal as DeployError).message).toContain("google, github");
+      // Nothing left for the Host: the mismatch is decided from the file.
+      expect(live.calls).toEqual([]);
+    } finally {
+      rmSync(input.root, { recursive: true, force: true });
+    }
+  });
+
+  test("names the provider when the Host verifies no assertion for it", async () => {
+    const input = await owned({ ...IDENTITY, provider: "github", subject: "staging-operator" });
+    try {
+      const live = host({ assertionProviders: ["google"] });
+      const refusal = await runOrgApiKey(
+        {
+          surface: "takoserver-org-api-key",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          organizationId: ORGANIZATION,
+        },
+        targetFor(input),
+        optionsFor(input, live),
+      ).catch((error: unknown) => error);
+      expect(refusal).toBeInstanceOf(DeployError);
+      expect((refusal as DeployError).phase).toBe("preflight");
+      expect((refusal as DeployError).message).toContain("github");
+      expect((refusal as DeployError).message).toContain("no operator assertion");
+      expect(live.keys.size).toBe(0);
+    } finally {
+      rmSync(input.root, { recursive: true, force: true });
+    }
+  });
+
+  test("names an assertion-capable identity that is not the organization's owner", async () => {
+    const input = await owned();
+    try {
+      const live = host({ ownerGateRefuses: true });
+      const refusal = await runOrgApiKey(
+        {
+          surface: "takoserver-org-api-key",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          organizationId: ORGANIZATION,
+        },
+        targetFor(input),
+        optionsFor(input, live),
+      ).catch((error: unknown) => error);
+      expect(refusal).toBeInstanceOf(DeployError);
+      expect((refusal as DeployError).message).toContain("does not own");
+      expect((refusal as DeployError).message).toContain(ORGANIZATION);
+      expect(live.sessionRevoked).toBe(true);
     } finally {
       rmSync(input.root, { recursive: true, force: true });
     }

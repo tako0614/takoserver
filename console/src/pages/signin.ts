@@ -82,7 +82,7 @@ function wayIn(providers: Resource<{ providers: readonly IdentityProvider[] }>):
   const operator = state.value.providers.find((entry) => entry.method === "operator-assertion");
   if (takosId?.clientId && takosId.issuer) return takosIdRow(takosId.issuer, takosId.clientId);
   if (google?.clientId) return googleRow(google.clientId);
-  if (operator) return operatorForm();
+  if (operator) return operatorForm(operator.id);
   return h(
     "div",
     { class: "notice notice--warn" },
@@ -196,8 +196,13 @@ function googleGlyph(): SVGSVGElement {
  * to paste a token they had to produce elsewhere. It stays reachable on the
  * wire either way — it is how the operator gets in when the provider is
  * misconfigured, which is exactly when nobody can sign in the ordinary way.
+ *
+ * The deployment may verify an operator assertion for more than one provider,
+ * so the form posts the provider the server advertised rather than a literal.
+ * One form is still the whole of the way in: which provider the assertion
+ * vouches for is the operator's own claim, signed into the assertion.
  */
-function operatorForm(): Child {
+function operatorForm(provider: string): Child {
   const busy = signal(false);
   const assertion = h("textarea", {
     class: "textarea",
@@ -217,7 +222,7 @@ function operatorForm(): Child {
     }
     busy.set(true);
     try {
-      await api.signIn("google", assertion.value.trim(), "operator-assertion");
+      await api.signIn(provider, assertion.value.trim(), "operator-assertion");
       adoptSession();
     } catch (error) {
       toast(explain(error as Error), "bad");

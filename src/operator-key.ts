@@ -3,10 +3,10 @@
  * it has none.
  *
  * A deployment with no identity provider configured advertises no way in, and
- * every sign-in fails with "no identity provider is configured for that
- * method". That is a true sentence about a server nobody can enter, which is
- * not a product — and configuring Google before you can see anything is a poor
- * reason to abandon a first run.
+ * every sign-in is refused because no verifier is registered for the provider
+ * and method the caller named. That is a true answer from a server nobody can
+ * enter, which is not a product — and configuring Google before you can see
+ * anything is a poor reason to abandon a first run.
  *
  * So a machine standing on its own mints an operator key, keeps the private
  * half under its data root, and offers operator assertions as its way in. The

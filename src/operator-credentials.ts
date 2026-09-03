@@ -183,4 +183,25 @@ export function createOperatorSettlement(
   };
 }
 
-export const OPERATOR_PROVIDERS: readonly IdentityProvider[] = ["google", "github"];
+/**
+ * Every provider an operator assertion may vouch for.
+ *
+ * This is the one declaration of that set. The identity plane registers a
+ * verifier for each entry and advertises exactly the same list, and the
+ * organization API key surface refuses an operator identity naming anything
+ * outside it. It used to be a constant nothing read while `resolveIdentity`
+ * registered the literal `"google:operator-assertion"` alone, so an
+ * organization whose owner principal signs in under `github` had no reachable
+ * way in at all and the Worker answered its own missing verifier with a 500.
+ */
+export const OPERATOR_PROVIDERS = [
+  "google",
+  "github",
+] as const satisfies readonly IdentityProvider[];
+
+export type OperatorProvider = (typeof OPERATOR_PROVIDERS)[number];
+
+/** Whether an operator assertion can vouch for this provider at all. */
+export function isOperatorProvider(value: unknown): value is OperatorProvider {
+  return (OPERATOR_PROVIDERS as readonly string[]).includes(value as string);
+}
