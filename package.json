@@ -35,13 +35,15 @@
     "debug:stable-local-cloudflare-host": "bun scripts/stable-local-cloudflare-host.ts",
     "openapi:write": "bun scripts/write-openapi.ts",
     "worker:types": "wrangler types worker-configuration.d.ts --include-runtime=false --config wrangler.jsonc",
-    "check": "bun run fmt:check && bun run lint && bun run check:imports && bun run check:form-corpora && bun run check:integration-form-packages && bun run check:worker-types && bun run check:managed-worker-gateway-types && bun run check:form-authority-worker-types && bun run typecheck && bun run typecheck:worker && bun run typecheck:managed-worker-gateway && bun run typecheck:form-authority-worker && bun run typecheck:console && bun run check:provider && bun run check:core-verifier && bun run test && bun run check:migrations && bun run build && bun run build:console && bun run build:site && bun run build:worker && bun run build:managed-worker-gateway && bun run build:form-authority-worker && bun run check:worker-startup && bun run check:openapi && bun run check:schema",
+    "check": "bun run fmt:check && bun run lint && bun run check:imports && bun run check:form-corpora && bun run check:integration-form-packages && bun run check:worker-types && bun run check:managed-worker-gateway-types && bun run check:form-authority-worker-types && bun run typecheck && bun run typecheck:worker && bun run typecheck:managed-worker-gateway && bun run typecheck:form-authority-worker && bun run typecheck:console && bun run check:provider && bun run check:core-verifier && bun run test && bun run check:migrations && bun run build && bun run build:console && bun run build:site && bun run build:worker && bun run build:managed-worker-gateway && bun run build:form-authority-worker && bun run check:worker-startup && bun run check:openapi && bun run check:error-taxonomy && bun run check:schema",
     "deploy": "bun scripts/deploy.ts",
     "schema:write": "bun scripts/write-schema.ts",
     "check:schema": "bun scripts/check-schema.ts",
     "typecheck:console": "tsc --noEmit -p tsconfig.console.json",
     "build:console": "bun scripts/build-console.ts",
-    "build:site": "bun scripts/build-site.ts"
+    "build:site": "bun scripts/build-site.ts",
+    "check:error-taxonomy": "bun scripts/generate-stable-error-taxonomy.ts --check",
+    "error-taxonomy:write": "bun scripts/generate-stable-error-taxonomy.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.2.0",

@@ -18,53 +18,84 @@
  */
 
 /**
- * Codes the released provider retries on its own. `retryable` is derived from
- * this list rather than passed in, so two call sites cannot disagree about
+ * The closed portable taxonomy, and the codes the released provider retries on
+ * its own.
+ *
+ * Both tables are generated from Takoform's frozen `spec/host-api/operations-v1.json`,
+ * vendored under `vendor/takoform/host-api-v1/` and pinned by size and SHA-256
+ * to an exact tag and commit. They used to be literals here under a sentence
+ * asking a reader to keep them equal to a Go map in another repository. A
+ * sentence is not a mechanism: nothing read both, so a Host that drifted would
+ * answer a well-formed envelope the provider reads as an opaque rejection
+ * instead of the classification the route meant. `retryable` is still derived
+ * from the list rather than passed in, so two call sites cannot disagree about
  * whether one code means "try again".
  */
-export const AUTOMATICALLY_RETRYABLE_ERROR_CODES: readonly string[] = [
-  "resource_busy",
-  "backend_unavailable",
-  "rate_limited",
-  "deadline_exceeded",
-];
+import {
+  AUTOMATICALLY_RETRYABLE_ERROR_CODES,
+  STABLE_ERROR_HTTP_STATUS,
+} from "./generated/takoform-stable-error-taxonomy.ts";
+
+export { AUTOMATICALLY_RETRYABLE_ERROR_CODES, STABLE_ERROR_HTTP_STATUS };
 
 /**
- * The closed code/status pairs the released provider's `parseAPIError` accepts.
+ * The refusals this Host answers that the portable taxonomy does not name.
  *
- * A code outside this table, or one at a status the table does not name, is
- * read by the provider as an opaque rejection rather than a classification.
- * That is a safe answer — the provider fails the operation instead of acting on
- * a code it does not understand — but it is never the answer a route wants when
- * the caller is supposed to act on the classification. Keep this table equal to
- * `internal/clientv3/errors.go`'s `stableErrorHTTPStatusByCode`.
+ * These are not drift. The `/v1/*` control lane, the private runtime-input
+ * route and the sponsorship seam are this Host's own surfaces, and a Host code
+ * is exactly what the portable taxonomy leaves room for — the released provider
+ * reads one as an opaque rejection, which is the correct answer for a refusal
+ * it was never meant to act on. Declaring them is what makes the *undeclared*
+ * pair below a refusal instead of a shrug.
+ *
+ * A code may appear at more than one status when two lanes answer it: a
+ * reseller lane's `offering_unavailable` is a 503 about capacity, the Host
+ * lane's is a 409 about the offering named in an apply.
  */
-export const STABLE_ERROR_HTTP_STATUS: Readonly<Record<string, number>> = Object.freeze({
-  invalid_argument: 400,
-  unauthenticated: 401,
-  permission_denied: 403,
-  form_unknown: 404,
-  form_not_installed: 409,
-  form_unavailable: 503,
-  resource_not_found: 404,
-  resource_busy: 409,
-  import_conflict: 409,
-  policy_denied: 403,
-  backend_unavailable: 503,
-  internal_error: 500,
-  rate_limited: 429,
-  deadline_exceeded: 504,
-  operation_cancelled: 409,
-  operation_not_found: 404,
-  dependency_in_use: 409,
-  artifact_missing: 404,
-  artifact_invalid: 400,
-  unsupported_capability: 422,
-  migration_required: 409,
-  uid_mismatch: 409,
-  revision_conflict: 412,
-  generation_conflict: 412,
+export const HOST_ERROR_HTTP_STATUS: Readonly<Record<string, readonly number[]>> = Object.freeze({
+  apply_commitment_mismatch: [409],
+  artifact_committed: [409],
+  conflict: [409],
+  delete_failed: [409],
+  expired: [409],
+  insufficient_funds: [402],
+  invalid: [400],
+  migration_commercial_authority_invalid: [409],
+  migration_conflict: [409],
+  not_found: [404],
+  offering_changed: [409],
+  offering_mismatch: [409],
+  offering_unavailable: [409, 503],
+  operation_not_cancellable: [409],
+  organization_not_found: [404],
+  space_mismatch: [409],
+  tenant_conflict: [409],
+  tenant_not_found: [404],
+  token_replayed: [409],
+  unavailable: [503],
 });
+
+/**
+ * Portable codes this Host still answers at a status the taxonomy does not name.
+ *
+ * Each of these is a live defect, not an exemption: the released provider finds
+ * the code in its table, finds the status disagrees, and reports an opaque
+ * rejection — so a caller that was supposed to act on the classification gets
+ * noise instead. They are listed rather than fixed here because both live in
+ * the resource-lifecycle surface that is being consolidated; the consolidation
+ * removes them.
+ *
+ * The list asserts they are *still* wrong. `tests/error-taxonomy.test.ts`
+ * fails when one stops being emitted, so closing a divergence forces the entry
+ * out rather than leaving a permanent excuse behind.
+ */
+export const PORTABLE_STATUS_DIVERGENCES: Readonly<Record<string, readonly number[]>> =
+  Object.freeze({
+    // src/takoform/routes.ts answers 404 for a wrong method on a known path.
+    invalid_argument: [404],
+    // src/takoform/artifacts.ts answers 409 for an upload that is not open.
+    artifact_invalid: [409],
+  });
 
 export interface WireErrorEnvelope {
   readonly error: {
@@ -93,6 +124,27 @@ export interface WireErrorEnvelope {
 export function isStableErrorEnvelope(code: string, status: number, retryable: boolean): boolean {
   if (STABLE_ERROR_HTTP_STATUS[code] !== status) return false;
   return retryable ? AUTOMATICALLY_RETRYABLE_ERROR_CODES.includes(code) : true;
+}
+
+/** How a refusal this Host answers relates to the closed portable taxonomy. */
+export type RefusalClassification =
+  /** The portable code, at the one status the frozen taxonomy names for it. */
+  | "portable"
+  /** This Host's own code, outside the portable taxonomy and declared as such. */
+  | "host"
+  /** A portable code at a status the taxonomy does not name — a declared defect. */
+  | "declared-divergence"
+  /** Nothing says what this pair means. */
+  | "unclassified";
+
+/** Where one code/status pair sits against the taxonomy this Host answers by. */
+export function classifyRefusal(code: string, status: number): RefusalClassification {
+  if (isStableErrorEnvelope(code, status, false)) return "portable";
+  if (PORTABLE_STATUS_DIVERGENCES[code]?.includes(status) === true) {
+    return "declared-divergence";
+  }
+  if (HOST_ERROR_HTTP_STATUS[code]?.includes(status) === true) return "host";
+  return "unclassified";
 }
 
 /**
@@ -145,6 +197,29 @@ export function sanitizedMessage(value: string | undefined): string | undefined 
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+/**
+ * Whether an unclassifiable refusal should fail here rather than ship.
+ *
+ * Outside production this is an authoring-time refusal: a pair no table names
+ * is one no caller can act on, and finding that out from a customer is finding
+ * it out too late. In production the guard is off — an error path is the last
+ * place to introduce a new way to fail — and the static scan in
+ * `tests/error-taxonomy.test.ts` is what keeps the tables complete.
+ */
+const REFUSE_UNCLASSIFIED_ENVELOPES = (() => {
+  try {
+    // Read through `globalThis` rather than a bare `process`: a Worker has no
+    // Node globals, and this module ships inside one.
+    const host = globalThis as {
+      readonly process?: { readonly env?: Readonly<Record<string, string | undefined>> };
+    };
+    const environment = host.process?.env?.NODE_ENV;
+    return environment !== undefined && environment !== "production";
+  } catch {
+    return false;
+  }
+})();
+
 /** The envelope as an HTTP response. Both lanes render errors through this. */
 export function errorEnvelopeResponse(
   code: string,
@@ -154,6 +229,12 @@ export function errorEnvelopeResponse(
   message?: string,
   hostCode?: string,
 ): Response {
+  if (REFUSE_UNCLASSIFIED_ENVELOPES && classifyRefusal(code, status) === "unclassified") {
+    throw new Error(
+      `unclassified refusal ${code} ${status}: name it in STABLE_ERROR_HTTP_STATUS ` +
+        "(portable), HOST_ERROR_HTTP_STATUS (this Host's own), or fix the status",
+    );
+  }
   return Response.json(errorEnvelope(code, details, undefined, message, hostCode), {
     ...init,
     status,

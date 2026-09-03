@@ -1,0 +1,715 @@
+{
+  "format": "takoform.host-api@v1",
+  "apiGroup": "forms.takoform.com/v1",
+  "discoveryPath": "/.well-known/takoform/v1",
+  "wireSchema": "https://forms.takoform.com/schemas/v1/host-api-wire.schema.json",
+  "requiredFeatures": [
+    "service_forms",
+    "exact_form_ref",
+    "optimistic_concurrency",
+    "idempotent_lifecycle",
+    "operations",
+    "artifact_upload",
+    "support_profiles"
+  ],
+  "optionalFeatures": [],
+  "requiredEndpoints": [
+    "api"
+  ],
+  "optionalEndpoints": [],
+  "pathShape": {
+    "namespacedGroup": "one-ordinary-path-segment-containing-the-whole-versionless-family-group",
+    "percentEncodedSlash": "never-in-any-path-segment",
+    "formRefApiVersionString": "unchanged-in-bodies-responses-and-the-group-query-key",
+    "advertisedEndpointPaths": "must-carry-no-percent-encoding"
+  },
+  "handleOwnership": {
+    "operationId": "bound-to-the-creating-tenant-and-principal",
+    "uploadId": "bound-to-the-creating-tenant-and-principal",
+    "foreignOperation": "operation_not_found/404",
+    "foreignUpload": "artifact_missing/404",
+    "unknownUpload": "artifact_missing/404-on-continue-commit-and-abandon-alike",
+    "rationale": "403-would-confirm-that-the-handle-names-a-real-record"
+  },
+  "artifactAccess": {
+    "manifestRead": "only-for-a-caller-whose-tenant-holds-the-manifest",
+    "blobHead": "only-for-a-caller-whose-tenant-holds-the-blob",
+    "foreignManifest": "artifact_missing/404",
+    "foreignBlob": "404",
+    "holding": "acquired-by-uploading-the-bytes-or-committing-a-manifest-that-names-them",
+    "missingBlobs": "answered-per-tenant-not-per-byte-store",
+    "deduplication": "physical-storage-may-be-shared; authorization-is-not"
+  },
+  "identity": {
+    "uid": "host-issued-immutable; delete-and-recreate-changes-uid",
+    "generation": {
+      "encoding": "canonical-decimal-string",
+      "minimum": "1",
+      "maximum": "9223372036854775807",
+      "increments": "only-on-portable-desired-spec-change",
+      "fence": "expectedGeneration-or-Takoform-Expected-Generation",
+      "fenceRequiredOn": [
+        "update",
+        "observe",
+        "prepare-on-existing",
+        "delete"
+      ],
+      "absentFenceFailure": "invalid_argument",
+      "staleFailure": "generation_conflict"
+    },
+    "revision": {
+      "encoding": "canonical-decimal-string",
+      "minimum": "1",
+      "maximum": "9223372036854775807",
+      "increments": "on-any-representation-change",
+      "etag": "exactly-one-strong-quoted-revision",
+      "fence": "If-Match",
+      "fenceOptionalOnDelete": "honored-when-sent; never-required; a-teardown-moves-revisions-it-does-not-own",
+      "staleFailure": "revision_conflict"
+    },
+    "packageDigest": "audit-evidence-only; never-identity-query-or-fence"
+  },
+  "prepareBinding": {
+    "specDigest": "rfc8785-canonical-spec-digest",
+    "prepareDigest": "binds-specDigest-identity-uid-generation-and-host-plan",
+    "substitution": "invalid_argument-before-mutation"
+  },
+  "wireJSON": {
+    "encoding": "utf-8-i-json",
+    "rawDocumentValidation": "before-typed-decoding",
+    "duplicateMember": "invalid_argument-before-mutation",
+    "unknownEnvelopeField": "invalid_argument-before-mutation"
+  },
+  "relationResolution": {
+    "derivedFrom": "installed-form-definition-desiredSchema",
+    "referenceShape": "closed-object-requiring-apiVersion-kind-name-with-const-apiVersion-and-const-kind",
+    "pointerNotation": "json-pointer-with-*-for-array-elements",
+    "sourceSpace": "resource.metadata.space",
+    "crossSpace": "unrepresentable",
+    "missingTarget": "resource_not_found/404-before-mutation",
+    "wrongTargetForm": "invalid_argument/400-before-mutation",
+    "storedResolution": "pointer+relation+targetApiVersion+targetKind+targetName+targetUid+bindingRef?",
+    "targetIdentity": "uid-pinned; a-name-is-never-re-resolved-without-a-new-apply",
+    "targetIncarnationChanged": "Ready=False/ExternalChange+hostReason",
+    "targetGone": "Ready=False/DependencyMissing+hostReason",
+    "referencedTargetDeletion": "dependency_in_use/409"
+  },
+  "bindingResolution": {
+    "sourceSpace": "resource.metadata.space",
+    "reference": "typed-binding-target-apiVersion-kind-and-name",
+    "contractAnnotation": "desiredSchema-binding-list-property-x-takoform-binding",
+    "crossSpace": "unrepresentable",
+    "missing": "resource_not_found/404-before-mutation",
+    "bindingNotAccepted": "invalid_argument/400-before-mutation",
+    "contractNotInstalled": "unsupported_capability/422-before-mutation",
+    "sourceRoleMismatch": "invalid_argument/400-before-mutation",
+    "targetFormNotAllowed": "invalid_argument/400-before-mutation",
+    "targetInterfaceNotProvided": "invalid_argument/400-before-mutation",
+    "boundTargetDeletion": "dependency_in_use/409"
+  },
+  "artifactReference": {
+    "desiredState": "bundle-shaped-revision-carries-the-manifest-digest-and-nothing-else",
+    "resolution": "host-resolves-the-committed-manifest-before-mutation-on-apply-and-import",
+    "uncommittedDigest": "artifact_missing/404-before-mutation",
+    "digestMismatchOrUndecodable": "artifact_invalid/400-before-mutation",
+    "kindMismatch": "artifact_invalid/400-before-mutation",
+    "manifestContractViolation": "artifact_invalid/400-before-mutation",
+    "perKindExclusivity": "WorkerBundle-carries-modules-not-files; StaticAssetBundle-and-MigrationBundle-carry-files-not-modules",
+    "loadableModuleMediaTypes": "application/javascript+module, text/plain, application/octet-stream, application/wasm",
+    "auxiliaryModuleMediaTypes": "application/source-map+json",
+    "unsupportedModuleMediaTypes": "application/json",
+    "mainModuleClass": "must-name-a-loadable-module; auxiliary-mainModule-is-artifact_invalid/400; carrying-an-auxiliary-module-is-never-an-error",
+    "commitRevalidation": "every-manifest-rule-re-verified-at-commit",
+    "retention": "committed-manifest-and-blobs-readable-while-any-resource-references-them"
+  },
+  "attachmentClaims": {
+    "hostnameCanonicalization": "trailing-root-dot-removed-and-ascii-lowercased-at-the-materialization-entry-point-before-validation-digesting-storage-and-echo",
+    "hostnameInternationalization": "a-label-only; the-form-pattern-admits-no-non-ascii-byte-and-a-host-performs-no-idna-mapping",
+    "hostnameUniqueness": "one-canonical-hostname-per-tenant-across-every-space; second-claim-is-invalid_argument/400-before-mutation",
+    "deadLetterAcyclicity": "a-dead-letter-reference-resolving-to-the-consumers-own-queue-or-closing-a-cycle-of-any-length-is-invalid_argument/400-before-mutation",
+    "commitRevalidation": "both-claims-re-verified-when-an-accepted-202-commits"
+  },
+  "adoption": {
+    "nativeId": "host-detail; required-on-import; never-echoed-in-any-response",
+    "recordedOn": "the-resource-the-adoption-mints-or-addresses",
+    "exclusivity": "one-live-resource-per-native-identity-per-tenant-across-every-space; second-claim-is-import_conflict/409-before-mutation",
+    "claimImmutability": "an-import-addressing-an-existing-resource-under-another-nativeId-is-import_conflict/409-before-mutation; re-importing-under-the-recorded-one-answers-the-same-incarnation",
+    "claimRelease": "released-when-the-resource-holding-it-is-deleted",
+    "crossTenant": "not-a-conflict; a-host-wide-claim-would-disclose-another-tenants-holdings"
+  },
+  "roleRules": {
+    "revisionUpdate": "invalid_argument",
+    "attachmentDeleteCascade": "never-deletes-parent",
+    "deploymentTrafficAuthority": "deployment-role-only"
+  },
+  "capabilityRules": {
+    "baseCapabilities": [
+      "create",
+      "read",
+      "delete",
+      "import",
+      "observe"
+    ],
+    "updateCapability": "declared-only-when-the-Form-has-a-mutable-desired-field",
+    "specChangeWithoutUpdateCapability": "invalid_argument-before-mutation"
+  },
+  "portableDefaults": {
+    "carrier": "desiredSchema-properties-default",
+    "materialization": "host-materializes-declared-defaults-at-the-entry-point-before-validation-and-digesting",
+    "specDigest": "digest-of-the-materialized-spec",
+    "clientObligation": "accept-the-materialized-echo",
+    "servedContract": "the-form-definition-surface-serves-the-installed-Definitions-own-desiredSchema-at-the-exact-formRef; declared-defaults-bounds-patterns-and-enums-unchanged"
+  },
+  "operations": [
+    {
+      "name": "forms",
+      "method": "GET",
+      "path": "/apis/forms.takoform.com/v1/forms",
+      "exactFormQuery": true,
+      "precondition": "none",
+      "idempotencyKey": false,
+      "mutates": false,
+      "successStatus": [
+        200
+      ],
+      "responseSchema": "https://forms.takoform.com/schemas/v1/host-api-wire.schema.json#/$defs/formsResponse",
+      "queryParameters": [
+        {
+          "name": "group",
+          "required": false,
+          "grammar": "DNS-like family group",
+          "absent": "unfiltered"
+        },
+        {
+          "name": "kind",
+          "required": false,
+          "grammar": "Form kind",
+          "absent": "unfiltered"
+        },
+        {
+          "name": "definitionVersion",
+          "required": false,
+          "grammar": "SemVer without build metadata",
+          "absent": "unfiltered"
+        },
+        {
+          "name": "schemaDigest",
+          "required": false,
+          "grammar": "sha256:<64 lowercase hex>",
+          "absent": "unfiltered"
+        },
+        {
+          "name": "space",
+          "required": false,
+          "grammar": "SpaceID",
+          "absent": "unfiltered"
+        }
+      ],
+      "queryRule": "every key optional; each present key narrows; a malformed value is invalid_argument; all five keys present is the exact-availability probe answering zero or one entry"
+    },
+    {
+      "name": "form-definition",
+      "method": "GET",
+      "path": "/apis/forms.takoform.com/v1/form-definitions/{formGroup}/{kind}",
+      "exactFormQuery": true,
+      "precondition": "none",
+      "idempotencyKey": false,
+      "mutates": false,
+      "successStatus": [
+        200
+      ],
+      "responseSchema": "https://forms.takoform.com/schemas/v1/host-api-wire.schema.json#/$defs/formDefinitionResponse",
+      "queryParameters": [
+        {
+          "name": "space",
+          "required": true,
+          "grammar": "SpaceID",
+          "absent": "invalid_argument"
+        },
+        {
+          "name": "definitionVersion",
+          "required": true,
+          "grammar": "SemVer without build metadata; + MUST travel percent-encoded",
+          "absent": "invalid_argument"
+        },
+        {
+          "name": "schemaDigest",
+          "required": true,
+          "grammar": "sha256:<64 lowercase hex>",
+          "absent": "invalid_argument"
+        }
+      ]
+    },
+    {
+      "name": "validate",
+      "method": "POST",
+      "path": "/apis/forms.takoform.com/v1/resources/validate",
+      "exactFormQuery": false,
+      "precondition": "none",
+      "idempotencyKey": false,
+      "mutates": false,
+      "successStatus": [
+        200
+      ],
+      "requestSchema": "https://forms.takoform.com/schemas/v1/host-api-wire.schema.json#/$defs/resourceRequest",
+      "responseSchema": "https://forms.takoform.com/schemas/v1/host-api-wire.schema.json#/$defs/validateResponse"
+    },
+    {
+      "name": "prepare",
+      "method": "POST",
+      "path": "/apis/forms.takoform.com/v1/resources/prepare",
+      "exactFormQuery": false,
+      "precondition": "generation-fence-when-updating",
+      "idempotencyKey": false,
+      "mutates": false,
+      "successStatus": [
+        200
+      ],
+      "requestSchema": "https://forms.takoform.com/schemas/v1/host-api-wire.schema.json#/$defs/resourceRequest",
+      "responseSchema": "https://forms.takoform.com/schemas/v1/host-api-wire.schema.json#/$defs/prepareResponse"
+    },
+    {
+      "name": "apply",
+      "method": "PUT",
+      "path": "/apis/forms.takoform.com/v1/resources/{formGroup}/{kind}/{name}",
+      "exactFormQuery": false,
+      "precondition": "create:if-none-match-star update:generation-fence",
+      "idempotencyKey": true,
+      "mutates": true,
+      "successStatus": [
+        200,
+        201,
+        202
+      ],
+      "requestSchema": "https://forms.takoform.com/schemas/v1/host-api-wire.schema.json#/$defs/applyRequest",
+      "responseSchema": "https://forms.takoform.com/schemas/v1/host-api-wire.schema.json#/$defs/mutationAccepted",
+      "successStatusMeaning": {
+        "200": "an existing resource updated",
+        "201": "a resource created",
+        "202": "accepted as a long-running operation"
+      }
+    },
+    {
+      "name": "read",
+      "method": "GET",
+      "path": "/apis/forms.takoform.com/v1/resources/{formGroup}/{kind}/{name}",
+      "exactFormQuery": true,
+      "precondition": "none",
+      "idempotencyKey": false,
+      "mutates": false,
+      "successStatus": [
+        200
+      ],
+      "responseSchema": "https://forms.takoform.com/schemas/v1/host-api-wire.schema.json#/$defs/resourceResponse",
+      "queryParameters": [
+        {
+          "name": "space",
+          "required": true,
+          "grammar": "SpaceID",
+          "absent": "invalid_argument"
+        },
+        {
+          "name": "definitionVersion",
+          "required": true,
+          "grammar": "SemVer without build metadata; + MUST travel percent-encoded",
+          "absent": "invalid_argument"
+        },
+        {
+          "name": "schemaDigest",
+          "required": true,
+          "grammar": "sha256:<64 lowercase hex>",
+          "absent": "invalid_argument"
+        }
+      ]
+    },
+    {
+      "name": "import",
+      "method": "POST",
+      "path": "/apis/forms.takoform.com/v1/resources/{formGroup}/{kind}/{name}/import",
+      "exactFormQuery": false,
+      "precondition": "new:if-none-match-star existing:generation-fence",
+      "idempotencyKey": true,
+      "mutates": true,
+      "successStatus": [
+        200,
+        201,
+        202
+      ],
+      "requestSchema": "https://forms.takoform.com/schemas/v1/host-api-wire.schema.json#/$defs/importRequest",
+      "responseSchema": "https://forms.takoform.com/schemas/v1/host-api-wire.schema.json#/$defs/mutationAccepted",
+      "successStatusMeaning": {
+        "200": "an existing resource adopted in place",
+        "201": "a resource minted by adoption",
+        "202": "accepted as a long-running operation"
+      }
+    },
+    {
+      "name": "observe",
+      "method": "POST",
+      "path": "/apis/forms.takoform.com/v1/resources/{formGroup}/{kind}/{name}/observe",
+      "exactFormQuery": true,
+      "precondition": "generation-fence",
+      "idempotencyKey": false,
+      "mutates": false,
+      "successStatus": [
+        200
+      ],
+      "successGeneration": "equals-fence",
+      "responseSchema": "https://forms.takoform.com/schemas/v1/host-api-wire.schema.json#/$defs/resourceEnvelope",
+      "queryParameters": [
+        {
+          "name": "space",
+          "required": true,
+          "grammar": "SpaceID",
+          "absent": "invalid_argument"
+        },
+        {
+          "name": "definitionVersion",
+          "required": true,
+          "grammar": "SemVer without build metadata; + MUST travel percent-encoded",
+          "absent": "invalid_argument"
+        },
+        {
+          "name": "schemaDigest",
+          "required": true,
+          "grammar": "sha256:<64 lowercase hex>",
+          "absent": "invalid_argument"
+        }
+      ],
+      "emptyBody": true
+    },
+    {
+      "name": "delete",
+      "method": "DELETE",
+      "path": "/apis/forms.takoform.com/v1/resources/{formGroup}/{kind}/{name}",
+      "exactFormQuery": true,
+      "precondition": "generation-fence",
+      "optionalPrecondition": "revision-fence",
+      "idempotencyKey": true,
+      "mutates": true,
+      "successStatus": [
+        202,
+        204
+      ],
+      "queryParameters": [
+        {
+          "name": "space",
+          "required": true,
+          "grammar": "SpaceID",
+          "absent": "invalid_argument"
+        },
+        {
+          "name": "definitionVersion",
+          "required": true,
+          "grammar": "SemVer without build metadata; + MUST travel percent-encoded",
+          "absent": "invalid_argument"
+        },
+        {
+          "name": "schemaDigest",
+          "required": true,
+          "grammar": "sha256:<64 lowercase hex>",
+          "absent": "invalid_argument"
+        }
+      ],
+      "successStatusMeaning": {
+        "202": "accepted as a long-running operation",
+        "204": "deleted synchronously"
+      }
+    },
+    {
+      "name": "operation",
+      "method": "GET",
+      "path": "/apis/forms.takoform.com/v1/operations/{id}",
+      "exactFormQuery": false,
+      "precondition": "none",
+      "idempotencyKey": false,
+      "mutates": false,
+      "successStatus": [
+        200
+      ],
+      "responseSchema": "https://forms.takoform.com/schemas/operations/v1/operation.schema.json"
+    },
+    {
+      "name": "operation-cancel",
+      "method": "POST",
+      "path": "/apis/forms.takoform.com/v1/operations/{id}/cancel",
+      "exactFormQuery": false,
+      "precondition": "none",
+      "idempotencyKey": true,
+      "mutates": true,
+      "successStatus": [
+        200
+      ],
+      "responseSchema": "https://forms.takoform.com/schemas/operations/v1/operation.schema.json",
+      "requestBody": "empty",
+      "outcomes": {
+        "cancelled": "200 with the operation now terminal: done true, error.code operation_cancelled",
+        "alreadyTerminal": "200 replaying the terminal record unchanged",
+        "notCancellable": "409 operation_cancelled with retryable false: the operation is past its safe stopping point and will run to its own terminal state"
+      }
+    },
+    {
+      "name": "artifact-upload-start",
+      "method": "POST",
+      "path": "/apis/forms.takoform.com/v1/artifacts/uploads",
+      "exactFormQuery": false,
+      "precondition": "none",
+      "idempotencyKey": true,
+      "mutates": true,
+      "successStatus": [
+        200,
+        201
+      ],
+      "requestSchema": "https://forms.takoform.com/schemas/v1/host-api-wire.schema.json#/$defs/artifactUploadRequest",
+      "responseSchema": "https://forms.takoform.com/schemas/v1/host-api-wire.schema.json#/$defs/artifactUploadStatus",
+      "successStatusMeaning": {
+        "200": "an existing session for these bytes answered again",
+        "201": "a new upload session"
+      }
+    },
+    {
+      "name": "artifact-blob-upload",
+      "method": "PUT",
+      "path": "/apis/forms.takoform.com/v1/artifacts/uploads/{uploadId}/blobs/{sha256}",
+      "exactFormQuery": false,
+      "precondition": "none",
+      "idempotencyKey": false,
+      "mutates": true,
+      "successStatus": [
+        201,
+        204
+      ],
+      "idempotencyKeyNote": "content-addressed bytes are their own idempotency: re-putting identical bytes converges and different bytes are a different address",
+      "successStatusMeaning": {
+        "201": "the blob stored",
+        "204": "the blob was already present"
+      }
+    },
+    {
+      "name": "artifact-commit",
+      "method": "POST",
+      "path": "/apis/forms.takoform.com/v1/artifacts/uploads/{uploadId}/commit",
+      "exactFormQuery": false,
+      "precondition": "none",
+      "idempotencyKey": true,
+      "mutates": true,
+      "successStatus": [
+        200,
+        201,
+        202
+      ],
+      "responseSchema": "https://forms.takoform.com/schemas/v1/host-api-wire.schema.json#/$defs/artifactCommitResponse"
+    },
+    {
+      "name": "artifact-manifest-read",
+      "method": "GET",
+      "path": "/apis/forms.takoform.com/v1/artifacts/{manifestDigest}",
+      "exactFormQuery": false,
+      "precondition": "none",
+      "idempotencyKey": false,
+      "mutates": false,
+      "successStatus": [
+        200
+      ],
+      "responseSchema": "https://forms.takoform.com/schemas/artifacts/v1alpha1/artifact-manifest.schema.json"
+    },
+    {
+      "name": "artifact-blob-head",
+      "method": "HEAD",
+      "path": "/apis/forms.takoform.com/v1/artifacts/blobs/{sha256}",
+      "exactFormQuery": false,
+      "precondition": "none",
+      "idempotencyKey": false,
+      "mutates": false,
+      "successStatus": [
+        200,
+        404
+      ]
+    },
+    {
+      "name": "artifact-upload-abandon",
+      "method": "DELETE",
+      "path": "/apis/forms.takoform.com/v1/artifacts/uploads/{uploadId}",
+      "exactFormQuery": false,
+      "precondition": "none",
+      "idempotencyKey": true,
+      "mutates": true,
+      "successStatus": [
+        204
+      ]
+    },
+    {
+      "name": "support-forms",
+      "method": "GET",
+      "path": "/apis/forms.takoform.com/v1/support/forms",
+      "exactFormQuery": false,
+      "precondition": "none",
+      "idempotencyKey": false,
+      "mutates": false,
+      "successStatus": [
+        200
+      ],
+      "responseSchema": "https://forms.takoform.com/schemas/v1/host-api-wire.schema.json#/$defs/supportProfilesResponse"
+    },
+    {
+      "name": "support-form",
+      "method": "GET",
+      "path": "/apis/forms.takoform.com/v1/support/forms/{formGroup}/{kind}/{definitionVersion}",
+      "exactFormQuery": false,
+      "precondition": "none",
+      "idempotencyKey": false,
+      "mutates": false,
+      "successStatus": [
+        200
+      ],
+      "responseSchema": "https://forms.takoform.com/schemas/support/v1/host-support-profile.schema.json"
+    },
+    {
+      "name": "support-interface",
+      "method": "GET",
+      "path": "/apis/forms.takoform.com/v1/support/interfaces/{name}/{version}",
+      "exactFormQuery": false,
+      "precondition": "none",
+      "idempotencyKey": false,
+      "mutates": false,
+      "successStatus": [
+        200
+      ],
+      "responseSchema": "https://forms.takoform.com/schemas/support/v1/host-support-profile.schema.json"
+    },
+    {
+      "name": "support-binding",
+      "method": "GET",
+      "path": "/apis/forms.takoform.com/v1/support/bindings/{name}/{version}",
+      "exactFormQuery": false,
+      "precondition": "none",
+      "idempotencyKey": false,
+      "mutates": false,
+      "successStatus": [
+        200
+      ],
+      "responseSchema": "https://forms.takoform.com/schemas/support/v1/host-support-profile.schema.json"
+    },
+    {
+      "name": "support-standard-service",
+      "method": "GET",
+      "path": "/apis/forms.takoform.com/v1/support/standard-services/{protocol}",
+      "exactFormQuery": false,
+      "precondition": "none",
+      "idempotencyKey": false,
+      "mutates": false,
+      "successStatus": [
+        200
+      ],
+      "responseSchema": "https://forms.takoform.com/schemas/support/v1/host-support-profile.schema.json"
+    }
+  ],
+  "errorEnvelope": {
+    "schema": "https://forms.takoform.com/schemas/v1/host-api-wire.schema.json#/$defs/errorEnvelope",
+    "codes": [
+      "invalid_argument",
+      "unauthenticated",
+      "permission_denied",
+      "form_unknown",
+      "form_not_installed",
+      "form_unavailable",
+      "resource_not_found",
+      "resource_busy",
+      "import_conflict",
+      "policy_denied",
+      "backend_unavailable",
+      "internal_error",
+      "rate_limited",
+      "deadline_exceeded",
+      "operation_cancelled",
+      "operation_not_found",
+      "dependency_in_use",
+      "artifact_missing",
+      "artifact_invalid",
+      "unsupported_capability",
+      "migration_required",
+      "uid_mismatch",
+      "revision_conflict",
+      "generation_conflict"
+    ],
+    "automaticallyRetryable": [
+      "resource_busy",
+      "backend_unavailable",
+      "rate_limited",
+      "deadline_exceeded"
+    ],
+    "retryAfter": "honored-when-present-else-full-jitter-backoff",
+    "httpStatusByCode": {
+      "invalid_argument": 400,
+      "unauthenticated": 401,
+      "permission_denied": 403,
+      "form_unknown": 404,
+      "form_not_installed": 409,
+      "form_unavailable": 503,
+      "resource_not_found": 404,
+      "resource_busy": 409,
+      "import_conflict": 409,
+      "policy_denied": 403,
+      "backend_unavailable": 503,
+      "internal_error": 500,
+      "rate_limited": 429,
+      "deadline_exceeded": 504,
+      "operation_cancelled": 409,
+      "operation_not_found": 404,
+      "dependency_in_use": 409,
+      "artifact_missing": 404,
+      "artifact_invalid": 400,
+      "unsupported_capability": 422,
+      "migration_required": 409,
+      "uid_mismatch": 409,
+      "revision_conflict": 412,
+      "generation_conflict": 412
+    }
+  },
+  "fences": {
+    "transport": {
+      "header": "Takoform-Expected-Generation",
+      "applyBodyField": "expectedGeneration",
+      "bothPresentRule": "when apply carries the header and the body field they MUST be equal; disagreement is invalid_argument before any fence is evaluated",
+      "createRule": "a create is fenced by If-None-Match: *; carrying If-None-Match together with a generation fence is invalid_argument"
+    },
+    "required": {
+      "update": {
+        "transport": [
+          "header",
+          "applyBodyField"
+        ],
+        "absent": "invalid_argument",
+        "stale": "generation_conflict"
+      },
+      "prepare-on-existing": {
+        "transport": [
+          "header"
+        ],
+        "absent": "invalid_argument",
+        "stale": "generation_conflict",
+        "absentResource": "resource_not_found"
+      },
+      "observe": {
+        "transport": [
+          "header"
+        ],
+        "absent": "invalid_argument",
+        "stale": "generation_conflict"
+      },
+      "delete": {
+        "transport": [
+          "header"
+        ],
+        "absent": "invalid_argument",
+        "stale": "generation_conflict"
+      }
+    }
+  },
+  "identifierGrammars": {
+    "operationId": "^op_[A-Za-z0-9][A-Za-z0-9._-]{0,124}$ (the operation schema's pattern, quoted)",
+    "uploadId": "^up_[A-Za-z0-9][A-Za-z0-9._-]{0,124}$ (the wire schema's pattern, quoted)",
+    "idempotencyKey": "1..255 visible ASCII characters (0x21-0x7E)"
+  },
+  "exactFormQueryMeaning": "true on an operation whose request addresses one exact installed FormRef through its path segments plus the queryParameters listed for it; the host answers only under that exact identity and a mismatched or partial exact query is resource_not_found after validation"
+}
