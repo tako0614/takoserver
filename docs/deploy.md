@@ -369,6 +369,17 @@ The routine surfaces are:
 - `takoserver-console`: one Console Worker upload. Exhaustive domain state must
   already name `takoserver-console` as owner and must be unchanged afterward.
 
+"Authority-sensitive Worker code" is not a hand-kept list of filenames.
+`scripts/deploy/worker-authority-paths.ts` answers it from three sources: the
+declared authority modules, each an exact path that must still exist; the
+runtime import closure of the public Form P/I roots; and the runtime import
+closure of the five authorities whose implementation *is* the authority — the
+prepaid ledger and its Stripe settlement, the sealed runtime-input handoff and
+its key ring, and the durable Takoform resource store. A new runtime dependency
+of any of those classifies on its own. Only the lockfile, the manifest, the
+Worker configuration and `scripts/deploy/**` stay path-shaped, because they have
+no import graph to walk.
+
 The separate authority and irreversible surfaces are:
 
 - `takoserver-worker-authority-cutover`: reviewed publication of

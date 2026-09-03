@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DeployError } from "../scripts/deploy/errors.ts";
@@ -13,7 +13,11 @@ import {
   type WorkerProcess,
   type WorkerState,
 } from "../scripts/deploy/worker.ts";
-import { publicFormIdentityAuthorityPaths } from "../scripts/deploy/worker-authority-paths.ts";
+import {
+  authorityImplementationClosure,
+  declaredAuthorityModulePaths,
+  publicFormIdentityAuthorityPaths,
+} from "../scripts/deploy/worker-authority-paths.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
 import { INTEGRATION_E2E_ORGANIZATION_ID } from "../src/integration-e2e-credential-authority.ts";
 
@@ -224,6 +228,85 @@ describe("split Takoserver Worker surfaces", () => {
       "src/takoform/host-authority.ts",
       "wrangler.jsonc",
     ]);
+  });
+
+  test("classifies money, customer secrets, and the durable store as authority", () => {
+    // Every one of these published as *routine* before the implementation
+    // closure existed: the prepaid ledger, its Stripe settlement, the sealed
+    // runtime-input handoff, the AES-256-GCM key ring that seals it, and the
+    // durable Takoform resource store every later decision is read back from.
+    const authorities = [
+      "src/ledger.ts",
+      "src/runtime-input-preparations.ts",
+      "src/runtime-input-seal-keyring.ts",
+      "src/stripe-settlement.ts",
+      "src/takoform/store.ts",
+    ];
+    expect(authoritySensitiveWorkerPaths(authorities)).toEqual(authorities);
+  });
+
+  test("derives the money, secret, and durable-store closure from the import graph", () => {
+    // A new runtime dependency of any of the five roots classifies without an
+    // edit here. Every module below beyond the roots themselves was already
+    // inside the public Form P/I closure, so making this walk authoritative
+    // widened the reviewed lane by exactly the five roots and nothing else.
+    expect(authorityImplementationClosure()).toEqual([
+      "src/json.ts",
+      "src/ledger.ts",
+      "src/ports.ts",
+      "src/provider-runtime-input-port.ts",
+      "src/runtime-input-preparations.ts",
+      "src/runtime-input-seal-keyring.ts",
+      "src/stripe-settlement.ts",
+      "src/takoform/limits.ts",
+      "src/takoform/store.ts",
+      "src/takoform/types.ts",
+    ]);
+    const previouslyClassified = new Set(publicFormIdentityAuthorityPaths());
+    expect(
+      authorityImplementationClosure().filter((path) => !previouslyClassified.has(path)),
+    ).toEqual([
+      "src/ledger.ts",
+      "src/runtime-input-preparations.ts",
+      "src/runtime-input-seal-keyring.ts",
+      "src/stripe-settlement.ts",
+      "src/takoform/store.ts",
+    ]);
+  });
+
+  test("every classified authority path still exists in the tree", () => {
+    // The classifier is exact paths and a resolved import graph rather than a
+    // pattern, so a renamed authority refuses instead of quietly falling out of
+    // a regex and publishing as routine.
+    for (const path of [
+      ...declaredAuthorityModulePaths(),
+      ...authorityImplementationClosure(),
+      ...publicFormIdentityAuthorityPaths(),
+    ]) {
+      expect(existsSync(join(import.meta.dir, "..", path))).toBe(true);
+    }
+  });
+
+  test("keeps the routine lane open: rendering, catalog, and metering stay routine", () => {
+    // The walk is not seeded from a composition root. `entry-worker.ts` reaches
+    // 140 of the 182 modules under `src` and `app.ts` reaches 73, so seeding
+    // there would classify almost the product and leave no routine lane at all.
+    expect(
+      authoritySensitiveWorkerPaths([
+        "src/catalog.ts",
+        "src/openapi.ts",
+        "src/landing.ts",
+        "src/metering.ts",
+        "README.md",
+      ]),
+    ).toEqual([]);
+    for (const reachedOnlyThroughAComposition of [
+      "src/openapi.ts",
+      "src/landing.ts",
+      "src/catalog.ts",
+    ]) {
+      expect(authorityImplementationClosure()).not.toContain(reachedOnlyThroughAComposition);
+    }
   });
 
   test("classifies every executable public Form P/I owner as authority", () => {
