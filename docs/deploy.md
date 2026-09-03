@@ -1,6 +1,6 @@
 # Takoserver deploy surfaces
 
-This repository owns one deploy entrypoint and twenty-two separate mutation surfaces.
+This repository owns one deploy entrypoint and twenty-three separate mutation surfaces.
 The contract is read-only:
 
 ```sh
@@ -13,6 +13,24 @@ Every routine status or apply invocation has exactly this shape:
 bun run deploy -- <surface> --status --environment=<integration|rehearsal|production> --commit=<40-hex-sha>
 bun run deploy -- <surface> --apply --environment=<integration|rehearsal|production> --commit=<40-hex-sha>
 ```
+
+The production-shaped D1 lane is deliberately narrower. Rehearsal and
+production require exactly one approved next-wave selector:
+
+```sh
+bun run deploy -- takoserver-d1-schema --status --environment=<rehearsal|production> --commit=<40-hex-sha> --through-migration=<0028|0033|0036|0042>
+bun run deploy -- takoserver-d1-schema --apply --environment=<rehearsal|production> --commit=<40-hex-sha> --through-migration=<0028|0033|0036|0042>
+```
+
+The fixed order is 0023–0028, 0029–0033, 0034–0036, then 0037–0042. A
+selector is accepted only when its predecessor is the current lineage; an
+incomplete wave can resume under the same selector, but cannot skip forward.
+Integration retains only the no-selector fast path for disposable cadence and
+rejects every protected selector. Its output is explicitly integration-only
+and it cannot write evidence accepted by rehearsal or production. The separate
+`takoserver-d1-schema-rehearsal-baseline` surface is rehearsal-only, accepts no
+selector, and takes only an exact empty database through the fixed 0001–0022
+prefix without emitting a production rehearsal receipt.
 
 The integration JIT credential authority instead accepts exactly one of
 `--issue`, `--status`, or `--revoke` through that same entrypoint, and the
@@ -386,7 +404,8 @@ no operator input.
 | `takoserver-integration-e2e-credentials` | `--issue`, `--status`, `--revoke` | integration only | `CLOUDFLARE_API_TOKEN`, `TAKOSERVER_INTEGRATION_E2E_API_KEY_PRIVATE_JWK_PATH`, and `TAKOSERVER_INTEGRATION_E2E_OUTPUT_DIRECTORY` for all three; `TAKOSERVER_INDEPENDENT_REVIEW` for `--issue` and `--revoke` only. |
 | `takoserver-site` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both actions. |
 | `takoserver-console` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both actions. |
-| `takoserver-d1-schema` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` for `--apply` in rehearsal or production only. |
+| `takoserver-d1-schema-rehearsal-baseline` | `--status`, `--apply` | rehearsal only | No selector is accepted. `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. The receipt-path input is never read. |
+| `takoserver-d1-schema` | `--status`, `--apply` | integration, rehearsal, production | Rehearsal and production require `--through-migration=0028|0033|0036|0042`; integration rejects every selector and accepts only its no-selector disposable path. `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; one distinct `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` per wave for `--apply` in rehearsal or production only; every rehearsal wave after the first also requires the immediately preceding `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH`. |
 | `takoserver-signing-key-register` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PUBLIC_JWK_PATH` for `--apply` only. |
 | `takoserver-signing-repair` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PRIVATE_JWK_PATH` for `--apply` only. |
 | `takoserver-signing-rotation` | `--status`, `--apply` | integration, rehearsal, production | `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_NEXT_PRIVATE_JWK_PATH` for `--apply` only. |
@@ -662,8 +681,46 @@ The separate authority and irreversible surfaces are:
   it requires the target to declare `operatorIdentity`, which is an
   integration-only target field today, so rehearsal and production refuse on
   the descriptor's own rule until that operator authority is extended.
-- `takoserver-d1-schema`: ordered, forward-only D1 migration apply and exact
-  post-lineage/schema-shape readback.
+- `takoserver-d1-schema-rehearsal-baseline`: rehearsal-only exact empty-to-0022
+  bootstrap for the selected disposable D1. It seals only that fixed prefix,
+  rechecks the empty lineage and canonical empty shape at the final fence, and
+  cannot emit a receipt usable by production.
+- `takoserver-d1-schema`: ordered, forward-only D1 migration waves. Status,
+  post-qualification, and the final mutation fence report and require zero for
+  0029 malformed FormRefs and duplicate live Resource UIDs, 0036 unmatched
+  dispatched repair sagas, the nonempty 0037 v1 replacement predecessor, and
+  0039 duplicate live native claims. The audited migration inventory has one
+  fixed SHA-256 per file, including every already-applied file; a changed old
+  migration therefore cannot be re-attested from the current checkout. Each
+  rehearsal wave writes one no-overwrite canonical `0600` receipt binding the
+  exact commit, predecessor, through boundary, selected bytes, and before/after
+  shape. Every later receipt embeds its predecessor and binds those exact bytes
+  by SHA-256, producing one chain rooted at the 0023–0028 rehearsal. Production
+  consumes the matching wave receipt read-only. Immediately before 0037, one D1
+  transaction installs an exact `BEFORE INSERT` guard on the v1 predecessor and
+  asserts its row count is still zero. Because the published 0037 replacement
+  drops that guarded table, no row inserted after the ordinary preflight can be
+  silently discarded. This is a separate protocol around immutable 0037 SQL;
+  production is blocked unless its trigger and zero assertion both read back.
+  The pinned Wrangler sends the single guard command through D1's query API;
+  Cloudflare documents that semicolon-joined statements execute as a
+  [batch](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/query/)
+  and that a failed D1 batch
+  [rolls back the entire sequence](https://developers.cloudflare.com/d1/worker-api/d1-database/#batch).
+  D1 also documents that each individual database
+  [processes queries one at a time](https://developers.cloudflare.com/d1/platform/limits/#how-much-work-can-a-d1-database-do),
+  so an insert either precedes the transactional zero assertion or encounters
+  the installed trigger.
+  On a provider failure the lane immediately reads authoritative lineage and
+  shape and reports `lastAppliedMigration` and `nextPendingMigration`; a rerun
+  resumes only the same selected wave and the next selector remains refused
+  until the current wave is complete. A target-D1 same-host kernel lease spans
+  attempt creation, mutation, authoritative readback, and receipt/marker
+  finalization. If D1 reached the selected boundary before the process lost its
+  acknowledgement, the next lease owner verifies the original attempt and
+  exact authoritative boundary, then finalizes evidence without applying the
+  migrations a second time. The lease does not claim to fence another operator
+  host or a direct Cloudflare/API mutation.
 - `takoserver-signing-key-register`: append-only public Ed25519 JWK registration
   with exact absence recheck and no overwrite.
 - `takoserver-signing-repair`: the current, already registered key only; an
@@ -863,6 +920,7 @@ payload or implementation digests; `P` and `I` remain build-derived.
 - `CLOUDFLARE_API_TOKEN`
 - `TAKOSERVER_INDEPENDENT_REVIEW`
 - `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH`
+- `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH`
 - `TAKOSERVER_SIGNING_PUBLIC_JWK_PATH`
 - `TAKOSERVER_SIGNING_PRIVATE_JWK_PATH`
 - `TAKOSERVER_SIGNING_NEXT_PRIVATE_JWK_PATH`
@@ -876,6 +934,24 @@ payload or implementation digests; `P` and `I` remain build-derived.
 - `TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH`
 - `TAKOSERVER_ORG_API_KEY_OUTPUT_DIRECTORY`
 - `--adopt-live=/absolute/operator-private/candidate.json`
+
+For a D1 rehearsal apply, the lane creates a no-overwrite
+`<TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH>.attempt` file after the final mutation
+fence and before any mutation. If Wrangler partially applies a wave, that file
+preserves the original predecessor shape and the exact predecessor-receipt
+digest so the same wave can resume without fabricating new evidence. Use a
+different receipt path for each of the four waves and, after the first, point
+`TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH` at the immediately preceding
+canonical receipt. It is embedded and SHA-256-linked into the new receipt.
+The attempt is removed only after the final no-overwrite receipt is written.
+Production similarly creates
+`<TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH>.production-attempt` at its final fence,
+binding the exact receipt bytes before any mutation. A partial production
+lineage without that original marker is refused; a successful exact post-shape
+readback removes it. Both marker lifecycles run under the target-D1 owned kernel
+lease. If an exact selected boundary is already authoritative while its marker
+remains, the lane reconciles the terminal readback and receipt/marker state
+without invoking the provider apply again.
 
 The Form authority surfaces must read the exhaustive account Worker script,
 domain, subdomain, secret, Version, zone, and Worker-route inventories before

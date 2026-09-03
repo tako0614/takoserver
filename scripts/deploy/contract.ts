@@ -574,30 +574,82 @@ export const DEPLOY_CONTRACT = {
       },
     },
     {
-      surface: "takoserver-d1-schema",
-      target: "cloudflare-d1:environment-selected-takoserver-state",
+      surface: "takoserver-d1-schema-rehearsal-baseline",
+      target: "cloudflare-d1:environment-selected-takoserver-rehearsal-baseline",
       covers: ["migrations", "scripts/deploy/schema.ts", "scripts/deploy/d1.ts"],
       requiresScripts: ["check:migrations", "deploy"],
       requiresTools: ["bun", "wrangler"],
+      requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
+      triggers: ["irreversible"],
+      obligations: {
+        provenance:
+          `${exactSource} The fixed empty-to-0022 migration prefix is copied byte-for-byte into ` +
+          "one sealed link-free artifact; this surface accepts only the rehearsal target and no through selector.",
+        "post-conditions":
+          "The selected D1 must be exactly empty before mutation and must read back the exact ordered " +
+          "0001-0022 lineage and canonical schema shape afterwards.",
+        reversal:
+          "Only the explicitly disposable isolated rehearsal database may be destroyed and recreated; " +
+          "this is never a production reset strategy.",
+        "failure-handling":
+          highRiskFailure +
+          inputContract(applyReviewInput) +
+          " The baseline never reads TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH and cannot emit production rehearsal evidence.",
+        "pre-mutation-proof":
+          "The empty lineage and empty canonical schema shape are read before qualification and again at the final mutation fence.",
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-d1-schema",
+      target: "cloudflare-d1:environment-selected-takoserver-state",
+      covers: [
+        "migrations",
+        "scripts/deploy/schema.ts",
+        "scripts/deploy/d1.ts",
+        "scripts/deploy/wrangler-state.ts",
+      ],
+      requiresScripts: ["check:migrations", "deploy"],
+      requiresTools: ["bun", "wrangler", "flock"],
       requiresEnv: [
         "CLOUDFLARE_API_TOKEN",
         "TAKOSERVER_INDEPENDENT_REVIEW",
         "TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH",
+        "TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH",
       ],
       triggers: ["irreversible"],
       obligations: {
         provenance:
-          `${exactSource} Migration names, bytes, lineage and canonical schema shape are digested ` +
-          "before the forward-only apply.",
+          `${exactSource} Rehearsal and production accept only the fixed next boundaries 0028, ` +
+          "0033, 0036 or 0042. The exact predecessor lineage, selected through-prefix and wave " +
+          "bytes are checked against their fixed SHA-256 inventory, digested and sealed before the " +
+          "forward-only apply. Integration accepts no selector; its no-selector disposable cadence " +
+          "is explicitly integration-only.",
         "post-conditions":
-          "D1 lineage and canonical schema shape are read authoritatively after the deliberate last mutation.",
+          "D1 must read back the exact selected through-lineage and canonical schema shape. Status " +
+          "always names lastAppliedMigration and nextPendingMigration within the selected wave.",
         reversal:
           "There is no down migration. Failure is repaired forward from the authoritative D1 lineage and schema shape.",
         "failure-handling":
-          highRiskFailure + inputContract(applyReviewInput, rehearsalReceiptInput),
+          highRiskFailure +
+          inputContract(applyReviewInput, rehearsalReceiptInput) +
+          " Every rehearsal wave after the first also requires " +
+          "TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH; its exact canonical bytes are " +
+          "SHA-256-linked into the next receipt. One target-D1 kernel lease spans attempt creation, " +
+          "mutation, authoritative readback, and receipt/marker finalization. " +
+          " A failed provider acknowledgement performs an immediate authoritative lineage/shape " +
+          "readback. A partial result can resume only under the same through selector and exact " +
+          "rehearsal/attempt evidence; a boundary already reached under that attempt is reconciled " +
+          "without a second provider apply, and a later boundary cannot be skipped to.",
         "pre-mutation-proof":
-          "Rehearsal writes a 0600 receipt outside every repository. Production requires that exact " +
-          "commit, migration digest, pre-shape and expected post-shape before applying the same bytes.",
+          "Status, post-qualification recheck and the final mutation fence all run named zero-count " +
+          "checks for 0029 malformed FormRef and duplicate live Resource UID, 0036 unmatched " +
+          "dispatched repair saga, 0037 nonempty replaced predecessor, and 0039 duplicate live " +
+          "native claim. Rehearsal writes one no-overwrite 0600 receipt per wave outside every " +
+          "repository. Production requires that exact commit, predecessor, through boundary, wave " +
+          "bytes, pre-shape and expected post-shape. Before 0037, one transactional D1 batch installs " +
+          "an exact insert-blocking trigger and asserts the replaced predecessor is still empty; " +
+          "0037 removes the guarded table. Integration evidence is never accepted.",
         "independent-review": review,
       },
     },

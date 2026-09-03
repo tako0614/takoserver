@@ -34,6 +34,7 @@ const SURFACES = [
   ["takoserver-integration-e2e-credentials", ["authority"]],
   ["takoserver-site", []],
   ["takoserver-console", []],
+  ["takoserver-d1-schema-rehearsal-baseline", ["irreversible"]],
   ["takoserver-d1-schema", ["irreversible"]],
   ["takoserver-signing-key-register", ["irreversible", "authority", "published-identity"]],
   ["takoserver-signing-repair", ["authority"]],
@@ -94,6 +95,10 @@ describe("Takoserver split deploy entrypoint", () => {
       ({ surface }) => surface === "takoserver-hosted-token-cutover",
     );
     const routineWorker = contract.surfaces.find(({ surface }) => surface === "takoserver-worker");
+    const schemaBaseline = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-d1-schema-rehearsal-baseline",
+    );
+    const schema = contract.surfaces.find(({ surface }) => surface === "takoserver-d1-schema");
     expect(routineWorker?.requiresTools).toContain("flock");
     expect(routineWorker?.obligations.provenance).toContain("explicit `CLOUDFLARE_API_TOKEN`");
     expect(routineWorker?.obligations.provenance).not.toContain("stored OAuth profile");
@@ -120,6 +125,13 @@ describe("Takoserver split deploy entrypoint", () => {
       "uploaded Version is inactive",
     );
     expect(routineWorker?.obligations["failure-handling"]).toContain("Wrangler OAuth is refused");
+    expect(schemaBaseline?.obligations.provenance).toContain("fixed empty-to-0022");
+    expect(schemaBaseline?.obligations["failure-handling"]).toContain(
+      "cannot emit production rehearsal evidence",
+    );
+    expect(schema?.obligations.provenance).toContain("fixed next boundaries 0028");
+    expect(schema?.obligations["pre-mutation-proof"]).toContain("malformed FormRef");
+    expect(schema?.obligations["failure-handling"]).toContain("immediate authoritative");
     expect(integrationAuthority?.obligations["post-conditions"]).toContain(
       "exact operator tenant and Space plain-text bindings",
     );
@@ -249,6 +261,109 @@ describe("Takoserver split deploy entrypoint", () => {
       expect(refused.exitCode).toBe(2);
       expect(refused.stdout).toBe("");
       expect(refused.stderr).toContain("no target was touched");
+    }
+  });
+
+  test("parses only the fixed rehearsal baseline and approved schema wave boundaries", async () => {
+    const sha = "a".repeat(40);
+    const baseline = await deploy([
+      "takoserver-d1-schema-rehearsal-baseline",
+      "--status",
+      "--environment=rehearsal",
+      `--commit=${sha}`,
+    ]);
+    expect(baseline.exitCode).toBe(2);
+    expect(baseline.stderr).toContain("deploy target descriptor not found");
+    expect(baseline.stderr).not.toContain("no target was touched");
+
+    for (const through of ["0028", "0033", "0036", "0042"] as const) {
+      for (const environment of ["rehearsal", "production"] as const) {
+        const accepted = await deploy([
+          "takoserver-d1-schema",
+          "--status",
+          `--environment=${environment}`,
+          `--commit=${sha}`,
+          `--through-migration=${through}`,
+        ]);
+        expect(accepted.exitCode).toBe(2);
+        expect(accepted.stderr).toContain("deploy target descriptor not found");
+        expect(accepted.stderr).not.toContain("no target was touched");
+      }
+    }
+
+    const integrationWithoutWave = await deploy([
+      "takoserver-d1-schema",
+      "--status",
+      "--environment=integration",
+      `--commit=${sha}`,
+    ]);
+    expect(integrationWithoutWave.exitCode).toBe(2);
+    expect(integrationWithoutWave.stderr).toContain("deploy target descriptor not found");
+    expect(integrationWithoutWave.stderr).not.toContain("no target was touched");
+
+    for (const through of ["0028", "0033", "0036", "0042"] as const) {
+      const refused = await deploy([
+        "takoserver-d1-schema",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--through-migration=${through}`,
+      ]);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
+    }
+
+    for (const args of [
+      [
+        "takoserver-d1-schema-rehearsal-baseline",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+      ],
+      [
+        "takoserver-d1-schema-rehearsal-baseline",
+        "--status",
+        "--environment=production",
+        `--commit=${sha}`,
+      ],
+      [
+        "takoserver-d1-schema-rehearsal-baseline",
+        "--status",
+        "--environment=rehearsal",
+        `--commit=${sha}`,
+        "--through-migration=0028",
+      ],
+      ["takoserver-d1-schema", "--status", "--environment=rehearsal", `--commit=${sha}`],
+      ["takoserver-d1-schema", "--status", "--environment=production", `--commit=${sha}`],
+      [
+        "takoserver-d1-schema",
+        "--status",
+        "--environment=production",
+        `--commit=${sha}`,
+        "--through-migration=0029",
+      ],
+      [
+        "takoserver-d1-schema",
+        "--status",
+        "--environment=production",
+        `--commit=${sha}`,
+        "--through-migration=0028_too_much",
+      ],
+      [
+        "takoserver-worker",
+        "--status",
+        "--environment=production",
+        `--commit=${sha}`,
+        "--through-migration=0028",
+      ],
+    ] as const) {
+      const refused = await deploy(args);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
     }
   });
 
