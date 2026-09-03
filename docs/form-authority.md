@@ -392,16 +392,50 @@ commands when nothing changed.
 
 ## Integration cutover order
 
-Before the first invocation after this identity change, deploy the public
-integration Worker through `bun run deploy` so it exposes the complete
-build-derived `PublicHostIdentity@v2`. Deploy and verify
-`takoserver-form-authority-identity-probe` next. Then run status/apply/status for
-the route-less integration authority and, after it is dynamic, for the operator
-gateway. This is the one-time migration from a verified legacy exact pin; no
-live request is signed until the probe and both authority status results are
-ready. Rehearsal and production use the same public Worker → identity probe →
-route-less authority order. These steps do not authorize deployment by
-themselves.
+There are two distinct starting states. Do not use the existing-Worker
+migration order for a released-Core authority Worker that has no Version.
+
+For an existing route-less Worker (the one-time migration from a verified
+legacy exact pin), deploy the public integration Worker through `bun run deploy`
+so it exposes the complete build-derived `PublicHostIdentity@v2`, deploy and
+verify `takoserver-form-authority-identity-probe`, then run status/apply/status
+for the route-less authority. After that Worker is dynamic, run the same
+status/apply/status sequence for the operator gateway. No live request is
+signed until the probe and both authority status results are ready.
+
+For a fresh released-Core target whose route-less authority Worker is absent,
+the authority lane has a deliberate bootstrap exception. The public Worker
+must already be serving its identity through the probe's public RPC; the
+probe's current Version may still lack its `FORM_AUTHORITY` binding. Then use
+this order:
+
+1. Run identity-probe status and capture its exact current `versionId`. It must
+   be the predecessor whose target closure differs only by missing
+   `FORM_AUTHORITY`; do not substitute a later Version after starting the lane.
+2. Confirm the route-less authority status reports `versionId: null`, and
+   publish its first Version with `takoserver-form-authority-worker --apply`,
+   `--bootstrap-verifier-bridge`, and
+   `--bootstrap-probe-predecessor-version=<probe-version>`. Before qualification
+   and again immediately before upload, this invocation reuses the probe
+   surface's strict transition inspection to prove the pinned Version is still
+   current, its commit/artifact identity is canonical, and its only acceptable
+   closure delta is missing `FORM_AUTHORITY`. Any extra or intervening drift
+   leaves the authority upload count at zero. This first upload defers only the
+   Core-verifier readback because the probe cannot bind an absent Worker.
+3. Transition the identity probe's `FORM_AUTHORITY` binding with the same declared
+   predecessor (`--closure-predecessor-version=<probe-version>` and
+   `--add-binding=FORM_AUTHORITY`), then run its status/apply/status sequence.
+   The binding names the Worker published in step 2; the probe refuses a
+   dangling service binding.
+4. Run route-less authority status again. It must report
+   `coreVerifierRpcReady: true`,
+   `coreVerifierAuthorityWorkerVersionId` equal to the exact bootstrapped
+   Version id, and `ready: true`.
+
+Every ordinary authority apply after this sequence omits
+`--bootstrap-verifier-bridge` and requires the probe's Core-verifier readback
+before it is accepted. Rehearsal and production use the same branch-specific
+order; these steps do not authorize deployment by themselves.
 
 The reviewed order is deliberately staged. First capture the old exact
 tenant/Space scope with status and its operator snapshot. Write an

@@ -65,6 +65,67 @@ export function signInPage(): Child {
   );
 }
 
+interface OperatorAssertionSignInClient {
+  readonly signIn: (
+    provider: string,
+    assertion: string,
+    method: "operator-assertion",
+  ) => Promise<unknown>;
+}
+
+/**
+ * Routes an operator assertion using the provider named in its payload.
+ *
+ * The payload is only a routing hint here. It is not trusted for identity, and
+ * the API still verifies the Ed25519 signature and the provider claim before
+ * creating a session. Refusing an assertion whose provider is not advertised
+ * keeps a malformed paste from being sent to an arbitrary endpoint.
+ */
+export async function signInWithOperatorAssertion(
+  client: OperatorAssertionSignInClient,
+  providers: readonly IdentityProvider[],
+  assertion: string,
+): Promise<void> {
+  const value = assertion.trim();
+  const provider = operatorProviderFromAssertion(providers, value);
+  if (provider === null) {
+    throw new Error("operator assertion does not name an advertised provider");
+  }
+  await client.signIn(provider, value, "operator-assertion");
+}
+
+const MAX_OPERATOR_ASSERTION_CHARS = 8 * 1_024;
+
+function operatorProviderFromAssertion(
+  providers: readonly IdentityProvider[],
+  assertion: string,
+): string | null {
+  if (assertion === "" || assertion.length > MAX_OPERATOR_ASSERTION_CHARS) return null;
+  const [payloadPart, signaturePart, ...rest] = assertion.split(".");
+  if (!payloadPart || !signaturePart || rest.length > 0) return null;
+
+  let payload: string;
+  try {
+    const normalized = payloadPart.replaceAll("-", "+").replaceAll("_", "/");
+    payload = atob(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "="));
+  } catch {
+    return null;
+  }
+
+  let claims: unknown;
+  try {
+    claims = JSON.parse(payload);
+  } catch {
+    return null;
+  }
+  if (typeof claims !== "object" || claims === null || Array.isArray(claims)) return null;
+  const provider = (claims as { readonly provider?: unknown }).provider;
+  if (typeof provider !== "string" || provider === "") return null;
+  return providers.some((entry) => entry.method === "operator-assertion" && entry.id === provider)
+    ? provider
+    : null;
+}
+
 function wayIn(providers: Resource<{ providers: readonly IdentityProvider[] }>): Child {
   const state = providers.get();
   if (state.state === "loading") {
@@ -79,10 +140,10 @@ function wayIn(providers: Resource<{ providers: readonly IdentityProvider[] }>):
   const google = state.value.providers.find(
     (entry) => entry.id === "google" && entry.method === "oidc",
   );
-  const operator = state.value.providers.find((entry) => entry.method === "operator-assertion");
+  const operators = state.value.providers.filter((entry) => entry.method === "operator-assertion");
   if (takosId?.clientId && takosId.issuer) return takosIdRow(takosId.issuer, takosId.clientId);
   if (google?.clientId) return googleRow(google.clientId);
-  if (operator) return operatorForm(operator.id);
+  if (operators.length > 0) return operatorForm(operators);
   return h(
     "div",
     { class: "notice notice--warn" },
@@ -198,11 +259,11 @@ function googleGlyph(): SVGSVGElement {
  * misconfigured, which is exactly when nobody can sign in the ordinary way.
  *
  * The deployment may verify an operator assertion for more than one provider,
- * so the form posts the provider the server advertised rather than a literal.
- * One form is still the whole of the way in: which provider the assertion
- * vouches for is the operator's own claim, signed into the assertion.
+ * so the form routes from the provider claim in the pasted payload rather than
+ * silently choosing the first descriptor. That claim is only a routing hint;
+ * the server verifies the signature and provider before accepting it.
  */
-function operatorForm(provider: string): Child {
+function operatorForm(providers: readonly IdentityProvider[]): Child {
   const busy = signal(false);
   const assertion = h("textarea", {
     class: "textarea",
@@ -222,7 +283,7 @@ function operatorForm(provider: string): Child {
     }
     busy.set(true);
     try {
-      await api.signIn(provider, assertion.value.trim(), "operator-assertion");
+      await signInWithOperatorAssertion(api, providers, assertion.value.trim());
       adoptSession();
     } catch (error) {
       toast(explain(error as Error), "bad");

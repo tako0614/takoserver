@@ -304,6 +304,7 @@ export async function runFormAuthorityIdentityProbe(
       invocation.transition,
     );
     assertSameProbe("preflight", before, last);
+    await assertBoundAuthorityWorkerExists("preflight", invocation, target, state);
     const upload = await run(
       wranglerCommand([
         "deploy",

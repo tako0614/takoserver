@@ -171,13 +171,10 @@ export const DEPLOY_CONTRACT = {
           "candidate; ordinary target realization remains free of both retired fields. " +
           "The named --closure-predecessor-version profile refuses before any mutation and names " +
           "every binding its declared delta does not account for. The selected target is composed " +
-          "with the Worker's own startup path before any upload and its refusal is reported verbatim." +
-          inputContract(applyReviewInput, closureSecretDirectoryInput),
-        "production-selector":
+          "with the Worker's own startup path before any upload and its refusal is reported verbatim. " +
           "Production accepts this transition only with the exact pinned predecessor Version ID, " +
           "a clean/reachable exact commit and independent review; ordinary takoserver-worker deploy " +
-          "cannot bypass the selector or carry the retired edge.",
-        "closure-transition-selector":
+          "cannot bypass the selector or carry the retired edge. " +
           "`--closure-predecessor-version=<uuid>` plus the repeatable `--retire-var=NAME`, " +
           "`--add-var=NAME`, `--refresh-var=NAME`, `--add-secret=NAME` and `--rotate-secret=NAME` " +
           "declaration is the only " +
@@ -195,7 +192,8 @@ export const DEPLOY_CONTRACT = {
           "surface produces them, every required secret, added and rotated values supplied only " +
           "through the owned 0700 secret-input directory as one ephemeral sealed Wrangler secrets " +
           "file, and every other held secret carried without being re-entered. The routine surfaces " +
-          "stay strict and never accept this predecessor.",
+          "stay strict and never accept this predecessor." +
+          inputContract(applyReviewInput, closureSecretDirectoryInput),
         "independent-review": review,
       },
     },
@@ -269,13 +267,29 @@ export const DEPLOY_CONTRACT = {
           "TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST and TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST, " +
           "with no public Worker identity pins, " +
           "secret, route, or public-domain ownership. Status is ready only after the permanent minimal " +
-          "identity probe actively calls PublicHostIdentity@v2 and matches live Version/A/P/capability/I.",
+          "identity probe actively calls PublicHostIdentity@v2 and matches live Version/A/P/capability/I. " +
+          "Every apply against a Worker that already has a Version must additionally read the live " +
+          "released Core verifier identity through the probe and match the uploaded Version exactly.",
         reversal:
-          "The immediately previous Form authority Worker version is printed as the provider-history rollback target.",
+          "The immediately previous Form authority Worker version is printed as the provider-history rollback target. " +
+          "A bootstrap upload has no predecessor and no surface deletes a Worker, so it names the " +
+          "forward repair that completes the lane instead.",
         "failure-handling":
           `${highRiskFailure} RPC apply remains fail-closed unless the released Core Container returns the ` +
           "exact raw 17-package set, checkpoint and artifact identity proof for the embedded publisher-set closure. " +
-          "Admission policy and private handle issuance remain Takoserver Host-owned." +
+          "Admission policy and private handle issuance remain Takoserver Host-owned. " +
+          "The Core-verifier readback is served by the identity probe through its FORM_AUTHORITY " +
+          "service binding, and the probe refuses to bind a script that does not exist, so the very " +
+          "first Version of this Worker cannot be verified through it. `--apply " +
+          "--bootstrap-verifier-bridge --bootstrap-probe-predecessor-version=<uuid>` is the declared " +
+          "order out for this released-Core Worker's `--apply`: it requires the identity probe's exact " +
+          "predecessor Version and is admitted only where this Worker has no Version at all, never " +
+          "alongside an authority-Worker predecessor pin, a scope transition, an adoption or reverse, " +
+          "and it publishes phase one with the readback deferred and " +
+          "`verifierBridgePending` set. The run prints the two commands that finish the lane — the " +
+          "probe's `--add-binding=FORM_AUTHORITY` transition, then this surface's `--status`, which " +
+          "reports `coreVerifierRpcReady: true` only once the bridge is live. No binding to an " +
+          "absent script is ever published, and the steady-state post-condition is never relaxed." +
           inputContract(applyReviewInput),
         "independent-review": review,
       },
@@ -961,6 +975,12 @@ export const DEPLOY_CONTRACT = {
           orgApiKeyInput,
         "independent-review": review,
       },
+    },
+  ],
+  otherProviderScripts: [
+    {
+      script: "build:managed-worker-gateway",
+      why: "This script runs Wrangler's strict --dry-run bundle build into an artifact outdir only; it never publishes a Worker or mutates a provider target.",
     },
   ],
 } as const;

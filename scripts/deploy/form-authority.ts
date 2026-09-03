@@ -28,7 +28,10 @@ import {
   verificationError,
 } from "./errors.ts";
 import { assertPublicFormCapabilityTarget } from "./form-authority-capability.ts";
-import { readPublicHostIdentityProbe } from "./form-authority-identity-probe.ts";
+import {
+  readPublicHostIdentityProbe,
+  runFormAuthorityIdentityProbe,
+} from "./form-authority-identity-probe.ts";
 import {
   assertLoadedFormAuthorityScopeTransition,
   type FormAuthorityScope,
@@ -53,6 +56,7 @@ import {
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import {
   inspectLiveWorkerVersion,
+  isWorkerVersionId,
   workerVersionAnnotationProfile,
   workerVersionIdentity,
 } from "./worker-live.ts";
@@ -117,6 +121,17 @@ export interface FormAuthorityDeployInvocation {
   readonly transition?: WorkerSurfaceTransition;
   /** `--status` only: absolute path of the candidate descriptor to write. */
   readonly adoptLivePath?: string;
+  /**
+   * `--apply` on the released-Core authority, and only where that Worker has no
+   * Version at all: publish it with its Core-verifier readback deferred to the
+   * probe run that can only follow it.
+   */
+  readonly bootstrapVerifierBridge?: boolean;
+  /**
+   * Immutable identity-probe Version which must be the exact predecessor of
+   * the one-binding transition that will make the deferred bridge live.
+   */
+  readonly bootstrapProbePredecessorVersionId?: string;
 }
 
 export type FormAuthorityProcess = (
@@ -214,6 +229,25 @@ interface PublicWorkerInspection {
   readonly workerArtifactDigest: `sha256:${string}`;
 }
 
+interface BootstrapProbePredecessorInspection {
+  readonly deploymentId: string;
+  readonly versionId: string;
+  readonly previousVersionId: string | null;
+  readonly commit: string;
+  readonly artifactDigest: `sha256:${string}`;
+  readonly publicWorkerVersionId: string;
+  readonly publicWorkerArtifactDigest: `sha256:${string}`;
+}
+
+const BOOTSTRAP_PROBE_TRANSITION_DELTA: WorkerSurfaceTransition["delta"] = {
+  retiredVars: [],
+  addedVars: [],
+  refreshedVars: [],
+  addedBindings: ["FORM_AUTHORITY"],
+  addedSecrets: [],
+  rotatedSecrets: [],
+};
+
 /**
  * Deploys the isolated authority composition or its authenticated integration
  * operator gateway. The gateway is a separate custom-domain Worker and never
@@ -245,6 +279,37 @@ export async function runFormAuthority(
     throw preflightError("one Form authority transition selector at a time");
   }
   const selected = selectTarget(invocation, target);
+  const bootstrapVerifierBridge = invocation.bootstrapVerifierBridge === true;
+  const bootstrapProbePredecessorVersionId = invocation.bootstrapProbePredecessorVersionId;
+  if (bootstrapVerifierBridge !== (bootstrapProbePredecessorVersionId !== undefined)) {
+    throw preflightError(
+      "the verifier-bridge bootstrap and its identity-probe predecessor must be declared together",
+      "Use --bootstrap-verifier-bridge with " +
+        "--bootstrap-probe-predecessor-version=<exact identity probe Version from --status>",
+    );
+  }
+  if (
+    bootstrapProbePredecessorVersionId !== undefined &&
+    !isWorkerVersionId(bootstrapProbePredecessorVersionId)
+  ) {
+    throw preflightError("bootstrap identity-probe predecessor is not a Worker Version id");
+  }
+  if (
+    bootstrapVerifierBridge &&
+    (invocation.action !== "apply" ||
+      invocation.transition !== undefined ||
+      invocation.scopeTransition !== undefined ||
+      invocation.adoptLivePath !== undefined)
+  ) {
+    throw preflightError(
+      "the verifier-bridge bootstrap is one forward-only first publication, not another transition",
+    );
+  }
+  if (bootstrapVerifierBridge && selected.verificationMode !== "released-core") {
+    throw preflightError(
+      "only the released-Core Form authority Worker has a Core-verifier readback bridge to bootstrap",
+    );
+  }
   const capabilityManifest = publicFormCapabilityManifest();
   const capabilityManifestJson = canonicalJson(capabilityManifest);
   const capabilityDigest = await canonicalDigest(capabilityManifest);
@@ -398,6 +463,17 @@ export async function runFormAuthority(
       coreVerifierCommit: statusCoreVerifierReadback?.identity?.verifier.coreCommit ?? null,
       coreVerifierObservedArtifactDigest:
         statusCoreVerifierReadback?.identity?.verifier.artifactDigest ?? null,
+      // The one readback nothing this surface publishes can repair on its own,
+      // so an unready bridge always arrives with the run that closes it.
+      ...(selected.verificationMode === "released-core" &&
+      statusCoreVerifierReadback?.ready !== true
+        ? {
+            coreVerifierBridgeRemedy:
+              before === null
+                ? bootstrapVerifierBridgeRemedy(invocation, target)
+                : verifierBridgeRemedy(invocation, target),
+          }
+        : {}),
       publicIdentityRpcReady: publicIdentityReadback.ready,
       implementationPayloadDigest:
         publicIdentityReadback.identity?.implementationPayloadDigest ?? null,
@@ -454,6 +530,35 @@ export async function runFormAuthority(
   if (!publicIdentityReadback.ready || operatorIdentity === null) {
     throw preflightError("public Host identity RPC is unavailable or inconsistent");
   }
+
+  if (bootstrapVerifierBridge && before !== null) {
+    throw preflightError(
+      `Worker ${selected.workerName} already has a live Version, so its Core-verifier bridge is ` +
+        "not a bootstrap",
+      `Drop --bootstrap-verifier-bridge. If the readback is not yet live, ${verifierBridgeRemedy(invocation, target)}`,
+    );
+  }
+  if (
+    !bootstrapVerifierBridge &&
+    before === null &&
+    selected.verificationMode === "released-core"
+  ) {
+    throw preflightError(
+      `Worker ${selected.workerName} does not exist yet, and its apply post-condition reads the ` +
+        "identity probe's FORM_AUTHORITY binding, which cannot name an absent script",
+      `Name the pinned two-phase order: ${bootstrapVerifierBridgeRemedy(invocation, target)}`,
+    );
+  }
+  const bootstrapProbeBefore = bootstrapVerifierBridge
+    ? await inspectBootstrapProbePredecessor(
+        "preflight",
+        invocation,
+        target,
+        publicBefore,
+        state,
+        options.fetcher ?? fetch,
+      )
+    : null;
 
   if (invocation.transition) {
     if (before === null) {
@@ -584,6 +689,17 @@ export async function runFormAuthority(
       );
       assertSameVersion(dependencyBefore, dependencyLast);
     }
+    if (bootstrapProbeBefore !== null) {
+      const bootstrapProbeLast = await inspectBootstrapProbePredecessor(
+        "preflight",
+        invocation,
+        target,
+        publicBefore,
+        state,
+        options.fetcher ?? fetch,
+      );
+      assertSameBootstrapProbePredecessor(bootstrapProbeBefore, bootstrapProbeLast);
+    }
     const upload = await run(
       wranglerCommand([
         "deploy",
@@ -670,8 +786,11 @@ export async function runFormAuthority(
         "Form authority authoritative history does not identify the exact uploaded successor",
       );
     }
+    // The bootstrap upload deliberately does not read the bridge: the probe
+    // cannot have bound a script that did not exist when this run started, so
+    // asking would only spend a timeout proving what the order already says.
     const coreVerifierAfter =
-      selected.verificationMode === "released-core"
+      selected.verificationMode === "released-core" && !bootstrapVerifierBridge
         ? await readFormAuthorityCoreVerifierIdentityProbe(
             {
               probeOrigin: requiredIdentityProbeOrigin(target),
@@ -681,7 +800,11 @@ export async function runFormAuthority(
             options.fetcher ?? fetch,
           )
         : null;
-    if (selected.verificationMode === "released-core" && coreVerifierAfter?.ready !== true) {
+    if (
+      selected.verificationMode === "released-core" &&
+      !bootstrapVerifierBridge &&
+      coreVerifierAfter?.ready !== true
+    ) {
       throw verificationError(
         "released Core verifier live identity is unavailable or differs from the uploaded Worker Version",
       );
@@ -710,6 +833,19 @@ export async function runFormAuthority(
       coreVerifierCommit: coreVerifierAfter?.identity?.verifier.coreCommit ?? null,
       coreVerifierObservedArtifactDigest:
         coreVerifierAfter?.identity?.verifier.artifactDigest ?? null,
+      ...(bootstrapVerifierBridge
+        ? {
+            verifierBridgePending: true,
+            verifierBridgeNextStep: verifierBridgeRemedy(invocation, target),
+          }
+        : {}),
+      ...(bootstrapProbeBefore === null
+        ? {}
+        : {
+            bootstrapProbePredecessorVersionId: bootstrapProbeBefore.versionId,
+            bootstrapProbePredecessorCommit: bootstrapProbeBefore.commit,
+            bootstrapProbeArtifactDigest: bootstrapProbeBefore.artifactDigest,
+          }),
       publicIdentityRpcReady: true,
       implementationPayloadDigest: publicIdentityAfter.identity.implementationPayloadDigest,
       implementationDigest: operatorIdentity.implementationDigest,
@@ -744,7 +880,10 @@ export async function runFormAuthority(
       productionEligible: selected.productionEligible,
       rollback: before
         ? `wrangler versions deploy ${before.history.versionId}@100% --yes --name ${selected.workerName}`
-        : "forward repair only: no previous Form authority Worker version exists",
+        : bootstrapVerifierBridge
+          ? "forward repair only: a first Version has no predecessor to roll back to, and no " +
+            `surface deletes a Worker. Finish the lane: ${verifierBridgeRemedy(invocation, target)}`
+          : "forward repair only: no previous Form authority Worker version exists",
     };
   } finally {
     unsealDirectory(root);
@@ -1484,6 +1623,142 @@ export async function readFormAuthorityCoreVerifierIdentityProbe(
 
 function unavailableCoreVerifierReadback(): FormAuthorityCoreVerifierReadback {
   return { ready: false, identity: null };
+}
+
+/**
+ * Reuses the identity-probe surface's own exact transition classifier. The
+ * authority bootstrap is allowed to defer its readback only when the probe is
+ * already one immutable, explicitly pinned upload away from closing it.
+ */
+async function inspectBootstrapProbePredecessor(
+  phase: DeployPhase,
+  invocation: FormAuthorityDeployInvocation,
+  target: DeployTarget,
+  publicWorker: PublicWorkerInspection,
+  state: FormAuthorityDeployState,
+  fetcher: (input: string, init?: RequestInit) => Promise<Response>,
+): Promise<BootstrapProbePredecessorInspection> {
+  const predecessorVersionId = invocation.bootstrapProbePredecessorVersionId;
+  if (predecessorVersionId === undefined) {
+    throw phaseError(phase, "verifier-bridge bootstrap has no identity-probe predecessor");
+  }
+  const status = await runFormAuthorityIdentityProbe(
+    {
+      surface: "takoserver-form-authority-identity-probe",
+      action: "status",
+      environment: invocation.environment,
+      commit: invocation.commit,
+      transition: {
+        predecessorVersionId,
+        delta: BOOTSTRAP_PROBE_TRANSITION_DELTA,
+      },
+    },
+    target,
+    { state, fetcher },
+  );
+  const exact =
+    status.kind === "takoserver.form-authority-identity-probe-status@v1" &&
+    status.versionId === predecessorVersionId &&
+    status.transitionPredecessorVersionId === predecessorVersionId &&
+    status.bindingTransitionProfile === "declared-delta-predecessor" &&
+    status.formAuthorityWorkerPresent === false &&
+    status.publicIdentityRpcReady === true &&
+    status.publicWorkerCommit === invocation.commit &&
+    status.publicWorkerVersionId === publicWorker.history.versionId &&
+    status.workerArtifactDigest === publicWorker.workerArtifactDigest &&
+    typeof status.deploymentId === "string" &&
+    typeof status.deployedCommit === "string" &&
+    typeof status.probeArtifactDigest === "string" &&
+    (status.previousVersionId === null || typeof status.previousVersionId === "string");
+  if (!exact) {
+    throw phaseError(
+      phase,
+      "identity probe is not the exact declared predecessor with only FORM_AUTHORITY missing",
+    );
+  }
+  return {
+    deploymentId: status.deploymentId as string,
+    versionId: predecessorVersionId,
+    previousVersionId: status.previousVersionId as string | null,
+    commit: status.deployedCommit as string,
+    artifactDigest: status.probeArtifactDigest as `sha256:${string}`,
+    publicWorkerVersionId: status.publicWorkerVersionId as string,
+    publicWorkerArtifactDigest: status.workerArtifactDigest as `sha256:${string}`,
+  };
+}
+
+function assertSameBootstrapProbePredecessor(
+  before: BootstrapProbePredecessorInspection,
+  last: BootstrapProbePredecessorInspection,
+): void {
+  if (
+    before.deploymentId !== last.deploymentId ||
+    before.versionId !== last.versionId ||
+    before.previousVersionId !== last.previousVersionId ||
+    before.commit !== last.commit ||
+    before.artifactDigest !== last.artifactDigest ||
+    before.publicWorkerVersionId !== last.publicWorkerVersionId ||
+    before.publicWorkerArtifactDigest !== last.publicWorkerArtifactDigest
+  ) {
+    throw preflightError("identity probe changed during verifier-bridge qualification");
+  }
+}
+
+/**
+ * The released-Core lane's readback bridge cannot exist before the Worker it
+ * reads, so the order is declared rather than deadlocked.
+ *
+ * `takoserver-form-authority-worker`'s apply post-condition is
+ * `GET <identityProbeOrigin>/v1/core-verifier-identity`, and the probe serves
+ * that route only through `env.FORM_AUTHORITY` — a service binding naming this
+ * Worker. `takoserver-form-authority-identity-probe` refuses to publish a
+ * binding to a script that is not there, because that would realize a dangling
+ * service binding. So each surface required the other to have gone first and
+ * the lane could not be started in any environment: a first upload would have
+ * failed its own verification with certainty, and a first Version has no
+ * predecessor to roll back to.
+ *
+ * Three phases, named on the invocation: publish the authority with the
+ * readback deferred, bind the probe, then prove the verifier live. The deferral
+ * is admitted only where the Worker has no Version at all — the one state in
+ * which the bridge provably cannot exist — and it relaxes nothing afterwards:
+ * every later apply meets the steady-state post-condition, and the probe's
+ * "no dangling binding" refusal is untouched, because by phase two the script
+ * it names exists.
+ */
+function verifierBridgeRemedy(
+  invocation: FormAuthorityDeployInvocation,
+  target: DeployTarget,
+): string {
+  const probe = target.formAuthority?.identityProbeWorkerName ?? "the identity probe";
+  const selector = `--environment=${invocation.environment} --commit=${invocation.commit}` as const;
+  const probePredecessor =
+    invocation.bootstrapProbePredecessorVersionId ?? "<probe-version-from-status>";
+  return (
+    `give ${probe} its FORM_AUTHORITY binding with \`bun run deploy -- ` +
+    `takoserver-form-authority-identity-probe --apply ${selector} ` +
+    `--closure-predecessor-version=${probePredecessor} ` +
+    "--add-binding=FORM_AUTHORITY`, then prove the bridge live with `bun run deploy -- " +
+    `takoserver-form-authority-worker --status ${selector}\`, which reports ` +
+    "coreVerifierRpcReady: true only once it is"
+  );
+}
+
+function bootstrapVerifierBridgeRemedy(
+  invocation: FormAuthorityDeployInvocation,
+  target: DeployTarget,
+): string {
+  const probe = target.formAuthority?.identityProbeWorkerName ?? "the identity probe";
+  const selector = `--environment=${invocation.environment} --commit=${invocation.commit}` as const;
+  return (
+    `read ${probe}'s exact current Version with \`bun run deploy -- ` +
+    `takoserver-form-authority-identity-probe --status ${selector}\`, then run \`bun run deploy -- ` +
+    `takoserver-form-authority-worker --apply ${selector} --bootstrap-verifier-bridge ` +
+    "--bootstrap-probe-predecessor-version=<that exact versionId>`. The apply admits only a " +
+    "probe closure missing FORM_AUTHORITY and rechecks the same immutable Version at its final " +
+    "mutation fence; after it succeeds, " +
+    verifierBridgeRemedy(invocation, target)
+  );
 }
 
 function requiredIdentityProbeOrigin(target: DeployTarget): string {

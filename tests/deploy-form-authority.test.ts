@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DeployError } from "../scripts/deploy/errors.ts";
 import {
   type FormAuthorityDeployState,
   type FormAuthorityProcess,
@@ -2483,5 +2484,422 @@ describe("Form authority forward transition and descriptor drift", () => {
       rmSync(root, { recursive: true, force: true });
       rmSync(outside, { recursive: true, force: true });
     }
+  });
+});
+
+/**
+ * Starting the released-Core lane at all.
+ *
+ * `takoserver-form-authority-worker`'s apply post-condition reads
+ * `GET <identityProbeOrigin>/v1/core-verifier-identity`, which the probe serves
+ * only through its `FORM_AUTHORITY` service binding — and the probe refuses to
+ * publish a binding to a script that does not exist. So the released-Core
+ * authority could not be deployed for the first time in any environment: its
+ * verification needed a bridge only its own existence makes possible, and a
+ * first Version has no predecessor to roll back to.
+ */
+describe("released-Core Form authority bootstrap", () => {
+  const CORE_VERIFIER_PATH = "/v1/core-verifier-identity";
+  const IDENTITY_PROBE_PREDECESSOR_VERSION_ID = "77777777-7777-4777-8777-777777777777";
+  const RELEASED_CORE_VERSION_ID = "88888888-8888-4888-8888-888888888888";
+  const RELEASED_CORE_SUCCESSOR_VERSION_ID = "99999999-9999-4999-8999-999999999999";
+
+  function releasedCoreVersion(commit: string, artifactDigest: `sha256:${string}`) {
+    return {
+      annotations: {
+        "workers/message": `form-authority:takoserver-form-authority-worker:${commit}:${artifactDigest}`,
+      },
+      resources: {
+        bindings: [
+          { type: "d1", name: "STATE_DB", id: target.d1.databaseId },
+          { type: "r2_bucket", name: "OBJECTS", bucket_name: target.r2.bucketName },
+          {
+            type: "service",
+            name: "PUBLIC_HOST_IDENTITY",
+            service: target.workerName,
+            entrypoint: "PublicHostIdentityEntrypoint",
+          },
+          { type: "plain_text", name: "TAKOSERVER_ENVIRONMENT", text: "integration" },
+          {
+            type: "plain_text",
+            name: "TAKOSERVER_FORM_AUTHORITY_HOST_ID",
+            text: target.formAuthority.hostId,
+          },
+          {
+            type: "plain_text",
+            name: "TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST",
+            text: CAPABILITY_MANIFEST_JSON,
+          },
+          { type: "version_metadata", name: "WORKER_VERSION" },
+          {
+            type: "durable_object_namespace",
+            name: "CORE_VERIFIER",
+            class_name: "TakoformCoreVerifierContainer",
+          },
+          {
+            type: "plain_text",
+            name: "TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST",
+            text: takoformCoreVerifierArtifactDigest(),
+          },
+        ],
+      },
+    };
+  }
+
+  /** The account before the first upload, and after it once `uploaded` flips. */
+  function releasedCoreState(input: {
+    readonly present: boolean;
+    readonly isUploaded?: () => boolean;
+  }): FormAuthorityDeployState {
+    const live = () => input.present || (input.isUploaded?.() ?? false);
+    return {
+      async workerScripts() {
+        return [
+          target.formAuthority.integrationWorkerName,
+          target.formAuthority.identityProbeWorkerName,
+          ...(live() ? [target.formAuthority.workerName] : []),
+        ];
+      },
+      async workerDeployments(workerName) {
+        if (workerName === target.workerName) {
+          return [
+            deployment("public-deployment", PUBLIC_WORKER_VERSION_ID, "2026-08-28T00:00:00Z"),
+          ];
+        }
+        if (workerName === target.formAuthority.identityProbeWorkerName) {
+          return [
+            deployment(
+              "identity-probe-predecessor",
+              IDENTITY_PROBE_PREDECESSOR_VERSION_ID,
+              "2026-08-28T01:00:00Z",
+            ),
+          ];
+        }
+        if (!live()) return [];
+        // A bootstrap upload leaves exactly one Version, with nothing behind
+        // it; a steady one leaves a successor whose predecessor is the Version
+        // the run read before it.
+        if (!input.present) {
+          return [deployment("core-first", RELEASED_CORE_VERSION_ID, "2026-08-28T02:00:00Z")];
+        }
+        return input.isUploaded?.()
+          ? [
+              deployment(
+                "core-successor",
+                RELEASED_CORE_SUCCESSOR_VERSION_ID,
+                "2026-08-28T03:00:00Z",
+              ),
+              deployment("core-current", RELEASED_CORE_VERSION_ID, "2026-08-28T02:00:00Z"),
+            ]
+          : [deployment("core-current", RELEASED_CORE_VERSION_ID, "2026-08-28T02:00:00Z")];
+      },
+      async workerVersion(workerName) {
+        if (workerName === target.workerName) {
+          return publicVersion(
+            `takoserver-worker:${PUBLIC_WORKER_COMMIT}:${PUBLIC_WORKER_DIGEST.slice("sha256:".length)}`,
+          );
+        }
+        if (workerName === target.formAuthority.identityProbeWorkerName) {
+          return {
+            annotations: {
+              "workers/message": `form-authority-identity-probe:${COMMIT}:${BUNDLE_DIGEST}`,
+            },
+            resources: {
+              bindings: [
+                {
+                  type: "plain_text",
+                  name: "TAKOSERVER_FORM_AUTHORITY_HOST_ID",
+                  text: target.formAuthority.hostId,
+                },
+                {
+                  type: "service",
+                  name: "PUBLIC_HOST_IDENTITY",
+                  service: target.workerName,
+                  entrypoint: "PublicHostIdentityEntrypoint",
+                },
+              ],
+            },
+          };
+        }
+        return releasedCoreVersion(COMMIT, BUNDLE_DIGEST);
+      },
+      async workerSecrets(workerName) {
+        return workerName === target.workerName
+          ? expectedWorkerSecrets(target).map((name) => ({ name, type: "secret_text" }))
+          : [];
+      },
+      async workerDomains() {
+        return [{ hostname: "api.integration.example.test", service: target.workerName }];
+      },
+      async workerSubdomain(workerName) {
+        return {
+          enabled: workerName === target.formAuthority.identityProbeWorkerName,
+          previewsEnabled: false,
+        };
+      },
+      async workerRoutes() {
+        return [];
+      },
+    };
+  }
+
+  /** The probe's two routes, told apart, so a run that must not read one cannot. */
+  function releasedCoreFetcher(
+    input: {
+      readonly coreVerifier?: "ready" | "absent";
+      readonly authorityWorkerVersionId?: string;
+    } = {},
+  ) {
+    const paths: string[] = [];
+    const fetcher = async (url: string): Promise<Response> => {
+      const path = new URL(url).pathname;
+      paths.push(path);
+      if (path === CORE_VERIFIER_PATH) {
+        if (input.coreVerifier !== "ready") {
+          return Response.json({ error: { code: "not_found" } }, { status: 404 });
+        }
+        return Response.json({
+          kind: "takoserver.form-authority-core-verifier-identity@v1",
+          authorityWorkerVersionId: input.authorityWorkerVersionId ?? RELEASED_CORE_VERSION_ID,
+          verifier: {
+            protocol: "takoserver.takoform-core-verifier@v1",
+            coreVersion: "v1.1.0",
+            coreCommit: "e0e48b864de2a127a255cb0574d37bbb0f1cac29",
+            artifactDigest: takoformCoreVerifierArtifactDigest(),
+          },
+        });
+      }
+      const implementationPayloadDigest = `sha256:${"9".repeat(64)}` as const;
+      const semantic = await derivePublicFormImplementationIdentity({
+        implementationPayloadDigest,
+        capabilities: publicFormCapabilityManifest(),
+      });
+      return Response.json({
+        kind: "takoserver.public-host-identity@v2",
+        hostId: target.formAuthority.hostId,
+        workerVersionId: PUBLIC_WORKER_VERSION_ID,
+        workerArtifactDigest: PUBLIC_WORKER_DIGEST,
+        ...semantic,
+      });
+    };
+    return { fetcher, paths };
+  }
+
+  const invocation = {
+    surface: "takoserver-form-authority-worker",
+    environment: "integration",
+    commit: COMMIT,
+  } as const;
+
+  test("publishes the first Version with its readback deferred, and names what finishes the lane", async () => {
+    let uploaded = false;
+    const process = fakeProcess({
+      onUpload: () => {
+        uploaded = true;
+      },
+    });
+    const live = releasedCoreFetcher();
+    const result = await runFormAuthorityImpl(
+      {
+        ...invocation,
+        action: "apply",
+        bootstrapVerifierBridge: true,
+        bootstrapProbePredecessorVersionId: IDENTITY_PROBE_PREDECESSOR_VERSION_ID,
+      },
+      target,
+      {
+        run: process.run,
+        state: releasedCoreState({ present: false, isUploaded: () => uploaded }),
+        fetcher: live.fetcher,
+        review: "independent-reviewer",
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+      },
+    );
+    expect(result).toMatchObject({
+      kind: "takoserver.form-authority-worker-apply@v1",
+      workerName: target.formAuthority.workerName,
+      verificationMode: "released-core",
+      verifierBridgePending: true,
+      bootstrapProbePredecessorVersionId: IDENTITY_PROBE_PREDECESSOR_VERSION_ID,
+      bootstrapProbePredecessorCommit: COMMIT,
+      bootstrapProbeArtifactDigest: BUNDLE_DIGEST,
+      coreVerifierRpcReady: null,
+      previousVersionId: null,
+      versionId: RELEASED_CORE_VERSION_ID,
+    });
+    // Deferred, not attempted: the bridge cannot answer, so nothing asks it.
+    expect(live.paths).not.toContain(CORE_VERIFIER_PATH);
+    expect(String(result.verifierBridgeNextStep)).toContain(
+      "takoserver-form-authority-identity-probe --apply",
+    );
+    expect(String(result.verifierBridgeNextStep)).toContain("--add-binding=FORM_AUTHORITY");
+    expect(String(result.verifierBridgeNextStep)).toContain(
+      `--closure-predecessor-version=${IDENTITY_PROBE_PREDECESSOR_VERSION_ID}`,
+    );
+    // A first Version has nothing to roll back to, so the forward repair is the
+    // rest of the sequence rather than a rollback that does not exist.
+    expect(String(result.rollback)).toContain("forward repair only");
+    expect(String(result.rollback)).toContain("takoserver-form-authority-identity-probe --apply");
+  });
+
+  test("refuses a first upload that does not name the deferral, before it uploads", async () => {
+    let uploaded = false;
+    const process = fakeProcess({
+      onUpload: () => {
+        uploaded = true;
+      },
+    });
+    const refusal = await runFormAuthorityImpl({ ...invocation, action: "apply" }, target, {
+      run: process.run,
+      state: releasedCoreState({ present: false, isUploaded: () => uploaded }),
+      fetcher: releasedCoreFetcher().fetcher,
+      review: "independent-reviewer",
+      cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+    }).catch((error: unknown) => error);
+    expect(refusal).toBeInstanceOf(DeployError);
+    expect((refusal as DeployError).phase).toBe("preflight");
+    expect((refusal as DeployError).message).toContain("does not exist yet");
+    expect((refusal as DeployError).detail).toContain("--bootstrap-verifier-bridge");
+    expect(uploaded).toBe(false);
+  });
+
+  test("requires the bootstrap and exact probe predecessor selectors together", async () => {
+    for (const partial of [
+      { bootstrapVerifierBridge: true },
+      { bootstrapProbePredecessorVersionId: IDENTITY_PROBE_PREDECESSOR_VERSION_ID },
+    ] as const) {
+      let uploaded = false;
+      const refusal = await runFormAuthorityImpl(
+        { ...invocation, action: "apply", ...partial },
+        target,
+        {
+          run: fakeProcess({
+            onUpload: () => {
+              uploaded = true;
+            },
+          }).run,
+          state: releasedCoreState({ present: false, isUploaded: () => uploaded }),
+          fetcher: releasedCoreFetcher().fetcher,
+          review: "independent-reviewer",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      ).catch((error: unknown) => error);
+      expect(refusal).toBeInstanceOf(DeployError);
+      expect((refusal as DeployError).phase).toBe("preflight");
+      expect((refusal as DeployError).message).toContain("declared together");
+      expect(uploaded).toBe(false);
+    }
+  });
+
+  test("refuses the deferral once the Worker has a Version of its own", async () => {
+    let uploaded = false;
+    const process = fakeProcess({
+      onUpload: () => {
+        uploaded = true;
+      },
+    });
+    const refusal = await runFormAuthorityImpl(
+      {
+        ...invocation,
+        action: "apply",
+        bootstrapVerifierBridge: true,
+        bootstrapProbePredecessorVersionId: IDENTITY_PROBE_PREDECESSOR_VERSION_ID,
+      },
+      target,
+      {
+        run: process.run,
+        state: releasedCoreState({ present: true, isUploaded: () => uploaded }),
+        fetcher: releasedCoreFetcher({ coreVerifier: "ready" }).fetcher,
+        review: "independent-reviewer",
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+      },
+    ).catch((error: unknown) => error);
+    expect(refusal).toBeInstanceOf(DeployError);
+    expect((refusal as DeployError).phase).toBe("preflight");
+    expect((refusal as DeployError).message).toContain("not a bootstrap");
+    expect(uploaded).toBe(false);
+  });
+
+  test("still refuses a steady-state upload whose Core verifier is not live", async () => {
+    let uploaded = false;
+    const process = fakeProcess({
+      onUpload: () => {
+        uploaded = true;
+      },
+    });
+    const refusal = await runFormAuthorityImpl({ ...invocation, action: "apply" }, target, {
+      run: process.run,
+      state: releasedCoreState({ present: true, isUploaded: () => uploaded }),
+      fetcher: releasedCoreFetcher().fetcher,
+      review: "independent-reviewer",
+      cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+    }).catch((error: unknown) => error);
+    expect(refusal).toBeInstanceOf(DeployError);
+    expect((refusal as DeployError).phase).toBe("verification");
+    expect((refusal as DeployError).message).toContain("released Core verifier live identity");
+  });
+
+  test("publishes a steady-state successor only once the bridge proves it live", async () => {
+    let uploaded = false;
+    const process = fakeProcess({
+      onUpload: () => {
+        uploaded = true;
+      },
+    });
+    const live = releasedCoreFetcher({
+      coreVerifier: "ready",
+      authorityWorkerVersionId: RELEASED_CORE_SUCCESSOR_VERSION_ID,
+    });
+    const result = await runFormAuthorityImpl({ ...invocation, action: "apply" }, target, {
+      run: process.run,
+      state: releasedCoreState({ present: true, isUploaded: () => uploaded }),
+      fetcher: live.fetcher,
+      review: "independent-reviewer",
+      cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+    });
+    expect(live.paths).toContain(CORE_VERIFIER_PATH);
+    expect(result).toMatchObject({
+      coreVerifierRpcReady: true,
+      coreVerifierAuthorityWorkerVersionId: RELEASED_CORE_SUCCESSOR_VERSION_ID,
+      versionId: RELEASED_CORE_SUCCESSOR_VERSION_ID,
+      previousVersionId: RELEASED_CORE_VERSION_ID,
+    });
+    expect(result.verifierBridgePending).toBeUndefined();
+    expect(String(result.rollback)).toContain(RELEASED_CORE_VERSION_ID);
+  });
+
+  test("reads the bridge and reports it ready once the probe has been bound", async () => {
+    const live = releasedCoreFetcher({ coreVerifier: "ready" });
+    const status = await runFormAuthorityImpl({ ...invocation, action: "status" }, target, {
+      run: fakeProcess().run,
+      state: releasedCoreState({ present: true }),
+      fetcher: live.fetcher,
+    });
+    expect(live.paths).toContain(CORE_VERIFIER_PATH);
+    expect(status).toMatchObject({
+      coreVerifierRpcReady: true,
+      coreVerifierAuthorityWorkerVersionId: RELEASED_CORE_VERSION_ID,
+      ready: true,
+    });
+    expect(status.coreVerifierBridgeRemedy).toBeUndefined();
+  });
+
+  test("names the run that closes an unready bridge, absent Worker or not", async () => {
+    const absent = await runFormAuthorityImpl({ ...invocation, action: "status" }, target, {
+      run: fakeProcess().run,
+      state: releasedCoreState({ present: false }),
+      fetcher: releasedCoreFetcher().fetcher,
+    });
+    expect(absent).toMatchObject({ versionId: null, coreVerifierRpcReady: false, ready: false });
+    expect(String(absent.coreVerifierBridgeRemedy)).toContain("--bootstrap-verifier-bridge");
+
+    const unbound = await runFormAuthorityImpl({ ...invocation, action: "status" }, target, {
+      run: fakeProcess().run,
+      state: releasedCoreState({ present: true }),
+      fetcher: releasedCoreFetcher().fetcher,
+    });
+    expect(unbound).toMatchObject({ coreVerifierRpcReady: false, ready: false });
+    expect(String(unbound.coreVerifierBridgeRemedy)).toContain("--add-binding=FORM_AUTHORITY");
+    expect(String(unbound.coreVerifierBridgeRemedy)).not.toContain("--bootstrap-verifier-bridge");
   });
 });

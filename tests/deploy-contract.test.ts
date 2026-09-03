@@ -61,12 +61,19 @@ describe("Takoserver split deploy entrypoint", () => {
         requiresTools: readonly string[];
         obligations: Record<string, string>;
       }[];
+      otherProviderScripts?: { script: string; why: string }[];
     };
     expect(contract.kind).toBe("takos.deploy-contract@v2");
     expect(contract.surfaces.map(({ surface, triggers }) => [surface, triggers])).toEqual(
       SURFACES.map(([surface, triggers]) => [surface, [...triggers]]),
     );
     expect(contract.surfaces.some(({ surface }) => surface === "takoserver-api")).toBe(false);
+    expect(contract.otherProviderScripts).toEqual([
+      {
+        script: "build:managed-worker-gateway",
+        why: expect.stringContaining("strict --dry-run bundle build"),
+      },
+    ]);
 
     const integrationAuthority = contract.surfaces.find(
       ({ surface }) => surface === "takoserver-integration-form-authority-worker",
@@ -709,14 +716,17 @@ describe("Takoserver split deploy entrypoint", () => {
     const cutover = contract.surfaces.find(
       ({ surface }) => surface === "takoserver-worker-authority-cutover",
     );
-    expect(cutover?.obligations["closure-transition-selector"]).toContain(
+    expect(cutover?.obligations["failure-handling"]).toContain(
       "--closure-predecessor-version=<uuid>",
     );
-    expect(cutover?.obligations["closure-transition-selector"]).toContain("--rotate-secret=NAME");
-    expect(cutover?.obligations["closure-transition-selector"]).toContain("--refresh-var=NAME");
-    expect(cutover?.obligations["closure-transition-selector"]).toContain(
-      "The routine surfaces stay strict",
+    expect(cutover?.obligations["failure-handling"]).toContain("--rotate-secret=NAME");
+    expect(cutover?.obligations["failure-handling"]).toContain("--refresh-var=NAME");
+    expect(cutover?.obligations["failure-handling"]).toContain("The routine surfaces stay strict");
+    expect(cutover?.obligations["failure-handling"]).toContain(
+      "Production accepts this transition only with the exact pinned predecessor Version ID",
     );
+    expect(cutover?.obligations).not.toHaveProperty("production-selector");
+    expect(cutover?.obligations).not.toHaveProperty("closure-transition-selector");
 
     const sha = "a".repeat(40);
     const predecessor = "00000000-0000-4000-8000-0000000000a1";
@@ -907,6 +917,192 @@ describe("Takoserver split deploy entrypoint", () => {
         `--commit=${sha}`,
         `--closure-predecessor-version=${predecessor}`,
         "--add-binding=form_authority",
+      ],
+    ] as const) {
+      const refused = await deploy(args);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
+    }
+  });
+
+  /**
+   * The released-Core lane could not be started: its apply post-condition reads
+   * a probe route the probe serves only through a binding it refuses to
+   * publish while the authority Worker is absent. The order is now declared,
+   * on one surface's one mutating action.
+   */
+  test("parses the released-Core bootstrap deferral only where it can mean something", async () => {
+    const probe = await deploy(["--contract"]);
+    const contract = JSON.parse(probe.stdout) as {
+      surfaces: { surface: string; obligations: Record<string, string> }[];
+    };
+    const authority = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-form-authority-worker",
+    );
+    expect(authority?.obligations).not.toHaveProperty("bootstrap-selector");
+    expect(authority?.obligations["failure-handling"]).toContain("--bootstrap-verifier-bridge");
+    expect(authority?.obligations["failure-handling"]).toContain(
+      "--bootstrap-probe-predecessor-version=<uuid>",
+    );
+    expect(authority?.obligations["failure-handling"]).toContain(
+      "identity probe's exact predecessor Version",
+    );
+    expect(authority?.obligations["failure-handling"]).toContain(
+      "this released-Core Worker's `--apply`",
+    );
+    expect(authority?.obligations["failure-handling"]).toContain("an adoption or reverse");
+    expect(authority?.obligations["failure-handling"]).toContain("has no Version at all");
+    expect(authority?.obligations["failure-handling"]).toContain("coreVerifierRpcReady: true");
+    expect(authority?.obligations["failure-handling"]).toContain(
+      "steady-state post-condition is never relaxed",
+    );
+    expect(authority?.obligations.reversal).toContain("forward repair");
+
+    for (const surface of contract.surfaces) {
+      const unknown = Object.keys(surface.obligations).filter(
+        (name) =>
+          ![
+            "provenance",
+            "post-conditions",
+            "reversal",
+            "failure-handling",
+            "pre-mutation-proof",
+            "independent-review",
+            "no-overwrite",
+            "halt",
+          ].includes(name),
+      );
+      expect(unknown).toEqual([]);
+    }
+
+    const sha = "a".repeat(40);
+    const predecessor = "00000000-0000-4000-8000-0000000000a1";
+    const probePredecessor = "00000000-0000-4000-8000-0000000000b1";
+    const accepted = await deploy([
+      "takoserver-form-authority-worker",
+      "--apply",
+      "--environment=integration",
+      `--commit=${sha}`,
+      "--bootstrap-verifier-bridge",
+      `--bootstrap-probe-predecessor-version=${probePredecessor}`,
+    ]);
+    expect(accepted.exitCode).toBe(2);
+    expect(accepted.stderr).toContain("deploy target descriptor not found");
+
+    for (const args of [
+      // Bootstrap requires the probe's exact predecessor pin.
+      [
+        "takoserver-form-authority-worker",
+        "--apply",
+        "--environment=integration",
+        `--commit=${sha}`,
+        "--bootstrap-verifier-bridge",
+      ],
+      // The probe predecessor selector is a Worker Version UUID.
+      [
+        "takoserver-form-authority-worker",
+        "--apply",
+        "--environment=integration",
+        `--commit=${sha}`,
+        "--bootstrap-verifier-bridge",
+        "--bootstrap-probe-predecessor-version=not-a-version-id",
+      ],
+      // It is a single exact predecessor, not a repeatable declaration.
+      [
+        "takoserver-form-authority-worker",
+        "--apply",
+        "--environment=integration",
+        `--commit=${sha}`,
+        "--bootstrap-verifier-bridge",
+        `--bootstrap-probe-predecessor-version=${probePredecessor}`,
+        `--bootstrap-probe-predecessor-version=${probePredecessor}`,
+      ],
+      // The selector without its bridge is not a standalone action.
+      [
+        "takoserver-form-authority-worker",
+        "--apply",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--bootstrap-probe-predecessor-version=${probePredecessor}`,
+      ],
+      // The readback bridge belongs to the released-Core authority alone.
+      [
+        "takoserver-integration-form-authority-worker",
+        "--apply",
+        "--environment=integration",
+        `--commit=${sha}`,
+        "--bootstrap-verifier-bridge",
+        `--bootstrap-probe-predecessor-version=${probePredecessor}`,
+      ],
+      [
+        "takoserver-form-authority-identity-probe",
+        "--apply",
+        "--environment=integration",
+        `--commit=${sha}`,
+        "--bootstrap-verifier-bridge",
+        `--bootstrap-probe-predecessor-version=${probePredecessor}`,
+      ],
+      // A readback deferral has nothing to defer on a read-only invocation.
+      [
+        "takoserver-form-authority-worker",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        "--bootstrap-verifier-bridge",
+        `--bootstrap-probe-predecessor-version=${probePredecessor}`,
+      ],
+      // A first upload has no predecessor Version to pin.
+      [
+        "takoserver-form-authority-worker",
+        "--apply",
+        "--environment=integration",
+        `--commit=${sha}`,
+        "--bootstrap-verifier-bridge",
+        `--bootstrap-probe-predecessor-version=${probePredecessor}`,
+        `--closure-predecessor-version=${predecessor}`,
+        "--add-binding=CORE_VERIFIER",
+      ],
+      // Nor an authority scope transition.
+      [
+        "takoserver-form-authority-worker",
+        "--apply",
+        "--environment=integration",
+        `--commit=${sha}`,
+        "--bootstrap-verifier-bridge",
+        `--bootstrap-probe-predecessor-version=${probePredecessor}`,
+        "--form-authority-scope-transition=/tmp/takoserver-scope.json",
+      ],
+      // Nor a live value to adopt from.
+      [
+        "takoserver-form-authority-worker",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        "--bootstrap-verifier-bridge",
+        `--bootstrap-probe-predecessor-version=${probePredecessor}`,
+        "--adopt-live=/tmp/takoserver-adopt-candidate.json",
+      ],
+      // Nor a reverse mutation.
+      [
+        "takoserver-form-authority-worker",
+        "--apply",
+        "--environment=integration",
+        `--commit=${sha}`,
+        "--bootstrap-verifier-bridge",
+        `--bootstrap-probe-predecessor-version=${probePredecessor}`,
+        "--reverse",
+      ],
+      // Named once.
+      [
+        "takoserver-form-authority-worker",
+        "--apply",
+        "--environment=integration",
+        `--commit=${sha}`,
+        "--bootstrap-verifier-bridge",
+        `--bootstrap-probe-predecessor-version=${probePredecessor}`,
+        "--bootstrap-verifier-bridge",
       ],
     ] as const) {
       const refused = await deploy(args);
