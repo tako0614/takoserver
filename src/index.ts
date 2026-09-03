@@ -165,6 +165,14 @@ export {
   type ResourceMigrationState,
   type ResourceMigrationStore,
 } from "./resource-migrations.ts";
+export {
+  ROUTES,
+  type RouteDeclaration,
+  type RouteMethod,
+  TAKOFORM_LANES,
+  TAKOFORM_ROUTES,
+  takoformRoutePattern,
+} from "./route-table.ts";
 export { createRouter, type Router } from "./router.ts";
 export {
   createRuntimeInputAuthority,

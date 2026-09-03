@@ -1,5 +1,13 @@
+import { ROUTES, TAKOFORM_LANES, TAKOFORM_ROUTES, takoformRoutePattern } from "./route-table.ts";
+
 /**
  * The published API description.
+ *
+ * The document is *projected* from `route-table.ts`: that table says which
+ * routes exist, and the table below says what each one does. A route the table
+ * declares and this file does not describe fails to build, and a description
+ * no route names fails to build too — so the document can no longer be a
+ * second, quietly divergent statement of the surface.
  *
  * The literal stable Takoform Host lane is the only Host API described here.
  * Retired beta/alpha identities remain historical Takoform artifacts, never
@@ -8,91 +16,30 @@
  * and compared byte for byte in the gate.
  */
 
-const TAKOFORM_LANES = ["v1"] as const;
-
-/** Every Takoform Host path, relative to a lane mount. */
-const TAKOFORM_PATHS: readonly {
-  readonly path: string;
-  readonly methods: readonly { readonly method: string; readonly summary: string }[];
-}[] = [
-  { path: "/forms", methods: [{ method: "get", summary: "Resolve one exact installed Form" }] },
-  {
-    path: "/form-definitions/{group}/{kind}",
-    methods: [{ method: "get", summary: "Read an installed Form definition" }],
-  },
-  {
-    path: "/support/forms",
-    methods: [{ method: "get", summary: "List support profiles for installed Forms" }],
-  },
-  {
-    path: "/support/forms/{group}/{kind}/{definitionVersion}",
-    methods: [{ method: "get", summary: "Read one Form support profile" }],
-  },
-  {
-    path: "/support/interfaces/{name}/{version}",
-    methods: [{ method: "get", summary: "Read a provided Interface contract" }],
-  },
-  {
-    path: "/support/bindings/{name}/{version}",
-    methods: [{ method: "get", summary: "Read an accepted Binding contract" }],
-  },
-  {
-    path: "/resources/validate",
-    methods: [{ method: "post", summary: "Validate desired state without recording it" }],
-  },
-  {
-    path: "/resources/prepare",
-    methods: [{ method: "post", summary: "Review desired state and mint a prepare digest" }],
-  },
-  {
-    path: "/resources/{group}/{kind}/{name}",
-    methods: [
-      { method: "get", summary: "Read a resource" },
-      { method: "put", summary: "Apply reviewed desired state" },
-      { method: "delete", summary: "Delete a resource" },
-    ],
-  },
-  {
-    path: "/resources/{group}/{kind}/{name}/observe",
-    methods: [{ method: "post", summary: "Refresh observed state from the backend" }],
-  },
-  {
-    path: "/resources/{group}/{kind}/{name}/import",
-    methods: [{ method: "post", summary: "Adopt an existing native resource" }],
-  },
-  {
-    path: "/operations/{operationId}",
-    methods: [{ method: "get", summary: "Read a settled operation" }],
-  },
-  {
-    path: "/operations/{operationId}/cancel",
-    methods: [{ method: "post", summary: "Request cancellation of an operation" }],
-  },
-  {
-    path: "/artifacts/uploads",
-    methods: [{ method: "post", summary: "Start an artifact upload" }],
-  },
-  {
-    path: "/artifacts/uploads/{uploadId}",
-    methods: [{ method: "delete", summary: "Abandon an artifact upload" }],
-  },
-  {
-    path: "/artifacts/uploads/{uploadId}/commit",
-    methods: [{ method: "post", summary: "Commit an artifact upload" }],
-  },
-  {
-    path: "/artifacts/uploads/{uploadId}/blobs/{digest}",
-    methods: [{ method: "put", summary: "Upload one declared blob" }],
-  },
-  {
-    path: "/artifacts/{digest}",
-    methods: [{ method: "get", summary: "Read a committed manifest" }],
-  },
-  {
-    path: "/artifacts/blobs/{digest}",
-    methods: [{ method: "head", summary: "Check whether a blob is held" }],
-  },
-];
+/** Every Takoform Host route's published summary, by operation name. */
+const TAKOFORM_OPERATION_SUMMARIES: Readonly<Record<string, string>> = {
+  takoformResolveForm: "Resolve one exact installed Form",
+  takoformReadFormDefinition: "Read an installed Form definition",
+  takoformListSupportProfiles: "List support profiles for installed Forms",
+  takoformReadSupportProfile: "Read one Form support profile",
+  takoformReadInterfaceContract: "Read a provided Interface contract",
+  takoformReadBindingContract: "Read an accepted Binding contract",
+  takoformValidateResource: "Validate desired state without recording it",
+  takoformPrepareResource: "Review desired state and mint a prepare digest",
+  takoformReadResource: "Read a resource",
+  takoformApplyResource: "Apply reviewed desired state",
+  takoformDeleteResource: "Delete a resource",
+  takoformObserveResource: "Refresh observed state from the backend",
+  takoformImportResource: "Adopt an existing native resource",
+  takoformReadOperation: "Read a settled operation",
+  takoformCancelOperation: "Request cancellation of an operation",
+  takoformStartArtifactUpload: "Start an artifact upload",
+  takoformAbandonArtifactUpload: "Abandon an artifact upload",
+  takoformCommitArtifactUpload: "Commit an artifact upload",
+  takoformUploadArtifactBlob: "Upload one declared blob",
+  takoformReadArtifactManifest: "Read a committed manifest",
+  takoformHeadArtifactBlob: "Check whether a blob is held",
+};
 
 const IDENTIFIER_SCHEMA = { type: "string", minLength: 1, maxLength: 128 } as const;
 const RESOURCE_NAME_SCHEMA = {
@@ -244,117 +191,112 @@ const RUNTIME_INPUT_PREPARATION_OPERATIONS = {
   },
 } as const;
 
-const PUBLIC_PATHS: Record<string, Record<string, unknown>> = {
-  "/": operation("get", "Console", { security: [] }),
-  "/openapi.json": operation("get", "This document", { security: [] }),
-  "/.well-known/takoserver": operation("get", "Product discovery", { security: [] }),
-  "/.well-known/takoform/v1": operation("get", "Stable Takoform Host discovery", {
+const OPERATIONS: Record<string, Record<string, unknown>> = {
+  console: described("Console", { security: [] }),
+  openapiDocument: described("This document", { security: [] }),
+  productDiscovery: described("Product discovery", { security: [] }),
+  takoformDiscovery: described("Stable Takoform Host discovery", {
     security: [],
   }),
-  "/v1/identity/providers": operation("get", "Identity providers accepted for sign-in", {
+  identityProviders: described("Identity providers accepted for sign-in", {
     security: [],
   }),
-  "/v1/sessions": operation("post", "Exchange an external assertion for a session", {
+  createSession: described("Exchange an external assertion for a session", {
     security: [],
   }),
-  "/v1/me": operation("get", "Read the signed-in principal and the organizations it owns"),
-  "/v1/ai/models": operation("get", "List configured OpenAI-compatible models"),
-  "/v1/ai/chat/completions": operation(
-    "post",
-    "Create a prepaid OpenAI-compatible chat completion",
-    {
-      parameters: [
-        {
-          name: "Idempotency-Key",
-          in: "header",
-          required: true,
-          schema: { type: "string", minLength: 1, maxLength: 128 },
-          description: "Stable per paid inference; replays return the same settled result.",
-        },
-        {
-          name: "X-Takoserver-AI-Pricing-Revision",
-          in: "header",
-          required: false,
-          schema: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" },
-          description:
-            "Optional exact model pricing revision from /v1/ai/models; drift is rejected before inference.",
-        },
-      ],
+  endSession: {
+    summary: "Sign out and revoke the current session",
+    responses: {
+      "204": { description: "The session is revoked and its cookie cleared" },
+      "401": errorResponse("A session credential is required"),
     },
-  ),
-  "/v1/forms": operation("get", "List every Form definition this Host will accept", {
+  },
+  readPrincipal: described("Read the signed-in principal and the organizations it owns"),
+  listAiModels: described("List configured OpenAI-compatible models"),
+  createAiChatCompletion: described("Create a prepaid OpenAI-compatible chat completion", {
+    parameters: [
+      {
+        name: "Idempotency-Key",
+        in: "header",
+        required: true,
+        schema: { type: "string", minLength: 1, maxLength: 128 },
+        description: "Stable per paid inference; replays return the same settled result.",
+      },
+      {
+        name: "X-Takoserver-AI-Pricing-Revision",
+        in: "header",
+        required: false,
+        schema: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" },
+        description:
+          "Optional exact model pricing revision from /v1/ai/models; drift is rejected before inference.",
+      },
+    ],
+  }),
+  listHostForms: described("List every Form definition this Host will accept", {
     security: [],
   }),
-  "/v1/organizations": operation("post", "Create an Organization"),
-  "/v1/organizations/{organizationId}/api-keys": operations({
-    post: "Create a scoped API key",
-    get: "List the organization's live API keys",
-  }),
-  "/v1/worker-endpoint-origin-reservations/{reservationId}":
-    WORKER_ENDPOINT_ORIGIN_RESERVATION_OPERATIONS,
-  "/v1/worker-endpoint-origin-reservations/{reservationId}/activation":
-    WORKER_ENDPOINT_ORIGIN_ACTIVATION_OPERATIONS,
-  "/v1/takoform/worker-runtime-input-preparations/{operationKey}":
-    RUNTIME_INPUT_PREPARATION_OPERATIONS,
-  "/v1/organizations/{organizationId}/resources": operation(
-    "get",
-    "List the organization's Takoform resources",
-  ),
-  "/v1/organizations/{organizationId}/resources/{resourceUid}": operation(
-    "get",
-    "Read one exact organization Takoform resource",
-  ),
-  "/v1/organizations/{organizationId}/resources/{resourceUid}/native-residual": {
-    get: {
-      summary: "Prove provider-native absence after a Resource delete",
-      parameters: [
-        {
-          name: "space",
-          in: "query",
-          required: true,
-          schema: { type: "string", minLength: 1, maxLength: 255 },
-        },
-        {
-          name: "name",
-          in: "query",
-          required: true,
-          schema: { type: "string", minLength: 1, maxLength: 128 },
-        },
-      ],
-      responses: {
-        "200": {
-          description: "Closed tri-state native absence attestation",
-          content: {
-            "application/json": {
-              schema: {
-                type: "object",
-                required: ["residual"],
-                additionalProperties: false,
-                properties: {
-                  residual: {
-                    type: "object",
-                    required: ["status", "source", "effectCount", "deploymentCount", "checkedAt"],
-                    additionalProperties: false,
-                    properties: {
-                      status: { type: "string", enum: ["absent", "present", "indeterminate"] },
-                      source: { type: "string", enum: ["intrinsic", "provider"] },
-                      evidenceRef: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" },
-                      effectCount: { type: "integer", minimum: 0 },
-                      deploymentCount: { type: "integer", minimum: 0 },
-                      checkedAt: { type: "string", format: "date-time" },
-                      reason: {
-                        type: "string",
-                        enum: [
-                          "closure_pending",
-                          "effect_unresolved",
-                          "deployment_active",
-                          "deployment_unmarked",
-                          "provider_unavailable",
-                          "provider_readback_failed",
-                          "provider_identity_missing",
-                          "legacy_unattested",
-                        ],
-                      },
+  createOrganization: described("Create an Organization"),
+  createApiKey: described("Create a scoped API key"),
+  listApiKeys: described("List the organization's live API keys"),
+  prepareWorkerEndpointOriginReservation: WORKER_ENDPOINT_ORIGIN_RESERVATION_OPERATIONS.put,
+  readWorkerEndpointOriginReservation: WORKER_ENDPOINT_ORIGIN_RESERVATION_OPERATIONS.get,
+  releaseWorkerEndpointOriginReservation: WORKER_ENDPOINT_ORIGIN_RESERVATION_OPERATIONS.delete,
+  activateWorkerEndpointOrigin: WORKER_ENDPOINT_ORIGIN_ACTIVATION_OPERATIONS.put,
+  deactivateWorkerEndpointOrigin: WORKER_ENDPOINT_ORIGIN_ACTIVATION_OPERATIONS.delete,
+  prepareWorkerRuntimeInput: RUNTIME_INPUT_PREPARATION_OPERATIONS.put,
+  readWorkerRuntimeInput: RUNTIME_INPUT_PREPARATION_OPERATIONS.get,
+  revokeWorkerRuntimeInput: RUNTIME_INPUT_PREPARATION_OPERATIONS.delete,
+  listOrganizationResources: described("List the organization's Takoform resources"),
+  readOrganizationResource: described("Read one exact organization Takoform resource"),
+  readNativeResidual: {
+    summary: "Prove provider-native absence after a Resource delete",
+    parameters: [
+      {
+        name: "space",
+        in: "query",
+        required: true,
+        schema: { type: "string", minLength: 1, maxLength: 255 },
+      },
+      {
+        name: "name",
+        in: "query",
+        required: true,
+        schema: { type: "string", minLength: 1, maxLength: 128 },
+      },
+    ],
+    responses: {
+      "200": {
+        description: "Closed tri-state native absence attestation",
+        content: {
+          "application/json": {
+            schema: {
+              type: "object",
+              required: ["residual"],
+              additionalProperties: false,
+              properties: {
+                residual: {
+                  type: "object",
+                  required: ["status", "source", "effectCount", "deploymentCount", "checkedAt"],
+                  additionalProperties: false,
+                  properties: {
+                    status: { type: "string", enum: ["absent", "present", "indeterminate"] },
+                    source: { type: "string", enum: ["intrinsic", "provider"] },
+                    evidenceRef: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" },
+                    effectCount: { type: "integer", minimum: 0 },
+                    deploymentCount: { type: "integer", minimum: 0 },
+                    checkedAt: { type: "string", format: "date-time" },
+                    reason: {
+                      type: "string",
+                      enum: [
+                        "closure_pending",
+                        "effect_unresolved",
+                        "deployment_active",
+                        "deployment_unmarked",
+                        "provider_unavailable",
+                        "provider_readback_failed",
+                        "provider_identity_missing",
+                        "legacy_unattested",
+                      ],
                     },
                   },
                 },
@@ -362,86 +304,46 @@ const PUBLIC_PATHS: Record<string, Record<string, unknown>> = {
             },
           },
         },
-        "400": errorResponse("Invalid exact address query"),
-        "401": errorResponse("Authentication required"),
-        "404": errorResponse("Resource incarnation not found"),
-        "503": errorResponse("Absence evidence is unavailable"),
       },
+      "400": errorResponse("Invalid exact address query"),
+      "401": errorResponse("Authentication required"),
+      "404": errorResponse("Resource incarnation not found"),
+      "503": errorResponse("Absence evidence is unavailable"),
     },
   },
-  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations": operations({
-    get: "List explicit provider migrations for one logical Resource",
-    post: "Plan a migration against an exact commercial reservation",
-  }),
-  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}": operation(
-    "get",
-    "Read one Resource Migration",
+  listResourceMigrations: described("List explicit provider migrations for one logical Resource"),
+  planResourceMigration: described("Plan a migration against an exact commercial reservation"),
+  readResourceMigration: described("Read one Resource Migration"),
+  executeResourceMigration: described("Provision, transfer, and verify a candidate Deployment"),
+  cutoverResourceMigration: described(
+    "Atomically activate the candidate and re-resolve Attachments",
   ),
-  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/execute":
-    operation("post", "Provision, transfer, and verify a candidate Deployment"),
-  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/cutover":
-    operation("post", "Atomically activate the candidate and re-resolve Attachments"),
-  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/rollback":
-    operation("post", "Restore the retained Deployment and Attachment resolutions"),
-  "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/cancel":
-    operation("post", "Delete an uncut candidate and release its commercial reservation"),
-  "/v1/organizations/{organizationId}/attachments": operations({
-    get: "List the organization's Resource Attachments",
-    post: "Resolve and create a Resource Attachment",
-  }),
-  "/v1/organizations/{organizationId}/attachments/{attachmentId}": operations({
-    get: "Read one Resource Attachment",
-    delete: "Delete one Resource Attachment",
-  }),
-  "/v1/organizations/{organizationId}/operations": operation(
-    "get",
-    "List the organization's recent Takoform operations",
+  rollbackResourceMigration: described(
+    "Restore the retained Deployment and Attachment resolutions",
   ),
-  "/v1/organizations/{organizationId}/api-keys/{apiKeyId}": operation(
-    "delete",
-    "Revoke an API key",
+  cancelResourceMigration: described(
+    "Delete an uncut candidate and release its commercial reservation",
   ),
-  "/v1/organizations/{organizationId}/wallet": operation("get", "Read the prepaid wallet"),
-  "/v1/organizations/{organizationId}/wallet/checkout": operation(
-    "post",
-    "Begin a card payment for this organization",
-  ),
-  "/v1/organizations/{organizationId}/wallet/funding": operation(
-    "post",
-    "Credit the wallet from a verified settlement proof",
-  ),
-  "/v1/catalog": operation("get", "List purchasable offerings"),
-  "/v1/reseller/quotes": operation("post", "Price an offering for a tenant"),
-  "/v1/reseller/reservations": operation("post", "Reserve a quote, holding funds"),
-  "/v1/reseller/reservations/{reservationId}/capture": operation(
-    "post",
-    "Capture a reservation against reported usage",
-  ),
-  "/v1/reseller/reservations/{reservationId}/release": operation(
-    "post",
-    "Release a reservation and return its hold",
-  ),
-  "/v1/reseller/reservations/{reservationId}/provision-tokens": operation(
-    "post",
-    "Mint a single-use provisioning token for a reservation",
-  ),
-  "/v1/reseller/reservations/{reservationId}/takoform-run-tokens": operation(
-    "post",
+  listAttachments: described("List the organization's Resource Attachments"),
+  createAttachment: described("Resolve and create a Resource Attachment"),
+  readAttachment: described("Read one Resource Attachment"),
+  deleteAttachment: described("Delete one Resource Attachment"),
+  listOrganizationOperations: described("List the organization's recent Takoform operations"),
+  revokeApiKey: described("Revoke an API key"),
+  readWallet: described("Read the prepaid wallet"),
+  beginWalletCheckout: described("Begin a card payment for this organization"),
+  creditWalletFromSettlement: described("Credit the wallet from a verified settlement proof"),
+  listOfferings: described("List purchasable offerings"),
+  createResellerQuote: described("Price an offering for a tenant"),
+  createResellerReservation: described("Reserve a quote, holding funds"),
+  captureResellerReservation: described("Capture a reservation against reported usage"),
+  releaseResellerReservation: described("Release a reservation and return its hold"),
+  mintProvisionToken: described("Mint a single-use provisioning token for a reservation"),
+  mintTakoformRunToken: described(
     "Mint a short-lived exact-Resource bearer for an ordinary Takoform provider run",
   ),
-  "/v1/reseller/reservations/{reservationId}/usage-statement": operation(
-    "get",
-    "Read the usage statement of a captured reservation",
-  ),
+  readUsageStatement: described("Read the usage statement of a captured reservation"),
 };
-
-/** One path that answers to more than one method. */
-function operations(summaries: Readonly<Record<string, string>>): Record<string, unknown> {
-  return Object.assign(
-    {},
-    ...Object.entries(summaries).map(([method, summary]) => operation(method, summary)),
-  ) as Record<string, unknown>;
-}
 
 function reservationResponse(description: string) {
   return {
@@ -537,8 +439,8 @@ function runtimeInputResponse(description: string) {
   } as const;
 }
 
-function operation(
-  method: string,
+/** One published operation description, addressed by its operation name. */
+function described(
   summary: string,
   extra: {
     readonly security?: readonly unknown[];
@@ -546,25 +448,57 @@ function operation(
   } = {},
 ): Record<string, unknown> {
   return {
-    [method]: {
-      summary,
-      responses: { "200": { description: "Success" } },
-      ...(extra.security ? { security: extra.security } : {}),
-      ...(extra.parameters ? { parameters: extra.parameters } : {}),
-    },
+    summary,
+    responses: { "200": { description: "Success" } },
+    ...(extra.security ? { security: extra.security } : {}),
+    ...(extra.parameters ? { parameters: extra.parameters } : {}),
   };
 }
 
-function takoformPaths(): Record<string, Record<string, unknown>> {
+/**
+ * The published `paths` object, projected from the route table.
+ *
+ * Both directions are refused here rather than reviewed: a documented route
+ * with no description cannot build, and a description no documented route names
+ * cannot build. Internal seams are declared in the table and deliberately left
+ * out of the document.
+ */
+function documentedPaths(): Record<string, Record<string, unknown>> {
   const paths: Record<string, Record<string, unknown>> = {};
-  for (const lane of TAKOFORM_LANES) {
-    for (const entry of TAKOFORM_PATHS) {
-      const methods: Record<string, unknown> = {};
-      for (const { method, summary } of entry.methods) {
-        methods[method] = { summary, responses: { "200": { description: "Success" } } };
-      }
-      paths[`/apis/forms.takoform.com/${lane}${entry.path}`] = methods;
+  const used = new Set<string>();
+  for (const route of ROUTES) {
+    if (route.internal) continue;
+    const described = OPERATIONS[route.operation];
+    if (described === undefined) {
+      throw new Error(`route ${route.method.toUpperCase()} ${route.pattern} has no description`);
     }
+    used.add(route.operation);
+    const methods = paths[route.pattern] ?? {};
+    paths[route.pattern] = methods;
+    methods[route.method] = described;
+  }
+  for (const lane of TAKOFORM_LANES) {
+    for (const route of TAKOFORM_ROUTES) {
+      const summary = TAKOFORM_OPERATION_SUMMARIES[route.operation];
+      if (summary === undefined) {
+        throw new Error(`Takoform Host route ${route.operation} has no summary`);
+      }
+      const pattern = takoformRoutePattern(lane, route.pattern);
+      const methods = paths[pattern] ?? {};
+      paths[pattern] = methods;
+      methods[route.method] = { summary, responses: { "200": { description: "Success" } } };
+    }
+  }
+  const unusedControl = Object.keys(OPERATIONS).filter((name) => !used.has(name));
+  if (unusedControl.length > 0) {
+    throw new Error(`described operations no route declares: ${unusedControl.join(", ")}`);
+  }
+  const declaredTakoform = new Set(TAKOFORM_ROUTES.map((route) => route.operation));
+  const unusedTakoform = Object.keys(TAKOFORM_OPERATION_SUMMARIES).filter(
+    (name) => !declaredTakoform.has(name),
+  );
+  if (unusedTakoform.length > 0) {
+    throw new Error(`Takoform summaries no route declares: ${unusedTakoform.join(", ")}`);
   }
   return paths;
 }
@@ -825,7 +759,7 @@ export const openApiDocument = {
       },
     },
   },
-  paths: { ...PUBLIC_PATHS, ...takoformPaths() },
+  paths: documentedPaths(),
 } as const;
 
 /**

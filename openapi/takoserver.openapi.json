@@ -600,6 +600,26 @@
         "security": []
       }
     },
+    "/v1/session": {
+      "delete": {
+        "summary": "Sign out and revoke the current session",
+        "responses": {
+          "204": {
+            "description": "The session is revoked and its cookie cleared"
+          },
+          "401": {
+            "description": "A session credential is required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/me": {
       "get": {
         "summary": "Read the signed-in principal and the organizations it owns",
