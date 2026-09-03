@@ -1,4 +1,8 @@
 import type { Clock, ObjectStoreAccess, Row, Sql, SqlStatement } from "../ports.ts";
+import {
+  createExactArtifactRecoveryMutations,
+  type ExactArtifactRecoveryMutations,
+} from "./artifact-recovery.ts";
 
 const MAXIMUM_SWEEP_LIMIT = 64;
 const CANDIDATE_QUARANTINE_MILLISECONDS = 60 * 60_000;
@@ -94,7 +98,7 @@ export interface ExactFailedRunRepairResult {
   readonly externalDeleteIssued: false;
 }
 
-export interface ArtifactReconciler {
+export interface ArtifactReconciler extends ExactArtifactRecoveryMutations {
   dryRun(input: { readonly limit: number }): Promise<ArtifactMaintenancePlan>;
   status(): Promise<ArtifactMaintenanceStatus>;
   repairExactFailedRun(input: ExactFailedRunRepairRequest): Promise<ExactFailedRunRepairResult>;
@@ -143,6 +147,7 @@ export function createTakoformArtifactReconciler(
   options: CreateArtifactReconcilerOptions,
 ): ArtifactReconciler {
   const { sql, objects, clock } = options;
+  const exactRecovery = createExactArtifactRecoveryMutations(options);
   const now = (): number => clock().getTime();
 
   const missingHolds = async (limit: number): Promise<readonly MissingHold[]> => {
@@ -456,6 +461,20 @@ export function createTakoformArtifactReconciler(
            WHERE candidate.kind = proposed.kind AND candidate.digest = proposed.digest
              AND candidate.state IN ('pending', 'deleting', 'retry')
          )
+         AND NOT EXISTS (
+           SELECT 1 FROM tf_artifact_owner_closure_receipts AS recovery
+           WHERE recovery.receipt_id GLOB 'afr_*'
+             AND length(recovery.receipt_id) = 68
+             AND substr(recovery.receipt_id, 5) NOT GLOB '*[^0-9a-f]*'
+             AND (
+               (proposed.kind = 'manifest' AND recovery.manifest_digest = proposed.digest) OR
+               (proposed.kind = 'blob' AND EXISTS (
+                 SELECT 1 FROM tf_artifact_manifest_members AS recovery_member
+                 WHERE recovery_member.manifest_digest = recovery.manifest_digest
+                   AND recovery_member.blob_digest = proposed.digest
+               ))
+             )
+         )
        ORDER BY proposed.kind, proposed.digest
        LIMIT ?`,
       [limit],
@@ -470,8 +489,25 @@ export function createTakoformArtifactReconciler(
     const rows = await sql.query(
       `SELECT kind, digest, state, fence, expected_etag
        FROM tf_artifact_gc_candidates
-       WHERE state = 'deleting'
-          OR (state IN ('pending', 'retry') AND not_before <= ?)
+       WHERE (
+         state = 'deleting'
+         OR (state IN ('pending', 'retry') AND not_before <= ?)
+       )
+         AND NOT EXISTS (
+           SELECT 1 FROM tf_artifact_owner_closure_receipts AS recovery
+           WHERE recovery.receipt_id GLOB 'afr_*'
+             AND length(recovery.receipt_id) = 68
+             AND substr(recovery.receipt_id, 5) NOT GLOB '*[^0-9a-f]*'
+             AND (
+               (tf_artifact_gc_candidates.kind = 'manifest'
+                 AND recovery.manifest_digest = tf_artifact_gc_candidates.digest) OR
+               (tf_artifact_gc_candidates.kind = 'blob' AND EXISTS (
+                 SELECT 1 FROM tf_artifact_manifest_members AS recovery_member
+                 WHERE recovery_member.manifest_digest = recovery.manifest_digest
+                   AND recovery_member.blob_digest = tf_artifact_gc_candidates.digest
+               ))
+             )
+         )
        ORDER BY CASE state WHEN 'deleting' THEN 0 ELSE 1 END,
                 updated_at, kind, digest
        LIMIT ?`,
@@ -695,6 +731,7 @@ export function createTakoformArtifactReconciler(
   };
 
   return {
+    ...exactRecovery,
     async dryRun(input) {
       const limit = boundedLimit(input.limit);
       const [holds, replays, candidates, evidence] = await Promise.all([

@@ -210,6 +210,27 @@ test("public Worker, router, and OpenAPI graphs reach readers but never Form aut
   expect(reachable.has("src/takoform/stable-production-catalog.ts")).toBe(false);
 });
 
+test("only the named Worker RPC graph reaches exact artifact recovery", async () => {
+  const [router, openapi, worker] = await Promise.all([
+    reachableModules(["src/router.ts"]),
+    reachableModules(["src/openapi.ts"]),
+    reachableModules(["src/entry-cloudflare-worker.ts"]),
+  ]);
+  for (const publicGraph of [router, openapi]) {
+    expect(publicGraph.has("src/artifact-recovery-worker.ts")).toBe(false);
+    expect(publicGraph.has("src/takoform/artifact-recovery.ts")).toBe(false);
+  }
+  expect(worker.has("src/artifact-recovery-worker.ts")).toBe(true);
+  expect(worker.has("src/takoform/artifact-recovery.ts")).toBe(true);
+
+  const entry = await loadAuthorityModule("../src/entry-cloudflare-worker.ts");
+  const prototype = (
+    entry.ExactFailedRunArtifactRecoveryEntrypoint as { readonly prototype: object }
+  ).prototype;
+  expect(Reflect.has(prototype, "recoverExactFailedRunArtifact")).toBe(true);
+  expect(Reflect.has(prototype, "fetch")).toBe(false);
+});
+
 test("route-less Form authority Workers own the writer graph and no public routes", async () => {
   const [production, integration] = await Promise.all([
     reachableModules(["src/entry-form-authority-worker.ts"]),

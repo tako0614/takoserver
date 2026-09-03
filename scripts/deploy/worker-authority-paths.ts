@@ -67,22 +67,20 @@ const DECLARED_AUTHORITY_MODULES = [
 /**
  * Authorities whose implementation — not just their entry module — is the
  * authority: the prepaid ledger and its Stripe settlement (money), the sealed
- * runtime-input handoff and its AES-256-GCM key ring (customer secrets), and
- * the durable Takoform resource store (the record every later decision is read
- * back from).
+ * runtime-input handoff and its AES-256-GCM key ring (customer secrets), the
+ * durable Takoform resource store (the record every later decision is read
+ * back from), and the exact artifact-recovery writer (irreversible deletion).
  *
  * These are walked because a change to anything they depend on at runtime
- * changes what the authority does. They are leaf-ward: their whole closure is
- * ten modules, and every module in it beyond these five roots was already
- * classified through the public Form P/I closure below, so making the walk
- * authoritative widened the lane by exactly these five files and nothing else.
- *
- * Before this list existed, all five classified as *routine*. A change to the
- * claim state machine, to the seal key ring, or to the settlement path could be
- * published with no reviewer named and `authorityPaths: []` recorded in the
- * receipt as positive evidence that nothing sensitive had changed.
+ * changes what the authority does. They are leaf-ward, so the closure does not
+ * pull rendering, catalogs, or the public router into the reviewed lane.
+ * Without this walk, a change to a claim state machine, seal key ring,
+ * settlement path, or exact object deleter could be published with no reviewer
+ * named and `authorityPaths: []` recorded as positive evidence that nothing
+ * sensitive had changed.
  */
 const AUTHORITY_IMPLEMENTATION_ROOTS = [
+  "src/artifact-recovery-worker.ts",
   "src/ledger.ts",
   "src/runtime-input-preparations.ts",
   "src/runtime-input-seal-keyring.ts",
@@ -122,8 +120,8 @@ export function publicFormIdentityAuthorityPaths(): readonly string[] {
 }
 
 /**
- * The money, customer-secret and durable-store authority closure, derived the
- * same way and from the same import scanner as the P/I closure above.
+ * The money, customer-secret, durable-store, and irreversible-recovery
+ * authority closure, derived from the same scanner as the P/I closure above.
  */
 export function authorityImplementationClosure(): readonly string[] {
   if (authorityImplementationPaths !== undefined) return authorityImplementationPaths;

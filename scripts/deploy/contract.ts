@@ -49,6 +49,8 @@ const orgApiKeyInput =
   "read: this surface acts through the Host's own published organization API, not through the provider.";
 const closureSecretDirectoryInput =
   "`TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY` is required for `--apply` only, and only when the declared closure delta names an added or rotated secret; `--status` never reads it.";
+const artifactRecoveryRequestInput =
+  "`TAKOSERVER_ARTIFACT_RECOVERY_REQUEST_PATH` is required for both `--status` and `--apply`; it must name one absolute, regular, link-free, current-owner 0600 file containing the canonical exact 28-member request.";
 
 function inputContractWithToken(
   tokenRequirement: string,
@@ -466,6 +468,62 @@ export const DEPLOY_CONTRACT = {
           "public closure, reverse, activation, and any third scope are refused before signing; refusal " +
           "output never includes raw binding JSON or an actual, predecessor, or foreign scope." +
           inputContract(applyReviewInput, formAuthorityPrivateJwkInput),
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-integration-exact-failed-run-artifact-recovery",
+      target: "service-rpc:integration-exact-live-worker-artifact-recovery",
+      covers: [
+        "src/entry-cloudflare-worker.ts",
+        "src/entry-integration-exact-artifact-recovery-caller.ts",
+        "src/artifact-recovery-worker.ts",
+        "src/takoform/artifact-recovery.ts",
+        "src/takoform/artifact-reconciler.ts",
+        "scripts/deploy.ts",
+        "scripts/deploy/artifact-recovery.ts",
+        "scripts/deploy/target.ts",
+        "scripts/deploy/worker-live.ts",
+        "scripts/deploy/worker-state.ts",
+      ],
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_ARTIFACT_RECOVERY_REQUEST_PATH",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+      ],
+      triggers: ["irreversible", "authority"],
+      obligations: {
+        provenance:
+          `${exactSource} Integration only. The request is an owner-0600 canonical commitment to ` +
+          "one run principal, upload/manifest, upload/root fences, exact 28-member, hold and replay " +
+          "sets, failed-run evidence and closure timestamp. Cloudflare's immutable live Worker Version, " +
+          "source annotation and exhaustive binding closure are selected before any RPC. Apply requires " +
+          "an independent reviewer, runs the scoped owner `bun run check` exactly once before caller " +
+          "startup, and re-fences the same live identity immediately before the single apply RPC.",
+        "post-conditions":
+          "Status performs only durable/R2 reads through the live Worker's named service RPC. Apply " +
+          "issues one deterministic append-only closure receipt, releases only the exact upload/replay " +
+          "roots, quarantines exactly one manifest and 28 blobs for at least one hour, and settles only " +
+          "that set behind ETag/fence checks. Final readback retains the committed upload and receipt, " +
+          "proves 29 tombstones, no manifest/member/hold/replay metadata, and exact R2 blob absence.",
+        reversal:
+          "Object deletion is irreversible. Before quarantine expires the retained upload and receipt " +
+          "provide diagnosis but not rollback; after deletion the only recovery is a separately authorized " +
+          "re-upload from independently retained source bytes.",
+        "failure-handling":
+          "The public fetch/router/OpenAPI graph has no recovery route. A 127.0.0.1 temporary remote-dev " +
+          "caller with one random bearer and only the named RPC binding is destroyed after each invocation. " +
+          "Redirects, malformed/oversized responses, timeout, child failure, source/binding/Version drift, " +
+          "consumer uncertainty, live/foreign/shared roots and every exact-set mismatch fail closed. Apply " +
+          "is sent once; any transport or acknowledgement failure is indeterminate and requires a separate " +
+          "status invocation before another apply. R2-delete/SQL-settlement loss is recovered from the " +
+          "durable deleting fence and object absence without a blind second DELETE." +
+          inputContract(applyReviewInput, artifactRecoveryRequestInput),
+        "pre-mutation-proof":
+          "Canonical status derives the phase from the exact upload/root fences, receipt, replay/hold/member " +
+          "sets, candidate fences and R2 ETags before any mutation; no caller boolean can assert closure.",
         "independent-review": review,
       },
     },

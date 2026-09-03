@@ -31,6 +31,7 @@ const SURFACES = [
   ["takoserver-integration-form-authority-operator-worker", ["authority"]],
   ["takoserver-integration-form-authority", ["authority"]],
   ["takoserver-integration-form-authority-deactivation", ["authority"]],
+  ["takoserver-integration-exact-failed-run-artifact-recovery", ["irreversible", "authority"]],
   ["takoserver-integration-e2e-credentials", ["authority"]],
   ["takoserver-site", []],
   ["takoserver-console", []],
@@ -90,6 +91,9 @@ describe("Takoserver split deploy entrypoint", () => {
     );
     const credentials = contract.surfaces.find(
       ({ surface }) => surface === "takoserver-integration-e2e-credentials",
+    );
+    const artifactRecovery = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-integration-exact-failed-run-artifact-recovery",
     );
     const hosted = contract.surfaces.find(
       ({ surface }) => surface === "takoserver-hosted-token-cutover",
@@ -173,6 +177,17 @@ describe("Takoserver split deploy entrypoint", () => {
       "distinct 3600-second writer and external-evidence secrets",
     );
     expect(credentials?.obligations.reversal).toContain("current dedicated authority");
+    expect(artifactRecovery?.obligations.provenance).toContain("exact 28-member");
+    expect(artifactRecovery?.obligations.provenance).toContain(
+      "owner `bun run check` exactly once",
+    );
+    expect(artifactRecovery?.obligations.provenance).toContain(
+      "immediately before the single apply RPC",
+    );
+    expect(artifactRecovery?.obligations["post-conditions"]).toContain("29 tombstones");
+    expect(artifactRecovery?.obligations["failure-handling"]).toContain(
+      "requires a separate status invocation",
+    );
     expect(hosted?.obligations.provenance).toContain(
       "canonical token-present proof-only apply is available in every environment",
     );
@@ -820,6 +835,31 @@ describe("Takoserver split deploy entrypoint", () => {
       expect(refused.stdout).toBe("");
       expect(refused.stderr).toContain("no target was touched");
       expect(refused.stderr).not.toContain("deploy target descriptor");
+    }
+  });
+
+  test("parses exact failed-run artifact recovery only in integration", async () => {
+    const sha = "a".repeat(40);
+    const accepted = await deploy([
+      "takoserver-integration-exact-failed-run-artifact-recovery",
+      "--status",
+      "--environment=integration",
+      `--commit=${sha}`,
+    ]);
+    expect(accepted.exitCode).toBe(2);
+    expect(accepted.stderr).toContain("deploy target descriptor not found");
+    expect(accepted.stderr).not.toContain("no target was touched");
+
+    for (const environment of ["rehearsal", "production"] as const) {
+      const refused = await deploy([
+        "takoserver-integration-exact-failed-run-artifact-recovery",
+        "--apply",
+        `--environment=${environment}`,
+        `--commit=${sha}`,
+      ]);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
     }
   });
 

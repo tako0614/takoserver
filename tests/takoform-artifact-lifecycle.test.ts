@@ -1109,5 +1109,14 @@ describe("Takoform artifact lifecycle", () => {
     );
     expect(response.status).toBe(404);
     expect(await response.json()).toEqual({ error: { code: "not_found", message: "not found" } });
+    const exactRecovery = await app.fetch(
+      new Request("https://api.test/__maintenance/artifacts/exact-failed-run-recovery", {
+        method: "POST",
+      }),
+    );
+    expect(exactRecovery.status).toBe(404);
+    expect(await exactRecovery.json()).toEqual({
+      error: { code: "not_found", message: "not found" },
+    });
   });
 });

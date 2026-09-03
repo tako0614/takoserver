@@ -245,19 +245,34 @@ describe("split Takoserver Worker surfaces", () => {
     expect(authoritySensitiveWorkerPaths(authorities)).toEqual(authorities);
   });
 
-  test("derives the money, secret, and durable-store closure from the import graph", () => {
-    // A new runtime dependency of any of the five roots classifies without an
-    // edit here. Every module below beyond the roots themselves was already
-    // inside the public Form P/I closure, so making this walk authoritative
-    // widened the reviewed lane by exactly the five roots and nothing else.
+  test("classifies the exact artifact recovery writer closure as authority", () => {
+    const authorities = [
+      "src/artifact-recovery-worker.ts",
+      "src/objects-r2.ts",
+      "src/sql-d1.ts",
+      "src/takoform/artifact-reconciler.ts",
+      "src/takoform/artifact-recovery.ts",
+    ];
+    expect(authoritySensitiveWorkerPaths(authorities)).toEqual(authorities);
+  });
+
+  test("derives the irreversible and stateful authority closure from the import graph", () => {
+    // A new runtime dependency of any root classifies without an edit here.
+    // The closure is kept leaf-ward so rendering and catalog code remain in
+    // the routine lane.
     expect(authorityImplementationClosure()).toEqual([
+      "src/artifact-recovery-worker.ts",
       "src/json.ts",
       "src/ledger.ts",
+      "src/objects-r2.ts",
       "src/ports.ts",
       "src/provider-runtime-input-port.ts",
       "src/runtime-input-preparations.ts",
       "src/runtime-input-seal-keyring.ts",
+      "src/sql-d1.ts",
       "src/stripe-settlement.ts",
+      "src/takoform/artifact-reconciler.ts",
+      "src/takoform/artifact-recovery.ts",
       "src/takoform/limits.ts",
       "src/takoform/space-id.ts",
       "src/takoform/store.ts",
@@ -267,10 +282,15 @@ describe("split Takoserver Worker surfaces", () => {
     expect(
       authorityImplementationClosure().filter((path) => !previouslyClassified.has(path)),
     ).toEqual([
+      "src/artifact-recovery-worker.ts",
       "src/ledger.ts",
+      "src/objects-r2.ts",
       "src/runtime-input-preparations.ts",
       "src/runtime-input-seal-keyring.ts",
+      "src/sql-d1.ts",
       "src/stripe-settlement.ts",
+      "src/takoform/artifact-reconciler.ts",
+      "src/takoform/artifact-recovery.ts",
       "src/takoform/store.ts",
     ]);
   });

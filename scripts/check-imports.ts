@@ -89,7 +89,7 @@ const LAYERS: readonly Layer[] = [
     // `payment-setup` builds the shape the routes layer asks for, which makes
     // it composition rather than domain: it is allowed to know both halves.
     match:
-      /^src\/(?:app|compat|cloudflare-runtime-binding-materializer|deployment-composition|form-authority-(?:identity-probe|public-identity|worker-composition)|integration-form-authority-gateway|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|public-form-(?:implementation-build|runtime)|public-worker-implementation|runtime-input-seal-keyring|selfhost-composition|selfhost-data-planes|selfhost-object-store|selfhost-queue-pump|selfhost-runtime-binding-materializer|selfhost-scheduler|standalone-provider-composition|worker-data-services|worker-(?:production|stable-local)-composition)\.ts$|^src\/takoform\/(?:host-admission-endpoint|integration-operator-endpoint)\.ts$/u,
+      /^src\/(?:app|artifact-recovery-worker|compat|cloudflare-runtime-binding-materializer|deployment-composition|form-authority-(?:identity-probe|public-identity|worker-composition)|integration-form-authority-gateway|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|public-form-(?:implementation-build|runtime)|public-worker-implementation|runtime-input-seal-keyring|selfhost-composition|selfhost-data-planes|selfhost-object-store|selfhost-queue-pump|selfhost-runtime-binding-materializer|selfhost-scheduler|standalone-provider-composition|worker-data-services|worker-(?:production|stable-local)-composition)\.ts$|^src\/takoform\/(?:host-admission-endpoint|integration-operator-endpoint)\.ts$/u,
     may: ["core", "adapter", "domain", "routes", "app", "release-data"],
   },
   // An entry chooses concrete implementations — that is its whole job. What it
@@ -257,6 +257,18 @@ if (existsSync("src/entry-form-authority-worker.ts")) {
   ]) {
     if (production.has(fixture)) {
       violations.push(`production Form authority Worker imports integration fixture ${fixture}`);
+    }
+  }
+}
+
+// The public entry hosts a named service-binding RPC beside the default
+// product export, but no HTTP router or generated OpenAPI graph may reach its
+// writer composition. This is the static half of the no-public-route proof.
+for (const entry of ["src/router.ts", "src/openapi.ts"]) {
+  const reachable = reachableFrom([entry]);
+  for (const writer of ["src/artifact-recovery-worker.ts", "src/takoform/artifact-recovery.ts"]) {
+    if (reachable.has(writer)) {
+      violations.push(`${entry} transitively imports exact artifact recovery writer ${writer}`);
     }
   }
 }

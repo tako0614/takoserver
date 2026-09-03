@@ -1,5 +1,6 @@
 import { isAbsolute } from "node:path";
 import { API_KEY_SCOPES, type ApiKeyScope } from "../src/auth.ts";
+import { runExactArtifactRecovery } from "./deploy/artifact-recovery.ts";
 import { runConsole } from "./deploy/console.ts";
 import { DEPLOY_CONTRACT } from "./deploy/contract.ts";
 import { DeployError, deployFailureAftermath, PHASE_EXIT_CODE } from "./deploy/errors.ts";
@@ -63,6 +64,8 @@ const USAGE = `takoserver deploy
   Worker has no Version at all, together with
   --bootstrap-probe-predecessor-version=<uuid>. The pinned identity-probe Version must already be
   the exact predecessor missing only FORM_AUTHORITY; it is checked again at the mutation fence.
+  Exact failed-run artifact recovery is integration-only and reads its canonical request from
+  TAKOSERVER_ARTIFACT_RECOVERY_REQUEST_PATH; apply requires TAKOSERVER_INDEPENDENT_REVIEW.
 
 The target descriptor is selected only by the exact environment. There is no
 deploy-plan flag, ledger, target override or mixed mutation controller.
@@ -494,6 +497,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       surfaceValue === "takoserver-integration-form-authority-operator-worker" ||
       surfaceValue === "takoserver-integration-form-authority" ||
       surfaceValue === "takoserver-integration-form-authority-deactivation" ||
+      surfaceValue === "takoserver-integration-exact-failed-run-artifact-recovery" ||
       surfaceValue === "takoserver-integration-e2e-credentials") &&
     environment !== "integration"
   ) {
@@ -851,6 +855,16 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
           environment: invocation.environment,
           commit: invocation.commit,
           ...(scopeTransition === undefined ? {} : { scopeTransition }),
+        },
+        target,
+      );
+    case "takoserver-integration-exact-failed-run-artifact-recovery":
+      return await runExactArtifactRecovery(
+        {
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
         },
         target,
       );

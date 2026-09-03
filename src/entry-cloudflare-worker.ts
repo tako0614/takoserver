@@ -1,4 +1,5 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
+import { invokeArtifactRecoveryRpc } from "./artifact-recovery-worker.ts";
 import worker, {
   requirePublicOrigin,
   resolvePublicWorkerImplementationIdentity,
@@ -19,6 +20,13 @@ export class PublicHostIdentityEntrypoint extends WorkerEntrypoint<WorkerEnv> {
       capabilityDigest: implementation.capabilityDigest,
       implementationDigest: implementation.implementationDigest,
     });
+  }
+}
+
+/** Integration-only owner maintenance RPC; deliberately has no fetch method. */
+export class ExactFailedRunArtifactRecoveryEntrypoint extends WorkerEntrypoint<WorkerEnv> {
+  async recoverExactFailedRunArtifact(input: unknown) {
+    return await invokeArtifactRecoveryRpc(this.env, input);
   }
 }
 
