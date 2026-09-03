@@ -4,6 +4,8 @@ import {
   type ApplyInput,
   failed,
   PROVIDER_READBACK_API_VERSION,
+  type ProviderArtifactConsumption,
+  type ProviderArtifactConsumptionInput,
   type ProviderNativeAbsence,
   type ProviderNativeReadbackDescriptor,
   type ProviderNativeReadbackInput,
@@ -426,18 +428,23 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
   }): Promise<ProviderNativeAbsence> {
     const raw = record(input.descriptor);
     const data = record(raw?.data);
+    const kind = providerKind(input.offering);
+    const native = typeof raw?.nativeId === "string" ? parseManagedNativeId(raw.nativeId) : null;
     if (
       !this.owns(input.offering) ||
       raw?.apiVersion !== PROVIDER_READBACK_API_VERSION ||
       raw.provider !== this.#providerId ||
-      raw.kind !== providerKind(input.offering) ||
-      typeof raw.nativeId !== "string" ||
-      !managedNativeId(raw.nativeId) ||
+      raw.kind !== kind ||
+      !native ||
+      (kind === "WorkerVersion") !== (native.kind === "version") ||
       !data ||
       Object.keys(data).length !== 1 ||
       typeof data.resourceUid !== "string"
     ) {
       return { outcome: "unknown", reason: "malformed", retryable: false };
+    }
+    if (native.kind === "version") {
+      return await this.#verifyWorkerVersionNativeAbsence(native.name, kind);
     }
     let receipt: ManagedWorkerReceipt | null;
     try {
@@ -448,22 +455,100 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
         : { outcome: "unknown", reason: "transport", retryable: true };
     }
     if (!receipt || receipt.nativeId !== raw.nativeId) {
-      return absence("absent", this.#providerId, raw.kind);
+      return { outcome: "unknown", reason: "authority_unavailable", retryable: false };
     }
-    if (receipt.state === "deleted") return absence("absent", this.#providerId, raw.kind);
     if (receipt.state === "pending" || receipt.state === "deleting") {
       return { outcome: "unknown", reason: "authority_unavailable", retryable: true };
     }
+    if (receipt.state === "deleted") {
+      return { outcome: "unknown", reason: "authority_unavailable", retryable: false };
+    }
     if (receipt.kind === "version") {
-      const native = parseManagedNativeId(receipt.nativeId);
-      if (native?.kind !== "version") {
+      return { outcome: "unknown", reason: "malformed", retryable: false };
+    }
+    return absence("present", this.#providerId, kind);
+  }
+
+  async #verifyWorkerVersionNativeAbsence(
+    scriptName: string,
+    kind: string,
+  ): Promise<ProviderNativeAbsence> {
+    const absent = await this.#client.scriptAbsent(scriptName);
+    if (absent.ok === false) return absenceFailure(absent);
+    return absence(absent.value ? "absent" : "present", this.#providerId, kind);
+  }
+
+  async verifyArtifactConsumption(
+    input: ProviderArtifactConsumptionInput,
+  ): Promise<ProviderArtifactConsumption> {
+    const kind = providerKind(input.offering);
+    const native = parseManagedNativeId(input.nativeId);
+    if (
+      !this.owns(input.offering) ||
+      !native ||
+      (kind === "WorkerVersion") !== (native.kind === "version")
+    ) {
+      return { outcome: "unknown", reason: "malformed", retryable: false };
+    }
+
+    // The receipt is Takoserver's attribution authority, but it is not native
+    // absence authority. A WorkerVersion can be terminalized as absent only
+    // after a fresh GET of its exact immutable release script returns 404.
+    if (native.kind === "version") {
+      const nativeAbsence = await this.#verifyWorkerVersionNativeAbsence(native.name, kind);
+      if (nativeAbsence.outcome === "unknown") return nativeAbsence;
+      if (nativeAbsence.outcome === "absent") {
+        return { outcome: "absent", evidence: nativeAbsence.evidence };
+      }
+    }
+
+    let receipt: ManagedWorkerReceipt | null;
+    try {
+      receipt = await this.#state.receiptByResourceUid(input.identity.resourceUid);
+    } catch (error) {
+      return error instanceof ManagedWorkerStateCorruptionError
+        ? { outcome: "unknown", reason: "malformed", retryable: false }
+        : { outcome: "unknown", reason: "transport", retryable: true };
+    }
+    if (!receipt || receipt.nativeId !== input.nativeId) {
+      return { outcome: "unknown", reason: "authority_unavailable", retryable: false };
+    }
+    if (receipt.state === "pending" || receipt.state === "deleting") {
+      return { outcome: "unknown", reason: "authority_unavailable", retryable: true };
+    }
+    if (receipt.state === "deleted") {
+      return { outcome: "unknown", reason: "authority_unavailable", retryable: false };
+    }
+    if (native.kind !== "version") {
+      if (receipt.kind === "version") {
         return { outcome: "unknown", reason: "malformed", retryable: false };
       }
-      const present = await this.#client.scriptAbsent(native.name);
-      if (present.ok === false) return absenceFailure(present);
-      return absence(present.value ? "absent" : "present", this.#providerId, raw.kind);
+      return {
+        outcome: "present",
+        manifestDigests: [],
+        evidence: {
+          provider: this.#providerId,
+          kind,
+          state: "non_artifact_consumer",
+        },
+      };
     }
-    return absence("present", this.#providerId, raw.kind);
+    if (receipt.kind !== "version") {
+      return { outcome: "unknown", reason: "malformed", retryable: false };
+    }
+    const manifestDigest = receipt.observed.manifestDigest;
+    if (typeof manifestDigest !== "string" || !sha256(manifestDigest)) {
+      return { outcome: "unknown", reason: "malformed", retryable: false };
+    }
+    return {
+      outcome: "present",
+      manifestDigests: [manifestDigest],
+      evidence: {
+        provider: this.#providerId,
+        kind,
+        authority: "managed_release_receipt",
+      },
+    };
   }
 
   async readSqliteMigrationLedger(input: {

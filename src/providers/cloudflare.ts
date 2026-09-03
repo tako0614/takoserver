@@ -10,6 +10,8 @@ import {
   failed,
   PROVIDER_READBACK_API_VERSION,
   type Provider,
+  type ProviderArtifactConsumption,
+  type ProviderArtifactConsumptionInput,
   type ProviderNativeAbsence,
   type ProviderNativeAbsenceUnknownReason,
   type ProviderNativeReadbackDescriptor,
@@ -107,6 +109,7 @@ const WORKER_VERSION_RECOVERY_PAGE_LIMIT = 10;
 const WORKER_VERSION_OPERATION_ID_BYTE_LIMIT = 512;
 const WORKER_VERSION_OPERATION_MARKER_BINDING = "TAKOSERVER_INTERNAL_OPERATION_MARKER";
 const WORKER_VERSION_OPERATION_MARKER_PREFIX = "tsop-v1:";
+const WORKER_VERSION_ARTIFACT_MANIFEST_BINDING = "TAKOSERVER_INTERNAL_ARTIFACT_MANIFEST";
 const WORKER_VERSION_RUNTIME_INPUT_COMMITMENT_BINDING =
   "TAKOSERVER_INTERNAL_RUNTIME_INPUT_COMMITMENT";
 
@@ -571,6 +574,152 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     if (state === "malformed") return unknownAbsence("malformed", false);
     if (state === "absent") return absenceResult("absent", input.descriptor);
     return absenceResult("present", input.descriptor);
+  }
+
+  /**
+   * Attribute an exact Worker Version only from immutable provider readback.
+   * New versions carry the manifest digest in a reserved plain-text binding.
+   * Older current Resources may instead be tied to their exact Host provider
+   * operation marker; historical rows without either proof stay unknown.
+   */
+  async verifyArtifactConsumption(
+    input: ProviderArtifactConsumptionInput,
+  ): Promise<ProviderArtifactConsumption> {
+    if (this.#workerBackend?.owns(input.offering)) {
+      return await this.#workerBackend.verifyArtifactConsumption(input);
+    }
+    const native = parseNativeId(input.nativeId);
+    if (!native || !cloudflareKindMatches(providerKind(input.offering), native.kind)) {
+      return { outcome: "unknown", reason: "malformed", retryable: false };
+    }
+    if (native.kind !== "version") {
+      let descriptor: ProviderNativeReadbackDescriptor;
+      try {
+        descriptor = this.createNativeReadbackDescriptor({
+          offering: input.offering,
+          nativeId: input.nativeId,
+          identity: {
+            tenantRef: input.identity.tenantRef,
+            space: input.identity.address?.space ?? "historical",
+            name: input.identity.address?.name ?? "historical",
+            uid: input.identity.resourceUid,
+          },
+        });
+      } catch {
+        return { outcome: "unknown", reason: "malformed", retryable: false };
+      }
+      const absence = await this.verifyNativeAbsence({ offering: input.offering, descriptor });
+      if (absence.outcome === "unknown") return absence;
+      if (absence.outcome === "absent") {
+        return {
+          outcome: "absent",
+          evidence: {
+            provider: this.id,
+            kind: providerKind(input.offering),
+            state: "native_absent",
+          },
+        };
+      }
+      // A present non-WorkerVersion consumes no candidate artifact, but its
+      // Deployment is not terminal. Report an exact zero-match result so the
+      // lifecycle stays retained instead of falsely recording native deletion.
+      return {
+        outcome: "present",
+        manifestDigests: [],
+        evidence: {
+          provider: this.id,
+          kind: providerKind(input.offering),
+          state: "non_artifact_consumer",
+        },
+      };
+    }
+    const read = await this.#call(
+      "GET",
+      `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(native.parent)}/versions/${encodeURIComponent(native.name)}`,
+    );
+    if (!read.ok) {
+      if (read.status === 404) {
+        return {
+          outcome: "absent",
+          evidence: { provider: this.id, kind: "WorkerVersion", state: "native_absent" },
+        };
+      }
+      if (read.status === 0 || read.status === 429 || read.status >= 500) {
+        return { outcome: "unknown", reason: "transport", retryable: true };
+      }
+      return {
+        outcome: "unknown",
+        reason: read.status === 401 || read.status === 403 ? "authority_unavailable" : "malformed",
+        retryable: false,
+      };
+    }
+    const detail = record(read.result);
+    const resources = record(detail?.resources);
+    const bindings = resources?.bindings;
+    if (
+      workerVersionId(detail?.id) !== native.name ||
+      !resources ||
+      (bindings !== undefined && !Array.isArray(bindings))
+    ) {
+      return { outcome: "unknown", reason: "malformed", retryable: false };
+    }
+    const manifestMarkers = (bindings ?? []).filter(
+      (binding) => record(binding)?.name === WORKER_VERSION_ARTIFACT_MANIFEST_BINDING,
+    );
+    if (manifestMarkers.length > 1) {
+      return { outcome: "unknown", reason: "malformed", retryable: false };
+    }
+    if (manifestMarkers.length === 1) {
+      const marker = record(manifestMarkers[0]);
+      if (
+        marker?.type !== "plain_text" ||
+        typeof marker.text !== "string" ||
+        !sha256Digest(marker.text)
+      ) {
+        return { outcome: "unknown", reason: "malformed", retryable: false };
+      }
+      return {
+        outcome: "present",
+        manifestDigests: [marker.text],
+        evidence: { provider: this.id, kind: "WorkerVersion", binding: "artifact_manifest" },
+      };
+    }
+
+    // The pre-marker compatibility is intentionally current-Resource-only.
+    // The provider Version must carry exactly one operation marker matching a
+    // succeeded provider effect in the fenced Resource snapshot, and that
+    // snapshot must expose one candidate. A historical row cannot obtain a
+    // digest merely because its tenant happens to hold one artifact.
+    const operationMarkers = (bindings ?? []).filter(
+      (binding) => record(binding)?.name === WORKER_VERSION_OPERATION_MARKER_BINDING,
+    );
+    if (
+      operationMarkers.length !== 1 ||
+      !input.currentResource ||
+      input.candidateManifestDigests.length !== 1 ||
+      input.currentResource.providerOperationIds.length === 0
+    ) {
+      return { outcome: "unknown", reason: "unsupported", retryable: false };
+    }
+    const operationMarker = record(operationMarkers[0]);
+    if (
+      operationMarker?.type !== "plain_text" ||
+      typeof operationMarker.text !== "string" ||
+      !workerVersionOperationMarkerValue(operationMarker.text)
+    ) {
+      return { outcome: "unknown", reason: "malformed", retryable: false };
+    }
+    const expected = await Promise.all(
+      input.currentResource.providerOperationIds.map(workerVersionOperationMarker),
+    );
+    if (expected.filter((candidate) => candidate === operationMarker.text).length !== 1) {
+      return { outcome: "unknown", reason: "unsupported", retryable: false };
+    }
+    return {
+      outcome: "present",
+      manifestDigests: [input.candidateManifestDigests[0] as `sha256:${string}`],
+      evidence: { provider: this.id, kind: "WorkerVersion", binding: "host_operation" },
+    };
   }
 
   async observe(input: {
@@ -1141,6 +1290,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       bindings.some(
         (binding) =>
           binding.name === WORKER_VERSION_OPERATION_MARKER_BINDING ||
+          binding.name === WORKER_VERSION_ARTIFACT_MANIFEST_BINDING ||
           binding.name === WORKER_VERSION_RUNTIME_INPUT_COMMITMENT_BINDING,
       )
     ) {
@@ -1309,6 +1459,11 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
                   type: "plain_text",
                   name: WORKER_VERSION_OPERATION_MARKER_BINDING,
                   text: operationMarker,
+                },
+                {
+                  type: "plain_text",
+                  name: WORKER_VERSION_ARTIFACT_MANIFEST_BINDING,
+                  text: manifestDigest,
                 },
                 ...(assetToken ? [{ type: "assets", name: ASSETS_BINDING }] : []),
               ],

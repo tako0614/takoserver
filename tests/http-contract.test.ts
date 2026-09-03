@@ -109,6 +109,7 @@ function completeHandler() {
 
 const PATH_SAMPLES: Readonly<Record<string, string>> = {
   organizationId: "org_probe",
+  deploymentId: "dep_probe",
   resourceUid: "uid_probe",
   migrationId: "mig_probe",
   attachmentId: "att_probe",

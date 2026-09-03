@@ -1,3 +1,8 @@
+import {
+  ARTIFACT_CONSUMER_REPAIR_APPLY_FORMAT,
+  type ArtifactConsumerRepair,
+  ArtifactConsumerRepairError,
+} from "./artifact-consumer-repair.ts";
 import { AttachmentError, type AttachmentService } from "./attachments.ts";
 import {
   type Accounts,
@@ -129,6 +134,8 @@ export interface CreateControlRoutesOptions {
   readonly consoleOrigin?: string;
   /** Optional provider-backed residual proof; absent means unavailable. */
   readonly nativeResidual?: NativeResidualReader;
+  /** Takoserver lifecycle-owned repair; never exposed through the Takoform Host API. */
+  readonly artifactConsumerRepair?: ArtifactConsumerRepair;
   /** Closed, encrypted handoff from the Takoserver companion provider to the Host. */
   readonly runtimeInputs?: RuntimeInputAuthority["preparations"];
   /** Value-free pre-mutation authority for one future stable Worker endpoint. */
@@ -155,6 +162,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     clock,
     consoleOrigin,
     nativeResidual,
+    artifactConsumerRepair,
     runtimeInputs,
     originReservations,
     runtimeInputPolicy,
@@ -761,6 +769,45 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       return Response.json({ residual: evidence }, { headers: { "cache-control": "no-store" } });
     }
 
+    const artifactConsumerRepairRoute =
+      /^\/v1\/organizations\/([^/]+)\/artifact-consumer-repairs\/([^/]+)$/u.exec(url.pathname);
+    if (artifactConsumerRepairRoute) {
+      const organizationId = segment(artifactConsumerRepairRoute[1]);
+      const deploymentId = segment(artifactConsumerRepairRoute[2]);
+      const headers = { "cache-control": "private, no-store", "x-content-type-options": "nosniff" };
+      if (request.method === "GET") {
+        await scoped(request, organizationId, "resources:read");
+        if (!artifactConsumerRepair) controlError("backend_unavailable", 503);
+        return Response.json(
+          { repair: await artifactConsumerRepair.status(organizationId, deploymentId) },
+          { headers },
+        );
+      }
+      if (request.method === "POST") {
+        await scoped(request, organizationId, "resources:write");
+        if (!artifactConsumerRepair) controlError("backend_unavailable", 503);
+        const idempotencyKey = request.headers.get("idempotency-key");
+        if (!idempotencyKey) controlError("invalid_argument", 400);
+        const body = await jsonObject(request);
+        exactKeys(body, ["kind", "planDigest"]);
+        if (body.kind !== ARTIFACT_CONSUMER_REPAIR_APPLY_FORMAT) {
+          controlError("invalid_argument", 400);
+        }
+        return Response.json(
+          {
+            receipt: await artifactConsumerRepair.apply({
+              tenantId: organizationId,
+              deploymentId,
+              idempotencyKey,
+              planDigest: text(body.planDigest) as `sha256:${string}`,
+            }),
+          },
+          { headers },
+        );
+      }
+      controlError("not_found", 404);
+    }
+
     const organizationAttachments = /^\/v1\/organizations\/([^/]+)\/attachments$/u.exec(
       url.pathname,
     );
@@ -1114,6 +1161,9 @@ export function controlErrorResponse(error: unknown): Response {
 
 function classify(error: unknown): { code: string; status: number } {
   if (error instanceof ControlError) return { code: error.code, status: error.status };
+  if (error instanceof ArtifactConsumerRepairError) {
+    return { code: error.code, status: error.status };
+  }
   if (error instanceof RuntimeInputPreparationError) {
     return { code: error.code, status: error.status };
   }
