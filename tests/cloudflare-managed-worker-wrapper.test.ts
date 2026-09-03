@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { Miniflare } from "miniflare";
+import { Miniflare, type MiniflareOptions } from "miniflare";
 import {
   MANAGED_WORKER_EDGE_OBJECTS_BINDING_KIND,
   MANAGED_WORKER_EDGE_SQL_BINDING_KIND,
@@ -1288,36 +1288,36 @@ test("Scheduled handler failure waits for its background task and fails the invo
  * empties the importable environment. This runs the generated wrapper under the
  * pinned workerd both ways and reads the difference.
  */
-async function importableEnvUnderFlag(compatibilityFlags: string[]) {
-  const runtime = new Miniflare({
-    workers: [
-      {
-        config: {
-          name: `wrapper-import-fence-${compatibilityFlags.length}`,
-          type: "worker",
-          compatibilityDate: "2026-08-18",
-          compatibilityFlags,
-          manifest: {
-            mainModule: "wrapper.js",
-            modules: {
-              "wrapper.js": {
-                type: "esm",
-                contents: managedWorkerEntrypointSource({
-                  ...EMPTY_WORKER,
-                  bindings: [
-                    { name: "GREETING", type: "plain_text" },
-                    { name: "API_KEY", type: "secret_text" },
-                    {
-                      kind: MANAGED_WORKER_EDGE_OBJECTS_BINDING_KIND,
-                      publicName: "MEDIA",
-                      nativeName: "__TAKOSERVER_OBJECTS_0",
-                    },
-                  ],
-                }),
-              },
-              "index.js": {
-                type: "esm",
-                contents: `import { env as importable } from "cloudflare:workers";
+type MiniflareWorker = MiniflareOptions["workers"][number];
+
+function importableEnvWorker(name: string, compatibilityFlags: string[]): MiniflareWorker {
+  return {
+    config: {
+      name,
+      type: "worker",
+      compatibilityDate: "2026-08-18",
+      compatibilityFlags,
+      manifest: {
+        mainModule: "wrapper.js",
+        modules: {
+          "wrapper.js": {
+            type: "esm",
+            contents: managedWorkerEntrypointSource({
+              ...EMPTY_WORKER,
+              bindings: [
+                { name: "GREETING", type: "plain_text" },
+                { name: "API_KEY", type: "secret_text" },
+                {
+                  kind: MANAGED_WORKER_EDGE_OBJECTS_BINDING_KIND,
+                  publicName: "MEDIA",
+                  nativeName: "__TAKOSERVER_OBJECTS_0",
+                },
+              ],
+            }),
+          },
+          "index.js": {
+            type: "esm",
+            contents: `import { env as importable } from "cloudflare:workers";
 export default { async fetch(_request, env) {
   const importableKeys = Reflect.ownKeys(importable ?? {}).sort();
   const rawBucket = importable?.__TAKOSERVER_OBJECTS_0;
@@ -1336,33 +1336,51 @@ export default { async fetch(_request, env) {
     mediaMethods: Reflect.ownKeys(env.MEDIA).sort(),
   });
 } };`,
-              },
-            },
           },
-          env: {
-            GREETING: { type: "text", value: "hello" },
-            API_KEY: { type: "text", value: "s3cret" },
-            __TAKOSERVER_OBJECTS_0: {
-              type: "r2",
-              name: `import-fence-${compatibilityFlags.length}`,
-            },
-          },
-          triggers: [],
         },
       },
+      env: {
+        GREETING: { type: "text", value: "hello" },
+        API_KEY: { type: "text", value: "s3cret" },
+        __TAKOSERVER_OBJECTS_0: {
+          type: "r2",
+          name: `${name}-bucket`,
+        },
+      },
+      triggers: [],
+    },
+  };
+}
+
+async function importableEnvComparison() {
+  const unflaggedWorkerName = "wrapper-import-fence-unflagged";
+  const flaggedWorkerName = "wrapper-import-fence-flagged";
+  const runtime = new Miniflare({
+    workers: [
+      importableEnvWorker(unflaggedWorkerName, []),
+      importableEnvWorker(flaggedWorkerName, ["disallow_importable_env"]),
     ],
   });
   try {
-    const response = await runtime.dispatchFetch("https://worker.example/");
-    const text = await response.text();
-    expect({ status: response.status, text }).toMatchObject({ status: 200 });
-    return JSON.parse(text) as Record<string, unknown>;
+    async function readWorker(name: string) {
+      const worker = await runtime.getWorker(name);
+      const response = await worker.fetch("https://worker.example/");
+      const text = await response.text();
+      expect({ status: response.status, text }).toMatchObject({ status: 200 });
+      return JSON.parse(text) as Record<string, unknown>;
+    }
+
+    return {
+      unflagged: await readWorker(unflaggedWorkerName),
+      flagged: await readWorker(flaggedWorkerName),
+    };
   } finally {
     await runtime.dispose();
   }
 }
 
 test("disallow_importable_env empties the tenant's importable env and changes nothing else", async () => {
+  const comparison = await importableEnvComparison();
   const projected = {
     handlerKeys: ["API_KEY", "GREETING", "MEDIA"],
     handlerGreeting: "hello",
@@ -1382,7 +1400,7 @@ test("disallow_importable_env empties the tenant's importable env and changes no
 
   // Without the flag the raw internal R2 handle and the raw secret are both
   // one import away, and the handle is usable. This is the defect.
-  expect(await importableEnvUnderFlag([])).toEqual({
+  expect(comparison.unflagged).toEqual({
     ...projected,
     importableKeys: ["API_KEY", "GREETING", "__TAKOSERVER_OBJECTS_0"],
     rawSecret: "s3cret",
@@ -1391,7 +1409,7 @@ test("disallow_importable_env empties the tenant's importable env and changes no
 
   // With it the importable environment is empty, and the handler env and the
   // projected facade are byte-for-byte what they were.
-  expect(await importableEnvUnderFlag(["disallow_importable_env"])).toEqual({
+  expect(comparison.flagged).toEqual({
     ...projected,
     importableKeys: [],
     rawSecret: null,
