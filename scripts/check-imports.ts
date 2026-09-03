@@ -54,14 +54,17 @@ const LAYERS: readonly Layer[] = [
   {
     name: "release-data",
     match:
-      /^(?:vendor\/takoform\/.*\.json|src\/generated\/takoform-(?:stable-v1-catalog|integration-form-packages|publisher-set-receipt|publisher-set-authority-closure)\.ts)$/u,
+      /^(?:vendor\/takoform\/.*\.json|src\/generated\/takoform-(?:stable-v1-catalog|stable-error-taxonomy|integration-form-packages|publisher-set-receipt|publisher-set-authority-closure)\.ts)$/u,
     may: ["release-data"],
   },
   {
     name: "core",
     match:
       /^src\/(?:ports|json|strict-json|error-envelope|route-table|public-host-identity|form-ref|interface-ref|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite)\.ts$/u,
-    may: ["core"],
+    // Frozen published data sits below every layer: it is bytes a release
+    // pinned, not a decision any layer here may make. The wire error taxonomy
+    // this Host answers by is exactly that.
+    may: ["core", "release-data"],
   },
   {
     name: "adapter",

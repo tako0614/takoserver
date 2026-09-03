@@ -1,0 +1,14 @@
+{
+  "format": "takoserver.vendored-takoform-source@v1",
+  "repository": "https://github.com/tako0614/takoform.git",
+  "tag": "v1.1.0",
+  "commit": "e0e48b864de2a127a255cb0574d37bbb0f1cac29",
+  "files": [
+    {
+      "local": "operations-v1.json",
+      "source": "spec/host-api/operations-v1.json",
+      "size": 26076,
+      "sha256": "7ca963517ca3aed1a2c90bf681745beac5fcde37e41b8a53a4877582abcdfb23"
+    }
+  ]
+}

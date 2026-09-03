@@ -314,6 +314,7 @@ describe("split Takoserver Worker surfaces", () => {
       "src/entry-public-form-runtime-payload.ts",
       "src/error-envelope.ts",
       "src/form-ref.ts",
+      "src/generated/takoform-stable-error-taxonomy.ts",
       "src/generated/takoform-stable-v1-catalog.ts",
       "src/json.ts",
       "src/ports.ts",
