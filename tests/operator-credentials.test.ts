@@ -18,6 +18,7 @@ let signingKey: CryptoKey;
 let publicKeyJwk: { kty: string; crv: string; x: string };
 let now: number;
 const clock = () => new Date(now);
+const OPERATOR_AUDIENCE = "https://api.takoserver.test";
 
 beforeEach(async () => {
   now = Date.UTC(2026, 7, 17, 12, 0, 0);
@@ -38,6 +39,7 @@ async function assert(claims: Record<string, unknown>, key = signingKey): Promis
 
 const SIGN_IN = {
   purpose: "sign-in",
+  aud: OPERATOR_AUDIENCE,
   provider: "google",
   subject: "operator-1",
   email: "owner@example.com",
@@ -54,10 +56,15 @@ const FUNDING = {
 
 describe("operator sign-in", () => {
   test("accepts exactly what the operator signed", async () => {
-    const identity = createOperatorIdentity({ publicKeyJwk, clock });
+    const identity = createOperatorIdentity({
+      publicKeyJwk,
+      audience: OPERATOR_AUDIENCE,
+      clock,
+    });
     const verified = await identity.verify({
       provider: "google",
       assertion: await assert(SIGN_IN),
+      audience: OPERATOR_AUDIENCE,
     });
     expect(verified).toEqual({
       providerSubject: "operator-1",
@@ -68,14 +75,18 @@ describe("operator sign-in", () => {
 
   test("refuses a signature from any other key", async () => {
     const other = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
-    const identity = createOperatorIdentity({ publicKeyJwk, clock });
+    const identity = createOperatorIdentity({ publicKeyJwk, audience: OPERATOR_AUDIENCE, clock });
     await expect(
-      identity.verify({ provider: "google", assertion: await assert(SIGN_IN, other.privateKey) }),
+      identity.verify({
+        provider: "google",
+        assertion: await assert(SIGN_IN, other.privateKey),
+        audience: OPERATOR_AUDIENCE,
+      }),
     ).rejects.toMatchObject({ code: "invalid_signature" });
   });
 
   test("refuses a tampered claim even with a valid-looking shape", async () => {
-    const identity = createOperatorIdentity({ publicKeyJwk, clock });
+    const identity = createOperatorIdentity({ publicKeyJwk, audience: OPERATOR_AUDIENCE, clock });
     const original = await assert(SIGN_IN);
     const [payload, signature] = original.split(".");
     const forged = JSON.parse(
@@ -83,32 +94,56 @@ describe("operator sign-in", () => {
     ) as Record<string, unknown>;
     forged.email = "intruder@example.com";
     const swapped = `${base64UrlEncode(new TextEncoder().encode(JSON.stringify(forged)))}.${signature}`;
-    await expect(identity.verify({ provider: "google", assertion: swapped })).rejects.toMatchObject(
-      { code: "invalid_signature" },
-    );
+    await expect(
+      identity.verify({ provider: "google", assertion: swapped, audience: OPERATOR_AUDIENCE }),
+    ).rejects.toMatchObject({ code: "invalid_signature" });
   });
 
   test("will not let a funding assertion sign anybody in", async () => {
-    const identity = createOperatorIdentity({ publicKeyJwk, clock });
+    const identity = createOperatorIdentity({ publicKeyJwk, audience: OPERATOR_AUDIENCE, clock });
     await expect(
-      identity.verify({ provider: "google", assertion: await assert(FUNDING) }),
+      identity.verify({
+        provider: "google",
+        assertion: await assert(FUNDING),
+        audience: OPERATOR_AUDIENCE,
+      }),
     ).rejects.toMatchObject({ code: "wrong_purpose" });
   });
 
   test("refuses an assertion for a different provider", async () => {
-    const identity = createOperatorIdentity({ publicKeyJwk, clock });
+    const identity = createOperatorIdentity({ publicKeyJwk, audience: OPERATOR_AUDIENCE, clock });
     await expect(
-      identity.verify({ provider: "github", assertion: await assert(SIGN_IN) }),
+      identity.verify({
+        provider: "github",
+        assertion: await assert(SIGN_IN),
+        audience: OPERATOR_AUDIENCE,
+      }),
     ).rejects.toMatchObject({ code: "wrong_purpose" });
   });
 
   test("stops accepting an assertion once it expires", async () => {
-    const identity = createOperatorIdentity({ publicKeyJwk, clock });
+    const identity = createOperatorIdentity({ publicKeyJwk, audience: OPERATOR_AUDIENCE, clock });
     const assertion = await assert(SIGN_IN);
     now += 301_000;
-    await expect(identity.verify({ provider: "google", assertion })).rejects.toMatchObject({
-      code: "expired",
+    await expect(
+      identity.verify({ provider: "google", assertion, audience: OPERATOR_AUDIENCE }),
+    ).rejects.toMatchObject({ code: "expired" });
+  });
+
+  test("rejects a valid assertion replayed at a different Host audience", async () => {
+    const identity = createOperatorIdentity({
+      publicKeyJwk,
+      audience: OPERATOR_AUDIENCE,
+      clock,
     });
+    const assertion = await assert(SIGN_IN);
+    await expect(
+      identity.verify({
+        provider: "google",
+        assertion,
+        audience: "https://api.other-host.test",
+      }),
+    ).rejects.toMatchObject({ code: "wrong_audience" });
   });
 });
 
@@ -162,7 +197,11 @@ describe("operator sign-in over HTTP", () => {
   const ORIGIN = "https://api.takoserver.test";
 
   function newApp() {
-    const setup = resolveIdentity({ operatorPublicKeyJwk: publicKeyJwk, clock });
+    const setup = resolveIdentity({
+      operatorPublicKeyJwk: publicKeyJwk,
+      operatorAudience: ORIGIN,
+      clock,
+    });
     return buildApp({
       sql: createEphemeralSql(),
       objects: createMemoryObjectStore(),

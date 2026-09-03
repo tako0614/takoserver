@@ -1,18 +1,9 @@
 import { createHash } from "node:crypto";
-import {
-  closeSync,
-  constants,
-  fstatSync,
-  mkdirSync,
-  mkdtempSync,
-  openSync,
-  readFileSync,
-  rmSync,
-} from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { signOperatorAssertion } from "../../src/operator-key.ts";
+import { join, resolve } from "node:path";
 import { CloudflareState } from "./cloudflare-state.ts";
+import { RemoteD1 } from "./d1.ts";
 import {
   DeployError,
   type DeployPhase,
@@ -20,35 +11,61 @@ import {
   preflightError,
   verificationError,
 } from "./errors.ts";
+import { pendingMigrations, readD1SchemaState, readMigrationArtifact } from "./migrations.ts";
+import {
+  OPERATOR_IDENTITY_ENV,
+  OPERATOR_PRIVATE_JWK_ENV,
+  type PrivateKeyInput,
+  provePrivateMatchesPublic,
+  readOperatorSignInIdentity,
+  readPrivateJwk,
+  withOperatorOwnerSession,
+} from "./operator-authority.ts";
 import {
   type CommandResult,
   cloudflareChildEnvironment,
+  REPOSITORY,
   requireEnvironment,
   runCommand,
   wranglerCommand,
 } from "./process.ts";
 import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualification.ts";
-import { expectedWorkerSecrets } from "./realized-config.ts";
+import { expectedWorkerSecrets, writeWorkerConfig } from "./realized-config.ts";
 import type { DeployTarget } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import {
   assertLiveWorkerRoutingClosure,
   type LiveWorkerVersion,
   type WorkerState,
+  workerVersionAnnotationProfile,
+  workerVersionAuthorityBindingShape,
   workerVersionIdentity,
 } from "./worker-live.ts";
 import {
   assertExactSecretInventory,
   assertExactVersionBindingClosure,
   expectedExactBindingClosure,
-  parseWorkerDeploymentHistory,
+  optionalExactPlainTextBinding,
+  parseWorkerDeploymentChain,
+  type WorkerDeploymentChainEntry,
+  type WorkerDeploymentHistory,
 } from "./worker-state.ts";
 
+export type { PrivateKeyInput } from "./operator-authority.ts";
+export { provePrivateMatchesPublic, readPrivateJwk } from "./operator-authority.ts";
+
+export type OperatorIdentitySurface =
+  | "takoserver-integration-operator-identity"
+  | "takoserver-operator-identity";
+
 export interface OperatorIdentityInvocation {
-  readonly surface: "takoserver-integration-operator-identity";
+  /** The legacy spelling remains accepted until deploy.ts/contract/docs move together. */
+  readonly surface: OperatorIdentitySurface;
   readonly action: "status" | "apply";
   readonly environment: DeployEnvironment;
   readonly commit: string;
+  /** Required at runtime; optional in the type until the CLI integration lands. */
+  readonly organizationId?: string;
 }
 
 export type OperatorIdentityProcess = (
@@ -56,10 +73,16 @@ export type OperatorIdentityProcess = (
   options?: { readonly env?: Readonly<Record<string, string>>; readonly input?: string },
 ) => Promise<CommandResult>;
 
+export interface OperatorIdentityMigrationReader {
+  read(): Promise<{ readonly local: readonly string[]; readonly applied: readonly string[] }>;
+}
+
 export interface OperatorIdentityOptions {
   readonly run?: OperatorIdentityProcess;
   readonly state?: WorkerState;
+  readonly migrations?: OperatorIdentityMigrationReader;
   readonly privateJwkPath?: string;
+  readonly operatorIdentityPath?: string;
   readonly review?: string;
   readonly outputDirectory?: string;
   readonly cloudflareEnvironment?: Readonly<Record<string, string>>;
@@ -67,90 +90,148 @@ export interface OperatorIdentityOptions {
   readonly now?: () => Date;
 }
 
+type PublicEd25519Jwk = NonNullable<DeployTarget["operatorIdentity"]>["publicJwk"];
+
 interface IdentityInspection extends LiveWorkerVersion {
-  readonly configured: boolean;
+  readonly deploymentChain: readonly WorkerDeploymentChainEntry[];
   readonly version: unknown;
+  readonly configuredPublicJwk: PublicEd25519Jwk | null;
+  readonly configuredPublicJwkDigest: string | null;
+  readonly state: "absent" | "different" | "desired";
 }
 
-export interface PrivateKeyInput {
-  readonly jwk: JsonWebKey & { readonly x: string; readonly d: string };
-}
-
-const PRIVATE_JWK_KEYS = ["crv", "d", "ext", "key_ops", "kty", "x"] as const;
+const ORGANIZATION_ID = /^org_[A-Za-z0-9][A-Za-z0-9._:-]{0,123}$/u;
 const BASE64URL_32 = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/u;
 
-/** Integration-only operator identity configuration transition. */
+/** Environment-neutral operator identity configuration transition. */
 export async function runOperatorIdentity(
   invocation: OperatorIdentityInvocation,
   target: DeployTarget,
   options: OperatorIdentityOptions = {},
 ): Promise<Record<string, unknown>> {
-  assertIntegrationInvocation(invocation, target);
+  assertInvocation(invocation, target);
+  const organizationId = invocation.organizationId;
+  if (organizationId === undefined || !ORGANIZATION_ID.test(organizationId)) {
+    throw preflightError("operator identity requires one exact --organization id");
+  }
   const publicJwk = target.operatorIdentity?.publicJwk;
   if (!publicJwk) {
     throw preflightError("operator identity surface requires target `operatorIdentity.publicJwk`");
   }
-  const canonicalPublicJwk = JSON.stringify(publicJwk);
-  const desiredPublicJwkDigest = sha256(canonicalPublicJwk);
-  const environment =
+  const desiredPublicJwkDigest = sha256(JSON.stringify(publicJwk));
+  const run = options.run ?? runCommand;
+  const suppliedToken =
+    options.cloudflareEnvironment === undefined
+      ? process.env.CLOUDFLARE_API_TOKEN
+      : options.cloudflareEnvironment.CLOUDFLARE_API_TOKEN;
+  if (options.state === undefined && suppliedToken === undefined) {
+    throw preflightError(
+      "CLOUDFLARE_API_TOKEN is required because authoritative Worker state must be read directly",
+    );
+  }
+  const cloudflareEnvironment =
     options.cloudflareEnvironment ??
     (options.state !== undefined && invocation.action === "status"
       ? {}
       : cloudflareChildEnvironment());
-  const state =
-    options.state ??
-    new CloudflareState({
-      accountId: target.accountId,
-      token: exactCloudflareToken(environment),
-    });
-  const live = await inspectIdentity("preflight", target, state);
-
-  if (invocation.action === "status") {
-    return {
-      kind: "takoserver.integration-operator-identity-status@v2",
-      surface: invocation.surface,
-      environment: invocation.environment,
-      selectedCommit: invocation.commit,
-      deployedCommit: live.commit,
-      versionId: live.history.versionId,
-      desiredPublicJwkDigest,
-      configuredPublicJwkDigest: live.configured ? desiredPublicJwkDigest : null,
-      configured: live.configured,
-      ready: live.commit === invocation.commit && !live.configured,
-    };
-  }
-
-  if (live.configured) {
-    throw preflightError("operator identity is already configured; use --status");
-  }
-  const run = options.run ?? runCommand;
-  const source = await qualifySource({
-    environment: "integration",
-    commit: invocation.commit,
-    run,
-  });
-  if (live.commit !== source.commit) {
-    throw preflightError("operator identity commit must equal the currently served Worker commit");
-  }
-  const reviewer = exactReviewer(
-    options.review ?? requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW"),
-  );
-  const privateInput = readPrivateJwk(
-    options.privateJwkPath ?? requireEnvironment("TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH"),
-  );
-  await provePrivateMatchesPublic(privateInput, publicJwk);
-  const gate = await run(["bun", "run", "check"]);
-  if (gate.exitCode !== 0) {
-    throw preflightError(
-      `scoped owner gate \`bun run check\` failed (exit ${gate.exitCode})`,
-      `${gate.stdout}${gate.stderr}`.trim(),
-    );
-  }
-
   const temporary = options.outputDirectory === undefined;
   const root = options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-identity-"));
   mkdirSync(root, { recursive: true, mode: 0o700 });
   try {
+    const state =
+      options.state ??
+      new CloudflareState({
+        accountId: target.accountId,
+        token: exactCloudflareToken(cloudflareEnvironment),
+      });
+    const migrations =
+      options.migrations ??
+      remoteMigrationReader(
+        writeInspectionConfig(root, target, invocation.commit),
+        cloudflareEnvironment,
+        run,
+      );
+    const live = await inspectIdentity("preflight", target, state, publicJwk);
+    const migrationState = await migrations.read();
+    const pending = pendingMigrations(migrationState.local, migrationState.applied);
+
+    if (invocation.action === "status") {
+      const desiredCurrent = live.state === "desired";
+      const configurationReady =
+        desiredCurrent && live.commit === invocation.commit && pending.length === 0;
+      const predecessorVersionId = desiredCurrent
+        ? live.history.previousVersionId
+        : live.history.versionId;
+      return {
+        kind: "takoserver.operator-identity-status@v1",
+        surface: invocation.surface,
+        environment: invocation.environment,
+        organizationId,
+        state: desiredCurrent ? "desired-current" : "identity-change-required",
+        selectedCommit: invocation.commit,
+        deployedCommit: live.commit,
+        commitMatches: live.commit === invocation.commit,
+        desiredPublicJwkDigest,
+        configuredPublicJwkDigest: live.configuredPublicJwkDigest,
+        transition: desiredCurrent ? null : live.configuredPublicJwk === null ? "add" : "change",
+        deploymentId: live.history.deploymentId,
+        predecessorVersionId,
+        successorVersionId: desiredCurrent ? live.history.versionId : null,
+        currentVersionId: live.history.versionId,
+        appliedMigrations: migrationState.applied,
+        pendingMigrations: pending,
+        ownerProof: "not_performed",
+        mutationApplied: false,
+        configurationReady,
+        ready: invocation.environment === "production" ? false : configurationReady,
+        readyForApply: !desiredCurrent && live.commit === invocation.commit && pending.length === 0,
+        rollback:
+          desiredCurrent && predecessorVersionId !== null
+            ? rollbackEvidence(target, predecessorVersionId)
+            : null,
+      };
+    }
+
+    if (pending.length > 0) {
+      throw preflightError(
+        "operator identity transition refuses pending D1 migrations; apply takoserver-d1-schema first",
+        JSON.stringify(pending),
+      );
+    }
+    if (live.state === "desired") {
+      throw preflightError(
+        "operator identity is already exact; --apply refuses to turn a no-op into mutation evidence",
+      );
+    }
+
+    const source = await qualifySource({
+      environment: invocation.environment,
+      commit: invocation.commit,
+      run,
+    });
+    if (live.commit !== source.commit) {
+      throw preflightError(
+        "operator identity commit must equal the currently served Worker commit",
+      );
+    }
+    const reviewer = exactReviewer(
+      options.review ?? requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW"),
+    );
+    const privateInput = readPrivateJwk(
+      options.privateJwkPath ?? requireEnvironment(OPERATOR_PRIVATE_JWK_ENV),
+    );
+    await provePrivateMatchesPublic(privateInput, publicJwk);
+    const operatorIdentity = readOperatorSignInIdentity(
+      options.operatorIdentityPath ?? requireEnvironment(OPERATOR_IDENTITY_ENV),
+    );
+    const gate = await run(["bun", "run", "check"]);
+    if (gate.exitCode !== 0) {
+      throw preflightError(
+        `scoped owner gate \`bun run check\` failed (exit ${gate.exitCode})`,
+        `${gate.stdout}${gate.stderr}`.trim(),
+      );
+    }
+
     const prepared = await prepareWorkerArtifact({
       root,
       target,
@@ -160,17 +241,20 @@ export async function runOperatorIdentity(
     });
     if (prepared.bundleDigestHex !== live.bundleDigestHex) {
       throw preflightError(
-        "operator identity cutover refuses to carry different Worker code bytes",
+        "operator identity transition refuses to carry different Worker code bytes",
         `served=sha256:${live.bundleDigestHex} built=sha256:${prepared.bundleDigestHex}`,
       );
     }
     const artifact = prepared.seal();
     artifact.assertUnchanged();
 
-    // Close the build/upload race. A Version advance after qualification is
-    // unrelated authority, even when its code annotation happens to match.
-    const last = await inspectIdentity("preflight", target, state);
-    assertSameUnconfiguredVersion(live, last);
+    const last = await inspectIdentity("preflight", target, state, publicJwk);
+    assertSamePredecessor(live, last);
+    const lastMigrations = await migrations.read();
+    if (pendingMigrations(lastMigrations.local, lastMigrations.applied).length > 0) {
+      throw preflightError("D1 migration lineage changed during operator identity qualification");
+    }
+    artifact.assertUnchanged();
 
     const upload = await run(
       wranglerCommand([
@@ -183,46 +267,111 @@ export async function runOperatorIdentity(
         "--message",
         `takoserver-worker:${source.commit}:${prepared.bundleDigestHex}`,
       ]),
-      { env: environment },
+      { env: cloudflareEnvironment },
     );
     if (upload.exitCode !== 0) {
       throw mutationError(
         "operator identity upload acknowledgement is indeterminate; do not retry before --status",
         redactDiagnostics(`${upload.stdout}${upload.stderr}`.trim(), [
-          environment.CLOUDFLARE_API_TOKEN,
+          cloudflareEnvironment.CLOUDFLARE_API_TOKEN,
         ]),
       );
     }
 
-    const after = await inspectIdentity("verification", target, state);
+    const after = await inspectIdentity("verification", target, state, publicJwk);
     assertOnlyOperatorIdentityAdvance(live, after);
-    const proof = await proveOperatorSession(
-      target.publicOrigin,
-      privateInput,
-      options.now?.() ?? new Date(),
-      options.fetcher ?? ((input, init) => fetch(input, init)),
-    );
+    const afterMigrations = await migrations.read();
+    if (pendingMigrations(afterMigrations.local, afterMigrations.applied).length > 0) {
+      throw verificationError("operator identity transition left pending D1 migrations");
+    }
+    if (after.history.previousVersionId === null) {
+      throw verificationError(
+        "operator identity successor has no authoritative rollback predecessor",
+      );
+    }
+
+    let ownerProof: Awaited<ReturnType<typeof proveOwner>>;
+    try {
+      ownerProof = await proveOwner({
+        origin: target.publicOrigin,
+        organizationId,
+        privateInput,
+        operatorIdentity,
+        fetcher: options.fetcher ?? ((input, init) => fetch(input, init)),
+        ...(options.now === undefined ? {} : { now: options.now }),
+      });
+    } catch (proofFailure) {
+      const rollback = await rollbackFailedOwnerProof({
+        target,
+        state,
+        migrations,
+        before: live,
+        successor: after,
+        proofFailure,
+        configPath: prepared.configPath,
+        run,
+        cloudflareEnvironment,
+      });
+      throw verificationError(
+        "operator identity owner proof failed; the exact predecessor was rolled back",
+        JSON.stringify({
+          cause: safeFailureMessage(proofFailure),
+          predecessorVersionId: live.history.versionId,
+          successorVersionId: after.history.versionId,
+          rollbackDeploymentId: rollback.deploymentId,
+          rollbackVersionId: rollback.versionId,
+        }),
+      );
+    }
+
+    const settled = await inspectIdentity("verification", target, state, publicJwk);
+    assertSameSuccessor(after, settled);
+    const settledMigrations = await migrations.read();
+    if (pendingMigrations(settledMigrations.local, settledMigrations.applied).length > 0) {
+      throw verificationError("D1 migration lineage changed during operator owner proof");
+    }
+
+    const transition = live.configuredPublicJwk === null ? "add" : "change";
     return {
-      kind: "takoserver.integration-operator-identity-apply@v2",
+      kind: "takoserver.operator-identity-apply@v1",
       surface: invocation.surface,
       environment: invocation.environment,
+      organizationId,
+      transition,
       commit: source.commit,
       dirty: source.dirty,
       remoteRef: source.remoteRef,
       reviewer,
-      publicJwkDigest: desiredPublicJwkDigest,
+      desiredPublicJwkDigest,
+      previousConfiguredPublicJwkDigest: live.configuredPublicJwkDigest,
       artifactDigest: artifact.digest,
       bundleDigest: `sha256:${prepared.bundleDigestHex}`,
-      previousVersionId: live.history.versionId,
-      versionId: after.history.versionId,
+      predecessorDeploymentId: live.history.deploymentId,
+      predecessorVersionId: live.history.versionId,
+      successorDeploymentId: settled.history.deploymentId,
+      successorVersionId: settled.history.versionId,
       exactConfigDiff: {
-        added: [{ name: "OPERATOR_IDENTITY_PUBLIC_JWK", valueDigest: desiredPublicJwkDigest }],
-        changed: [],
+        added:
+          transition === "add"
+            ? [{ name: "OPERATOR_IDENTITY_PUBLIC_JWK", valueDigest: desiredPublicJwkDigest }]
+            : [],
+        changed:
+          transition === "change"
+            ? [
+                {
+                  name: "OPERATOR_IDENTITY_PUBLIC_JWK",
+                  previousValueDigest: live.configuredPublicJwkDigest,
+                  valueDigest: desiredPublicJwkDigest,
+                },
+              ]
+            : [],
         removed: [],
       },
-      proof,
-      reversal:
-        "revoke every session and API key issued through this identity before a separately reviewed identity removal",
+      appliedMigrations: settledMigrations.applied,
+      pendingMigrations: [],
+      ownerProof,
+      mutationApplied: true,
+      rollback: rollbackEvidence(target, live.history.versionId),
     };
   } finally {
     unsealDirectory(root);
@@ -234,9 +383,10 @@ async function inspectIdentity(
   phase: DeployPhase,
   target: DeployTarget,
   state: WorkerState,
+  desiredPublicJwk: PublicEd25519Jwk,
 ): Promise<IdentityInspection> {
   try {
-    return await inspectIdentityState(phase, target, state);
+    return await inspectIdentityState(phase, target, state, desiredPublicJwk);
   } catch (error) {
     if (phase === "verification" && error instanceof DeployError && error.phase !== phase) {
       throw verificationError(error.message, error.detail);
@@ -249,171 +399,133 @@ async function inspectIdentityState(
   phase: DeployPhase,
   target: DeployTarget,
   state: WorkerState,
+  desiredPublicJwk: PublicEd25519Jwk,
 ): Promise<IdentityInspection> {
-  const history = parseWorkerDeploymentHistory(await state.workerDeployments(target.workerName));
-  if (history === null) {
-    throw phase === "verification"
-      ? verificationError("Worker has no authoritative current deployment")
-      : preflightError("Worker has no authoritative current deployment");
-  }
+  const deploymentChain = parseWorkerDeploymentChain(
+    await state.workerDeployments(target.workerName),
+    phase,
+    { requireUuidVersionIds: true },
+  );
+  const history = historyFromDeploymentChain(phase, deploymentChain);
   const version = await state.workerVersion(target.workerName, history.versionId);
-  const identity = workerVersionIdentity(phase, version);
-  const authorityProfile =
-    target.integrationE2eCredentialAuthority === undefined
-      ? undefined
-      : {
-          kind: "provenance-bound-jit" as const,
-          provenance: {
-            sourceCommit: identity.commit,
-            artifactDigest: `sha256:${identity.bundleDigestHex}` as const,
-          },
-        };
-  const desired = expectedExactBindingClosure(target, {
-    signingKeyId: target.signing.currentKeyId,
-    workerArtifactDigest: `sha256:${identity.bundleDigestHex}`,
-    ...(authorityProfile === undefined ? {} : { authorityProfile }),
-  });
-  let configured = true;
-  try {
-    assertExactVersionBindingClosure(phase, history.versionId, version, desired);
-  } catch {
-    configured = false;
-    assertExactVersionBindingClosure(
+  if (workerVersionAnnotationProfile(version) !== "canonical") {
+    throw phaseError(
       phase,
-      history.versionId,
-      version,
-      expectedExactBindingClosure(withoutOperatorIdentity(target), {
-        signingKeyId: target.signing.currentKeyId,
-        workerArtifactDigest: `sha256:${identity.bundleDigestHex}`,
-        ...(authorityProfile === undefined ? {} : { authorityProfile }),
-      }),
+      `version ${history.versionId} has a non-canonical annotation inventory`,
     );
   }
+  const identity = workerVersionIdentity(phase, version);
+  const raw = optionalExactPlainTextBinding(
+    phase,
+    history.versionId,
+    version,
+    "OPERATOR_IDENTITY_PUBLIC_JWK",
+  );
+  const configuredPublicJwk = raw === null ? null : parseConfiguredPublicJwk(phase, raw);
+  const closureTarget = withConfiguredIdentity(target, configuredPublicJwk);
+  const authorityProfile = authorityProfileForVersion(
+    phase,
+    target,
+    history.versionId,
+    version,
+    identity,
+  );
+  assertExactVersionBindingClosure(
+    phase,
+    history.versionId,
+    version,
+    expectedExactBindingClosure(closureTarget, {
+      signingKeyId: target.signing.currentKeyId,
+      workerArtifactDigest: `sha256:${identity.bundleDigestHex}`,
+      ...(authorityProfile === undefined ? {} : { authorityProfile }),
+    }),
+  );
   assertExactSecretInventory(
     await state.workerSecrets(target.workerName),
     expectedWorkerSecrets(target),
     phase,
   );
   await assertLiveWorkerRoutingClosure(phase, target, state);
-  return { history, ...identity, configured, version };
+  const configuredPublicJwkDigest =
+    configuredPublicJwk === null ? null : sha256(JSON.stringify(configuredPublicJwk));
+  return {
+    deploymentChain,
+    history,
+    ...identity,
+    version,
+    configuredPublicJwk,
+    configuredPublicJwkDigest,
+    state:
+      configuredPublicJwk === null
+        ? "absent"
+        : configuredPublicJwk.x === desiredPublicJwk.x
+          ? "desired"
+          : "different",
+  };
 }
 
-function withoutOperatorIdentity(target: DeployTarget): DeployTarget {
-  const { operatorIdentity: _operatorIdentity, ...withoutIdentity } = target;
-  return withoutIdentity;
-}
-
-function assertIntegrationInvocation(
-  invocation: OperatorIdentityInvocation,
+function authorityProfileForVersion(
+  phase: DeployPhase,
   target: DeployTarget,
-): void {
-  if (invocation.environment !== "integration" || target.environment !== "integration") {
-    throw preflightError("operator identity surface is integration-only");
-  }
-  if (target.environment !== invocation.environment) {
-    throw preflightError("operator identity invocation and target environments differ");
-  }
+  versionId: string,
+  version: unknown,
+  identity: { readonly commit: string; readonly bundleDigestHex: string },
+) {
+  if (target.integrationE2eCredentialAuthority === undefined) return undefined;
+  return workerVersionAuthorityBindingShape(phase, versionId, version) === "historical-pre-jit"
+    ? ({ kind: "historical-pre-jit" } as const)
+    : ({
+        kind: "provenance-bound-jit",
+        provenance: {
+          sourceCommit: identity.commit,
+          artifactDigest: `sha256:${identity.bundleDigestHex}` as const,
+        },
+      } as const);
 }
 
-function exactCloudflareToken(environment: Readonly<Record<string, string>>): string {
-  const value = environment.CLOUDFLARE_API_TOKEN;
-  if (!value) throw preflightError("CLOUDFLARE_API_TOKEN is required");
-  return value;
+function withConfiguredIdentity(
+  target: DeployTarget,
+  publicJwk: PublicEd25519Jwk | null,
+): DeployTarget {
+  const { operatorIdentity: _operatorIdentity, ...withoutIdentity } = target;
+  return publicJwk === null
+    ? withoutIdentity
+    : { ...withoutIdentity, operatorIdentity: { publicJwk } };
 }
 
-function sha256(value: string): string {
-  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
-}
-
-export function readPrivateJwk(path: string): PrivateKeyInput {
-  let descriptor: number | null = null;
-  let raw: string;
-  try {
-    descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-    const status = fstatSync(descriptor);
-    if (
-      !status.isFile() ||
-      status.nlink !== 1 ||
-      (typeof process.getuid === "function" && status.uid !== process.getuid()) ||
-      (status.mode & 0o777) !== 0o600
-    ) {
-      throw new Error("unsafe");
-    }
-    raw = readFileSync(descriptor, "utf8");
-  } catch {
-    throw preflightError("operator private JWK must be an owned 0600 link-free regular file");
-  } finally {
-    if (descriptor !== null) closeSync(descriptor);
-  }
-  if (raw.length === 0 || raw.length > 16_384) {
-    throw preflightError("operator private JWK must be an owned 0600 link-free regular file");
-  }
+function parseConfiguredPublicJwk(phase: DeployPhase, raw: string): PublicEd25519Jwk {
   let value: unknown;
   try {
     value = JSON.parse(raw);
   } catch {
-    throw preflightError("operator private JWK is not valid JSON");
+    throw phaseError(phase, "Worker has a malformed OPERATOR_IDENTITY_PUBLIC_JWK binding");
   }
   if (
     !isRecord(value) ||
-    JSON.stringify(Object.keys(value).sort()) !== JSON.stringify([...PRIVATE_JWK_KEYS].sort()) ||
+    !exactKeys(value, ["kty", "crv", "x"]) ||
     value.kty !== "OKP" ||
     value.crv !== "Ed25519" ||
-    value.ext !== true ||
-    !Array.isArray(value.key_ops) ||
-    JSON.stringify(value.key_ops) !== JSON.stringify(["sign"]) ||
     typeof value.x !== "string" ||
-    typeof value.d !== "string" ||
-    !BASE64URL_32.test(value.x) ||
-    !BASE64URL_32.test(value.d)
+    !BASE64URL_32.test(value.x)
   ) {
-    throw preflightError("operator private JWK must be one exact Ed25519 signing key");
+    throw phaseError(phase, "Worker has a malformed OPERATOR_IDENTITY_PUBLIC_JWK binding");
   }
-  return {
-    jwk: value as unknown as JsonWebKey & { readonly x: string; readonly d: string },
-  };
+  const canonical = { kty: "OKP" as const, crv: "Ed25519" as const, x: value.x };
+  if (raw !== JSON.stringify(canonical)) {
+    throw phaseError(phase, "Worker has a non-canonical OPERATOR_IDENTITY_PUBLIC_JWK binding");
+  }
+  return canonical;
 }
 
-export async function provePrivateMatchesPublic(
-  input: PrivateKeyInput,
-  publicJwk: { readonly kty: "OKP"; readonly crv: "Ed25519"; readonly x: string },
-): Promise<void> {
-  if (input.jwk.x !== publicJwk.x) {
-    throw preflightError("operator private JWK does not match target public JWK");
-  }
-  try {
-    const privateKey = await crypto.subtle.importKey("jwk", input.jwk, { name: "Ed25519" }, false, [
-      "sign",
-    ]);
-    const publicKey = await crypto.subtle.importKey("jwk", publicJwk, { name: "Ed25519" }, false, [
-      "verify",
-    ]);
-    const message = new TextEncoder().encode("takoserver.deploy.operator-identity-proof@v1");
-    const signature = await crypto.subtle.sign("Ed25519", privateKey, message);
-    if (!(await crypto.subtle.verify("Ed25519", publicKey, signature, message))) {
-      throw new Error("key pair proof failed");
-    }
-  } catch {
-    throw preflightError("operator private JWK does not match target public JWK");
-  }
-}
-
-function exactReviewer(value: string): string {
-  if (value.trim() !== value || value.length < 1 || value.length > 256 || value.includes("\n")) {
-    throw preflightError("TAKOSERVER_INDEPENDENT_REVIEW must name one reviewer");
-  }
-  return value;
-}
-
-function assertSameUnconfiguredVersion(before: IdentityInspection, last: IdentityInspection): void {
+function assertSamePredecessor(before: IdentityInspection, last: IdentityInspection): void {
   if (
-    before.configured ||
-    last.configured ||
     last.history.deploymentId !== before.history.deploymentId ||
     last.history.versionId !== before.history.versionId ||
     last.history.previousVersionId !== before.history.previousVersionId ||
+    !sameDeploymentChain(last.deploymentChain, before.deploymentChain) ||
     last.commit !== before.commit ||
     last.bundleDigestHex !== before.bundleDigestHex ||
+    last.configuredPublicJwkDigest !== before.configuredPublicJwkDigest ||
     canonicalNonIdentityResources(last.version) !== canonicalNonIdentityResources(before.version)
   ) {
     throw preflightError("Worker changed during operator identity qualification; upload refused");
@@ -425,8 +537,7 @@ function assertOnlyOperatorIdentityAdvance(
   after: IdentityInspection,
 ): void {
   if (
-    before.configured ||
-    !after.configured ||
+    after.state !== "desired" ||
     after.history.versionId === before.history.versionId ||
     after.history.previousVersionId !== before.history.versionId ||
     after.commit !== before.commit ||
@@ -434,9 +545,183 @@ function assertOnlyOperatorIdentityAdvance(
     canonicalNonIdentityResources(after.version) !== canonicalNonIdentityResources(before.version)
   ) {
     throw verificationError(
-      "operator identity cutover changed more than the exact OPERATOR_IDENTITY_PUBLIC_JWK variable",
+      "operator identity transition changed more than the exact OPERATOR_IDENTITY_PUBLIC_JWK variable",
     );
   }
+}
+
+function assertSameSuccessor(after: IdentityInspection, settled: IdentityInspection): void {
+  if (
+    settled.history.deploymentId !== after.history.deploymentId ||
+    settled.history.versionId !== after.history.versionId ||
+    settled.history.previousVersionId !== after.history.previousVersionId ||
+    !sameDeploymentChain(settled.deploymentChain, after.deploymentChain) ||
+    settled.commit !== after.commit ||
+    settled.bundleDigestHex !== after.bundleDigestHex ||
+    settled.configuredPublicJwkDigest !== after.configuredPublicJwkDigest ||
+    canonicalNonIdentityResources(settled.version) !== canonicalNonIdentityResources(after.version)
+  ) {
+    throw verificationError("Worker changed during operator owner proof");
+  }
+}
+
+async function proveOwner(input: {
+  readonly origin: string;
+  readonly organizationId: string;
+  readonly privateInput: PrivateKeyInput;
+  readonly operatorIdentity: ReturnType<typeof readOperatorSignInIdentity>;
+  readonly fetcher: (input: string, init?: RequestInit) => Promise<Response>;
+  readonly now?: () => Date;
+}) {
+  const result = await withOperatorOwnerSession(
+    {
+      origin: input.origin,
+      organizationId: input.organizationId,
+      privateInput: input.privateInput,
+      identity: input.operatorIdentity,
+      fetcher: input.fetcher,
+      ...(input.now === undefined ? {} : { now: input.now }),
+      phase: "verification",
+    },
+    async () => undefined,
+  );
+  return result.proof;
+}
+
+async function rollbackFailedOwnerProof(input: {
+  readonly target: DeployTarget;
+  readonly state: WorkerState;
+  readonly migrations: OperatorIdentityMigrationReader;
+  readonly before: IdentityInspection;
+  readonly successor: IdentityInspection;
+  readonly proofFailure: unknown;
+  readonly configPath: string;
+  readonly run: OperatorIdentityProcess;
+  readonly cloudflareEnvironment: Readonly<Record<string, string>>;
+}): Promise<{ readonly deploymentId: string; readonly versionId: string }> {
+  let current: IdentityInspection | undefined;
+  let observedDeploymentChain: readonly WorkerDeploymentChainEntry[] | undefined;
+  try {
+    current = await inspectIdentity(
+      "verification",
+      input.target,
+      input.state,
+      input.target.operatorIdentity?.publicJwk as PublicEd25519Jwk,
+    );
+    observedDeploymentChain = current.deploymentChain;
+    assertSameSuccessor(input.successor, current);
+    const migrations = await input.migrations.read();
+    if (pendingMigrations(migrations.local, migrations.applied).length > 0) {
+      throw verificationError("D1 migration lineage changed before operator identity rollback");
+    }
+    // Closure and migration inspection are asynchronous. Re-read the strict
+    // provider history after both and immediately before publication so a
+    // concurrent deploy cannot be overwritten from the earlier snapshot.
+    observedDeploymentChain = parseWorkerDeploymentChain(
+      await input.state.workerDeployments(input.target.workerName),
+      "verification",
+      { requireUuidVersionIds: true },
+    );
+    if (!sameDeploymentChain(input.successor.deploymentChain, observedDeploymentChain)) {
+      throw verificationError(
+        "authoritative Worker deployment history changed during rollback qualification",
+      );
+    }
+  } catch {
+    const observedCurrent = observedDeploymentChain?.[0];
+    throw verificationError(
+      "operator identity owner proof failed and rollback was refused because the successor history drifted; target state is indeterminate",
+      JSON.stringify({
+        primary: safeFailure(input.proofFailure, "verification"),
+        rollback: "not_performed",
+        expectedSuccessorDeploymentId: input.successor.history.deploymentId,
+        expectedSuccessorVersionId: input.successor.history.versionId,
+        observedDeploymentId:
+          observedCurrent?.deploymentId ?? current?.history.deploymentId ?? null,
+        observedVersionId: observedCurrent?.versionId ?? current?.history.versionId ?? null,
+        expectedHistoryDigest: sha256(canonicalJson(input.successor.deploymentChain)),
+        observedHistoryDigest:
+          observedDeploymentChain === undefined
+            ? null
+            : sha256(canonicalJson(observedDeploymentChain)),
+      }),
+    );
+  }
+  const rollback = await input.run(
+    wranglerCommand([
+      "versions",
+      "deploy",
+      `${input.before.history.versionId}@100%`,
+      "--yes",
+      "--name",
+      input.target.workerName,
+      "--config",
+      input.configPath,
+    ]),
+    { env: input.cloudflareEnvironment },
+  );
+  if (rollback.exitCode !== 0) {
+    throw verificationError(
+      "operator identity owner proof failed and rollback acknowledgement is indeterminate; do not retry before --status",
+      redactDiagnostics(`${rollback.stdout}${rollback.stderr}`.trim(), [
+        input.cloudflareEnvironment.CLOUDFLARE_API_TOKEN,
+      ]),
+    );
+  }
+  const restored = await inspectIdentity(
+    "verification",
+    input.target,
+    input.state,
+    input.target.operatorIdentity?.publicJwk as PublicEd25519Jwk,
+  );
+  if (
+    restored.history.deploymentId === input.before.history.deploymentId ||
+    restored.history.deploymentId === input.successor.history.deploymentId ||
+    restored.history.versionId !== input.before.history.versionId ||
+    restored.history.previousVersionId !== input.successor.history.versionId ||
+    restored.commit !== input.before.commit ||
+    restored.bundleDigestHex !== input.before.bundleDigestHex ||
+    restored.configuredPublicJwkDigest !== input.before.configuredPublicJwkDigest ||
+    canonicalNonIdentityResources(restored.version) !==
+      canonicalNonIdentityResources(input.before.version)
+  ) {
+    throw verificationError(
+      "operator identity rollback did not restore the exact authoritative predecessor",
+    );
+  }
+  const migrations = await input.migrations.read();
+  if (pendingMigrations(migrations.local, migrations.applied).length > 0) {
+    throw verificationError("operator identity rollback readback found pending D1 migrations");
+  }
+  return {
+    deploymentId: restored.history.deploymentId,
+    versionId: restored.history.versionId,
+  };
+}
+
+function writeInspectionConfig(root: string, target: DeployTarget, commit: string): string {
+  return writeWorkerConfig(target, {
+    path: join(root, "inspect-wrangler.jsonc"),
+    main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
+    commit,
+    ...(target.integrationE2eCredentialAuthority === undefined
+      ? {}
+      : { authorityProfile: { kind: "historical-pre-jit" as const } }),
+  });
+}
+
+function remoteMigrationReader(
+  configPath: string,
+  environment: Readonly<Record<string, string>>,
+  run: OperatorIdentityProcess,
+): OperatorIdentityMigrationReader {
+  return {
+    async read() {
+      const local = readMigrationArtifact();
+      const remote = await readD1SchemaState(new RemoteD1(configPath, { environment, run }));
+      return { local: local.names, applied: remote.applied };
+    },
+  };
 }
 
 function canonicalNonIdentityResources(version: unknown): string {
@@ -455,11 +740,103 @@ function canonicalNonIdentityResources(version: unknown): string {
   return canonicalJson({ ...version.resources, bindings });
 }
 
-function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) {
-    const entries = value.map((entry) => canonicalJson(entry));
-    return `[${entries.join(",")}]`;
+function rollbackEvidence(target: DeployTarget, predecessorVersionId: string) {
+  return {
+    kind: "takoserver.operator-identity-rollback-evidence@v1",
+    environment: target.environment,
+    workerName: target.workerName,
+    predecessorVersionId,
+    executable: false,
+    recovery:
+      "requires a freshly qualified product-owned exact-target recovery operation; no provider command is emitted",
+  } as const;
+}
+
+function assertInvocation(invocation: OperatorIdentityInvocation, target: DeployTarget): void {
+  if (target.environment !== invocation.environment) {
+    throw preflightError("operator identity invocation and target environments differ");
   }
+  if (
+    invocation.surface !== "takoserver-integration-operator-identity" &&
+    invocation.surface !== "takoserver-operator-identity"
+  ) {
+    throw preflightError("operator identity invocation names an unsupported surface");
+  }
+  if (
+    invocation.surface === "takoserver-integration-operator-identity" &&
+    invocation.environment !== "integration"
+  ) {
+    throw preflightError(
+      "legacy takoserver-integration-operator-identity is restricted to integration",
+    );
+  }
+}
+
+function exactCloudflareToken(environment: Readonly<Record<string, string>>): string {
+  const value = environment.CLOUDFLARE_API_TOKEN;
+  if (!value) throw preflightError("CLOUDFLARE_API_TOKEN is required");
+  return value;
+}
+
+function exactReviewer(value: string): string {
+  if (value.trim() !== value || value.length < 1 || value.length > 256 || value.includes("\n")) {
+    throw preflightError("TAKOSERVER_INDEPENDENT_REVIEW must name one reviewer");
+  }
+  return value;
+}
+
+function safeFailureMessage(value: unknown): string {
+  return safeFailure(value, "verification").message;
+}
+
+function safeFailure(
+  value: unknown,
+  fallbackPhase: DeployPhase,
+): { readonly phase: DeployPhase; readonly message: string } {
+  return value instanceof DeployError
+    ? { phase: value.phase, message: value.message }
+    : {
+        phase: fallbackPhase,
+        message: "operator owner proof failed; failure details redacted",
+      };
+}
+
+function historyFromDeploymentChain(
+  phase: DeployPhase,
+  chain: readonly WorkerDeploymentChainEntry[],
+): WorkerDeploymentHistory {
+  const current = chain[0];
+  if (current === undefined) {
+    throw phaseError(phase, "Worker has no authoritative current deployment");
+  }
+  return {
+    deploymentId: current.deploymentId,
+    versionId: current.versionId,
+    previousVersionId: chain[1]?.versionId ?? null,
+  };
+}
+
+function sameDeploymentChain(
+  left: readonly WorkerDeploymentChainEntry[],
+  right: readonly WorkerDeploymentChainEntry[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every(
+      (entry, index) =>
+        entry.deploymentId === right[index]?.deploymentId &&
+        entry.versionId === right[index]?.versionId &&
+        entry.createdOn === right[index]?.createdOn,
+    )
+  );
+}
+
+function sha256(value: string): string {
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((entry) => canonicalJson(entry)).join(",")}]`;
   if (isRecord(value)) {
     return `{${Object.keys(value)
       .sort()
@@ -467,172 +844,6 @@ function canonicalJson(value: unknown): string {
       .join(",")}}`;
   }
   return JSON.stringify(value);
-}
-
-async function proveOperatorSession(
-  origin: string,
-  privateInput: PrivateKeyInput,
-  now: Date,
-  fetcher: (input: string, init?: RequestInit) => Promise<Response>,
-): Promise<{
-  readonly sessionStatus: 200;
-  readonly meStatus: 200;
-  readonly revokeStatus: number | "transport-error";
-  readonly replayStatus: 401;
-  readonly sessionRevoked: true;
-  readonly assertionRedacted: true;
-  readonly sessionRedacted: true;
-}> {
-  const nowSeconds = Math.floor(now.getTime() / 1_000);
-  if (!Number.isSafeInteger(nowSeconds)) {
-    throw verificationError("operator identity proof clock is invalid");
-  }
-  let assertion: string;
-  try {
-    assertion = await signOperatorAssertion({
-      privateJwk: JSON.stringify(privateInput.jwk),
-      claims: {
-        purpose: "sign-in",
-        provider: "google",
-        subject: "task-0037-integration-operator",
-        email: "task-0037-integration-operator@localhost",
-        displayName: "TASK-0037 Integration Operator",
-      },
-      nowSeconds,
-      lifetimeSeconds: 60,
-    });
-  } catch {
-    throw verificationError("operator identity assertion signing failed; private key redacted");
-  }
-  let sessionResponse: Response;
-  try {
-    sessionResponse = await fetcher(`${origin}/v1/sessions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "cache-control": "no-store" },
-      body: JSON.stringify({
-        provider: "google",
-        method: "operator-assertion",
-        assertion,
-      }),
-      redirect: "error",
-    });
-  } catch {
-    throw verificationError(
-      "operator identity session proof transport failed; credentials redacted",
-    );
-  }
-  const sessionBody = (await sessionResponse.json().catch(() => null)) as unknown;
-  if (sessionResponse.status !== 200 || !isRecord(sessionBody)) {
-    throw verificationError(
-      "operator identity session proof returned an invalid redacted response",
-      `status=${sessionResponse.status}`,
-    );
-  }
-  const sessionToken = sessionBody.sessionToken;
-  if (typeof sessionToken !== "string" || sessionToken.length < 1 || sessionToken.length > 16_384) {
-    throw verificationError(
-      "operator identity session proof returned no usable redacted session",
-      `status=${sessionResponse.status}`,
-    );
-  }
-  let proofFailure: Error | null = null;
-  const principal = sessionBody.principal;
-  if (!exactKeys(sessionBody, ["principal", "sessionToken"]) || !validProofPrincipal(principal)) {
-    proofFailure = verificationError(
-      "operator identity session proof returned an invalid redacted principal",
-      `status=${sessionResponse.status}`,
-    );
-  }
-  let meResponse: Response | null = null;
-  try {
-    meResponse = await fetcher(`${origin}/v1/me`, {
-      method: "GET",
-      headers: { authorization: `Bearer ${sessionToken}`, "cache-control": "no-store" },
-      redirect: "error",
-    });
-  } catch {
-    proofFailure ??= verificationError(
-      "operator identity /v1/me proof transport failed; credentials redacted",
-    );
-  }
-  if (meResponse !== null) {
-    const meBody = (await meResponse.json().catch(() => null)) as unknown;
-    if (
-      meResponse.status !== 200 ||
-      !isRecord(meBody) ||
-      !exactKeys(meBody, ["organizations", "principal"]) ||
-      !Array.isArray(meBody.organizations) ||
-      !validProofPrincipal(meBody.principal) ||
-      !validProofPrincipal(principal) ||
-      canonicalJson(meBody.principal) !== canonicalJson(principal)
-    ) {
-      proofFailure ??= verificationError(
-        "operator identity /v1/me proof returned an invalid redacted response",
-        `status=${meResponse.status}`,
-      );
-    }
-  }
-  const cleanup = await revokeProofSession(origin, sessionToken, fetcher);
-  if (proofFailure) throw proofFailure;
-  return {
-    sessionStatus: 200,
-    meStatus: 200,
-    ...cleanup,
-    sessionRevoked: true,
-    assertionRedacted: true,
-    sessionRedacted: true,
-  };
-}
-
-async function revokeProofSession(
-  origin: string,
-  sessionToken: string,
-  fetcher: (input: string, init?: RequestInit) => Promise<Response>,
-): Promise<{ readonly revokeStatus: number | "transport-error"; readonly replayStatus: 401 }> {
-  let revokeStatus: number | "transport-error" = "transport-error";
-  try {
-    const response = await fetcher(`${origin}/v1/session`, {
-      method: "DELETE",
-      headers: { authorization: `Bearer ${sessionToken}`, "cache-control": "no-store" },
-      redirect: "error",
-    });
-    revokeStatus = response.status;
-  } catch {
-    // The read-only replay below is the authority for an acknowledgement that
-    // may have been lost. The bearer itself never enters the diagnostic.
-  }
-  let replay: Response;
-  try {
-    replay = await fetcher(`${origin}/v1/me`, {
-      method: "GET",
-      headers: { authorization: `Bearer ${sessionToken}`, "cache-control": "no-store" },
-      redirect: "error",
-    });
-  } catch {
-    throw verificationError(
-      "operator identity session revocation replay failed; credential state is indeterminate and redacted",
-    );
-  }
-  if (replay.status !== 401) {
-    throw verificationError(
-      "operator identity proof session remains usable after revocation",
-      `revoke_status=${revokeStatus} replay_status=${replay.status}`,
-    );
-  }
-  return { revokeStatus, replayStatus: 401 };
-}
-
-function validProofPrincipal(value: unknown): value is Record<string, unknown> {
-  return (
-    isRecord(value) &&
-    exactKeys(value, ["displayName", "email", "id", "provider", "providerSubject"]) &&
-    typeof value.id === "string" &&
-    value.id.length > 0 &&
-    value.provider === "google" &&
-    value.providerSubject === "task-0037-integration-operator" &&
-    value.email === "task-0037-integration-operator@localhost" &&
-    value.displayName === "TASK-0037 Integration Operator"
-  );
 }
 
 function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
@@ -645,6 +856,12 @@ function redactDiagnostics(value: string, secrets: readonly (string | undefined)
     if (secret) redacted = redacted.replaceAll(secret, "[redacted]");
   }
   return redacted;
+}
+
+function phaseError(phase: DeployPhase, message: string, detail?: string) {
+  if (phase === "preflight") return preflightError(message, detail);
+  if (phase === "mutation") return mutationError(message, detail);
+  return verificationError(message, detail);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -158,6 +158,8 @@ export interface ExternalIdentityVerifier {
     readonly method?: IdentityProviderDescriptor["method"] | undefined;
     /** The value the caller asked the provider to embed in the token. */
     readonly nonce?: string | undefined;
+    /** Canonical request origin, for credentials that are audience-bound to one Host. */
+    readonly audience?: string | undefined;
   }): Promise<{
     readonly providerSubject: string;
     readonly email: string;
@@ -186,8 +188,20 @@ export interface Accounts {
     readonly assertion: string;
     readonly method?: IdentityProviderDescriptor["method"] | undefined;
     readonly nonce?: string | undefined;
+    readonly audience?: string | undefined;
     readonly sessionTtlSeconds?: number;
   }): Promise<{ readonly principal: Principal; readonly sessionToken: string }>;
+  /**
+   * Read-only proof that an assertion names an already-stored exact owner.
+   * It never provisions a principal, projects membership, or issues a bearer.
+   */
+  proveExistingOwner(input: {
+    readonly provider: IdentityProvider;
+    readonly assertion: string;
+    readonly method: "operator-assertion";
+    readonly organizationId: string;
+    readonly audience: string;
+  }): Promise<{ readonly principal: Principal; readonly organization: Organization }>;
   createOrganization(input: {
     readonly actor: Actor;
     readonly name: string;
@@ -435,7 +449,7 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
   };
 
   const accounts: Accounts = {
-    async signIn({ provider, assertion, method, nonce, sessionTtlSeconds }) {
+    async signIn({ provider, assertion, method, nonce, audience, sessionTtlSeconds }) {
       if (provider !== "takos-id" && provider !== "google" && provider !== "github") {
         throw new AuthError("invalid");
       }
@@ -444,6 +458,7 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
         assertion,
         method,
         nonce,
+        audience,
       });
       const rows = await sql.query(
         "SELECT id, email, display_name FROM principals WHERE provider = ? AND provider_subject = ?",
@@ -498,6 +513,50 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
           displayName: verified.displayName,
         },
         sessionToken: secret,
+      };
+    },
+
+    async proveExistingOwner({ provider, assertion, method, organizationId, audience }) {
+      if (provider !== "google" && provider !== "github") {
+        throw new AuthError("invalid");
+      }
+      const verified = await identity.verify({
+        provider,
+        assertion,
+        method,
+        audience,
+      });
+      const rows = await sql.query(
+        `SELECT p.id AS principal_id,
+                o.id AS organization_id, o.name AS organization_name,
+                o.owner_principal_id, o.created_at AS organization_created_at
+         FROM principals p
+         JOIN orgs o ON o.owner_principal_id = p.id AND o.id = ?
+         JOIN org_memberships m
+           ON m.org_id = o.id AND m.principal_id = p.id AND m.role = 'owner'
+         WHERE p.provider = ? AND p.provider_subject = ?
+           AND p.email = ? AND p.display_name = ?`,
+        [organizationId, provider, verified.providerSubject, verified.email, verified.displayName],
+      );
+      const row = rows[0];
+      // Unknown identities, stale membership and somebody else's organization
+      // are deliberately indistinguishable, and this path has made no write.
+      if (!row) throw new AuthError("not_found");
+      const principal: Principal = {
+        id: String(row.principal_id),
+        provider,
+        providerSubject: verified.providerSubject,
+        email: verified.email,
+        displayName: verified.displayName,
+      };
+      return {
+        principal,
+        organization: {
+          id: String(row.organization_id),
+          name: String(row.organization_name),
+          ownerPrincipalId: String(row.owner_principal_id),
+          createdAt: String(row.organization_created_at),
+        },
       };
     },
 
@@ -632,8 +691,9 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
 
     async requireOwner(actor, organizationId) {
       const memberships = await sql.query(
-        `SELECT role FROM org_memberships
-         WHERE org_id = ? AND principal_id = ? AND role = 'owner'`,
+        `SELECT m.role FROM org_memberships m
+         JOIN orgs o ON o.id = m.org_id AND o.owner_principal_id = m.principal_id
+         WHERE m.org_id = ? AND m.principal_id = ? AND m.role = 'owner'`,
         [organizationId, actor.principalId],
       );
       const organization = memberships[0] ? await accounts.organization(organizationId) : null;

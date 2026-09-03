@@ -158,6 +158,7 @@ describe("Google identity", () => {
  */
 describe("identity setup", () => {
   const OPERATOR_JWK = { kty: "OKP", crv: "Ed25519", x: "0".repeat(43) };
+  const OPERATOR_AUDIENCE = "https://api.example.test";
 
   test("advertises nothing when nothing is configured", async () => {
     const { resolveIdentity } = await import("../src/identity-setup.ts");
@@ -171,7 +172,10 @@ describe("identity setup", () => {
   test("names the operator path as what it is, once per provider it verifies", async () => {
     const { resolveIdentity } = await import("../src/identity-setup.ts");
     const { OPERATOR_PROVIDERS } = await import("../src/operator-credentials.ts");
-    const setup = resolveIdentity({ operatorPublicKeyJwk: OPERATOR_JWK });
+    const setup = resolveIdentity({
+      operatorPublicKeyJwk: OPERATOR_JWK,
+      operatorAudience: OPERATOR_AUDIENCE,
+    });
     expect(setup.providers).toEqual(
       OPERATOR_PROVIDERS.map((id) => ({
         id,
@@ -195,7 +199,10 @@ describe("identity setup", () => {
     const { OperatorAssertionError, OPERATOR_PROVIDERS } = await import(
       "../src/operator-credentials.ts"
     );
-    const setup = resolveIdentity({ operatorPublicKeyJwk: OPERATOR_JWK });
+    const setup = resolveIdentity({
+      operatorPublicKeyJwk: OPERATOR_JWK,
+      operatorAudience: OPERATOR_AUDIENCE,
+    });
     for (const provider of OPERATOR_PROVIDERS) {
       // Reaching the operator verifier at all is the claim: the assertion is
       // deliberately not a real one, so it must be refused as an assertion.
@@ -212,7 +219,10 @@ describe("identity setup", () => {
   test("refuses a provider it registers nothing for as the caller's error", async () => {
     const { resolveIdentity } = await import("../src/identity-setup.ts");
     const { AuthError } = await import("../src/auth.ts");
-    const setup = resolveIdentity({ operatorPublicKeyJwk: OPERATOR_JWK });
+    const setup = resolveIdentity({
+      operatorPublicKeyJwk: OPERATOR_JWK,
+      operatorAudience: OPERATOR_AUDIENCE,
+    });
     // `takos-id` is a real provider of this product and no operator assertion
     // can vouch for it. That is a 4xx about the request, never a 500.
     const refusal = setup.verifier.verify({
@@ -229,6 +239,7 @@ describe("identity setup", () => {
     const setup = resolveIdentity({
       googleClientId: CLIENT_ID,
       operatorPublicKeyJwk: OPERATOR_JWK,
+      operatorAudience: OPERATOR_AUDIENCE,
     });
     // One button, not a button and a text field asking for a pasted token.
     expect(setup.providers.map((entry) => entry.method)).toEqual(["oidc"]);
@@ -240,6 +251,7 @@ describe("identity setup", () => {
     const setup = resolveIdentity({
       takosId: { issuer: "https://id.takos.test", clientId: "takoserver" },
       operatorPublicKeyJwk: OPERATOR_JWK,
+      operatorAudience: OPERATOR_AUDIENCE,
     });
     expect(setup.providers).toEqual([
       {
@@ -267,6 +279,7 @@ describe("identity setup", () => {
     const setup = resolveIdentity({
       googleClientId: CLIENT_ID,
       operatorPublicKeyJwk: OPERATOR_JWK,
+      operatorAudience: OPERATOR_AUDIENCE,
     });
     // The escape hatch for a misconfigured provider — which is precisely when
     // nobody can sign in the ordinary way — so it must not be removed with the
@@ -285,6 +298,7 @@ describe("identity setup", () => {
     const setup = resolveIdentity({
       googleClientId: CLIENT_ID,
       operatorPublicKeyJwk: OPERATOR_JWK,
+      operatorAudience: OPERATOR_AUDIENCE,
     });
     // An operator assertion is not a Google token; sent as one it must fail as
     // a Google token, so the message is about the thing the caller actually

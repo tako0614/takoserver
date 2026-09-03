@@ -18,10 +18,11 @@ import type { Clock } from "./ports.ts";
  * it is not a payment provider; it is the operator vouching, in a form the
  * server can check and a third party cannot forge.
  *
- * Assertions are short-lived and single-purpose. A funding assertion names its
- * organization, so one cannot be replayed against another, and its funding
- * reference makes the ledger credit it exactly once no matter how many times it
- * is presented.
+ * Assertions are short-lived and single-purpose. A sign-in assertion names its
+ * canonical Host audience, so it cannot be replayed at another deployment. A
+ * funding assertion names its organization, so one cannot be redirected at
+ * another, and its funding reference makes the ledger credit it exactly once no
+ * matter how many times it is presented.
  */
 
 const MAX_ASSERTION_BYTES = 8 * 1_024;
@@ -34,8 +35,20 @@ export interface OperatorCredentialOptions {
   readonly maxLifetimeSeconds?: number;
 }
 
+export interface OperatorIdentityCredentialOptions extends OperatorCredentialOptions {
+  /** Exact bare Host origin this sign-in assertion must name and address. */
+  readonly audience: string;
+}
+
 export class OperatorAssertionError extends Error {
-  constructor(readonly code: "malformed" | "invalid_signature" | "expired" | "wrong_purpose") {
+  constructor(
+    readonly code:
+      | "malformed"
+      | "invalid_signature"
+      | "expired"
+      | "wrong_purpose"
+      | "wrong_audience",
+  ) {
     super(code);
     this.name = "OperatorAssertionError";
   }
@@ -132,12 +145,16 @@ function createVerifier(options: OperatorCredentialOptions) {
 
 /** Accepts a sign-in the operator vouched for. */
 export function createOperatorIdentity(
-  options: OperatorCredentialOptions,
+  options: OperatorIdentityCredentialOptions,
 ): ExternalIdentityVerifier {
   const verify = createVerifier(options);
+  const audience = canonicalOperatorAudience(options.audience);
   return {
-    async verify({ provider, assertion }) {
+    async verify({ provider, assertion, audience: requestAudience }) {
       const { claims } = await verify(assertion, "sign-in");
+      if (requestAudience !== audience || claims.aud !== audience) {
+        throw new OperatorAssertionError("wrong_audience");
+      }
       if (claims.provider !== provider) throw new OperatorAssertionError("wrong_purpose");
       const providerSubject = claims.subject;
       const email = claims.email;
@@ -152,6 +169,28 @@ export function createOperatorIdentity(
       return { providerSubject, email, displayName };
     },
   };
+}
+
+export function canonicalOperatorAudience(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new TypeError("operator identity audience must be one canonical bare Host origin");
+  }
+  const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1";
+  if (
+    url.origin !== value ||
+    (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) ||
+    url.username ||
+    url.password ||
+    url.pathname !== "/" ||
+    url.search ||
+    url.hash
+  ) {
+    throw new TypeError("operator identity audience must be one canonical bare Host origin");
+  }
+  return value;
 }
 
 /** Accepts a wallet credit the operator vouched for. */

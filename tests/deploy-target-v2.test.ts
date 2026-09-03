@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadTarget, targetPath } from "../scripts/deploy/target.ts";
+import { loadTarget, parseDeployTarget, targetPath } from "../scripts/deploy/target.ts";
 import { INTEGRATION_E2E_ORGANIZATION_ID } from "../src/integration-e2e-credential-authority.ts";
 
 function descriptor(overrides: Record<string, unknown> = {}) {
@@ -101,21 +101,21 @@ describe("environment-exact deploy target", () => {
     expect(targetPath("production")).toEndWith("/.deploy/targets/production.json");
   });
 
-  test("accepts only one exact public Ed25519 operator identity on integration", () => {
+  test("accepts one exact public Ed25519 operator identity in every deploy environment", () => {
     const publicJwk = {
       kty: "OKP" as const,
       crv: "Ed25519" as const,
       x: "A".repeat(43),
     };
-    withTarget(
-      descriptor({
-        environment: "integration",
-        operatorIdentity: { publicJwk },
-      }),
-      (path) => {
-        expect(loadTarget(path, "integration").operatorIdentity).toEqual({ publicJwk });
-      },
-    );
+    for (const environment of ["integration", "rehearsal", "production"] as const) {
+      const value = descriptor({ environment, operatorIdentity: { publicJwk } });
+      expect(
+        parseDeployTarget(value, `${environment} target`, environment).operatorIdentity,
+      ).toEqual({ publicJwk });
+      withTarget(value, (path) => {
+        expect(loadTarget(path, environment).operatorIdentity).toEqual({ publicJwk });
+      });
+    }
 
     for (const rejected of [
       { ...publicJwk, d: "private-material" },
@@ -130,17 +130,6 @@ describe("environment-exact deploy target", () => {
         (path) => expect(() => loadTarget(path, "integration")).toThrow("operatorIdentity"),
       );
     }
-  });
-
-  test("refuses operator identity in a non-integration target", () => {
-    withTarget(
-      descriptor({
-        operatorIdentity: {
-          publicJwk: { kty: "OKP", crv: "Ed25519", x: "A".repeat(43) },
-        },
-      }),
-      (path) => expect(() => loadTarget(path, "rehearsal")).toThrow("integration-only"),
-    );
   });
 
   test("validates distinct route-less Form authority targets", () => {
@@ -280,9 +269,14 @@ describe("environment-exact deploy target", () => {
         );
       },
     );
-    withTarget(descriptor({ integrationE2eCredentialAuthority: authority }), (path) => {
-      expect(() => loadTarget(path, "rehearsal")).toThrow("integration-only");
-    });
+    for (const environment of ["rehearsal", "production"] as const) {
+      withTarget(
+        descriptor({ environment, integrationE2eCredentialAuthority: authority }),
+        (path) => {
+          expect(() => loadTarget(path, environment)).toThrow("integration-only");
+        },
+      );
+    }
     withTarget(
       descriptor({
         environment: "integration",

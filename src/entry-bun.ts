@@ -554,6 +554,7 @@ const identity = resolveIdentity({
     : {}),
   googleClientId: process.env.GOOGLE_CLIENT_ID,
   operatorPublicKeyJwk: identityPublicKeyJwk,
+  operatorAudience: publicOrigin,
 });
 
 /**
@@ -775,6 +776,7 @@ if (identity.providers.some((provider) => provider.method === "operator-assertio
       privateJwk: stored,
       claims: {
         purpose: "sign-in",
+        aud: publicOrigin,
         provider: "google",
         subject: "operator",
         email: "operator@localhost",

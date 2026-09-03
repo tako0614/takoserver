@@ -591,6 +591,17 @@
         "security": []
       }
     },
+    "/v1/operator-owner-proof": {
+      "post": {
+        "summary": "Prove an operator assertion names an existing exact Organization owner without creating durable state",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        },
+        "security": []
+      }
+    },
     "/v1/sessions": {
       "post": {
         "summary": "Exchange an external assertion for a session",

@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { canonicalOperatorAudience } from "../src/operator-credentials.ts";
 
 /**
  * The operator's own key, and the assertions it signs.
@@ -53,7 +54,14 @@ function signInClaims(input: readonly string[]): Record<string, unknown> {
     process.stderr.write("sign-in needs <provider> <subject> <email> <name>\n");
     process.exit(2);
   }
-  return { purpose: "sign-in", provider, subject, email, displayName };
+  return {
+    purpose: "sign-in",
+    aud: canonicalOperatorAudience(process.env.TAKOSERVER_PUBLIC_ORIGIN ?? "http://localhost:8787"),
+    provider,
+    subject,
+    email,
+    displayName,
+  };
 }
 
 function fundingClaims(input: readonly string[]): Record<string, unknown> {

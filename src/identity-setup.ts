@@ -34,6 +34,8 @@ export interface IdentitySetupOptions {
   readonly operatorPublicKeyJwk?:
     | { readonly kty: string; readonly crv: string; readonly x: string }
     | undefined;
+  /** Canonical public Host origin bound into every operator sign-in assertion. */
+  readonly operatorAudience?: string | undefined;
   readonly clock?: Clock;
 }
 
@@ -84,8 +86,12 @@ export function resolveIdentity(options: IdentitySetupOptions): IdentitySetup {
   }
 
   if (options.operatorPublicKeyJwk) {
+    if (!options.operatorAudience) {
+      throw new TypeError("operator identity public JWK requires its canonical Host audience");
+    }
     const operator = createOperatorIdentity({
       publicKeyJwk: options.operatorPublicKeyJwk,
+      audience: options.operatorAudience,
       ...(options.clock ? { clock: options.clock } : {}),
     });
     // One registration per provider an operator assertion may vouch for, read

@@ -4,6 +4,7 @@ import { signOperatorAssertion } from "../src/operator-key.ts";
 
 const LEGACY = JSON.stringify({ kty: "OKP", crv: "Ed25519", x: "legacy" });
 const IDENTITY = JSON.stringify({ kty: "OKP", crv: "Ed25519", x: "identity" });
+const ORIGIN = "https://api.example.test";
 
 describe("Worker operator authority", () => {
   test("keeps the legacy key compatible with login and funding", () => {
@@ -33,9 +34,12 @@ describe("Worker operator authority", () => {
 
   test("the composed Worker refuses funding signed by an identity-only key", async () => {
     const key = await keyPair();
-    const settlement = workerCredentials({
-      OPERATOR_IDENTITY_PUBLIC_JWK: JSON.stringify(key.publicJwk),
-    }).settlement;
+    const settlement = workerCredentials(
+      {
+        OPERATOR_IDENTITY_PUBLIC_JWK: JSON.stringify(key.publicJwk),
+      },
+      ORIGIN,
+    ).settlement;
     const proof = await fundingProof(key.privateJwk);
 
     await expect(
@@ -45,9 +49,12 @@ describe("Worker operator authority", () => {
 
   test("the composed Worker retains legacy signed funding compatibility", async () => {
     const key = await keyPair();
-    const settlement = workerCredentials({
-      OPERATOR_PUBLIC_JWK: JSON.stringify(key.publicJwk),
-    }).settlement;
+    const settlement = workerCredentials(
+      {
+        OPERATOR_PUBLIC_JWK: JSON.stringify(key.publicJwk),
+      },
+      ORIGIN,
+    ).settlement;
     const proof = await fundingProof(key.privateJwk);
 
     await expect(

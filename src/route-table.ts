@@ -46,6 +46,11 @@ export const ROUTES: readonly RouteDeclaration[] = [
   { method: "get", pattern: "/.well-known/takoserver", operation: "productDiscovery" },
   { method: "get", pattern: "/.well-known/takoform/v1", operation: "takoformDiscovery" },
   { method: "get", pattern: "/v1/identity/providers", operation: "identityProviders" },
+  {
+    method: "post",
+    pattern: "/v1/operator-owner-proof",
+    operation: "proveOperatorOrganizationOwner",
+  },
   { method: "post", pattern: "/v1/sessions", operation: "createSession" },
   { method: "delete", pattern: "/v1/session", operation: "endSession" },
   { method: "get", pattern: "/v1/me", operation: "readPrincipal" },

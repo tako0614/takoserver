@@ -3,458 +3,821 @@ import { createHash } from "node:crypto";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runOperatorIdentity } from "../scripts/deploy/identity.ts";
+import {
+  type OperatorIdentityMigrationReader,
+  runOperatorIdentity,
+} from "../scripts/deploy/identity.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
+import type { DeployEnvironment } from "../scripts/deploy/qualification.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
-import { runWorker } from "../scripts/deploy/worker.ts";
 import type { WorkerState } from "../scripts/deploy/worker-live.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
 
 const COMMIT = "a".repeat(40);
 const BUNDLE = "export default {fetch(){return new Response('ok')}};\n";
 const BUNDLE_DIGEST = createHash("sha256").update(BUNDLE).digest("hex");
-const PUBLIC_JWK = { kty: "OKP" as const, crv: "Ed25519" as const, x: "A".repeat(43) };
-const PUBLIC_JWK_DIGEST = `sha256:${createHash("sha256")
-  .update(JSON.stringify(PUBLIC_JWK))
-  .digest("hex")}`;
+const ORGANIZATION = "org_operator_owner";
+const VERSION_BEFORE = "11111111-1111-4111-8111-111111111111";
+const VERSION_AFTER = "22222222-2222-4222-8222-222222222222";
+const VERSION_RACED = "33333333-3333-4333-8333-333333333333";
+const DEPLOYMENT_BEFORE = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1";
+const DEPLOYMENT_AFTER = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2";
+const DEPLOYMENT_ROLLBACK = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3";
+const DEPLOYMENT_RACED = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4";
+const IDENTITY = {
+  kind: "takoserver.operator-sign-in-identity@v1",
+  provider: "github",
+  subject: "takoserver-owner",
+  email: "owner@example.test",
+  displayName: "Takoserver Owner",
+} as const;
 
-const target = {
-  kind: "takoserver.deploy-target@v2",
-  environment: "integration",
-  accountId: "a".repeat(32),
-  workerName: "takoserver-api-integration",
-  d1: {
-    databaseName: "takoserver-runtime-integration",
-    databaseId: "00000000-0000-4000-8000-000000000000",
-  },
-  r2: { bucketName: "takoserver-objects-integration" },
-  publicOrigin: "https://api.integration.example.test",
-  signing: { currentKeyId: "key-current" },
-  operatorIdentity: { publicJwk: PUBLIC_JWK },
-} satisfies DeployTarget;
+describe("operator identity authority", () => {
+  test("status inspects integration, rehearsal and production with the same authority model", async () => {
+    for (const environment of ["integration", "rehearsal", "production"] as const) {
+      const selected = await authorityFixture(environment);
+      try {
+        const state = staticState(selected.target, versionFor(selected.target, null));
+        const result = await runOperatorIdentity(
+          invocation(environment, "status"),
+          selected.target,
+          {
+            state,
+            migrations: migrations(),
+          },
+        );
+        expect(result).toMatchObject({
+          kind: "takoserver.operator-identity-status@v1",
+          surface: "takoserver-operator-identity",
+          environment,
+          state: "identity-change-required",
+          selectedCommit: COMMIT,
+          deployedCommit: COMMIT,
+          configuredPublicJwkDigest: null,
+          appliedMigrations: [],
+          pendingMigrations: [],
+          ownerProof: "not_performed",
+          mutationApplied: false,
+          ready: false,
+          readyForApply: true,
+        });
+      } finally {
+        rmSync(selected.root, { recursive: true, force: true });
+      }
+    }
+  });
 
-describe("integration operator identity deploy surface", () => {
-  test("status is mutation-free and reports the desired public digest and readiness", async () => {
-    const root = mkdtempSync(join(tmpdir(), "takoserver-identity-status-"));
+  test("keeps the legacy integration spelling integration-only", async () => {
+    const integration = await authorityFixture("integration");
     try {
-      const state = staticState(version("absent"));
-      const result = await runOperatorIdentity(
-        {
-          surface: "takoserver-integration-operator-identity",
-          action: "status",
-          environment: "integration",
-          commit: COMMIT,
-        },
-        target,
-        { state, outputDirectory: root },
-      );
-      expect(result).toEqual({
-        kind: "takoserver.integration-operator-identity-status@v2",
+      await expect(
+        runOperatorIdentity(
+          invocation("integration", "status", "takoserver-integration-operator-identity"),
+          integration.target,
+          {
+            state: staticState(integration.target, versionFor(integration.target, null)),
+            migrations: migrations(),
+          },
+        ),
+      ).resolves.toMatchObject({
         surface: "takoserver-integration-operator-identity",
         environment: "integration",
-        selectedCommit: COMMIT,
-        deployedCommit: COMMIT,
-        versionId: "version-before",
-        desiredPublicJwkDigest: PUBLIC_JWK_DIGEST,
-        configuredPublicJwkDigest: null,
-        configured: false,
-        ready: true,
       });
-      expect(state.reads()).toEqual({ deployments: 1, versions: 1, secrets: 1, domains: 1 });
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSync(integration.root, { recursive: true, force: true });
     }
-  });
 
-  test("routine Worker publication cannot bridge an absent operator identity", async () => {
-    const root = mkdtempSync(join(tmpdir(), "takoserver-identity-routine-"));
-    try {
-      const process = processFixture();
-      const failure = await runWorker(
-        {
-          surface: "takoserver-worker",
-          action: "apply",
-          environment: "integration",
-          commit: COMMIT,
-        },
-        target,
-        {
-          state: staticState(version("absent")),
-          migrations: {
-            async read() {
-              return { local: [], applied: [] };
+    for (const environment of ["rehearsal", "production"] as const) {
+      const selected = await authorityFixture(environment);
+      try {
+        await expect(
+          runOperatorIdentity(
+            invocation(environment, "status", "takoserver-integration-operator-identity"),
+            selected.target,
+            {
+              state: staticState(selected.target, versionFor(selected.target, null)),
+              migrations: migrations(),
             },
-          },
-          run: process.run,
-          outputDirectory: root,
-          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
-        },
-      ).catch((error) => error);
-
-      expect(failure).toMatchObject({ phase: "preflight" });
-      expect(failure.message).toContain(
-        "does not declare the OPERATOR_IDENTITY_PUBLIC_JWK binding",
-      );
-      expect(process.calls.some((command) => command.includes("check"))).toBe(false);
-      expect(process.calls.some((command) => command.includes("deploy"))).toBe(false);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
+          ),
+        ).rejects.toMatchObject({ phase: "preflight" });
+      } finally {
+        rmSync(selected.root, { recursive: true, force: true });
+      }
     }
   });
 
-  test("apply refuses an unsafe or mismatched private JWK before gate or upload", async () => {
-    const root = mkdtempSync(join(tmpdir(), "takoserver-identity-private-"));
+  test("never presents provider-only production status as owner-ready", async () => {
+    const selected = await authorityFixture("production");
     try {
-      const selected = await keyPair();
-      const other = await keyPair();
-      const selectedTarget = targetWithPublicX(selected.publicJwk.x);
-      const privatePath = join(root, "operator-private.jwk");
-      writeFileSync(privatePath, `${JSON.stringify(selected.privateJwk)}\n`, { mode: 0o644 });
-      chmodSync(privatePath, 0o644);
-      const process = processFixture();
-      const invocation = {
-        surface: "takoserver-integration-operator-identity" as const,
-        action: "apply" as const,
-        environment: "integration" as const,
-        commit: COMMIT,
-      };
-      const options = {
-        state: staticState(versionForTarget(selectedTarget, "absent")),
-        run: process.run,
-        privateJwkPath: privatePath,
-        review: "reviewer@example.test",
-        outputDirectory: join(root, "unsafe-work"),
-        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
-      };
-
-      const unsafe = await runOperatorIdentity(invocation, selectedTarget, options).catch(
-        (error) => error,
-      );
-      expect(unsafe).toBeInstanceOf(Error);
-      expect(unsafe.message).toContain("owned 0600");
-
-      writeFileSync(privatePath, `${JSON.stringify(other.privateJwk)}\n`);
-      chmodSync(privatePath, 0o600);
-      const mismatch = await runOperatorIdentity(invocation, selectedTarget, {
-        ...options,
-        state: staticState(versionForTarget(selectedTarget, "absent")),
-        outputDirectory: join(root, "mismatch-work"),
-      }).catch((error) => error);
-      expect(mismatch).toBeInstanceOf(Error);
-      expect(mismatch.message).toContain("does not match");
-      expect(process.calls.some((command) => command.includes("check"))).toBe(false);
-      expect(process.calls.some((command) => command.includes("deploy"))).toBe(false);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("uploads one identical-code Version, adds only the public var, and proves a redacted session", async () => {
-    const root = mkdtempSync(join(tmpdir(), "takoserver-identity-apply-"));
-    try {
-      const selected = await keyPair();
-      const selectedTarget = targetWithPublicX(selected.publicJwk.x);
-      const privateRaw = `${JSON.stringify(selected.privateJwk)}\n`;
-      const privatePath = join(root, "operator-private.jwk");
-      writeFileSync(privatePath, privateRaw, { mode: 0o600 });
-      const process = processFixture({ build: true, upload: true });
-      const state = transitionState(selectedTarget);
-      const requests: Request[] = [];
-      const captured: { assertion?: string } = {};
-      const result = await runOperatorIdentity(
+      const status = await runOperatorIdentity(
+        invocation("production", "status"),
+        selected.target,
         {
-          surface: "takoserver-integration-operator-identity",
-          action: "apply",
-          environment: "integration",
-          commit: COMMIT,
+          state: staticState(
+            selected.target,
+            versionFor(selected.target, selected.publicJwk),
+            VERSION_BEFORE,
+            VERSION_RACED,
+          ),
+          migrations: migrations(),
         },
-        selectedTarget,
+      );
+      expect(status).toMatchObject({
+        state: "desired-current",
+        ownerProof: "not_performed",
+        configurationReady: true,
+        ready: false,
+        readyForApply: false,
+        rollback: {
+          kind: "takoserver.operator-identity-rollback-evidence@v1",
+          environment: "production",
+          workerName: selected.target.workerName,
+          predecessorVersionId: VERSION_RACED,
+          executable: false,
+        },
+      });
+      expect(JSON.stringify(status.rollback)).not.toContain("wrangler");
+    } finally {
+      rmSync(selected.root, { recursive: true, force: true });
+    }
+  });
+
+  test("requires UUID Worker Version identities on the authority-sensitive history", async () => {
+    const selected = await authorityFixture("integration");
+    try {
+      await expect(
+        runOperatorIdentity(invocation("integration", "status"), selected.target, {
+          state: staticState(
+            selected.target,
+            versionFor(selected.target, null),
+            "not-a-version-uuid",
+          ),
+          migrations: migrations(),
+        }),
+      ).rejects.toThrow("invalid Version ID");
+    } finally {
+      rmSync(selected.root, { recursive: true, force: true });
+    }
+  });
+
+  test("adds only OPERATOR_IDENTITY_PUBLIC_JWK and proves the real owner identity", async () => {
+    const selected = await authorityFixture("integration");
+    try {
+      const process = processFixture("integration");
+      const state = transitionState(selected.target, null, process);
+      const requests: Request[] = [];
+      const result = await runOperatorIdentity(
+        invocation("integration", "apply"),
+        selected.target,
         {
           state,
+          migrations: migrations(),
           run: process.run,
-          privateJwkPath: privatePath,
-          review: "reviewer@example.test",
-          outputDirectory: join(root, "work"),
-          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
-          fetcher: sessionFetcher(selected.pair.publicKey, requests, captured),
-          now: () => new Date("2026-08-28T12:00:00Z"),
+          privateJwkPath: selected.privateJwkPath,
+          operatorIdentityPath: selected.identityPath,
+          review: "independent-reviewer",
+          outputDirectory: join(selected.root, "work"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "cloudflare-secret" },
+          fetcher: ownerSessionFetcher(selected.publicKey, requests),
+          now: () => new Date("2026-09-03T12:00:00.000Z"),
         },
       );
       expect(result).toMatchObject({
-        kind: "takoserver.integration-operator-identity-apply@v2",
-        surface: "takoserver-integration-operator-identity",
+        kind: "takoserver.operator-identity-apply@v1",
         environment: "integration",
-        commit: COMMIT,
-        reviewer: "reviewer@example.test",
-        previousVersionId: "version-before",
-        versionId: "version-after",
-        publicJwkDigest: sha256(JSON.stringify(selectedTarget.operatorIdentity?.publicJwk)),
+        organizationId: ORGANIZATION,
+        transition: "add",
+        predecessorVersionId: VERSION_BEFORE,
+        successorVersionId: VERSION_AFTER,
         exactConfigDiff: {
-          added: [
-            {
-              name: "OPERATOR_IDENTITY_PUBLIC_JWK",
-              valueDigest: expect.stringMatching(/^sha256:/),
-            },
-          ],
+          added: [{ name: "OPERATOR_IDENTITY_PUBLIC_JWK", valueDigest: expect.any(String) }],
           changed: [],
           removed: [],
         },
-        proof: {
-          sessionStatus: 200,
-          meStatus: 200,
+        ownerProof: {
+          organizationId: ORGANIZATION,
+          organizationRole: "owner",
           revokeStatus: 204,
           replayStatus: 401,
-          sessionRevoked: true,
-          assertionRedacted: true,
-          sessionRedacted: true,
         },
+        mutationApplied: true,
       });
-      const uploads = process.calls.filter(
-        (command) => command.includes("--no-bundle") && !command.includes("--dry-run"),
-      );
-      expect(uploads).toHaveLength(1);
-      expect(process.calls.filter((command) => command.join(" ") === "bun run check")).toHaveLength(
-        1,
-      );
-      expect(process.calls.some((command) => command.includes("d1"))).toBe(false);
-      expect(
-        requests.map((request) => `${request.method} ${new URL(request.url).pathname}`),
-      ).toEqual(["POST /v1/sessions", "GET /v1/me", "DELETE /v1/session", "GET /v1/me"]);
-      const rendered = JSON.stringify(result);
-      expect(rendered).not.toContain(String(selected.privateJwk.d));
-      expect(rendered).not.toContain("session-secret-do-not-print");
-      expect(captured.assertion).toEqual(expect.any(String));
-      expect(rendered).not.toContain(captured.assertion as string);
-      expect(process.calls.some((command) => command.join(" ").includes(privateRaw.trim()))).toBe(
-        false,
-      );
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("refuses unrelated live configuration drift before any mutation", async () => {
-    const drifted = structuredClone(version("absent")) as {
-      resources: { bindings: Record<string, unknown>[] };
-    };
-    drifted.resources.bindings.push({
-      name: "UNRELATED_CONFIGURATION",
-      type: "plain_text",
-      text: "must-not-survive",
-    });
-    const failure = await runOperatorIdentity(
-      {
-        surface: "takoserver-integration-operator-identity",
-        action: "status",
+      expect(result.rollback).toEqual({
+        kind: "takoserver.operator-identity-rollback-evidence@v1",
         environment: "integration",
-        commit: COMMIT,
-      },
-      target,
-      { state: staticState(drifted) },
-    ).catch((error) => error);
-    expect(failure).toBeInstanceOf(Error);
-    expect(failure.message).toContain("exact selected target closure");
-  });
-
-  test("classifies unrelated post-upload configuration drift as verification failure", async () => {
-    const root = mkdtempSync(join(tmpdir(), "takoserver-identity-after-drift-"));
-    try {
-      const selected = await keyPair();
-      const selectedTarget = targetWithPublicX(selected.publicJwk.x);
-      const privatePath = join(root, "operator-private.jwk");
-      writeFileSync(privatePath, `${JSON.stringify(selected.privateJwk)}\n`, { mode: 0o600 });
-      const process = processFixture({ build: true, upload: true });
-      const requests: Request[] = [];
-      const failure = await runOperatorIdentity(
-        {
-          surface: "takoserver-integration-operator-identity",
-          action: "apply",
-          environment: "integration",
-          commit: COMMIT,
-        },
-        selectedTarget,
-        {
-          state: transitionStateWithDrift(selectedTarget),
-          run: process.run,
-          privateJwkPath: privatePath,
-          review: "reviewer@example.test",
-          outputDirectory: join(root, "work"),
-          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
-          fetcher: async (input, init) => {
-            requests.push(new Request(input, init));
-            return Response.json({ error: "unexpected proof" }, { status: 500 });
-          },
-        },
-      ).catch((error) => error);
-
-      expect(failure).toMatchObject({ phase: "verification" });
-      expect(failure.message).toContain("exact selected target closure");
-      expect(
-        process.calls.filter(
-          (command) => command.includes("--no-bundle") && !command.includes("--dry-run"),
-        ),
-      ).toHaveLength(1);
-      expect(requests).toHaveLength(0);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("requires revoked-session replay refusal without exposing proof credentials", async () => {
-    const root = mkdtempSync(join(tmpdir(), "takoserver-identity-replay-"));
-    try {
-      const selected = await keyPair();
-      const selectedTarget = targetWithPublicX(selected.publicJwk.x);
-      const privatePath = join(root, "operator-private.jwk");
-      writeFileSync(privatePath, `${JSON.stringify(selected.privateJwk)}\n`, { mode: 0o600 });
-      const process = processFixture({ build: true, upload: true });
-      const requests: Request[] = [];
-      const captured: { assertion?: string } = {};
-      const failure = await runOperatorIdentity(
-        {
-          surface: "takoserver-integration-operator-identity",
-          action: "apply",
-          environment: "integration",
-          commit: COMMIT,
-        },
-        selectedTarget,
-        {
-          state: transitionState(selectedTarget),
-          run: process.run,
-          privateJwkPath: privatePath,
-          review: "reviewer@example.test",
-          outputDirectory: join(root, "work"),
-          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
-          fetcher: sessionFetcher(selected.pair.publicKey, requests, captured, {
-            allowRevokedReplay: true,
-          }),
-          now: () => new Date("2026-08-28T12:00:00Z"),
-        },
-      ).catch((error) => error);
-
-      expect(failure).toMatchObject({ phase: "verification" });
-      expect(failure.message).toContain("remains usable after revocation");
+        workerName: selected.target.workerName,
+        predecessorVersionId: VERSION_BEFORE,
+        executable: false,
+        recovery:
+          "requires a freshly qualified product-owned exact-target recovery operation; no provider command is emitted",
+      });
+      expect(JSON.stringify(result.rollback)).not.toContain("wrangler");
+      expect(process.uploads).toBe(1);
+      expect(process.rollbacks).toBe(0);
       expect(
         requests.map((request) => `${request.method} ${new URL(request.url).pathname}`),
-      ).toEqual(["POST /v1/sessions", "GET /v1/me", "DELETE /v1/session", "GET /v1/me"]);
-      const renderedFailure = `${failure.message}\n${String(failure.detail)}\n${JSON.stringify(failure)}`;
-      expect(renderedFailure).not.toContain("session-secret-do-not-print");
-      expect(renderedFailure).not.toContain(String(selected.privateJwk.d));
-      expect(captured.assertion).toEqual(expect.any(String));
-      expect(renderedFailure).not.toContain(captured.assertion as string);
+      ).toEqual([
+        "POST /v1/operator-owner-proof",
+        "POST /v1/sessions",
+        "GET /v1/me",
+        "DELETE /v1/session",
+        "GET /v1/me",
+      ]);
+      const rendered = JSON.stringify(result);
+      expect(rendered).not.toContain(selected.privateJwk.d);
+      expect(rendered).not.toContain(selected.privateJwkPath);
+      expect(rendered).not.toContain(selected.identityPath);
+      expect(rendered).not.toContain("session-secret");
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSync(selected.root, { recursive: true, force: true });
     }
   });
 
-  test("closes the qualification race and performs no upload after a Version advance", async () => {
-    const root = mkdtempSync(join(tmpdir(), "takoserver-identity-race-"));
+  test("rotates a different valid operator JWK but refuses an exact no-op", async () => {
+    const selected = await authorityFixture("rehearsal");
+    const old = await publicKey();
     try {
-      const selected = await keyPair();
-      const selectedTarget = targetWithPublicX(selected.publicJwk.x);
-      const privatePath = join(root, "operator-private.jwk");
-      writeFileSync(privatePath, `${JSON.stringify(selected.privateJwk)}\n`, { mode: 0o600 });
-      const process = processFixture({ build: true, upload: true });
-      const failure = await runOperatorIdentity(
-        {
-          surface: "takoserver-integration-operator-identity",
-          action: "apply",
-          environment: "integration",
-          commit: COMMIT,
-        },
-        selectedTarget,
-        {
-          state: racingState(selectedTarget),
-          run: process.run,
-          privateJwkPath: privatePath,
-          review: "reviewer@example.test",
-          outputDirectory: join(root, "work"),
-          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
-        },
-      ).catch((error) => error);
-      expect(failure).toBeInstanceOf(Error);
-      expect(failure.message).toContain("changed during operator identity qualification");
-      expect(
-        process.calls.filter(
-          (command) => command.includes("--no-bundle") && !command.includes("--dry-run"),
-        ),
-      ).toHaveLength(0);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("treats a lost upload acknowledgement as indeterminate and reconciles by status", async () => {
-    const root = mkdtempSync(join(tmpdir(), "takoserver-identity-ack-"));
-    try {
-      const selected = await keyPair();
-      const selectedTarget = targetWithPublicX(selected.publicJwk.x);
-      const privatePath = join(root, "operator-private.jwk");
-      writeFileSync(privatePath, `${JSON.stringify(selected.privateJwk)}\n`, { mode: 0o600 });
-      const process = processFixture({
-        build: true,
-        upload: true,
-        uploadExitCode: 1,
-        uploadStderr: "acknowledgement lost while token was in provider diagnostic",
+      const process = processFixture("rehearsal");
+      const result = await runOperatorIdentity(invocation("rehearsal", "apply"), selected.target, {
+        state: transitionState(selected.target, old.publicJwk, process),
+        migrations: migrations(),
+        run: process.run,
+        privateJwkPath: selected.privateJwkPath,
+        operatorIdentityPath: selected.identityPath,
+        review: "independent-reviewer",
+        outputDirectory: join(selected.root, "change-work"),
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "cloudflare-secret" },
+        fetcher: ownerSessionFetcher(selected.publicKey, []),
       });
+      expect(result).toMatchObject({
+        transition: "change",
+        exactConfigDiff: {
+          added: [],
+          changed: [
+            {
+              name: "OPERATOR_IDENTITY_PUBLIC_JWK",
+              previousValueDigest: sha256(JSON.stringify(old.publicJwk)),
+              valueDigest: sha256(JSON.stringify(selected.target.operatorIdentity?.publicJwk)),
+            },
+          ],
+          removed: [],
+        },
+      });
+
+      const noOpProcess = processFixture("rehearsal");
+      const failure = await runOperatorIdentity(invocation("rehearsal", "apply"), selected.target, {
+        state: staticState(selected.target, versionFor(selected.target, selected.publicJwk)),
+        migrations: migrations(),
+        run: noOpProcess.run,
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "cloudflare-secret" },
+      }).catch((error: unknown) => error);
+      expect(failure).toMatchObject({ phase: "preflight" });
+      expect((failure as Error).message).toContain("already exact");
+      expect(noOpProcess.calls).toEqual([]);
+    } finally {
+      rmSync(selected.root, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses pending migrations before qualification, proof or upload", async () => {
+    const selected = await authorityFixture("production");
+    try {
+      const process = processFixture("production");
       const failure = await runOperatorIdentity(
+        invocation("production", "apply"),
+        selected.target,
         {
-          surface: "takoserver-integration-operator-identity",
-          action: "apply",
-          environment: "integration",
-          commit: COMMIT,
-        },
-        selectedTarget,
-        {
-          state: transitionState(selectedTarget),
+          state: staticState(selected.target, versionFor(selected.target, null)),
+          migrations: migrations(["0043_pending.sql"]),
           run: process.run,
-          privateJwkPath: privatePath,
-          review: "reviewer@example.test",
-          outputDirectory: join(root, "work"),
-          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "cloudflare-secret" },
         },
-      ).catch((error) => error);
+      ).catch((error: unknown) => error);
+      expect(failure).toMatchObject({ phase: "preflight" });
+      expect((failure as Error).message).toContain("pending D1 migrations");
+      expect(process.calls).toEqual([]);
+    } finally {
+      rmSync(selected.root, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses owner mismatch after upload and rolls production back to the exact predecessor", async () => {
+    const selected = await authorityFixture("production");
+    const old = await publicKey();
+    try {
+      const process = processFixture("production");
+      const state = transitionState(selected.target, old.publicJwk, process);
+      const requests: Request[] = [];
+      const failure = await runOperatorIdentity(
+        invocation("production", "apply"),
+        selected.target,
+        {
+          state,
+          migrations: migrations(),
+          run: process.run,
+          privateJwkPath: selected.privateJwkPath,
+          operatorIdentityPath: selected.identityPath,
+          review: "independent-reviewer",
+          outputDirectory: join(selected.root, "work"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "cloudflare-secret" },
+          fetcher: ownerSessionFetcher(selected.publicKey, requests, { owner: false }),
+        },
+      ).catch((error: unknown) => error);
+      expect(failure).toMatchObject({ phase: "verification" });
+      expect((failure as Error).message).toContain("rolled back");
+      expect(String((failure as { detail?: string }).detail)).toContain(VERSION_BEFORE);
+      expect(String((failure as { detail?: string }).detail)).toContain(VERSION_AFTER);
+      expect(process.productionQualified).toBe(true);
+      expect(process.uploads).toBe(1);
+      expect(process.rollbacks).toBe(1);
+      expect(state.stage()).toBe("rollback");
+      expect(
+        requests.map((request) => `${request.method} ${new URL(request.url).pathname}`),
+      ).toEqual(["POST /v1/operator-owner-proof"]);
+    } finally {
+      rmSync(selected.root, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses rollback without mutation when the proved successor history drifts", async () => {
+    const selected = await authorityFixture("production");
+    const old = await publicKey();
+    try {
+      const process = processFixture("production");
+      const state = transitionState(selected.target, old.publicJwk, process);
+      const failure = await runOperatorIdentity(
+        invocation("production", "apply"),
+        selected.target,
+        {
+          state,
+          migrations: migrations(),
+          run: process.run,
+          privateJwkPath: selected.privateJwkPath,
+          operatorIdentityPath: selected.identityPath,
+          review: "independent-reviewer",
+          outputDirectory: join(selected.root, "drift-work"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "cloudflare-secret" },
+          fetcher: ownerSessionFetcher(selected.publicKey, [], {
+            owner: false,
+            onOwnerProof: state.advanceToDrift,
+          }),
+        },
+      ).catch((error: unknown) => error);
+      expect(failure).toMatchObject({ phase: "verification" });
+      expect((failure as Error).message).toContain("rollback was refused");
+      expect((failure as Error).message).toContain("indeterminate");
+      const detail = JSON.parse(String((failure as { detail?: string }).detail)) as Record<
+        string,
+        unknown
+      >;
+      expect(detail).toMatchObject({
+        primary: {
+          phase: "verification",
+          message: expect.stringContaining("does not own"),
+        },
+        rollback: "not_performed",
+        expectedSuccessorVersionId: VERSION_AFTER,
+        observedVersionId: VERSION_AFTER,
+        expectedHistoryDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+        observedHistoryDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+      });
+      expect(detail.observedHistoryDigest).not.toBe(detail.expectedHistoryDigest);
+      expect(process.uploads).toBe(1);
+      expect(process.rollbacks).toBe(0);
+      expect(state.stage()).toBe("drift");
+      expect(JSON.stringify(failure)).not.toContain("cloudflare-secret");
+      expect(JSON.stringify(failure)).not.toContain(selected.privateJwk.d);
+    } finally {
+      rmSync(selected.root, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses rollback when history advances during the rollback closure inspection", async () => {
+    const selected = await authorityFixture("production");
+    const old = await publicKey();
+    try {
+      const process = processFixture("production");
+      const state = transitionState(selected.target, old.publicJwk, process);
+      const failure = await runOperatorIdentity(
+        invocation("production", "apply"),
+        selected.target,
+        {
+          state,
+          migrations: migrations(),
+          run: process.run,
+          privateJwkPath: selected.privateJwkPath,
+          operatorIdentityPath: selected.identityPath,
+          review: "independent-reviewer",
+          outputDirectory: join(selected.root, "closure-race-work"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "cloudflare-secret" },
+          fetcher: ownerSessionFetcher(selected.publicKey, [], {
+            owner: false,
+            onOwnerProof: state.advanceDuringNextSuccessorClosure,
+          }),
+        },
+      ).catch((error: unknown) => error);
+      expect(failure).toMatchObject({ phase: "verification" });
+      expect((failure as Error).message).toContain("rollback was refused");
+      expect((failure as Error).message).toContain("indeterminate");
+      const detail = JSON.parse(String((failure as { detail?: string }).detail)) as Record<
+        string,
+        unknown
+      >;
+      expect(detail).toMatchObject({
+        primary: {
+          phase: "verification",
+          message: expect.stringContaining("does not own"),
+        },
+        rollback: "not_performed",
+        expectedSuccessorVersionId: VERSION_AFTER,
+        observedVersionId: VERSION_AFTER,
+        expectedHistoryDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+        observedHistoryDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+      });
+      expect(detail.observedHistoryDigest).not.toBe(detail.expectedHistoryDigest);
+      expect(process.uploads).toBe(1);
+      expect(process.rollbacks).toBe(0);
+      expect(state.stage()).toBe("drift");
+      expect(JSON.stringify(failure)).not.toContain("cloudflare-secret");
+      expect(JSON.stringify(failure)).not.toContain(selected.privateJwk.d);
+    } finally {
+      rmSync(selected.root, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses closure drift and closes the pre-upload Version race", async () => {
+    const selected = await authorityFixture("integration");
+    try {
+      const drifted = structuredClone(versionFor(selected.target, null)) as {
+        resources: { bindings: Record<string, unknown>[] };
+      };
+      drifted.resources.bindings.push({
+        name: "UNRELATED_CONFIGURATION",
+        type: "plain_text",
+        text: "must-not-survive",
+      });
+      const drift = await runOperatorIdentity(
+        invocation("integration", "status"),
+        selected.target,
+        {
+          state: staticState(selected.target, drifted),
+          migrations: migrations(),
+        },
+      ).catch((error: unknown) => error);
+      expect(drift).toMatchObject({ phase: "preflight" });
+      expect((drift as Error).message).toContain("exact selected target closure");
+
+      const process = processFixture("integration");
+      const race = await runOperatorIdentity(invocation("integration", "apply"), selected.target, {
+        state: racingState(selected.target),
+        migrations: migrations(),
+        run: process.run,
+        privateJwkPath: selected.privateJwkPath,
+        operatorIdentityPath: selected.identityPath,
+        review: "independent-reviewer",
+        outputDirectory: join(selected.root, "race-work"),
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "cloudflare-secret" },
+      }).catch((error: unknown) => error);
+      expect(race).toMatchObject({ phase: "preflight" });
+      expect((race as Error).message).toContain("changed during operator identity qualification");
+      expect(process.uploads).toBe(0);
+    } finally {
+      rmSync(selected.root, { recursive: true, force: true });
+    }
+  });
+
+  test("settles a lost upload acknowledgement through status without a blind retry", async () => {
+    const selected = await authorityFixture("rehearsal");
+    try {
+      const process = processFixture("rehearsal", { uploadFails: true });
+      const failure = await runOperatorIdentity(invocation("rehearsal", "apply"), selected.target, {
+        state: staticState(selected.target, versionFor(selected.target, null)),
+        migrations: migrations(),
+        run: process.run,
+        privateJwkPath: selected.privateJwkPath,
+        operatorIdentityPath: selected.identityPath,
+        review: "independent-reviewer",
+        outputDirectory: join(selected.root, "work"),
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "cloudflare-secret" },
+      }).catch((error: unknown) => error);
       expect(failure).toMatchObject({ phase: "mutation" });
-      expect(failure.message).toContain("indeterminate");
-      expect(String(failure.detail)).not.toContain("token");
-      expect(String(failure.detail)).toContain("[redacted]");
-      expect(
-        process.calls.filter(
-          (command) => command.includes("--no-bundle") && !command.includes("--dry-run"),
-        ),
-      ).toHaveLength(1);
+      expect((failure as Error).message).toContain("do not retry before --status");
+      expect(String((failure as { detail?: string }).detail)).not.toContain("cloudflare-secret");
+      expect(process.uploads).toBe(1);
 
-      const status = await runOperatorIdentity(
-        {
-          surface: "takoserver-integration-operator-identity",
-          action: "status",
-          environment: "integration",
-          commit: COMMIT,
-        },
-        selectedTarget,
-        { state: staticState(versionForTarget(selectedTarget, "desired")) },
-      );
-      expect(status).toMatchObject({
-        configured: true,
-        configuredPublicJwkDigest: sha256(
-          JSON.stringify(selectedTarget.operatorIdentity?.publicJwk),
+      const status = await runOperatorIdentity(invocation("rehearsal", "status"), selected.target, {
+        state: staticState(
+          selected.target,
+          versionFor(selected.target, selected.publicJwk),
+          VERSION_AFTER,
+          VERSION_BEFORE,
         ),
-        ready: false,
+        migrations: migrations(),
       });
+      expect(status).toMatchObject({
+        state: "desired-current",
+        successorVersionId: VERSION_AFTER,
+        predecessorVersionId: VERSION_BEFORE,
+        ownerProof: "not_performed",
+        ready: true,
+        readyForApply: false,
+      });
+      expect(process.uploads).toBe(1);
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSync(selected.root, { recursive: true, force: true });
     }
   });
 });
 
-function version(identity: "desired" | "absent") {
-  return versionForTarget(target, identity);
+function invocation(
+  environment: DeployEnvironment,
+  action: "status" | "apply",
+  surface:
+    | "takoserver-operator-identity"
+    | "takoserver-integration-operator-identity" = "takoserver-operator-identity",
+) {
+  return {
+    surface,
+    action,
+    environment,
+    commit: COMMIT,
+    organizationId: ORGANIZATION,
+  };
 }
 
-function versionForTarget(selected: DeployTarget, identity: "desired" | "absent") {
-  const selectedTarget = identity === "desired" ? selected : withoutOperatorIdentity(selected);
-  const expected = expectedExactBindingClosure(selectedTarget, {
-    signingKeyId: selected.signing.currentKeyId,
+async function authorityFixture(environment: DeployEnvironment) {
+  const root = mkdtempSync(join(tmpdir(), `takoserver-identity-${environment}-`));
+  const pair = (await crypto.subtle.generateKey("Ed25519", true, [
+    "sign",
+    "verify",
+  ])) as CryptoKeyPair;
+  const privateJwk = (await crypto.subtle.exportKey("jwk", pair.privateKey)) as JsonWebKey & {
+    x: string;
+    d: string;
+  };
+  const publicJwk = (await crypto.subtle.exportKey("jwk", pair.publicKey)) as JsonWebKey & {
+    x: string;
+  };
+  const exactPublicJwk = {
+    kty: "OKP" as const,
+    crv: "Ed25519" as const,
+    x: publicJwk.x,
+  };
+  const privateJwkPath = join(root, "operator.jwk");
+  writeFileSync(privateJwkPath, JSON.stringify(privateJwk), { mode: 0o600 });
+  chmodSync(privateJwkPath, 0o600);
+  const identityPath = join(root, "operator-identity.json");
+  writeFileSync(identityPath, JSON.stringify(IDENTITY), { mode: 0o600 });
+  chmodSync(identityPath, 0o600);
+  const target = targetFor(environment, exactPublicJwk);
+  return {
+    root,
+    target,
+    privateJwk,
+    privateJwkPath,
+    identityPath,
+    publicJwk: exactPublicJwk,
+    publicKey: pair.publicKey,
+  };
+}
+
+function targetFor(
+  environment: DeployEnvironment,
+  publicJwk: { readonly kty: "OKP"; readonly crv: "Ed25519"; readonly x: string },
+): DeployTarget {
+  return {
+    kind: "takoserver.deploy-target@v2",
+    environment,
+    accountId: "a".repeat(32),
+    workerName: `takoserver-api-${environment}`,
+    d1: {
+      databaseName: `takoserver-runtime-${environment}`,
+      databaseId: "00000000-0000-4000-8000-000000000000",
+    },
+    r2: { bucketName: `takoserver-objects-${environment}` },
+    publicOrigin: `https://api.${environment}.example.test`,
+    signing: { currentKeyId: "key-current" },
+    operatorIdentity: { publicJwk },
+  };
+}
+
+async function publicKey() {
+  const pair = (await crypto.subtle.generateKey("Ed25519", true, [
+    "sign",
+    "verify",
+  ])) as CryptoKeyPair;
+  const publicJwk = (await crypto.subtle.exportKey("jwk", pair.publicKey)) as JsonWebKey & {
+    x: string;
+  };
+  return {
+    publicJwk: { kty: "OKP" as const, crv: "Ed25519" as const, x: publicJwk.x },
+  };
+}
+
+function migrations(pending: readonly string[] = []): OperatorIdentityMigrationReader {
+  return {
+    async read() {
+      return { local: [...pending], applied: [] };
+    },
+  };
+}
+
+interface ProcessFixture {
+  readonly calls: readonly string[][];
+  readonly run: (command: readonly string[]) => Promise<CommandResult>;
+  readonly uploads: number;
+  readonly rollbacks: number;
+  readonly productionQualified: boolean;
+  onUpload?: () => void;
+  onRollback?: () => void;
+}
+
+function processFixture(
+  environment: DeployEnvironment,
+  options: { readonly uploadFails?: boolean } = {},
+): ProcessFixture {
+  const calls: string[][] = [];
+  let uploads = 0;
+  let rollbacks = 0;
+  let productionQualified = false;
+  const fixture: ProcessFixture = {
+    calls,
+    get uploads() {
+      return uploads;
+    },
+    get rollbacks() {
+      return rollbacks;
+    },
+    get productionQualified() {
+      return productionQualified;
+    },
+    async run(command) {
+      calls.push([...command]);
+      const key = command.join(" ");
+      if (key === "git rev-parse HEAD") return ok(`${COMMIT}\n`);
+      if (key === "git branch --show-current") return ok("feature/operator-identity\n");
+      if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
+      if (key === "git fetch --quiet --all --prune") {
+        productionQualified = true;
+        return ok("");
+      }
+      if (key === `git branch -r --contains ${COMMIT}`) return ok("  origin/main\n");
+      if (key === "bun run check") return ok("checked\n");
+      if (command.includes("--dry-run")) {
+        const out = command[command.indexOf("--outdir") + 1];
+        if (!out) throw new Error("missing build outdir");
+        writeFileSync(join(out, "index.js"), BUNDLE);
+        return ok("built\n");
+      }
+      if (command.includes("--no-bundle")) {
+        uploads += 1;
+        fixture.onUpload?.();
+        return options.uploadFails
+          ? { exitCode: 1, stdout: "", stderr: "cloudflare-secret acknowledgement lost" }
+          : ok("uploaded\n");
+      }
+      if (command.includes("versions") && command.includes("deploy")) {
+        rollbacks += 1;
+        fixture.onRollback?.();
+        return ok("rolled back\n");
+      }
+      throw new Error(`unexpected command for ${environment}: ${key}`);
+    },
+  };
+  return fixture;
+}
+
+interface TransitionState extends WorkerState {
+  stage(): "before" | "successor" | "rollback" | "drift";
+  advanceToDrift(): void;
+  advanceDuringNextSuccessorClosure(): void;
+}
+
+function transitionState(
+  target: DeployTarget,
+  previous: NonNullable<DeployTarget["operatorIdentity"]>["publicJwk"] | null,
+  process: ProcessFixture,
+): TransitionState {
+  let stage: "before" | "successor" | "rollback" | "drift" = "before";
+  let advanceDuringNextSuccessorClosure = false;
+  process.onUpload = () => {
+    stage = "successor";
+  };
+  process.onRollback = () => {
+    stage = "rollback";
+  };
+  return {
+    stage: () => stage,
+    advanceToDrift: () => {
+      stage = "drift";
+    },
+    advanceDuringNextSuccessorClosure: () => {
+      advanceDuringNextSuccessorClosure = true;
+    },
+    async workerDeployments() {
+      if (stage === "successor") {
+        return [
+          deployment(DEPLOYMENT_AFTER, VERSION_AFTER, "2026-09-03T02:00:00Z"),
+          deployment(DEPLOYMENT_BEFORE, VERSION_BEFORE, "2026-09-03T01:00:00Z"),
+        ];
+      }
+      if (stage === "rollback") {
+        return [
+          deployment(DEPLOYMENT_ROLLBACK, VERSION_BEFORE, "2026-09-03T03:00:00Z"),
+          deployment(DEPLOYMENT_AFTER, VERSION_AFTER, "2026-09-03T02:00:00Z"),
+        ];
+      }
+      if (stage === "drift") {
+        return [
+          deployment(DEPLOYMENT_AFTER, VERSION_AFTER, "2026-09-03T02:00:00Z"),
+          deployment(DEPLOYMENT_BEFORE, VERSION_BEFORE, "2026-09-03T01:00:00Z"),
+          deployment(DEPLOYMENT_RACED, VERSION_RACED, "2026-09-03T00:30:00Z"),
+        ];
+      }
+      return [deployment(DEPLOYMENT_BEFORE, VERSION_BEFORE, "2026-09-03T01:00:00Z")];
+    },
+    async workerVersion(_worker, versionId) {
+      return versionFor(
+        target,
+        versionId === VERSION_AFTER || versionId === VERSION_RACED
+          ? (target.operatorIdentity?.publicJwk ?? null)
+          : previous,
+      );
+    },
+    async workerSecrets() {
+      if (advanceDuringNextSuccessorClosure && stage === "successor") {
+        advanceDuringNextSuccessorClosure = false;
+        stage = "drift";
+      }
+      return [{ name: "TAKOSERVER_SIGNING_KEY", type: "secret_text" }];
+    },
+    async workerDomains() {
+      return [{ hostname: new URL(target.publicOrigin).hostname, service: target.workerName }];
+    },
+  };
+}
+
+function racingState(target: DeployTarget): WorkerState {
+  let reads = 0;
+  return {
+    async workerDeployments() {
+      reads += 1;
+      return reads === 1
+        ? [deployment(DEPLOYMENT_BEFORE, VERSION_BEFORE, "2026-09-03T01:00:00Z")]
+        : [
+            deployment(DEPLOYMENT_RACED, VERSION_RACED, "2026-09-03T01:30:00Z"),
+            deployment(DEPLOYMENT_BEFORE, VERSION_BEFORE, "2026-09-03T01:00:00Z"),
+          ];
+    },
+    async workerVersion() {
+      return versionFor(target, null);
+    },
+    async workerSecrets() {
+      return [{ name: "TAKOSERVER_SIGNING_KEY", type: "secret_text" }];
+    },
+    async workerDomains() {
+      return [{ hostname: new URL(target.publicOrigin).hostname, service: target.workerName }];
+    },
+  };
+}
+
+function staticState(
+  target: DeployTarget,
+  workerVersion: unknown,
+  versionId = VERSION_BEFORE,
+  previousVersionId: string | null = null,
+): WorkerState {
+  return {
+    async workerDeployments() {
+      return [
+        deployment(DEPLOYMENT_AFTER, versionId, "2026-09-03T02:00:00Z"),
+        ...(previousVersionId === null
+          ? []
+          : [deployment(DEPLOYMENT_BEFORE, previousVersionId, "2026-09-03T01:00:00Z")]),
+      ];
+    },
+    async workerVersion() {
+      return workerVersion;
+    },
+    async workerSecrets() {
+      return [{ name: "TAKOSERVER_SIGNING_KEY", type: "secret_text" }];
+    },
+    async workerDomains() {
+      return [{ hostname: new URL(target.publicOrigin).hostname, service: target.workerName }];
+    },
+  };
+}
+
+function versionFor(
+  target: DeployTarget,
+  publicJwk: NonNullable<DeployTarget["operatorIdentity"]>["publicJwk"] | null,
+) {
+  const selected =
+    publicJwk === null
+      ? withoutOperatorIdentity(target)
+      : { ...target, operatorIdentity: { publicJwk } };
+  const expected = expectedExactBindingClosure(selected, {
+    signingKeyId: target.signing.currentKeyId,
   });
   return {
     annotations: {
@@ -469,234 +832,99 @@ function versionForTarget(selected: DeployTarget, identity: "desired" | "absent"
   };
 }
 
-async function keyPair() {
-  const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
-  const privateJwk = (await crypto.subtle.exportKey("jwk", pair.privateKey)) as JsonWebKey & {
-    x: string;
-    d: string;
-  };
-  const publicJwk = (await crypto.subtle.exportKey("jwk", pair.publicKey)) as JsonWebKey & {
-    x: string;
-  };
-  return { pair, privateJwk, publicJwk };
+function withoutOperatorIdentity(target: DeployTarget): DeployTarget {
+  const { operatorIdentity: _operatorIdentity, ...without } = target;
+  return without;
 }
 
-function targetWithPublicX(x: string): DeployTarget {
-  return {
-    ...target,
-    operatorIdentity: { publicJwk: { kty: "OKP", crv: "Ed25519", x } },
-  };
-}
-
-function processFixture(
-  options: {
-    readonly build?: boolean;
-    readonly upload?: boolean;
-    readonly uploadExitCode?: number;
-    readonly uploadStderr?: string;
-  } = {},
-) {
-  const calls: string[][] = [];
-  return {
-    calls,
-    run: async (command: readonly string[]): Promise<CommandResult> => {
-      calls.push([...command]);
-      const key = command.join(" ");
-      if (key === "git rev-parse HEAD") return ok(`${COMMIT}\n`);
-      if (key === "git branch --show-current") return ok("feature/operator-identity\n");
-      if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
-      if (key === "bun run check") return ok("checked\n");
-      if (options.build && command.includes("--dry-run")) {
-        const out = command[command.indexOf("--outdir") + 1];
-        if (!out) throw new Error("missing build outdir");
-        writeFileSync(join(out, "index.js"), BUNDLE);
-        return ok("built\n");
-      }
-      if (options.upload && command.includes("--no-bundle")) {
-        return options.uploadExitCode
-          ? {
-              exitCode: options.uploadExitCode,
-              stdout: "",
-              stderr: options.uploadStderr ?? "acknowledgement lost",
-            }
-          : ok("uploaded\n");
-      }
-      throw new Error(`unexpected command: ${key}`);
-    },
-  };
-}
-
-function racingState(selectedTarget: DeployTarget): WorkerState {
-  let deploymentReads = 0;
-  return {
-    async workerDeployments() {
-      deploymentReads += 1;
-      return deploymentReads === 1
-        ? [deployment("deployment-before", "version-before", "2026-08-28T01:00:00Z")]
-        : [
-            deployment("deployment-raced", "version-raced", "2026-08-28T01:30:00Z"),
-            deployment("deployment-before", "version-before", "2026-08-28T01:00:00Z"),
-          ];
-    },
-    async workerVersion() {
-      return versionForTarget(selectedTarget, "absent");
-    },
-    async workerSecrets() {
-      return [{ name: "TAKOSERVER_SIGNING_KEY", type: "secret_text" }];
-    },
-    async workerDomains() {
-      return [{ hostname: "api.integration.example.test", service: selectedTarget.workerName }];
-    },
-  };
-}
-
-function transitionState(selectedTarget: DeployTarget): WorkerState {
-  let deploymentReads = 0;
-  return {
-    async workerDeployments() {
-      deploymentReads += 1;
-      return deploymentReads <= 2
-        ? [deployment("deployment-before", "version-before", "2026-08-28T01:00:00Z")]
-        : [
-            deployment("deployment-after", "version-after", "2026-08-28T02:00:00Z"),
-            deployment("deployment-before", "version-before", "2026-08-28T01:00:00Z"),
-          ];
-    },
-    async workerVersion(_worker, versionId) {
-      return versionForTarget(selectedTarget, versionId === "version-after" ? "desired" : "absent");
-    },
-    async workerSecrets() {
-      return [{ name: "TAKOSERVER_SIGNING_KEY", type: "secret_text" }];
-    },
-    async workerDomains() {
-      return [{ hostname: "api.integration.example.test", service: selectedTarget.workerName }];
-    },
-  };
-}
-
-function transitionStateWithDrift(selectedTarget: DeployTarget): WorkerState {
-  const state = transitionState(selectedTarget);
-  return {
-    ...state,
-    async workerVersion(workerName, versionId) {
-      const value = await state.workerVersion(workerName, versionId);
-      if (versionId !== "version-after") return value;
-      const drifted = structuredClone(value) as {
-        resources: { bindings: Record<string, unknown>[] };
-      };
-      drifted.resources.bindings.push({
-        name: "UNRELATED_CONFIGURATION",
-        type: "plain_text",
-        text: "must-not-survive",
-      });
-      return drifted;
-    },
-  };
-}
-
-function sessionFetcher(
+function ownerSessionFetcher(
   publicKey: CryptoKey,
   requests: Request[],
-  captured: { assertion?: string },
-  options: { readonly allowRevokedReplay?: boolean } = {},
+  options: { readonly owner?: boolean; readonly onOwnerProof?: () => void } = {},
 ) {
   let revoked = false;
   return async (input: string, init?: RequestInit): Promise<Response> => {
     const request = new Request(input, init);
     requests.push(request.clone());
-    if (request.method === "POST" && new URL(request.url).pathname === "/v1/sessions") {
+    const path = new URL(request.url).pathname;
+    if (
+      request.method === "POST" &&
+      (path === "/v1/operator-owner-proof" || path === "/v1/sessions")
+    ) {
       const body = (await request.json()) as Record<string, unknown>;
       const assertion = String(body.assertion ?? "");
-      captured.assertion = assertion;
-      const [payloadPart, signaturePart] = assertion.split(".");
-      if (!payloadPart || !signaturePart)
-        return Response.json({ error: "bad proof" }, { status: 401 });
+      const [payload, signature] = assertion.split(".");
+      if (!payload || !signature) return new Response(null, { status: 401 });
       const valid = await crypto.subtle.verify(
         "Ed25519",
         publicKey,
-        Buffer.from(signaturePart, "base64url"),
-        new TextEncoder().encode(payloadPart),
+        Buffer.from(signature, "base64url"),
+        new TextEncoder().encode(payload),
       );
-      const claims = JSON.parse(Buffer.from(payloadPart, "base64url").toString("utf8")) as Record<
+      const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as Record<
         string,
         unknown
       >;
       if (
         !valid ||
-        body.provider !== "google" ||
+        body.provider !== IDENTITY.provider ||
         body.method !== "operator-assertion" ||
-        claims.purpose !== "sign-in" ||
-        claims.provider !== "google" ||
-        claims.subject !== "task-0037-integration-operator" ||
-        claims.email !== "task-0037-integration-operator@localhost" ||
-        claims.displayName !== "TASK-0037 Integration Operator" ||
+        claims.aud !== new URL(request.url).origin ||
+        claims.provider !== IDENTITY.provider ||
+        claims.subject !== IDENTITY.subject ||
+        claims.email !== IDENTITY.email ||
+        claims.displayName !== IDENTITY.displayName ||
         Number(claims.exp) - Number(claims.iat) !== 60
       ) {
-        return Response.json({ error: "bad proof" }, { status: 401 });
+        return new Response(null, { status: 401 });
       }
+      if (path === "/v1/operator-owner-proof") {
+        options.onOwnerProof?.();
+        if (options.owner === false) {
+          return Response.json({ error: { code: "not_found" } }, { status: 404 });
+        }
+        return Response.json({
+          principal: principal(),
+          organization: {
+            id: ORGANIZATION,
+            name: "Operator organization",
+            ownerPrincipalId: "prn_operator_owner",
+            createdAt: "2026-09-03T11:00:00.000Z",
+          },
+        });
+      }
+      return Response.json({ principal: principal(), sessionToken: "session-secret" });
+    }
+    if (request.method === "GET" && path === "/v1/me") {
+      if (revoked) return new Response(null, { status: 401 });
       return Response.json({
-        principal: proofPrincipal(),
-        sessionToken: "session-secret-do-not-print",
+        principal: principal(),
+        organizations: [
+          {
+            id: ORGANIZATION,
+            name: "Operator organization",
+            ownerPrincipalId: options.owner === false ? "prn_somebody_else" : "prn_operator_owner",
+            createdAt: "2026-09-03T11:00:00.000Z",
+          },
+        ],
       });
     }
-    if (request.method === "GET" && new URL(request.url).pathname === "/v1/me") {
-      if (request.headers.get("authorization") !== "Bearer session-secret-do-not-print") {
-        return Response.json({ error: "unauthenticated" }, { status: 401 });
-      }
-      if (revoked && options.allowRevokedReplay !== true) {
-        return Response.json({ error: "unauthenticated" }, { status: 401 });
-      }
-      return Response.json({ principal: proofPrincipal(), organizations: [] });
-    }
-    if (request.method === "DELETE" && new URL(request.url).pathname === "/v1/session") {
-      if (request.headers.get("authorization") !== "Bearer session-secret-do-not-print") {
-        return Response.json({ error: "unauthenticated" }, { status: 401 });
-      }
+    if (request.method === "DELETE" && path === "/v1/session") {
       revoked = true;
       return new Response(null, { status: 204 });
     }
-    return Response.json({ error: "not found" }, { status: 404 });
+    return new Response(null, { status: 404 });
   };
 }
 
-function proofPrincipal() {
+function principal() {
   return {
-    id: "principal-proof",
-    provider: "google",
-    providerSubject: "task-0037-integration-operator",
-    email: "task-0037-integration-operator@localhost",
-    displayName: "TASK-0037 Integration Operator",
+    id: "prn_operator_owner",
+    provider: IDENTITY.provider,
+    providerSubject: IDENTITY.subject,
+    email: IDENTITY.email,
+    displayName: IDENTITY.displayName,
   };
-}
-
-function staticState(workerVersion: unknown): WorkerState & {
-  reads(): { deployments: number; versions: number; secrets: number; domains: number };
-} {
-  const reads = { deployments: 0, versions: 0, secrets: 0, domains: 0 };
-  return {
-    reads: () => ({ ...reads }),
-    async workerDeployments() {
-      reads.deployments += 1;
-      return [deployment("deployment-before", "version-before", "2026-08-28T01:00:00Z")];
-    },
-    async workerVersion() {
-      reads.versions += 1;
-      return workerVersion;
-    },
-    async workerSecrets() {
-      reads.secrets += 1;
-      return [{ name: "TAKOSERVER_SIGNING_KEY", type: "secret_text" }];
-    },
-    async workerDomains() {
-      reads.domains += 1;
-      return [{ hostname: "api.integration.example.test", service: target.workerName }];
-    },
-  };
-}
-
-function withoutOperatorIdentity(value: DeployTarget): DeployTarget {
-  const { operatorIdentity: _operatorIdentity, ...withoutIdentity } = value;
-  return withoutIdentity;
 }
 
 function deployment(id: string, versionId: string, created: string) {

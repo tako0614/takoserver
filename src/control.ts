@@ -331,18 +331,40 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       return Response.json({ providers: identityProviders });
     }
 
+    if (request.method === "POST" && url.pathname === "/v1/operator-owner-proof") {
+      const body = await jsonObject(request);
+      exactKeys(body, ["provider", "method", "assertion", "organizationId"]);
+      const proved = await accounts.proveExistingOwner({
+        provider: enumValue(body.provider, ["google", "github"]) as "google" | "github",
+        method: enumValue(body.method, ["operator-assertion"]) as "operator-assertion",
+        assertion: bounded(body.assertion, 8 * 1_024),
+        organizationId: text(body.organizationId),
+        audience: url.origin,
+      });
+      return Response.json(proved, {
+        headers: { "cache-control": "private, no-store", "x-content-type-options": "nosniff" },
+      });
+    }
+
     if (request.method === "POST" && url.pathname === "/v1/sessions") {
       const body = await jsonObject(request);
       // `method` is optional: a caller that knows only one way in should not
       // have to name it, and a deployment that offers only one has nothing to
       // disambiguate.
-      exactKeys(body, ["provider", "assertion"], ["method", "nonce"]);
+      exactKeys(body, ["provider", "assertion"], ["method", "nonce", "sessionTtlSeconds"]);
+      if (
+        body.sessionTtlSeconds !== undefined &&
+        (body.method !== "operator-assertion" || integer(body.sessionTtlSeconds) !== 60)
+      ) {
+        controlError("invalid_argument", 400);
+      }
       const { principal, sessionToken } = await accounts.signIn({
         provider: enumValue(body.provider, ["takos-id", "google", "github"]) as
           | "takos-id"
           | "google"
           | "github",
         assertion: bounded(body.assertion, 8 * 1_024),
+        audience: url.origin,
         ...(body.method === undefined
           ? {}
           : {
@@ -351,6 +373,9 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
                 | "operator-assertion",
             }),
         ...(body.nonce === undefined ? {} : { nonce: text(body.nonce) }),
+        ...(body.sessionTtlSeconds === undefined
+          ? {}
+          : { sessionTtlSeconds: integer(body.sessionTtlSeconds) }),
       });
       if (consoleOrigin && request.headers.get("origin") === consoleOrigin) {
         return Response.json(
