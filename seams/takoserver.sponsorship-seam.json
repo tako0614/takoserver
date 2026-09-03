@@ -1,0 +1,580 @@
+{
+  "kind": "takoserver.sponsorship-seam@v1",
+  "summary": "The private product-to-product seam Takosumi Hosted speaks to this Host through. Every exchange below was recorded from a composed Takoserver, not written by hand. A request without the service credential is answered `not_found`, so the seam does not disclose that it exists.",
+  "basePath": "/v1/sponsorship/tenants",
+  "credential": {
+    "header": "authorization",
+    "scheme": "Bearer",
+    "note": "The sponsorship service credential. One first-party product holds it."
+  },
+  "requestId": {
+    "note": "Every refusal carries a fresh `requestId`. It is replaced with a placeholder here so the recording is reproducible; a consumer must accept any value and must not treat the member as optional.",
+    "placeholder": "req_<fresh per response>"
+  },
+  "tenantRef": {
+    "example": "tenant:opaque",
+    "encoding": "One URI path component. The reference may contain characters that must be encoded; the Host decodes exactly one component and refuses a value containing a slash."
+  },
+  "runtimeMaterialization": {
+    "note": "The sponsor's value-free statement of which run is asking. It is validated for this exact shape and then carried nowhere: not into the credential, the token claims, the ledger, or a provider. A shape this Host does not understand refuses the whole request.",
+    "exactKeys": [
+      "capsuleId",
+      "contract",
+      "phase",
+      "runId",
+      "workspaceId"
+    ],
+    "contract": "takosumi.runtime-bindings/v1",
+    "phases": [
+      "plan",
+      "apply",
+      "destroy"
+    ]
+  },
+  "operations": [
+    "bindSponsoredTenant",
+    "readSponsoredTenantWallet",
+    "issueSponsoredTakoformRunCredential",
+    "authorizeSponsoredInterfaceOauthResource",
+    "listSponsoredTenantInventory",
+    "fundSponsoredTenant",
+    "listSponsoredResources",
+    "setSponsoredResourceBillingMode",
+    "deleteSponsoredResource"
+  ],
+  "exchanges": [
+    {
+      "name": "a caller without the service credential is not told the seam exists",
+      "operation": "bindSponsoredTenant",
+      "request": {
+        "method": "POST",
+        "path": "/v1/sponsorship/tenants/tenant%3Aopaque",
+        "credential": "absent",
+        "body": {
+          "organizationId": "org_legal"
+        }
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "error": {
+            "code": "not_found",
+            "message": "not found",
+            "requestId": "req_<fresh per response>",
+            "retryable": false
+          }
+        }
+      }
+    },
+    {
+      "name": "a wrong service credential answers the same way",
+      "operation": "bindSponsoredTenant",
+      "request": {
+        "method": "POST",
+        "path": "/v1/sponsorship/tenants/tenant%3Aopaque",
+        "credential": "wrong",
+        "body": {
+          "organizationId": "org_legal"
+        }
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "error": {
+            "code": "not_found",
+            "message": "not found",
+            "requestId": "req_<fresh per response>",
+            "retryable": false
+          }
+        }
+      }
+    },
+    {
+      "name": "binding names an Organization this Host does not have",
+      "operation": "bindSponsoredTenant",
+      "request": {
+        "method": "POST",
+        "path": "/v1/sponsorship/tenants/tenant%3Aopaque",
+        "credential": "service",
+        "body": {
+          "organizationId": "org_absent"
+        }
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "error": {
+            "code": "organization_not_found",
+            "message": "organization not found",
+            "requestId": "req_<fresh per response>",
+            "retryable": false
+          }
+        }
+      }
+    },
+    {
+      "name": "binding the tenant to the sponsor's Organization",
+      "operation": "bindSponsoredTenant",
+      "request": {
+        "method": "POST",
+        "path": "/v1/sponsorship/tenants/tenant%3Aopaque",
+        "credential": "service",
+        "body": {
+          "organizationId": "org_legal"
+        }
+      },
+      "response": {
+        "status": 201,
+        "body": {
+          "tenantRef": "tenant:opaque",
+          "organizationId": "org_legal"
+        }
+      }
+    },
+    {
+      "name": "rebinding the same tenant to a different Organization is refused",
+      "operation": "bindSponsoredTenant",
+      "request": {
+        "method": "POST",
+        "path": "/v1/sponsorship/tenants/tenant%3Aopaque",
+        "credential": "service",
+        "body": {
+          "organizationId": "org_second"
+        }
+      },
+      "response": {
+        "status": 409,
+        "body": {
+          "error": {
+            "code": "tenant_conflict",
+            "message": "tenant conflict",
+            "requestId": "req_<fresh per response>",
+            "retryable": false
+          }
+        }
+      }
+    },
+    {
+      "name": "the wallet of a tenant with no funding",
+      "operation": "readSponsoredTenantWallet",
+      "request": {
+        "method": "GET",
+        "path": "/v1/sponsorship/tenants/tenant%3Aopaque/wallet",
+        "credential": "service"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "availableMinor": 0,
+          "currency": "USD"
+        }
+      }
+    },
+    {
+      "name": "plan-included funding must expire",
+      "operation": "fundSponsoredTenant",
+      "request": {
+        "method": "POST",
+        "path": "/v1/sponsorship/tenants/tenant%3Aopaque/funding",
+        "credential": "service",
+        "body": {
+          "tenantRef": "tenant:opaque",
+          "amountMinor": 1000,
+          "currency": "USD",
+          "kind": "plan-included",
+          "reference": "included:never",
+          "expiresAt": null
+        }
+      },
+      "response": {
+        "status": 400,
+        "body": {
+          "error": {
+            "code": "invalid",
+            "message": "invalid",
+            "requestId": "req_<fresh per response>",
+            "retryable": false
+          }
+        }
+      }
+    },
+    {
+      "name": "purchased funding must not expire",
+      "operation": "fundSponsoredTenant",
+      "request": {
+        "method": "POST",
+        "path": "/v1/sponsorship/tenants/tenant%3Aopaque/funding",
+        "credential": "service",
+        "body": {
+          "tenantRef": "tenant:opaque",
+          "amountMinor": 1000,
+          "currency": "USD",
+          "kind": "purchased",
+          "reference": "purchase:expires",
+          "expiresAt": "2026-09-01T00:00:00.000Z"
+        }
+      },
+      "response": {
+        "status": 400,
+        "body": {
+          "error": {
+            "code": "invalid",
+            "message": "invalid",
+            "requestId": "req_<fresh per response>",
+            "retryable": false
+          }
+        }
+      }
+    },
+    {
+      "name": "crediting the wallet with expiring plan-included funding",
+      "operation": "fundSponsoredTenant",
+      "request": {
+        "method": "POST",
+        "path": "/v1/sponsorship/tenants/tenant%3Aopaque/funding",
+        "credential": "service",
+        "body": {
+          "tenantRef": "tenant:opaque",
+          "amountMinor": 1000,
+          "currency": "USD",
+          "kind": "plan-included",
+          "reference": "included:august",
+          "expiresAt": "2026-09-01T00:00:00.000Z"
+        }
+      },
+      "response": {
+        "status": 201,
+        "body": {
+          "fundingId": "included:august"
+        }
+      }
+    },
+    {
+      "name": "crediting the wallet with purchased funding",
+      "operation": "fundSponsoredTenant",
+      "request": {
+        "method": "POST",
+        "path": "/v1/sponsorship/tenants/tenant%3Aopaque/funding",
+        "credential": "service",
+        "body": {
+          "tenantRef": "tenant:opaque",
+          "amountMinor": 1000,
+          "currency": "USD",
+          "kind": "purchased",
+          "reference": "purchase:1",
+          "expiresAt": null
+        }
+      },
+      "response": {
+        "status": 201,
+        "body": {
+          "fundingId": "purchase:1"
+        }
+      }
+    },
+    {
+      "name": "the wallet after both credits",
+      "operation": "readSponsoredTenantWallet",
+      "request": {
+        "method": "GET",
+        "path": "/v1/sponsorship/tenants/tenant%3Aopaque/wallet",
+        "credential": "service"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "availableMinor": 2000,
+          "currency": "USD"
+        }
+      }
+    },
+    {
+      "name": "minting a run credential",
+      "operation": "issueSponsoredTakoformRunCredential",
+      "request": {
+        "method": "POST",
+        "path": "/v1/sponsorship/tenants/tenant%3Aopaque/takoform-run-credentials",
+        "credential": "service",
+        "body": {
+          "runRef": "run_1",
+          "spaceRef": "tsp_capsule",
+          "expiresInSeconds": 300
+        }
+      },
+      "response": {
+        "status": 201,
+        "body": {
+          "takoformRunCredential": {
+            "token": "runner-only-secret",
+            "expiresAt": "2026-08-20T00:05:00.000Z"
+          }
+        }
+      }
+    },
+    {
+      "name": "minting a run credential with the sponsor's value-free run statement",
+      "operation": "issueSponsoredTakoformRunCredential",
+      "request": {
+        "method": "POST",
+        "path": "/v1/sponsorship/tenants/tenant%3Aopaque/takoform-run-credentials",
+        "credential": "service",
+        "body": {
+          "runRef": "run_2",
+          "spaceRef": "tsp_capsule",
+          "expiresInSeconds": 300,
+          "runtimeMaterialization": {
+            "contract": "takosumi.runtime-bindings/v1",
+            "phase": "apply",
+            "workspaceId": "wsp_1",
+            "capsuleId": "cap_1",
+            "runId": "run_1"
+          }
+        }
+      },
+      "response": {
+        "status": 201,
+        "body": {
+          "takoformRunCredential": {
+            "token": "runner-only-secret",
+            "expiresAt": "2026-08-20T00:05:00.000Z"
+          }
+        }
+      }
+    },
+    {
+      "name": "a run statement this Host does not understand is refused whole",
+      "operation": "issueSponsoredTakoformRunCredential",
+      "request": {
+        "method": "POST",
+        "path": "/v1/sponsorship/tenants/tenant%3Aopaque/takoform-run-credentials",
+        "credential": "service",
+        "body": {
+          "runRef": "run_3",
+          "spaceRef": "tsp_capsule",
+          "expiresInSeconds": 300,
+          "runtimeMaterialization": {
+            "contract": "takosumi.something/v9",
+            "phase": "apply",
+            "workspaceId": "wsp_1",
+            "capsuleId": "cap_1",
+            "runId": "run_1"
+          }
+        }
+      },
+      "response": {
+        "status": 400,
+        "body": {
+          "error": {
+            "code": "invalid",
+            "message": "invalid",
+            "requestId": "req_<fresh per response>",
+            "retryable": false
+          }
+        }
+      }
+    },
+    {
+      "name": "sponsoring one Resource",
+      "operation": "setSponsoredResourceBillingMode",
+      "request": {
+        "method": "PUT",
+        "path": "/v1/sponsorship/tenants/tenant%3Aopaque/resources/res_sponsored",
+        "credential": "service",
+        "body": {
+          "billingMode": "sponsored"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "resourceId": "res_sponsored",
+          "billingMode": "sponsored"
+        }
+      }
+    },
+    {
+      "name": "leaving another Resource billed directly",
+      "operation": "setSponsoredResourceBillingMode",
+      "request": {
+        "method": "PUT",
+        "path": "/v1/sponsorship/tenants/tenant%3Aopaque/resources/res_direct",
+        "credential": "service",
+        "body": {
+          "billingMode": "direct"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "resourceId": "res_direct",
+          "billingMode": "direct"
+        }
+      }
+    },
+    {
+      "name": "a Resource this Host does not hold cannot be sponsored",
+      "operation": "setSponsoredResourceBillingMode",
+      "request": {
+        "method": "PUT",
+        "path": "/v1/sponsorship/tenants/tenant%3Aopaque/resources/res_absent",
+        "credential": "service",
+        "body": {
+          "billingMode": "sponsored"
+        }
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "error": {
+            "code": "resource_not_found",
+            "message": "resource not found",
+            "requestId": "req_<fresh per response>",
+            "retryable": false
+          }
+        }
+      }
+    },
+    {
+      "name": "only sponsored Resources are listed",
+      "operation": "listSponsoredResources",
+      "request": {
+        "method": "GET",
+        "path": "/v1/sponsorship/tenants/tenant%3Aopaque/resources",
+        "credential": "service"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "resources": [
+            {
+              "resourceId": "res_sponsored"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "the first page of the tenant's Resource inventory",
+      "operation": "listSponsoredTenantInventory",
+      "request": {
+        "method": "GET",
+        "path": "/v1/sponsorship/tenants/tenant%3Aopaque/inventory?limit=1",
+        "credential": "service"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "items": [
+            {
+              "apiVersion": "edge.forms.takoform.com/v1beta1",
+              "kind": "ObjectBucket",
+              "name": "res_direct",
+              "formRef": {
+                "apiVersion": "edge.forms.takoform.com/v1beta1",
+                "kind": "ObjectBucket",
+                "definitionVersion": "0.1.0",
+                "schemaDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              },
+              "uid": "res_direct",
+              "generation": "3",
+              "revision": "7",
+              "conditions": []
+            }
+          ],
+          "nextCursor": "cmVzX2RpcmVjdA"
+        }
+      }
+    },
+    {
+      "name": "an OAuth resource served by the tenant's own Worker endpoint",
+      "operation": "authorizeSponsoredInterfaceOauthResource",
+      "request": {
+        "method": "POST",
+        "path": "/v1/sponsorship/tenants/tenant%3Aopaque/interface-oauth-resources/authorize",
+        "credential": "service",
+        "body": {
+          "spaceRef": "hosted-space",
+          "resource": "https://tenant.example.test/mcp"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "authorized": true
+        }
+      }
+    },
+    {
+      "name": "an OAuth resource the tenant does not serve",
+      "operation": "authorizeSponsoredInterfaceOauthResource",
+      "request": {
+        "method": "POST",
+        "path": "/v1/sponsorship/tenants/tenant%3Aopaque/interface-oauth-resources/authorize",
+        "credential": "service",
+        "body": {
+          "spaceRef": "hosted-space",
+          "resource": "https://attacker.example.test/mcp"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "authorized": false
+        }
+      }
+    },
+    {
+      "name": "releasing the sponsored Resource through the Takoform lifecycle",
+      "operation": "deleteSponsoredResource",
+      "request": {
+        "method": "DELETE",
+        "path": "/v1/sponsorship/tenants/tenant%3Aopaque/resources/res_sponsored",
+        "credential": "service"
+      },
+      "response": {
+        "status": 204,
+        "body": null
+      }
+    },
+    {
+      "name": "a Resource that is not sponsored cannot be released across this seam",
+      "operation": "deleteSponsoredResource",
+      "request": {
+        "method": "DELETE",
+        "path": "/v1/sponsorship/tenants/tenant%3Aopaque/resources/res_direct",
+        "credential": "service"
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "error": {
+            "code": "resource_not_found",
+            "message": "resource not found",
+            "requestId": "req_<fresh per response>",
+            "retryable": false
+          }
+        }
+      }
+    },
+    {
+      "name": "a path under the seam that is not an operation is refused, credential or not",
+      "operation": "bindSponsoredTenant",
+      "request": {
+        "method": "GET",
+        "path": "/v1/sponsorship/tenants/tenant%3Aopaque/not-an-operation",
+        "credential": "service"
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "error": {
+            "code": "not_found",
+            "message": "not found",
+            "requestId": "req_<fresh per response>",
+            "retryable": false
+          }
+        }
+      }
+    }
+  ]
+}

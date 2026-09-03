@@ -1,7 +1,15 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import {
+  observeSponsorshipSeam,
+  SPONSORSHIP_BASE_PATH,
+  SPONSORSHIP_SEAM_KIND,
+} from "../scripts/sponsorship-seam-session.ts";
 import { createEphemeralSql } from "../src/compat.ts";
 import type { ResourceInventory } from "../src/control.ts";
 import { createLedger } from "../src/ledger.ts";
+import { ROUTES } from "../src/route-table.ts";
 import { createSponsorshipRoutes } from "../src/sponsorship-api.ts";
 import type { TakoformHost } from "../src/takoform/types.ts";
 import type { TokenService } from "../src/token.ts";
@@ -395,6 +403,68 @@ describe("Hosted sponsorship owner API", () => {
         }),
       ),
     ).toEqual({ authorized: false });
+  });
+});
+
+describe("published sponsorship seam fixture", () => {
+  const artifactPath = join(import.meta.dir, "..", "seams/takoserver.sponsorship-seam.json");
+  const published = JSON.parse(readFileSync(artifactPath, "utf8")) as {
+    kind: string;
+    basePath: string;
+    operations: readonly string[];
+    exchanges: readonly {
+      operation: string;
+      request: { method: string; path: string; credential: string };
+      response: { status: number; body: unknown };
+    }[];
+  };
+
+  test("is a recording of this Host, not a description of it", async () => {
+    // The artifact each consumer pins has to be something this Host answered.
+    // Regenerating it here means a change in behaviour fails in `bun test`,
+    // not only in the separate gate.
+    expect(published).toEqual(
+      JSON.parse(JSON.stringify(await observeSponsorshipSeam())) as typeof published,
+    );
+    expect(published.kind).toBe(SPONSORSHIP_SEAM_KIND);
+    expect(published.basePath).toBe(SPONSORSHIP_BASE_PATH);
+  });
+
+  test("covers every private route the surface declares, and nothing else", () => {
+    const declared = ROUTES.filter((route) => route.internal).map((route) => route.operation);
+    expect([...published.operations].sort()).toEqual([...declared].sort());
+    const exercised = new Set(published.exchanges.map((exchange) => exchange.operation));
+    expect([...exercised].sort()).toEqual([...declared].sort());
+  });
+
+  test("records that the seam does not disclose itself without the credential", () => {
+    const unprivileged = published.exchanges.filter(
+      (exchange) => exchange.request.credential !== "service",
+    );
+    expect(unprivileged.length).toBeGreaterThan(0);
+    for (const exchange of unprivileged) {
+      expect(exchange.response.status).toBe(404);
+      expect(exchange.response.body).toMatchObject({ error: { code: "not_found" } });
+    }
+  });
+
+  test("records the four-member envelope a consumer must decode", () => {
+    const refusals = published.exchanges.filter((exchange) => exchange.response.status >= 400);
+    expect(refusals.length).toBeGreaterThan(0);
+    for (const refusal of refusals) {
+      expect(Object.keys((refusal.response.body as { error: object }).error).sort()).toEqual([
+        "code",
+        "message",
+        "requestId",
+        "retryable",
+      ]);
+    }
+  });
+
+  test("every path in the recording is under the seam's own base path", () => {
+    for (const exchange of published.exchanges) {
+      expect(exchange.request.path.startsWith(`${SPONSORSHIP_BASE_PATH}/`)).toBe(true);
+    }
   });
 });
 

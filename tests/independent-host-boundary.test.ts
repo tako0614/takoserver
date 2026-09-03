@@ -99,11 +99,14 @@ describe("independent Takoserver Host boundary", () => {
      * retired seam: that was a service binding this Host called Hosted
      * through, and the value is carried nowhere — not
      * into the credential, the token claims, the ledger, or a provider. The
-     * allowance is exactly the one file that receives the request. Every other
-     * file, and every other retired name, still fails here.
+     * allowance is exactly the one file that receives the request, plus the
+     * script that records what the seam answers to it — a recording that did
+     * not send the key would not be a recording of the seam. Every other file,
+     * and every other retired name, still fails here.
      */
     const allowed = new Map<string, ReadonlySet<string>>([
       ["src/sponsorship-api.ts", new Set([["runtime", "Materialization"].join("")])],
+      ["scripts/sponsorship-seam-session.ts", new Set([["runtime", "Materialization"].join("")])],
     ]);
     const retained: string[] = [];
     for (const root of [join(repository, "src"), join(repository, "scripts")]) {
