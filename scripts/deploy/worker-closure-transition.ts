@@ -24,7 +24,14 @@ import {
   writeWorkerConfig,
 } from "./realized-config.ts";
 import type { DeployTarget } from "./target.ts";
-import { probeProduct, type WorkerMigrationReader } from "./worker.ts";
+import {
+  assertProviderExecutorUnchanged,
+  probeProduct,
+  providerExecutorQualificationReader,
+  type WorkerMigrationReader,
+  type WorkerProviderExecutorQualification,
+  withProviderExecutorQualification,
+} from "./worker.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import { assertTargetComposes } from "./worker-composition.ts";
 import {
@@ -82,6 +89,8 @@ export interface WorkerClosureTransitionOptions {
   /** Owner-private secret input root override for portable tests. */
   readonly secretDirectory?: string;
   readonly fetcher?: (input: string, init?: RequestInit) => Promise<Response>;
+  /** Exact private-executor qualification seam; injectable only for portable tests. */
+  readonly providerExecutorQualification?: WorkerProviderExecutorQualification;
 }
 
 interface ClosurePredecessor {
@@ -144,12 +153,38 @@ export async function runWorkerClosureTransition(
     options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-worker-closure-transition-"));
   mkdirSync(root, { recursive: true, mode: 0o700 });
   try {
-    const state =
-      options.state ??
-      new CloudflareState({
-        accountId: target.accountId,
-        token: credential?.token ?? exactToken(environment),
-      });
+    const cloudflareState =
+      options.state === undefined
+        ? new CloudflareState({
+            accountId: target.accountId,
+            token: credential?.token ?? exactToken(environment),
+          })
+        : null;
+    const state = options.state ?? cloudflareState;
+    if (state === null) throw preflightError("Worker state is unavailable");
+    const providerExecutorQualification = providerExecutorQualificationReader({
+      target,
+      commit: invocation.commit,
+      state: cloudflareState,
+      environment,
+      run,
+      ...(options.providerExecutorQualification === undefined
+        ? {}
+        : { injected: options.providerExecutorQualification }),
+    });
+    const providerExecutorBefore =
+      providerExecutorQualification === null
+        ? null
+        : await providerExecutorQualification.read("preflight");
+    if (
+      invocation.action === "apply" &&
+      providerExecutorBefore !== null &&
+      !providerExecutorBefore.ready
+    ) {
+      throw preflightError(
+        "public Worker publication requires the exact selected-commit Cloudflare provider executor",
+      );
+    }
     const inspectionConfig = writeWorkerConfig(target, {
       path: join(root, "inspect-wrangler.jsonc"),
       main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
@@ -164,7 +199,10 @@ export async function runWorkerClosureTransition(
     const selector = invocation.closurePredecessorVersionId;
 
     if (invocation.action === "status" && history.versionId !== selector) {
-      return await appliedClosureTransitionStatus(invocation, target, state, migrations, history);
+      return withProviderExecutorQualification(
+        await appliedClosureTransitionStatus(invocation, target, state, migrations, history),
+        providerExecutorBefore,
+      );
     }
     if (history.versionId !== selector) {
       throw preflightError(
@@ -177,27 +215,32 @@ export async function runWorkerClosureTransition(
     const pending = pendingMigrations(migrationState.local, migrationState.applied);
 
     if (invocation.action === "status") {
-      return {
-        kind: "takoserver.worker-closure-transition-status@v1",
-        surface: invocation.surface,
-        environment: invocation.environment,
-        selectedCommit: invocation.commit,
-        state: "closure-predecessor-current",
-        closurePredecessorVersionId: selector,
-        deploymentId: before.history.deploymentId,
-        versionId: before.history.versionId,
-        previousVersionId: before.history.previousVersionId,
-        deployedCommit: before.commit,
-        artifactDigest: `sha256:${before.bundleDigestHex}`,
-        delta: { ...delta },
-        carriedSecrets: before.carriedSecrets,
-        carriedStoreSecrets: before.carriedStoreSecrets,
-        secretInputsRequired: [...delta.addedSecrets, ...delta.rotatedSecrets].sort(),
-        appliedMigrations: migrationState.applied,
-        pendingMigrations: pending,
-        mutationApplied: false,
-        ready: pending.length === 0 || artifactBlobIoCompatibilityAllowsPending(target, pending),
-      };
+      return withProviderExecutorQualification(
+        {
+          kind: "takoserver.worker-closure-transition-status@v1",
+          surface: invocation.surface,
+          environment: invocation.environment,
+          selectedCommit: invocation.commit,
+          state: "closure-predecessor-current",
+          closurePredecessorVersionId: selector,
+          deploymentId: before.history.deploymentId,
+          versionId: before.history.versionId,
+          previousVersionId: before.history.previousVersionId,
+          deployedCommit: before.commit,
+          artifactDigest: `sha256:${before.bundleDigestHex}`,
+          delta: { ...delta },
+          carriedSecrets: before.carriedSecrets,
+          carriedStoreSecrets: before.carriedStoreSecrets,
+          secretInputsRequired: [...delta.addedSecrets, ...delta.rotatedSecrets].sort(),
+          appliedMigrations: migrationState.applied,
+          pendingMigrations: pending,
+          mutationApplied: false,
+          ready:
+            (pending.length === 0 || artifactBlobIoCompatibilityAllowsPending(target, pending)) &&
+            (providerExecutorBefore === null || providerExecutorBefore.ready),
+        },
+        providerExecutorBefore,
+      );
     }
 
     if (pending.length > 0 && !artifactBlobIoCompatibilityAllowsPending(target, pending)) {
@@ -290,6 +333,10 @@ export async function runWorkerClosureTransition(
     ) {
       throw preflightError("pinned closure predecessor identity changed before the upload");
     }
+    if (providerExecutorQualification !== null && providerExecutorBefore !== null) {
+      const currentProviderExecutor = await providerExecutorQualification.read("preflight");
+      assertProviderExecutorUnchanged(providerExecutorBefore, currentProviderExecutor);
+    }
     const message = `takoserver-worker:${source.commit}:${prepared.bundleDigestHex}`;
     const upload = await run(
       wranglerCommand([
@@ -342,6 +389,17 @@ export async function runWorkerClosureTransition(
     ) {
       throw verificationError("closure transition left pending D1 migrations");
     }
+    const providerExecutorAfter =
+      providerExecutorQualification === null
+        ? null
+        : await providerExecutorQualification.read("verification");
+    if (providerExecutorBefore !== null && providerExecutorAfter !== null) {
+      assertProviderExecutorUnchanged(
+        providerExecutorBefore,
+        providerExecutorAfter,
+        "verification",
+      );
+    }
     const probe =
       target.artifactBlobIoMode === "pre-0043-quiesced"
         ? await probeArtifactBlobIoQuiescence(
@@ -358,33 +416,37 @@ export async function runWorkerClosureTransition(
         "authoritative Worker deployment history does not identify the actual immediate predecessor",
       );
     }
-    return {
-      kind: "takoserver.worker-closure-transition-apply@v1",
-      surface: invocation.surface,
-      environment: invocation.environment,
-      state: "closure-transition-applied",
-      commit: source.commit,
-      dirty: source.dirty,
-      remoteRef: source.remoteRef,
-      reviewer,
-      closurePredecessorVersionId: selector,
-      delta: { ...delta },
-      carriedSecrets: before.carriedSecrets,
-      carriedStoreSecrets: before.carriedStoreSecrets,
-      artifactDigest: artifact.digest,
-      artifactBytes: artifact.bytes,
-      artifactFiles: artifact.files,
-      bundleDigest: `sha256:${prepared.bundleDigestHex}`,
-      preMutationObservedVersionId: before.history.versionId,
-      previousVersionId: rollbackVersionId,
-      deploymentId: after.history.deploymentId,
-      versionId: after.history.versionId,
-      pendingMigrations: afterPending,
-      probe,
-      mutationApplied: true,
-      rollback:
-        `wrangler versions deploy ${rollbackVersionId}@100% --yes ` + `--name ${target.workerName}`,
-    };
+    return withProviderExecutorQualification(
+      {
+        kind: "takoserver.worker-closure-transition-apply@v1",
+        surface: invocation.surface,
+        environment: invocation.environment,
+        state: "closure-transition-applied",
+        commit: source.commit,
+        dirty: source.dirty,
+        remoteRef: source.remoteRef,
+        reviewer,
+        closurePredecessorVersionId: selector,
+        delta: { ...delta },
+        carriedSecrets: before.carriedSecrets,
+        carriedStoreSecrets: before.carriedStoreSecrets,
+        artifactDigest: artifact.digest,
+        artifactBytes: artifact.bytes,
+        artifactFiles: artifact.files,
+        bundleDigest: `sha256:${prepared.bundleDigestHex}`,
+        preMutationObservedVersionId: before.history.versionId,
+        previousVersionId: rollbackVersionId,
+        deploymentId: after.history.deploymentId,
+        versionId: after.history.versionId,
+        pendingMigrations: afterPending,
+        probe,
+        mutationApplied: true,
+        rollback:
+          `wrangler versions deploy ${rollbackVersionId}@100% --yes ` +
+          `--name ${target.workerName}`,
+      },
+      providerExecutorAfter,
+    );
   } finally {
     unsealDirectory(root);
     if (temporary) rmSync(root, { recursive: true, force: true });

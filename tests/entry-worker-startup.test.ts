@@ -84,8 +84,8 @@ describe("Worker startup diagnostics", () => {
     // half without `storage.object`. Composition is lazy and per request, so
     // the Worker went live and then threw on every route.
     const env = workerEnv({
-      CLOUDFLARE_ACCOUNT_ID: "a".repeat(32),
-      CLOUDFLARE_API_TOKEN: "token",
+      CLOUDFLARE_PROVIDER_EXECUTOR: {},
+      TAKOSERVER_MANAGED_BASE_DOMAIN: "workers.example.test",
       TAKOSERVER_EDGE_SUPPLIES: JSON.stringify(edgeSuppliesFixture(EDGE_ONLY_RESOURCE_CLASSES)),
       TAKOSERVER_OBJECT_BUCKET_SUPPLIES: JSON.stringify(objectBucketSuppliesFixture()),
     });

@@ -207,8 +207,14 @@ sponsorship were configured. It is available only when the current target has
 both features, requires every unchanged account, origin, D1, R2, supply,
 operator-identity, and secret binding to remain exact, and takes only the
 historical signing-key id from the already pinned immutable Version. The
-historical Version must omit the later provenance, artifact-variable, and
-sponsorship bindings; a mixed generation is refused. Its canonical annotation,
+pre-executor variant additionally requires the closed integration-only
+`formAuthority.historicalPreExecutorPublicWorker.workerEndpointSuffix` snapshot.
+That value is readback-only, is never materialized into the current public
+Worker, and is not inferred from the executor's managed base domain. The legacy
+Version must carry the exact snapshotted suffix, account, zones, and parent-token
+binding name while omitting both executor-era bindings; missing evidence or a
+mixed old/new generation is refused. The historical Version must also omit the
+later provenance, artifact-variable, and sponsorship bindings. Its canonical annotation,
 authority-held Version and artifact pins, bundle digest, and source commit must
 still agree exactly. Canonical means the annotation inventory contains exactly
 `workers/message` with the expected public Worker commit/digest identity and
@@ -232,6 +238,9 @@ dynamic-public-rpc` and `ready: true`, and gateway status reports both
 `authorityPublicWorkerBindingProfile: dynamic-public-rpc`, and `ready: true` at
 the same selected commit. Until that joint readback, the bridge remains needed;
 after it, the bridge is deleted rather than retained as compatibility.
+Delete `historicalPreExecutorPublicWorker` in that same reviewed target update;
+retaining the readback snapshot after joint dynamic convergence is not steady
+configuration.
 
 The operator-private scope-transition selector uses a separate stricter state
 machine. Its status accepts either the dynamic profile or one fully verified

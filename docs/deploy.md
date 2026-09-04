@@ -454,6 +454,30 @@ from this tuple; no duplicate environment variable may redirect it. Keep the
 executor two-secret file and the receipt three-secret file separate from this
 non-secret target.
 
+While the integration Form-authority migration still has to recognize the
+immutable public Worker generation from before the executor, the operator must
+also copy that generation's exact endpoint suffix into this closed,
+readback-only snapshot inside `formAuthority`:
+
+```json
+{
+  "formAuthority": {
+    "historicalPreExecutorPublicWorker": {
+      "workerEndpointSuffix": "<exact suffix read from the pinned historical Version>"
+    }
+  }
+}
+```
+
+This member is integration-only, is accepted only with the complete historical
+Form-authority bridge, sponsorship, JIT authority, edge supplies, and executor
+topology, and is never emitted by `deploymentVariables` or `writeWorkerConfig`.
+It must not be inferred from `cloudflareProviderExecutor.managedBaseDomain`:
+the two values may differ. A missing or mismatched snapshot refuses the legacy
+Version rather than widening the readback profile. Delete the member after the
+joint route-less authority and gateway status described in
+[`docs/form-authority.md`](form-authority.md) proves the bridge complete.
+
 A private composer pinned to an older public contract that still requires or
 emits `workerEndpointSuffix` is not a realization source. Advance that pin and
 review its current v2 output, or author the current v2 object directly; never
@@ -665,7 +689,11 @@ The separate authority and irreversible surfaces are:
   secret into the candidate predecessor state.
   Its named closure-transition profile is the only way to bring a live Version
   forward after the operator-private target descriptor legitimately changes
-  shape. Apply performs exactly one upload of the complete current closure: the
+  shape. A Cloudflare target uses the same selected-commit provider-executor
+  qualification as the routine surface: status includes it in readiness, apply
+  refuses an unready executor before public Worker readback or build, and apply
+  re-fences the exact executor deployment both immediately before upload and
+  after public readback. Apply performs exactly one upload of the complete current closure: the
   target plain-text vars exactly as the routine surface produces them, every
   required secret, and the same authoritative readback, annotation, closure and
   public product probe the cutover already performs. Added and rotated secret

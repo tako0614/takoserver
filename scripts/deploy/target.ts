@@ -106,6 +106,14 @@ export interface DeployTarget {
       readonly crv: "Ed25519";
       readonly x: string;
     };
+    /**
+     * Readback-only snapshot of the immutable public Worker generation from
+     * before the route-less provider executor. It is never realized into a
+     * current Worker config and must be removed after the bridge converges.
+     */
+    readonly historicalPreExecutorPublicWorker?: {
+      readonly workerEndpointSuffix: string;
+    };
     readonly hostId: string;
   };
   /**
@@ -414,6 +422,20 @@ export function parseDeployTarget(
         "deploy target Form authority operator gateway requires its dedicated operatorPublicJwk",
       );
     }
+    if (
+      target.formAuthority.historicalPreExecutorPublicWorker !== undefined &&
+      (target.environment !== "integration" ||
+        target.sponsorship !== true ||
+        target.integrationE2eCredentialAuthority === undefined ||
+        target.cloudflareProviderExecutor === undefined ||
+        target.edgeSupplies === undefined ||
+        target.formAuthority.integrationWorkerName === undefined ||
+        target.formAuthority.integrationOperatorWorkerName === undefined)
+    ) {
+      throw preflightError(
+        "deploy target historical pre-executor public Worker snapshot requires the integration Form-authority bridge, sponsorship, JIT authority, edge supplies and provider executor",
+      );
+    }
   }
   const allWorkerNames = [
     target.workerName,
@@ -471,6 +493,7 @@ function formAuthority(
       "integrationOperatorOrigin",
       "integrationOperatorScope",
       "operatorPublicJwk",
+      "historicalPreExecutorPublicWorker",
     ],
   );
   const integrationWorkerName =
@@ -513,6 +536,15 @@ function formAuthority(
     value.integrationOperatorScope === undefined
       ? undefined
       : formAuthorityOperatorScope(value.integrationOperatorScope);
+  const historicalPreExecutorPublicWorker =
+    value.historicalPreExecutorPublicWorker === undefined
+      ? undefined
+      : parseHistoricalPreExecutorPublicWorker(value.historicalPreExecutorPublicWorker);
+  if (historicalPreExecutorPublicWorker !== undefined && environment !== "integration") {
+    throw preflightError(
+      "deploy target `formAuthority.historicalPreExecutorPublicWorker` is integration-only",
+    );
+  }
   if (
     Boolean(integrationOperatorWorkerName) !== Boolean(operatorPublicJwk) ||
     Boolean(integrationOperatorWorkerName) !== Boolean(integrationOperatorScope)
@@ -554,7 +586,27 @@ function formAuthority(
             NonNullable<DeployTarget["formAuthority"]>["operatorPublicJwk"]
           >,
         }),
+    ...(historicalPreExecutorPublicWorker === undefined
+      ? {}
+      : { historicalPreExecutorPublicWorker }),
     hostId: value.hostId,
+  };
+}
+
+function parseHistoricalPreExecutorPublicWorker(
+  value: unknown,
+): NonNullable<NonNullable<DeployTarget["formAuthority"]>["historicalPreExecutorPublicWorker"]> {
+  if (!isRecord(value) || !exactKeySet(value, ["workerEndpointSuffix"])) {
+    throw preflightError(
+      "deploy target `formAuthority.historicalPreExecutorPublicWorker` must contain only `workerEndpointSuffix`",
+    );
+  }
+  return {
+    workerEndpointSuffix: pattern(
+      value.workerEndpointSuffix,
+      HOSTNAME,
+      "formAuthority.historicalPreExecutorPublicWorker.workerEndpointSuffix",
+    ),
   };
 }
 

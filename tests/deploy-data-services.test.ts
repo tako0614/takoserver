@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deploymentVariables } from "../scripts/deploy/realized-config.ts";
 import { loadTarget } from "../scripts/deploy/target.ts";
+import { cloudflareProviderExecutorTarget } from "./helpers/hosted-supply-fixtures.ts";
 
 const BASE = {
   kind: "takoserver.deploy-target@v2",
@@ -112,6 +113,11 @@ const EDGE_SUPPLIES = {
   ],
 };
 
+const CLOUDFLARE_PROVIDER_EXECUTOR = {
+  ...cloudflareProviderExecutorTarget("cloudflare.primary"),
+  managedBaseDomain: "hosted.workers.dev",
+};
+
 describe("private data service deploy configuration", () => {
   test("realizes the exact Takos ID issuer and client without a direct upstream identity", () => {
     const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
@@ -168,20 +174,21 @@ describe("private data service deploy configuration", () => {
           stripeCheckout: true,
           objectBucketSupplies: SUPPLIES,
           edgeSupplies: EDGE_SUPPLIES,
-          workerEndpointSuffix: "hosted.workers.dev",
+          cloudflareProviderExecutor: CLOUDFLARE_PROVIDER_EXECUTOR,
           sponsorship: true,
         }),
       );
       const target = loadTarget(path, "production");
       const realized = deploymentVariables(target) as { vars: Record<string, string> };
       expect(JSON.parse(realized.vars.TAKOSERVER_AI_MODELS ?? "null")).toEqual([MODEL]);
-      expect(realized.vars.CLOUDFLARE_ACCOUNT_ID).toBe(BASE.accountId);
+      expect(realized.vars).not.toHaveProperty("CLOUDFLARE_ACCOUNT_ID");
       expect(realized.vars.TAKOSERVER_STRIPE_CHECKOUT_ENABLED).toBe("1");
       expect(JSON.parse(realized.vars.TAKOSERVER_OBJECT_BUCKET_SUPPLIES ?? "null")).toEqual(
         SUPPLIES,
       );
       expect(JSON.parse(realized.vars.TAKOSERVER_EDGE_SUPPLIES ?? "null")).toEqual(EDGE_SUPPLIES);
-      expect(realized.vars.TAKOSERVER_WORKER_ENDPOINT_SUFFIX).toBe("hosted.workers.dev");
+      expect(realized.vars.TAKOSERVER_MANAGED_BASE_DOMAIN).toBe("hosted.workers.dev");
+      expect(realized.vars).not.toHaveProperty("TAKOSERVER_WORKER_ENDPOINT_SUFFIX");
       expect(realized.vars).not.toHaveProperty("TAKOSERVER_ZONES");
       expect(JSON.stringify(realized)).not.toContain("TOKEN");
       expect(JSON.stringify(realized)).not.toContain("sk_");
@@ -220,7 +227,14 @@ describe("private data service deploy configuration", () => {
     const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
     try {
       const path = join(directory, "target.json");
-      writeFileSync(path, JSON.stringify({ ...BASE, objectBucketSupplies: SUPPLIES }));
+      writeFileSync(
+        path,
+        JSON.stringify({
+          ...BASE,
+          objectBucketSupplies: SUPPLIES,
+          cloudflareProviderExecutor: CLOUDFLARE_PROVIDER_EXECUTOR,
+        }),
+      );
       const realized = deploymentVariables(loadTarget(path, "production")) as {
         vars: Record<string, string>;
       };
@@ -233,13 +247,13 @@ describe("private data service deploy configuration", () => {
     }
   });
 
-  test("will not sell edge capacity without the exact provider endpoint suffix", () => {
+  test("will not sell edge capacity without the route-less provider executor", () => {
     const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
     try {
       const path = join(directory, "target.json");
       writeFileSync(path, JSON.stringify({ ...BASE, edgeSupplies: EDGE_SUPPLIES }));
       expect(() => loadTarget(path, "production")).toThrow(
-        "edge supplies and `workerEndpointSuffix`",
+        "Cloudflare supplies and `cloudflareProviderExecutor`",
       );
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -255,7 +269,7 @@ describe("private data service deploy configuration", () => {
         JSON.stringify({
           ...BASE,
           edgeSupplies: EDGE_SUPPLIES,
-          workerEndpointSuffix: "hosted.workers.dev",
+          cloudflareProviderExecutor: CLOUDFLARE_PROVIDER_EXECUTOR,
         }),
       );
       const target = loadTarget(path, "production");

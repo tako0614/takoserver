@@ -614,7 +614,7 @@ export async function runWorker(
   }
 }
 
-function providerExecutorQualificationReader(input: {
+export function providerExecutorQualificationReader(input: {
   readonly target: DeployTarget;
   readonly commit: string;
   readonly state: CloudflareProviderExecutorState | null;
@@ -662,7 +662,7 @@ function providerExecutorQualificationReader(input: {
   };
 }
 
-function providerExecutorStatus(
+export function providerExecutorStatus(
   inspection: CloudflareProviderExecutorInspection | null,
 ): Record<string, unknown> {
   return inspection === null
@@ -684,7 +684,7 @@ function providerExecutorStatus(
       };
 }
 
-function withProviderExecutorQualification(
+export function withProviderExecutorQualification(
   result: Record<string, unknown>,
   inspection: CloudflareProviderExecutorInspection | null,
 ): Record<string, unknown> {
@@ -697,7 +697,7 @@ function withProviderExecutorQualification(
   };
 }
 
-function assertProviderExecutorUnchanged(
+export function assertProviderExecutorUnchanged(
   expected: CloudflareProviderExecutorInspection,
   actual: CloudflareProviderExecutorInspection,
   phase: "preflight" | "verification" = "preflight",

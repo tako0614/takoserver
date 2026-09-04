@@ -1386,13 +1386,14 @@ async function inspectLegacyPinnedPublicWorker(
     TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST: null,
   };
   const historicalBeforeJitAndSponsorship = allowHistoricalProfile
-    ? expectedHistoricalPinnedPublicWorkerClosure(phase, target, versionId, publicVersion)
-    : null;
+    ? expectedHistoricalPinnedPublicWorkerClosures(phase, target, versionId, publicVersion)
+    : [];
   if (
     !hasExactBindingClosure(phase, versionId, publicVersion, expected) &&
     !hasExactBindingClosure(phase, versionId, publicVersion, legacyBeforeCapabilityIdentity) &&
-    (historicalBeforeJitAndSponsorship === null ||
-      !hasExactBindingClosure(phase, versionId, publicVersion, historicalBeforeJitAndSponsorship))
+    !historicalBeforeJitAndSponsorship.some((closure) =>
+      hasExactBindingClosure(phase, versionId, publicVersion, closure),
+    )
   ) {
     throw phaseError(
       phase,
@@ -1417,18 +1418,18 @@ async function inspectLegacyPinnedPublicWorker(
  * One-time integration bridge for the deployed generation before JIT provenance
  * and sponsorship. Remove it after both authority Workers are verified dynamic.
  */
-function expectedHistoricalPinnedPublicWorkerClosure(
+function expectedHistoricalPinnedPublicWorkerClosures(
   phase: DeployPhase,
   target: DeployTarget,
   versionId: string,
   publicVersion: unknown,
-): Parameters<typeof assertExactVersionBindingClosure>[3] | null {
+): readonly Parameters<typeof assertExactVersionBindingClosure>[3][] {
   if (
     target.environment !== "integration" ||
     target.sponsorship !== true ||
     target.integrationE2eCredentialAuthority === undefined
   ) {
-    return null;
+    return [];
   }
   const signingKeyId = optionalExactPlainTextBinding(
     phase,
@@ -1436,16 +1437,56 @@ function expectedHistoricalPinnedPublicWorkerClosure(
     publicVersion,
     "TAKOSERVER_SIGNING_KEY_ID",
   );
-  if (signingKeyId === null || !HISTORICAL_SIGNING_KEY_ID.test(signingKeyId)) return null;
+  if (signingKeyId === null || !HISTORICAL_SIGNING_KEY_ID.test(signingKeyId)) return [];
   const {
     sponsorship: _currentSponsorship,
     integrationE2eCredentialAuthority: _currentCredentialAuthority,
     ...historicalTarget
   } = target;
-  return expectedExactBindingClosure({
+  const credentialFreeExecutorClosure = expectedExactBindingClosure({
     ...historicalTarget,
     signing: { currentKeyId: signingKeyId },
   });
+  const topology = target.cloudflareProviderExecutor;
+  const historical = target.formAuthority?.historicalPreExecutorPublicWorker;
+  if (topology === undefined || historical === undefined) {
+    return [credentialFreeExecutorClosure];
+  }
+
+  // The immutable integration generation this bridge was introduced for
+  // predates the route-less provider executor. Keep that old authority shape
+  // only as an exact readback profile: no current Worker config or runtime path
+  // receives the parent token again. The operator-private snapshot supplies
+  // the one exact historical value this
+  // profile can admit; the executor's current managed domain is not a proxy
+  // for it and may legitimately differ.
+  const legacyDirectCloudflareClosure = {
+    ...credentialFreeExecutorClosure,
+    CLOUDFLARE_PROVIDER_EXECUTOR: null,
+    TAKOSERVER_MANAGED_BASE_DOMAIN: null,
+    CLOUDFLARE_ACCOUNT_ID: {
+      type: "plain_text",
+      fields: { text: target.accountId },
+    },
+    ...(target.zones === undefined
+      ? {}
+      : {
+          TAKOSERVER_ZONES: {
+            type: "plain_text",
+            fields: { text: JSON.stringify(target.zones) },
+          },
+        }),
+    ...(target.edgeSupplies === undefined
+      ? {}
+      : {
+          TAKOSERVER_WORKER_ENDPOINT_SUFFIX: {
+            type: "plain_text",
+            fields: { text: historical.workerEndpointSuffix },
+          },
+        }),
+    CLOUDFLARE_API_TOKEN: { type: "secret_text", fields: {} },
+  } as const;
+  return [credentialFreeExecutorClosure, legacyDirectCloudflareClosure];
 }
 
 function expectedLegacyBindings(
