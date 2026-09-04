@@ -68,6 +68,7 @@ export type TokenErrorCode =
   | "malformed_token"
   | "unknown_key"
   | "invalid_signature"
+  | "invalid_credential_authority"
   | "wrong_issuer"
   | "wrong_audience"
   | "token_not_yet_valid"
@@ -125,15 +126,6 @@ export interface TokenService {
     ),
   ): Promise<{ readonly token: string; readonly expiresAt: string }>;
 
-  issueTakoformTenantRunToken(input: {
-    readonly organizationId: string;
-    readonly tenantRef: string;
-    readonly spaceRef: string;
-    readonly runRef: string;
-    readonly workerEndpointOriginReservationId?: string;
-    readonly ttlSeconds: number;
-  }): Promise<{ readonly token: string; readonly expiresAt: string }>;
-
   verifyTakoformTenantRunToken(token: string): Promise<TakoformTenantRunTokenClaims>;
 
   /** Reusable only within its short lifetime and exact Resource address. */
@@ -173,6 +165,10 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
     claims: Record<string, unknown>,
     ttlSeconds: number,
     maxLifetime: number,
+    issuance?: {
+      readonly issuedAtEpochSeconds: number;
+      readonly tokenId: string;
+    },
   ): Promise<{ token: string; expiresAt: string }> => {
     const key = options.signingKey;
     if (!key) throw new TokenError("no_active_keys");
@@ -183,7 +179,15 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
     const lifetime = positiveInteger(ttlSeconds);
     if (lifetime > maxLifetime) throw new TokenError("token_lifetime_exceeded");
 
-    const issuedAt = Math.floor(clock().getTime() / 1_000);
+    const clockEpochSeconds = Math.floor(clock().getTime() / 1_000);
+    const issuedAt = issuance?.issuedAtEpochSeconds ?? clockEpochSeconds;
+    if (!Number.isSafeInteger(issuedAt) || issuedAt < 0 || issuedAt > clockEpochSeconds) {
+      throw new TypeError("token issuance instant is invalid");
+    }
+    const tokenId =
+      issuance === undefined
+        ? `tok_${base64UrlEncode(crypto.getRandomValues(new Uint8Array(16)))}`
+        : reference(issuance.tokenId);
     const expiresAt = issuedAt + lifetime;
     const header = encode({ alg: "EdDSA", kid: key.keyId, typ: TOKEN_TYPE });
     const payload = encode({
@@ -192,7 +196,7 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
       exp: expiresAt,
       iat: issuedAt,
       iss: issuer,
-      jti: `tok_${base64UrlEncode(crypto.getRandomValues(new Uint8Array(16)))}`,
+      jti: tokenId,
       nbf: issuedAt,
     });
     const signingInput = `${header}.${payload}`;
@@ -211,7 +215,7 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
     token: string,
     audience: string,
     maxLifetime: number,
-  ): Promise<Record<string, unknown>> => {
+  ): Promise<{ readonly payload: Record<string, unknown>; readonly keyId: string }> => {
     if (typeof token !== "string" || token.length > 16_384) fail("malformed_token");
     const parts = token.split(".");
     if (parts.length !== 3) fail("malformed_token");
@@ -248,7 +252,7 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
     if (now >= expiresAt) fail("token_expired");
     if (expiresAt - issuedAt > maxLifetime) fail("token_lifetime_exceeded");
     if (typeof payload.jti !== "string" || !REFERENCE.test(payload.jti)) fail("malformed_token");
-    return payload;
+    return { payload, keyId: header.kid };
   };
 
   return {
@@ -269,13 +273,13 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
     },
 
     async verifyProvisionToken(token) {
-      const payload = await open(token, PROVISION_AUDIENCE, maxProvisionLifetime);
-      return provisionClaims(payload);
+      const opened = await open(token, PROVISION_AUDIENCE, maxProvisionLifetime);
+      return provisionClaims(opened.payload);
     },
 
     async consumeProvisionToken(token) {
-      const payload = await open(token, PROVISION_AUDIENCE, maxProvisionLifetime);
-      const claims = provisionClaims(payload);
+      const opened = await open(token, PROVISION_AUDIENCE, maxProvisionLifetime);
+      const claims = provisionClaims(opened.payload);
       await consume(options.sql, clock, claims);
       return claims;
     },
@@ -307,47 +311,64 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
       );
     },
 
-    async issueTakoformTenantRunToken(input) {
-      return await sign(
-        TAKOFORM_RUN_AUDIENCE,
-        {
-          mode: "tenant-run",
-          organizationId: reference(input.organizationId),
-          runRef: reference(input.runRef),
-          spaceRef: reference(input.spaceRef),
-          tenantRef: reference(input.tenantRef),
-          ...(input.workerEndpointOriginReservationId === undefined
-            ? {}
-            : {
-                workerEndpointOriginReservationId: reference(
-                  input.workerEndpointOriginReservationId,
-                ),
-              }),
-        },
-        input.ttlSeconds,
-        maxTakoformRunLifetime,
-      );
-    },
-
     async verifyTakoformRunToken(token) {
-      return takoformRunClaims(await open(token, TAKOFORM_RUN_AUDIENCE, maxTakoformRunLifetime));
+      const opened = await open(token, TAKOFORM_RUN_AUDIENCE, maxTakoformRunLifetime);
+      return takoformRunClaims(opened.payload);
     },
 
     async verifyTakoformTenantRunToken(token) {
-      return takoformTenantRunClaims(
-        await open(token, TAKOFORM_RUN_AUDIENCE, maxTakoformRunLifetime),
-      );
+      const opened = await open(token, TAKOFORM_RUN_AUDIENCE, maxTakoformRunLifetime);
+      const claims = takoformTenantRunClaims(opened.payload);
+      await assertAdmittedSponsorshipCredential(options.sql, claims, opened.keyId);
+      return claims;
     },
 
     async claimTakoformRunTokenForCreate(token) {
-      const claims = takoformRunClaims(
-        await open(token, TAKOFORM_RUN_AUDIENCE, maxTakoformRunLifetime),
-      );
+      const opened = await open(token, TAKOFORM_RUN_AUDIENCE, maxTakoformRunLifetime);
+      const claims = takoformRunClaims(opened.payload);
       if (claims.mode !== "provision") fail("malformed_token");
       await claimReusableCreate(options.sql, clock, claims);
       return claims;
     },
   };
+}
+
+/**
+ * A tenant-run JWT is not authoritative merely because an active Takoserver
+ * key signed it. The route-less authority first appends one immutable
+ * admission row and records the dedicated credential key identity. Verification
+ * pins the JWT `kid` and scope to that row, so the public Worker's ordinary
+ * signing key cannot mint an accepted sponsorship credential.
+ */
+async function assertAdmittedSponsorshipCredential(
+  sql: Sql,
+  claims: TakoformTenantRunTokenClaims,
+  keyId: string,
+): Promise<void> {
+  let rows: readonly Record<string, unknown>[];
+  try {
+    rows = await sql.query(
+      `SELECT token_id, org_id, tenant_ref, issued_at_epoch_seconds,
+              expires_at_epoch_seconds, credential_key_id
+       FROM sponsorship_credential_issuance_operations
+       WHERE token_id = ? LIMIT 2`,
+      [claims.tokenId],
+    );
+  } catch {
+    throw new TokenError("state_unavailable");
+  }
+  const row = rows.length === 1 ? rows[0] : undefined;
+  if (
+    !row ||
+    row.token_id !== claims.tokenId ||
+    row.org_id !== claims.organizationId ||
+    row.tenant_ref !== claims.tenantRef ||
+    row.issued_at_epoch_seconds !== claims.issuedAtEpochSeconds ||
+    row.expires_at_epoch_seconds !== claims.expiresAtEpochSeconds ||
+    row.credential_key_id !== keyId
+  ) {
+    fail("invalid_credential_authority");
+  }
 }
 
 /**

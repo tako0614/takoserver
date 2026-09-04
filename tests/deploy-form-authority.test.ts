@@ -43,6 +43,7 @@ const BUNDLE_DIGEST = `sha256:${createHash("sha256").update(BUNDLE).digest("hex"
 const PREVIOUS_DIGEST = `sha256:${"c".repeat(64)}` as const;
 const PREVIOUS_PUBLIC_WORKER_DIGEST = `sha256:${"d".repeat(64)}` as const;
 const HISTORICAL_SIGNING_KEY_ID = "key-historical";
+const RETIRED_SPONSORSHIP_SECRET = ["TAKOSERVER", "HOSTED", "SPONSORSHIP", "TOKEN"].join("_");
 const PUBLIC_WORKER_DIGEST = `sha256:${createHash("sha256")
   .update(PUBLIC_BUNDLE)
   .digest("hex")}` as const;
@@ -478,7 +479,14 @@ function evolvedIntegrationTarget(): DeployTarget {
     ...target,
     zones: [{ zoneId: "zone-integration", suffix: "apps.integration.example.test" }],
     aiModels: [{ id: "model-integration", provider: "openai" }],
-    sponsorship: true,
+    sponsorshipAuthority: {
+      workerName: "takoserver-sponsorship-authority",
+      organizationId: "org_hosted",
+      credentialKeyId: "sponsorship-credential-key",
+      credentialPublicJwk: { kty: "OKP", crv: "Ed25519", x: "B".repeat(42) + "A" },
+      receiptKeyId: "receipt-key",
+      receiptPublicJwk: { kty: "OKP", crv: "Ed25519", x: "A".repeat(43) },
+    },
     operatorIdentity: { publicJwk: OPERATOR_PUBLIC_JWK },
     integrationE2eCredentialAuthority: {
       organizationId: "org_takosumi_hosted_staging",
@@ -510,7 +518,7 @@ function historicalPinnedPublicState(
 ): FormAuthorityDeployState {
   const current = stateSequence({ isUploaded: options.isUploaded ?? (() => false) }, currentTarget);
   const {
-    sponsorship: _currentSponsorship,
+    sponsorshipAuthority: _currentSponsorshipAuthority,
     integrationE2eCredentialAuthority: _currentCredentialAuthority,
     ...historicalBase
   } = currentTarget;
@@ -609,7 +617,7 @@ function historicalAuthorityMigrationState(
   const authorityWorkerName = formAuthority.integrationWorkerName;
   const gatewayWorkerName = formAuthority.integrationOperatorWorkerName;
   const {
-    sponsorship: _currentSponsorship,
+    sponsorshipAuthority: _currentSponsorshipAuthority,
     integrationE2eCredentialAuthority: _currentCredentialAuthority,
     ...historicalBase
   } = currentTarget;
@@ -1469,7 +1477,7 @@ describe("route-less Form authority deploy surfaces", () => {
       "unexpected sponsorship secret",
       (version: HistoricalPublicVersion) =>
         version.resources.bindings.push({
-          name: "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN",
+          name: RETIRED_SPONSORSHIP_SECRET,
           type: "secret_text",
         }),
     ],

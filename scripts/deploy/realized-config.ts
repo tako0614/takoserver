@@ -368,7 +368,6 @@ export function expectedWorkerSecrets(target: DeployTarget): readonly string[] {
   if (target.edgeSupplies !== undefined) {
     names.add("TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING");
   }
-  if (target.sponsorship === true) names.add("TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN");
   if (target.stripeCheckout === true) names.add("STRIPE_SECRET_KEY");
   return [...names].sort();
 }

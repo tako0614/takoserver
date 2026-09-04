@@ -25,7 +25,14 @@ function descriptor(overrides: Record<string, unknown> = {}) {
     publicOrigin: "https://takoserver-api-rehearsal.example.workers.dev",
     consoleOrigin: "https://console-rehearsal.example.test",
     signing: { currentKeyId: "takoserver-rehearsal-2026-08" },
-    sponsorship: true,
+    sponsorshipAuthority: {
+      workerName: "takoserver-sponsorship-authority",
+      organizationId: "org_hosted",
+      credentialKeyId: "sponsorship-credential-key",
+      credentialPublicJwk: { kty: "OKP", crv: "Ed25519", x: "B".repeat(42) + "A" },
+      receiptKeyId: "receipt-key",
+      receiptPublicJwk: { kty: "OKP", crv: "Ed25519", x: "A".repeat(43) },
+    },
     ...overrides,
   };
 }
@@ -47,9 +54,65 @@ describe("environment-exact deploy target", () => {
       expect(loadTarget(path, "rehearsal")).toMatchObject({
         environment: "rehearsal",
         signing: { currentKeyId: "takoserver-rehearsal-2026-08" },
-        sponsorship: true,
+        sponsorshipAuthority: {
+          workerName: "takoserver-sponsorship-authority",
+          organizationId: "org_hosted",
+          credentialKeyId: "sponsorship-credential-key",
+          credentialPublicJwk: { kty: "OKP", crv: "Ed25519", x: "B".repeat(42) + "A" },
+          receiptKeyId: "receipt-key",
+          receiptPublicJwk: { kty: "OKP", crv: "Ed25519", x: "A".repeat(43) },
+        },
       });
     });
+  });
+
+  test("requires three distinct run-token, sponsorship credential, and receipt identities", () => {
+    withTarget(
+      descriptor({
+        sponsorshipAuthority: {
+          workerName: "takoserver-sponsorship-authority",
+          organizationId: "org_hosted",
+          credentialKeyId: "sponsorship-credential-key",
+          credentialPublicJwk: { kty: "OKP", crv: "Ed25519", x: "B".repeat(42) + "A" },
+          receiptKeyId: "takoserver-rehearsal-2026-08",
+          receiptPublicJwk: { kty: "OKP", crv: "Ed25519", x: "A".repeat(43) },
+        },
+      }),
+      (path) => expect(() => loadTarget(path, "rehearsal")).toThrow("must differ"),
+    );
+    for (const sponsorshipAuthority of [
+      {
+        ...descriptor().sponsorshipAuthority,
+        credentialKeyId: "takoserver-rehearsal-2026-08",
+      },
+      {
+        ...descriptor().sponsorshipAuthority,
+        receiptKeyId: "sponsorship-credential-key",
+      },
+      {
+        ...descriptor().sponsorshipAuthority,
+        credentialPublicJwk: descriptor().sponsorshipAuthority.receiptPublicJwk,
+      },
+    ]) {
+      withTarget(descriptor({ sponsorshipAuthority }), (path) => {
+        expect(() => loadTarget(path, "rehearsal")).toThrow("must differ");
+      });
+    }
+
+    for (const nextKeyId of [
+      descriptor().sponsorshipAuthority.credentialKeyId,
+      descriptor().sponsorshipAuthority.receiptKeyId,
+    ]) {
+      withTarget(
+        descriptor({
+          signing: {
+            currentKeyId: "takoserver-rehearsal-2026-08",
+            nextKeyId,
+          },
+        }),
+        (path) => expect(() => loadTarget(path, "rehearsal")).toThrow("must differ"),
+      );
+    }
   });
 
   test("accepts only the explicit pre-0043 artifact I/O compatibility mode", () => {

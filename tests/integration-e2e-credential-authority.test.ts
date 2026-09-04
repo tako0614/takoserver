@@ -859,14 +859,17 @@ describe("integration-only exact-organization API-key authority", () => {
     expect(await count(fixture.sql, "wallet_credit_lots")).toBe(0);
 
     const sponsorship = await fixture.app.fetch(
-      new Request(`${ORIGIN}/v1/sponsorship/tenants/tenant_not_authorized`, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${fundingAssertion}`,
-          "content-type": "application/json",
+      new Request(
+        `${ORIGIN}/${["v1", "sponsorship", "tenants", "tenant_not_authorized"].join("/")}`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${fundingAssertion}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ organizationId: fixture.organizationId }),
         },
-        body: JSON.stringify({ organizationId: fixture.organizationId }),
-      }),
+      ),
     );
     expect(sponsorship.status).toBe(404);
     expect(await count(fixture.sql, "sponsorship_tenants")).toBe(0);
@@ -1061,7 +1064,6 @@ async function authorityFixture(options: { readonly clock?: () => Date } = {}) {
     clock,
     publicWorkerVersionId: WORKER_VERSION,
     integrationE2eCredentialAuthority: authority,
-    sponsorshipServiceToken: "distinct-sponsorship-service-token",
   });
 
   const assertion = async (

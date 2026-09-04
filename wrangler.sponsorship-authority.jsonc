@@ -1,0 +1,44 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "takoserver-sponsorship-authority",
+  "main": "src/entry-sponsorship-authority-worker.ts",
+  "compatibility_date": "2026-08-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "vars": {
+    "TAKOSERVER_SPONSORSHIP_ORGANIZATION_ID": "unconfigured",
+    "TAKOSERVER_SPONSORSHIP_TOKEN_ISSUER": "https://unconfigured.invalid",
+    "TAKOSERVER_SPONSORSHIP_CREDENTIAL_KEY_ID": "unconfigured",
+    "TAKOSERVER_SPONSORSHIP_CREDENTIAL_PUBLIC_JWK": "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}",
+    "TAKOSERVER_SPONSORSHIP_RECEIPT_KEY_ID": "unconfigured",
+    "TAKOSERVER_SPONSORSHIP_AUTHORITY_WORKER_NAME": "takoserver-sponsorship-authority",
+    "TAKOSERVER_SPONSORSHIP_AUTHORITY_SOURCE_COMMIT": "0000000000000000000000000000000000000000",
+    "TAKOSERVER_SPONSORSHIP_AUTHORITY_ARTIFACT_SHA256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "secrets": {
+    "required": [
+      "TAKOSERVER_SPONSORSHIP_CREDENTIAL_SIGNING_KEY",
+      "TAKOSERVER_SPONSORSHIP_RECEIPT_SIGNING_KEY"
+    ]
+  },
+  "version_metadata": { "binding": "WORKER_VERSION" },
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": true
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.01
+    }
+  },
+  "d1_databases": [
+    {
+      "binding": "STATE_DB",
+      "migrations_dir": "migrations"
+    }
+  ]
+}

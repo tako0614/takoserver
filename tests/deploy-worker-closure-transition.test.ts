@@ -68,10 +68,9 @@ const target = {
   edgeSupplies: edgeSuppliesFixture(),
   objectBucketSupplies: objectBucketSuppliesFixture(),
   cloudflareProviderExecutor: cloudflareProviderExecutorTarget(),
-  sponsorship: true,
 } satisfies DeployTarget;
 
-/** The post-rollback target adds Stripe to the three public-owned Worker secrets. */
+/** The post-rollback target adds Stripe to the two public-owned Worker secrets. */
 const rollbackTarget = {
   ...target,
   stripeCheckout: true,
@@ -472,10 +471,7 @@ describe("reviewed Worker closure transition", () => {
         addedSecrets: [ADDED_SECRET],
         rotatedSecrets: [ROTATED_SECRET],
       });
-      expect(status.carriedSecrets).toEqual([
-        "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN",
-        "TAKOSERVER_SIGNING_KEY",
-      ]);
+      expect(status.carriedSecrets).toEqual(["TAKOSERVER_SIGNING_KEY"]);
       expect(status.secretInputsRequired).toEqual([ADDED_SECRET, ROTATED_SECRET].sort());
       // Status never builds, never uploads and never reads a secret input.
       expect(parts.calls.some((call) => call.includes("--no-bundle"))).toBe(false);
@@ -802,10 +798,7 @@ describe("reviewed Worker closure transition", () => {
         addedSecrets: [ADDED_SECRET],
         rotatedSecrets: [ROTATED_SECRET],
       });
-      expect(result.carriedSecrets).toEqual([
-        "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN",
-        "TAKOSERVER_SIGNING_KEY",
-      ]);
+      expect(result.carriedSecrets).toEqual(["TAKOSERVER_SIGNING_KEY"]);
       expect(result.rollback).toBe(
         `wrangler versions deploy ${PREDECESSOR}@100% --yes --name ${target.workerName}`,
       );

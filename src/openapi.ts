@@ -586,14 +586,12 @@ function described(
  *
  * Both directions are refused here rather than reviewed: a documented route
  * with no description cannot build, and a description no documented route names
- * cannot build. Internal seams are declared in the table and deliberately left
- * out of the document.
+ * cannot build.
  */
 function documentedPaths(): Record<string, Record<string, unknown>> {
   const paths: Record<string, Record<string, unknown>> = {};
   const used = new Set<string>();
   for (const route of ROUTES) {
-    if (route.internal) continue;
     const described = OPERATIONS[route.operation];
     if (described === undefined) {
       throw new Error(`route ${route.method.toUpperCase()} ${route.pattern} has no description`);

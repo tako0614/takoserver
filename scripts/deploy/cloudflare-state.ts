@@ -1,8 +1,14 @@
+import {
+  type CloudflareTopologyAuditEvidence,
+  verifyCloudflareTopologyVisibility,
+} from "./cloudflare-topology-audit.ts";
 import { preflightError } from "./errors.ts";
 
 const API = "https://api.cloudflare.com/client/v4";
 const PAGE_SIZE = 100;
 const MAX_PAGES = 10_000;
+const MAX_PROVIDER_RESPONSE_BYTES = 32 * 1024 * 1024;
+const MAX_TOPOLOGY_AUDIT_RESPONSE_BYTES = 1024 * 1024;
 
 type StateFetcher = (request: Request) => Promise<Response>;
 
@@ -30,11 +36,13 @@ export class CloudflareState {
   readonly #accountId: string;
   readonly #token: string;
   readonly #fetcher: StateFetcher;
+  readonly #topologyAuditCredentialPath: string;
 
   constructor(input: {
     readonly accountId: string;
     readonly token: string;
     readonly fetcher?: StateFetcher;
+    readonly topologyAuditCredentialPath?: string;
   }) {
     if (!/^[0-9a-f]{32}$/u.test(input.accountId)) {
       throw preflightError("Cloudflare state requires one exact account id");
@@ -45,6 +53,10 @@ export class CloudflareState {
     this.#accountId = input.accountId;
     this.#token = input.token;
     this.#fetcher = input.fetcher ?? ((request) => fetch(request));
+    this.#topologyAuditCredentialPath =
+      input.topologyAuditCredentialPath ??
+      process.env.TAKOSERVER_CLOUDFLARE_TOPOLOGY_AUDIT_CREDENTIAL ??
+      "";
   }
 
   async list(path: string, label: string): Promise<readonly unknown[]> {
@@ -268,6 +280,38 @@ export class CloudflareState {
     return flattened;
   }
 
+  async workerTopologyAudit(): Promise<CloudflareTopologyAuditEvidence> {
+    if (!this.#topologyAuditCredentialPath) {
+      throw preflightError("Cloudflare topology audit credential is unavailable");
+    }
+    return await verifyCloudflareTopologyVisibility({
+      accountId: this.#accountId,
+      deploymentToken: this.#token,
+      auditCredentialPath: this.#topologyAuditCredentialPath,
+      get: async (url, token) => {
+        const response = await this.#fetcher(
+          new Request(url, {
+            method: "GET",
+            headers: { accept: "application/json", authorization: `Bearer ${token}` },
+            signal: AbortSignal.timeout(15_000),
+          }),
+        );
+        if (!response.ok || response.redirected) {
+          throw preflightError("Cloudflare topology audit API read failed");
+        }
+        const text = await readBoundedResponseText(
+          response,
+          MAX_TOPOLOGY_AUDIT_RESPONSE_BYTES,
+          "Cloudflare topology audit API",
+        );
+        if (text.length < 1) {
+          throw preflightError("Cloudflare topology audit API response is invalid");
+        }
+        return text;
+      },
+    });
+  }
+
   pagesDeployments(project: string): Promise<readonly unknown[]> {
     return this.list(
       `/pages/projects/${encodeURIComponent(project)}/deployments`,
@@ -298,9 +342,10 @@ export class CloudflareState {
         error instanceof Error ? `${error.name}: ${error.message}` : String(error),
       );
     }
+    const text = await readBoundedResponseText(response, MAX_PROVIDER_RESPONSE_BYTES, label);
     let body: unknown;
     try {
-      body = await response.json();
+      body = JSON.parse(text);
     } catch {
       throw preflightError(`${label} returned malformed JSON (HTTP ${response.status})`);
     }
@@ -311,6 +356,46 @@ export class CloudflareState {
       );
     }
     return body;
+  }
+}
+
+async function readBoundedResponseText(
+  response: Response,
+  maximumBytes: number,
+  label: string,
+): Promise<string> {
+  const declared = response.headers.get("content-length");
+  if (
+    declared !== null &&
+    (!/^(?:0|[1-9][0-9]*)$/u.test(declared) || Number(declared) > maximumBytes)
+  ) {
+    await response.body?.cancel();
+    throw preflightError(`${label} response is too large`);
+  }
+  if (response.body === null) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    length += value.byteLength;
+    if (length > maximumBytes) {
+      await reader.cancel();
+      throw preflightError(`${label} response is too large`);
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw preflightError(`${label} response is not valid UTF-8`);
   }
 }
 

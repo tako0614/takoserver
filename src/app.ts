@@ -34,7 +34,6 @@ import {
 } from "./resource-migrations.ts";
 import { createRouter, type Router } from "./router.ts";
 import type { RuntimeInputAuthority } from "./runtime-input-preparations.ts";
-import { createSponsorshipRoutes } from "./sponsorship-api.ts";
 import {
   type ArtifactReconcileReport,
   type ArtifactReconciler,
@@ -103,8 +102,6 @@ export interface AppPorts {
   readonly originReservations?: WorkerEndpointOriginReservations;
   /** Where this deployment's console is served, if it has one. */
   readonly consoleOrigin?: string;
-  /** Private Hosted-to-Takoserver sponsorship bearer; absent disables the seam. */
-  readonly sponsorshipServiceToken?: string;
   readonly forms: readonly InstalledTakoformForm[];
   /** Exact portable BindingDefinitions installed by this Host composition. */
   readonly bindings?: readonly InstalledTakoformBinding[];
@@ -510,50 +507,6 @@ export function buildApp(ports: AppPorts): App {
       ? ports.takoformHostFactory(hostOptions)
       : createDerivedTakoformHost(hostOptions));
 
-  const sponsorshipLifecycle = ports.sponsorshipServiceToken
-    ? (() => {
-        const sponsorshipOptions: Omit<CreateTakoformHostOptions, "authority"> = {
-          sql: ports.sql,
-          objects: ports.objects,
-          authenticate: async (request) => {
-            if (request.headers.get("authorization") !== "Bearer internal-sponsorship-lifecycle") {
-              return null;
-            }
-            const tenantId = request.headers.get("x-takoserver-sponsorship-organization");
-            const expectedResourceUid = request.headers.get("x-takoserver-sponsorship-resource");
-            if (!tenantId || !expectedResourceUid) return null;
-            const listing = await inventory.resourceByUid(tenantId, expectedResourceUid);
-            if (!listing) return null;
-            return {
-              tenantId,
-              principalId: "service:hosted-sponsorship",
-              scope: {
-                space: listing.space,
-                formRef: listing.resource.form.formRef,
-                resourceName: listing.name,
-                mode: "manage",
-                expectedResourceUid,
-              },
-            };
-          },
-          forms: ports.forms,
-          ...(ports.bindings ? { bindings: ports.bindings } : {}),
-          driver,
-          ...(ports.artifacts ? { artifacts: ports.artifacts } : {}),
-          ...(ports.workerModuleInspector
-            ? { workerModuleInspector: ports.workerModuleInspector }
-            : {}),
-          ...(availability ? { availability } : {}),
-          clock,
-          randomId,
-          blockingRelations: attachments.blocksDeletion,
-        };
-        return ports.takoformHostFactory
-          ? ports.takoformHostFactory(sponsorshipOptions)
-          : createDerivedTakoformHost(sponsorshipOptions);
-      })()
-    : null;
-
   const verifyNativeAbsence = driver.verifyNativeAbsence;
   const control = createControlRoutes({
     accounts,
@@ -609,23 +562,8 @@ export function buildApp(ports: AppPorts): App {
     clock,
     randomId,
   });
-  const sponsorship =
-    ports.sponsorshipServiceToken && sponsorshipLifecycle
-      ? createSponsorshipRoutes({
-          sql: ports.sql,
-          ledger,
-          inventory,
-          lifecycle: sponsorshipLifecycle,
-          tokens,
-          serviceToken: ports.sponsorshipServiceToken,
-          publicOrigin: ports.publicOrigin,
-          clock,
-        })
-      : undefined;
-
   const router = createRouter({
     control,
-    ...(sponsorship ? { sponsorship } : {}),
     dataAi,
     aiAvailable: ports.ai !== undefined,
     takoformHost,

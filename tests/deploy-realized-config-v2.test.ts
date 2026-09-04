@@ -26,7 +26,14 @@ const target = {
   r2: { bucketName: "takoserver-objects" },
   publicOrigin: "https://api.takoserver.example",
   signing: { currentKeyId: "key-current", nextKeyId: "key-next" },
-  sponsorship: true,
+  sponsorshipAuthority: {
+    workerName: "takoserver-sponsorship-authority",
+    organizationId: "org_hosted",
+    credentialKeyId: "sponsorship-credential-key",
+    credentialPublicJwk: { kty: "OKP", crv: "Ed25519", x: "B".repeat(42) + "A" },
+    receiptKeyId: "receipt-key",
+    receiptPublicJwk: { kty: "OKP", crv: "Ed25519", x: "A".repeat(43) },
+  },
 } satisfies DeployTarget;
 
 describe("realized Worker configuration", () => {
@@ -60,7 +67,7 @@ describe("realized Worker configuration", () => {
       expect(config.vars).toMatchObject({ TAKOSERVER_SIGNING_KEY_ID: "key-current" });
       expect(config).not.toHaveProperty("services");
       expect(config.secrets).toEqual({
-        required: ["TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN", "TAKOSERVER_SIGNING_KEY"],
+        required: ["TAKOSERVER_SIGNING_KEY"],
       });
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -146,11 +153,10 @@ describe("realized Worker configuration", () => {
     }
   });
 
-  test("does not infer sponsorship or a service route for a standalone target", () => {
+  test("keeps the route-less sponsorship authority out of the public Worker", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-config-token-"));
     try {
-      const { sponsorship: _sponsorship, ...standalone } = target;
-      const path = writeWorkerConfig(standalone, {
+      const path = writeWorkerConfig(target, {
         path: join(root, "wrangler.jsonc"),
         main: join(root, "worker.js"),
         commit: "a".repeat(40),
@@ -160,6 +166,11 @@ describe("realized Worker configuration", () => {
       expect(config).not.toHaveProperty("services");
       expect(config.vars).toMatchObject({ TAKOSERVER_SIGNING_KEY_ID: "key-current" });
       expect(config.secrets).toEqual({ required: ["TAKOSERVER_SIGNING_KEY"] });
+      const closure = JSON.stringify(config);
+      expect(closure).not.toContain(target.sponsorshipAuthority.credentialKeyId);
+      expect(closure).not.toContain(target.sponsorshipAuthority.credentialPublicJwk.x);
+      expect(closure).not.toContain("TAKOSERVER_SPONSORSHIP_CREDENTIAL_SIGNING_KEY");
+      expect(closure).not.toContain("TAKOSERVER_SPONSORSHIP_RECEIPT_SIGNING_KEY");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -306,14 +317,11 @@ describe("realized Worker configuration", () => {
   });
 
   test("derives an exact secret inventory from enabled product capabilities", () => {
-    expect(expectedWorkerSecrets(target)).toEqual([
-      "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN",
-      "TAKOSERVER_SIGNING_KEY",
-    ]);
-    const { sponsorship: _sponsorship, ...withoutSponsorship } = target;
+    expect(expectedWorkerSecrets(target)).toEqual(["TAKOSERVER_SIGNING_KEY"]);
+    const { sponsorshipAuthority: _authority, ...withoutAuthority } = target;
     expect(
       expectedWorkerSecrets({
-        ...withoutSponsorship,
+        ...withoutAuthority,
         stripeCheckout: true,
       }),
     ).toEqual(["STRIPE_SECRET_KEY", "TAKOSERVER_SIGNING_KEY"]);

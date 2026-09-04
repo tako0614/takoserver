@@ -14,7 +14,9 @@ const NON_MODULE_AUTHORITY_PATHS = [
   /^bun\.lock$/u,
   /^package\.json$/u,
   /^wrangler\.jsonc$/u,
+  /^wrangler\.sponsorship-authority\.jsonc$/u,
   /^scripts\/build-worker\.ts$/u,
+  /^scripts\/build-sponsorship-authority-worker\.ts$/u,
   /^scripts\/deploy(?:\.ts|\/)/u,
 ] as const;
 
@@ -41,6 +43,7 @@ const DECLARED_AUTHORITY_MODULES = [
   "src/deployment-composition.ts",
   "src/entry-cloudflare-worker.ts",
   "src/entry-worker.ts",
+  "src/entry-sponsorship-authority-worker.ts",
   "src/google-identity.ts",
   "src/identity-setup.ts",
   "src/operator-credentials.ts",
@@ -54,7 +57,7 @@ const DECLARED_AUTHORITY_MODULES = [
   "src/router.ts",
   "src/runtime-grants.ts",
   "src/signing-key.ts",
-  "src/sponsorship-api.ts",
+  "src/sponsorship-authority.ts",
   "src/takoform/admission-projection.ts",
   "src/takoform/admission.ts",
   "src/takoform/host-authority.ts",

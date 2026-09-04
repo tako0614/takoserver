@@ -1426,7 +1426,7 @@ function expectedHistoricalPinnedPublicWorkerClosures(
 ): readonly Parameters<typeof assertExactVersionBindingClosure>[3][] {
   if (
     target.environment !== "integration" ||
-    target.sponsorship !== true ||
+    target.sponsorshipAuthority === undefined ||
     target.integrationE2eCredentialAuthority === undefined
   ) {
     return [];
@@ -1439,7 +1439,7 @@ function expectedHistoricalPinnedPublicWorkerClosures(
   );
   if (signingKeyId === null || !HISTORICAL_SIGNING_KEY_ID.test(signingKeyId)) return [];
   const {
-    sponsorship: _currentSponsorship,
+    sponsorshipAuthority: _currentSponsorshipAuthority,
     integrationE2eCredentialAuthority: _currentCredentialAuthority,
     ...historicalTarget
   } = target;
@@ -1488,7 +1488,6 @@ function expectedHistoricalPinnedPublicWorkerClosures(
   } as const;
   return [credentialFreeExecutorClosure, legacyDirectCloudflareClosure];
 }
-
 function expectedLegacyBindings(
   environment: DeployEnvironment,
   target: DeployTarget,

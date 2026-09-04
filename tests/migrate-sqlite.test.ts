@@ -23,6 +23,7 @@ const ARTIFACT_BLOB_IO_FENCES = "0043_artifact_blob_io_fences.sql";
 const ARTIFACT_CONSUMER_RESOLUTION_RECEIPTS = "0044_artifact_consumer_resolution_receipts.sql";
 const CLOUDFLARE_PROVIDER_EXECUTOR_OPERATIONS = "0045_cloudflare_provider_executor_operations.sql";
 const EXACT_ARTIFACT_RECOVERY_RECEIPTS = "0046_exact_artifact_recovery_receipts.sql";
+const SPONSORSHIP_CUTOVER_CONSUMPTION = "0047_sponsorship_cutover_consumption.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
@@ -38,6 +39,7 @@ const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_CONSUMER_RESOLUTION_RECEIPTS,
   CLOUDFLARE_PROVIDER_EXECUTOR_OPERATIONS,
   EXACT_ARTIFACT_RECOVERY_RECEIPTS,
+  SPONSORSHIP_CUTOVER_CONSUMPTION,
 ] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
@@ -363,6 +365,7 @@ describe("bringing a local database up to date", () => {
       CLOUDFLARE_PROVIDER_EXECUTOR_OPERATIONS,
     );
     expect(MIGRATIONS[receiptMigrationIndex + 2]?.name).toBe(EXACT_ARTIFACT_RECOVERY_RECEIPTS);
+    expect(MIGRATIONS[receiptMigrationIndex + 3]?.name).toBe(SPONSORSHIP_CUTOVER_CONSUMPTION);
 
     const database = new Database(":memory:");
     database.exec(`
@@ -379,6 +382,7 @@ describe("bringing a local database up to date", () => {
       ARTIFACT_CONSUMER_RESOLUTION_RECEIPTS,
       CLOUDFLARE_PROVIDER_EXECUTOR_OPERATIONS,
       EXACT_ARTIFACT_RECOVERY_RECEIPTS,
+      SPONSORSHIP_CUTOVER_CONSUMPTION,
     ]);
 
     const digest = (character: string) => `sha256:${character.repeat(64)}`;
@@ -506,6 +510,7 @@ describe("bringing a local database up to date", () => {
         ARTIFACT_CONSUMER_RESOLUTION_RECEIPTS,
         CLOUDFLARE_PROVIDER_EXECUTOR_OPERATIONS,
         EXACT_ARTIFACT_RECOVERY_RECEIPTS,
+        SPONSORSHIP_CUTOVER_CONSUMPTION,
       ]);
       expect(() => database.exec(LIVE_CLAIM("tenant_b", "dep_b"))).toThrow(/UNIQUE|constraint/iu);
     });
@@ -1056,6 +1061,7 @@ describe("bringing a local database up to date", () => {
       "0044_artifact_consumer_resolution_receipts.sql",
       "0045_cloudflare_provider_executor_operations.sql",
       "0046_exact_artifact_recovery_receipts.sql",
+      "0047_sponsorship_cutover_consumption.sql",
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -1183,6 +1189,7 @@ describe("bringing a local database up to date", () => {
       "0044_artifact_consumer_resolution_receipts.sql",
       "0045_cloudflare_provider_executor_operations.sql",
       "0046_exact_artifact_recovery_receipts.sql",
+      "0047_sponsorship_cutover_consumption.sql",
     ]);
     expect(
       database
@@ -2117,6 +2124,7 @@ describe("bringing a local database up to date", () => {
       ARTIFACT_CONSUMER_RESOLUTION_RECEIPTS,
       CLOUDFLARE_PROVIDER_EXECUTOR_OPERATIONS,
       EXACT_ARTIFACT_RECOVERY_RECEIPTS,
+      SPONSORSHIP_CUTOVER_CONSUMPTION,
     ]);
     expect(
       database

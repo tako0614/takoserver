@@ -9,7 +9,6 @@ import { runFormAuthority } from "./deploy/form-authority.ts";
 import { runFormAuthorityIdentityProbe } from "./deploy/form-authority-identity-probe.ts";
 import { runFormAuthorityInvoke } from "./deploy/form-authority-invoke.ts";
 import { loadFormAuthorityScopeTransition } from "./deploy/form-authority-scope-transition.ts";
-import { runHosted } from "./deploy/hosted.ts";
 import { runOperatorIdentity } from "./deploy/identity.ts";
 import { runIntegrationE2eCredentials } from "./deploy/integration-e2e-credentials.ts";
 import { runManagedObjectReceiptAuthority } from "./deploy/managed-object-receipt-authority.ts";
@@ -25,6 +24,7 @@ import {
   type SchemaWaveBoundary,
 } from "./deploy/schema.ts";
 import { runSigning } from "./deploy/signing.ts";
+import { runSponsorshipAuthority } from "./deploy/sponsorship-authority.ts";
 import { runStaticSite } from "./deploy/static.ts";
 import { loadTarget, targetPath } from "./deploy/target.ts";
 import { isWorkerVersionId, runWorker } from "./deploy/worker.ts";
@@ -42,10 +42,13 @@ const USAGE = `takoserver deploy
   bun run deploy -- takoserver-integration-operator-identity --<status|apply> --environment=integration --commit=<sha>
     --organization=org_... (legacy spelling; integration only)
   bun run deploy -- takoserver-integration-e2e-credentials --<issue|status|revoke> --environment=integration --commit=<sha>
+  bun run deploy -- takoserver-sponsorship-authority-worker --<status|apply> --environment=<env> --commit=<sha>
+  bun run deploy -- takoserver-sponsorship-public-route-retirement --<status|apply> --environment=<integration|production> --commit=<sha>
+    --legacy-host-runtime-predecessor-version=<uuid> [--reverse]
   bun run deploy -- takoserver-org-api-key --<mint|status|revoke> --environment=<env> --commit=<sha>
     --organization=org_... [--key-name=<name> --scope=<scope> --expires-in-days=<n>] [--key-id=key_...]
   Rehearsal and production D1 schema status/apply require one fixed next-wave selector:
-    --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046>
+    --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047>
   Pending 0043 additionally requires the staged pre-0043-quiesced Worker target and the absolute
   operator-private TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH documented in docs/deploy.md.
   takoserver-d1-schema-rehearsal-baseline is fixed empty -> 0022, rehearsal-only, and accepts no selector.
@@ -579,7 +582,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   if (
     legacyHostRuntimePredecessorVersionId !== null &&
     (!(
-      surfaceValue === "takoserver-worker-authority-cutover" ||
+      surfaceValue === "takoserver-sponsorship-public-route-retirement" ||
       surfaceValue === "takoserver-host-runtime-topology-retirement" ||
       surfaceValue === "takoserver-hosted-token-retirement" ||
       surfaceValue === "takoserver-worker-retirement-attribution-repair"
@@ -590,7 +593,8 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   }
   if (
     legacyHostRuntimePredecessorVersionId === null &&
-    (surfaceValue === "takoserver-host-runtime-topology-retirement" ||
+    (surfaceValue === "takoserver-sponsorship-public-route-retirement" ||
+      surfaceValue === "takoserver-host-runtime-topology-retirement" ||
       surfaceValue === "takoserver-hosted-token-retirement" ||
       surfaceValue === "takoserver-worker-retirement-attribution-repair")
   ) {
@@ -623,7 +627,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   if (
     reverse &&
     !(
-      surfaceValue === "takoserver-worker-authority-cutover" ||
+      surfaceValue === "takoserver-sponsorship-public-route-retirement" ||
       surfaceValue === "takoserver-host-runtime-topology-retirement" ||
       surfaceValue === "takoserver-managed-worker-gateway" ||
       surfaceValue === "cloudflare-provider-executor"
@@ -634,7 +638,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   if (reverse && action !== "apply") return null;
   if (
     reverse &&
-    surfaceValue === "takoserver-worker-authority-cutover" &&
+    surfaceValue === "takoserver-sponsorship-public-route-retirement" &&
     legacyHostRuntimePredecessorVersionId === null
   ) {
     return null;
@@ -734,22 +738,6 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
           target,
         );
       }
-      if (
-        invocation.surface === "takoserver-worker-authority-cutover" &&
-        invocation.legacyHostRuntimePredecessorVersionId !== undefined
-      ) {
-        return await runRetirement(
-          {
-            surface: invocation.surface,
-            action: invocation.action,
-            environment: invocation.environment,
-            commit: invocation.commit,
-            ...(invocation.reverse ? { reverse: true } : {}),
-            legacyHostRuntimePredecessorVersionId: invocation.legacyHostRuntimePredecessorVersionId,
-          },
-          target,
-        );
-      }
       return await runWorker(
         {
           surface: invocation.surface,
@@ -792,8 +780,8 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
         },
         target,
       );
-    case "takoserver-hosted-token-cutover":
-      return await runHosted(
+    case "takoserver-sponsorship-authority-worker":
+      return await runSponsorshipAuthority(
         {
           surface: invocation.surface,
           action: invocation.action,
@@ -809,6 +797,23 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
           action: invocation.action,
           environment: invocation.environment,
           commit: invocation.commit,
+        },
+        target,
+      );
+    case "takoserver-sponsorship-public-route-retirement":
+      return await runRetirement(
+        {
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
+          ...(invocation.reverse ? { reverse: true } : {}),
+          ...(invocation.legacyHostRuntimePredecessorVersionId === undefined
+            ? {}
+            : {
+                legacyHostRuntimePredecessorVersionId:
+                  invocation.legacyHostRuntimePredecessorVersionId,
+              }),
         },
         target,
       );

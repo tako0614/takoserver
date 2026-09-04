@@ -399,6 +399,7 @@ describe("production-shaped D1 migration lane", () => {
         "0044",
         "0045",
         "0046",
+        "0047",
       ] as const) {
         const failure = await runD1Schema(
           {
@@ -829,14 +830,14 @@ describe("production-shaped D1 migration lane", () => {
     }
   });
 
-  test("a fixed wave refuses migrations outside the exact audited 0001-0046 inventory", async () => {
+  test("a fixed wave refuses migrations outside the exact audited 0001-0047 inventory", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-lineage-extension-"));
     try {
       const migrationDirectory = join(root, "migrations");
       cpSync(resolve(import.meta.dir, "../migrations"), migrationDirectory, { recursive: true });
       copyFileSync(
-        join(migrationDirectory, "0046_exact_artifact_recovery_receipts.sql"),
-        join(migrationDirectory, "0047_unreviewed_extension.sql"),
+        join(migrationDirectory, "0047_sponsorship_cutover_consumption.sql"),
+        join(migrationDirectory, "0048_unreviewed_extension.sql"),
       );
       const failure = await runD1Schema(
         {
@@ -859,7 +860,7 @@ describe("production-shaped D1 migration lane", () => {
     }
   });
 
-  test("the seven no-overwrite wave receipts cover the exact 24-file production suffix once", async () => {
+  test("the eight no-overwrite wave receipts cover the exact 25-file production suffix once", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-all-waves-"));
     try {
       chmodSync(root, 0o700);
@@ -871,6 +872,7 @@ describe("production-shaped D1 migration lane", () => {
         ["0044", 43, 44],
         ["0045", 44, 45],
         ["0046", 45, 46],
+        ["0047", 46, 47],
       ] as const;
       const receipted: {
         readonly name: string;
@@ -918,7 +920,7 @@ describe("production-shaped D1 migration lane", () => {
             bytes,
           })),
       );
-      expect(new Set(receipted.map(({ name }) => name)).size).toBe(24);
+      expect(new Set(receipted.map(({ name }) => name)).size).toBe(25);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
