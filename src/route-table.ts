@@ -125,6 +125,16 @@ export const ROUTES: readonly RouteDeclaration[] = [
   },
   {
     method: "get",
+    pattern: "/v1/organizations/{organizationId}/artifact-consumer-repairs/{deploymentId}",
+    operation: "readArtifactConsumerRepair",
+  },
+  {
+    method: "post",
+    pattern: "/v1/organizations/{organizationId}/artifact-consumer-repairs/{deploymentId}",
+    operation: "applyArtifactConsumerRepair",
+  },
+  {
+    method: "get",
     pattern: "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations",
     operation: "listResourceMigrations",
   },

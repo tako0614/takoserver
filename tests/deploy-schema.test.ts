@@ -393,7 +393,7 @@ describe("forward-only D1 schema surface", () => {
     }
   });
 
-  test("integration 0043 dispatch passes the OAuth bearer to compatibility reads only", async () => {
+  test("integration pending-0043 dispatch passes the OAuth bearer to compatibility reads only", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-oauth-0043-"));
     try {
       const oauthToken = "d1-0043-oauth-token-only-in-process";
@@ -414,7 +414,7 @@ describe("forward-only D1 schema surface", () => {
         return await fixture.run(command, options);
       };
       const pre = migrationStateThrough(36, "oauth-0043-pre");
-      const post = migrationStateThrough(43, "oauth-0043-post");
+      const post = migrationStateThrough(45, "oauth-0045-post");
       const result = await runD1Schema(
         { action: "apply", environment: "integration", commit: COMMIT },
         integration0043Target,
@@ -450,6 +450,8 @@ describe("forward-only D1 schema surface", () => {
           "0041_selfhost_object_buckets.sql",
           "0042_worker_endpoint_origin_reservation_space_id.sql",
           "0043_artifact_blob_io_fences.sql",
+          "0044_artifact_consumer_resolution_receipts.sql",
+          "0045_cloudflare_provider_executor_operations.sql",
         ],
       });
       expect(compatibilityReads).toHaveLength(4);

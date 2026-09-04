@@ -179,7 +179,7 @@ function parseExactSecrets(raw: Buffer): Readonly<Record<ManagedObjectReceiptSec
         secret.length === 0 ||
         new TextEncoder().encode(secret).byteLength > MAX_SECRET_VALUE_BYTES ||
         secret.trim() !== secret ||
-        /[\u0000-\u001f\u007f]/u.test(secret)
+        containsControlCharacter(secret)
       ) {
         throw preflightError(`managed ObjectBucket receipt secret ${name} is invalid`);
       }
@@ -193,6 +193,14 @@ function parseExactSecrets(raw: Buffer): Readonly<Record<ManagedObjectReceiptSec
     );
   }
   return result;
+}
+
+function containsControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x1f || code === 0x7f) return true;
+  }
+  return false;
 }
 
 function canonicalBytes(secrets: Readonly<Record<ManagedObjectReceiptSecretName, string>>): Buffer {

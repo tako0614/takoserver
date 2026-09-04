@@ -1,3 +1,4 @@
+import type { DeployTarget } from "../../scripts/deploy/target.ts";
 import {
   HOSTED_EDGE_SUPPLIES_KIND,
   type HostedEdgeSupplies,
@@ -6,7 +7,6 @@ import {
   HOSTED_OBJECT_BUCKET_SUPPLIES_KIND,
   type HostedObjectBucketSupplies,
 } from "../../src/hosted-object-bucket-supplies.ts";
-import type { DeployTarget } from "../../scripts/deploy/target.ts";
 
 /**
  * The shape the operator's real integration target has: two supply halves that

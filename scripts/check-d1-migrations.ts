@@ -320,6 +320,24 @@ try {
              ${sqlText(fencedManifestJson)}, ${sqlText(fencedManifestDigest)}, 2)`,
     "artifact_gc_delete_fenced",
   );
+  await execute(
+    `INSERT INTO tf_artifact_consumer_resolution_receipts
+       (receipt_id, tenant_id, deployment_id, uncertainty_fence, idempotency_key,
+        plan_digest, snapshot_digest, resolution, manifest_digest,
+        provider_evidence_digest, deployment_state_before,
+        deployment_updated_at_before, created_at)
+     VALUES ('acr_d1_fixture', 'tenant_receipt_d1', 'dep_receipt_d1', 1,
+             'repair:d1:fixture', ${sqlText(manifestDigest)}, ${sqlText(manifestDigest)},
+             'terminalized_absent', NULL, ${sqlText(blobDigest)}, 'retained', 100, 100)`,
+  );
+  await expectExecuteFailure(
+    "UPDATE tf_artifact_consumer_resolution_receipts SET created_at = 101 WHERE receipt_id = 'acr_d1_fixture'",
+    "artifact_consumer_resolution_receipt_immutable",
+  );
+  await expectExecuteFailure(
+    "DELETE FROM tf_artifact_consumer_resolution_receipts WHERE receipt_id = 'acr_d1_fixture'",
+    "artifact_consumer_resolution_receipt_durable",
+  );
   const raw = await run([
     "d1",
     "execute",
@@ -331,7 +349,7 @@ try {
     config,
     "--json",
     "--command",
-    "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('integration_e2e_credential_pair_operations', 'provision_token_consumptions', 'runtime_grant_keys', 'runtime_grant_replays', 'runtime_resources', 'sponsorship_resources', 'sponsorship_tenants', 'tf_artifact_blob_io_leases', 'tf_artifact_blob_io_results', 'tf_artifact_consumer_uncertainties', 'tf_artifact_gc_candidates', 'tf_artifact_gc_guards', 'tf_artifact_manifest_members', 'tf_artifact_owner_closure_receipts', 'tf_artifact_roots', 'tf_cloudflare_provider_executor_operations', 'tf_deferred_operations', 'tf_operation_commit_guards', 'tf_provider_mutation_sagas', 'tf_resource_attachments', 'tf_resource_claims', 'tf_resource_deletion_attestations', 'tf_resource_deployments', 'tf_resource_provider_effects', 'wallet_credit_allocations', 'wallet_credit_lots', 'worker_endpoint_origin_reservations', 'worker_runtime_input_preparations') ORDER BY name",
+    "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('integration_e2e_credential_pair_operations', 'provision_token_consumptions', 'runtime_grant_keys', 'runtime_grant_replays', 'runtime_resources', 'sponsorship_resources', 'sponsorship_tenants', 'tf_artifact_blob_io_leases', 'tf_artifact_blob_io_results', 'tf_artifact_consumer_resolution_receipts', 'tf_artifact_consumer_uncertainties', 'tf_artifact_gc_candidates', 'tf_artifact_gc_guards', 'tf_artifact_manifest_members', 'tf_artifact_owner_closure_receipts', 'tf_artifact_roots', 'tf_cloudflare_provider_executor_operations', 'tf_deferred_operations', 'tf_operation_commit_guards', 'tf_provider_mutation_sagas', 'tf_resource_attachments', 'tf_resource_claims', 'tf_resource_deletion_attestations', 'tf_resource_deployments', 'tf_resource_provider_effects', 'wallet_credit_allocations', 'wallet_credit_lots', 'worker_endpoint_origin_reservations', 'worker_runtime_input_preparations') ORDER BY name",
   ]);
   const value: unknown = JSON.parse(raw);
   if (!Array.isArray(value) || !isRecord(value[0]) || !Array.isArray(value[0].results)) {
@@ -353,6 +371,7 @@ try {
       "sponsorship_tenants",
       "tf_artifact_blob_io_leases",
       "tf_artifact_blob_io_results",
+      "tf_artifact_consumer_resolution_receipts",
       "tf_artifact_consumer_uncertainties",
       "tf_artifact_gc_candidates",
       "tf_artifact_gc_guards",

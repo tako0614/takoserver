@@ -669,7 +669,7 @@ describe("production-shaped D1 migration lane", () => {
             bytes,
           })),
       );
-      expect(new Set(receipted.map(({ name }) => name)).size).toBe(21);
+      expect(new Set(receipted.map(({ name }) => name)).size).toBe(23);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

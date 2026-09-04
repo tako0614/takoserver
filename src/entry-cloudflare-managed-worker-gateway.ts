@@ -6,8 +6,8 @@ import {
   type ManagedWorkerDispatchNamespace,
 } from "./providers/cloudflare-managed-worker-gateway.ts";
 import {
-  managedWorkerSqliteAdminProof,
   type ManagedWorkerSqliteAuthority,
+  managedWorkerSqliteAdminProof,
   managedWorkerSqliteInstanceName,
 } from "./providers/cloudflare-managed-worker-sqlite.ts";
 import type { CloudflareManagedWorkerGatewayAuthority } from "./providers/cloudflare-worker-backend.ts";

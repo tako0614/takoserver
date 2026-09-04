@@ -20,6 +20,8 @@ const SELFHOST_OBJECT_BUCKETS = "0041_selfhost_object_buckets.sql";
 const WORKER_ENDPOINT_ORIGIN_RESERVATION_SPACE_ID =
   "0042_worker_endpoint_origin_reservation_space_id.sql";
 const ARTIFACT_BLOB_IO_FENCES = "0043_artifact_blob_io_fences.sql";
+const ARTIFACT_CONSUMER_RESOLUTION_RECEIPTS = "0044_artifact_consumer_resolution_receipts.sql";
+const CLOUDFLARE_PROVIDER_EXECUTOR_OPERATIONS = "0045_cloudflare_provider_executor_operations.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
@@ -32,6 +34,8 @@ const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   SELFHOST_OBJECT_BUCKETS,
   WORKER_ENDPOINT_ORIGIN_RESERVATION_SPACE_ID,
   ARTIFACT_BLOB_IO_FENCES,
+  ARTIFACT_CONSUMER_RESOLUTION_RECEIPTS,
+  CLOUDFLARE_PROVIDER_EXECUTOR_OPERATIONS,
 ] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
@@ -347,6 +351,90 @@ describe("bringing a local database up to date", () => {
     );
   });
 
+  test("appends durable artifact-consumer resolution receipts after the blob I/O fences", () => {
+    const receiptMigrationIndex = MIGRATIONS.findIndex(
+      (migration) => migration.name === ARTIFACT_CONSUMER_RESOLUTION_RECEIPTS,
+    );
+    expect(receiptMigrationIndex).toBeGreaterThan(0);
+    expect(MIGRATIONS[receiptMigrationIndex - 1]?.name).toBe(ARTIFACT_BLOB_IO_FENCES);
+    expect(MIGRATIONS[receiptMigrationIndex + 1]?.name).toBe(
+      CLOUDFLARE_PROVIDER_EXECUTOR_OPERATIONS,
+    );
+
+    const database = new Database(":memory:");
+    database.exec(`
+      CREATE TABLE applied_migrations (
+        name TEXT PRIMARY KEY NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+    for (const migration of MIGRATIONS.slice(0, receiptMigrationIndex)) {
+      applyHistoricalMigration(database, migration.name, migration.sql);
+    }
+
+    expect(migrateSqlite(database).applied).toEqual([
+      ARTIFACT_CONSUMER_RESOLUTION_RECEIPTS,
+      CLOUDFLARE_PROVIDER_EXECUTOR_OPERATIONS,
+    ]);
+
+    const digest = (character: string) => `sha256:${character.repeat(64)}`;
+    const insert = database.query(`
+      INSERT INTO tf_artifact_consumer_resolution_receipts
+        (receipt_id, tenant_id, deployment_id, uncertainty_fence, idempotency_key,
+         plan_digest, snapshot_digest, resolution, manifest_digest,
+         provider_evidence_digest, deployment_state_before,
+         deployment_updated_at_before, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insert.run(
+      "acr_sqlite_fixture",
+      "tenant_fixture",
+      "deployment_fixture",
+      1,
+      "repair:sqlite:fixture",
+      digest("1"),
+      digest("2"),
+      "terminalized_absent",
+      null,
+      digest("3"),
+      "retained",
+      100,
+      101,
+    );
+
+    expect(() =>
+      insert.run(
+        "acr_duplicate_fence",
+        "tenant_fixture",
+        "deployment_fixture",
+        1,
+        "repair:sqlite:other",
+        digest("4"),
+        digest("5"),
+        "terminalized_absent",
+        null,
+        digest("6"),
+        "retained",
+        100,
+        102,
+      ),
+    ).toThrow(/UNIQUE|constraint/iu);
+    expect(() =>
+      database
+        .query(
+          "UPDATE tf_artifact_consumer_resolution_receipts SET created_at = 102 WHERE receipt_id = 'acr_sqlite_fixture'",
+        )
+        .run(),
+    ).toThrow("artifact_consumer_resolution_receipt_immutable");
+    expect(() =>
+      database
+        .query(
+          "DELETE FROM tf_artifact_consumer_resolution_receipts WHERE receipt_id = 'acr_sqlite_fixture'",
+        )
+        .run(),
+    ).toThrow("artifact_consumer_resolution_receipt_durable");
+  });
+
   /**
    * One provider installation is one account, so one native object has one
    * live claim in it. The migration states that; a database where two tenants
@@ -411,6 +499,8 @@ describe("bringing a local database up to date", () => {
         SELFHOST_OBJECT_BUCKETS,
         WORKER_ENDPOINT_ORIGIN_RESERVATION_SPACE_ID,
         ARTIFACT_BLOB_IO_FENCES,
+        ARTIFACT_CONSUMER_RESOLUTION_RECEIPTS,
+        CLOUDFLARE_PROVIDER_EXECUTOR_OPERATIONS,
       ]);
       expect(() => database.exec(LIVE_CLAIM("tenant_b", "dep_b"))).toThrow(/UNIQUE|constraint/iu);
     });
@@ -958,6 +1048,8 @@ describe("bringing a local database up to date", () => {
       "0041_selfhost_object_buckets.sql",
       "0042_worker_endpoint_origin_reservation_space_id.sql",
       "0043_artifact_blob_io_fences.sql",
+      "0044_artifact_consumer_resolution_receipts.sql",
+      "0045_cloudflare_provider_executor_operations.sql",
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -1082,6 +1174,8 @@ describe("bringing a local database up to date", () => {
       "0041_selfhost_object_buckets.sql",
       "0042_worker_endpoint_origin_reservation_space_id.sql",
       "0043_artifact_blob_io_fences.sql",
+      "0044_artifact_consumer_resolution_receipts.sql",
+      "0045_cloudflare_provider_executor_operations.sql",
     ]);
     expect(
       database
@@ -2013,6 +2107,8 @@ describe("bringing a local database up to date", () => {
       SELFHOST_OBJECT_BUCKETS,
       WORKER_ENDPOINT_ORIGIN_RESERVATION_SPACE_ID,
       ARTIFACT_BLOB_IO_FENCES,
+      ARTIFACT_CONSUMER_RESOLUTION_RECEIPTS,
+      CLOUDFLARE_PROVIDER_EXECUTOR_OPERATIONS,
     ]);
     expect(
       database

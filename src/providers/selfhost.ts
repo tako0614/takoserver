@@ -1762,6 +1762,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         script,
         versionId,
         manifestDigest,
+        ...(dataPlane ? { dataPlane } : {}),
         ...(assetsInput ? { assets: assetsInput } : {}),
       });
     } catch (error) {

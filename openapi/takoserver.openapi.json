@@ -73,6 +73,139 @@
           }
         }
       },
+      "ArtifactConsumerRepairApply": {
+        "type": "object",
+        "required": [
+          "kind",
+          "planDigest"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "takoserver.artifact-consumer-repair-apply@v1"
+          },
+          "planDigest": {
+            "type": "string",
+            "pattern": "^sha256:[a-f0-9]{64}$"
+          }
+        }
+      },
+      "ArtifactConsumerResolutionReceipt": {
+        "type": "object",
+        "required": [
+          "kind",
+          "receiptId",
+          "deploymentId",
+          "uncertaintyFence",
+          "planDigest",
+          "resolution",
+          "createdAt"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "takoserver.artifact-consumer-resolution-receipt@v1"
+          },
+          "receiptId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "deploymentId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "uncertaintyFence": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "planDigest": {
+            "type": "string",
+            "pattern": "^sha256:[a-f0-9]{64}$"
+          },
+          "resolution": {
+            "type": "string",
+            "enum": [
+              "terminalized_absent",
+              "attributed_manifest"
+            ]
+          },
+          "manifestDigest": {
+            "type": "string",
+            "pattern": "^sha256:[a-f0-9]{64}$"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ArtifactConsumerRepairStatus": {
+        "type": "object",
+        "required": [
+          "kind",
+          "deploymentId",
+          "state",
+          "planDigest",
+          "uncertaintyFence",
+          "candidateManifestCount"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "takoserver.artifact-consumer-repair-status@v1"
+          },
+          "deploymentId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "actionable",
+              "blocked",
+              "resolved"
+            ]
+          },
+          "planDigest": {
+            "type": "string",
+            "pattern": "^sha256:[a-f0-9]{64}$"
+          },
+          "uncertaintyFence": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "candidateManifestCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "path": {
+            "type": "string",
+            "enum": [
+              "retained-closed",
+              "retained-historical",
+              "active-resource"
+            ]
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "verify-native-absence",
+              "verify-artifact-consumption"
+            ]
+          },
+          "blocker": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "receipt": {
+            "$ref": "#/components/schemas/ArtifactConsumerResolutionReceipt"
+          }
+        }
+      },
       "WorkerEndpointOriginReservationLegacyTarget": {
         "type": "object",
         "required": [
@@ -1540,6 +1673,213 @@
           },
           "503": {
             "description": "Absence evidence is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationId}/artifact-consumer-repairs/{deploymentId}": {
+      "get": {
+        "summary": "Read the provider-backed repair plan for one uncertain artifact consumer",
+        "description": "Lifecycle-owner surface. This canonicalizes the current database snapshot but performs no provider readback and no mutation.",
+        "parameters": [
+          {
+            "name": "organizationId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          {
+            "name": "deploymentId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Canonical current repair status and plan digest",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "repair"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "repair": {
+                      "$ref": "#/components/schemas/ArtifactConsumerRepairStatus"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed organization or deployment identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Organization owner session required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Organization ownership, deployment, or uncertainty not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Lifecycle state unavailable or malformed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Apply one exact provider-backed artifact-consumer repair plan",
+        "description": "Recomputes the plan, obtains fresh provider evidence, rechecks the entire snapshot, and commits through lifecycle-owned CAS. The caller supplies neither an outcome nor evidence.",
+        "parameters": [
+          {
+            "name": "organizationId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          {
+            "name": "deploymentId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 8,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ArtifactConsumerRepairApply"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Durable append-only resolution receipt",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "receipt"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "receipt": {
+                      "$ref": "#/components/schemas/ArtifactConsumerResolutionReceipt"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed body, plan digest, or idempotency key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Organization owner session required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Organization ownership, deployment, or uncertainty not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Plan drift, blocked evidence, or idempotency conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Provider or lifecycle authority unavailable",
             "content": {
               "application/json": {
                 "schema": {

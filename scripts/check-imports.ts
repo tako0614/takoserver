@@ -75,7 +75,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "domain",
     match:
-      /^src\/(?:token|auth|ledger|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|provider-metering|provider-placement|provider-runtime-bindings|resource-deployments|resource-migrations|runtime-input-preparations|worker-endpoint-origin-reservations|attachments|reconcile|metering|edge-forms|ai-requests|operator-credentials|integration-e2e-credential-authority|form-authority-operator-proof|google-identity|takos-id-identity|identity-setup|stripe-settlement|signing-key|operator-key|ed25519-private-jwk|runtime-grants|takoform-released-provider)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$|host-admission-endpoint\.ts$|integration-operator-endpoint\.ts$)/u,
+      /^src\/(?:token|auth|ledger|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|provider-metering|provider-placement|provider-runtime-bindings|resource-deployments|resource-migrations|runtime-input-preparations|worker-endpoint-origin-reservations|artifact-consumer-repair|attachments|reconcile|metering|edge-forms|ai-requests|operator-credentials|integration-e2e-credential-authority|form-authority-operator-proof|google-identity|takos-id-identity|identity-setup|stripe-settlement|signing-key|operator-key|ed25519-private-jwk|runtime-grants|takoform-released-provider)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$|host-admission-endpoint\.ts$|integration-operator-endpoint\.ts$)/u,
     may: ["core", "domain", "release-data"],
   },
   {
@@ -158,10 +158,9 @@ const HOST_ONLY = [
   // Writing files and starting processes: a Worker can do neither.
   "src/workerd-runtime.ts",
   "src/workerd-supervisor.ts",
-  // The Worker has D1 and R2 bindings. A credential-bearing HTTP transport is
-  // not a capability it needs, and a capability nothing needs is one worth
-  // refusing — see docs/adr/0001-provision-from-the-worker.md, which permits
-  // the Cloudflare provider here and keeps these two out.
+  // The public Worker has D1 and R2 bindings. Credential-bearing HTTP
+  // transports and the real Cloudflare provider belong only to the route-less
+  // executor; see docs/adr/0001-provision-from-the-worker.md.
   "src/sql-d1-http.ts",
   "src/objects-r2-http.ts",
 ];

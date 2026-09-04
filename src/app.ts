@@ -1,4 +1,8 @@
 import type { AiGateway } from "./ai-port.ts";
+import {
+  type ArtifactConsumerProviderReader,
+  createArtifactConsumerRepair,
+} from "./artifact-consumer-repair.ts";
 import { createAttachmentService, createAttachmentStore } from "./attachments.ts";
 import {
   createAccounts,
@@ -18,9 +22,9 @@ import {
 import { createLedger, type FundingSettlementVerifier } from "./ledger.ts";
 import { createMetering, type MeteringRates } from "./metering.ts";
 import type { Clock, ObjectStoreAccess, Sql } from "./ports.ts";
+import { createProviderDriver, createProviderFormAvailability } from "./provider-driver.ts";
 import { createProviderMetering } from "./provider-metering.ts";
 import type { ProviderPack } from "./provider-pack.ts";
-import { createProviderDriver, createProviderFormAvailability } from "./provider-driver.ts";
 import type { Provider } from "./provider-port.ts";
 import { createReseller } from "./reseller.ts";
 import { createResourceDeploymentStore } from "./resource-deployments.ts";
@@ -120,6 +124,8 @@ export interface AppPorts {
   /** Capability bundles used for attachments and explicit cross-provider migration. */
   readonly providerPacks?: readonly ProviderPack[];
   readonly driver?: TakoformResourceDriver;
+  /** Explicit lifecycle readback override for tests and non-default compositions. */
+  readonly artifactConsumerProvider?: ArtifactConsumerProviderReader;
   /** Explicit Host availability policy; production derives one from its provider composition. */
   readonly availability?: TakoformFormAvailabilityResolver;
   /** Explicit authority override for conformance tests; production derives D1/R2 authority here. */
@@ -290,17 +296,30 @@ export function buildApp(ports: AppPorts): App {
     ...(ports.signingKey ? { signingKey: ports.signingKey } : {}),
   });
 
-  const driver =
-    ports.driver ??
-    createProviderDriver({
-      providers: ports.providers ?? [],
-      providerPacks: ports.providerPacks ?? [],
-      catalog,
-      ledger,
-      deployments,
-      deletions: inventory,
-      ...(originReservations ? { originReservations } : {}),
-    });
+  const defaultProviderDriver =
+    ports.driver === undefined
+      ? createProviderDriver({
+          providers: ports.providers ?? [],
+          providerPacks: ports.providerPacks ?? [],
+          catalog,
+          ledger,
+          deployments,
+          deletions: inventory,
+          ...(originReservations ? { originReservations } : {}),
+        })
+      : undefined;
+  const driver = ports.driver ?? defaultProviderDriver;
+  if (!driver) throw new Error("Takoform provider driver is unavailable");
+  const artifactConsumerProvider =
+    ports.artifactConsumerProvider ?? defaultProviderDriver?.artifactConsumerRepair;
+  const artifactConsumerRepair = artifactConsumerProvider
+    ? createArtifactConsumerRepair({
+        sql: ports.sql,
+        provider: artifactConsumerProvider,
+        clock,
+        randomId,
+      })
+    : undefined;
   const availability =
     ports.availability ??
     (ports.driver === undefined
@@ -559,6 +578,7 @@ export function buildApp(ports: AppPorts): App {
           },
         }
       : {}),
+    ...(artifactConsumerRepair ? { artifactConsumerRepair } : {}),
     ...(ports.runtimeInputs ? { runtimeInputs: ports.runtimeInputs.preparations } : {}),
     ...(originReservations ? { originReservations } : {}),
     ...(driver.runtimeInputPolicy ? { runtimeInputPolicy: driver.runtimeInputPolicy } : {}),

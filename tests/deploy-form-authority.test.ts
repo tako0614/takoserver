@@ -14,7 +14,6 @@ import {
 } from "../scripts/deploy/form-authority.ts";
 import { expectedWorkerSecrets } from "../scripts/deploy/realized-config.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
-import { cloudflareProviderExecutorTarget } from "./helpers/hosted-supply-fixtures.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
 import { canonicalJson } from "../src/json.ts";
 import { derivePublicFormImplementationIdentity } from "../src/public-worker-implementation.ts";
@@ -23,6 +22,7 @@ import {
   yurucommuLifecycleCapabilityManifest,
 } from "../src/takoform/implementation-catalog.ts";
 import {
+  cloudflareProviderExecutorTarget,
   edgeSuppliesFixture,
   objectBucketSuppliesFixture,
 } from "./helpers/hosted-supply-fixtures.ts";

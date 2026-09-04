@@ -1,3 +1,7 @@
+import type {
+  ArtifactConsumerProviderDeployment,
+  ArtifactConsumerProviderReader,
+} from "./artifact-consumer-repair.ts";
 import type { Catalog } from "./catalog.ts";
 import { sanitizedMessage } from "./error-envelope.ts";
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
@@ -110,7 +114,14 @@ export interface CreateProviderDriverOptions {
   readonly sleep?: (milliseconds: number) => Promise<void>;
 }
 
-export function createProviderDriver(options: CreateProviderDriverOptions): TakoformResourceDriver {
+export interface TakoserverProviderDriver extends TakoformResourceDriver {
+  /** Host-lifecycle-only fresh provider evidence; never mounted as a Takoform Host route. */
+  readonly artifactConsumerRepair: ArtifactConsumerProviderReader;
+}
+
+export function createProviderDriver(
+  options: CreateProviderDriverOptions,
+): TakoserverProviderDriver {
   const { providers, catalog, ledger, deployments, deletions, originReservations } = options;
   const pollBudget = options.inlinePollBudget ?? 5;
   const sleep =
@@ -515,6 +526,96 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     return { provider, offering };
   };
 
+  const repairDeployment = (
+    deployment: ArtifactConsumerProviderDeployment,
+  ): ResourceDeployment => ({
+    tenantId: deployment.tenantId,
+    id: deployment.deploymentId,
+    resourceUid: deployment.resourceUid,
+    offeringId: deployment.offeringId,
+    providerPackRef: deployment.providerPackRef,
+    providerInstallationRef: deployment.providerInstallationRef,
+    nativeId: deployment.nativeId,
+    nativeClaimed: false,
+    state: deployment.state,
+    observed: deployment.observed,
+    outputs: deployment.outputs,
+    createdAt: new Date(deployment.createdAt).toISOString(),
+    updatedAt: new Date(deployment.updatedAt).toISOString(),
+  });
+
+  const parsedRepairFormRef = (value: JsonObject): TakoformV1Alpha3FormRef | null => {
+    if (
+      Object.keys(value).sort().join("\u0000") !==
+        ["apiVersion", "definitionVersion", "kind", "schemaDigest"].sort().join("\u0000") ||
+      typeof value.apiVersion !== "string" ||
+      typeof value.kind !== "string" ||
+      typeof value.definitionVersion !== "string" ||
+      typeof value.schemaDigest !== "string" ||
+      !/^sha256:[0-9a-f]{64}$/u.test(value.schemaDigest)
+    ) {
+      return null;
+    }
+    return {
+      apiVersion: value.apiVersion,
+      kind: value.kind,
+      definitionVersion: value.definitionVersion,
+      schemaDigest: value.schemaDigest as `sha256:${string}`,
+    };
+  };
+
+  const repairInstalled = (
+    deployment: ArtifactConsumerProviderDeployment,
+    formRef?: JsonObject,
+  ): { provider: Provider; offering: ProviderOffering } | null => {
+    const recorded = repairDeployment(deployment);
+    let form = formRef === undefined ? null : parsedRepairFormRef(formRef);
+    // A surviving Resource or deletion attestation is the Form authority for
+    // this readback. If it is malformed, never replace it with a current
+    // Catalog row that merely shares the recorded offering id.
+    if (formRef !== undefined && !form) return null;
+    if (formRef === undefined) {
+      const provider = byId.get(deployment.providerPackRef);
+      const sold = catalog.findOffering(deployment.offeringId);
+      if (
+        sold &&
+        (sold.providerPackRef !== deployment.providerPackRef ||
+          sold.providerInstallationRef !== deployment.providerInstallationRef)
+      ) {
+        return null;
+      }
+      const matching = [
+        ...(provider?.offerings ?? []),
+        ...(provider?.recoveryOfferings ?? []),
+      ].filter((candidate) => candidate.id === deployment.offeringId);
+      const exact = matching[0];
+      // With no surviving FormRef, an offering id reused across Form families
+      // carries no authority to choose either family. The provider must expose
+      // one unambiguous family, and any current catalog projection must agree.
+      if (
+        !exact ||
+        matching.some((candidate) => !sameForm(candidate.form, exact.form)) ||
+        (sold !== undefined && !sameForm(sold.form, exact.form))
+      ) {
+        return null;
+      }
+      form = exact.form;
+    }
+    const installations = installationsByPack.get(deployment.providerPackRef);
+    if (
+      !form ||
+      installations?.size !== 1 ||
+      !installations.has(deployment.providerInstallationRef)
+    ) {
+      return null;
+    }
+    try {
+      return installed(recorded, form);
+    } catch {
+      return null;
+    }
+  };
+
   const active = async (tenantId: string, resourceUid: string): Promise<ResourceDeployment> => {
     const deployment = await deployments.active(tenantId, resourceUid);
     if (!deployment) throw new TakoformHostError("resource_not_found", 404);
@@ -563,6 +664,122 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
 
   return {
     runtimeInputPolicy,
+    artifactConsumerRepair: {
+      async verifyNativeAbsence(input) {
+        const selected = repairInstalled(input.deployment, input.formRef);
+        if (
+          !selected?.provider.createNativeReadbackDescriptor ||
+          !selected.provider.verifyNativeAbsence
+        ) {
+          return { outcome: "indeterminate", reason: "authority_unavailable", retryable: false };
+        }
+        const marker = deploymentMarker(input.deployment.outputs);
+        if (
+          !marker ||
+          marker.resourceUid !== input.deployment.resourceUid ||
+          marker.space !== input.address.space ||
+          marker.name !== input.address.name
+        ) {
+          return { outcome: "indeterminate", reason: "malformed", retryable: false };
+        }
+        let descriptor: ProviderNativeReadbackDescriptor;
+        try {
+          descriptor = selected.provider.createNativeReadbackDescriptor({
+            offering: selected.offering,
+            nativeId: input.deployment.nativeId,
+            identity: {
+              tenantRef: input.deployment.tenantId,
+              space: input.address.space,
+              name: input.address.name,
+              uid: input.deployment.resourceUid,
+              incarnationId: input.deployment.deploymentId,
+              generation: marker.generation,
+            },
+            spec: input.deployment.observed,
+          });
+        } catch {
+          return { outcome: "indeterminate", reason: "malformed", retryable: false };
+        }
+        try {
+          const result = await selected.provider.verifyNativeAbsence({
+            offering: selected.offering,
+            descriptor,
+            target: {
+              tenantId: input.deployment.tenantId,
+              resourceUid: input.deployment.resourceUid,
+              incarnationId: input.deployment.deploymentId,
+              generation: marker.generation,
+            },
+          });
+          return result.outcome === "unknown"
+            ? {
+                outcome: "indeterminate",
+                reason: result.reason,
+                retryable: result.retryable,
+              }
+            : result;
+        } catch {
+          return { outcome: "indeterminate", reason: "transport", retryable: true };
+        }
+      },
+      async verifyArtifactConsumption(input) {
+        const selected = repairInstalled(input.deployment, input.resource?.formRef);
+        if (!selected?.provider.verifyArtifactConsumption) {
+          return { outcome: "indeterminate", reason: "unsupported", retryable: false };
+        }
+        const marker = deploymentMarker(input.deployment.outputs);
+        if (
+          input.resource &&
+          (!marker ||
+            marker.resourceUid !== input.resource.uid ||
+            marker.space !== input.resource.space ||
+            marker.name !== input.resource.name)
+        ) {
+          return { outcome: "indeterminate", reason: "malformed", retryable: false };
+        }
+        try {
+          const result = await selected.provider.verifyArtifactConsumption({
+            offering: selected.offering,
+            nativeId: input.deployment.nativeId,
+            target: {
+              tenantId: input.deployment.tenantId,
+              resourceUid: input.deployment.resourceUid,
+              incarnationId: input.deployment.deploymentId,
+              state: input.deployment.state,
+              updatedAt: input.deployment.updatedAt,
+            },
+            identity: {
+              tenantRef: input.deployment.tenantId,
+              resourceUid: input.deployment.resourceUid,
+              ...(input.resource
+                ? { address: { space: input.resource.space, name: input.resource.name } }
+                : marker
+                  ? { address: { space: marker.space, name: marker.name } }
+                  : {}),
+            },
+            candidateManifestDigests: input.candidateManifestDigests,
+            ...(input.resource
+              ? {
+                  currentResource: {
+                    revision: input.resource.revision,
+                    relationsDigest: input.resource.relationsDigest,
+                    providerOperationIds: input.resource.providerOperationIds,
+                  },
+                }
+              : {}),
+          });
+          return result.outcome === "unknown"
+            ? {
+                outcome: "indeterminate",
+                reason: result.reason,
+                retryable: result.retryable,
+              }
+            : result;
+        } catch {
+          return { outcome: "indeterminate", reason: "transport", retryable: true };
+        }
+      },
+    },
     sqliteMigrations: {
       async readLedger(input) {
         const { deployment, port } = await sqliteProvider(input.tenantId, input.database);

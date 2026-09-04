@@ -1,10 +1,12 @@
 # Running the Bun provisioner
 
-Production Cloudflare execution is provisioned from the Worker itself; see
+Production Cloudflare execution runs in the named, route-less
+`CloudflareProviderExecutor` Worker; see
 [ADR 0001](adr/0001-provision-from-the-worker.md). Set its zones on the reviewed
-deploy target and keep its scoped token in the Worker secret. The Bun entry is
-a different composition: it always executes current Provider3 Edge Forms on
-the local workerd-backed provider.
+deploy target and keep its scoped token only in that executor's secret binding.
+The public API Worker holds a typed service binding and credential-free proxy.
+The Bun entry is a different composition: it always executes current Provider3
+Edge Forms on the local workerd-backed provider.
 
 The Bun process can expose that provider through one authenticated endpoint for
 an explicitly composed external control-plane client. A provider call enters,
@@ -43,7 +45,7 @@ not provider-selection authority. `TAKOSERVER_D1_DATABASE_ID` and
 before any local directory, database, or key is opened because request-time
 control and artifact writes require capabilities their HTTP adapters do not
 provide. `TAKOSERVER_ZONES` is rejected because DNS and
-Worker-route authority belongs to the production Worker entry. The retired
+Worker-route authority belongs to the private production provider executor. The retired
 implicit `TAKOSERVER_EDGE_FORMS` switch is rejected as well.
 
 ### The Cloudflare token

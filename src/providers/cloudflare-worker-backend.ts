@@ -1,6 +1,8 @@
 import type { JsonObject, Sql } from "../ports.ts";
 import type {
   ApplyInput,
+  ProviderArtifactConsumption,
+  ProviderArtifactConsumptionInput,
   ProviderNativeAbsence,
   ProviderNativeReadbackDescriptor,
   ProviderNativeReadbackInput,
@@ -12,7 +14,6 @@ import type {
   ResourceIdentity,
 } from "../provider-port.ts";
 import type {
-  ManagedObjectReceiptAdminOperation,
   ManagedObjectReceiptAuthority,
   ManagedObjectReceiptResult,
 } from "./cloudflare-managed-object-receipt.ts";
@@ -324,6 +325,9 @@ export interface CloudflareWorkerBackend {
     readonly offering: ProviderOffering;
     readonly descriptor: ProviderNativeReadbackDescriptor;
   }): Promise<ProviderNativeAbsence>;
+  verifyArtifactConsumption(
+    input: ProviderArtifactConsumptionInput,
+  ): Promise<ProviderArtifactConsumption>;
   readSqliteMigrationLedger?(input: {
     readonly nativeId: string;
   }): Promise<ProviderValue<readonly ProviderSqliteMigrationIdentity[]>>;

@@ -11,7 +11,6 @@ import {
 import { formAuthorityScopeTransitionDigest } from "../scripts/deploy/form-authority-scope-transition.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
-import { cloudflareProviderExecutorTarget } from "./helpers/hosted-supply-fixtures.ts";
 import { createEphemeralSql } from "../src/compat.ts";
 import { normalizeGeneratedEd25519PrivateJwk } from "../src/ed25519-private-jwk.ts";
 import { verifyFormAuthorityOperatorAssertion } from "../src/form-authority-operator-proof.ts";
@@ -28,6 +27,7 @@ import {
   YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
 } from "../src/takoform/implementation-catalog.ts";
 import { createIntegrationFormAuthorityComposition } from "../src/takoform/integration-operator-endpoint.ts";
+import { cloudflareProviderExecutorTarget } from "./helpers/hosted-supply-fixtures.ts";
 
 const COMMIT = "a".repeat(40);
 const NEXT_COMMIT = "d".repeat(40);
