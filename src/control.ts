@@ -21,6 +21,7 @@ import { OperatorAssertionError } from "./operator-credentials.ts";
 import type { Clock } from "./ports.ts";
 import { type Reseller, ResellerError } from "./reseller.ts";
 import type { ResourceDeploymentStore } from "./resource-deployments.ts";
+import type { ResourceExecutionEvidenceResponse } from "./resource-execution-evidence.ts";
 import { ResourceMigrationError, type ResourceMigrationService } from "./resource-migrations.ts";
 import {
   RUNTIME_INPUT_PREPARATION_FORMAT,
@@ -66,6 +67,8 @@ const MAX_BODY_BYTES = 64 * 1_024;
  * are the real contract; this is only the outer refusal.
  */
 const MAX_RUNTIME_INPUT_BODY_BYTES = 4 * 1_024 * 1_024;
+const RESOURCE_EXECUTION_EVIDENCE_PATH =
+  /^\/v1\/organizations\/([^/]+)\/resources\/([^/]+)\/execution-evidence$/u;
 
 /**
  * The read side of what a tenant declared.
@@ -85,6 +88,12 @@ export interface ResourceInventory {
     },
   ): Promise<{ readonly resources: readonly ResourceListing[]; readonly cursor: string | null }>;
   resourceByUid(tenantId: string, uid: string): Promise<ResourceListing | null>;
+  readResourceExecutionEvidence(input: {
+    readonly tenantId: string;
+    readonly resourceUid: string;
+    readonly limit: number;
+    readonly cursor?: string;
+  }): Promise<ResourceExecutionEvidenceResponse | null>;
   listOperations(tenantId: string, limit: number): Promise<readonly OperationListing[]>;
 }
 
@@ -234,7 +243,12 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     try {
       return await route(request, url);
     } catch (error) {
-      return controlErrorResponse(error);
+      const response = controlErrorResponse(error);
+      if (RESOURCE_EXECUTION_EVIDENCE_PATH.test(url.pathname)) {
+        response.headers.set("cache-control", "private, no-store");
+        response.headers.set("x-content-type-options", "nosniff");
+      }
+      return response;
     }
   };
 
@@ -774,6 +788,35 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       return Response.json({ resource: presentResource(resource) });
     }
 
+    const organizationExecutionEvidence = RESOURCE_EXECUTION_EVIDENCE_PATH.exec(url.pathname);
+    if (request.method === "GET" && organizationExecutionEvidence) {
+      const organizationId = segment(organizationExecutionEvidence[1]);
+      const resourceUid = segment(organizationExecutionEvidence[2]);
+      // Authenticate before existence lookup so this endpoint is never an
+      // oracle for another organization's durable or deleted Resource UIDs.
+      await scoped(request, organizationId, "resources:read");
+      const allowed = new Set(["cursor", "limit"]);
+      if ([...url.searchParams.keys()].some((key) => !allowed.has(key))) {
+        controlError("invalid_argument", 400);
+      }
+      const cursors = url.searchParams.getAll("cursor");
+      if (cursors.length > 1 || cursors[0] === "") controlError("invalid_argument", 400);
+      const cursor = cursors[0];
+      const evidence = await inventory.readResourceExecutionEvidence({
+        tenantId: organizationId,
+        resourceUid,
+        limit: resourceExecutionEvidencePageSize(url),
+        ...(cursor === undefined ? {} : { cursor }),
+      });
+      if (!evidence) controlError("not_found", 404);
+      return Response.json(evidence, {
+        headers: {
+          "cache-control": "private, no-store",
+          "x-content-type-options": "nosniff",
+        },
+      });
+    }
+
     const organizationNativeResidual =
       /^\/v1\/organizations\/([^/]+)\/resources\/([^/]+)\/native-residual$/u.exec(url.pathname);
     if (request.method === "GET" && organizationNativeResidual) {
@@ -1144,6 +1187,16 @@ function pageSize(url: URL): number {
   const value = Number(raw);
   if (!Number.isSafeInteger(value) || value < 1) controlError("invalid_argument", 400);
   return Math.min(value, 200);
+}
+
+/** Closed decimal grammar for the immutable Resource evidence contract. */
+function resourceExecutionEvidencePageSize(url: URL): number {
+  const values = url.searchParams.getAll("limit");
+  if (values.length === 0) return 50;
+  if (values.length !== 1 || !/^(?:[1-9]|[1-9][0-9]|1[0-9]{2}|200)$/u.test(values[0] ?? "")) {
+    controlError("invalid_argument", 400);
+  }
+  return Number(values[0]);
 }
 
 export class ControlError extends Error {

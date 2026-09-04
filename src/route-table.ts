@@ -120,6 +120,11 @@ export const ROUTES: readonly RouteDeclaration[] = [
   },
   {
     method: "get",
+    pattern: "/v1/organizations/{organizationId}/resources/{resourceUid}/execution-evidence",
+    operation: "readResourceExecutionEvidence",
+  },
+  {
+    method: "get",
     pattern: "/v1/organizations/{organizationId}/resources/{resourceUid}/native-residual",
     operation: "readNativeResidual",
   },

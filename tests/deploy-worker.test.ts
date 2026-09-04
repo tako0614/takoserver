@@ -341,6 +341,7 @@ describe("split Takoserver Worker surfaces", () => {
       "src/ledger.ts",
       "src/ports.ts",
       "src/provider-runtime-input-port.ts",
+      "src/resource-execution-evidence.ts",
       "src/runtime-input-preparations.ts",
       "src/runtime-input-seal-keyring.ts",
       "src/stripe-settlement.ts",
@@ -354,6 +355,7 @@ describe("split Takoserver Worker surfaces", () => {
       authorityImplementationClosure().filter((path) => !previouslyClassified.has(path)),
     ).toEqual([
       "src/ledger.ts",
+      "src/resource-execution-evidence.ts",
       "src/runtime-input-preparations.ts",
       "src/runtime-input-seal-keyring.ts",
       "src/stripe-settlement.ts",

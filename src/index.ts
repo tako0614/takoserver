@@ -168,6 +168,12 @@ export {
   type ResourceDeploymentStore,
 } from "./resource-deployments.ts";
 export {
+  RESOURCE_EXECUTION_EVIDENCE_FORMAT,
+  type ResourceExecutionCommit,
+  type ResourceExecutionEvidence,
+  type ResourceExecutionEvidenceResponse,
+} from "./resource-execution-evidence.ts";
+export {
   createResourceMigrationService,
   createResourceMigrationStore,
   type MigrationResourceView,

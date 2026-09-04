@@ -14,6 +14,9 @@ function fixture() {
     async resourceByUid() {
       return null;
     },
+    async readResourceExecutionEvidence() {
+      return null;
+    },
     async listOperations() {
       return [];
     },

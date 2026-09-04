@@ -338,6 +338,102 @@ try {
     "DELETE FROM tf_artifact_consumer_resolution_receipts WHERE receipt_id = 'acr_d1_fixture'",
     "artifact_consumer_resolution_receipt_durable",
   );
+  await execute(
+    `INSERT INTO tf_resource_deletion_attestations
+       (tenant_id, resource_uid, space, api_version, kind, name, form_ref_json,
+        state, closure_fence, effects_json, created_at, updated_at)
+     VALUES ('tenant_execution_evidence_d1', 'uid_execution_evidence_d1', 'main',
+             'example.forms.invalid/v1', 'EvidenceThing', 'example',
+             ${sqlText(
+               JSON.stringify({
+                 apiVersion: "example.forms.invalid/v1",
+                 kind: "EvidenceThing",
+                 definitionVersion: "1.0.0",
+                 schemaDigest: `sha256:${"a".repeat(64)}`,
+               }),
+             )},
+             'live', 1, '[]', 700, 700)`,
+  );
+  await execute(
+    `INSERT INTO tf_operations
+       (id, tenant_id, operation, state, resource_json, created_at, expires_at)
+     VALUES ('op_execution_claimed_d1', 'tenant_execution_evidence_d1',
+             'create', 'succeeded', NULL, '2026-09-04T00:00:00.000Z', 701)`,
+  );
+  await expectExecuteFailure(
+    `INSERT INTO tf_resource_execution_evidence
+       (tenant_id, resource_uid, operation_id, sequence, action,
+        resource_generation, resource_revision, committed_at)
+     VALUES ('tenant_execution_evidence_d1', 'uid_execution_evidence_d1',
+             'op_execution_claimed_d1', 1, 'create', '1', '1', 700)`,
+    "resource_execution_evidence_operation_claimed",
+  );
+  await execute(
+    `INSERT INTO tf_resource_execution_evidence
+       (tenant_id, resource_uid, operation_id, sequence, action,
+        resource_generation, resource_revision, committed_at)
+     VALUES ('tenant_execution_evidence_d1', 'uid_execution_evidence_d1',
+             'op_execution_create_d1', 1, 'create', '1', '1', 700)`,
+  );
+  await expectExecuteFailure(
+    `UPDATE tf_resource_execution_evidence SET action = 'update'
+     WHERE operation_id = 'op_execution_create_d1'`,
+    "resource_execution_evidence_immutable",
+  );
+  await expectExecuteFailure(
+    `DELETE FROM tf_resource_execution_evidence
+     WHERE operation_id = 'op_execution_create_d1'`,
+    "resource_execution_evidence_durable",
+  );
+  await expectExecuteFailure(
+    `INSERT INTO tf_resource_execution_evidence
+       (tenant_id, resource_uid, operation_id, sequence, action,
+        resource_generation, resource_revision, committed_at)
+     VALUES ('tenant_execution_evidence_d1', 'uid_execution_evidence_d1',
+             'op_execution_gap_d1', 3, 'update', '1', '2', 701)`,
+    "resource_execution_evidence_noncontiguous",
+  );
+  await expectExecuteFailure(
+    `INSERT INTO tf_resource_execution_evidence
+       (tenant_id, resource_uid, operation_id, sequence, action,
+        resource_generation, resource_revision, committed_at)
+     VALUES ('tenant_execution_evidence_d1', 'uid_execution_evidence_d1',
+             'op_execution_second_create_d1', 2, 'create', '1', '2', 701)`,
+    "resource_execution_evidence_create_not_first",
+  );
+  await execute(
+    `INSERT INTO tf_resource_execution_evidence
+       (tenant_id, resource_uid, operation_id, sequence, action,
+        resource_generation, resource_revision, committed_at)
+     VALUES ('tenant_execution_evidence_d1', 'uid_execution_evidence_d1',
+             'op_execution_delete_d1', 2, 'delete', '1', '1', 702)`,
+  );
+  await expectExecuteFailure(
+    `INSERT INTO tf_resource_execution_evidence
+       (tenant_id, resource_uid, operation_id, sequence, action,
+        resource_generation, resource_revision, committed_at)
+     VALUES ('tenant_execution_evidence_d1', 'uid_execution_evidence_d1',
+             'op_execution_after_delete_d1', 3, 'update', '1', '3', 703)`,
+    "resource_execution_evidence_deleted",
+  );
+  const executionEvidence = firstResult(
+    await execute(
+      `SELECT COUNT(*) AS evidence_count, MIN(sequence) AS first_sequence,
+              MAX(sequence) AS last_sequence
+       FROM tf_resource_execution_evidence
+       WHERE tenant_id = 'tenant_execution_evidence_d1'
+         AND resource_uid = 'uid_execution_evidence_d1'`,
+    ),
+  );
+  if (
+    executionEvidence.evidence_count !== 2 ||
+    executionEvidence.first_sequence !== 1 ||
+    executionEvidence.last_sequence !== 2
+  ) {
+    throw new Error(
+      `D1 execution-evidence append-only readback failed: ${JSON.stringify(executionEvidence)}`,
+    );
+  }
   const raw = await run([
     "d1",
     "execute",
@@ -349,7 +445,7 @@ try {
     config,
     "--json",
     "--command",
-    "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('integration_e2e_credential_pair_operations', 'provision_token_consumptions', 'runtime_grant_keys', 'runtime_grant_replays', 'runtime_resources', 'sponsorship_resources', 'sponsorship_tenants', 'tf_artifact_blob_io_leases', 'tf_artifact_blob_io_results', 'tf_artifact_consumer_resolution_receipts', 'tf_artifact_consumer_uncertainties', 'tf_artifact_gc_candidates', 'tf_artifact_gc_guards', 'tf_artifact_manifest_members', 'tf_artifact_owner_closure_receipts', 'tf_artifact_recovery_candidates', 'tf_artifact_recovery_details', 'tf_artifact_recovery_once', 'tf_artifact_roots', 'tf_cloudflare_provider_executor_operations', 'tf_deferred_operations', 'tf_operation_commit_guards', 'tf_provider_mutation_sagas', 'tf_resource_attachments', 'tf_resource_claims', 'tf_resource_deletion_attestations', 'tf_resource_deployments', 'tf_resource_provider_effects', 'wallet_credit_allocations', 'wallet_credit_lots', 'worker_endpoint_origin_reservations', 'worker_runtime_input_preparations') ORDER BY name",
+    "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('integration_e2e_credential_pair_operations', 'provision_token_consumptions', 'runtime_grant_keys', 'runtime_grant_replays', 'runtime_resources', 'sponsorship_resources', 'sponsorship_tenants', 'tf_artifact_blob_io_leases', 'tf_artifact_blob_io_results', 'tf_artifact_consumer_resolution_receipts', 'tf_artifact_consumer_uncertainties', 'tf_artifact_gc_candidates', 'tf_artifact_gc_guards', 'tf_artifact_manifest_members', 'tf_artifact_owner_closure_receipts', 'tf_artifact_recovery_candidates', 'tf_artifact_recovery_details', 'tf_artifact_recovery_once', 'tf_artifact_roots', 'tf_cloudflare_provider_executor_operations', 'tf_deferred_operations', 'tf_operation_commit_guards', 'tf_provider_mutation_sagas', 'tf_resource_attachments', 'tf_resource_claims', 'tf_resource_deletion_attestations', 'tf_resource_deployments', 'tf_resource_execution_evidence', 'tf_resource_provider_effects', 'wallet_credit_allocations', 'wallet_credit_lots', 'worker_endpoint_origin_reservations', 'worker_runtime_input_preparations') ORDER BY name",
   ]);
   const value: unknown = JSON.parse(raw);
   if (!Array.isArray(value) || !isRecord(value[0]) || !Array.isArray(value[0].results)) {
@@ -389,6 +485,7 @@ try {
       "tf_resource_claims",
       "tf_resource_deletion_attestations",
       "tf_resource_deployments",
+      "tf_resource_execution_evidence",
       "tf_resource_provider_effects",
       "wallet_credit_allocations",
       "wallet_credit_lots",

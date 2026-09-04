@@ -498,6 +498,9 @@ function emptyInventory(): ResourceInventory {
     async resourceByUid() {
       return null;
     },
+    async readResourceExecutionEvidence() {
+      return null;
+    },
     async listOperations() {
       return [];
     },
@@ -545,6 +548,9 @@ function resourceInventory(): ResourceInventory {
     },
     async resourceByUid(_tenantId, uid) {
       return uid === "res_sponsored" || uid === "res_direct" ? listing(uid) : null;
+    },
+    async readResourceExecutionEvidence() {
+      return null;
     },
     async listOperations() {
       return [];

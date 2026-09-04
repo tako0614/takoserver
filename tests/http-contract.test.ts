@@ -254,6 +254,48 @@ describe("published API description", () => {
     expect(JSON.stringify(path)).not.toContain("nativeId");
   });
 
+  test("publishes the closed value-free Resource execution evidence contract", () => {
+    const path = openApiDocument.paths[
+      "/v1/organizations/{organizationId}/resources/{resourceUid}/execution-evidence"
+    ] as {
+      get: {
+        parameters: readonly { name: string; in: string; required: boolean }[];
+        responses: {
+          "200": { content: { "application/json": { schema: { $ref: string } } } };
+        };
+      };
+    };
+    expect(
+      path.get.parameters.map(({ name, in: location, required }) => [name, location, required]),
+    ).toEqual([
+      ["organizationId", "path", true],
+      ["resourceUid", "path", true],
+      ["limit", "query", false],
+      ["cursor", "query", false],
+    ]);
+    expect(path.get.responses["200"].content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/ResourceExecutionEvidenceResponse",
+    );
+
+    const schemas = openApiDocument.components.schemas;
+    expect(schemas.ResourceExecutionEvidenceResponse.additionalProperties).toBe(false);
+    expect(schemas.ResourceExecutionEvidence.additionalProperties).toBe(false);
+    expect(schemas.ResourceExecutionCommit.additionalProperties).toBe(false);
+    expect(schemas.ResourceExecutionEvidence.properties.format.const).toBe(
+      "takoserver.resource-execution-evidence/v1",
+    );
+    expect(schemas.ResourceExecutionEvidence.properties.coverage.enum).toEqual([
+      "complete",
+      "partial",
+    ]);
+    const serialized = JSON.stringify({
+      response: schemas.ResourceExecutionEvidenceResponse,
+      evidence: schemas.ResourceExecutionEvidence,
+      commit: schemas.ResourceExecutionCommit,
+    });
+    expect(serialized).not.toMatch(/credential|providerReceipt|nativeId|outputs|spec/i);
+  });
+
   test("publishes closed reservation, activation, and plan-known runtime-input schemas", () => {
     const schemas = openApiDocument.components.schemas;
     expect(schemas.WorkerEndpointOriginReservationRequest.additionalProperties).toBe(false);
