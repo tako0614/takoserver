@@ -3,6 +3,7 @@ import {
   ARTIFACT_CONSUMER_REPAIR_STATUS_FORMAT,
   ARTIFACT_CONSUMER_RESOLUTION_RECEIPT_FORMAT,
 } from "./artifact-consumer-repair.ts";
+import { RESOURCE_EXECUTION_EVIDENCE_FORMAT } from "./resource-execution-evidence.ts";
 import { ROUTES, TAKOFORM_LANES, TAKOFORM_ROUTES, takoformRoutePattern } from "./route-table.ts";
 import { SPACE_ID_MAX_CODE_POINTS, SPACE_ID_PATTERN_SOURCE } from "./takoform/space-id.ts";
 
@@ -220,6 +221,33 @@ const ARTIFACT_CONSUMER_REPAIR_PARAMETERS = [
   },
 ] as const;
 
+const RESOURCE_EXECUTION_EVIDENCE_PARAMETERS = [
+  {
+    name: "organizationId",
+    in: "path",
+    required: true,
+    schema: IDENTIFIER_SCHEMA,
+  },
+  {
+    name: "resourceUid",
+    in: "path",
+    required: true,
+    schema: IDENTIFIER_SCHEMA,
+  },
+  {
+    name: "limit",
+    in: "query",
+    required: false,
+    schema: { type: "integer", minimum: 1, maximum: 200, default: 50 },
+  },
+  {
+    name: "cursor",
+    in: "query",
+    required: false,
+    schema: { type: "string", minLength: 1, maxLength: 1_024, pattern: "^[A-Za-z0-9_-]+$" },
+  },
+] as const;
+
 const ARTIFACT_CONSUMER_REPAIR_OPERATIONS = {
   get: {
     summary: "Read the provider-backed repair plan for one uncertain artifact consumer",
@@ -336,6 +364,28 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
     ],
   }),
   readOrganizationResource: described("Read one exact organization Takoform resource"),
+  readResourceExecutionEvidence: {
+    summary: "Read immutable value-free Resource execution evidence",
+    description:
+      "Returns one cursor-bound snapshot of the logical Resource commits owned by Takoserver. " +
+      "The projection contains no desired values, outputs, credentials, provider-native identity, or provider receipt.",
+    parameters: RESOURCE_EXECUTION_EVIDENCE_PARAMETERS,
+    responses: {
+      "200": {
+        description: "One immutable Resource execution-evidence page",
+        content: {
+          "application/json": {
+            schema: { $ref: "#/components/schemas/ResourceExecutionEvidenceResponse" },
+          },
+        },
+      },
+      "400": errorResponse("Malformed limit or snapshot cursor"),
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("The key lacks resources:read"),
+      "404": errorResponse("Resource incarnation not found"),
+      "503": errorResponse("Execution evidence is unavailable or malformed"),
+    },
+  },
   readNativeResidual: {
     summary: "Prove provider-native absence after a Resource delete",
     parameters: [
@@ -740,6 +790,94 @@ export const openApiDocument = {
           },
           blocker: { type: "string", minLength: 1, maxLength: 128 },
           receipt: { $ref: "#/components/schemas/ArtifactConsumerResolutionReceipt" },
+        },
+      },
+      ResourceExecutionCommit: {
+        type: "object",
+        required: [
+          "sequence",
+          "operationId",
+          "action",
+          "outcome",
+          "resourceVersion",
+          "committedAt",
+        ],
+        additionalProperties: false,
+        properties: {
+          sequence: { type: "integer", minimum: 1 },
+          operationId: { type: "string", minLength: 3, maxLength: 128 },
+          action: { type: "string", enum: ["create", "update", "delete"] },
+          outcome: { const: "committed" },
+          resourceVersion: {
+            type: "object",
+            required: ["generation", "revision"],
+            additionalProperties: false,
+            properties: {
+              generation: { type: "string", minLength: 1, maxLength: 128, pattern: "^[0-9]+$" },
+              revision: { type: "string", minLength: 1, maxLength: 128, pattern: "^[0-9]+$" },
+            },
+          },
+          committedAt: { type: "string", format: "date-time" },
+        },
+      },
+      ResourceExecutionEvidence: {
+        type: "object",
+        required: ["format", "organizationId", "resource", "coverage", "snapshotFence", "commits"],
+        additionalProperties: false,
+        properties: {
+          format: { const: RESOURCE_EXECUTION_EVIDENCE_FORMAT },
+          organizationId: IDENTIFIER_SCHEMA,
+          resource: {
+            type: "object",
+            required: ["uid", "address", "formRef"],
+            additionalProperties: false,
+            properties: {
+              uid: IDENTIFIER_SCHEMA,
+              address: {
+                type: "object",
+                required: ["space", "apiVersion", "kind", "name"],
+                additionalProperties: false,
+                properties: {
+                  space: SPACE_ID_SCHEMA,
+                  apiVersion: { type: "string", minLength: 1, maxLength: 320 },
+                  kind: { type: "string", minLength: 1, maxLength: 128 },
+                  name: RESOURCE_NAME_SCHEMA,
+                },
+              },
+              formRef: {
+                type: "object",
+                required: ["apiVersion", "kind", "definitionVersion", "schemaDigest"],
+                additionalProperties: false,
+                properties: {
+                  apiVersion: { type: "string", minLength: 1, maxLength: 320 },
+                  kind: { type: "string", minLength: 1, maxLength: 128 },
+                  definitionVersion: { type: "string", minLength: 1, maxLength: 128 },
+                  schemaDigest: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" },
+                },
+              },
+            },
+          },
+          coverage: { type: "string", enum: ["complete", "partial"] },
+          snapshotFence: { type: "integer", minimum: 0 },
+          commits: {
+            type: "array",
+            maxItems: 200,
+            items: { $ref: "#/components/schemas/ResourceExecutionCommit" },
+          },
+        },
+      },
+      ResourceExecutionEvidenceResponse: {
+        type: "object",
+        required: ["executionEvidence"],
+        additionalProperties: false,
+        properties: {
+          executionEvidence: { $ref: "#/components/schemas/ResourceExecutionEvidence" },
+          cursor: {
+            type: "string",
+            minLength: 1,
+            maxLength: 1_024,
+            pattern: "^[A-Za-z0-9_-]+$",
+          },
         },
       },
       WorkerEndpointOriginReservationLegacyTarget: {

@@ -471,6 +471,7 @@ describe("Takoserver split deploy entrypoint", () => {
       "0045",
       "0046",
       "0047",
+      "0048",
     ] as const) {
       for (const environment of ["rehearsal", "production"] as const) {
         const accepted = await deploy([
@@ -506,6 +507,7 @@ describe("Takoserver split deploy entrypoint", () => {
       "0045",
       "0046",
       "0047",
+      "0048",
     ] as const) {
       const refused = await deploy([
         "takoserver-d1-schema",

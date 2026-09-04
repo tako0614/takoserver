@@ -840,7 +840,7 @@ export const DEPLOY_CONTRACT = {
       obligations: {
         provenance:
           `${exactSource} Rehearsal and production accept only the fixed next boundaries 0022, 0028, ` +
-          "0033, 0036, 0043, 0044, 0045, 0046 or 0047. The exact predecessor lineage, selected through-prefix and wave " +
+          "0033, 0036, 0043, 0044, 0045, 0046, 0047 or 0048. The exact predecessor lineage, selected through-prefix and wave " +
           "bytes are checked against their fixed SHA-256 inventory, digested and sealed before the " +
           "forward-only apply. Integration accepts no selector; its no-selector disposable cadence " +
           "is explicitly integration-only. The 0022 selector is a one-time exact 0016-to-0022 " +
@@ -853,7 +853,8 @@ export const DEPLOY_CONTRACT = {
           "0044 boundary ends at the durable artifact-consumer resolution receipt migration; the " +
           "0045 boundary is the separate additive Cloudflare executor pre-effect CAS; the 0046 " +
           "boundary adds one exact artifact-recovery singleton and its receipt constraints only after 0045; " +
-          "the 0047 boundary adds the sponsorship issuance admission and cutover-consumption receipts only after 0046. " +
+          "the 0047 boundary adds the sponsorship issuance admission and cutover-consumption receipts only after 0046; " +
+          "the 0048 boundary adds value-free Resource execution evidence only after 0047. " +
           "The standalone 0022 catch-up receipt binds the canonical 0016 application shape and critical " +
           "data digest before the exact 0017-0022 transition; it is not an ordinary receipt-chain predecessor.",
         reversal:

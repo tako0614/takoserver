@@ -1,6 +1,11 @@
 import { canonicalDigest, canonicalJson } from "../json.ts";
 import type { Clock, JsonObject, Row, Sql, SqlParam, SqlStatement } from "../ports.ts";
 import { SqlError } from "../ports.ts";
+import {
+  RESOURCE_EXECUTION_EVIDENCE_FORMAT,
+  type ResourceExecutionCommit,
+  type ResourceExecutionEvidenceResponse,
+} from "../resource-execution-evidence.ts";
 import type { TakoformAuthorityFence } from "./host-authority.ts";
 import {
   OPERATION_TTL_MILLISECONDS,
@@ -577,6 +582,18 @@ export interface TakoformStore {
   /** Exact resource lookup for a credential broker; a uid is not a list cursor. */
   resourceByUid(tenantId: string, uid: string): Promise<ResourceListing | null>;
 
+  /**
+   * One immutable snapshot page of Takoserver-owned Resource commit evidence.
+   * The deletion attestation owns identity even after the live Resource row is
+   * gone; a cursor binds all later pages to the first page's maximum sequence.
+   */
+  readResourceExecutionEvidence(input: {
+    readonly tenantId: string;
+    readonly resourceUid: string;
+    readonly limit: number;
+    readonly cursor?: string;
+  }): Promise<ResourceExecutionEvidenceResponse | null>;
+
   /** One UID-scoped snapshot used by authorities that must bind Resource and relations together. */
   resourceWithRelationsByUid(tenantId: string, uid: string): Promise<ResourceWithRelations | null>;
 
@@ -674,6 +691,94 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       return new TakoformHostError("revision_conflict", 412);
     }
     return new TakoformHostError("resource_busy", 409);
+  };
+
+  /**
+   * Recognize only the immutable answer of one already-committed mutation.
+   *
+   * This check runs only after the commit batch has been rejected atomically.
+   * Letting an existing-evidence branch continue through that batch would let
+   * caller-supplied replay or provider fields mutate after the operation id was
+   * already claimed. A lost acknowledgement is therefore a read-only outcome:
+   * every durable identity must match, or the retry is a conflict.
+   */
+  const exactCommittedMutationReplay = async (input: {
+    readonly tenantId: string;
+    readonly operationId: string;
+    readonly operation: "create" | "update" | "apply" | "import" | "delete";
+    readonly mutation: ResourceMutationCommit;
+    readonly deleteGeneration?: string;
+    readonly fenceDeleteRevision: boolean;
+  }): Promise<boolean> => {
+    const operationRows = await sql.query(
+      `SELECT tenant_id, operation, state, resource_json
+       FROM tf_operations WHERE id = ? LIMIT 2`,
+      [input.operationId],
+    );
+    const evidenceRows = await sql.query(
+      `SELECT tenant_id, resource_uid, action, resource_generation, resource_revision
+       FROM tf_resource_execution_evidence WHERE operation_id = ? LIMIT 2`,
+      [input.operationId],
+    );
+    const replayRows = await sql.query(
+      `SELECT fingerprint, status, resource_json, bound_uid
+       FROM tf_replays WHERE replay_key = ? LIMIT 2`,
+      [input.mutation.replayKey],
+    );
+    if (operationRows.length === 0 && evidenceRows.length === 0 && replayRows.length === 0) {
+      return false;
+    }
+
+    const identityNoOp =
+      input.mutation.kind === "write" &&
+      input.mutation.preserveClaims === true &&
+      input.mutation.expectedRevision !== null &&
+      input.mutation.resource?.metadata.revision === input.mutation.expectedRevision;
+    const operationRow = operationRows[0];
+    const replayRow = replayRows[0];
+    const evidenceRow = evidenceRows[0];
+    const sameJson = (stored: unknown, expected: unknown | undefined): boolean => {
+      if (expected === undefined) return stored === null;
+      if (typeof stored !== "string") return false;
+      return canonicalJson(JSON.parse(stored)) === canonicalJson(expected);
+    };
+    const operationMatches =
+      operationRows.length === 1 &&
+      operationRow !== undefined &&
+      operationRow.tenant_id === input.tenantId &&
+      operationRow.operation === input.operation &&
+      operationRow.state === "succeeded" &&
+      sameJson(operationRow.resource_json, input.mutation.resource);
+    const replayMatches =
+      replayRows.length === 1 &&
+      replayRow !== undefined &&
+      replayRow.fingerprint === input.mutation.replay.fingerprint &&
+      Number(replayRow.status) === input.mutation.replay.status &&
+      sameJson(replayRow.resource_json, input.mutation.replay.resource) &&
+      replayRow.bound_uid === (input.mutation.replay.boundUid ?? null);
+    const expectedAction =
+      input.mutation.kind === "delete"
+        ? "delete"
+        : input.mutation.expectedRevision === null
+          ? "create"
+          : "update";
+    const evidenceMatches = identityNoOp
+      ? evidenceRows.length === 0
+      : evidenceRows.length === 1 &&
+        evidenceRow !== undefined &&
+        evidenceRow.tenant_id === input.tenantId &&
+        evidenceRow.resource_uid === input.mutation.resourceUid &&
+        evidenceRow.action === expectedAction &&
+        (input.mutation.kind === "write"
+          ? input.mutation.resource !== undefined &&
+            evidenceRow.resource_generation === input.mutation.resource.metadata.generation &&
+            evidenceRow.resource_revision === input.mutation.resource.metadata.revision
+          : (input.deleteGeneration === undefined ||
+              evidenceRow.resource_generation === input.deleteGeneration) &&
+            (!input.fenceDeleteRevision ||
+              evidenceRow.resource_revision === input.mutation.expectedRevision));
+    if (operationMatches && replayMatches && evidenceMatches) return true;
+    throw new TakoformHostError("resource_busy", 409);
   };
 
   return {
@@ -1874,6 +1979,8 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async commitImmediateMutation(input) {
       const { mutation } = input;
+      assertResourceMutationOperation(input.operation, mutation);
+      assertResourceMutationIdentity({ tenantId: input.tenantId, mutation });
       const guard = boundedGuard(`guard_${input.operationId}`);
       const authority = mutation.authorityFence
         ? await authorityFenceSql(mutation.authorityFence)
@@ -1894,6 +2001,17 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         await sql.batch(statements);
       } catch (error) {
         if (!(error instanceof SqlError) || error.code !== "constraint") throw error;
+        if (
+          await exactCommittedMutationReplay({
+            tenantId: input.tenantId,
+            operationId: input.operationId,
+            operation: input.operation,
+            mutation,
+            fenceDeleteRevision: true,
+          })
+        ) {
+          return;
+        }
         const claimKeys = mutation.claimKeys ?? [];
         if (claimKeys.length > 0) {
           const owned = await sql.query(
@@ -2176,8 +2294,17 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async commitDeferredMutation(input) {
       const { operation, mutation, leaseToken } = input;
+      const timestamp = now();
       const guard = boundedGuard(`guard_${operation.id}_${leaseToken}`);
       const target = operation.target;
+      assertResourceMutationOperation(operation.operation, mutation);
+      assertResourceMutationIdentity({
+        tenantId: operation.tenantId,
+        mutation,
+        expectedResourceUid: operation.resourceUid,
+        expectedAddress: target,
+        expectedFormRef: target.formRef,
+      });
       const targetKey = [
         operation.tenantId,
         target.space,
@@ -2231,9 +2358,17 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       const receiptJson = mutation.providerReceipt
         ? canonicalJson(mutation.providerReceipt)
         : undefined;
-      const deployment = deploymentMutationSql(mutation.providerReceipt, now());
-      const providerEffect = providerEffectSql(mutation, now());
+      const deployment = deploymentMutationSql(mutation.providerReceipt, timestamp);
+      const providerEffect = providerEffectSql(mutation, timestamp);
       const deletionFence = deletionTombstoneFence(mutation, operation.id);
+      const executionEvidence = resourceExecutionEvidenceSql({
+        tenantId: operation.tenantId,
+        operationId: operation.id,
+        mutation,
+        committedAt: timestamp,
+        fenceDeleteRevision: fencesRevision,
+      });
+      const executionEvidenceGuard = boundedGuard(`evidence_${guard}`);
       const authority = mutation.authorityFence
         ? await authorityFenceSql(mutation.authorityFence)
         : { sql: "1 = 1", params: [] as readonly SqlParam[] };
@@ -2260,7 +2395,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
             operation.tenantId,
             operation.principalId,
             leaseToken,
-            now(),
+            timestamp,
             ...resourceFenceParameters,
             ...(claimKeys.length === 0
               ? []
@@ -2287,9 +2422,11 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
             ...authority.params,
           ],
         },
+        resourceExecutionEvidenceGuardStatement(executionEvidenceGuard, executionEvidence),
         ...deployment.statements,
         ...providerEffect.statements,
-        ...deletionTombstoneStatements(mutation, now()),
+        ...deletionTombstoneStatements(mutation, timestamp),
+        ...executionEvidence.statements,
       ];
       if (mutation.kind === "write") {
         const resource = mutation.resource;
@@ -2311,7 +2448,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
               JSON.stringify(relations),
               packageDigest,
               implementationDigest,
-              now(),
+              timestamp,
             ],
           });
         } else {
@@ -2329,7 +2466,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
               JSON.stringify(relations),
               packageDigest,
               implementationDigest,
-              now(),
+              timestamp,
               ...targetKey,
               operation.acceptedUid,
               operation.acceptedGeneration ?? "",
@@ -2365,12 +2502,12 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
             mutation.replay.status,
             mutation.replay.resource ? JSON.stringify(mutation.replay.resource) : null,
             mutation.replay.boundUid ?? null,
-            now() + REPLAY_TTL_MILLISECONDS,
+            timestamp + REPLAY_TTL_MILLISECONDS,
           ],
         },
         ...(mutation.preserveClaims
           ? []
-          : claimCommitStatements({ ...operation, id: leaseToken }, claimKeys, now())),
+          : claimCommitStatements({ ...operation, id: leaseToken }, claimKeys, timestamp)),
         {
           sql: `UPDATE tf_deferred_operations
                 SET phase = 'succeeded', terminal_json = ?, committed_uid = ?,
@@ -2380,8 +2517,8 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           params: [
             mutation.terminalJson,
             mutation.resource?.metadata.uid ?? null,
-            now(),
-            now() + OPERATION_TTL_MILLISECONDS,
+            timestamp,
+            timestamp + OPERATION_TTL_MILLISECONDS,
             operation.id,
             operation.tenantId,
             operation.principalId,
@@ -2398,7 +2535,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
             operation.operation,
             mutation.resource ? JSON.stringify(mutation.resource) : null,
             operation.createdAt,
-            now() + OPERATION_TTL_MILLISECONDS,
+            timestamp + OPERATION_TTL_MILLISECONDS,
           ],
         },
         ...(receiptJson
@@ -2412,6 +2549,10 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           : []),
         {
           sql: "DELETE FROM tf_operation_commit_guards WHERE token = ?",
+          params: [executionEvidenceGuard],
+        },
+        {
+          sql: "DELETE FROM tf_operation_commit_guards WHERE token = ?",
           params: [guard],
         },
       );
@@ -2419,6 +2560,20 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         await sql.batch(statements);
       } catch (error) {
         if (!(error instanceof SqlError) || error.code !== "constraint") throw error;
+        if (
+          await exactCommittedMutationReplay({
+            tenantId: operation.tenantId,
+            operationId: operation.id,
+            operation: operation.operation,
+            mutation,
+            ...(operation.acceptedGeneration === undefined
+              ? {}
+              : { deleteGeneration: operation.acceptedGeneration }),
+            fenceDeleteRevision: fencesRevision,
+          })
+        ) {
+          return;
+        }
         throw await commitFenceError(operation, leaseToken);
       }
     },
@@ -2634,6 +2789,131 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       return resourceListing(rows[0] as Row);
     },
 
+    async readResourceExecutionEvidence(input) {
+      const identityRows = await sql.query(
+        `SELECT space, api_version, kind, name, form_ref_json
+         FROM tf_resource_deletion_attestations
+         WHERE tenant_id = ? AND resource_uid = ?
+         LIMIT 2`,
+        [input.tenantId, input.resourceUid],
+      );
+      if (identityRows.length === 0) return null;
+      if (identityRows.length !== 1 || !identityRows[0]) {
+        throw new TakoformHostError("backend_unavailable", 503);
+      }
+      const identity = identityRows[0];
+      const formRef = resourceExecutionFormRef(identity.form_ref_json);
+
+      const boundRows = await sql.query(
+        `SELECT MAX(sequence) AS snapshot_fence
+         FROM tf_resource_execution_evidence
+         WHERE tenant_id = ? AND resource_uid = ?`,
+        [input.tenantId, input.resourceUid],
+      );
+      if (boundRows.length !== 1) throw new TakoformHostError("backend_unavailable", 503);
+      const currentFenceValue = boundRows[0]?.snapshot_fence;
+      const currentFence =
+        currentFenceValue === null ? 0 : positiveIntegerColumn(currentFenceValue);
+      const cursor = decodeResourceExecutionEvidenceCursor(input.cursor);
+      if (
+        cursor &&
+        (cursor.organizationId !== input.tenantId ||
+          cursor.resourceUid !== input.resourceUid ||
+          cursor.snapshotFence > currentFence ||
+          cursor.beforeSequence > cursor.snapshotFence ||
+          cursor.beforeSequence < 1)
+      ) {
+        throw new TakoformHostError("invalid_argument", 400);
+      }
+      const snapshotFence = cursor?.snapshotFence ?? currentFence;
+      const page = Math.min(Math.max(input.limit, 1), 200);
+      const rows =
+        snapshotFence === 0
+          ? []
+          : await sql.query(
+              `SELECT sequence, operation_id, action, resource_generation,
+                      resource_revision, committed_at
+               FROM tf_resource_execution_evidence
+               WHERE tenant_id = ? AND resource_uid = ?
+                 AND sequence <= ?
+                 ${cursor ? "AND sequence < ?" : ""}
+               ORDER BY sequence DESC
+               LIMIT ?`,
+              [
+                input.tenantId,
+                input.resourceUid,
+                snapshotFence,
+                ...(cursor ? [cursor.beforeSequence] : []),
+                page + 1,
+              ],
+            );
+      const expectedFirstSequence = cursor ? cursor.beforeSequence - 1 : snapshotFence;
+      if (expectedFirstSequence === 0) {
+        if (rows.length !== 0) throw new TakoformHostError("backend_unavailable", 503);
+      } else {
+        if (rows.length === 0) throw new TakoformHostError("backend_unavailable", 503);
+        for (const [index, row] of rows.entries()) {
+          if (positiveIntegerColumn(row.sequence) !== expectedFirstSequence - index) {
+            throw new TakoformHostError("backend_unavailable", 503);
+          }
+        }
+        if (rows.length <= page && positiveIntegerColumn(rows.at(-1)?.sequence) !== 1) {
+          throw new TakoformHostError("backend_unavailable", 503);
+        }
+      }
+      const visible = rows.slice(0, page).map(resourceExecutionCommit);
+      const last = visible[visible.length - 1];
+      const firstActionRows =
+        snapshotFence === 0
+          ? []
+          : await sql.query(
+              `SELECT action
+               FROM tf_resource_execution_evidence
+               WHERE tenant_id = ? AND resource_uid = ? AND sequence = 1
+               LIMIT 2`,
+              [input.tenantId, input.resourceUid],
+            );
+      const firstAction = firstActionRows[0]?.action;
+      if (
+        (snapshotFence === 0 && firstActionRows.length !== 0) ||
+        (snapshotFence > 0 &&
+          (firstActionRows.length !== 1 ||
+            (firstAction !== "create" && firstAction !== "update" && firstAction !== "delete")))
+      ) {
+        throw new TakoformHostError("backend_unavailable", 503);
+      }
+      const coverage = firstAction === "create" ? "complete" : "partial";
+      return {
+        executionEvidence: {
+          format: RESOURCE_EXECUTION_EVIDENCE_FORMAT,
+          organizationId: input.tenantId,
+          resource: {
+            uid: input.resourceUid,
+            address: {
+              space: text(identity.space),
+              apiVersion: text(identity.api_version),
+              kind: text(identity.kind),
+              name: text(identity.name),
+            },
+            formRef,
+          },
+          coverage,
+          snapshotFence,
+          commits: visible,
+        },
+        ...(rows.length > page && last
+          ? {
+              cursor: encodeResourceExecutionEvidenceCursor({
+                organizationId: input.tenantId,
+                resourceUid: input.resourceUid,
+                snapshotFence,
+                beforeSequence: last.sequence,
+              }),
+            }
+          : {}),
+      };
+    },
+
     async resourceWithRelationsByUid(tenantId, uid) {
       const rows = await sql.query(
         `SELECT space, api_version, kind, name, uid, generation, revision,
@@ -2812,6 +3092,381 @@ function providerReceipt(value: unknown): TakoformDriverReceipt {
   return parsed as TakoformDriverReceipt;
 }
 
+/**
+ * The public execution ledger is derived only from the logical commit input.
+ * It never accepts a caller-supplied evidence object and never copies opaque
+ * provider receipt/effect data into its durable or public shape.
+ */
+function resourceExecutionEvidenceSql(input: {
+  readonly tenantId: string;
+  readonly operationId: string;
+  readonly mutation: ResourceMutationCommit;
+  readonly committedAt: number;
+  readonly fenceDeleteRevision: boolean;
+}): {
+  readonly fence: string;
+  readonly fenceParams: readonly SqlParam[];
+  readonly statements: readonly SqlStatement[];
+} {
+  const { mutation } = input;
+  const identityNoOp =
+    mutation.kind === "write" &&
+    mutation.preserveClaims === true &&
+    mutation.expectedRevision !== null &&
+    mutation.resource?.metadata.revision === mutation.expectedRevision;
+  const identity = resourceExecutionAttestationFence(input.tenantId, mutation);
+  const predecessor = resourceExecutionPredecessorFence(
+    input.tenantId,
+    mutation,
+    identityNoOp,
+    input.fenceDeleteRevision,
+  );
+  if (identityNoOp) {
+    // A successful identity-preserving apply is useful replay evidence, but it
+    // did not commit a new Resource version and must not advance this ledger.
+    // It still must not borrow an operation id that already proves a different
+    // committed mutation: the absence of a new row is not permission to bypass
+    // the ledger's tenant-scoped operation identity.
+    return {
+      fence: `(${identity.sql}) AND (${predecessor.sql}) AND NOT EXISTS (
+          SELECT 1 FROM tf_resource_execution_evidence
+          WHERE tenant_id = ? AND operation_id = ?
+        ) AND NOT EXISTS (
+          SELECT 1 FROM tf_operations WHERE id = ?
+        )`,
+      fenceParams: [
+        ...identity.params,
+        ...predecessor.params,
+        input.tenantId,
+        input.operationId,
+        input.operationId,
+      ],
+      statements: [],
+    };
+  }
+  const action =
+    mutation.kind === "delete"
+      ? ("delete" as const)
+      : mutation.expectedRevision === null
+        ? ("create" as const)
+        : ("update" as const);
+  const fence = `(${identity.sql}) AND NOT EXISTS (
+    SELECT 1 FROM tf_resource_execution_evidence
+    WHERE tenant_id = ? AND operation_id = ?
+  ) AND NOT EXISTS (
+    SELECT 1 FROM tf_operations WHERE id = ?
+  ) AND (${predecessor.sql})`;
+  const fenceParams: readonly SqlParam[] = [
+    ...identity.params,
+    input.tenantId,
+    input.operationId,
+    input.operationId,
+    ...predecessor.params,
+  ];
+  const nextSequence = `(
+    SELECT COALESCE(MAX(previous.sequence), 0) + 1
+    FROM tf_resource_execution_evidence AS previous
+    WHERE previous.tenant_id = ? AND previous.resource_uid = ?
+  )`;
+  const notRecorded = `NOT EXISTS (
+    SELECT 1 FROM tf_resource_execution_evidence
+    WHERE tenant_id = ? AND operation_id = ?
+  ) AND NOT EXISTS (
+    SELECT 1 FROM tf_operations WHERE id = ?
+  )`;
+  if (mutation.kind === "write") {
+    const resource = mutation.resource;
+    if (!resource) throw new TypeError("write commit requires a resource");
+    return {
+      fence,
+      fenceParams,
+      statements: [
+        {
+          sql: `INSERT INTO tf_resource_execution_evidence
+                  (tenant_id, resource_uid, operation_id, sequence, action,
+                   resource_generation, resource_revision, committed_at)
+                SELECT ?, ?, ?, ${nextSequence}, ?, ?, ?, ?
+                WHERE ${notRecorded}`,
+          params: [
+            input.tenantId,
+            mutation.resourceUid,
+            input.operationId,
+            input.tenantId,
+            mutation.resourceUid,
+            action,
+            resource.metadata.generation,
+            resource.metadata.revision,
+            input.committedAt,
+            input.tenantId,
+            input.operationId,
+            input.operationId,
+          ],
+        },
+      ],
+    };
+  }
+  return {
+    fence,
+    fenceParams,
+    statements: [
+      {
+        // Read the exact incarnation immediately before its DELETE statement.
+        // The enclosing Resource fence and this SELECT are one serialized
+        // batch, so the version cannot be substituted between proof and delete.
+        sql: `INSERT INTO tf_resource_execution_evidence
+                (tenant_id, resource_uid, operation_id, sequence, action,
+                 resource_generation, resource_revision, committed_at)
+              SELECT ?, ?, ?, ${nextSequence}, 'delete', resource.generation,
+                     resource.revision, ?
+              FROM tf_resources AS resource
+              WHERE resource.tenant_id = ? AND resource.space = ?
+                AND resource.api_version = ? AND resource.kind = ? AND resource.name = ?
+                AND resource.uid = ? AND ${notRecorded}`,
+        params: [
+          input.tenantId,
+          mutation.resourceUid,
+          input.operationId,
+          input.tenantId,
+          mutation.resourceUid,
+          input.committedAt,
+          input.tenantId,
+          mutation.address.space,
+          mutation.address.apiVersion,
+          mutation.address.kind,
+          mutation.address.name,
+          mutation.resourceUid,
+          input.tenantId,
+          input.operationId,
+          input.operationId,
+        ],
+      },
+    ],
+  };
+}
+
+function resourceExecutionEvidenceGuardStatement(
+  token: string,
+  evidence: {
+    readonly fence: string;
+    readonly fenceParams: readonly SqlParam[];
+  },
+): SqlStatement {
+  const params: readonly SqlParam[] = [token, ...evidence.fenceParams];
+  // D1 accepts at most 100 bound values per prepared statement. Keep this
+  // proof in its own guard statement so declared Resource claims cannot consume
+  // its headroom in the main commit guard.
+  if (params.length > 100) throw new TypeError("resource execution evidence fence is too large");
+  return {
+    sql: `INSERT INTO tf_operation_commit_guards (token, valid)
+          SELECT ?, CASE WHEN ${evidence.fence} THEN 1 ELSE 0 END`,
+    params,
+  };
+}
+
+function resourceExecutionAttestationFence(
+  tenantId: string,
+  mutation: ResourceMutationCommit,
+): { readonly sql: string; readonly params: readonly SqlParam[] } {
+  const address = mutation.address;
+  const resource = mutation.kind === "write" ? mutation.resource : undefined;
+  return {
+    sql: `EXISTS (
+      SELECT 1 FROM tf_resource_deletion_attestations AS attestation
+      WHERE attestation.tenant_id = ? AND attestation.resource_uid = ?
+        AND attestation.space = ? AND attestation.api_version = ?
+        AND attestation.kind = ? AND attestation.name = ?
+        ${resource ? "AND attestation.form_ref_json = ?" : ""}
+    )`,
+    params: [
+      tenantId,
+      mutation.resourceUid,
+      address.space,
+      address.apiVersion,
+      address.kind,
+      address.name,
+      ...(resource ? [canonicalJson(resource.form.formRef)] : []),
+    ],
+  };
+}
+
+function resourceExecutionPredecessorFence(
+  tenantId: string,
+  mutation: ResourceMutationCommit,
+  identityNoOp: boolean,
+  fenceDeleteRevision: boolean,
+): { readonly sql: string; readonly params: readonly SqlParam[] } {
+  const address = mutation.address;
+  if (mutation.kind === "write" && mutation.expectedRevision === null) {
+    const resource = mutation.resource;
+    if (!resource) throw new TypeError("write commit requires a resource");
+    return {
+      sql: `EXISTS (
+          SELECT 1 FROM tf_resource_deletion_attestations AS attestation
+          WHERE attestation.tenant_id = ? AND attestation.resource_uid = ?
+            AND attestation.space = ? AND attestation.api_version = ?
+            AND attestation.kind = ? AND attestation.name = ?
+            AND attestation.state = 'live' AND attestation.form_ref_json = ?
+        ) AND NOT EXISTS (
+          SELECT 1 FROM tf_resources AS current
+          WHERE current.tenant_id = ? AND current.space = ?
+            AND current.api_version = ? AND current.kind = ? AND current.name = ?
+        )`,
+      params: [
+        tenantId,
+        mutation.resourceUid,
+        address.space,
+        address.apiVersion,
+        address.kind,
+        address.name,
+        canonicalJson(resource.form.formRef),
+        tenantId,
+        address.space,
+        address.apiVersion,
+        address.kind,
+        address.name,
+      ],
+    };
+  }
+
+  const resource = mutation.kind === "write" ? mutation.resource : undefined;
+  const exactContent =
+    identityNoOp && resource
+      ? (() => {
+          const [packageDigest, implementationDigest] = exactResourceDigests(resource);
+          return {
+            sql: `AND current.resource_json = ? AND current.relations_json = ?
+                    AND current.package_digest IS ? AND current.implementation_digest IS ?`,
+            params: [
+              JSON.stringify(resource),
+              JSON.stringify(mutation.relations ?? []),
+              packageDigest,
+              implementationDigest,
+            ] as readonly SqlParam[],
+          };
+        })()
+      : { sql: "", params: [] as readonly SqlParam[] };
+  const state = mutation.kind === "delete" ? "IN ('live', 'pending')" : "= 'live'";
+  const revisionFence =
+    mutation.kind === "delete" && !fenceDeleteRevision
+      ? { sql: "", params: [] as readonly SqlParam[] }
+      : {
+          sql: "AND current.revision = ?",
+          params: [mutation.expectedRevision ?? ""] as readonly SqlParam[],
+        };
+  return {
+    sql: `EXISTS (
+      SELECT 1
+      FROM tf_resources AS current
+      INNER JOIN tf_resource_deletion_attestations AS attestation
+        ON attestation.tenant_id = current.tenant_id
+       AND attestation.resource_uid = current.uid
+      WHERE current.tenant_id = ? AND current.space = ?
+        AND current.api_version = ? AND current.kind = ? AND current.name = ?
+        AND current.uid = ? ${revisionFence.sql}
+        AND attestation.space = current.space
+        AND attestation.api_version = current.api_version
+        AND attestation.kind = current.kind AND attestation.name = current.name
+        AND attestation.state ${state}
+        AND json_extract(current.resource_json, '$.apiVersion') = current.api_version
+        AND json_extract(current.resource_json, '$.kind') = current.kind
+        AND json_extract(current.resource_json, '$.metadata.space') = current.space
+        AND json_extract(current.resource_json, '$.metadata.name') = current.name
+        AND json_extract(current.resource_json, '$.metadata.uid') = current.uid
+        AND json_extract(current.resource_json, '$.metadata.generation') = current.generation
+        AND json_extract(current.resource_json, '$.metadata.revision') = current.revision
+        AND json_extract(current.resource_json, '$.form.formRef.apiVersion') =
+            json_extract(attestation.form_ref_json, '$.apiVersion')
+        AND json_extract(current.resource_json, '$.form.formRef.kind') =
+            json_extract(attestation.form_ref_json, '$.kind')
+        AND json_extract(current.resource_json, '$.form.formRef.definitionVersion') =
+            json_extract(attestation.form_ref_json, '$.definitionVersion')
+        AND json_extract(current.resource_json, '$.form.formRef.schemaDigest') =
+            json_extract(attestation.form_ref_json, '$.schemaDigest')
+        ${resource ? "AND attestation.form_ref_json = ?" : ""}
+        ${exactContent.sql}
+    )`,
+    params: [
+      tenantId,
+      address.space,
+      address.apiVersion,
+      address.kind,
+      address.name,
+      mutation.resourceUid,
+      ...revisionFence.params,
+      ...(resource ? [canonicalJson(resource.form.formRef)] : []),
+      ...exactContent.params,
+    ],
+  };
+}
+
+function assertResourceMutationIdentity(input: {
+  readonly tenantId: string;
+  readonly mutation: ResourceMutationCommit;
+  readonly expectedResourceUid?: string;
+  readonly expectedAddress?: {
+    readonly space: string;
+    readonly apiVersion: string;
+    readonly kind: string;
+    readonly name: string;
+  };
+  readonly expectedFormRef?: TakoformV1Alpha3FormRef;
+}): void {
+  const { mutation } = input;
+  const address = mutation.address;
+  const expected = input.expectedAddress;
+  if (
+    address.tenantId !== input.tenantId ||
+    (input.expectedResourceUid !== undefined &&
+      mutation.resourceUid !== input.expectedResourceUid) ||
+    (expected !== undefined &&
+      (address.space !== expected.space ||
+        address.apiVersion !== expected.apiVersion ||
+        address.kind !== expected.kind ||
+        address.name !== expected.name))
+  ) {
+    throw new TypeError("resource mutation identity mismatch");
+  }
+  if (mutation.kind !== "write") {
+    if (mutation.expectedRevision === null || mutation.preserveClaims === true) {
+      throw new TypeError("resource mutation identity mismatch");
+    }
+    return;
+  }
+  const resource = mutation.resource;
+  if (
+    !resource ||
+    resource.metadata.uid !== mutation.resourceUid ||
+    resource.metadata.space !== address.space ||
+    resource.apiVersion !== address.apiVersion ||
+    resource.kind !== address.kind ||
+    resource.metadata.name !== address.name ||
+    resource.form.formRef.apiVersion !== resource.apiVersion ||
+    resource.form.formRef.kind !== resource.kind ||
+    (input.expectedFormRef !== undefined &&
+      canonicalJson(resource.form.formRef) !== canonicalJson(input.expectedFormRef)) ||
+    (mutation.preserveClaims === true &&
+      (mutation.expectedRevision === null ||
+        resource.metadata.revision !== mutation.expectedRevision))
+  ) {
+    throw new TypeError("resource mutation identity mismatch");
+  }
+}
+
+function assertResourceMutationOperation(
+  operation: "create" | "update" | "apply" | "import" | "delete",
+  mutation: ResourceMutationCommit,
+): void {
+  const valid =
+    operation === "delete"
+      ? mutation.kind === "delete"
+      : operation === "create"
+        ? mutation.kind === "write" && mutation.expectedRevision === null
+        : operation === "update"
+          ? mutation.kind === "write" && mutation.expectedRevision !== null
+          : mutation.kind === "write";
+  if (!valid) throw new TypeError("resource mutation operation mismatch");
+}
+
 function providerMutationCommitStatements(input: {
   readonly guard: string;
   readonly tenantId: string;
@@ -2841,6 +3496,14 @@ function providerMutationCommitStatements(input: {
   const deployment = deploymentMutationSql(mutation.providerReceipt, input.now);
   const providerEffect = providerEffectSql(mutation, input.now);
   const deletionFence = deletionTombstoneFence(mutation, input.operationId);
+  const executionEvidence = resourceExecutionEvidenceSql({
+    tenantId: input.tenantId,
+    operationId: input.operationId,
+    mutation,
+    committedAt: input.now,
+    fenceDeleteRevision: true,
+  });
+  const executionEvidenceGuard = boundedGuard(`evidence_${input.guard}`);
   const sagaFence = receiptJson
     ? `EXISTS (
     SELECT 1 FROM tf_provider_mutation_sagas AS saga
@@ -2909,9 +3572,11 @@ function providerMutationCommitStatements(input: {
         ...(input.additionalFenceParams ?? []),
       ],
     },
+    resourceExecutionEvidenceGuardStatement(executionEvidenceGuard, executionEvidence),
     ...deployment.statements,
     ...providerEffect.statements,
     ...deletionTombstoneStatements(mutation, input.now),
+    ...executionEvidence.statements,
   ];
   if (mutation.kind === "write") {
     const resource = mutation.resource;
@@ -3017,6 +3682,10 @@ function providerMutationCommitStatements(input: {
           },
         ]
       : []),
+    {
+      sql: "DELETE FROM tf_operation_commit_guards WHERE token = ?",
+      params: [executionEvidenceGuard],
+    },
     {
       sql: "DELETE FROM tf_operation_commit_guards WHERE token = ?",
       params: [input.guard],
@@ -3937,6 +4606,147 @@ function integerColumn(value: unknown): number {
     throw new TakoformHostError("backend_unavailable", 503);
   }
   return value;
+}
+
+function positiveIntegerColumn(value: unknown): number {
+  const parsed = integerColumn(value);
+  if (parsed < 1) throw new TakoformHostError("backend_unavailable", 503);
+  return parsed;
+}
+
+function resourceExecutionCommit(row: Row): ResourceExecutionCommit {
+  const action = text(row.action);
+  if (action !== "create" && action !== "update" && action !== "delete") {
+    throw new TakoformHostError("backend_unavailable", 503);
+  }
+  const committedAt = integerColumn(row.committed_at);
+  const timestamp = new Date(committedAt);
+  if (!Number.isFinite(timestamp.getTime())) {
+    throw new TakoformHostError("backend_unavailable", 503);
+  }
+  return {
+    sequence: positiveIntegerColumn(row.sequence),
+    operationId: text(row.operation_id),
+    action,
+    outcome: "committed",
+    resourceVersion: {
+      generation: numericTextColumn(row.resource_generation),
+      revision: numericTextColumn(row.resource_revision),
+    },
+    committedAt: timestamp.toISOString(),
+  };
+}
+
+function resourceExecutionFormRef(value: unknown): TakoformV1Alpha3FormRef {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text(value)) as unknown;
+  } catch {
+    throw new TakoformHostError("backend_unavailable", 503);
+  }
+  if (
+    !recordValue(parsed) ||
+    Object.keys(parsed).sort().join("|") !== "apiVersion|definitionVersion|kind|schemaDigest" ||
+    typeof parsed.apiVersion !== "string" ||
+    parsed.apiVersion.length < 1 ||
+    parsed.apiVersion.length > 320 ||
+    typeof parsed.kind !== "string" ||
+    parsed.kind.length < 1 ||
+    parsed.kind.length > 128 ||
+    typeof parsed.definitionVersion !== "string" ||
+    parsed.definitionVersion.length < 1 ||
+    parsed.definitionVersion.length > 128 ||
+    !isDigest(parsed.schemaDigest)
+  ) {
+    throw new TakoformHostError("backend_unavailable", 503);
+  }
+  return {
+    apiVersion: parsed.apiVersion,
+    kind: parsed.kind,
+    definitionVersion: parsed.definitionVersion,
+    schemaDigest: parsed.schemaDigest,
+  };
+}
+
+function numericTextColumn(value: unknown): string {
+  const parsed = text(value);
+  if (!/^[0-9]+$/u.test(parsed)) {
+    throw new TakoformHostError("backend_unavailable", 503);
+  }
+  return parsed;
+}
+
+interface ResourceExecutionEvidenceCursor {
+  readonly organizationId: string;
+  readonly resourceUid: string;
+  readonly snapshotFence: number;
+  readonly beforeSequence: number;
+}
+
+function encodeResourceExecutionEvidenceCursor(cursor: ResourceExecutionEvidenceCursor): string {
+  const bytes = new TextEncoder().encode(
+    JSON.stringify({
+      kind: "takoserver.resource-execution-evidence-cursor/v1",
+      organizationId: cursor.organizationId,
+      resourceUid: cursor.resourceUid,
+      snapshotFence: cursor.snapshotFence,
+      beforeSequence: cursor.beforeSequence,
+    }),
+  );
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
+}
+
+function decodeResourceExecutionEvidenceCursor(
+  value: string | undefined,
+): ResourceExecutionEvidenceCursor | null {
+  if (value === undefined) return null;
+  if (value.length < 1 || value.length > 1_024 || !/^[A-Za-z0-9_-]+$/u.test(value)) {
+    throw new TakoformHostError("invalid_argument", 400);
+  }
+  try {
+    const base64 = value.replaceAll("-", "+").replaceAll("_", "/");
+    const binary = atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, "="));
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    const parsed = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes),
+    ) as unknown;
+    if (
+      !recordValue(parsed) ||
+      JSON.stringify(Object.keys(parsed).sort()) !==
+        JSON.stringify([
+          "beforeSequence",
+          "kind",
+          "organizationId",
+          "resourceUid",
+          "snapshotFence",
+        ]) ||
+      parsed.kind !== "takoserver.resource-execution-evidence-cursor/v1" ||
+      typeof parsed.organizationId !== "string" ||
+      parsed.organizationId.length < 1 ||
+      parsed.organizationId.length > 255 ||
+      typeof parsed.resourceUid !== "string" ||
+      parsed.resourceUid.length < 3 ||
+      parsed.resourceUid.length > 128 ||
+      typeof parsed.snapshotFence !== "number" ||
+      !Number.isSafeInteger(parsed.snapshotFence) ||
+      parsed.snapshotFence < 1 ||
+      typeof parsed.beforeSequence !== "number" ||
+      !Number.isSafeInteger(parsed.beforeSequence) ||
+      parsed.beforeSequence < 2
+    ) {
+      throw new Error("invalid cursor");
+    }
+    return {
+      organizationId: parsed.organizationId,
+      resourceUid: parsed.resourceUid,
+      snapshotFence: parsed.snapshotFence,
+      beforeSequence: parsed.beforeSequence,
+    };
+  } catch {
+    throw new TakoformHostError("invalid_argument", 400);
+  }
 }
 
 function text(value: unknown): string {

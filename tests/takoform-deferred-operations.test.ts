@@ -1166,6 +1166,19 @@ describe("durable deferred Takoform operations", () => {
     expect(
       opened.database.query("SELECT name FROM tf_resources WHERE name = 'delete-fence'").all(),
     ).toEqual([]);
+    expect(
+      opened.database
+        .query(
+          `SELECT action, resource_generation, resource_revision
+           FROM tf_resource_execution_evidence
+           WHERE tenant_id = 'tenant-a' AND operation_id = ?`,
+        )
+        .get(operationId),
+    ).toEqual({
+      action: "delete",
+      resource_generation: current.metadata.generation,
+      resource_revision: "91",
+    });
     opened.close();
   });
 

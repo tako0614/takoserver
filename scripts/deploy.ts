@@ -48,7 +48,7 @@ const USAGE = `takoserver deploy
   bun run deploy -- takoserver-org-api-key --<mint|status|revoke> --environment=<env> --commit=<sha>
     --organization=org_... [--key-name=<name> --scope=<scope> --expires-in-days=<n>] [--key-id=key_...]
   Rehearsal and production D1 schema status/apply require one fixed next-wave selector:
-    --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047>
+    --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048>
   Pending 0043 additionally requires the staged pre-0043-quiesced Worker target and the absolute
   operator-private TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH documented in docs/deploy.md.
   takoserver-d1-schema-rehearsal-baseline is fixed empty -> 0022, rehearsal-only, and accepts no selector.
