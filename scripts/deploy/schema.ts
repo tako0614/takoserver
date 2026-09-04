@@ -54,6 +54,10 @@ const RECEIPT_KIND = "takoserver.d1-schema-rehearsal-receipt@v3";
 const REHEARSAL_ATTEMPT_KIND = "takoserver.d1-schema-rehearsal-attempt@v2";
 const PRODUCTION_ATTEMPT_KIND = "takoserver.d1-schema-production-attempt@v1";
 const REHEARSAL_BASELINE_MIGRATION = "0022_takoform_admission.sql";
+const LEGACY_PRODUCTION_CATCHUP_BOUNDARY = "0022" as const;
+const LEGACY_PRODUCTION_CATCHUP_FROM_MIGRATION = "0016_takos_id_organization_projection.sql";
+const CANONICAL_0016_APPLICATION_SCHEMA_SHAPE_DIGEST =
+  "sha256:5c53ab9a929eab9323b45640f29bca203a0aef387b515cdb3a56c6aa42426c0b";
 const AUDITED_MIGRATION_LINEAGE = [
   "0001_runtime_storage.sql",
   "0002_takoform_state.sql",
@@ -100,6 +104,7 @@ const AUDITED_MIGRATION_LINEAGE = [
   "0043_artifact_blob_io_fences.sql",
   "0044_artifact_consumer_resolution_receipts.sql",
   "0045_cloudflare_provider_executor_operations.sql",
+  "0046_exact_artifact_recovery_receipts.sql",
 ] as const;
 const AUDITED_MIGRATION_SHA256: Readonly<
   Record<(typeof AUDITED_MIGRATION_LINEAGE)[number], string>
@@ -193,8 +198,19 @@ const AUDITED_MIGRATION_SHA256: Readonly<
     "sha256:ea0ebaab3e944b23ddea3c0ab8c847560fec2931471c8dd8e81b334e5548b5e2",
   "0045_cloudflare_provider_executor_operations.sql":
     "sha256:7d87cb2eec7a3434ece89f1e5d2ecac470d1e717c0611ee3f47b5390f991f9f2",
+  "0046_exact_artifact_recovery_receipts.sql":
+    "sha256:e5cd3a0b5a955642a0072b819c5de7148dac03a12c21721e4ecf9013e6d5b189",
 };
-export const SCHEMA_WAVE_BOUNDARIES = ["0028", "0033", "0036", "0043", "0044", "0045"] as const;
+export const SCHEMA_WAVE_BOUNDARIES = [
+  LEGACY_PRODUCTION_CATCHUP_BOUNDARY,
+  "0028",
+  "0033",
+  "0036",
+  "0043",
+  "0044",
+  "0045",
+  "0046",
+] as const;
 export type SchemaWaveBoundary = (typeof SCHEMA_WAVE_BOUNDARIES)[number];
 const SCHEMA_WAVES: Readonly<
   Record<
@@ -207,6 +223,12 @@ const SCHEMA_WAVES: Readonly<
     }
   >
 > = {
+  "0022": {
+    fromCount: 16,
+    fromMigration: LEGACY_PRODUCTION_CATCHUP_FROM_MIGRATION,
+    throughCount: 22,
+    throughMigration: REHEARSAL_BASELINE_MIGRATION,
+  },
   "0028": {
     fromCount: 22,
     fromMigration: REHEARSAL_BASELINE_MIGRATION,
@@ -243,7 +265,17 @@ const SCHEMA_WAVES: Readonly<
     throughCount: 45,
     throughMigration: "0045_cloudflare_provider_executor_operations.sql",
   },
+  "0046": {
+    fromCount: 45,
+    fromMigration: "0045_cloudflare_provider_executor_operations.sql",
+    throughCount: 46,
+    throughMigration: "0046_exact_artifact_recovery_receipts.sql",
+  },
 };
+const RECEIPT_CHAIN_BOUNDARIES = SCHEMA_WAVE_BOUNDARIES.filter(
+  (boundary): boundary is Exclude<SchemaWaveBoundary, "0022"> =>
+    boundary !== LEGACY_PRODUCTION_CATCHUP_BOUNDARY,
+);
 const RESOURCE_DELETION_ATTESTATION_MIGRATION = "0029_resource_deletion_attestations.sql";
 const PROVIDER_REPAIR_MIGRATION = "0036_provider_repair_and_managed_schedule_reconciliation.sql";
 const PROVIDER_EXECUTION_LEASE_MIGRATION = "0024_takoform_provider_execution_leases.sql";
@@ -258,13 +290,10 @@ BEFORE INSERT ON worker_runtime_input_preparations
 BEGIN
   SELECT RAISE(ABORT, 'runtime_input_preparation_v2_quiesced');
 END`;
-const RUNTIME_INPUT_QUIESCENCE_BATCH_SQL = `${RUNTIME_INPUT_QUIESCENCE_TRIGGER_SQL};
-CREATE TABLE takoserver_0037_runtime_input_zero_guard (
-  singleton INTEGER NOT NULL CHECK (singleton = 0)
+const RUNTIME_INPUT_QUIESCENCE_INSTALL_SQL = RUNTIME_INPUT_QUIESCENCE_TRIGGER_SQL.replace(
+  "CREATE TRIGGER ",
+  "CREATE TRIGGER IF NOT EXISTS ",
 );
-INSERT INTO takoserver_0037_runtime_input_zero_guard (singleton)
-SELECT COUNT(*) FROM worker_runtime_input_preparations;
-DROP TABLE takoserver_0037_runtime_input_zero_guard;`;
 
 export type SchemaProcess = (
   command: readonly string[],
@@ -273,6 +302,18 @@ export type SchemaProcess = (
 
 export interface SchemaReader {
   read(phase: DeployPhase): Promise<D1SchemaState>;
+  /** Fixed 0016->0022 catch-up snapshot; counts bind rehearsal to production. */
+  legacyProductionCatchupDataIntegrity?(phase: DeployPhase): Promise<{
+    readonly ledgerRowCount: number;
+    readonly principalRowCount: number;
+    readonly organizationRowCount: number;
+    readonly organizationMembershipRowCount: number;
+    readonly organizationOwnerProjectionMismatchCount: number;
+    readonly usageEventRowCount: number;
+    readonly resourceDeploymentRowCount: number;
+    readonly activeResourceUidConflictCount: number;
+    readonly liveNativeIdentityConflictCount: number;
+  }>;
   /** Read-only 0029 preflight; both counts must be exactly zero. */
   resourceDeletionAttestationBackfillCounts?(phase: DeployPhase): Promise<{
     readonly malformedFormRefCount: number;
@@ -282,7 +323,7 @@ export interface SchemaReader {
   unmatchedProviderRepairSagaCount?(phase: DeployPhase): Promise<number>;
   /** Read-only 0037 predecessor proof; the replaced v1 table must be empty. */
   legacyRuntimeInputPreparationCount?(phase: DeployPhase): Promise<number>;
-  /** Test boundary for the authoritative D1 trigger plus transactional zero assertion. */
+  /** Test boundary for the monotonic D1 trigger install/readback and zero predecessor proof. */
   installRuntimeInputPreparationV2Quiescence?(phase: DeployPhase): Promise<{
     readonly status: "installed";
     readonly predecessorRowCount: number;
@@ -342,8 +383,11 @@ interface RehearsalReceipt {
   }[];
   readonly preAppliedMigrations: readonly string[];
   readonly preShapeDigest: string;
+  readonly preApplicationShapeDigest: string | null;
+  readonly preDataIntegrityDigest: string | null;
   readonly postAppliedMigrations: readonly string[];
   readonly postShapeDigest: string;
+  readonly postDataIntegrityDigest: string | null;
   readonly predecessorReceipt: RehearsalReceiptLink | null;
 }
 
@@ -357,6 +401,8 @@ interface RehearsalAttempt {
   readonly migrationFiles: RehearsalReceipt["migrationFiles"];
   readonly preAppliedMigrations: readonly string[];
   readonly preShapeDigest: string;
+  readonly preApplicationShapeDigest: string | null;
+  readonly preDataIntegrityDigest: string | null;
   readonly predecessorReceiptDigest: string | null;
 }
 
@@ -368,6 +414,8 @@ interface ProductionAttempt {
   readonly receiptDigest: string;
   readonly preAppliedMigrations: readonly string[];
   readonly preShapeDigest: string;
+  readonly preApplicationShapeDigest: string | null;
+  readonly preDataIntegrityDigest: string | null;
 }
 
 /**
@@ -619,6 +667,18 @@ export async function runD1Schema(
       run,
       injected: options.reader,
     });
+    const legacyCatchupIntegrity = await inspectLegacyProductionCatchupDataIntegrity({
+      phase: "preflight",
+      wave,
+      configPath: inspectionConfig,
+      environment,
+      run,
+      injected: options.reader,
+    });
+    const legacyCatchupApplicationShapeDigest =
+      wave.selector === LEGACY_PRODUCTION_CATCHUP_BOUNDARY
+        ? applicationSchemaShapeDigest(initial)
+        : null;
     const artifactBlobIoCompatibility = await inspectArtifactBlobIoCompatibility({
       phase: "preflight",
       pending: wave.pending,
@@ -650,15 +710,34 @@ export async function runD1Schema(
         nextPendingMigration: wave.pending[0] ?? null,
         schemaShapeDigest: initial.shapeDigest,
         dataPreflights,
+        legacyProductionCatchup: {
+          ...legacyCatchupIntegrity,
+          applicationSchemaShapeDigest: legacyCatchupApplicationShapeDigest,
+          expectedApplicationSchemaShapeDigest:
+            wave.selector === LEGACY_PRODUCTION_CATCHUP_BOUNDARY
+              ? CANONICAL_0016_APPLICATION_SCHEMA_SHAPE_DIGEST
+              : null,
+        },
         artifactBlobIoCompatibility,
         readyForApply:
           wave.pending.length > 0 &&
           dataPreflights.status === "ready" &&
+          (wave.selector !== LEGACY_PRODUCTION_CATCHUP_BOUNDARY ||
+            (legacyCatchupIntegrity.status === "ready" &&
+              (JSON.stringify(initial.applied) !== JSON.stringify(wave.fromPrefixNames) ||
+                legacyCatchupApplicationShapeDigest ===
+                  CANONICAL_0016_APPLICATION_SCHEMA_SHAPE_DIGEST))) &&
           (artifactBlobIoCompatibility.status === "ready" ||
             artifactBlobIoCompatibility.status === "not_pending"),
       };
     }
     assertDataPreflightsReady(dataPreflights, "before qualification");
+    assertLegacyProductionCatchupReady(
+      wave,
+      initial,
+      legacyCatchupIntegrity,
+      "before qualification",
+    );
     assertArtifactBlobIoCompatibilityReady(artifactBlobIoCompatibility, "before qualification");
     if (invocation.environment === "integration" && wave.pending.length === 0) {
       throw preflightError(
@@ -728,8 +807,27 @@ export async function runD1Schema(
       run,
       injected: options.reader,
     });
+    const requalifiedLegacyCatchupIntegrity = await inspectLegacyProductionCatchupDataIntegrity({
+      phase: "preflight",
+      wave: requalifiedWave,
+      configPath,
+      environment,
+      run,
+      injected: options.reader,
+    });
     assertSameDataPreflights(dataPreflights, requalifiedDataPreflights, "during qualification");
+    assertSameLegacyProductionCatchupIntegrity(
+      legacyCatchupIntegrity,
+      requalifiedLegacyCatchupIntegrity,
+      "during qualification",
+    );
     assertDataPreflightsReady(requalifiedDataPreflights, "after qualification");
+    assertLegacyProductionCatchupReady(
+      requalifiedWave,
+      requalified,
+      requalifiedLegacyCatchupIntegrity,
+      "after qualification",
+    );
     const requalifiedArtifactBlobIoCompatibility = await inspectArtifactBlobIoCompatibility({
       phase: "preflight",
       pending: requalifiedWave.pending,
@@ -760,6 +858,7 @@ export async function runD1Schema(
         wave: requalifiedWave,
         pre: requalified,
         artifact: sourceMigrations,
+        preDataIntegrity: requalifiedLegacyCatchupIntegrity,
       });
     }
 
@@ -776,12 +875,31 @@ export async function runD1Schema(
       run,
       injected: options.reader,
     });
+    const fencedLegacyCatchupIntegrity = await inspectLegacyProductionCatchupDataIntegrity({
+      phase: "preflight",
+      wave: fencedWave,
+      configPath,
+      environment,
+      run,
+      injected: options.reader,
+    });
     assertSameDataPreflights(
       requalifiedDataPreflights,
       fencedDataPreflights,
       "at the final mutation fence",
     );
     assertDataPreflightsReady(fencedDataPreflights, "at the final mutation fence");
+    assertSameLegacyProductionCatchupIntegrity(
+      requalifiedLegacyCatchupIntegrity,
+      fencedLegacyCatchupIntegrity,
+      "at the final mutation fence",
+    );
+    assertLegacyProductionCatchupReady(
+      fencedWave,
+      fenced,
+      fencedLegacyCatchupIntegrity,
+      "at the final mutation fence",
+    );
     const fencedArtifactBlobIoCompatibility = await inspectArtifactBlobIoCompatibility({
       phase: "preflight",
       pending: fencedWave.pending,
@@ -818,6 +936,7 @@ export async function runD1Schema(
             commit: source.commit,
             wave: fencedWave,
             pre: fenced,
+            preDataIntegrity: fencedLegacyCatchupIntegrity,
             predecessorReceipt: predecessorReceiptEvidence,
           })
         : null;
@@ -840,16 +959,22 @@ export async function runD1Schema(
         wave: fencedWave,
         pre: fenced,
         artifact: sourceMigrations,
+        preDataIntegrity: fencedLegacyCatchupIntegrity,
       });
       if (invocation.environment === "production") {
         const productionAttempt = prepareProductionAttempt(receiptPath, {
           commit: source.commit,
           wave: fencedWave,
           pre: fenced,
+          preDataIntegrity: fencedLegacyCatchupIntegrity,
           receiptDigest: fencedReceiptEvidence.digest,
         });
         if (
           productionAttempt.preShapeDigest !== fencedReceiptEvidence.receipt.preShapeDigest ||
+          productionAttempt.preApplicationShapeDigest !==
+            fencedReceiptEvidence.receipt.preApplicationShapeDigest ||
+          productionAttempt.preDataIntegrityDigest !==
+            fencedReceiptEvidence.receipt.preDataIntegrityDigest ||
           JSON.stringify(productionAttempt.preAppliedMigrations) !==
             JSON.stringify(fencedReceiptEvidence.receipt.preAppliedMigrations)
         ) {
@@ -897,10 +1022,38 @@ export async function runD1Schema(
           "0043 artifact blob I/O deployment compatibility is not ready at the immediate migration fence",
         );
       }
-      // Keep this D1 count after the slower Worker/history proof. It is the
-      // final provider read before Wrangler starts the wave's first migration.
+      // Keep this D1 count after the slower Worker/history proof. The only
+      // later provider reads are the selected catch-up integrity fence and the
+      // 0037 exact monotonic-trigger/zero-count fence immediately below.
       await enforceArtifactBlobIoConflictMutationFence({
         pending: fencedWave.pending,
+        configPath,
+        environment,
+        run,
+        injected: options.reader,
+      });
+      const immediateLegacyCatchupIntegrity = await inspectLegacyProductionCatchupDataIntegrity({
+        phase: "mutation",
+        wave: fencedWave,
+        configPath,
+        environment,
+        run,
+        injected: options.reader,
+      });
+      assertSameLegacyProductionCatchupIntegrity(
+        fencedLegacyCatchupIntegrity,
+        immediateLegacyCatchupIntegrity,
+        "at the immediate migration fence",
+      );
+      assertLegacyProductionCatchupReady(
+        fencedWave,
+        fenced,
+        immediateLegacyCatchupIntegrity,
+        "at the immediate migration fence",
+      );
+      await verifyRuntimeInputPreparationV2QuiescenceAtMigrationFence({
+        pending: fencedWave.pending,
+        applied: fenced.applied,
         configPath,
         environment,
         run,
@@ -973,10 +1126,32 @@ export async function runD1Schema(
         post = await readState("verification", configPath, environment, run, options.reader);
       }
     }
+    const postLegacyCatchupIntegrity = await inspectLegacyProductionCatchupDataIntegrity({
+      phase: "verification",
+      wave,
+      configPath,
+      environment,
+      run,
+      injected: options.reader,
+    });
+    assertSameLegacyProductionCatchupIntegrity(
+      fencedLegacyCatchupIntegrity,
+      postLegacyCatchupIntegrity,
+      "across the migration",
+    );
     if (JSON.stringify(post.applied) !== JSON.stringify(wave.throughPrefixNames)) {
       throw verificationError(
         "D1 post-readback does not contain the exact selected-wave lineage",
         `expected=${JSON.stringify(wave.throughPrefixNames)} actual=${JSON.stringify(post.applied)}`,
+      );
+    }
+    if (
+      fencedReceiptEvidence &&
+      postLegacyCatchupIntegrity.dataIntegrityDigest !==
+        fencedReceiptEvidence.receipt.postDataIntegrityDigest
+    ) {
+      throw verificationError(
+        "production D1 post-data integrity differs from the exact rehearsal receipt",
       );
     }
     if (pendingMigrations(wave.throughPrefixNames, post.applied).length !== 0) {
@@ -1012,8 +1187,11 @@ export async function runD1Schema(
         })),
         preAppliedMigrations: wave.fromPrefixNames,
         preShapeDigest: (rehearsalAttempt as RehearsalAttempt).preShapeDigest,
+        preApplicationShapeDigest: (rehearsalAttempt as RehearsalAttempt).preApplicationShapeDigest,
+        preDataIntegrityDigest: (rehearsalAttempt as RehearsalAttempt).preDataIntegrityDigest,
         postAppliedMigrations: post.applied,
         postShapeDigest: post.shapeDigest,
+        postDataIntegrityDigest: postLegacyCatchupIntegrity.dataIntegrityDigest,
         predecessorReceipt:
           predecessorReceiptEvidence === null
             ? null
@@ -1052,6 +1230,13 @@ export async function runD1Schema(
       throughPrefixDigest: wave.throughPrefixDigest,
       pendingMigrations: wave.pending,
       dataPreflights: fencedDataPreflights,
+      legacyProductionCatchup: {
+        ...postLegacyCatchupIntegrity,
+        applicationSchemaShapeDigest:
+          wave.selector === LEGACY_PRODUCTION_CATCHUP_BOUNDARY
+            ? CANONICAL_0016_APPLICATION_SCHEMA_SHAPE_DIGEST
+            : null,
+      },
       artifactBlobIoCompatibility: fencedArtifactBlobIoCompatibility,
       runtimeInputQuiescence,
       preShapeDigest: requalified.shapeDigest,
@@ -1128,7 +1313,7 @@ function selectSchemaWave(
   const definition = SCHEMA_WAVES[invocation.throughMigration];
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "selected D1 wave requires the exact audited source inventory 0001-0045",
+      "selected D1 wave requires the exact audited source inventory 0001-0046",
       `from=${definition.fromMigration} through=${definition.throughMigration}`,
     );
   }
@@ -1173,7 +1358,7 @@ function assertAuditedMigrationHashes(
       file?.bytes !== body?.byteLength
     ) {
       throw preflightError(
-        "selected D1 wave requires the exact audited migration SHA-256 for every 0001-0045 file",
+        "selected D1 wave requires the exact audited migration SHA-256 for every 0001-0046 file",
         `position=${index + 1} name=${name} expected=${AUDITED_MIGRATION_SHA256[name]} actual=${actualDigest}`,
       );
     }
@@ -1195,6 +1380,199 @@ function digestMigrationFiles(files: readonly MigrationArtifactFile[]): string {
 
 function digestBytes(value: Uint8Array): string {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+interface LegacyProductionCatchupDataIntegrity {
+  readonly status: "not_pending" | "ready" | "data_repair_required";
+  readonly dataIntegrityDigest: string | null;
+  readonly ledgerRowCount: number | null;
+  readonly principalRowCount: number | null;
+  readonly organizationRowCount: number | null;
+  readonly organizationMembershipRowCount: number | null;
+  readonly organizationOwnerProjectionMismatchCount: number | null;
+  readonly usageEventRowCount: number | null;
+  readonly resourceDeploymentRowCount: number | null;
+  readonly activeResourceUidConflictCount: number | null;
+  readonly liveNativeIdentityConflictCount: number | null;
+}
+
+async function inspectLegacyProductionCatchupDataIntegrity(input: {
+  readonly phase: DeployPhase;
+  readonly wave: SelectedSchemaWave;
+  readonly configPath: string;
+  readonly environment: Readonly<Record<string, string>>;
+  readonly run: SchemaProcess;
+  readonly injected: SchemaReader | undefined;
+}): Promise<LegacyProductionCatchupDataIntegrity> {
+  if (input.wave.selector !== LEGACY_PRODUCTION_CATCHUP_BOUNDARY) {
+    return {
+      status: "not_pending",
+      dataIntegrityDigest: null,
+      ledgerRowCount: null,
+      principalRowCount: null,
+      organizationRowCount: null,
+      organizationMembershipRowCount: null,
+      organizationOwnerProjectionMismatchCount: null,
+      usageEventRowCount: null,
+      resourceDeploymentRowCount: null,
+      activeResourceUidConflictCount: null,
+      liveNativeIdentityConflictCount: null,
+    };
+  }
+  const raw = input.injected
+    ? await input.injected.legacyProductionCatchupDataIntegrity?.(input.phase)
+    : (
+        await new RemoteD1(input.configPath, {
+          environment: input.environment,
+          run: input.run,
+        }).query(
+          input.phase,
+          "0016 to 0022 critical data integrity",
+          `SELECT
+             (SELECT COUNT(*) FROM ledger) AS ledger_row_count,
+             (SELECT COUNT(*) FROM principals) AS principal_row_count,
+             (SELECT COUNT(*) FROM orgs) AS organization_row_count,
+             (SELECT COUNT(*) FROM org_memberships) AS organization_membership_row_count,
+             (SELECT COUNT(*) FROM orgs AS organization
+              WHERE NOT EXISTS (
+                SELECT 1 FROM org_memberships AS membership
+                WHERE membership.org_id = organization.id
+                  AND membership.principal_id = organization.owner_principal_id
+                  AND membership.role = 'owner'
+              )) AS organization_owner_projection_mismatch_count,
+             (SELECT COUNT(*) FROM usage_events) AS usage_event_row_count,
+             (SELECT COUNT(*) FROM tf_resource_deployments) AS resource_deployment_row_count,
+             (SELECT COUNT(*) FROM (
+                SELECT tenant_id, resource_uid
+                FROM tf_resource_deployments WHERE state = 'active'
+                GROUP BY tenant_id, resource_uid HAVING COUNT(*) > 1
+              )) AS active_resource_uid_conflict_count,
+             (SELECT COUNT(*) FROM (
+                SELECT tenant_id, provider_installation_ref, native_id
+                FROM tf_resource_deployments
+                WHERE state IN ('provisioning', 'candidate', 'active', 'draining')
+                GROUP BY tenant_id, provider_installation_ref, native_id
+                HAVING COUNT(*) > 1
+              )) AS live_native_identity_conflict_count`,
+        )
+      )[0];
+  const row = raw as Readonly<Record<string, unknown>> | undefined;
+  const snapshot = {
+    ledgerRowCount: exactNonnegativeCount(
+      row?.ledgerRowCount ?? row?.ledger_row_count,
+      "0016 to 0022 ledger row count",
+    ),
+    principalRowCount: exactNonnegativeCount(
+      row?.principalRowCount ?? row?.principal_row_count,
+      "0016 to 0022 principal row count",
+    ),
+    organizationRowCount: exactNonnegativeCount(
+      row?.organizationRowCount ?? row?.organization_row_count,
+      "0016 to 0022 organization row count",
+    ),
+    organizationMembershipRowCount: exactNonnegativeCount(
+      row?.organizationMembershipRowCount ?? row?.organization_membership_row_count,
+      "0016 to 0022 organization membership row count",
+    ),
+    organizationOwnerProjectionMismatchCount: exactNonnegativeCount(
+      row?.organizationOwnerProjectionMismatchCount ??
+        row?.organization_owner_projection_mismatch_count,
+      "0016 to 0022 organization owner projection mismatch count",
+    ),
+    usageEventRowCount: exactNonnegativeCount(
+      row?.usageEventRowCount ?? row?.usage_event_row_count,
+      "0016 to 0022 usage event row count",
+    ),
+    resourceDeploymentRowCount: exactNonnegativeCount(
+      row?.resourceDeploymentRowCount ?? row?.resource_deployment_row_count,
+      "0016 to 0022 resource deployment row count",
+    ),
+    activeResourceUidConflictCount: exactNonnegativeCount(
+      row?.activeResourceUidConflictCount ?? row?.active_resource_uid_conflict_count,
+      "0016 to 0022 active Resource UID conflict count",
+    ),
+    liveNativeIdentityConflictCount: exactNonnegativeCount(
+      row?.liveNativeIdentityConflictCount ?? row?.live_native_identity_conflict_count,
+      "0016 to 0022 live native identity conflict count",
+    ),
+  };
+  const dataIntegrityDigest = digestBytes(
+    Buffer.from(
+      JSON.stringify({
+        kind: "takoserver.d1-0016-to-0022-critical-data@v1",
+        ...snapshot,
+      }),
+    ),
+  );
+  return {
+    status:
+      snapshot.ledgerRowCount === 0 &&
+      snapshot.organizationOwnerProjectionMismatchCount === 0 &&
+      snapshot.activeResourceUidConflictCount === 0 &&
+      snapshot.liveNativeIdentityConflictCount === 0
+        ? "ready"
+        : "data_repair_required",
+    dataIntegrityDigest,
+    ...snapshot,
+  };
+}
+
+function applicationSchemaShapeDigest(state: D1SchemaState): string {
+  let value: unknown;
+  try {
+    value = JSON.parse(state.shape);
+  } catch {
+    throw preflightError("0016 canonical application schema shape is not valid JSON");
+  }
+  if (!Array.isArray(value)) {
+    throw preflightError("0016 canonical application schema shape is not an array");
+  }
+  const applicationRows = value.filter((entry) => {
+    if (
+      !isRecord(entry) ||
+      typeof entry.type !== "string" ||
+      typeof entry.name !== "string" ||
+      typeof entry.table !== "string" ||
+      typeof entry.sql !== "string"
+    ) {
+      throw preflightError("0016 canonical application schema shape has an invalid row");
+    }
+    return entry.name !== "d1_migrations" && entry.table !== "d1_migrations";
+  });
+  return digestBytes(Buffer.from(`${JSON.stringify(applicationRows)}\n`));
+}
+
+function assertLegacyProductionCatchupReady(
+  wave: SelectedSchemaWave,
+  state: D1SchemaState,
+  integrity: LegacyProductionCatchupDataIntegrity,
+  when: string,
+): void {
+  if (wave.selector !== LEGACY_PRODUCTION_CATCHUP_BOUNDARY) return;
+  if (integrity.status !== "ready" || integrity.dataIntegrityDigest === null) {
+    throw preflightError(
+      `0016 to 0022 production catch-up critical data requires operator repair ${when}`,
+      JSON.stringify(integrity),
+    );
+  }
+  if (
+    JSON.stringify(state.applied) === JSON.stringify(wave.fromPrefixNames) &&
+    applicationSchemaShapeDigest(state) !== CANONICAL_0016_APPLICATION_SCHEMA_SHAPE_DIGEST
+  ) {
+    throw preflightError(
+      `0016 to 0022 production catch-up requires the exact canonical 0001-0016 application schema shape ${when}`,
+    );
+  }
+}
+
+function assertSameLegacyProductionCatchupIntegrity(
+  left: LegacyProductionCatchupDataIntegrity,
+  right: LegacyProductionCatchupDataIntegrity,
+  when: string,
+): void {
+  if (JSON.stringify(left) !== JSON.stringify(right)) {
+    throw preflightError(`0016 to 0022 critical data integrity changed ${when}`);
+  }
 }
 
 interface ResourceDeletionAttestationPreflight {
@@ -1482,7 +1860,7 @@ async function enforceRuntimeInputPreparationV2Quiescence(input: {
     const result = await input.injected.installRuntimeInputPreparationV2Quiescence?.("mutation");
     if (result?.status !== "installed" || result.predecessorRowCount !== 0) {
       throw mutationError(
-        "0037 runtime-input quiescence could not prove its insert guard and zero predecessor in one transaction",
+        "0037 runtime-input quiescence could not prove its monotonic insert guard and zero predecessor",
       );
     }
     return "installed-and-zero";
@@ -1496,8 +1874,8 @@ async function enforceRuntimeInputPreparationV2Quiescence(input: {
   if (before.triggerSql === "") {
     await database.statement(
       "mutation",
-      "0037 runtime-input transactional quiescence",
-      RUNTIME_INPUT_QUIESCENCE_BATCH_SQL,
+      "0037 runtime-input monotonic quiescence trigger",
+      RUNTIME_INPUT_QUIESCENCE_INSTALL_SQL,
     );
   } else if (before.triggerSql !== RUNTIME_INPUT_QUIESCENCE_TRIGGER_SQL) {
     throw mutationError("0037 runtime-input quiescence trigger exists with unexpected SQL");
@@ -1513,6 +1891,43 @@ async function enforceRuntimeInputPreparationV2Quiescence(input: {
     );
   }
   return "installed-and-zero";
+}
+
+async function verifyRuntimeInputPreparationV2QuiescenceAtMigrationFence(input: {
+  readonly pending: readonly string[];
+  readonly applied: readonly string[];
+  readonly configPath: string;
+  readonly environment: Readonly<Record<string, string>>;
+  readonly run: SchemaProcess;
+  readonly injected: SchemaReader | undefined;
+}): Promise<void> {
+  if (
+    !input.pending.includes(RUNTIME_INPUT_PREPARATION_V2_MIGRATION) ||
+    !input.applied.includes(RUNTIME_INPUT_PREPARATION_MIGRATION)
+  ) {
+    return;
+  }
+  if (input.injected) {
+    const result = await input.injected.installRuntimeInputPreparationV2Quiescence?.("mutation");
+    if (result?.status !== "installed" || result.predecessorRowCount !== 0) {
+      throw mutationError("0037 runtime-input quiescence changed at the immediate migration fence");
+    }
+    return;
+  }
+  const database = new RemoteD1(input.configPath, {
+    environment: input.environment,
+    run: input.run,
+  });
+  const fenced = await readRuntimeInputQuiescence(database, "mutation");
+  if (
+    fenced.triggerSql !== RUNTIME_INPUT_QUIESCENCE_TRIGGER_SQL ||
+    fenced.predecessorRowCount !== 0
+  ) {
+    throw mutationError(
+      "0037 runtime-input quiescence changed at the immediate migration fence",
+      JSON.stringify(fenced),
+    );
+  }
 }
 
 async function readRuntimeInputQuiescence(
@@ -1997,6 +2412,7 @@ function assertReceiptMatches(
     readonly wave: SelectedSchemaWave;
     readonly pre: D1SchemaState;
     readonly artifact: MigrationArtifact;
+    readonly preDataIntegrity: LegacyProductionCatchupDataIntegrity;
   },
 ): void {
   assertReceiptChain(receipt, {
@@ -2011,6 +2427,7 @@ function assertReceiptMatches(
   }));
   const atWaveStart =
     JSON.stringify(input.pre.applied) === JSON.stringify(input.wave.fromPrefixNames);
+  const catchup = input.wave.selector === LEGACY_PRODUCTION_CATCHUP_BOUNDARY;
   if (
     receipt.commit !== input.commit ||
     receipt.fromMigration !== input.wave.fromMigration ||
@@ -2021,7 +2438,17 @@ function assertReceiptMatches(
     JSON.stringify(receipt.preAppliedMigrations) !== JSON.stringify(input.wave.fromPrefixNames) ||
     JSON.stringify(receipt.postAppliedMigrations) !==
       JSON.stringify(input.wave.throughPrefixNames) ||
-    (atWaveStart && receipt.preShapeDigest !== input.pre.shapeDigest)
+    (atWaveStart && receipt.preShapeDigest !== input.pre.shapeDigest) ||
+    (catchup &&
+      ((atWaveStart &&
+        receipt.preApplicationShapeDigest !== applicationSchemaShapeDigest(input.pre)) ||
+        receipt.preApplicationShapeDigest !== CANONICAL_0016_APPLICATION_SCHEMA_SHAPE_DIGEST ||
+        receipt.preDataIntegrityDigest !== input.preDataIntegrity.dataIntegrityDigest ||
+        !sha256Digest(receipt.postDataIntegrityDigest))) ||
+    (!catchup &&
+      (receipt.preApplicationShapeDigest !== null ||
+        receipt.preDataIntegrityDigest !== null ||
+        receipt.postDataIntegrityDigest !== null))
   ) {
     throw preflightError("production state does not exactly match the D1 rehearsal receipt");
   }
@@ -2038,8 +2465,10 @@ function readPredecessorReceiptEvidence(
   if (input.wave.selector === null) {
     throw preflightError("integration-only migration evidence has no predecessor receipt chain");
   }
-  const waveIndex = SCHEMA_WAVE_BOUNDARIES.indexOf(input.wave.selector);
-  if (waveIndex === 0) {
+  const waveIndex = RECEIPT_CHAIN_BOUNDARIES.indexOf(
+    input.wave.selector as (typeof RECEIPT_CHAIN_BOUNDARIES)[number],
+  );
+  if (input.wave.selector === LEGACY_PRODUCTION_CATCHUP_BOUNDARY || waveIndex === 0) {
     if (pathValue !== undefined) {
       throw preflightError("the first D1 wave refuses a predecessor rehearsal receipt");
     }
@@ -2059,7 +2488,7 @@ function readPredecessorReceiptEvidence(
   const path = exactReceiptPath(configuredPath);
   const evidence = readReceiptEvidence(path);
   assertReceiptChain(evidence.receipt, {
-    boundary: SCHEMA_WAVE_BOUNDARIES[waveIndex - 1] as SchemaWaveBoundary,
+    boundary: RECEIPT_CHAIN_BOUNDARIES[waveIndex - 1] as SchemaWaveBoundary,
     commit: input.commit,
     artifact: input.artifact,
   });
@@ -2078,8 +2507,10 @@ function assertPredecessorReceiptMatches(
   if (input.wave.selector === null) {
     throw preflightError("integration-only migration evidence has no predecessor receipt chain");
   }
-  const waveIndex = SCHEMA_WAVE_BOUNDARIES.indexOf(input.wave.selector);
-  const predecessorBoundary = SCHEMA_WAVE_BOUNDARIES[waveIndex - 1];
+  const waveIndex = RECEIPT_CHAIN_BOUNDARIES.indexOf(
+    input.wave.selector as (typeof RECEIPT_CHAIN_BOUNDARIES)[number],
+  );
+  const predecessorBoundary = RECEIPT_CHAIN_BOUNDARIES[waveIndex - 1];
   if (predecessorBoundary === undefined) {
     throw preflightError("the first D1 wave has no predecessor rehearsal receipt");
   }
@@ -2110,7 +2541,9 @@ function assertReceiptChain(
   if (input.boundary === null) {
     throw preflightError("integration-only migration evidence cannot enter a rehearsal chain");
   }
-  const waveIndex = SCHEMA_WAVE_BOUNDARIES.indexOf(input.boundary);
+  const waveIndex = RECEIPT_CHAIN_BOUNDARIES.indexOf(
+    input.boundary as (typeof RECEIPT_CHAIN_BOUNDARIES)[number],
+  );
   const definition = SCHEMA_WAVES[input.boundary];
   const migrationFiles = input.artifact.files
     .slice(definition.fromCount, definition.throughCount)
@@ -2129,11 +2562,18 @@ function assertReceiptChain(
     receipt.throughPrefixDigest !== digestMigrationFiles(throughPrefixFiles) ||
     JSON.stringify(receipt.migrationFiles) !== JSON.stringify(migrationFiles) ||
     JSON.stringify(receipt.preAppliedMigrations) !== JSON.stringify(expectedPreApplied) ||
-    JSON.stringify(receipt.postAppliedMigrations) !== JSON.stringify(expectedPostApplied)
+    JSON.stringify(receipt.postAppliedMigrations) !== JSON.stringify(expectedPostApplied) ||
+    (input.boundary === LEGACY_PRODUCTION_CATCHUP_BOUNDARY
+      ? receipt.preApplicationShapeDigest !== CANONICAL_0016_APPLICATION_SCHEMA_SHAPE_DIGEST ||
+        !sha256Digest(receipt.preDataIntegrityDigest) ||
+        !sha256Digest(receipt.postDataIntegrityDigest)
+      : receipt.preApplicationShapeDigest !== null ||
+        receipt.preDataIntegrityDigest !== null ||
+        receipt.postDataIntegrityDigest !== null)
   ) {
     throw preflightError("D1 rehearsal receipt chain does not match the frozen audited wave");
   }
-  if (waveIndex === 0) {
+  if (input.boundary === LEGACY_PRODUCTION_CATCHUP_BOUNDARY || waveIndex === 0) {
     if (receipt.predecessorReceipt !== null) {
       throw preflightError("the first D1 rehearsal receipt must have no predecessor receipt");
     }
@@ -2149,7 +2589,7 @@ function assertReceiptChain(
       "D1 rehearsal predecessor receipt digest does not match its exact embedded bytes",
     );
   }
-  const predecessorBoundary = SCHEMA_WAVE_BOUNDARIES[waveIndex - 1] as SchemaWaveBoundary;
+  const predecessorBoundary = RECEIPT_CHAIN_BOUNDARIES[waveIndex - 1] as SchemaWaveBoundary;
   assertReceiptChain(link.receipt, {
     boundary: predecessorBoundary,
     commit: input.commit,
@@ -2170,6 +2610,7 @@ function prepareRehearsalAttempt(
     readonly commit: string;
     readonly wave: SelectedSchemaWave;
     readonly pre: D1SchemaState;
+    readonly preDataIntegrity: LegacyProductionCatchupDataIntegrity;
     readonly predecessorReceipt: ReceiptEvidence | null;
   },
 ): RehearsalAttempt {
@@ -2191,6 +2632,15 @@ function prepareRehearsalAttempt(
     })),
     preAppliedMigrations: input.wave.fromPrefixNames,
     preShapeDigest: input.pre.shapeDigest,
+    preApplicationShapeDigest:
+      input.wave.selector === LEGACY_PRODUCTION_CATCHUP_BOUNDARY &&
+      JSON.stringify(input.pre.applied) === JSON.stringify(input.wave.fromPrefixNames)
+        ? applicationSchemaShapeDigest(input.pre)
+        : null,
+    preDataIntegrityDigest:
+      input.wave.selector === LEGACY_PRODUCTION_CATCHUP_BOUNDARY
+        ? input.preDataIntegrity.dataIntegrityDigest
+        : null,
     predecessorReceiptDigest: input.predecessorReceipt?.digest ?? null,
   };
   if (!existsSync(attemptPath)) {
@@ -2215,7 +2665,10 @@ function prepareRehearsalAttempt(
     JSON.stringify(attempt.preAppliedMigrations) !==
       JSON.stringify(expected.preAppliedMigrations) ||
     attempt.predecessorReceiptDigest !== expected.predecessorReceiptDigest ||
-    (atWaveStart && attempt.preShapeDigest !== input.pre.shapeDigest)
+    (atWaveStart && attempt.preShapeDigest !== input.pre.shapeDigest) ||
+    (atWaveStart && attempt.preApplicationShapeDigest !== expected.preApplicationShapeDigest) ||
+    (input.wave.selector === LEGACY_PRODUCTION_CATCHUP_BOUNDARY &&
+      attempt.preDataIntegrityDigest !== expected.preDataIntegrityDigest)
   ) {
     throw preflightError(
       "rehearsal state does not exactly match its original wave attempt evidence",
@@ -2247,6 +2700,8 @@ function readRehearsalAttempt(path: string): RehearsalAttempt {
     "migrationFiles",
     "preAppliedMigrations",
     "preShapeDigest",
+    "preApplicationShapeDigest",
+    "preDataIntegrityDigest",
     "predecessorReceiptDigest",
   ]);
   if (
@@ -2259,6 +2714,9 @@ function readRehearsalAttempt(path: string): RehearsalAttempt {
     !Array.isArray(value.migrationFiles) ||
     !stringArray(value.preAppliedMigrations) ||
     typeof value.preShapeDigest !== "string" ||
+    (value.preApplicationShapeDigest !== null &&
+      typeof value.preApplicationShapeDigest !== "string") ||
+    (value.preDataIntegrityDigest !== null && typeof value.preDataIntegrityDigest !== "string") ||
     (value.predecessorReceiptDigest !== null && typeof value.predecessorReceiptDigest !== "string")
   ) {
     throw preflightError("D1 rehearsal attempt evidence has an invalid shape");
@@ -2273,6 +2731,8 @@ function readRehearsalAttempt(path: string): RehearsalAttempt {
     migrationFiles: parseMigrationRows(value.migrationFiles, "D1 rehearsal attempt evidence"),
     preAppliedMigrations: value.preAppliedMigrations,
     preShapeDigest: value.preShapeDigest,
+    preApplicationShapeDigest: value.preApplicationShapeDigest as string | null,
+    preDataIntegrityDigest: value.preDataIntegrityDigest as string | null,
     predecessorReceiptDigest: value.predecessorReceiptDigest as string | null,
   };
 }
@@ -2283,6 +2743,7 @@ function prepareProductionAttempt(
     readonly commit: string;
     readonly wave: SelectedSchemaWave;
     readonly pre: D1SchemaState;
+    readonly preDataIntegrity: LegacyProductionCatchupDataIntegrity;
     readonly receiptDigest: string;
   },
 ): ProductionAttempt {
@@ -2298,6 +2759,15 @@ function prepareProductionAttempt(
     receiptDigest: input.receiptDigest,
     preAppliedMigrations: input.wave.fromPrefixNames,
     preShapeDigest: input.pre.shapeDigest,
+    preApplicationShapeDigest:
+      input.wave.selector === LEGACY_PRODUCTION_CATCHUP_BOUNDARY &&
+      JSON.stringify(input.pre.applied) === JSON.stringify(input.wave.fromPrefixNames)
+        ? applicationSchemaShapeDigest(input.pre)
+        : null,
+    preDataIntegrityDigest:
+      input.wave.selector === LEGACY_PRODUCTION_CATCHUP_BOUNDARY
+        ? input.preDataIntegrity.dataIntegrityDigest
+        : null,
   };
   if (!existsSync(path)) {
     if (JSON.stringify(input.pre.applied) !== JSON.stringify(input.wave.fromPrefixNames)) {
@@ -2318,7 +2788,10 @@ function prepareProductionAttempt(
     attempt.receiptDigest !== expected.receiptDigest ||
     JSON.stringify(attempt.preAppliedMigrations) !==
       JSON.stringify(expected.preAppliedMigrations) ||
-    (atWaveStart && attempt.preShapeDigest !== input.pre.shapeDigest)
+    (atWaveStart && attempt.preShapeDigest !== input.pre.shapeDigest) ||
+    (atWaveStart && attempt.preApplicationShapeDigest !== expected.preApplicationShapeDigest) ||
+    (input.wave.selector === LEGACY_PRODUCTION_CATCHUP_BOUNDARY &&
+      attempt.preDataIntegrityDigest !== expected.preDataIntegrityDigest)
   ) {
     throw preflightError(
       "production state does not exactly match its original wave attempt evidence",
@@ -2348,6 +2821,8 @@ function readProductionAttempt(path: string): ProductionAttempt {
     "receiptDigest",
     "preAppliedMigrations",
     "preShapeDigest",
+    "preApplicationShapeDigest",
+    "preDataIntegrityDigest",
   ]);
   if (
     value.kind !== PRODUCTION_ATTEMPT_KIND ||
@@ -2356,7 +2831,10 @@ function readProductionAttempt(path: string): ProductionAttempt {
     typeof value.throughMigration !== "string" ||
     typeof value.receiptDigest !== "string" ||
     !stringArray(value.preAppliedMigrations) ||
-    typeof value.preShapeDigest !== "string"
+    typeof value.preShapeDigest !== "string" ||
+    (value.preApplicationShapeDigest !== null &&
+      typeof value.preApplicationShapeDigest !== "string") ||
+    (value.preDataIntegrityDigest !== null && typeof value.preDataIntegrityDigest !== "string")
   ) {
     throw preflightError("D1 production wave attempt evidence has an invalid shape");
   }
@@ -2368,6 +2846,8 @@ function readProductionAttempt(path: string): ProductionAttempt {
     receiptDigest: value.receiptDigest,
     preAppliedMigrations: value.preAppliedMigrations,
     preShapeDigest: value.preShapeDigest,
+    preApplicationShapeDigest: value.preApplicationShapeDigest as string | null,
+    preDataIntegrityDigest: value.preDataIntegrityDigest as string | null,
   };
 }
 
@@ -2426,8 +2906,11 @@ function parseReceipt(
     "migrationFiles",
     "preAppliedMigrations",
     "preShapeDigest",
+    "preApplicationShapeDigest",
+    "preDataIntegrityDigest",
     "postAppliedMigrations",
     "postShapeDigest",
+    "postDataIntegrityDigest",
     "predecessorReceipt",
   ]);
   if (
@@ -2440,8 +2923,12 @@ function parseReceipt(
     !Array.isArray(value.migrationFiles) ||
     !stringArray(value.preAppliedMigrations) ||
     typeof value.preShapeDigest !== "string" ||
+    (value.preApplicationShapeDigest !== null &&
+      typeof value.preApplicationShapeDigest !== "string") ||
+    (value.preDataIntegrityDigest !== null && typeof value.preDataIntegrityDigest !== "string") ||
     !stringArray(value.postAppliedMigrations) ||
     typeof value.postShapeDigest !== "string" ||
+    (value.postDataIntegrityDigest !== null && typeof value.postDataIntegrityDigest !== "string") ||
     (value.predecessorReceipt !== null && !isRecord(value.predecessorReceipt))
   ) {
     throw preflightError(`${label} has an invalid shape`);
@@ -2468,8 +2955,11 @@ function parseReceipt(
     migrationFiles: parseMigrationRows(value.migrationFiles, label),
     preAppliedMigrations: value.preAppliedMigrations,
     preShapeDigest: value.preShapeDigest,
+    preApplicationShapeDigest: value.preApplicationShapeDigest as string | null,
+    preDataIntegrityDigest: value.preDataIntegrityDigest as string | null,
     postAppliedMigrations: value.postAppliedMigrations,
     postShapeDigest: value.postShapeDigest,
+    postDataIntegrityDigest: value.postDataIntegrityDigest as string | null,
     predecessorReceipt,
   };
 }
@@ -2613,6 +3103,10 @@ function last(values: readonly string[]): string | null {
 
 function stringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((entry) => typeof entry === "string");
+}
+
+function sha256Digest(value: unknown): value is string {
+  return typeof value === "string" && /^sha256:[0-9a-f]{64}$/u.test(value);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

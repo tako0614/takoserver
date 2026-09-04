@@ -21,9 +21,11 @@
     "src/entry-form-authority-worker.ts",
     "src/entry-integration-form-authority-worker.ts",
     "src/entry-integration-form-authority-operator-worker.ts",
+    "src/entry-exact-artifact-recovery-worker.ts",
     "worker-configuration.d.ts",
     "form-authority-worker-configuration.d.ts",
     "integration-form-authority-worker-configuration.d.ts",
-    "integration-form-authority-operator-worker-configuration.d.ts"
+    "integration-form-authority-operator-worker-configuration.d.ts",
+    "exact-artifact-recovery-worker-configuration.d.ts"
   ]
 }

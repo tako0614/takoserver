@@ -69,6 +69,36 @@ describe("exact source qualification", () => {
     expect(fake.calls.some((call) => call[1] === "fetch")).toBe(false);
   });
 
+  test("can require clean remote-reachable provenance without changing routine integration", async () => {
+    const dirty = gitProcess({
+      branch: "release/candidate",
+      dirty: " M src/entry-exact-artifact-recovery-worker.ts\0",
+    });
+    await expect(
+      qualifySource({
+        environment: "integration",
+        commit: COMMIT,
+        policy: "clean-remote",
+        run: dirty.run,
+      }),
+    ).rejects.toThrow("clean");
+    expect(dirty.calls.some((call) => call[1] === "fetch")).toBe(false);
+
+    const clean = gitProcess({ branch: "release/candidate" });
+    const source = await qualifySource({
+      environment: "integration",
+      commit: COMMIT,
+      policy: "clean-remote",
+      run: clean.run,
+    });
+    expect(source).toMatchObject({
+      commit: COMMIT,
+      dirty: false,
+      changedPaths: [],
+      remoteRef: "origin/release-candidate",
+    });
+  });
+
   test("requires clean production main equal to freshly fetched origin/main", async () => {
     const fake = gitProcess({ branch: "main" });
     const source = await qualifySource({

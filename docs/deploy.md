@@ -1,6 +1,6 @@
 # Takoserver deploy surfaces
 
-This repository owns one deploy entrypoint and twenty-seven separate mutation surfaces.
+This repository owns one deploy entrypoint and twenty-eight separate mutation surfaces.
 The contract is read-only:
 
 ```sh
@@ -18,11 +18,12 @@ The production-shaped D1 lane is deliberately narrower. Rehearsal and
 production require exactly one approved next-wave selector:
 
 ```sh
-bun run deploy -- takoserver-d1-schema --status --environment=<rehearsal|production> --commit=<40-hex-sha> --through-migration=<0028|0033|0036|0043|0044|0045>
-bun run deploy -- takoserver-d1-schema --apply --environment=<rehearsal|production> --commit=<40-hex-sha> --through-migration=<0028|0033|0036|0043|0044|0045>
+bun run deploy -- takoserver-d1-schema --status --environment=<rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046>
+bun run deploy -- takoserver-d1-schema --apply --environment=<rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046>
 ```
 
-The fixed order is 0023–0028, 0029–0033, 0034–0036, 0037–0043, 0044, then 0045. A
+The fixed order is the one-time legacy production catch-up 0017–0022, then
+0023–0028, 0029–0033, 0034–0036, 0037–0043, 0044, 0045, and 0046. A
 selector is accepted only when its predecessor is the current lineage; an
 incomplete wave can resume under the same selector, but cannot skip forward.
 Integration retains only the no-selector fast path for disposable cadence and
@@ -31,6 +32,12 @@ and it cannot write evidence accepted by rehearsal or production. The separate
 `takoserver-d1-schema-rehearsal-baseline` surface is rehearsal-only, accepts no
 selector, and takes only an exact empty database through the fixed 0001–0022
 prefix without emitting a production rehearsal receipt.
+The 0022 selector is not a general prefix-adoption mechanism. It accepts only
+the exact audited 0001–0016 lineage and canonical 0016 application-schema shape,
+rehearses the exact 0017–0022 bytes against an independently populated
+0016-compatible database, and binds critical data counts to its standalone
+immutable receipt. Production must present that exact receipt and the same
+pre-shape and data digest before the first migration can run.
 
 The integration JIT credential authority instead accepts exactly one of
 `--issue`, `--status`, or `--revoke` through that same entrypoint, and the
@@ -480,6 +487,28 @@ from this tuple; no duplicate environment variable may redirect it. Keep the
 executor two-secret file and the receipt three-secret file separate from this
 non-secret target.
 
+The one reviewed integration incident additionally requires this closed target
+member. It is rejected outside integration and unless the current provider
+executor, authenticated Form operator gateway, and fixed integration E2E tenant
+are all present:
+
+```json
+{
+  "exactArtifactRecovery": {
+    "workerName": "takoserver-exact-artifact-recovery-integration",
+    "retentionPolicy": {
+      "kind": "takoserver.exact-failed-run-artifact-recovery-detail-retention@v1",
+      "evidenceDigest": "sha256:<digest of the current owner retention policy>",
+      "detailRetentionMilliseconds": 604800000
+    }
+  }
+}
+```
+
+The retention duration is an owner decision, not a recovery default. A target
+without a current explicit policy cannot run recovery or purge details. The
+recovery Worker name must be distinct from every permanent Worker name.
+
 While the integration Form-authority migration still has to recognize the
 immutable public Worker generation from before the executor, the operator must
 also copy that generation's exact endpoint suffix into this closed,
@@ -526,6 +555,60 @@ status calls also require the integration deploy credential described below;
 the executor status reads its parent token only from the separate canonical
 two-secret file named above.
 
+## One-shot exact artifact recovery
+
+The recovery owner is the normal product deploy entrypoint, not a permanent
+HTTP API and not a raw D1/R2 operator script:
+
+```bash
+export TAKOSERVER_EXACT_ARTIFACT_RECOVERY_REQUEST_PATH=/absolute/owner-private/recovery-request.v2.json
+export TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH=/absolute/owner-private/cloudflare-provider-executor.secrets.json
+export TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH=/absolute/owner-private/form-authority-operator.private.jwk.json
+
+bun run deploy -- takoserver-exact-artifact-recovery --status --environment=integration --commit=<request-source-commit>
+bun run deploy -- takoserver-exact-artifact-recovery --apply --environment=integration --commit=<request-source-commit>
+```
+
+The request file is canonical
+`takoserver.exact-failed-run-artifact-recovery-request@v2`, owned by the current
+user, mode `0600`, link-free, outside the repository, and contains the complete
+exact incident closure. Its body and private evidence are never printed. The
+same request digest, target, selected commit, R2 identity, explicit retention
+policy, migration 0045 lineage, 4 owners, 5 uploads, 2 replay keys, 28 members,
+and 29 holds are checked again on every step. Migration 0046 contains no
+incident digest.
+
+Each apply runs the complete owner gate and performs at most one transition;
+run status again after every invocation. The ordered states are:
+
+1. Publish one request-pinned Worker Version with no route, custom domain,
+   workers.dev endpoint, preview URL, scheduled trigger, or secret.
+2. Publish one temporary overlay of the existing authenticated Form operator
+   gateway, adding only the recovery service binding plus the exact request and
+   Worker Version pins.
+3. Invoke one signed prepare/settle/complete transition through that gateway.
+4. Keep the route-less Worker and its authenticated service-binding overlay
+   installed through the target-declared retention deadline.
+5. At that deadline, recheck the complete D1/R2/identity fence and invoke the
+   signed purge through the gateway. The Worker performs all destructive detail
+   changes with one real `D1Database.batch()` and requires a durable compact
+   `purged` readback; a failed statement rolls the whole batch back and a lost
+   acknowledgement is settled from that readback without repeating a committed
+   purge.
+6. Only after the durable `purged` readback, republish the gateway's ordinary
+   closure and then delete the route-less recovery Worker.
+
+A `delete_started` candidate is never retried. Status first plans
+`retire_gateway_for_handoff`; only after the ordinary gateway Version is live
+does it emit a deterministic `quiescenceEvidenceDigest`. A separate reviewed,
+canonical owner-only `TAKOSERVER_EXACT_ARTIFACT_RECOVERY_LOST_ACK_PATH` must
+bind that digest, the exact predecessor Version, candidate ordinal, and either
+confirmed HEAD absence or a new reviewed operation/fence for the observed
+ETag. The next apply publishes a new immutable route-less Worker Version with
+that handoff; only a later step reattaches the gateway. Present or changed
+bytes never become an inferred retry. Publication or deletion acknowledgement
+loss always returns to status and is never blindly repeated.
+
 ## Environment inputs and action matrix
 
 `requiresEnv` in `takos.deploy-contract@v2` is the conservative union of the
@@ -557,6 +640,7 @@ remains unchanged.
 | `takoserver-managed-object-receipt-authority` | `--status`, `--apply` | integration, rehearsal, production | The Worker name and provider installation come solely from `target.cloudflareProviderExecutor`; a resolved Cloudflare deploy credential is required for both actions. `--apply` additionally requires `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_MANAGED_OBJECT_RECEIPT_SECRETS_PATH`; only a fresh rehearsal/production `v1` apply reads `TAKOSERVER_MANAGED_OBJECT_RECEIPT_AUTHORITY_REHEARSAL_RECEIPT_PATH`. Status never reads any of those three apply-only inputs. |
 | `takoserver-managed-worker-gateway` | `--status`, `--apply` | integration, rehearsal, production | Exact route, gateway and legacy script, zone, provider, dispatch namespace, and gateway identities plus a resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. It reads no managed-object S3/proof secret or receipt-authority evidence. |
 | `cloudflare-provider-executor` | `--status`, `--apply`; `--apply --reverse` | integration, rehearsal, production | `TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH` is required for every action and contains exactly the parent `CLOUDFLARE_API_TOKEN` and runtime-input seal keyring. Status uses the token only for authoritative readback; forward apply publishes both secret bindings atomically. Apply/reverse additionally require `TAKOSERVER_INDEPENDENT_REVIEW`. Receipt authority, gateway, migration 0045, and the selected target must already be exact. |
+| `takoserver-exact-artifact-recovery` | `--status`, `--apply` | integration only | `TAKOSERVER_EXACT_ARTIFACT_RECOVERY_REQUEST_PATH`, `TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH`, and `TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH` for both actions; `TAKOSERVER_INDEPENDENT_REVIEW` for apply. `TAKOSERVER_EXACT_ARTIFACT_RECOVERY_LOST_ACK_PATH` is read only after status has proved the predecessor quiesced and planned a successor. Every path names a canonical owner-only 0600 file outside the repository. |
 | `takoserver-form-authority-identity-probe` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-form-authority-worker` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-integration-form-authority-worker` | `--status`, `--apply` | integration only | Resolved Cloudflare credential for both (explicit token, or the integration OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
@@ -568,7 +652,7 @@ remains unchanged.
 | `takoserver-site` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback). |
 | `takoserver-console` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback). |
 | `takoserver-d1-schema-rehearsal-baseline` | `--status`, `--apply` | rehearsal only | No selector is accepted. `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. The receipt-path input is never read. |
-| `takoserver-d1-schema` | `--status`, `--apply` | integration, rehearsal, production | Rehearsal and production require `--through-migration=0028|0033|0036|0043|0044|0045`; integration rejects every selector and accepts only its no-selector disposable path. Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; one distinct `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` per wave for `--apply` in rehearsal or production only; every rehearsal wave after the first also requires the immediately preceding `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH`. A pending 0043 additionally requires `TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH` and the staged compatibility protocol below. |
+| `takoserver-d1-schema` | `--status`, `--apply` | integration, rehearsal, production | Rehearsal and production require `--through-migration=0022|0028|0033|0036|0043|0044|0045|0046`; integration rejects every selector and accepts only its no-selector disposable path. Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; one distinct `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` per wave for `--apply` in rehearsal or production only. The one-time 0016→0022 receipt is standalone; ordinary chained rehearsal waves after 0028 require the immediately preceding `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH`. A pending 0043 additionally requires `TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH` and the staged compatibility protocol below. |
 | `takoserver-signing-key-register` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PUBLIC_JWK_PATH` for `--apply` only. |
 | `takoserver-signing-repair` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PRIVATE_JWK_PATH` for `--apply` only. |
 | `takoserver-signing-rotation` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_NEXT_PRIVATE_JWK_PATH` for `--apply` only. |
@@ -906,7 +990,7 @@ The separate authority and irreversible surfaces are:
   member of an active manifest root as
   `dataPreflights.artifactBlobIoFence.activeRootDeletingCandidateConflictCount`.
   A nonzero count is `legacy_data_repair_required`, and the exact query is run
-  again after the 0037 transactional guard and immediately before the wave's
+  again after the 0037 monotonic insert guard and immediately before the wave's
   first migration. The audited migration inventory has one
   fixed SHA-256 per file, including every already-applied file; a changed old
   migration therefore cannot be re-attested from the current checkout. Each
@@ -917,22 +1001,34 @@ The separate authority and irreversible surfaces are:
   consumes the matching wave receipt read-only. The fixed 0044 wave adds durable
   artifact-consumer resolution receipts. Its distinct 0045 successor adds the
   private Cloudflare executor's pre-effect operation CAS and can start only from
-  the exact 0044 boundary. Immediately
-  before 0037, one D1
-  transaction installs an exact `BEFORE INSERT` guard on the v1 predecessor and
-  asserts its row count is still zero. Because the published 0037 replacement
-  drops that guarded table, no row inserted after the ordinary preflight can be
-  silently discarded. This is a separate protocol around immutable 0037 SQL;
-  production is blocked unless its trigger and zero assertion both read back.
-  The pinned Wrangler sends the single guard command through D1's query API;
-  Cloudflare documents that semicolon-joined statements execute as a
-  [batch](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/query/)
-  and that a failed D1 batch
-  [rolls back the entire sequence](https://developers.cloudflare.com/d1/worker-api/d1-database/#batch).
-  D1 also documents that each individual database
+  the exact 0044 boundary. The separate 0046 successor widens exact owner-closure
+  receipts only for deterministic integration recovery writers and adds one
+  durable singleton authorization; it can start only from the exact 0045
+  boundary. The exceptional 0022 selector is a standalone catch-up receipt,
+  not the root of this ordinary chain and not permission to adopt an arbitrary
+  migration-name prefix. It can start only from the exact audited 0001–0016
+  names and the frozen canonical 0016 application-schema digest. Rehearsal and
+  production must have the same critical-data digest covering ledger,
+  principal, organization, owner-membership projection, usage-event, resource
+  deployment, active Resource UID conflict, and live native-identity conflict
+  counts. Unsafe conflicts or a nonempty ledger stop before mutation. The
+  receipt binds that pre-shape/data snapshot, exact 0017–0022 bytes, and the
+  post-shape/data readback; production consumes it once under the usual
+  no-overwrite attempt and forward-repair-only rules. Immediately
+  before 0037, one single-statement
+  `CREATE TRIGGER IF NOT EXISTS` durably installs the exact `BEFORE INSERT`
+  guard on the v1 predecessor. The lane reads the canonical trigger SQL back,
+  then separately proves the predecessor count is zero. It repeats the exact
+  trigger-plus-count read immediately before starting the migration; the
+  published 0037 replacement then drops the guarded table. A crash after
+  trigger installation therefore leaves a safe monotonic forward-repair state:
+  retry validates the same trigger and continues, while a different trigger is
+  never replaced. D1 documents that each individual database
   [processes queries one at a time](https://developers.cloudflare.com/d1/platform/limits/#how-much-work-can-a-d1-database-do),
-  so an insert either precedes the transactional zero assertion or encounters
-  the installed trigger.
+  so an insert before installation is observed by the zero-count proof, and an
+  insert after installation encounters the guard. This protocol does not send
+  multiple destructive REST statements and does not claim that the REST query
+  endpoint provides `D1Database.batch()` rollback semantics.
   On a provider failure the lane immediately reads authoritative lineage and
   shape and reports `lastAppliedMigration` and `nextPendingMigration`; a rerun
   resumes only the same selected wave and the next selector remains refused
@@ -1274,7 +1370,7 @@ For a D1 rehearsal apply, the lane creates a no-overwrite
 fence and before any mutation. If Wrangler partially applies a wave, that file
 preserves the original predecessor shape and the exact predecessor-receipt
 digest so the same wave can resume without fabricating new evidence. Use a
-different receipt path for each of the four waves and, after the first, point
+different receipt path for each selected wave and, after the first, point
 `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH` at the immediately preceding
 canonical receipt. It is embedded and SHA-256-linked into the new receipt.
 The attempt is removed only after the final no-overwrite receipt is written.

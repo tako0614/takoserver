@@ -27,16 +27,20 @@ export interface SourceQualification {
   readonly remoteRef: string | null;
 }
 
+export type SourceQualificationPolicy = "environment-default" | "clean-remote";
+
 /**
  * Qualifies the one worktree the command will publish.
  *
- * Integration and rehearsal intentionally retain dirty iteration. Production
- * accepts either current origin/main or an explicit clean commit that a remote
- * ref already contains; the `--commit` selector never means "whatever HEAD is".
+ * Integration and rehearsal intentionally retain dirty iteration by default.
+ * A high-risk surface can opt into the same clean, remote-reachable provenance
+ * required by production without changing the routine integration contract.
+ * The `--commit` selector never means "whatever HEAD is".
  */
 export async function qualifySource(input: {
   readonly environment: DeployEnvironment;
   readonly commit: string;
+  readonly policy?: SourceQualificationPolicy;
   readonly run?: QualificationProcess;
 }): Promise<SourceQualification> {
   if (!/^[0-9a-f]{40}$/u.test(input.commit)) {
@@ -59,12 +63,13 @@ export async function qualifySource(input: {
   ]);
   const changedPaths = porcelainPaths(dirtyOutput);
   const dirty = changedPaths.length > 0;
-  if (input.environment !== "production") {
+  const requiresCleanRemote = input.environment === "production" || input.policy === "clean-remote";
+  if (!requiresCleanRemote) {
     return { commit: head, branch, dirty, changedPaths, remoteRef: null };
   }
   if (dirty) {
     throw preflightError(
-      "production publication requires a clean worktree",
+      "clean remote publication requires a clean worktree",
       JSON.stringify(changedPaths),
     );
   }
@@ -97,7 +102,7 @@ export async function qualifySource(input: {
     .sort();
   const remoteRef = remoteRefs[0];
   if (!remoteRef) {
-    throw preflightError(`production commit ${head} is not reachable from an exact remote ref`);
+    throw preflightError(`source commit ${head} is not reachable from an exact remote ref`);
   }
   return { commit: head, branch, dirty: false, changedPaths: [], remoteRef };
 }
