@@ -643,7 +643,7 @@ export const DEPLOY_CONTRACT = {
       obligations: {
         provenance:
           `${exactSource} Rehearsal and production accept only the fixed next boundaries 0028, ` +
-          "0033, 0036 or 0043. The exact predecessor lineage, selected through-prefix and wave " +
+          "0033, 0036, 0043 or 0044. The exact predecessor lineage, selected through-prefix and wave " +
           "bytes are checked against their fixed SHA-256 inventory, digested and sealed before the " +
           "forward-only apply. Integration accepts no selector; its no-selector disposable cadence " +
           "is explicitly integration-only.",

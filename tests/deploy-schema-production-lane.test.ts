@@ -357,7 +357,7 @@ describe("production-shaped D1 migration lane", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-integration-selector-"));
     try {
       const fixture = processFixture();
-      for (const throughMigration of ["0028", "0033", "0036", "0043"] as const) {
+      for (const throughMigration of ["0028", "0033", "0036", "0043", "0044"] as const) {
         const failure = await runD1Schema(
           {
             action: "status",
@@ -581,14 +581,14 @@ describe("production-shaped D1 migration lane", () => {
     }
   });
 
-  test("a fixed wave refuses migrations outside the exact audited 0001-0043 inventory", async () => {
+  test("a fixed wave refuses migrations outside the exact audited 0001-0044 inventory", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-lineage-extension-"));
     try {
       const migrationDirectory = join(root, "migrations");
       cpSync(resolve(import.meta.dir, "../migrations"), migrationDirectory, { recursive: true });
       copyFileSync(
-        join(migrationDirectory, "0043_artifact_blob_io_fences.sql"),
-        join(migrationDirectory, "0044_unreviewed_extension.sql"),
+        join(migrationDirectory, "0044_artifact_consumer_resolution_receipts.sql"),
+        join(migrationDirectory, "0045_unreviewed_extension.sql"),
       );
       const failure = await runD1Schema(
         {
@@ -611,7 +611,7 @@ describe("production-shaped D1 migration lane", () => {
     }
   });
 
-  test("the four no-overwrite wave receipts cover the exact 21-file production suffix once", async () => {
+  test("the five no-overwrite wave receipts cover the exact 22-file production suffix once", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-all-waves-"));
     try {
       chmodSync(root, 0o700);
@@ -620,6 +620,7 @@ describe("production-shaped D1 migration lane", () => {
         ["0033", 28, 33],
         ["0036", 33, 36],
         ["0043", 36, 43],
+        ["0044", 43, 44],
       ] as const;
       const receipted: {
         readonly name: string;
@@ -667,7 +668,7 @@ describe("production-shaped D1 migration lane", () => {
             bytes,
           })),
       );
-      expect(new Set(receipted.map(({ name }) => name)).size).toBe(21);
+      expect(new Set(receipted.map(({ name }) => name)).size).toBe(22);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

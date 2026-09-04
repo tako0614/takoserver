@@ -311,6 +311,47 @@ export type ProviderNativeAbsence =
       readonly retryable: boolean;
     };
 
+/** Provider-owned answer about which held artifact an exact native identity consumes. */
+export type ProviderArtifactConsumption =
+  | {
+      readonly outcome: "absent";
+      /** Bounded, value-free evidence; never includes a native id or credential. */
+      readonly evidence: JsonObject;
+    }
+  | {
+      readonly outcome: "present";
+      /** Exact provider-backed matches. Zero and multiple remain non-terminal upstream. */
+      readonly manifestDigests: readonly `sha256:${string}`[];
+      readonly evidence: JsonObject;
+    }
+  | {
+      readonly outcome: "unknown";
+      readonly reason: ProviderNativeAbsenceUnknownReason;
+      readonly retryable: boolean;
+    };
+
+export interface ProviderArtifactConsumptionInput {
+  readonly offering: ProviderOffering;
+  readonly nativeId: string;
+  readonly identity: {
+    readonly tenantRef: string;
+    readonly resourceUid: string;
+    /** Historical pre-attestation rows legitimately have no surviving address. */
+    readonly address?: { readonly space: string; readonly name: string };
+  };
+  /** Complete, sorted manifest hold candidates from the fenced tenant snapshot. */
+  readonly candidateManifestDigests: readonly `sha256:${string}`[];
+  /**
+   * Present only for the exact current Resource snapshot. It is not caller
+   * evidence: Takoserver derives and fences it before invoking the adapter.
+   */
+  readonly currentResource?: {
+    readonly revision: string;
+    readonly relationsDigest: `sha256:${string}`;
+    readonly providerOperationIds: readonly string[];
+  };
+}
+
 export interface ProviderNativeReadbackInput {
   readonly offering: ProviderOffering;
   readonly nativeId: string;
@@ -347,6 +388,16 @@ export interface Provider {
     readonly offering: ProviderOffering;
     readonly descriptor: ProviderNativeReadbackDescriptor;
   }): Promise<ProviderNativeAbsence>;
+  /**
+   * Strictly read-only artifact attribution for one recorded Deployment.
+   * Implementations may identify only digests from provider-owned state or a
+   * provider identity bound to the exact current Resource snapshot. Missing,
+   * zero, multiple, or unverifiable matches must stay unknown/present-empty;
+   * this method must never mutate the provider to manufacture evidence.
+   */
+  verifyArtifactConsumption?(
+    input: ProviderArtifactConsumptionInput,
+  ): Promise<ProviderArtifactConsumption>;
   /**
    * Deterministic, non-mutating recovery for an apply whose acknowledgement
    * was lost. Implementations must read/adopt an existing native identity (or

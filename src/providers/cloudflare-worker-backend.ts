@@ -1,6 +1,8 @@
 import type { JsonObject, Sql } from "../ports.ts";
 import type {
   ApplyInput,
+  ProviderArtifactConsumption,
+  ProviderArtifactConsumptionInput,
   ProviderNativeAbsence,
   ProviderNativeReadbackDescriptor,
   ProviderNativeReadbackInput,
@@ -210,6 +212,9 @@ export interface CloudflareWorkerBackend {
     readonly offering: ProviderOffering;
     readonly descriptor: ProviderNativeReadbackDescriptor;
   }): Promise<ProviderNativeAbsence>;
+  verifyArtifactConsumption(
+    input: ProviderArtifactConsumptionInput,
+  ): Promise<ProviderArtifactConsumption>;
   readSqliteMigrationLedger?(input: {
     readonly nativeId: string;
   }): Promise<ProviderValue<readonly ProviderSqliteMigrationIdentity[]>>;

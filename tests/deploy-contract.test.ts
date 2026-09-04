@@ -304,7 +304,7 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(baseline.stderr).toContain("deploy target descriptor not found");
     expect(baseline.stderr).not.toContain("no target was touched");
 
-    for (const through of ["0028", "0033", "0036", "0043"] as const) {
+    for (const through of ["0028", "0033", "0036", "0043", "0044"] as const) {
       for (const environment of ["rehearsal", "production"] as const) {
         const accepted = await deploy([
           "takoserver-d1-schema",
@@ -329,7 +329,7 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(integrationWithoutWave.stderr).toContain("deploy target descriptor not found");
     expect(integrationWithoutWave.stderr).not.toContain("no target was touched");
 
-    for (const through of ["0028", "0033", "0036", "0043"] as const) {
+    for (const through of ["0028", "0033", "0036", "0043", "0044"] as const) {
       const refused = await deploy([
         "takoserver-d1-schema",
         "--status",
