@@ -15,6 +15,7 @@ import {
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { type WorkerState, workerVersionAnnotationProfile } from "../scripts/deploy/worker-live.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
+import { normalizeGeneratedEd25519PrivateJwk } from "../src/ed25519-private-jwk.ts";
 
 const COMMIT = "a".repeat(40);
 const BUNDLE = "export default {fetch(){return new Response('ok')}};\n";
@@ -72,7 +73,9 @@ class FakeDatabase implements SigningDatabase {
 
 async function keyPair(keyId: string) {
   const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
-  const privateJwk = await crypto.subtle.exportKey("jwk", pair.privateKey);
+  const privateJwk = normalizeGeneratedEd25519PrivateJwk(
+    await crypto.subtle.exportKey("jwk", pair.privateKey),
+  );
   const exported = await crypto.subtle.exportKey("jwk", pair.publicKey);
   const publicJwk = JSON.stringify({ kty: "OKP", crv: "Ed25519", x: exported.x });
   return { keyId, pair, privateJwk, publicJwk };

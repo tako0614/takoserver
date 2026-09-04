@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { normalizeGeneratedEd25519PrivateJwk } from "../src/ed25519-private-jwk.ts";
 import { canonicalOperatorAudience } from "../src/operator-credentials.ts";
 
 /**
@@ -32,7 +33,9 @@ const [command, ...args] = process.argv.slice(2);
 
 if (command === "init") {
   const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
-  const privateJwk = await crypto.subtle.exportKey("jwk", pair.privateKey);
+  const privateJwk = normalizeGeneratedEd25519PrivateJwk(
+    await crypto.subtle.exportKey("jwk", pair.privateKey),
+  );
   const publicJwk = await crypto.subtle.exportKey("jwk", pair.publicKey);
   mkdirSync(PRIVATE_DIRECTORY, { recursive: true, mode: 0o700 });
   writeFileSync(PRIVATE_PATH, `${JSON.stringify(privateJwk)}\n`, { mode: 0o600 });

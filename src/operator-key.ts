@@ -17,6 +17,8 @@
  * answers who someone is, and a self-signed way past it would be a back door.
  */
 
+import { normalizeGeneratedEd25519PrivateJwk } from "./ed25519-private-jwk.ts";
+
 export interface OperatorPublicKey {
   readonly kty: string;
   readonly crv: string;
@@ -49,7 +51,9 @@ export async function ensureOperatorKey(
     "sign",
     "verify",
   ])) as CryptoKeyPair;
-  const privateJwk = (await crypto.subtle.exportKey("jwk", pair.privateKey)) as JsonWebKey;
+  const privateJwk = normalizeGeneratedEd25519PrivateJwk(
+    await crypto.subtle.exportKey("jwk", pair.privateKey),
+  );
   await input.writeFile(input.path, JSON.stringify(privateJwk));
   return await publicHalfOf(JSON.stringify(privateJwk));
 }
