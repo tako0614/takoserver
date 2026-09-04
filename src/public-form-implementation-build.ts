@@ -1,5 +1,5 @@
 import { isSha256Digest } from "./json.ts";
-import type { PublicFormImplementationIdentity } from "./public-worker-implementation.ts";
+import type { PublicFormImplementationIdentity } from "./public-host-identity.ts";
 
 declare const TAKOSERVER_BUILD_FORM_IMPLEMENTATION_PAYLOAD_DIGEST: string;
 declare const TAKOSERVER_BUILD_FORM_CAPABILITY_DIGEST: string;

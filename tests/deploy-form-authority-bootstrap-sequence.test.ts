@@ -20,6 +20,7 @@ import { handleFormAuthorityIdentityProbe } from "../src/form-authority-identity
 import { canonicalJson } from "../src/json.ts";
 import { derivePublicFormImplementationIdentity } from "../src/public-worker-implementation.ts";
 import { YURUCOMMU_IDENTITY_CAPABILITY_KINDS } from "../src/takoform/implementation-catalog.ts";
+import { cloudflareProviderExecutorTarget } from "./helpers/hosted-supply-fixtures.ts";
 
 const COMMIT = "a".repeat(40);
 const PUBLIC_VERSION_ID = "11111111-1111-4111-8111-111111111111";
@@ -60,7 +61,7 @@ const target = {
   objectBucketSupplies: {
     supplies: [{ provider: { kind: "cloudflare" } }],
   } as unknown as NonNullable<DeployTarget["objectBucketSupplies"]>,
-  workerEndpointSuffix: "integration.example.workers.dev",
+  cloudflareProviderExecutor: cloudflareProviderExecutorTarget("cloudflare.primary"),
   formAuthority: {
     workerName: "takoserver-form-authority-integration",
     identityProbeWorkerName: "takoserver-form-identity-integration",

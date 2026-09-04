@@ -29,12 +29,14 @@ const CLOUDFLARE_R2_ROUTE = Object.freeze({
  * material kind — including inside a single Provider Pack.
  *
  * The importer deliberately carries nothing but the derived bucket name. What
- * the Worker then sees is the selected backend's business, and only one backend
- * answers: the ordinary-workers backend binds it natively, because it uploads
- * the tenant's exact bytes and has nowhere to interpose a wrapper, and native
- * R2 keeps its multipart state provider-side. The managed backend refuses the
- * declaration by name — its wrapper's receipt ledger is in-isolate — so a route
- * published here is not by itself permission to consume it (ADR 0007).
+ * the Worker then sees is the selected backend's business. The
+ * ordinary-workers backend binds it natively because it uploads the tenant's
+ * exact bytes and has nowhere to interpose a wrapper. The managed backend
+ * projects `edge.objects` from its provider-authored wrapper and keeps the
+ * multipart validation ledger behind the dedicated route-less receipt-authority
+ * Worker. A route published here is still not by itself permission to consume
+ * it: each backend validates its own relation and provider authority before
+ * mutation (ADR 0007).
  */
 export function createCloudflareRuntimeBindingMaterializer(
   providerPackRef: string,

@@ -4,6 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadTarget, parseDeployTarget, targetPath } from "../scripts/deploy/target.ts";
 import { INTEGRATION_E2E_ORGANIZATION_ID } from "../src/integration-e2e-credential-authority.ts";
+import {
+  cloudflareProviderExecutorTarget,
+  edgeSuppliesFixture,
+  objectBucketSuppliesFixture,
+} from "./helpers/hosted-supply-fixtures.ts";
 
 function descriptor(overrides: Record<string, unknown> = {}) {
   return {
@@ -67,6 +72,55 @@ describe("environment-exact deploy target", () => {
     );
   });
 
+  test("requires one exact route-less executor topology for every Cloudflare supply", () => {
+    const edgeSupplies = edgeSuppliesFixture();
+    const objectBucketSupplies = objectBucketSuppliesFixture();
+    const cloudflareProviderExecutor = cloudflareProviderExecutorTarget();
+    expect(
+      parseDeployTarget(
+        descriptor({ edgeSupplies, objectBucketSupplies, cloudflareProviderExecutor }),
+        "Cloudflare target",
+        "rehearsal",
+      ).cloudflareProviderExecutor,
+    ).toEqual(cloudflareProviderExecutor);
+
+    for (const rejected of [
+      descriptor({ edgeSupplies }),
+      descriptor({ cloudflareProviderExecutor }),
+      descriptor({
+        edgeSupplies,
+        cloudflareProviderExecutor: {
+          ...cloudflareProviderExecutor,
+          providerInstallationId: "cloudflare.other",
+        },
+      }),
+      descriptor({
+        edgeSupplies,
+        cloudflareProviderExecutor: {
+          ...cloudflareProviderExecutor,
+          releaseReadbackQualification: {
+            ...cloudflareProviderExecutor.releaseReadbackQualification,
+            dispatchNamespace: "another-dispatch",
+          },
+        },
+      }),
+      descriptor({
+        edgeSupplies,
+        cloudflareProviderExecutor: {
+          ...cloudflareProviderExecutor,
+          workerName: "takoserver-api-rehearsal",
+        },
+      }),
+      descriptor({
+        edgeSupplies,
+        cloudflareProviderExecutor,
+        workerEndpointSuffix: "legacy.example.workers.dev",
+      }),
+    ]) {
+      expect(() => parseDeployTarget(rejected, "Cloudflare target", "rehearsal")).toThrow();
+    }
+  });
+
   test("refuses a descriptor for another environment", () => {
     withTarget(descriptor(), (path) => {
       expect(() => loadTarget(path, "production")).toThrow("environment");
@@ -108,6 +162,18 @@ describe("environment-exact deploy target", () => {
     expect(targetPath("integration")).toEndWith("/.deploy/targets/integration.json");
     expect(targetPath("rehearsal")).toEndWith("/.deploy/targets/rehearsal.json");
     expect(targetPath("production")).toEndWith("/.deploy/targets/production.json");
+  });
+
+  test("missing integration target names the clean-checkout private realization path", () => {
+    const missing = join(tmpdir(), "takoserver-target-v2-missing", "integration.json");
+    expect(() => loadTarget(missing, "integration")).toThrow(
+      expect.objectContaining({
+        message: expect.stringContaining("TAKOSERVER_DEPLOY_TARGET_INTEGRATION"),
+        detail: expect.stringMatching(
+          /cloudflareProviderExecutor[\s\S]*receiptAuthorityWorkerName[\s\S]*takoserver\.hosted-edge-supplies@v2/u,
+        ),
+      }),
+    );
   });
 
   test("accepts one exact public Ed25519 operator identity in every deploy environment", () => {

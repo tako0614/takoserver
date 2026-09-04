@@ -2,13 +2,14 @@ import type { Catalog } from "./catalog.ts";
 import { sanitizedMessage } from "./error-envelope.ts";
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import { isEdgeFormsApiVersion } from "./form-ref.ts";
-import { canonicalDigest } from "./json.ts";
+import { canonicalDigest, canonicalJson } from "./json.ts";
 import type { Ledger } from "./ledger.ts";
 import type { JsonObject } from "./ports.ts";
 import type { ProviderPack } from "./provider-pack.ts";
 import { createSoldProviderPlacementSelector } from "./provider-placement.ts";
 import type {
   Provider,
+  ProviderExecutionAuthority,
   ProviderNativeAbsence,
   ProviderNativeReadbackDescriptor,
   ProviderOffering,
@@ -36,6 +37,7 @@ import type {
   TakoformStoredResource,
 } from "./takoform/types.ts";
 import { TakoformHostError } from "./takoform/types.ts";
+import { increment } from "./takoform/wire.ts";
 import {
   type WorkerEndpointOriginAssignment,
   WorkerEndpointOriginReservationError,
@@ -280,6 +282,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     provider: Provider,
     operationId: string,
     first: ProviderTicket,
+    executionAuthority: ProviderExecutionAuthority,
     handleDurable = false,
   ): Promise<ProviderTicket> => {
     let ticket = first;
@@ -296,7 +299,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
       if (!provider.poll) break;
       try {
         await sleep(ticket.pollAfterMs);
-        ticket = await provider.poll({ operationId, handle: ticket.handle });
+        ticket = await provider.poll({ operationId, handle: ticket.handle, executionAuthority });
       } catch {
         // The opaque handle was durable before entering this loop. Preserve it
         // when a transport or scheduler failure leaves the outcome unknown.
@@ -317,6 +320,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     provider: Provider,
     operationId: string,
     handle: string,
+    executionAuthority: ProviderExecutionAuthority,
   ): Promise<ProviderTicket> => {
     if (!provider.poll) {
       return {
@@ -330,7 +334,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
       };
     }
     try {
-      const ticket = await provider.poll({ operationId, handle });
+      const ticket = await provider.poll({ operationId, handle, executionAuthority });
       return ticket.phase === "failed" && ticket.failure.retryable && !ticket.handle
         ? { ...ticket, handle }
         : ticket;
@@ -424,13 +428,26 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
   /** Deployment rows are Host-internal; this marker is never projected onto a Resource. */
   const deploymentOutputs = (
     outputs: ProviderResult["outputs"],
-    input: { readonly resourceUid: string; readonly space: string; readonly name: string },
+    input: {
+      readonly resourceUid: string;
+      readonly space: string;
+      readonly name: string;
+      readonly spec: JsonObject;
+      readonly previous?: TakoformStoredResource;
+      readonly deleteOperationId?: string;
+    },
   ): ProviderResult["outputs"] => ({
     ...structuredClone(outputs),
     __takoserver: {
       resourceUid: input.resourceUid,
       space: input.space,
       name: input.name,
+      generation: input.previous
+        ? canonicalJson(input.previous.spec) === canonicalJson(input.spec)
+          ? input.previous.metadata.generation
+          : increment(input.previous.metadata.generation)
+        : "1",
+      ...(input.deleteOperationId ? { deleteOperationId: input.deleteOperationId } : {}),
     },
   });
 
@@ -440,6 +457,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     readonly resourceUid: string;
     readonly space: string;
     readonly name: string;
+    readonly generation: string;
     readonly deleteOperationId?: string;
   } | null => {
     const value = outputs.__takoserver;
@@ -448,7 +466,10 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     if (
       typeof marker.resourceUid !== "string" ||
       typeof marker.space !== "string" ||
-      typeof marker.name !== "string"
+      typeof marker.name !== "string" ||
+      typeof marker.generation !== "string" ||
+      !/^[1-9][0-9]{0,18}$/u.test(marker.generation) ||
+      BigInt(marker.generation) > 9_223_372_036_854_775_807n
     ) {
       return null;
     }
@@ -456,6 +477,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
       resourceUid: marker.resourceUid,
       space: marker.space,
       name: marker.name,
+      generation: marker.generation,
       ...(typeof marker.deleteOperationId === "string"
         ? { deleteOperationId: marker.deleteOperationId }
         : {}),
@@ -499,7 +521,11 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     return deployment;
   };
 
-  const refresh = async (deployment: ResourceDeployment, result: ProviderResult): Promise<void> => {
+  const refresh = async (
+    deployment: ResourceDeployment,
+    result: ProviderResult,
+    outputs: JsonObject = result.outputs,
+  ): Promise<void> => {
     if (
       result.nativeId !== deployment.nativeId ||
       !(await deployments.refresh(
@@ -507,7 +533,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
         deployment.id,
         deployment.nativeId,
         result.observed,
-        result.outputs,
+        outputs,
       ))
     ) {
       throw new TakoformHostError("resource_busy", 409);
@@ -540,13 +566,32 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
     sqliteMigrations: {
       async readLedger(input) {
         const { deployment, port } = await sqliteProvider(input.tenantId, input.database);
-        return providerValue(await port.readLedger({ nativeId: deployment.nativeId }));
+        return providerValue(
+          await port.readLedger({
+            nativeId: deployment.nativeId,
+            target: {
+              tenantId: input.tenantId,
+              resourceUid: input.database.metadata.uid,
+              incarnationId: deployment.id,
+              generation: input.database.metadata.generation,
+            },
+          }),
+        );
       },
       async applySuffix(input) {
         const { deployment, port } = await sqliteProvider(input.tenantId, input.database);
         providerValue(
           await port.applySuffix({
+            operationId: input.operationId,
+            operationMode: input.operationMode,
+            executionAuthority: input.executionAuthority,
             nativeId: deployment.nativeId,
+            target: {
+              resourceUid: input.database.metadata.uid,
+              incarnationId: deployment.id,
+              generation: input.database.metadata.generation,
+            },
+            desired: input.desired,
             expectedPrefix: input.expectedPrefix,
             migrations: input.migrations,
           }),
@@ -605,6 +650,12 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
         space: input.space,
         name: input.name,
         uid: input.resourceUid,
+        ...(current && input.previous
+          ? {
+              incarnationId: current.id,
+              generation: input.previous.metadata.generation,
+            }
+          : {}),
       } as const;
       const runtimeBindings = await materializeProviderRuntimeBindings({
         tenantId: input.tenantId,
@@ -724,6 +775,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
         operationKey: input.operationKey,
         ...(input.publicApply ? { publicApply: input.publicApply } : {}),
         ...(input.operationMode ? { operationMode: input.operationMode } : {}),
+        executionAuthority: input.executionAuthority,
         offering,
         identity: providerIdentity,
         spec: input.spec,
@@ -747,7 +799,12 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
           provider,
           input.operationId,
           input.providerHandle
-            ? await pollHandle(provider, input.operationId, input.providerHandle)
+            ? await pollHandle(
+                provider,
+                input.operationId,
+                input.providerHandle,
+                input.executionAuthority,
+              )
             : input.operationMode === "recovery"
               ? provider.convergeApply
                 ? await provider.convergeApply(providerInput)
@@ -759,6 +816,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
                     throw new ProviderMutationRecoveryError("indeterminate");
                   })()
               : await provider.apply(providerInput),
+          input.executionAuthority,
           Boolean(input.providerHandle),
         );
         if (endpointAssignment && ticket.phase === "succeeded") {
@@ -865,7 +923,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
         };
       }
       if (current) {
-        await refresh(current, result);
+        await refresh(current, result, deploymentOutputs(result.outputs, input));
       } else {
         try {
           await deployments.create({
@@ -907,12 +965,25 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
             tenantRef: input.tenantId,
             space: input.resource.metadata.space,
             name: input.resource.metadata.name,
+            uid: input.resourceUid,
+            incarnationId: deployment.id,
+            generation: input.resource.metadata.generation,
           },
           spec: input.resource.spec,
           relations: await providerRelations(input.tenantId, input.relations),
         }),
       );
-      await refresh(deployment, result);
+      await refresh(
+        deployment,
+        result,
+        deploymentOutputs(result.outputs, {
+          resourceUid: input.resourceUid,
+          space: input.resource.metadata.space,
+          name: input.resource.metadata.name,
+          spec: input.resource.spec,
+          previous: input.resource,
+        }),
+      );
       return receiptOf(result);
     },
 
@@ -950,18 +1021,27 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
         provider,
         input.operationId,
         input.providerHandle
-          ? await pollHandle(provider, input.operationId, input.providerHandle)
+          ? await pollHandle(
+              provider,
+              input.operationId,
+              input.providerHandle,
+              input.executionAuthority,
+            )
           : input.operationMode === "recovery"
             ? provider.recoverDelete
               ? await provider.recoverDelete({
                   operationId: input.operationId,
                   operationMode: "recovery",
+                  executionAuthority: input.executionAuthority,
                   offering,
                   nativeId: deployment.nativeId,
                   identity: {
                     tenantRef: input.tenantId,
                     space: input.resource.metadata.space,
                     name: input.resource.metadata.name,
+                    uid: input.resourceUid,
+                    incarnationId: deployment.id,
+                    generation: input.resource.metadata.generation,
                   },
                   spec: input.resource.spec,
                   relations: await providerRelations(input.tenantId, input.relations),
@@ -974,16 +1054,21 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
             : await provider.delete({
                 operationId: input.operationId,
                 ...(input.operationMode ? { operationMode: input.operationMode } : {}),
+                executionAuthority: input.executionAuthority,
                 offering,
                 nativeId: deployment.nativeId,
                 identity: {
                   tenantRef: input.tenantId,
                   space: input.resource.metadata.space,
                   name: input.resource.metadata.name,
+                  uid: input.resourceUid,
+                  incarnationId: deployment.id,
+                  generation: input.resource.metadata.generation,
                 },
                 spec: input.resource.spec,
                 relations: await providerRelations(input.tenantId, input.relations),
               }),
+        input.executionAuthority,
         Boolean(input.providerHandle),
       );
       const result = resultOf(ticket);
@@ -1007,7 +1092,14 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
                   deploymentId: deployment.id,
                   expectedNativeId: deployment.nativeId,
                   observed: result.observed,
-                  outputs: result.outputs,
+                  outputs: deploymentOutputs(result.outputs, {
+                    resourceUid: input.resourceUid,
+                    space: input.resource.metadata.space,
+                    name: input.resource.metadata.name,
+                    spec: input.resource.spec,
+                    previous: input.resource,
+                    deleteOperationId: input.operationId,
+                  }),
                   operationId: input.operationId,
                   resourceUid: input.resourceUid,
                   space: input.resource.metadata.space,
@@ -1036,13 +1128,14 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
               deployment.id,
               deployment.nativeId,
               result.observed,
-              result.outputs,
-              {
-                operationId: input.operationId,
+              deploymentOutputs(result.outputs, {
                 resourceUid: input.resourceUid,
                 space: input.resource.metadata.space,
                 name: input.resource.metadata.name,
-              },
+                spec: input.resource.spec,
+                previous: input.resource,
+                deleteOperationId: input.operationId,
+              }),
             )
           : await deployments.markDeleted(input.tenantId, deployment.id, deployment.nativeId, {
               operationId: input.operationId,
@@ -1296,12 +1389,21 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
         ) {
           return await attest("indeterminate", "provider_unavailable");
         }
+        const marker = deploymentMarker(deployment.outputs);
+        if (!marker) return await attest("indeterminate", "deployment_unmarked");
         let descriptor: ProviderNativeReadbackDescriptor;
         try {
           descriptor = provider.createNativeReadbackDescriptor({
             offering,
             nativeId: deployment.nativeId,
-            identity: { tenantRef: input.tenantId, space: input.space, name: input.name },
+            identity: {
+              tenantRef: input.tenantId,
+              space: input.space,
+              name: input.name,
+              uid: input.resourceUid,
+              incarnationId: deployment.id,
+              generation: marker.generation,
+            },
             spec: deployment.observed,
           });
         } catch {
@@ -1309,7 +1411,16 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
         }
         let proof: ProviderNativeAbsence;
         try {
-          proof = await provider.verifyNativeAbsence({ offering, descriptor });
+          proof = await provider.verifyNativeAbsence({
+            offering,
+            descriptor,
+            target: {
+              tenantId: input.tenantId,
+              resourceUid: input.resourceUid,
+              incarnationId: deployment.id,
+              generation: marker.generation,
+            },
+          });
         } catch {
           return await attest("indeterminate", "provider_readback_failed");
         }
@@ -1367,12 +1478,18 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
           provider,
           input.operationId,
           input.providerHandle
-            ? await pollHandle(provider, input.operationId, input.providerHandle)
+            ? await pollHandle(
+                provider,
+                input.operationId,
+                input.providerHandle,
+                input.executionAuthority,
+              )
             : input.operationMode === "recovery"
               ? provider.recoverAdopt
                 ? await provider.recoverAdopt({
                     operationId: input.operationId,
                     operationMode: "recovery",
+                    executionAuthority: input.executionAuthority,
                     offering,
                     nativeId: input.nativeId,
                     identity: {
@@ -1380,6 +1497,12 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
                       space: input.space,
                       name: input.name,
                       uid: input.resourceUid,
+                      ...(current && input.previous
+                        ? {
+                            incarnationId: current.id,
+                            generation: input.previous.metadata.generation,
+                          }
+                        : {}),
                     },
                     spec: input.spec,
                     relations: await providerRelations(input.tenantId, input.relations),
@@ -1392,6 +1515,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
               : await provider.adopt({
                   operationId: input.operationId,
                   ...(input.operationMode ? { operationMode: input.operationMode } : {}),
+                  executionAuthority: input.executionAuthority,
                   offering,
                   nativeId: input.nativeId,
                   // The adopting provider needs the Resource UID: a bucket's
@@ -1402,10 +1526,17 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
                     space: input.space,
                     name: input.name,
                     uid: input.resourceUid,
+                    ...(current && input.previous
+                      ? {
+                          incarnationId: current.id,
+                          generation: input.previous.metadata.generation,
+                        }
+                      : {}),
                   },
                   spec: input.spec,
                   relations: await providerRelations(input.tenantId, input.relations),
                 }),
+          input.executionAuthority,
           Boolean(input.providerHandle),
         ),
       );
@@ -1459,7 +1590,7 @@ export function createProviderDriver(options: CreateProviderDriverOptions): Tako
         // workspace would adopt the same object unopposed. The fence is in the
         // ledger, so a concurrent import cannot record two first claims.
         if (current.nativeClaimed) {
-          await refresh(current, result);
+          await refresh(current, result, deploymentOutputs(result.outputs, input));
         } else if (
           !(await deployments.claimNative({
             tenantId: input.tenantId,

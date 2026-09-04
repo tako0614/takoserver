@@ -10,30 +10,18 @@ import {
   record,
 } from "./provider-meter.ts";
 
+export {
+  CLOUDFLARE_EDGE_METER_SETS,
+  CLOUDFLARE_EDGE_METERS,
+} from "./cloudflare-edge-meter-contract.ts";
+
+import {
+  CLOUDFLARE_EDGE_METERS,
+  CLOUDFLARE_PROVIDER_METER_SOURCES,
+} from "./cloudflare-edge-meter-contract.ts";
+
 const GRAPHQL_ENDPOINT = "https://api.cloudflare.com/client/v4/graphql";
 const GIBIBYTE = 1_073_741_824;
-
-export const CLOUDFLARE_EDGE_METERS = {
-  workerRequests: "compute.worker.requests.million",
-  kvOperations: "storage.kv.operations.million",
-  kvStorage: "storage.kv.gib-hour",
-  d1RowsRead: "database.sqlite.rows-read.million",
-  d1RowsWritten: "database.sqlite.rows-written.million",
-  d1Storage: "database.sqlite.gib-hour",
-  queueOperations: "messaging.queue.operations.million",
-  queueTransfer: "messaging.queue.transfer.gib",
-} as const;
-
-export const CLOUDFLARE_EDGE_METER_SETS = {
-  ModuleWorker: [CLOUDFLARE_EDGE_METERS.workerRequests],
-  EdgeKVNamespace: [CLOUDFLARE_EDGE_METERS.kvOperations, CLOUDFLARE_EDGE_METERS.kvStorage],
-  SQLiteDatabase: [
-    CLOUDFLARE_EDGE_METERS.d1RowsRead,
-    CLOUDFLARE_EDGE_METERS.d1RowsWritten,
-    CLOUDFLARE_EDGE_METERS.d1Storage,
-  ],
-  AtLeastOnceQueue: [CLOUDFLARE_EDGE_METERS.queueOperations, CLOUDFLARE_EDGE_METERS.queueTransfer],
-} as const;
 
 /**
  * Exact per-resource readers for Cloudflare-hosted edge identities.
@@ -77,11 +65,7 @@ export function createCloudflareEdgeMeterSources(options: {
 
   return [
     {
-      id: "cloudflare-worker-analytics",
-      meters: [CLOUDFLARE_EDGE_METERS.workerRequests],
-      settlementDelaySeconds: 900,
-      maximumWindowSeconds: 3_600,
-      retentionSeconds: 31 * 86_400,
+      ...CLOUDFLARE_PROVIDER_METER_SOURCES.worker,
       async read({ deployment, from, until }) {
         meterWindow(from, until);
         const scriptName = native(deployment, "worker:");
@@ -100,12 +84,7 @@ export function createCloudflareEdgeMeterSources(options: {
       },
     },
     {
-      id: "cloudflare-kv-analytics",
-      meters: [CLOUDFLARE_EDGE_METERS.kvOperations, CLOUDFLARE_EDGE_METERS.kvStorage],
-      settlementDelaySeconds: 86_400,
-      maximumWindowSeconds: 86_400,
-      retentionSeconds: 31 * 86_400,
-      windowAlignment: "utc-day",
+      ...CLOUDFLARE_PROVIDER_METER_SOURCES.kv,
       async read({ deployment, from, until }) {
         const window = dailyWindow(from, until);
         const namespaceId = native(deployment, "kv:");
@@ -129,16 +108,7 @@ export function createCloudflareEdgeMeterSources(options: {
       },
     },
     {
-      id: "cloudflare-d1-analytics",
-      meters: [
-        CLOUDFLARE_EDGE_METERS.d1RowsRead,
-        CLOUDFLARE_EDGE_METERS.d1RowsWritten,
-        CLOUDFLARE_EDGE_METERS.d1Storage,
-      ],
-      settlementDelaySeconds: 86_400,
-      maximumWindowSeconds: 86_400,
-      retentionSeconds: 31 * 86_400,
-      windowAlignment: "utc-day",
+      ...CLOUDFLARE_PROVIDER_METER_SOURCES.d1,
       async read({ deployment, from, until }) {
         const window = dailyWindow(from, until);
         const databaseId = native(deployment, "d1:");
@@ -168,11 +138,7 @@ export function createCloudflareEdgeMeterSources(options: {
       },
     },
     {
-      id: "cloudflare-queue-analytics",
-      meters: [CLOUDFLARE_EDGE_METERS.queueOperations, CLOUDFLARE_EDGE_METERS.queueTransfer],
-      settlementDelaySeconds: 900,
-      maximumWindowSeconds: 3_600,
-      retentionSeconds: 31 * 86_400,
+      ...CLOUDFLARE_PROVIDER_METER_SOURCES.queue,
       async read({ deployment, from, until }) {
         meterWindow(from, until);
         const queueId = native(deployment, "queue:");

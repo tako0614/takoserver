@@ -6,7 +6,7 @@ import {
   parseHostedSupplyContract,
 } from "./hosted-object-bucket-supplies.ts";
 import type { ObjectBucketPlacement } from "./object-bucket-deployment.ts";
-import { CLOUDFLARE_EDGE_METER_SETS } from "./providers/cloudflare-edge-meter.ts";
+import { CLOUDFLARE_EDGE_METER_SETS } from "./providers/cloudflare-edge-meter-contract.ts";
 import { parseStrictJson } from "./strict-json.ts";
 
 export const HOSTED_EDGE_SUPPLIES_KIND = "takoserver.hosted-edge-supplies@v2" as const;

@@ -14,6 +14,7 @@ import {
 } from "../scripts/deploy/form-authority.ts";
 import { expectedWorkerSecrets } from "../scripts/deploy/realized-config.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
+import { cloudflareProviderExecutorTarget } from "./helpers/hosted-supply-fixtures.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
 import { canonicalJson } from "../src/json.ts";
 import { derivePublicFormImplementationIdentity } from "../src/public-worker-implementation.ts";
@@ -76,7 +77,7 @@ const target = {
   objectBucketSupplies: {
     supplies: [{ provider: { kind: "cloudflare" } }],
   } as unknown as NonNullable<DeployTarget["objectBucketSupplies"]>,
-  workerEndpointSuffix: "integration.example.workers.dev",
+  cloudflareProviderExecutor: cloudflareProviderExecutorTarget("cloudflare.primary"),
   formAuthority: {
     workerName: "takoserver-form-authority-integration",
     identityProbeWorkerName: "takoserver-form-identity-integration",

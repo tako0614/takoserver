@@ -12,6 +12,7 @@ import {
   prepareWorkerArtifact,
 } from "../scripts/deploy/worker-artifact.ts";
 import { YURUCOMMU_IDENTITY_CAPABILITY_KINDS } from "../src/takoform/implementation-catalog.ts";
+import { cloudflareProviderExecutorTarget } from "./helpers/hosted-supply-fixtures.ts";
 
 const COMMIT = "a".repeat(40);
 const target = {
@@ -57,7 +58,7 @@ describe("hermetic Worker bundle identity", () => {
       objectBucketSupplies: {
         supplies: [{ provider: { kind: "cloudflare" } }],
       } as unknown as NonNullable<DeployTarget["objectBucketSupplies"]>,
-      workerEndpointSuffix: "integration.example.workers.dev",
+      cloudflareProviderExecutor: cloudflareProviderExecutorTarget("cloudflare.primary"),
       formAuthority: {
         workerName: "takoserver-form-authority-integration",
         identityProbeWorkerName: "takoserver-form-identity-integration",

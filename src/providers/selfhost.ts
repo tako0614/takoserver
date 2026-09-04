@@ -9,6 +9,7 @@ import {
   failed,
   PROVIDER_READBACK_API_VERSION,
   type Provider,
+  type ProviderExecutionAuthority,
   type ProviderNativeAbsence,
   type ProviderNativeAbsenceUnknownReason,
   type ProviderNativeReadbackDescriptor,
@@ -19,6 +20,8 @@ import {
   type ProviderRuntimeBinding,
   type ProviderSqliteMigration,
   type ProviderSqliteMigrationIdentity,
+  type ProviderSqliteMigrationReadTarget,
+  type ProviderSqliteMigrationTarget,
   type ProviderTicket,
   type ProviderValue,
   type ResourceIdentity,
@@ -38,6 +41,7 @@ import {
   derivedProviderResourceIncarnationName,
   derivedProviderResourceName,
 } from "../provider-worker-endpoint-origin.ts";
+import { TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES } from "../takoform/limits.ts";
 import {
   internalHostname,
   WORKERD_ASSETS_BINDING,
@@ -3142,6 +3146,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     sqliteMigrations: {
       readLedger: async (input: {
         readonly nativeId: string;
+        readonly target: ProviderSqliteMigrationReadTarget;
       }): Promise<ProviderValue<readonly ProviderSqliteMigrationIdentity[]>> => {
         const path = sqlitePathOf(input.nativeId, databasePath);
         if (!path) {
@@ -3192,7 +3197,12 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         }
       },
       applySuffix: async (input: {
+        readonly operationId: string;
+        readonly operationMode: "initial" | "recovery";
+        readonly executionAuthority?: ProviderExecutionAuthority;
         readonly nativeId: string;
+        readonly target: ProviderSqliteMigrationTarget;
+        readonly desired: readonly ProviderSqliteMigration[];
         readonly expectedPrefix: readonly ProviderSqliteMigrationIdentity[];
         readonly migrations: readonly ProviderSqliteMigration[];
       }): Promise<ProviderValue<undefined>> => {
@@ -3207,7 +3217,11 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             },
           };
         }
-        if (input.migrations.length < 1 || input.migrations.length > 100) {
+        if (
+          input.migrations.length < 1 ||
+          input.migrations.length > 100 ||
+          !validMigrationProjection(input.desired, input.expectedPrefix, input.migrations)
+        ) {
           return {
             ok: false,
             failure: {
@@ -4007,4 +4021,42 @@ function migrationPath(value: unknown): value is string {
 
 function sha256(value: unknown): value is `sha256:${string}` {
   return typeof value === "string" && /^sha256:[0-9a-f]{64}$/u.test(value);
+}
+
+function validMigrationProjection(
+  desired: readonly ProviderSqliteMigration[],
+  expectedPrefix: readonly ProviderSqliteMigrationIdentity[],
+  migrations: readonly ProviderSqliteMigration[],
+): boolean {
+  if (
+    desired.length < 1 ||
+    desired.length > TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES ||
+    expectedPrefix.length > desired.length ||
+    migrations.length !== desired.length - expectedPrefix.length
+  ) {
+    return false;
+  }
+  for (const [index, migration] of desired.entries()) {
+    if (
+      !migrationPath(migration.path) ||
+      !sha256(migration.digest) ||
+      `sha256:${createHash("sha256").update(migration.sql).digest("hex")}` !== migration.digest
+    ) {
+      return false;
+    }
+    if (index < expectedPrefix.length) {
+      const applied = expectedPrefix[index];
+      if (applied?.path !== migration.path || applied.digest !== migration.digest) return false;
+      continue;
+    }
+    const suffix = migrations[index - expectedPrefix.length];
+    if (
+      suffix?.path !== migration.path ||
+      suffix.digest !== migration.digest ||
+      `sha256:${createHash("sha256").update(suffix.sql).digest("hex")}` !== migration.digest
+    ) {
+      return false;
+    }
+  }
+  return true;
 }

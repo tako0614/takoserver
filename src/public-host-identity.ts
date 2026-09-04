@@ -1,5 +1,17 @@
 import { isSha256Digest } from "./json.ts";
 
+/** Semantic identity of the executable Form payload independent of its outer Worker. */
+export interface PublicFormImplementationIdentity {
+  readonly implementationPayloadDigest: `sha256:${string}`;
+  readonly capabilityDigest: `sha256:${string}`;
+  readonly implementationDigest: `sha256:${string}`;
+}
+
+/** Semantic Form identity bound to the exact published outer Worker artifact. */
+export interface PublicWorkerImplementationIdentity extends PublicFormImplementationIdentity {
+  readonly workerArtifactDigest: `sha256:${string}`;
+}
+
 export interface PublicHostIdentity {
   readonly kind: "takoserver.public-host-identity@v2";
   readonly hostId: string;

@@ -70,8 +70,20 @@ export interface DeployTarget {
   readonly objectBucketSupplies?: HostedObjectBucketSupplies;
   /** Reviewed Cloudflare sales for released edge identity Forms. */
   readonly edgeSupplies?: HostedEdgeSupplies;
-  /** Exact workers.dev suffix assigned to the provisioning account. */
-  readonly workerEndpointSuffix?: string;
+  /** Route-less parent-account authority required by every Cloudflare supply. */
+  readonly cloudflareProviderExecutor?: {
+    readonly workerName: string;
+    readonly dispatchNamespace: string;
+    readonly gatewayWorkerName: string;
+    readonly managedBaseDomain: string;
+    readonly providerInstallationId: string;
+    readonly receiptAuthorityWorkerName: string;
+    readonly releaseReadbackQualification: {
+      readonly schema: "takoserver.cloudflare-wfp-release-readback-qualification@v1";
+      readonly dispatchNamespace: string;
+      readonly rehearsalDigest: `sha256:${string}`;
+    };
+  };
   /** Requires the private bearer that authorizes the sponsorship owner API. */
   readonly sponsorship?: boolean;
   /** Route-less Form authority Workers sharing this target's existing D1/R2. */
@@ -143,6 +155,7 @@ const GOOGLE_CLIENT_ID = /^[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com$/u;
 const HOSTNAME =
   /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/u;
 const BASE64URL_32 = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/u;
+const SHA256 = /^sha256:[0-9a-f]{64}$/u;
 
 export function targetPath(environment: DeployEnvironment): string {
   const variable = `TAKOSERVER_DEPLOY_TARGET_${environment.toUpperCase()}`;
@@ -155,10 +168,13 @@ export function loadTarget(path: string, environment: DeployEnvironment): Deploy
   try {
     raw = readFileSync(path, "utf8");
   } catch {
+    const selector = `TAKOSERVER_DEPLOY_TARGET_${environment.toUpperCase()}`;
     throw preflightError(
-      `deploy target descriptor not found: ${path}`,
-      "Create an operator-private descriptor. It is gitignored and holds the only " +
-        "account-specific values:\n" +
+      `deploy target descriptor not found: ${path}; select its absolute path with ${selector}`,
+      "Create one reviewed operator-private takoserver.deploy-target@v2 descriptor outside the " +
+        "clean checkout; do not copy the retired .deploy/target.staging.json shape. Set " +
+        `${selector} to that absolute path. The current base and Cloudflare authority identity ` +
+        "checklist is:\n" +
         JSON.stringify(
           {
             kind: DEPLOY_TARGET_KIND,
@@ -168,11 +184,28 @@ export function loadTarget(path: string, environment: DeployEnvironment): Deploy
             d1: { databaseName: `takoserver-runtime-${environment}`, databaseId: "<uuid>" },
             r2: { bucketName: `takoserver-objects-${environment}` },
             publicOrigin: `https://<${environment}-worker>.<subdomain>.workers.dev`,
+            cloudflareProviderExecutor: {
+              workerName: `takoserver-cloudflare-provider-executor-${environment}`,
+              dispatchNamespace: `takoserver-customers-${environment}`,
+              gatewayWorkerName: `takoserver-managed-worker-gateway-${environment}`,
+              managedBaseDomain: `<managed-base-domain>`,
+              providerInstallationId: `cloudflare.${environment}`,
+              receiptAuthorityWorkerName: `takoserver-managed-object-receipt-authority-${environment}`,
+              releaseReadbackQualification: {
+                schema: "takoserver.cloudflare-wfp-release-readback-qualification@v1",
+                dispatchNamespace: `takoserver-customers-${environment}`,
+                rehearsalDigest: "sha256:<64 lowercase hex characters>",
+              },
+            },
             signing: { currentKeyId: `takoserver-${environment}-<yyyy-mm>` },
           },
           null,
           2,
-        ),
+        ) +
+        "\nJoin cloudflareProviderExecutor only together with a freshly compiled exact " +
+        "takoserver.hosted-edge-supplies@v2 and/or " +
+        "takoserver.hosted-object-bucket-supplies@v2 value. Every Cloudflare " +
+        "providerInstallation.id must equal cloudflareProviderExecutor.providerInstallationId.",
     );
   }
 
@@ -207,7 +240,7 @@ export function parseDeployTarget(
       "aiModels",
       "objectBucketSupplies",
       "edgeSupplies",
-      "workerEndpointSuffix",
+      "cloudflareProviderExecutor",
       "sponsorship",
       "formAuthority",
       "operatorIdentity",
@@ -263,14 +296,10 @@ export function parseDeployTarget(
     ...(value.edgeSupplies === undefined
       ? {}
       : { edgeSupplies: edgeSupplyList(value.edgeSupplies) }),
-    ...(value.workerEndpointSuffix === undefined
+    ...(value.cloudflareProviderExecutor === undefined
       ? {}
       : {
-          workerEndpointSuffix: pattern(
-            value.workerEndpointSuffix,
-            HOSTNAME,
-            "workerEndpointSuffix",
-          ),
+          cloudflareProviderExecutor: cloudflareProviderExecutor(value.cloudflareProviderExecutor),
         }),
     ...(value.sponsorship === undefined
       ? {}
@@ -292,10 +321,48 @@ export function parseDeployTarget(
         }),
     signing: signing(value.signing),
   };
-  if (Boolean(target.edgeSupplies) !== Boolean(target.workerEndpointSuffix)) {
+  const cloudflareSupplies = [
+    ...(target.objectBucketSupplies?.supplies.filter(
+      (supply) => supply.provider.kind === "cloudflare",
+    ) ?? []),
+    ...(target.edgeSupplies ? [target.edgeSupplies] : []),
+  ];
+  if (target.objectBucketSupplies?.supplies.some((supply) => supply.provider.kind === "wasabi")) {
+    throw preflightError("deploy target Wasabi supplies require a separate private executor");
+  }
+  if (Boolean(cloudflareSupplies.length > 0) !== Boolean(target.cloudflareProviderExecutor)) {
     throw preflightError(
-      "deploy target edge supplies and `workerEndpointSuffix` must be configured together",
+      "deploy target Cloudflare supplies and `cloudflareProviderExecutor` must be configured together",
     );
+  }
+  if (target.zones !== undefined && !target.cloudflareProviderExecutor) {
+    throw preflightError("deploy target zones require `cloudflareProviderExecutor`");
+  }
+  if (target.cloudflareProviderExecutor) {
+    const installationIds = cloudflareSupplies.map((supply) =>
+      "providerInstallation" in supply
+        ? supply.providerInstallation.id
+        : (() => {
+            throw preflightError("deploy target Cloudflare supply installation is unavailable");
+          })(),
+    );
+    if (
+      installationIds.length === 0 ||
+      installationIds.some((id) => id !== target.cloudflareProviderExecutor?.providerInstallationId)
+    ) {
+      throw preflightError(
+        "deploy target Cloudflare executor provider installation must match every supply",
+      );
+    }
+    const providerWorkerNames = [
+      target.workerName,
+      target.cloudflareProviderExecutor.workerName,
+      target.cloudflareProviderExecutor.gatewayWorkerName,
+      target.cloudflareProviderExecutor.receiptAuthorityWorkerName,
+    ];
+    if (new Set(providerWorkerNames).size !== providerWorkerNames.length) {
+      throw preflightError("deploy target Cloudflare authority Worker names must be distinct");
+    }
   }
   if (target.takosId && target.googleClientId) {
     throw preflightError("deploy target cannot configure both `takosId` and `googleClientId`");
@@ -347,6 +414,31 @@ export function parseDeployTarget(
         "deploy target Form authority operator gateway requires its dedicated operatorPublicJwk",
       );
     }
+  }
+  const allWorkerNames = [
+    target.workerName,
+    ...(target.cloudflareProviderExecutor
+      ? [
+          target.cloudflareProviderExecutor.workerName,
+          target.cloudflareProviderExecutor.gatewayWorkerName,
+          target.cloudflareProviderExecutor.receiptAuthorityWorkerName,
+        ]
+      : []),
+    ...(target.formAuthority
+      ? [
+          target.formAuthority.workerName,
+          target.formAuthority.identityProbeWorkerName,
+          ...(target.formAuthority.integrationWorkerName
+            ? [target.formAuthority.integrationWorkerName]
+            : []),
+          ...(target.formAuthority.integrationOperatorWorkerName
+            ? [target.formAuthority.integrationOperatorWorkerName]
+            : []),
+        ]
+      : []),
+  ];
+  if (new Set(allWorkerNames).size !== allWorkerNames.length) {
+    throw preflightError("deploy target authority Worker names must be globally distinct");
   }
   if (target.integrationE2eCredentialAuthority) {
     const authorityKey = target.integrationE2eCredentialAuthority.publicJwk.x;
@@ -463,6 +555,76 @@ function formAuthority(
           >,
         }),
     hostId: value.hostId,
+  };
+}
+
+function cloudflareProviderExecutor(
+  value: unknown,
+): NonNullable<DeployTarget["cloudflareProviderExecutor"]> {
+  if (!isRecord(value)) {
+    throw preflightError("deploy target `cloudflareProviderExecutor` must be an object");
+  }
+  assertExactKeys(value, [
+    "workerName",
+    "dispatchNamespace",
+    "gatewayWorkerName",
+    "managedBaseDomain",
+    "providerInstallationId",
+    "receiptAuthorityWorkerName",
+    "releaseReadbackQualification",
+  ]);
+  const qualification = value.releaseReadbackQualification;
+  if (!isRecord(qualification)) {
+    throw preflightError(
+      "deploy target Cloudflare provider executor release qualification must be an object",
+    );
+  }
+  assertExactKeys(qualification, ["schema", "dispatchNamespace", "rehearsalDigest"]);
+  const dispatchNamespace = pattern(
+    value.dispatchNamespace,
+    WORKER_NAME,
+    "cloudflareProviderExecutor.dispatchNamespace",
+  );
+  if (
+    qualification.schema !== "takoserver.cloudflare-wfp-release-readback-qualification@v1" ||
+    qualification.dispatchNamespace !== dispatchNamespace
+  ) {
+    throw preflightError(
+      "deploy target Cloudflare provider executor release qualification must name its exact dispatch namespace",
+    );
+  }
+  return {
+    workerName: pattern(value.workerName, WORKER_NAME, "cloudflareProviderExecutor.workerName"),
+    dispatchNamespace,
+    gatewayWorkerName: pattern(
+      value.gatewayWorkerName,
+      WORKER_NAME,
+      "cloudflareProviderExecutor.gatewayWorkerName",
+    ),
+    managedBaseDomain: pattern(
+      value.managedBaseDomain,
+      HOSTNAME,
+      "cloudflareProviderExecutor.managedBaseDomain",
+    ),
+    providerInstallationId: pattern(
+      value.providerInstallationId,
+      KEY_ID,
+      "cloudflareProviderExecutor.providerInstallationId",
+    ),
+    receiptAuthorityWorkerName: pattern(
+      value.receiptAuthorityWorkerName,
+      WORKER_NAME,
+      "cloudflareProviderExecutor.receiptAuthorityWorkerName",
+    ),
+    releaseReadbackQualification: {
+      schema: "takoserver.cloudflare-wfp-release-readback-qualification@v1",
+      dispatchNamespace,
+      rehearsalDigest: pattern(
+        qualification.rehearsalDigest,
+        SHA256,
+        "cloudflareProviderExecutor.releaseReadbackQualification.rehearsalDigest",
+      ) as `sha256:${string}`,
+    },
   };
 }
 

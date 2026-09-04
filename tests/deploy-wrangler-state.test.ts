@@ -14,6 +14,7 @@ import {
   acquireWranglerVersionPublicationLease,
   inspectWranglerVersionPublicationLease,
   parseWranglerDeploymentOutput,
+  parseWranglerLifecycleDeployOutput,
   parseWranglerSecretOutput,
   parseWranglerVersionDeployOutput,
   parseWranglerVersionOutput,
@@ -319,6 +320,21 @@ describe("Wrangler version publication output", () => {
         WORKER,
       ),
     ).toEqual({ deploymentId: DEPLOYMENT });
+    expect(
+      parseWranglerLifecycleDeployOutput(
+        JSON.stringify({
+          type: "deploy",
+          version: 1,
+          worker_name: WORKER,
+          worker_tag: null,
+          version_id: VERSION,
+          targets: [],
+          worker_name_overridden: false,
+          timestamp: "2026-08-30T00:00:00.000Z",
+        }),
+        WORKER,
+      ),
+    ).toEqual({ versionId: VERSION, targets: [] });
     expect(() =>
       parseWranglerVersionDeployOutput(
         JSON.stringify({
@@ -369,6 +385,19 @@ describe("Wrangler version publication output", () => {
         WORKER,
       ),
     ).toThrow("traffic");
+    expect(() =>
+      parseWranglerLifecycleDeployOutput(
+        JSON.stringify({
+          type: "deploy",
+          version: 1,
+          worker_name: WORKER,
+          version_id: VERSION,
+          targets: [42],
+          worker_name_overridden: false,
+        }),
+        WORKER,
+      ),
+    ).toThrow("lifecycle deployment");
   });
 });
 

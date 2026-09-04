@@ -1,0 +1,73 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "takoserver-cloudflare-provider-executor",
+  "main": "src/entry-cloudflare-provider-executor.ts",
+  "compatibility_date": "2026-08-31",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": true
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.01
+    }
+  },
+  "d1_databases": [
+    {
+      "binding": "STATE_DB",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "OBJECTS"
+    }
+  ],
+  "dispatch_namespaces": [
+    {
+      "binding": "DISPATCHER",
+      "namespace": "unconfigured"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "SQLITE_DATABASES",
+        "class_name": "TakoserverManagedWorkerSqlite",
+        "script_name": "unconfigured"
+      }
+    ]
+  },
+  "services": [
+    {
+      "binding": "MANAGED_WORKER_AUTHORITY",
+      "service": "unconfigured",
+      "entrypoint": "TakoserverManagedWorkerAuthority"
+    },
+    {
+      "binding": "MANAGED_OBJECT_RECEIPT_AUTHORITY",
+      "service": "unconfigured",
+      "entrypoint": "TakoserverManagedObjectReceiptAuthority"
+    }
+  ],
+  "vars": {
+    "PUBLIC_ORIGIN": "https://unconfigured.invalid",
+    "CLOUDFLARE_ACCOUNT_ID": "unconfigured",
+    "TAKOSERVER_ZONES": "[]",
+    "TAKOSERVER_CLOUDFLARE_DISPATCH_NAMESPACE": "unconfigured",
+    "TAKOSERVER_MANAGED_WORKER_GATEWAY_NAME": "unconfigured",
+    "TAKOSERVER_MANAGED_BASE_DOMAIN": "unconfigured.invalid",
+    "TAKOSERVER_CLOUDFLARE_PROVIDER_INSTALLATION_ID": "unconfigured",
+    "TAKOSERVER_CLOUDFLARE_RELEASE_READBACK_QUALIFICATION": "{}",
+    "TAKOSERVER_MANAGED_OBJECT_RECEIPT_AUTHORITY_NAME": "unconfigured"
+  },
+  "secrets": {
+    "required": ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING"]
+  }
+}

@@ -1,6 +1,10 @@
 import { expect, test } from "bun:test";
 import { createEphemeralSql } from "../src/compat.ts";
-import { buildEdgeForms, edgeProviderOffering } from "../src/edge-forms.ts";
+import {
+  buildEdgeForms,
+  edgeProviderOffering,
+  objectBucketProviderOffering,
+} from "../src/edge-forms.ts";
 import type { JsonObject, Row, Sql } from "../src/ports.ts";
 import type {
   ApplyInput,
@@ -8,7 +12,15 @@ import type {
   ProviderRelation,
   ProviderTicket,
 } from "../src/provider-port.ts";
+import type { ProviderRuntimeInputLeasePort } from "../src/provider-runtime-input-port.ts";
 import { type ArtifactBytes, CloudflareProvider } from "../src/providers/cloudflare.ts";
+import {
+  type ManagedObjectReceiptAdminOperation,
+  type ManagedObjectReceiptAuthority,
+  managedObjectReceiptAdminProof,
+  managedObjectReceiptInstanceName,
+  managedObjectReceiptRuntimeProof,
+} from "../src/providers/cloudflare-managed-object-receipt.ts";
 import {
   managedWorkerHostRouteKey,
   TAKOSERVER_MANAGED_WORKER_ROUTE_SCHEMAS,
@@ -20,14 +32,19 @@ import {
   managedWorkerSqliteAdminProof,
 } from "../src/providers/cloudflare-managed-worker-sqlite.ts";
 import type {
+  CloudflareManagedObjectReceiptAdminRequest,
+  CloudflareManagedObjectReceiptAuthority,
+  CloudflareManagedObjectReceiptStub,
   CloudflareManagedSqliteAdminRequest,
   CloudflareManagedSqliteNamespace,
   CloudflareManagedSqliteStub,
   CloudflareWorkersForPlatformsBackendOptions,
 } from "../src/providers/cloudflare-worker-backend.ts";
+import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
 
 /** Stands in for the gateway's `TAKOSERVER_MANAGED_SQLITE_ADMIN_SECRET`. */
 const TEST_SQLITE_ADMIN_SECRET = "test-managed-sqlite-admin-secret";
+const TEST_OBJECT_RECEIPT_SECRET = "test-managed-object-receipt-secret";
 
 import { ManagedWorkerState } from "../src/providers/managed-worker-state.ts";
 
@@ -49,6 +66,15 @@ const customDomainOffering = technical("WorkerCustomDomain");
 const cronOffering = technical("WorkerCronTrigger");
 const queueConsumerOffering = technical("QueueConsumer");
 const sqliteOffering = technical("SQLiteDatabase");
+const objectBucketForm = currentTakoformCandidates().forms.find(
+  (candidate) => candidate.identity.formRef.kind === "ObjectBucket",
+);
+if (!objectBucketForm) throw new Error("current ObjectBucket Form is missing");
+const objectBucketOffering = objectBucketProviderOffering(objectBucketForm, {
+  id: "storage.object.cloudflare",
+  displayName: "Cloudflare Object Storage",
+  regions: ["global"],
+});
 
 const moduleBytes = new TextEncoder().encode(
   "export default { fetch() { return new Response('ok') } }",
@@ -130,6 +156,379 @@ test("managed Cloudflare reservations are official origins, never workers.dev", 
       outputs: { scriptName: expect.stringMatching(/^tsw-[0-9a-f]{40}$/u) },
     },
   });
+});
+
+test("managed ObjectBucket destruction drains receipt authority before R2 and commits only after absence", async () => {
+  const bucketName = "tsb-managed-destroy-order";
+  const authority: ManagedObjectReceiptAuthority = {
+    schema: "takoserver.managed-object-receipt-authority@v1",
+    providerId: "cloudflare.wfp.integration",
+    resourceUid: "bucket_destroy_order",
+    incarnationId: "dep_bucket_destroy_order",
+    generation: "7",
+  };
+  const receipt = new ManagedObjectReceiptFake(authority, bucketName);
+  receipt.prepareStates = ["draining", "prepared"];
+  const events = receipt.events;
+  const provider = new CloudflareProvider({
+    id: authority.providerId,
+    accountId: "acct_1",
+    offerings: [objectBucketOffering],
+    artifacts,
+    authorize: () => "Bearer test-token",
+    workerBackend: managedObjectBackend(createEphemeralSql(), receipt),
+    async fetch(request) {
+      const path = new URL(request.url).pathname;
+      events.push(`cloudflare.${request.method} ${path}`);
+      if (request.method === "DELETE" && path.endsWith(`/r2/buckets/${bucketName}`)) {
+        return Response.json({ success: true, result: {} });
+      }
+      if (request.method === "GET" && path.endsWith(`/r2/buckets/${bucketName}`)) {
+        return Response.json({ success: false, errors: [] }, { status: 404 });
+      }
+      throw new Error(`unexpected Cloudflare call: ${request.method} ${path}`);
+    },
+  });
+  const identity = {
+    tenantRef: "organization_yurucommu",
+    space: "production",
+    name: "media",
+    uid: authority.resourceUid,
+    incarnationId: authority.incarnationId,
+    generation: authority.generation,
+  };
+
+  const draining = await provider.delete({
+    operationId: "destroy-bucket-order",
+    operationMode: "initial",
+    offering: objectBucketOffering,
+    nativeId: `r2:${bucketName}`,
+    identity,
+    spec: {},
+  });
+  expect(draining.phase).toBe("running");
+  if (draining.phase !== "running") throw new Error("expected receipt drain handle");
+  expect(events).toEqual(["receipt.prepare"]);
+
+  const tampered = mutateManagedObjectDestroyHandle(draining.handle, (value) => {
+    const identity = value.identity as Record<string, unknown>;
+    identity.generation = "8";
+  });
+  expect(
+    await provider.poll({ operationId: "destroy-bucket-order", handle: tampered }),
+  ).toMatchObject({ phase: "failed", failure: { code: "conflict", retryable: false } });
+  expect(events).toEqual(["receipt.prepare"]);
+
+  expect(
+    await provider.poll({ operationId: "destroy-bucket-order", handle: draining.handle }),
+  ).toMatchObject({
+    phase: "succeeded",
+    result: { nativeId: `r2:${bucketName}`, disposition: "deleted" },
+  });
+  expect(events).toEqual([
+    "receipt.prepare",
+    "receipt.prepare",
+    `cloudflare.DELETE /client/v4/accounts/acct_1/r2/buckets/${bucketName}`,
+    `cloudflare.GET /client/v4/accounts/acct_1/r2/buckets/${bucketName}`,
+    "receipt.commit",
+  ]);
+  expect(receipt.destroyed).toBe(true);
+  const expectedInstanceName = await managedObjectReceiptInstanceName(authority);
+  const rejectedInstanceName = await managedObjectReceiptInstanceName({
+    ...authority,
+    generation: "8",
+  });
+  expect(receipt.instanceNames.filter((value) => value === expectedInstanceName)).toHaveLength(3);
+  expect(receipt.instanceNames.filter((value) => value === rejectedInstanceName)).toHaveLength(1);
+  expect(new Set(receipt.instanceNames)).toEqual(
+    new Set([expectedInstanceName, rejectedInstanceName]),
+  );
+});
+
+test("managed ObjectBucket destruction reconciles lost R2 and receipt acknowledgements without replay", async () => {
+  const bucketName = "tsb-managed-destroy-lost-ack";
+  const authority: ManagedObjectReceiptAuthority = {
+    schema: "takoserver.managed-object-receipt-authority@v1",
+    providerId: "cloudflare.wfp.integration",
+    resourceUid: "bucket_destroy_lost_ack",
+    incarnationId: "dep_bucket_destroy_lost_ack",
+    generation: "2",
+  };
+  const receipt = new ManagedObjectReceiptFake(authority, bucketName);
+  receipt.commitLosesAck = true;
+  const events = receipt.events;
+  let deleteCalls = 0;
+  const provider = new CloudflareProvider({
+    id: authority.providerId,
+    accountId: "acct_1",
+    offerings: [objectBucketOffering],
+    artifacts,
+    authorize: () => "Bearer test-token",
+    workerBackend: managedObjectBackend(createEphemeralSql(), receipt),
+    async fetch(request) {
+      const path = new URL(request.url).pathname;
+      events.push(`cloudflare.${request.method} ${path}`);
+      if (request.method === "DELETE") {
+        deleteCalls += 1;
+        throw new Error("R2 transport closed after delete");
+      }
+      if (request.method === "GET" && path.endsWith(`/r2/buckets/${bucketName}`)) {
+        return Response.json({ success: false, errors: [] }, { status: 404 });
+      }
+      throw new Error(`unexpected Cloudflare call: ${request.method} ${path}`);
+    },
+  });
+  const operationId = "destroy-bucket-lost-ack";
+  const identity = {
+    tenantRef: "organization_yurucommu",
+    space: "production",
+    name: "media",
+    uid: authority.resourceUid,
+    incarnationId: authority.incarnationId,
+    generation: authority.generation,
+  };
+
+  const indeterminate = await provider.delete({
+    operationId,
+    operationMode: "initial",
+    offering: objectBucketOffering,
+    nativeId: `r2:${bucketName}`,
+    identity,
+    spec: {},
+  });
+  expect(indeterminate.phase).toBe("running");
+  if (indeterminate.phase !== "running") throw new Error("expected R2 confirmation handle");
+
+  const commitAckLost = await provider.poll({ operationId, handle: indeterminate.handle });
+  expect(commitAckLost).toMatchObject({
+    phase: "failed",
+    failure: { code: "unavailable", retryable: true },
+  });
+  if (commitAckLost.phase !== "failed" || !commitAckLost.handle) {
+    throw new Error("expected retryable receipt commit handle");
+  }
+  const commitHandle = commitAckLost.handle;
+  expect(commitHandle).toMatch(/^tsobjd1\./u);
+  expect(receipt.destroyed).toBe(true);
+
+  expect(
+    await provider.recoverDelete({
+      operationId,
+      operationMode: "recovery",
+      providerHandle: commitHandle,
+      offering: objectBucketOffering,
+      nativeId: `r2:${bucketName}`,
+      identity,
+      spec: {},
+    }),
+  ).toMatchObject({
+    phase: "succeeded",
+    result: { nativeId: `r2:${bucketName}`, disposition: "deleted" },
+  });
+  expect(deleteCalls).toBe(1);
+  expect(events).toEqual([
+    "receipt.prepare",
+    `cloudflare.DELETE /client/v4/accounts/acct_1/r2/buckets/${bucketName}`,
+    `cloudflare.GET /client/v4/accounts/acct_1/r2/buckets/${bucketName}`,
+    "receipt.commit",
+    "receipt.commit",
+  ]);
+});
+
+test("ambiguous managed ObjectBucket delete stays visibly fenced and never replays DELETE", async () => {
+  const bucketName = "tsb-managed-destroy-ambiguous";
+  const authority: ManagedObjectReceiptAuthority = {
+    schema: "takoserver.managed-object-receipt-authority@v1",
+    providerId: "cloudflare.wfp.integration",
+    resourceUid: "bucket_destroy_ambiguous",
+    incarnationId: "dep_bucket_destroy_ambiguous",
+    generation: "4",
+  };
+  const receipt = new ManagedObjectReceiptFake(authority, bucketName);
+  let present = true;
+  let deleteCalls = 0;
+  const provider = new CloudflareProvider({
+    id: authority.providerId,
+    accountId: "acct_1",
+    offerings: [objectBucketOffering],
+    artifacts,
+    authorize: () => "Bearer test-token",
+    workerBackend: managedObjectBackend(createEphemeralSql(), receipt),
+    async fetch(request) {
+      const path = new URL(request.url).pathname;
+      if (request.method === "DELETE") {
+        deleteCalls += 1;
+        throw new Error("R2 transport closed after delete");
+      }
+      if (request.method === "GET" && path.endsWith(`/r2/buckets/${bucketName}`)) {
+        return present
+          ? Response.json({ success: true, result: { name: bucketName } })
+          : Response.json({ success: false, errors: [] }, { status: 404 });
+      }
+      throw new Error(`unexpected Cloudflare call: ${request.method} ${path}`);
+    },
+  });
+  const operationId = "destroy-bucket-ambiguous";
+  const identity = {
+    tenantRef: "organization_yurucommu",
+    space: "production",
+    name: "media",
+    uid: authority.resourceUid,
+    incarnationId: authority.incarnationId,
+    generation: authority.generation,
+  };
+
+  const started = await provider.delete({
+    operationId,
+    operationMode: "initial",
+    offering: objectBucketOffering,
+    nativeId: `r2:${bucketName}`,
+    identity,
+    spec: {},
+  });
+  expect(started.phase).toBe("running");
+  if (started.phase !== "running") throw new Error("expected R2 confirmation handle");
+  expect(deleteCalls).toBe(1);
+  expect(await provider.managedObjectBucketReceiptStatus({ identity, bucketName })).toEqual({
+    ok: true,
+    value: {
+      lifecycle: "destroying",
+      receiptCount: 0,
+      operatorReconciliationRequired: 0,
+      repairRequired: true,
+      nextActionAt: null,
+    },
+  });
+
+  const fenced = await provider.poll({ operationId, handle: started.handle });
+  expect(fenced).toMatchObject({
+    phase: "failed",
+    failure: { code: "unavailable", retryable: true },
+    handle: started.handle,
+  });
+  expect(deleteCalls).toBe(1);
+
+  present = false;
+  expect(
+    await provider.recoverDelete({
+      operationId,
+      operationMode: "recovery",
+      providerHandle: started.handle,
+      offering: objectBucketOffering,
+      nativeId: `r2:${bucketName}`,
+      identity,
+      spec: {},
+    }),
+  ).toMatchObject({
+    phase: "succeeded",
+    result: { nativeId: `r2:${bucketName}`, disposition: "deleted" },
+  });
+  expect(deleteCalls).toBe(1);
+});
+
+test("managed ObjectBucket operator status exposes the permanent receipt repair fence", async () => {
+  const bucketName = "tsb-managed-receipt-status";
+  const authority: ManagedObjectReceiptAuthority = {
+    schema: "takoserver.managed-object-receipt-authority@v1",
+    providerId: "cloudflare.wfp.integration",
+    resourceUid: "bucket_receipt_status",
+    incarnationId: "dep_bucket_receipt_status",
+    generation: "9",
+  };
+  const receipt = new ManagedObjectReceiptFake(authority, bucketName);
+  receipt.receiptCount = 3;
+  receipt.operatorReconciliationRequired = 2;
+  receipt.nextActionAt = 1_788_480_000_000;
+  const provider = new CloudflareProvider({
+    id: authority.providerId,
+    accountId: "acct_1",
+    offerings: [objectBucketOffering],
+    artifacts,
+    authorize: () => "Bearer test-token",
+    workerBackend: managedObjectBackend(createEphemeralSql(), receipt),
+    fetch: async () => {
+      throw new Error("receipt status must not call a tenant or R2 API");
+    },
+  });
+  const identity = {
+    tenantRef: "organization_yurucommu",
+    space: "production",
+    name: "media",
+    uid: authority.resourceUid,
+    incarnationId: authority.incarnationId,
+    generation: authority.generation,
+  };
+
+  expect(await provider.managedObjectBucketReceiptStatus({ identity, bucketName })).toEqual({
+    ok: true,
+    value: {
+      lifecycle: "active",
+      receiptCount: 3,
+      operatorReconciliationRequired: 2,
+      repairRequired: true,
+      nextActionAt: 1_788_480_000_000,
+    },
+  });
+  expect(receipt.events).toEqual(["receipt.inspect"]);
+
+  receipt.lifecycle = "destroying";
+  receipt.receiptCount = 0;
+  receipt.operatorReconciliationRequired = 0;
+  receipt.nextActionAt = null;
+  expect(await provider.managedObjectBucketReceiptStatus({ identity, bucketName })).toEqual({
+    ok: true,
+    value: {
+      lifecycle: "destroying",
+      receiptCount: 0,
+      operatorReconciliationRequired: 0,
+      repairRequired: true,
+      nextActionAt: null,
+    },
+  });
+  expect(receipt.events).toEqual(["receipt.inspect", "receipt.inspect"]);
+
+  expect(
+    await provider.managedObjectBucketReceiptStatus({
+      identity: { ...identity, generation: "10" },
+      bucketName,
+    }),
+  ).toMatchObject({ ok: false, failure: { code: "conflict", retryable: false } });
+  expect(receipt.events).toEqual(["receipt.inspect", "receipt.inspect"]);
+});
+
+test("managed ObjectBucket support refuses incomplete receipt authority at composition", () => {
+  const backend = managedBackend(createEphemeralSql());
+  const {
+    objectReceiptWorkerName: _receiptWorkerName,
+    objectReceiptAuthority: _receiptAuthority,
+    ...withoutReceiptAuthority
+  } = backend;
+  expect(
+    () =>
+      new CloudflareProvider({
+        id: "cloudflare.wfp.integration",
+        accountId: "acct_1",
+        offerings: [objectBucketOffering],
+        artifacts,
+        authorize: () => "Bearer test-token",
+        workerBackend: withoutReceiptAuthority,
+      }),
+  ).toThrow("managed ObjectBucket offerings require complete receipt authority");
+
+  expect(
+    () =>
+      new CloudflareProvider({
+        id: "cloudflare.wfp.integration",
+        accountId: "acct_1",
+        offerings: [offering],
+        artifacts,
+        authorize: () => "Bearer test-token",
+        workerBackend: {
+          ...withoutReceiptAuthority,
+          objectReceiptAuthority: missingObjectReceiptAuthority,
+        },
+      }),
+  ).toThrow("managed ObjectBucket receipt authority must be configured as one complete capability");
 });
 
 test("managed backend mode captures legacy and drifted Worker offerings before ordinary APIs", async () => {
@@ -521,17 +920,16 @@ test("managed Worker Versions bind SQLite through the gateway's exact exported D
 });
 
 /**
- * ADR 0007. The managed wrapper can project the `edge.objects` facade over an
- * internal R2 binding — `tests/cloudflare-managed-worker-wrapper.test.ts`
- * exercises that facade against a real R2 — but its multipart validation
- * receipts live in isolate memory, and an eviction between
- * `createMultipartUpload` and `completeMultipartUpload` is ordinary. So this
- * backend refuses the Binding by name rather than binding a bucket whose
- * in-flight uploads it cannot honestly carry.
+ * The managed wrapper projects the public `edge.objects` facade over hidden R2
+ * and provider-owned receipt capabilities. The receipt Durable Object, rather
+ * than the customer Worker isolate, owns the multipart lifecycle across
+ * eviction and restart.
  */
-test("managed Worker Versions refuse an ObjectBucket the wrapper cannot keep restart-safe", async () => {
+test("managed Worker Versions bind ObjectBucket through hidden R2 and receipt capabilities", async () => {
   const api = new ManagedReleaseApi();
-  const provider = releaseProvider(api, createEphemeralSql());
+  // The Provider Pack id (`cloudflare`) and installed authority id are distinct.
+  // ObjectBucket relations are fenced by the latter, not by the adapter id.
+  const provider = releaseProvider(api, createEphemeralSql(), true, "cloudflare");
   const input = managedVersionInput(
     "version_objects_binding",
     "release-objects-binding",
@@ -552,44 +950,75 @@ test("managed Worker Versions refuse an ObjectBucket the wrapper cannot keep res
     }),
     bindingRef,
   };
+  const bucketBindings = [
+    {
+      name: "MEDIA",
+      resource: {
+        apiVersion: "edge.forms.takoform.com",
+        kind: "ObjectBucket",
+        name: "objectbucket",
+      },
+    },
+  ];
+  const runtimeBindings = [
+    {
+      name: "MEDIA",
+      targetUid: "bucket_binding",
+      bindingRef,
+      material: { kind: "takoserver.cloudflare-r2.edge-objects@v1", bucketName },
+    },
+  ];
 
+  const versionSpec = {
+    ...input.spec,
+    bucketBindings,
+  };
+  const versionRelations = [...(input.relations ?? []), bucket];
   const ticket = await provider.apply({
     ...input,
-    spec: {
-      ...input.spec,
-      bucketBindings: [
-        {
-          name: "MEDIA",
-          resource: {
-            apiVersion: "edge.forms.takoform.com",
-            kind: "ObjectBucket",
-            name: "objectbucket",
-          },
-        },
-      ],
-    },
-    relations: [...(input.relations ?? []), bucket],
-    runtimeBindings: [
+    spec: versionSpec,
+    relations: versionRelations,
+    runtimeBindings,
+  });
+
+  expect(ticket).toMatchObject({ phase: "succeeded" });
+  const release = [...api.scripts.values()][0];
+  expect(release?.settings).toMatchObject({
+    compatibility_flags: ["disallow_importable_env"],
+    bindings: [
       {
-        name: "MEDIA",
-        targetUid: "bucket_binding",
-        bindingRef,
-        material: { kind: "takoserver.cloudflare-r2.edge-objects@v1", bucketName },
+        type: "r2_bucket",
+        name: "__TAKOSERVER_OBJECTS_0",
+        bucket_name: bucketName,
+      },
+      {
+        type: "durable_object_namespace",
+        name: "__TAKOSERVER_OBJECT_RECEIPTS_0",
+        class_name: "TakoserverManagedObjectReceipt",
+        script_name: "takoserver-managed-object-receipt-authority",
       },
     ],
   });
-
-  expect(ticket).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
-  if (ticket.phase !== "failed") throw new Error("expected failure");
-  expect(ticket.failure.retryable).toBe(false);
-  expect(ticket.failure.message).toContain("multipart upload ledger");
-  // Refused before the release closure is built: nothing was uploaded, and the
-  // bucket name never reached the ticket.
-  expect(api.scripts.size).toBe(0);
+  // Provider-native bucket identity stays out of the public ticket.
   expect(JSON.stringify(ticket)).not.toContain(bucketName);
+  const versionNativeId = succeededNativeId(ticket);
 
-  // A materialized Binding the Version never declared is refused on the same
-  // terms; the managed backend has no path that reaches a bucket at all.
+  // Observe reconstructs the provider-private binding closure from the same
+  // pinned Resource relation. Runtime material is intentionally an apply-only
+  // input and cannot be required for later lifecycle readback.
+  expect(
+    await provider.observe({
+      offering: versionOffering,
+      nativeId: versionNativeId,
+      identity: input.identity,
+      spec: versionSpec,
+      relations: versionRelations,
+    }),
+  ).toMatchObject({ phase: "succeeded" });
+
+  // A materialized Binding the Version never declared is refused before an
+  // upload or any other Cloudflare mutation.
+  api.scripts.clear();
   const undeclared = managedVersionInput(
     "version_objects_undeclared",
     "release-objects-undeclared",
@@ -610,6 +1039,136 @@ test("managed Worker Versions refuse an ObjectBucket the wrapper cannot keep res
     }),
   ).toMatchObject({ phase: "failed", failure: { code: "invalid_spec", retryable: false } });
   expect(api.scripts.size).toBe(0);
+
+  // A relation for another tenant is not authority over this Version even
+  // when its R2 material is otherwise internally consistent.
+  const malformed = managedVersionInput(
+    "version_objects_malformed",
+    "release-objects-malformed",
+    "tsw-objects-malformed",
+  );
+  const foreign = {
+    ...bucket,
+    deployment: { ...bucket.deployment, tenantId: "organization_other" },
+  } as ProviderRelation;
+  expect(foreign.deployment?.tenantId).toBe("organization_other");
+  expect(
+    await provider.apply({
+      ...malformed,
+      spec: { ...malformed.spec, bucketBindings },
+      relations: [...(malformed.relations ?? []), foreign],
+      runtimeBindings,
+    }),
+  ).toMatchObject({ phase: "failed", failure: { code: "invalid_spec", retryable: false } });
+  expect(api.scripts.size).toBe(0);
+
+  // Namespace/kind text is insufficient authority: a retained or fabricated
+  // Form definition cannot be used to materialize the current ObjectBucket
+  // Binding even when every provider-native field still matches.
+  const staleForm = {
+    ...bucket,
+    resource: {
+      ...bucket.resource,
+      form: {
+        formRef: {
+          ...bucket.resource.form.formRef,
+          definitionVersion: "0.0.1",
+        },
+      },
+    },
+  } as ProviderRelation;
+  expect(
+    await provider.apply({
+      ...malformed,
+      operationId: "release-objects-stale-form",
+      spec: { ...malformed.spec, bucketBindings },
+      relations: [...(malformed.relations ?? []), staleForm],
+      runtimeBindings,
+    }),
+  ).toMatchObject({ phase: "failed", failure: { code: "invalid_spec", retryable: false } });
+  expect(api.scripts.size).toBe(0);
+
+  // An otherwise-valid relation cannot hide a second claimant for the same
+  // pointer. Authority is a unique Host relation, never first-match wins.
+  expect(
+    await provider.apply({
+      ...malformed,
+      operationId: "release-objects-duplicate-relation",
+      spec: { ...malformed.spec, bucketBindings },
+      relations: [...versionRelations, foreign],
+      runtimeBindings,
+    }),
+  ).toMatchObject({ phase: "failed", failure: { code: "invalid_spec", retryable: false } });
+  expect(api.scripts.size).toBe(0);
+
+  // Relation closure also precedes a one-shot runtime-input lease claim. A
+  // malformed ObjectBucket relation must not consume or erase unrelated
+  // secret material while failing the Version before Cloudflare I/O.
+  let acquireCalls = 0;
+  const guardedApi = new ManagedReleaseApi();
+  const runtimeInputs: ProviderRuntimeInputLeasePort = {
+    async acquire() {
+      acquireCalls++;
+      throw new Error("malformed relation must not acquire a runtime-input lease");
+    },
+    async recover() {
+      throw new Error("initial apply must not recover a runtime-input lease");
+    },
+    async abandon() {
+      throw new Error("unclaimed runtime-input material must not be abandoned");
+    },
+  };
+  const guardedProvider = new CloudflareProvider({
+    id: "cloudflare.wfp.integration",
+    accountId: "acct_1",
+    offerings: [offering, versionOffering, objectBucketOffering],
+    artifacts,
+    authorize: () => "Bearer test-token",
+    apiOrigin: "https://api.cloudflare.test/client/v4",
+    workerBackend: managedBackend(createEphemeralSql(), guardedApi.inspectRelease),
+    runtimeInputs,
+    fetch: guardedApi.fetch,
+  });
+  const guardedMalformed = managedVersionInput(
+    "version_objects_guarded_malformed",
+    "release-objects-guarded-malformed",
+    "tsw-objects-guarded-malformed",
+  );
+  expect(
+    await guardedProvider.apply({
+      ...guardedMalformed,
+      operationKey: `takoform-worker-runtime-v1-${"e".repeat(64)}`,
+      publicApply: {
+        method: "PUT",
+        path: "/apis/forms.takoform.com/v1/resources/edge.forms.takoform.com/WorkerVersion/version_objects_guarded_malformed",
+        ifNoneMatch: "*",
+        body: "{}",
+      },
+      spec: {
+        ...guardedMalformed.spec,
+        requiredSensitiveVars: ["API_KEY"],
+        bucketBindings,
+      },
+      relations: [...(guardedMalformed.relations ?? []), foreign],
+      runtimeBindings,
+    }),
+  ).toMatchObject({ phase: "failed", failure: { code: "invalid_spec", retryable: false } });
+  expect(acquireCalls).toBe(0);
+  expect(guardedApi.scripts.size).toBe(0);
+
+  // Deletion has the same durable reconstruction path and does not need the
+  // ephemeral apply-time material after the native release is already absent.
+  expect(
+    await provider.delete({
+      operationId: "delete-release-objects-binding",
+      operationMode: "initial",
+      offering: versionOffering,
+      nativeId: versionNativeId,
+      identity: input.identity,
+      spec: versionSpec,
+      relations: versionRelations,
+    }),
+  ).toMatchObject({ phase: "succeeded", result: { disposition: "deleted" } });
 });
 
 test("release readiness failure cleans the exact artifact and permits a fresh operation", async () => {
@@ -1810,7 +2369,8 @@ test("Queue Consumer creation cleans its exact native result when the route CAS 
 });
 
 function stored(kind: string, uid: string, spec: JsonObject) {
-  const form = released.forms.find((candidate) => candidate.identity.formRef.kind === kind);
+  const forms = kind === "ObjectBucket" ? currentTakoformCandidates().forms : released.forms;
+  const form = forms.find((candidate) => candidate.identity.formRef.kind === kind);
   if (!form) throw new Error(`released ${kind} Form is missing`);
   return {
     apiVersion: form.identity.formRef.apiVersion,
@@ -1978,11 +2538,12 @@ function releaseProvider(
   api: ManagedReleaseApi,
   sql: Sql,
   readbackQualified = true,
+  providerId = "cloudflare.wfp.integration",
 ): CloudflareProvider {
   return new CloudflareProvider({
-    id: "cloudflare.wfp.integration",
+    id: providerId,
     accountId: "acct_1",
-    offerings: [offering, versionOffering],
+    offerings: [offering, versionOffering, objectBucketOffering],
     artifacts,
     authorize: () => "Bearer test-token",
     apiOrigin: "https://api.cloudflare.test/client/v4",
@@ -2028,6 +2589,179 @@ function recordValue(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+}
+
+class ManagedObjectReceiptFake implements CloudflareManagedObjectReceiptStub {
+  prepareStates: Array<"draining" | "prepared"> = ["prepared"];
+  readonly events: string[] = [];
+  readonly instanceNames: string[] = [];
+  commitLosesAck = false;
+  destroyed = false;
+  lifecycle: "active" | "destroying" = "active";
+  receiptCount = 0;
+  operatorReconciliationRequired = 0;
+  nextActionAt: number | null = null;
+
+  constructor(
+    readonly authority: ManagedObjectReceiptAuthority,
+    readonly bucketName: string,
+  ) {}
+
+  async #authorization(
+    operation: ManagedObjectReceiptAdminOperation,
+    input: CloudflareManagedObjectReceiptAdminRequest,
+  ): Promise<"ok" | "conflict" | "invalid_argument"> {
+    if (
+      input.proof !==
+      (await managedObjectReceiptAdminProof({
+        secret: TEST_OBJECT_RECEIPT_SECRET,
+        operation,
+        authority: input.authority,
+        bucketName: input.bucketName,
+      }))
+    ) {
+      return "invalid_argument";
+    }
+    return JSON.stringify(input.authority) === JSON.stringify(this.authority) &&
+      input.bucketName === this.bucketName
+      ? "ok"
+      : "conflict";
+  }
+
+  async takoserverObjectReceiptInspect(input: CloudflareManagedObjectReceiptAdminRequest) {
+    const authorization = await this.#authorization("inspect", input);
+    if (authorization !== "ok") {
+      return { ok: false as const, error: { code: authorization } };
+    }
+    this.events.push("receipt.inspect");
+    return {
+      ok: true as const,
+      value: {
+        schemaVersion: 2 as const,
+        lifecycle: this.lifecycle,
+        authority: this.authority,
+        bucketName: this.bucketName,
+        receiptCount: this.receiptCount,
+        operatorReconciliationRequired: this.operatorReconciliationRequired,
+        nextActionAt: this.nextActionAt,
+      },
+    };
+  }
+
+  async takoserverObjectReceiptPrepareDestroy(input: CloudflareManagedObjectReceiptAdminRequest) {
+    const authorization = await this.#authorization("prepare-destroy", input);
+    if (authorization !== "ok") {
+      return { ok: false as const, error: { code: authorization } };
+    }
+    this.events.push("receipt.prepare");
+    this.lifecycle = "destroying";
+    const state = this.prepareStates.shift() ?? "prepared";
+    return { ok: true as const, value: { state } };
+  }
+
+  async takoserverObjectReceiptCommitDestroy(input: CloudflareManagedObjectReceiptAdminRequest) {
+    const authorization = await this.#authorization("commit-destroy", input);
+    if (authorization !== "ok") {
+      return { ok: false as const, error: { code: authorization } };
+    }
+    this.events.push("receipt.commit");
+    if (this.destroyed) return { ok: true as const, value: { destroyed: true as const } };
+    this.destroyed = true;
+    if (this.commitLosesAck) {
+      this.commitLosesAck = false;
+      throw new Error("receipt transport closed after destroy commit");
+    }
+    return { ok: true as const, value: { destroyed: true as const } };
+  }
+}
+
+function managedObjectBackend(
+  sql: Sql,
+  receipt: ManagedObjectReceiptFake,
+): CloudflareWorkersForPlatformsBackendOptions {
+  return {
+    ...managedBackend(sql),
+    objectReceiptAuthority: receiptAuthority(receipt),
+  };
+}
+
+function receiptAuthority(
+  receipt: ManagedObjectReceiptFake,
+): CloudflareManagedObjectReceiptAuthority {
+  const prepareProof = "a".repeat(43);
+  const admin = async (
+    operation: ManagedObjectReceiptAdminOperation,
+    input: { readonly authority: ManagedObjectReceiptAuthority; readonly bucketName: string },
+  ): Promise<CloudflareManagedObjectReceiptAdminRequest> => {
+    receipt.instanceNames.push(await managedObjectReceiptInstanceName(input.authority));
+    return {
+      ...input,
+      proof: await managedObjectReceiptAdminProof({
+        secret: TEST_OBJECT_RECEIPT_SECRET,
+        operation,
+        authority: input.authority,
+        bucketName: input.bucketName,
+      }),
+    };
+  };
+  return {
+    async takoserverObjectReceiptRuntimeBinding(input) {
+      const instanceName = await managedObjectReceiptInstanceName(input.authority);
+      receipt.instanceNames.push(instanceName);
+      return {
+        ok: true,
+        value: {
+          instanceName,
+          proof: await managedObjectReceiptRuntimeProof({
+            secret: TEST_OBJECT_RECEIPT_SECRET,
+            authority: input.authority,
+            bucketName: input.bucketName,
+          }),
+        },
+      };
+    },
+    async takoserverObjectReceiptInspect(input) {
+      return receipt.takoserverObjectReceiptInspect(await admin("inspect", input));
+    },
+    async takoserverObjectReceiptPrepareDestroy(input) {
+      if (input.authorityProof !== undefined && input.authorityProof !== prepareProof) {
+        return { ok: false, error: { code: "invalid_argument" } };
+      }
+      const result = await receipt.takoserverObjectReceiptPrepareDestroy(
+        await admin("prepare-destroy", input),
+      );
+      return result.ok
+        ? { ok: true, value: { state: result.value.state, authorityProof: prepareProof } }
+        : result;
+    },
+    async takoserverObjectReceiptCommitDestroy(input) {
+      if (input.authorityProof !== prepareProof) {
+        return { ok: false, error: { code: "invalid_argument" } };
+      }
+      return receipt.takoserverObjectReceiptCommitDestroy(await admin("commit-destroy", input));
+    },
+  };
+}
+
+function mutateManagedObjectDestroyHandle(
+  handle: string,
+  mutate: (value: Record<string, unknown>) => void,
+): string {
+  const prefix = "tsobjd1.";
+  if (!handle.startsWith(prefix)) throw new Error("unexpected managed ObjectBucket handle");
+  const encoded = handle.slice(prefix.length).replaceAll("-", "+").replaceAll("_", "/");
+  const value = JSON.parse(
+    new TextDecoder().decode(
+      Uint8Array.from(atob(encoded.padEnd(Math.ceil(encoded.length / 4) * 4, "=")), (character) =>
+        character.charCodeAt(0),
+      ),
+    ),
+  ) as Record<string, unknown>;
+  mutate(value);
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return `${prefix}${btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "")}`;
 }
 
 /**
@@ -2181,6 +2915,7 @@ function managedBackend(
     kind: "workers-for-platforms",
     dispatchNamespace: "takoserver-customers",
     gatewayWorkerName: "takoserver-dispatch",
+    providerInstallationId: "cloudflare.wfp.integration",
     managedBaseDomain: "app-staging.takos.jp",
     sql,
     inspectRelease,
@@ -2204,6 +2939,8 @@ function managedBackend(
       });
     },
     sqliteNamespace: missingSqliteNamespace,
+    objectReceiptWorkerName: "takoserver-managed-object-receipt-authority",
+    objectReceiptAuthority: missingObjectReceiptAuthority,
   };
 }
 
@@ -2256,6 +2993,55 @@ const missingSqliteStub: CloudflareManagedSqliteStub = {
 const missingSqliteNamespace: CloudflareManagedSqliteNamespace = {
   getByName() {
     return missingSqliteStub;
+  },
+};
+
+const missingObjectReceiptStub: CloudflareManagedObjectReceiptStub = {
+  async takoserverObjectReceiptInspect() {
+    return { ok: false, error: { code: "not_found" } };
+  },
+  async takoserverObjectReceiptPrepareDestroy() {
+    return { ok: false, error: { code: "not_found" } };
+  },
+  async takoserverObjectReceiptCommitDestroy() {
+    return { ok: false, error: { code: "not_found" } };
+  },
+};
+
+const missingObjectReceiptAuthority: CloudflareManagedObjectReceiptAuthority = {
+  async takoserverObjectReceiptRuntimeBinding(input) {
+    return {
+      ok: true,
+      value: {
+        instanceName: await managedObjectReceiptInstanceName(input.authority),
+        proof: await managedObjectReceiptRuntimeProof({
+          secret: TEST_OBJECT_RECEIPT_SECRET,
+          authority: input.authority,
+          bucketName: input.bucketName,
+        }),
+      },
+    };
+  },
+  async takoserverObjectReceiptInspect(input) {
+    return missingObjectReceiptStub.takoserverObjectReceiptInspect({
+      ...input,
+      proof: "p".repeat(64),
+    });
+  },
+  async takoserverObjectReceiptPrepareDestroy(input) {
+    const result = await missingObjectReceiptStub.takoserverObjectReceiptPrepareDestroy({
+      ...input,
+      proof: "p".repeat(64),
+    });
+    return result.ok
+      ? { ok: true, value: { ...result.value, authorityProof: "p".repeat(64) } }
+      : result;
+  },
+  async takoserverObjectReceiptCommitDestroy(input) {
+    return missingObjectReceiptStub.takoserverObjectReceiptCommitDestroy({
+      ...input,
+      proof: "p".repeat(64),
+    });
   },
 };
 

@@ -11,6 +11,7 @@ import {
 import { formAuthorityScopeTransitionDigest } from "../scripts/deploy/form-authority-scope-transition.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
+import { cloudflareProviderExecutorTarget } from "./helpers/hosted-supply-fixtures.ts";
 import { createEphemeralSql } from "../src/compat.ts";
 import { normalizeGeneratedEd25519PrivateJwk } from "../src/ed25519-private-jwk.ts";
 import { verifyFormAuthorityOperatorAssertion } from "../src/form-authority-operator-proof.ts";
@@ -738,7 +739,7 @@ async function integrationTarget(): Promise<DeployTarget> {
     objectBucketSupplies: {
       supplies: [{ provider: { kind: "cloudflare" } }],
     } as unknown as NonNullable<DeployTarget["objectBucketSupplies"]>,
-    workerEndpointSuffix: "integration.example.workers.dev",
+    cloudflareProviderExecutor: cloudflareProviderExecutorTarget("cloudflare.primary"),
     formAuthority: {
       workerName: "takoserver-form-authority-integration",
       identityProbeWorkerName: "takoserver-form-identity-integration",

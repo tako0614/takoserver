@@ -7,6 +7,10 @@ import type { DeployTarget } from "./target.ts";
 import type { LegacyHostServiceBinding } from "./worker-state.ts";
 
 const NEUTRAL_CONFIG_PATH = resolve(REPOSITORY, "wrangler.jsonc");
+const CLOUDFLARE_PROVIDER_EXECUTOR_NEUTRAL_CONFIG_PATH = resolve(
+  REPOSITORY,
+  "wrangler.cloudflare-provider-executor.jsonc",
+);
 
 export interface WorkerConfigOptions {
   readonly path: string;
@@ -99,6 +103,26 @@ export function writeWorkerConfig(target: DeployTarget, options: WorkerConfigOpt
         )
       : neutralConfigWithTopology;
   const signingKeyId = options.signingKeyId ?? effectiveSigningKeyId(target);
+  const services = [
+    ...(target.cloudflareProviderExecutor === undefined
+      ? []
+      : [
+          {
+            binding: "CLOUDFLARE_PROVIDER_EXECUTOR",
+            service: target.cloudflareProviderExecutor.workerName,
+            entrypoint: "CloudflareProviderExecutor",
+          },
+        ]),
+    ...(options.transitionServiceBinding === undefined
+      ? []
+      : [
+          {
+            binding: legacyServiceBindingName(),
+            service: options.transitionServiceBinding.service,
+            entrypoint: options.transitionServiceBinding.entrypoint,
+          },
+        ]),
+  ];
   const realized = {
     ...neutralConfig,
     name: target.workerName,
@@ -138,19 +162,96 @@ export function writeWorkerConfig(target: DeployTarget, options: WorkerConfigOpt
             ),
           },
         }),
-    ...(options.transitionServiceBinding === undefined
-      ? {}
-      : {
-          services: [
-            {
-              binding: legacyServiceBindingName(),
-              service: options.transitionServiceBinding.service,
-              entrypoint: options.transitionServiceBinding.entrypoint,
-            },
-          ],
-        }),
+    ...(services.length === 0 ? {} : { services }),
     secrets: {
       required: options.transitionExpectedSecrets ?? expectedWorkerSecrets(target),
+    },
+  };
+  writeFileSync(options.path, `${JSON.stringify(realized, null, 2)}\n`, { mode: 0o600 });
+  return options.path;
+}
+
+export interface CloudflareProviderExecutorConfigOptions {
+  readonly path: string;
+  readonly main: string;
+}
+
+/**
+ * Realizes the private Cloudflare provider executor from the same exact target
+ * as the public Worker. Secret values are never accepted here: Wrangler fills
+ * only the two declared secret names at the separate secret-mutation boundary.
+ */
+export function writeCloudflareProviderExecutorConfig(
+  target: DeployTarget,
+  options: CloudflareProviderExecutorConfigOptions,
+): string {
+  const topology = target.cloudflareProviderExecutor;
+  if (!topology) {
+    throw preflightError("Cloudflare provider executor config requires exact target topology");
+  }
+  const neutral = readExecutorNeutralConfig();
+  assertExecutorNeutral(neutral);
+  const { $schema: _schema, ...base } = neutral;
+  const vars: Record<string, string> = {
+    PUBLIC_ORIGIN: target.publicOrigin,
+    CLOUDFLARE_ACCOUNT_ID: target.accountId,
+    TAKOSERVER_ZONES: JSON.stringify(target.zones ?? []),
+    TAKOSERVER_CLOUDFLARE_DISPATCH_NAMESPACE: topology.dispatchNamespace,
+    TAKOSERVER_MANAGED_WORKER_GATEWAY_NAME: topology.gatewayWorkerName,
+    TAKOSERVER_MANAGED_BASE_DOMAIN: topology.managedBaseDomain,
+    TAKOSERVER_CLOUDFLARE_PROVIDER_INSTALLATION_ID: topology.providerInstallationId,
+    TAKOSERVER_CLOUDFLARE_RELEASE_READBACK_QUALIFICATION: JSON.stringify(
+      topology.releaseReadbackQualification,
+    ),
+    TAKOSERVER_MANAGED_OBJECT_RECEIPT_AUTHORITY_NAME: topology.receiptAuthorityWorkerName,
+  };
+  if (target.objectBucketSupplies !== undefined) {
+    vars.TAKOSERVER_OBJECT_BUCKET_SUPPLIES = JSON.stringify(target.objectBucketSupplies);
+  }
+  if (target.edgeSupplies !== undefined) {
+    vars.TAKOSERVER_EDGE_SUPPLIES = JSON.stringify(target.edgeSupplies);
+  }
+  const realized = {
+    ...base,
+    name: topology.workerName,
+    main: options.main,
+    account_id: target.accountId,
+    workers_dev: false,
+    preview_urls: false,
+    d1_databases: [
+      {
+        binding: "STATE_DB",
+        database_name: target.d1.databaseName,
+        database_id: target.d1.databaseId,
+        migrations_dir: "migrations",
+      },
+    ],
+    r2_buckets: [{ binding: "OBJECTS", bucket_name: target.r2.bucketName }],
+    dispatch_namespaces: [{ binding: "DISPATCHER", namespace: topology.dispatchNamespace }],
+    durable_objects: {
+      bindings: [
+        {
+          name: "SQLITE_DATABASES",
+          class_name: "TakoserverManagedWorkerSqlite",
+          script_name: topology.gatewayWorkerName,
+        },
+      ],
+    },
+    services: [
+      {
+        binding: "MANAGED_WORKER_AUTHORITY",
+        service: topology.gatewayWorkerName,
+        entrypoint: "TakoserverManagedWorkerAuthority",
+      },
+      {
+        binding: "MANAGED_OBJECT_RECEIPT_AUTHORITY",
+        service: topology.receiptAuthorityWorkerName,
+        entrypoint: "TakoserverManagedObjectReceiptAuthority",
+      },
+    ],
+    vars,
+    secrets: {
+      required: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING"],
     },
   };
   writeFileSync(options.path, `${JSON.stringify(realized, null, 2)}\n`, { mode: 0o600 });
@@ -202,15 +303,6 @@ export function deploymentVariables(
     vars.TAKOS_ID_CLIENT_ID = target.takosId.clientId;
   }
   if (target.stripeCheckout === true) vars.TAKOSERVER_STRIPE_CHECKOUT_ENABLED = "1";
-  if (
-    target.zones !== undefined ||
-    target.aiModels !== undefined ||
-    target.objectBucketSupplies !== undefined ||
-    target.edgeSupplies !== undefined
-  ) {
-    vars.CLOUDFLARE_ACCOUNT_ID = target.accountId;
-  }
-  if (target.zones !== undefined) vars.TAKOSERVER_ZONES = JSON.stringify(target.zones);
   if (target.aiModels !== undefined) vars.TAKOSERVER_AI_MODELS = JSON.stringify(target.aiModels);
   if (target.objectBucketSupplies !== undefined) {
     vars.TAKOSERVER_OBJECT_BUCKET_SUPPLIES = JSON.stringify(target.objectBucketSupplies);
@@ -221,8 +313,8 @@ export function deploymentVariables(
   if (target.formAuthority !== undefined && implementation.workerArtifactDigest !== undefined) {
     vars.TAKOSERVER_WORKER_ARTIFACT_DIGEST = implementation.workerArtifactDigest;
   }
-  if (target.workerEndpointSuffix !== undefined) {
-    vars.TAKOSERVER_WORKER_ENDPOINT_SUFFIX = target.workerEndpointSuffix;
+  if (target.cloudflareProviderExecutor !== undefined) {
+    vars.TAKOSERVER_MANAGED_BASE_DOMAIN = target.cloudflareProviderExecutor.managedBaseDomain;
   }
   if (target.operatorIdentity !== undefined) {
     vars.OPERATOR_IDENTITY_PUBLIC_JWK = JSON.stringify(target.operatorIdentity.publicJwk);
@@ -278,16 +370,6 @@ export function expectedWorkerSecrets(target: DeployTarget): readonly string[] {
   }
   if (target.sponsorship === true) names.add("TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN");
   if (target.stripeCheckout === true) names.add("STRIPE_SECRET_KEY");
-  if (
-    target.edgeSupplies !== undefined ||
-    target.objectBucketSupplies?.supplies.some((supply) => supply.provider.kind === "cloudflare")
-  ) {
-    names.add("CLOUDFLARE_API_TOKEN");
-  }
-  if (target.objectBucketSupplies?.supplies.some((supply) => supply.provider.kind === "wasabi")) {
-    names.add("TAKOSERVER_WASABI_ACCESS_KEY_ID");
-    names.add("TAKOSERVER_WASABI_SECRET_ACCESS_KEY");
-  }
   return [...names].sort();
 }
 
@@ -306,6 +388,38 @@ function readNeutralConfig(): NeutralConfig {
     throw preflightError("wrangler.jsonc must declare a string `name`");
   }
   return parsed as NeutralConfig;
+}
+
+function readExecutorNeutralConfig(): NeutralConfig {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(CLOUDFLARE_PROVIDER_EXECUTOR_NEUTRAL_CONFIG_PATH, "utf8"));
+  } catch {
+    throw preflightError("wrangler.cloudflare-provider-executor.jsonc must stay comment-free JSON");
+  }
+  if (!isRecord(parsed) || typeof parsed.name !== "string") {
+    throw preflightError("Cloudflare provider executor Wrangler config must declare a name");
+  }
+  return parsed as NeutralConfig;
+}
+
+function assertExecutorNeutral(neutral: Record<string, unknown>): void {
+  if (
+    neutral.main !== "src/entry-cloudflare-provider-executor.ts" ||
+    neutral.workers_dev !== false ||
+    neutral.preview_urls !== false
+  ) {
+    throw preflightError(
+      "Cloudflare provider executor Wrangler config must remain route-less and name its exact entry",
+    );
+  }
+  for (const forbidden of ["account_id", "routes", "route", "triggers"]) {
+    if (forbidden in neutral) {
+      throw preflightError(
+        `Cloudflare provider executor Wrangler config must not declare ${JSON.stringify(forbidden)}`,
+      );
+    }
+  }
 }
 
 function assertNeutral(neutral: Record<string, unknown>): void {

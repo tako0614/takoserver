@@ -1,4 +1,8 @@
 import {
+  MANAGED_OBJECT_RECEIPT_AUTHORITY_SCHEMA,
+  type ManagedObjectReceiptAuthority,
+} from "./cloudflare-managed-object-receipt.ts";
+import {
   TAKOSERVER_MANAGED_WORKER_EVENT_CONTENT_TYPE,
   TAKOSERVER_MANAGED_WORKER_EVENT_PATH,
   TAKOSERVER_MANAGED_WORKER_EVENT_PROTOCOL,
@@ -67,6 +71,11 @@ export interface ManagedWorkerEdgeObjectsBindingDescriptor {
   readonly kind: typeof MANAGED_WORKER_EDGE_OBJECTS_BINDING_KIND;
   readonly publicName: string;
   readonly nativeName: string;
+  readonly receiptNativeName: string;
+  readonly receiptInstanceName: string;
+  readonly bucketName: string;
+  readonly runtimeProof: string;
+  readonly authority: ManagedObjectReceiptAuthority;
 }
 
 export type ManagedWorkerBindingDescriptor =
@@ -82,6 +91,10 @@ export interface ManagedWorkerEntrypointSourceInput {
 
 const ARTIFACT_PART_NAME = /^[A-Za-z0-9_.][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_.][A-Za-z0-9._-]*)*$/u;
 const BINDING_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/u;
+const AUTHORITY_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,511}$/u;
+const RECEIPT_INSTANCE_NAME = /^tsobj-[A-Za-z0-9_-]{43}$/u;
+const RECEIPT_PROOF = /^[A-Za-z0-9_-]{43}$/u;
+const OBJECT_BUCKET_NAME = /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/u;
 const VARIABLE_NAME = /^[A-Za-z][A-Za-z0-9._-]*$/u;
 const RESERVED_PUBLIC_BINDINGS = new Set([
   "TAKOSERVER_INTERNAL_OPERATION_MARKER",
@@ -131,7 +144,6 @@ const SafeHeadersForEach = Headers.prototype.forEach;
 const SafeJSONParse = JSON.parse;
 const SafeJSONStringify = JSON.stringify;
 const SafeMap = Map;
-const SafeMapDelete = Map.prototype.delete;
 const SafeMapGet = Map.prototype.get;
 const SafeMapHas = Map.prototype.has;
 const SafeMapSet = Map.prototype.set;
@@ -221,12 +233,14 @@ const MAX_OBJECT_KEY_BYTES = 979;
 const MAX_OBJECT_BYTES = 5368709120;
 const MAX_OBJECT_SINGLE_PUT_BYTES = 314572800;
 const MAX_OBJECT_PARTS = 10000;
-const MIN_OBJECT_NON_FINAL_PART_BYTES = 5242880;
+const OBJECT_RECEIPT_MARKER_KEY = "takoserver-multipart-receipt-v1";
 const TOKEN_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,511}$/u;
 const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
 const DECIMAL_PATTERN = /^(?:0|[1-9][0-9]*)$/u;
-const R2_INVALID_PART_PATTERN = /[(](?:10011|10025)[)]$/u;
+const R2_INVALID_PART_PATTERN = /[(](?:10011|10025|10048)[)]$/u;
+const R2_UPLOAD_NOT_FOUND_PATTERN = /[(]10024[)]$/u;
 const SQL_ERROR_CODES = ["sql_error", "numeric_out_of_range", "busy", "backend_unavailable"];
+const OBJECT_RECEIPT_ERROR_CODES = ["invalid_argument", "conflict", "not_found", "invalid_part", "value_too_large", "backend_unavailable"];
 const encoder = new SafeTextEncoder();
 let originalPromise;
 
@@ -297,6 +311,19 @@ function sealGeneratedConfiguration(raw) {
       descriptor.publicName = source.publicName;
       descriptor.nativeName = source.nativeName;
       if (source.kind === "edge.sql@1.0.0") descriptor.instanceName = source.instanceName;
+      if (source.kind === "edge.objects@1.0.0") {
+        descriptor.receiptNativeName = source.receiptNativeName;
+        descriptor.receiptInstanceName = source.receiptInstanceName;
+        descriptor.bucketName = source.bucketName;
+        descriptor.runtimeProof = source.runtimeProof;
+        const authority = SafeObjectCreate(null);
+        authority.schema = source.authority.schema;
+        authority.providerId = source.authority.providerId;
+        authority.resourceUid = source.authority.resourceUid;
+        authority.incarnationId = source.authority.incarnationId;
+        authority.generation = source.authority.generation;
+        descriptor.authority = SafeApply(SafeObjectFreeze, SafeObject, [authority]);
+      }
     } else {
       descriptor.name = source.name;
       descriptor.type = source.type;
@@ -371,7 +398,7 @@ function projectEnv(rawEnv) {
       continue;
     }
     if (descriptor.kind === "edge.objects@1.0.0") {
-      projected[descriptor.publicName] = createEdgeObjectsR2Adapter(rawEnv[descriptor.nativeName]);
+      projected[descriptor.publicName] = createEdgeObjectsR2Adapter(rawEnv, descriptor);
       continue;
     }
     const raw = rawEnv[descriptor.name];
@@ -711,15 +738,26 @@ function createServiceAdapter(raw) {
   return portable;
 }
 
-function createEdgeObjectsR2Adapter(raw) {
+function createEdgeObjectsR2Adapter(rawEnv, descriptor) {
+  const raw = rawEnv[descriptor.nativeName];
+  const receiptNamespace = rawEnv[descriptor.receiptNativeName];
+  const getReceiptByName = captureMethod(receiptNamespace, "getByName");
+  const receipt = SafeApply(getReceiptByName, receiptNamespace, [descriptor.receiptInstanceName]);
+  const beginPart = captureMethod(receipt, "beginPart");
+  const commitPart = captureMethod(receipt, "commitPart");
+  const releasePart = captureMethod(receipt, "releasePart");
+  const beginComplete = captureMethod(receipt, "beginComplete");
+  const commitComplete = captureMethod(receipt, "commitComplete");
+  const failComplete = captureMethod(receipt, "failComplete");
+  const markCompleteLost = captureMethod(receipt, "markCompleteLost");
+  const beginAbort = captureMethod(receipt, "beginAbort");
+  const commitAbort = captureMethod(receipt, "commitAbort");
   const head = captureMethod(raw, "head");
   const get = captureMethod(raw, "get");
   const put = captureMethod(raw, "put");
   const remove = captureMethod(raw, "delete");
   const list = captureMethod(raw, "list");
-  const createMultipartUpload = captureMethod(raw, "createMultipartUpload");
   const resumeMultipartUpload = captureMethod(raw, "resumeMultipartUpload");
-  const multipart = new SafeMap();
   const portable = SafeObjectCreate(null);
   portable.head = async function (key) {
     exactObjectArgumentCount(arguments.length, 1);
@@ -841,22 +879,23 @@ function createEdgeObjectsR2Adapter(raw) {
     exactObjectArgumentCount(arguments.length, 2);
     objectKey(key);
     const contentType = objectMultipartOptions(rawOptions);
-    const nativeOptions = SafeObjectCreate(null);
-    if (contentType !== undefined) {
-      const httpMetadata = SafeObjectCreate(null);
-      httpMetadata.contentType = contentType;
-      nativeOptions.httpMetadata = httpMetadata;
-    }
+    const receiptId = "tsmp-" + SafeApply(SafeCryptoRandomUUID, SafeCrypto, []);
+    const marker = objectReceiptMarker();
+    const receiptInput = objectReceiptInput(descriptor, key, receiptId);
+    receiptInput.contentType = contentType === undefined ? null : contentType;
+    receiptInput.marker = marker;
+    let created;
     try {
-      const upload = await SafeApply(createMultipartUpload, raw, [key, nativeOptions]);
-      objectUploadId(upload && upload.uploadId);
-      SafeApply(SafeMapSet, multipart, [objectUploadIdentity(key, upload.uploadId), new SafeMap()]);
-      const result = SafeObjectCreate(null);
-      result.uploadId = upload.uploadId;
-      return freezeObject(result);
-    } catch (error) {
-      throw mapObjectError(error, ["invalid_key", "backend_unavailable"]);
+      const createReceipt = captureMethod(receipt, "createMultipartUpload");
+      created = await objectReceiptRpc(receipt, createReceipt, receiptInput);
     }
+    catch { throw portableError("backend_unavailable"); }
+    if (!isRecord(created) || !exactKeys(created, ["state"]) || created.state !== "active") {
+      throw portableError("backend_unavailable");
+    }
+    const result = SafeObjectCreate(null);
+    result.uploadId = receiptId;
+    return freezeObject(result);
   };
   portable.uploadPart = async function (key, uploadId, partNumber, body, rawOptions) {
     exactObjectArgumentCount(arguments.length, 5);
@@ -865,24 +904,42 @@ function createEdgeObjectsR2Adapter(raw) {
     objectPartNumber(partNumber);
     const options = objectUploadPartOptions(rawOptions);
     const source = objectBodySource(body, MAX_OBJECT_BYTES, options.contentLength, "invalid_body");
+    const attemptId = "tsmpa-" + SafeApply(SafeCryptoRandomUUID, SafeCrypto, []);
+    const receiptInput = objectReceiptInput(descriptor, key, uploadId);
+    receiptInput.partNumber = partNumber;
+    receiptInput.size = source.length;
+    receiptInput.attemptId = attemptId;
+    let begun;
     try {
-      const upload = SafeApply(resumeMultipartUpload, raw, [key, uploadId]);
+      begun = await objectReceiptRpc(receipt, beginPart, receiptInput);
+      if (!isRecord(begun) || !exactKeys(begun, ["nativeUploadId", "attemptId"]) || begun.attemptId !== attemptId) {
+        throw portableError("backend_unavailable");
+      }
+      objectUploadId(begun.nativeUploadId);
+    } catch (error) {
+      throw mapObjectReceiptError(error, "upload_not_found");
+    }
+    try {
+      const upload = SafeApply(resumeMultipartUpload, raw, [key, begun.nativeUploadId]);
       const uploadPart = captureMethod(upload, "uploadPart");
       const pending = SafeApply(uploadPart, upload, [partNumber, source.body]);
       const part = await finishObjectBody(pending, source.completion);
       const etag = objectEtag(part && part.etag);
-      const known = SafeApply(SafeMapGet, multipart, [objectUploadIdentity(key, uploadId)]);
-      if (known) {
-        const recorded = SafeObjectCreate(null);
-        recorded.etag = etag;
-        recorded.size = source.length;
-        SafeApply(SafeMapSet, known, [partNumber, freezeObject(recorded)]);
+      const commitInput = objectReceiptInput(descriptor, key, uploadId);
+      commitInput.partNumber = partNumber;
+      commitInput.size = source.length;
+      commitInput.attemptId = attemptId;
+      commitInput.etag = etag;
+      const committed = await objectReceiptRpc(receipt, commitPart, commitInput);
+      if (!isRecord(committed) || !exactKeys(committed, ["etag", "partNumber"]) || committed.etag !== etag || committed.partNumber !== partNumber) {
+        throw portableError("backend_unavailable");
       }
       const result = SafeObjectCreate(null);
       result.etag = etag;
       result.partNumber = partNumber;
       return freezeObject(result);
     } catch (error) {
+      try { await objectReceiptRpc(receipt, releasePart, receiptInput); } catch {}
       throw mapObjectError(error, ["invalid_key", "invalid_body", "upload_not_found", "backend_unavailable"]);
     }
   };
@@ -891,35 +948,272 @@ function createEdgeObjectsR2Adapter(raw) {
     objectKey(key);
     objectUploadId(uploadId);
     const parts = objectParts(rawParts);
-    validateKnownObjectParts(multipart, key, uploadId, parts);
+    const receiptInput = objectReceiptInput(descriptor, key, uploadId);
+    receiptInput.parts = objectReceiptParts(parts);
+    let begun;
     try {
-      const upload = SafeApply(resumeMultipartUpload, raw, [key, uploadId]);
-      const complete = captureMethod(upload, "complete");
-      const completed = await SafeApply(complete, upload, [parts]);
-      const metadata = objectMetadata(completed);
-      const result = SafeObjectCreate(null);
-      result.etag = metadata.etag;
-      result.size = metadata.size;
-      SafeApply(SafeMapDelete, multipart, [objectUploadIdentity(key, uploadId)]);
-      return freezeObject(result);
+      begun = await objectReceiptRpc(receipt, beginComplete, receiptInput);
     } catch (error) {
-      throw mapObjectCompleteError(error);
+      throw mapObjectReceiptError(error, "invalid_part");
     }
+    if (!isRecord(begun) || typeof begun.action !== "string") throw portableError("backend_unavailable");
+    if (begun.action === "done") {
+      if (!exactKeys(begun, ["action", "etag", "size"])) throw portableError("backend_unavailable");
+      const result = SafeObjectCreate(null);
+      result.etag = objectEtag(begun.etag);
+      result.size = objectSize(begun.size);
+      return freezeObject(result);
+    }
+    if (
+      (begun.action !== "execute" && begun.action !== "reconcile") ||
+      !exactKeys(begun, ["action", "nativeUploadId", "marker", "expectedSize"])
+    ) throw portableError("backend_unavailable");
+    objectUploadId(begun.nativeUploadId);
+    objectReceiptMarkerValue(begun.marker);
+    objectSize(begun.expectedSize);
+    let readback;
+    if (begun.action === "execute") {
+      try {
+        const upload = SafeApply(resumeMultipartUpload, raw, [key, begun.nativeUploadId]);
+        const complete = captureMethod(upload, "complete");
+        await SafeApply(complete, upload, [parts]);
+      } catch (error) {
+        readback = await objectReceiptCompletionReadback(raw, head, key, begun.marker, begun.expectedSize);
+        if (readback.state !== "complete") {
+          const mapped = mapObjectCompleteError(error);
+          if (mapped.name === "invalid_part" && readback.state === "absent") {
+            let reopened;
+            try { reopened = await objectReceiptRpc(receipt, failComplete, receiptInput); }
+            catch { throw portableError("backend_unavailable"); }
+            if (!isRecord(reopened) || !exactKeys(reopened, ["state"]) || reopened.state !== "active") {
+              throw portableError("backend_unavailable");
+            }
+            throw mapped;
+          }
+          await markObjectReceiptCompletionReconciliation(receipt, markCompleteLost, receiptInput);
+          if (mapped.name === "upload_not_found" && readback.state === "absent") throw mapped;
+          throw portableError("backend_unavailable");
+        }
+      }
+    }
+    if (!readback) {
+      readback = await objectReceiptCompletionReadback(raw, head, key, begun.marker, begun.expectedSize);
+    }
+    if (readback.state !== "complete") {
+      if (readback.state === "mismatch" || readback.state === "ambiguous") {
+        await markObjectReceiptCompletionReconciliation(receipt, markCompleteLost, receiptInput);
+      }
+      throw portableError("backend_unavailable");
+    }
+    const metadata = readback.metadata;
+    const commitInput = objectReceiptInput(descriptor, key, uploadId);
+    commitInput.parts = objectReceiptParts(parts);
+    commitInput.etag = metadata.etag;
+    commitInput.size = metadata.size;
+    let committed;
+    try { committed = await objectReceiptRpc(receipt, commitComplete, commitInput); }
+    catch { throw portableError("backend_unavailable"); }
+    if (!isRecord(committed) || !exactKeys(committed, ["etag", "size"]) || committed.etag !== metadata.etag || committed.size !== metadata.size) {
+      throw portableError("backend_unavailable");
+    }
+    const result = SafeObjectCreate(null);
+    result.etag = committed.etag;
+    result.size = committed.size;
+    return freezeObject(result);
   };
   portable.abortMultipartUpload = async function (key, uploadId) {
     exactObjectArgumentCount(arguments.length, 2);
     objectKey(key);
     objectUploadId(uploadId);
+    const receiptInput = objectReceiptInput(descriptor, key, uploadId);
+    let begun;
     try {
-      const upload = SafeApply(resumeMultipartUpload, raw, [key, uploadId]);
+      begun = await objectReceiptRpc(receipt, beginAbort, receiptInput);
+    } catch (error) {
+      throw mapObjectReceiptError(error, "upload_not_found");
+    }
+    if (!isRecord(begun) || typeof begun.action !== "string") throw portableError("backend_unavailable");
+    if (begun.action === "done" && exactKeys(begun, ["action"])) return;
+    if (
+      begun.action !== "execute" ||
+      !exactKeys(begun, ["action", "nativeUploadId", "marker"])
+    ) {
+      throw portableError("backend_unavailable");
+    }
+    objectUploadId(begun.nativeUploadId);
+    objectReceiptMarkerValue(begun.marker);
+    try {
+      const upload = SafeApply(resumeMultipartUpload, raw, [key, begun.nativeUploadId]);
       const abort = captureMethod(upload, "abort");
       await SafeApply(abort, upload, []);
-      SafeApply(SafeMapDelete, multipart, [objectUploadIdentity(key, uploadId)]);
     } catch (error) {
-      throw mapObjectError(error, ["invalid_key", "upload_not_found", "backend_unavailable"]);
+      const mapped = mapObjectError(error, ["upload_not_found", "backend_unavailable"]);
+      if (mapped.name !== "upload_not_found") throw mapped;
+      let found;
+      try { found = await SafeApply(head, raw, [key]); } catch { throw portableError("backend_unavailable"); }
+      if (found !== null && objectPrivateMarker(found) === begun.marker) {
+        throw portableError("backend_unavailable");
+      }
     }
+    let committed;
+    try { committed = await objectReceiptRpc(receipt, commitAbort, receiptInput); }
+    catch { throw portableError("backend_unavailable"); }
+    if (!isRecord(committed) || !exactKeys(committed, ["state"]) || committed.state !== "aborted") throw portableError("backend_unavailable");
   };
   return portable;
+}
+
+function objectReceiptInput(descriptor, key, receiptId) {
+  const input = SafeObjectCreate(SafeObjectPrototype);
+  const authority = SafeObjectCreate(SafeObjectPrototype);
+  authority.schema = descriptor.authority.schema;
+  authority.providerId = descriptor.authority.providerId;
+  authority.resourceUid = descriptor.authority.resourceUid;
+  authority.incarnationId = descriptor.authority.incarnationId;
+  authority.generation = descriptor.authority.generation;
+  input.authority = authority;
+  input.bucketName = descriptor.bucketName;
+  input.proof = descriptor.runtimeProof;
+  input.key = key;
+  input.receiptId = receiptId;
+  return input;
+}
+
+function objectReceiptParts(parts) {
+  const projected = [];
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = SafeObjectCreate(SafeObjectPrototype);
+    part.partNumber = parts[index].partNumber;
+    part.etag = parts[index].etag;
+    projected[index] = part;
+  }
+  return projected;
+}
+
+async function objectReceiptRpc(stub, method, input) {
+  let envelope;
+  try { envelope = await SafeApply(method, stub, [input]); }
+  catch { throw portableError("backend_unavailable"); }
+  try { envelope = SafeJSONParse(SafeJSONStringify(envelope)); }
+  catch { throw portableError("backend_unavailable"); }
+  if (!isRecord(envelope)) throw portableError("backend_unavailable");
+  if (envelope.ok === true && exactKeys(envelope, ["ok", "value"])) return envelope.value;
+  if (
+    envelope.ok === false &&
+    exactKeys(envelope, ["ok", "error"]) &&
+    isRecord(envelope.error) &&
+    exactKeys(envelope.error, ["code"]) &&
+    includes(OBJECT_RECEIPT_ERROR_CODES, envelope.error.code)
+  ) throw portableError(envelope.error.code);
+  throw portableError("backend_unavailable");
+}
+
+function mapObjectReceiptError(error, missingCode) {
+  try {
+    if (error && error.name === "not_found") return portableError(missingCode);
+    if (error && includes(["invalid_part", "value_too_large"], error.name)) {
+      return portableError(error.name);
+    }
+  } catch {}
+  return portableError("backend_unavailable");
+}
+
+function objectReceiptMarker() {
+  const source =
+    SafeApply(SafeCryptoRandomUUID, SafeCrypto, []) +
+    SafeApply(SafeCryptoRandomUUID, SafeCrypto, []);
+  let marker = "";
+  for (let index = 0; index < source.length && marker.length < 43; index += 1) {
+    const character = source[index];
+    if (character !== "-") marker += character;
+  }
+  return objectReceiptMarkerValue(marker);
+}
+
+function objectReceiptMarkerValue(value) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]{43}$/u.test(value)) {
+    throw portableError("backend_unavailable");
+  }
+  return value;
+}
+
+function objectPrivateMarker(value) {
+  if (!isRecord(value) || !isRecord(value.customMetadata)) return undefined;
+  const marker = value.customMetadata[OBJECT_RECEIPT_MARKER_KEY];
+  return typeof marker === "string" ? marker : undefined;
+}
+
+async function objectReceiptCompletionReadback(raw, head, key, marker, expectedSize) {
+  try {
+    const found = await SafeApply(head, raw, [key]);
+    if (found === null) return { state: "absent" };
+    if (objectPrivateMarker(found) !== marker) return { state: "mismatch" };
+    const metadata = objectMetadata(found);
+    return metadata.size === expectedSize
+      ? { state: "complete", metadata }
+      : { state: "mismatch" };
+  } catch {
+    return { state: "ambiguous" };
+  }
+}
+
+async function markObjectReceiptCompletionReconciliation(receipt, markCompleteLost, input) {
+  let marked;
+  try { marked = await objectReceiptRpc(receipt, markCompleteLost, input); }
+  catch { throw portableError("backend_unavailable"); }
+  if (
+    !isRecord(marked) ||
+    !exactKeys(marked, ["state"]) ||
+    marked.state !== "completion_reconciling"
+  ) {
+    throw portableError("backend_unavailable");
+  }
+}
+
+async function abortManagedObjectReceipt({
+  raw,
+  head,
+  resumeMultipartUpload,
+  receipt,
+  beginAbort,
+  commitAbort,
+  descriptor,
+  key,
+  receiptId,
+  nativeUploadId,
+}) {
+  const input = objectReceiptInput(descriptor, key, receiptId);
+  if (nativeUploadId !== undefined) input.nativeUploadId = nativeUploadId;
+  const begun = await objectReceiptRpc(receipt, beginAbort, input);
+  if (!isRecord(begun) || typeof begun.action !== "string") throw portableError("backend_unavailable");
+  if (begun.action === "done") {
+    if (!exactKeys(begun, ["action"])) throw portableError("backend_unavailable");
+  } else {
+    if (
+      begun.action !== "execute" ||
+      !exactKeys(begun, ["action", "nativeUploadId", "marker"])
+    ) throw portableError("backend_unavailable");
+    objectUploadId(begun.nativeUploadId);
+    objectReceiptMarkerValue(begun.marker);
+    try {
+      const upload = SafeApply(resumeMultipartUpload, raw, [key, begun.nativeUploadId]);
+      const abort = captureMethod(upload, "abort");
+      await SafeApply(abort, upload, []);
+    } catch (error) {
+      const mapped = mapObjectError(error, ["upload_not_found", "backend_unavailable"]);
+      if (mapped.name !== "upload_not_found") throw mapped;
+      let found;
+      try { found = await SafeApply(head, raw, [key]); }
+      catch { throw portableError("backend_unavailable"); }
+      if (found !== null && objectPrivateMarker(found) === begun.marker) {
+        throw portableError("backend_unavailable");
+      }
+    }
+  }
+  const committed = await objectReceiptRpc(receipt, commitAbort, objectReceiptInput(descriptor, key, receiptId));
+  if (!isRecord(committed) || !exactKeys(committed, ["state"]) || committed.state !== "aborted") {
+    throw portableError("backend_unavailable");
+  }
 }
 
 function objectMetadata(value) {
@@ -1135,35 +1429,6 @@ function objectParts(value) {
   return freezeObject(result);
 }
 
-function objectUploadIdentity(key, uploadId) {
-  return key + "\0" + uploadId;
-}
-
-function validateKnownObjectParts(multipart, key, uploadId, parts) {
-  const known = SafeApply(SafeMapGet, multipart, [objectUploadIdentity(key, uploadId)]);
-  if (!known) return;
-  let total = 0;
-  for (let index = 0; index < parts.length; index += 1) {
-    const part = parts[index];
-    const recorded = SafeApply(SafeMapGet, known, [part.partNumber]);
-    if (
-      !recorded ||
-      recorded.etag !== part.etag ||
-      (index < parts.length - 1 && recorded.size < MIN_OBJECT_NON_FINAL_PART_BYTES)
-    ) {
-      throw portableError("invalid_part");
-    }
-    if (
-      !nonNegativeInteger(total) ||
-      !nonNegativeInteger(recorded.size) ||
-      recorded.size > MAX_OBJECT_BYTES - total
-    ) {
-      throw portableError("value_too_large");
-    }
-    total += recorded.size;
-  }
-}
-
 function servedObjectRange(range, size) {
   if (range === undefined) return undefined;
   const result = SafeObjectCreate(null);
@@ -1306,7 +1571,16 @@ function objectPartNumber(value) {
 }
 
 function mapObjectError(error, allowed) {
-  try { if (error && includes(allowed, error.name)) return portableError(error.name); } catch {}
+  try {
+    if (error && includes(allowed, error.name)) return portableError(error.name);
+    const descriptor = SafeApply(SafeObjectGetOwnPropertyDescriptor, SafeObject, [error, "message"]);
+    if (
+      includes(allowed, "upload_not_found") &&
+      descriptor &&
+      typeof descriptor.value === "string" &&
+      SafeApply(SafeRegExpTest, R2_UPLOAD_NOT_FOUND_PATTERN, [descriptor.value])
+    ) return portableError("upload_not_found");
+  } catch {}
   return portableError("backend_unavailable");
 }
 
@@ -1325,6 +1599,13 @@ function mapObjectCompleteError(error) {
       SafeApply(SafeRegExpTest, R2_INVALID_PART_PATTERN, [descriptor.value])
     ) {
       return portableError("invalid_part");
+    }
+    if (
+      descriptor &&
+      typeof descriptor.value === "string" &&
+      SafeApply(SafeRegExpTest, R2_UPLOAD_NOT_FOUND_PATTERN, [descriptor.value])
+    ) {
+      return portableError("upload_not_found");
     }
   } catch {}
   return portableError("backend_unavailable");
@@ -1772,7 +2053,20 @@ function normalizeSourceInput(input: ManagedWorkerEntrypointSourceInput): {
           "bindings",
         );
       } else if (binding.kind === MANAGED_WORKER_EDGE_OBJECTS_BINDING_KIND) {
-        exactNormalizedKeys(binding, ["kind", "publicName", "nativeName"], "bindings");
+        exactNormalizedKeys(
+          binding,
+          [
+            "kind",
+            "publicName",
+            "nativeName",
+            "receiptNativeName",
+            "receiptInstanceName",
+            "bucketName",
+            "runtimeProof",
+            "authority",
+          ],
+          "bindings",
+        );
       } else {
         invalid("bindings");
       }
@@ -1803,10 +2097,33 @@ function normalizeSourceInput(input: ManagedWorkerEntrypointSourceInput): {
           instanceName,
         });
       } else {
+        if (
+          typeof binding.receiptNativeName !== "string" ||
+          !BINDING_NAME.test(binding.receiptNativeName) ||
+          !binding.receiptNativeName.startsWith(MANAGED_WORKER_INTERNAL_BINDING_PREFIX) ||
+          nativeNames.has(binding.receiptNativeName) ||
+          typeof binding.receiptInstanceName !== "string" ||
+          !RECEIPT_INSTANCE_NAME.test(binding.receiptInstanceName) ||
+          typeof binding.bucketName !== "string" ||
+          !OBJECT_BUCKET_NAME.test(binding.bucketName) ||
+          binding.bucketName.includes("..") ||
+          /^\d+(?:\.\d+){3}$/u.test(binding.bucketName) ||
+          typeof binding.runtimeProof !== "string" ||
+          !RECEIPT_PROOF.test(binding.runtimeProof)
+        ) {
+          invalid("bindings");
+        }
+        const authority = normalizeObjectReceiptAuthority(binding.authority);
+        nativeNames.add(binding.receiptNativeName);
         bindings.push({
           kind: MANAGED_WORKER_EDGE_OBJECTS_BINDING_KIND,
           publicName: binding.publicName as string,
           nativeName: binding.nativeName,
+          receiptNativeName: binding.receiptNativeName,
+          receiptInstanceName: binding.receiptInstanceName,
+          bucketName: binding.bucketName,
+          runtimeProof: binding.runtimeProof,
+          authority,
         });
       }
       continue;
@@ -1832,6 +2149,35 @@ function normalizeSourceInput(input: ManagedWorkerEntrypointSourceInput): {
     originalMainModule: fields.originalMainModule,
     declaredHandlers,
     bindings,
+  };
+}
+
+function normalizeObjectReceiptAuthority(value: unknown): ManagedObjectReceiptAuthority {
+  const authority = dataProperties(value, "bindings");
+  exactNormalizedKeys(
+    authority,
+    ["schema", "providerId", "resourceUid", "incarnationId", "generation"],
+    "bindings",
+  );
+  if (
+    authority.schema !== MANAGED_OBJECT_RECEIPT_AUTHORITY_SCHEMA ||
+    typeof authority.providerId !== "string" ||
+    !AUTHORITY_TOKEN.test(authority.providerId) ||
+    typeof authority.resourceUid !== "string" ||
+    !AUTHORITY_TOKEN.test(authority.resourceUid) ||
+    typeof authority.incarnationId !== "string" ||
+    !AUTHORITY_TOKEN.test(authority.incarnationId) ||
+    typeof authority.generation !== "string" ||
+    !/^[1-9][0-9]{0,18}$/u.test(authority.generation)
+  ) {
+    invalid("bindings");
+  }
+  return {
+    schema: MANAGED_OBJECT_RECEIPT_AUTHORITY_SCHEMA,
+    providerId: authority.providerId,
+    resourceUid: authority.resourceUid,
+    incarnationId: authority.incarnationId,
+    generation: authority.generation,
   };
 }
 

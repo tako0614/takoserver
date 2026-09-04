@@ -1,15 +1,23 @@
 # ADR 0001 — Provision from the Worker
 
-**Status:** accepted, 2026-08-17
+**Status:** superseded, 2026-09-04
 **Supersedes:** the unwritten rule recorded in `scripts/check-imports.ts` that
 `src/providers/cloudflare.ts` may never be reachable from the Workers entry.
 
-## What changed
+> This ADR records the former public-credential decision. The current design
+> keeps Cloudflare provisioning on Workers, but moves parent-account authority
+> into the named route-less `CloudflareProviderExecutor` WorkerEntrypoint. The
+> public API Worker holds only a typed service binding and credential-free
+> Provider proxy. It cannot import the credential-bearing provider/backend or
+> declare `CLOUDFLARE_API_TOKEN`. The executor validates exact Host saga/deployment
+> authority and owns a pre-effect D1 CAS before any provider mutation.
+
+## What changed at the time
 
 The Workers entry may now reach the Cloudflare provider and hold an account
 credential as a secret. The D1 and R2 HTTP transports stay banned from it.
 
-## Why the old rule went
+## Historical rationale
 
 The rule carried its reason in a comment:
 
@@ -31,12 +39,13 @@ Two consequences followed from it, and both were bad:
   somebody maintains, reachable from the internet. That is a real operational
   burden accepted in exchange for a benefit that was not there.
 
-## What we give up
+## Historical cost
 
-Blast radius. The API Worker is the most exposed code in the system, and an
-account-wide credential now lives in the same isolate. A bug that lets somebody
-read the environment or drive an arbitrary subrequest yields the Cloudflare
-account: every customer's Worker, database, and bucket.
+The accepted design increased blast radius. The API Worker is the most exposed
+code in the system, and an account-wide credential then lived in the same
+isolate. A bug that let somebody read the environment or drive an arbitrary
+subrequest could yield the Cloudflare account: every customer's Worker,
+database, and bucket. This is the cost the superseding split removes.
 
 This is a real cost and it is worth naming plainly. Two things bound it:
 
@@ -48,7 +57,7 @@ This is a real cost and it is worth naming plainly. Two things bound it:
   attacker with code execution in the API could always ask the provisioner to
   provision. Splitting narrowed the path; it did not close it.
 
-## What we keep
+## Boundary retained
 
 The `Provider` port and the remote provisioner built against it stay.
 
@@ -65,13 +74,20 @@ sending everything down it.
 
 ## What the gates check now
 
-`scripts/check-imports.ts` still refuses `src/sql-d1-http.ts` and
-`src/objects-r2-http.ts` in the Worker graph. The Worker has D1 and R2
-bindings; a credential-bearing HTTP transport is not a capability it needs, and
-a capability nothing needs is one worth refusing.
+`scripts/check-imports.ts` proves the public Worker cannot reach the real
+Cloudflare provider, its parent REST backends, or Wasabi credential paths. The
+credential-bearing graph is rooted only at
+`src/entry-cloudflare-provider-executor.ts`, whose named RPC surface is closed
+to the implemented Provider operations and has no `fetch` entrypoint. That
+surface includes import/adoption recovery, exact-Deployment artifact-consumption
+readback, and bounded upstream meters, so none of those capabilities can force
+a parent credential back into the public Worker.
 
-`scripts/build-worker.ts` still refuses long-lived S3 key names in the bundle
-and still requires the `STATE_DB` and `OBJECTS` bindings to be used. It no
-longer refuses the Cloudflare REST origin or the name of a secret: naming a
-secret is how a Worker reads one, and a gate that forbids the name only teaches
-people to spell it differently.
+`scripts/build-worker.ts` rejects Cloudflare parent-token/account identifiers,
+Wasabi credential names, and parent REST origins in the public bundle. The
+public immutable binding closure admits `CLOUDFLARE_PROVIDER_EXECUTOR`, not
+`CLOUDFLARE_API_TOKEN`; every Cloudflare supply fails closed when the exact
+target topology and qualified executor Version are absent. The executor's own
+route-less build and deploy readback separately require its D1, R2, dispatch,
+gateway, receipt-authority, plain-text, and two secret bindings, with
+workers.dev/preview disabled and no route or custom domain.

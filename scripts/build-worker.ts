@@ -32,20 +32,25 @@ try {
     const bundles = files(output).filter((path) => path.endsWith(".js"));
     if (bundles.length === 0) throw new Error("Wrangler dry-run produced no JavaScript bundle");
     const source = bundles.map((path) => readFileSync(path, "utf8")).join("\n");
-    // Long-lived S3 keys have no business in an edge bundle: nothing here
-    // needs them, and unlike a Worker secret they cannot be rotated by the
-    // platform that issued them. The Cloudflare REST origin and the name of a
-    // secret are no longer refused — naming a secret is how a Worker reads
-    // one, and a gate that forbids the name only teaches people to spell it
-    // differently. See docs/adr/0001-provision-from-the-worker.md.
-    for (const forbidden of ["R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]) {
+    // The public API Worker owns no parent-provider authority. A credential
+    // name or parent REST origin in these bytes means a provider implementation
+    // crossed the route-less executor boundary even if the target currently
+    // leaves its binding unset.
+    for (const forbidden of [
+      "R2_ACCESS_KEY_ID",
+      "R2_SECRET_ACCESS_KEY",
+      "CLOUDFLARE_API_TOKEN",
+      "CLOUDFLARE_ACCOUNT_ID",
+      "TAKOSERVER_WASABI_",
+      "api.cloudflare.com/client/v4",
+    ]) {
       if (source.includes(forbidden)) {
         throw new Error(
           `Worker bundle contains forbidden REST or credential surface: ${forbidden}`,
         );
       }
     }
-    for (const binding of ["STATE_DB", "OBJECTS", "AI"]) {
+    for (const binding of ["STATE_DB", "OBJECTS", "AI", "CLOUDFLARE_PROVIDER_EXECUTOR"]) {
       if (!source.includes(binding)) throw new Error(`Worker bundle does not use ${binding}`);
     }
   }

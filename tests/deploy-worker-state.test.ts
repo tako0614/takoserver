@@ -12,6 +12,7 @@ import {
   parseWorkerDeploymentHistory,
   workerVersionMetadataBindingProfile,
 } from "../scripts/deploy/worker-state.ts";
+import { cloudflareProviderExecutorTarget } from "./helpers/hosted-supply-fixtures.ts";
 
 const VERSION = {
   id: "version-1",
@@ -113,6 +114,28 @@ describe("immutable Worker Version binding closure", () => {
         expectedExactBindingClosure(target),
       ),
     ).toThrow("exact selected target closure");
+  });
+
+  test("binds the public Version to the exact private provider executor service", () => {
+    const cloudflareProviderExecutor = cloudflareProviderExecutorTarget();
+    const target = {
+      kind: "takoserver.deploy-target@v2",
+      environment: "integration",
+      accountId: "a".repeat(32),
+      workerName: "takoserver-api-integration",
+      d1: { databaseName: "runtime-db", databaseId: "database-id" },
+      r2: { bucketName: "objects" },
+      publicOrigin: "https://api.integration.example.test",
+      signing: { currentKeyId: "key-current" },
+      cloudflareProviderExecutor,
+    } satisfies DeployTarget;
+    expect(expectedExactBindingClosure(target).CLOUDFLARE_PROVIDER_EXECUTOR).toEqual({
+      type: "service",
+      fields: {
+        service: cloudflareProviderExecutor.workerName,
+        entrypoint: "CloudflareProviderExecutor",
+      },
+    });
   });
 
   test("JIT authority closures require an exact five-binding provenance profile", () => {

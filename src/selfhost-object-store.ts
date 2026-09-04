@@ -34,16 +34,18 @@ import type { Sql } from "./ports.ts";
  * resolved the old row and lost the race re-reads the row rather than reporting
  * a missing object.
  *
- * **Multipart receipts are durable.** That is the whole reason a self-host may
- * serve `bucketBindings` where the managed Cloudflare wrapper may not
- * ([ADR 0007](../docs/adr/0007-objectbucket-joins-the-implementation-catalog.md)):
- * a restart between `createMultipartUpload` and `completeMultipartUpload` loses
- * nothing here, so the part sizes and etags a complete is validated against
- * survive it.
+ * **Multipart receipts are durable.** This runtime owns them in its control
+ * database; the managed Cloudflare wrapper uses a provider-owned receipt
+ * Durable Object instead
+ * ([ADR 0007](../docs/adr/0007-objectbucket-joins-the-implementation-catalog.md)).
+ * A restart between `createMultipartUpload` and `completeMultipartUpload`
+ * therefore preserves the part sizes and etags in either wrapper.
  *
- * Directories are `0700` and files `0600`, and both are tightened and re-read
- * rather than created hopefully — `mkdir(mode)` does nothing to a directory an
- * earlier build or an operator's `mkdir -p` already made.
+ * Directory permission bits are fail-closed: this module requests `0700`,
+ * tightens an existing directory, then refuses it if `stat` still reports any
+ * group/other bit. New body files use `O_EXCL | O_NOFOLLOW` with `0600`. Those
+ * are permission/symlink checks at the operation boundary, not a claim that
+ * this module proves filesystem ownership or a stable inode identity.
  */
 
 /** The exact ceilings `edge.objects` fixes, enforced here and at the facade. */
@@ -1042,8 +1044,9 @@ async function run(
  * A directory this process is willing to keep a tenant's objects in.
  *
  * `mkdir(mode)` does nothing to a directory that already exists, so the mode is
- * tightened and re-read rather than assumed — exactly as the SQL plane does for
- * the directory holding tenants' databases.
+ * tightened and re-read rather than assumed. This deliberately proves only
+ * that no group/other permission bit remains; it does not claim OS ownership or
+ * stable inode identity.
  */
 async function privateDirectory(path: string): Promise<void> {
   await mkdir(path, { recursive: true, mode: 0o700 });

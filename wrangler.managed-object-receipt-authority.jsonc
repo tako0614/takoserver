@@ -1,0 +1,46 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "takoserver-managed-object-receipt-authority",
+  "main": "src/entry-cloudflare-managed-object-receipt-authority.ts",
+  "compatibility_date": "2026-08-31",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": true
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.01
+    }
+  },
+  "vars": {
+    "MANAGED_PROVIDER_ID": "unconfigured",
+    "TAKOSERVER_MANAGED_OBJECT_ACCOUNT_ID": "unconfigured"
+  },
+  "secrets": {
+    "required": [
+      "TAKOSERVER_MANAGED_OBJECT_ACCESS_KEY_ID",
+      "TAKOSERVER_MANAGED_OBJECT_SECRET_ACCESS_KEY",
+      "TAKOSERVER_MANAGED_OBJECT_PROOF_SECRET"
+    ]
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "OBJECT_RECEIPTS",
+        "class_name": "TakoserverManagedObjectReceipt"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["TakoserverManagedObjectReceipt"]
+    }
+  ]
+}

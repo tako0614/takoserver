@@ -6,6 +6,7 @@ import {
   HOSTED_OBJECT_BUCKET_SUPPLIES_KIND,
   type HostedObjectBucketSupplies,
 } from "../../src/hosted-object-bucket-supplies.ts";
+import type { DeployTarget } from "../../scripts/deploy/target.ts";
 
 /**
  * The shape the operator's real integration target has: two supply halves that
@@ -42,6 +43,24 @@ const INSTALLATION = {
   state: "active",
   regions: [{ id: "global", capacity: "available" }],
 } as const;
+
+export function cloudflareProviderExecutorTarget(
+  providerInstallationId: string = INSTALLATION.id,
+): NonNullable<DeployTarget["cloudflareProviderExecutor"]> {
+  return {
+    workerName: "takoserver-cloudflare-provider-executor",
+    dispatchNamespace: "takoserver-customers",
+    gatewayWorkerName: "takoserver-managed-worker-gateway",
+    managedBaseDomain: "workers.example.test",
+    providerInstallationId,
+    receiptAuthorityWorkerName: "takoserver-managed-object-receipts",
+    releaseReadbackQualification: {
+      schema: "takoserver.cloudflare-wfp-release-readback-qualification@v1",
+      dispatchNamespace: "takoserver-customers",
+      rehearsalDigest: `sha256:${"9".repeat(64)}` as const,
+    },
+  };
+}
 
 /** Every class either half sells, on the one contract both halves name. */
 export const SHARED_RESOURCE_CLASSES = [

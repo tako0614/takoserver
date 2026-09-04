@@ -1,4 +1,9 @@
 import { isSha256Digest } from "./json.ts";
+import type { PublicFormImplementationIdentity } from "./public-host-identity.ts";
+export type {
+  PublicFormImplementationIdentity,
+  PublicWorkerImplementationIdentity,
+} from "./public-host-identity.ts";
 import {
   CLOUDFLARE_TAKOFORM_HANDLER_KINDS,
   CloudflareProvider,
@@ -29,16 +34,6 @@ const RESOURCE_OPERATION_ORDER = [
 export interface PublicFormImplementationConfiguration {
   readonly implementationPayloadDigest: `sha256:${string}`;
   readonly capabilities: TakoformLifecycleCapabilityManifest;
-}
-
-export interface PublicFormImplementationIdentity {
-  readonly implementationPayloadDigest: `sha256:${string}`;
-  readonly capabilityDigest: `sha256:${string}`;
-  readonly implementationDigest: `sha256:${string}`;
-}
-
-export interface PublicWorkerImplementationIdentity extends PublicFormImplementationIdentity {
-  readonly workerArtifactDigest: `sha256:${string}`;
 }
 
 /**

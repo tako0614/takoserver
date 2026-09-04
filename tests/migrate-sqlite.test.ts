@@ -862,6 +862,7 @@ describe("bringing a local database up to date", () => {
       "tf_artifact_manifest_members",
       "tf_artifact_owner_closure_receipts",
       "tf_artifact_roots",
+      "tf_cloudflare_provider_executor_operations",
       "tf_resources",
       "tf_resource_attachments",
       "tf_resource_deployments",

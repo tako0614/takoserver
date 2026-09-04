@@ -5,6 +5,13 @@ import {
   artifactBlobIoCompatibilityAllowsPending,
   probeArtifactBlobIoQuiescence,
 } from "./artifact-blob-io-compatibility.ts";
+import {
+  type CloudflareProviderExecutorInspection,
+  type CloudflareProviderExecutorState,
+  cloudflareProviderExecutorDependencies,
+  inspectCloudflareProviderExecutor,
+  remoteCloudflareProviderExecutorSchema,
+} from "./cloudflare-provider-executor.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1 } from "./d1.ts";
 import {
@@ -24,7 +31,7 @@ import {
   wranglerCommand,
 } from "./process.ts";
 import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualification.ts";
-import { writeWorkerConfig } from "./realized-config.ts";
+import { writeCloudflareProviderExecutorConfig, writeWorkerConfig } from "./realized-config.ts";
 import { runAuthorityTransition } from "./retirement.ts";
 import {
   activePublicJwk,
@@ -90,6 +97,12 @@ export interface WorkerOptions {
   readonly publicationLeaseRoot?: string;
   /** Authoritative active runtime-signing identity; injectable only for portable tests. */
   readonly signingDatabase?: Pick<SigningDatabase, "readKey">;
+  /** Exact private-executor qualification seam; injectable only for portable tests. */
+  readonly providerExecutorQualification?: WorkerProviderExecutorQualification;
+}
+
+export interface WorkerProviderExecutorQualification {
+  read(phase: "preflight" | "verification"): Promise<CloudflareProviderExecutorInspection>;
 }
 
 interface WorkerInspection {
@@ -141,13 +154,45 @@ export async function runWorker(
   // Before any live read or upload: the selected target must compose the
   // Worker the same way the Worker composes itself on its first request.
   await assertTargetComposes("preflight", target);
+  const cloudflareState =
+    options.state === undefined
+      ? new CloudflareState({
+          accountId: target.accountId,
+          token: credential?.token ?? exactToken(environment),
+        })
+      : null;
+  const state = options.state ?? cloudflareState;
+  if (state === null) throw preflightError("Worker state is unavailable");
+  const providerExecutorQualification = providerExecutorQualificationReader({
+    target,
+    commit: invocation.commit,
+    state: cloudflareState,
+    environment,
+    run,
+    ...(options.providerExecutorQualification === undefined
+      ? {}
+      : { injected: options.providerExecutorQualification }),
+  });
+  const providerExecutorBefore =
+    providerExecutorQualification === null
+      ? null
+      : await providerExecutorQualification.read("preflight");
+  if (
+    invocation.action === "apply" &&
+    providerExecutorBefore !== null &&
+    !providerExecutorBefore.ready
+  ) {
+    throw preflightError(
+      "public Worker publication requires the exact selected-commit Cloudflare provider executor",
+    );
+  }
   if (invocation.legacyHostRuntimePredecessorVersionId !== undefined) {
     if (invocation.surface !== "takoserver-worker-authority-cutover") {
       throw preflightError(
         "legacy Host-runtime predecessor transition requires takoserver-worker-authority-cutover",
       );
     }
-    return await runAuthorityTransition(
+    const transition = await runAuthorityTransition(
       {
         surface: "takoserver-worker-authority-cutover",
         action: invocation.action,
@@ -157,14 +202,11 @@ export async function runWorker(
         ...(invocation.reverse ? { reverse: true } : {}),
       },
       target,
-      options.state ??
-        new CloudflareState({
-          accountId: target.accountId,
-          token: credential?.token ?? exactToken(environment),
-        }),
+      state,
       run,
       { ...options, cloudflareEnvironment: environment },
     );
+    return withProviderExecutorQualification(transition, providerExecutorBefore);
   }
   const temporary = options.outputDirectory === undefined;
   const root = options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-worker-"));
@@ -179,12 +221,6 @@ export async function runWorker(
         ? {}
         : { authorityProfile: { kind: "historical-pre-jit" as const } }),
     });
-    const state =
-      options.state ??
-      new CloudflareState({
-        accountId: target.accountId,
-        token: credential?.token ?? exactToken(environment),
-      });
     const migrations =
       options.migrations ?? remoteMigrationReader(inspectionConfig, environment, run);
     const signingDatabase =
@@ -233,6 +269,7 @@ export async function runWorker(
         pendingMigrations: before.pending,
         integrationE2eCredentialAuthorityConfigured:
           before.integrationE2eCredentialAuthorityConfigured,
+        ...providerExecutorStatus(providerExecutorBefore),
         ...(versionPublication
           ? {
               publicationLease: inspectWranglerVersionPublicationLease({
@@ -250,6 +287,7 @@ export async function runWorker(
           !legacyProfileCurrent &&
           (target.integrationE2eCredentialAuthority === undefined ||
             before.integrationE2eCredentialAuthorityConfigured) &&
+          (providerExecutorBefore === null || providerExecutorBefore.ready) &&
           (!advancedFromSelector || before.commit === invocation.commit),
         ...(advancedFromSelector
           ? {
@@ -383,6 +421,10 @@ export async function runWorker(
         throw preflightError("active runtime signing identity changed before Worker upload");
       }
     }
+    if (providerExecutorQualification !== null && providerExecutorBefore !== null) {
+      const currentProviderExecutor = await providerExecutorQualification.read("preflight");
+      assertProviderExecutorUnchanged(providerExecutorBefore, currentProviderExecutor);
+    }
     if (legacyBootstrap) {
       const selector = invocation.legacyPredecessorVersionId;
       if (selector === undefined) {
@@ -434,6 +476,10 @@ export async function runWorker(
             current,
             "Worker state changed after Version upload and before traffic deployment",
           );
+          if (providerExecutorQualification !== null && providerExecutorBefore !== null) {
+            const currentProviderExecutor = await providerExecutorQualification.read("preflight");
+            assertProviderExecutorUnchanged(providerExecutorBefore, currentProviderExecutor);
+          }
         },
       });
     } else {
@@ -498,6 +544,17 @@ export async function runWorker(
     ) {
       throw verificationError("Worker publication left pending D1 migrations");
     }
+    const providerExecutorAfter =
+      providerExecutorQualification === null
+        ? null
+        : await providerExecutorQualification.read("verification");
+    if (providerExecutorBefore !== null && providerExecutorAfter !== null) {
+      assertProviderExecutorUnchanged(
+        providerExecutorBefore,
+        providerExecutorAfter,
+        "verification",
+      );
+    }
     const probe =
       target.artifactBlobIoMode === "pre-0043-quiesced"
         ? await probeArtifactBlobIoQuiescence(
@@ -528,6 +585,7 @@ export async function runWorker(
       deploymentId: after.history.deploymentId,
       versionId: after.history.versionId,
       probe,
+      ...providerExecutorStatus(providerExecutorAfter),
       ...(publication === null
         ? {}
         : {
@@ -553,6 +611,114 @@ export async function runWorker(
     await publicationLease?.release();
     unsealDirectory(root);
     if (temporary) rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function providerExecutorQualificationReader(input: {
+  readonly target: DeployTarget;
+  readonly commit: string;
+  readonly state: CloudflareProviderExecutorState | null;
+  readonly environment: Readonly<Record<string, string>>;
+  readonly run: WorkerProcess;
+  readonly injected?: WorkerProviderExecutorQualification;
+}): WorkerProviderExecutorQualification | null {
+  if (input.target.cloudflareProviderExecutor === undefined) return null;
+  if (input.injected !== undefined) return input.injected;
+  if (input.state === null) {
+    throw preflightError(
+      "a public Worker test state with Cloudflare supplies must inject provider-executor qualification",
+    );
+  }
+  const dependencies = cloudflareProviderExecutorDependencies(
+    input.state,
+    input.target,
+    input.commit,
+  );
+  return {
+    async read(phase) {
+      const root = mkdtempSync(join(tmpdir(), "takoserver-public-executor-inspection-"));
+      try {
+        const configPath = writeCloudflareProviderExecutorConfig(input.target, {
+          path: join(root, "wrangler.jsonc"),
+          main: resolve(REPOSITORY, "src/entry-cloudflare-provider-executor.ts"),
+        });
+        const schema = remoteCloudflareProviderExecutorSchema(
+          configPath,
+          input.environment,
+          input.run,
+        );
+        return await inspectCloudflareProviderExecutor(
+          phase,
+          input.state as CloudflareProviderExecutorState,
+          schema,
+          dependencies,
+          input.target,
+          { commit: input.commit },
+        );
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  };
+}
+
+function providerExecutorStatus(
+  inspection: CloudflareProviderExecutorInspection | null,
+): Record<string, unknown> {
+  return inspection === null
+    ? { cloudflareProviderExecutor: { required: false } }
+    : {
+        cloudflareProviderExecutor: {
+          required: true,
+          ready: inspection.ready,
+          status: inspection.status,
+          routeLess: inspection.routeLess,
+          versionId: inspection.versionId,
+          deploymentId: inspection.deploymentId,
+          commit: inspection.commit,
+          bundleDigest:
+            inspection.bundleDigestHex === null ? null : `sha256:${inspection.bundleDigestHex}`,
+          schemaReady: inspection.schemaReady,
+          dependencies: inspection.dependencies,
+        },
+      };
+}
+
+function withProviderExecutorQualification(
+  result: Record<string, unknown>,
+  inspection: CloudflareProviderExecutorInspection | null,
+): Record<string, unknown> {
+  return {
+    ...result,
+    ...providerExecutorStatus(inspection),
+    ...(typeof result.ready === "boolean"
+      ? { ready: result.ready && (inspection === null || inspection.ready) }
+      : {}),
+  };
+}
+
+function assertProviderExecutorUnchanged(
+  expected: CloudflareProviderExecutorInspection,
+  actual: CloudflareProviderExecutorInspection,
+  phase: "preflight" | "verification" = "preflight",
+): void {
+  if (
+    !actual.ready ||
+    actual.versionId !== expected.versionId ||
+    actual.deploymentId !== expected.deploymentId ||
+    actual.previousVersionId !== expected.previousVersionId ||
+    actual.commit !== expected.commit ||
+    actual.bundleDigestHex !== expected.bundleDigestHex ||
+    actual.moduleDigestHex !== expected.moduleDigestHex ||
+    actual.managedExact !== expected.managedExact ||
+    actual.routeLess !== expected.routeLess ||
+    actual.schemaReady !== expected.schemaReady ||
+    JSON.stringify(actual.dependencies) !== JSON.stringify(expected.dependencies)
+  ) {
+    const message =
+      "Cloudflare provider executor qualification changed during public Worker publication";
+    if (phase === "verification") throw verificationError(message);
+    throw preflightError(message);
   }
 }
 

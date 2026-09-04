@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2022"],
+    "types": ["@cloudflare/workers-types"]
+  },
+  "include": [
+    "managed-object-receipt-authority-worker-configuration.d.ts",
+    "src/entry-cloudflare-managed-object-receipt-authority.ts"
+  ],
+  "exclude": []
+}

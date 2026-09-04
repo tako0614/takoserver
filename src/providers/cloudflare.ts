@@ -8,18 +8,17 @@ import type {
 import {
   type ApplyInput,
   failed,
-  PROVIDER_READBACK_API_VERSION,
   type Provider,
   type ProviderNativeAbsence,
   type ProviderNativeAbsenceUnknownReason,
   type ProviderNativeReadbackDescriptor,
   type ProviderNativeReadbackInput,
   type ProviderOffering,
-  ProviderReadbackDescriptorError,
   type ProviderSqliteMigration,
   type ProviderSqliteMigrationIdentity,
   type ProviderTicket,
   type ProviderValue,
+  running,
   succeeded,
 } from "../provider-port.ts";
 import type {
@@ -35,12 +34,17 @@ import {
   derivedProviderResourceName,
 } from "../provider-worker-endpoint-origin.ts";
 import {
+  createCloudflareNativeReadbackDescriptor,
+  validateCloudflareNativeReadbackDescriptor,
+} from "./cloudflare-readback-descriptor.ts";
+import {
   cloudflareR2EdgeObjectsMaterial,
   EDGE_OBJECTS_BINDING_REF,
 } from "./cloudflare-runtime-bindings.ts";
 import { CloudflareWfpBackend } from "./cloudflare-wfp-backend.ts";
 import type {
   ArtifactBytes,
+  CloudflareManagedObjectBucketReceiptStatus,
   CloudflareManagedScheduleOperatorProof,
   CloudflareManagedScheduleReconciliationStatus,
   CloudflareWorkerBackend,
@@ -49,6 +53,7 @@ import type {
 
 export type {
   ArtifactBytes,
+  CloudflareManagedObjectBucketReceiptStatus,
   CloudflareManagedScheduleOperatorProof,
   CloudflareManagedScheduleReconciliationStatus,
   CloudflareOrdinaryWorkerBackendOptions,
@@ -71,6 +76,8 @@ export type {
  */
 
 const API_ORIGIN = "https://api.cloudflare.com/client/v4";
+const MANAGED_OBJECT_DESTROY_HANDLE_SCHEMA =
+  "takoserver.cloudflare-managed-object-destroy@v1" as const;
 
 /** Same concrete kind set consumed by `apply`'s provider dispatch below. */
 export const CLOUDFLARE_TAKOFORM_HANDLER_KINDS = [
@@ -182,6 +189,18 @@ export interface CloudflareProviderOptions {
   readonly fetch?: (request: Request) => Promise<Response>;
 }
 
+interface ManagedObjectDestroyHandle {
+  readonly schema: typeof MANAGED_OBJECT_DESTROY_HANDLE_SCHEMA;
+  readonly stage: "prepare" | "confirm" | "commit";
+  readonly operationId: string;
+  readonly nativeId: string;
+  readonly bucketName: string;
+  readonly authorityProof: string;
+  readonly identity: Required<
+    Pick<ResourceIdentity, "tenantRef" | "space" | "name" | "uid" | "incarnationId" | "generation">
+  >;
+}
+
 export class CloudflareProvider implements Provider {
   readonly id: string;
   readonly offerings: readonly ProviderOffering[];
@@ -233,6 +252,7 @@ export class CloudflareProvider implements Provider {
             authorize: this.#authorize,
             fetch: this.#fetch,
             artifacts: this.#artifacts,
+            offerings: this.offerings,
             ...(this.#runtimeInputs === undefined ? {} : { runtimeInputs: this.#runtimeInputs }),
             workerCompatibilityDate: this.#workerCompatibilityDate,
           })
@@ -291,6 +311,20 @@ export class CloudflareProvider implements Provider {
       );
     }
     return await this.#workerBackend.reconcileManagedSchedules(proof);
+  }
+
+  /** Provider/operator-only readback; this is not part of the Edge ObjectBucket facade. */
+  async managedObjectBucketReceiptStatus(input: {
+    readonly identity: ResourceIdentity;
+    readonly bucketName: string;
+  }): Promise<ProviderValue<CloudflareManagedObjectBucketReceiptStatus>> {
+    if (!this.#workerBackend?.managedObjectBucketReceiptStatus) {
+      return providerValueFailure(
+        "invalid_spec",
+        "the managed ObjectBucket receipt operator is unavailable",
+      );
+    }
+    return await this.#workerBackend.managedObjectBucketReceiptStatus(input);
   }
 
   readonly sqliteMigrations = {
@@ -513,22 +547,13 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
   createNativeReadbackDescriptor(
     input: ProviderNativeReadbackInput,
   ): ProviderNativeReadbackDescriptor {
-    if (this.#workerBackend?.owns(input.offering)) {
-      return this.#workerBackend.createNativeReadbackDescriptor(input);
-    }
-    const native = parseNativeId(input.nativeId);
-    if (!native || !cloudflareKindMatches(providerKind(input.offering), native.kind)) {
-      throw new ProviderReadbackDescriptorError();
-    }
-    const data = cloudflareReadbackData(native, input.spec);
-    if (!data) throw new ProviderReadbackDescriptorError();
-    return {
-      apiVersion: PROVIDER_READBACK_API_VERSION,
-      provider: this.id,
-      kind: providerKind(input.offering),
-      nativeId: input.nativeId,
-      data,
-    };
+    return createCloudflareNativeReadbackDescriptor({
+      providerId: this.id,
+      placement: this.#workerBackend?.owns(input.offering)
+        ? "workers-for-platforms"
+        : "ordinary-workers",
+      readback: input,
+    });
   }
 
   /**
@@ -543,8 +568,16 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     if (this.#workerBackend?.owns(input.offering)) {
       return await this.#workerBackend.verifyNativeAbsence(input);
     }
-    const native = validateCloudflareReadbackDescriptor(this.id, input.offering, input.descriptor);
-    if (!native) return unknownAbsence("malformed", false);
+    const validated = validateCloudflareNativeReadbackDescriptor({
+      providerId: this.id,
+      placement: "ordinary-workers",
+      offering: input.offering,
+      descriptor: input.descriptor,
+    });
+    if (validated?.placement !== "ordinary-workers") {
+      return unknownAbsence("malformed", false);
+    }
+    const { native } = validated;
     const path = cloudflareReadbackPath(this.#accountId, native);
     if (!path) return unknownAbsence("unsupported", false);
     const read = await this.#call("GET", path);
@@ -743,11 +776,13 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       // operator/readback path rather than sending the mutation twice.
       return failed("unavailable", "provider mutation recovery requires an opaque handle", true);
     }
-    if (input.providerHandle) {
-      return failed("unavailable", "Cloudflare delete recovery cannot poll this handle", true);
-    }
+    if (input.providerHandle)
+      return await this.poll({ operationId: input.operationId, handle: input.providerHandle });
     const native = parseNativeId(input.nativeId);
     if (!native) return failed("not_found", "unrecognised native identity");
+    if (native.kind === "r2" && this.#workerBackend?.prepareManagedObjectBucketDestroy) {
+      return await this.#beginManagedObjectBucketDestroy(input, native.name);
+    }
     if (native.kind === "version") {
       // The stable Workers Scripts Versions API has no delete method. Preserve
       // the immutable provider revision and record that truth in Deployment
@@ -828,6 +863,56 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     });
   }
 
+  async poll(input: {
+    readonly operationId: string;
+    readonly handle: string;
+  }): Promise<ProviderTicket> {
+    const handle = managedObjectDestroyHandle(input.handle);
+    if (!handle || handle.operationId !== input.operationId) {
+      return failed("unavailable", "the Cloudflare provider handle is unavailable", false);
+    }
+    if (
+      !this.#workerBackend?.prepareManagedObjectBucketDestroy ||
+      !this.#workerBackend.commitManagedObjectBucketDestroy
+    ) {
+      return failed(
+        "unavailable",
+        "the managed ObjectBucket destroy authority is unavailable",
+        false,
+      );
+    }
+    if (handle.stage === "prepare") {
+      const prepared = await this.#workerBackend.prepareManagedObjectBucketDestroy({
+        identity: handle.identity,
+        bucketName: handle.bucketName,
+        authorityProof: handle.authorityProof,
+      });
+      if (!prepared.ok) return providerValueTicket(prepared, handle);
+      const next = { ...handle, authorityProof: prepared.value.authorityProof };
+      return prepared.value.state === "draining"
+        ? running(managedObjectDestroyHandleValue(next), 2_000)
+        : await this.#deletePreparedManagedObjectBucket({ ...next, stage: "confirm" });
+    }
+    if (handle.stage === "confirm") {
+      const present = await this.#r2BucketPresent(handle.bucketName);
+      if (present === null) return running(input.handle, 2_000);
+      if (present) {
+        return {
+          phase: "failed",
+          failure: {
+            code: "unavailable",
+            message:
+              "the managed ObjectBucket delete outcome is not absent; operator reconciliation is required",
+            retryable: true,
+          },
+          handle: input.handle,
+        };
+      }
+      return await this.#commitManagedObjectBucketDestroy({ ...handle, stage: "commit" });
+    }
+    return await this.#commitManagedObjectBucketDestroy(handle);
+  }
+
   /** Read-only delete recovery for resources with an authoritative GET path. */
   async recoverDelete(input: {
     operationId: string;
@@ -843,7 +928,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       return await this.#workerBackend.recoverDelete(input);
     }
     if (input.providerHandle) {
-      return failed("unavailable", "Cloudflare delete recovery cannot poll this handle", true);
+      return await this.poll({ operationId: input.operationId, handle: input.providerHandle });
     }
     const observed = await this.observe({
       offering: input.offering,
@@ -1002,6 +1087,90 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     if (read.ok) return true;
     if (read.status === 404) return false;
     return null;
+  }
+
+  async #beginManagedObjectBucketDestroy(
+    input: {
+      readonly operationId: string;
+      readonly nativeId: string;
+      readonly identity: ResourceIdentity;
+    },
+    bucketName: string,
+  ): Promise<ProviderTicket> {
+    const identity = exactManagedObjectDestroyIdentity(input.identity);
+    if (!identity || !this.#workerBackend?.prepareManagedObjectBucketDestroy) {
+      return failed("invalid_spec", "the managed ObjectBucket destruction identity is incomplete");
+    }
+    const prepared = await this.#workerBackend.prepareManagedObjectBucketDestroy({
+      identity,
+      bucketName,
+    });
+    if (!prepared.ok) return providerValueTicket(prepared);
+    const handle: ManagedObjectDestroyHandle = {
+      schema: MANAGED_OBJECT_DESTROY_HANDLE_SCHEMA,
+      stage: "prepare",
+      operationId: input.operationId,
+      nativeId: input.nativeId,
+      bucketName,
+      authorityProof: prepared.value.authorityProof,
+      identity,
+    };
+    return prepared.value.state === "draining"
+      ? running(managedObjectDestroyHandleValue(handle), 2_000)
+      : await this.#deletePreparedManagedObjectBucket({ ...handle, stage: "confirm" });
+  }
+
+  async #deletePreparedManagedObjectBucket(
+    handle: ManagedObjectDestroyHandle,
+  ): Promise<ProviderTicket> {
+    const path = `/accounts/${this.#accountId}/r2/buckets/${encodeURIComponent(handle.bucketName)}`;
+    const removed = await this.#call("DELETE", path);
+    if (!removed.ok && removed.status !== 404) {
+      if (removed.indeterminate) {
+        return running(managedObjectDestroyHandleValue({ ...handle, stage: "confirm" }), 2_000);
+      }
+      if (
+        (removed.status === 400 || removed.status === 409) &&
+        (await this.#r2BucketPresent(handle.bucketName)) === true
+      ) {
+        return failed(
+          "conflict",
+          "the bucket is still present and contains objects; empty it and destroy again",
+        );
+      }
+      return removed.ticket;
+    }
+    const present = await this.#r2BucketPresent(handle.bucketName);
+    if (present === null || present === true) {
+      return running(managedObjectDestroyHandleValue({ ...handle, stage: "confirm" }), 2_000);
+    }
+    return await this.#commitManagedObjectBucketDestroy({ ...handle, stage: "commit" });
+  }
+
+  async #commitManagedObjectBucketDestroy(
+    handle: ManagedObjectDestroyHandle,
+  ): Promise<ProviderTicket> {
+    if (!this.#workerBackend?.commitManagedObjectBucketDestroy) {
+      return failed(
+        "unavailable",
+        "the managed ObjectBucket destroy authority is unavailable",
+        false,
+      );
+    }
+    const committed = await this.#workerBackend.commitManagedObjectBucketDestroy({
+      identity: handle.identity,
+      bucketName: handle.bucketName,
+      authorityProof: handle.authorityProof,
+    });
+    if (!committed.ok) {
+      return providerValueTicket(committed, { ...handle, stage: "commit" });
+    }
+    return succeeded({
+      nativeId: handle.nativeId,
+      disposition: "deleted",
+      observed: { deleted: true },
+      outputs: {},
+    });
   }
 
   // --- object storage -------------------------------------------------------
@@ -2378,108 +2547,6 @@ function cloudflareKindMatches(kind: string, nativeKind: NativeId["kind"]): bool
   }
 }
 
-function cloudflareReadbackData(native: NativeId, spec?: JsonObject): JsonObject | null {
-  switch (native.kind) {
-    case "r2":
-      return { bucketName: native.name };
-    case "d1":
-      return { databaseId: native.name };
-    case "kv":
-      return { namespaceId: native.name };
-    case "queue":
-      return { queueId: native.name };
-    case "worker":
-      return { scriptName: native.name };
-    case "version":
-      return { scriptName: native.parent, versionId: native.name };
-    case "deployment":
-      return { scriptName: native.parent, deploymentId: native.name };
-    case "endpoint":
-      return { scriptName: native.name };
-    case "domain":
-      return { domainId: native.name };
-    case "cron": {
-      const cron = optionalString(spec?.cron);
-      return cron ? { scriptName: native.parent, cron } : null;
-    }
-    case "consumer":
-      return { queueId: native.parent, consumerId: native.name };
-  }
-}
-
-function validateCloudflareReadbackDescriptor(
-  provider: string,
-  offering: ProviderOffering,
-  descriptor: ProviderNativeReadbackDescriptor,
-): NativeId | null {
-  const raw = record(descriptor);
-  if (!raw) return null;
-  if (
-    raw.apiVersion !== PROVIDER_READBACK_API_VERSION ||
-    raw.provider !== provider ||
-    raw.kind !== providerKind(offering) ||
-    typeof raw.nativeId !== "string" ||
-    raw.nativeId.length < 1 ||
-    raw.nativeId.length > 4_096
-  ) {
-    // The parser below enforces the exact native kind/parent shape; this
-    // branch only bounds the opaque descriptor value before parsing it.
-    return null;
-  }
-  const native = parseNativeId(raw.nativeId);
-  if (!native || !cloudflareKindMatches(providerKind(offering), native.kind)) return null;
-  const data = record(raw.data);
-  if (!data || !cloudflareReadbackDataMatches(native, data)) return null;
-  return native;
-}
-
-function cloudflareReadbackDataMatches(native: NativeId, data: Record<string, unknown>): boolean {
-  switch (native.kind) {
-    case "r2":
-      return exactData(data, { bucketName: native.name });
-    case "d1":
-      return exactData(data, { databaseId: native.name });
-    case "kv":
-      return exactData(data, { namespaceId: native.name });
-    case "queue":
-      return exactData(data, { queueId: native.name });
-    case "worker":
-      return exactData(data, { scriptName: native.name });
-    case "version":
-      return exactData(data, { scriptName: native.parent, versionId: native.name });
-    case "deployment":
-      return exactData(data, { scriptName: native.parent, deploymentId: native.name });
-    case "endpoint":
-      return exactData(data, { scriptName: native.name });
-    case "domain":
-      return exactData(data, { domainId: native.name });
-    case "cron":
-      return (
-        exactKeys(data, ["scriptName", "cron"]) &&
-        data.scriptName === native.parent &&
-        typeof data.cron === "string" &&
-        data.cron.length > 0 &&
-        data.cron.length <= 4_096
-      );
-    case "consumer":
-      return exactData(data, { queueId: native.parent, consumerId: native.name });
-  }
-}
-
-function exactData(data: Record<string, unknown>, expected: Record<string, string>): boolean {
-  return (
-    exactKeys(data, Object.keys(expected)) &&
-    Object.entries(expected).every(([key, value]) => data[key] === value)
-  );
-}
-
-function exactKeys(data: Record<string, unknown>, keys: readonly string[]): boolean {
-  const actual = Object.keys(data).sort();
-  return (
-    actual.length === keys.length && actual.every((key, index) => key === [...keys].sort()[index])
-  );
-}
-
 function cloudflareReadbackPath(accountId: string, native: NativeId): string | null {
   const account = `/accounts/${accountId}`;
   switch (native.kind) {
@@ -3049,6 +3116,151 @@ function record(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+}
+
+function exactManagedObjectDestroyIdentity(
+  identity: ResourceIdentity,
+): ManagedObjectDestroyHandle["identity"] | null {
+  if (
+    !plainIdentity(identity.tenantRef, 255) ||
+    !plainIdentity(identity.space, 255) ||
+    !plainIdentity(identity.name, 128) ||
+    !nativeIdentity(identity.uid) ||
+    !nativeIdentity(identity.incarnationId) ||
+    typeof identity.generation !== "string" ||
+    !/^[1-9][0-9]{0,18}$/u.test(identity.generation)
+  ) {
+    return null;
+  }
+  return {
+    tenantRef: identity.tenantRef,
+    space: identity.space,
+    name: identity.name,
+    uid: identity.uid,
+    incarnationId: identity.incarnationId,
+    generation: identity.generation,
+  };
+}
+
+function managedObjectDestroyHandleValue(handle: ManagedObjectDestroyHandle): string {
+  const bytes = new TextEncoder().encode(JSON.stringify(handle));
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return `tsobjd1.${btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "")}`;
+}
+
+function managedObjectDestroyHandle(value: string): ManagedObjectDestroyHandle | null {
+  if (value.length > 4_096 || !/^tsobjd1\.[A-Za-z0-9_-]+$/u.test(value)) return null;
+  try {
+    const encoded = value.slice("tsobjd1.".length).replaceAll("-", "+").replaceAll("_", "/");
+    const binary = atob(encoded.padEnd(Math.ceil(encoded.length / 4) * 4, "="));
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    const parsed = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes),
+    ) as unknown;
+    const outer = exactObject(parsed, [
+      "schema",
+      "stage",
+      "operationId",
+      "nativeId",
+      "bucketName",
+      "authorityProof",
+      "identity",
+    ]);
+    const identity = outer
+      ? exactObject(outer.identity, [
+          "tenantRef",
+          "space",
+          "name",
+          "uid",
+          "incarnationId",
+          "generation",
+        ])
+      : null;
+    if (
+      !outer ||
+      !identity ||
+      outer.schema !== MANAGED_OBJECT_DESTROY_HANDLE_SCHEMA ||
+      (outer.stage !== "prepare" && outer.stage !== "confirm" && outer.stage !== "commit") ||
+      !plainIdentity(outer.operationId, 128) ||
+      !plainIdentity(outer.nativeId, 512) ||
+      !managedObjectBucketValue(outer.bucketName) ||
+      outer.nativeId !== `r2:${outer.bucketName}` ||
+      typeof outer.authorityProof !== "string" ||
+      !/^[A-Za-z0-9_-]{43}$/u.test(outer.authorityProof)
+    ) {
+      return null;
+    }
+    const normalizedIdentity = exactManagedObjectDestroyIdentity(
+      identity as unknown as ResourceIdentity,
+    );
+    return normalizedIdentity
+      ? {
+          schema: MANAGED_OBJECT_DESTROY_HANDLE_SCHEMA,
+          stage: outer.stage,
+          operationId: outer.operationId,
+          nativeId: outer.nativeId,
+          bucketName: outer.bucketName,
+          authorityProof: outer.authorityProof,
+          identity: normalizedIdentity,
+        }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function exactObject(value: unknown, expected: readonly string[]): Record<string, unknown> | null {
+  const object = record(value);
+  if (!object) return null;
+  const keys = Object.keys(object).sort();
+  const wanted = [...expected].sort();
+  return keys.length === wanted.length && keys.every((key, index) => key === wanted[index])
+    ? object
+    : null;
+}
+
+function plainIdentity(value: unknown, maximum: number): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= maximum &&
+    hasNoControlCharacters(value)
+  );
+}
+
+function hasNoControlCharacters(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 31 || code === 127) return false;
+  }
+  return true;
+}
+
+function nativeIdentity(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,511}$/u.test(value);
+}
+
+function managedObjectBucketValue(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/u.test(value) &&
+    !value.includes("..") &&
+    !/^\d+(?:\.\d+){3}$/u.test(value)
+  );
+}
+
+function providerValueTicket<T>(
+  value: Extract<ProviderValue<T>, { readonly ok: false }>,
+  handle?: ManagedObjectDestroyHandle,
+): ProviderTicket {
+  return value.failure.retryable && handle
+    ? {
+        phase: "failed",
+        failure: value.failure,
+        handle: managedObjectDestroyHandleValue(handle),
+      }
+    : { phase: "failed", failure: value.failure };
 }
 
 function base64(bytes: Uint8Array): string {

@@ -6,6 +6,7 @@ import {
   workerCompositionEnv,
 } from "../scripts/deploy/worker-composition.ts";
 import {
+  cloudflareProviderExecutorTarget,
   EDGE_ONLY_RESOURCE_CLASSES,
   edgeSuppliesFixture,
   objectBucketSuppliesFixture,
@@ -29,15 +30,18 @@ function target(
     r2: { bucketName: "takoserver-objects-integration" },
     publicOrigin: "https://api.integration.example.test",
     signing: { currentKeyId: "key-current" },
-    workerEndpointSuffix: "hosted.workers.dev",
+    cloudflareProviderExecutor: cloudflareProviderExecutorTarget(),
     edgeSupplies: edgeSuppliesFixture(input.edgeResourceClasses),
     objectBucketSupplies: objectBucketSuppliesFixture(input.objectResourceClasses),
   } satisfies DeployTarget;
 }
 
 describe("Worker composition preflight", () => {
-  test("accepts a target whose supply halves share one exact SupplyContract", async () => {
-    await assertTargetComposes("preflight", target());
+  test("accepts metered Cloudflare supplies only through the private executor capability", async () => {
+    await expect(assertTargetComposes("preflight", target())).resolves.toBeUndefined();
+    expect(workerCompositionEnv(target())).toMatchObject({
+      CLOUDFLARE_PROVIDER_EXECUTOR: {},
+    });
   });
 
   test("refuses a target that declares one contract twice with different content", async () => {
@@ -59,24 +63,22 @@ describe("Worker composition preflight", () => {
     const {
       edgeSupplies: _edge,
       objectBucketSupplies: _objects,
-      workerEndpointSuffix: _suffix,
+      cloudflareProviderExecutor: _executor,
       ...plain
     } = target();
     await assertTargetComposes("preflight", plain);
     expect(workerCompositionEnv(plain)).toEqual({});
   });
 
-  test("passes the derived plain-text bindings and placeholder secrets only", () => {
-    const env = workerCompositionEnv(target()) as Readonly<Record<string, string>>;
+  test("passes only non-secret supply facts and the typed executor capability", () => {
+    const env = workerCompositionEnv(target());
     expect(Object.keys(env).sort()).toEqual([
-      "CLOUDFLARE_ACCOUNT_ID",
-      "CLOUDFLARE_API_TOKEN",
+      "CLOUDFLARE_PROVIDER_EXECUTOR",
       "TAKOSERVER_EDGE_SUPPLIES",
+      "TAKOSERVER_MANAGED_BASE_DOMAIN",
       "TAKOSERVER_OBJECT_BUCKET_SUPPLIES",
-      "TAKOSERVER_WORKER_ENDPOINT_SUFFIX",
     ]);
-    // The credential is a stand-in: composition only tests presence and pairing.
-    expect(env.CLOUDFLARE_API_TOKEN).toBe("deploy-preflight-placeholder");
+    expect(env.CLOUDFLARE_PROVIDER_EXECUTOR).toBeDefined();
     expect(JSON.parse(env.TAKOSERVER_EDGE_SUPPLIES as string)).toMatchObject({
       supplyContract: { id: "cloudflare.staging-supply" },
     });

@@ -131,11 +131,17 @@ describe("Wasabi ObjectBucket provisioner", () => {
       nativeId: `wasabi:eu-central-1:ts-${"a".repeat(40)}`,
       identity: { tenantRef: "tenant_alpha", space: "default", name: "assets" },
     });
-    const present = await provider.verifyNativeAbsence({ offering, descriptor });
+    const target = {
+      tenantId: "tenant_alpha",
+      resourceUid: "uid-assets",
+      incarnationId: "dep-assets",
+      generation: "1",
+    };
+    const present = await provider.verifyNativeAbsence({ offering, descriptor, target });
     expect(present).toMatchObject({ outcome: "present", evidence: { kind: "ObjectBucket" } });
-    const absent = await provider.verifyNativeAbsence({ offering, descriptor });
+    const absent = await provider.verifyNativeAbsence({ offering, descriptor, target });
     expect(absent).toMatchObject({ outcome: "absent" });
-    const unknown = await provider.verifyNativeAbsence({ offering, descriptor });
+    const unknown = await provider.verifyNativeAbsence({ offering, descriptor, target });
     expect(unknown).toEqual({ outcome: "unknown", reason: "transport", retryable: true });
     expect(requests.map((request) => request.method)).toEqual(["HEAD", "HEAD", "HEAD"]);
     expect(JSON.stringify(present)).not.toContain("ts-");

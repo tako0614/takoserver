@@ -1,5 +1,6 @@
 import { isAbsolute } from "node:path";
 import { API_KEY_SCOPES, type ApiKeyScope } from "../src/auth.ts";
+import { runCloudflareProviderExecutor } from "./deploy/cloudflare-provider-executor.ts";
 import { runConsole } from "./deploy/console.ts";
 import { DEPLOY_CONTRACT } from "./deploy/contract.ts";
 import { DeployError, deployFailureAftermath, PHASE_EXIT_CODE } from "./deploy/errors.ts";
@@ -10,6 +11,7 @@ import { loadFormAuthorityScopeTransition } from "./deploy/form-authority-scope-
 import { runHosted } from "./deploy/hosted.ts";
 import { runOperatorIdentity } from "./deploy/identity.ts";
 import { runIntegrationE2eCredentials } from "./deploy/integration-e2e-credentials.ts";
+import { runManagedObjectReceiptAuthority } from "./deploy/managed-object-receipt-authority.ts";
 import { runManagedWorkerGateway } from "./deploy/managed-worker-gateway.ts";
 import { runOrgApiKey } from "./deploy/org-api-key.ts";
 import type { DeployEnvironment } from "./deploy/qualification.ts";
@@ -41,7 +43,7 @@ const USAGE = `takoserver deploy
   bun run deploy -- takoserver-org-api-key --<mint|status|revoke> --environment=<env> --commit=<sha>
     --organization=org_... [--key-name=<name> --scope=<scope> --expires-in-days=<n>] [--key-id=key_...]
   Rehearsal and production D1 schema status/apply require one fixed next-wave selector:
-    --through-migration=<0028|0033|0036|0043>
+    --through-migration=<0028|0033|0036|0043|0044|0045>
   Pending 0043 additionally requires the staged pre-0043-quiesced Worker target and the absolute
   operator-private TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH documented in docs/deploy.md.
   takoserver-d1-schema-rehearsal-baseline is fixed empty -> 0022, rehearsal-only, and accepts no selector.
@@ -69,6 +71,17 @@ const USAGE = `takoserver deploy
   Worker has no Version at all, together with
   --bootstrap-probe-predecessor-version=<uuid>. The pinned identity-probe Version must already be
   the exact predecessor missing only FORM_AUTHORITY; it is checked again at the mutation fence.
+  takoserver-managed-object-receipt-authority --apply reads the exact operator-private
+  TAKOSERVER_MANAGED_OBJECT_RECEIPT_SECRETS_PATH and publishes all three required secrets with
+  code and the receipt Durable Object in one Wrangler operation. Rehearsal/production bootstrap
+  also requires TAKOSERVER_MANAGED_OBJECT_RECEIPT_AUTHORITY_REHEARSAL_RECEIPT_PATH.
+  Its MANAGED_PROVIDER_ID comes only from the target's Cloudflare provider-executor installation,
+  deliberately distinct from the gateway's legacy provider-pack identity.
+  cloudflare-provider-executor --apply reads the exact operator-private
+  TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH. The canonical owner-only file contains only
+  CLOUDFLARE_API_TOKEN and TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING; code and both secret bindings are
+  published together. Deploy in dependency order: receipt authority, managed gateway, provider
+  executor, then the public Worker. The executor accepts --reverse only with --apply.
 
 The target descriptor is selected only by the exact environment. There is no
 deploy-plan flag, ledger, target override or mixed mutation controller.
@@ -599,7 +612,8 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     !(
       surfaceValue === "takoserver-worker-authority-cutover" ||
       surfaceValue === "takoserver-host-runtime-topology-retirement" ||
-      surfaceValue === "takoserver-managed-worker-gateway"
+      surfaceValue === "takoserver-managed-worker-gateway" ||
+      surfaceValue === "cloudflare-provider-executor"
     )
   ) {
     return null;
@@ -841,8 +855,29 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
         },
         target,
       );
+    case "takoserver-managed-object-receipt-authority":
+      return await runManagedObjectReceiptAuthority(
+        {
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
+        },
+        target,
+      );
     case "takoserver-managed-worker-gateway":
       return await runManagedWorkerGateway(
+        {
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
+          ...(invocation.reverse ? { reverse: true } : {}),
+        },
+        target,
+      );
+    case "cloudflare-provider-executor":
+      return await runCloudflareProviderExecutor(
         {
           surface: invocation.surface,
           action: invocation.action,

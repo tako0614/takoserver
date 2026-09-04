@@ -45,7 +45,9 @@ const SURFACES = [
   ["takoserver-worker-retirement-attribution-repair", []],
   ["takoserver-operator-identity", ["authority"]],
   ["takoserver-integration-operator-identity", ["authority"]],
+  ["takoserver-managed-object-receipt-authority", ["irreversible", "authority"]],
   ["takoserver-managed-worker-gateway", ["authority"]],
+  ["cloudflare-provider-executor", ["authority"]],
   ["takoserver-org-api-key", ["authority"]],
 ] as const;
 
@@ -72,6 +74,14 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(contract.surfaces.some(({ surface }) => surface === "takoserver-api")).toBe(false);
     expect(contract.otherProviderScripts).toEqual([
       {
+        script: "build:cloudflare-provider-executor",
+        why: expect.stringContaining("route-less provider executor"),
+      },
+      {
+        script: "build:managed-object-receipt-authority",
+        why: expect.stringContaining("strict --dry-run bundle build"),
+      },
+      {
         script: "build:managed-worker-gateway",
         why: expect.stringContaining("strict --dry-run bundle build"),
       },
@@ -94,6 +104,12 @@ describe("Takoserver split deploy entrypoint", () => {
     );
     const hosted = contract.surfaces.find(
       ({ surface }) => surface === "takoserver-hosted-token-cutover",
+    );
+    const receiptAuthority = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-managed-object-receipt-authority",
+    );
+    const providerExecutor = contract.surfaces.find(
+      ({ surface }) => surface === "cloudflare-provider-executor",
     );
     const routineWorker = contract.surfaces.find(({ surface }) => surface === "takoserver-worker");
     const schemaBaseline = contract.surfaces.find(
@@ -148,6 +164,7 @@ describe("Takoserver split deploy entrypoint", () => {
       "cannot emit production rehearsal evidence",
     );
     expect(schema?.obligations.provenance).toContain("fixed next boundaries 0028");
+    expect(schema?.obligations.provenance).toContain("0045");
     expect(schema?.requiresEnv).toContain("TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH");
     expect(schema?.obligations["pre-mutation-proof"]).toContain("malformed FormRef");
     expect(schema?.obligations["pre-mutation-proof"]).toContain(
@@ -210,6 +227,26 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(hosted?.obligations["post-conditions"]).toContain(
       "functionalProofPending=false, repairRequired=false, and ready=true",
     );
+    expect(receiptAuthority?.obligations["post-conditions"]).toContain("--secrets-file");
+    expect(receiptAuthority?.obligations["post-conditions"]).toContain("custom domains");
+    expect(receiptAuthority?.obligations["post-conditions"]).toContain("removed");
+    expect(receiptAuthority?.obligations["pre-mutation-proof"]).toContain("null predecessor");
+    expect(receiptAuthority?.requiresEnv).not.toContain(
+      "TAKOSERVER_CLOUDFLARE_PROVIDER_INSTALLATION_ID",
+    );
+    expect(providerExecutor?.obligations["post-conditions"]).toContain(
+      "receipt authority -> gateway -> executor -> public API",
+    );
+    expect(providerExecutor?.obligations["post-conditions"]).toContain("Migration 0045");
+    expect(providerExecutor?.obligations.reversal).toContain("immediate predecessor");
+    expect(providerExecutor?.obligations.provenance).toContain(
+      "TAKOSERVER_DEPLOY_TARGET_<ENVIRONMENT>",
+    );
+    expect(providerExecutor?.obligations.provenance).toContain(
+      ".operator-private/takoserver/<environment>/target.v2.json",
+    );
+    expect(providerExecutor?.obligations.provenance).toContain(".deploy/target.staging.json");
+    expect(providerExecutor?.obligations.provenance).toContain("receiptAuthorityWorkerName");
 
     for (const surface of contract.surfaces) {
       expect(surface.obligations).toMatchObject({
@@ -304,7 +341,7 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(baseline.stderr).toContain("deploy target descriptor not found");
     expect(baseline.stderr).not.toContain("no target was touched");
 
-    for (const through of ["0028", "0033", "0036", "0043"] as const) {
+    for (const through of ["0028", "0033", "0036", "0043", "0044", "0045"] as const) {
       for (const environment of ["rehearsal", "production"] as const) {
         const accepted = await deploy([
           "takoserver-d1-schema",
@@ -329,7 +366,7 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(integrationWithoutWave.stderr).toContain("deploy target descriptor not found");
     expect(integrationWithoutWave.stderr).not.toContain("no target was touched");
 
-    for (const through of ["0028", "0033", "0036", "0043"] as const) {
+    for (const through of ["0028", "0033", "0036", "0043", "0044", "0045"] as const) {
       const refused = await deploy([
         "takoserver-d1-schema",
         "--status",
@@ -541,6 +578,30 @@ describe("Takoserver split deploy entrypoint", () => {
       expect(refused.stdout).toBe("");
       expect(refused.stderr).toContain("no target was touched");
     }
+  });
+
+  test("accepts provider-executor reverse only as an apply mutation", async () => {
+    const sha = "a".repeat(40);
+    const accepted = await deploy([
+      "cloudflare-provider-executor",
+      "--apply",
+      "--environment=integration",
+      `--commit=${sha}`,
+      "--reverse",
+    ]);
+    expect(accepted.exitCode).toBe(2);
+    expect(accepted.stderr).toContain("deploy target descriptor not found");
+    expect(accepted.stderr).not.toContain("no target was touched");
+
+    const refused = await deploy([
+      "cloudflare-provider-executor",
+      "--status",
+      "--environment=integration",
+      `--commit=${sha}`,
+      "--reverse",
+    ]);
+    expect(refused.exitCode).toBe(2);
+    expect(refused.stderr).toContain("no target was touched");
   });
 
   test("parses attribution repair only with both pinned Versions and no reverse", async () => {

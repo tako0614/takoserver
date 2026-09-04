@@ -1,4 +1,5 @@
 import type { MeterSource, ProviderMeterDeployment } from "../provider-meter-port.ts";
+import { CLOUDFLARE_PROVIDER_METER_SOURCES } from "./cloudflare-edge-meter-contract.ts";
 import {
   array,
   boundedJson,
@@ -22,11 +23,7 @@ export function createCloudflareR2MeterSource(options: {
   const apiToken = bounded(options.apiToken, 3, 4_096);
   const send = options.fetch ?? ((request: Request) => fetch(request));
   return {
-    id: "cloudflare-r2-analytics",
-    meters: [OBJECT_STORAGE_METERS.storage, OBJECT_STORAGE_METERS.requests],
-    settlementDelaySeconds: 300,
-    maximumWindowSeconds: 86_400,
-    retentionSeconds: 31 * 86_400,
+    ...CLOUDFLARE_PROVIDER_METER_SOURCES.r2,
     async read({ deployment, from, until }) {
       const bucketName = r2Bucket(deployment);
       const window = meterWindow(from, until);

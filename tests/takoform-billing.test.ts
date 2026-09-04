@@ -14,7 +14,13 @@ import {
 } from "../src/index.ts";
 import { type Sql, SqlError } from "../src/ports.ts";
 import { createProviderDriver, ProviderMutationRecoveryError } from "../src/provider-driver.ts";
-import { failed, type Provider, type ProviderOffering, succeeded } from "../src/provider-port.ts";
+import {
+  failed,
+  type Provider,
+  type ProviderOffering,
+  type ProviderReadAuthorityTarget,
+  succeeded,
+} from "../src/provider-port.ts";
 import { createFakeProviderState, FakeProvider } from "../src/providers/fake.ts";
 import { createTakoformStore } from "../src/takoform/store.ts";
 import { createStaticStableTestTakoformHost } from "./helpers/historical-takoform-host.ts";
@@ -95,6 +101,15 @@ const RETAINED_PROVIDER_OFFERING: ProviderOffering = {
   ...PROVIDER_OFFERING,
   form: RETAINED_FORM_REF,
 };
+
+function testExecutionAuthority(tenantId: string, resourceUid: string, operationId: string) {
+  return {
+    tenantId,
+    resourceUid,
+    leaseToken: `pmlease_${operationId}`,
+    fingerprint: `test:${operationId}`,
+  };
+}
 
 const SOLD: Offering = {
   id: PROVIDER_OFFERING.id,
@@ -272,6 +287,7 @@ describe("Takoform apply on a real backend", () => {
       operationKey: "key_priced_running",
       tenantId: "org_priced",
       resourceUid: "uid_priced",
+      executionAuthority: testExecutionAuthority("org_priced", "uid_priced", "op_priced_running"),
       form: FORM,
       name: "slow",
       space: "default",
@@ -368,6 +384,7 @@ describe("Takoform apply on a real backend", () => {
       operationKey: "key_poll_lost",
       tenantId: "org_poll_lost",
       resourceUid: "uid_poll_lost",
+      executionAuthority: testExecutionAuthority("org_poll_lost", "uid_poll_lost", "op_poll_lost"),
       form: FORM,
       name: "poll-lost",
       space: "default",
@@ -435,6 +452,11 @@ describe("Takoform apply on a real backend", () => {
       operationKey: "key_priced_indeterminate",
       tenantId: "org_indeterminate",
       resourceUid: "uid_indeterminate",
+      executionAuthority: testExecutionAuthority(
+        "org_indeterminate",
+        "uid_indeterminate",
+        "op_priced_indeterminate",
+      ),
       form: FORM,
       name: "uncertain",
       space: "default",
@@ -518,6 +540,11 @@ describe("Takoform apply on a real backend", () => {
       operationKey: "key_recover_apply",
       tenantId: "org_recover_apply",
       resourceUid: "uid_recover_apply",
+      executionAuthority: testExecutionAuthority(
+        "org_recover_apply",
+        "uid_recover_apply",
+        "op_recover_apply",
+      ),
       form: FORM,
       name: "recoverable",
       space: "default",
@@ -640,6 +667,7 @@ describe("Takoform apply on a real backend", () => {
       operationKey: "key_version",
       tenantId: "org_inherited",
       resourceUid: "uid_version",
+      executionAuthority: testExecutionAuthority("org_inherited", "uid_version", "op_version"),
       form: version,
       name: "v1",
       space: "default",
@@ -755,6 +783,11 @@ describe("Takoform apply on a real backend", () => {
       operationKey: "key_runtime_capable",
       tenantId,
       resourceUid: "uid_version_capable",
+      executionAuthority: testExecutionAuthority(
+        tenantId,
+        "uid_version_capable",
+        "op_runtime_capable",
+      ),
       form: version,
       name: "version-capable",
       space: "default",
@@ -777,6 +810,11 @@ describe("Takoform apply on a real backend", () => {
         operationKey: "key_runtime_incapable",
         tenantId,
         resourceUid: "uid_version_incapable",
+        executionAuthority: testExecutionAuthority(
+          tenantId,
+          "uid_version_incapable",
+          "op_runtime_incapable",
+        ),
         form: version,
         name: "version-incapable",
         space: "default",
@@ -807,6 +845,11 @@ describe("Takoform apply on a real backend", () => {
       operationKey: "key_reseller_create",
       tenantId: "org_reseller",
       resourceUid: "uid_reseller_bucket",
+      executionAuthority: testExecutionAuthority(
+        "org_reseller",
+        "uid_reseller_bucket",
+        "op_reseller_create",
+      ),
       form: FORM,
       name: "media",
       space: "opaque-tenant",
@@ -824,6 +867,204 @@ describe("Takoform apply on a real backend", () => {
       heldMinor: 0,
     });
     expect(provider.listResources()).toEqual(["org_reseller/opaque-tenant/media"]);
+  });
+
+  test("projects the incumbent deployment and Resource generation into provider updates", async () => {
+    const sql = createEphemeralSql();
+    const clock = () => new Date("2026-09-04T00:00:00.000Z");
+    const deployments = createResourceDeploymentStore(sql, clock);
+    const previous = {
+      apiVersion: FORM_REF.apiVersion,
+      kind: FORM_REF.kind,
+      form: FORM.identity,
+      metadata: {
+        name: "update-target",
+        space: "default",
+        uid: "uid-update-target",
+        generation: "7",
+        revision: "3",
+      },
+      spec: { location: "apac" },
+      status: { observedGeneration: "7", conditions: [] },
+    } as const;
+    await deployments.create({
+      tenantId: "org_update_target",
+      id: "deployment-update-target",
+      resourceUid: previous.metadata.uid,
+      offeringId: SOLD.id,
+      providerPackRef: SOLD.providerPackRef,
+      providerInstallationRef: SOLD.providerInstallationRef,
+      nativeId: "fake:update-target",
+      state: "active",
+      observed: {},
+      outputs: {},
+    });
+    let providerIdentity: unknown;
+    const provider: Provider = {
+      id: "fake",
+      offerings: [PROVIDER_OFFERING],
+      async apply(input) {
+        providerIdentity = input.identity;
+        return succeeded({
+          nativeId: "fake:update-target",
+          observed: input.spec,
+          outputs: {},
+        });
+      },
+      async observe() {
+        return failed("not_found", "not used");
+      },
+      async delete() {
+        return failed("not_found", "not used");
+      },
+    };
+    const catalog = createCatalog([SOLD]);
+    const driver = createProviderDriver({
+      providers: [provider],
+      catalog,
+      ledger: createLedger(sql, clock),
+      deployments,
+    });
+
+    await driver.apply({
+      operationId: "op-update-target",
+      operationKey: "key-update-target",
+      operationMode: "initial",
+      executionAuthority: testExecutionAuthority(
+        "org_update_target",
+        previous.metadata.uid,
+        "op-update-target",
+      ),
+      tenantId: "org_update_target",
+      resourceUid: previous.metadata.uid,
+      form: FORM,
+      name: previous.metadata.name,
+      space: previous.metadata.space,
+      spec: { location: "eu" },
+      relations: [],
+      previous,
+      commercialAuthority: {
+        reservationId: "rsv-update-target",
+        offeringId: SOLD.id,
+        offeringDigest: await catalog.digest(SOLD),
+      },
+    });
+
+    expect(providerIdentity).toEqual({
+      tenantRef: "org_update_target",
+      space: "default",
+      name: "update-target",
+      uid: "uid-update-target",
+      incarnationId: "deployment-update-target",
+      generation: "7",
+    });
+  });
+
+  test("projects incumbent Deployment and generation into adoption and adoption recovery", async () => {
+    const sql = createEphemeralSql();
+    const clock = () => new Date("2026-09-04T00:00:00.000Z");
+    const deployments = createResourceDeploymentStore(sql, clock);
+    const previous = {
+      apiVersion: FORM_REF.apiVersion,
+      kind: FORM_REF.kind,
+      form: FORM.identity,
+      metadata: {
+        name: "import-target",
+        space: "default",
+        uid: "uid-import-target",
+        generation: "7",
+        revision: "3",
+      },
+      spec: { location: "apac" },
+      status: { observedGeneration: "7", conditions: [] },
+    } as const;
+    await deployments.create({
+      tenantId: "org_import_target",
+      id: "deployment-import-target",
+      resourceUid: previous.metadata.uid,
+      offeringId: SOLD.id,
+      providerPackRef: SOLD.providerPackRef,
+      providerInstallationRef: SOLD.providerInstallationRef,
+      nativeId: "fake:import-target",
+      nativeClaimed: true,
+      state: "active",
+      observed: {},
+      outputs: {},
+    });
+    const calls: unknown[] = [];
+    const adopted = async (input: Parameters<NonNullable<Provider["adopt"]>>[0]) => {
+      calls.push({ mode: input.operationMode, identity: input.identity });
+      return succeeded({
+        nativeId: input.nativeId,
+        observed: input.spec,
+        outputs: {},
+      });
+    };
+    const provider: Provider = {
+      id: "fake",
+      offerings: [PROVIDER_OFFERING],
+      async apply() {
+        return failed("not_found", "not used");
+      },
+      async observe() {
+        return failed("not_found", "not used");
+      },
+      async delete() {
+        return failed("not_found", "not used");
+      },
+      adopt: adopted,
+      recoverAdopt: adopted,
+    };
+    const driver = createProviderDriver({
+      providers: [provider],
+      catalog: createCatalog([SOLD]),
+      ledger: createLedger(sql, clock),
+      deployments,
+    });
+    const command = {
+      operationId: "op-import-target",
+      executionAuthority: testExecutionAuthority(
+        "org_import_target",
+        previous.metadata.uid,
+        "op-import-target",
+      ),
+      tenantId: "org_import_target",
+      resourceUid: previous.metadata.uid,
+      form: FORM,
+      name: previous.metadata.name,
+      space: previous.metadata.space,
+      spec: previous.spec,
+      nativeId: "fake:import-target",
+      relations: [],
+      previous,
+    } as const;
+
+    await driver.import?.({ ...command, operationMode: "initial" });
+    await driver.import?.({ ...command, operationMode: "recovery" });
+    expect(calls).toEqual([
+      {
+        mode: "initial",
+        identity: {
+          tenantRef: "org_import_target",
+          space: "default",
+          name: "import-target",
+          uid: "uid-import-target",
+          incarnationId: "deployment-import-target",
+          generation: "7",
+        },
+      },
+      {
+        mode: "recovery",
+        identity: {
+          tenantRef: "org_import_target",
+          space: "default",
+          name: "import-target",
+          uid: "uid-import-target",
+          incarnationId: "deployment-import-target",
+          generation: "7",
+        },
+      },
+    ]);
   });
 
   test("provisions and charges the wallet exactly once", async () => {
@@ -1169,6 +1410,11 @@ describe("Takoform apply on a real backend", () => {
       operationKey: "key_residual_present",
       tenantId: "org_residual_present",
       resourceUid: "uid_residual_present",
+      executionAuthority: testExecutionAuthority(
+        "org_residual_present",
+        "uid_residual_present",
+        "op_residual_present",
+      ),
       form: FORM,
       name: "residual-present",
       space: "default",
@@ -1196,6 +1442,11 @@ describe("Takoform apply on a real backend", () => {
     });
     await driver.delete({
       operationId: "op_residual_delete",
+      executionAuthority: testExecutionAuthority(
+        input.tenantId,
+        input.resourceUid,
+        "op_residual_delete",
+      ),
       tenantId: input.tenantId,
       resourceUid: input.resourceUid,
       resource: {
@@ -1289,6 +1540,7 @@ describe("Takoform apply on a real backend", () => {
         resourceUid: "uid_residual_multi",
         space: "default",
         name: "residual-multi",
+        generation: "1",
         deleteOperationId,
       },
     });
@@ -1628,7 +1880,7 @@ describe("Takoform apply on a real backend", () => {
           nativeId: input.nativeId,
           observed: { deleted: true },
           outputs: {},
-          disposition: "deleted",
+          disposition: "retained",
         });
       },
     };
@@ -1671,6 +1923,11 @@ describe("Takoform apply on a real backend", () => {
         operationKey: "key_retained_authoring",
         tenantId,
         resourceUid: "uid_retained_authoring",
+        executionAuthority: testExecutionAuthority(
+          tenantId,
+          "uid_retained_authoring",
+          "op_retained_authoring",
+        ),
         form: RETAINED_FORM,
         name: "retained-authoring",
         space: "default",
@@ -1681,6 +1938,11 @@ describe("Takoform apply on a real backend", () => {
     await driver.observe({ tenantId, resourceUid, resource, relations: [] });
     await driver.delete({
       operationId: "op_retained_lifecycle_delete",
+      executionAuthority: testExecutionAuthority(
+        tenantId,
+        resourceUid,
+        "op_retained_lifecycle_delete",
+      ),
       tenantId,
       resourceUid,
       resource,
@@ -1690,6 +1952,18 @@ describe("Takoform apply on a real backend", () => {
       "observe:edge.forms.takoform.com/v1beta1",
       "delete:edge.forms.takoform.com/v1beta1",
     ]);
+    expect(await deployments.find(tenantId, "dep_retained_lifecycle")).toMatchObject({
+      state: "retained",
+      outputs: {
+        __takoserver: {
+          resourceUid,
+          space: "default",
+          name: "retained-lifecycle",
+          generation: "1",
+          deleteOperationId: "op_retained_lifecycle_delete",
+        },
+      },
+    });
   });
 
   test("proves a retained deployment absent only through its exact recovery offering", async () => {
@@ -1743,6 +2017,12 @@ describe("Takoform apply on a real backend", () => {
        WHERE tenant_id = ? AND resource_uid = ?`,
       [clock().getTime(), tenantId, resourceUid],
     );
+    const deploymentMarker = {
+      resourceUid,
+      space: "default",
+      name: "retained",
+      deleteOperationId: operationId,
+    };
     await deployments.create({
       tenantId,
       id: "dep_retained_absence",
@@ -1754,22 +2034,19 @@ describe("Takoform apply on a real backend", () => {
       state: "retained",
       observed: { retained: true },
       outputs: {
-        __takoserver: {
-          resourceUid,
-          space: "default",
-          name: "retained",
-          deleteOperationId: operationId,
-        },
+        __takoserver: deploymentMarker,
       },
     });
     let readbacks = 0;
+    let readbackTarget: ProviderReadAuthorityTarget | undefined;
     const provider: Provider = {
       id: "fake",
       offerings: [PROVIDER_OFFERING],
       recoveryOfferings: [RETAINED_PROVIDER_OFFERING],
       ...fakeReadback,
-      async verifyNativeAbsence() {
+      async verifyNativeAbsence(input) {
         readbacks += 1;
+        readbackTarget = input.target;
         return await fakeReadback.verifyNativeAbsence();
       },
       async apply() {
@@ -1798,6 +2075,29 @@ describe("Takoform apply on a real backend", () => {
       deployments,
       deletions,
     });
+    const historical = await driver.verifyNativeAbsence?.({
+      tenantId,
+      resourceUid,
+      space: "default",
+      name: "retained",
+    });
+    expect(historical).toMatchObject({
+      status: "indeterminate",
+      source: "provider",
+      reason: "deployment_unmarked",
+    });
+    expect(readbacks).toBe(0);
+    await sql.run(
+      `UPDATE tf_resource_deployments
+       SET outputs_json = ?, updated_at = ?
+       WHERE tenant_id = ? AND id = ?`,
+      [
+        JSON.stringify({ __takoserver: { ...deploymentMarker, generation: "1" } }),
+        clock().getTime(),
+        tenantId,
+        "dep_retained_absence",
+      ],
+    );
     const evidence = await driver.verifyNativeAbsence?.({
       tenantId,
       resourceUid,
@@ -1811,6 +2111,12 @@ describe("Takoform apply on a real backend", () => {
       deploymentCount: 1,
     });
     expect(readbacks).toBe(1);
+    expect(readbackTarget).toEqual({
+      tenantId,
+      resourceUid,
+      incarnationId: "dep_retained_absence",
+      generation: "1",
+    });
   });
 
   test("keeps a provider tombstone indeterminate when dispatch had no Deployment receipt", async () => {
@@ -1978,6 +2284,7 @@ describe("Takoform apply on a real backend", () => {
         resourceUid,
         space: "default",
         name: "same-native",
+        generation: "1",
         deleteOperationId: operationId,
       },
     });
@@ -2121,6 +2428,7 @@ describe("Takoform apply on a real backend", () => {
           resourceUid,
           space: "default",
           name: "offering-form-drift",
+          generation: "1",
           deleteOperationId: operationId,
         },
       },

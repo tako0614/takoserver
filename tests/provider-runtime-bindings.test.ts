@@ -614,6 +614,11 @@ describe("provider-private runtime Binding materialization", () => {
         operationKey: "key-remote-version",
         tenantId: "org-remote",
         resourceUid: "uid-version",
+        executionAuthority: testExecutionAuthority(
+          "org-remote",
+          "uid-version",
+          "op-remote-version",
+        ),
         form: version,
         name: "version",
         space: "default",
@@ -730,6 +735,11 @@ describe("provider-private runtime Binding materialization", () => {
         operationKey: "key-remote-kv-version",
         tenantId: "org-remote",
         resourceUid: "uid-version",
+        executionAuthority: testExecutionAuthority(
+          "org-remote",
+          "uid-version",
+          "op-remote-kv-version",
+        ),
         form: version,
         name: "version",
         space: "default",
@@ -880,6 +890,7 @@ describe("provider-private runtime Binding materialization", () => {
       operationMode: "initial",
       tenantId: "org-chain",
       resourceUid: "uid-version",
+      executionAuthority: testExecutionAuthority("org-chain", "uid-version", "op-chain-version"),
       form: version,
       name: "version",
       space: "default",
@@ -931,3 +942,12 @@ describe("provider-private runtime Binding materialization", () => {
     expect(JSON.stringify(applied)).not.toContain(bucketName);
   });
 });
+
+function testExecutionAuthority(tenantId: string, resourceUid: string, operationId: string) {
+  return {
+    tenantId,
+    resourceUid,
+    leaseToken: `pmlease_${operationId}`,
+    fingerprint: `test:${operationId}`,
+  };
+}

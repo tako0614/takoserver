@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { CloudflareProviderExecutorInspection } from "../scripts/deploy/cloudflare-provider-executor.ts";
 import { DeployError } from "../scripts/deploy/errors.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
@@ -20,6 +21,7 @@ import {
 } from "../scripts/deploy/worker-authority-paths.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
 import { INTEGRATION_E2E_ORGANIZATION_ID } from "../src/integration-e2e-credential-authority.ts";
+import { objectBucketSuppliesFixture } from "./helpers/hosted-supply-fixtures.ts";
 
 const COMMIT = "a".repeat(40);
 const LIVE_COMMIT = "b".repeat(40);
@@ -51,6 +53,24 @@ const target = {
   r2: { bucketName: "takoserver-objects-integration" },
   publicOrigin: "https://api.integration.example.test",
   signing: { currentKeyId: "key-current" },
+} satisfies DeployTarget;
+
+const executorTarget = {
+  ...target,
+  objectBucketSupplies: objectBucketSuppliesFixture(),
+  cloudflareProviderExecutor: {
+    workerName: "takoserver-cloudflare-provider-executor-integration",
+    dispatchNamespace: "takoserver-managed-workers-integration",
+    gatewayWorkerName: "takoserver-managed-worker-gateway-integration",
+    managedBaseDomain: "workers.integration.example.test",
+    providerInstallationId: "cloudflare.staging",
+    receiptAuthorityWorkerName: "takoserver-object-receipts-integration",
+    releaseReadbackQualification: {
+      schema: "takoserver.cloudflare-wfp-release-readback-qualification@v1",
+      dispatchNamespace: "takoserver-managed-workers-integration",
+      rehearsalDigest: `sha256:${"9".repeat(64)}`,
+    },
+  },
 } satisfies DeployTarget;
 
 function fixture(
@@ -199,6 +219,55 @@ function fixture(
 }
 
 describe("split Takoserver Worker surfaces", () => {
+  test("public Worker status and apply fail closed on an unqualified provider executor", async () => {
+    const current = fixture({ selectedTarget: executorTarget });
+    const qualification = {
+      async read(): Promise<CloudflareProviderExecutorInspection> {
+        return providerExecutorInspection(false);
+      },
+    };
+    const status = await runWorker(
+      {
+        surface: "takoserver-worker",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      executorTarget,
+      { ...current, providerExecutorQualification: qualification },
+    );
+    expect(status).toMatchObject({
+      ready: false,
+      cloudflareProviderExecutor: {
+        required: true,
+        ready: false,
+        status: "stale",
+        versionId: "00000000-0000-4000-8000-000000000099",
+      },
+    });
+
+    const refusal = await runWorker(
+      {
+        surface: "takoserver-worker",
+        action: "apply",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      executorTarget,
+      {
+        ...current,
+        providerExecutorQualification: qualification,
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "deploy-token" },
+      },
+    ).catch((error: unknown) => error);
+    expect(refusal).toBeInstanceOf(DeployError);
+    expect((refusal as Error).message).toContain(
+      "exact selected-commit Cloudflare provider executor",
+    );
+    expect(current.calls.some((call) => call.join(" ") === "bun run check")).toBe(false);
+    expect(current.calls.some((call) => call.includes("--dry-run"))).toBe(false);
+  });
+
   test("published product and OpenAPI stay bound to the exact target origin", async () => {
     const fetcher = publishedProductFetcher();
     await expect(probeProduct(target.publicOrigin, fetcher)).resolves.toMatchObject({
@@ -342,8 +411,10 @@ describe("split Takoserver Worker surfaces", () => {
       "src/provider-runtime-bindings.ts",
       "src/provider-runtime-input-port.ts",
       "src/provider-worker-endpoint-origin.ts",
+      "src/providers/cloudflare-managed-object-receipt.ts",
       "src/providers/cloudflare-managed-worker-gateway.ts",
       "src/providers/cloudflare-managed-worker-wrapper.ts",
+      "src/providers/cloudflare-readback-descriptor.ts",
       "src/providers/cloudflare-runtime-bindings.ts",
       "src/providers/cloudflare-wfp-backend.ts",
       "src/providers/cloudflare-wfp-client.ts",
@@ -1708,6 +1779,35 @@ describe("split Takoserver Worker surfaces", () => {
     }
   });
 });
+
+function providerExecutorInspection(ready: boolean): CloudflareProviderExecutorInspection {
+  const digest = "8".repeat(64);
+  return {
+    status: ready ? "ready" : "stale",
+    ready,
+    managedExact: true,
+    routeLess: true,
+    schemaReady: true,
+    dependencies: {
+      ready: true,
+      receiptAuthorityReady: true,
+      receiptAuthorityVersionId: "00000000-0000-4000-8000-000000000097",
+      managedWorkerGatewayReady: true,
+      managedWorkerGatewayVersionId: "00000000-0000-4000-8000-000000000098",
+    },
+    versionId: "00000000-0000-4000-8000-000000000099",
+    deploymentId: "00000000-0000-4000-8000-000000000100",
+    previousVersionId: "00000000-0000-4000-8000-000000000096",
+    commit: ready ? COMMIT : OTHER_COMMIT,
+    bundleDigestHex: digest,
+    moduleDigestHex: digest,
+    moduleBytes: Uint8Array.from([1, 2, 3]),
+    bindingsExact: true,
+    secretsExact: true,
+    settingsExact: true,
+    migrationExact: true,
+  };
+}
 
 function publishedProductFetcher(
   options: { readonly discoveryOrigin?: string; readonly openApiOrigin?: string } = {},
