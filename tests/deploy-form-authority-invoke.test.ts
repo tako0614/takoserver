@@ -12,6 +12,7 @@ import { formAuthorityScopeTransitionDigest } from "../scripts/deploy/form-autho
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { createEphemeralSql } from "../src/compat.ts";
+import { normalizeGeneratedEd25519PrivateJwk } from "../src/ed25519-private-jwk.ts";
 import { verifyFormAuthorityOperatorAssertion } from "../src/form-authority-operator-proof.ts";
 import { canonicalJson } from "../src/json.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
@@ -50,7 +51,9 @@ beforeAll(async () => {
     "sign",
     "verify",
   ])) as CryptoKeyPair;
-  privateJwk = await crypto.subtle.exportKey("jwk", pair.privateKey);
+  privateJwk = normalizeGeneratedEd25519PrivateJwk(
+    await crypto.subtle.exportKey("jwk", pair.privateKey),
+  );
   const publicPart = await crypto.subtle.exportKey("jwk", pair.publicKey);
   if (publicPart.kty !== "OKP" || publicPart.crv !== "Ed25519" || !publicPart.x) {
     throw new Error("test Ed25519 key is unavailable");

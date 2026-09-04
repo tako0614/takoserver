@@ -1,3 +1,4 @@
+import { normalizeGeneratedEd25519PrivateJwk } from "./ed25519-private-jwk.ts";
 import type { SigningKey } from "./token.ts";
 
 /**
@@ -67,7 +68,9 @@ export async function ensureSigningKey(input: {
     "sign",
     "verify",
   ])) as CryptoKeyPair;
-  const jwk = (await crypto.subtle.exportKey("jwk", pair.privateKey)) as JsonWebKey;
+  const jwk = normalizeGeneratedEd25519PrivateJwk(
+    await crypto.subtle.exportKey("jwk", pair.privateKey),
+  );
   await input.writeFile(input.path, JSON.stringify(jwk));
   await registerPublicHalf(input, jwk);
   return { keyId: input.keyId, privateKey: pair.privateKey };

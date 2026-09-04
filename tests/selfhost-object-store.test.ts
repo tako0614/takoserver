@@ -119,6 +119,9 @@ describe("the self-host object store", () => {
     // A length that runs past the object is clamped, exactly as R2 clamps it.
     const clamped = await store.get(BUCKET_A, "ranged", { range: { offset: 8, length: 999 } });
     expect(clamped?.range).toEqual({ offset: 8, length: 2 });
+    // This assertion intentionally inspects only metadata. Explicitly cancel
+    // the unread stream so its held FileHandle is not left to GC.
+    await clamped?.body.cancel();
     expect(await failure(store.get(BUCKET_A, "ranged", { range: { offset: 10 } }))).toBe(
       "range_not_satisfiable",
     );

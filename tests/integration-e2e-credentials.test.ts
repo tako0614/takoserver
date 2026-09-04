@@ -25,6 +25,7 @@ import {
   statusIntegrationCredentials,
   WRITER_KEY_NAME,
 } from "../scripts/integration-e2e-credentials.ts";
+import { normalizeGeneratedEd25519PrivateJwk } from "../src/ed25519-private-jwk.ts";
 import { buildApp, createEphemeralSql, createMemoryObjectStore } from "../src/index.ts";
 import {
   credentialAuthorityPath,
@@ -294,7 +295,9 @@ describe("integration E2E credential helper", () => {
         "sign",
         "verify",
       ])) as CryptoKeyPair;
-      const nextPrivate = (await crypto.subtle.exportKey("jwk", nextPair.privateKey)) as JsonWebKey;
+      const nextPrivate = normalizeGeneratedEd25519PrivateJwk(
+        await crypto.subtle.exportKey("jwk", nextPair.privateKey),
+      );
       const nextPublic = (await crypto.subtle.exportKey("jwk", nextPair.publicKey)) as JsonWebKey;
       const nextPrivatePath = join(fixture.root, "integration-e2e-api-key-next.jwk");
       writeFileSync(nextPrivatePath, `${JSON.stringify(nextPrivate)}\n`, { mode: 0o600 });
@@ -566,7 +569,9 @@ async function testFixture() {
     "sign",
     "verify",
   ])) as CryptoKeyPair;
-  const privateJwk = (await crypto.subtle.exportKey("jwk", pair.privateKey)) as JsonWebKey;
+  const privateJwk = normalizeGeneratedEd25519PrivateJwk(
+    await crypto.subtle.exportKey("jwk", pair.privateKey),
+  );
   const publicJwk = (await crypto.subtle.exportKey("jwk", pair.publicKey)) as JsonWebKey;
   writeFileSync(privatePath, `${JSON.stringify(privateJwk)}\n`, { mode: 0o600 });
   chmodSync(privatePath, 0o600);

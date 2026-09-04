@@ -47,6 +47,7 @@ describe("ensureOperatorKey", () => {
     expect(typeof written.d).toBe("string");
     expect(key?.x).toBe(written.x);
     expect((key as { d?: string }).d).toBeUndefined();
+    expect(Object.keys(written)).toEqual(["crv", "d", "ext", "key_ops", "kty", "x"]);
   });
 
   test("keeps the key it already made, so a restart is not a new identity", async () => {

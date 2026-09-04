@@ -10,6 +10,7 @@ import {
   readPrivateJwk,
   withOperatorOwnerSession,
 } from "../scripts/deploy/operator-authority.ts";
+import { normalizeGeneratedEd25519PrivateJwk } from "../src/ed25519-private-jwk.ts";
 import { resolveIdentity } from "../src/identity-setup.ts";
 import {
   buildApp,
@@ -38,10 +39,9 @@ describe("operator authority", () => {
         "sign",
         "verify",
       ])) as CryptoKeyPair;
-      const privateJwk = (await crypto.subtle.exportKey("jwk", pair.privateKey)) as JsonWebKey & {
-        x: string;
-        d: string;
-      };
+      const privateJwk = normalizeGeneratedEd25519PrivateJwk(
+        await crypto.subtle.exportKey("jwk", pair.privateKey),
+      );
       const publicJwk = (await crypto.subtle.exportKey("jwk", pair.publicKey)) as JsonWebKey & {
         x: string;
       };
@@ -595,7 +595,9 @@ async function authorityFixture() {
     "sign",
     "verify",
   ])) as CryptoKeyPair;
-  const privateJwk = await crypto.subtle.exportKey("jwk", pair.privateKey);
+  const privateJwk = normalizeGeneratedEd25519PrivateJwk(
+    await crypto.subtle.exportKey("jwk", pair.privateKey),
+  );
   const privateJwkPath = join(root, "operator.jwk");
   writeFileSync(privateJwkPath, JSON.stringify(privateJwk), { mode: 0o600 });
   chmodSync(privateJwkPath, 0o600);
