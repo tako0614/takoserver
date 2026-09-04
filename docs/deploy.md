@@ -1,6 +1,6 @@
 # Takoserver deploy surfaces
 
-This repository owns one deploy entrypoint and twenty-eight separate mutation surfaces.
+This repository owns one deploy entrypoint and twenty-nine separate mutation surfaces.
 The contract is read-only:
 
 ```sh
