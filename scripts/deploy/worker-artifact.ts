@@ -55,6 +55,8 @@ export async function prepareWorkerArtifact(input: {
   readonly writeConfig?: WorkerArtifactConfigWriter;
   /** Use the version API for a non-mutating build when the caller will publish explicitly. */
   readonly dryRunCommand?: WorkerDryRunCommand;
+  /** Credential-scoped environment for Wrangler; OAuth passes only its log-suppression flag. */
+  readonly environment?: Readonly<Record<string, string>> | undefined;
   readonly run: WorkerArtifactProcess;
 }): Promise<PreparedWorkerArtifact> {
   const build = join(input.root, "build");
@@ -69,6 +71,7 @@ export async function prepareWorkerArtifact(input: {
           root: join(input.root, "form-implementation-payload"),
           target: input.target,
           run: input.run,
+          environment: input.environment,
         })
       : undefined;
   const writeConfig =
@@ -112,6 +115,7 @@ export async function prepareWorkerArtifact(input: {
       "--outdir",
       build,
     ]),
+    { env: input.environment ?? {} },
   );
   if (built.exitCode !== 0) {
     throw new DeployError(
@@ -149,6 +153,7 @@ async function preparePublicFormImplementationPayload(input: {
   readonly root: string;
   readonly target: DeployTarget;
   readonly run: WorkerArtifactProcess;
+  readonly environment?: Readonly<Record<string, string>> | undefined;
 }): Promise<PublicFormImplementationIdentity> {
   assertPublicFormCapabilityTarget(input.target);
   const build = join(input.root, "build");
@@ -174,6 +179,7 @@ async function preparePublicFormImplementationPayload(input: {
   );
   const built = await input.run(
     wranglerCommand(["deploy", "--dry-run", "--strict", "--config", configPath, "--outdir", build]),
+    { env: input.environment ?? {} },
   );
   if (built.exitCode !== 0) {
     throw new DeployError(

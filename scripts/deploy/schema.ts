@@ -30,9 +30,9 @@ import {
 } from "./migrations.ts";
 import {
   type CommandResult,
-  cloudflareChildEnvironment,
   REPOSITORY,
   requireEnvironment,
+  resolveCloudflareCredential,
   runCommand,
   wranglerCommand,
 } from "./process.ts";
@@ -351,11 +351,11 @@ export async function runD1SchemaRehearsalBaseline(
     throw preflightError("D1 rehearsal baseline is rehearsal-only and accepts no wave selector");
   }
   const run = options.run ?? runCommand;
-  const environment =
-    options.cloudflareEnvironment ??
-    (options.reader !== undefined && invocation.action === "status"
-      ? {}
-      : cloudflareChildEnvironment());
+  const credential = await resolveCloudflareCredential(invocation.environment, {
+    cloudflareEnvironment: options.cloudflareEnvironment,
+    run,
+  });
+  const environment = credential?.childEnvironment ?? {};
   const sourceMigrations = readMigrationArtifact(
     options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
   );
@@ -529,11 +529,16 @@ export async function runD1Schema(
     );
   }
   const run = options.run ?? runCommand;
-  const environment =
-    options.cloudflareEnvironment ??
-    (options.reader !== undefined && invocation.action === "status"
-      ? {}
-      : cloudflareChildEnvironment());
+  const credential =
+    invocation.environment === "integration" &&
+    options.reader !== undefined &&
+    invocation.action === "status"
+      ? undefined
+      : await resolveCloudflareCredential(invocation.environment, {
+          cloudflareEnvironment: options.cloudflareEnvironment,
+          run,
+        });
+  const environment = credential?.childEnvironment ?? {};
   const sourceMigrations = readMigrationArtifact(
     options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
   );

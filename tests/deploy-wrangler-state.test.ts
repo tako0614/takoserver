@@ -400,9 +400,15 @@ describe("routine Worker authentication and version publication boundary", () =>
         },
       ).catch((error) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(failure.message).toContain("CLOUDFLARE_API_TOKEN");
+      if (invocation.environment === "production") {
+        expect(failure.message).toContain("CLOUDFLARE_API_TOKEN");
+      } else {
+        expect(failure.message).toContain("Wrangler OAuth token response is malformed");
+      }
     }
-    expect(commands).toHaveLength(0);
+    expect(
+      commands.filter((command) => command.slice(-3).join(" ") === "auth token --json"),
+    ).toHaveLength(1);
   });
 
   test("keeps token-less publication disabled when Wrangler cannot prove live topology", async () => {
@@ -425,9 +431,10 @@ describe("routine Worker authentication and version publication boundary", () =>
       },
     ).catch((error) => error);
     expect(failure).toBeInstanceOf(DeployError);
-    expect(failure.message).toContain("CLOUDFLARE_API_TOKEN");
-    expect(failure.message).toContain("authoritative live topology");
-    expect(commands).toHaveLength(0);
+    expect(failure.message).toContain("Wrangler OAuth token response is malformed");
+    expect(
+      commands.filter((command) => command.slice(-3).join(" ") === "auth token --json"),
+    ).toHaveLength(1);
   });
 
   test("uses explicit-token version publication and re-reads the predecessor before deploy", async () => {

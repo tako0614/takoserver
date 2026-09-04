@@ -11,9 +11,9 @@ import {
 } from "./errors.ts";
 import {
   type CommandResult,
-  cloudflareChildEnvironment,
   REPOSITORY,
   requireEnvironment,
+  resolveCloudflareCredential,
   runCommand,
   wranglerCommand,
 } from "./process.ts";
@@ -105,16 +105,21 @@ export async function runRetirement(
 ): Promise<Record<string, unknown>> {
   validateInvocation(invocation, target);
   const run = options.run ?? runCommand;
-  const environment =
-    options.cloudflareEnvironment ??
-    (options.state !== undefined && invocation.action === "status"
-      ? {}
-      : cloudflareChildEnvironment());
+  const credential =
+    invocation.environment === "integration" &&
+    options.state !== undefined &&
+    invocation.action === "status"
+      ? undefined
+      : await resolveCloudflareCredential(invocation.environment, {
+          cloudflareEnvironment: options.cloudflareEnvironment,
+          run,
+        });
+  const environment = credential?.childEnvironment ?? {};
   const state =
     options.state ??
     new CloudflareState({
       accountId: target.accountId,
-      token: exactToken(environment),
+      token: credential?.token ?? exactToken(environment),
     });
   const runtimeOptions: RetirementOptions = {
     ...options,
@@ -244,6 +249,7 @@ export async function runAuthorityTransition(
       commit: source.commit,
       signingKeyId: target.signing.currentKeyId,
       run,
+      environment: options.cloudflareEnvironment,
       writeConfig: transitionConfigWriter(
         target,
         source.commit,
@@ -771,6 +777,7 @@ async function runTopologyRetirement(
       commit: source.commit,
       signingKeyId: target.signing.currentKeyId,
       run,
+      environment: options.cloudflareEnvironment,
       writeConfig: transitionConfigWriter(
         target,
         source.commit,
@@ -1106,6 +1113,7 @@ async function runAttributionRepair(
       commit: source.commit,
       signingKeyId: target.signing.currentKeyId,
       run,
+      environment: options.cloudflareEnvironment,
       writeConfig: transitionConfigWriter(
         target,
         source.commit,

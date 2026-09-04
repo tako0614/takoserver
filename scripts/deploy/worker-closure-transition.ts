@@ -7,9 +7,9 @@ import { type DeployPhase, mutationError, preflightError, verificationError } fr
 import { pendingMigrations, readD1SchemaState, readMigrationArtifact } from "./migrations.ts";
 import {
   type CommandResult,
-  cloudflareChildEnvironment,
   REPOSITORY,
   requireEnvironment,
+  resolveCloudflareCredential,
   runCommand,
   wranglerCommand,
 } from "./process.ts";
@@ -122,20 +122,16 @@ export async function runWorkerClosureTransition(
     );
   }
   const run = options.run ?? runCommand;
-  const suppliedToken =
-    options.cloudflareEnvironment === undefined
-      ? process.env.CLOUDFLARE_API_TOKEN
-      : options.cloudflareEnvironment.CLOUDFLARE_API_TOKEN;
-  if (options.state === undefined && suppliedToken === undefined) {
-    throw preflightError(
-      "CLOUDFLARE_API_TOKEN is required because Wrangler OAuth cannot prove authoritative live topology",
-    );
-  }
-  const environment =
-    options.cloudflareEnvironment ??
-    (options.state !== undefined && invocation.action === "status"
-      ? {}
-      : cloudflareChildEnvironment());
+  const credential =
+    invocation.environment === "integration" &&
+    options.state !== undefined &&
+    invocation.action === "status"
+      ? undefined
+      : await resolveCloudflareCredential(invocation.environment, {
+          cloudflareEnvironment: options.cloudflareEnvironment,
+          run,
+        });
+  const environment = credential?.childEnvironment ?? {};
   // A transition exists to publish a corrected target. Prove that the
   // correction composes before it can be uploaded.
   await assertTargetComposes("preflight", target);
@@ -146,7 +142,10 @@ export async function runWorkerClosureTransition(
   try {
     const state =
       options.state ??
-      new CloudflareState({ accountId: target.accountId, token: exactToken(environment) });
+      new CloudflareState({
+        accountId: target.accountId,
+        token: credential?.token ?? exactToken(environment),
+      });
     const inspectionConfig = writeWorkerConfig(target, {
       path: join(root, "inspect-wrangler.jsonc"),
       main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
@@ -231,6 +230,7 @@ export async function runWorkerClosureTransition(
       target,
       commit: source.commit,
       run,
+      environment,
       writeConfig: ({ path, main, bundleDigestHex, formImplementationIdentity }) =>
         writeWorkerConfig(target, {
           path,

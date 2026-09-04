@@ -105,6 +105,7 @@ describe("Form authority identity probe deploy surface", () => {
       target,
       {
         state: probeState(true),
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         async fetcher(): Promise<never> {
           fetchCalls += 1;
           throw new Error("rpc unavailable");
@@ -128,6 +129,7 @@ describe("Form authority identity probe deploy surface", () => {
       target,
       {
         state: probeState(true),
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         async fetcher() {
           return Response.json({
             kind: "takoserver.public-host-identity@v2",
@@ -289,7 +291,11 @@ describe("Form authority identity probe forward transition", () => {
         commit: COMMIT,
       },
       target,
-      { state: twoBindingProbeState({}), fetcher: readyFetcher() },
+      {
+        state: twoBindingProbeState({}),
+        fetcher: readyFetcher(),
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+      },
     );
     expect(status).toMatchObject({
       bindingTransitionProfile: "none",
@@ -327,7 +333,11 @@ describe("Form authority identity probe forward transition", () => {
         },
       },
       target,
-      { state: twoBindingProbeState({}), fetcher: readyFetcher() },
+      {
+        state: twoBindingProbeState({}),
+        fetcher: readyFetcher(),
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+      },
     );
     expect(admitted).toMatchObject({
       bindingTransitionProfile: "declared-delta-predecessor",
@@ -348,7 +358,11 @@ describe("Form authority identity probe forward transition", () => {
         },
       },
       target,
-      { state: twoBindingProbeState({}), fetcher: readyFetcher() },
+      {
+        state: twoBindingProbeState({}),
+        fetcher: readyFetcher(),
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+      },
     );
     expect(misdeclared).toMatchObject({ bindingTransitionProfile: "none", ready: false });
   });
@@ -388,6 +402,7 @@ describe("Form authority identity probe forward transition", () => {
       {
         state: twoBindingProbeState({ authorityWorkerPresent: false }),
         fetcher: readyFetcher(),
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
       },
     );
     expect(status).toMatchObject({

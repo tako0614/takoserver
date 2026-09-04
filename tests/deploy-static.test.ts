@@ -92,7 +92,7 @@ describe("routine Takoserver Pages surface", () => {
     ]);
     const result = await runStaticSite(
       { action: "status", environment: "production", commit: COMMIT },
-      { state },
+      { state, cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" } },
     );
     expect(result).toMatchObject({
       kind: "takoserver.site-status@v2",

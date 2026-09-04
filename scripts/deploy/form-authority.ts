@@ -39,9 +39,9 @@ import {
 } from "./form-authority-scope-transition.ts";
 import {
   type CommandResult,
-  cloudflareChildEnvironment,
   REPOSITORY,
   requireEnvironment,
+  resolveCloudflareCredential,
   runCommand,
   wranglerCommand,
 } from "./process.ts";
@@ -314,14 +314,22 @@ export async function runFormAuthority(
   const capabilityManifestJson = canonicalJson(capabilityManifest);
   const capabilityDigest = await canonicalDigest(capabilityManifest);
   const run = options.run ?? runCommand;
-  const environment =
-    options.cloudflareEnvironment ??
-    (options.state !== undefined && invocation.action === "status"
-      ? {}
-      : cloudflareChildEnvironment());
+  const credential =
+    invocation.environment === "integration" &&
+    options.state !== undefined &&
+    invocation.action === "status"
+      ? undefined
+      : await resolveCloudflareCredential(invocation.environment, {
+          cloudflareEnvironment: options.cloudflareEnvironment,
+          run,
+        });
+  const environment = credential?.childEnvironment ?? {};
   const state =
     options.state ??
-    new CloudflareState({ accountId: target.accountId, token: exactToken(environment) });
+    new CloudflareState({
+      accountId: target.accountId,
+      token: credential?.token ?? exactToken(environment),
+    });
   const publicBefore = await inspectPublicWorker("preflight", target, state);
   const publicIdentityReadback = await readPublicHostIdentityProbe(
     target,
@@ -635,6 +643,7 @@ export async function runFormAuthority(
       target,
       commit: source.commit,
       run,
+      environment,
     });
     const expectedPublicDigest = `sha256:${publicProof.bundleDigestHex}` as const;
     if (expectedPublicDigest !== publicBefore.workerArtifactDigest) {
@@ -650,6 +659,7 @@ export async function runFormAuthority(
       target,
       commit: source.commit,
       run,
+      environment,
       main: resolve(REPOSITORY, selected.main),
       writeConfig: ({ path, main }) =>
         writeFormAuthorityConfig({

@@ -736,6 +736,7 @@ describe("Hosted sponsorship token cutover", () => {
             state: worker,
             run: process.run,
             outputDirectory: join(root, "status"),
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
           },
         );
         expect(status, environment).toMatchObject({
@@ -853,6 +854,7 @@ describe("Hosted sponsorship token cutover", () => {
           state: canonicalTokenState(selectedTarget),
           run: processFixture().run,
           outputDirectory: join(tmpdir(), `takoserver-canonical-token-${environment}`),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       );
       expect(result, environment).toMatchObject({
@@ -967,6 +969,7 @@ describe("Hosted sponsorship token cutover", () => {
               tmpdir(),
               `takoserver-canonical-token-status-${environment}-${proofApplyReady}`,
             ),
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
           },
         );
 

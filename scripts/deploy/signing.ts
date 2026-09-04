@@ -7,9 +7,9 @@ import { RemoteD1, sqlLiteral } from "./d1.ts";
 import { type DeployPhase, mutationError, preflightError, verificationError } from "./errors.ts";
 import {
   type CommandResult,
-  cloudflareChildEnvironment,
   REPOSITORY,
   requireEnvironment,
+  resolveCloudflareCredential,
   runCommand,
   wranglerCommand,
 } from "./process.ts";
@@ -114,13 +114,17 @@ export async function runSigning(
     throw preflightError("signing invocation and target environments differ");
   }
   const run = options.run ?? runCommand;
-  const environment =
-    options.cloudflareEnvironment ??
-    (options.database !== undefined &&
+  const credential =
+    invocation.environment === "integration" &&
+    options.database !== undefined &&
     (invocation.surface === "takoserver-signing-key-register" || options.state !== undefined) &&
     invocation.action === "status"
-      ? {}
-      : cloudflareChildEnvironment());
+      ? undefined
+      : await resolveCloudflareCredential(invocation.environment, {
+          cloudflareEnvironment: options.cloudflareEnvironment,
+          run,
+        });
+  const environment = credential?.childEnvironment ?? {};
   const temporary = options.outputDirectory === undefined;
   const root = options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-signing-"));
   mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -140,7 +144,10 @@ export async function runSigning(
 
     const state =
       options.state ??
-      new CloudflareState({ accountId: target.accountId, token: exactToken(environment) });
+      new CloudflareState({
+        accountId: target.accountId,
+        token: credential?.token ?? exactToken(environment),
+      });
     if (invocation.surface === "takoserver-signing-repair") {
       return await repairSigningSecret(
         invocation,
@@ -478,6 +485,7 @@ async function rotateSigningKey(
     commit: source.commit,
     signingKeyId: nextKeyId,
     run,
+    environment,
   });
   if (prepared.bundleDigestHex !== before.bundleDigestHex) {
     throw preflightError(

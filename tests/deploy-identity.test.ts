@@ -44,6 +44,7 @@ describe("operator identity authority", () => {
           {
             state,
             migrations: migrations(),
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
           },
         );
         expect(result).toMatchObject({
@@ -97,6 +98,7 @@ describe("operator identity authority", () => {
             {
               state: staticState(selected.target, versionFor(selected.target, null)),
               migrations: migrations(),
+              cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
             },
           ),
         ).rejects.toMatchObject({ phase: "preflight" });
@@ -120,6 +122,7 @@ describe("operator identity authority", () => {
             VERSION_RACED,
           ),
           migrations: migrations(),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       );
       expect(status).toMatchObject({
@@ -513,6 +516,7 @@ describe("operator identity authority", () => {
           VERSION_BEFORE,
         ),
         migrations: migrations(),
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
       });
       expect(status).toMatchObject({
         state: "desired-current",

@@ -6,7 +6,7 @@ import { CloudflareState } from "./cloudflare-state.ts";
 import { DeployError, mutationError, preflightError, verificationError } from "./errors.ts";
 import {
   type CommandResult,
-  cloudflareChildEnvironment,
+  resolveCloudflareCredential,
   runCommand,
   wranglerCommand,
 } from "./process.ts";
@@ -63,16 +63,22 @@ export async function runStaticSite(
   invocation: StaticSiteInvocation,
   options: StaticSiteOptions = {},
 ): Promise<Record<string, unknown>> {
-  const environment =
-    options.cloudflareEnvironment ??
-    (options.state !== undefined && invocation.action === "status"
-      ? {}
-      : cloudflareChildEnvironment());
+  const run = options.run ?? runCommand;
+  const credential =
+    invocation.environment === "integration" &&
+    options.state !== undefined &&
+    invocation.action === "status"
+      ? undefined
+      : await resolveCloudflareCredential(invocation.environment, {
+          cloudflareEnvironment: options.cloudflareEnvironment,
+          run,
+        });
+  const environment = credential?.childEnvironment ?? {};
   const state =
     options.state ??
     new CloudflareState({
       accountId: exactAccount(options.accountId),
-      token: exactToken(environment),
+      token: credential?.token ?? exactToken(environment),
     });
   const lane = invocation.environment === "production" ? "production" : "preview";
   const before = pagesHistory(await state.pagesDeployments(PAGES_PROJECT)).filter(
@@ -93,8 +99,6 @@ export async function runStaticSite(
       rollbackDeploymentId: before[1]?.id ?? null,
     };
   }
-
-  const run = options.run ?? runCommand;
   const source = await qualifySource({
     environment: invocation.environment,
     commit: invocation.commit,

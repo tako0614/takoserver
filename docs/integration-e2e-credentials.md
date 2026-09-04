@@ -42,11 +42,18 @@ signing public JWK from D1 and refuses reuse. The matching JIT private JWK is
 never placed in the deploy target, realized Worker configuration, Cloudflare
 binding, argv, or command output.
 
-The owner reads these operator-private values:
+The owner reads these operator-private values. For Cloudflare access, an
+explicit `CLOUDFLARE_API_TOKEN` always wins. Integration may resolve an absent
+token from the exact `wrangler auth token --json` OAuth object; its bearer is
+held only by in-process direct REST readers, never logged or serialized, and
+is not passed to Wrangler children (which use their stored OAuth profile). The
+extractor sets `WRANGLER_WRITE_LOGS=false` to prevent Wrangler's mode-0644
+debug log from persisting the bearer and passes no competing API key, email,
+token variant, or unrelated secret to the child.
 
 | Variable | Meaning |
 | --- | --- |
-| `CLOUDFLARE_API_TOKEN` | Read access to the exhaustive live Worker deployment and immutable Version state. |
+| `CLOUDFLARE_API_TOKEN` | Explicit read access to exhaustive live Worker deployment and immutable Version state; optional in integration when the exact Wrangler OAuth resolver is available. Rehearsal and production require it. |
 | `TAKOSERVER_DEPLOY_TARGET_INTEGRATION` | Owned `0600` integration deploy-target descriptor outside the repository. |
 | `TAKOSERVER_INTEGRATION_E2E_API_KEY_PRIVATE_JWK_PATH` | Owned, link-free `0600` Ed25519 private JWK matching the dedicated target public key. |
 | `TAKOSERVER_INTEGRATION_E2E_OUTPUT_DIRECTORY` | Existing absolute, link-free `0700` directory outside every Git repository. |

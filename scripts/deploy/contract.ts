@@ -12,13 +12,23 @@ const review =
   "without granting deploy authority.";
 const legacyServiceBindingName = () => ["HOST", "RUNTIME", "MATERIALIZER"].join("_");
 const cloudflareTokenInput =
-  "Input contract: `CLOUDFLARE_API_TOKEN` is required for both `--status` and `--apply` in every supported environment.";
+  "Input contract: an explicit `CLOUDFLARE_API_TOKEN` always wins. In `integration`, when it is absent, " +
+  'the deploy process may consume only the exact `{type:"oauth",token}` result of `wrangler auth token --json`; ' +
+  "the bearer is used only by in-process direct REST readers and is never logged, serialized, or passed to Wrangler " +
+  "children (which use their stored OAuth profile). The OAuth extractor sets `WRANGLER_WRITE_LOGS=false` and " +
+  "passes only that explicit Wrangler behavior flag as its credential child-environment overlay; ambient API keys, " +
+  "emails, token variants, and unrelated secrets are stripped. `rehearsal` and `production` still require the explicit API token.";
 const routineWorkerAuthInput =
-  "Input contract: explicit `CLOUDFLARE_API_TOKEN` is required for both `--status` and `--apply` in every environment. " +
-  "Wrangler OAuth is refused because its supported readers cannot prove workers.dev enabled state or exhaustive " +
-  "custom-domain inventory; the deploy tool never extracts an OAuth credential.";
+  "Input contract: the same credential resolver applies to this Worker surface: an explicit `CLOUDFLARE_API_TOKEN` " +
+  "always wins; integration may consume the exact Wrangler OAuth token for direct REST readback only, while Wrangler " +
+  "children use stored OAuth with no token environment variable (the extractor disables Wrangler disk logs with " +
+  "`WRANGLER_WRITE_LOGS=false` and passes no competing or unrelated credential variables); rehearsal and production " +
+  "require the explicit token.";
 const integrationE2eCloudflareTokenInput =
-  "Input contract: `CLOUDFLARE_API_TOKEN` is required for each `--issue`, `--status`, and `--revoke` action; all three actions are integration-only.";
+  "Input contract: an explicit `CLOUDFLARE_API_TOKEN` always wins; integration may resolve an absent token through the " +
+  "exact Wrangler OAuth JSON result for direct REST readback while Wrangler children use stored OAuth without a token " +
+  "environment variable. The OAuth extractor sets `WRANGLER_WRITE_LOGS=false` and strips competing or unrelated " +
+  "credential variables. Each action is integration-only.";
 const applyReviewInput =
   "`TAKOSERVER_INDEPENDENT_REVIEW` is required for `--apply` only; `--status` does not read it.";
 const formAuthorityPrivateJwkInput =
@@ -87,7 +97,9 @@ export const DEPLOY_CONTRACT = {
         provenance:
           `${exactSource} The owner gate runs once, then the exact link-free bundle and realized ` +
           "configuration are sealed and requalified immediately before one upload. Every environment " +
-          "uses explicit `CLOUDFLARE_API_TOKEN` and direct-REST live state; stored OAuth is not a topology authority.",
+          "uses the Cloudflare credential resolver and direct-REST live state. Integration's OAuth bearer remains " +
+          "in-process only; Wrangler children receive either `CLOUDFLARE_API_TOKEN` or no token environment and use " +
+          "their stored OAuth profile. Surface triggers, gates, and topology readback obligations are unchanged.",
         "post-conditions":
           "Authoritative deployment/version state, exact binding/configuration closure and the " +
           "public product probe identify the selected commit and uploaded artifact. Non-production " +
