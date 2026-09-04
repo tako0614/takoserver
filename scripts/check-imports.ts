@@ -75,13 +75,13 @@ const LAYERS: readonly Layer[] = [
   {
     name: "domain",
     match:
-      /^src\/(?:token|auth|ledger|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|provider-metering|provider-placement|provider-runtime-bindings|resource-deployments|resource-execution-evidence|resource-migrations|runtime-input-preparations|worker-endpoint-origin-reservations|artifact-consumer-repair|artifact-recovery|artifact-recovery-owner-gc|exact-artifact-recovery-operator-proof|attachments|reconcile|metering|edge-forms|ai-requests|operator-credentials|integration-e2e-credential-authority|form-authority-operator-proof|google-identity|takos-id-identity|identity-setup|stripe-settlement|signing-key|operator-key|ed25519-private-jwk|runtime-grants|takoform-released-provider)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$|host-admission-endpoint\.ts$|integration-operator-endpoint\.ts$)/u,
+      /^src\/(?:token|auth|ledger|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|provider-metering|provider-placement|provider-runtime-bindings|resource-deployments|resource-execution-evidence|resource-migrations|runtime-input-preparations|worker-endpoint-origin-reservations|artifact-consumer-repair|artifact-recovery|artifact-recovery-owner-gc|exact-artifact-recovery-operator-proof|attachments|reconcile|metering|edge-forms|ai-requests|operator-credentials|integration-e2e-credential-authority|sponsorship-authority|sponsorship-credential|sponsorship-issuance-receipt|form-authority-operator-proof|google-identity|takos-id-identity|identity-setup|stripe-settlement|signing-key|operator-key|ed25519-private-jwk|runtime-grants|takoform-released-provider)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$|host-admission-endpoint\.ts$|integration-operator-endpoint\.ts$)/u,
     may: ["core", "domain", "release-data"],
   },
   {
     name: "routes",
     match:
-      /^src\/(?:router|control|data-storage|data-ai|openapi|landing|provisioner-endpoint|sponsorship-api)\.ts$|^src\/takoform\/(?:routes|host)\.ts$/u,
+      /^src\/(?:router|control|data-storage|data-ai|openapi|landing|provisioner-endpoint)\.ts$|^src\/takoform\/(?:routes|host)\.ts$/u,
     may: ["core", "adapter", "domain", "routes"],
   },
   {
@@ -267,11 +267,50 @@ const FORM_AUTHORITY_RPC_MODULES = [
   "src/takoform/integration-operator-endpoint.ts",
 ];
 
+const SPONSORSHIP_AUTHORITY_ENTRY = "src/entry-sponsorship-authority-worker.ts";
+
 for (const entry of PUBLIC_READER_ENTRIES.filter(existsSync)) {
   const reachable = reachableFrom([entry]);
+  if (
+    reachable.has("src/sponsorship-authority.ts") ||
+    reachable.has("src/sponsorship-issuance-receipt.ts") ||
+    reachable.has("src/sponsorship-credential.ts")
+  ) {
+    violations.push(`${entry} transitively imports private sponsorship authority`);
+  }
   for (const writer of [...FORM_AUTHORITY_WRITERS, ...FORM_AUTHORITY_RPC_MODULES]) {
     if (reachable.has(writer)) {
       violations.push(`${entry} transitively imports private Form authority module ${writer}`);
+    }
+  }
+}
+
+if (existsSync(SPONSORSHIP_AUTHORITY_ENTRY)) {
+  const reachable = reachableFrom([SPONSORSHIP_AUTHORITY_ENTRY]);
+  for (const required of [
+    "src/sponsorship-authority.ts",
+    "src/sponsorship-credential.ts",
+    "src/sponsorship-issuance-receipt.ts",
+    "src/sql-d1.ts",
+    "src/token.ts",
+  ]) {
+    if (!reachable.has(required)) {
+      violations.push(`${SPONSORSHIP_AUTHORITY_ENTRY} does not reach required ${required}`);
+    }
+  }
+  for (const forbidden of [
+    "src/app.ts",
+    "src/router.ts",
+    "src/openapi.ts",
+    "src/reseller.ts",
+    "src/integration-e2e-credential-authority.ts",
+    ...FORM_AUTHORITY_WRITERS,
+    ...FORM_AUTHORITY_RPC_MODULES,
+  ]) {
+    if (reachable.has(forbidden)) {
+      violations.push(
+        `${SPONSORSHIP_AUTHORITY_ENTRY} transitively imports unrelated authority ${forbidden}`,
+      );
     }
   }
 }

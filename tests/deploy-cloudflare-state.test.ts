@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { CloudflareState } from "../scripts/deploy/cloudflare-state.ts";
 import { DeployError } from "../scripts/deploy/errors.ts";
 
@@ -27,6 +30,120 @@ function envelope(
 }
 
 describe("strict paginated Cloudflare state", () => {
+  test("re-authenticates all-zone token authority for every topology scan", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "takoserver-topology-audit-"));
+    const auditCredentialPath = join(directory, "credential.json");
+    const auditToken = "audit-token-value";
+    const deploymentToken = "deployment-token-value";
+    const auditId = "b".repeat(32);
+    const deploymentId = "c".repeat(32);
+    const zoneRead = "d".repeat(32);
+    const routesRead = "e".repeat(32);
+    const routesWrite = "a".repeat(32);
+    writeFileSync(
+      auditCredentialPath,
+      `${JSON.stringify({
+        kind: "takoserver.cloudflare-topology-audit-credential@v1",
+        deploymentTokenOwner: "user",
+        token: auditToken,
+      })}\n`,
+      { mode: 0o600 },
+    );
+    let detailReads = 0;
+    const state = new CloudflareState({
+      accountId: ACCOUNT,
+      token: deploymentToken,
+      topologyAuditCredentialPath: auditCredentialPath,
+      fetcher: async (request) => {
+        const url = new URL(request.url);
+        const token = request.headers.get("authorization")?.slice("Bearer ".length);
+        if (url.pathname.endsWith("/verify")) {
+          return Response.json({
+            success: true,
+            result: { id: token === auditToken ? auditId : deploymentId, status: "active" },
+          });
+        }
+        if (url.pathname.endsWith("/permission_groups")) {
+          return Response.json({
+            success: true,
+            result: [
+              { id: zoneRead, name: "Zone Read", scopes: ["com.cloudflare.api.account.zone"] },
+              {
+                id: routesRead,
+                name: "Workers Routes Read",
+                scopes: ["com.cloudflare.api.account.zone"],
+              },
+              {
+                id: routesWrite,
+                name: "Workers Routes Write",
+                scopes: ["com.cloudflare.api.account.zone"],
+              },
+            ],
+          });
+        }
+        if (url.pathname.endsWith(`/${deploymentId}`)) {
+          detailReads += 1;
+          return Response.json({
+            success: true,
+            result: {
+              id: deploymentId,
+              status: "active",
+              policies: [
+                {
+                  effect: "allow",
+                  resources:
+                    detailReads === 1
+                      ? {
+                          [`com.cloudflare.api.account.${ACCOUNT}`]: {
+                            "com.cloudflare.api.account.zone.*": "*",
+                          },
+                        }
+                      : { [`com.cloudflare.api.account.zone.${"f".repeat(32)}`]: "*" },
+                  permission_groups: [{ id: zoneRead }, { id: routesRead }],
+                },
+              ],
+            },
+          });
+        }
+        throw new Error(`unexpected request ${url.pathname}`);
+      },
+    });
+    try {
+      await expect(state.workerTopologyAudit()).resolves.toMatchObject({
+        deploymentTokenIdSha256: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+      });
+      await expect(state.workerTopologyAudit()).rejects.toThrow(
+        "token lacks exact all-zone visibility",
+      );
+      expect(detailReads).toBe(2);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("bounds provider bodies before parsing authoritative topology state", async () => {
+    const state = new CloudflareState({
+      accountId: ACCOUNT,
+      token: "operator-token",
+      fetcher: async () =>
+        new Response(
+          new ReadableStream({
+            pull(controller) {
+              controller.enqueue(new Uint8Array([0x7b]));
+              controller.close();
+            },
+          }),
+          {
+            headers: { "content-length": String(32 * 1024 * 1024 + 1) },
+          },
+        ),
+    });
+
+    await expect(state.workerSubdomain("takoserver-sponsorship-authority")).rejects.toThrow(
+      "response is too large",
+    );
+  });
+
   test("reads the closed Worker deployment-history envelope without pagination", async () => {
     const requests: Request[] = [];
     const deployments = [{ id: "deployment-1" }];

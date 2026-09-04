@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { beforeEach, describe, expect, test } from "bun:test";
 import type { Sql } from "../src/ports.ts";
+import { createSponsorshipCredentialIssuer } from "../src/sponsorship-credential.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import {
   createTokenService,
@@ -36,6 +37,36 @@ function service(signingKey?: SigningKey, keyCacheSeconds = 0): TokenService {
   });
 }
 
+function sponsorshipIssuer(signingKey: SigningKey) {
+  return createSponsorshipCredentialIssuer({ issuer: ISSUER, signingKey, clock });
+}
+
+async function admitSponsorshipCredential(
+  input: {
+    readonly organizationId: string;
+    readonly tenantRef: string;
+    readonly issuedAtEpochSeconds: number;
+    readonly tokenId: string;
+    readonly ttlSeconds: number;
+  },
+  credentialKeyId: string,
+): Promise<void> {
+  await sql.run(
+    `INSERT INTO sponsorship_credential_issuance_operations
+       (token_id, org_id, tenant_ref, issued_at_epoch_seconds,
+        expires_at_epoch_seconds, credential_key_id)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [
+      input.tokenId,
+      input.organizationId,
+      input.tenantRef,
+      input.issuedAtEpochSeconds,
+      input.issuedAtEpochSeconds + input.ttlSeconds,
+      credentialKeyId,
+    ],
+  );
+}
+
 beforeEach(() => {
   now = NOW;
   const database = new Database(":memory:");
@@ -69,6 +100,14 @@ beforeEach(() => {
       offering_digest TEXT NOT NULL,
       expires_at_epoch_seconds INTEGER NOT NULL,
       consumed_at_epoch_seconds INTEGER NOT NULL
+    );
+    CREATE TABLE sponsorship_credential_issuance_operations (
+      token_id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+      tenant_ref TEXT NOT NULL,
+      issued_at_epoch_seconds INTEGER NOT NULL,
+      expires_at_epoch_seconds INTEGER NOT NULL,
+      credential_key_id TEXT NOT NULL
     );
     INSERT INTO reservations
       (id, org_id, tenant_ref, offering_id, offering_digest, status)
@@ -186,15 +225,22 @@ describe("provision tokens", () => {
 
 describe("Takoform run tokens", () => {
   test("bind a multi-Resource runner credential without a private materialization claim", async () => {
-    const tokens = service(await provisionKey("sign-tenant-run"));
-    const issued = await tokens.issueTakoformTenantRunToken({
+    const key = await provisionKey("sponsorship-credential-run");
+    const tokens = service();
+    expect(tokens).not.toHaveProperty("issueTakoformTenantRunToken");
+    expect(tokens).not.toHaveProperty("issueTakoformTenantRunTokenDeterministic");
+    const input = {
       organizationId: "org_alpha",
       tenantRef: "tenant_workspace_x",
       spaceRef: "tsp_capsule_yurucommu",
       runRef: "run_host_1",
       runtimeMaterialization: { kind: "retired" },
       ttlSeconds: 300,
-    } as never);
+      issuedAtEpochSeconds: Math.floor(NOW / 1_000),
+      tokenId: "tok_sponsor_multi_resource",
+    } as const;
+    const issued = await sponsorshipIssuer(key).issue(input);
+    await admitSponsorshipCredential(input, key.keyId);
     const claims = await tokens.verifyTakoformTenantRunToken(issued.token);
     expect(claims).toMatchObject({
       organizationId: "org_alpha",
@@ -207,15 +253,20 @@ describe("Takoform run tokens", () => {
   });
 
   test("binds only the opaque endpoint reservation authority into a tenant-run credential", async () => {
-    const tokens = service(await provisionKey("sign-tenant-run-reservation"));
-    const issued = await tokens.issueTakoformTenantRunToken({
+    const key = await provisionKey("sponsorship-credential-reservation");
+    const tokens = service();
+    const input = {
       organizationId: "org_alpha",
       tenantRef: "tenant_workspace_x",
       spaceRef: "tsp_capsule_yurucommu",
       runRef: "run_host_endpoint",
       workerEndpointOriginReservationId: "reservation_endpoint_01",
       ttlSeconds: 300,
-    });
+      issuedAtEpochSeconds: Math.floor(NOW / 1_000),
+      tokenId: "tok_sponsor_endpoint_reservation",
+    } as const;
+    const issued = await sponsorshipIssuer(key).issue(input);
+    await admitSponsorshipCredential(input, key.keyId);
     expect(await tokens.verifyTakoformTenantRunToken(issued.token)).toMatchObject({
       organizationId: "org_alpha",
       tenantRef: "tenant_workspace_x",
@@ -223,6 +274,68 @@ describe("Takoform run tokens", () => {
       runRef: "run_host_endpoint",
       mode: "tenant-run",
       workerEndpointOriginReservationId: "reservation_endpoint_01",
+    });
+  });
+
+  test("reconstructs an admitted tenant-run credential byte-for-byte after result loss", async () => {
+    const key = await provisionKey("sponsorship-credential-idempotent");
+    const issuer = sponsorshipIssuer(key);
+    const tokens = service();
+    const input = {
+      organizationId: "org_alpha",
+      tenantRef: "tenant_workspace_x",
+      spaceRef: "tsp_capsule_yurucommu",
+      runRef: "run_host_idempotent",
+      ttlSeconds: 300,
+      issuedAtEpochSeconds: Math.floor(NOW / 1_000),
+      tokenId: "tok_sponsor_exact_operation",
+    } as const;
+    const first = await issuer.issue(input);
+    await admitSponsorshipCredential(input, key.keyId);
+    now += 120_000;
+    const replay = await issuer.issue(input);
+    expect(replay).toEqual(first);
+    expect(await tokens.verifyTakoformTenantRunToken(replay.token)).toMatchObject({
+      issuedAtEpochSeconds: Math.floor(NOW / 1_000),
+      expiresAtEpochSeconds: Math.floor(NOW / 1_000) + 300,
+      tokenId: "tok_sponsor_exact_operation",
+    });
+  });
+
+  test("rejects a tenant-run JWT made with the public Worker's ordinary signing key", async () => {
+    const ordinaryKey = await provisionKey("public-runtime-signing-key");
+    const credentialKey = await provisionKey("sponsorship-credential-key");
+    const input = {
+      organizationId: "org_alpha",
+      tenantRef: "tenant_workspace_x",
+      spaceRef: "tsp_capsule_yurucommu",
+      runRef: "run_outside_authority",
+      ttlSeconds: 300,
+      issuedAtEpochSeconds: Math.floor(NOW / 1_000),
+      tokenId: "tok_sponsor_outside_authority",
+    } as const;
+    await admitSponsorshipCredential(input, credentialKey.keyId);
+    const forged = await sponsorshipIssuer(ordinaryKey).issue(input);
+
+    await expect(service().verifyTakoformTenantRunToken(forged.token)).rejects.toMatchObject({
+      code: "invalid_credential_authority",
+    });
+  });
+
+  test("rejects a credential-key JWT without the route-less authority admission", async () => {
+    const credentialKey = await provisionKey("sponsorship-credential-unadmitted");
+    const issued = await sponsorshipIssuer(credentialKey).issue({
+      organizationId: "org_alpha",
+      tenantRef: "tenant_workspace_x",
+      spaceRef: "tsp_capsule_yurucommu",
+      runRef: "run_without_authority_receipt",
+      ttlSeconds: 300,
+      issuedAtEpochSeconds: Math.floor(NOW / 1_000),
+      tokenId: "tok_sponsor_without_authority_receipt",
+    });
+
+    await expect(service().verifyTakoformTenantRunToken(issued.token)).rejects.toMatchObject({
+      code: "invalid_credential_authority",
     });
   });
 

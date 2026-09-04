@@ -6,10 +6,13 @@ import { join } from "node:path";
 import { DeployError } from "../scripts/deploy/errors.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import {
+  type RetirementInvocation,
+  type RetirementOptions,
   type RetirementProcess,
   type RetirementState,
-  runRetirement,
+  runRetirement as runRetirementOwned,
 } from "../scripts/deploy/retirement.ts";
+import type { SponsorshipCutoverProofGate } from "../scripts/deploy/sponsorship-cutover-proof.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import {
   assertExactVersionBindingClosure,
@@ -37,6 +40,39 @@ const VERSION_REBOUND = "00000000-0000-4000-8000-00000000000b";
 const SERVICE = "takosumi-platform";
 const ENTRYPOINT = "TakosumiHostRuntimeMaterializerEntrypoint";
 
+const testProofGate: SponsorshipCutoverProofGate = {
+  async authorize(stage) {
+    return { stage, proofSha256: `sha256:${"9".repeat(64)}` };
+  },
+  async begin() {
+    return {
+      operationId: `sha256:${"7".repeat(64)}`,
+      candidateIdentitySha256: `sha256:${"6".repeat(64)}`,
+      fresh: true,
+      executionClaim: {
+        async execute(mutation) {
+          return await mutation();
+        },
+      },
+    };
+  },
+  async complete() {},
+  async settle() {
+    return `sha256:${"9".repeat(64)}`;
+  },
+};
+
+function runRetirement(
+  invocation: RetirementInvocation,
+  selectedTarget: DeployTarget,
+  options: RetirementOptions = {},
+): Promise<Record<string, unknown>> {
+  return runRetirementOwned(invocation, selectedTarget, {
+    proofGate: testProofGate,
+    ...options,
+  });
+}
+
 const target = {
   kind: "takoserver.deploy-target@v2",
   environment: "integration",
@@ -49,7 +85,14 @@ const target = {
   r2: { bucketName: "takoserver-objects-integration" },
   publicOrigin: "https://api.integration.example.test",
   signing: { currentKeyId: "key-current" },
-  sponsorship: true,
+  sponsorshipAuthority: {
+    workerName: "takoserver-sponsorship-authority",
+    organizationId: "org_hosted",
+    credentialKeyId: "sponsorship-credential-key",
+    credentialPublicJwk: { kty: "OKP", crv: "Ed25519", x: "B".repeat(42) + "A" },
+    receiptKeyId: "receipt-key",
+    receiptPublicJwk: { kty: "OKP", crv: "Ed25519", x: "A".repeat(43) },
+  },
 } satisfies DeployTarget;
 
 const integrationE2eTarget = {
@@ -61,7 +104,7 @@ const integrationE2eTarget = {
 } satisfies DeployTarget;
 
 const BASE_SECRETS = ["TAKOSERVER_SIGNING_KEY"];
-const HOSTED_SPONSORSHIP_SECRET = "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN";
+const HOSTED_SPONSORSHIP_SECRET = ["TAKOSERVER", "HOSTED", "SPONSORSHIP", "TOKEN"].join("_");
 const HOSTED_SECRETS = [...BASE_SECRETS, HOSTED_SPONSORSHIP_SECRET];
 type TestAuthorityProfile =
   | { readonly kind: "historical-pre-jit" }
@@ -108,7 +151,7 @@ describe("reviewed Hosted legacy-edge retirement", () => {
       const fixture = stateFixture("legacy");
       const result = await runRetirement(
         {
-          surface: "takoserver-worker-authority-cutover",
+          surface: "takoserver-sponsorship-public-route-retirement",
           action: "apply",
           environment: "integration",
           commit: COMMIT,
@@ -139,6 +182,157 @@ describe("reviewed Hosted legacy-edge retirement", () => {
     }
   });
 
+  test("route removal consumes the current staging proof before its only upload", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-proof-gate-"));
+    try {
+      const fixture = stateFixture("legacy");
+      const events: string[] = [];
+      const proofGate: SponsorshipCutoverProofGate = {
+        async authorize(stage) {
+          events.push(`authorize:${stage}`);
+          return { stage, proofSha256: `sha256:${"8".repeat(64)}` };
+        },
+        async begin(handle) {
+          expect(
+            fixture.mutations.filter(({ command }) => command.includes("--no-bundle")),
+          ).toHaveLength(0);
+          events.push(`begin:${handle.stage}`);
+          return {
+            operationId: `sha256:${"7".repeat(64)}`,
+            candidateIdentitySha256: `sha256:${"6".repeat(64)}`,
+            fresh: true,
+            executionClaim: {
+              async execute(mutation) {
+                events.push(`execute:${handle.stage}`);
+                return await mutation();
+              },
+            },
+          };
+        },
+        async complete(handle, versionId) {
+          expect(
+            fixture.mutations.filter(({ command }) => command.includes("--no-bundle")),
+          ).toHaveLength(1);
+          expect(versionId).toBe(VERSION_CANDIDATE);
+          events.push(`complete:${handle.stage}`);
+        },
+        async settle() {
+          return undefined;
+        },
+      };
+      const result = await runRetirementOwned(
+        {
+          surface: "takoserver-sponsorship-public-route-retirement",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+        },
+        target,
+        {
+          run: fixture.run,
+          state: fixture.state,
+          outputDirectory: root,
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          proofGate,
+        },
+      );
+      expect(events).toEqual([
+        "authorize:public-route-removal",
+        "begin:public-route-removal",
+        "execute:public-route-removal",
+        "complete:public-route-removal",
+      ]);
+      expect(result.sponsorshipCutoverProofSha256).toBe(`sha256:${"8".repeat(64)}`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("an existing durable start is status-only and never repeats the route-removal upload", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-existing-start-"));
+    try {
+      const fixture = stateFixture("legacy");
+      const proofGate: SponsorshipCutoverProofGate = {
+        async authorize(stage) {
+          return { stage, proofSha256: `sha256:${"8".repeat(64)}` };
+        },
+        async begin() {
+          return {
+            operationId: `sha256:${"7".repeat(64)}`,
+            candidateIdentitySha256: `sha256:${"6".repeat(64)}`,
+            fresh: false,
+          };
+        },
+        async complete() {
+          throw new Error("must not complete without a provider successor");
+        },
+        async settle() {
+          return undefined;
+        },
+      };
+
+      await expect(
+        runRetirementOwned(
+          {
+            surface: "takoserver-sponsorship-public-route-retirement",
+            action: "apply",
+            environment: "integration",
+            commit: COMMIT,
+            legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+          },
+          target,
+          {
+            run: fixture.run,
+            state: fixture.state,
+            outputDirectory: root,
+            review: "reviewer@example.test",
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+            proofGate,
+          },
+        ),
+      ).rejects.toThrow("status reconciliation");
+      expect(
+        fixture.mutations.filter(({ command }) => command.includes("--no-bundle")),
+      ).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("terminal route and secret status cannot claim readiness without the current proof", async () => {
+    const route = stateFixture("candidate");
+    await expect(
+      runRetirementOwned(
+        {
+          surface: "takoserver-sponsorship-public-route-retirement",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+        },
+        target,
+        { run: route.run, state: route.state },
+      ),
+    ).rejects.toThrow("current sponsorship cutover proof");
+
+    const token = stateFixture("token");
+    await expect(
+      runRetirementOwned(
+        {
+          surface: "takoserver-hosted-token-retirement",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+        },
+        target,
+        { run: token.run, state: token.state },
+      ),
+    ).rejects.toThrow("current sponsorship cutover proof");
+  });
+
   test("authority transition classifies historical L as pre-JIT and requires provenance-bound JIT C", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-jit-authority-"));
     try {
@@ -147,7 +341,7 @@ describe("reviewed Hosted legacy-edge retirement", () => {
       });
       const result = await runRetirement(
         {
-          surface: "takoserver-worker-authority-cutover",
+          surface: "takoserver-sponsorship-public-route-retirement",
           action: "apply",
           environment: "integration",
           commit: COMMIT,
@@ -184,7 +378,7 @@ describe("reviewed Hosted legacy-edge retirement", () => {
       await expect(
         runRetirement(
           {
-            surface: "takoserver-worker-authority-cutover",
+            surface: "takoserver-sponsorship-public-route-retirement",
             action: "apply",
             environment: "integration",
             commit: COMMIT,
@@ -205,7 +399,7 @@ describe("reviewed Hosted legacy-edge retirement", () => {
       ).toHaveLength(1);
       const status = await runRetirement(
         {
-          surface: "takoserver-worker-authority-cutover",
+          surface: "takoserver-sponsorship-public-route-retirement",
           action: "status",
           environment: "integration",
           commit: COMMIT,
@@ -229,7 +423,7 @@ describe("reviewed Hosted legacy-edge retirement", () => {
       const fixture = stateFixture("candidate");
       const result = await runRetirement(
         {
-          surface: "takoserver-worker-authority-cutover",
+          surface: "takoserver-sponsorship-public-route-retirement",
           action: "apply",
           reverse: true,
           environment: "integration",

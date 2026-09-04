@@ -24,8 +24,10 @@ async function deploy(args: readonly string[]): Promise<{
 
 const SURFACES = [
   ["takoserver-worker", []],
+  ["takoserver-sponsorship-authority-worker", ["irreversible", "authority", "published-identity"]],
   ["takoserver-worker-authority-cutover", ["authority"]],
   ["takoserver-public-parent-token-retirement", ["irreversible", "authority"]],
+  ["takoserver-sponsorship-public-route-retirement", ["irreversible", "authority"]],
   ["takoserver-form-authority-identity-probe", ["authority"]],
   ["takoserver-form-authority-worker", ["authority"]],
   ["takoserver-integration-form-authority-worker", ["authority"]],
@@ -40,7 +42,6 @@ const SURFACES = [
   ["takoserver-signing-key-register", ["irreversible", "authority", "published-identity"]],
   ["takoserver-signing-repair", ["authority"]],
   ["takoserver-signing-rotation", ["authority", "published-identity"]],
-  ["takoserver-hosted-token-cutover", ["authority"]],
   ["takoserver-host-runtime-topology-retirement", ["irreversible", "authority"]],
   ["takoserver-hosted-token-retirement", ["irreversible", "authority"]],
   ["takoserver-worker-retirement-attribution-repair", []],
@@ -104,8 +105,8 @@ describe("Takoserver split deploy entrypoint", () => {
     const credentials = contract.surfaces.find(
       ({ surface }) => surface === "takoserver-integration-e2e-credentials",
     );
-    const hosted = contract.surfaces.find(
-      ({ surface }) => surface === "takoserver-hosted-token-cutover",
+    const sponsorshipAuthority = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-sponsorship-authority-worker",
     );
     const receiptAuthority = contract.surfaces.find(
       ({ surface }) => surface === "takoserver-managed-object-receipt-authority",
@@ -186,8 +187,12 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(schema?.obligations.provenance).toContain("one-time exact 0016-to-0022 catch-up");
     expect(schema?.obligations.provenance).toContain("0045");
     expect(schema?.obligations.provenance).toContain("0046");
+    expect(schema?.obligations.provenance).toContain("0047");
     expect(schema?.obligations["post-conditions"]).toContain(
       "exact artifact-recovery singleton and its receipt constraints",
+    );
+    expect(schema?.obligations["post-conditions"]).toContain(
+      "sponsorship issuance admission and cutover-consumption receipts",
     );
     expect(schema?.requiresEnv).toContain("TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH");
     expect(schema?.obligations["pre-mutation-proof"]).toContain("malformed FormRef");
@@ -248,14 +253,14 @@ describe("Takoserver split deploy entrypoint", () => {
       "distinct 3600-second writer and external-evidence secrets",
     );
     expect(credentials?.obligations.reversal).toContain("current dedicated authority");
-    expect(hosted?.obligations.provenance).toContain(
-      "canonical token-present proof-only apply is available in every environment",
+    expect(sponsorshipAuthority?.obligations.provenance).toContain(
+      "target pins the only organization and Worker name",
     );
-    expect(hosted?.obligations["post-conditions"]).toContain(
-      "zero secret, build, dry-run, upload, or configuration mutation",
+    expect(sponsorshipAuthority?.obligations["post-conditions"]).toContain(
+      "Hosted's exact service-binding release",
     );
-    expect(hosted?.obligations["post-conditions"]).toContain(
-      "functionalProofPending=false, repairRequired=false, and ready=true",
+    expect(sponsorshipAuthority?.obligations["post-conditions"]).toContain(
+      "bounded authenticated staging credential issuance/readback",
     );
     expect(receiptAuthority?.obligations["post-conditions"]).toContain("--secrets-file");
     expect(receiptAuthority?.obligations["post-conditions"]).toContain("custom domains");
@@ -294,6 +299,36 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(JSON.stringify(publicParentTokenRetirement)).not.toContain(
       "TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH",
     );
+    expect(sponsorshipAuthority?.requiresEnv).toEqual([
+      "CLOUDFLARE_API_TOKEN",
+      "TAKOSERVER_INDEPENDENT_REVIEW",
+      "TAKOSERVER_SPONSORSHIP_CREDENTIAL_PRIVATE_JWK_PATH",
+      "TAKOSERVER_SPONSORSHIP_RECEIPT_PRIVATE_JWK_PATH",
+      "TAKOSERVER_CLOUDFLARE_TOPOLOGY_AUDIT_CREDENTIAL",
+    ]);
+    const routeRetirement = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-sponsorship-public-route-retirement",
+    );
+    const tokenRetirement = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-hosted-token-retirement",
+    );
+    for (const retirement of [routeRetirement, tokenRetirement]) {
+      expect(retirement?.requiresEnv).toEqual([
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+        "TAKOSERVER_SPONSORSHIP_CUTOVER_PROOF_PATH",
+        "TAKOSERVER_SPONSORSHIP_CUTOVER_PROOF_SHA256",
+        "TAKOSERVER_CLOUDFLARE_TOPOLOGY_AUDIT_CREDENTIAL",
+      ]);
+      expect(retirement?.obligations["pre-mutation-proof"]).toContain(
+        "0047_sponsorship_cutover_consumption.sql",
+      );
+      expect(retirement?.obligations["pre-mutation-proof"]).toContain("0046");
+      expect(retirement?.obligations["failure-handling"]).toContain("remote STATE_DB");
+    }
+    expect(routeRetirement?.obligations.provenance).toContain("append-only Hosted 0003 receipt");
+    expect(routeRetirement?.obligations.provenance).toContain("public Worker predecessor");
+    expect(routeRetirement?.obligations.provenance).toContain("all-zone");
 
     for (const surface of contract.surfaces) {
       expect(surface.obligations).toMatchObject({
@@ -435,6 +470,8 @@ describe("Takoserver split deploy entrypoint", () => {
       "0044",
       "0045",
       "0046",
+      "0047",
+      "0048",
     ] as const) {
       for (const environment of ["rehearsal", "production"] as const) {
         const accepted = await deploy([
@@ -469,6 +506,8 @@ describe("Takoserver split deploy entrypoint", () => {
       "0044",
       "0045",
       "0046",
+      "0047",
+      "0048",
     ] as const) {
       const refused = await deploy([
         "takoserver-d1-schema",
@@ -598,7 +637,7 @@ describe("Takoserver split deploy entrypoint", () => {
     const sha = "a".repeat(40);
     const version = "00000000-0000-4000-8000-000000000001";
     for (const surface of [
-      "takoserver-worker-authority-cutover",
+      "takoserver-sponsorship-public-route-retirement",
       "takoserver-host-runtime-topology-retirement",
       "takoserver-hosted-token-retirement",
     ] as const) {
@@ -618,7 +657,7 @@ describe("Takoserver split deploy entrypoint", () => {
 
     for (const args of [
       [
-        "takoserver-worker-authority-cutover",
+        "takoserver-sponsorship-public-route-retirement",
         "--status",
         "--environment=integration",
         `--commit=${sha}`,
@@ -631,6 +670,13 @@ describe("Takoserver split deploy entrypoint", () => {
         "--environment=integration",
         `--commit=${sha}`,
         "--reverse",
+      ],
+      [
+        "takoserver-worker-authority-cutover",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--legacy-host-runtime-predecessor-version=${version}`,
       ],
       [
         "takoserver-worker-authority-cutover",
@@ -647,7 +693,7 @@ describe("Takoserver split deploy entrypoint", () => {
         `--legacy-host-runtime-predecessor-version=${version}`,
       ],
       [
-        "takoserver-hosted-token-cutover",
+        "takoserver-sponsorship-authority-worker",
         "--status",
         "--environment=integration",
         `--commit=${sha}`,

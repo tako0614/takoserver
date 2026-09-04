@@ -85,8 +85,23 @@ export interface DeployTarget {
       readonly rehearsalDigest: `sha256:${string}`;
     };
   };
-  /** Requires the private bearer that authorizes the sponsorship owner API. */
-  readonly sponsorship?: boolean;
+  /** Route-less Hosted sponsorship authority; its organization is deploy-pinned. */
+  readonly sponsorshipAuthority?: {
+    readonly workerName: string;
+    readonly organizationId: string;
+    readonly credentialKeyId: string;
+    readonly credentialPublicJwk: {
+      readonly kty: "OKP";
+      readonly crv: "Ed25519";
+      readonly x: string;
+    };
+    readonly receiptKeyId: string;
+    readonly receiptPublicJwk: {
+      readonly kty: "OKP";
+      readonly crv: "Ed25519";
+      readonly x: string;
+    };
+  };
   /** Route-less Form authority Workers sharing this target's existing D1/R2. */
   readonly formAuthority?: {
     readonly workerName: string;
@@ -174,6 +189,7 @@ const HOSTNAME =
   /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/u;
 const BASE64URL_32 = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/u;
 const SHA256 = /^sha256:[0-9a-f]{64}$/u;
+const ORGANIZATION_ID = /^org_[A-Za-z0-9][A-Za-z0-9._:-]{0,123}$/u;
 
 export function targetPath(environment: DeployEnvironment): string {
   const variable = `TAKOSERVER_DEPLOY_TARGET_${environment.toUpperCase()}`;
@@ -259,7 +275,7 @@ export function parseDeployTarget(
       "objectBucketSupplies",
       "edgeSupplies",
       "cloudflareProviderExecutor",
-      "sponsorship",
+      "sponsorshipAuthority",
       "formAuthority",
       "exactArtifactRecovery",
       "operatorIdentity",
@@ -320,9 +336,11 @@ export function parseDeployTarget(
       : {
           cloudflareProviderExecutor: cloudflareProviderExecutor(value.cloudflareProviderExecutor),
         }),
-    ...(value.sponsorship === undefined
+    ...(value.sponsorshipAuthority === undefined
       ? {}
-      : { sponsorship: boolean(value.sponsorship, "sponsorship") }),
+      : {
+          sponsorshipAuthority: sponsorshipAuthority(value.sponsorshipAuthority),
+        }),
     ...(value.formAuthority === undefined
       ? {}
       : {
@@ -400,6 +418,7 @@ export function parseDeployTarget(
     }
     const names = [
       target.workerName,
+      ...(target.sponsorshipAuthority ? [target.sponsorshipAuthority.workerName] : []),
       target.formAuthority.workerName,
       target.formAuthority.identityProbeWorkerName,
       ...(target.formAuthority.integrationWorkerName
@@ -439,7 +458,7 @@ export function parseDeployTarget(
     if (
       target.formAuthority.historicalPreExecutorPublicWorker !== undefined &&
       (target.environment !== "integration" ||
-        target.sponsorship !== true ||
+        target.sponsorshipAuthority === undefined ||
         target.integrationE2eCredentialAuthority === undefined ||
         target.cloudflareProviderExecutor === undefined ||
         target.edgeSupplies === undefined ||
@@ -469,6 +488,7 @@ export function parseDeployTarget(
   }
   const allWorkerNames = [
     target.workerName,
+    ...(target.sponsorshipAuthority ? [target.sponsorshipAuthority.workerName] : []),
     ...(target.cloudflareProviderExecutor
       ? [
           target.cloudflareProviderExecutor.workerName,
@@ -492,6 +512,33 @@ export function parseDeployTarget(
   ];
   if (new Set(allWorkerNames).size !== allWorkerNames.length) {
     throw preflightError("deploy target authority Worker names must be globally distinct");
+  }
+  if (target.sponsorshipAuthority && target.sponsorshipAuthority.workerName === target.workerName) {
+    throw preflightError(
+      "deploy target sponsorship authority Worker must be distinct from the public Worker",
+    );
+  }
+  if (
+    target.sponsorshipAuthority &&
+    new Set([
+      target.signing.currentKeyId,
+      ...(target.signing.nextKeyId === undefined ? [] : [target.signing.nextKeyId]),
+      target.sponsorshipAuthority.credentialKeyId,
+      target.sponsorshipAuthority.receiptKeyId,
+    ]).size !== (target.signing.nextKeyId === undefined ? 3 : 4)
+  ) {
+    throw preflightError(
+      "deploy target run-token, sponsorship credential, and receipt signing key identities must differ",
+    );
+  }
+  if (
+    target.sponsorshipAuthority &&
+    target.sponsorshipAuthority.credentialPublicJwk.x ===
+      target.sponsorshipAuthority.receiptPublicJwk.x
+  ) {
+    throw preflightError(
+      "deploy target sponsorship credential and receipt public keys must differ",
+    );
   }
   if (target.integrationE2eCredentialAuthority) {
     const authorityKey = target.integrationE2eCredentialAuthority.publicJwk.x;
@@ -539,6 +586,42 @@ function exactArtifactRecovery(value: unknown): NonNullable<DeployTarget["exactA
       ) as `sha256:${string}`,
       detailRetentionMilliseconds: Number(detailRetentionMilliseconds),
     },
+  };
+}
+
+function sponsorshipAuthority(value: unknown): NonNullable<DeployTarget["sponsorshipAuthority"]> {
+  if (
+    !isRecord(value) ||
+    !exactKeySet(value, [
+      "credentialKeyId",
+      "credentialPublicJwk",
+      "organizationId",
+      "receiptKeyId",
+      "receiptPublicJwk",
+      "workerName",
+    ])
+  ) {
+    throw preflightError(
+      "deploy target `sponsorshipAuthority` must contain its exact worker, organization, credential key, and receipt key members",
+    );
+  }
+  return {
+    workerName: pattern(value.workerName, WORKER_NAME, "sponsorshipAuthority.workerName"),
+    organizationId: pattern(
+      value.organizationId,
+      ORGANIZATION_ID,
+      "sponsorshipAuthority.organizationId",
+    ),
+    credentialKeyId: pattern(value.credentialKeyId, KEY_ID, "sponsorshipAuthority.credentialKeyId"),
+    credentialPublicJwk: publicEd25519Jwk(
+      value.credentialPublicJwk,
+      "sponsorshipAuthority.credentialPublicJwk",
+    ),
+    receiptKeyId: pattern(value.receiptKeyId, KEY_ID, "sponsorshipAuthority.receiptKeyId"),
+    receiptPublicJwk: publicEd25519Jwk(
+      value.receiptPublicJwk,
+      "sponsorshipAuthority.receiptPublicJwk",
+    ),
   };
 }
 

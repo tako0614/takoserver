@@ -2,7 +2,6 @@ import type { ControlRoutes } from "./control.ts";
 import type { DataAiRoutes } from "./data-ai.ts";
 import { landingHtml } from "./landing.ts";
 import { createOpenApiDocument } from "./openapi.ts";
-import type { SponsorshipRoutes } from "./sponsorship-api.ts";
 import type { TakoformHost } from "./takoform/types.ts";
 
 /**
@@ -23,7 +22,6 @@ import type { TakoformHost } from "./takoform/types.ts";
 
 export interface CreateRouterOptions {
   readonly control: ControlRoutes;
-  readonly sponsorship?: SponsorshipRoutes;
   readonly dataAi?: DataAiRoutes;
   readonly aiAvailable?: boolean;
   readonly takoformHost?: TakoformHost;
@@ -103,11 +101,6 @@ function dispatch(options: CreateRouterOptions, origin: string): Router {
   const console = options.consoleOrigin === undefined ? null : httpsOrigin(options.consoleOrigin);
   return async (request) => {
     const url = new URL(request.url);
-
-    if (options.sponsorship) {
-      const served = await options.sponsorship(request, url);
-      if (served) return served;
-    }
 
     if (options.dataAi) {
       const served = await options.dataAi(request, url);

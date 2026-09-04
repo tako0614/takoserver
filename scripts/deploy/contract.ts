@@ -66,10 +66,16 @@ const signingPublicJwkInput =
   "`TAKOSERVER_SIGNING_PUBLIC_JWK_PATH` is required for `--apply` only; `--status` does not read it.";
 const signingPrivateJwkInput =
   "`TAKOSERVER_SIGNING_PRIVATE_JWK_PATH` is required for `--apply` only; `--status` does not read it.";
+const sponsorshipCredentialPrivateJwkInput =
+  "`TAKOSERVER_SPONSORSHIP_CREDENTIAL_PRIVATE_JWK_PATH` is required for `--apply` only; its public half is target-pinned and append-only registered with exact readback. `--status` does not read the private file.";
+const sponsorshipReceiptPrivateJwkInput =
+  "`TAKOSERVER_SPONSORSHIP_RECEIPT_PRIVATE_JWK_PATH` is required for `--apply` only; `--status` does not read it.";
+const topologyAuditCredentialInput =
+  "`TAKOSERVER_CLOUDFLARE_TOPOLOGY_AUDIT_CREDENTIAL` must name an owned absolute 0600 credential file for every action; it is distinct from the deployment token and may only read that exact token's active policy and permission-group metadata.";
+const sponsorshipCutoverProofInput =
+  "`TAKOSERVER_SPONSORSHIP_CUTOVER_PROOF_PATH` and `TAKOSERVER_SPONSORSHIP_CUTOVER_PROOF_SHA256` select and confirm the exact owned 0600 proof; no local consumption path is accepted.";
 const signingNextPrivateJwkInput =
   "`TAKOSERVER_SIGNING_NEXT_PRIVATE_JWK_PATH` is required for `--apply` only; `--status` does not read it.";
-const hostedTokenInput =
-  "`TAKOSERVER_HOSTED_TOKEN_PATH` is required for `--apply` only; `--status` does not read it.";
 const operatorPrivateJwkInput =
   "`TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH` and `TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH` are required for `--apply` only; `--status` does not read either file. Every action also requires one exact `--organization=<org_...>` selector.";
 const orgApiKeyInput =
@@ -160,6 +166,54 @@ export const DEPLOY_CONTRACT = {
       },
     },
     {
+      surface: "takoserver-sponsorship-authority-worker",
+      target: "cloudflare-worker:environment-selected-route-less-sponsorship-authority",
+      covers: [
+        "src/entry-sponsorship-authority-worker.ts",
+        "src/sponsorship-credential.ts",
+        "src/sponsorship-authority.ts",
+        "src/sponsorship-issuance-receipt.ts",
+        "migrations/0047_sponsorship_cutover_consumption.sql",
+        "wrangler.sponsorship-authority.jsonc",
+        "scripts/build-sponsorship-authority-worker.ts",
+        "scripts/deploy/cloudflare-topology-audit.ts",
+        "scripts/deploy/sponsorship-authority.ts",
+        "scripts/deploy/target.ts",
+      ],
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+        "TAKOSERVER_SPONSORSHIP_CREDENTIAL_PRIVATE_JWK_PATH",
+        "TAKOSERVER_SPONSORSHIP_RECEIPT_PRIVATE_JWK_PATH",
+        "TAKOSERVER_CLOUDFLARE_TOPOLOGY_AUDIT_CREDENTIAL",
+      ],
+      triggers: ["irreversible", "authority", "published-identity"],
+      obligations: {
+        provenance:
+          `${exactSource} The operator-private target pins the only organization and Worker name; ` +
+          "the ordinary runtime signing row is read only to prove separation, the target-pinned sponsorship credential public key is append-only registered and read back before its owned 0600 private half is published only to this route-less Worker, the distinct receipt public key is proven against its separate owned 0600 private JWK, and the exact bundle/config/two-secret file is sealed before one upload. A separate owner-private audit credential authenticates the deployment token's active all-zone Zone Read and Workers Routes Read policy; Workers Routes Write is explicitly refused before exhaustive topology readback.",
+        "post-conditions":
+          "Authoritative Worker history identifies the selected commit and artifact; immutable Version readback proves exactly STATE_DB, the deploy-pinned organization and issuer, dedicated sponsorship credential key id/public JWK/secret, distinct issuance-receipt key id/secret, and Worker version metadata. The public Worker retains only its ordinary run-token key and has no tenant-run mint API or sponsorship private material. Runtime verification requires the immutable issuance-operation row's credential key id to match the JWT kid. Authenticated all-zone topology readback proves workers.dev=false, preview URLs=false, and no public route or custom domain and records only token/policy/resource digests. The entrypoint has exactly one issueTenantRunCredential method, no fetch, and a maximum 300-second credential. After additive migration 0047, one stable logical operation atomically admits the tenant/wallet decision and exact retries reconstruct byte-identical bearer/receipt bytes. This closure status is followed by Hosted's exact service-binding release and a bounded authenticated staging credential issuance/readback before any public route or retired-secret removal.",
+        reversal:
+          "The immediately previous authority Worker Version is the provider-history rollback target; first publication has forward repair only and never deletes shared D1 state.",
+        "failure-handling":
+          `${highRiskFailure} The only receipt authority is the dedicated redacted issuance-attestation signer; no funding, inventory, OAuth, billing, delete, managed-object/payment receipt, executor, Form, or public-fetch authority is present. Any extra binding, partial-scope topology token, or public topology fails closed.` +
+          inputContract(
+            applyReviewInput,
+            sponsorshipCredentialPrivateJwkInput,
+            sponsorshipReceiptPrivateJwkInput,
+            topologyAuditCredentialInput,
+          ),
+        "independent-review": review,
+        "pre-mutation-proof":
+          "Before the append-only public-key registration or Worker upload, the command proves the exact source, target, ordinary key row, optional existing credential key row, both owned private/public JWK pairs, closed bundle/config/secrets bytes, and read-only all-zone topology. An existing credential row must already be byte-identical; it is never updated.",
+        "no-overwrite":
+          "Migration 0047 additively introduces the append-only logical issuance admission while reusing sponsorship_tenants and never rewriting prior migration history. Exact retries reconstruct one fixed bearer/receipt; changed input or a conflicting tenant organization is refused.",
+      },
+    },
+    {
       surface: "takoserver-worker-authority-cutover",
       target: "cloudflare-worker:environment-selected-takoserver-worker-authority-code-and-config",
       covers: [
@@ -207,9 +261,9 @@ export const DEPLOY_CONTRACT = {
           "Any other configuration, secret, signing or Hosted topology drift is still refused. Integration alone may bridge exact absence to the complete JIT " +
           "credential-authority profile; partial fields, wrong organization, reused keys and provenance " +
           "mismatch are refused. " +
-          "The named --legacy-host-runtime-predecessor-version transition profile is the only " +
-          "path that may carry the observed legacy service binding and Hosted secret into a " +
-          "candidate; ordinary target realization remains free of both retired fields. " +
+          "The separate takoserver-sponsorship-public-route-retirement surface is the only " +
+          "path that may carry the observed legacy service binding and Hosted secret into the " +
+          "route-removing candidate; this generic authority surface rejects that selector. " +
           "The named --closure-predecessor-version profile refuses before any mutation and names " +
           "every binding its declared delta does not account for. The selected target is composed " +
           "with the Worker's own startup path before any upload and its refusal is reported verbatim. " +
@@ -299,6 +353,64 @@ export const DEPLOY_CONTRACT = {
           "present. If the executor binding is not yet exact, only the sealed exact binding release " +
           "may precede deletion; token absence before that release is refused unless status proves " +
           "an exact completed adoption.",
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-sponsorship-public-route-retirement",
+      target: "cloudflare-worker:environment-selected-proof-gated-sponsorship-route-retirement",
+      covers: [
+        "src",
+        "wrangler.jsonc",
+        "scripts/build-worker.ts",
+        "scripts/deploy.ts",
+        "scripts/deploy/retirement.ts",
+        "scripts/deploy/cloudflare-topology-audit.ts",
+        "scripts/deploy/sponsorship-cutover-consumption.ts",
+        "scripts/deploy/sponsorship-cutover-proof.ts",
+        "scripts/deploy/sponsorship-authority.ts",
+        "scripts/deploy/worker-live.ts",
+        "scripts/deploy/worker-state.ts",
+        "migrations/0047_sponsorship_cutover_consumption.sql",
+      ],
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+        "TAKOSERVER_SPONSORSHIP_CUTOVER_PROOF_PATH",
+        "TAKOSERVER_SPONSORSHIP_CUTOVER_PROOF_SHA256",
+        "TAKOSERVER_CLOUDFLARE_TOPOLOGY_AUDIT_CREDENTIAL",
+      ],
+      triggers: ["irreversible", "authority"],
+      obligations: {
+        provenance:
+          `${exactSource} The owner-private proof must be a fresh self-digested Hosted staging ` +
+          "artifact whose separately confirmed raw SHA-256 binds the exact observed public Worker predecessor/topology/generation, exact served authority " +
+          "Version/source/artifact/script, Hosted Version/source/artifact/config/complete binding " +
+          "set, and its one default-entrypoint authority service binding. The proof also binds the actual authenticated Hosted exchangeProviderCredential invocation, the authority's separately signed redacted issuance receipt, the matching append-only Hosted 0003 receipt, exact audience/single scope, verified run-credential signature and tenant/space/run claims, at-most-300-second lifetime, and successful Takoform readback. The deployment token's active exact all-zone policy is independently authenticated before either Worker topology is accepted.",
+        "post-conditions":
+          "Immediately before the sole upload, provider readback must still identify both exact " +
+          "proof-bound Workers, exact authority binding, and zero Hosted public topology. The " +
+          "uploaded direct successor removes the public sponsorship routes while preserving only " +
+          "the separately retired legacy Host-runtime edge and bearer until their ordered steps. " +
+          "Terminal ready/status evidence requires proof-aware settlement of the exact remote receipt and includes that proof digest.",
+        reversal:
+          "The exact direct predecessor may be redeployed through provider history. Reapplying " +
+          "route removal after a reverse requires a newly completed staging proof; a consumed " +
+          "proof cannot replay.",
+        "failure-handling":
+          `${highRiskFailure} Missing, stale, mismatched, already consumed, or indeterminate proof ` +
+          "state fails before upload, and terminal status without the current proof inputs and exact remote receipt fails closed. The target-derived remote STATE_DB authority writes an append-only operation start immediately before provider mutation and the exact successor completion afterward; the start binds environment/stage/proof, predecessor deployment/version/topology, source commit, exact bundle/config, candidate identity, and operation id. Acknowledgement loss is settled only when proof-aware status observes that exact intended successor carrying the operation id, never by a second upload. Changing checkout, machine, or local path cannot reset replay state." +
+          inputContract(
+            applyReviewInput,
+            sponsorshipCutoverProofInput,
+            topologyAuditCredentialInput,
+          ),
+        "pre-mutation-proof":
+          "The route-less authority deploy remains independently allowed first and cannot remove " +
+          "the public routes. This surface is the sole route-removing owner lane and requires the " +
+          "current bounded Hosted staging proof on every forward apply. Exact migration 0047_sponsorship_cutover_consumption.sql must already be applied through the owning D1 schema surface after the reviewed 0046 lineage. The owned 0600 artifact is selected by TAKOSERVER_SPONSORSHIP_CUTOVER_PROOF_PATH and its raw bytes must match TAKOSERVER_SPONSORSHIP_CUTOVER_PROOF_SHA256; create-only phase state exists only in the target-derived remote STATE_DB.",
         "independent-review": review,
       },
     },
@@ -728,7 +840,7 @@ export const DEPLOY_CONTRACT = {
       obligations: {
         provenance:
           `${exactSource} Rehearsal and production accept only the fixed next boundaries 0022, 0028, ` +
-          "0033, 0036, 0043, 0044, 0045 or 0046. The exact predecessor lineage, selected through-prefix and wave " +
+          "0033, 0036, 0043, 0044, 0045, 0046, 0047 or 0048. The exact predecessor lineage, selected through-prefix and wave " +
           "bytes are checked against their fixed SHA-256 inventory, digested and sealed before the " +
           "forward-only apply. Integration accepts no selector; its no-selector disposable cadence " +
           "is explicitly integration-only. The 0022 selector is a one-time exact 0016-to-0022 " +
@@ -740,7 +852,9 @@ export const DEPLOY_CONTRACT = {
           "Version identities, drain state, and active-root/deleting-candidate repair count. The " +
           "0044 boundary ends at the durable artifact-consumer resolution receipt migration; the " +
           "0045 boundary is the separate additive Cloudflare executor pre-effect CAS; the 0046 " +
-          "boundary adds one exact artifact-recovery singleton and its receipt constraints only after 0045. " +
+          "boundary adds one exact artifact-recovery singleton and its receipt constraints only after 0045; " +
+          "the 0047 boundary adds the sponsorship issuance admission and cutover-consumption receipts only after 0046; " +
+          "the 0048 boundary adds value-free Resource execution evidence only after 0047. " +
           "The standalone 0022 catch-up receipt binds the canonical 0016 application shape and critical " +
           "data digest before the exact 0017-0022 transition; it is not an ordinary receipt-chain predecessor.",
         reversal:
@@ -852,13 +966,10 @@ export const DEPLOY_CONTRACT = {
       obligations: {
         provenance:
           "The target explicitly names different current and next ids; both public keys must be pre-registered and the owned 0600 next private JWK must prove the next public half. " +
-          "The ordinary path requires a canonical current-key Version even when the Hosted secret is present. " +
-          "Only integration may instead select the exact workers/triggered_by=secret H profile and its strict canonical C predecessor. " +
-          "Status and apply branch exhaustively on that exact annotation profile: mixed or unknown inventories fail before build/upload. " +
-          "Every history entry has a valid shape and UUID Version, deployment ids are globally unique, and only the inferred C-to-H or C-to-H-to-S prefix requires unique Version ids; older rollback reuse remains valid outside it.",
+          "The public Worker must be an exact canonical current-key Version with the ordinary public secret closure. " +
+          "Provider-created secret successors and mixed or unknown annotation inventories fail before build/upload.",
         "post-conditions":
-          "The immutable Worker version explicitly names the next id with the exact secret inventory and unchanged code, while both public rows remain byte-identical. " +
-          "An integration H status remains ready=false and repair-required while naming rotationApplyReady separately; H-to-S performs exactly one canonical deploy with --secrets-file and no classic secret put/delete mutation.",
+          "The immutable Worker version explicitly names the next id with the exact secret inventory and unchanged code, while both public rows remain byte-identical.",
         reversal:
           "The explicit current key remains pre-registered, so an operator may run a separately reviewed inverse rotation; no silent switch or key deletion occurs.",
         "failure-handling":
@@ -866,61 +977,6 @@ export const DEPLOY_CONTRACT = {
         "independent-review": review,
         "no-overwrite":
           "Rotation consumes a separately pre-registered next id, retains the current public row, and never overwrites either identity.",
-      },
-    },
-    {
-      surface: "takoserver-hosted-token-cutover",
-      target: "cloudflare-worker-secret:environment-selected-hosted-token",
-      covers: [
-        "scripts/deploy/hosted.ts",
-        "scripts/deploy/signing.ts",
-        "scripts/deploy/worker-live.ts",
-        "scripts/deploy/worker-state.ts",
-      ],
-      requiresScripts: ["deploy"],
-      requiresTools: ["bun", "wrangler"],
-      requiresEnv: [
-        "CLOUDFLARE_API_TOKEN",
-        "TAKOSERVER_INDEPENDENT_REVIEW",
-        "TAKOSERVER_HOSTED_TOKEN_PATH",
-      ],
-      triggers: ["authority"],
-      obligations: {
-        provenance:
-          "The owned 0600 token file is sent only on stdin to the independent public Worker. " +
-          "During the temporary integration transition, a provider-created H Version is " +
-          "trusted only as the exact C-to-H direct successor: C has the canonical " +
-          "workers/message commit/digest plus workers/triggered_by=version_upload and closure without the named secret, H has only " +
-          "workers/triggered_by=secret, both have equal resources.script.etag, and the " +
-          "secret/domain inventory and deployment history are exact and stable. The trigger " +
-          "annotation alone is not provenance. Rehearsal and production reject H even with a " +
-          "canonical D1 row; canonical token-present proof-only apply is available in every environment " +
-          "after exact local and remote source qualification, with production-strength qualification " +
-          "outside integration. Its strict status remains proof-pending and ready=false, and reports " +
-          "proofApplyReady only from the selected commit and source-independent live closure. Secret " +
-          "presence alone never selects the bridge. Fresh C-to-H apply is also " +
-          "integration-only: rehearsal/production C status reports cutoverApplyReady=false and " +
-          "ready=false, while apply refuses after minimal Worker-state classification and before " +
-          "source, reviewer, token-file, D1-row, proof-tenant, mutation, or HTTP-proof work. " +
-          "Immediately before the " +
-          "first secret put, the exact C history, commit, digest, script etag, D1 signing row, " +
-          "and proof tenant are requalified.",
-        "post-conditions":
-          "The bounded sponsorship route accepts the exact token and returns a credential whose signature matches the current D1 public key. " +
-          "Status reports an exact H state as unattributed and repair-required; recovery performs " +
-          "proof only after exact source and independent-review qualification (zero additional " +
-          "secret mutations), and integration signing rotation may repair attribution with one " +
-          "canonical H-to-S upload. After proof, H closure/history/inventory/domains and the D1 row " +
-          "are read back again. Canonical proof-only apply performs zero secret, build, dry-run, upload, or configuration mutation; " +
-          "it validates the owned 0600 token, active current D1 row, stable tenant, exact JWT kid, claims, " +
-          "lifetime and signature, and re-reads canonical Version/history/commit/digest/script identity, " +
-          "binding/secret/domain closure and the byte-identical D1 row around the one HTTP proof. Its " +
-          "sanitized receipt reports mutationApplied=false, functionalProofPending=false, repairRequired=false, and ready=true. " +
-          "This temporary bridge is removed after canonical integration cutover.",
-        reversal:
-          "Proof-only apply has no mutation to reverse. For a fresh integration cutover, remove the newly added named secret through an explicit Cloudflare secret deletion; token bytes are never printed.",
-        "failure-handling": highRiskFailure + inputContract(applyReviewInput, hostedTokenInput),
-        "independent-review": review,
       },
     },
     {
@@ -958,26 +1014,43 @@ export const DEPLOY_CONTRACT = {
     {
       surface: "takoserver-hosted-token-retirement",
       target: "cloudflare-worker-secret:environment-selected-hosted-token-retirement",
-      covers: ["scripts/deploy.ts", "scripts/deploy/retirement.ts"],
+      covers: [
+        "scripts/deploy.ts",
+        "scripts/deploy/retirement.ts",
+        "scripts/deploy/cloudflare-topology-audit.ts",
+        "scripts/deploy/sponsorship-cutover-consumption.ts",
+        "scripts/deploy/sponsorship-cutover-proof.ts",
+        "migrations/0047_sponsorship_cutover_consumption.sql",
+      ],
       requiresScripts: ["deploy"],
       requiresTools: ["bun", "wrangler"],
-      requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+        "TAKOSERVER_SPONSORSHIP_CUTOVER_PROOF_PATH",
+        "TAKOSERVER_SPONSORSHIP_CUTOVER_PROOF_SHA256",
+        "TAKOSERVER_CLOUDFLARE_TOPOLOGY_AUDIT_CREDENTIAL",
+      ],
       triggers: ["irreversible", "authority"],
       obligations: {
         provenance:
           "Forward retirement deletes only the named Hosted secret. Cloudflare creates a new direct-successor Worker Version; its commit, bundle digest and non-secret closure must remain byte-identical with the topology-retired predecessor.",
         "post-conditions":
-          "Authoritative secret inventory omits only TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN and the current Version is the exact direct successor of the topology-retired predecessor, with unchanged commit and bundle digest.",
+          "Authoritative secret inventory omits only the retired Hosted bearer and the current Version is the exact direct successor of the topology-retired predecessor, with unchanged commit and bundle digest. Terminal ready/status evidence requires proof-aware settlement of the exact remote receipt and includes that proof digest.",
         reversal:
           "Forward-only; restoration requires a separately reviewed dedicated surface. This surface never re-puts the retired secret.",
         "failure-handling":
-          `${highRiskFailure} A lost acknowledgement is settled by status accepting only the exact ` +
+          `${highRiskFailure} A lost acknowledgement is settled from the remote STATE_DB operation receipt by status accepting only the exact ` +
           "direct successor; a secret-created Version without the exact canonical annotation inventory is " +
           "reported as token-retired-unattributed-successor with ready=false and repairRequired=true. " +
-          "The surface refuses to run before topology retirement and never reports a partial delete as complete." +
-          inputContract(applyReviewInput),
+          "The operation binds the completed route-removal proof plus the exact topology-only direct predecessor, source commit, bundle/config, candidate identity and intended successor; the surface refuses to run before topology retirement, terminal status without current proof inputs and exact remote receipt fails closed, and it never reports a partial delete as complete. Changing checkout, machine, or local path cannot reset replay state." +
+          inputContract(
+            applyReviewInput,
+            sponsorshipCutoverProofInput,
+            topologyAuditCredentialInput,
+          ),
         "pre-mutation-proof":
-          "Status must prove the direct candidate successor has no Hosted service binding and still carries the Hosted secret before deletion.",
+          "Status must prove the direct candidate successor has no Hosted service binding and still carries the Hosted secret before deletion. Exact migration 0047_sponsorship_cutover_consumption.sql must already be applied through the owning D1 schema surface after the reviewed 0046 lineage. Forward apply reads TAKOSERVER_SPONSORSHIP_CUTOVER_PROOF_PATH, confirms its exact bytes with TAKOSERVER_SPONSORSHIP_CUTOVER_PROOF_SHA256, and requires a valid completed route-removal receipt in the target-derived remote STATE_DB before recording its own append-only proof consumption immediately ahead of the one secret delete.",
         "independent-review": review,
       },
     },

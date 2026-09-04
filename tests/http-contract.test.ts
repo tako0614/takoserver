@@ -45,8 +45,6 @@ function handler(publicOrigin = "https://api.takoserver.com") {
   }).fetch;
 }
 
-const SPONSORSHIP_SERVICE_TOKEN = "sponsorship-service-token";
-
 /**
  * The reservation authority is an optional port, so a composition without one
  * answers its routes `not_found` — which would make the reachability check
@@ -103,7 +101,6 @@ function completeHandler() {
     driver: new InMemoryTakoformResourceDriver(),
     offerings: [],
     originReservations: reservationStub(),
-    sponsorshipServiceToken: SPONSORSHIP_SERVICE_TOKEN,
   }).fetch;
 }
 
@@ -135,7 +132,7 @@ function concretePath(pattern: string): string {
   });
 }
 
-/** Every route the table declares, including the private seams and both lanes. */
+/** Every route the public Worker declares, including both Takoform lanes. */
 const DECLARED_ROUTES = [
   ...ROUTES,
   ...TAKOFORM_LANES.flatMap((lane) =>
@@ -147,13 +144,7 @@ const DECLARED_ROUTES = [
 ];
 
 /** Every path the document is expected to publish, derived from the same table. */
-const DOCUMENTED_PATTERNS = [
-  ...new Set(
-    DECLARED_ROUTES.filter((route) => !("internal" in route && route.internal)).map(
-      (route) => route.pattern,
-    ),
-  ),
-].sort();
+const DOCUMENTED_PATTERNS = [...new Set(DECLARED_ROUTES.map((route) => route.pattern))].sort();
 
 describe("published API description", () => {
   test("publishes exactly the paths the route table declares", () => {
@@ -175,12 +166,7 @@ describe("published API description", () => {
     expect(openApiPaths()).toContain("/v1/session");
   });
 
-  test("keeps the private sponsorship seam out of the published document", () => {
-    const internal = ROUTES.filter((route) => route.internal);
-    expect(internal.length).toBeGreaterThan(0);
-    for (const route of internal) {
-      expect(openApiPaths()).not.toContain(route.pattern);
-    }
+  test("publishes no sponsorship surface", () => {
     expect(JSON.stringify(openApiDocument)).not.toMatch(/sponsorship/u);
   });
 
@@ -195,10 +181,6 @@ describe("published API description", () => {
       const response = await fetch(
         new Request(`https://api.takoserver.com${concretePath(route.pattern)}`, {
           method: route.method.toUpperCase(),
-          headers:
-            "internal" in route && route.internal
-              ? { authorization: `Bearer ${SPONSORSHIP_SERVICE_TOKEN}` }
-              : {},
         }),
       );
       const body = (await response
@@ -509,6 +491,34 @@ describe("published API description", () => {
     const response = await fetch(new Request("https://api.takoserver.com/v1/nope"));
     expect(response.status).toBe(404);
     expect(await response.json()).toMatchObject({ error: { code: "not_found" } });
+  });
+
+  test("keeps every retired sponsorship operation unreachable with or without a bearer", async () => {
+    const fetch = handler();
+    const base = ["", "v1", "sponsorship", "tenants", "tenant_probe"].join("/");
+    const operations = [
+      ["POST", base],
+      ["GET", `${base}/wallet`],
+      ["POST", `${base}/takoform-run-credentials`],
+      ["POST", `${base}/interface-oauth-resources/authorize`],
+      ["GET", `${base}/inventory`],
+      ["POST", `${base}/funding`],
+      ["GET", `${base}/resources`],
+      ["PUT", `${base}/resources/resource_probe`],
+      ["DELETE", `${base}/resources/resource_probe`],
+    ] as const;
+    for (const authorization of [undefined, "Bearer retired-credential"]) {
+      for (const [method, path] of operations) {
+        const response = await fetch(
+          new Request(`https://api.takoserver.com${path}`, {
+            method,
+            ...(authorization === undefined ? {} : { headers: { authorization } }),
+          }),
+        );
+        expect(response.status).toBe(404);
+        expect(await response.json()).toMatchObject({ error: { code: "not_found" } });
+      }
+    }
   });
 
   test("does not publish S3 credential or managed-service retail beside ObjectBucket", async () => {

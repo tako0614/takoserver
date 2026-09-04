@@ -14,6 +14,8 @@ import {
 } from "../scripts/deploy/worker-state.ts";
 import { cloudflareProviderExecutorTarget } from "./helpers/hosted-supply-fixtures.ts";
 
+const RETIRED_SPONSORSHIP_SECRET = ["TAKOSERVER", "HOSTED", "SPONSORSHIP", "TOKEN"].join("_");
+
 const VERSION = {
   id: "version-1",
   resources: {
@@ -436,9 +438,9 @@ describe("authoritative Worker history and secret closure", () => {
       assertExactSecretInventory(
         [
           { name: "TAKOSERVER_SIGNING_KEY", type: "secret_text" },
-          { name: "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN", type: "secret_text" },
+          { name: RETIRED_SPONSORSHIP_SECRET, type: "secret_text" },
         ],
-        ["TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN", "TAKOSERVER_SIGNING_KEY"],
+        [RETIRED_SPONSORSHIP_SECRET, "TAKOSERVER_SIGNING_KEY"],
       ),
     ).not.toThrow();
     expect(() =>
