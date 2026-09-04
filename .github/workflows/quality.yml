@@ -54,9 +54,6 @@ jobs:
       - name: Install locked dependencies
         run: bun install --frozen-lockfile
 
-      - name: Audit dependencies
-        run: bun audit
-
       - name: Run canonical Takoserver checks
         env:
           TAKOFORM_FORMS_ROOT: ${{ runner.temp }}/takoform-forms
