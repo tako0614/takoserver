@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
+import { ARTIFACT_RECOVERY_RETENTION_FORMAT } from "../../src/artifact-recovery.ts";
 import {
   type HostedEdgeSupplies,
   parseHostedEdgeSupplies,
@@ -115,6 +116,15 @@ export interface DeployTarget {
       readonly workerEndpointSuffix: string;
     };
     readonly hostId: string;
+  };
+  /** One incident-only route-less integration recovery Worker and owner retention authority. */
+  readonly exactArtifactRecovery?: {
+    readonly workerName: string;
+    readonly retentionPolicy: {
+      readonly kind: typeof ARTIFACT_RECOVERY_RETENTION_FORMAT;
+      readonly evidenceDigest: `sha256:${string}`;
+      readonly detailRetentionMilliseconds: number;
+    };
   };
   /**
    * Public half of this deployment operator's identity-only proof key.
@@ -251,6 +261,7 @@ export function parseDeployTarget(
       "cloudflareProviderExecutor",
       "sponsorship",
       "formAuthority",
+      "exactArtifactRecovery",
       "operatorIdentity",
       "integrationE2eCredentialAuthority",
       "artifactBlobIoMode",
@@ -317,6 +328,9 @@ export function parseDeployTarget(
       : {
           formAuthority: formAuthority(value.formAuthority, environment),
         }),
+    ...(value.exactArtifactRecovery === undefined
+      ? {}
+      : { exactArtifactRecovery: exactArtifactRecovery(value.exactArtifactRecovery) }),
     ...(value.operatorIdentity === undefined
       ? {}
       : { operatorIdentity: operatorIdentity(value.operatorIdentity) }),
@@ -437,6 +451,22 @@ export function parseDeployTarget(
       );
     }
   }
+  if (target.exactArtifactRecovery) {
+    if (
+      environment !== "integration" ||
+      target.cloudflareProviderExecutor === undefined ||
+      target.formAuthority?.integrationWorkerName === undefined ||
+      target.formAuthority.integrationOperatorWorkerName === undefined ||
+      target.formAuthority.integrationOperatorOrigin === undefined ||
+      target.formAuthority.integrationOperatorScope?.tenantId !== INTEGRATION_E2E_ORGANIZATION_ID ||
+      target.formAuthority.operatorPublicJwk === undefined ||
+      target.integrationE2eCredentialAuthority === undefined
+    ) {
+      throw preflightError(
+        "deploy target `exactArtifactRecovery` requires the complete integration provider-executor and authenticated Form-authority operator topology",
+      );
+    }
+  }
   const allWorkerNames = [
     target.workerName,
     ...(target.cloudflareProviderExecutor
@@ -458,6 +488,7 @@ export function parseDeployTarget(
             : []),
         ]
       : []),
+    ...(target.exactArtifactRecovery ? [target.exactArtifactRecovery.workerName] : []),
   ];
   if (new Set(allWorkerNames).size !== allWorkerNames.length) {
     throw preflightError("deploy target authority Worker names must be globally distinct");
@@ -475,6 +506,40 @@ export function parseDeployTarget(
     }
   }
   return target;
+}
+
+function exactArtifactRecovery(value: unknown): NonNullable<DeployTarget["exactArtifactRecovery"]> {
+  if (!isRecord(value)) {
+    throw preflightError("deploy target `exactArtifactRecovery` must be an object");
+  }
+  assertExactKeys(value, ["workerName", "retentionPolicy"]);
+  if (!isRecord(value.retentionPolicy)) {
+    throw preflightError("deploy target exact recovery `retentionPolicy` must be an object");
+  }
+  assertExactKeys(value.retentionPolicy, ["kind", "evidenceDigest", "detailRetentionMilliseconds"]);
+  if (value.retentionPolicy.kind !== ARTIFACT_RECOVERY_RETENTION_FORMAT) {
+    throw preflightError("deploy target exact recovery retention policy kind is invalid");
+  }
+  const detailRetentionMilliseconds = value.retentionPolicy.detailRetentionMilliseconds;
+  if (
+    !Number.isSafeInteger(detailRetentionMilliseconds) ||
+    Number(detailRetentionMilliseconds) < 3_600_000 ||
+    Number(detailRetentionMilliseconds) > 31_536_000_000
+  ) {
+    throw preflightError("deploy target exact recovery retention duration is invalid");
+  }
+  return {
+    workerName: pattern(value.workerName, WORKER_NAME, "exactArtifactRecovery.workerName"),
+    retentionPolicy: {
+      kind: ARTIFACT_RECOVERY_RETENTION_FORMAT,
+      evidenceDigest: pattern(
+        value.retentionPolicy.evidenceDigest,
+        SHA256,
+        "exactArtifactRecovery.retentionPolicy.evidenceDigest",
+      ) as `sha256:${string}`,
+      detailRetentionMilliseconds: Number(detailRetentionMilliseconds),
+    },
+  };
 }
 
 function formAuthority(

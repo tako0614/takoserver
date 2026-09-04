@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadTarget, parseDeployTarget, targetPath } from "../scripts/deploy/target.ts";
+import { ARTIFACT_RECOVERY_RETENTION_FORMAT } from "../src/artifact-recovery.ts";
 import { INTEGRATION_E2E_ORGANIZATION_ID } from "../src/integration-e2e-credential-authority.ts";
 import {
   cloudflareProviderExecutorTarget,
@@ -373,6 +374,91 @@ describe("environment-exact deploy target", () => {
     withTarget(descriptor({ formAuthority }), (path) => {
       expect(() => loadTarget(path, "rehearsal")).toThrow("integration-only");
     });
+  });
+
+  test("accepts one integration-only exact recovery worker and current owner retention policy", () => {
+    const operatorPublicJwk = {
+      kty: "OKP" as const,
+      crv: "Ed25519" as const,
+      x: "A".repeat(43),
+    };
+    const formAuthority = {
+      workerName: "takoserver-form-authority-integration",
+      identityProbeWorkerName: "takoserver-form-identity-integration",
+      identityProbeOrigin: "https://takoserver-form-identity-integration.example.workers.dev",
+      integrationWorkerName: "takoserver-form-fixture-integration",
+      integrationOperatorWorkerName: "takoserver-form-operator-integration",
+      integrationOperatorOrigin: "https://form-authority.integration.takoserver.com",
+      integrationOperatorScope: {
+        tenantId: INTEGRATION_E2E_ORGANIZATION_ID,
+        space: "space-yurucommu-integration",
+      },
+      operatorPublicJwk,
+      hostId: "https://takoserver-api-rehearsal.example.workers.dev",
+    };
+    const exactArtifactRecovery = {
+      workerName: "takoserver-exact-artifact-recovery-integration",
+      retentionPolicy: {
+        kind: ARTIFACT_RECOVERY_RETENTION_FORMAT,
+        evidenceDigest: `sha256:${"d".repeat(64)}` as const,
+        detailRetentionMilliseconds: 7 * 24 * 60 * 60_000,
+      },
+    } as const;
+    const complete = descriptor({
+      environment: "integration",
+      edgeSupplies: edgeSuppliesFixture(),
+      objectBucketSupplies: objectBucketSuppliesFixture(),
+      cloudflareProviderExecutor: cloudflareProviderExecutorTarget(),
+      formAuthority,
+      integrationE2eCredentialAuthority: {
+        organizationId: INTEGRATION_E2E_ORGANIZATION_ID,
+        publicJwk: { kty: "OKP", crv: "Ed25519", x: "E".repeat(43) },
+      },
+      exactArtifactRecovery,
+    });
+    expect(
+      parseDeployTarget(complete, "exact recovery target", "integration").exactArtifactRecovery,
+    ).toEqual(exactArtifactRecovery);
+
+    for (const rejected of [
+      descriptor({ environment: "integration", exactArtifactRecovery }),
+      { ...complete, environment: "rehearsal" },
+      {
+        ...complete,
+        exactArtifactRecovery: {
+          ...exactArtifactRecovery,
+          workerName: formAuthority.integrationOperatorWorkerName,
+        },
+      },
+      {
+        ...complete,
+        exactArtifactRecovery: {
+          ...exactArtifactRecovery,
+          retentionPolicy: {
+            ...exactArtifactRecovery.retentionPolicy,
+            evidenceDigest: "sha256:wrong",
+          },
+        },
+      },
+      {
+        ...complete,
+        exactArtifactRecovery: {
+          ...exactArtifactRecovery,
+          retentionPolicy: {
+            ...exactArtifactRecovery.retentionPolicy,
+            detailRetentionMilliseconds: 0,
+          },
+        },
+      },
+    ]) {
+      expect(() =>
+        parseDeployTarget(
+          rejected,
+          "invalid exact recovery target",
+          rejected.environment as "integration" | "rehearsal",
+        ),
+      ).toThrow();
+    }
   });
 
   test("keeps a transition predecessor outside the steady deploy target", () => {

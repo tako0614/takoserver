@@ -54,6 +54,18 @@ const EMPTY: D1SchemaState = {
   shapeDigest: `sha256:${"0".repeat(64)}`,
 };
 
+const LEGACY_CATCHUP_DATA = {
+  ledgerRowCount: 0,
+  principalRowCount: 0,
+  organizationRowCount: 0,
+  organizationMembershipRowCount: 0,
+  organizationOwnerProjectionMismatchCount: 0,
+  usageEventRowCount: 0,
+  resourceDeploymentRowCount: 0,
+  activeResourceUidConflictCount: 0,
+  liveNativeIdentityConflictCount: 0,
+} as const;
+
 async function readyArtifactBlobIoCompatibility() {
   return {
     status: "ready" as const,
@@ -78,6 +90,21 @@ function readerSequence(states: readonly D1SchemaState[]): SchemaReader {
   return {
     async read() {
       return states[Math.min(reads++, states.length - 1)] as D1SchemaState;
+    },
+  };
+}
+
+function legacyCatchupReader(
+  states: readonly D1SchemaState[],
+  data: Awaited<
+    ReturnType<NonNullable<SchemaReader["legacyProductionCatchupDataIntegrity"]>>
+  > = LEGACY_CATCHUP_DATA,
+): SchemaReader {
+  const state = readerSequence(states);
+  return {
+    read: state.read.bind(state),
+    async legacyProductionCatchupDataIntegrity() {
+      return data;
     },
   };
 }
@@ -241,9 +268,17 @@ function databaseLaneProcess(
   database: Database,
   onImmediatelyBeforeMigrations: () => void,
   onImmediatelyBeforeQuiescence: () => void = () => {},
-): { readonly run: SchemaProcess; readonly migrationApplyCalls: () => number } {
+  onImmediatelyBeforeFinalQuiescenceRead: () => void = () => {},
+): {
+  readonly run: SchemaProcess;
+  readonly migrationApplyCalls: () => number;
+  readonly guardCommands: () => readonly string[];
+} {
   const fixture = processFixture();
   let migrationApplyCalls = 0;
+  let quiescenceInstalled = false;
+  let postInstallQuiescenceReads = 0;
+  const guardCommands: string[] = [];
   return {
     async run(command) {
       if (command.includes("execute") && command.includes("--command")) {
@@ -251,6 +286,13 @@ function databaseLaneProcess(
         if (sql === undefined) throw new Error("D1 command omitted SQL");
         if (command.includes("--json")) {
           try {
+            if (
+              quiescenceInstalled &&
+              sql.includes("takoserver_0037_worker_runtime_input_preparations_quiescence") &&
+              postInstallQuiescenceReads++ === 1
+            ) {
+              onImmediatelyBeforeFinalQuiescenceRead();
+            }
             const results = database.query(sql).all() as Record<string, unknown>[];
             return ok(`${JSON.stringify([{ success: true, results }])}\n`);
           } catch (error) {
@@ -260,20 +302,11 @@ function databaseLaneProcess(
         try {
           if (sql.includes("takoserver_0037_worker_runtime_input_preparations_quiescence")) {
             onImmediatelyBeforeQuiescence();
-            const triggerEnd = sql.indexOf("\nEND;");
-            if (triggerEnd < 0) throw new Error("quiescence trigger is not a compound statement");
-            const trigger = sql.slice(0, triggerEnd + "\nEND".length);
-            const remainder = sql.slice(triggerEnd + "\nEND;".length);
-            const statements = remainder
-              .split(";")
-              .map((statement) => statement.trim())
-              .filter(Boolean);
-            database.transaction(() => {
-              database.exec(trigger);
-              for (const statement of statements) database.exec(statement);
-            })();
+            guardCommands.push(sql);
+            database.exec(sql);
+            quiescenceInstalled = true;
           } else {
-            database.transaction(() => database.exec(sql))();
+            database.exec(sql);
           }
           return ok("guard applied\n");
         } catch (error) {
@@ -300,6 +333,7 @@ function databaseLaneProcess(
       return await fixture.run(command);
     },
     migrationApplyCalls: () => migrationApplyCalls,
+    guardCommands: () => guardCommands,
   };
 }
 
@@ -357,7 +391,15 @@ describe("production-shaped D1 migration lane", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-integration-selector-"));
     try {
       const fixture = processFixture();
-      for (const throughMigration of ["0028", "0033", "0036", "0043", "0044", "0045"] as const) {
+      for (const throughMigration of [
+        "0028",
+        "0033",
+        "0036",
+        "0043",
+        "0044",
+        "0045",
+        "0046",
+      ] as const) {
         const failure = await runD1Schema(
           {
             action: "status",
@@ -465,6 +507,212 @@ describe("production-shaped D1 migration lane", () => {
       }
       expect(fixture.calls).toHaveLength(0);
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("the protected 0016 to 0022 catch-up rehearses canonical shape and data before one matching production apply", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-0016-catchup-"));
+    const preDatabase = databaseThrough(16);
+    const postDatabase = databaseThrough(22);
+    try {
+      chmodSync(root, 0o700);
+      const [pre, post] = await Promise.all([
+        databaseState(preDatabase),
+        databaseState(postDatabase),
+      ]);
+      const receiptPath = join(root, "0016-0022.receipt.json");
+      const rehearsal = processFixture();
+      const rehearsalResult = await runD1Schema(
+        { action: "apply", environment: "rehearsal", commit: COMMIT, throughMigration: "0022" },
+        target,
+        {
+          run: rehearsal.run,
+          reader: legacyCatchupReader([pre, pre, pre, post]),
+          outputDirectory: join(root, "rehearsal-work"),
+          receiptPath,
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+      expect(rehearsalResult).toMatchObject({
+        fromMigration: "0016_takos_id_organization_projection.sql",
+        throughMigration: "0022_takoform_admission.sql",
+        pendingMigrations: MIGRATIONS.slice(16, 22).map(({ name }) => name),
+        lastAppliedMigration: "0022_takoform_admission.sql",
+        legacyProductionCatchup: { status: "ready" },
+      });
+      expect(rehearsal.appliedFiles()).toEqual(MIGRATIONS.slice(0, 22).map(({ name }) => name));
+      const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
+      expect(receipt).toMatchObject({
+        fromMigration: "0016_takos_id_organization_projection.sql",
+        throughMigration: "0022_takoform_admission.sql",
+        preAppliedMigrations: MIGRATIONS.slice(0, 16).map(({ name }) => name),
+        postAppliedMigrations: MIGRATIONS.slice(0, 22).map(({ name }) => name),
+        predecessorReceipt: null,
+      });
+      expect(receipt.preApplicationShapeDigest).toBe(
+        "sha256:5c53ab9a929eab9323b45640f29bca203a0aef387b515cdb3a56c6aa42426c0b",
+      );
+      expect(receipt.preDataIntegrityDigest).toMatch(/^sha256:[0-9a-f]{64}$/u);
+      expect(receipt.postDataIntegrityDigest).toBe(receipt.preDataIntegrityDigest);
+
+      const mismatchedProduction = processFixture("production");
+      const mismatch = await runD1Schema(
+        { action: "apply", environment: "production", commit: COMMIT, throughMigration: "0022" },
+        { ...target, environment: "production" },
+        {
+          run: mismatchedProduction.run,
+          reader: legacyCatchupReader([pre, pre, pre], {
+            ...LEGACY_CATCHUP_DATA,
+            principalRowCount: 1,
+          }),
+          outputDirectory: join(root, "mismatched-production-work"),
+          receiptPath,
+          review: "production-reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      ).catch((error) => error);
+      expect(mismatch).toBeInstanceOf(DeployError);
+      expect(mismatch.message).toContain("rehearsal receipt");
+      expect(
+        mismatchedProduction.calls.filter(
+          (call) => call.includes("migrations") && call.includes("apply"),
+        ),
+      ).toHaveLength(0);
+
+      const production = processFixture("production");
+      const productionResult = await runD1Schema(
+        { action: "apply", environment: "production", commit: COMMIT, throughMigration: "0022" },
+        { ...target, environment: "production" },
+        {
+          run: production.run,
+          reader: legacyCatchupReader([pre, pre, pre, post]),
+          outputDirectory: join(root, "production-work"),
+          receiptPath,
+          review: "production-reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+      expect(productionResult).toMatchObject({
+        environment: "production",
+        rehearsalReceipt: "exact-match-consumed-read-only",
+        postShapeDigest: post.shapeDigest,
+      });
+      expect(
+        production.calls.filter((call) => call.includes("migrations") && call.includes("apply")),
+      ).toHaveLength(1);
+    } finally {
+      preDatabase.close();
+      postDatabase.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("the 0016 catch-up reads canonical shape and every critical data invariant through the real D1 query boundary", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-0016-catchup-real-read-"));
+    const database = databaseThrough(16);
+    try {
+      const lane = databaseLaneProcess(database, () => {});
+      const status = await runD1Schema(
+        { action: "status", environment: "rehearsal", commit: COMMIT, throughMigration: "0022" },
+        target,
+        {
+          run: lane.run,
+          outputDirectory: join(root, "work"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+      expect(status).toMatchObject({
+        readyForApply: true,
+        legacyProductionCatchup: {
+          status: "ready",
+          ledgerRowCount: 0,
+          principalRowCount: 0,
+          organizationRowCount: 0,
+          organizationMembershipRowCount: 0,
+          organizationOwnerProjectionMismatchCount: 0,
+          usageEventRowCount: 0,
+          resourceDeploymentRowCount: 0,
+          activeResourceUidConflictCount: 0,
+          liveNativeIdentityConflictCount: 0,
+          applicationSchemaShapeDigest:
+            "sha256:5c53ab9a929eab9323b45640f29bca203a0aef387b515cdb3a56c6aa42426c0b",
+        },
+      });
+    } finally {
+      database.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("the 0016 catch-up refuses names-only shape claims, unsafe data, and an unreceipted partial prefix without mutation", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-0016-catchup-refusal-"));
+    const preDatabase = databaseThrough(16);
+    const partialDatabase = databaseThrough(17);
+    try {
+      const [pre, partial] = await Promise.all([
+        databaseState(preDatabase),
+        databaseState(partialDatabase),
+      ]);
+      const parsed = JSON.parse(pre.shape) as unknown[];
+      const driftedShape = `${JSON.stringify(parsed.slice(0, -1))}\n`;
+      const drifted = {
+        ...pre,
+        shape: driftedShape,
+        shapeDigest: `sha256:${createHash("sha256").update(driftedShape).digest("hex")}`,
+      };
+      const cases = [
+        {
+          label: "names-only",
+          state: drifted,
+          data: LEGACY_CATCHUP_DATA,
+          expected: "exact canonical 0001-0016 application schema shape",
+        },
+        {
+          label: "ledger-data",
+          state: pre,
+          data: { ...LEGACY_CATCHUP_DATA, ledgerRowCount: 1 },
+          expected: "critical data requires operator repair",
+        },
+        {
+          label: "partial-without-attempt",
+          state: partial,
+          data: LEGACY_CATCHUP_DATA,
+          expected: "partial rehearsal wave",
+        },
+      ] as const;
+      for (const selected of cases) {
+        const fixture = processFixture();
+        const failure = await runD1Schema(
+          {
+            action: "apply",
+            environment: "rehearsal",
+            commit: COMMIT,
+            throughMigration: "0022",
+          },
+          target,
+          {
+            run: fixture.run,
+            reader: legacyCatchupReader(
+              [selected.state, selected.state, selected.state],
+              selected.data,
+            ),
+            outputDirectory: join(root, `${selected.label}-work`),
+            receiptPath: join(root, `${selected.label}.receipt.json`),
+            review: "reviewer@example.test",
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          },
+        ).catch((error) => error);
+        expect(failure).toBeInstanceOf(DeployError);
+        expect(failure.message).toContain(selected.expected);
+        expect(
+          fixture.calls.filter((call) => call.includes("migrations") && call.includes("apply")),
+        ).toHaveLength(0);
+      }
+    } finally {
+      preDatabase.close();
+      partialDatabase.close();
       rmSync(root, { recursive: true, force: true });
     }
   });
@@ -581,14 +829,14 @@ describe("production-shaped D1 migration lane", () => {
     }
   });
 
-  test("a fixed wave refuses migrations outside the exact audited 0001-0045 inventory", async () => {
+  test("a fixed wave refuses migrations outside the exact audited 0001-0046 inventory", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-lineage-extension-"));
     try {
       const migrationDirectory = join(root, "migrations");
       cpSync(resolve(import.meta.dir, "../migrations"), migrationDirectory, { recursive: true });
       copyFileSync(
-        join(migrationDirectory, "0045_cloudflare_provider_executor_operations.sql"),
-        join(migrationDirectory, "0046_unreviewed_extension.sql"),
+        join(migrationDirectory, "0046_exact_artifact_recovery_receipts.sql"),
+        join(migrationDirectory, "0047_unreviewed_extension.sql"),
       );
       const failure = await runD1Schema(
         {
@@ -611,7 +859,7 @@ describe("production-shaped D1 migration lane", () => {
     }
   });
 
-  test("the six no-overwrite wave receipts cover the exact 23-file production suffix once", async () => {
+  test("the seven no-overwrite wave receipts cover the exact 24-file production suffix once", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-all-waves-"));
     try {
       chmodSync(root, 0o700);
@@ -622,6 +870,7 @@ describe("production-shaped D1 migration lane", () => {
         ["0043", 36, 43],
         ["0044", 43, 44],
         ["0045", 44, 45],
+        ["0046", 45, 46],
       ] as const;
       const receipted: {
         readonly name: string;
@@ -669,7 +918,7 @@ describe("production-shaped D1 migration lane", () => {
             bytes,
           })),
       );
-      expect(new Set(receipted.map(({ name }) => name)).size).toBe(23);
+      expect(new Set(receipted.map(({ name }) => name)).size).toBe(24);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -822,7 +1071,7 @@ describe("production-shaped D1 migration lane", () => {
     }
   });
 
-  test("a row arriving after the last read-only 0037 count aborts the atomic guard and is preserved", async () => {
+  test("a row arriving before the monotonic 0037 trigger is preserved and leaves the guard installed", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-0037-zero-race-"));
     const database = databaseThrough(36);
     try {
@@ -857,7 +1106,10 @@ describe("production-shaped D1 migration lane", () => {
             "SELECT COUNT(*) AS count FROM sqlite_schema WHERE type = 'trigger' AND name = 'takoserver_0037_worker_runtime_input_preparations_quiescence'",
           )
           .get(),
-      ).toEqual({ count: 0 });
+      ).toEqual({ count: 1 });
+      expect(process.guardCommands()).toHaveLength(1);
+      expect(process.guardCommands()[0]).toStartWith("CREATE TRIGGER IF NOT EXISTS ");
+      expect(process.guardCommands()[0]).not.toContain("takoserver_0037_runtime_input_zero_guard");
     } finally {
       database.close();
       rmSync(root, { recursive: true, force: true });
@@ -923,6 +1175,168 @@ describe("production-shaped D1 migration lane", () => {
       expect(resumedProcess.migrationApplyCalls()).toBe(1);
       expect(existsSync(`${receiptPath}.attempt`)).toBe(false);
       expect(existsSync(receiptPath)).toBe(true);
+    } finally {
+      database.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a lost acknowledgement after the 0037 guard persists resumes from exact readback", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-0037-guard-lost-ack-"));
+    const database = databaseThrough(36);
+    try {
+      chmodSync(root, 0o700);
+      const predecessor = await rehearsalReceiptChainThrough0036(root);
+      const firstProcess = databaseLaneProcess(database, () => {});
+      let lostGuardAcknowledgement = false;
+      const firstRun: SchemaProcess = async (command, options) => {
+        const sql = command[command.indexOf("--command") + 1];
+        if (
+          !lostGuardAcknowledgement &&
+          command.includes("execute") &&
+          !command.includes("--json") &&
+          sql?.startsWith("CREATE TRIGGER IF NOT EXISTS ")
+        ) {
+          database.exec(sql);
+          lostGuardAcknowledgement = true;
+          return { exitCode: 1, stdout: "", stderr: "provider connection lost\n" };
+        }
+        return await firstProcess.run(command, options);
+      };
+      const receiptPath = join(root, "0043.receipt.json");
+      const first = await runD1Schema(
+        { action: "apply", environment: "rehearsal", commit: COMMIT, throughMigration: "0043" },
+        target,
+        {
+          run: firstRun,
+          outputDirectory: join(root, "first-work"),
+          receiptPath,
+          predecessorReceiptPath: predecessor.receiptPath,
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          artifactBlobIoCompatibilityReader: readyArtifactBlobIoCompatibility,
+        },
+      ).catch((error) => error);
+      expect(first).toMatchObject({ phase: "mutation" });
+      expect(first).toMatchObject({ detail: expect.stringContaining("provider connection lost") });
+      expect(firstProcess.migrationApplyCalls()).toBe(0);
+      expect(existsSync(`${receiptPath}.attempt`)).toBe(true);
+      expect(
+        database
+          .query(
+            "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'takoserver_0037_worker_runtime_input_preparations_quiescence'",
+          )
+          .get(),
+      ).toMatchObject({
+        sql: expect.stringContaining("runtime_input_preparation_v2_quiesced"),
+      });
+
+      const resumedProcess = databaseLaneProcess(database, () => {});
+      const resumed = await runD1Schema(
+        { action: "apply", environment: "rehearsal", commit: COMMIT, throughMigration: "0043" },
+        target,
+        {
+          run: resumedProcess.run,
+          outputDirectory: join(root, "resumed-work"),
+          receiptPath,
+          predecessorReceiptPath: predecessor.receiptPath,
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          artifactBlobIoCompatibilityReader: readyArtifactBlobIoCompatibility,
+        },
+      );
+      expect(resumed).toMatchObject({
+        runtimeInputQuiescence: "installed-and-zero",
+        providerAcknowledgement: "acknowledged",
+        lastAppliedMigration: "0043_artifact_blob_io_fences.sql",
+      });
+      expect(resumedProcess.guardCommands()).toHaveLength(0);
+      expect(resumedProcess.migrationApplyCalls()).toBe(1);
+      expect(
+        database
+          .query(
+            "SELECT COUNT(*) AS count FROM sqlite_schema WHERE type = 'trigger' AND name = 'takoserver_0037_worker_runtime_input_preparations_quiescence'",
+          )
+          .get(),
+      ).toEqual({ count: 0 });
+    } finally {
+      database.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a pre-existing wrong 0037 trigger is rejected without replacement or migration", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-0037-wrong-guard-"));
+    const database = databaseThrough(36);
+    try {
+      chmodSync(root, 0o700);
+      const predecessor = await rehearsalReceiptChainThrough0036(root);
+      database.exec(`CREATE TRIGGER takoserver_0037_worker_runtime_input_preparations_quiescence
+        BEFORE INSERT ON worker_runtime_input_preparations
+        BEGIN SELECT RAISE(ABORT, 'wrong_quiescence_authority'); END`);
+      const process = databaseLaneProcess(database, () => {});
+      const failure = await runD1Schema(
+        { action: "apply", environment: "rehearsal", commit: COMMIT, throughMigration: "0043" },
+        target,
+        {
+          run: process.run,
+          outputDirectory: join(root, "work"),
+          receiptPath: join(root, "0043.receipt.json"),
+          predecessorReceiptPath: predecessor.receiptPath,
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          artifactBlobIoCompatibilityReader: readyArtifactBlobIoCompatibility,
+        },
+      ).catch((error) => error);
+      expect(failure).toMatchObject({ phase: "preflight" });
+      expect(failure.message).toContain("trigger exists with unexpected SQL");
+      expect(process.guardCommands()).toHaveLength(0);
+      expect(process.migrationApplyCalls()).toBe(0);
+      expect(
+        database
+          .query(
+            "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'takoserver_0037_worker_runtime_input_preparations_quiescence'",
+          )
+          .get(),
+      ).toMatchObject({ sql: expect.stringContaining("wrong_quiescence_authority") });
+    } finally {
+      database.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("0037 refuses final-fence trigger drift before the first migration", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-0037-final-fence-drift-"));
+    const database = databaseThrough(36);
+    try {
+      chmodSync(root, 0o700);
+      const predecessor = await rehearsalReceiptChainThrough0036(root);
+      const process = databaseLaneProcess(
+        database,
+        () => {},
+        () => {},
+        () =>
+          database.exec(
+            "DROP TRIGGER takoserver_0037_worker_runtime_input_preparations_quiescence",
+          ),
+      );
+      const failure = await runD1Schema(
+        { action: "apply", environment: "rehearsal", commit: COMMIT, throughMigration: "0043" },
+        target,
+        {
+          run: process.run,
+          outputDirectory: join(root, "work"),
+          receiptPath: join(root, "0043.receipt.json"),
+          predecessorReceiptPath: predecessor.receiptPath,
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          artifactBlobIoCompatibilityReader: readyArtifactBlobIoCompatibility,
+        },
+      ).catch((error) => error);
+      expect(failure).toMatchObject({ phase: "mutation" });
+      expect(failure.message).toContain("changed at the immediate migration fence");
+      expect(process.guardCommands()).toHaveLength(1);
+      expect(process.migrationApplyCalls()).toBe(0);
     } finally {
       database.close();
       rmSync(root, { recursive: true, force: true });
@@ -1122,7 +1536,7 @@ describe("production-shaped D1 migration lane", () => {
     }
   });
 
-  test("0043 makes the conflict count the final provider read before its first migration", async () => {
+  test("0043 keeps the conflict count after compatibility and before the exact 0037 fence", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-0043-last-read-"));
     try {
       chmodSync(root, 0o700);

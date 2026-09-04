@@ -4,6 +4,7 @@ import { runCloudflareProviderExecutor } from "./deploy/cloudflare-provider-exec
 import { runConsole } from "./deploy/console.ts";
 import { DEPLOY_CONTRACT } from "./deploy/contract.ts";
 import { DeployError, deployFailureAftermath, PHASE_EXIT_CODE } from "./deploy/errors.ts";
+import { runExactArtifactRecoveryDeployment } from "./deploy/exact-artifact-recovery.ts";
 import { runFormAuthority } from "./deploy/form-authority.ts";
 import { runFormAuthorityIdentityProbe } from "./deploy/form-authority-identity-probe.ts";
 import { runFormAuthorityInvoke } from "./deploy/form-authority-invoke.ts";
@@ -44,7 +45,7 @@ const USAGE = `takoserver deploy
   bun run deploy -- takoserver-org-api-key --<mint|status|revoke> --environment=<env> --commit=<sha>
     --organization=org_... [--key-name=<name> --scope=<scope> --expires-in-days=<n>] [--key-id=key_...]
   Rehearsal and production D1 schema status/apply require one fixed next-wave selector:
-    --through-migration=<0028|0033|0036|0043|0044|0045>
+    --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046>
   Pending 0043 additionally requires the staged pre-0043-quiesced Worker target and the absolute
   operator-private TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH documented in docs/deploy.md.
   takoserver-d1-schema-rehearsal-baseline is fixed empty -> 0022, rehearsal-only, and accepts no selector.
@@ -86,6 +87,10 @@ const USAGE = `takoserver deploy
   takoserver-public-parent-token-retirement accepts only the fixed status/apply selector above.
   It binds the target-selected public Worker to the exact route-less executor before deleting only
   the public CLOUDFLARE_API_TOKEN. It never reads the executor's owner-private credential file.
+  takoserver-exact-artifact-recovery is integration-only. Status/apply read the canonical owner-only
+  TAKOSERVER_EXACT_ARTIFACT_RECOVERY_REQUEST_PATH, the existing provider-executor secrets path and
+  the Form-authority operator private JWK. Each apply performs one status-planned transition. Only
+  a post-quiescence handoff reads TAKOSERVER_EXACT_ARTIFACT_RECOVERY_LOST_ACK_PATH.
 
 The target descriptor is selected only by the exact environment. There is no
 deploy-plan flag, ledger, target override or mixed mutation controller.
@@ -559,7 +564,8 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       surfaceValue === "takoserver-integration-form-authority-operator-worker" ||
       surfaceValue === "takoserver-integration-form-authority" ||
       surfaceValue === "takoserver-integration-form-authority-deactivation" ||
-      surfaceValue === "takoserver-integration-e2e-credentials") &&
+      surfaceValue === "takoserver-integration-e2e-credentials" ||
+      surfaceValue === "takoserver-exact-artifact-recovery") &&
     environment !== "integration"
   ) {
     return null;
@@ -901,6 +907,16 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
           environment: invocation.environment,
           commit: invocation.commit,
           ...(invocation.reverse ? { reverse: true } : {}),
+        },
+        target,
+      );
+    case "takoserver-exact-artifact-recovery":
+      return await runExactArtifactRecoveryDeployment(
+        {
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
         },
         target,
       );

@@ -1,5 +1,5 @@
 import { bytesDigest } from "../json.ts";
-import type { Clock, ObjectStoreAccess, Row, Sql, SqlStatement } from "../ports.ts";
+import type { Clock, ObjectStoreAccess, Row, Sql, SqlStatement, SqlWrite } from "../ports.ts";
 import { SqlError } from "../ports.ts";
 import {
   ARTIFACT_BLOB_IO_LEASE_MILLISECONDS,
@@ -526,14 +526,16 @@ export function createTakoformArtifactReconciler(
     const rows = await sql.query(
       `SELECT kind, digest, state, fence, expected_etag
        FROM tf_artifact_gc_candidates AS candidate
-       WHERE (candidate.state IN ('pending', 'retry') AND candidate.not_before <= ?)
-          OR (candidate.state = 'deleting' AND EXISTS (
-            SELECT 1 FROM tf_artifact_blob_io_leases AS lease
-            WHERE lease.digest = candidate.digest AND lease.state = 'deleting'
-              AND lease.candidate_fence = candidate.fence
-              AND lease.last_outcome IN ('delete_claimed', 'delete_reclaimed')
-              AND lease.lease_expires_at <= ?
-          ))
+       WHERE (
+         (candidate.state IN ('pending', 'retry') AND candidate.not_before <= ?)
+         OR (candidate.state = 'deleting' AND EXISTS (
+           SELECT 1 FROM tf_artifact_blob_io_leases AS lease
+           WHERE lease.digest = candidate.digest AND lease.state = 'deleting'
+             AND lease.candidate_fence = candidate.fence
+             AND lease.last_outcome IN ('delete_claimed', 'delete_reclaimed')
+             AND lease.lease_expires_at <= ?
+         ))
+       )
        ORDER BY CASE candidate.state WHEN 'deleting' THEN 0 ELSE 1 END,
                 updated_at, kind, digest
        LIMIT ?`,
@@ -576,13 +578,13 @@ export function createTakoformArtifactReconciler(
     return rows.length > 0;
   };
 
-  const cancelReferencedCandidate = async (candidate: CandidateDigest): Promise<void> => {
+  const cancelReferencedCandidate = async (candidate: CandidateRow): Promise<void> => {
     await sql.run(
       `UPDATE tf_artifact_gc_candidates
        SET state = 'cancelled', fence = fence + 1, expected_etag = NULL,
            last_outcome = 'reference_present', updated_at = ?, deleted_at = NULL
-       WHERE kind = ? AND digest = ? AND state IN ('pending', 'deleting', 'retry')`,
-      [now(), candidate.kind, candidate.digest],
+       WHERE kind = ? AND digest = ? AND state = ? AND fence = ?`,
+      [now(), candidate.kind, candidate.digest, candidate.state, candidate.fence],
     );
   };
 
@@ -593,28 +595,46 @@ export function createTakoformArtifactReconciler(
     if (candidate.kind !== "manifest") {
       throw new Error("blob candidates require the per-digest delete lease");
     }
+    let claimedFence = candidate.fence;
     if (candidate.state !== "deleting") {
-      const claimed = await sql.run(
-        `UPDATE tf_artifact_gc_candidates
-         SET state = 'deleting', fence = fence + 1, expected_etag = ?,
-             attempts = attempts + 1, last_outcome = 'claimed', updated_at = ?
-         WHERE kind = 'manifest' AND digest = ? AND state IN ('pending', 'retry')
-           AND NOT EXISTS (
-             SELECT 1 FROM tf_artifact_roots
-             WHERE state = 'active' AND target_kind = 'manifest' AND digest = ?
-           )`,
-        [expectedEtag, now(), candidate.digest, candidate.digest],
-      );
+      let claimed: SqlWrite;
+      try {
+        claimed = await sql.run(
+          `UPDATE tf_artifact_gc_candidates
+           SET state = 'deleting', fence = fence + 1, expected_etag = ?,
+               attempts = attempts + 1, last_outcome = 'claimed', updated_at = ?
+           WHERE kind = 'manifest' AND digest = ? AND state = ? AND fence = ?
+             AND NOT EXISTS (
+               SELECT 1 FROM tf_artifact_roots
+               WHERE state = 'active' AND target_kind = 'manifest' AND digest = ?
+             )`,
+          [
+            expectedEtag,
+            now(),
+            candidate.digest,
+            candidate.state,
+            candidate.fence,
+            candidate.digest,
+          ],
+        );
+      } catch (error) {
+        // Migration 0046 reserves its shared candidate rows in a database
+        // trigger. Treat that serialized loss just like any other lost claim;
+        // this collector intentionally has no dependency on recovery tables.
+        if (error instanceof SqlError && error.code === "constraint") return null;
+        throw error;
+      }
       if (claimed.changes !== 1) {
         if (await hasLiveReference(candidate)) await cancelReferencedCandidate(candidate);
         return null;
       }
+      claimedFence += 1;
     }
     const rows = await sql.query(
       `SELECT kind, digest, state, fence, expected_etag
        FROM tf_artifact_gc_candidates
-       WHERE kind = ? AND digest = ? AND state = 'deleting'`,
-      [candidate.kind, candidate.digest],
+       WHERE kind = ? AND digest = ? AND state = 'deleting' AND fence = ?`,
+      [candidate.kind, candidate.digest, claimedFence],
     );
     const row = rows[0];
     if (!row) return null;
@@ -915,7 +935,10 @@ export function createTakoformArtifactReconciler(
   ): Promise<"deleted" | "absent" | "retry" | "skipped"> => {
     const before =
       candidate.state === "deleting" ? null : await objects.head(blobKey(candidate.digest));
-    const observedEtag = before?.etag ?? candidate.expectedEtag;
+    // Recovery candidates pin the ETag observed before quarantine. Ordinary
+    // candidates carry null and acquire the current ETag here. Never replace
+    // an existing quarantine fence with a later observation before DELETE.
+    const observedEtag = candidate.expectedEtag ?? before?.etag ?? null;
     let claimed = await claimBlobCandidate(candidate, observedEtag);
     if (!claimed) return "skipped";
     if (await hasLiveReference(claimed.candidate)) {
@@ -1133,6 +1156,7 @@ export function createTakoformArtifactReconciler(
                       AND upload.principal_id = ? AND upload.manifest_digest = ?
                       AND upload.lifecycle_state = 'committed'
                       AND root.state = 'active'
+                      AND receipt.receipt_kind = 'run_owner_closure'
                       AND receipt.receipt_id = ? AND receipt.receipt_fence = ?
                       AND receipt.state = 'closed'
                       AND receipt.closed_at <= ? AND receipt.expires_at > ?
@@ -1872,6 +1896,7 @@ async function hasExactClosureReceipt(
       AND root.digest = receipt.manifest_digest
       AND root.fence = receipt.root_fence
      WHERE receipt.receipt_id = ? AND receipt.receipt_fence = ?
+       AND receipt.receipt_kind = 'run_owner_closure'
        AND receipt.tenant_id = ? AND receipt.principal_id = ?
        AND receipt.upload_id = ? AND receipt.manifest_digest = ?
        AND receipt.state = 'closed'

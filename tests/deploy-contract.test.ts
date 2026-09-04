@@ -49,6 +49,7 @@ const SURFACES = [
   ["takoserver-managed-object-receipt-authority", ["irreversible", "authority"]],
   ["takoserver-managed-worker-gateway", ["authority"]],
   ["cloudflare-provider-executor", ["authority"]],
+  ["takoserver-exact-artifact-recovery", ["irreversible", "authority"]],
   ["takoserver-org-api-key", ["authority"]],
 ] as const;
 
@@ -112,6 +113,9 @@ describe("Takoserver split deploy entrypoint", () => {
     const providerExecutor = contract.surfaces.find(
       ({ surface }) => surface === "cloudflare-provider-executor",
     );
+    const exactArtifactRecovery = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-exact-artifact-recovery",
+    );
     const publicParentTokenRetirement = contract.surfaces.find(
       ({ surface }) => surface === "takoserver-public-parent-token-retirement",
     );
@@ -129,6 +133,17 @@ describe("Takoserver split deploy entrypoint", () => {
       "TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH",
       "TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH",
     ]);
+    expect(exactArtifactRecovery?.requiresTools).toEqual(["bun", "wrangler", "flock"]);
+    expect(exactArtifactRecovery?.requiresEnv).toContain(
+      "TAKOSERVER_EXACT_ARTIFACT_RECOVERY_REQUEST_PATH",
+    );
+    expect(exactArtifactRecovery?.obligations["post-conditions"]).toContain("no route");
+    expect(exactArtifactRecovery?.obligations["post-conditions"]).toContain(
+      "retains the compact terminal singleton",
+    );
+    expect(exactArtifactRecovery?.obligations["failure-handling"]).toContain(
+      "never issues a second R2 DELETE",
+    );
     expect(operatorIdentity?.obligations.provenance).toContain("--organization=<org_...>");
     expect(operatorIdentity?.obligations.reversal).toContain("non-executable");
     expect(operatorIdentity?.obligations.reversal).toContain("freshly qualified");
@@ -167,8 +182,13 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(schemaBaseline?.obligations["failure-handling"]).toContain(
       "cannot emit production rehearsal evidence",
     );
-    expect(schema?.obligations.provenance).toContain("fixed next boundaries 0028");
+    expect(schema?.obligations.provenance).toContain("fixed next boundaries 0022, 0028");
+    expect(schema?.obligations.provenance).toContain("one-time exact 0016-to-0022 catch-up");
     expect(schema?.obligations.provenance).toContain("0045");
+    expect(schema?.obligations.provenance).toContain("0046");
+    expect(schema?.obligations["post-conditions"]).toContain(
+      "exact artifact-recovery singleton and its receipt constraints",
+    );
     expect(schema?.requiresEnv).toContain("TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH");
     expect(schema?.obligations["pre-mutation-proof"]).toContain("malformed FormRef");
     expect(schema?.obligations["pre-mutation-proof"]).toContain(
@@ -177,6 +197,12 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(schema?.obligations["pre-mutation-proof"]).toContain("current and immediate rollback");
     expect(schema?.obligations["pre-mutation-proof"]).toContain("public preview URLs are disabled");
     expect(schema?.obligations["pre-mutation-proof"]).toContain("immediately before");
+    expect(schema?.obligations["pre-mutation-proof"]).toContain(
+      "frozen canonical application-schema digest",
+    );
+    expect(schema?.obligations["pre-mutation-proof"]).toContain(
+      "never treats REST query execution as D1Database.batch()",
+    );
     expect(schema?.obligations["failure-handling"]).toContain("immediate authoritative");
     expect(schema?.obligations["failure-handling"]).toContain(
       "TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH",
@@ -400,7 +426,16 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(baseline.stderr).toContain("deploy target descriptor not found");
     expect(baseline.stderr).not.toContain("no target was touched");
 
-    for (const through of ["0028", "0033", "0036", "0043", "0044", "0045"] as const) {
+    for (const through of [
+      "0022",
+      "0028",
+      "0033",
+      "0036",
+      "0043",
+      "0044",
+      "0045",
+      "0046",
+    ] as const) {
       for (const environment of ["rehearsal", "production"] as const) {
         const accepted = await deploy([
           "takoserver-d1-schema",
@@ -425,7 +460,16 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(integrationWithoutWave.stderr).toContain("deploy target descriptor not found");
     expect(integrationWithoutWave.stderr).not.toContain("no target was touched");
 
-    for (const through of ["0028", "0033", "0036", "0043", "0044", "0045"] as const) {
+    for (const through of [
+      "0022",
+      "0028",
+      "0033",
+      "0036",
+      "0043",
+      "0044",
+      "0045",
+      "0046",
+    ] as const) {
       const refused = await deploy([
         "takoserver-d1-schema",
         "--status",
@@ -833,6 +877,32 @@ describe("Takoserver split deploy entrypoint", () => {
     for (const environment of ["rehearsal", "production"] as const) {
       const refused = await deploy([
         "takoserver-integration-form-authority-operator-worker",
+        "--status",
+        `--environment=${environment}`,
+        `--commit=${sha}`,
+      ]);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
+    }
+  });
+
+  test("parses exact artifact recovery only through the integration deploy surface", async () => {
+    const sha = "a".repeat(40);
+    const accepted = await deploy([
+      "takoserver-exact-artifact-recovery",
+      "--status",
+      "--environment=integration",
+      `--commit=${sha}`,
+    ]);
+    expect(accepted.exitCode).toBe(2);
+    expect(accepted.stderr).toContain("deploy target descriptor not found");
+    expect(accepted.stderr).not.toContain("no target was touched");
+
+    for (const environment of ["rehearsal", "production"] as const) {
+      const refused = await deploy([
+        "takoserver-exact-artifact-recovery",
         "--status",
         `--environment=${environment}`,
         `--commit=${sha}`,

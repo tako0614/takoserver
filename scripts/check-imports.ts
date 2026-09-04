@@ -75,7 +75,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "domain",
     match:
-      /^src\/(?:token|auth|ledger|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|provider-metering|provider-placement|provider-runtime-bindings|resource-deployments|resource-migrations|runtime-input-preparations|worker-endpoint-origin-reservations|artifact-consumer-repair|attachments|reconcile|metering|edge-forms|ai-requests|operator-credentials|integration-e2e-credential-authority|form-authority-operator-proof|google-identity|takos-id-identity|identity-setup|stripe-settlement|signing-key|operator-key|ed25519-private-jwk|runtime-grants|takoform-released-provider)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$|host-admission-endpoint\.ts$|integration-operator-endpoint\.ts$)/u,
+      /^src\/(?:token|auth|ledger|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|provider-metering|provider-placement|provider-runtime-bindings|resource-deployments|resource-migrations|runtime-input-preparations|worker-endpoint-origin-reservations|artifact-consumer-repair|artifact-recovery|artifact-recovery-owner-gc|exact-artifact-recovery-operator-proof|attachments|reconcile|metering|edge-forms|ai-requests|operator-credentials|integration-e2e-credential-authority|form-authority-operator-proof|google-identity|takos-id-identity|identity-setup|stripe-settlement|signing-key|operator-key|ed25519-private-jwk|runtime-grants|takoform-released-provider)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$|host-admission-endpoint\.ts$|integration-operator-endpoint\.ts$)/u,
     may: ["core", "domain", "release-data"],
   },
   {
@@ -89,7 +89,7 @@ const LAYERS: readonly Layer[] = [
     // `payment-setup` builds the shape the routes layer asks for, which makes
     // it composition rather than domain: it is allowed to know both halves.
     match:
-      /^src\/(?:app|compat|cloudflare-provider-surface|cloudflare-runtime-binding-materializer|deployment-composition|form-authority-(?:identity-probe|public-identity|worker-composition)|integration-form-authority-gateway|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|public-form-(?:implementation-build|runtime)|public-worker-implementation|runtime-input-seal-keyring|selfhost-composition|selfhost-data-planes|selfhost-object-store|selfhost-queue-pump|selfhost-runtime-binding-materializer|selfhost-scheduler|standalone-provider-composition|worker-data-services|worker-(?:production|stable-local)-composition)\.ts$|^src\/takoform\/(?:host-admission-endpoint|integration-operator-endpoint)\.ts$/u,
+      /^src\/(?:app|compat|cloudflare-provider-surface|cloudflare-runtime-binding-materializer|deployment-composition|exact-artifact-recovery-worker|form-authority-(?:identity-probe|public-identity|worker-composition)|integration-form-authority-gateway|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|public-form-(?:implementation-build|runtime)|public-worker-implementation|runtime-input-seal-keyring|selfhost-composition|selfhost-data-planes|selfhost-object-store|selfhost-queue-pump|selfhost-runtime-binding-materializer|selfhost-scheduler|standalone-provider-composition|worker-data-services|worker-(?:production|stable-local)-composition)\.ts$|^src\/takoform\/(?:host-admission-endpoint|integration-operator-endpoint)\.ts$/u,
     may: ["core", "adapter", "domain", "routes", "app", "release-data"],
   },
   // An entry chooses concrete implementations — that is its whole job. What it
@@ -312,6 +312,63 @@ if (existsSync("src/entry-form-authority-worker.ts")) {
   ]) {
     if (production.has(fixture)) {
       violations.push(`production Form authority Worker imports integration fixture ${fixture}`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// One-shot artifact recovery separation. Customer/public entries cannot reach
+// it. The existing owner-authenticated gateway may carry only the signed RPC
+// proof and service binding; only the route-less target owns D1/R2 adapters and
+// the exact recovery coordinator.
+// ---------------------------------------------------------------------------
+
+const EXACT_RECOVERY_ENTRY = "src/entry-exact-artifact-recovery-worker.ts";
+const EXACT_RECOVERY_PRIVATE_MODULES = [
+  "src/artifact-recovery.ts",
+  "src/artifact-recovery-owner-gc.ts",
+  "src/exact-artifact-recovery-worker.ts",
+  "src/takoform/exact-artifact-recovery-coordinator.ts",
+];
+for (const entry of PUBLIC_READER_ENTRIES.filter(existsSync)) {
+  const reachable = reachableFrom([entry]);
+  for (const recovery of EXACT_RECOVERY_PRIVATE_MODULES) {
+    if (reachable.has(recovery)) {
+      violations.push(`${entry} transitively imports private exact recovery module ${recovery}`);
+    }
+  }
+}
+
+for (const entry of FORM_AUTHORITY_OPERATOR_GATEWAY_ENTRIES.filter(existsSync)) {
+  const reachable = reachableFrom([entry]);
+  for (const forbidden of [
+    "src/sql-d1.ts",
+    "src/objects-r2.ts",
+    "src/exact-artifact-recovery-worker.ts",
+    "src/takoform/exact-artifact-recovery-coordinator.ts",
+  ]) {
+    if (reachable.has(forbidden)) {
+      violations.push(`${entry} transitively imports forbidden recovery authority ${forbidden}`);
+    }
+  }
+}
+
+if (existsSync(EXACT_RECOVERY_ENTRY)) {
+  const reachable = reachableFrom([EXACT_RECOVERY_ENTRY]);
+  for (const required of [
+    "src/sql-d1.ts",
+    "src/objects-r2.ts",
+    "src/takoform/exact-artifact-recovery-coordinator.ts",
+  ]) {
+    if (!reachable.has(required)) {
+      violations.push(`${EXACT_RECOVERY_ENTRY} does not reach required ${required}`);
+    }
+  }
+  for (const forbidden of ["src/app.ts", "src/router.ts", "src/control.ts", "src/openapi.ts"]) {
+    if (reachable.has(forbidden)) {
+      violations.push(
+        `${EXACT_RECOVERY_ENTRY} transitively imports public route module ${forbidden}`,
+      );
     }
   }
 }

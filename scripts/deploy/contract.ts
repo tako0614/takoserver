@@ -47,6 +47,15 @@ const managedObjectReceiptRehearsalInput =
   "`TAKOSERVER_MANAGED_OBJECT_RECEIPT_AUTHORITY_REHEARSAL_RECEIPT_PATH` is required only when `rehearsal` or `production` `--apply` installs the authority's fresh v1 Durable Object lifecycle; integration apply and every `--status` action do not read it.";
 const cloudflareProviderExecutorSecretsInput =
   "`TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH` is required for both `--status` and `--apply` and must name one canonical, link-free, single-link, owner-only mode-0600 JSON file outside the repository. It contains exactly `CLOUDFLARE_API_TOKEN` and `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING`. Status uses the token only for direct authoritative readback and never copies the file; apply publishes the exact two values through Wrangler's single `--secrets-file` operation. Neither value enters argv, result JSON, generated configuration, build children, or diagnostics.";
+const exactArtifactRecoveryInput =
+  "Input contract: `TAKOSERVER_EXACT_ARTIFACT_RECOVERY_REQUEST_PATH`, " +
+  "`TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH`, and " +
+  "`TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH` are required for status and apply. " +
+  "Each names one canonical, link-free, single-link, owner-only mode-0600 file outside the repository. " +
+  "The recovery request is canonical v2 and is never emitted, passed in argv, or copied into the repository. " +
+  "The provider-executor file is reused as the only Cloudflare credential source; this surface adds no parent credential. " +
+  "`TAKOSERVER_EXACT_ARTIFACT_RECOVERY_LOST_ACK_PATH` is read only for the post-quiescence successor " +
+  "step and must bind the status-emitted quiescence digest. `TAKOSERVER_INDEPENDENT_REVIEW` is required for apply only.";
 const providerExecutorTargetInput =
   "Clean-checkout realization uses one freshly authored `takoserver.deploy-target@v2` at " +
   "`/root/dev/takos/.operator-private/takoserver/<environment>/target.v2.json`, selected by its " +
@@ -718,18 +727,22 @@ export const DEPLOY_CONTRACT = {
       triggers: ["irreversible"],
       obligations: {
         provenance:
-          `${exactSource} Rehearsal and production accept only the fixed next boundaries 0028, ` +
-          "0033, 0036, 0043, 0044 or 0045. The exact predecessor lineage, selected through-prefix and wave " +
+          `${exactSource} Rehearsal and production accept only the fixed next boundaries 0022, 0028, ` +
+          "0033, 0036, 0043, 0044, 0045 or 0046. The exact predecessor lineage, selected through-prefix and wave " +
           "bytes are checked against their fixed SHA-256 inventory, digested and sealed before the " +
           "forward-only apply. Integration accepts no selector; its no-selector disposable cadence " +
-          "is explicitly integration-only.",
+          "is explicitly integration-only. The 0022 selector is a one-time exact 0016-to-0022 " +
+          "catch-up and never permits arbitrary migration-prefix adoption.",
         "post-conditions":
           "D1 must read back the exact selected through-lineage and canonical schema shape. Status " +
           "always names lastAppliedMigration and nextPendingMigration within the selected wave. " +
           "While 0043 is pending it also names current and rollback compatibility deployment and " +
           "Version identities, drain state, and active-root/deleting-candidate repair count. The " +
           "0044 boundary ends at the durable artifact-consumer resolution receipt migration; the " +
-          "0045 boundary is the separate additive Cloudflare executor pre-effect CAS.",
+          "0045 boundary is the separate additive Cloudflare executor pre-effect CAS; the 0046 " +
+          "boundary adds one exact artifact-recovery singleton and its receipt constraints only after 0045. " +
+          "The standalone 0022 catch-up receipt binds the canonical 0016 application shape and critical " +
+          "data digest before the exact 0017-0022 transition; it is not an ordinary receipt-chain predecessor.",
         reversal:
           "There is no down migration. Failure is repaired forward from the authoritative D1 lineage and schema shape.",
         "failure-handling":
@@ -752,14 +765,19 @@ export const DEPLOY_CONTRACT = {
           "native claim, plus the 0043 active-root/deleting-candidate conflict count. Rehearsal writes " +
           "one no-overwrite 0600 receipt per wave outside every " +
           "repository. Production requires that exact commit, predecessor, through boundary, wave " +
-          "bytes, pre-shape and expected post-shape. Before 0037, one transactional D1 batch installs " +
-          "an exact insert-blocking trigger and asserts the replaced predecessor is still empty; " +
-          "0037 removes the guarded table. For 0043, current and immediate rollback Worker deployments and Versions " +
+          "bytes, pre-shape and expected post-shape. Before 0037, one monotonic single-statement " +
+          "CREATE TRIGGER IF NOT EXISTS installs the exact insert guard. Canonical trigger SQL and a zero " +
+          "predecessor count are read back after installation and again immediately before migration; 0037 " +
+          "removes the guarded table. This never treats REST query execution as D1Database.batch(). For 0043, " +
+          "current and immediate rollback Worker deployments and Versions " +
           "must both be exact all-traffic compatibility builds at the selected commit, public preview URLs are disabled, and a private " +
           "receipt created after and bound to both deployments must attest that every older request/event " +
           "invocation drained or was cancelled. " +
           "Those Version/history, receipt, and conflict proofs are re-read in mutation phase after " +
-          "the 0037 guard and immediately before the wave's first migration. Integration evidence is never accepted.",
+          "the 0037 guard and immediately before the wave's first migration. For the exceptional 0022 " +
+          "catch-up, the exact audited 0001-0016 names, frozen canonical application-schema digest, zero " +
+          "unsafe critical-data invariants, and matching rehearsal data counts/digest are checked before " +
+          "qualification, after qualification, and at the final mutation fence. Integration evidence is never accepted.",
         "independent-review": review,
       },
     },
@@ -1225,6 +1243,75 @@ export const DEPLOY_CONTRACT = {
         "failure-handling":
           `${highRiskFailure} Unknown or drifted predecessors, a missing dependency, missing migration 0045, any route/domain/workers.dev exposure, extra binding or secret, changing provider history, and unsafe or changing external secret material fail closed. The build receives neither executor secret. A lost publication acknowledgement is not retried and reports only sanitized Version/deployment identities; the operator must run this surface's fresh status before repair. ` +
           cloudflareProviderExecutorSecretsInput,
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-exact-artifact-recovery",
+      target: "cloudflare-worker:integration-exact-one-shot-artifact-recovery",
+      covers: [
+        "migrations/0046_exact_artifact_recovery_receipts.sql",
+        "src/artifact-recovery.ts",
+        "src/artifact-recovery-owner-gc.ts",
+        "src/exact-artifact-recovery-worker.ts",
+        "src/entry-exact-artifact-recovery-worker.ts",
+        "src/integration-form-authority-gateway.ts",
+        "src/entry-integration-form-authority-operator-worker.ts",
+        "src/takoform/exact-artifact-recovery-prepare.ts",
+        "src/takoform/exact-artifact-recovery-coordinator.ts",
+        "scripts/exact-artifact-recovery.ts",
+        "scripts/deploy/exact-artifact-recovery.ts",
+        "scripts/deploy/target.ts",
+        "scripts/deploy.ts",
+      ],
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler", "flock"],
+      requiresEnv: [
+        "TAKOSERVER_EXACT_ARTIFACT_RECOVERY_REQUEST_PATH",
+        "TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH",
+        "TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH",
+        "TAKOSERVER_EXACT_ARTIFACT_RECOVERY_LOST_ACK_PATH",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+      ],
+      triggers: ["irreversible", "authority"],
+      obligations: {
+        provenance:
+          `${exactSource} Integration only. One environment-selected target v2 fixes the existing ` +
+          "qualified provider executor, D1, R2, public Host identity, authenticated operator gateway, " +
+          "route-less incident Worker name, and explicit owner retention policy. The immutable recovery " +
+          "Version binds the canonical request digest, R2 identity, source commit/version and any separately " +
+          "reviewed lost-ack handoff. Every mutating apply, including integration, requires a clean exact " +
+          "commit reachable from a fetched remote ref. " +
+          exactArtifactRecoveryInput,
+        "post-conditions":
+          "Each apply performs at most one status-planned transition. Preparation is one D1 batch and the " +
+          "singleton authorizes only the exact 4 owners, 5 uploads, 2 replays, 28 members and 29 holds. " +
+          "The recovery Worker has no route, custom domain, workers.dev endpoint or preview URL; only the " +
+          "existing signed Form-authority gateway temporarily receives its exact service binding and Worker " +
+          "Version pin. The binding remains installed through the explicit retention deadline. The signed " +
+          "purge RPC then rechecks R2 absence and every D1 fence and uses the Worker's real " +
+          "D1Database.batch() to delete only incident details atomically and retains the compact terminal " +
+          "singleton/result digest. Only a durable purged readback permits restoring the ordinary gateway " +
+          "closure and deleting the route-less Worker.",
+        reversal:
+          "The one-shot authorization and terminal singleton are forward-only and never reset. Worker and " +
+          "gateway publications retain their immediate provider-history predecessors, but a completed delete " +
+          "is not reversed. Any new object identity or ETag needs a new reviewed operation and fence.",
+        "failure-handling":
+          `${highRiskFailure} A second descriptor, wrong tenant/cardinality/set digest/lineage/R2/source/retention ` +
+          "identity, provider or gateway drift, active uncertainty, root/hold/writer race, rolled-back batch, or " +
+          "unapplied migration fails closed. A delete_started candidate never issues a second R2 DELETE. The " +
+          "gateway capability must be removed before status emits the deterministic quiescence digest; only a " +
+          "new immutable successor carrying the matching external lost-ack descriptor may reconcile absence or " +
+          "apply a separately reviewed ETag retry. Publication/delete acknowledgement loss is status-only and " +
+          "is never blindly repeated. A lost purge acknowledgement is settled by durable singleton readback; " +
+          "the host never fabricates D1 transaction semantics over REST. Request, evidence, credential and " +
+          "object bytes never enter output or logs.",
+        "pre-mutation-proof":
+          "Fresh status proves migration 0046, the exact selected-commit provider executor and dependencies, " +
+          "the public Host/Form identity, exact Worker/gateway module and binding closures, exhaustive route/domain " +
+          "state, and the singleton/request fence. Apply then runs the complete owner gate and re-reads the same " +
+          "planned predecessor under the target-scoped publication lease before its single transition.",
         "independent-review": review,
       },
     },

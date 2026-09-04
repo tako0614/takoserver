@@ -1,4 +1,12 @@
 import {
+  type ExactArtifactRecoveryGatewayAction,
+  ExactArtifactRecoveryOperatorProofError,
+  exactArtifactRecoveryActionPath,
+  type SignedExactArtifactRecoveryRpcInvocation,
+  signedExactArtifactRecoveryRpcInvocation,
+  verifyExactArtifactRecoveryOperatorAssertion,
+} from "./exact-artifact-recovery-operator-proof.ts";
+import {
   assertFormAuthorityOperatorScope,
   type FormAuthorityGatewayAction,
   FormAuthorityOperatorProofError,
@@ -7,6 +15,7 @@ import {
   signedFormAuthorityRpcInvocation,
   verifyFormAuthorityOperatorAssertion,
 } from "./form-authority-operator-proof.ts";
+import { isSha256Digest } from "./json.ts";
 import { isPublicHostIdentity, type PublicHostIdentityRpc } from "./public-host-identity.ts";
 import { parseStrictJson } from "./strict-json.ts";
 
@@ -19,6 +28,13 @@ export interface FormAuthorityRpc {
   readback(invocation: SignedFormAuthorityRpcInvocation): Promise<unknown>;
 }
 
+export interface ExactArtifactRecoveryRpc {
+  identity(): Promise<unknown>;
+  status(invocation: SignedExactArtifactRecoveryRpcInvocation): Promise<unknown>;
+  apply(invocation: SignedExactArtifactRecoveryRpcInvocation): Promise<unknown>;
+  purge(invocation: SignedExactArtifactRecoveryRpcInvocation): Promise<unknown>;
+}
+
 export interface IntegrationFormAuthorityGatewayEnv {
   readonly TAKOSERVER_ENVIRONMENT: string;
   readonly TAKOSERVER_FORM_AUTHORITY_HOST_ID: string;
@@ -28,6 +44,58 @@ export interface IntegrationFormAuthorityGatewayEnv {
   readonly TAKOSERVER_FORM_AUTHORITY_OPERATOR_SPACE: string;
   readonly FORM_AUTHORITY: FormAuthorityRpc;
   readonly PUBLIC_HOST_IDENTITY: PublicHostIdentityRpc;
+  readonly EXACT_ARTIFACT_RECOVERY?: ExactArtifactRecoveryRpc;
+  readonly TAKOSERVER_EXACT_ARTIFACT_RECOVERY_REQUEST_DIGEST?: string;
+  readonly TAKOSERVER_EXACT_ARTIFACT_RECOVERY_WORKER_VERSION_ID?: string;
+}
+
+/** Runtime boundary shared by the ordinary and temporary target-generated gateway closures. */
+export function integrationFormAuthorityGatewayEnv(
+  value: unknown,
+): IntegrationFormAuthorityGatewayEnv {
+  if (!isRecord(value)) throw new TypeError("integration Form authority gateway Env is invalid");
+  const formAuthority = value.FORM_AUTHORITY;
+  const publicIdentity = value.PUBLIC_HOST_IDENTITY;
+  const recovery = value.EXACT_ARTIFACT_RECOVERY;
+  const requestDigest = value.TAKOSERVER_EXACT_ARTIFACT_RECOVERY_REQUEST_DIGEST;
+  const recoveryWorkerVersionId = value.TAKOSERVER_EXACT_ARTIFACT_RECOVERY_WORKER_VERSION_ID;
+  if (
+    typeof value.TAKOSERVER_ENVIRONMENT !== "string" ||
+    typeof value.TAKOSERVER_FORM_AUTHORITY_HOST_ID !== "string" ||
+    typeof value.TAKOSERVER_FORM_AUTHORITY_OPERATOR_ORIGIN !== "string" ||
+    typeof value.TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK !== "string" ||
+    typeof value.TAKOSERVER_FORM_AUTHORITY_OPERATOR_TENANT_ID !== "string" ||
+    typeof value.TAKOSERVER_FORM_AUTHORITY_OPERATOR_SPACE !== "string" ||
+    !isFormAuthorityRpc(formAuthority) ||
+    !isPublicHostIdentityRpc(publicIdentity) ||
+    (recovery === undefined) !== (requestDigest === undefined) ||
+    (recovery === undefined) !== (recoveryWorkerVersionId === undefined) ||
+    (recovery !== undefined &&
+      (!isExactArtifactRecoveryRpc(recovery) ||
+        typeof requestDigest !== "string" ||
+        typeof recoveryWorkerVersionId !== "string"))
+  ) {
+    throw new TypeError("integration Form authority gateway Env is invalid");
+  }
+  return {
+    TAKOSERVER_ENVIRONMENT: value.TAKOSERVER_ENVIRONMENT,
+    TAKOSERVER_FORM_AUTHORITY_HOST_ID: value.TAKOSERVER_FORM_AUTHORITY_HOST_ID,
+    TAKOSERVER_FORM_AUTHORITY_OPERATOR_ORIGIN: value.TAKOSERVER_FORM_AUTHORITY_OPERATOR_ORIGIN,
+    TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK:
+      value.TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK,
+    TAKOSERVER_FORM_AUTHORITY_OPERATOR_TENANT_ID:
+      value.TAKOSERVER_FORM_AUTHORITY_OPERATOR_TENANT_ID,
+    TAKOSERVER_FORM_AUTHORITY_OPERATOR_SPACE: value.TAKOSERVER_FORM_AUTHORITY_OPERATOR_SPACE,
+    FORM_AUTHORITY: formAuthority,
+    PUBLIC_HOST_IDENTITY: publicIdentity,
+    ...(recovery === undefined
+      ? {}
+      : {
+          EXACT_ARTIFACT_RECOVERY: recovery,
+          TAKOSERVER_EXACT_ARTIFACT_RECOVERY_REQUEST_DIGEST: requestDigest as string,
+          TAKOSERVER_EXACT_ARTIFACT_RECOVERY_WORKER_VERSION_ID: recoveryWorkerVersionId as string,
+        }),
+  };
 }
 
 export async function handleIntegrationFormAuthorityGateway(
@@ -43,10 +111,17 @@ export async function handleIntegrationFormAuthorityGateway(
   try {
     const url = new URL(request.url);
     const origin = exactOrigin(env.TAKOSERVER_FORM_AUTHORITY_OPERATOR_ORIGIN);
-    const action = gatewayAction(url.pathname);
-    if (url.origin !== origin || url.search || request.method !== "POST" || !action) {
+    const formAction = gatewayAction(url.pathname);
+    const recoveryAction = recoveryGatewayAction(url.pathname);
+    if (
+      url.origin !== origin ||
+      url.search ||
+      request.method !== "POST" ||
+      (!formAction && !recoveryAction)
+    ) {
       return response(404, "not_found");
     }
+    if (recoveryAction && !env.EXACT_ARTIFACT_RECOVERY) return response(404, "not_found");
     if (request.headers.get("content-type") !== "application/json") {
       return response(415, "unsupported_media_type");
     }
@@ -68,6 +143,19 @@ export async function handleIntegrationFormAuthorityGateway(
       return response(503, "identity_unavailable");
     }
     if (live.hostId !== hostId) return response(409, "public_host_drift");
+    if (recoveryAction) {
+      return await handleExactArtifactRecoveryGateway({
+        action: recoveryAction,
+        assertion,
+        body,
+        env,
+        live,
+        hostId,
+        clock,
+      });
+    }
+    const action = formAction;
+    if (!action) return response(404, "not_found");
     try {
       await verifyFormAuthorityOperatorAssertion({
         assertion,
@@ -140,6 +228,102 @@ export async function handleIntegrationFormAuthorityGateway(
   }
 }
 
+async function handleExactArtifactRecoveryGateway(input: {
+  readonly action: ExactArtifactRecoveryGatewayAction;
+  readonly assertion: string;
+  readonly body: Readonly<Record<string, unknown>>;
+  readonly env: IntegrationFormAuthorityGatewayEnv;
+  readonly live: {
+    readonly hostId: string;
+    readonly workerArtifactDigest: `sha256:${string}`;
+    readonly workerVersionId: string;
+    readonly implementationDigest: `sha256:${string}`;
+  };
+  readonly hostId: string;
+  readonly clock: () => Date;
+}): Promise<Response> {
+  const binding = input.env.EXACT_ARTIFACT_RECOVERY;
+  const requestDigest = input.env.TAKOSERVER_EXACT_ARTIFACT_RECOVERY_REQUEST_DIGEST;
+  const workerVersionId = input.env.TAKOSERVER_EXACT_ARTIFACT_RECOVERY_WORKER_VERSION_ID;
+  if (!binding || !requestDigest || !workerVersionId || !isSha256Digest(requestDigest)) {
+    return response(503, "identity_unavailable");
+  }
+  let target: unknown;
+  try {
+    target = await binding.identity();
+  } catch {
+    return response(503, "identity_unavailable");
+  }
+  if (
+    !isRecord(target) ||
+    target.kind !== "takoserver.exact-artifact-recovery-worker-identity@v1" ||
+    target.requestDigest !== requestDigest ||
+    target.workerVersionId !== workerVersionId
+  ) {
+    return response(409, "recovery_worker_drift");
+  }
+  try {
+    await verifyExactArtifactRecoveryOperatorAssertion({
+      assertion: input.assertion,
+      action: input.action,
+      body: input.body,
+      identity: {
+        environment: "integration",
+        hostId: input.hostId,
+        workerArtifactDigest: input.live.workerArtifactDigest,
+        publicWorkerVersionId: input.live.workerVersionId,
+        implementationDigest: input.live.implementationDigest,
+        requestDigest,
+        recoveryWorkerVersionId: workerVersionId,
+      },
+      publicJwk: input.env.TAKOSERVER_FORM_AUTHORITY_OPERATOR_PUBLIC_JWK,
+      clock: input.clock,
+    });
+  } catch (error) {
+    if (
+      error instanceof ExactArtifactRecoveryOperatorProofError &&
+      error.code === "identity_unavailable"
+    ) {
+      return response(503, "identity_unavailable");
+    }
+    if (
+      error instanceof ExactArtifactRecoveryOperatorProofError &&
+      error.code === "operator_scope_mismatch"
+    ) {
+      return response(403, "operator_scope_mismatch");
+    }
+    return response(401, "invalid_operator_assertion");
+  }
+  const invocation = signedExactArtifactRecoveryRpcInvocation({
+    action: input.action,
+    assertion: input.assertion,
+    body: input.body,
+  });
+  let result: unknown;
+  try {
+    switch (input.action) {
+      case "status":
+        result = await binding.status(invocation);
+        break;
+      case "apply":
+        result = await binding.apply(invocation);
+        break;
+      case "purge":
+        result = await binding.purge(invocation);
+        break;
+    }
+  } catch (error) {
+    const code = error instanceof Error ? error.message : "invalid_request";
+    if (code === "state_conflict") return response(409, code);
+    if (code === "identity_unavailable") return response(503, code);
+    return response(400, "invalid_request");
+  }
+  return Response.json(result, {
+    status: 200,
+    headers: { "cache-control": "no-store", "x-content-type-options": "nosniff" },
+  });
+}
+
 function gatewayAction(path: string): FormAuthorityGatewayAction | null {
   switch (path) {
     case "/v1/plan":
@@ -151,6 +335,13 @@ function gatewayAction(path: string): FormAuthorityGatewayAction | null {
     default:
       return null;
   }
+}
+
+function recoveryGatewayAction(path: string): ExactArtifactRecoveryGatewayAction | null {
+  for (const action of ["status", "apply", "purge"] as const) {
+    if (path === exactArtifactRecoveryActionPath(action)) return action;
+  }
+  return null;
 }
 
 async function boundedBody(request: Request): Promise<Uint8Array> {
@@ -238,4 +429,27 @@ function response(status: number, code: string): Response {
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isFormAuthorityRpc(value: unknown): value is FormAuthorityRpc {
+  return (
+    isRecord(value) &&
+    typeof value.plan === "function" &&
+    typeof value.apply === "function" &&
+    typeof value.readback === "function"
+  );
+}
+
+function isPublicHostIdentityRpc(value: unknown): value is PublicHostIdentityRpc {
+  return isRecord(value) && typeof value.identity === "function";
+}
+
+function isExactArtifactRecoveryRpc(value: unknown): value is ExactArtifactRecoveryRpc {
+  return (
+    isRecord(value) &&
+    typeof value.identity === "function" &&
+    typeof value.status === "function" &&
+    typeof value.apply === "function" &&
+    typeof value.purge === "function"
+  );
 }
