@@ -6,7 +6,7 @@ import { CloudflareState } from "./cloudflare-state.ts";
 import { mutationError, preflightError, verificationError } from "./errors.ts";
 import {
   type CommandResult,
-  cloudflareChildEnvironment,
+  resolveCloudflareCredential,
   runChecked,
   runCommand,
   wranglerCommand,
@@ -55,16 +55,22 @@ export async function runConsole(
 ): Promise<Record<string, unknown>> {
   if (!target.consoleOrigin) throw preflightError("selected target has no consoleOrigin");
   const hostname = new URL(target.consoleOrigin).hostname;
-  const environment =
-    options.cloudflareEnvironment ??
-    (options.state !== undefined && invocation.action === "status"
-      ? {}
-      : cloudflareChildEnvironment());
+  const run = options.run ?? runCommand;
+  const credential =
+    invocation.environment === "integration" &&
+    options.state !== undefined &&
+    invocation.action === "status"
+      ? undefined
+      : await resolveCloudflareCredential(invocation.environment, {
+          cloudflareEnvironment: options.cloudflareEnvironment,
+          run,
+        });
+  const environment = credential?.childEnvironment ?? {};
   const state =
     options.state ??
     new CloudflareState({
       accountId: target.accountId,
-      token: exactToken(environment),
+      token: credential?.token ?? exactToken(environment),
     });
   const ownerBefore = await state.workerDomainOwner(hostname);
   if (ownerBefore !== CONSOLE_WORKER) {
@@ -88,8 +94,6 @@ export async function runConsole(
       commitMatches: version === null ? false : versionCommit(version) === invocation.commit,
     };
   }
-
-  const run = options.run ?? runCommand;
   const source = await qualifySource({
     environment: invocation.environment,
     commit: invocation.commit,

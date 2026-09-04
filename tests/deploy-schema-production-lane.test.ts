@@ -311,7 +311,7 @@ async function rehearsalReceiptChainThrough0036(
           receiptPath,
           ...(predecessorReceiptPath === undefined ? {} : { predecessorReceiptPath }),
           review: "reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       );
       predecessorReceiptPath = receiptPath;
@@ -343,7 +343,7 @@ describe("production-shaped D1 migration lane", () => {
             run: fixture.run,
             reader: readerSequence([stateThrough(22, "i")]),
             outputDirectory: join(root, `work-${throughMigration}`),
-            cloudflareEnvironment: {},
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
           },
         ).catch((error) => error);
         expect(failure).toBeInstanceOf(DeployError);
@@ -369,7 +369,7 @@ describe("production-shaped D1 migration lane", () => {
           reader: readerSequence([EMPTY, EMPTY, EMPTY, post]),
           outputDirectory: join(root, "work"),
           review: "reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       );
 
@@ -430,7 +430,7 @@ describe("production-shaped D1 migration lane", () => {
           reader: readerSequence([state]),
           outputDirectory: join(root, `work-${expected.replaceAll(" ", "-")}`),
           review: "reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         }).catch((error) => error);
         expect(failure.message).toContain(expected);
       }
@@ -462,7 +462,7 @@ describe("production-shaped D1 migration lane", () => {
           outputDirectory: join(root, "work"),
           receiptPath,
           review: "reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       );
 
@@ -513,7 +513,7 @@ describe("production-shaped D1 migration lane", () => {
           reader: readerSequence([stateThrough(22, "l")]),
           migrationDirectory,
           outputDirectory: join(root, "work"),
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       ).catch((error) => error);
       expect(failure.message).toContain("exact audited source inventory");
@@ -541,7 +541,7 @@ describe("production-shaped D1 migration lane", () => {
           reader: readerSequence([stateThrough(28, "h")]),
           migrationDirectory,
           outputDirectory: join(root, "work"),
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       ).catch((error) => error);
       expect(failure).toBeInstanceOf(DeployError);
@@ -572,7 +572,7 @@ describe("production-shaped D1 migration lane", () => {
           reader: readerSequence([stateThrough(22, "l")]),
           migrationDirectory,
           outputDirectory: join(root, "work"),
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       ).catch((error) => error);
       expect(failure.message).toContain("exact audited source inventory");
@@ -614,7 +614,7 @@ describe("production-shaped D1 migration lane", () => {
             receiptPath,
             ...(predecessorReceiptPath === undefined ? {} : { predecessorReceiptPath }),
             review: "reviewer@example.test",
-            cloudflareEnvironment: {},
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
           },
         );
         const receipt = JSON.parse(readFileSync(receiptPath, "utf8")) as {
@@ -659,7 +659,7 @@ describe("production-shaped D1 migration lane", () => {
           outputDirectory: join(root, "first-work"),
           receiptPath: firstPath,
           review: "reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       );
 
@@ -672,7 +672,7 @@ describe("production-shaped D1 migration lane", () => {
           outputDirectory: join(root, "missing-work"),
           receiptPath: join(root, "0033-missing.receipt.json"),
           review: "reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       ).catch((error) => error);
       expect(missing.message).toContain("predecessor rehearsal receipt");
@@ -689,7 +689,7 @@ describe("production-shaped D1 migration lane", () => {
           receiptPath: secondPath,
           predecessorReceiptPath: firstPath,
           review: "reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       );
       const second = JSON.parse(readFileSync(secondPath, "utf8"));
@@ -715,7 +715,7 @@ describe("production-shaped D1 migration lane", () => {
           outputDirectory: join(root, "forged-work"),
           receiptPath: secondPath,
           review: "second-reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       ).catch((error) => error);
       expect(forged.message).toContain("predecessor receipt digest");
@@ -733,7 +733,7 @@ describe("production-shaped D1 migration lane", () => {
           outputDirectory: join(root, "mismatched-work"),
           receiptPath: secondPath,
           review: "second-reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       ).catch((error) => error);
       expect(mismatched.message).toContain("mismatched predecessor transition");
@@ -768,7 +768,7 @@ describe("production-shaped D1 migration lane", () => {
           receiptPath,
           predecessorReceiptPath: predecessor.receiptPath,
           review: "reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       );
       expect(lateInsertRejected).toBe(true);
@@ -809,7 +809,7 @@ describe("production-shaped D1 migration lane", () => {
           receiptPath: join(root, "0042.receipt.json"),
           predecessorReceiptPath: predecessor.receiptPath,
           review: "reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       ).catch((error) => error);
       expect(failure).toMatchObject({ phase: "mutation" });
@@ -853,7 +853,7 @@ describe("production-shaped D1 migration lane", () => {
           receiptPath,
           predecessorReceiptPath: predecessor.receiptPath,
           review: "reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       ).catch((error) => error);
       expect(interrupted).toBeInstanceOf(Error);
@@ -876,7 +876,7 @@ describe("production-shaped D1 migration lane", () => {
           receiptPath,
           predecessorReceiptPath: predecessor.receiptPath,
           review: "reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       );
       expect(resumed).toMatchObject({
@@ -921,7 +921,7 @@ describe("production-shaped D1 migration lane", () => {
             outputDirectory: join(root, `work-${index}`),
             receiptPath: join(root, `receipt-${index}.json`),
             review: "reviewer@example.test",
-            cloudflareEnvironment: {},
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
           },
         ).catch((error) => error);
 
@@ -988,7 +988,7 @@ describe("production-shaped D1 migration lane", () => {
           {
             reader: dataReaderSequence([stateThrough(item.from, `s${index}`)], item.counts),
             outputDirectory: join(root, `work-${index}`),
-            cloudflareEnvironment: {},
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
           },
         );
         expect(result).toMatchObject({
@@ -1038,7 +1038,7 @@ describe("production-shaped D1 migration lane", () => {
         {
           run: d1ReadProcess(resourceDatabase),
           outputDirectory: join(root, "resource-work"),
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       );
       expect(resourceStatus).toMatchObject({
@@ -1078,7 +1078,7 @@ describe("production-shaped D1 migration lane", () => {
         {
           run: d1ReadProcess(sagaDatabase),
           outputDirectory: join(root, "saga-work"),
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       );
       expect(sagaStatus).toMatchObject({
@@ -1122,7 +1122,7 @@ describe("production-shaped D1 migration lane", () => {
         {
           run: d1ReadProcess(preparationDatabase),
           outputDirectory: join(root, "preparation-work"),
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       );
       expect(preparationStatus).toMatchObject({
@@ -1162,7 +1162,7 @@ describe("production-shaped D1 migration lane", () => {
         {
           run: d1ReadProcess(nativeClaimDatabase),
           outputDirectory: join(root, "native-claim-work"),
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       );
       expect(nativeClaimStatus).toMatchObject({
@@ -1201,7 +1201,7 @@ describe("production-shaped D1 migration lane", () => {
           outputDirectory: join(root, "rehearsal-work"),
           receiptPath,
           review: "reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       );
 
@@ -1221,7 +1221,7 @@ describe("production-shaped D1 migration lane", () => {
           outputDirectory: join(root, "unproven-production-work"),
           receiptPath,
           review: "second-reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       ).catch((error) => error);
       expect(unproven.message).toContain("original no-overwrite attempt evidence");
@@ -1246,7 +1246,7 @@ describe("production-shaped D1 migration lane", () => {
           outputDirectory: join(root, "failed-production-work"),
           receiptPath,
           review: "second-reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       ).catch((error) => error);
       expect(failure).toBeInstanceOf(DeployError);
@@ -1270,7 +1270,7 @@ describe("production-shaped D1 migration lane", () => {
         {
           reader: readerSequence([partial]),
           outputDirectory: join(root, "status-work"),
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       );
       expect(status).toMatchObject({
@@ -1289,7 +1289,7 @@ describe("production-shaped D1 migration lane", () => {
         {
           reader: readerSequence([partial]),
           outputDirectory: join(root, "skipped-work"),
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       ).catch((error) => error);
       expect(skipped.message).toContain("cannot skip or replay a boundary");
@@ -1309,7 +1309,7 @@ describe("production-shaped D1 migration lane", () => {
           outputDirectory: join(root, "resumed-production-work"),
           receiptPath,
           review: "second-reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       );
       expect(resumed).toMatchObject({
@@ -1364,7 +1364,7 @@ describe("production-shaped D1 migration lane", () => {
           receiptPath,
           leaseRoot,
           review: "reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       ).catch((error) => error);
       await entered;
@@ -1380,7 +1380,7 @@ describe("production-shaped D1 migration lane", () => {
           receiptPath,
           leaseRoot,
           review: "reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       ).catch((error) => error);
       releaseApply?.();
@@ -1431,7 +1431,7 @@ describe("production-shaped D1 migration lane", () => {
           receiptPath,
           leaseRoot,
           review: "reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       ).catch((error) => error);
       expect(interrupted).toBeInstanceOf(Error);
@@ -1449,7 +1449,7 @@ describe("production-shaped D1 migration lane", () => {
           receiptPath,
           leaseRoot,
           review: "reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       );
       expect(recovered).toMatchObject({
@@ -1491,7 +1491,7 @@ describe("production-shaped D1 migration lane", () => {
           outputDirectory: join(root, "failed-work"),
           receiptPath,
           review: "reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       ).catch((error) => error);
       expect(failure).toMatchObject({ phase: "mutation" });
@@ -1513,7 +1513,7 @@ describe("production-shaped D1 migration lane", () => {
           outputDirectory: join(root, "resumed-work"),
           receiptPath,
           review: "reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       );
       const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
@@ -1546,7 +1546,7 @@ describe("production-shaped D1 migration lane", () => {
           outputDirectory: join(root, "rehearsal-work"),
           receiptPath,
           review: "reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       );
       const failed = processFixture("production", {
@@ -1568,7 +1568,7 @@ describe("production-shaped D1 migration lane", () => {
           outputDirectory: join(root, "production-work"),
           receiptPath,
           review: "second-reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       ).catch((error) => error);
       expect(failure).toMatchObject({

@@ -13,9 +13,9 @@ import {
 import { pendingMigrations, readD1SchemaState, readMigrationArtifact } from "./migrations.ts";
 import {
   type CommandResult,
-  cloudflareChildEnvironment,
   REPOSITORY,
   requireEnvironment,
+  resolveCloudflareCredential,
   runCommand,
   wranglerCommand,
 } from "./process.ts";
@@ -124,20 +124,16 @@ export async function runWorker(
     }
   }
   const run = options.run ?? runCommand;
-  const suppliedToken =
-    options.cloudflareEnvironment === undefined
-      ? process.env.CLOUDFLARE_API_TOKEN
-      : options.cloudflareEnvironment.CLOUDFLARE_API_TOKEN;
-  if (options.state === undefined && suppliedToken === undefined) {
-    throw preflightError(
-      "CLOUDFLARE_API_TOKEN is required because Wrangler OAuth cannot prove authoritative live topology",
-    );
-  }
-  const environment =
-    options.cloudflareEnvironment ??
-    (options.state !== undefined && invocation.action === "status"
-      ? {}
-      : cloudflareChildEnvironment());
+  const credential =
+    invocation.environment === "integration" &&
+    options.state !== undefined &&
+    invocation.action === "status"
+      ? undefined
+      : await resolveCloudflareCredential(invocation.environment, {
+          cloudflareEnvironment: options.cloudflareEnvironment,
+          run,
+        });
+  const environment = credential?.childEnvironment ?? {};
   // Before any live read or upload: the selected target must compose the
   // Worker the same way the Worker composes itself on its first request.
   await assertTargetComposes("preflight", target);
@@ -158,7 +154,10 @@ export async function runWorker(
       },
       target,
       options.state ??
-        new CloudflareState({ accountId: target.accountId, token: exactToken(environment) }),
+        new CloudflareState({
+          accountId: target.accountId,
+          token: credential?.token ?? exactToken(environment),
+        }),
       run,
       { ...options, cloudflareEnvironment: environment },
     );
@@ -178,7 +177,10 @@ export async function runWorker(
     });
     const state =
       options.state ??
-      new CloudflareState({ accountId: target.accountId, token: exactToken(environment) });
+      new CloudflareState({
+        accountId: target.accountId,
+        token: credential?.token ?? exactToken(environment),
+      });
     const migrations =
       options.migrations ?? remoteMigrationReader(inspectionConfig, environment, run);
     const signingDatabase =
@@ -313,6 +315,7 @@ export async function runWorker(
       target,
       commit: source.commit,
       run,
+      environment,
       ...(versionPublication ? { dryRunCommand: "versions-upload" as const } : {}),
       writeConfig: ({ path, main, bundleDigestHex, formImplementationIdentity }) =>
         writeWorkerConfig(target, {

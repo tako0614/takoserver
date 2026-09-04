@@ -5,9 +5,9 @@ import { join, resolve } from "node:path";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { mutationError, preflightError, verificationError } from "./errors.ts";
 import {
-  cloudflareChildEnvironment,
   REPOSITORY,
   requireEnvironment,
+  resolveCloudflareCredential,
   runCommand,
 } from "./process.ts";
 import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualification.ts";
@@ -273,14 +273,22 @@ export async function runManagedWorkerGateway(
   const dispatchNamespace =
     options.dispatchNamespace ?? process.env.TAKOSERVER_MANAGED_WORKER_DISPATCH_NAMESPACE ?? null;
   const gatewayId = options.gatewayId ?? process.env.TAKOSERVER_MANAGED_WORKER_GATEWAY_ID ?? null;
-  const cloudflareEnvironment =
-    options.cloudflareEnvironment ??
-    (options.state !== undefined ? {} : cloudflareChildEnvironment());
+  const run = options.run ?? runCommand;
+  const credential =
+    invocation.environment !== "integration" ||
+    options.state === undefined ||
+    (invocation.action === "apply" && options.mutate === undefined)
+      ? await resolveCloudflareCredential(invocation.environment, {
+          cloudflareEnvironment: options.cloudflareEnvironment,
+          run,
+        })
+      : undefined;
+  const cloudflareEnvironment = credential?.childEnvironment ?? {};
   const state =
     options.state ??
     new CloudflareState({
       accountId: options.accountId ?? target.accountId,
-      token: exactCloudflareToken(cloudflareEnvironment),
+      token: credential?.token ?? exactCloudflareToken(cloudflareEnvironment),
     });
   const inspect = (routes: readonly ManagedWorkerGatewayRoute[]) =>
     inspectManagedWorkerGatewayRoute(routes, {
@@ -328,7 +336,7 @@ export async function runManagedWorkerGateway(
       options.mutate ??
       createCloudflareManagedWorkerMutation({
         accountId: options.accountId ?? target.accountId,
-        token: exactCloudflareToken(cloudflareEnvironment),
+        token: credential?.token ?? exactCloudflareToken(cloudflareEnvironment),
         ...(options.routeMutationFetcher === undefined
           ? {}
           : { fetcher: options.routeMutationFetcher }),
@@ -349,7 +357,6 @@ export async function runManagedWorkerGateway(
   }
 
   if (!worker.ready) {
-    const run = options.run ?? runCommand;
     const source = await qualifySource({
       environment: invocation.environment,
       commit: invocation.commit,
@@ -373,6 +380,7 @@ export async function runManagedWorkerGateway(
         commit: source.commit,
         main: resolve(REPOSITORY, "src/entry-cloudflare-managed-worker-gateway.ts"),
         run,
+        environment: cloudflareEnvironment,
         writeConfig: ({ path, main, bundleDigestHex }) =>
           writeManagedGatewayConfig({
             path,
@@ -512,7 +520,7 @@ export async function runManagedWorkerGateway(
     options.mutate ??
     createCloudflareManagedWorkerMutation({
       accountId: options.accountId ?? target.accountId,
-      token: exactCloudflareToken(cloudflareEnvironment),
+      token: credential?.token ?? exactCloudflareToken(cloudflareEnvironment),
       ...(options.routeMutationFetcher === undefined
         ? {}
         : { fetcher: options.routeMutationFetcher }),

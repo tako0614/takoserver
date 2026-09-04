@@ -21,9 +21,9 @@ import { CloudflareState } from "./cloudflare-state.ts";
 import { mutationError, preflightError } from "./errors.ts";
 import {
   type CommandResult,
-  cloudflareChildEnvironment,
   REPOSITORY,
   requireEnvironment,
+  resolveCloudflareCredential,
   runCommand,
 } from "./process.ts";
 import { type DeployEnvironment, unsealDirectory } from "./qualification.ts";
@@ -80,17 +80,22 @@ export async function runIntegrationE2eCredentials(
 ): Promise<Record<string, unknown>> {
   assertIntegrationInvocation(invocation, target);
   const authority = exactTargetAuthority(target);
-  const environment =
-    options.cloudflareEnvironment ??
-    (options.state !== undefined && options.signingDatabase !== undefined
-      ? {}
-      : cloudflareChildEnvironment());
   const run = options.run ?? runCommand;
+  const credential =
+    invocation.environment === "integration" &&
+    options.state !== undefined &&
+    options.signingDatabase !== undefined
+      ? undefined
+      : await resolveCloudflareCredential(invocation.environment, {
+          cloudflareEnvironment: options.cloudflareEnvironment,
+          run,
+        });
+  const environment = credential?.childEnvironment ?? {};
   const state =
     options.state ??
     new CloudflareState({
       accountId: target.accountId,
-      token: exactCloudflareToken(environment),
+      token: credential?.token ?? exactCloudflareToken(environment),
     });
   const temporary = options.temporaryDirectory === undefined;
   const root =

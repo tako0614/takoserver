@@ -392,6 +392,70 @@ describe("split Takoserver Worker surfaces", () => {
     }
   });
 
+  test("integration Worker dispatch resolves OAuth without exposing it to Wrangler", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-worker-oauth-"));
+    try {
+      const current = fixture();
+      const oauthToken = "worker-oauth-token-only-in-process";
+      const calls: {
+        readonly command: readonly string[];
+        readonly env: Readonly<Record<string, string>>;
+      }[] = [];
+      const run: WorkerProcess = async (command, options) => {
+        calls.push({ command: [...command], env: options?.env ?? {} });
+        if (command.slice(-3).join(" ") === "auth token --json") {
+          return ok(JSON.stringify({ type: "oauth", token: oauthToken }));
+        }
+        return await current.run(command, options);
+      };
+      const result = await runWorker(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target,
+        {
+          state: current.state,
+          migrations: current.migrations,
+          run,
+          outputDirectory: root,
+          cloudflareEnvironment: {},
+          review: "reviewer@example.test",
+          fetcher: publishedProductFetcher(),
+        },
+      );
+      expect(result).toMatchObject({ kind: "takoserver.worker-apply@v2", commit: COMMIT });
+      const wranglerCalls = calls.filter((entry) => entry.command[0]?.endsWith("/wrangler"));
+      expect(wranglerCalls.length).toBeGreaterThan(0);
+      expect(wranglerCalls.every(({ env }) => env.CLOUDFLARE_API_TOKEN === undefined)).toBe(true);
+      expect(
+        calls.find(({ command }) => command.slice(-3).join(" ") === "auth token --json")?.env,
+      ).toEqual({ WRANGLER_WRITE_LOGS: "false" });
+      expect(JSON.stringify(wranglerCalls)).not.toContain(oauthToken);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rehearsal Worker injected state cannot bypass the explicit token lane", async () => {
+    const current = fixture();
+    const failure = await runWorker(
+      { surface: "takoserver-worker", action: "status", environment: "rehearsal", commit: COMMIT },
+      { ...target, environment: "rehearsal" },
+      {
+        state: current.state,
+        migrations: current.migrations,
+        run: current.run,
+        cloudflareEnvironment: {},
+      },
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain("CLOUDFLARE_API_TOKEN is required");
+    expect(current.calls).toHaveLength(0);
+  });
+
   test("routine refuses pending migrations before its gate or upload", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-pending-"));
     try {

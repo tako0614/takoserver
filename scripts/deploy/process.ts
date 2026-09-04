@@ -10,6 +10,31 @@ export interface CommandResult {
   readonly stderr: string;
 }
 
+export type CloudflareDeployEnvironment = "integration" | "rehearsal" | "production";
+
+export type DeployProcess = (
+  command: readonly string[],
+  options?: { readonly env?: Readonly<Record<string, string>>; readonly input?: string },
+) => Promise<CommandResult>;
+
+/**
+ * The credential used by a Cloudflare deploy invocation.
+ *
+ * `token` is intentionally kept separate from `childEnvironment`: direct REST
+ * readers need the bearer, while Wrangler must either receive an explicit API
+ * token or use its stored OAuth profile without a token in its environment.
+ */
+export interface CloudflareCredential {
+  readonly token: string;
+  readonly childEnvironment: Readonly<Record<string, string>>;
+  readonly source: "api-token" | "oauth";
+}
+
+/** Wrangler behavior allowed alongside the credential boundary. */
+const WRANGLER_OAUTH_CHILD_ENVIRONMENT = Object.freeze({
+  WRANGLER_WRITE_LOGS: "false",
+});
+
 const CHILD_SUBSTRATE = [
   "PATH",
   "HOME",
@@ -61,9 +86,112 @@ export function requireEnvironment(name: string): string {
   return value;
 }
 
-/** The only ambient credential forwarded to Cloudflare commands. */
+/** The explicit API token forwarded to a Wrangler child when one is supplied. */
 export function cloudflareChildEnvironment(): Readonly<Record<string, string>> {
   return { CLOUDFLARE_API_TOKEN: requireEnvironment("CLOUDFLARE_API_TOKEN") };
+}
+
+/**
+ * Parse the only OAuth credential shape accepted from Wrangler.
+ *
+ * The raw output is deliberately never included in an error: the command's
+ * stdout may contain the bearer itself, and malformed output is still a
+ * credential-handling failure rather than useful deploy diagnostics.
+ */
+export function parseWranglerAuthToken(raw: string): string {
+  let value: unknown;
+  try {
+    value = JSON.parse(raw.trim());
+  } catch {
+    throw new DeployError("preflight", "Wrangler OAuth token response is malformed");
+  }
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    Object.keys(value).length !== 2 ||
+    (value as Record<string, unknown>).type !== "oauth" ||
+    typeof (value as Record<string, unknown>).token !== "string"
+  ) {
+    throw new DeployError("preflight", "Wrangler OAuth token response is malformed");
+  }
+  const token = (value as Record<string, unknown>).token as string;
+  if (!isExactCredentialToken(token)) {
+    throw new DeployError("preflight", "Wrangler OAuth token response is malformed");
+  }
+  return token;
+}
+
+/**
+ * Resolve one Cloudflare credential for a deploy surface.
+ *
+ * An explicit `CLOUDFLARE_API_TOKEN` always wins (and malformed explicit
+ * input is rejected rather than falling through to OAuth). Only integration
+ * may ask Wrangler for its stored OAuth token; rehearsal and production stay
+ * explicit-token-only. The OAuth bearer is returned for in-process REST
+ * requests but is never placed in a child environment.
+ */
+export async function resolveCloudflareCredential(
+  deploymentEnvironment: CloudflareDeployEnvironment,
+  options: {
+    readonly cloudflareEnvironment?: Readonly<Record<string, string>> | undefined;
+    readonly run?: DeployProcess;
+  } = {},
+): Promise<CloudflareCredential> {
+  const explicitToken =
+    options.cloudflareEnvironment === undefined
+      ? process.env.CLOUDFLARE_API_TOKEN
+      : options.cloudflareEnvironment.CLOUDFLARE_API_TOKEN;
+  if (explicitToken !== undefined) {
+    if (!isExactCredentialToken(explicitToken)) {
+      throw new DeployError(
+        "preflight",
+        "CLOUDFLARE_API_TOKEN is required and must not have outer whitespace",
+      );
+    }
+    return {
+      token: explicitToken,
+      childEnvironment: { CLOUDFLARE_API_TOKEN: explicitToken },
+      source: "api-token",
+    };
+  }
+  if (deploymentEnvironment !== "integration") {
+    throw new DeployError(
+      "preflight",
+      "CLOUDFLARE_API_TOKEN is required for rehearsal and production",
+    );
+  }
+  const run = options.run ?? runCommand;
+  let result: CommandResult;
+  try {
+    // Keep Wrangler's debug logger off: auth --json intentionally writes the
+    // returned bearer to stdout, and Wrangler's default 0644 debug log would
+    // otherwise persist that bearer on disk. The OAuth token must remain inside
+    // Wrangler's stored profile rather than entering this child environment.
+    result = await run(wranglerCommand(["auth", "token", "--json"]), {
+      env: { ...WRANGLER_OAUTH_CHILD_ENVIRONMENT },
+    });
+  } catch {
+    throw new DeployError("preflight", "Wrangler OAuth token could not be read");
+  }
+  if (result.exitCode !== 0) {
+    throw new DeployError("preflight", "Wrangler OAuth token command failed");
+  }
+  const token = parseWranglerAuthToken(result.stdout);
+  return {
+    token,
+    childEnvironment: { ...WRANGLER_OAUTH_CHILD_ENVIRONMENT },
+    source: "oauth",
+  };
+}
+
+function isExactCredentialToken(value: string): boolean {
+  if (value.length === 0 || value.trim() !== value) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code < 0x20 || code === 0x7f) return false;
+  }
+  return true;
 }
 
 /** Runs a command to completion, capturing both streams and never inheriting stdin. */

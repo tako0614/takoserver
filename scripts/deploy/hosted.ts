@@ -7,9 +7,9 @@ import { RemoteD1 } from "./d1.ts";
 import { type DeployPhase, mutationError, preflightError, verificationError } from "./errors.ts";
 import {
   type CommandResult,
-  cloudflareChildEnvironment,
   REPOSITORY,
   requireEnvironment,
+  resolveCloudflareCredential,
   runCommand,
   wranglerCommand,
 } from "./process.ts";
@@ -77,11 +77,17 @@ export async function runHosted(
     throw preflightError("Hosted token cutover requires target sponsorship");
   }
   const run = options.run ?? runCommand;
-  const environment =
-    options.cloudflareEnvironment ??
-    (options.database !== undefined && options.state !== undefined && invocation.action === "status"
-      ? {}
-      : cloudflareChildEnvironment());
+  const credential =
+    invocation.environment === "integration" &&
+    options.database !== undefined &&
+    options.state !== undefined &&
+    invocation.action === "status"
+      ? undefined
+      : await resolveCloudflareCredential(invocation.environment, {
+          cloudflareEnvironment: options.cloudflareEnvironment,
+          run,
+        });
+  const environment = credential?.childEnvironment ?? {};
   const temporary = options.outputDirectory === undefined;
   const root = options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-hosted-"));
   mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -98,7 +104,7 @@ export async function runHosted(
       options.state ??
       new CloudflareState({
         accountId: target.accountId,
-        token: exactCloudflareToken(environment),
+        token: credential?.token ?? exactCloudflareToken(environment),
       });
     if (invocation.action === "status") {
       return await hostedStatus(invocation, target, state);

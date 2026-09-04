@@ -149,6 +149,26 @@ describe("forward-only D1 schema surface", () => {
     }
   });
 
+  test("rehearsal D1 injected readers cannot bypass the explicit token lane", async () => {
+    let reads = 0;
+    const failure = await runD1Schema(
+      { action: "status", environment: "rehearsal", commit: COMMIT, throughMigration: "0028" },
+      target,
+      {
+        reader: {
+          async read() {
+            reads += 1;
+            return PRE;
+          },
+        },
+        cloudflareEnvironment: {},
+      },
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain("CLOUDFLARE_API_TOKEN is required");
+    expect(reads).toBe(0);
+  });
+
   test("status reports dispatched provider sagas that block the 0036 backfill", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-provider-repair-status-"));
     try {
@@ -171,7 +191,7 @@ describe("forward-only D1 schema surface", () => {
         {
           reader,
           outputDirectory: join(root, "work"),
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       );
       expect(result).toMatchObject({
@@ -214,7 +234,7 @@ describe("forward-only D1 schema surface", () => {
           outputDirectory: join(root, "work"),
           receiptPath: join(root, "receipt.json"),
           review: "reviewer@example.test",
-          cloudflareEnvironment: {},
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       ).catch((error) => error);
       expect(failure).toBeInstanceOf(DeployError);
@@ -288,6 +308,51 @@ describe("forward-only D1 schema surface", () => {
       expect(applies).toHaveLength(1);
       expect(applies[0]).toContain(target.d1.databaseName);
       expect(existsSync(receiptPath)).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("integration D1 dispatch resolves OAuth and leaves Wrangler children token-free", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-oauth-"));
+    try {
+      const fixture = processFixture("rehearsal");
+      const oauthToken = "d1-oauth-token-only-in-process";
+      const calls: {
+        readonly command: readonly string[];
+        readonly env: Readonly<Record<string, string>>;
+      }[] = [];
+      const run: SchemaProcess = async (command, options) => {
+        calls.push({ command: [...command], env: options?.env ?? {} });
+        if (command.slice(-3).join(" ") === "auth token --json") {
+          return ok(JSON.stringify({ type: "oauth", token: oauthToken }));
+        }
+        return await fixture.run(command, options);
+      };
+      const result = await runD1Schema(
+        { action: "apply", environment: "integration", commit: COMMIT },
+        { ...target, environment: "integration" },
+        {
+          run,
+          reader: readerSequence([PRE, PRE, PRE, POST]),
+          migrationDirectory: migrations(root),
+          outputDirectory: join(root, "work"),
+          receiptPath: join(root, "receipt.json"),
+          review: "reviewer@example.test",
+          cloudflareEnvironment: {},
+        },
+      );
+      expect(result).toMatchObject({
+        kind: "takoserver.d1-schema-apply@v3",
+        environment: "integration",
+      });
+      const wranglerCalls = calls.filter((entry) => entry.command[0]?.endsWith("/wrangler"));
+      expect(wranglerCalls.length).toBeGreaterThan(0);
+      expect(wranglerCalls.every(({ env }) => env.CLOUDFLARE_API_TOKEN === undefined)).toBe(true);
+      expect(
+        calls.find(({ command }) => command.slice(-3).join(" ") === "auth token --json")?.env,
+      ).toEqual({ WRANGLER_WRITE_LOGS: "false" });
+      expect(JSON.stringify(wranglerCalls)).not.toContain(oauthToken);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

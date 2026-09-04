@@ -12,9 +12,9 @@ import { type DeployPhase, mutationError, preflightError, verificationError } fr
 import { assertPublicFormCapabilityTarget } from "./form-authority-capability.ts";
 import {
   type CommandResult,
-  cloudflareChildEnvironment,
   REPOSITORY,
   requireEnvironment,
+  resolveCloudflareCredential,
   runCommand,
   wranglerCommand,
 } from "./process.ts";
@@ -135,14 +135,22 @@ export async function runFormAuthorityIdentityProbe(
   }
   const selected = requireProbeTarget(target);
   const run = options.run ?? runCommand;
-  const environment =
-    options.cloudflareEnvironment ??
-    (options.state !== undefined && invocation.action === "status"
-      ? {}
-      : cloudflareChildEnvironment());
+  const credential =
+    invocation.environment === "integration" &&
+    options.state !== undefined &&
+    invocation.action === "status"
+      ? undefined
+      : await resolveCloudflareCredential(invocation.environment, {
+          cloudflareEnvironment: options.cloudflareEnvironment,
+          run,
+        });
+  const environment = credential?.childEnvironment ?? {};
   const state =
     options.state ??
-    new CloudflareState({ accountId: target.accountId, token: exactToken(environment) });
+    new CloudflareState({
+      accountId: target.accountId,
+      token: credential?.token ?? exactToken(environment),
+    });
   const fetcher = options.fetcher ?? fetch;
   const publicBefore = await inspectPublic("preflight", target, state);
   const authorityWorkerPresent = await assertBoundAuthorityWorkerExists(
@@ -274,6 +282,7 @@ export async function runFormAuthorityIdentityProbe(
       target,
       commit: source.commit,
       run,
+      environment,
     });
     if (`sha256:${publicProof.bundleDigestHex}` !== publicBefore.workerArtifactDigest) {
       throw preflightError(
@@ -287,6 +296,7 @@ export async function runFormAuthorityIdentityProbe(
       target,
       commit: source.commit,
       run,
+      environment,
       main: resolve(REPOSITORY, "src/entry-form-authority-identity-probe.ts"),
       writeConfig: ({ path, main }) => writeProbeConfig({ path, main, target }),
     });

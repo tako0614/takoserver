@@ -115,8 +115,8 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(operatorIdentity?.obligations["post-conditions"]).toContain("owner");
     expect(operatorIdentity?.obligations["failure-handling"]).toContain("--status");
     expect(routineWorker?.requiresTools).toContain("flock");
-    expect(routineWorker?.obligations.provenance).toContain("explicit `CLOUDFLARE_API_TOKEN`");
-    expect(routineWorker?.obligations.provenance).not.toContain("stored OAuth profile");
+    expect(routineWorker?.obligations.provenance).toContain("CLOUDFLARE_API_TOKEN");
+    expect(routineWorker?.obligations.provenance).toContain("stored OAuth profile");
     expect(routineWorker?.obligations["post-conditions"]).toContain(
       "one versions upload followed by one explicit 100 percent deployment",
     );
@@ -139,7 +139,7 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(routineWorker?.obligations["failure-handling"]).not.toContain(
       "uploaded Version is inactive",
     );
-    expect(routineWorker?.obligations["failure-handling"]).toContain("Wrangler OAuth is refused");
+    expect(routineWorker?.obligations["failure-handling"]).toContain("credential resolver");
     expect(schemaBaseline?.obligations.provenance).toContain("fixed empty-to-0022");
     expect(schemaBaseline?.obligations["failure-handling"]).toContain(
       "cannot emit production rehearsal evidence",

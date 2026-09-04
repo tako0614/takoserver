@@ -1034,6 +1034,7 @@ test("production reversal restores the exact provider-history predecessor before
       gatewayId: "gateway",
       review: "reviewer",
       run,
+      cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
       publicationLease: publicationLease(),
       mutate: {
         async create() {

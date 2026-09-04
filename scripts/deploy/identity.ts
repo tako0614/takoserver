@@ -23,9 +23,9 @@ import {
 } from "./operator-authority.ts";
 import {
   type CommandResult,
-  cloudflareChildEnvironment,
   REPOSITORY,
   requireEnvironment,
+  resolveCloudflareCredential,
   runCommand,
   wranglerCommand,
 } from "./process.ts";
@@ -120,20 +120,16 @@ export async function runOperatorIdentity(
   }
   const desiredPublicJwkDigest = sha256(JSON.stringify(publicJwk));
   const run = options.run ?? runCommand;
-  const suppliedToken =
-    options.cloudflareEnvironment === undefined
-      ? process.env.CLOUDFLARE_API_TOKEN
-      : options.cloudflareEnvironment.CLOUDFLARE_API_TOKEN;
-  if (options.state === undefined && suppliedToken === undefined) {
-    throw preflightError(
-      "CLOUDFLARE_API_TOKEN is required because authoritative Worker state must be read directly",
-    );
-  }
-  const cloudflareEnvironment =
-    options.cloudflareEnvironment ??
-    (options.state !== undefined && invocation.action === "status"
-      ? {}
-      : cloudflareChildEnvironment());
+  const credential =
+    invocation.environment === "integration" &&
+    options.state !== undefined &&
+    invocation.action === "status"
+      ? undefined
+      : await resolveCloudflareCredential(invocation.environment, {
+          cloudflareEnvironment: options.cloudflareEnvironment,
+          run,
+        });
+  const cloudflareEnvironment = credential?.childEnvironment ?? {};
   const temporary = options.outputDirectory === undefined;
   const root = options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-identity-"));
   mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -142,7 +138,7 @@ export async function runOperatorIdentity(
       options.state ??
       new CloudflareState({
         accountId: target.accountId,
-        token: exactCloudflareToken(cloudflareEnvironment),
+        token: credential?.token ?? exactCloudflareToken(cloudflareEnvironment),
       });
     const migrations =
       options.migrations ??
@@ -238,6 +234,7 @@ export async function runOperatorIdentity(
       commit: source.commit,
       signingKeyId: target.signing.currentKeyId,
       run,
+      environment: cloudflareEnvironment,
     });
     if (prepared.bundleDigestHex !== live.bundleDigestHex) {
       throw preflightError(
